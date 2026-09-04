@@ -10656,3 +10656,118 @@ fn d8_w1_ordinary_caller_uses_terminal_safe_inner_interface() {
         "D8-W1 terminal wrapper/inner pairing must type-check:\n{emitted}"
     );
 }
+
+/// D13-W2 — the renderer's localized failure becomes a dropped PAIR site with
+/// exact readable and hex source, so finalization holds only the owning class.
+#[test]
+fn d13_w2_pair_parse_failure_is_a_source_carrying_class_site() {
+    let fixture = Fixture::new(&[("lib.rs", "fn caller() {} fn callee() {}\n")]);
+    ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let mut ids = tcx.hir_body_owners().collect::<Vec<_>>();
+        ids.sort_by_key(|did| did.local_def_index.as_u32());
+        let [caller, callee] = ids.as_slice() else { panic!("two functions") };
+        let call = super::decision::seam::PairRawViewCall {
+            owner_class: super::bridge_receipt::SignatureClassId::of(*callee),
+            caller: *caller,
+            callee: *callee,
+            call_span: rustc_span::DUMMY_SP,
+            views: vec![super::decision::seam::PairRawViewTemp {
+                argument_index: 1,
+                raw_expression: "p".to_owned(),
+                target_type: "*const i8".to_owned(),
+            }],
+            reasons: vec!["pair-t2".to_owned()],
+            atom_ids: vec!["site".to_owned()],
+        };
+        let source = r#"f(p, b"\x1B[1;36m\0" as *const u8)"#;
+        let site = super::pair_raw_view_failure_site(
+            &call,
+            &super::plan::FileKey::Virtual("lib.rs".to_owned()),
+            10,
+            40,
+            source,
+            "C-9 argument source has an unclosed delimiter",
+        );
+        assert_eq!(site.key.bridge_kind, "pair-c9-source-held");
+        let super::plan::ClassSiteState::Dropped(reason) = site.state else {
+            panic!("D13 site was not held")
+        };
+        assert!(
+            reason.contains(r#"argument-text=f(p, b"\x1B[1;36m\0""#),
+            "{reason}"
+        );
+        assert!(reason.contains("argument-hex="), "{reason}");
+    })
+    .expect("D13-W2 input compiles");
+}
+
+/// D13-W3 — exercise the actual emission boundary: a PAIR call whose byte
+/// string defeats the delimiter scanner returns an `Emission` with a dropped
+/// class site.  Restoring `?` propagation turns this back into a program-level
+/// pre-compile failure and this witness fails.
+#[test]
+fn d13_w3_pair_parse_failure_does_not_abort_program_emission() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        r##"#![allow(dead_code, unused_unsafe)]
+            pub unsafe fn callee(p: *mut i32, text: *const i8) { let _ = (p, text); }
+            pub unsafe fn caller(p: *mut i32) {
+                callee(p, b"\x1B[1;36m\0" as *const u8 as *const i8);
+            }
+        "##,
+    )]);
+    let (held, reason) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (mut table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )?;
+            let callee = tcx
+                .hir_body_owners()
+                .find(|did| tcx.def_path_str(did.to_def_id()).ends_with("callee"))
+                .expect("callee");
+            let call = ctx
+                .facts
+                .call_args
+                .get(&callee)
+                .and_then(|calls| calls.first())
+                .expect("caller/callee site");
+            table.seams.pair_raw_calls = vec![super::decision::seam::PairRawViewCall {
+                owner_class: super::bridge_receipt::SignatureClassId::of(callee),
+                caller: call.caller,
+                callee,
+                call_span: call.span,
+                views: vec![super::decision::seam::PairRawViewTemp {
+                    argument_index: 0,
+                    raw_expression: "p".to_owned(),
+                    target_type: "*mut i32".to_owned(),
+                }],
+                reasons: vec!["pair-t2".to_owned()],
+                atom_ids: vec!["d13-site".to_owned()],
+            }];
+            let emission = super::emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )?;
+            let class = &emission.plan.class_finalization.classes
+                [&super::bridge_receipt::SignatureClassId::of(callee)];
+            let reason = class.hold_reasons().join(";");
+            Ok::<_, String>((!class.is_ready(), reason))
+        })
+        .expect("D13-W3 input compiles")
+        .expect("D13-W3 failure is localized, not propagated");
+    assert!(held, "PAIR source failure did not hold its class");
+    assert!(
+        reason.contains("pair-c9-source-held")
+            && reason.contains(r#"b"\x1B[1;36m\0""#)
+            && reason.contains("argument-hex="),
+        "{reason}"
+    );
+}

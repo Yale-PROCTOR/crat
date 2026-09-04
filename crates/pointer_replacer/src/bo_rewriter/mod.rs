@@ -4238,6 +4238,67 @@ fn file_key(name: &rustc_span::FileName) -> Option<plan::FileKey> {
     }
 }
 
+fn pair_raw_view_failure_site(
+    call: &decision::seam::PairRawViewCall,
+    file: &plan::FileKey,
+    lo: usize,
+    hi: usize,
+    source: &str,
+    error: &str,
+) -> plan::ClassSite {
+    let file = match file {
+        plan::FileKey::Real(path) => path.display().to_string(),
+        plan::FileKey::Virtual(name) => name.clone(),
+    };
+    let readable = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let source_hex = source
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let bridge = bridge_receipt::BridgeSitePlan {
+        caller: call.caller,
+        callee: bridge_receipt::BridgeCalleeId::Local(call.callee),
+        arm: decision::Arm::Pair.key().to_owned(),
+        position: format!(
+            "args={};site-hold",
+            call.views
+                .iter()
+                .map(|view| view.argument_index.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        bridge_kind: "pair-c9-source-held".to_owned(),
+        expected_form: "raw".to_owned(),
+        found_form: "safe-pair-source".to_owned(),
+        argument_kind: "pair-call".to_owned(),
+        extent: bridge_receipt::BridgeExtentKind::None,
+        retention: bridge_receipt::BridgeRetentionTier::None,
+        waiver_id: None,
+    };
+    plan::ClassSite {
+        key: bridge.materialize(
+            call.owner_class,
+            file,
+            u32::try_from(lo).unwrap_or(u32::MAX),
+            u32::try_from(hi).unwrap_or(u32::MAX),
+        ),
+        edit_key: "-".to_owned(),
+        state: plan::ClassSiteState::Dropped(format!(
+            "c9-source-held:{}:argument-text={}:argument-hex={}",
+            error.replace(['\t', '\r', '\n'], " "),
+            readable,
+            source_hex,
+        )),
+        expected_form: "raw".to_owned(),
+        found_form: "safe-pair-source".to_owned(),
+        argument_kind: "pair-call".to_owned(),
+        extent: bridge_receipt::BridgeExtentKind::None,
+        retention: bridge_receipt::BridgeRetentionTier::None,
+        waiver_id: None,
+    }
+}
+
 /// Plan and apply, **grouped by file**.
 ///
 /// Grouping is what makes the offsets meaningful: `lookup_byte_offset` yields
@@ -4312,7 +4373,15 @@ pub(crate) fn emit_files<'tcx>(
             })
             .collect::<Vec<_>>();
         let temp_stem = format!("__crat_pair_raw_{}", call.call_span.lo().0);
-        let replacement = c9::render_pair_raw_view_source(original, &temp_stem, &views)?;
+        let replacement = match c9::render_pair_raw_view_source(original, &temp_stem, &views) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                planned.preclass_sites.push(pair_raw_view_failure_site(
+                    call, &file, lo, hi, original, &error,
+                ));
+                continue;
+            }
+        };
         planned.by_file.entry(file).or_default().push(plan::Edit {
             lo,
             hi,

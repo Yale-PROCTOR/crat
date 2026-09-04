@@ -97,7 +97,16 @@ pub(crate) fn render_pair_raw_view_source(
     if callee.is_empty() {
         return Err("PAIR call source has an empty callee".to_owned());
     }
-    let mut arguments = split_arguments(&source[open + 1..close])?;
+    let argument_source = &source[open + 1..close];
+    let mut arguments = split_arguments(argument_source).map_err(|why| {
+        format!(
+            "{why};argument-source={}",
+            argument_source
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    })?;
     let mut declarations = Vec::new();
     for (argument_index, raw_expression, target_type) in views {
         let Some(argument) = arguments.get_mut(*argument_index) else {
@@ -180,6 +189,26 @@ mod tests {
             "i32".to_owned(),
         )
         .unwrap()
+    }
+
+    /// D13-W1 — LibTree's ANSI byte string contains `[` as data.  The current
+    /// delimiter-only splitter rejects it, but the rejection must carry the
+    /// exact argument source so the caller can turn this one site into a typed
+    /// class hold instead of degrading the whole program.
+    #[test]
+    fn d13_w1_unclosed_delimiter_error_carries_the_argument_text() {
+        let source = r#"print_line(x, b"\x1B[1;36m\0" as *const u8 as *mut i8)"#;
+        let error = render_pair_raw_view_source(
+            source,
+            "__crat_pair_raw_fixture",
+            &[(0, "x".to_owned(), "*mut i32".to_owned())],
+        )
+        .expect_err("the byte-string delimiter shape remains a site hold");
+        assert!(
+            error.contains("C-9 argument source has an unclosed delimiter")
+                && error.contains(r#"b"\x1B[1;36m\0""#),
+            "{error}"
+        );
     }
 
     #[test]
