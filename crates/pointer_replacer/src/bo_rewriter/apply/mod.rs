@@ -140,6 +140,19 @@ struct Segment {
     /// 1-based inclusive line range in the EMITTED document.
     emit_lo: usize,
     emit_hi: usize,
+    /// Token anchors retained by the AST pretty-printer.  New bridge syntax
+    /// has no input coordinate of its own, but the expression it wraps does;
+    /// pairing equal identifier occurrences lets a diagnostic span cross the
+    /// new syntax and still land on that original expression.
+    anchors: Vec<PointAnchor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PointAnchor {
+    orig_line: usize,
+    orig_column: usize,
+    emit_line: usize,
+    emit_column: usize,
 }
 
 impl LineMap {
@@ -149,28 +162,78 @@ impl LineMap {
         let mut ordered: Vec<&(usize, usize, String)> = splices.iter().collect();
         ordered.sort_by_key(|(lo, hi, _)| (*lo, *hi));
 
-        let line_of = |byte: usize| -> usize {
-            // 1-based, matching rustc diagnostics.
-            1 + source[..byte.min(source.len())]
-                .bytes()
-                .filter(|b| *b == b'\n')
-                .count()
+        let point_of = |text: &str, byte: usize| -> (usize, usize) {
+            let byte = byte.min(text.len());
+            let line = 1 + text[..byte].bytes().filter(|b| *b == b'\n').count();
+            let line_start = text[..byte].rfind('\n').map_or(0, |at| at + 1);
+            (line, text[line_start..byte].chars().count() + 1)
+        };
+
+        let word_offsets = |text: &str| {
+            let mut words = std::collections::BTreeMap::<String, Vec<usize>>::new();
+            let mut start = None;
+            for (offset, ch) in text
+                .char_indices()
+                .chain(std::iter::once((text.len(), ' ')))
+            {
+                if ch == '_' || ch.is_alphanumeric() {
+                    start.get_or_insert(offset);
+                } else if let Some(lo) = start.take() {
+                    let word = &text[lo..offset];
+                    if word.chars().any(|ch| ch == '_' || ch.is_alphabetic()) {
+                        words.entry(word.to_owned()).or_default().push(lo);
+                    }
+                }
+            }
+            words
         };
 
         let mut segments = Vec::new();
         let mut delta: isize = 0;
         for (lo, hi, replacement) in ordered {
-            let orig_lo = line_of(*lo);
-            let orig_hi = line_of(*hi);
+            let (orig_lo, splice_column) = point_of(source, *lo);
+            let orig_hi = point_of(source, *hi).0;
             let new_lines = replacement.bytes().filter(|b| *b == b'\n').count();
             let emit_lo = (orig_lo as isize + delta).max(1) as usize;
             let emit_hi = emit_lo + new_lines;
+            let original_words = word_offsets(&source[*lo..*hi]);
+            let emitted_words = word_offsets(replacement);
+            let mut anchors = Vec::new();
+            for (word, original_offsets) in original_words {
+                let Some(emitted_offsets) = emitted_words.get(&word) else {
+                    continue;
+                };
+                if original_offsets.len() != emitted_offsets.len() {
+                    continue;
+                }
+                for (original_offset, emitted_offset) in original_offsets
+                    .into_iter()
+                    .zip(emitted_offsets.iter().copied())
+                {
+                    let (orig_line, orig_column) = point_of(source, *lo + original_offset);
+                    let (local_line, local_column) = point_of(replacement, emitted_offset);
+                    let emit_line = emit_lo + local_line - 1;
+                    let emit_column = if local_line == 1 {
+                        splice_column + local_column - 1
+                    } else {
+                        local_column
+                    };
+                    anchors.push(PointAnchor {
+                        orig_line,
+                        orig_column,
+                        emit_line,
+                        emit_column,
+                    });
+                }
+            }
+            anchors.sort_by_key(|anchor| (anchor.emit_line, anchor.emit_column));
             delta += new_lines as isize - (orig_hi - orig_lo) as isize;
             segments.push(Segment {
                 orig_lo,
                 orig_hi,
                 emit_lo,
                 emit_hi,
+                anchors,
             });
         }
         Self { segments }
@@ -193,6 +256,26 @@ impl LineMap {
             delta += (seg.emit_hi - seg.emit_lo) as isize - (seg.orig_hi - seg.orig_lo) as isize;
         }
         (emit_line as isize - delta).max(1) as usize
+    }
+
+    /// Map one displayed emitted point back to the nearest input token retained
+    /// by a whole-function AST reprint.  Both coordinates are 1-based.
+    pub(crate) fn to_original_point(&self, emit_line: usize, emit_column: usize) -> (usize, usize) {
+        for segment in &self.segments {
+            if emit_line < segment.emit_lo {
+                break;
+            }
+            if emit_line <= segment.emit_hi {
+                if let Some(anchor) = segment.anchors.iter().min_by_key(|anchor| {
+                    anchor.emit_line.abs_diff(emit_line) * 1_000_000
+                        + anchor.emit_column.abs_diff(emit_column)
+                }) {
+                    return (anchor.orig_line, anchor.orig_column);
+                }
+                return (segment.orig_lo, 1);
+            }
+        }
+        (self.to_original(emit_line), emit_column)
     }
 
     /// Exact offset-preserving map for a replacement whose original and
@@ -266,6 +349,7 @@ mod tests {
                 orig_hi: 65,
                 emit_lo: 57,
                 emit_hi: 65,
+                anchors: Vec::new(),
             }],
         };
         assert_eq!(equal.to_original(60), 57, "ordinary gate map collapses");
@@ -278,6 +362,7 @@ mod tests {
                 orig_hi: 65,
                 emit_lo: 57,
                 emit_hi: 63,
+                anchors: Vec::new(),
             }],
         };
         assert_eq!(unequal.to_original_if_bijective(60), None);

@@ -565,6 +565,9 @@ fn classify(message: &str) -> Direction {
 pub(crate) struct RelatedDiag {
     pub file: String,
     pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
     pub message: String,
 }
 
@@ -572,6 +575,9 @@ pub(crate) struct RelatedDiag {
 pub(crate) struct Diag {
     pub file: String,
     pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
     pub message: String,
     pub direction: Direction,
     /// `E0308` and the like. `None` for lint errors, which carry no code — the
@@ -785,6 +791,7 @@ impl rustc_errors::emitter::Emitter for Capture {
             .filter_map(|child| {
                 let span = child.span.primary_span()?;
                 let loc = self.source_map.lookup_char_pos(span.lo());
+                let end = self.source_map.lookup_char_pos(span.hi());
                 let message = child
                     .messages
                     .iter()
@@ -797,16 +804,23 @@ impl rustc_errors::emitter::Emitter for Capture {
                 Some(RelatedDiag {
                     file: loc.file.name.prefer_local().to_string(),
                     line: loc.line,
+                    column: loc.col_display + 1,
+                    end_line: end.line,
+                    end_column: end.col_display + 1,
                     message,
                 })
             })
             .collect();
         if let Some(span) = diag.span.primary_span() {
             let loc = self.source_map.lookup_char_pos(span.lo());
+            let end = self.source_map.lookup_char_pos(span.hi());
             let direction = classify(&message);
             self.diags.lock().unwrap().push(Diag {
                 file: loc.file.name.prefer_local().to_string(),
                 line: loc.line,
+                column: loc.col_display + 1,
+                end_line: end.line,
+                end_column: end.col_display + 1,
                 message,
                 direction,
                 code: diag.code.map(|c| format!("{c:?}")),
@@ -874,10 +888,16 @@ fn call_mismatch_capture_retains_the_callee_definition_span() {
         .find(|diagnostic| matches!(diagnostic.code.as_deref(), Some("E0308" | "ErrCode(308)")))
         .expect("E0308 mismatch diagnostic");
     assert!(
-        mismatch
-            .related
-            .iter()
-            .any(|related| related.message.contains("function defined here")),
+        mismatch.column > 1
+            && (mismatch.end_line, mismatch.end_column) >= (mismatch.line, mismatch.column),
+        "primary diagnostic point range was not captured: {mismatch:?}"
+    );
+    assert!(
+        mismatch.related.iter().any(|related| {
+            related.message.contains("function defined here")
+                && related.column > 0
+                && (related.end_line, related.end_column) >= (related.line, related.column)
+        }),
         "callee-definition span was discarded: {mismatch:?}"
     );
 }

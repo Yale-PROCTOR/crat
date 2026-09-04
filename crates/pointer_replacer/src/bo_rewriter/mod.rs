@@ -1539,6 +1539,9 @@ fn verify_and_revert(
                         let mut related_diagnostic = verify::Diag {
                             file: related.file.clone(),
                             line: related.line,
+                            column: related.column,
+                            end_line: related.end_line,
+                            end_column: related.end_column,
                             message: related.message.clone(),
                             direction: verify::Direction::Other,
                             code: diagnostic.code.clone(),
@@ -1636,6 +1639,9 @@ fn verify_and_revert(
                     diagnostic: verify::Diag {
                         file: "<spanless>".to_owned(),
                         line: 0,
+                        column: 0,
+                        end_line: 0,
+                        end_column: 0,
                         message: format!(
                             "{novel_errors} baseline-subtracted error(s) carried no located diagnostic"
                         ),
@@ -3125,7 +3131,9 @@ pub(crate) struct EditSite {
     /// Display-only path for receipts.
     pub fn_path: String,
     pub lo_line: usize,
+    pub lo_column: usize,
     pub hi_line: usize,
+    pub hi_column: usize,
     /// Stable plan-edit identity used only in atom coverage/receipts.
     pub edit_id: String,
     /// Typed interval role used by attribution precedence.
@@ -3274,18 +3282,25 @@ pub(crate) fn select_atoms_on_original_lines(
     files.sort_unstable();
     files.dedup();
     let single_file = files.len() <= 1;
-    let at = |file: &str, line: usize| {
+    let at = |file: &str, lo: (usize, usize), hi: (usize, usize)| {
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
         edits
             .iter()
             .filter(|edit| {
-                (single_file || edit.file == file) && edit.lo_line <= line && line <= edit.hi_line
+                (single_file || edit.file == file)
+                    && lo <= (edit.hi_line, edit.hi_column)
+                    && (edit.lo_line, edit.lo_column) <= hi
             })
             .collect::<Vec<_>>()
     };
     let mut selected = std::collections::BTreeSet::new();
     let mut grouped = false;
     for diagnostic in diags {
-        let primary = at(&diagnostic.file, diagnostic.line);
+        let primary = at(
+            &diagnostic.file,
+            (diagnostic.line, diagnostic.column),
+            (diagnostic.end_line, diagnostic.end_column),
+        );
         if primary.is_empty() {
             return atom_fallback("atom-attribution-ambiguous");
         }
@@ -3330,7 +3345,11 @@ pub(crate) fn select_atoms_on_original_lines(
         if alias_group {
             grouped = true;
             for related in &diagnostic.related {
-                let related_sites = at(&related.file, related.line);
+                let related_sites = at(
+                    &related.file,
+                    (related.line, related.column),
+                    (related.end_line, related.end_column),
+                );
                 if related_sites
                     .iter()
                     .any(|edit| !edit.atom_covered || edit.atom_ids.is_empty())
@@ -3386,17 +3405,19 @@ fn select_subject_atoms(
         .iter()
         .map(|edit| edit.file.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let translate = |file: &str, line: usize| {
+    let translate = |file: &str, line: usize, column: usize| {
         let relative = verify::crate_relative(file, observed_root);
         let matched = maps
             .iter()
             .filter(|(candidate, _, _)| *candidate == relative)
             .collect::<Vec<_>>();
         if let [(_, original, map)] = matched.as_slice() {
-            return ((*original).clone(), map.to_original(line));
+            let (line, column) = map.to_original_point(line, column);
+            return ((*original).clone(), line, column);
         }
         if maps.len() == 1 {
-            return (maps[0].1.clone(), maps[0].2.to_original(line));
+            let (line, column) = maps[0].2.to_original_point(line, column);
+            return (maps[0].1.clone(), line, column);
         }
         let matching_files = edit_files
             .iter()
@@ -3404,23 +3425,32 @@ fn select_subject_atoms(
             .cloned()
             .collect::<Vec<_>>();
         if let [original] = matching_files.as_slice() {
-            (original.clone(), line)
+            (original.clone(), line, column)
         } else {
-            (file.to_owned(), line)
+            (file.to_owned(), line, column)
         }
     };
     let translated = diags
         .iter()
         .map(|diagnostic| {
-            let (file, line) = translate(&diagnostic.file, diagnostic.line);
+            let (file, line, column) =
+                translate(&diagnostic.file, diagnostic.line, diagnostic.column);
+            let (_, end_line, end_column) =
+                translate(&diagnostic.file, diagnostic.end_line, diagnostic.end_column);
             let related = diagnostic
                 .related
                 .iter()
                 .map(|related| {
-                    let (file, line) = translate(&related.file, related.line);
+                    let (file, line, column) =
+                        translate(&related.file, related.line, related.column);
+                    let (_, end_line, end_column) =
+                        translate(&related.file, related.end_line, related.end_column);
                     verify::RelatedDiag {
                         file,
                         line,
+                        column,
+                        end_line,
+                        end_column,
                         message: related.message.clone(),
                     }
                 })
@@ -3428,6 +3458,9 @@ fn select_subject_atoms(
             verify::Diag {
                 file,
                 line,
+                column,
+                end_line,
+                end_column,
                 message: diagnostic.message.clone(),
                 direction: diagnostic.direction,
                 code: diagnostic.code.clone(),
@@ -3459,6 +3492,19 @@ fn line_span(text: &str, lo: usize, hi: usize) -> (usize, usize) {
     (count(lo), count(hi))
 }
 
+/// Display coordinates of a byte range, 1-based and end-exclusive.
+fn source_span(text: &str, lo: usize, hi: usize) -> (usize, usize, usize, usize) {
+    let point = |at: usize| {
+        let at = at.min(text.len());
+        let line = text[..at].matches('\n').count() + 1;
+        let line_start = text[..at].rfind('\n').map_or(0, |index| index + 1);
+        (line, text[line_start..at].chars().count() + 1)
+    };
+    let (lo_line, lo_column) = point(lo);
+    let (hi_line, hi_column) = point(hi);
+    (lo_line, lo_column, hi_line, hi_column)
+}
+
 /// Every planned edit, located in lines.
 fn edit_sites(
     planned: &plan::Plan,
@@ -3486,7 +3532,7 @@ fn edit_sites(
             plan::FileKey::Virtual(name) => name.clone(),
         };
         for edit in edits {
-            let (lo_line, hi_line) = line_span(text, edit.lo, edit.hi);
+            let (lo_line, lo_column, hi_line, hi_column) = source_span(text, edit.lo, edit.hi);
             let replacement_sha256 = {
                 use sha2::{Digest, Sha256};
                 format!("{:x}", Sha256::digest(edit.replacement.as_bytes()))
@@ -3506,7 +3552,9 @@ fn edit_sites(
                 owner_class: edit.owner_class,
                 fn_path: edit.owner_path.clone(),
                 lo_line,
+                lo_column,
                 hi_line,
+                hi_column,
                 edit_id: edit_key.render(),
                 site_kind: edit.edit_kind,
                 atom_ids: edit.atom_ids.clone(),
@@ -3528,13 +3576,15 @@ fn edit_sites(
             plan::FileKey::Real(path) => path.display().to_string(),
             plan::FileKey::Virtual(name) => name.clone(),
         };
-        let (lo_line, hi_line) = line_span(text, interval.lo, interval.hi);
+        let (lo_line, lo_column, hi_line, hi_column) = source_span(text, interval.lo, interval.hi);
         out.push(EditSite {
             file,
             owner_class: Some(interval.owner_class),
             fn_path: interval.owner_path.clone(),
             lo_line,
+            lo_column,
             hi_line,
+            hi_column,
             edit_id: format!(
                 "class={}|attribution={}:{}:{}|kind={}",
                 interval.owner_class.order_key(),
@@ -3833,32 +3883,41 @@ pub(crate) fn attribute_with_rule(
             plan::FileKey::Virtual(name) => Some((name.clone(), map)),
         })
         .collect();
-    let translate = |file: &str, line: usize| {
+    let translate = |file: &str, line: usize, column: usize| {
         let relative = verify::crate_relative(file, observed_root);
-        let line = maps_by_rel
+        let point = maps_by_rel
             .get(&relative)
             .or(if maps_by_rel.len() == 1 {
                 maps_by_rel.values().next()
             } else {
                 None
             })
-            .map_or(line, |map| map.to_original(line));
-        (relative, line)
+            .map_or((line, column), |map| map.to_original_point(line, column));
+        (relative, point)
     };
-    let exact_edits = |file: &str, line: usize, seam: bool| {
-        let (relative, line) = translate(file, line);
+    let overlaps = |left_lo: (usize, usize), left_hi: (usize, usize), edit: &&EditSite| {
+        let (left_lo, left_hi) = if left_lo <= left_hi {
+            (left_lo, left_hi)
+        } else {
+            (left_hi, left_lo)
+        };
+        left_lo <= (edit.hi_line, edit.hi_column) && (edit.lo_line, edit.lo_column) <= left_hi
+    };
+    let exact_edits = |diagnostic: &verify::Diag, seam: bool| {
+        let (relative, lo) = translate(&diagnostic.file, diagnostic.line, diagnostic.column);
+        let (_, hi) = translate(&diagnostic.file, diagnostic.end_line, diagnostic.end_column);
         edits
             .iter()
             .filter(|edit| seam_site_kind(edit.site_kind) == seam)
             .filter(|edit| {
                 single_file || verify::crate_relative(&edit.file, original_root) == relative
             })
-            .filter(|edit| edit.lo_line <= line && line <= edit.hi_line)
+            .filter(|edit| overlaps(lo, hi, edit))
             .filter_map(|edit| edit.owner_class)
             .collect::<std::collections::BTreeSet<_>>()
     };
     let exact_sites = |file: &str, line: usize| {
-        let (relative, line) = translate(file, line);
+        let (relative, (line, _)) = translate(file, line, 1);
         sites
             .iter()
             .filter(|site| {
@@ -3869,14 +3928,14 @@ pub(crate) fn attribute_with_rule(
             .collect::<std::collections::BTreeSet<_>>()
     };
 
-    let ordinary = exact_edits(&diagnostic.file, diagnostic.line, false);
+    let ordinary = exact_edits(diagnostic, false);
     if !ordinary.is_empty() {
         return AttributionResult {
             classes: ordinary,
             rule: AttributionRule::ExactEdit,
         };
     }
-    let seam = exact_edits(&diagnostic.file, diagnostic.line, true);
+    let seam = exact_edits(diagnostic, true);
     if !seam.is_empty() {
         return AttributionResult {
             classes: seam,
@@ -3885,8 +3944,19 @@ pub(crate) fn attribute_with_rule(
     }
     let mut related_classes = std::collections::BTreeSet::new();
     for related in &diagnostic.related {
-        related_classes.extend(exact_edits(&related.file, related.line, false));
-        related_classes.extend(exact_edits(&related.file, related.line, true));
+        let related = verify::Diag {
+            file: related.file.clone(),
+            line: related.line,
+            column: related.column,
+            end_line: related.end_line,
+            end_column: related.end_column,
+            message: related.message.clone(),
+            direction: verify::Direction::Other,
+            code: diagnostic.code.clone(),
+            related: Vec::new(),
+        };
+        related_classes.extend(exact_edits(&related, false));
+        related_classes.extend(exact_edits(&related, true));
         if related_classes.is_empty() {
             related_classes.extend(exact_sites(&related.file, related.line));
         }
@@ -7559,6 +7629,9 @@ mod raw_boundary_atom_tests {
         verify::Diag {
             file: "fixture.rs".to_owned(),
             line,
+            column: 1,
+            end_line: line,
+            end_column: 1,
             message: "fixture diagnostic".to_owned(),
             direction: verify::Direction::Other,
             code: Some(code.to_owned()),
@@ -7567,6 +7640,9 @@ mod raw_boundary_atom_tests {
                 .map(|line| verify::RelatedDiag {
                     file: "fixture.rs".to_owned(),
                     line: *line,
+                    column: 1,
+                    end_line: *line,
+                    end_column: 1,
                     message: "related fixture span".to_owned(),
                 })
                 .collect(),
@@ -7581,7 +7657,9 @@ mod raw_boundary_atom_tests {
             file: "fixture.rs".to_owned(),
             fn_path: "crate::f".to_owned(),
             lo_line: line,
+            lo_column: 1,
             hi_line: line,
+            hi_column: usize::MAX,
             edit_id: id.to_owned(),
             site_kind: "raw-boundary-atom",
             atom_ids: group.iter().map(|id| (*id).to_owned()).collect(),

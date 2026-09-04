@@ -2045,6 +2045,9 @@ fn a_repeat_of_a_masked_class_is_still_novel() {
     let diag = |line: usize| verify::Diag {
         file: "/p/crate/src/x.rs".to_owned(),
         line,
+        column: 1,
+        end_line: line,
+        end_column: 1,
         message: "reference casting".to_owned(),
         direction: verify::Direction::Other,
         code: None,
@@ -2099,6 +2102,9 @@ fn both_sides_key_the_same_file_identically() {
             &verify::Diag {
                 file: path.to_owned(),
                 line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 1,
                 message: "same message".to_owned(),
                 direction: verify::Direction::Other,
                 code: None,
@@ -5053,6 +5059,9 @@ mod attribution_and_escapes {
         Diag {
             file: file.to_owned(),
             line,
+            column: 1,
+            end_line: line,
+            end_column: 1,
             message: "mismatched types".to_owned(),
             direction: Direction::RawIntoRewritten,
             code: Some("E0308".to_owned()),
@@ -5094,7 +5103,9 @@ mod attribution_and_escapes {
                     file: "/crate/caller.rs".to_owned(),
                     fn_path: "same-display".to_owned(),
                     lo_line: 10,
+                    lo_column: 1,
                     hi_line: 10,
+                    hi_column: usize::MAX,
                     edit_id: "ordinary".to_owned(),
                     site_kind: "subject-declaration",
                     atom_ids: Vec::new(),
@@ -5105,7 +5116,9 @@ mod attribution_and_escapes {
                     file: "/crate/caller.rs".to_owned(),
                     fn_path: "same-display".to_owned(),
                     lo_line: 20,
+                    lo_column: 1,
                     hi_line: 20,
+                    hi_column: usize::MAX,
                     edit_id: "callee-seam".to_owned(),
                     site_kind: "seam-adapter",
                     atom_ids: Vec::new(),
@@ -5116,7 +5129,9 @@ mod attribution_and_escapes {
                     file: "/crate/caller.rs".to_owned(),
                     fn_path: "same-display".to_owned(),
                     lo_line: 21,
+                    lo_column: 1,
                     hi_line: 21,
+                    hi_column: usize::MAX,
                     edit_id: "mir-interface-inventory".to_owned(),
                     site_kind: "interface-inventory-site",
                     atom_ids: Vec::new(),
@@ -5127,7 +5142,9 @@ mod attribution_and_escapes {
                     file: "/crate/caller.rs".to_owned(),
                     fn_path: "left".to_owned(),
                     lo_line: 40,
+                    lo_column: 1,
                     hi_line: 40,
+                    hi_column: usize::MAX,
                     edit_id: "multi-left".to_owned(),
                     site_kind: "subject-use",
                     atom_ids: Vec::new(),
@@ -5138,7 +5155,9 @@ mod attribution_and_escapes {
                     file: "/crate/caller.rs".to_owned(),
                     fn_path: "right".to_owned(),
                     lo_line: 40,
+                    lo_column: 1,
                     hi_line: 40,
+                    hi_column: usize::MAX,
                     edit_id: "multi-right".to_owned(),
                     site_kind: "subject-use",
                     atom_ids: Vec::new(),
@@ -5172,6 +5191,9 @@ mod attribution_and_escapes {
             related.related.push(super::super::verify::RelatedDiag {
                 file: "/crate/caller.rs".to_owned(),
                 line: 20,
+                column: 1,
+                end_line: 20,
+                end_column: 1,
                 message: "callee seam".to_owned(),
             });
             assert_eq!(run(related).rule, AttributionRule::RelatedSpan);
@@ -5200,6 +5222,103 @@ mod attribution_and_escapes {
             );
         })
         .expect("attribution fixture compiles");
+    }
+
+    /// D9-W1 — whole-function pretty-printing may move a bridge several lines
+    /// below its input span.  Attribution must follow the preserved expression
+    /// token inside that reprint; collapsing every point in the replacement to
+    /// the function's first input line reproduces the R172 unresolved rows.
+    #[test]
+    fn d9_w1_reprinted_bridge_maps_to_its_original_site() {
+        let original = "prefix\nfn caller() {\n    target(p);\n}\n";
+        let lo = original.find("fn caller").expect("function start");
+        let hi = original.len() - 1;
+        let replacement = "fn caller() {\n    target(unsafe {\n        &*p\n    });\n}".to_owned();
+        let maps = BTreeMap::from([(
+            FileKey::Real("/crate/lib.rs".into()),
+            crate::bo_rewriter::apply::LineMap::from_splices(original, &[(lo, hi, replacement)]),
+        )]);
+        let owner = class(rustc_hir::def_id::CRATE_DEF_ID);
+        let edits = [EditSite {
+            owner_class: Some(owner),
+            file: "/crate/lib.rs".to_owned(),
+            fn_path: "crate::caller".to_owned(),
+            lo_line: 3,
+            lo_column: 12,
+            hi_line: 3,
+            hi_column: 13,
+            edit_id: "d9-bridge".to_owned(),
+            site_kind: "seam-adapter",
+            atom_ids: Vec::new(),
+            atom_covered: false,
+        }];
+        let result = attribute_with_rule(
+            &diag("/tmp/observed/lib.rs", 4),
+            &maps,
+            Path::new("/tmp/observed"),
+            &[],
+            &edits,
+            &BTreeSet::new(),
+            Path::new("/crate"),
+        );
+        assert_eq!(result.rule, AttributionRule::ExactSeam);
+        assert_eq!(result.classes, BTreeSet::from([owner]));
+    }
+
+    /// D9-W2 — two class-owned operands may share a source line.  The primary
+    /// span's columns select only the operand it covers; line-only matching
+    /// would revert both classes.
+    #[test]
+    fn d9_w2_same_line_operands_are_column_granular() {
+        let fixture = Fixture::new(&[("lib.rs", "pub fn left() {} pub fn right() {}\n")]);
+        ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+            let mut classes = tcx.hir_body_owners().map(class).collect::<Vec<_>>();
+            classes.sort();
+            let [left, right] = classes.as_slice() else { panic!("two classes") };
+            let mut diagnostic = diag("/crate/caller.rs", 10);
+            diagnostic.column = 20;
+            diagnostic.end_column = 21;
+            let edits = [
+                EditSite {
+                    owner_class: Some(*left),
+                    file: "/crate/caller.rs".to_owned(),
+                    fn_path: "left".to_owned(),
+                    lo_line: 10,
+                    lo_column: 5,
+                    hi_line: 10,
+                    hi_column: 6,
+                    edit_id: "left".to_owned(),
+                    site_kind: "seam-adapter",
+                    atom_ids: Vec::new(),
+                    atom_covered: false,
+                },
+                EditSite {
+                    owner_class: Some(*right),
+                    file: "/crate/caller.rs".to_owned(),
+                    fn_path: "right".to_owned(),
+                    lo_line: 10,
+                    lo_column: 20,
+                    hi_line: 10,
+                    hi_column: 21,
+                    edit_id: "right".to_owned(),
+                    site_kind: "seam-adapter",
+                    atom_ids: Vec::new(),
+                    atom_covered: false,
+                },
+            ];
+            let result = attribute_with_rule(
+                &diagnostic,
+                &Default::default(),
+                Path::new("/crate"),
+                &[],
+                &edits,
+                &BTreeSet::new(),
+                Path::new("/crate"),
+            );
+            assert_eq!(result.rule, AttributionRule::ExactSeam);
+            assert_eq!(result.classes, BTreeSet::from([*right]));
+        })
+        .expect("D9-W2 input compiles");
     }
 
     /// **A caller-file diagnostic names the CALLEE that caused it.**
@@ -5236,7 +5355,9 @@ mod attribution_and_escapes {
             file: "/crate/caller.rs".to_owned(),
             fn_path: "k::callee".to_owned(),
             lo_line: 10,
+            lo_column: 1,
             hi_line: 10,
+            hi_column: usize::MAX,
             edit_id: "caller-edit".to_owned(),
             site_kind: "seam-adapter",
             atom_ids: Vec::new(),
@@ -5298,7 +5419,9 @@ mod attribution_and_escapes {
             file: "/crate/callee.rs".to_owned(),
             fn_path: "k::callee".to_owned(),
             lo_line: 1,
+            lo_column: 1,
             hi_line: 1,
+            hi_column: usize::MAX,
             edit_id: "callee-edit".to_owned(),
             site_kind: "subject-declaration",
             atom_ids: Vec::new(),
@@ -5358,7 +5481,9 @@ mod attribution_and_escapes {
                 file: "/crate/m.rs".to_owned(),
                 fn_path: "same-display".to_owned(),
                 lo_line: 10,
+                lo_column: 1,
                 hi_line: 10,
+                hi_column: usize::MAX,
                 edit_id: "reverted-edit".to_owned(),
                 site_kind: "seam-adapter",
                 atom_ids: Vec::new(),
@@ -5794,6 +5919,9 @@ fn e_adapt_classifier_separates_call_boundary_from_body_expression() {
     let body = verify::Diag {
         file: "lib.rs".to_owned(),
         line: 10,
+        column: 1,
+        end_line: 10,
+        end_column: 1,
         message: "expected reference found raw pointer".to_owned(),
         direction: verify::Direction::RawIntoRewritten,
         code: Some("E0308".to_owned()),
@@ -5808,6 +5936,9 @@ fn e_adapt_classifier_separates_call_boundary_from_body_expression() {
     call.related.push(verify::RelatedDiag {
         file: "lib.rs".to_owned(),
         line: 2,
+        column: 1,
+        end_line: 2,
+        end_column: 1,
         message: "function defined here".to_owned(),
     });
     assert!(

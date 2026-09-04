@@ -22694,6 +22694,9 @@ fn e_adapt_classifier_residual_classes_are_disjoint_and_callsite_mechanism_beats
             diagnostic: Diag {
                 file: "lib.rs".to_owned(),
                 line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 1,
                 message: message.to_owned(),
                 direction: Direction::Other,
                 code: code.map(str::to_owned),
