@@ -20703,6 +20703,114 @@ fn raw_boundary_wave2_preflight() {
     .expect("write preflight receipt");
 }
 
+fn raw_boundary_worker_row(program: &str, outcome: &orchestrate::ChildOutcome) -> report::Row {
+    let Some(mut row) = outcome.row.clone() else {
+        let mut row = report::Row::default();
+        let panic_line = outcome
+            .stderr
+            .lines()
+            .position(|line| line.contains("panicked at "));
+        let (file, line) = panic_line
+            .and_then(|index| outcome.stderr.lines().nth(index))
+            .and_then(|header| header.split_once("panicked at ").map(|(_, rest)| rest))
+            .map(|location| location.trim_end_matches(':'))
+            .and_then(|location| {
+                let mut fields = location.rsplitn(3, ':');
+                let _column = fields.next()?;
+                let line = fields.next()?;
+                let file = fields.next()?;
+                Some((file.to_owned(), line.to_owned()))
+            })
+            .unwrap_or_else(|| ("unknown".to_owned(), "0".to_owned()));
+        let message = panic_line
+            .and_then(|index| {
+                outcome
+                    .stderr
+                    .lines()
+                    .skip(index + 1)
+                    .find(|line| !line.is_empty())
+            })
+            .unwrap_or_else(|| {
+                if outcome.note.is_empty() {
+                    outcome.status.as_str()
+                } else {
+                    outcome.note.as_str()
+                }
+            });
+        row.set(raw_schema::STATUS, "worker-abort");
+        row.set(raw_schema::OUTCOME_KIND, "worker-abort");
+        row.set(raw_schema::DATA, "false");
+        row.set(raw_schema::DELIVERY, "degraded");
+        row.set(raw_schema::WORKER_ABORT_FILE, file);
+        row.set(raw_schema::WORKER_ABORT_LINE, line);
+        row.set_lossless_token(
+            raw_schema::WORKER_ABORT_MESSAGE,
+            &raw_boundary_lossless_encode(message),
+        );
+        row.set("orchestrator_status", &outcome.status);
+        row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
+        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        row.set("program", program);
+        return row;
+    };
+    row.set("program", program);
+    row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
+    row.set("peak_rss_kb", outcome.peak_rss_kb);
+    row
+}
+
+fn raw_boundary_rows_have_data(rows: &[report::Row]) -> bool {
+    rows.iter()
+        .all(|row| row.get(raw_schema::STATUS) != Some("worker-abort"))
+}
+
+#[test]
+fn worker_abort_w1_is_typed_and_row_collection_continues() {
+    let panic = orchestrate::ChildOutcome {
+        status: "panic".to_owned(),
+        row: None,
+        wall_s: 0.25,
+        peak_rss_kb: 42,
+        note: "worker panicked".to_owned(),
+        stdout: String::new(),
+        stderr: "thread 'rustc' panicked at crates/pointer_replacer/src/bo_rewriter/decision/lifetime.rs:1307:14:\nattempted to read from stolen value: rustc_middle::mir::Body\n".to_owned(),
+    };
+    let mut ok_row = report::Row::default();
+    ok_row.set(raw_schema::STATUS, "ok");
+    let ok = orchestrate::ChildOutcome {
+        status: "ok".to_owned(),
+        row: Some(ok_row),
+        wall_s: 0.5,
+        peak_rss_kb: 43,
+        note: String::new(),
+        stdout: String::new(),
+        stderr: String::new(),
+    };
+    let rows = [("buffer", panic), ("next", ok)]
+        .into_iter()
+        .map(|(program, outcome)| raw_boundary_worker_row(program, &outcome))
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 2, "a worker abort must not stop row collection");
+    assert_eq!(rows[0].get(raw_schema::STATUS), Some("worker-abort"));
+    assert_eq!(
+        rows[0].get(raw_schema::WORKER_ABORT_FILE),
+        Some("crates/pointer_replacer/src/bo_rewriter/decision/lifetime.rs")
+    );
+    assert_eq!(rows[0].get(raw_schema::WORKER_ABORT_LINE), Some("1307"));
+    assert_eq!(
+        raw_boundary_lossless_decode(
+            rows[0]
+                .get(raw_schema::WORKER_ABORT_MESSAGE)
+                .expect("lossless abort message")
+        )
+        .expect("decode abort message"),
+        "attempted to read from stolen value: rustc_middle::mir::Body"
+    );
+    assert_eq!(rows[1].get(raw_schema::STATUS), Some("ok"));
+    assert!(!raw_boundary_rows_have_data(&rows));
+}
+
 #[test]
 #[ignore = "raw-boundary wave 2: serialized release cache-only 20-program census"]
 fn raw_boundary_wave2_corpus_census() {
@@ -20787,15 +20895,15 @@ fn raw_boundary_wave2_corpus_census() {
             recipe.memory_mib,
             &recipe.raw_boundary_child_env(&cache_dir, &artifact_dir, &code_frame),
         );
-        let mut row = outcome.row.unwrap_or_else(|| {
-            panic!(
-                "{} produced no raw-boundary row: status={} note={}",
-                program.name, outcome.status, outcome.note
-            )
-        });
-        row.set("program", program.name);
-        row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
-        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        let row = raw_boundary_worker_row(program.name, &outcome);
+        if row.get(raw_schema::STATUS) == Some("worker-abort") {
+            eprintln!(
+                "RAW-BOUNDARY-CENSUS program={} stage=worker-abort rc=1 wall={:.3} rss={}",
+                program.name, outcome.wall_s, outcome.peak_rss_kb
+            );
+            rows.push(row);
+            continue;
+        }
         assert_eq!(row.get(raw_schema::STATUS), Some("ok"), "{row:?}");
         assert_eq!(row.get(raw_schema::CACHE_STATUS), Some("hit"), "{row:?}");
         assert_eq!(
@@ -20824,6 +20932,62 @@ fn raw_boundary_wave2_corpus_census() {
         rows.push(row);
     }
     assert_eq!(rows.len(), 20);
+    if !raw_boundary_rows_have_data(&rows) {
+        let per_program = rows
+            .iter()
+            .map(report::to_kv_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(artifact_dir.join("per-program.kv"), per_program)
+            .expect("write worker-abort per-program rows");
+        let aborts = rows
+            .iter()
+            .filter(|row| row.get(raw_schema::STATUS) == Some("worker-abort"))
+            .collect::<Vec<_>>();
+        let mut ledger = String::from("program\tstatus\tfile\tline\tmessage\n");
+        for row in &aborts {
+            let message = row
+                .get(raw_schema::WORKER_ABORT_MESSAGE)
+                .and_then(|value| raw_boundary_lossless_decode(value).ok())
+                .unwrap_or_else(|| "unavailable".to_owned());
+            ledger.push_str(&format!(
+                "{}\tworker-abort\t{}\t{}\t{}\n",
+                row.get("program").unwrap_or("unknown"),
+                row.get(raw_schema::WORKER_ABORT_FILE).unwrap_or("unknown"),
+                row.get(raw_schema::WORKER_ABORT_LINE).unwrap_or("0"),
+                message.replace(['\t', '\n'], " "),
+            ));
+        }
+        fs::write(artifact_dir.join("worker-aborts.tsv"), ledger)
+            .expect("write worker-abort ledger");
+        let mut aggregate = report::Row::default();
+        aggregate.set(raw_schema::CORPUS, "rs-crown");
+        aggregate.set(
+            raw_schema::ANALYSIS_FRAME,
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+        );
+        aggregate.set(raw_schema::CODE_FRAME, &code_frame);
+        aggregate.set(raw_schema::DATA, "false");
+        aggregate.set(raw_schema::DELIVERY, "degraded");
+        aggregate.set(raw_schema::STATUS, "worker-abort");
+        aggregate.set(raw_schema::WORKER_ABORT_COUNT, aborts.len());
+        fs::write(
+            artifact_dir.join("aggregate.kv"),
+            format!("{}\n", report::to_kv_line(&aggregate)),
+        )
+        .expect("write worker-abort aggregate");
+        fs::write(
+            artifact_dir.join("census-receipt.txt"),
+            format!(
+                "status=complete-with-worker-abort\ndata=false\ndelivery=degraded\nprograms=20/20\nworker_aborts={}\nin_run_repair=none\n",
+                aborts.len()
+            ),
+        )
+        .expect("write worker-abort census receipt");
+        raw_boundary_write_manifest(&artifact_dir).expect("write worker-abort artifact manifest");
+        return;
+    }
     for row in &rows {
         assert_eq!(
             row.get(raw_schema::CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT),

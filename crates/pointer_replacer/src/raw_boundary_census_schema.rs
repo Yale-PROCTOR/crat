@@ -160,6 +160,10 @@ pub(crate) const SITES_FROM_NON_SUBJECT_ARGUMENTS: &str =
     "raw_boundary_sites_from_non_subject_arguments";
 pub(crate) const CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT: &str =
     "raw_boundary_converted_callee_without_site_receipt";
+pub(crate) const WORKER_ABORT_FILE: &str = "raw_boundary_worker_abort_file";
+pub(crate) const WORKER_ABORT_LINE: &str = "raw_boundary_worker_abort_line";
+pub(crate) const WORKER_ABORT_MESSAGE: &str = "raw_boundary_worker_abort_message";
+pub(crate) const WORKER_ABORT_COUNT: &str = "raw_boundary_worker_abort_count";
 pub(crate) const STATUS: &str = "raw_boundary_status";
 
 pub(crate) const BRIDGE_RECEIPT_FILE: &str = "raw-boundary-bridge-receipts.tsv";
@@ -319,5 +323,9 @@ pub(crate) const ALL: &[&str] = &[
     INTERFACE_INVENTORY_SITES,
     SITES_FROM_NON_SUBJECT_ARGUMENTS,
     CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT,
+    WORKER_ABORT_FILE,
+    WORKER_ABORT_LINE,
+    WORKER_ABORT_MESSAGE,
+    WORKER_ABORT_COUNT,
     STATUS,
 ];
