@@ -6623,6 +6623,107 @@ fn inv_w1_non_subject_mir_call_is_bridged_or_holds_the_class() {
     super::bridge_receipt::reconcile_bridge_events(&events).expect("INV-W1 receipts reconcile");
 }
 
+const D1_CALLEE_UNIVERSE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub struct Holder { pub left: *mut i32, pub right: *mut i32 }\n\
+     pub unsafe fn target(p: *mut i32) -> i32 { *p }\n\
+     pub unsafe fn caller(holder: &mut Holder) -> i32 {\n\
+         target(holder.left) + target(holder.right)\n\
+     }\n";
+
+/// D1-W1 — a placed base parameter decision defines the callee universe even
+/// when one call is absent from the older HIR/subject-keyed carrier. Coverage
+/// is per MIR call site, never merely per caller/callee/position triple.
+#[test]
+fn d1_w1_base_parameter_callee_requires_each_mir_call_site() {
+    let fixture = Fixture::new(&[("lib.rs", D1_CALLEE_UNIVERSE)]);
+    let (emission, receipt, omitted_control) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (mut table, mut ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("D1-W1 decision table");
+            force_inv_w1_target_ref(&mut table);
+            let target = ctx
+                .subjects
+                .iter()
+                .find(|subject| subject.label.ends_with("target::p"))
+                .expect("target parameter subject")
+                .fn_did;
+            let calls = ctx
+                .facts
+                .call_args
+                .get_mut(&target)
+                .expect("two legacy HIR call sites");
+            calls.sort_by_key(|site| site.span.lo().0);
+            assert_eq!(calls.len(), 2);
+            calls.truncate(1);
+            table.seams = super::decision::seam::synthesize_with_raw_boundary(
+                tcx,
+                &ctx.facts,
+                &ctx.subjects,
+                &table,
+                &ctx.retained_c9_plans,
+                &ctx.a5_site_proofs,
+                &ctx.raw_boundary,
+                &ctx.coconv,
+                &ctx.retention,
+                &ctx.lifetime_eligibility,
+            );
+            let mut omitted = table.seams.clone();
+            omitted.interface_inventory.clear();
+            omitted.interface_required_sites.clear();
+            let omitted_control = omitted.converted_callee_without_site_receipt();
+            table.arm_requirements = super::derive_arm_requirements(
+                &ctx.subjects,
+                &table,
+                &ctx.coconv,
+                &ctx.raw_boundary,
+                &ctx.exposure,
+            );
+            let receipt = super::seam_tsv_from_table(tcx, &table);
+            let emission = emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )
+            .expect("D1-W1 attempted emission");
+            (emission, receipt, omitted_control)
+        })
+        .expect("D1-W1 fixture compiles before rewriting");
+    let attempt = E2Attempt {
+        fixture,
+        emission,
+        receipt,
+    };
+    let held = attempt
+        .emission
+        .plan
+        .class_finalization
+        .classes
+        .values()
+        .filter(|class| !class.is_ready())
+        .count();
+    assert_eq!(
+        held, 1,
+        "the uncovered second MIR call must hold the callee"
+    );
+    assert!(
+        e2_type_checks(&attempt),
+        "D1-W1 emitted tree must type-check after bridge-or-hold"
+    );
+    assert_eq!(
+        omitted_control, 1,
+        "the control must derive from the emitted-signature diff, not inventory rows"
+    );
+}
+
 const BR_W2_RAW_OPTIONALS: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
      pub unsafe fn maybe_shared(p: *const i32) { let _ = p; }\n\
      pub unsafe fn maybe_mut(p: *mut i32) { let _ = p; }\n\

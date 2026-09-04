@@ -2489,6 +2489,11 @@ pub(crate) struct SeamPlan {
     /// Every resolved MIR call position whose callee parameter is emitted in a
     /// safe form. This inventory is independent of pointer-subject membership.
     pub interface_inventory: Vec<InterfaceInventorySite>,
+    /// Required MIR sites derived directly from the emitted signature diff.
+    ///
+    /// Kept separate from `interface_inventory`: the latter is the observed
+    /// receipt population and therefore cannot also be the control universe.
+    pub emitted_signature_required_sites: BTreeSet<InterfaceInventoryKey>,
     pub interface_required_sites: BTreeSet<InterfaceInventoryKey>,
     /// A zero-syntax safe/safe site relies on the caller class remaining live.
     /// The callee therefore depends on that caller and follows its reversion.
@@ -2502,7 +2507,7 @@ impl SeamPlan {
             .iter()
             .map(|site| site.key)
             .collect::<BTreeSet<_>>();
-        self.interface_required_sites
+        self.emitted_signature_required_sites
             .difference(&receipted)
             .map(|key| key.callee)
             .collect::<BTreeSet<_>>()
@@ -2686,38 +2691,45 @@ fn existing_interface_disposition(
     plan: &SeamPlan,
     caller: LocalDefId,
     callee: LocalDefId,
+    call_span: Span,
     index: usize,
 ) -> Option<&'static str> {
     if plan.edits.iter().any(|edit| {
         edit.bridge.caller == caller
             && edit.owner_class.local_def_id() == callee
             && edit.param_index == index
+            && call_spans_match(edit.call_span, call_span)
     }) {
         return Some("bridged");
     }
-    if plan
-        .blocked
-        .iter()
-        .any(|site| site.caller == caller && site.callee == callee && site.index == index)
-        || plan.raw_boundary_blocked.iter().any(|site| {
-            site.bridge.caller == caller
-                && matches!(site.bridge.callee, BridgeCalleeId::Local(did) if did == callee)
-                && site.bridge.position == format!("arg{index}")
-        })
-    {
+    if plan.blocked.iter().any(|site| {
+        site.caller == caller
+            && site.callee == callee
+            && site.index == index
+            && call_spans_match(site.span, call_span)
+    }) || plan.raw_boundary_blocked.iter().any(|site| {
+        site.bridge.caller == caller
+            && matches!(site.bridge.callee, BridgeCalleeId::Local(did) if did == callee)
+            && site.bridge.position == format!("arg{index}")
+            && call_spans_match(site.span, call_span)
+    }) {
         return Some("held");
     }
-    if plan
-        .pair_sites
-        .iter()
-        .any(|site| site.caller == caller && site.callee == callee && site.argument_index == index)
-    {
+    if plan.pair_sites.iter().any(|site| {
+        site.caller == caller
+            && site.callee == callee
+            && site.argument_index == index
+            && call_spans_match(site.call_span, call_span)
+    }) {
         return Some("pair");
     }
     if plan.zero_bridges.iter().any(|site| {
         site.caller == caller
             && site.owner_class.local_def_id() == callee
             && site.position == format!("arg{index}")
+            && site
+                .span
+                .is_some_and(|span| call_spans_match(span, call_span))
     }) {
         return Some("zero-syntax");
     }
@@ -2754,6 +2766,53 @@ fn complete_interface_inventory(
     let Some(web) = lifetime_eligibility.fnptr_web() else {
         return;
     };
+
+    // Derive the required universe before observing any bridge/inventory row.
+    // Base-path parameter decisions are the source of truth for emitted type
+    // changes; lifetime plans and wrapper surfaces can add signature syntax,
+    // but their pointer parameter positions are already represented here.
+    let emitted_parameters = params
+        .iter()
+        .filter_map(|(&(callee, index), node)| {
+            decisions
+                .get(node)
+                .map(|decision| form_of(decision))
+                .filter(|form| *form != Form::Raw)
+                .map(|form| ((callee, index), form))
+        })
+        .collect::<FxHashMap<_, _>>();
+    let mut emitted_signature_classes = emitted_parameters
+        .keys()
+        .map(|&(callee, _)| callee)
+        .collect::<rustc_hash::FxHashSet<_>>();
+    emitted_signature_classes.extend(table.lifetime_plan.functions().map(|(callee, _)| callee));
+    if let Some(exposure) = table.exposure.as_ref() {
+        emitted_signature_classes.extend(exposure.functions().iter().filter_map(|row| {
+            (!matches!(
+                row.plan,
+                super::exposure::ExposureSurfacePlan::NotApplicable
+            ))
+            .then_some(row.did)
+        }));
+    }
+    for mir_site in web.mir_call_sites() {
+        if !emitted_signature_classes.contains(&mir_site.callee) {
+            continue;
+        }
+        for index in 0..mir_site.argument_count {
+            if !emitted_parameters.contains_key(&(mir_site.callee, index)) {
+                continue;
+            }
+            plan.emitted_signature_required_sites
+                .insert(InterfaceInventoryKey {
+                    caller: SignatureClassId::of(mir_site.caller),
+                    callee: SignatureClassId::of(mir_site.callee),
+                    block: mir_site.block,
+                    argument_index: index,
+                });
+        }
+    }
+
     for mir_site in web.mir_call_sites() {
         let hir_site = facts.call_args.get(&mir_site.callee).and_then(|sites| {
             sites.iter().find(|site| {
@@ -2764,12 +2823,7 @@ fn complete_interface_inventory(
             super::co_conversion::retained_c9_shared_params(c9_marks, site, mir_site.callee)
         });
         for index in 0..mir_site.argument_count {
-            let Some(expected) = params
-                .get(&(mir_site.callee, index))
-                .and_then(|node| decisions.get(node))
-                .map(|decision| form_of(decision))
-                .filter(|form| *form != Form::Raw)
-            else {
+            let Some(&expected) = emitted_parameters.get(&(mir_site.callee, index)) else {
                 continue;
             };
             let key = InterfaceInventoryKey {
@@ -2791,9 +2845,13 @@ fn complete_interface_inventory(
 
             let disposition = if c9_positions.contains(&index) {
                 "c9-snapshot"
-            } else if let Some(disposition) =
-                existing_interface_disposition(plan, mir_site.caller, mir_site.callee, index)
-            {
+            } else if let Some(disposition) = existing_interface_disposition(
+                plan,
+                mir_site.caller,
+                mir_site.callee,
+                mir_site.span,
+                index,
+            ) {
                 disposition
             } else if let Some(argument) = argument {
                 let found = argument_form(mir_site.caller, argument, decisions);
