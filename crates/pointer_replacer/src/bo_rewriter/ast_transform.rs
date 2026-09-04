@@ -1877,6 +1877,74 @@ impl MutVisitor for SeamGraftVisitor<'_> {
     }
 }
 
+/// Call-level same-object raw-view consumer. Ordinary argument seams run
+/// first; this wrapper then snapshots every selected raw view before the call,
+/// so no generated raw-pointer construction occurs after a surviving `&mut`.
+struct PairRawGraftVisitor<'a> {
+    calls: &'a FxHashMap<(u32, u32), &'a super::decision::seam::PairRawViewCall>,
+    guard: &'a mut Composition,
+    consumed: FxHashSet<(u32, u32)>,
+    failure: Option<String>,
+}
+
+impl MutVisitor for PairRawGraftVisitor<'_> {
+    fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+        if expression.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        }
+        let key = (expression.span.lo().0, expression.span.hi().0);
+        let Some(call) = self.calls.get(&key).copied() else {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        };
+        if !matches!(expression.kind, rustc_ast::ExprKind::Call(..)) {
+            self.failure = Some(format!(
+                "PAIR raw-view call at {}..{} resolved to a non-call AST node",
+                key.0, key.1
+            ));
+            return;
+        }
+        // First realize any argument-level seams nested in this call. Their
+        // rendered forms are what the call wrapper must preserve.
+        rustc_ast::mut_visit::walk_expr(self, expression);
+        let source = rustc_ast_pretty::pprust::expr_to_string(expression);
+        let views = call
+            .views
+            .iter()
+            .map(|view| {
+                (
+                    view.argument_index,
+                    view.raw_expression.clone(),
+                    view.target_type.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let stem = format!("__crat_pair_raw_{}", call.call_span.lo().0);
+        let rendered = match super::c9::render_pair_raw_view_source(&source, &stem, &views) {
+            Ok(rendered) => rendered,
+            Err(why) => {
+                self.failure = Some(format!("could not render PAIR raw-view call: {why}"));
+                return;
+            }
+        };
+        let parsed = match graft_expr(&rendered) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.failure = Some("PAIR raw-view call did not round-trip".to_owned());
+                return;
+            }
+        };
+        if !self.guard.claim(expression.id, expression.span, "pair-raw") {
+            self.failure =
+                Some("PAIR raw-view call collided with another AST transform".to_owned());
+            return;
+        }
+        self.consumed.insert(key);
+        expression.kind = parsed.kind;
+    }
+}
+
 /// Structural consumer for retained C-9 call-site marks.
 ///
 /// This runs after the use and seam grafts so the snapshot block captures the
@@ -2826,6 +2894,42 @@ fn transform_with(
     seams.key_collisions = seam_key_collisions;
     seams.len_fabricated += box_fabricated;
 
+    let mut pair_raw_calls = FxHashMap::default();
+    for call in table
+        .seams
+        .pair_raw_calls
+        .iter()
+        .filter(|call| reverts.keeps_edit(call.owner_class, &call.atom_ids))
+    {
+        let key = (call.call_span.lo().0, call.call_span.hi().0);
+        if pair_raw_calls.insert(key, call).is_some() {
+            return Err(format!(
+                "multiple PAIR raw-view plans target call span {}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    let mut pair_raw = PairRawGraftVisitor {
+        calls: &pair_raw_calls,
+        guard: &mut guard,
+        consumed: FxHashSet::default(),
+        failure: None,
+    };
+    pair_raw.visit_crate(&mut krate);
+    if let Some(why) = pair_raw.failure.take() {
+        return Err(why);
+    }
+    let unmatched_pair_raw = pair_raw_calls
+        .keys()
+        .filter(|key| !pair_raw.consumed.contains(key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unmatched_pair_raw.is_empty() {
+        return Err(format!(
+            "unmatched PAIR raw-view call spans: {unmatched_pair_raw:?}"
+        ));
+    }
+
     // **C-9 — mandatory companion emission.** The plan is already filtered by
     // the accepted model. Reverts use the mark's callee owner, matching the
     // span-plan edit and the decision whose both-Ref result justified it.
@@ -2963,29 +3067,6 @@ fn transform_with(
     ))
 }
 
-/// **THE SWITCHOVER ARTIFACT** — the AST layer, emitting.
-///
-/// Until now the AST layer computed statistics and threw its transformed krate
-/// away: `transform_inner` had three call sites and all three discarded it, so
-/// nothing anywhere produced a rewritten crate through this layer. The phase-3
-/// and phase-4 gates could compare it to the span layer per function; no caller
-/// could ASK IT FOR A PROGRAM.
-///
-/// This is that caller. It runs the same three passes the parity gates measured
-/// — `transform_inner`, unchanged — and hands the transformed krate to the same
-/// printer `substituted_source` uses, so the emitted text differs from the
-/// substrate in exactly the functions the transforms touched.
-/// **ONE-SHOT.** Captures, then emits. Correct for a caller that emits once
-/// (the string entry, the parity gates). **A verify/revert loop must NOT use
-/// it** — see [`ast_emitted_source_from`] for why a second call cannot work.
-pub(crate) fn ast_emitted_source(
-    tcx: rustc_middle::ty::TyCtxt<'_>,
-    reverts: &RevertSet,
-) -> Result<(String, super::ast_bridge::SubstStats), String> {
-    let capture = capture_ast(tcx)?;
-    ast_emitted_source_from(tcx, &capture, reverts)
-}
-
 /// **THE LOOP'S ENTRY — emit round N from the round-0 capture.**
 ///
 /// `capture_ast` may succeed **at most once per session**: `expanded_ast`
@@ -2995,9 +3076,9 @@ pub(crate) fn ast_emitted_source(
 /// capture under each round's revert set. `transform_with` already transforms a
 /// CLONE, so the capture stays reusable.
 ///
-/// This split is not a convenience: calling [`ast_emitted_source`] twice in one
-/// session returns `Err("AST capture panicked")` on the second call, witnessed
-/// at `a_second_capture_in_one_session_fails`.
+/// This split is not a convenience: capturing twice in one session returns
+/// `Err("AST capture panicked")` on the second call, witnessed at
+/// `a_second_capture_in_one_session_fails`.
 /// **The loop's per-file entry (A1).** Same transform, same const rule, but the
 /// emission is keyed by source file rather than collapsed into the root.
 ///

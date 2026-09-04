@@ -714,6 +714,20 @@ pub(crate) struct FunctionPlan {
     lifetimes: BTreeMap<FnSignatureSlot, String>,
     pub(crate) sccs: Vec<Vec<FnSignatureSlot>>,
     pub(crate) outlives: Vec<(String, String)>,
+    return_reuses: Vec<ReturnLifetimeReuse>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ReturnTie {
+    sources: Vec<FnSignatureSlot>,
+    target: FnSignatureSlot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReturnLifetimeReuse {
+    sources: Vec<FnSignatureSlot>,
+    target: FnSignatureSlot,
+    common_name: String,
 }
 
 /// Final, analysis-blind carrier handed to seam planning and structural AST
@@ -768,6 +782,19 @@ impl FunctionPlan {
         }
         for (longer, shorter) in &self.outlives {
             rows.push(format!("outlives\t{longer}\t{shorter}"));
+        }
+        for reuse in &self.return_reuses {
+            rows.push(format!(
+                "return_tie\tsources={}\ttarget={}\tcommon_name={}\treturn_lifetime_reused=true",
+                reuse
+                    .sources
+                    .iter()
+                    .map(|slot| slot.receipt_key())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                reuse.target.receipt_key(),
+                reuse.common_name,
+            ));
         }
         rows.join("\n")
     }
@@ -832,6 +859,7 @@ pub(crate) fn finalize(
         .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
         .collect::<FxHashMap<_, _>>();
     let mut required = FxHashMap::<LocalDefId, BTreeSet<OriginSlot>>::default();
+    let mut return_ties = FxHashMap::<LocalDefId, BTreeSet<ReturnTie>>::default();
     for (subject, permit) in &eligibility.return_permits {
         if !matches!(
             final_decisions.get(subject),
@@ -842,6 +870,16 @@ pub(crate) fn finalize(
         let slots = required.entry(permit.function).or_default();
         slots.extend(permit.origin_sources.iter().copied());
         slots.insert(permit.origin_target);
+        let mut sources = permit.sources.clone();
+        sources.sort();
+        sources.dedup();
+        return_ties
+            .entry(permit.function)
+            .or_default()
+            .insert(ReturnTie {
+                sources,
+                target: permit.target,
+            });
     }
     for permit in eligibility.output_storage_permits.values() {
         let slots = required.entry(permit.function).or_default();
@@ -860,14 +898,24 @@ pub(crate) fn finalize(
             )
         })?;
         let required = slots.into_iter().collect::<Vec<_>>();
-        let plan = plan_function(summary, &required, &existing_lifetime_names(program, did))
-            .map_err(|failure| {
-                format!(
-                    "{}: {}",
-                    failure.key(),
-                    program.tcx.def_path_str(did.to_def_id())
-                )
-            })?;
+        let ties = return_ties
+            .remove(&did)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let plan = plan_function_with_return_ties(
+            summary,
+            &required,
+            &existing_lifetime_names(program, did),
+            &ties,
+        )
+        .map_err(|failure| {
+            format!(
+                "{}: {}",
+                failure.key(),
+                program.tcx.def_path_str(did.to_def_id())
+            )
+        })?;
         functions.insert(did, plan);
     }
     Ok(LifetimePlan { functions })
@@ -894,6 +942,15 @@ pub(crate) fn plan_function(
     summary: &OriginSummary,
     required: &[OriginSlot],
     existing_names: &BTreeSet<String>,
+) -> Result<FunctionPlan, LifetimeFailure> {
+    plan_function_with_return_ties(summary, required, existing_names, &[])
+}
+
+fn plan_function_with_return_ties(
+    summary: &OriginSummary,
+    required: &[OriginSlot],
+    existing_names: &BTreeSet<String>,
+    return_ties: &[ReturnTie],
 ) -> Result<FunctionPlan, LifetimeFailure> {
     if required.is_empty() {
         return Err(LifetimeFailure::OriginAbsent);
@@ -943,6 +1000,31 @@ pub(crate) fn plan_function(
         group.sort_by_key(|(key, _)| *key);
         groups.push(group);
     }
+
+    for tie in return_ties {
+        let mut merged = Vec::new();
+        let mut untouched = Vec::new();
+        for group in groups.drain(..) {
+            if group
+                .iter()
+                .any(|(key, _)| *key == tie.target || tie.sources.contains(key))
+            {
+                merged.extend(group);
+            } else {
+                untouched.push(group);
+            }
+        }
+        let complete = std::iter::once(tie.target)
+            .chain(tie.sources.iter().copied())
+            .all(|required| merged.iter().any(|(key, _)| *key == required));
+        if !complete {
+            return Err(LifetimeFailure::OriginConflict);
+        }
+        merged.sort_by_key(|(key, _)| *key);
+        merged.dedup_by_key(|(key, _)| *key);
+        untouched.push(merged);
+        groups = untouched;
+    }
     groups.sort_by_key(|group| group[0].0);
 
     let mut used = existing_names
@@ -957,6 +1039,25 @@ pub(crate) fn plan_function(
             lifetimes.insert(key, name.clone());
         }
         group_names.push(name);
+    }
+
+    let mut return_reuses = Vec::new();
+    for tie in return_ties {
+        let Some(common_name) = lifetimes.get(&tie.target).cloned() else {
+            return Err(LifetimeFailure::OriginConflict);
+        };
+        if !tie
+            .sources
+            .iter()
+            .all(|source| lifetimes.get(source) == Some(&common_name))
+        {
+            return Err(LifetimeFailure::OriginConflict);
+        }
+        return_reuses.push(ReturnLifetimeReuse {
+            sources: tie.sources.clone(),
+            target: tie.target,
+            common_name,
+        });
     }
 
     let mut outlives = BTreeSet::new();
@@ -986,6 +1087,7 @@ pub(crate) fn plan_function(
             .map(|group| group.into_iter().map(|(key, _)| key).collect())
             .collect(),
         outlives: outlives.into_iter().collect(),
+        return_reuses,
     })
 }
 
@@ -1639,6 +1741,24 @@ mod tests {
                 &summary,
                 &[OriginSlot::from_usize(0), OriginSlot::from_usize(1)],
                 &BTreeSet::new(),
+            ),
+            Err(LifetimeFailure::OriginUnknown)
+        );
+    }
+
+    #[test]
+    fn life_w2_return_tie_cannot_override_an_unknown_origin() {
+        let summary = summary(vec![arg(1), ret()], &[(0, 1)], &[1]);
+        let tie = ReturnTie {
+            sources: vec![FnSignatureSlot::arg(1, 0, 0)],
+            target: FnSignatureSlot::RETURN,
+        };
+        assert_eq!(
+            plan_function_with_return_ties(
+                &summary,
+                &[OriginSlot::from_usize(0), OriginSlot::from_usize(1)],
+                &BTreeSet::new(),
+                &[tie],
             ),
             Err(LifetimeFailure::OriginUnknown)
         );

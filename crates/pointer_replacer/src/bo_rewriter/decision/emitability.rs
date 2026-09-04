@@ -256,6 +256,10 @@ pub(crate) struct Arg {
     pub direct_storage: Option<(HirId, Span)>,
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<super::raw_boundary::RawMutability>,
+    /// Exact syntactic place identity after peeling address/cast wrappers.
+    /// Distinct field projections remain distinct even when `place_root` is
+    /// the same aggregate local.
+    pub place_identity: Option<String>,
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -598,6 +602,27 @@ impl BodyFacts<'_, '_> {
         }
         false
     }
+
+    fn exact_place_identity(expr: &Expr<'_>) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                Res::Local(hir_id) => Some(format!("local:{}", hir_id.local_id.as_u32())),
+                _ => None,
+            },
+            ExprKind::AddrOf(_, _, inner)
+            | ExprKind::Cast(inner, _)
+            | ExprKind::DropTemps(inner) => Self::exact_place_identity(inner),
+            ExprKind::Unary(rustc_hir::UnOp::Deref, inner) => {
+                Some(format!("{}/*", Self::exact_place_identity(inner)?))
+            }
+            ExprKind::Field(base, field) => Some(format!(
+                "{}/field:{}",
+                Self::exact_place_identity(base)?,
+                field.name
+            )),
+            _ => None,
+        }
+    }
 }
 
 impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
@@ -801,6 +826,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             direct_storage: direct_mutable_storage(arg),
                                             adapter_operand_span,
                                             adapter_operand_mutability,
+                                            place_identity: Self::exact_place_identity(arg),
                                         }
                                     })
                                     .collect(),

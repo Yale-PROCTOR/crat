@@ -587,6 +587,11 @@ pub(crate) fn finalize_signature_classes(
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_) => (true, None),
+            Decision::Degraded(record)
+                if record.reason == super::decision::DegradeReason::PairRawView =>
+            {
+                (false, None)
+            }
             Decision::Degraded(record) => (false, Some(record.reason.key())),
         };
         if emits {
@@ -1911,24 +1916,45 @@ pub(crate) fn plan(
             continue;
         }
         let owner = SignatureClassId::of(pair.callee);
-        let mut site = match pair.role {
-            PairRole::Clear | PairRole::Primary => ClassSite::zero(
-                owner,
-                SignatureClassId::of(pair.caller),
-                Arm::Pair,
-                pair.role.key(),
+        let bridge = BridgeSitePlan::local(
+            pair.caller,
+            pair.callee,
+            Arm::Pair.key(),
+            format!("arg{}:{}", pair.argument_index, pair.reason),
+            match pair.role {
+                PairRole::Clear => "pair-a5-clear",
+                PairRole::Primary => "pair-safe-primary",
+                PairRole::Blocked => "pair-blocked",
+                PairRole::RawView => unreachable!(),
+            },
+        );
+        let (file, lo, hi, state) = match span_to_loc(pair.span) {
+            Ok((file, lo, hi)) => (
+                file_key_label(&file),
+                u32::try_from(lo).unwrap_or(u32::MAX),
+                u32::try_from(hi).unwrap_or(u32::MAX),
+                if pair.role == PairRole::Blocked {
+                    ClassSiteState::Dropped(pair.reason.clone())
+                } else {
+                    ClassSiteState::ZeroSyntaxReady
+                },
             ),
-            PairRole::Blocked => ClassSite::dropped(
-                owner,
-                SignatureClassId::of(pair.caller),
-                Arm::Pair,
-                pair.role.key(),
-                pair.reason.clone(),
+            Err(reason) => (
+                "<unplaceable>".to_owned(),
+                0,
+                0,
+                ClassSiteState::Dropped(reason.to_owned()),
             ),
-            PairRole::RawView => unreachable!(),
+        };
+        let mut site = ClassSite {
+            key: bridge.materialize(owner, file, lo, hi),
+            edit_key: "-".to_owned(),
+            state,
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
         };
         site.retention = match pair.tier {
-            PairTier::T1 => BridgeRetentionTier::T1,
             PairTier::T2 => BridgeRetentionTier::T2,
             PairTier::None | PairTier::Blocked => BridgeRetentionTier::None,
         };

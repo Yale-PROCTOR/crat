@@ -492,33 +492,6 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     )
 }
 
-/// **THE SWITCHOVER ARTIFACT's string entry** — the AST layer, emitting a
-/// program.
-///
-/// The counterpart of [`rewrite_m1`] on the new layer. It runs no verify loop
-/// and no revert rounds: those live in `rewrite_core` around the SPAN layer, and
-/// phase 5's question is what the AST layer emits, not how the loop converges
-/// over it. Wiring the loop to this layer is the M1-close merge list's business.
-///
-/// ⚠ **ORDERING**: `ast_emitted_source` captures the AST as its first action,
-/// before `decide_table_with_ctx` touches HIR — the constraint `ast_bridge`'s
-/// module doc states. Nothing here may run a query ahead of it.
-#[cfg(test)]
-pub(crate) fn ast_emitted_source_of(input: &str) -> Result<String, String> {
-    match ::utils::compilation::run_compiler_on_input(
-        ::utils::compilation::str_to_input(input),
-        |tcx| {
-            // The string entry emits the UN-reverted program: it runs no verify
-            // loop, so there is no revert set to honour. Named, not defaulted.
-            ast_transform::ast_emitted_source(tcx, &ast_transform::RevertSet::default())
-                .map(|(source, _stats)| source)
-        },
-    ) {
-        Ok(inner) => inner,
-        Err(why) => Err(format!("{why:?}")),
-    }
-}
-
 /// **W1's entry — the AST layer emitting under a NON-EMPTY revert set.**
 ///
 /// Every cross-layer witness before this one ran with `RevertSet::default()`, a
@@ -4235,6 +4208,65 @@ pub(crate) fn emit_files<'tcx>(
         |subject| tcx.def_path_str(subject.fn_did.to_def_id()),
         &|subject: &decision::Subject| reverted.contains(&subject.fn_did),
     );
+    for call in &table.seams.pair_raw_calls {
+        if reverted.contains(&call.owner_class.local_def_id()) {
+            continue;
+        }
+        let (file, lo, hi) = span_to_loc(call.call_span)
+            .map_err(|why| format!("unplaceable PAIR raw-view call: {why}"))?;
+        let source = text_of(&file)
+            .ok_or_else(|| format!("no source text for PAIR raw-view file {file:?}"))?;
+        let original = source
+            .get(lo..hi)
+            .ok_or_else(|| "PAIR raw-view span is outside its source file".to_owned())?;
+        let views = call
+            .views
+            .iter()
+            .map(|view| {
+                (
+                    view.argument_index,
+                    view.raw_expression.clone(),
+                    view.target_type.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let temp_stem = format!("__crat_pair_raw_{}", call.call_span.lo().0);
+        let replacement = c9::render_pair_raw_view_source(original, &temp_stem, &views)?;
+        planned.by_file.entry(file).or_default().push(plan::Edit {
+            lo,
+            hi,
+            replacement,
+            justification: plan::Justification::C9Mark,
+            owner_class: Some(call.owner_class),
+            owner_path: tcx.def_path_str(call.callee.to_def_id()),
+            bridge: Some(bridge_receipt::BridgeSitePlan {
+                caller: call.caller,
+                callee: bridge_receipt::BridgeCalleeId::Local(call.callee),
+                arm: decision::Arm::Pair.key().to_owned(),
+                position: format!(
+                    "args={};reasons={}",
+                    call.views
+                        .iter()
+                        .map(|view| view.argument_index.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    call.reasons.join(","),
+                ),
+                bridge_kind: "pair-t2-raw-view".to_owned(),
+                extent: bridge_receipt::BridgeExtentKind::None,
+                retention: bridge_receipt::BridgeRetentionTier::T2,
+                waiver_id: Some(bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+            }),
+            atom_ids: call.atom_ids.clone(),
+            subject_id: format!(
+                "pair-call:{}..{}",
+                call.call_span.lo().0,
+                call.call_span.hi().0
+            ),
+            required_arms: "PAIR".to_owned(),
+            edit_kind: "pair-raw-view",
+        });
+    }
     for mark in retained_c9_plans {
         if reverted.contains(&mark.owner_did) {
             continue;
@@ -4254,17 +4286,25 @@ pub(crate) fn emit_files<'tcx>(
             justification: plan::Justification::C9Mark,
             owner_class: Some(bridge_receipt::SignatureClassId::of(mark.owner_did)),
             owner_path: mark.owner_fn.clone(),
-            bridge: Some(bridge_receipt::BridgeSitePlan::local(
-                mark.owner_did,
-                mark.owner_did,
-                decision::Arm::Pair.key(),
-                format!("c9:{}..{}", mark.call_span.lo().0, mark.call_span.hi().0),
-                "c9-mark",
-            )),
+            bridge: Some(bridge_receipt::BridgeSitePlan {
+                caller: mark.caller_did,
+                callee: bridge_receipt::BridgeCalleeId::Local(mark.owner_did),
+                arm: decision::Arm::Pair.key().to_owned(),
+                position: format!(
+                    "copy-snapshot:carrier=c9:bb{}:s{}:pointee={}",
+                    mark.key.location.block,
+                    mark.key.location.statement_index,
+                    mark.key.pointee_type,
+                ),
+                bridge_kind: "pair-copy-snapshot".to_owned(),
+                extent: bridge_receipt::BridgeExtentKind::None,
+                retention: bridge_receipt::BridgeRetentionTier::T1,
+                waiver_id: None,
+            }),
             atom_ids: Vec::new(),
             subject_id: mark.owner_fn.clone(),
             required_arms: "-".to_owned(),
-            edit_kind: "c9-mark",
+            edit_kind: "pair-copy-snapshot",
         });
     }
     plan::finalize_signature_classes(&mut planned, table, reverted);
@@ -5343,7 +5383,7 @@ fn arm_outcomes_tsv(
         let mut ready = required;
         let mut blocked_arm = None;
         let mut blocked_reason = "-".to_owned();
-        if coconv.node_block(key).is_some() {
+        if coconv.node_block(key).is_some() && !coconv.is_pair_raw_view(key) {
             let arm = if coconv.pair_sites().iter().any(|row| {
                 row.subject == key && row.role == decision::co_conversion::PairRole::Blocked
             }) {

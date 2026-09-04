@@ -66,6 +66,55 @@ pub(crate) fn render_marked_source(mark: &C9MarkKey, source: &str) -> Result<Str
     Ok(format!("{rendered}{}", &source[close + 1..]))
 }
 
+pub(crate) fn render_pair_raw_view_source(
+    source: &str,
+    temp_stem: &str,
+    views: &[(usize, String, String)],
+) -> Result<String, String> {
+    let open = source
+        .char_indices()
+        .find_map(|(index, ch)| (ch == '(').then_some(index))
+        .ok_or_else(|| "PAIR call source has no argument list".to_owned())?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, ch) in source[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "PAIR call source has unmatched ')'".to_owned())?;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close.ok_or_else(|| "PAIR call source has unmatched '('".to_owned())?;
+    let callee = source[..open].trim();
+    if callee.is_empty() {
+        return Err("PAIR call source has an empty callee".to_owned());
+    }
+    let mut arguments = split_arguments(&source[open + 1..close])?;
+    let mut declarations = Vec::new();
+    for (argument_index, raw_expression, target_type) in views {
+        let Some(argument) = arguments.get_mut(*argument_index) else {
+            return Err("PAIR raw-view argument is outside the call arity".to_owned());
+        };
+        let temp = format!("{temp_stem}_{argument_index}");
+        declarations.push(format!("let {temp}: {target_type} = {raw_expression};"));
+        *argument = temp;
+    }
+    Ok(format!(
+        "{{ {} {callee}({}) }}{}",
+        declarations.join(" "),
+        arguments.join(", "),
+        &source[close + 1..],
+    ))
+}
+
 fn split_arguments(source: &str) -> Result<Vec<String>, String> {
     if source.trim().is_empty() {
         return Ok(Vec::new());

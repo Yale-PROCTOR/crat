@@ -17,6 +17,45 @@ use super::{Emission, decide_table, emit_files, plan::FileKey, verify};
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
+/// AST-only golden helper after atomic class finalization. It intentionally
+/// lives in this test module so the one-production-emission-path ratchet keeps
+/// counting only shipping call sites.
+pub(super) fn ast_emitted_source_of(input: &str) -> Result<String, String> {
+    match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let capture = super::ast_transform::capture_ast(tcx)?;
+            let (table, ctx) = super::decide_table_with_ctx(tcx)?;
+            let emission = emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )?;
+            let held = emission.plan.held_classes();
+            let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+                &held,
+                &std::collections::BTreeSet::new(),
+                &table,
+            )?;
+            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+                tcx,
+                &capture,
+                &reverts,
+                emission.plan.root_file.as_ref(),
+                &table,
+            )?;
+            files
+                .into_values()
+                .next()
+                .ok_or_else(|| "AST golden emitted no source file".to_owned())
+        },
+    ) {
+        Ok(inner) => inner,
+        Err(why) => Err(format!("{why:?}")),
+    }
+}
+
 /// A throwaway multi-file crate on disk. Removed on drop.
 struct Fixture(PathBuf);
 
@@ -4488,18 +4527,14 @@ mod coconv_witnesses {
         );
     }
 
-    /// **A duplicated argument blocks its class, and NOT the clean one beside
-    /// it.** g21's shape.
+    /// **R165-2 PAIR:** a duplicated argument keeps one safe primary and one
+    /// raw-view position, without affecting the clean class beside it.
     ///
-    /// The negative half is what makes this a witness rather than a
-    /// tautology: an implementation that blocks everything satisfies the first
-    /// assertion and fails the second.
-    ///
-    /// *Mutation-tested (deletion first):* deleting the overlap loop makes the
-    /// aliased class admissible and fails here; blocking unconditionally fails
-    /// on `g21_ok`.
+    /// The two aliased formal positions must split deterministically; treating
+    /// both as safe recreates E0499, while blocking unconditionally loses the
+    /// ruled T2 fallback and also fails on `g21_ok`.
     #[test]
-    fn e_adapt_n1_duplicated_argument_blocks_only_its_own_class() {
+    fn pair_w1_duplicated_argument_selects_primary_and_raw_view() {
         let rows = census(&format!(
             "{PRE}pub unsafe fn g21_ok(p: *mut i32) {{ *p = 1; }}\n\
              pub unsafe fn g21_aliased(a: *mut i32, b: *mut i32) {{ *a += *b; }}\n\
@@ -4508,11 +4543,13 @@ mod coconv_witnesses {
         ));
         let ok = row(&rows, "g21_ok", 1);
         let a = row(&rows, "g21_aliased", 1);
+        let b = row(&rows, "g21_aliased", 2);
         assert_eq!(
-            a["admissible"], "0",
-            "`g21_aliased(q, q)` is E0499 after conversion and must block: {a:?}"
+            a["admissible"], "1",
+            "the canonical primary must stay safe: {a:?}"
         );
-        assert_eq!(a["class_block"], "duplicate-place-root", "{a:?}");
+        assert_eq!(b["admissible"], "0", "the peer must be the raw view: {b:?}");
+        assert_eq!(b["node_block"], "duplicate-place-root", "{b:?}");
         assert_eq!(
             ok["admissible"], "1",
             "a blocked class must not take the clean one with it — one blocked \
@@ -7799,6 +7836,316 @@ fn br_w13_raw_to_safe_return_without_exact_permit_holds_class() {
     }
 }
 
+/// LIFE-W1 RED: the returned mutable parameter and return slot are one emitted
+/// lifetime group. A fresh return-only name (the former `'b`) is forbidden.
+#[test]
+fn life_w1_kazmath_return_reuses_the_origin_parameter_lifetime() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn kazmath(p_out: *mut i32, add: *const i32) -> *mut i32 {\n\
+             *p_out += *add;\n\
+             p_out\n\
+         }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = outcome else {
+        panic!("LIFE-W1 kazmath shape must emit: {outcome:#?}");
+    };
+    assert!(
+        source.contains("fn kazmath<'a>(p_out: &'a mut i32"),
+        "{source}"
+    );
+    assert!(source.contains(") -> &'a mut i32"), "{source}");
+    assert!(!source.contains("'b"), "{source}");
+    assert!(source.contains("unsafe { &mut *p_out }"), "{source}");
+}
+
+/// LIFE-W2 RED: every permitted source of a multi-branch return joins the
+/// return target before name allocation, so all three signature positions use
+/// one lifetime and the receipt says it was reused.
+#[test]
+fn life_w2_multi_source_return_uses_one_common_lifetime_and_receipt() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn choose(a: *const i32, b: *const i32, pick: bool) -> *const i32 {\n\
+             if pick { return a; }\n\
+             b\n\
+         }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = outcome else {
+        panic!("LIFE-W2 multi-source shape must emit: {outcome:#?}");
+    };
+    let receipt = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("LIFE-W2 decision table");
+        table.lifetime_plan.canonical_receipt(tcx)
+    })
+    .expect("LIFE-W2 fixture compiles");
+    assert!(
+        source.contains("fn choose<'a>(a: &'a i32, b: &'a i32, pick: bool) -> &'a i32"),
+        "{source}"
+    );
+    assert!(!source.contains("'b") && !source.contains("'c"), "{source}");
+    assert!(receipt.contains("return_lifetime_reused=true"), "{receipt}");
+    assert!(receipt.contains("common_name=a"), "{receipt}");
+}
+
+fn pair_w1_outcome(source: &str) -> super::RewriteOutcome {
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    )
+}
+
+/// PAIR-W1 RED, A5-clear branch: disjoint fields sharing one aggregate root
+/// stay safe on both positions and carry the existing site-audit proof.
+#[test]
+fn pair_w1_a5_clear_keeps_both_same_root_fields_safe() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub struct Pair { pub left: i32, pub right: i32 }\n\
+         pub unsafe fn update(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
+         pub unsafe fn caller() {\n\
+             let mut pair = Pair { left: 1, right: 2 };\n\
+             update(&mut pair.left, &mut pair.right);\n\
+         }\n";
+    let outcome = pair_w1_outcome(source);
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        degradations,
+        ..
+    } = outcome
+    else {
+        panic!("PAIR-W1 clear branch must emit: {outcome:#?}");
+    };
+    assert!(
+        source.contains("update(a: &mut i32, b: &mut i32)"),
+        "degradations={degradations:#?}\n{source}"
+    );
+    assert!(
+        source.contains("update(&mut pair.left, &mut pair.right)"),
+        "{source}"
+    );
+    let clear = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "pair-a5-clear")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        clear.len(),
+        4,
+        "one pair per position: {:#?}",
+        raw_boundary_artifacts.bridge_events
+    );
+}
+
+/// PAIR-W1 RED, Copy branch: the read-only side may be snapshotted only through
+/// the pre-existing C9 mark, which already carries Copy pointee and effect
+/// ordering proof. No in-wave proof is synthesized.
+#[test]
+fn pair_w1_copy_read_uses_the_existing_c9_effect_carrier() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub struct H { pub symbol: i32, pub previous: i32 }\n\
+         pub unsafe fn update(write: *mut i32, read: *const i32) { *write = *read + 1; }\n\
+         pub unsafe fn caller(h: *mut H) {\n\
+             let q: *const i32 = &(*h).symbol;\n\
+             update(&mut (*h).symbol, q);\n\
+         }\n";
+    let outcome = pair_w1_outcome(source);
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        degradations,
+        ..
+    } = outcome
+    else {
+        panic!("PAIR-W1 Copy branch must emit: {outcome:#?}");
+    };
+    assert!(
+        source.contains("let __crat_c9_"),
+        "degradations={degradations:#?}\npairs={}\n{source}",
+        raw_boundary_artifacts.pairs,
+    );
+    assert!(source.contains(": i32 = *(q)"), "{source}");
+    let snapshot = source.find("let __crat_c9_").expect("snapshot temp");
+    let mutable_borrow = source
+        .find("update(&mut (*h).symbol,")
+        .expect("mutable call argument");
+    assert!(snapshot < mutable_borrow, "{source}");
+    assert!(
+        source.contains("update(&mut (*h).symbol, &__crat_c9_"),
+        "{source}"
+    );
+    let copy = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "pair-copy-snapshot")
+        .collect::<Vec<_>>();
+    assert_eq!(copy.len(), 2, "{:#?}", raw_boundary_artifacts.bridge_events);
+    assert!(
+        copy.iter()
+            .all(|event| event.site.position.contains("carrier=c9"))
+    );
+}
+
+/// PAIR-W1/A-2 RED: this source has a Copy read side but no existing C9
+/// site/effect carrier. The Copy arm is `held-no-proof`; the site falls through
+/// to the separately receipted T2 raw view.
+#[test]
+fn pair_w1_copy_shape_without_existing_carrier_is_held_then_t2() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn update(write: *mut i32, read: *const i32) { *write = *read + 1; }\n\
+         pub unsafe fn caller() {\n\
+             let mut x = 1;\n\
+             update(&mut x, &mut x);\n\
+         }\n";
+    let outcome = pair_w1_outcome(source);
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
+        panic!("PAIR-W1 no-carrier fallback must emit: {outcome:#?}");
+    };
+    assert!(!source.contains("__crat_c9_"), "{source}");
+    assert!(source.contains("let __crat_pair_raw_"), "{source}");
+    assert!(
+        raw_boundary_artifacts
+            .pairs
+            .contains("held-no-proof:c9-effect-carrier-absent;pair-t2"),
+        "{}",
+        raw_boundary_artifacts.pairs
+    );
+    assert!(raw_boundary_artifacts.bridge_events.iter().any(|event| {
+        event.site.bridge_kind == "pair-t2-raw-view"
+            && event.retention == super::bridge_receipt::BridgeRetentionTier::T2
+            && event.waiver_id.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
+    }));
+}
+
+/// PAIR-W1 RED, T2 branch: without a licensed Copy snapshot, the selected raw
+/// view is materialized before the surviving mutable borrow and carries the
+/// exact unsafe-bridge waiver.
+#[test]
+fn pair_w1_t2_raw_view_is_materialized_before_the_safe_borrow() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn update(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
+         pub unsafe fn caller() {\n\
+             let mut x = 0;\n\
+             update(&mut x, &mut x);\n\
+         }\n";
+    let outcome = pair_w1_outcome(source);
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        degradations,
+        ..
+    } = outcome
+    else {
+        panic!("PAIR-W1 T2 branch must emit: {outcome:#?}");
+    };
+    let temp = source
+        .find("let __crat_pair_raw_")
+        .unwrap_or_else(|| panic!("degradations={degradations:#?}\n{source}"));
+    let borrow = source.find("update(&mut").expect("safe borrow");
+    assert!(temp < borrow, "{source}");
+    assert!(source.contains("core::ptr::from_mut(&mut x)"), "{source}");
+    let raw = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "pair-t2-raw-view")
+        .collect::<Vec<_>>();
+    assert_eq!(raw.len(), 2, "{:#?}", raw_boundary_artifacts.bridge_events);
+    assert!(raw.iter().all(|event| {
+        event.retention == super::bridge_receipt::BridgeRetentionTier::T2
+            && event.waiver_id.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
+    }));
+}
+
+/// PAIR-W1/G18: when both same-object positions may retain the pointer there is
+/// no lawful raw-view side. T2 is not spent and the class is held with the
+/// positive-retention reason.
+#[test]
+fn pair_w1_positive_retention_holds_instead_of_spending_t2() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn retain(a: *mut i32, b: *mut i32, pick: bool) -> *mut i32 {\n\
+             *a += 1; *b += 1;\n\
+             if pick { a } else { b }\n\
+         }\n\
+         pub unsafe fn caller() {\n\
+             let mut x = 0;\n\
+             let _ = retain(&mut x, &mut x, false);\n\
+         }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let pairs = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("PAIR-W1 positive-retention table");
+        ctx.raw_boundary_artifacts.pairs
+    })
+    .expect("PAIR-W1 positive-retention fixture compiles");
+    assert!(
+        pairs.contains("\tblocked\tblocked\tpair-positive-retention\t"),
+        "{pairs}"
+    );
+    let outcome = pair_w1_outcome(source);
+    let (emitted, artifacts) = match &outcome {
+        super::RewriteOutcome::Emitted {
+            source,
+            raw_boundary_artifacts,
+            ..
+        }
+        | super::RewriteOutcome::Degraded {
+            source,
+            raw_boundary_artifacts,
+            ..
+        } => (source, raw_boundary_artifacts),
+    };
+    assert!(!emitted.contains("__crat_pair_raw_"), "{outcome:#?}");
+    assert!(!artifacts.bridge_events.iter().any(|event| {
+        event.site.bridge_kind == "pair-t2-raw-view"
+            && event.state == super::bridge_receipt::BridgeReceiptState::Applied
+    }));
+}
+
 /// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,
 /// but E2-FN has no consumer yet. The lifetime producer must receive the intact
 /// summary object rather than an A5-shaped projection of it.
@@ -8231,7 +8578,7 @@ fn e2_w3_output_storage_uses_source_not_temp_lifetime() {
 
 /// E2-W1/BR-W13 structural witness — the production AST path materializes the
 /// lifetime plan and the return-site reborrow. Separate SCC names make the
-/// accepted source-to-return direction visible as `'a: 'b`.
+/// accepted source-to-return direction visible as one reused `'a`.
 #[test]
 fn e2_w1_production_emits_named_signature_lifetimes() {
     let fixture = Fixture::new(&[(
@@ -8254,15 +8601,15 @@ fn e2_w1_production_emits_named_signature_lifetimes() {
         .values()
         .find(|source| source.contains("fn id"))
         .expect("emitted E2-W1 function");
-    assert!(emitted.contains("fn id<'a: 'b, 'b>"), "{emitted}");
+    assert!(emitted.contains("fn id<'a>"), "{emitted}");
     assert!(emitted.contains("p: &'a i32"), "{emitted}");
-    assert!(emitted.contains("-> &'b i32"), "{emitted}");
+    assert!(emitted.contains("-> &'a i32"), "{emitted}");
     let signature = emitted
         .lines()
         .find(|line| line.contains("fn id"))
         .expect("E2-W1 emitted signature line");
     assert_eq!(
-        signature, "pub unsafe fn id<'a: 'b, 'b>(p: &'a i32) -> &'b i32 { unsafe { &*p } }",
+        signature, "pub unsafe fn id<'a>(p: &'a i32) -> &'a i32 { unsafe { &*p } }",
         "the lifetime and return bridge must move this exact structural line",
     );
 }
@@ -8297,25 +8644,19 @@ fn e2_structural_plan_covers_bounds_output_storage_and_existing_generics() {
         .values()
         .find(|source| source.contains("fn choose"))
         .expect("emitted E2 structural fixture");
-    assert!(
-        emitted.contains("fn choose<'a: 'c, 'b: 'c, 'c>"),
-        "{emitted}"
-    );
+    assert!(emitted.contains("fn choose<'a>"), "{emitted}");
     assert!(
         emitted.contains("fn store<'a, 'b: 'a>(out: &mut &'a i32, p: &'b i32)"),
         "{emitted}"
     );
-    assert!(
-        emitted.contains("fn existing<'a, 'b: 'c, 'c, T>"),
-        "{emitted}"
-    );
+    assert!(emitted.contains("fn existing<'a, 'b, T>"), "{emitted}");
 }
 
-/// E2-W2 precision-side negative — body-local reassignment does not create a
-/// caller-visible relation between signature origins. Each input retains its
-/// own SCC and both independently outlive the return.
+/// E2-W2/R165-2 — body-local reassignment does not create an analysis relation,
+/// but the typed multi-source return permit intentionally joins both source
+/// groups with the return before emitted-name allocation.
 #[test]
-fn e2_w2_local_reassignment_keeps_signature_origins_distinct() {
+fn e2_w2_local_reassignment_reuses_the_common_return_lifetime() {
     let source = "#![allow(dead_code, unused_unsafe, unused_assignments)]\n\
          pub unsafe fn cross(\n\
              mut a: *const i32,\n\
@@ -8350,9 +8691,10 @@ fn e2_w2_local_reassignment_keeps_signature_origins_distinct() {
             .iter()
             .filter(|scc| scc.contains(&arg1) || scc.contains(&arg2))
             .collect::<Vec<_>>();
-        assert_eq!(mutual.len(), 2, "{}: {}", tcx.def_path_str(did.to_def_id()), plan.receipt());
-        assert_ne!(plan.lifetime_for(arg1), plan.lifetime_for(arg2));
+        assert_eq!(mutual.len(), 1, "{}: {}", tcx.def_path_str(did.to_def_id()), plan.receipt());
+        assert_eq!(plan.lifetime_for(arg1), plan.lifetime_for(arg2));
         assert!(plan.outlives.iter().all(|(longer, shorter)| longer != shorter));
+        assert!(plan.receipt().contains("return_lifetime_reused=true"));
         plan.receipt()
     })
     .expect("E2-W2 local-reassignment fixture compiles before rewriting");
@@ -8365,32 +8707,19 @@ fn e2_w2_local_reassignment_keeps_signature_origins_distinct() {
         ),
         &|_| {},
     );
-    let super::RewriteOutcome::Degraded {
-        source: degraded_source,
-        files,
-        reverted_count,
-        raw_boundary_artifacts,
-        ..
-    } = outcome
-    else {
-        panic!("E2-W2 must type Degraded after revert-all: plan={plan_dump}; outcome={outcome:#?}");
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("E2-W2 common lifetime must emit: plan={plan_dump}; outcome={outcome:#?}");
     };
-    let unmodified = files
+    let emitted = files
         .values()
         .find(|text| text.contains("fn cross"))
-        .expect("E2-W2 unmodified function");
-    assert!(reverted_count >= 1, "plan={plan_dump}; source={unmodified}");
-    assert_eq!(degraded_source, source);
+        .expect("E2-W2 emitted function");
     assert!(
-        unmodified.contains("mut a: *const i32")
-            && unmodified.contains("mut b: *const i32")
-            && !unmodified.contains("fn cross<'"),
-        "the precision-side negative must revert, never unify by convenience: \
-         plan={plan_dump}; source={unmodified}",
-    );
-    assert_eq!(
-        raw_boundary_artifacts.degraded_output_receipt,
-        "degraded-unmodified-input"
+        emitted.contains("fn cross<'a>(")
+            && emitted.contains("mut a: &'a i32")
+            && emitted.contains("mut b: &'a i32")
+            && emitted.contains("-> &'a i32"),
+        "plan={plan_dump}; source={emitted}",
     );
 }
 
@@ -8510,7 +8839,7 @@ fn e2_w6_lifetime_callee_keeps_adapter_one_evaluation() {
         .values()
         .find(|text| text.contains("fn first"))
         .expect("E2-W6 emitted source");
-    assert!(emitted.contains("fn first<'a: 'b, 'b>"), "{emitted}");
+    assert!(emitted.contains("fn first<'a>"), "{emitted}");
     assert_eq!(emitted.matches("source()").count(), 2, "{emitted}");
 }
 
@@ -9216,7 +9545,7 @@ fn a_reverted_fn_keeps_its_raw_declaration() {
     // Both convert with an EMPTY revert set — the control that makes the
     // reverted half non-vacuous. Without it, "revert_me stayed raw" would be
     // satisfied by a fixture that never converted at all.
-    let none = super::ast_emitted_source_of(SRC).expect("the AST layer emits");
+    let none = ast_emitted_source_of(SRC).expect("the AST layer emits");
     assert!(
         !none.contains("p: *mut i32") && !none.contains("q: *mut i32"),
         "CONTROL: both params must convert under an empty revert set, or the \
@@ -9278,7 +9607,7 @@ fn both_layers_omit_the_const_when_safe_glue_needs_no_extent() {
                        pub unsafe fn fab_one(d: *mut i32) -> i32 { fab_total(d) }\n";
     let decl = "const FALLBACK_SLICE_EXTENT: usize = 1024;";
 
-    let ast = super::ast_emitted_source_of(SRC).expect("the AST layer emits");
+    let ast = ast_emitted_source_of(SRC).expect("the AST layer emits");
     assert_eq!(ast.matches(decl).count(), 0, "{ast}");
     assert!(ast.contains("core::slice::from_ref(d)"), "{ast}");
 
@@ -9338,7 +9667,7 @@ fn a_function_carrying_declaration_and_safe_glue_renders_identically_in_both_lay
          not a cross-arm function:\n{span}"
     );
 
-    let ast = super::ast_emitted_source_of(SRC).expect("the AST layer emits");
+    let ast = ast_emitted_source_of(SRC).expect("the AST layer emits");
     assert_eq!(
         crate::bo_rewriter::goldens::canonicalize("span", &span),
         crate::bo_rewriter::goldens::canonicalize("ast", &ast),

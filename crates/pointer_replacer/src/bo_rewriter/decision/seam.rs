@@ -33,7 +33,7 @@
 //! is proven. **65.7 % of the measured market sits behind that gate**, which is
 //! why it is a first-class outcome here rather than a `None`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_span::Span;
 
@@ -588,6 +588,24 @@ pub(crate) struct ZeroBridgeSite {
     pub bridge_kind: &'static str,
     pub retention: BridgeRetentionTier,
     pub waiver_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PairRawViewTemp {
+    pub argument_index: usize,
+    pub raw_expression: String,
+    pub target_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PairRawViewCall {
+    pub owner_class: SignatureClassId,
+    pub caller: LocalDefId,
+    pub callee: LocalDefId,
+    pub call_span: Span,
+    pub views: Vec<PairRawViewTemp>,
+    pub reasons: Vec<String>,
+    pub atom_ids: Vec<String>,
 }
 
 /// **The authorization rule for fabrication, as a pure function** (R8).
@@ -2447,6 +2465,9 @@ pub(crate) struct SeamPlan {
     /// Generated/zero-syntax bridge sites that still require plan and terminal
     /// receipts in their owning signature class.
     pub zero_bridges: Vec<ZeroBridgeSite>,
+    /// Same-object T2 raw views grouped by call so every raw temp is created
+    /// before any surviving safe borrow in the call expression.
+    pub pair_raw_calls: Vec<PairRawViewCall>,
 }
 
 /// The form a decision emits.
@@ -2563,6 +2584,28 @@ fn blocked_call(
         peers: Vec::new(),
         overlap: None,
     }
+}
+
+fn block_pair_raw_view(
+    plan: &mut SeamPlan,
+    pair: &super::co_conversion::PairSiteDecision,
+    reason: &str,
+) {
+    plan.raw_boundary_blocked.push(BlockedRawBoundary {
+        owner_class: SignatureClassId::of(pair.callee),
+        bridge: BridgeSitePlan {
+            caller: pair.caller,
+            callee: BridgeCalleeId::Local(pair.callee),
+            arm: "pair".to_owned(),
+            position: format!("arg{}", pair.argument_index),
+            bridge_kind: "pair-t2-raw-view".to_owned(),
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::T2,
+            waiver_id: Some(RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+        },
+        span: pair.span,
+        reason: reason.to_owned(),
+    });
 }
 
 /// Compute every seam adapter the crate needs.
@@ -3011,13 +3054,24 @@ pub(crate) fn synthesize_with_raw_boundary(
                         a5_site_proofs,
                     )
                 });
-                if let Some(proof) = &overlap {
+                let pair_owned = coconv.pair_sites().iter().any(|pair| {
+                    pair.caller == site.caller
+                        && pair.callee == *callee
+                        && pair.argument_index == pos.index
+                        && pair
+                            .call_span
+                            .source_callsite()
+                            .contains(site.span.source_callsite())
+                        && pair.role != super::co_conversion::PairRole::Blocked
+                });
+                if !pair_owned && let Some(proof) = &overlap {
                     plan.overlap_proofs.push(proof.clone());
                 }
                 if overlap
                     .as_ref()
                     .is_some_and(|proof| !proof.clears_site_overlap())
                     && !pos.raw_boundary_observation
+                    && !pair_owned
                 {
                     plan.blocked.push(BlockedSeam {
                         caller: site.caller,
@@ -3290,86 +3344,81 @@ pub(crate) fn synthesize_with_raw_boundary(
         });
     }
 
-    // PAIR raw views are decided before the final table, but rendered here by
-    // the same seam algebra as every other safe-to-raw bridge. The callee
-    // subject is intentionally Raw; the caller-side safe value is made
-    // explicit under the recorded T1/T2 tier instead of relying on an implicit
-    // coercion.
+    // PAIR raw views are grouped by call. Their temps must be evaluated before
+    // any surviving safe borrow, so an argument-local edit is insufficient.
+    let mut pair_raw_calls = BTreeMap::<(u32, u32, u32, u32), PairRawViewCall>::new();
     for pair in coconv
         .pair_sites()
         .iter()
         .filter(|pair| pair.role == super::co_conversion::PairRole::RawView)
     {
-        let Some(source_node) = pair.source_node else {
+        if pair.tier != super::co_conversion::PairTier::T2 {
             continue;
-        };
-        let Some(source_decision) = decision_of.get(&source_node).copied() else {
-            continue;
-        };
+        }
         let Some(target) = pair.target.as_ref() else {
-            continue;
-        };
-        let Ok(template) = super::raw_boundary::template_for(source_decision, target, None, false)
-        else {
+            block_pair_raw_view(&mut plan, pair, "pair-raw-view-target-missing");
             continue;
         };
         let Ok(argument) = sm.span_to_snippet(pair.span) else {
+            block_pair_raw_view(&mut plan, pair, "pair-raw-view-source-unplaceable");
             continue;
         };
-        let spec = GlueSpec::raw_boundary(template, target.mutability, false, true);
-        let Some(replacement) = spec.render(&argument) else {
+        let raw_expression = pair
+            .source_node
+            .and_then(|source_node| decision_of.get(&source_node).copied())
+            .and_then(|source_decision| {
+                let template =
+                    super::raw_boundary::template_for(source_decision, target, None, false).ok()?;
+                GlueSpec::raw_boundary_target(template, target, false, true).render(&argument)
+            })
+            .or_else(|| match (pair.source_shape, target.mutability) {
+                ("addr-of-mut", super::raw_boundary::RawMutability::Mut) => {
+                    Some(format!("core::ptr::from_mut({argument})"))
+                }
+                ("addr-of-mut", super::raw_boundary::RawMutability::Const) => {
+                    Some(format!("core::ptr::from_ref(&*{argument})"))
+                }
+                ("addr-of", super::raw_boundary::RawMutability::Const) => {
+                    Some(format!("core::ptr::from_ref({argument})"))
+                }
+                _ => None,
+            });
+        let Some(raw_expression) = raw_expression else {
+            block_pair_raw_view(&mut plan, pair, "pair-raw-view-template-unavailable");
             continue;
         };
-        if plan
-            .edits
-            .iter()
-            .any(|edit| edit.span == pair.span && edit.replacement == replacement)
-        {
-            continue;
-        }
-        plan.edits.push(SeamEdit {
-            span: pair.span,
-            call_span: pair.span,
-            replacement,
-            owner_class: SignatureClassId::of(pair.callee),
-            bridge: BridgeSitePlan {
+        let key = (
+            pair.caller.local_def_index.as_u32(),
+            pair.callee.local_def_index.as_u32(),
+            pair.call_span.lo().0,
+            pair.call_span.hi().0,
+        );
+        let call = pair_raw_calls
+            .entry(key)
+            .or_insert_with(|| PairRawViewCall {
+                owner_class: SignatureClassId::of(pair.callee),
                 caller: pair.caller,
-                callee: BridgeCalleeId::Local(pair.callee),
-                arm: "pair".to_owned(),
-                position: format!("arg{}", pair.argument_index),
-                bridge_kind: template.key().to_owned(),
-                extent: receipt_extent(&spec),
-                retention: match pair.tier {
-                    super::co_conversion::PairTier::T1 => BridgeRetentionTier::T1,
-                    super::co_conversion::PairTier::T2 => BridgeRetentionTier::T2,
-                    super::co_conversion::PairTier::None
-                    | super::co_conversion::PairTier::Blocked => BridgeRetentionTier::None,
-                },
-                waiver_id: (pair.tier == super::co_conversion::PairTier::T2)
-                    .then(|| RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
-            },
-            owner_fn: tcx.def_path_str(pair.callee.to_def_id()),
-            lifetime_plan_digest: table
-                .lifetime_plan
-                .function(pair.callee)
-                .map(super::lifetime::FunctionPlan::digest),
-            caller_fn: tcx.def_path_str(pair.caller.to_def_id()),
-            param_index: pair.argument_index,
-            source_shape: "pair-raw-view",
-            family: SeamFamily::Safe,
-            len_arm: None,
-            spec,
-            arg_span: pair.span,
-            expected: Form::Raw,
-            found: form_of(source_decision),
-            root_identity: labels
-                .get(&source_node)
-                .cloned()
-                .unwrap_or_else(|| "-".to_owned()),
-            blind: false,
-            overlap: None,
-            atom_ids: vec![pair.atom_id()],
+                callee: pair.callee,
+                call_span: pair.call_span,
+                views: Vec::new(),
+                reasons: Vec::new(),
+                atom_ids: Vec::new(),
+            });
+        call.views.push(PairRawViewTemp {
+            argument_index: pair.argument_index,
+            raw_expression,
+            target_type: target.rendered.clone(),
         });
+        call.reasons.push(pair.reason.clone());
+        call.atom_ids.push(pair.atom_id());
+    }
+    plan.pair_raw_calls = pair_raw_calls.into_values().collect();
+    for call in &mut plan.pair_raw_calls {
+        call.views.sort_by_key(|view| view.argument_index);
+        call.reasons.sort();
+        call.reasons.dedup();
+        call.atom_ids.sort();
+        call.atom_ids.dedup();
     }
     for site in raw_boundary.address_sites() {
         let Ok(argument) = sm.span_to_snippet(site.span) else {

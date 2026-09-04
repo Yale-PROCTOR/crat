@@ -307,7 +307,6 @@ impl PairRole {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PairTier {
     None,
-    T1,
     T2,
     Blocked,
 }
@@ -316,7 +315,6 @@ impl PairTier {
     pub(crate) fn key(self) -> &'static str {
         match self {
             Self::None => "-",
-            Self::T1 => "T1",
             Self::T2 => "T2",
             Self::Blocked => "blocked",
         }
@@ -329,9 +327,11 @@ pub(crate) struct PairSiteDecision {
     pub(crate) callee: LocalDefId,
     pub(crate) argument_index: usize,
     pub(crate) span: Span,
+    pub(crate) call_span: Span,
     pub(crate) subject: NodeKey,
     pub(crate) source_node: Option<NodeKey>,
     pub(crate) target: Option<RawTargetType>,
+    pub(crate) source_shape: &'static str,
     pub(crate) role: PairRole,
     pub(crate) tier: PairTier,
     pub(crate) verdict: A5SiteProofVerdict,
@@ -356,7 +356,6 @@ fn resolve_pair_roles(
     entries: &[(usize, usize, A5SiteProofVerdict, bool)],
 ) -> BTreeMap<usize, PairRole> {
     let mut vertices = BTreeSet::new();
-    let mut unknown = BTreeSet::new();
     let mut overlap = BTreeMap::<usize, BTreeSet<usize>>::new();
     let mut positive = BTreeSet::new();
     for &(left, right, verdict, positive_retention) in entries {
@@ -371,7 +370,8 @@ fn resolve_pair_roles(
                 overlap.entry(right).or_default().insert(left);
             }
             A5SiteProofVerdict::Undeterminable => {
-                unknown.extend([left, right]);
+                overlap.entry(left).or_default().insert(right);
+                overlap.entry(right).or_default().insert(left);
             }
         }
     }
@@ -379,10 +379,6 @@ fn resolve_pair_roles(
         .iter()
         .map(|&index| (index, PairRole::Clear))
         .collect::<BTreeMap<_, _>>();
-    for index in unknown {
-        roles.insert(index, PairRole::Blocked);
-    }
-
     let mut seen = BTreeSet::new();
     for &start in overlap.keys() {
         if seen.contains(&start) {
@@ -397,15 +393,6 @@ fn resolve_pair_roles(
             stack.extend(overlap.get(&index).into_iter().flatten().copied());
         }
         seen.extend(component.iter().copied());
-        if component
-            .iter()
-            .any(|index| roles[index] == PairRole::Blocked)
-        {
-            for index in component {
-                roles.insert(index, PairRole::Blocked);
-            }
-            continue;
-        }
         // A raw-view vertex may not have positive-retention evidence. Choose
         // the lowest canonical index whose removal leaves every raw view
         // admissible; if none exists, the entire component remains blocked.
@@ -486,6 +473,12 @@ impl CoConv {
 
     pub(crate) fn pair_sites(&self) -> &[PairSiteDecision] {
         &self.pair_sites
+    }
+
+    pub(crate) fn is_pair_raw_view(&self, key: NodeKey) -> bool {
+        self.pair_sites
+            .iter()
+            .any(|site| site.subject == key && site.role == PairRole::RawView)
     }
 
     pub(crate) fn edge_routes(&self, key: NodeKey) -> Vec<&'static str> {
@@ -638,12 +631,7 @@ pub(crate) fn retained_c9_shared_params(
 ) -> FxHashSet<usize> {
     marks
         .iter()
-        .filter(|mark| {
-            mark.caller_did == site.caller
-                && mark.call_span.lo() == site.span.lo()
-                && mark.call_span.hi() == site.span.hi()
-                && mark.key.pair.function() == callee.local_def_index.as_u32()
-        })
+        .filter(|mark| c9_mark_matches(mark, site, callee))
         .filter_map(|mark| {
             let params = mark.key.pair.params();
             let shared = match mark.key.shared_side {
@@ -653,6 +641,18 @@ pub(crate) fn retained_c9_shared_params(
             usize::try_from(shared).ok()?.checked_sub(1)
         })
         .collect()
+}
+
+fn c9_mark_matches(
+    mark: &PlannedC9Mark,
+    site: &super::emitability::CallSite,
+    callee: LocalDefId,
+) -> bool {
+    let mark_span = mark.call_span.source_callsite();
+    let site_span = site.span.source_callsite();
+    mark.caller_did == site.caller
+        && (mark_span.contains(site_span) || site_span.contains(mark_span))
+        && mark.key.pair.function() == callee.local_def_index.as_u32()
 }
 
 pub(crate) fn build_with_c9_marks(
@@ -880,6 +880,8 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                 blind: bool,
                 source_node: Option<NodeKey>,
                 target: Option<RawTargetType>,
+                source_shape: &'static str,
+                place_identity: Option<String>,
             }
             let node_positions: Vec<PairPosition> = site
                 .args
@@ -915,6 +917,8 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                         blind,
                         source_node: arg.shape.place_root().map(|root| (site.caller, root)),
                         target: arg.target.clone(),
+                        source_shape: arg.shape.key(),
+                        place_identity: arg.place_identity.clone(),
                     })
                 })
                 .collect();
@@ -936,18 +940,25 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                     };
                     if conflicts {
                         if let Some(proofs) = a5_site_proofs {
-                            pair_edges.push((
-                                i,
-                                j,
-                                proofs.lookup(
-                                    site.caller.local_def_index.as_u32(),
-                                    callee.local_def_index.as_u32(),
-                                    a.argument_index,
-                                    b.argument_index,
-                                    a.span,
-                                    b.span,
-                                ),
-                            ));
+                            let mut proof = proofs.lookup(
+                                site.caller.local_def_index.as_u32(),
+                                callee.local_def_index.as_u32(),
+                                a.argument_index,
+                                b.argument_index,
+                                a.span,
+                                b.span,
+                            );
+                            let exact_same_place =
+                                a.place_identity.is_some() && a.place_identity == b.place_identity;
+                            if exact_same_place
+                                && proof.verdict == A5SiteProofVerdict::Clear
+                                && proof.reason != "projection-disjoint"
+                            {
+                                proof.verdict = A5SiteProofVerdict::Overlapping;
+                                proof.reason = "same-place-root";
+                                proof.family = "same-object-identity";
+                            }
+                            pair_edges.push((i, j, proof));
                         } else {
                             block(&mut node_block, a.key, BlockReason::DuplicatePlaceRoot);
                             block(&mut node_block, b.key, BlockReason::DuplicatePlaceRoot);
@@ -1023,26 +1034,46 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                         .into_iter()
                         .collect::<Vec<_>>()
                         .join(";");
+                    let copy_candidate = incident.iter().any(|(left, right, _)| {
+                        node_positions[*left].mutable != node_positions[*right].mutable
+                    });
+                    let positive_retention = incident.iter().any(|(left, right, _)| {
+                        [*left, *right].into_iter().any(|index| {
+                            matches!(
+                                retention.get(*callee, node_positions[index].argument_index,),
+                                Some(RetentionVerdict::Retains { .. })
+                            )
+                        })
+                    });
                     let (mut tier, mut reason) = match role {
                         PairRole::RawView => {
                             match retention.get(*callee, position.argument_index) {
-                                Some(RetentionVerdict::NoRetain { .. }) => {
-                                    (PairTier::T1, "pair-no-retain-certificate".to_owned())
-                                }
-                                Some(RetentionVerdict::Unknown { reason, .. }) => {
-                                    (PairTier::T2, format!("pair-waiver:{}", reason.key()))
-                                }
                                 Some(RetentionVerdict::Retains { .. }) => {
                                     (PairTier::Blocked, "pair-positive-retention".to_owned())
                                 }
-                                None => {
-                                    (PairTier::T2, "pair-waiver:retention-unavailable".to_owned())
-                                }
+                                Some(RetentionVerdict::NoRetain { .. }) => (
+                                    PairTier::T2,
+                                    if copy_candidate {
+                                        "held-no-proof:c9-effect-carrier-absent;pair-t2".to_owned()
+                                    } else {
+                                        "pair-t2-same-object".to_owned()
+                                    },
+                                ),
+                                Some(RetentionVerdict::Unknown { reason, .. }) => (
+                                    PairTier::T2,
+                                    format!("held-no-proof:{};pair-t2", reason.key()),
+                                ),
+                                None => (
+                                    PairTier::T2,
+                                    "held-no-proof:retention-unavailable;pair-t2".to_owned(),
+                                ),
                             }
                         }
                         PairRole::Blocked => (
                             PairTier::Blocked,
-                            if verdict == A5SiteProofVerdict::Undeterminable {
+                            if positive_retention {
+                                "pair-positive-retention".to_owned()
+                            } else if verdict == A5SiteProofVerdict::Undeterminable {
                                 incident
                                     .iter()
                                     .filter(|(_, _, proof)| {
@@ -1061,15 +1092,29 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                             (PairTier::None, "pair-proof-accepted".to_owned())
                         }
                     };
+                    if tier == PairTier::Blocked {
+                        role = PairRole::Blocked;
+                    }
                     if role == PairRole::RawView {
-                        let template_available = position
-                            .source_node
-                            .and_then(|node| decision_of.get(&node).copied())
-                            .zip(position.target.as_ref())
-                            .is_some_and(|(decision, target)| {
-                                super::raw_boundary::template_for(decision, target, None, false)
-                                    .is_ok()
-                            });
+                        let order_safe = matches!(
+                            position.source_shape,
+                            "bare-local" | "cast-of-local" | "addr-of-mut" | "addr-of"
+                        );
+                        let template_available = order_safe
+                            && (position
+                                .source_node
+                                .and_then(|node| decision_of.get(&node).copied())
+                                .zip(position.target.as_ref())
+                                .is_some_and(|(decision, target)| {
+                                    super::raw_boundary::template_for(decision, target, None, false)
+                                        .is_ok()
+                                })
+                                || position.target.as_ref().is_some_and(|target| {
+                                    matches!(position.source_shape, "addr-of-mut")
+                                        || (position.source_shape == "addr-of"
+                                            && target.mutability
+                                                == super::raw_boundary::RawMutability::Const)
+                                }));
                         if !template_available {
                             role = PairRole::Blocked;
                             tier = PairTier::Blocked;
@@ -1088,9 +1133,11 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                         callee: *callee,
                         argument_index: position.argument_index,
                         span: position.span,
+                        call_span: site.span,
                         subject: position.key,
                         source_node: position.source_node,
                         target: position.target.clone(),
+                        source_shape: position.source_shape,
                         role,
                         tier,
                         verdict,
@@ -1686,13 +1733,13 @@ mod pair_plan_tests {
     }
 
     #[test]
-    fn pair_n1_unknown_is_never_mapped_to_clear() {
+    fn pair_n1_unknown_falls_to_primary_raw_view_never_clear() {
         assert_eq!(
             resolve_pair_roles_for_test(&[
                 (0, 1, A5SiteProofVerdict::Undeterminable, false),
                 (1, 0, A5SiteProofVerdict::Undeterminable, false),
             ]),
-            ["blocked", "blocked"]
+            ["primary", "raw-view"]
         );
     }
 

@@ -488,6 +488,10 @@ pub(crate) enum DegradeReason {
     /// BO decided the slot is a raw pointer; leaving the source alone is the
     /// decision, not a failure.
     KindRaw,
+    /// The parameter intentionally keeps its raw presentation as the T2 side
+    /// of a same-object PAIR seam. Its class may still apply the safe sibling
+    /// signature edit and the call-level raw-view bridge atomically.
+    PairRawView,
     /// BO decided owning; Box forms and the drop policy arrive in S3.
     KindOwning,
     /// Box wave-1 filter failure, preserving the exact first-failure class.
@@ -727,6 +731,7 @@ impl DegradeReason {
             DegradeReason::RevertedAfterVerifyFailure => "reverted-after-verify-failure",
             DegradeReason::SignatureClassHeld { .. } => "signature-class-held",
             DegradeReason::KindRaw => "kind-raw",
+            DegradeReason::PairRawView => "pair-raw-view",
             DegradeReason::KindOwning => "kind-owning",
             DegradeReason::BoxFailure { failure } => failure.key(),
             DegradeReason::RawPointerOperation { .. } => "raw-pointer-operation",
@@ -1532,18 +1537,22 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         if let Some(cc) = coconv {
             let key = (subject.fn_did, subject.hir_id);
             if !cc.admits(key) {
-                let reason = match cc.node_block(key) {
-                    Some(via) => DegradeReason::SilentCoercion { via },
-                    None => match cc.class_block(key) {
-                        Some(via) => DegradeReason::ClassBlocked { via },
-                        // Not a node. Unreachable through the pipeline —
-                        // production and the hypothetical differ ONLY by
-                        // `coconv` — and attributed rather than silently
-                        // emitted, because an unreachable arm that falls
-                        // through is how a subject escapes its own gate once
-                        // the premise stops holding.
-                        None => DegradeReason::CallSiteNotAdapted,
-                    },
+                let reason = if cc.is_pair_raw_view(key) {
+                    DegradeReason::PairRawView
+                } else {
+                    match cc.node_block(key) {
+                        Some(via) => DegradeReason::SilentCoercion { via },
+                        None => match cc.class_block(key) {
+                            Some(via) => DegradeReason::ClassBlocked { via },
+                            // Not a node. Unreachable through the pipeline —
+                            // production and the hypothetical differ ONLY by
+                            // `coconv` — and attributed rather than silently
+                            // emitted, because an unreachable arm that falls
+                            // through is how a subject escapes its own gate once
+                            // the premise stops holding.
+                            None => DegradeReason::CallSiteNotAdapted,
+                        },
+                    }
                 };
                 return degrade(subject, decl_site, reason);
             }

@@ -1176,7 +1176,7 @@ fn the_ast_layer_reproduces_every_green_golden() {
         if RED.contains(&g.name) {
             continue;
         }
-        let src = crate::bo_rewriter::ast_emitted_source_of(g.input)
+        let src = super::emit_tests::ast_emitted_source_of(g.input)
             .unwrap_or_else(|why| panic!("{}: AST layer declined to emit — {why}", g.name));
         compared += 1;
         if canonicalize("new", &src) != canonicalize("expected", g.expected) {
