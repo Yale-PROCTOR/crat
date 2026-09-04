@@ -1160,11 +1160,11 @@ impl BridgeTemplate {
             Self::SliceMutToRawMut => "slice-mut-to-raw-mut",
             Self::SliceToRawConst => "slice-to-raw-const",
             Self::SliceToRawMut => "slice-to-raw-mut",
-            Self::OptRefMutToRawMut => "opt-ref-mut-to-raw-mut",
-            Self::OptRefToRawConst => "opt-ref-to-raw-const",
-            Self::OptRefToRawMut => "opt-ref-to-raw-mut",
-            Self::OptSliceToRaw => "opt-slice-to-raw",
-            Self::OptSliceToRawMut => "opt-slice-to-raw-mut",
+            Self::OptRefMutToRawMut
+            | Self::OptRefToRawConst
+            | Self::OptRefToRawMut
+            | Self::OptSliceToRaw
+            | Self::OptSliceToRawMut => "option-to-raw-null-map",
             Self::BoxBorrowViewToRaw => "box-borrow-view-to-raw",
             Self::KnownFreeDrop => "known-free-drop",
         }
@@ -1244,26 +1244,41 @@ impl BridgeTemplate {
             Self::SliceToRawMut => Ok(BridgeRender::Edit(format!(
                 "{argument}.as_ptr().cast_mut()"
             ))),
-            Self::OptRefMutToRawMut => Ok(BridgeRender::Edit(format!(
-                "{argument}.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut)"
-            ))),
-            Self::OptRefToRawConst => Ok(BridgeRender::Edit(format!(
-                "{argument}.as_deref().map_or(core::ptr::null(), core::ptr::from_ref)"
-            ))),
-            Self::OptRefToRawMut => Ok(BridgeRender::Edit(format!(
-                "{argument}.as_deref().map_or(core::ptr::null_mut(), |value| core::ptr::from_ref(value).cast_mut())"
-            ))),
-            Self::OptSliceToRaw => Ok(BridgeRender::Edit(match target_mutability {
-                RawMutability::Mut => format!(
-                    "{argument}.as_deref_mut().map_or(core::ptr::null_mut(), |slice| slice.as_mut_ptr())"
-                ),
-                RawMutability::Const => format!(
-                    "{argument}.as_deref().map_or(core::ptr::null(), |slice| slice.as_ptr())"
-                ),
-            })),
-            Self::OptSliceToRawMut => Ok(BridgeRender::Edit(format!(
-                "{argument}.as_deref().map_or(core::ptr::null_mut(), |slice| slice.as_ptr().cast_mut())"
-            ))),
+            Self::OptRefMutToRawMut => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), core::ptr::from_mut)"
+                )))
+            }
+            Self::OptRefToRawConst => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref().map_or(core::ptr::null::<{pointee}>(), core::ptr::from_ref)"
+                )))
+            }
+            Self::OptRefToRawMut => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |value| core::ptr::from_ref(value).cast_mut())"
+                )))
+            }
+            Self::OptSliceToRaw => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(match target_mutability {
+                    RawMutability::Mut => format!(
+                        "{argument}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_mut_ptr())"
+                    ),
+                    RawMutability::Const => format!(
+                        "{argument}.as_deref().map_or(core::ptr::null::<{pointee}>(), |slice| slice.as_ptr())"
+                    ),
+                }))
+            }
+            Self::OptSliceToRawMut => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_ptr().cast_mut())"
+                )))
+            }
             Self::BoxBorrowViewToRaw if box_slice => {
                 Ok(BridgeRender::Edit(match target_mutability {
                     RawMutability::Mut => format!("{argument}.as_mut_ptr()"),
@@ -2546,7 +2561,7 @@ mod tests {
     #[test]
     fn rb_w5_optional_mutable_ref_bridge_is_one_evaluation_without_unwrap() {
         let rendered = BridgeTemplate::OptRefMutToRawMut
-            .render("p", RawMutability::Mut, false, None)
+            .render("p", RawMutability::Mut, false, Some("i32"))
             .expect("optional bridge");
         let BridgeRender::Edit(text) = rendered else {
             panic!("expected edit, got {rendered:?}");

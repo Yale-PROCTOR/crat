@@ -111,6 +111,9 @@ pub(crate) enum SeamBlock {
     /// The converted callee is known to retain this parameter. A call-scoped
     /// raw-to-safe bridge cannot license a reference that escapes the call.
     PositiveRetention,
+    /// A slice cannot be projected to a required thin reference without a
+    /// carried proof that the slice has at least one element.
+    NonemptyUnknown,
 }
 
 impl SeamBlock {
@@ -122,6 +125,7 @@ impl SeamBlock {
             SeamBlock::NullabilityInsufficient => "glue-nullability-insufficient",
             SeamBlock::SiteOverlap => "seam-site-overlap",
             SeamBlock::PositiveRetention => "seam-positive-retention",
+            SeamBlock::NonemptyUnknown => "seam-nonempty-unknown",
         }
     }
 }
@@ -627,6 +631,9 @@ pub(crate) enum GlueCore {
     /// `unsafe { X.as_mut() }` / `unsafe { X.as_ref() }` for a nullable raw
     /// pointer crossing into an optional safe parameter.
     RawOption,
+    /// `X.first().unwrap()` / `X.first_mut().unwrap()` under a carried
+    /// nonempty contract.
+    First,
     /// `&mut X[0]` / `&X[0]`
     Index0,
     /// `core::slice::from_raw_parts{_mut}(X, (LEN) as usize)`
@@ -688,6 +695,7 @@ pub(crate) struct GlueSpec {
     /// Raw-boundary wave-1's explicit safe-to-raw form. Kept inside the seam
     /// algebra so span and AST consumers share one carried template.
     pub raw_boundary: Option<RawBoundaryGlue>,
+    pub nonempty_evidence: bool,
 }
 
 impl GlueSpec {
@@ -700,6 +708,7 @@ impl GlueSpec {
             optional: false,
             null_arm: NullArm::None,
             raw_boundary: None,
+            nonempty_evidence: false,
         }
     }
 
@@ -740,6 +749,11 @@ impl GlueSpec {
         self
     }
 
+    pub(crate) fn with_nonempty_evidence(mut self) -> Self {
+        self.nonempty_evidence = true;
+        self
+    }
+
     pub(crate) fn literal_none(mutable: bool) -> Self {
         Self {
             core: GlueCore::Bare,
@@ -749,6 +763,7 @@ impl GlueSpec {
             optional: true,
             null_arm: NullArm::LiteralNone,
             raw_boundary: None,
+            nonempty_evidence: false,
         }
     }
 
@@ -772,6 +787,7 @@ impl GlueSpec {
                 force_explicit,
                 cast_pointee: None,
             }),
+            nonempty_evidence: false,
         }
     }
 
@@ -789,11 +805,25 @@ impl GlueSpec {
             .depth2
             .as_ref()
             .map(|depth2| depth2.inner_pointee.clone())
-            .or_else(|| target.is_void_pointee().then(|| target.pointee.clone()));
+            .or_else(|| {
+                (target.is_void_pointee()
+                    || matches!(
+                        template,
+                        super::raw_boundary::BridgeTemplate::OptRefMutToRawMut
+                            | super::raw_boundary::BridgeTemplate::OptRefToRawConst
+                            | super::raw_boundary::BridgeTemplate::OptRefToRawMut
+                            | super::raw_boundary::BridgeTemplate::OptSliceToRaw
+                            | super::raw_boundary::BridgeTemplate::OptSliceToRawMut
+                    ))
+                .then(|| target.pointee.clone())
+            });
         spec
     }
 
     pub(crate) fn null_arm_key(&self) -> &'static str {
+        if self.unwrap.is_some() {
+            return "callee-required";
+        }
         match self.null_arm {
             NullArm::Checked => "checked-is-null",
             NullArm::PointerApi => "raw-pointer-option",
@@ -820,13 +850,18 @@ impl GlueSpec {
                 GlueCore::RawOption if self.mutable => "c-raw-option-mut",
                 GlueCore::RawOption => "c-raw-option-shared",
                 GlueCore::FromRawParts => "c-raw-option-slice",
-                GlueCore::Bare | GlueCore::Reborrow | GlueCore::Index0 | GlueCore::FromRefMut => {
-                    "optional"
-                }
+                GlueCore::Bare
+                | GlueCore::Reborrow
+                | GlueCore::First
+                | GlueCore::Index0
+                | GlueCore::FromRefMut => "optional",
             };
         }
         if self.null_arm == NullArm::Checked && matches!(self.core, GlueCore::FromRawParts) {
             return "c-raw-option-slice";
+        }
+        if self.unwrap.is_some() {
+            return "nullable-required-unwrap";
         }
         if !self.optional {
             match self.core {
@@ -835,13 +870,18 @@ impl GlueSpec {
                 GlueCore::FromRawParts if self.mutable => return "c-raw-slice-mut",
                 GlueCore::FromRawParts => return "c-raw-slice-shared",
                 GlueCore::Bare | GlueCore::RawOption | GlueCore::Index0 | GlueCore::FromRefMut => {}
+                GlueCore::First => {}
             }
         }
         if self.optional {
             "optional"
         } else {
             match self.core {
-                GlueCore::FromRawParts | GlueCore::FromRefMut => "slice",
+                GlueCore::FromRawParts => "slice",
+                GlueCore::FromRefMut if self.mutable => "thin-to-slice-mut",
+                GlueCore::FromRefMut => "thin-to-slice-shared",
+                GlueCore::First if self.mutable => "slice-to-thin-mut",
+                GlueCore::First => "slice-to-thin-shared",
                 GlueCore::Reborrow | GlueCore::RawOption | GlueCore::Index0 | GlueCore::Bare => {
                     "scalar-reference"
                 }
@@ -894,12 +934,14 @@ impl GlueSpec {
             (true, GlueCore::FromRawParts) => "some_from_raw_parts",
             (true, GlueCore::Reborrow) => "some_reborrow",
             (true, GlueCore::RawOption) => "checked_optional",
+            (true, GlueCore::First) => "some_wrap",
             (true, GlueCore::FromRefMut) => "some_from_ref_mut",
             // `Some(&X[0])` matches neither `Some(&mut *` nor `Some(&*`.
             (true, GlueCore::Bare | GlueCore::Index0) => "some_wrap",
             (false, GlueCore::FromRawParts) => "from_raw_parts",
             (false, GlueCore::Reborrow) => "reborrow",
             (false, GlueCore::RawOption) => "checked_optional",
+            (false, GlueCore::First) => "first",
             (false, GlueCore::FromRefMut) => "from_ref_mut",
             // `index` is the classifier's FALLBACK arm, and the two cores that
             // land in it are **not** in the same position — a distinction this
@@ -988,6 +1030,10 @@ impl GlueSpec {
                 let method = if self.mutable { "as_mut" } else { "as_ref" };
                 format!("unsafe {{ {base}.{method}() }}")
             }
+            GlueCore::First => {
+                let method = if self.mutable { "first_mut" } else { "first" };
+                format!("{base}.{method}().unwrap()")
+            }
             GlueCore::Index0 => format!("{}{base}[0]", amp(self.mutable)),
             GlueCore::FromRawParts => {
                 let ctor = if self.mutable {
@@ -1053,6 +1099,15 @@ pub(crate) fn glue(
     expected: Form,
     found: Form,
     len: Option<&str>,
+) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
+    glue_with_nonempty(expected, found, len, true)
+}
+
+fn glue_with_nonempty(
+    expected: Form,
+    found: Form,
+    len: Option<&str>,
+    nonempty: bool,
 ) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
     use Form::*;
     // A shared borrow can never satisfy a `&mut` position, whatever the shapes
@@ -1151,7 +1206,13 @@ pub(crate) fn glue(
             if shared_to_mut(w, h) {
                 return Err(SeamBlock::SharedToMut);
             }
-            Some((GlueSpec::core(GlueCore::Index0, w), SeamFamily::Safe))
+            if !nonempty {
+                return Err(SeamBlock::NonemptyUnknown);
+            }
+            Some((
+                GlueSpec::core(GlueCore::First, w).with_nonempty_evidence(),
+                SeamFamily::Safe,
+            ))
         }
         (
             Opt {
@@ -1219,11 +1280,73 @@ pub(crate) fn glue(
             ))
         }
 
-        // Optional-to-required conversion needs positive non-null/nonempty
-        // evidence. None is carried at this seam in wave 2, so both thin and
-        // fat forms fail closed and no unwrap is synthesized.
-        (Ref { .. } | Slice { .. }, Opt { .. }) => {
-            return Err(SeamBlock::NullabilityInsufficient);
+        // Under §29, a required callee contract opens the nullable source by a
+        // one-evaluation unwrap. Cross-shape cases compose the same core used
+        // by the non-optional matrix.
+        (
+            Ref { mutable: w },
+            Opt {
+                mutable: h,
+                slice: false,
+            },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::Bare, w).with_unwrap(h),
+                SeamFamily::Safe,
+            ))
+        }
+        (
+            Slice { mutable: w },
+            Opt {
+                mutable: h,
+                slice: true,
+            },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::Bare, w).with_unwrap(h),
+                SeamFamily::Safe,
+            ))
+        }
+        (
+            Slice { mutable: w },
+            Opt {
+                mutable: h,
+                slice: false,
+            },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::FromRefMut, w).with_unwrap(h),
+                SeamFamily::Safe,
+            ))
+        }
+        (
+            Ref { mutable: w },
+            Opt {
+                mutable: h,
+                slice: true,
+            },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            if !nonempty {
+                return Err(SeamBlock::NonemptyUnknown);
+            }
+            Some((
+                GlueSpec::core(GlueCore::First, w)
+                    .with_unwrap(h)
+                    .with_nonempty_evidence(),
+                SeamFamily::Safe,
+            ))
         }
         (Opt { slice: ws, .. }, Opt { slice: hs, .. }) => {
             debug_assert_ne!(ws, hs, "identical optional twins matched above");
@@ -1370,7 +1493,7 @@ mod tests {
     /// **Optional, BOTH SIDES.** `Some(..)` one way, `.unwrap()` the other —
     /// the latter on `-3`'s null-panic convention.
     #[test]
-    fn glue_w1_optional_wraps_safe_values_and_glue_n1_never_unwraps_none() {
+    fn optional_wrap_and_required_unwrap_are_directional() {
         assert_eq!(
             text(
                 Opt {
@@ -1382,24 +1505,24 @@ mod tests {
             "Some(p)"
         );
         assert_eq!(
-            g(
+            text(
                 Ref { mutable: false },
                 Opt {
                     mutable: false,
                     slice: false
                 }
             ),
-            Err(SeamBlock::NullabilityInsufficient)
+            "p.unwrap()"
         );
         assert_eq!(
-            g(
+            text(
                 Ref { mutable: true },
                 Opt {
                     mutable: true,
                     slice: false
                 }
             ),
-            Err(SeamBlock::NullabilityInsufficient)
+            "p.as_mut().unwrap()"
         );
     }
 
@@ -1422,16 +1545,16 @@ mod tests {
     /// case, and it is not exotic: `&T` is exactly what a read-only callee
     /// parameter converts to.
     #[test]
-    fn glue_n1_optional_required_is_fail_closed_off_the_diagonal_too() {
+    fn required_unwrap_reads_mutability_from_the_found_side() {
         assert_eq!(
-            g(
+            text(
                 Ref { mutable: false },
                 Opt {
                     mutable: true,
                     slice: false
                 }
             ),
-            Err(SeamBlock::NullabilityInsufficient)
+            "p.as_mut().unwrap()"
         );
         // The other off-diagonal pairing cannot occur: `shared_to_mut` blocks a
         // `&mut` position fed from a shared optional before any spec is built.
@@ -1444,7 +1567,7 @@ mod tests {
                     slice: false
                 }
             ),
-            Err(SeamBlock::NullabilityInsufficient)
+            Err(SeamBlock::SharedToMut)
         );
     }
 
@@ -1459,26 +1582,26 @@ mod tests {
     ///
     /// Unwitnessed until mutation M25 swapped them and the suite stayed green.
     #[test]
-    fn glue_n1_optional_to_required_and_cross_shape_optional_are_held() {
+    fn optional_to_required_uses_the_matching_cross_shape_core() {
         assert_eq!(
-            g(
+            text(
                 Slice { mutable: false },
                 Opt {
                     mutable: false,
                     slice: true
                 }
             ),
-            Err(SeamBlock::NullabilityInsufficient)
+            "p.unwrap()"
         );
         assert_eq!(
-            g(
+            text(
                 Slice { mutable: true },
                 Opt {
                     mutable: true,
                     slice: false
                 }
             ),
-            Err(SeamBlock::NullabilityInsufficient)
+            "core::slice::from_mut(p.as_mut().unwrap())"
         );
         assert_eq!(
             g(
@@ -1548,11 +1671,21 @@ mod tests {
         // The reverse projection.
         assert_eq!(
             text(Ref { mutable: true }, Slice { mutable: true }),
-            "&mut p[0]"
+            "p.first_mut().unwrap()"
         );
         assert_eq!(
             text(Ref { mutable: false }, Slice { mutable: false }),
-            "&p[0]"
+            "p.first().unwrap()"
+        );
+        assert_eq!(
+            glue_with_nonempty(
+                Ref { mutable: false },
+                Slice { mutable: false },
+                None,
+                false,
+            ),
+            Err(SeamBlock::NonemptyUnknown),
+            "reverse conversion without the class's nonempty contract must hold"
         );
     }
 
@@ -1969,7 +2102,10 @@ mod tests {
             spec.null_arm == NullArm::None
                 && !matches!(
                     spec.core,
-                    GlueCore::Reborrow | GlueCore::RawOption | GlueCore::FromRawParts
+                    GlueCore::Reborrow
+                        | GlueCore::RawOption
+                        | GlueCore::First
+                        | GlueCore::FromRawParts
                 )
         }) {
             assert_eq!(
@@ -2061,21 +2197,20 @@ mod tests {
     /// was right; the prose was not, so this is the witness the corrected prose
     /// needed rather than a second correction of it.
     #[test]
-    fn the_index_shape_is_reachable_and_the_bare_one_is_not() {
+    fn first_and_optional_index_shapes_are_both_reachable() {
         let (spec, family) = glue(Ref { mutable: true }, Slice { mutable: true }, None)
             .expect("a mutable reference from a mutable slice is adaptable")
             .expect("and it needs an edit");
         assert_eq!(
             spec.shape_key(),
-            "index",
+            "first",
             "reached through `glue`, not by hand"
         );
-        assert_eq!(spec.render("p").unwrap(), "&mut p[0]");
+        assert_eq!(spec.render("p").unwrap(), "p.first_mut().unwrap()");
         assert_eq!(family, SeamFamily::Safe);
         assert!(
             !spec.optional && spec.unwrap.is_none(),
-            "and with neither wrapper nor unwrap, so it lands in the fallback \
-             arm rather than in a `some_*` one: {spec:?}"
+            "and with neither wrapper nor source unwrap: {spec:?}"
         );
 
         // The other half: no pairing `glue` accepts produces a bare core with
@@ -2088,14 +2223,12 @@ mod tests {
             "a bare core with no wrapper renders the argument unchanged; `glue` \
              returns `Ok(None)` for every pairing that would need it"
         );
-        // ...and `index` really is corpus-zero, which is why the distinction
-        // was invisible until now.
+        // `Index0` remains reachable for the optional thin target over a slice.
         assert!(
             every_emitting_spec()
                 .iter()
-                .any(|s| s.shape_key() == "index"),
-            "the enumeration must actually reach `index`, or the assertion \
-             above is vacuous"
+                .any(|s| matches!(s.core, GlueCore::Index0)),
+            "the enumeration must still reach the optional `index` arm"
         );
     }
 
@@ -2176,14 +2309,11 @@ mod tests {
                 }
             }
         }
-        // **THE EXACT CARDINALITY, not a floor.** Wave 2 deliberately removes
-        // every optional-to-required and cross-shape optional arm that needed
-        // an unwrap without positive evidence. The remaining safe matrix has
-        // 26 emitting cells; pinning it makes both an accidental reopening and
-        // an accidental lost arm fail here rather than in the corpus.
+        // **THE EXACT CARDINALITY, not a floor.** Wave 3 opens the twelve
+        // §29 required-unwrap cells over the former 26-cell matrix.
         assert_eq!(
             out.len(),
-            26,
+            38,
             "the product must reach every emitting arm exactly; got {}",
             out.len()
         );
@@ -3012,15 +3142,9 @@ pub(crate) fn synthesize_with_raw_boundary(
             &argument,
             site.target.mutability,
             site.box_slice,
-            site.target
-                .depth2
+            spec.raw_boundary
                 .as_ref()
-                .map(|depth2| depth2.inner_pointee.as_str())
-                .or_else(|| {
-                    site.target
-                        .is_void_pointee()
-                        .then_some(site.target.pointee.as_str())
-                }),
+                .and_then(|raw| raw.cast_pointee.as_deref()),
         ) {
             Ok(super::raw_boundary::BridgeRender::Edit(_)) => {}
             Ok(

@@ -7150,6 +7150,152 @@ fn br_w7_raw_const_mut_casts_use_the_exact_direction() {
     }
 }
 
+/// BR-W8 RED: a nullable safe source may satisfy a required safe contract by
+/// the ruled one-evaluation unwrap, while a raw target maps None to typed null.
+#[test]
+fn br_w8_nullable_required_and_raw_null_map_are_exact() {
+    let required_source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub unsafe fn required_shared(p: *const i32) { let _ = p; }\n\
+         pub unsafe fn required_mut(p: *mut i32) { let _ = p; }\n\
+         pub unsafe fn caller(shared: *const i32, mut writable: *mut i32) {\n\
+             required_shared(shared);\n\
+             required_mut(writable);\n\
+         }\n";
+    let required = e3_attempt_with(required_source, true, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("caller::shared") {
+                *decision = super::decision::Decision::Opt {
+                    mutable: false,
+                    slice: false,
+                    uses: Vec::new(),
+                };
+            } else if subject.label.ends_with("caller::writable") {
+                *decision = super::decision::Decision::Opt {
+                    mutable: true,
+                    slice: false,
+                    uses: Vec::new(),
+                };
+            } else if subject.label.ends_with("required_shared::p") {
+                *decision = super::decision::Decision::Ref { mutable: false };
+            } else if subject.label.ends_with("required_mut::p") {
+                *decision = super::decision::Decision::Ref { mutable: true };
+            }
+        }
+    });
+    let emitted = e2_root_text(&required);
+    assert!(
+        emitted.contains("required_shared(shared.unwrap())"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("required_mut(writable.as_mut().unwrap())"),
+        "{emitted}"
+    );
+    assert!(
+        e2_type_checks(&required),
+        "required unwrap twins must type-check"
+    );
+    let required_events = required
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    assert_eq!(
+        required_events
+            .iter()
+            .filter(|event| event.site.bridge_kind == "nullable-required-unwrap")
+            .count(),
+        4,
+        "{required_events:#?}"
+    );
+
+    let raw_source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         unsafe extern \"C\" { fn observe(p: *const i32); }\n\
+         pub unsafe fn caller(p: *const i32) { observe(p); }\n";
+    let raw = raw_boundary_attempt_with(raw_source, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("caller::p") {
+                *decision = super::decision::Decision::Opt {
+                    mutable: false,
+                    slice: false,
+                    uses: Vec::new(),
+                };
+            }
+        }
+    });
+    let emitted = e2_root_text(&raw);
+    assert!(
+        emitted.contains("p.as_deref().map_or(core::ptr::null::<i32>(), core::ptr::from_ref)"),
+        "Option-to-raw must map None to typed null:\n{emitted}"
+    );
+    assert!(e2_type_checks(&raw), "raw null-map twin must type-check");
+    let raw_events = raw
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    assert_eq!(
+        raw_events
+            .iter()
+            .filter(|event| event.site.bridge_kind == "option-to-raw-null-map")
+            .count(),
+        2,
+        "{raw_events:#?}"
+    );
+}
+
+/// BR-W9 RED: thin-to-slice and licensed slice-to-thin conversions use the
+/// explicit standard-library forms rather than indexing or implicit coercion.
+#[test]
+fn br_w9_thin_slice_glue_uses_from_ref_mut_and_first() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub unsafe fn slice_target(p: *mut i32, n: usize) { let _ = (p, n); }\n\
+         pub unsafe fn thin_target(p: *const i32) { let _ = p; }\n\
+         pub unsafe fn caller(thin: *mut i32, slice: *const i32) {\n\
+             slice_target(thin, 1);\n\
+             thin_target(slice);\n\
+         }\n";
+    let attempt = e3_attempt_with(source, true, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("caller::thin") {
+                *decision = super::decision::Decision::Ref { mutable: true };
+            } else if subject.label.ends_with("caller::slice") {
+                *decision = super::decision::Decision::Slice {
+                    mutable: false,
+                    uses: Vec::new(),
+                };
+            } else if subject.label.ends_with("slice_target::p") {
+                *decision = super::decision::Decision::Slice {
+                    mutable: true,
+                    uses: Vec::new(),
+                };
+            } else if subject.label.ends_with("thin_target::p") {
+                *decision = super::decision::Decision::Ref { mutable: false };
+            }
+        }
+    });
+    let emitted = e2_root_text(&attempt);
+    assert!(
+        emitted.contains("slice_target(core::slice::from_mut(thin), 1)"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("thin_target(slice.first().unwrap())"),
+        "{emitted}"
+    );
+    assert!(e2_type_checks(&attempt), "BR-W9 twins must type-check");
+    let events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    assert!(events.iter().any(|event| {
+        event.site.bridge_kind == "thin-to-slice-mut"
+            && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
+    }));
+    assert!(events.iter().any(|event| {
+        event.site.bridge_kind == "slice-to-thin-shared"
+            && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
+    }));
+}
+
 /// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,
 /// but E2-FN has no consumer yet. The lifetime producer must receive the intact
 /// summary object rather than an A5-shaped projection of it.

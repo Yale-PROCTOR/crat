@@ -341,11 +341,10 @@ pub(crate) struct Refusal {
 /// `reborrow` alone, `unwrap`, `as_mut_unwrap`, `index` alone,
 /// `some_from_ref_mut` — have market **0**.
 ///
-/// `Reborrow` and `Index0` are built anyway, because they are the INNER forms
-/// the realized `some_*` shapes wrap; they are not unbuilt zero-market arms in
-/// the `-4`/`-5` sense. `Unwrap`/`AsMutUnwrap` are deliberately NOT built: they
-/// are standalone shapes with zero market, and a shape the transform does not
-/// know must become a typed row rather than a silent skip.
+/// `Reborrow` and `Index0` are built because they are inner forms. Wave 3 also
+/// builds `Unwrap`/`AsMutUnwrap` through the carried method-chain layer and
+/// replaces the unsafe `Index0` reverse conversion with nonempty-gated
+/// `first`/`first_mut`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GlueShape {
     /// `&mut *X` / `&*X`
@@ -1235,12 +1234,10 @@ pub(crate) struct SeamGraftStats {
     pub key_collisions: usize,
     /// A spec the builder deliberately does not build.
     ///
-    /// The unwrap family (`unwrap` / `as_mut_unwrap`) is standalone with **zero
-    /// market** on the frozen corpus, so it stays unbuilt on the `-4`/`-5`
-    /// precedent — and an unknown shape becomes a row here rather than a silent
-    /// skip. `Bare` with neither an unwrap nor a wrapper is the second case: it
-    /// renders the argument unchanged, `glue` cannot produce it, and building it
-    /// would be a no-op indistinguishable from success.
+    /// Wave 3 builds the ruled required-unwrap family. The remaining deliberate
+    /// case is `Bare` with neither an unwrap nor a wrapper: it renders the
+    /// argument unchanged, `glue` cannot produce it, and building it would be a
+    /// no-op indistinguishable from success.
     pub unsupported: usize,
     /// `arg_span` named a subtree the matched node does not contain.
     pub arg_not_found: usize,
@@ -1403,6 +1400,35 @@ fn raw_option_expr(argument: rustc_ast::Expr, mutable: bool) -> Option<rustc_ast
     let mut replace = Replace { argument, hits: 0 };
     replace.visit_expr(&mut parsed);
     (replace.hits == 1).then_some(parsed.kind)
+}
+
+fn method_chain_expr(argument: rustc_ast::Expr, suffix: &str) -> Option<rustc_ast::Expr> {
+    const ARG: &str = "__CRAT_METHOD_CHAIN_ARG";
+    let mut parsed = graft_expr(&format!("{ARG}{suffix}")).ok()?;
+
+    struct Replace {
+        argument: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(ARG)
+            ) {
+                *expr = self.argument.clone();
+                self.hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut replace = Replace { argument, hits: 0 };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 1).then_some(parsed)
 }
 
 fn raw_boundary_expr(
@@ -1581,22 +1607,22 @@ impl<'a> SeamGraftVisitor<'a> {
         if spec.null_arm == NullArm::LiteralNone {
             return graft_expr("None").ok().map(|parsed| parsed.kind);
         }
-        // The unwrap family is deliberately unbuilt — see [`SeamGraftStats`].
-        if spec.unwrap.is_some() {
-            self.stats.unsupported += 1;
-            return None;
-        }
         let shape = match spec.core {
             GlueCore::Bare => None,
             GlueCore::Reborrow => Some(GlueShape::Reborrow),
             GlueCore::RawOption => None,
+            GlueCore::First => None,
             GlueCore::Index0 => Some(GlueShape::Index0),
             GlueCore::FromRawParts => Some(GlueShape::FromRawParts),
             GlueCore::FromRefMut => Some(GlueShape::FromRefMut),
         };
         // A bare core with no wrapper renders the argument unchanged, so
         // "building" it would be a no-op that reads as a placement.
-        if shape.is_none() && !spec.optional {
+        if shape.is_none()
+            && !spec.optional
+            && spec.unwrap.is_none()
+            && !matches!(spec.core, GlueCore::First)
+        {
             self.stats.unsupported += 1;
             return None;
         }
@@ -1666,6 +1692,24 @@ impl<'a> SeamGraftVisitor<'a> {
         let source_arg = (*arg).clone();
         if matches!(spec.core, GlueCore::RawOption) {
             return raw_option_expr(source_arg, spec.mutable);
+        }
+        let arg = if let Some(found_mutable) = spec.unwrap {
+            let suffix = if found_mutable {
+                ".as_mut().unwrap()"
+            } else {
+                ".unwrap()"
+            };
+            P(method_chain_expr((*arg).clone(), suffix)?)
+        } else {
+            arg
+        };
+        if matches!(spec.core, GlueCore::First) {
+            let suffix = if spec.mutable {
+                ".first_mut().unwrap()"
+            } else {
+                ".first().unwrap()"
+            };
+            return Some(method_chain_expr((*arg).clone(), suffix)?.kind);
         }
         let core_arg = if spec.null_arm == NullArm::Checked {
             P(graft_expr("__crat_call_adapter_ptr").expect("fixed adapter path parses"))
@@ -6165,17 +6209,10 @@ mod arm2_witnesses {
         });
     }
 
-    /// **A spec the builder does not build becomes a ROW, never a silent skip.**
-    ///
-    /// The unwrap family is standalone with zero market on the frozen corpus and
-    /// stays unbuilt on the `-4`/`-5` precedent. What must not happen is that it
-    /// disappears: an adapter that evaporates leaves the callee converted and
-    /// the call site raw, which is the `E0308` the slice exists to remove.
-    ///
-    /// The node is asserted INTACT as well as counted — a decline that mangled
-    /// the tree and reported itself would pass a count-only test.
+    /// Wave 3 builds required unwraps, while a true identity spec remains a
+    /// typed non-placement rather than a phantom edit.
     #[test]
-    fn an_unbuilt_shape_declines_with_a_typed_row_and_leaves_the_node_intact() {
+    fn required_unwrap_is_built_while_a_true_identity_still_declines() {
         rustc_span::create_default_session_globals_then(|| {
             let src = "fn f(o: Option<&mut u8>) { g(o) }";
             let krate = ::utils::ast::parse_crate(src.to_owned());
@@ -6183,16 +6220,16 @@ mod arm2_witnesses {
 
             let unwrapping = GlueSpec::core(GlueCore::Bare, true).with_unwrap(true);
             let (text, stats) = seam_over(src, &[(arg, arg, unwrapping, false)]);
-            assert_eq!(stats.grafted, 0, "the shape is deliberately unbuilt");
-            assert_eq!(stats.unsupported, 1, "and it is COUNTED");
+            assert_eq!(stats.grafted, 1, "the §29 shape must be built");
+            assert_eq!(stats.unsupported, 0);
             assert_eq!(
                 stats.unmatched, 0,
                 "the key WAS reached — declined is a different fact from never \
                  found, exactly as at the use pass"
             );
             assert!(
-                text.contains("g(o)"),
-                "a declined seam must leave the node untouched: {text}"
+                text.contains("g(o.as_mut().unwrap())"),
+                "the mutable Option must be borrowed rather than moved: {text}"
             );
 
             // The second unbuilt case: a bare core with no wrapper renders the
@@ -6566,7 +6603,7 @@ mod arm2_witnesses {
     /// So the load-bearing assertion here is the guard's, exactly as M17b's
     /// was. Found by the adversarial review.
     #[test]
-    fn a_declined_seam_does_not_take_ownership_of_the_node() {
+    fn a_built_required_unwrap_takes_ownership_of_the_node() {
         rustc_span::create_default_session_globals_then(|| {
             let src = "fn f(o: Option<&mut u8>) { g(o) }";
             let mut krate = ::utils::ast::parse_crate(src.to_owned());
@@ -6583,7 +6620,7 @@ mod arm2_witnesses {
                 args[0].id
             };
 
-            // A spec the builder deliberately does not build.
+            // A §29 required-unwrap spec the builder now owns.
             let seams: FxHashMap<(u32, u32), SeamTarget> = [(
                 (arg.lo().0, arg.hi().0),
                 SeamTarget {
@@ -6599,16 +6636,13 @@ mod arm2_witnesses {
             let mut v = SeamGraftVisitor::new(&seams, &mut guard);
             v.visit_crate(&mut krate);
             let stats = v.finish();
-            assert_eq!(stats.grafted, 0);
-            assert_eq!(stats.unsupported, 1, "it declined, as designed");
+            assert_eq!(stats.grafted, 1);
+            assert_eq!(stats.unsupported, 0);
             assert_eq!(stats.refused, 0, "and was not refused — nothing collided");
 
             assert!(
-                guard.claim(node_id, rustc_span::DUMMY_SP, "arm4"),
-                "THE LOAD-BEARING ASSERTION: a node this pass could not \
-                 transform must stay claimable. Claiming before building leaves \
-                 a phantom owner that fail-closes a later arm's transform on a \
-                 node nobody actually rewrote"
+                !guard.claim(node_id, rustc_span::DUMMY_SP, "arm4"),
+                "a built unwrap owns its node and a later arm must be refused"
             );
         });
     }
