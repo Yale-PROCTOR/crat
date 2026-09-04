@@ -1343,6 +1343,68 @@ fn checked_optional(
     (replace.arg_hits == 1 && replace.payload_hits == 1).then_some(parsed.kind)
 }
 
+/// Wrap one already-built inbound bridge payload in an explicit `unsafe`
+/// block while retaining that payload as an AST subtree. Only the fixed block
+/// syntax is parsed; the operand is neither printed nor reparsed.
+fn unsafe_payload(payload: rustc_ast::Expr) -> Option<rustc_ast::Expr> {
+    const PAYLOAD: &str = "__CRAT_UNSAFE_BRIDGE_PAYLOAD";
+    let mut parsed = graft_expr(&format!("unsafe {{ {PAYLOAD} }}")).ok()?;
+
+    struct Replace {
+        payload: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(PAYLOAD)
+            ) {
+                *expr = self.payload.clone();
+                self.hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut replace = Replace { payload, hits: 0 };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 1).then_some(parsed)
+}
+
+fn raw_option_expr(argument: rustc_ast::Expr, mutable: bool) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_RAW_OPTION_ARG";
+    let method = if mutable { "as_mut" } else { "as_ref" };
+    let mut parsed = graft_expr(&format!("unsafe {{ {ARG}.{method}() }}")).ok()?;
+
+    struct Replace {
+        argument: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(ARG)
+            ) {
+                *expr = self.argument.clone();
+                self.hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut replace = Replace { argument, hits: 0 };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 1).then_some(parsed.kind)
+}
+
 fn raw_boundary_expr(
     argument: rustc_ast::Expr,
     raw: super::decision::seam::RawBoundaryGlue,
@@ -1514,6 +1576,7 @@ impl<'a> SeamGraftVisitor<'a> {
         let shape = match spec.core {
             GlueCore::Bare => None,
             GlueCore::Reborrow => Some(GlueShape::Reborrow),
+            GlueCore::RawOption => None,
             GlueCore::Index0 => Some(GlueShape::Index0),
             GlueCore::FromRawParts => Some(GlueShape::FromRawParts),
             GlueCore::FromRefMut => Some(GlueShape::FromRefMut),
@@ -1588,6 +1651,9 @@ impl<'a> SeamGraftVisitor<'a> {
         };
 
         let source_arg = (*arg).clone();
+        if matches!(spec.core, GlueCore::RawOption) {
+            return raw_option_expr(source_arg, spec.mutable);
+        }
         let core_arg = if spec.null_arm == NullArm::Checked {
             P(graft_expr("__crat_call_adapter_ptr").expect("fixed adapter path parses"))
         } else {
@@ -1604,6 +1670,11 @@ impl<'a> SeamGraftVisitor<'a> {
                 };
                 expr(kind)
             }
+        };
+        let core = if matches!(spec.core, GlueCore::Reborrow | GlueCore::FromRawParts) {
+            P(unsafe_payload((*core).clone())?)
+        } else {
+            core
         };
         Some(if spec.null_arm == NullArm::Checked {
             checked_optional(source_arg, (*core).clone())?
@@ -5754,17 +5825,17 @@ mod arm2_witnesses {
             let cases: Vec<(GlueSpec, &str)> = vec![
                 (
                     GlueSpec::core(GlueCore::FromRawParts, true).with_len("n"),
-                    "core::slice::from_raw_parts_mut((*s).ptr, (n) as usize)",
+                    "unsafe { core::slice::from_raw_parts_mut((*s).ptr, (n) as usize) }",
                 ),
                 (
                     GlueSpec::core(GlueCore::FromRawParts, false)
                         .with_len("n")
                         .wrapped(),
-                    "Some(core::slice::from_raw_parts((*s).ptr, (n) as usize))",
+                    "Some(unsafe { core::slice::from_raw_parts((*s).ptr, (n) as usize) })",
                 ),
                 (
                     GlueSpec::core(GlueCore::Reborrow, true).wrapped(),
-                    "Some(&mut *(*s).ptr)",
+                    "Some(unsafe { &mut *(*s).ptr })",
                 ),
                 (
                     GlueSpec::core(GlueCore::Bare, false).wrapped(),
@@ -6680,7 +6751,7 @@ mod arm2_witnesses {
                 vec![(arg, "use+seam")]
             );
             let text = pprust::item_to_string(&krate.items[0]);
-            assert!(text.contains("g(&mut *p[1])"), "{text}");
+            assert!(text.contains("g(unsafe { &mut *p[1] })"), "{text}");
         });
     }
 }

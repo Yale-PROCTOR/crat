@@ -4922,6 +4922,7 @@ fn finish_decide<'tcx>(
         &a5_site_proofs,
         &raw_boundary,
         &coconv,
+        &retention,
     );
     table.arm_requirements = derive_arm_requirements(&subjects, &coconv, &raw_boundary, &exposure);
     let seam_wall_s = seam_started.elapsed().as_secs_f64();
@@ -4963,6 +4964,7 @@ fn finish_decide<'tcx>(
             &a5_site_proofs,
             &raw_boundary,
             &coconv,
+            &retention,
         );
     }
     table.c9_marks = retained_c9_plans.clone();

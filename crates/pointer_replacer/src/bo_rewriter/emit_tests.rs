@@ -5610,8 +5610,8 @@ fn e_adapt_w2_optional_maps_null_to_none_without_unwrap() {
         "null must become None:\n{emitted}"
     );
     assert!(
-        emitted.contains("is_null"),
-        "a maybe-null raw expression needs an explicit boundary test:\n{emitted}"
+        emitted.contains("unsafe { base.offset(1).as_ref() }"),
+        "a maybe-null raw expression must use the one-evaluation pointer Option API:\n{emitted}"
     );
     let caller_line = emitted
         .lines()
@@ -5702,11 +5702,11 @@ fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
     let seams = e_adapt_seams(&src);
     let emitted = e_adapt_source(&src);
     assert!(
-        seams.contains("\treborrow\t") && seams.contains("\t0\tscalar-reference\t"),
+        seams.contains("\treborrow\t") && seams.contains("\t0\tc-raw-reborrow-shared\t"),
         "the raw-expression bridge must be typed as the scalar template:\n{seams}"
     );
     assert!(
-        emitted.contains("scalar(&*base.offset(1))"),
+        emitted.contains("scalar(unsafe { &*base.offset(1) })"),
         "the call-scoped shared reborrow must surround the whole expression:\n{emitted}"
     );
 }
@@ -5792,6 +5792,7 @@ fn e2_attempt(
             &table,
             &ctx.retained_c9_plans,
             &ctx.a5_site_proofs,
+            &ctx.retention,
         );
         let receipt = super::seam_tsv_from_table(tcx, &table);
         let emission = emit_files(
@@ -5917,7 +5918,7 @@ fn e2_body_w2_assignment_uses_the_production_scalar_adapter() {
         attempt.receipt
     );
     assert!(
-        e2_root_text(&attempt).contains("q = &mut *p"),
+        e2_root_text(&attempt).contains("q = unsafe { &mut *p }"),
         "{}",
         e2_root_text(&attempt)
     );
@@ -6047,7 +6048,7 @@ fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
     for row in blocked {
         assert_eq!(row[expected], "ref-mut", "{row:?}");
         assert_eq!(row[found], "raw", "{row:?}");
-        assert_eq!(row[candidate], "scalar-reference", "{row:?}");
+        assert_eq!(row[candidate], "c-raw-reborrow-mut", "{row:?}");
         assert_eq!(
             row[peers], "0/1[same_root=1,left_blind=0,right_blind=0]",
             "{row:?}"
@@ -6231,6 +6232,7 @@ fn e3_attempt_with(
             &table,
             &ctx.retained_c9_plans,
             &ctx.a5_site_proofs,
+            &ctx.retention,
         );
         let receipt = super::seam_tsv_from_table(tcx, &table);
         let emission = emit_files(
@@ -6248,6 +6250,355 @@ fn e3_attempt_with(
         emission,
         receipt,
     }
+}
+
+const BR_W1_RAW_SCALARS: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub unsafe fn read_target(p: *const i32) -> i32 { *p }\n\
+     pub unsafe fn write_target(p: *mut i32) { *p += 1; }\n\
+     pub unsafe fn caller(read_p: *const i32, write_p: *mut i32) -> i32 {\n\
+         let value = read_target(read_p);\n\
+         write_target(write_p);\n\
+         value\n\
+     }\n";
+
+fn force_br_w1_scalar_targets(table: &mut super::decision::DecisionTable) {
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("caller::read_p") || subject.label.ends_with("caller::write_p") {
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: subject.label.clone(),
+                site: "<br-w1-injected>".to_owned(),
+                reason: super::decision::DegradeReason::CallSiteNotAdapted,
+            });
+        } else if subject.label.ends_with("read_target::p") {
+            *decision = super::decision::Decision::Ref { mutable: false };
+        } else if subject.label.ends_with("write_target::p") {
+            *decision = super::decision::Decision::Ref { mutable: true };
+        }
+    }
+}
+
+/// BR-W1 RED: both raw-scalar inbound directions are explicit unsafe
+/// reborrows, owned and receipted by the converted callee's signature class.
+#[test]
+fn br_w1_raw_scalar_inbound_reborrows_and_receipts_are_exact() {
+    use super::bridge_receipt::{
+        BridgeCalleeId, BridgeReceiptStage, BridgeReceiptState, BridgeRetentionTier,
+    };
+
+    let attempt = e3_attempt_with(BR_W1_RAW_SCALARS, true, &force_br_w1_scalar_targets);
+    let source = e2_root_text(&attempt);
+    assert!(
+        source.contains("read_target(unsafe { &*read_p })"),
+        "shared raw inbound bridge must be explicit and evaluate its operand once:\n{source}"
+    );
+    assert!(
+        source.contains("write_target(unsafe { &mut *write_p })"),
+        "mutable raw inbound bridge must be explicit and evaluate its operand once:\n{source}"
+    );
+
+    let events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    let scalar = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.site.bridge_kind.as_str(),
+                "c-raw-reborrow-shared" | "c-raw-reborrow-mut"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scalar.len(),
+        4,
+        "one plan and terminal event per scalar: {events:#?}"
+    );
+    for kind in ["c-raw-reborrow-shared", "c-raw-reborrow-mut"] {
+        let pair = scalar
+            .iter()
+            .copied()
+            .filter(|event| event.site.bridge_kind == kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pair.len(),
+            2,
+            "exact plan/terminal pair for {kind}: {events:#?}"
+        );
+        assert!(pair.iter().all(|event| event.site.arm == "c"));
+        assert!(
+            pair.iter()
+                .all(|event| event.retention == BridgeRetentionTier::T1)
+        );
+        assert!(pair.iter().all(|event| event.waiver_id.is_none()));
+        assert!(pair.iter().all(|event| {
+            matches!(event.site.callee, BridgeCalleeId::Local(callee) if event.site.owner_class.local_def_id() == callee)
+        }));
+        assert!(pair.iter().any(|event| {
+            event.stage == BridgeReceiptStage::Plan && event.state == BridgeReceiptState::Planned
+        }));
+        assert!(pair.iter().any(|event| {
+            event.stage == BridgeReceiptStage::Terminal
+                && event.state == BridgeReceiptState::Applied
+        }));
+    }
+    super::bridge_receipt::reconcile_bridge_events(&events).expect("BR-W1 bridge events reconcile");
+}
+
+const BR_W2_RAW_OPTIONALS: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub unsafe fn maybe_shared(p: *const i32) { let _ = p; }\n\
+     pub unsafe fn maybe_mut(p: *mut i32) { let _ = p; }\n\
+     pub unsafe fn caller(read_p: *const i32, write_p: *mut i32) {\n\
+         maybe_shared(read_p);\n\
+         maybe_mut(write_p);\n\
+     }\n";
+
+fn force_br_w2_optional_targets(table: &mut super::decision::DecisionTable) {
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("caller::read_p") || subject.label.ends_with("caller::write_p") {
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: subject.label.clone(),
+                site: "<br-w2-injected>".to_owned(),
+                reason: super::decision::DegradeReason::CallSiteNotAdapted,
+            });
+        } else if subject.label.ends_with("maybe_shared::p") {
+            *decision = super::decision::Decision::Opt {
+                mutable: false,
+                slice: false,
+                uses: Vec::new(),
+            };
+        } else if subject.label.ends_with("maybe_mut::p") {
+            *decision = super::decision::Decision::Opt {
+                mutable: true,
+                slice: false,
+                uses: Vec::new(),
+            };
+        }
+    }
+}
+
+/// BR-W2 RED: nullable inbound raw pointers use the pointer APIs directly;
+/// they neither dereference unconditionally nor construct an intermediate
+/// borrow before the null check.
+#[test]
+fn br_w2_raw_optional_inbound_uses_as_ref_and_as_mut_once() {
+    use super::bridge_receipt::{BridgeReceiptStage, BridgeRetentionTier};
+
+    let attempt = e3_attempt_with(BR_W2_RAW_OPTIONALS, true, &force_br_w2_optional_targets);
+    let source = e2_root_text(&attempt);
+    assert!(
+        source.contains("maybe_shared(unsafe { read_p.as_ref() })"),
+        "shared optional bridge must use as_ref exactly once:\n{source}"
+    );
+    assert!(
+        source.contains("maybe_mut(unsafe { write_p.as_mut() })"),
+        "mutable optional bridge must use as_mut exactly once:\n{source}"
+    );
+    assert!(
+        !source.contains("&*read_p"),
+        "unchecked shared deref survived: {source}"
+    );
+    assert!(
+        !source.contains("&mut *write_p"),
+        "unchecked mutable deref survived: {source}"
+    );
+    assert_eq!(source.matches("read_p.as_ref()").count(), 1, "{source}");
+    assert_eq!(source.matches("write_p.as_mut()").count(), 1, "{source}");
+    let null_arm = receipt_column(&attempt.receipt, "null_arm");
+    let option_rows = attempt
+        .receipt
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .filter(|row| {
+            row.first() == Some(&"placed")
+                && matches!(
+                    row.get(receipt_column(&attempt.receipt, "template")),
+                    Some(&"c-raw-option-shared") | Some(&"c-raw-option-mut")
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(option_rows.len(), 2, "{}", attempt.receipt);
+    assert!(
+        option_rows
+            .iter()
+            .all(|row| row[null_arm] == "raw-pointer-option"),
+        "{}",
+        attempt.receipt
+    );
+
+    let events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    for kind in ["c-raw-option-shared", "c-raw-option-mut"] {
+        let pair = events
+            .iter()
+            .filter(|event| event.site.bridge_kind == kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pair.len(),
+            2,
+            "exact plan/terminal pair for {kind}: {events:#?}"
+        );
+        assert!(pair.iter().all(|event| event.site.arm == "c"));
+        assert!(
+            pair.iter()
+                .all(|event| event.retention == BridgeRetentionTier::T1)
+        );
+        assert!(pair.iter().all(|event| event.waiver_id.is_none()));
+        assert!(
+            pair.iter()
+                .any(|event| event.stage == BridgeReceiptStage::Plan)
+        );
+        assert!(
+            pair.iter()
+                .any(|event| event.stage == BridgeReceiptStage::Terminal)
+        );
+    }
+    super::bridge_receipt::reconcile_bridge_events(&events).expect("BR-W2 bridge events reconcile");
+}
+
+const BR_W3_RAW_SLICES: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub unsafe fn licensed_shared(p: *const i32, n: usize) { let _ = (p, n); }\n\
+     pub unsafe fn licensed_mut(p: *mut i32, n: usize) { let _ = (p, n); }\n\
+     pub unsafe fn fallback_shared(p: *const i32) { let _ = p; }\n\
+     pub unsafe fn optional_shared(p: *const i32) { let _ = p; }\n\
+     pub unsafe fn optional_mut(p: *mut i32) { let _ = p; }\n\
+     pub unsafe fn caller(read_p: *const i32, write_p: *mut i32, n: usize) {\n\
+         licensed_shared(read_p, n);\n\
+         licensed_mut(write_p, n);\n\
+         fallback_shared(read_p);\n\
+         optional_shared(read_p);\n\
+         optional_mut(write_p);\n\
+     }\n";
+
+fn force_br_w3_slice_targets(table: &mut super::decision::DecisionTable) {
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("caller::read_p") || subject.label.ends_with("caller::write_p") {
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: subject.label.clone(),
+                site: "<br-w3-injected>".to_owned(),
+                reason: super::decision::DegradeReason::CallSiteNotAdapted,
+            });
+        } else if subject.label.ends_with("licensed_shared::p")
+            || subject.label.ends_with("fallback_shared::p")
+        {
+            *decision = super::decision::Decision::Slice {
+                mutable: false,
+                uses: Vec::new(),
+            };
+        } else if subject.label.ends_with("licensed_mut::p") {
+            *decision = super::decision::Decision::Slice {
+                mutable: true,
+                uses: Vec::new(),
+            };
+        } else if subject.label.ends_with("optional_shared::p") {
+            *decision = super::decision::Decision::Opt {
+                mutable: false,
+                slice: true,
+                uses: Vec::new(),
+            };
+        } else if subject.label.ends_with("optional_mut::p") {
+            *decision = super::decision::Decision::Opt {
+                mutable: true,
+                slice: true,
+                uses: Vec::new(),
+            };
+        }
+    }
+}
+
+/// BR-W3 RED: raw slice constructors are explicit unsafe bridges, prefer the
+/// carried companion extent, and use only the named fallback otherwise.
+#[test]
+fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
+    use super::bridge_receipt::{BridgeExtentKind, BridgeRetentionTier};
+
+    let attempt = e3_attempt_with(BR_W3_RAW_SLICES, true, &force_br_w3_slice_targets);
+    let source = e2_root_text(&attempt);
+    assert!(
+        source.contains(
+            "licensed_shared(unsafe { core::slice::from_raw_parts(read_p, (n) as usize) }, n)"
+        ),
+        "{source}"
+    );
+    assert!(
+        source.contains(
+            "licensed_mut(unsafe { core::slice::from_raw_parts_mut(write_p, (n) as usize) }, n)"
+        ),
+        "{source}"
+    );
+    assert!(
+        source.contains(
+            "fallback_shared(unsafe { core::slice::from_raw_parts(read_p, crate::FALLBACK_SLICE_EXTENT) })"
+        ),
+        "{source}"
+    );
+    assert_eq!(
+        source
+            .matches("const FALLBACK_SLICE_EXTENT: usize = 1024;")
+            .count(),
+        1,
+        "{source}"
+    );
+    assert!(
+        source.contains("optional_shared({ let __crat_call_adapter_ptr = read_p;"),
+        "{source}"
+    );
+    assert!(
+        source.contains("Some(unsafe { core::slice::from_raw_parts(__crat_call_adapter_ptr, crate::FALLBACK_SLICE_EXTENT) })"),
+        "{source}"
+    );
+    assert!(
+        source.contains("optional_mut({ let __crat_call_adapter_ptr = write_p;"),
+        "{source}"
+    );
+    assert!(
+        source.contains("Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, crate::FALLBACK_SLICE_EXTENT) })"),
+        "{source}"
+    );
+
+    let events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    let applied = events
+        .iter()
+        .filter(|event| {
+            event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
+                && event.state == super::bridge_receipt::BridgeReceiptState::Applied
+        })
+        .collect::<Vec<_>>();
+    assert!(applied.iter().any(|event| {
+        event.site.bridge_kind == "c-raw-slice-shared"
+            && matches!(&event.extent, BridgeExtentKind::Evidence(source) if source == "n")
+    }));
+    assert!(applied.iter().any(|event| {
+        event.site.bridge_kind == "c-raw-slice-mut"
+            && matches!(&event.extent, BridgeExtentKind::Evidence(source) if source == "n")
+    }));
+    assert!(applied.iter().any(|event| {
+        event.site.bridge_kind == "c-raw-slice-shared" && event.extent == BridgeExtentKind::Fallback
+    }));
+    assert_eq!(
+        applied
+            .iter()
+            .filter(|event| {
+                event.site.bridge_kind == "c-raw-option-slice"
+                    && event.extent == BridgeExtentKind::Fallback
+            })
+            .count(),
+        2,
+        "{events:#?}"
+    );
+    assert!(
+        applied
+            .iter()
+            .filter(|event| event.site.bridge_kind.starts_with("c-raw-"))
+            .all(|event| event.retention == BridgeRetentionTier::T1 && event.waiver_id.is_none())
+    );
+    super::bridge_receipt::reconcile_bridge_events(&events).expect("BR-W3 bridge events reconcile");
 }
 
 /// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,

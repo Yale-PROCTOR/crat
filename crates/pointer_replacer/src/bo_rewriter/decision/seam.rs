@@ -108,6 +108,9 @@ pub(crate) enum SeamBlock {
     /// bypass it, because the reborrow family places its borrow precisely where
     /// §5a measured borrowck as blind.
     SiteOverlap,
+    /// The converted callee is known to retain this parameter. A call-scoped
+    /// raw-to-safe bridge cannot license a reference that escapes the call.
+    PositiveRetention,
 }
 
 impl SeamBlock {
@@ -118,6 +121,7 @@ impl SeamBlock {
             SeamBlock::UnnameableOperand => "seam-unnameable-operand",
             SeamBlock::NullabilityInsufficient => "glue-nullability-insufficient",
             SeamBlock::SiteOverlap => "seam-site-overlap",
+            SeamBlock::PositiveRetention => "seam-positive-retention",
         }
     }
 }
@@ -612,6 +616,9 @@ pub(crate) enum GlueCore {
     Bare,
     /// `&mut *X` / `&*X`
     Reborrow,
+    /// `unsafe { X.as_mut() }` / `unsafe { X.as_ref() }` for a nullable raw
+    /// pointer crossing into an optional safe parameter.
+    RawOption,
     /// `&mut X[0]` / `&X[0]`
     Index0,
     /// `core::slice::from_raw_parts{_mut}(X, (LEN) as usize)`
@@ -629,6 +636,9 @@ pub(crate) enum NullArm {
     /// The source expression is a raw pointer. Evaluate it once, test
     /// `is_null`, and construct the payload only on the non-null branch.
     Checked,
+    /// The raw pointer's `as_ref`/`as_mut` API performs the null-to-Option
+    /// mapping directly and evaluates the receiver once.
+    PointerApi,
     /// The source expression is syntactically a null literal.
     LiteralNone,
 }
@@ -715,6 +725,12 @@ impl GlueSpec {
         self
     }
 
+    pub(crate) fn pointer_option(mut self) -> Self {
+        self.optional = true;
+        self.null_arm = NullArm::PointerApi;
+        self
+    }
+
     pub(crate) fn literal_none(mutable: bool) -> Self {
         Self {
             core: GlueCore::Bare,
@@ -752,6 +768,7 @@ impl GlueSpec {
     pub(crate) fn null_arm_key(&self) -> &'static str {
         match self.null_arm {
             NullArm::Checked => "checked-is-null",
+            NullArm::PointerApi => "raw-pointer-option",
             NullArm::LiteralNone => "literal-none",
             NullArm::None if self.optional => "known-some",
             NullArm::None => "-",
@@ -770,12 +787,36 @@ impl GlueSpec {
         if let Some(raw) = self.raw_boundary {
             return raw.template.key();
         }
+        if self.null_arm == NullArm::PointerApi {
+            return match self.core {
+                GlueCore::RawOption if self.mutable => "c-raw-option-mut",
+                GlueCore::RawOption => "c-raw-option-shared",
+                GlueCore::FromRawParts => "c-raw-option-slice",
+                GlueCore::Bare | GlueCore::Reborrow | GlueCore::Index0 | GlueCore::FromRefMut => {
+                    "optional"
+                }
+            };
+        }
+        if self.null_arm == NullArm::Checked && matches!(self.core, GlueCore::FromRawParts) {
+            return "c-raw-option-slice";
+        }
+        if !self.optional {
+            match self.core {
+                GlueCore::Reborrow if self.mutable => return "c-raw-reborrow-mut",
+                GlueCore::Reborrow => return "c-raw-reborrow-shared",
+                GlueCore::FromRawParts if self.mutable => return "c-raw-slice-mut",
+                GlueCore::FromRawParts => return "c-raw-slice-shared",
+                GlueCore::Bare | GlueCore::RawOption | GlueCore::Index0 | GlueCore::FromRefMut => {}
+            }
+        }
         if self.optional {
             "optional"
         } else {
             match self.core {
                 GlueCore::FromRawParts | GlueCore::FromRefMut => "slice",
-                GlueCore::Reborrow | GlueCore::Index0 | GlueCore::Bare => "scalar-reference",
+                GlueCore::Reborrow | GlueCore::RawOption | GlueCore::Index0 | GlueCore::Bare => {
+                    "scalar-reference"
+                }
             }
         }
     }
@@ -806,10 +847,12 @@ impl GlueSpec {
             NullArm::Checked => {
                 return match self.core {
                     GlueCore::FromRawParts => "checked_from_raw_parts",
+                    GlueCore::RawOption => "checked_optional",
                     GlueCore::Reborrow => "checked_reborrow",
                     _ => "checked_optional",
                 };
             }
+            NullArm::PointerApi => return "raw_option",
             NullArm::None => {}
         }
         if let Some(found_mutable) = self.unwrap {
@@ -822,11 +865,13 @@ impl GlueSpec {
         match (self.optional, &self.core) {
             (true, GlueCore::FromRawParts) => "some_from_raw_parts",
             (true, GlueCore::Reborrow) => "some_reborrow",
+            (true, GlueCore::RawOption) => "checked_optional",
             (true, GlueCore::FromRefMut) => "some_from_ref_mut",
             // `Some(&X[0])` matches neither `Some(&mut *` nor `Some(&*`.
             (true, GlueCore::Bare | GlueCore::Index0) => "some_wrap",
             (false, GlueCore::FromRawParts) => "from_raw_parts",
             (false, GlueCore::Reborrow) => "reborrow",
+            (false, GlueCore::RawOption) => "checked_optional",
             (false, GlueCore::FromRefMut) => "from_ref_mut",
             // `index` is the classifier's FALLBACK arm, and the two cores that
             // land in it are **not** in the same position — a distinction this
@@ -884,6 +929,10 @@ impl GlueSpec {
             return Some("None".to_owned());
         }
         let argument = text;
+        if self.null_arm == NullArm::PointerApi && matches!(self.core, GlueCore::RawOption) {
+            let method = if self.mutable { "as_mut" } else { "as_ref" };
+            return Some(format!("unsafe {{ {argument}.{method}() }}"));
+        }
         let checked_name = "__crat_call_adapter_ptr";
         let text = if self.null_arm == NullArm::Checked {
             checked_name
@@ -896,7 +945,13 @@ impl GlueSpec {
         };
         let inner = match self.core {
             GlueCore::Bare => base,
-            GlueCore::Reborrow => format!("{}*{base}", amp(self.mutable)),
+            GlueCore::Reborrow => {
+                format!("unsafe {{ {}*{base} }}", amp(self.mutable))
+            }
+            GlueCore::RawOption => {
+                let method = if self.mutable { "as_mut" } else { "as_ref" };
+                format!("unsafe {{ {base}.{method}() }}")
+            }
             GlueCore::Index0 => format!("{}{base}[0]", amp(self.mutable)),
             GlueCore::FromRawParts => {
                 let ctor = if self.mutable {
@@ -904,7 +959,7 @@ impl GlueSpec {
                 } else {
                     "from_raw_parts"
                 };
-                match self.len.as_ref()? {
+                let call = match self.len.as_ref()? {
                     // The C spelling is `size_t`/`c_int`/`c_ulong` depending on
                     // the header and `from_raw_parts` takes `usize`, so the
                     // companion is cast; parenthesised because it may be an
@@ -919,7 +974,8 @@ impl GlueSpec {
                     SeamLen::Fabricated => {
                         format!("core::slice::{ctor}({base}, {FABRICATED_LEN_PATH})")
                     }
-                }
+                };
+                format!("unsafe {{ {call} }}")
             }
             GlueCore::FromRefMut => {
                 let ctor = if self.mutable { "from_mut" } else { "from_ref" };
@@ -1010,7 +1066,7 @@ pub(crate) fn glue(
             },
             Raw,
         ) => Some((
-            GlueSpec::core(GlueCore::Reborrow, mutable).checked(),
+            GlueSpec::core(GlueCore::RawOption, mutable).pointer_option(),
             SeamFamily::Reborrow,
         )),
 
@@ -1179,26 +1235,29 @@ mod tests {
     fn render_reproduces_every_emitting_glue_arm_byte_for_byte() {
         let cases: Vec<(GlueSpec, &str)> = vec![
             // (Ref, Raw) and its optional twin
-            (GlueSpec::core(GlueCore::Reborrow, true), "&mut *p"),
-            (GlueSpec::core(GlueCore::Reborrow, false), "&*p"),
             (
-                GlueSpec::core(GlueCore::Reborrow, true).wrapped(),
-                "Some(&mut *p)",
+                GlueSpec::core(GlueCore::Reborrow, true),
+                "unsafe { &mut *p }",
+            ),
+            (GlueSpec::core(GlueCore::Reborrow, false), "unsafe { &*p }"),
+            (
+                GlueSpec::core(GlueCore::RawOption, true).pointer_option(),
+                "unsafe { p.as_mut() }",
             ),
             // (Slice, Raw) and its optional twin
             (
                 GlueSpec::core(GlueCore::FromRawParts, true).with_len("n"),
-                "core::slice::from_raw_parts_mut(p, (n) as usize)",
+                "unsafe { core::slice::from_raw_parts_mut(p, (n) as usize) }",
             ),
             (
                 GlueSpec::core(GlueCore::FromRawParts, false).with_len("n"),
-                "core::slice::from_raw_parts(p, (n) as usize)",
+                "unsafe { core::slice::from_raw_parts(p, (n) as usize) }",
             ),
             (
                 GlueSpec::core(GlueCore::FromRawParts, true)
                     .with_len("n")
-                    .wrapped(),
-                "Some(core::slice::from_raw_parts_mut(p, (n) as usize))",
+                    .checked(),
+                "{ let __crat_call_adapter_ptr = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize) }) } }",
             ),
             // safe family
             (
@@ -1266,8 +1325,8 @@ mod tests {
     /// produce `&mut *(&mut x)` at every raw position.
     #[test]
     fn reborrow_is_directional() {
-        assert_eq!(text(Ref { mutable: true }, Raw), "&mut *p");
-        assert_eq!(text(Ref { mutable: false }, Raw), "&*p");
+        assert_eq!(text(Ref { mutable: true }, Raw), "unsafe { &mut *p }");
+        assert_eq!(text(Ref { mutable: false }, Raw), "unsafe { &*p }");
         assert_eq!(g(Raw, Ref { mutable: true }), Ok(None), "reverse: coercion");
         assert_eq!(g(Raw, Slice { mutable: true }), Ok(None));
     }
@@ -1413,11 +1472,11 @@ mod tests {
         );
     }
 
-    /// **Optional over a raw base composes both families** behind one explicit
-    /// null check. The binding evaluates the source once and the borrow is built
-    /// only in the non-null branch.
+    /// **Optional over a raw base uses the raw-pointer Option API directly.**
+    /// The method evaluates the source once and maps null to `None` without an
+    /// unconditional dereference.
     #[test]
-    fn optional_over_raw_composes_reborrow_inside_some() {
+    fn optional_over_raw_uses_as_mut_once() {
         let (spec, fam) = g(
             Opt {
                 mutable: true,
@@ -1427,10 +1486,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(
-            spec.render(T).unwrap(),
-            "{ let __crat_call_adapter_ptr = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(&mut *__crat_call_adapter_ptr) } }"
-        );
+        assert_eq!(spec.render(T).unwrap(), "unsafe { p.as_mut() }");
         assert_eq!(fam, SeamFamily::Reborrow, "the raw base carries the family");
     }
 
@@ -1597,7 +1653,7 @@ mod tests {
             .expect("fabricated specs render");
         assert_eq!(
             fabricated,
-            "core::slice::from_raw_parts(p, crate::FALLBACK_SLICE_EXTENT)"
+            "unsafe { core::slice::from_raw_parts(p, crate::FALLBACK_SLICE_EXTENT) }"
         );
         assert!(
             !fabricated.contains("1024"),
@@ -1614,7 +1670,7 @@ mod tests {
                 .with_len("n")
                 .render("p")
                 .as_deref(),
-            Some("core::slice::from_raw_parts_mut(p, (n) as usize)")
+            Some("unsafe { core::slice::from_raw_parts_mut(p, (n) as usize) }")
         );
     }
 
@@ -1651,11 +1707,11 @@ mod tests {
     fn a_companion_length_converts_the_gate_into_a_slice_seam() {
         assert_eq!(
             rendered(glue(Slice { mutable: true }, Raw, Some("n")), "p"),
-            "core::slice::from_raw_parts_mut(p, (n) as usize)"
+            "unsafe { core::slice::from_raw_parts_mut(p, (n) as usize) }"
         );
         assert_eq!(
             rendered(glue(Slice { mutable: false }, Raw, Some("len")), "p"),
-            "core::slice::from_raw_parts(p, (len) as usize)"
+            "unsafe { core::slice::from_raw_parts(p, (len) as usize) }"
         );
         // The fat optional composes the wrap around it.
         assert_eq!(
@@ -1670,7 +1726,7 @@ mod tests {
                 ),
                 "p"
             ),
-            "{ let __crat_call_adapter_ptr = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize)) } }"
+            "{ let __crat_call_adapter_ptr = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize) }) } }"
         );
         // **Without one, the position now FABRICATES** (ruling 2026-08-12,
         // superseding ruling item 4's `None` arm). What ruling B settled is
@@ -1682,7 +1738,7 @@ mod tests {
         assert_eq!(spec.len, Some(SeamLen::Fabricated));
         assert_eq!(
             spec.render("p").as_deref(),
-            Some("core::slice::from_raw_parts_mut(p, crate::FALLBACK_SLICE_EXTENT)")
+            Some("unsafe { core::slice::from_raw_parts_mut(p, crate::FALLBACK_SLICE_EXTENT) }")
         );
     }
 
@@ -1873,10 +1929,13 @@ mod tests {
     /// was not are the next test, and they are the schema movement.
     #[test]
     fn the_carried_shape_agrees_with_the_retired_classifier() {
-        for spec in every_emitting_spec()
-            .into_iter()
-            .filter(|spec| spec.null_arm == NullArm::None)
-        {
+        for spec in every_emitting_spec().into_iter().filter(|spec| {
+            spec.null_arm == NullArm::None
+                && !matches!(
+                    spec.core,
+                    GlueCore::Reborrow | GlueCore::RawOption | GlueCore::FromRawParts
+                )
+        }) {
             assert_eq!(
                 spec.shape_key(),
                 inferred_shape(&spec.render("p").expect("emitting spec renders")),
@@ -1919,7 +1978,7 @@ mod tests {
                 .with_len("n")
                 .render("p")
                 .as_deref(),
-            Some("core::slice::from_raw_parts(p, (n) as usize)")
+            Some("unsafe { core::slice::from_raw_parts(p, (n) as usize) }")
         );
         // The gate is UPSTREAM and STAYS upstream after the fabrication ruling
         // — what changed is which answer it gives. `glue` still never names the
@@ -2219,6 +2278,31 @@ struct Candidate {
     family: SeamFamily,
     replacement: String,
     len_arm: Option<LenArm>,
+    retention: BridgeRetentionTier,
+    waiver_id: Option<String>,
+}
+
+fn inbound_retention(
+    retention: &super::raw_boundary::RetentionSummaries,
+    callee: LocalDefId,
+    argument_index: usize,
+    return_tied: bool,
+) -> Result<(BridgeRetentionTier, Option<String>), SeamBlock> {
+    use super::raw_boundary::{RetentionEventKind, RetentionVerdict};
+
+    match retention.get(callee, argument_index) {
+        Some(RetentionVerdict::NoRetain { .. }) => Ok((BridgeRetentionTier::T1, None)),
+        Some(RetentionVerdict::Retains { sink, .. })
+            if sink.kind == RetentionEventKind::Return && return_tied =>
+        {
+            Ok((BridgeRetentionTier::T1, None))
+        }
+        Some(RetentionVerdict::Retains { .. }) => Err(SeamBlock::PositiveRetention),
+        Some(RetentionVerdict::Unknown { .. }) | None => Ok((
+            BridgeRetentionTier::T2,
+            Some(RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+        )),
+    }
 }
 
 fn root_label(
@@ -2269,6 +2353,7 @@ pub(crate) fn synthesize(
     table: &DecisionTable,
     c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
     a5_site_proofs: &A5SeamProofIndex,
+    retention: &super::raw_boundary::RetentionSummaries,
 ) -> SeamPlan {
     let coconv = super::co_conversion::CoConv::default();
     synthesize_with_raw_boundary(
@@ -2280,6 +2365,7 @@ pub(crate) fn synthesize(
         a5_site_proofs,
         &super::raw_boundary::RawBoundaryDispositionIndex::default(),
         &coconv,
+        retention,
     )
 }
 
@@ -2292,6 +2378,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     a5_site_proofs: &A5SeamProofIndex,
     raw_boundary: &super::raw_boundary::RawBoundaryDispositionIndex,
     coconv: &super::co_conversion::CoConv,
+    retention: &super::raw_boundary::RetentionSummaries,
 ) -> SeamPlan {
     let sm = tcx.sess.source_map();
     let mut plan = SeamPlan::default();
@@ -2548,11 +2635,32 @@ pub(crate) fn synthesize_with_raw_boundary(
                                         LenArm::Licensed(e)
                                     }
                                 });
+                                let (retention, waiver_id) =
+                                    if pos.found == Form::Raw && pos.expected != Form::Raw {
+                                        inbound_retention(
+                                            retention,
+                                            *callee,
+                                            pos.index,
+                                            table
+                                                .lifetime_plan
+                                                .function(*callee)
+                                                .and_then(|plan| {
+                                                    plan.lifetime_for(
+                                                        super::lifetime::FnSignatureSlot::RETURN,
+                                                    )
+                                                })
+                                                .is_some(),
+                                        )?
+                                    } else {
+                                        (BridgeRetentionTier::None, None)
+                                    };
                                 Ok(Candidate {
                                     spec,
                                     family,
                                     replacement,
                                     len_arm,
+                                    retention,
+                                    waiver_id,
                                 })
                             })
                             .transpose()
@@ -2727,8 +2835,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 position: format!("arg{}", pos.index),
                                 bridge_kind: candidate.spec.template_key().to_owned(),
                                 extent: receipt_extent(&candidate.spec),
-                                retention: BridgeRetentionTier::None,
-                                waiver_id: None,
+                                retention: candidate.retention,
+                                waiver_id: candidate.waiver_id.clone(),
                             },
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
                             lifetime_plan_digest: table
