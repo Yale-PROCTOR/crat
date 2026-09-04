@@ -19912,6 +19912,66 @@ struct RawBoundaryControlReconciliation {
     free_arm_b_ledger: String,
     t2_cross_tab: String,
     libc_site_movement: String,
+    io_domain_migrations: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawBoundaryIoDomainMigration {
+    program: &'static str,
+    identity: &'static str,
+    callee: &'static str,
+    argument: usize,
+    line: usize,
+}
+
+const RAW_BOUNDARY_IO_DOMAIN_MIGRATIONS: [RawBoundaryIoDomainMigration; 4] = [
+    RawBoundaryIoDomainMigration {
+        program: "genann",
+        identity: "src::genann::genann_read::in_0#1",
+        callee: "fscanf",
+        argument: 0,
+        line: 752,
+    },
+    RawBoundaryIoDomainMigration {
+        program: "genann",
+        identity: "src::genann::genann_read::in_0#1",
+        callee: "fscanf",
+        argument: 0,
+        line: 769,
+    },
+    RawBoundaryIoDomainMigration {
+        program: "genann",
+        identity: "src::genann::genann_write::out#2",
+        callee: "fprintf",
+        argument: 0,
+        line: 1111,
+    },
+    RawBoundaryIoDomainMigration {
+        program: "genann",
+        identity: "src::genann::genann_write::out#2",
+        callee: "fprintf",
+        argument: 0,
+        line: 1117,
+    },
+];
+
+fn raw_boundary_io_domain_migration(
+    program: &str,
+    identity: &str,
+    callee: &str,
+    argument: usize,
+    line: usize,
+) -> Option<RawBoundaryIoDomainMigration> {
+    RAW_BOUNDARY_IO_DOMAIN_MIGRATIONS
+        .iter()
+        .copied()
+        .find(|migration| {
+            migration.program == program
+                && migration.identity == identity
+                && migration.callee == callee
+                && migration.argument == argument
+                && migration.line == line
+        })
 }
 
 fn control_edge_parts(edge: &str) -> Option<(&str, usize, usize)> {
@@ -20000,6 +20060,9 @@ fn reconcile_raw_boundary_controls(
     let mut libc_site_movement = String::from(
         "program\tidentity\tcallee\targument_index\tcontrol_line\tproduction_line\tline_delta\ttemplate\tevidence\n",
     );
+    let mut io_domain_migrations = String::from(
+        "program\tidentity\tcallee\targument_index\tcontrol_line\tprevious_expectation\tmigrated_expectation\tproduction_reason\tproduction_detail\towner\tpipeline_order\tauthority\n",
+    );
     let mut used_libc_dispositions = std::collections::BTreeSet::<usize>::new();
     let mut t2_cross_counts = std::collections::BTreeMap::<(String, String, String), usize>::new();
     let mut counts = RawBoundaryControlReconciliation {
@@ -20016,6 +20079,7 @@ fn reconcile_raw_boundary_controls(
         free_arm_b_ledger: String::new(),
         t2_cross_tab: String::new(),
         libc_site_movement: String::new(),
+        io_domain_migrations: String::new(),
     };
     for row in &primary.rows {
         let program = primary.field(row, "program")?;
@@ -20039,6 +20103,47 @@ fn reconcile_raw_boundary_controls(
                         continue;
                     };
                     counts.libc_edges += 1;
+                    if raw_boundary_io_domain_migration(program, identity, callee, argument, line)
+                        .is_some()
+                    {
+                        let candidate = dispositions.iter().enumerate().find(|(index, record)| {
+                            !used_libc_dispositions.contains(index)
+                                && record.get("program").is_some_and(|value| value == program)
+                                && record
+                                    .get("subject_identity")
+                                    .is_some_and(|value| value == identity)
+                                && record.get("tier").is_some_and(|value| value == "blocked")
+                                && record.get("argument_index").is_some_and(|value| {
+                                    value.parse::<usize>().ok() == Some(argument)
+                                })
+                                && record
+                                    .get("callee")
+                                    .is_some_and(|value| value.split("::").last() == Some(callee))
+                                && record
+                                    .get("source_site")
+                                    .and_then(|value| diagnostic_site_line(value))
+                                    == Some(line)
+                                && record
+                                    .get("reason")
+                                    .is_some_and(|value| value == "raw-boundary-shared-to-mut")
+                                && record.get("detail").is_some_and(|value| {
+                                    value == "negative-write-absent:libc-access=stream"
+                                })
+                        });
+                        let Some((matched_index, record)) = candidate else {
+                            divergences.push_str(&format!(
+                                "libc-edge\t{program}\t{identity}\tio-domain-migration-unmatched\t{edge}\n"
+                            ));
+                            continue;
+                        };
+                        used_libc_dispositions.insert(matched_index);
+                        io_domain_migrations.push_str(&format!(
+                            "{program}\t{identity}\t{callee}\t{argument}\t{line}\tT1-ref-mut-to-raw-mut\theld:io-domain\t{}\t{}\tio_replacer\tio-before-pointer\tloop2-s39-addendum-176;addendum-177;addendum-168-R-B\n",
+                            record.get("reason").map_or("missing", String::as_str),
+                            record.get("detail").map_or("missing", String::as_str),
+                        ));
+                        continue;
+                    }
                     let candidate = dispositions
                         .iter()
                         .enumerate()
@@ -20225,6 +20330,7 @@ fn reconcile_raw_boundary_controls(
     counts.free_arm_b_ledger = free_arm_b;
     counts.t2_cross_tab = t2_cross_tab;
     counts.libc_site_movement = libc_site_movement;
+    counts.io_domain_migrations = io_domain_migrations;
     Ok(counts)
 }
 
@@ -21645,6 +21751,11 @@ fn raw_boundary_wave2_corpus_census() {
         &controls.libc_site_movement,
     )
     .expect("write libc contract site movement");
+    fs::write(
+        artifact_dir.join("io-domain-control-migrations.tsv"),
+        &controls.io_domain_migrations,
+    )
+    .expect("write io-domain control migrations");
     assert_eq!(
         (
             controls.libc_subjects,
@@ -21665,6 +21776,7 @@ fn raw_boundary_wave2_corpus_census() {
         controls.divergences
     );
     assert_eq!(controls.arm_b_ledger.lines().count(), 63);
+    assert_eq!(controls.io_domain_migrations.lines().count(), 5);
     assert_eq!(
         controls.free_arm_b_rows, 5,
         "free-parameter Arm-B receipt population drift"
@@ -22550,6 +22662,62 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
         assert!(
             !fields[6].is_empty(),
             "missing-fact payload disappeared: {line}"
+        );
+    }
+}
+
+/// R176-W1 / R177 — the four genann stream-position rows are owned by the
+/// earlier I/O stage.  The pointer-stage control expects a typed io-domain
+/// hold, not the superseded wave-2 T1 bridge.
+#[test]
+fn r176_w1_genann_stdio_control_migrates_to_io_domain_holds() {
+    let primary = concat!(
+        "read\tprogram\trecord_key\tcategory\ttyped_subkind\tconsumer_edges\n",
+        "A\tgenann\tsrc::genann::genann_read::in_0#1\tLIBC-CONTRACT-OPENABLE\tknown-libc-no-independent-hard-conflict\tfscanf#0@genann/lib.rs:752;fscanf#0@genann/lib.rs:769\n",
+        "A\tgenann\tsrc::genann::genann_write::out#2\tLIBC-CONTRACT-OPENABLE\tknown-libc-no-independent-hard-conflict\tfprintf#0@genann/lib.rs:1111;fprintf#0@genann/lib.rs:1117\n",
+    );
+    let box_control = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\n";
+    let subjects = concat!(
+        "subject_identity\towner\tmir_local\tsubject_kind\thypothetical\tsettled\tdirect_site_count\tdirect_tiers\traw_open\tclass_id\tclass_admits\tclass_block\tnode_block\tptr_depth\n",
+        "src::genann::genann_read::in_0#1\tsrc::genann::genann_read\t1\tparam\tref\tdegraded\t2\tblocked\t0\t4\t0\tescapes-via-foreign-arg\tescapes-via-foreign-arg\t1\n",
+        "src::genann::genann_write::out#2\tsrc::genann::genann_write\t2\tparam\tref\tdegraded\t2\tblocked\t0\t10\t0\tescapes-via-foreign-arg\tescapes-via-foreign-arg\t1\n",
+    );
+    let dispositions = concat!(
+        "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n",
+        "src::genann::genann_read\t1\t32\tsrc::genann::fscanf\t0\th1\tsrc::genann::genann_read::in_0#1\t<program>/lib.rs:752:24: 752:28\tblocked\t-\t-\t-\traw-boundary-shared-to-mut\tnegative-write-absent:libc-access=stream\t-\n",
+        "src::genann::genann_read\t14\t2\tsrc::genann::fscanf\t0\th1\tsrc::genann::genann_read::in_0#1\t<program>/lib.rs:769:28: 769:32\tblocked\t-\t-\t-\traw-boundary-shared-to-mut\tnegative-write-absent:libc-access=stream\t-\n",
+        "src::genann::genann_write\t0\t21\tsrc::genann::fprintf\t0\th2\tsrc::genann::genann_write::out#2\t<program>/lib.rs:1111:21: 1111:24\tblocked\t-\t-\t-\traw-boundary-shared-to-mut\tnegative-write-absent:libc-access=stream\t-\n",
+        "src::genann::genann_write\t4\t3\tsrc::genann::fprintf\t0\th2\tsrc::genann::genann_write::out#2\t<program>/lib.rs:1117:25: 1117:28\tblocked\t-\t-\t-\traw-boundary-shared-to-mut\tnegative-write-absent:libc-access=stream\t-\n",
+    );
+    let result = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("genann".to_owned(), subjects.to_owned())],
+        &[("genann".to_owned(), dispositions.to_owned())],
+    )
+    .expect("genann migration fixture reconciles");
+
+    assert_eq!(result.libc_subjects, 2);
+    assert_eq!(result.libc_edges, 4);
+    assert_eq!(
+        result.divergences.lines().count(),
+        1,
+        "{}",
+        result.divergences
+    );
+    assert_eq!(result.io_domain_migrations.lines().count(), 5);
+    for required in [
+        "held:io-domain",
+        "io_replacer",
+        "io-before-pointer",
+        "addendum-176",
+        "addendum-177",
+        "addendum-168-R-B",
+    ] {
+        assert!(
+            result.io_domain_migrations.contains(required),
+            "migration receipt lacks {required}: {}",
+            result.io_domain_migrations
         );
     }
 }
