@@ -132,7 +132,31 @@ pub(crate) const RENDER_WALL_S: &str = "raw_boundary_render_wall_s";
 pub(crate) const RECEIPT_WALL_S: &str = "raw_boundary_receipt_wall_s";
 pub(crate) const INITIAL_VERIFY_WALL_S: &str = "raw_boundary_initial_verify_wall_s";
 pub(crate) const ATOM_REVERIFY_WALL_S: &str = "raw_boundary_atom_reverify_wall_s";
+pub(crate) const BRIDGE_RECEIPT_ROWS: &str = "raw_boundary_bridge_receipt_rows";
+pub(crate) const BRIDGE_REQUIRED_SITES: &str = "raw_boundary_bridge_required_sites";
+pub(crate) const BRIDGE_PLANNED_EVENTS: &str = "raw_boundary_bridge_planned_events";
+pub(crate) const BRIDGE_APPLIED_EVENTS: &str = "raw_boundary_bridge_applied_events";
+pub(crate) const BRIDGE_DROPPED_EVENTS: &str = "raw_boundary_bridge_dropped_events";
+pub(crate) const SIGNATURE_CLASS_COUNT: &str = "raw_boundary_signature_class_count";
+pub(crate) const ATTRIBUTION_HITS_EXACT_EDIT: &str = "raw_boundary_attribution_hits_exact_edit";
+pub(crate) const ATTRIBUTION_HITS_EXACT_SEAM: &str = "raw_boundary_attribution_hits_exact_seam";
+pub(crate) const ATTRIBUTION_HITS_RELATED_SPAN: &str = "raw_boundary_attribution_hits_related_span";
+pub(crate) const ATTRIBUTION_HITS_ENCLOSING_REGION: &str =
+    "raw_boundary_attribution_hits_enclosing_region";
+pub(crate) const ATTRIBUTION_HITS_UNRESOLVED: &str = "raw_boundary_attribution_hits_unresolved";
+pub(crate) const CLASS_BISECT_PROBES: &str = "raw_boundary_class_bisect_probes";
+pub(crate) const VERIFY_WALL_S: &str = "raw_boundary_verify_wall_s";
+pub(crate) const EMIT_BUDGET_S: &str = "raw_boundary_emit_budget_s";
+pub(crate) const PER_ARM_TIMERS_STATUS: &str = "raw_boundary_per_arm_timers_status";
+pub(crate) const CROSS_CLASS_COLLISION_COUNT: &str = "raw_boundary_cross_class_collision_count";
+pub(crate) const DEGRADED_OUTPUT_RECEIPT: &str = "raw_boundary_degraded_output_receipt";
+pub(crate) const UNRESOLVED_CLASS_COUNT: &str = "raw_boundary_unresolved_class_count";
 pub(crate) const STATUS: &str = "raw_boundary_status";
+
+pub(crate) const BRIDGE_RECEIPT_FILE: &str = "raw-boundary-bridge-receipts.tsv";
+pub(crate) const CLASS_COST_ROWS: &str = "raw-boundary-class-costs.tsv";
+pub(crate) const CROSS_CLASS_COLLISION_ROWS: &str = "raw-boundary-class-collisions.tsv";
+pub(crate) const UNRESOLVED_CLASS_ROWS: &str = "raw-boundary-unresolved-classes.tsv";
 
 pub(crate) const ALL: &[&str] = &[
     CORPUS,
@@ -264,5 +288,23 @@ pub(crate) const ALL: &[&str] = &[
     RECEIPT_WALL_S,
     INITIAL_VERIFY_WALL_S,
     ATOM_REVERIFY_WALL_S,
+    BRIDGE_RECEIPT_ROWS,
+    BRIDGE_REQUIRED_SITES,
+    BRIDGE_PLANNED_EVENTS,
+    BRIDGE_APPLIED_EVENTS,
+    BRIDGE_DROPPED_EVENTS,
+    SIGNATURE_CLASS_COUNT,
+    ATTRIBUTION_HITS_EXACT_EDIT,
+    ATTRIBUTION_HITS_EXACT_SEAM,
+    ATTRIBUTION_HITS_RELATED_SPAN,
+    ATTRIBUTION_HITS_ENCLOSING_REGION,
+    ATTRIBUTION_HITS_UNRESOLVED,
+    CLASS_BISECT_PROBES,
+    VERIFY_WALL_S,
+    EMIT_BUDGET_S,
+    PER_ARM_TIMERS_STATUS,
+    CROSS_CLASS_COLLISION_COUNT,
+    DEGRADED_OUTPUT_RECEIPT,
+    UNRESOLVED_CLASS_COUNT,
     STATUS,
 ];

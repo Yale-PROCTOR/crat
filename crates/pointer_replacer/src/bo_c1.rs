@@ -10518,6 +10518,11 @@ mod run {
             format!("{:x}", Sha256::digest(stamped_patch.as_bytes())),
         );
         let artifact = &capture.raw_boundary_artifacts;
+        let bridge_summary =
+            crate::bo_rewriter::bridge_receipt::reconcile_bridge_events(&artifact.bridge_events)
+                .expect("bridge receipt reconciliation");
+        let bridge_receipts =
+            crate::bo_rewriter::bridge_receipt::render_bridge_events(&artifact.bridge_events);
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
             ("d4-edges", artifact.d4_edges.as_str()),
@@ -10533,6 +10538,10 @@ mod run {
             ("atoms", artifact.atoms.as_str()),
             ("atom-outcomes", artifact.atom_outcomes.as_str()),
             ("final-reverts", artifact.final_reverts.as_str()),
+            ("bridge-receipts", bridge_receipts.as_str()),
+            ("class-costs", artifact.class_costs.as_str()),
+            ("class-collisions", artifact.class_collisions.as_str()),
+            ("unresolved-classes", artifact.unresolved_classes.as_str()),
             ("subjects", capture.subject_receipt.as_str()),
         ];
         for (suffix, contents) in artifact_rows {
@@ -11209,6 +11218,54 @@ mod run {
         row.set(
             raw_schema::ATOM_REVERIFY_WALL_S,
             &timing.atom_reverify_wall_s,
+        );
+        row.set(
+            raw_schema::BRIDGE_RECEIPT_ROWS,
+            bridge_receipts.lines().skip(1).count(),
+        );
+        row.set(
+            raw_schema::BRIDGE_REQUIRED_SITES,
+            bridge_summary.required_sites,
+        );
+        row.set(
+            raw_schema::BRIDGE_PLANNED_EVENTS,
+            bridge_summary.planned_events,
+        );
+        row.set(
+            raw_schema::BRIDGE_APPLIED_EVENTS,
+            bridge_summary.applied_events,
+        );
+        row.set(
+            raw_schema::BRIDGE_DROPPED_EVENTS,
+            bridge_summary.dropped_events,
+        );
+        row.set(raw_schema::SIGNATURE_CLASS_COUNT, 0);
+        row.set(raw_schema::ATTRIBUTION_HITS_EXACT_EDIT, 0);
+        row.set(raw_schema::ATTRIBUTION_HITS_EXACT_SEAM, 0);
+        row.set(raw_schema::ATTRIBUTION_HITS_RELATED_SPAN, 0);
+        row.set(raw_schema::ATTRIBUTION_HITS_ENCLOSING_REGION, 0);
+        row.set(raw_schema::ATTRIBUTION_HITS_UNRESOLVED, 0);
+        row.set(raw_schema::CLASS_BISECT_PROBES, 0);
+        row.set(raw_schema::VERIFY_WALL_S, &timing.initial_verify_wall_s);
+        row.set(
+            raw_schema::EMIT_BUDGET_S,
+            std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS").unwrap_or_else(|_| "900".to_owned()),
+        );
+        row.set(
+            raw_schema::PER_ARM_TIMERS_STATUS,
+            &artifact.per_arm_timers_status,
+        );
+        row.set(
+            raw_schema::CROSS_CLASS_COLLISION_COUNT,
+            artifact.class_collisions.lines().skip(1).count(),
+        );
+        row.set(
+            raw_schema::DEGRADED_OUTPUT_RECEIPT,
+            &artifact.degraded_output_receipt,
+        );
+        row.set(
+            raw_schema::UNRESOLVED_CLASS_COUNT,
+            artifact.unresolved_classes.lines().skip(1).count(),
         );
         let profile_ok =
             build_profile == "release" && launch_profile == "release" && !cfg!(debug_assertions);
@@ -20507,6 +20564,10 @@ fn raw_boundary_wave2_preflight() {
         "raw-boundary-dispositions.tsv",
         "raw-boundary-subject-index.tsv",
         "raw-boundary-atoms.tsv",
+        raw_schema::BRIDGE_RECEIPT_FILE,
+        raw_schema::CLASS_COST_ROWS,
+        raw_schema::CROSS_CLASS_COLLISION_ROWS,
+        raw_schema::UNRESOLVED_CLASS_ROWS,
         "raw-boundary-outcome.tsv",
         "raw-boundary-subject-outcomes.tsv",
         "raw-boundary-emitted-tree.tsv",
@@ -21570,6 +21631,121 @@ fn raw_boundary_census_schema_is_one_shared_authority() {
     }
 }
 
+/// RCP-W1 — every required bridge site has one plan event and exactly one
+/// terminal event. Duplicate or missing events must fail before aggregation.
+#[test]
+fn raw_boundary_bridge_receipts_require_one_plan_and_one_terminal_event() {
+    use crate::bo_rewriter::bridge_receipt::{
+        BridgeReceiptEvent, BridgeReceiptStage, BridgeReceiptState, reconcile_bridge_events,
+    };
+
+    let plan = BridgeReceiptEvent::for_test(
+        "site-a",
+        BridgeReceiptStage::Plan,
+        BridgeReceiptState::Planned,
+    );
+    let applied = BridgeReceiptEvent::for_test(
+        "site-a",
+        BridgeReceiptStage::Terminal,
+        BridgeReceiptState::Applied,
+    );
+    let summary = reconcile_bridge_events(&[plan.clone(), applied.clone()])
+        .expect("one plan plus one terminal event");
+    assert_eq!(summary.required_sites, 1);
+    assert_eq!(summary.planned_events, 1);
+    assert_eq!(summary.applied_events, 1);
+    assert_eq!(summary.dropped_events, 0);
+
+    assert!(reconcile_bridge_events(std::slice::from_ref(&plan)).is_err());
+    assert!(reconcile_bridge_events(&[plan.clone(), plan, applied.clone()]).is_err());
+    assert!(reconcile_bridge_events(&[applied.clone(), applied]).is_err());
+}
+
+/// RCP-W2 — a T2 bridge names the exact waiver and a fallback extent is
+/// present on both plan and terminal events. Neither fact may be inferred from
+/// aggregate counts.
+#[test]
+fn raw_boundary_bridge_receipts_require_exact_waiver_and_extent() {
+    use crate::bo_rewriter::bridge_receipt::{
+        BridgeExtentKind, BridgeReceiptEvent, BridgeReceiptStage, BridgeReceiptState,
+        BridgeRetentionTier, RAW_BOUNDARY_T2_WAIVER_ID, reconcile_bridge_events,
+    };
+
+    let plan = BridgeReceiptEvent::for_test(
+        "site-t2",
+        BridgeReceiptStage::Plan,
+        BridgeReceiptState::Planned,
+    )
+    .with_retention(BridgeRetentionTier::T2, Some(RAW_BOUNDARY_T2_WAIVER_ID))
+    .with_extent(BridgeExtentKind::Fallback);
+    let terminal = BridgeReceiptEvent::for_test(
+        "site-t2",
+        BridgeReceiptStage::Terminal,
+        BridgeReceiptState::Applied,
+    )
+    .with_retention(BridgeRetentionTier::T2, Some(RAW_BOUNDARY_T2_WAIVER_ID))
+    .with_extent(BridgeExtentKind::Fallback);
+    assert!(reconcile_bridge_events(&[plan.clone(), terminal.clone()]).is_ok());
+
+    let missing_waiver = plan.clone().with_retention(BridgeRetentionTier::T2, None);
+    assert!(reconcile_bridge_events(&[missing_waiver, terminal.clone()]).is_err());
+
+    let missing_extent = terminal.with_extent(BridgeExtentKind::None);
+    assert!(reconcile_bridge_events(&[plan, missing_extent]).is_err());
+}
+
+/// COST-W1 schema half — the parent cannot silently omit any per-program cost
+/// stamp after the worker starts producing it.
+#[test]
+fn raw_boundary_schema_seals_class_recovery_cost_keys() {
+    use crate::raw_boundary_census_schema as schema;
+
+    for key in [
+        schema::SIGNATURE_CLASS_COUNT,
+        schema::ATTRIBUTION_HITS_EXACT_EDIT,
+        schema::ATTRIBUTION_HITS_EXACT_SEAM,
+        schema::ATTRIBUTION_HITS_RELATED_SPAN,
+        schema::ATTRIBUTION_HITS_ENCLOSING_REGION,
+        schema::ATTRIBUTION_HITS_UNRESOLVED,
+        schema::CLASS_BISECT_PROBES,
+        schema::VERIFY_WALL_S,
+        schema::EMIT_BUDGET_S,
+    ] {
+        assert!(schema::ALL.contains(&key), "missing cost key {key}");
+    }
+}
+
+/// COLL-W1 schema half — long collision identities live in a dedicated TSV;
+/// only its exact row count travels through the compact KV wire.
+#[test]
+fn raw_boundary_schema_seals_cross_class_collision_keys() {
+    use crate::raw_boundary_census_schema as schema;
+
+    assert!(schema::ALL.contains(&schema::CROSS_CLASS_COLLISION_COUNT));
+    assert_eq!(
+        schema::CROSS_CLASS_COLLISION_ROWS,
+        "raw-boundary-class-collisions.tsv"
+    );
+}
+
+/// DEG-W1 schema half. Phase E supplies the bytes; Phase A seals the outcome
+/// vocabulary and unresolved-class artifact identity first.
+#[test]
+fn raw_boundary_schema_seals_degraded_unmodified_output_keys() {
+    use crate::raw_boundary_census_schema as schema;
+
+    for key in [
+        schema::DEGRADED_OUTPUT_RECEIPT,
+        schema::UNRESOLVED_CLASS_COUNT,
+    ] {
+        assert!(schema::ALL.contains(&key), "missing Degraded key {key}");
+    }
+    assert_eq!(
+        schema::UNRESOLVED_CLASS_ROWS,
+        "raw-boundary-unresolved-classes.tsv"
+    );
+}
+
 #[test]
 fn raw_boundary_degraded_outcome_never_survives_an_empty_revert_ledger() {
     assert!(!raw_boundary_site_survives(
@@ -21707,7 +21883,7 @@ fn raw_boundary_census_schema_renamed_identifier_is_a_compile_error() {
     let schema =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/raw_boundary_census_schema.rs");
     let source = format!(
-        "#![allow(dead_code)]\n#[path = {:?}] mod schema;\nconst _: &str = schema::SITE_ROWS_RENAMED;\n",
+        "#![allow(dead_code)]\n#[path = {:?}] mod schema;\nconst _: &str = schema::BRIDGE_REQUIRED_SITES_RENAMED;\n",
         schema
     );
     let result = ::utils::compilation::run_compiler_on_str(&source, |tcx| {

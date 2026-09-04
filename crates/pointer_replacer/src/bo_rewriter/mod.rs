@@ -71,6 +71,7 @@ use crate::{
 
 pub(crate) mod apply;
 pub(crate) mod artifact;
+pub(crate) mod bridge_receipt;
 pub(crate) mod c9;
 pub(crate) mod decision;
 pub(crate) mod fat_facts;
@@ -213,6 +214,12 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) atoms: String,
     pub(crate) atom_outcomes: String,
     pub(crate) final_reverts: String,
+    pub(crate) bridge_events: Vec<bridge_receipt::BridgeReceiptEvent>,
+    pub(crate) class_costs: String,
+    pub(crate) class_collisions: String,
+    pub(crate) unresolved_classes: String,
+    pub(crate) degraded_output_receipt: String,
+    pub(crate) per_arm_timers_status: String,
     pub(crate) timings: RawBoundaryTimings,
 }
 
@@ -4459,6 +4466,12 @@ fn finish_decide<'tcx>(
             out
         },
         final_reverts: String::from("kind\tidentity\n"),
+        bridge_events: Vec::new(),
+        class_costs: bridge_receipt::class_cost_header(),
+        class_collisions: bridge_receipt::class_collision_header(),
+        unresolved_classes: bridge_receipt::unresolved_class_header(),
+        degraded_output_receipt: "not-applicable".to_owned(),
+        per_arm_timers_status: "queued-no-free-column".to_owned(),
         timings: RawBoundaryTimings {
             site_derivation_wall_s: format!("{raw_boundary_site_derivation_wall_s:.6}"),
             retention_fixpoint_wall_s: format!("{retention_fixpoint_wall_s:.6}"),
