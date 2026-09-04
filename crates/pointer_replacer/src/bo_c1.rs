@@ -11297,11 +11297,26 @@ mod run {
                 .collect::<BTreeSet<_>>()
                 .len(),
         );
-        row.set(raw_schema::ATTRIBUTION_HITS_EXACT_EDIT, 0);
-        row.set(raw_schema::ATTRIBUTION_HITS_EXACT_SEAM, 0);
-        row.set(raw_schema::ATTRIBUTION_HITS_RELATED_SPAN, 0);
-        row.set(raw_schema::ATTRIBUTION_HITS_ENCLOSING_REGION, 0);
-        row.set(raw_schema::ATTRIBUTION_HITS_UNRESOLVED, 0);
+        row.set(
+            raw_schema::ATTRIBUTION_HITS_EXACT_EDIT,
+            artifact.attribution_hits.exact_edit,
+        );
+        row.set(
+            raw_schema::ATTRIBUTION_HITS_EXACT_SEAM,
+            artifact.attribution_hits.exact_seam,
+        );
+        row.set(
+            raw_schema::ATTRIBUTION_HITS_RELATED_SPAN,
+            artifact.attribution_hits.related_span,
+        );
+        row.set(
+            raw_schema::ATTRIBUTION_HITS_ENCLOSING_REGION,
+            artifact.attribution_hits.enclosing_region,
+        );
+        row.set(
+            raw_schema::ATTRIBUTION_HITS_UNRESOLVED,
+            artifact.attribution_hits.unresolved,
+        );
         row.set(raw_schema::CLASS_BISECT_PROBES, 0);
         row.set(raw_schema::VERIFY_WALL_S, &timing.initial_verify_wall_s);
         row.set(

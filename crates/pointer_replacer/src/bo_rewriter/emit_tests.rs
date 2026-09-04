@@ -1508,25 +1508,21 @@ fn keep_r_raw(table: &mut super::decision::DecisionTable) {
     }
 }
 
-/// **S2b.1.3 — an attribution failure reaches bounded recovery.**
+/// **CLS-W2 — an error in an unedited caller names the converted callee class.**
 ///
 /// The inverted-direction shape: the error lands inside `caller`, so span
 /// attribution reverts `caller` — but the culprit is `callee`, and the error
-/// survives. Atomic class holding can now remove the stale caller interval
-/// before attribution, in which case the loop escalates immediately as
-/// unattributed; otherwise the no-progress detector escalates on the next
-/// round. Both routes must enter bounded recovery.
+/// survives. Wave 3 carries the whole-call seam interval under the callee
+/// class, so the first round takes back exactly that class and converges
+/// without bisection.
 ///
 /// **Why injection is legitimate here.** This is a DERIVED breach shape, not an
 /// invention: reality emits it (1 of 86 corpus diagnostics, in heman), and A1's
 /// `CallSiteNotAdapted` is exactly what normally prevents it — so it cannot be
 /// written as ordinary source. The between-phase hook exists to test downstream
 /// phases against shapes the upstream guard suppresses.
-///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** disable the
-/// no-progress check and this fails — the loop no longer escalates.
 #[test]
-fn the_no_progress_detector_escalates_when_attribution_is_wrong() {
+fn an_unedited_caller_error_reverts_only_converted_callee_class() {
     let fixture = Fixture::new(&[
         (
             "lib.rs",
@@ -1538,21 +1534,12 @@ fn the_no_progress_detector_escalates_when_attribution_is_wrong() {
         super::RewriteOutcome::Emitted {
             escalated,
             bisect_probes,
+            reverted_count,
             ..
         } => {
-            let reason = escalated.expect(
-                "the loop converged on a shape whose culprit it cannot \
-                 attribute — attribution silently got away with it",
-            );
-            assert!(
-                reason.contains("no progress")
-                    || reason.contains("attributed to no rewritten function"),
-                "attribution failure did not reach a typed escalation: {reason}"
-            );
-            assert!(
-                bisect_probes > 0,
-                "the detector fired but (C) never ran: {reason}"
-            );
+            assert!(escalated.is_none(), "direct seam attribution escalated");
+            assert_eq!(bisect_probes, 0, "direct attribution invoked bisect");
+            assert_eq!(reverted_count, 1, "more than the callee class reverted");
         }
         super::RewriteOutcome::Degraded { reason, .. } => {
             panic!("bisect failed to recover the inverted shape: {reason}")
@@ -4974,7 +4961,7 @@ mod attribution_and_escapes {
 
     use super::Fixture;
     use crate::bo_rewriter::{
-        EditSite, EmittedSite, attribute,
+        AttributionRule, EditSite, EmittedSite, attribute, attribute_with_rule,
         bridge_receipt::SignatureClassId,
         edit_sites,
         plan::{Edit, FileKey, Justification, Plan},
@@ -4994,6 +4981,132 @@ mod attribution_and_escapes {
             code: Some("E0308".to_owned()),
             related: Vec::new(),
         }
+    }
+
+    #[test]
+    fn cls_w2_and_rule_precedence_keep_exact_class_sets() {
+        assert_eq!(
+            AttributionRule::ALL.map(AttributionRule::key),
+            [
+                "exact-edit",
+                "exact-seam",
+                "related-span",
+                "enclosing-region",
+                "unresolved",
+            ]
+        );
+        let fixture = Fixture::new(&[("lib.rs", "pub fn class_a() {}\npub fn class_b() {}\n")]);
+        ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+            let mut classes = tcx
+                .hir_body_owners()
+                .map(|did| class(did))
+                .collect::<Vec<_>>();
+            classes.sort();
+            let [left, right] = classes.as_slice() else { panic!("two class fixture") };
+            let root = Path::new("/crate");
+            let sites = [EmittedSite {
+                owner_class: *left,
+                file: "/crate/caller.rs".to_owned(),
+                fn_path: "display-only".to_owned(),
+                lo_line: 30,
+                hi_line: 35,
+            }];
+            let edits = [
+                EditSite {
+                    owner_class: Some(*left),
+                    file: "/crate/caller.rs".to_owned(),
+                    fn_path: "same-display".to_owned(),
+                    lo_line: 10,
+                    hi_line: 10,
+                    edit_id: "ordinary".to_owned(),
+                    site_kind: "subject-declaration",
+                    atom_ids: Vec::new(),
+                    atom_covered: false,
+                },
+                EditSite {
+                    owner_class: Some(*right),
+                    file: "/crate/caller.rs".to_owned(),
+                    fn_path: "same-display".to_owned(),
+                    lo_line: 20,
+                    hi_line: 20,
+                    edit_id: "callee-seam".to_owned(),
+                    site_kind: "seam-adapter",
+                    atom_ids: Vec::new(),
+                    atom_covered: false,
+                },
+                EditSite {
+                    owner_class: Some(*left),
+                    file: "/crate/caller.rs".to_owned(),
+                    fn_path: "left".to_owned(),
+                    lo_line: 40,
+                    hi_line: 40,
+                    edit_id: "multi-left".to_owned(),
+                    site_kind: "subject-use",
+                    atom_ids: Vec::new(),
+                    atom_covered: false,
+                },
+                EditSite {
+                    owner_class: Some(*right),
+                    file: "/crate/caller.rs".to_owned(),
+                    fn_path: "right".to_owned(),
+                    lo_line: 40,
+                    hi_line: 40,
+                    edit_id: "multi-right".to_owned(),
+                    site_kind: "subject-use",
+                    atom_ids: Vec::new(),
+                    atom_covered: false,
+                },
+            ];
+            let run = |diagnostic: Diag| {
+                attribute_with_rule(
+                    &diagnostic,
+                    &Default::default(),
+                    root,
+                    &sites,
+                    &edits,
+                    &BTreeSet::new(),
+                    root,
+                )
+            };
+            assert_eq!(
+                run(diag("/crate/caller.rs", 10)).rule,
+                AttributionRule::ExactEdit
+            );
+            let seam = run(diag("/crate/caller.rs", 20));
+            assert_eq!(seam.rule, AttributionRule::ExactSeam);
+            assert_eq!(seam.classes, BTreeSet::from([*right]));
+            let mut related = diag("/crate/caller.rs", 99);
+            related.related.push(super::super::verify::RelatedDiag {
+                file: "/crate/caller.rs".to_owned(),
+                line: 20,
+                message: "callee seam".to_owned(),
+            });
+            assert_eq!(run(related).rule, AttributionRule::RelatedSpan);
+            assert_eq!(
+                run(diag("/crate/caller.rs", 32)).rule,
+                AttributionRule::EnclosingRegion
+            );
+            let multi = run(diag("/crate/caller.rs", 40));
+            assert_eq!(multi.rule, AttributionRule::ExactEdit);
+            assert_eq!(multi.classes, BTreeSet::from([*left, *right]));
+            let mut reversed = edits.to_vec();
+            reversed.reverse();
+            let reversed_multi = attribute_with_rule(
+                &diag("/crate/caller.rs", 40),
+                &Default::default(),
+                root,
+                &sites,
+                &reversed,
+                &BTreeSet::new(),
+                root,
+            );
+            assert_eq!(reversed_multi, multi, "input order changed attribution");
+            assert_eq!(
+                run(diag("/crate/caller.rs", 99)).rule,
+                AttributionRule::Unresolved
+            );
+        })
+        .expect("attribution fixture compiles");
     }
 
     /// **A caller-file diagnostic names the CALLEE that caused it.**
@@ -5032,6 +5145,7 @@ mod attribution_and_escapes {
             lo_line: 10,
             hi_line: 10,
             edit_id: "caller-edit".to_owned(),
+            site_kind: "seam-adapter",
             atom_ids: Vec::new(),
             atom_covered: false,
         }];
@@ -5093,6 +5207,7 @@ mod attribution_and_escapes {
             lo_line: 1,
             hi_line: 1,
             edit_id: "callee-edit".to_owned(),
+            site_kind: "subject-declaration",
             atom_ids: Vec::new(),
             atom_covered: false,
         }];
@@ -5152,6 +5267,7 @@ mod attribution_and_escapes {
                 lo_line: 10,
                 hi_line: 10,
                 edit_id: "reverted-edit".to_owned(),
+                site_kind: "seam-adapter",
                 atom_ids: Vec::new(),
                 atom_covered: false,
             }];

@@ -220,7 +220,29 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) unresolved_classes: String,
     pub(crate) degraded_output_receipt: String,
     pub(crate) per_arm_timers_status: String,
+    pub(crate) attribution_hits: AttributionHits,
     pub(crate) timings: RawBoundaryTimings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AttributionHits {
+    pub(crate) exact_edit: usize,
+    pub(crate) exact_seam: usize,
+    pub(crate) related_span: usize,
+    pub(crate) enclosing_region: usize,
+    pub(crate) unresolved: usize,
+}
+
+impl AttributionHits {
+    fn record(&mut self, rule: AttributionRule) {
+        match rule {
+            AttributionRule::ExactEdit => self.exact_edit += 1,
+            AttributionRule::ExactSeam => self.exact_seam += 1,
+            AttributionRule::RelatedSpan => self.related_span += 1,
+            AttributionRule::EnclosingRegion => self.enclosing_region += 1,
+            AttributionRule::Unresolved => self.unresolved += 1,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1392,8 +1414,8 @@ fn verify_and_revert(
                     ),
                 };
             for diagnostic in &novel {
-                let mut owners = attribute(
-                    std::slice::from_ref(diagnostic),
+                let first_attribution = attribute_with_rule(
+                    diagnostic,
                     &line_maps,
                     &observed_root,
                     &facts.emitted_sites,
@@ -1401,7 +1423,14 @@ fn verify_and_revert(
                     &reverted,
                     crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
                 );
-                let mut attribution = "standard";
+                let mut owners = first_attribution.classes;
+                let mut attribution = match first_attribution.rule {
+                    AttributionRule::RelatedSpan => "related-span",
+                    AttributionRule::ExactEdit
+                    | AttributionRule::ExactSeam
+                    | AttributionRule::EnclosingRegion
+                    | AttributionRule::Unresolved => "standard",
+                };
                 if owners.is_empty() {
                     let original_root = crate_dir.as_deref().unwrap_or(std::path::Path::new(""));
                     if let Some(original_line) =
@@ -1696,19 +1725,27 @@ fn verify_and_revert(
             break;
         }
 
-        let newly = attribute(
-            &novel,
-            // The map of the round whose program produced these diagnostics.
-            &line_maps,
-            &observed_root,
-            &facts.emitted_sites,
-            &planned_edit_sites,
-            &reverted,
-            crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
-        )
-        .difference(&reverted)
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
+        let mut attributed = std::collections::BTreeSet::new();
+        for diagnostic in &novel {
+            let result = attribute_with_rule(
+                diagnostic,
+                &line_maps,
+                &observed_root,
+                &facts.emitted_sites,
+                &planned_edit_sites,
+                &reverted,
+                crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+            );
+            facts
+                .raw_boundary_artifacts
+                .attribution_hits
+                .record(result.rule);
+            attributed.extend(result.classes);
+        }
+        let newly = attributed
+            .difference(&reverted)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         if newly.is_empty() {
             escalation = Some(format!(
                 "escalation-required: {} error(s) attributed to no rewritten \
@@ -2886,6 +2923,8 @@ pub(crate) struct EditSite {
     pub hi_line: usize,
     /// Stable plan-edit identity used only in atom coverage/receipts.
     pub edit_id: String,
+    /// Typed interval role used by attribution precedence.
+    pub site_kind: &'static str,
     /// Already-expanded subject dependency group.
     pub atom_ids: Vec<String>,
     /// False means another edit under this owner has no atom coverage, so the
@@ -3232,6 +3271,7 @@ fn edit_sites(
                 lo_line,
                 hi_line,
                 edit_id: edit_key.render(),
+                site_kind: edit.edit_kind,
                 atom_ids: edit.atom_ids.clone(),
                 atom_covered: !edit.atom_ids.is_empty()
                     && edit
@@ -3242,6 +3282,37 @@ fn edit_sites(
                         .is_some_and(|owner| !owners_with_uncovered_edits.contains(&owner)),
             });
         }
+    }
+    for interval in &planned.attribution_intervals {
+        let Some(text) = texts.get(&interval.file) else {
+            continue;
+        };
+        let file = match &interval.file {
+            plan::FileKey::Real(path) => path.display().to_string(),
+            plan::FileKey::Virtual(name) => name.clone(),
+        };
+        let (lo_line, hi_line) = line_span(text, interval.lo, interval.hi);
+        out.push(EditSite {
+            file,
+            owner_class: Some(interval.owner_class),
+            fn_path: interval.owner_path.clone(),
+            lo_line,
+            hi_line,
+            edit_id: format!(
+                "class={}|attribution={}:{}:{}|kind={}",
+                interval.owner_class.order_key(),
+                match &interval.file {
+                    plan::FileKey::Real(path) => path.display().to_string(),
+                    plan::FileKey::Virtual(name) => name.clone(),
+                },
+                interval.lo,
+                interval.hi,
+                interval.kind,
+            ),
+            site_kind: interval.kind,
+            atom_ids: Vec::new(),
+            atom_covered: false,
+        });
     }
     out
 }
@@ -3436,32 +3507,63 @@ fn e1_call_site_not_adapted(diagnostic: &verify::Diag) -> bool {
     e1_diagnostic_site(diagnostic) == E1DiagnosticSite::CallBoundary
 }
 
-fn attribute(
-    diags: &[verify::Diag],
-    // **I-31**: emitted→original line translation, per file, produced by the
-    // splicer that emitted this round. Without it the comparison below matches
-    // a line in the EMITTED program against ranges measured in the ORIGINAL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttributionRule {
+    ExactEdit,
+    ExactSeam,
+    RelatedSpan,
+    EnclosingRegion,
+    Unresolved,
+}
+
+impl AttributionRule {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::ExactEdit,
+        Self::ExactSeam,
+        Self::RelatedSpan,
+        Self::EnclosingRegion,
+        Self::Unresolved,
+    ];
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::ExactEdit => "exact-edit",
+            Self::ExactSeam => "exact-seam",
+            Self::RelatedSpan => "related-span",
+            Self::EnclosingRegion => "enclosing-region",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AttributionResult {
+    pub(crate) classes: std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    pub(crate) rule: AttributionRule,
+}
+
+fn seam_site_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "seam-adapter"
+            | "seam-site"
+            | "body-adapter"
+            | "pair-raw-view"
+            | "address-observation"
+            | "c9-mark"
+            | "raw-boundary-atom"
+    )
+}
+
+pub(crate) fn attribute_with_rule(
+    diagnostic: &verify::Diag,
     line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
     observed_root: &std::path::Path,
     sites: &[EmittedSite],
     edits: &[EditSite],
     reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     original_root: &std::path::Path,
-) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
-    // **ONLY THE EDITS THIS ROUND ACTUALLY APPLIED.**
-    //
-    // `edit_sites` is built once from the whole plan, but `render` keeps an
-    // edit only while its direct owner class is live. Attributing through
-    // the unfiltered list is therefore a SECOND derivation of "which edits are
-    // live", and the two diverge the moment anything is reverted: a stale edit
-    // matches a later round's diagnostic, contributes only an already-reverted
-    // owner, short-circuits the extent pass below, and is then removed by the
-    // caller's `.difference(&reverted)` — leaving the diagnostic attributed to
-    // nobody and sending a convergent run to bisect.
-    //
-    // Two derivations assumed identical is this module's founding defect class
-    // (it cost a brotli sweep when `candidates` and `emitted_sites` diverged),
-    // so attribution filters by the SAME predicate `render` filters by.
+) -> AttributionResult {
     let edits: Vec<&EditSite> = edits
         .iter()
         .filter(|edit| {
@@ -3469,15 +3571,10 @@ fn attribute(
                 .is_some_and(|class| !reverted.contains(&class))
         })
         .collect();
-    // The SAME canonicalizer as the differential gate, each side against its own
-    // root: sites were recorded in the original tree, diagnostics come from the
-    // temp copy. A second normalization here would drift attribution away from
-    // the gate — the same defect class, one layer over.
-    //
-    // The single-file shortcut is computed over the UNION of both site kinds:
-    // computing it over `sites` alone would let a caller-file edit be matched
-    // file-blind whenever the subject functions happen to share one file, which
-    // is precisely the multi-file case this repair is for.
+    let sites = sites
+        .iter()
+        .filter(|site| !reverted.contains(&site.owner_class))
+        .collect::<Vec<_>>();
     let single_file = {
         let mut files: Vec<&str> = sites
             .iter()
@@ -3488,10 +3585,6 @@ fn attribute(
         files.dedup();
         files.len() <= 1
     };
-    let mut owners = std::collections::BTreeSet::new();
-    // Crate-relative keys, so a diagnostic's file can find its map: the maps
-    // are keyed by the ORIGINAL path, the diagnostic names a path in the
-    // materialized copy.
     let maps_by_rel: std::collections::BTreeMap<String, &apply::LineMap> = line_maps
         .iter()
         .filter_map(|(key, map)| match key {
@@ -3502,49 +3595,108 @@ fn attribute(
             plan::FileKey::Virtual(name) => Some((name.clone(), map)),
         })
         .collect();
-    for diag in diags {
-        let diag_rel = verify::crate_relative(&diag.file, observed_root);
-        // **THE TRANSLATION** (I-31). `diag.line` indexes the EMITTED document;
-        // every range below was measured in the ORIGINAL. `render` kept the two
-        // within a line, so this was invisible for the whole span era;
-        // `pprust` reprints whole functions and the drift reaches −36 on
-        // libtree, which silently reverts functions that did nothing wrong.
-        //
-        // Single-file crates (all 20, C-20) have exactly one map, so the
-        // lookup falls back to it rather than failing on a path mismatch —
-        // and a MISSING map means "no splice happened", where the identity is
-        // correct, not a reason to skip attribution.
-        let diag_line = maps_by_rel
-            .get(&diag_rel)
+    let translate = |file: &str, line: usize| {
+        let relative = verify::crate_relative(file, observed_root);
+        let line = maps_by_rel
+            .get(&relative)
             .or(if maps_by_rel.len() == 1 {
                 maps_by_rel.values().next()
             } else {
                 None
             })
-            .map_or(diag.line, |map| map.to_original(diag.line));
-        let mut by_edit = std::collections::BTreeSet::new();
-        for edit in &edits {
-            let same_file =
-                single_file || verify::crate_relative(&edit.file, original_root) == diag_rel;
-            if same_file && edit.lo_line <= diag_line && diag_line <= edit.hi_line {
-                if let Some(owner_class) = edit.owner_class {
-                    by_edit.insert(owner_class);
-                }
-            }
-        }
-        if !by_edit.is_empty() {
-            owners.extend(by_edit);
-            continue;
-        }
-        for site in sites {
-            let same_file =
-                single_file || verify::crate_relative(&site.file, original_root) == diag_rel;
-            if same_file && site.lo_line <= diag_line && diag_line <= site.hi_line {
-                owners.insert(site.owner_class);
-            }
+            .map_or(line, |map| map.to_original(line));
+        (relative, line)
+    };
+    let exact_edits = |file: &str, line: usize, seam: bool| {
+        let (relative, line) = translate(file, line);
+        edits
+            .iter()
+            .filter(|edit| seam_site_kind(edit.site_kind) == seam)
+            .filter(|edit| {
+                single_file || verify::crate_relative(&edit.file, original_root) == relative
+            })
+            .filter(|edit| edit.lo_line <= line && line <= edit.hi_line)
+            .filter_map(|edit| edit.owner_class)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let exact_sites = |file: &str, line: usize| {
+        let (relative, line) = translate(file, line);
+        sites
+            .iter()
+            .filter(|site| {
+                single_file || verify::crate_relative(&site.file, original_root) == relative
+            })
+            .filter(|site| site.lo_line <= line && line <= site.hi_line)
+            .map(|site| site.owner_class)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    let ordinary = exact_edits(&diagnostic.file, diagnostic.line, false);
+    if !ordinary.is_empty() {
+        return AttributionResult {
+            classes: ordinary,
+            rule: AttributionRule::ExactEdit,
+        };
+    }
+    let seam = exact_edits(&diagnostic.file, diagnostic.line, true);
+    if !seam.is_empty() {
+        return AttributionResult {
+            classes: seam,
+            rule: AttributionRule::ExactSeam,
+        };
+    }
+    let mut related_classes = std::collections::BTreeSet::new();
+    for related in &diagnostic.related {
+        related_classes.extend(exact_edits(&related.file, related.line, false));
+        related_classes.extend(exact_edits(&related.file, related.line, true));
+        if related_classes.is_empty() {
+            related_classes.extend(exact_sites(&related.file, related.line));
         }
     }
-    owners
+    if !related_classes.is_empty() {
+        return AttributionResult {
+            classes: related_classes,
+            rule: AttributionRule::RelatedSpan,
+        };
+    }
+    let enclosing = exact_sites(&diagnostic.file, diagnostic.line);
+    if enclosing.len() == 1 {
+        return AttributionResult {
+            classes: enclosing,
+            rule: AttributionRule::EnclosingRegion,
+        };
+    }
+    AttributionResult {
+        classes: std::collections::BTreeSet::new(),
+        rule: AttributionRule::Unresolved,
+    }
+}
+
+fn attribute(
+    diags: &[verify::Diag],
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    sites: &[EmittedSite],
+    edits: &[EditSite],
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    original_root: &std::path::Path,
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
+    let mut classes = std::collections::BTreeSet::new();
+    for diagnostic in diags {
+        classes.extend(
+            attribute_with_rule(
+                diagnostic,
+                line_maps,
+                observed_root,
+                sites,
+                edits,
+                reverted,
+                original_root,
+            )
+            .classes,
+        );
+    }
+    classes
 }
 
 /// Where a rewritten subject's own function lives, for attributing a verify
@@ -4596,6 +4748,7 @@ fn finish_decide<'tcx>(
         unresolved_classes: bridge_receipt::unresolved_class_header(),
         degraded_output_receipt: "not-applicable".to_owned(),
         per_arm_timers_status: "queued-no-free-column".to_owned(),
+        attribution_hits: AttributionHits::default(),
         timings: RawBoundaryTimings {
             site_derivation_wall_s: format!("{raw_boundary_site_derivation_wall_s:.6}"),
             retention_fixpoint_wall_s: format!("{retention_fixpoint_wall_s:.6}"),
@@ -6880,6 +7033,7 @@ mod raw_boundary_atom_tests {
             lo_line: line,
             hi_line: line,
             edit_id: id.to_owned(),
+            site_kind: "raw-boundary-atom",
             atom_ids: group.iter().map(|id| (*id).to_owned()).collect(),
             atom_covered: covered,
         }

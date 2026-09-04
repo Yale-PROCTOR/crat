@@ -284,6 +284,8 @@ pub(crate) enum SeamFamily {
 pub(crate) struct SeamEdit {
     /// The **argument expression's** span, in the CALLER's file.
     pub span: Span,
+    /// Whole call expression used only for class attribution.
+    pub call_span: Span,
     pub replacement: String,
     /// Direct identity of the converted signature class. This is the sole
     /// ownership key used by verification; `owner_fn` is display-only.
@@ -2715,6 +2717,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                         }
                         plan.edits.push(SeamEdit {
                             span: pos.span,
+                            call_span: site.span,
                             replacement: candidate.replacement.clone(),
                             owner_class: SignatureClassId::of(*callee),
                             bridge: BridgeSitePlan {
@@ -2858,6 +2861,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         };
         plan.edits.push(SeamEdit {
             span: site.span,
+            call_span: site.call_span,
             replacement,
             owner_class: SignatureClassId::of(owner_did),
             bridge: BridgeSitePlan {
@@ -2930,6 +2934,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         }
         plan.edits.push(SeamEdit {
             span: pair.span,
+            call_span: pair.span,
             replacement,
             owner_class: SignatureClassId::of(pair.callee),
             bridge: BridgeSitePlan {
@@ -2990,6 +2995,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             .unwrap_or_default();
         plan.edits.push(SeamEdit {
             span: site.span,
+            call_span: site.span,
             replacement,
             owner_class: SignatureClassId::of(site.node.0),
             bridge: BridgeSitePlan {

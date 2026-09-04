@@ -370,6 +370,16 @@ pub(crate) struct ClassIntervalCollision {
     pub right_kind: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ClassAttributionInterval {
+    pub owner_class: SignatureClassId,
+    pub owner_path: String,
+    pub file: FileKey,
+    pub lo: usize,
+    pub hi: usize,
+    pub kind: &'static str,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ClassFinalization {
     pub classes: BTreeMap<SignatureClassId, SignatureClassPlan>,
@@ -721,6 +731,9 @@ pub(crate) fn finalize_signature_classes(
         });
         !edits.is_empty()
     });
+    planned
+        .attribution_intervals
+        .retain(|site| finalization.classes[&site.owner_class].is_ready());
     planned.class_finalization = finalization;
 }
 
@@ -770,6 +783,9 @@ pub(crate) struct Plan {
     pub preclass_sites: Vec<ClassSite>,
     /// Final signature-class transaction inventory.
     pub class_finalization: ClassFinalization,
+    /// Whole-call/generated-site intervals used for diagnostics that land
+    /// outside an edited argument or declaration.
+    pub attribution_intervals: Vec<ClassAttributionInterval>,
 }
 
 impl Plan {
@@ -1524,6 +1540,25 @@ pub(crate) fn plan(
         preclass_sites.push(site);
     }
 
+    let mut attribution_intervals = table
+        .seams
+        .edits
+        .iter()
+        .filter_map(|edit| {
+            let (file, lo, hi) = span_to_loc(edit.call_span).ok()?;
+            Some(ClassAttributionInterval {
+                owner_class: edit.owner_class,
+                owner_path: edit.owner_fn.clone(),
+                file,
+                lo,
+                hi,
+                kind: "seam-site",
+            })
+        })
+        .collect::<Vec<_>>();
+    attribution_intervals.sort();
+    attribution_intervals.dedup();
+
     Plan {
         by_file,
         unplaceable,
@@ -1533,6 +1568,7 @@ pub(crate) fn plan(
         len_const_item: None,
         preclass_sites,
         class_finalization: ClassFinalization::default(),
+        attribution_intervals,
     }
 }
 

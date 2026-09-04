@@ -143,6 +143,7 @@ pub(crate) struct RawBoundarySiteFact {
     pub callee_local: Option<LocalDefId>,
     pub direction: BoundaryDirection,
     pub source_span: Span,
+    pub call_span: Span,
     pub source_site: String,
     pub source_shape: &'static str,
     pub source_type: String,
@@ -252,6 +253,7 @@ impl RawBoundarySiteFacts {
                     callee_local: None,
                     direction: BoundaryDirection::OutgoingArgument,
                     source_span: fact.argument_span,
+                    call_span: fact.call_span,
                     source_site: tcx
                         .sess
                         .source_map()
@@ -305,6 +307,7 @@ impl RawBoundarySiteFacts {
                             callee_local: Some(callee),
                             direction: BoundaryDirection::OutgoingArgument,
                             source_span: argument.span,
+                            call_span: call.span,
                             source_site: tcx
                                 .sess
                                 .source_map()
@@ -1226,6 +1229,7 @@ pub(crate) enum RawBoundaryDisposition {
 #[derive(Clone, Debug)]
 pub(crate) struct RawBoundaryRenderSite {
     pub span: Span,
+    pub call_span: Span,
     pub target: RawTargetType,
     pub box_slice: bool,
     pub source_shape: &'static str,
@@ -1556,6 +1560,7 @@ impl RawBoundaryDispositionIndex {
                 site.key.clone(),
                 RawBoundaryRenderSite {
                     span: site.source_span,
+                    call_span: site.call_span,
                     target: site.target.clone(),
                     box_slice,
                     source_shape: site.source_shape,

@@ -5945,6 +5945,7 @@ mod arm2_witnesses {
         rustc_span::create_default_session_globals_then(|| {
             let edit = |family| super::super::decision::seam::SeamEdit {
                 span: DUMMY_SP,
+                call_span: DUMMY_SP,
                 replacement: String::new(),
                 owner_class: super::super::bridge_receipt::SignatureClassId::of(
                     rustc_hir::def_id::CRATE_DEF_ID,
