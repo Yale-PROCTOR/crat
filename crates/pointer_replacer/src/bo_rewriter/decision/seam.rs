@@ -2745,6 +2745,7 @@ fn argument_form(
 fn complete_interface_inventory(
     facts: &super::emitability::EmitabilityFacts,
     table: &DecisionTable,
+    c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
     lifetime_eligibility: &super::lifetime::LifetimeEligibility,
     decisions: &FxHashMap<(LocalDefId, HirId), &Decision>,
     params: &FxHashMap<(LocalDefId, usize), (LocalDefId, HirId)>,
@@ -2758,6 +2759,9 @@ fn complete_interface_inventory(
             sites.iter().find(|site| {
                 site.caller == mir_site.caller && call_spans_match(site.span, mir_site.span)
             })
+        });
+        let c9_positions = hir_site.map_or_else(rustc_hash::FxHashSet::default, |site| {
+            super::co_conversion::retained_c9_shared_params(c9_marks, site, mir_site.callee)
         });
         for index in 0..mir_site.argument_count {
             let Some(expected) = params
@@ -2785,7 +2789,9 @@ fn complete_interface_inventory(
                 )
             });
 
-            let disposition = if let Some(disposition) =
+            let disposition = if c9_positions.contains(&index) {
+                "c9-snapshot"
+            } else if let Some(disposition) =
                 existing_interface_disposition(plan, mir_site.caller, mir_site.callee, index)
             {
                 disposition
@@ -4131,6 +4137,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     complete_interface_inventory(
         facts,
         table,
+        c9_marks,
         lifetime_eligibility,
         &decision_of,
         &param_key,
