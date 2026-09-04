@@ -1570,6 +1570,49 @@ pub(crate) fn plan(
             waiver_id: site.bridge.waiver_id.clone(),
         }
     }));
+    if let Some(exposure) = table.exposure.as_ref() {
+        for seed in exposure.static_fnptr_seeds() {
+            if !matches!(
+                exposure.plan(seed.function),
+                super::decision::exposure::ExposureSurfacePlan::PositiveSeedShim
+                    | super::decision::exposure::ExposureSurfacePlan::FnPtrRawWrapper
+            ) {
+                continue;
+            }
+            let owner = SignatureClassId::of(seed.function);
+            let bridge = BridgeSitePlan::local(
+                seed.owner,
+                seed.function,
+                Arm::Surface.key(),
+                format!("static:{}", seed.location_key()),
+                "surface-static-fnptr-wrapper",
+            );
+            let site = match span_to_loc(seed.span) {
+                Ok((file, lo, hi)) => ClassSite {
+                    key: bridge.materialize(
+                        owner,
+                        file_key_label(&file),
+                        u32::try_from(lo).unwrap_or(u32::MAX),
+                        u32::try_from(hi).unwrap_or(u32::MAX),
+                    ),
+                    edit_key: "-".to_owned(),
+                    state: ClassSiteState::ZeroSyntaxReady,
+                    extent: BridgeExtentKind::None,
+                    retention: BridgeRetentionTier::None,
+                    waiver_id: None,
+                },
+                Err(reason) => ClassSite {
+                    key: bridge.materialize(owner, "<unplaceable>".to_owned(), 0, 0),
+                    edit_key: "-".to_owned(),
+                    state: ClassSiteState::Dropped(reason.to_owned()),
+                    extent: BridgeExtentKind::None,
+                    retention: BridgeRetentionTier::None,
+                    waiver_id: None,
+                },
+            };
+            preclass_sites.push(site);
+        }
+    }
     for proof in &table.seams.overlap_proofs {
         use crate::bo_rewriter::decision::a5_site_proof::A5SiteProofVerdict;
         let owner = SignatureClassId::of(proof.callee);
@@ -1705,6 +1748,32 @@ pub(crate) fn plan(
             })
         })
         .collect::<Vec<_>>();
+    if let Some(exposure) = table.exposure.as_ref() {
+        attribution_intervals.extend(exposure.static_fnptr_seeds().iter().filter_map(|seed| {
+            if !matches!(
+                exposure.plan(seed.function),
+                super::decision::exposure::ExposureSurfacePlan::PositiveSeedShim
+                    | super::decision::exposure::ExposureSurfacePlan::FnPtrRawWrapper
+            ) {
+                return None;
+            }
+            let (file, lo, hi) = span_to_loc(seed.span).ok()?;
+            let owner_path = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.fn_did == seed.function)
+                .map(|(subject, _)| owner_of(subject))
+                .unwrap_or_else(|| format!("local-def-{}", seed.function.local_def_index.as_u32()));
+            Some(ClassAttributionInterval {
+                owner_class: SignatureClassId::of(seed.function),
+                owner_path,
+                file,
+                lo,
+                hi,
+                kind: "static-fnptr-site",
+            })
+        }));
+    }
     attribution_intervals.sort();
     attribution_intervals.dedup();
 

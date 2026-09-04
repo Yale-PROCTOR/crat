@@ -6601,6 +6601,160 @@ fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
     super::bridge_receipt::reconcile_bridge_events(&events).expect("BR-W3 bridge events reconcile");
 }
 
+/// BR-W4 RED: a function item reified inside a static descriptor table must
+/// keep the table's raw function-pointer type and route through the existing
+/// raw-wrapper/safe-inner surface.
+#[test]
+fn br_w4_static_table_function_item_uses_atomic_raw_wrapper_surface() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub type Callback = unsafe extern \"C\" fn(*mut i32) -> i32;\n\
+         pub unsafe extern \"C\" fn target(p: *mut i32) -> i32 { *p }\n\
+         pub static TABLE: [Option<Callback>; 1] = [Some(target as Callback)];\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
+        panic!("BR-W4 static-table fixture must emit: {outcome:#?}");
+    };
+    assert!(
+        source.contains("fn target(p: *mut i32) -> i32"),
+        "the table-visible wrapper keeps the raw signature:\n{source}"
+    );
+    assert!(
+        source.contains("fn __crat_safe_target(p: &i32) -> i32"),
+        "the converted body must live behind the raw wrapper:\n{source}"
+    );
+    assert!(
+        source.contains("Some(target as Callback)"),
+        "the static table must continue to name the raw wrapper:\n{source}"
+    );
+    assert!(
+        !source.contains("Some(__crat_safe_target as Callback)"),
+        "the safe inner may never be cast back to the raw table type:\n{source}"
+    );
+    let wrapper_events = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "surface-static-fnptr-wrapper")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wrapper_events.len(),
+        2,
+        "one plan and terminal static-site receipt: {:#?}",
+        raw_boundary_artifacts.bridge_events
+    );
+    assert!(wrapper_events.iter().all(|event| {
+        matches!(
+            event.site.callee,
+            super::bridge_receipt::BridgeCalleeId::Local(callee)
+                if event.site.owner_class.local_def_id() == callee
+        )
+    }));
+    super::bridge_receipt::reconcile_bridge_events(&raw_boundary_artifacts.bridge_events)
+        .expect("BR-W4 bridge events reconcile");
+}
+
+#[test]
+fn br_w4_const_mir_static_table_cardinality_is_exactly_207() {
+    let mut source = String::from(
+        "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub type Callback = unsafe extern \"C\" fn(*mut i32) -> i32;\n",
+    );
+    for index in 0..207 {
+        source.push_str(&format!(
+            "pub unsafe extern \"C\" fn target_{index}(p: *mut i32) -> i32 {{ *p + {index} }}\n"
+        ));
+    }
+    source.push_str("pub static TABLE: [Option<Callback>; 207] = [\n");
+    for index in 0..207 {
+        source.push_str(&format!("Some(target_{index} as Callback),\n"));
+    }
+    source.push_str("];\n");
+
+    let (roots, members, seeds, unique_functions, unique_owners) =
+        ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+            let program = super::collect_program(tcx);
+            let web = super::decision::lifetime::derive_fn_ptr_web(
+                &program,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )
+            .expect("attested fn-pointer web");
+            let seeds = web.static_seeds();
+            (
+                web.root_count(),
+                web.member_count(),
+                seeds.len(),
+                seeds
+                    .iter()
+                    .map(|seed| seed.function.local_def_index.as_u32())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                seeds
+                    .iter()
+                    .map(|seed| seed.owner.local_def_index.as_u32())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+            )
+        })
+        .expect("207-entry static table compiles");
+    assert_eq!((roots, members, seeds), (207, 207, 207));
+    assert_eq!(
+        unique_functions, 207,
+        "one exact local function ID per entry"
+    );
+    assert_eq!(
+        unique_owners, 1,
+        "all entries belong to the one static initializer"
+    );
+}
+
+#[test]
+fn br_w4_generated_safe_inner_name_collision_is_typed_and_held() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub type Callback = unsafe extern \"C\" fn(*mut i32) -> i32;\n\
+         pub unsafe extern \"C\" fn target(p: *mut i32) -> i32 { *p }\n\
+         pub fn __crat_safe_target() {}\n\
+         pub static TABLE: [Option<Callback>; 1] = [Some(target as Callback)];\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Degraded {
+        reason,
+        source: unmodified,
+        ..
+    } = outcome
+    else {
+        panic!("a generated-name collision must hold/degrade: {outcome:#?}");
+    };
+    assert!(
+        reason.contains("generated inner name collides: __crat_safe_target"),
+        "{reason}"
+    );
+    assert_eq!(
+        unmodified, source,
+        "collision fallback must preserve input bytes"
+    );
+}
+
 /// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,
 /// but E2-FN has no consumer yet. The lifetime producer must receive the intact
 /// summary object rather than an A5-shaped projection of it.

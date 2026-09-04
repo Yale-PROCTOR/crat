@@ -10,7 +10,7 @@ use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
 use rustc_span::symbol::sym;
 use sha2::{Digest, Sha256};
 
-use super::lifetime::FnPtrWeb;
+use super::lifetime::{FnPtrWeb, StaticFnPtrSeed};
 use crate::utils::rustc::RustProgram;
 
 pub(crate) const EXPOSURE_INPUT_VERSION: &str = "raw-boundary-exposure-seed/v1";
@@ -263,6 +263,7 @@ pub(crate) struct FunctionExposure {
 #[derive(Clone, Debug)]
 pub(crate) struct ExposurePolicy {
     functions: Vec<FunctionExposure>,
+    static_fnptr_seeds: Vec<StaticFnPtrSeed>,
     seed_counts: SeedCounts,
     pub(crate) configured_input_sha256: String,
     pub(crate) manifest_sha256: String,
@@ -295,6 +296,7 @@ impl ExposurePolicy {
         functions.sort_by(|left, right| left.path.cmp(&right.path));
         Self {
             functions,
+            static_fnptr_seeds: web.map_or_else(Vec::new, |web| web.static_seeds().to_vec()),
             seed_counts: seed.counts(),
             configured_input_sha256: seed.configured_input_sha256.clone(),
             manifest_sha256: seed.manifest_sha256.clone(),
@@ -310,6 +312,10 @@ impl ExposurePolicy {
 
     pub(crate) fn seed_counts(&self) -> SeedCounts {
         self.seed_counts
+    }
+
+    pub(crate) fn static_fnptr_seeds(&self) -> &[StaticFnPtrSeed] {
+        &self.static_fnptr_seeds
     }
 
     pub(crate) fn receipts_tsv(&self) -> String {

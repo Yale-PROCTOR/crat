@@ -15,9 +15,10 @@ use rustc_hir::{
     intravisit::{Visitor, walk_expr},
 };
 use rustc_middle::{
-    mir::{RETURN_PLACE, TerminatorKind},
+    mir::{self, Location, RETURN_PLACE, StatementKind, TerminatorKind},
     ty::TyKind,
 };
+use rustc_span::Span;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -986,8 +987,19 @@ pub(crate) fn plan_function(
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WebDerivation {
     AdjustedFnPtr,
-    Direct { caller: LocalDefId, block: u32 },
-    Andersen { caller: LocalDefId, block: u32 },
+    ConstMir {
+        owner: LocalDefId,
+        block: u32,
+        statement: usize,
+    },
+    Direct {
+        caller: LocalDefId,
+        block: u32,
+    },
+    Andersen {
+        caller: LocalDefId,
+        block: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -995,6 +1007,22 @@ pub(crate) struct FnPtrWeb {
     roots: FxHashSet<LocalDefId>,
     members: FxHashSet<LocalDefId>,
     reasons: FxHashMap<LocalDefId, WebDerivation>,
+    static_seeds: Vec<StaticFnPtrSeed>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StaticFnPtrSeed {
+    pub(crate) owner: LocalDefId,
+    pub(crate) function: LocalDefId,
+    pub(crate) block: u32,
+    pub(crate) statement: usize,
+    pub(crate) span: Span,
+}
+
+impl StaticFnPtrSeed {
+    pub(crate) fn location_key(&self) -> String {
+        format!("bb{}:s{}", self.block, self.statement)
+    }
 }
 
 impl FnPtrWeb {
@@ -1008,6 +1036,10 @@ impl FnPtrWeb {
 
     pub(crate) fn contains(&self, function: LocalDefId) -> bool {
         self.members.contains(&function)
+    }
+
+    pub(crate) fn static_seeds(&self) -> &[StaticFnPtrSeed] {
+        &self.static_seeds
     }
 
     pub(crate) fn root_count(&self) -> usize {
@@ -1049,6 +1081,14 @@ impl FnPtrWeb {
                 let name = tcx.item_name(did.to_def_id());
                 match reason {
                     WebDerivation::AdjustedFnPtr => format!("root\t{name}\tadjusted-fnptr"),
+                    WebDerivation::ConstMir {
+                        owner,
+                        block,
+                        statement,
+                    } => format!(
+                        "root\t{name}\tconst-mir:{}:bb{block}:s{statement}",
+                        tcx.item_name(owner.to_def_id())
+                    ),
                     WebDerivation::Direct { caller, block } => format!(
                         "closure\t{name}\tdirect:{}:bb{block}",
                         tcx.item_name(caller.to_def_id())
@@ -1115,11 +1155,106 @@ fn collect_fn_ptr_roots(program: &RustProgram<'_>) -> FxHashSet<LocalDefId> {
     collector.roots
 }
 
+fn collect_const_mir_fn_ptr_seeds(program: &RustProgram<'_>) -> Vec<StaticFnPtrSeed> {
+    struct OperandCollector<'a, 'tcx> {
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+        body: &'a mir::Body<'tcx>,
+        owner: LocalDefId,
+        local_functions: &'a FxHashSet<LocalDefId>,
+        hits: &'a mut Vec<StaticFnPtrSeed>,
+    }
+
+    impl<'tcx> mir::visit::Visitor<'tcx> for OperandCollector<'_, 'tcx> {
+        fn visit_operand(&mut self, operand: &mir::Operand<'tcx>, location: Location) {
+            if let TyKind::FnDef(def_id, _) = operand.ty(self.body, self.tcx).kind()
+                && let Some(function) = def_id.as_local()
+                && self.local_functions.contains(&function)
+            {
+                self.hits.push(StaticFnPtrSeed {
+                    owner: self.owner,
+                    function,
+                    block: location.block.as_u32(),
+                    statement: location.statement_index,
+                    span: self.body.source_info(location).span,
+                });
+            }
+            self.super_operand(operand, location);
+        }
+    }
+
+    let local_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
+    let mut hits = Vec::new();
+    for owner in program.tcx.hir_body_owners().filter(|owner| {
+        matches!(
+            program.tcx.def_kind(*owner),
+            DefKind::Static { .. }
+                | DefKind::Const
+                | DefKind::AssocConst
+                | DefKind::AnonConst
+                | DefKind::InlineConst
+        )
+    }) {
+        let body_ref = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(owner)
+            .borrow();
+        let body = &*body_ref;
+        let mut collector = OperandCollector {
+            tcx: program.tcx,
+            body,
+            owner,
+            local_functions: &local_functions,
+            hits: &mut hits,
+        };
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            for (statement_index, statement) in data.statements.iter().enumerate() {
+                let StatementKind::Assign(assignment) = &statement.kind else {
+                    continue;
+                };
+                mir::visit::Visitor::visit_rvalue(
+                    &mut collector,
+                    &assignment.1,
+                    Location {
+                        block,
+                        statement_index,
+                    },
+                );
+            }
+        }
+    }
+    hits.sort_by_key(|seed| {
+        (
+            seed.owner.local_def_index.as_u32(),
+            seed.span.lo().0,
+            seed.span.hi().0,
+            seed.function.local_def_index.as_u32(),
+        )
+    });
+    hits.dedup_by_key(|seed| {
+        (
+            seed.owner.local_def_index.as_u32(),
+            seed.span.lo().0,
+            seed.span.hi().0,
+            seed.function.local_def_index.as_u32(),
+        )
+    });
+    hits
+}
+
 fn web_reason_order(reason: &WebDerivation) -> (u8, u32, u32) {
     match *reason {
         WebDerivation::AdjustedFnPtr => (0, 0, 0),
-        WebDerivation::Direct { caller, block } => (1, caller.local_def_index.as_u32(), block),
-        WebDerivation::Andersen { caller, block } => (2, caller.local_def_index.as_u32(), block),
+        WebDerivation::ConstMir {
+            owner,
+            block,
+            statement,
+        } => (
+            1,
+            owner.local_def_index.as_u32(),
+            block.saturating_add(u32::try_from(statement).unwrap_or(u32::MAX)),
+        ),
+        WebDerivation::Direct { caller, block } => (2, caller.local_def_index.as_u32(), block),
+        WebDerivation::Andersen { caller, block } => (3, caller.local_def_index.as_u32(), block),
     }
 }
 
@@ -1158,7 +1293,9 @@ pub(crate) fn derive_fn_ptr_web(
         return Err(LifetimeFailure::FnPtrWebHeld);
     }
 
-    let roots = collect_fn_ptr_roots(program);
+    let mut roots = collect_fn_ptr_roots(program);
+    let static_seeds = collect_const_mir_fn_ptr_seeds(program);
+    roots.extend(static_seeds.iter().map(|seed| seed.function));
     let call_world = resolve_closed_world_call_world(program, attestation);
     let mut members = FxHashSet::default();
     let mut reasons = roots
@@ -1166,6 +1303,16 @@ pub(crate) fn derive_fn_ptr_web(
         .copied()
         .map(|root| (root, WebDerivation::AdjustedFnPtr))
         .collect::<FxHashMap<_, _>>();
+    for seed in &static_seeds {
+        reasons.insert(
+            seed.function,
+            WebDerivation::ConstMir {
+                owner: seed.owner,
+                block: seed.block,
+                statement: seed.statement,
+            },
+        );
+    }
     let mut pending = roots.iter().copied().collect::<Vec<_>>();
     pending.sort_unstable_by_key(|did| std::cmp::Reverse(did.local_def_index.as_u32()));
 
@@ -1199,6 +1346,7 @@ pub(crate) fn derive_fn_ptr_web(
         roots,
         members,
         reasons,
+        static_seeds,
     })
 }
 
@@ -1238,6 +1386,14 @@ impl FnPtrWebDifferential {
 fn derivation_text(tcx: rustc_middle::ty::TyCtxt<'_>, reason: &WebDerivation) -> String {
     match *reason {
         WebDerivation::AdjustedFnPtr => "adjusted-fnptr".to_owned(),
+        WebDerivation::ConstMir {
+            owner,
+            block,
+            statement,
+        } => format!(
+            "const-mir:{}:bb{block}:s{statement}",
+            tcx.def_path_str(owner)
+        ),
         WebDerivation::Direct { caller, block } => {
             format!("direct:{}:bb{block}", tcx.def_path_str(caller))
         }
