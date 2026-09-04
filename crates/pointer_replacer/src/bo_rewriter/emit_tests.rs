@@ -5857,17 +5857,17 @@ fn e_adapt_w3_nested_use_then_seam_composes_at_the_ast_choke_point() {
     );
     let attempt = e2_attempt(&src, &|_| {});
     assert!(
-        !attempt
+        attempt
             .emission
             .plan
             .class_finalization
             .collisions
             .is_empty(),
-        "the cross-class nested interval must be counted and listed"
+        "strict bridge-over-use nesting is composition, not a cross-class collision"
     );
     assert!(
-        attempt.emission.files.is_empty(),
-        "a cross-class interval collision holds both classes; no edit order is selected"
+        !attempt.emission.files.is_empty(),
+        "inner-first composition should leave an emitted plan"
     );
 }
 

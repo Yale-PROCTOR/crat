@@ -1240,12 +1240,13 @@ fn verify_and_revert(
     // the seed is already the ruled definition.
     let files_edited = files.len();
     let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
-    let nested_seam_composition = emission_plan.by_file.values().any(|edits| {
-        edits
-            .iter()
-            .enumerate()
-            .any(|(index, _)| nested_kind_under_seam(edits, index))
-    });
+    let nested_seam_composition = !table.seams.pair_raw_calls.is_empty()
+        || emission_plan.by_file.values().any(|edits| {
+            edits
+                .iter()
+                .enumerate()
+                .any(|(index, _)| nested_kind_under_seam(edits, index))
+        });
     let e1_edit_contexts = if census_once {
         e1_edit_contexts(&emission_plan, &emission_texts)
     } else {

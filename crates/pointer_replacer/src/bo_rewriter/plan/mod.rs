@@ -457,6 +457,62 @@ fn nested_ast_composition(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct A5ProofResolution {
+    kind: &'static str,
+    state: ClassSiteState,
+    retention: BridgeRetentionTier,
+    waiver_id: Option<String>,
+}
+
+fn a5_proof_resolution(
+    verdict: super::decision::a5_site_proof::A5SiteProofVerdict,
+    pair: Option<(
+        super::decision::co_conversion::PairRole,
+        super::decision::co_conversion::PairTier,
+    )>,
+    reason: &str,
+) -> A5ProofResolution {
+    use super::decision::{
+        a5_site_proof::A5SiteProofVerdict,
+        co_conversion::{PairRole, PairTier},
+    };
+    match (verdict, pair) {
+        (A5SiteProofVerdict::Clear, _) => A5ProofResolution {
+            kind: "a5-site-proof-clear",
+            state: ClassSiteState::ZeroSyntaxReady,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        },
+        (
+            A5SiteProofVerdict::Overlapping | A5SiteProofVerdict::Undeterminable,
+            Some((PairRole::RawView, PairTier::T2)),
+        ) => A5ProofResolution {
+            kind: "a5-site-proof-t2-fallback",
+            state: ClassSiteState::ZeroSyntaxReady,
+            retention: BridgeRetentionTier::T2,
+            waiver_id: Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+        },
+        (
+            A5SiteProofVerdict::Overlapping | A5SiteProofVerdict::Undeterminable,
+            Some((PairRole::Primary, PairTier::None)),
+        ) => A5ProofResolution {
+            kind: "a5-site-proof-pair-primary",
+            state: ClassSiteState::ZeroSyntaxReady,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        },
+        (A5SiteProofVerdict::Overlapping | A5SiteProofVerdict::Undeterminable, _) => {
+            A5ProofResolution {
+                kind: "a5-site-proof-blocked",
+                state: ClassSiteState::Dropped(reason.to_owned()),
+                retention: BridgeRetentionTier::None,
+                waiver_id: None,
+            }
+        }
+    }
+}
+
 pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalization {
     let mut merged = BTreeMap::<SignatureClassId, ClassInput>::new();
     for input in inputs {
@@ -1942,26 +1998,66 @@ pub(crate) fn plan(
         }
     }
     for proof in &table.seams.overlap_proofs {
-        use crate::bo_rewriter::decision::a5_site_proof::A5SiteProofVerdict;
         let owner = SignatureClassId::of(proof.callee);
-        let site = match proof.verdict {
-            A5SiteProofVerdict::Clear => ClassSite::zero(
-                owner,
-                SignatureClassId::of(proof.caller),
-                Arm::Pair,
-                "a5-site-proof-clear",
+        let pair = table
+            .seams
+            .pair_sites
+            .iter()
+            .find(|pair| {
+                pair.caller == proof.caller
+                    && pair.callee == proof.callee
+                    && pair.argument_index == proof.index
+                    && (pair.span.source_callsite() == proof.span.source_callsite()
+                        || pair
+                            .call_span
+                            .source_callsite()
+                            .contains(proof.span.source_callsite()))
+            })
+            .and_then(|pair| {
+                let primary_has_t2_peer = pair.role
+                    != super::decision::co_conversion::PairRole::Primary
+                    || table.seams.pair_sites.iter().any(|peer| {
+                        peer.caller == pair.caller
+                            && peer.callee == pair.callee
+                            && peer.call_span.source_callsite() == pair.call_span.source_callsite()
+                            && peer.role == super::decision::co_conversion::PairRole::RawView
+                            && peer.tier == super::decision::co_conversion::PairTier::T2
+                    });
+                primary_has_t2_peer.then_some((pair.role, pair.tier))
+            });
+        let resolution = a5_proof_resolution(proof.verdict, pair, &proof.reason);
+        let bridge = BridgeSitePlan::local(
+            proof.caller,
+            proof.callee,
+            Arm::Pair.key(),
+            format!("arg{}", proof.index),
+            resolution.kind,
+        );
+        let (file, lo, hi, state) = match span_to_loc(proof.span) {
+            Ok((file, lo, hi)) => (
+                file_key_label(&file),
+                u32::try_from(lo).unwrap_or(u32::MAX),
+                u32::try_from(hi).unwrap_or(u32::MAX),
+                resolution.state,
             ),
-            A5SiteProofVerdict::Overlapping | A5SiteProofVerdict::Undeterminable => {
-                ClassSite::dropped(
-                    owner,
-                    SignatureClassId::of(proof.caller),
-                    Arm::Pair,
-                    "a5-site-proof-blocked",
-                    proof.reason.clone(),
-                )
-            }
+            Err(reason) => (
+                "<unplaceable>".to_owned(),
+                0,
+                0,
+                ClassSiteState::Dropped(reason.to_owned()),
+            ),
         };
-        preclass_sites.push(site);
+        preclass_sites.push(ClassSite {
+            key: bridge.materialize(owner, file, lo, hi),
+            edit_key: "-".to_owned(),
+            state,
+            expected_form: "safe-parameter".to_owned(),
+            found_form: "pair-site".to_owned(),
+            argument_kind: "a5-proof".to_owned(),
+            extent: BridgeExtentKind::None,
+            retention: resolution.retention,
+            waiver_id: resolution.waiver_id,
+        });
     }
     for blocked in &table.seams.blocked {
         let arm = if blocked.source_shape == "return-seam" {
@@ -2661,6 +2757,39 @@ mod wave3_class_tests {
             );
             assert!(!finalized.classes[&ids[1]].is_ready());
         });
+    }
+
+    /// D14-W1 — a non-clear A5 proof is not itself a hold once PAIR has
+    /// selected a receipted T2 raw view.  The exact waiver moves onto the
+    /// zero-syntax proof receipt.  A blocked PAIR outcome remains dropped.
+    #[test]
+    fn d14_w1_a5_block_falls_through_to_the_pair_t2_receipt() {
+        use crate::bo_rewriter::decision::{
+            a5_site_proof::A5SiteProofVerdict,
+            co_conversion::{PairRole, PairTier},
+        };
+        let resolved = a5_proof_resolution(
+            A5SiteProofVerdict::Overlapping,
+            Some((PairRole::RawView, PairTier::T2)),
+            "at-least-one-peer-overlapping",
+        );
+        assert_eq!(resolved.kind, "a5-site-proof-t2-fallback");
+        assert_eq!(resolved.state, ClassSiteState::ZeroSyntaxReady);
+        assert_eq!(resolved.retention, BridgeRetentionTier::T2);
+        assert_eq!(
+            resolved.waiver_id.as_deref(),
+            Some(super::super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
+        );
+
+        let blocked = a5_proof_resolution(
+            A5SiteProofVerdict::Overlapping,
+            Some((PairRole::Blocked, PairTier::Blocked)),
+            "at-least-one-peer-overlapping",
+        );
+        assert_eq!(blocked.kind, "a5-site-proof-blocked");
+        assert!(matches!(blocked.state, ClassSiteState::Dropped(_)));
+        assert_eq!(blocked.retention, BridgeRetentionTier::None);
+        assert!(blocked.waiver_id.is_none());
     }
 
     #[test]

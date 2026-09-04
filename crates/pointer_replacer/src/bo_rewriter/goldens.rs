@@ -122,12 +122,11 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // `g20_via` is `E0308` (measured), so byte identity here is unreachable
     // without the joint decision.
     //
-    // **g21** is the negative control, made discriminating by pairing it with a
-    // positive IN THE SAME FILE: `g21_ok` converts, the `g21_aliased`/`g21_dirty`
-    // class does not, because one call site passes the same binding to two
-    // `*mut` positions. Convert nothing and `g21_ok` fails; convert everything
-    // and the emitted crate is `E0499`. A no-edit golden ALONE is not a witness
-    // — that is g19's rule, honoured rather than restated.
+    // **g21** was the negative duplicate-argument control. R165-2 and D14 now
+    // make the split explicit: the canonical primary converts, its peer stays
+    // raw under the receipted T2 PAIR verdict, and the clean sibling still
+    // converts. Making both positions safe still yields E0499; blocking both
+    // now fails the ruled mechanical-fallback branch.
     "g20_callsite_adapt_propagate",
     "g21_callsite_blocked_class",
     // **g22-g25 — THE SEAM BATCH, ratified 2026-08-11.** All four land GREEN:

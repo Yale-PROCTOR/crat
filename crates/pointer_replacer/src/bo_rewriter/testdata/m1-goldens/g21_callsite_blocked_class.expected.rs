@@ -8,7 +8,7 @@ pub unsafe fn g21_ok(p: &mut i32) {
     *p = 1;
 }
 
-pub unsafe fn g21_aliased(a: *mut i32, b: *mut i32) {
+pub unsafe fn g21_aliased(a: &mut i32, b: *mut i32) {
     *a += *b;
 }
 
@@ -18,5 +18,8 @@ pub unsafe fn g21_clean() {
 }
 
 pub unsafe fn g21_dirty(q: *mut i32) {
-    g21_aliased(q, q);
+    {
+        let __crat_pair_raw_418_1: *mut i32 = q;
+        g21_aliased(unsafe { &mut *q }, __crat_pair_raw_418_1)
+    };
 }
