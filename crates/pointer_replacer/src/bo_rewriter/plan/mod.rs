@@ -1171,6 +1171,47 @@ pub(crate) fn plan(
             }),
         }
     }
+    for storage in &table.depth2_npo_storages {
+        let owner = SignatureClassId::of(storage.node.0);
+        let subject_id = table
+            .entries
+            .iter()
+            .find(|(subject, _)| (subject.fn_did, subject.hir_id) == storage.node)
+            .map(|(subject, _)| subject.identity_key(&owner_of(subject)))
+            .unwrap_or_else(|| format!("depth2-storage:{}", storage.node.1.local_id.as_u32()));
+        let bridge = BridgeSitePlan::local(
+            storage.node.0,
+            storage.node.0,
+            Arm::C.key(),
+            format!("storage-init:hir{}", storage.node.1.local_id.as_u32()),
+            "depth2-npo-storage",
+        );
+        match span_to_loc(storage.init_span) {
+            Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
+                lo,
+                hi,
+                replacement: storage.replacement.clone(),
+                justification: Justification::SeamAdapter {
+                    family: "safe",
+                    fabricated: false,
+                },
+                owner_class: Some(owner),
+                owner_path: subject_id.clone(),
+                bridge: Some(bridge),
+                atom_ids: Vec::new(),
+                subject_id,
+                required_arms: owner_arms.get(&owner).copied().unwrap_or_default().render(),
+                edit_kind: "depth2-npo-storage-init",
+            }),
+            Err(reason) => unplaceable.push(Unplaceable {
+                owner_class: owner,
+                bridge,
+                reason,
+                detail: subject_id.clone(),
+                subject: subject_id,
+            }),
+        }
+    }
 
     for (subject, decision) in &table.entries {
         if reverted(subject) {
@@ -1700,6 +1741,27 @@ pub(crate) fn plan(
             waiver_id: None,
         });
     }
+    for blocked in &table.seams.raw_boundary_blocked {
+        let (file, lo, hi) = span_to_loc(blocked.span)
+            .map(|(file, lo, hi)| {
+                (
+                    file_key_label(&file),
+                    u32::try_from(lo).unwrap_or(u32::MAX),
+                    u32::try_from(hi).unwrap_or(u32::MAX),
+                )
+            })
+            .unwrap_or_else(|_| ("<unplaceable>".to_owned(), 0, 0));
+        preclass_sites.push(ClassSite {
+            key: blocked
+                .bridge
+                .materialize(blocked.owner_class, file, lo, hi),
+            edit_key: "-".to_owned(),
+            state: ClassSiteState::Dropped(blocked.reason.clone()),
+            extent: blocked.bridge.extent.clone(),
+            retention: blocked.bridge.retention,
+            waiver_id: blocked.bridge.waiver_id.clone(),
+        });
+    }
     for pair in &table.seams.pair_sites {
         use super::decision::co_conversion::{PairRole, PairTier};
         if pair.role == PairRole::RawView {
@@ -1846,6 +1908,7 @@ mod tests {
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
+            depth2_npo_storages: Vec::new(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -1900,6 +1963,7 @@ mod tests {
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
+            depth2_npo_storages: Vec::new(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

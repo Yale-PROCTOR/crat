@@ -121,6 +121,7 @@ pub(crate) struct ConstructionFacts {
     /// long-lived construction key and all unrelated receipts remain stable.
     pub call_result_targets: FxHashMap<(LocalDefId, HirId), CallResultTarget>,
     pub init_spans: FxHashMap<(LocalDefId, HirId), rustc_span::Span>,
+    pub init_sources: FxHashMap<(LocalDefId, HirId), HirId>,
     pub statement_spans: FxHashMap<(LocalDefId, HirId), rustc_span::Span>,
     pub first_stores: FxHashMap<(LocalDefId, HirId), Vec<FirstStore>>,
     pub deallocator_calls: FxHashMap<(LocalDefId, HirId), Vec<rustc_span::Span>>,
@@ -388,6 +389,14 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
             self.facts
                 .init_spans
                 .insert((self.fn_did, local.pat.hir_id), init.span);
+            if let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) =
+                Self::peel(init).kind
+                && let rustc_hir::def::Res::Local(source) = path.res
+            {
+                self.facts
+                    .init_sources
+                    .insert((self.fn_did, local.pat.hir_id), source);
+            }
             self.facts
                 .statement_spans
                 .insert((self.fn_did, local.pat.hir_id), stmt.span);

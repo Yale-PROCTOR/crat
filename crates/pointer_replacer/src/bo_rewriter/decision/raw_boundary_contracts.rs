@@ -264,6 +264,7 @@ mod tests {
             rendered: "*mut i8".to_owned(),
             pointee: "i8".to_owned(),
             mutability,
+            depth2: None,
         }
     }
 

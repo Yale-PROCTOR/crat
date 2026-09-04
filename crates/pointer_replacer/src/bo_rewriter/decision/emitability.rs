@@ -249,6 +249,9 @@ pub(crate) struct Arg {
     pub shape: ArgShape,
     pub source_type: String,
     pub target: Option<super::raw_boundary::RawTargetType>,
+    /// Exact variable-local storage under `&mut local` (optionally beneath raw
+    /// casts). Projections, dereferences, fields, and temporaries are absent.
+    pub direct_storage: Option<(HirId, Span)>,
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -417,6 +420,20 @@ fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
             None => ArgShape::Other,
         },
     }
+}
+
+fn direct_mutable_storage(expr: &Expr<'_>) -> Option<(HirId, Span)> {
+    let peeled = peel_casts(expr);
+    let ExprKind::AddrOf(_, Mutability::Mut, storage) = peeled.kind else {
+        return None;
+    };
+    let ExprKind::Path(QPath::Resolved(_, path)) = storage.kind else {
+        return None;
+    };
+    let Res::Local(binding) = path.res else {
+        return None;
+    };
+    Some((binding, storage.span))
 }
 
 #[derive(Debug, Default)]
@@ -673,12 +690,14 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             .get(index)
                                             .copied()
                                             .and_then(raw_target_type);
+                                        let shape = classify_arg(self.tcx, arg);
                                         Arg {
                                             index,
                                             span: arg.span,
-                                            shape: classify_arg(self.tcx, arg),
+                                            shape,
                                             source_type: format!("{:?}", typeck.expr_ty(arg)),
                                             target,
+                                            direct_storage: direct_mutable_storage(arg),
                                         }
                                     })
                                     .collect(),
@@ -711,6 +730,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 shape: shape.key(),
                                 source_type: format!("{source_ty:?}"),
                                 target,
+                                direct_storage: direct_mutable_storage(arg),
                             });
                         }
                     }
@@ -816,7 +836,11 @@ impl EmitabilityFacts {
     ) -> rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)> {
         let mut out = rustc_hash::FxHashSet::default();
         for fact in &self.foreign_call_args {
-            if let Some(root) = fact.root {
+            if let Some(root) = fact
+                .direct_storage
+                .map(|(storage, _)| storage)
+                .or(fact.root)
+            {
                 out.insert((
                     fact.caller,
                     root,
@@ -829,7 +853,10 @@ impl EmitabilityFacts {
             for call in calls {
                 for argument in &call.args {
                     if argument.target.is_some()
-                        && let Some(root) = argument.shape.place_root()
+                        && let Some(root) = argument
+                            .direct_storage
+                            .map(|(storage, _)| storage)
+                            .or_else(|| argument.shape.place_root())
                     {
                         out.insert((
                             call.caller,
@@ -842,6 +869,34 @@ impl EmitabilityFacts {
             }
         }
         out
+    }
+
+    pub(crate) fn depth2_npo_target(
+        &self,
+        node: (LocalDefId, HirId),
+    ) -> Option<super::raw_boundary::Depth2Target> {
+        let mut targets = self
+            .foreign_call_args
+            .iter()
+            .filter_map(|fact| {
+                (fact.caller == node.0
+                    && fact.direct_storage.map(|(storage, _)| storage) == Some(node.1))
+                .then(|| fact.target.depth2.clone())
+                .flatten()
+            })
+            .chain(self.call_args.values().flat_map(|calls| {
+                calls.iter().flat_map(|call| {
+                    call.args.iter().filter_map(|argument| {
+                        (call.caller == node.0
+                            && argument.direct_storage.map(|(storage, _)| storage) == Some(node.1))
+                        .then(|| argument.target.as_ref()?.depth2.clone())
+                        .flatten()
+                    })
+                })
+            }))
+            .filter(|target| target.thin);
+        let first = targets.next()?;
+        targets.all(|target| target == first).then_some(first)
     }
 
     pub(crate) fn is_value_observation_candidate(&self, node: (LocalDefId, HirId)) -> bool {

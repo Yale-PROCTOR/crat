@@ -547,6 +547,14 @@ pub(crate) struct BlockedBody {
     pub blind: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockedRawBoundary {
+    pub owner_class: SignatureClassId,
+    pub bridge: BridgeSitePlan,
+    pub span: Span,
+    pub reason: String,
+}
+
 /// **The authorization rule for fabrication, as a pure function** (R8).
 ///
 /// One place decides *licensed vs fabricated*, and it decides it from the only
@@ -643,12 +651,13 @@ pub(crate) enum NullArm {
     LiteralNone,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RawBoundaryGlue {
     pub template: super::raw_boundary::BridgeTemplate,
     pub target_mutability: super::raw_boundary::RawMutability,
     pub box_slice: bool,
     pub force_explicit: bool,
+    pub cast_pointee: Option<String>,
 }
 
 /// One adapter, described rather than rendered.
@@ -761,8 +770,26 @@ impl GlueSpec {
                 target_mutability,
                 box_slice,
                 force_explicit,
+                cast_pointee: None,
             }),
         }
+    }
+
+    pub(crate) fn raw_boundary_target(
+        template: super::raw_boundary::BridgeTemplate,
+        target: &super::raw_boundary::RawTargetType,
+        box_slice: bool,
+        force_explicit: bool,
+    ) -> Self {
+        let mut spec = Self::raw_boundary(template, target.mutability, box_slice, force_explicit);
+        spec.raw_boundary
+            .as_mut()
+            .expect("constructed")
+            .cast_pointee = target
+            .depth2
+            .as_ref()
+            .map(|depth2| depth2.inner_pointee.clone());
+        spec
     }
 
     pub(crate) fn null_arm_key(&self) -> &'static str {
@@ -784,7 +811,7 @@ impl GlueSpec {
     }
 
     pub(crate) fn template_key(&self) -> &'static str {
-        if let Some(raw) = self.raw_boundary {
+        if let Some(raw) = self.raw_boundary.as_ref() {
             return raw.template.key();
         }
         if self.null_arm == NullArm::PointerApi {
@@ -911,13 +938,21 @@ impl GlueSpec {
     /// first — so this is fail-closed structure rather than a live path, and it
     /// moves no corpus line.
     pub(crate) fn render(&self, text: &str) -> Option<String> {
-        if let Some(raw) = self.raw_boundary {
+        if let Some(raw) = self.raw_boundary.as_ref() {
             let rendered = if raw.force_explicit {
-                raw.template
-                    .render_explicit(text, raw.target_mutability, raw.box_slice)
+                raw.template.render_explicit(
+                    text,
+                    raw.target_mutability,
+                    raw.box_slice,
+                    raw.cast_pointee.as_deref(),
+                )
             } else {
-                raw.template
-                    .render(text, raw.target_mutability, raw.box_slice)
+                raw.template.render(
+                    text,
+                    raw.target_mutability,
+                    raw.box_slice,
+                    raw.cast_pointee.as_deref(),
+                )
             };
             return match rendered.ok()? {
                 super::raw_boundary::BridgeRender::ZeroSyntax => Some(text.to_owned()),
@@ -2222,6 +2257,9 @@ pub(crate) struct SeamPlan {
     /// Typed PAIR sites, including zero-syntax and blocked roles, retained for
     /// signature-class completeness rather than reconstructed from TSV.
     pub pair_sites: Vec<super::co_conversion::PairSiteDecision>,
+    /// Raw-boundary sites whose source had a safe presentation but whose
+    /// required bridge was held. These become terminal dropped class sites.
+    pub raw_boundary_blocked: Vec<BlockedRawBoundary>,
 }
 
 /// The form a decision emits.
@@ -2907,12 +2945,42 @@ pub(crate) fn synthesize_with_raw_boundary(
     }
     for (key, disposition, site) in raw_boundary.emission_sites() {
         let Some(template) = disposition.template() else {
+            if let super::raw_boundary::RawBoundaryDisposition::Blocked { reason, .. } = disposition
+                && let Some((owner_did, node)) = site.node
+                && decision_of
+                    .get(&(owner_did, node))
+                    .is_some_and(|decision| !matches!(decision, Decision::Degraded(_)))
+            {
+                plan.raw_boundary_blocked.push(BlockedRawBoundary {
+                    owner_class: SignatureClassId::of(owner_did),
+                    bridge: BridgeSitePlan {
+                        caller: owner_did,
+                        callee: site.callee_local.map_or_else(
+                            || BridgeCalleeId::Foreign(key.callee.path.clone()),
+                            BridgeCalleeId::Local,
+                        ),
+                        arm: "c".to_owned(),
+                        position: format!("arg{}", key.argument_index),
+                        bridge_kind: if site.target.depth2.is_some() {
+                            "depth2-npo-bridge".to_owned()
+                        } else {
+                            reason.key().to_owned()
+                        },
+                        extent: BridgeExtentKind::None,
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                    },
+                    span: site.span,
+                    reason: reason.key().to_owned(),
+                });
+            }
             continue;
         };
-        let Ok(argument) = sm.span_to_snippet(site.span) else {
+        let argument_span = site.direct_storage_span.unwrap_or(site.span);
+        let Ok(argument) = sm.span_to_snippet(argument_span) else {
             continue;
         };
-        let spec = GlueSpec::raw_boundary(template, site.target.mutability, site.box_slice, false);
+        let spec = GlueSpec::raw_boundary_target(template, &site.target, site.box_slice, false);
         let exact_subject_use = site
             .node
             .and_then(|node| decision_of.get(&node).copied())
@@ -2936,7 +3004,15 @@ pub(crate) fn synthesize_with_raw_boundary(
         let Some(replacement) = spec.render(&argument) else {
             continue;
         };
-        match template.render(&argument, site.target.mutability, site.box_slice) {
+        match template.render(
+            &argument,
+            site.target.mutability,
+            site.box_slice,
+            site.target
+                .depth2
+                .as_ref()
+                .map(|depth2| depth2.inner_pointee.as_str()),
+        ) {
             Ok(super::raw_boundary::BridgeRender::Edit(_)) => {}
             Ok(
                 super::raw_boundary::BridgeRender::ZeroSyntax
@@ -2993,7 +3069,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             family: SeamFamily::Safe,
             len_arm: None,
             spec,
-            arg_span: site.span,
+            arg_span: argument_span,
             expected: Form::Raw,
             found,
             root_identity: key.subject.clone(),

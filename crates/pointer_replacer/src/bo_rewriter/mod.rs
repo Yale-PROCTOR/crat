@@ -4898,6 +4898,7 @@ fn finish_decide<'tcx>(
     // are visible — a per-subject check left 15 of brotli's 17 collisions
     // standing, measured.
     decision::refuse_nested_use_edits(tcx, &mut table);
+    table.depth2_npo_storages = decision::plan_depth2_npo_storages(tcx, &table, &facts, &ctors);
 
     let finalization_started = std::time::Instant::now();
     table.lifetime_plan = decision::lifetime::finalize(

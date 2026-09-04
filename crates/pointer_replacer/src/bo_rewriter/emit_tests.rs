@@ -6755,6 +6755,212 @@ fn br_w4_generated_safe_inner_name_collision_is_typed_and_held() {
     );
 }
 
+/// BR-W5b RED: thin depth-2 storage is presented as an NPO-compatible Option
+/// and the out-parameter receives only a pointer to that Option storage.
+#[test]
+fn br_w5b_thin_const_and_mut_depth2_storage_use_npo_bridge() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         unsafe extern \"C\" {\n\
+             fn set_const(out: *mut *const i32, clear: bool);\n\
+             fn set_mut(out: *mut *mut i32, clear: bool);\n\
+         }\n\
+         pub unsafe fn caller() {\n\
+             let value = 7;\n\
+             let mut mutable_value = 9;\n\
+             let mut shared_slot: *const i32 = &value;\n\
+             let mut mut_slot: *mut i32 = &mut mutable_value;\n\
+             set_const(&mut shared_slot, false);\n\
+             set_mut(&mut mut_slot, false);\n\
+             set_const(&mut shared_slot, true);\n\
+             set_mut(&mut mut_slot, true);\n\
+         }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let emission = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (mut table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("BR-W5b decision table");
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("caller::shared_slot") {
+                *decision = super::decision::Decision::Opt {
+                    mutable: false,
+                    slice: false,
+                    uses: Vec::new(),
+                };
+            } else if subject.label.ends_with("caller::mut_slot") {
+                *decision = super::decision::Decision::Opt {
+                    mutable: true,
+                    slice: false,
+                    uses: Vec::new(),
+                };
+            }
+        }
+        let raw_boundary = super::decision::raw_boundary::RawBoundaryDispositionIndex::derive(
+            &ctx.raw_boundary_sites,
+            &ctx.retention,
+            &table,
+            &ctx.facts,
+        );
+        table.depth2_npo_storages = super::decision::plan_depth2_npo_storages(
+            tcx,
+            &table,
+            &ctx.facts,
+            &ctx.constructions,
+        );
+        table.seams = super::decision::seam::synthesize_with_raw_boundary(
+            tcx,
+            &ctx.facts,
+            &ctx.subjects,
+            &table,
+            &ctx.retained_c9_plans,
+            &ctx.a5_site_proofs,
+            &raw_boundary,
+            &ctx.coconv,
+            &ctx.retention,
+        );
+        table.arm_requirements = super::derive_arm_requirements(
+            &ctx.subjects,
+            &ctx.coconv,
+            &raw_boundary,
+            &ctx.exposure,
+        );
+        emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .expect("BR-W5b emission")
+    })
+    .expect("BR-W5b source compiles");
+    let source = text_for(&emission, "lib.rs").expect("BR-W5b emitted root");
+    let materialized =
+        verify::materialize(&fixture.root(), &emission.files).expect("materialize BR-W5b emission");
+    assert!(
+        verify::type_checks_crate(materialized.root()),
+        "BR-W5b emitted tree must type-check:\n{source}"
+    );
+    assert!(
+        source.contains("shared_slot: Option<&i32>"),
+        "shared storage must use the NPO Option form:\n{source}"
+    );
+    assert!(
+        source.contains("mut_slot: Option<&mut i32>"),
+        "mutable storage must use the NPO Option form:\n{source}"
+    );
+    assert!(
+        source.contains("core::ptr::from_mut(&mut shared_slot).cast::<*const i32>()"),
+        "const-inner out-param bridge missing:\n{source}"
+    );
+    assert!(
+        source.contains("core::ptr::from_mut(&mut mut_slot).cast::<*mut i32>()"),
+        "mut-inner out-param bridge missing:\n{source}"
+    );
+    assert!(
+        !source.contains("&mut &"),
+        "live reference storage is forbidden: {source}"
+    );
+    let all_events = emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    let events = all_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "depth2-npo-bridge")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events.len(),
+        8,
+        "four sites, each plan+terminal: {events:#?}"
+    );
+    assert!(events.iter().all(|event| {
+        event.site.arm == "c" && event.state != super::bridge_receipt::BridgeReceiptState::Dropped
+    }));
+    assert!(events.iter().all(|event| {
+        event.retention == super::bridge_receipt::BridgeRetentionTier::T2
+            && event.waiver_id.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
+    }));
+    super::bridge_receipt::reconcile_bridge_events(&all_events)
+        .expect("BR-W5b bridge events reconcile");
+
+    let value = 1;
+    let mut shared = Some(&value);
+    let shared_raw = core::ptr::from_mut(&mut shared).cast::<*const i32>();
+    // SAFETY: R-A admits exactly this thin NPO-compatible storage write; the
+    // null representation of Option<&T> is guaranteed to be None.
+    unsafe { *shared_raw = core::ptr::null() };
+    assert!(shared.is_none());
+
+    let mut value = 2;
+    let mut mutable = Some(&mut value);
+    let mutable_raw = core::ptr::from_mut(&mut mutable).cast::<*mut i32>();
+    // SAFETY: the mutable twin has the same guaranteed thin NPO layout.
+    unsafe { *mutable_raw = core::ptr::null_mut() };
+    assert!(mutable.is_none());
+}
+
+#[test]
+fn br_w5b_fat_and_non_variable_depth2_storage_are_typed_holds() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         unsafe extern \"C\" {\n\
+             fn set_fat(out: *mut *const [i32]);\n\
+             fn set_thin(out: *mut *const i32);\n\
+         }\n\
+         pub struct Holder { slot: *const i32 }\n\
+         pub unsafe fn caller(slice: &[i32], p: *const i32) {\n\
+             let mut fat_slot: *const [i32] = slice as *const [i32];\n\
+             let mut holder = Holder { slot: p };\n\
+             set_fat(&mut fat_slot);\n\
+             set_thin(&mut holder.slot);\n\
+         }\n";
+    let receipt = ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let (mut table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("BR-W5b negative decision table");
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("caller::fat_slot") {
+                *decision = super::decision::Decision::Opt {
+                    mutable: false,
+                    slice: true,
+                    uses: Vec::new(),
+                };
+            }
+        }
+        super::decision::raw_boundary::RawBoundaryDispositionIndex::derive(
+            &ctx.raw_boundary_sites,
+            &ctx.retention,
+            &table,
+            &ctx.facts,
+        )
+        .receipts_tsv()
+    })
+    .expect("BR-W5b negative source compiles");
+    assert!(
+        receipt.contains("depth2-fat-layout-incompatible"),
+        "fat Option<&[T]> storage must not enter the NPO cast:\n{receipt}"
+    );
+    assert!(
+        receipt.contains("depth2-storage-shape-held"),
+        "field/projection storage must be held with its own reason:\n{receipt}"
+    );
+    assert!(
+        !receipt.contains("\tdepth2-npo-bridge\t"),
+        "a negative branch must not receive the admitted template:\n{receipt}"
+    );
+}
+
 /// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,
 /// but E2-FN has no consumer yet. The lifetime producer must receive the intact
 /// summary object rather than an A5-shaped projection of it.

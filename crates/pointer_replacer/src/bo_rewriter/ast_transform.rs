@@ -1407,15 +1407,23 @@ fn raw_option_expr(argument: rustc_ast::Expr, mutable: bool) -> Option<rustc_ast
 
 fn raw_boundary_expr(
     argument: rustc_ast::Expr,
-    raw: super::decision::seam::RawBoundaryGlue,
+    raw: &super::decision::seam::RawBoundaryGlue,
 ) -> Option<rustc_ast::ExprKind> {
     const ARG: &str = "__CRAT_RAW_BOUNDARY_ARG";
     let rendered = if raw.force_explicit {
-        raw.template
-            .render_explicit(ARG, raw.target_mutability, raw.box_slice)
+        raw.template.render_explicit(
+            ARG,
+            raw.target_mutability,
+            raw.box_slice,
+            raw.cast_pointee.as_deref(),
+        )
     } else {
-        raw.template
-            .render(ARG, raw.target_mutability, raw.box_slice)
+        raw.template.render(
+            ARG,
+            raw.target_mutability,
+            raw.box_slice,
+            raw.cast_pointee.as_deref(),
+        )
     };
     let rendered = match rendered.ok()? {
         super::decision::raw_boundary::BridgeRender::Edit(rendered) => rendered,
@@ -1553,12 +1561,17 @@ impl<'a> SeamGraftVisitor<'a> {
     fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
         use super::decision::seam::{GlueCore, NullArm};
         let spec = &target.spec;
-        if let Some(raw) = spec.raw_boundary {
+        if let Some(raw) = spec.raw_boundary.as_ref() {
+            let argument = if target.arg_span == e.span {
+                e.clone()
+            } else {
+                find_by_span(e, target.arg_span)?.clone()
+            };
             return raw_boundary_expr(
                 rustc_ast::Expr {
                     id: DUMMY_NODE_ID,
-                    kind: e.kind.clone(),
-                    span: e.span,
+                    kind: argument.kind,
+                    span: argument.span,
                     attrs: Default::default(),
                     tokens: None,
                 },
@@ -3409,6 +3422,17 @@ pub(crate) fn filtered_inputs(
                 &mut out.use_key_collisions,
             );
         }
+    }
+    for storage in &table.depth2_npo_storages {
+        if !reverts.keeps_subject(storage.node.0, storage.node.1) {
+            continue;
+        }
+        insert_counting(
+            &mut out.uses,
+            (storage.init_span.lo().0, storage.init_span.hi().0),
+            storage.replacement.clone(),
+            &mut out.use_key_collisions,
+        );
     }
     for edit in &table.seams.edits {
         // ARM 3's filter, on the CALLEE's direct class ID.

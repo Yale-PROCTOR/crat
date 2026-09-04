@@ -851,6 +851,17 @@ pub(crate) struct DecisionTable {
     /// file receives it. Attaching it to either end alone would misplace one of
     /// the two.
     pub seams: seam::SeamPlan,
+    /// R-A storage presentations whose declaration is an existing `Opt`
+    /// decision but whose initializer also needs to become an Option value.
+    pub depth2_npo_storages: Vec<Depth2NpoStoragePlan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Depth2NpoStoragePlan {
+    pub(crate) node: (LocalDefId, rustc_hir::HirId),
+    pub(crate) init_span: Span,
+    pub(crate) replacement: String,
+    pub(crate) target: raw_boundary::Depth2Target,
 }
 
 impl DecisionTable {
@@ -983,7 +994,110 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
         // `decide` stays PURE over subjects; seams need the call graph and are
         // filled by the driver, which is also where the analyses live.
         seams: Default::default(),
+        depth2_npo_storages: Vec::new(),
     }
+}
+
+pub(crate) fn plan_depth2_npo_storages(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    facts: &EmitabilityFacts,
+    constructions: &construction::ConstructionFacts,
+) -> Vec<Depth2NpoStoragePlan> {
+    let decisions = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<FxHashMap<_, _>>();
+    let labels = table
+        .entries
+        .iter()
+        .filter_map(|(subject, _)| {
+            subject
+                .param_name
+                .as_ref()
+                .map(|name| ((subject.fn_did, subject.hir_id), name.clone()))
+        })
+        .collect::<FxHashMap<_, _>>();
+    let mut plans = Vec::new();
+    for (subject, decision) in &table.entries {
+        if !matches!(subject.kind, SubjectKind::Local)
+            || !matches!(decision, Decision::Opt { slice: false, .. })
+        {
+            continue;
+        }
+        let node = (subject.fn_did, subject.hir_id);
+        let Some(target) = facts.depth2_npo_target(node) else {
+            continue;
+        };
+        let Some(&init_span) = constructions.init_spans.get(&node) else {
+            continue;
+        };
+        let Ok(init_text) = tcx.sess.source_map().span_to_snippet(init_span) else {
+            continue;
+        };
+        let method = if target.inner_mutability == raw_boundary::RawMutability::Mut {
+            "as_mut"
+        } else {
+            "as_ref"
+        };
+        let raw_inner = if target.inner_mutability == raw_boundary::RawMutability::Mut {
+            format!("*mut {}", target.inner_pointee)
+        } else {
+            format!("*const {}", target.inner_pointee)
+        };
+        let replacement = if matches!(subject.ctor, Some(construction::Construction::NullLit)) {
+            "None".to_owned()
+        } else if let Some(&source) = constructions.init_sources.get(&node) {
+            let source_node = (subject.fn_did, source);
+            let source_text = labels
+                .get(&source_node)
+                .cloned()
+                .unwrap_or_else(|| init_text.clone());
+            match decisions.get(&source_node).copied() {
+                Some(
+                    Decision::Ref { mutable: true } | Decision::InferredRef { mutable: true, .. },
+                ) => {
+                    if target.inner_mutability == raw_boundary::RawMutability::Mut {
+                        format!("Some(&mut *{source_text})")
+                    } else {
+                        format!("Some(&*{source_text})")
+                    }
+                }
+                Some(
+                    Decision::Ref { mutable: false } | Decision::InferredRef { mutable: false, .. },
+                ) => {
+                    format!("Some({source_text})")
+                }
+                Some(Decision::Opt { mutable: true, .. })
+                    if target.inner_mutability == raw_boundary::RawMutability::Mut =>
+                {
+                    format!("{source_text}.as_deref_mut()")
+                }
+                Some(Decision::Opt { .. }) => format!("{source_text}.as_deref()"),
+                Some(Decision::Slice { .. } | Decision::Box(_)) => continue,
+                Some(Decision::Degraded(_)) | None => {
+                    format!("unsafe {{ (({init_text}) as {raw_inner}).{method}() }}")
+                }
+            }
+        } else {
+            format!("unsafe {{ (({init_text}) as {raw_inner}).{method}() }}")
+        };
+        plans.push(Depth2NpoStoragePlan {
+            node,
+            init_span,
+            replacement,
+            target,
+        });
+    }
+    plans.sort_by_key(|plan| {
+        (
+            plan.node.0.local_def_index.as_u32(),
+            plan.init_span.lo().0,
+            plan.init_span.hi().0,
+        )
+    });
+    plans
 }
 
 /// **Refuse every use-edit NESTING, across the whole table.**
@@ -1172,6 +1286,9 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         exposure,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
+    let depth2_npo = matches!(subject.kind, SubjectKind::Local)
+        .then(|| facts.depth2_npo_target((subject.fn_did, subject.hir_id)))
+        .flatten();
 
     // The declaration's SHAPE comes FIRST, before any analysis is consulted.
     //
@@ -1370,7 +1487,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // a count rather than an estimate — the same construction that made the
     // freed gate's zero movement structural.
     if matches!(form, Form::Plain) {
-        if subject.null_init {
+        if subject.null_init && depth2_npo.is_none() {
             return degrade(subject, decl_site, DegradeReason::NullInit);
         }
         // **LAST, on the freed-slot placement rule.** Every subject reaching
@@ -1431,6 +1548,27 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 return degrade(subject, decl_site, reason);
             }
         }
+        if depth2_npo.is_some() {
+            let uses = opt_uses
+                .get(&(subject.fn_did, subject.hir_id))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(span) = uses.unsupported {
+                return degrade(
+                    subject,
+                    EmitabilityFacts::site(tcx, span),
+                    DegradeReason::OptUseUnsupported,
+                );
+            }
+            if subject.mutable && uses.non_test_uses > 1 && !subject.mut_binding {
+                return degrade(subject, decl_site, DegradeReason::OptNeedsMutBinding);
+            }
+            return Decision::Opt {
+                mutable: subject.mutable,
+                slice: false,
+                uses: uses.rewrites,
+            };
+        }
         return Decision::Ref {
             mutable: subject.mutable,
         };
@@ -1440,7 +1578,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // The construction-site guard, exactly as the slice arm has one: an
         // optional's VALUE has to be built at the initializer, and this phase
         // owns declarations and uses, not initializers.
-        if matches!(subject.kind, SubjectKind::Local) {
+        if matches!(subject.kind, SubjectKind::Local) && depth2_npo.is_none() {
             return degrade(subject, decl_site, DegradeReason::OptLocalConstruction);
         }
         let uses = opt_uses
@@ -1643,6 +1781,7 @@ mod self_consistency_tests {
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
+            depth2_npo_storages: Vec::new(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))
