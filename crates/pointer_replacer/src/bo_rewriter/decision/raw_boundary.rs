@@ -93,6 +93,21 @@ impl RawMutability {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NegativeWriteEvidence {
+    FosterImmutable,
+    LibcReadOnly,
+}
+
+impl NegativeWriteEvidence {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::FosterImmutable => "foster-immutable",
+            Self::LibcReadOnly => "libc-read-only",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RawTargetType {
     pub rendered: String,
@@ -1127,6 +1142,7 @@ pub(crate) enum BridgeTemplate {
     Depth2NpoMut,
     VoidFromMut,
     VoidFromRef,
+    VoidFromRefCastMut,
     VoidFromMutAsConst,
     RawCastMut,
     RawCastConst,
@@ -1151,12 +1167,13 @@ impl BridgeTemplate {
         match self {
             Self::Depth2NpoConst | Self::Depth2NpoMut => "depth2-npo-bridge",
             Self::VoidFromMut | Self::VoidFromRef | Self::VoidFromMutAsConst => "void-generic-raw",
+            Self::VoidFromRefCastMut => "shared-ref-to-mut-raw",
             Self::RawCastMut => "raw-cast-mut",
             Self::RawCastConst => "raw-cast-const",
             Self::RefMutToRawMut => "ref-mut-to-raw-mut",
             Self::RefMutToRawConst => "ref-mut-to-raw-const",
             Self::RefSharedToRawConst => "ref-shared-to-raw-const",
-            Self::RefSharedToRawMut => "ref-shared-to-raw-mut",
+            Self::RefSharedToRawMut => "shared-ref-to-mut-raw",
             Self::SliceMutToRawMut => "slice-mut-to-raw-mut",
             Self::SliceToRawConst => "slice-to-raw-const",
             Self::SliceToRawMut => "slice-to-raw-mut",
@@ -1210,11 +1227,17 @@ impl BridgeTemplate {
                     "core::ptr::from_mut(&mut {argument}).cast::<*{inner} {pointee}>()"
                 )))
             }
-            Self::VoidFromMut | Self::VoidFromRef | Self::VoidFromMutAsConst => {
+            Self::VoidFromMut
+            | Self::VoidFromRef
+            | Self::VoidFromRefCastMut
+            | Self::VoidFromMutAsConst => {
                 let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
                 let source = match self {
                     Self::VoidFromMut => format!("core::ptr::from_mut({argument})"),
                     Self::VoidFromRef => format!("core::ptr::from_ref({argument})"),
+                    Self::VoidFromRefCastMut => {
+                        format!("core::ptr::from_ref({argument}).cast_mut()")
+                    }
                     Self::VoidFromMutAsConst => {
                         format!("core::ptr::from_ref(&*{argument})")
                     }
@@ -1344,6 +1367,7 @@ pub(crate) enum RawBoundaryDisposition {
         template: BridgeTemplate,
         reason: RetentionUnknownReason,
         waiver_id: &'static str,
+        evidence: String,
     },
     Blocked {
         reason: RawBoundaryBlockReason,
@@ -1452,7 +1476,7 @@ pub(crate) fn template_for(
     decision: &super::Decision,
     target: &RawTargetType,
     ownership: Option<super::raw_boundary_contracts::OwnershipContract>,
-    permits_shared_to_mut: bool,
+    has_negative_write_evidence: bool,
 ) -> Result<BridgeTemplate, RawBoundaryBlockReason> {
     use super::{Decision, box_facts::BoxShape, raw_boundary_contracts::OwnershipContract};
 
@@ -1497,6 +1521,11 @@ pub(crate) fn template_for(
             {
                 Ok(BridgeTemplate::VoidFromRef)
             }
+            Decision::Ref { mutable: false } | Decision::InferredRef { mutable: false, .. }
+                if has_negative_write_evidence =>
+            {
+                Ok(BridgeTemplate::VoidFromRefCastMut)
+            }
             Decision::Ref { mutable: false } | Decision::InferredRef { mutable: false, .. } => {
                 Err(RawBoundaryBlockReason::SharedToMut)
             }
@@ -1512,7 +1541,7 @@ pub(crate) fn template_for(
                 (true, RawMutability::Mut) => Ok(BridgeTemplate::RefMutToRawMut),
                 (true, RawMutability::Const) => Ok(BridgeTemplate::RefMutToRawConst),
                 (false, RawMutability::Const) => Ok(BridgeTemplate::RefSharedToRawConst),
-                (false, RawMutability::Mut) if permits_shared_to_mut => {
+                (false, RawMutability::Mut) if has_negative_write_evidence => {
                     Ok(BridgeTemplate::RefSharedToRawMut)
                 }
                 (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
@@ -1521,7 +1550,7 @@ pub(crate) fn template_for(
         Decision::Slice { mutable, .. } => match (*mutable, target.mutability) {
             (true, RawMutability::Mut) => Ok(BridgeTemplate::SliceMutToRawMut),
             (_, RawMutability::Const) => Ok(BridgeTemplate::SliceToRawConst),
-            (false, RawMutability::Mut) if permits_shared_to_mut => {
+            (false, RawMutability::Mut) if has_negative_write_evidence => {
                 Ok(BridgeTemplate::SliceToRawMut)
             }
             (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
@@ -1529,7 +1558,7 @@ pub(crate) fn template_for(
         Decision::Opt { mutable, slice, .. } => {
             if *slice {
                 match (*mutable, target.mutability) {
-                    (false, RawMutability::Mut) if permits_shared_to_mut => {
+                    (false, RawMutability::Mut) if has_negative_write_evidence => {
                         Ok(BridgeTemplate::OptSliceToRawMut)
                     }
                     (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
@@ -1539,7 +1568,7 @@ pub(crate) fn template_for(
                 match (*mutable, target.mutability) {
                     (true, RawMutability::Mut) => Ok(BridgeTemplate::OptRefMutToRawMut),
                     (_, RawMutability::Const) => Ok(BridgeTemplate::OptRefToRawConst),
-                    (false, RawMutability::Mut) if permits_shared_to_mut => {
+                    (false, RawMutability::Mut) if has_negative_write_evidence => {
                         Ok(BridgeTemplate::OptRefToRawMut)
                     }
                     (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
@@ -1579,6 +1608,7 @@ impl RawBoundaryDispositionIndex {
         retention: &RetentionSummaries,
         hypothetical: &super::DecisionTable,
         emitability: &super::emitability::EmitabilityFacts,
+        mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
     ) -> Self {
         let decisions = hypothetical
             .entries
@@ -1640,7 +1670,7 @@ impl RawBoundaryDispositionIndex {
                         site.key.argument_index,
                         &site.target,
                     );
-                    let (retention_verdict, ownership, permits_shared_to_mut, evidence) =
+                    let (retention_verdict, ownership, negative_write, evidence, negative_detail) =
                         match contract {
                             Ok(contract) => (
                                 RetentionVerdict::NoRetain {
@@ -1652,8 +1682,21 @@ impl RawBoundaryDispositionIndex {
                                     },
                                 },
                                 Some(contract.ownership),
-                                contract.permits_shared_to_mut,
-                                format!("contract:{}", contract.provenance),
+                                (contract.access
+                                    == super::raw_boundary_contracts::PointeeAccess::Read)
+                                    .then_some(NegativeWriteEvidence::LibcReadOnly),
+                                format!(
+                                    "contract:{};negative-write={}",
+                                    contract.provenance,
+                                    if contract.access
+                                        == super::raw_boundary_contracts::PointeeAccess::Read
+                                    {
+                                        NegativeWriteEvidence::LibcReadOnly.key()
+                                    } else {
+                                        "none"
+                                    }
+                                ),
+                                format!("libc-access={}", contract.access.key()),
                             ),
                             Err(
                                 super::raw_boundary_contracts::ContractFailure::PositionUnmodeled,
@@ -1663,13 +1706,17 @@ impl RawBoundaryDispositionIndex {
                                     frontier: Vec::new(),
                                 },
                                 None,
-                                false,
+                                None,
                                 "foreign-retention-unknown".to_owned(),
+                                "foreign-contract-missing".to_owned(),
                             ),
                             Err(super::raw_boundary_contracts::ContractFailure::NotForeign)
                                 if site.callee_local.is_some() =>
                             {
                                 let callee = site.callee_local.expect("guarded local callee");
+                                let local = Local::from_usize(site.key.argument_index + 1);
+                                let foster_immutable = !mut_facts.is_defaulted(callee, local)
+                                    && !mut_facts.is_mutable(callee, local);
                                 (
                                     retention
                                         .get(callee, site.key.argument_index)
@@ -1679,8 +1726,23 @@ impl RawBoundaryDispositionIndex {
                                             frontier: Vec::new(),
                                         }),
                                     None,
-                                    false,
-                                    "local-retention-summary".to_owned(),
+                                    foster_immutable
+                                        .then_some(NegativeWriteEvidence::FosterImmutable),
+                                    format!(
+                                        "local-retention-summary;negative-write={}",
+                                        if foster_immutable {
+                                            NegativeWriteEvidence::FosterImmutable.key()
+                                        } else {
+                                            "none"
+                                        }
+                                    ),
+                                    if mut_facts.is_defaulted(callee, local) {
+                                        "foster-defaulted".to_owned()
+                                    } else if mut_facts.is_mutable(callee, local) {
+                                        "foster-mutable".to_owned()
+                                    } else {
+                                        "foster-immutable".to_owned()
+                                    },
                                 )
                             }
                             Err(error) => {
@@ -1691,8 +1753,15 @@ impl RawBoundaryDispositionIndex {
                             }
                         };
                     let template =
-                        template_for(decision, &site.target, ownership, permits_shared_to_mut)
-                            .map_err(|reason| (reason, "template-preflight".to_owned()))?;
+                        template_for(decision, &site.target, ownership, negative_write.is_some())
+                            .map_err(|reason| {
+                            let detail = if reason == RawBoundaryBlockReason::SharedToMut {
+                                format!("negative-write-absent:{negative_detail}")
+                            } else {
+                                "template-preflight".to_owned()
+                            };
+                            (reason, detail)
+                        })?;
                     match retention_verdict {
                         RetentionVerdict::NoRetain { certificate } => {
                             let certificate_started = std::time::Instant::now();
@@ -1723,6 +1792,7 @@ impl RawBoundaryDispositionIndex {
                                 template,
                                 reason,
                                 waiver_id: RAW_BOUNDARY_WAIVER_ID,
+                                evidence,
                             })
                         }
                     }
@@ -1943,10 +2013,11 @@ impl RawBoundaryDispositionIndex {
                     template,
                     reason,
                     waiver_id,
+                    evidence,
                 } => (
                     template.key(),
                     *waiver_id,
-                    "retention-unknown",
+                    evidence.as_str(),
                     reason.key(),
                     "-",
                     "arm-a",

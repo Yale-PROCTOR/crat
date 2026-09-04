@@ -5836,6 +5836,7 @@ fn raw_boundary_attempt_with(
                     &ctx.retention,
                     &table,
                     &ctx.facts,
+                    &ctx.mut_facts,
                 );
             table.depth2_npo_storages = super::decision::plan_depth2_npo_storages(
                 tcx,
@@ -6876,6 +6877,7 @@ fn br_w5b_thin_const_and_mut_depth2_storage_use_npo_bridge() {
             &ctx.retention,
             &table,
             &ctx.facts,
+            &ctx.mut_facts,
         );
         table.depth2_npo_storages = super::decision::plan_depth2_npo_storages(
             tcx,
@@ -7013,6 +7015,7 @@ fn br_w5b_fat_and_non_variable_depth2_storage_are_typed_holds() {
             &ctx.retention,
             &table,
             &ctx.facts,
+            &ctx.mut_facts,
         )
         .receipts_tsv()
     })
@@ -7294,6 +7297,131 @@ fn br_w9_thin_slice_glue_uses_from_ref_mut_and_first() {
         event.site.bridge_kind == "slice-to-thin-shared"
             && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
     }));
+}
+
+/// BR-W10: the shared-reference-to-mutable-raw form is selected only from an
+/// exact Foster-immutable local parameter fact.
+#[test]
+fn br_w10_foster_immutable_local_allows_shared_to_mut_raw() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub unsafe fn read_local(p: *mut i32) -> i32 { *p }\n\
+         pub unsafe fn caller(shared: *const i32) -> i32 {\n\
+             read_local(shared as *mut i32)\n\
+         }\n";
+    let attempt = raw_boundary_attempt_with(source, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("caller::shared") {
+                *decision = super::decision::Decision::Ref { mutable: false };
+            } else if subject.label.ends_with("read_local::p") {
+                *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                    subject: subject.label.clone(),
+                    site: "<br-w10-injected>".to_owned(),
+                    reason: super::decision::DegradeReason::KindRaw,
+                });
+            }
+        }
+    });
+    let emitted = e2_root_text(&attempt);
+    assert!(
+        emitted.contains("read_local(core::ptr::from_ref(shared).cast_mut())"),
+        "{emitted}"
+    );
+    assert!(attempt.receipt.contains("negative-write=foster-immutable"));
+    assert!(
+        e2_type_checks(&attempt),
+        "Foster-immutable twin must type-check"
+    );
+    let events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    let pair = events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "shared-ref-to-mut-raw")
+        .collect::<Vec<_>>();
+    assert_eq!(pair.len(), 2, "{events:#?}");
+}
+
+/// BR-W10/R-B negative matrix. Retention tier and the T2 waiver are downstream
+/// of this verdict and therefore cannot turn any non-negative write fact into
+/// permission.
+#[test]
+fn br_w10_write_stream_lifecycle_and_missing_evidence_all_hold() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         #[repr(C)] pub struct FILE { _private: [u8; 0] }\n\
+         pub unsafe fn write_local(p: *mut i32) { *p = 1; }\n\
+         unsafe extern \"C\" {\n\
+             fn printf(fmt: *const i8, ...) -> i32;\n\
+             fn scanf(fmt: *const i8, ...) -> i32;\n\
+             fn fputs(s: *const i8, stream: *mut FILE) -> i32;\n\
+             fn free(p: *mut core::ffi::c_void);\n\
+             fn opaque(p: *mut i32);\n\
+         }\n\
+         pub unsafe fn caller(\n\
+             local: *const i32, read: *const i32, write: *const i32,\n\
+             stream: *const FILE, life: *const i32, missing: *const i32,\n\
+         ) {\n\
+             write_local(local as *mut i32);\n\
+             printf(b\"%p\\0\".as_ptr() as *const i8, read as *mut core::ffi::c_void);\n\
+             scanf(b\"%d\\0\".as_ptr() as *const i8, write as *mut i32);\n\
+             fputs(b\"x\\0\".as_ptr() as *const i8, stream as *mut FILE);\n\
+             free(life as *mut core::ffi::c_void);\n\
+             opaque(missing as *mut i32);\n\
+         }\n";
+    let receipt = ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let (mut table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("BR-W10 evidence matrix");
+        for (subject, decision) in &mut table.entries {
+            if subject.label.starts_with("caller::") {
+                *decision = super::decision::Decision::Ref { mutable: false };
+            } else if subject.label.ends_with("write_local::p") {
+                *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                    subject: subject.label.clone(),
+                    site: "<br-w10-injected>".to_owned(),
+                    reason: super::decision::DegradeReason::KindRaw,
+                });
+            }
+        }
+        super::decision::raw_boundary::RawBoundaryDispositionIndex::derive(
+            &ctx.raw_boundary_sites,
+            &ctx.retention,
+            &table,
+            &ctx.facts,
+            &ctx.mut_facts,
+        )
+        .receipts_tsv()
+    })
+    .expect("BR-W10 matrix source compiles");
+    assert!(
+        receipt.lines().any(|line| {
+            line.contains("\tprintf\t")
+                && line.contains("\tshared-ref-to-mut-raw\t")
+                && line.contains("negative-write=libc-read-only")
+        }),
+        "{receipt}"
+    );
+    for detail in [
+        "negative-write-absent:foster-mutable",
+        "negative-write-absent:libc-access=write",
+        "negative-write-absent:libc-access=stream",
+        "negative-write-absent:libc-access=lifecycle",
+        "negative-write-absent:foreign-contract-missing",
+    ] {
+        assert!(receipt.contains(detail), "missing {detail}:\n{receipt}");
+    }
+    assert_eq!(
+        receipt.matches("\tshared-ref-to-mut-raw\t").count(),
+        1,
+        "only the read-only libc arm may bridge:\n{receipt}"
+    );
 }
 
 /// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,
@@ -9055,14 +9183,14 @@ fn raw_boundary_exact_slice_use_region_has_one_owner() {
     );
 }
 
-/// Addendum-149 production witness for both RB-X3 family rules. The subjects
-/// are read-only in Rust but cross C positions whose written signatures use
-/// `*mut`; only the exact printf-tail and FILE-stream contracts may license the
-/// explicit address view.
+/// Addendum-169 R-B production witness for the two RB-X3 family shapes. The
+/// variadic subject crosses a libc position whose contract marks the argument
+/// read-only, so it may use the explicit address view. The FILE stream contract
+/// is not read-only and therefore must remain raw even when the Rust body only
+/// reads through the pointer.
 ///
-/// Mutations deleting either family rule leave its named parameter raw (or
-/// block with shared-to-mut), so the signature and bridge assertions identify
-/// which rule was lost.
+/// A mutation that treats the stream shape itself as negative-write evidence
+/// incorrectly promotes `stream` and emits a second `cast_mut` bridge.
 #[test]
 fn rb_x3_family_contracts_reach_the_shared_emission_path() {
     let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
@@ -9082,16 +9210,19 @@ fn rb_x3_family_contracts_reach_the_shared_emission_path() {
         panic!("both exact family contracts must emit");
     };
     assert!(source.contains("print_arg(p: &i8)"), "{source}");
-    assert!(source.contains("print_stream(stream: &File)"), "{source}");
+    assert!(
+        source.contains("print_stream(stream: *mut File)"),
+        "{source}"
+    );
     assert_eq!(
         source.matches("core::ptr::from_ref(").count(),
-        2,
-        "one explicit family bridge per subject: {source}"
+        1,
+        "only the libc-read-only subject may use an explicit bridge: {source}"
     );
     assert_eq!(
         source.matches(".cast_mut()").count(),
-        2,
-        "the family permission must not become a general implicit coercion: {source}"
+        1,
+        "a stream contract must not license a shared-to-mut raw bridge: {source}"
     );
 }
 

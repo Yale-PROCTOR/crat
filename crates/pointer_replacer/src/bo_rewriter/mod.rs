@@ -4826,6 +4826,7 @@ fn finish_decide<'tcx>(
         &retention,
         &e2_hypothetical,
         &facts,
+        &mut_facts,
     );
     let raw_boundary_decision_wall_s = raw_boundary_decision_started.elapsed().as_secs_f64();
     // Derive the attested A5 site index once, before PAIR, and pass the same
@@ -5053,6 +5054,7 @@ fn finish_decide<'tcx>(
         DecideCtx {
             slots,
             model,
+            mut_facts,
             facts,
             coconv,
             lifetime_eligibility,
@@ -5413,6 +5415,7 @@ fn raw_boundary_subjects_tsv(
 pub(crate) struct DecideCtx {
     slots: CrateSlots,
     model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    mut_facts: MutFacts,
     facts: decision::emitability::EmitabilityFacts,
     /// **S3.6-1 task 2.** Carried out with the table rather than recomputed by
     /// the census exporter, for R1's reason: the second derivation is what made

@@ -24,6 +24,18 @@ pub(crate) enum PointeeAccess {
     Lifecycle,
 }
 
+impl PointeeAccess {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Stream => "stream",
+            Self::Lifecycle => "lifecycle",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnershipContract {
     BorrowView,
@@ -37,7 +49,6 @@ pub(crate) struct ArgumentContract {
     pub retention: RetentionContract,
     pub access: PointeeAccess,
     pub ownership: OwnershipContract,
-    pub permits_shared_to_mut: bool,
     pub provenance: &'static str,
 }
 
@@ -174,23 +185,20 @@ fn family_contract(
     argument_index: usize,
     target: &RawTargetType,
 ) -> Result<Option<ArgumentContract>, ContractFailure> {
-    let (access, permits_shared_to_mut, provenance) =
+    let (access, provenance) =
         if printf_tail_first(symbol).is_some_and(|first| argument_index >= first) {
             (
                 PointeeAccess::Read,
-                true,
                 "pinned-libc-family-printf-tail-0.2.184",
             )
         } else if scanf_tail_first(symbol).is_some_and(|first| argument_index >= first) {
             (
                 PointeeAccess::Write,
-                false,
                 "pinned-libc-family-scanf-tail-0.2.184",
             )
         } else if is_stdio_stream_position(symbol, argument_index) {
             (
                 PointeeAccess::Stream,
-                true,
                 "pinned-libc-family-stdio-stream-0.2.184",
             )
         } else {
@@ -203,7 +211,6 @@ fn family_contract(
         retention: RetentionContract::NoRetain,
         access,
         ownership: OwnershipContract::BorrowView,
-        permits_shared_to_mut,
         provenance,
     }))
 }
@@ -240,7 +247,6 @@ pub(crate) fn classify_contract(
         retention: RetentionContract::NoRetain,
         access: row.access,
         ownership: row.ownership,
-        permits_shared_to_mut: false,
         provenance: "pinned-libc-0.2.184",
     })
 }
@@ -277,7 +283,6 @@ mod tests {
                 retention: RetentionContract::NoRetain,
                 access: PointeeAccess::Read,
                 ownership: OwnershipContract::BorrowView,
-                permits_shared_to_mut: false,
                 provenance: "pinned-libc-0.2.184",
             })
         );
@@ -292,27 +297,24 @@ mod tests {
     }
 
     /// RB-X3 variadic-family witness. Mutation: moving the printf tail start
-    /// past argument 2 (or dropping its shared-to-mut permission) changes this
-    /// exact contract and is observed here.
+    /// past argument 2 changes this exact contract and is observed here.
     #[test]
     fn rb_x3_printf_and_scanf_variadic_tails_keep_distinct_access() {
         let printf = classify_contract(&callee("fprintf", true), 2, &target(RawMutability::Mut))
             .expect("fprintf variadic tail");
         assert_eq!(printf.retention, RetentionContract::NoRetain);
         assert_eq!(printf.access, PointeeAccess::Read);
-        assert!(printf.permits_shared_to_mut);
         assert_eq!(printf.provenance, "pinned-libc-family-printf-tail-0.2.184");
 
         let scanf = classify_contract(&callee("fscanf", true), 2, &target(RawMutability::Mut))
             .expect("fscanf variadic tail");
         assert_eq!(scanf.retention, RetentionContract::NoRetain);
         assert_eq!(scanf.access, PointeeAccess::Write);
-        assert!(!scanf.permits_shared_to_mut);
         assert_eq!(scanf.provenance, "pinned-libc-family-scanf-tail-0.2.184");
     }
 
     /// RB-X3 stream-position witness. Mutation: routing the FILE* position
-    /// through the ordinary write rule loses the explicit stream permission;
+    /// through the ordinary write rule loses the distinct stream receipt;
     /// routing fclose through it loses lifecycle-hard ownership.
     #[test]
     fn rb_x3_stdio_stream_positions_are_no_retain_but_fclose_is_lifecycle_hard() {
@@ -320,14 +322,12 @@ mod tests {
             .expect("fprintf stream");
         assert_eq!(stream.retention, RetentionContract::NoRetain);
         assert_eq!(stream.access, PointeeAccess::Stream);
-        assert!(stream.permits_shared_to_mut);
         assert_eq!(stream.provenance, "pinned-libc-family-stdio-stream-0.2.184");
 
         let close = classify_contract(&callee("fclose", true), 0, &target(RawMutability::Mut))
             .expect("fclose lifecycle");
         assert_eq!(close.access, PointeeAccess::Lifecycle);
         assert_eq!(close.ownership, OwnershipContract::Consume);
-        assert!(!close.permits_shared_to_mut);
     }
 
     #[test]
