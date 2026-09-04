@@ -425,6 +425,34 @@ fn intervals_overlap(left: &ClassSite, right: &ClassSite) -> bool {
     left.key.lo < right.key.hi && right.key.lo < left.key.hi
 }
 
+/// The AST pipeline rewrites a subject use before it wraps the containing call
+/// argument.  This one strict nesting is therefore composition, not a byte
+/// collision.  Return `(outer, inner)` so cross-class nesting also records the
+/// readiness dependency needed to keep the composition atomic.
+fn nested_subject_use_composition(
+    left: &ClassSite,
+    right: &ClassSite,
+) -> Option<(SignatureClassId, SignatureClassId)> {
+    let strictly_contains = |outer: &ClassSite, inner: &ClassSite| {
+        outer.key.file == inner.key.file
+            && outer.key.lo <= inner.key.lo
+            && inner.key.hi <= outer.key.hi
+            && (outer.key.lo < inner.key.lo || inner.key.hi < outer.key.hi)
+    };
+    let composable = |outer: &ClassSite, inner: &ClassSite| {
+        matches!(outer.key.arm.as_str(), "c" | "glue")
+            && inner.key.bridge_kind == "subject-use"
+            && strictly_contains(outer, inner)
+    };
+    if composable(left, right) {
+        Some((left.key.owner_class, right.key.owner_class))
+    } else if composable(right, left) {
+        Some((right.key.owner_class, left.key.owner_class))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalization {
     let mut merged = BTreeMap::<SignatureClassId, ClassInput>::new();
     for input in inputs {
@@ -447,9 +475,16 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
         .collect::<Vec<_>>();
     let mut collisions = Vec::new();
     let mut intra_class_collisions = std::collections::BTreeSet::new();
+    let mut composed_dependencies = std::collections::BTreeSet::new();
     for (left_index, left) in all_sites.iter().enumerate() {
         for right in &all_sites[left_index + 1..] {
             if !intervals_overlap(left, right) {
+                continue;
+            }
+            if let Some((outer, inner)) = nested_subject_use_composition(left, right) {
+                if outer != inner {
+                    composed_dependencies.insert((outer, inner));
+                }
                 continue;
             }
             if left.key.owner_class == right.key.owner_class {
@@ -481,6 +516,14 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
                 right_kind: right.key.bridge_kind.clone(),
             });
         }
+    }
+
+    for (outer, inner) in composed_dependencies {
+        merged
+            .get_mut(&outer)
+            .expect("composed outer class came from merged inputs")
+            .depends_on
+            .push(inner);
     }
 
     for class in intra_class_collisions {
@@ -2492,6 +2535,69 @@ mod wave3_class_tests {
                     .any(|reason| reason == "intra-class-interval-overlap"),
                 "missing typed intra-class hold: {:?}",
                 class.hold_reasons()
+            );
+        });
+    }
+
+    /// D10-W1 — lil's 204/260 shape.  A call-level C bridge owns an outer AST
+    /// node while a subject-use rewrite owns a strict descendant.  The AST
+    /// pipeline applies the descendant first and then moves that rewritten
+    /// subtree into the bridge, so finalization must not classify the nesting
+    /// as a flat-splice collision.  A true crossing remains held.
+    #[test]
+    fn d10_w1_nested_c_bridge_composes_but_crossing_intervals_hold() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(4, |ids| {
+            let outer = ClassInput::new(ids[0], arms(&[Arm::C])).with_site(ClassSite::edit(
+                ids[0],
+                ids[0],
+                Arm::C,
+                "lil.rs",
+                200,
+                260,
+                "c-raw-option-slice",
+            ));
+            let inner = ClassInput::new(ids[1], arms(&[Arm::Surface])).with_site(ClassSite::edit(
+                ids[1],
+                ids[1],
+                Arm::Surface,
+                "lil.rs",
+                220,
+                230,
+                "subject-use",
+            ));
+            let crossing_outer =
+                ClassInput::new(ids[2], arms(&[Arm::Glue])).with_site(ClassSite::edit(
+                    ids[2],
+                    ids[2],
+                    Arm::Glue,
+                    "lil.rs",
+                    300,
+                    330,
+                    "nullable-required-unwrap",
+                ));
+            let crossing_inner =
+                ClassInput::new(ids[3], arms(&[Arm::Surface])).with_site(ClassSite::edit(
+                    ids[3],
+                    ids[3],
+                    Arm::Surface,
+                    "lil.rs",
+                    320,
+                    340,
+                    "subject-use",
+                ));
+            let finalized =
+                finalize_class_inputs(vec![outer, inner, crossing_outer, crossing_inner]);
+            assert!(
+                finalized.classes[&ids[0]].is_ready(),
+                "strict inner-first composition was held: {:?}",
+                finalized.classes[&ids[0]].hold_reasons()
+            );
+            assert!(finalized.classes[&ids[1]].is_ready());
+            assert!(finalized.classes[&ids[0]].depends_on.contains(&ids[1]));
+            assert!(
+                !finalized.classes[&ids[2]].is_ready() && !finalized.classes[&ids[3]].is_ready(),
+                "a true crossing reached application"
             );
         });
     }
