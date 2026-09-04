@@ -155,13 +155,17 @@ pub(crate) const SURFACE_APPLIED_REQUIRED_C_MISSING: &str =
     "raw_boundary_surface_applied_required_c_missing";
 pub(crate) const BLOCKED_SUBJECT_WITH_APPLIED_ARM: &str =
     "raw_boundary_blocked_subject_with_applied_arm";
+pub(crate) const INTERFACE_INVENTORY_SITES: &str = "raw_boundary_interface_inventory_sites";
+pub(crate) const SITES_FROM_NON_SUBJECT_ARGUMENTS: &str =
+    "raw_boundary_sites_from_non_subject_arguments";
+pub(crate) const CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT: &str =
+    "raw_boundary_converted_callee_without_site_receipt";
 pub(crate) const STATUS: &str = "raw_boundary_status";
 
 pub(crate) const BRIDGE_RECEIPT_FILE: &str = "raw-boundary-bridge-receipts.tsv";
 pub(crate) const CLASS_COST_ROWS: &str = "raw-boundary-class-costs.tsv";
 pub(crate) const CROSS_CLASS_COLLISION_ROWS: &str = "raw-boundary-class-collisions.tsv";
 pub(crate) const UNRESOLVED_CLASS_ROWS: &str = "raw-boundary-unresolved-classes.tsv";
-
 pub(crate) const ALL: &[&str] = &[
     CORPUS,
     ANALYSIS_FRAME,
@@ -312,5 +316,8 @@ pub(crate) const ALL: &[&str] = &[
     UNRESOLVED_CLASS_COUNT,
     SURFACE_APPLIED_REQUIRED_C_MISSING,
     BLOCKED_SUBJECT_WITH_APPLIED_ARM,
+    INTERFACE_INVENTORY_SITES,
+    SITES_FROM_NON_SUBJECT_ARGUMENTS,
+    CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT,
     STATUS,
 ];

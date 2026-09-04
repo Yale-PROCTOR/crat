@@ -10582,6 +10582,7 @@ mod run {
             ("class-costs", artifact.class_costs.as_str()),
             ("class-collisions", artifact.class_collisions.as_str()),
             ("unresolved-classes", artifact.unresolved_classes.as_str()),
+            ("interface-inventory", artifact.interface_inventory.as_str()),
             ("subjects", capture.subject_receipt.as_str()),
         ];
         for (suffix, contents) in artifact_rows {
@@ -11333,6 +11334,18 @@ mod run {
         row.set(
             raw_schema::UNRESOLVED_CLASS_COUNT,
             artifact.unresolved_classes.lines().skip(1).count(),
+        );
+        row.set(
+            raw_schema::INTERFACE_INVENTORY_SITES,
+            artifact.interface_inventory.lines().skip(1).count(),
+        );
+        row.set(
+            raw_schema::SITES_FROM_NON_SUBJECT_ARGUMENTS,
+            artifact.sites_from_non_subject_arguments,
+        );
+        row.set(
+            raw_schema::CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT,
+            artifact.converted_callee_without_site_receipt,
         );
         let profile_ok =
             build_profile == "release" && launch_profile == "release" && !cfg!(debug_assertions);
@@ -20811,6 +20824,37 @@ fn raw_boundary_wave2_corpus_census() {
         rows.push(row);
     }
     assert_eq!(rows.len(), 20);
+    for row in &rows {
+        assert_eq!(
+            row.get(raw_schema::CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT),
+            Some("0"),
+            "converted callee lacks a required call-site receipt: {row:?}"
+        );
+        if matches!(
+            row.get("program"),
+            Some(
+                "binn"
+                    | "brotli"
+                    | "buffer"
+                    | "bzip2"
+                    | "heman"
+                    | "json.h"
+                    | "libzahl"
+                    | "lil"
+                    | "lodepng"
+                    | "robotfindskitten"
+                    | "tulipindicators"
+                    | "urlparser"
+            )
+        ) {
+            assert!(
+                row.get(raw_schema::ATTRIBUTION_HITS_EXACT_SEAM)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .is_some_and(|value| value > 0),
+                "checkpoint-unresolved program has no exact-seam attribution: {row:?}"
+            );
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Default)]
     struct DeliveryCounts {
@@ -21526,6 +21570,25 @@ fn raw_boundary_wave2_corpus_census() {
         raw_schema::R1_PTR_COMPARISON,
         raw_schema::R1_ESCAPES_VIA_FOREIGN_ARG,
         raw_schema::R1_OTHER,
+        raw_schema::BRIDGE_RECEIPT_ROWS,
+        raw_schema::BRIDGE_REQUIRED_SITES,
+        raw_schema::BRIDGE_PLANNED_EVENTS,
+        raw_schema::BRIDGE_APPLIED_EVENTS,
+        raw_schema::BRIDGE_DROPPED_EVENTS,
+        raw_schema::SIGNATURE_CLASS_COUNT,
+        raw_schema::ATTRIBUTION_HITS_EXACT_EDIT,
+        raw_schema::ATTRIBUTION_HITS_EXACT_SEAM,
+        raw_schema::ATTRIBUTION_HITS_RELATED_SPAN,
+        raw_schema::ATTRIBUTION_HITS_ENCLOSING_REGION,
+        raw_schema::ATTRIBUTION_HITS_UNRESOLVED,
+        raw_schema::CLASS_BISECT_PROBES,
+        raw_schema::CROSS_CLASS_COLLISION_COUNT,
+        raw_schema::UNRESOLVED_CLASS_COUNT,
+        raw_schema::SURFACE_APPLIED_REQUIRED_C_MISSING,
+        raw_schema::BLOCKED_SUBJECT_WITH_APPLIED_ARM,
+        raw_schema::INTERFACE_INVENTORY_SITES,
+        raw_schema::SITES_FROM_NON_SUBJECT_ARGUMENTS,
+        raw_schema::CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT,
     ] {
         aggregate.set(key, total(key));
     }

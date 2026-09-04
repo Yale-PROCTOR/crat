@@ -218,6 +218,9 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
+    pub(crate) interface_inventory: String,
+    pub(crate) sites_from_non_subject_arguments: usize,
+    pub(crate) converted_callee_without_site_receipt: usize,
     pub(crate) degraded_output_receipt: String,
     pub(crate) per_arm_timers_status: String,
     pub(crate) attribution_hits: AttributionHits,
@@ -3786,6 +3789,7 @@ fn seam_site_kind(kind: &str) -> bool {
             | "address-observation"
             | "c9-mark"
             | "raw-boundary-atom"
+            | "interface-inventory-site"
     )
 }
 
@@ -5071,6 +5075,9 @@ fn finish_decide<'tcx>(
         class_costs: bridge_receipt::class_cost_header(),
         class_collisions: bridge_receipt::class_collision_header(),
         unresolved_classes: bridge_receipt::unresolved_class_header(),
+        interface_inventory: table.seams.interface_inventory_tsv(tcx),
+        sites_from_non_subject_arguments: table.seams.sites_from_non_subject_arguments(),
+        converted_callee_without_site_receipt: table.seams.converted_callee_without_site_receipt(),
         degraded_output_receipt: "not-applicable".to_owned(),
         per_arm_timers_status: "queued-no-free-column".to_owned(),
         attribution_hits: AttributionHits::default(),

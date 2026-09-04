@@ -672,6 +672,7 @@ pub(crate) fn finalize_signature_classes(
         .iter()
         .map(|edit| (SignatureClassId::of(edit.bridge.caller), edit.owner_class))
         .collect::<Vec<_>>();
+    dependency_edges.extend(table.seams.interface_dependencies.iter().copied());
     dependency_edges.extend(table.entries.iter().filter_map(
         |(subject, decision)| match decision {
             Decision::InferredRef { callee, .. } => Some((
@@ -2005,6 +2006,22 @@ pub(crate) fn plan(
             })
         }));
     }
+    attribution_intervals.extend(table.seams.interface_inventory.iter().filter_map(|site| {
+        let (file, lo, hi) = span_to_loc(site.call_span).ok()?;
+        Some(ClassAttributionInterval {
+            owner_class: site.key.callee,
+            owner_path: table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.fn_did == site.key.callee.local_def_id())
+                .map(|(subject, _)| owner_of(subject))
+                .unwrap_or_else(|| format!("local-def-{}", site.key.callee.order_key())),
+            file,
+            lo,
+            hi,
+            kind: "interface-inventory-site",
+        })
+    }));
     attribution_intervals.sort();
     attribution_intervals.dedup();
 

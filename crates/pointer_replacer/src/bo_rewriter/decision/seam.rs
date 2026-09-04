@@ -608,6 +608,24 @@ pub(crate) struct PairRawViewCall {
     pub atom_ids: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct InterfaceInventoryKey {
+    pub(crate) caller: SignatureClassId,
+    pub(crate) callee: SignatureClassId,
+    pub(crate) block: u32,
+    pub(crate) argument_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InterfaceInventorySite {
+    pub(crate) key: InterfaceInventoryKey,
+    pub(crate) call_span: Span,
+    pub(crate) argument_span: Span,
+    pub(crate) source_shape: &'static str,
+    pub(crate) non_subject: bool,
+    pub(crate) disposition: &'static str,
+}
+
 /// **The authorization rule for fabrication, as a pure function** (R8).
 ///
 /// One place decides *licensed vs fabricated*, and it decides it from the only
@@ -2468,6 +2486,56 @@ pub(crate) struct SeamPlan {
     /// Same-object T2 raw views grouped by call so every raw temp is created
     /// before any surviving safe borrow in the call expression.
     pub pair_raw_calls: Vec<PairRawViewCall>,
+    /// Every resolved MIR call position whose callee parameter is emitted in a
+    /// safe form. This inventory is independent of pointer-subject membership.
+    pub interface_inventory: Vec<InterfaceInventorySite>,
+    pub interface_required_sites: BTreeSet<InterfaceInventoryKey>,
+    /// A zero-syntax safe/safe site relies on the caller class remaining live.
+    /// The callee therefore depends on that caller and follows its reversion.
+    pub interface_dependencies: Vec<(SignatureClassId, SignatureClassId)>,
+}
+
+impl SeamPlan {
+    pub(crate) fn converted_callee_without_site_receipt(&self) -> usize {
+        let receipted = self
+            .interface_inventory
+            .iter()
+            .map(|site| site.key)
+            .collect::<BTreeSet<_>>();
+        self.interface_required_sites
+            .difference(&receipted)
+            .map(|key| key.callee)
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    pub(crate) fn sites_from_non_subject_arguments(&self) -> usize {
+        self.interface_inventory
+            .iter()
+            .filter(|site| site.non_subject)
+            .count()
+    }
+
+    pub(crate) fn interface_inventory_tsv(&self, tcx: TyCtxt<'_>) -> String {
+        let mut out = String::from(
+            "caller\tcallee\tblock\targument_index\tsource_shape\tnon_subject\tdisposition\n",
+        );
+        let mut rows = self.interface_inventory.clone();
+        rows.sort_by_key(|site| site.key);
+        for site in rows {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                tcx.def_path_str(site.key.caller.local_def_id().to_def_id()),
+                tcx.def_path_str(site.key.callee.local_def_id().to_def_id()),
+                site.key.block,
+                site.key.argument_index,
+                site.source_shape,
+                u8::from(site.non_subject),
+                site.disposition,
+            ));
+        }
+        out
+    }
 }
 
 /// The form a decision emits.
@@ -2606,6 +2674,208 @@ fn block_pair_raw_view(
         span: pair.span,
         reason: reason.to_owned(),
     });
+}
+
+fn call_spans_match(left: Span, right: Span) -> bool {
+    let left = left.source_callsite();
+    let right = right.source_callsite();
+    left == right || left.contains(right) || right.contains(left)
+}
+
+fn existing_interface_disposition(
+    plan: &SeamPlan,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    index: usize,
+) -> Option<&'static str> {
+    if plan.edits.iter().any(|edit| {
+        edit.bridge.caller == caller
+            && edit.owner_class.local_def_id() == callee
+            && edit.param_index == index
+    }) {
+        return Some("bridged");
+    }
+    if plan
+        .blocked
+        .iter()
+        .any(|site| site.caller == caller && site.callee == callee && site.index == index)
+        || plan.raw_boundary_blocked.iter().any(|site| {
+            site.bridge.caller == caller
+                && matches!(site.bridge.callee, BridgeCalleeId::Local(did) if did == callee)
+                && site.bridge.position == format!("arg{index}")
+        })
+    {
+        return Some("held");
+    }
+    if plan
+        .pair_sites
+        .iter()
+        .any(|site| site.caller == caller && site.callee == callee && site.argument_index == index)
+    {
+        return Some("pair");
+    }
+    if plan.zero_bridges.iter().any(|site| {
+        site.caller == caller
+            && site.owner_class.local_def_id() == callee
+            && site.position == format!("arg{index}")
+    }) {
+        return Some("zero-syntax");
+    }
+    None
+}
+
+fn argument_form(
+    caller: LocalDefId,
+    arg: &super::emitability::Arg,
+    decisions: &FxHashMap<(LocalDefId, HirId), &Decision>,
+) -> Form {
+    match arg.shape {
+        ArgShape::BareLocal(hir) | ArgShape::CastOfLocal { binding: hir, .. } => decisions
+            .get(&(caller, hir))
+            .map_or(Form::Raw, |decision| form_of(decision)),
+        ArgShape::AddrOf { mutable, .. } | ArgShape::AddrOfCast { mutable, .. } => {
+            Form::Ref { mutable }
+        }
+        ArgShape::RawExpr { .. } | ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => {
+            Form::Raw
+        }
+    }
+}
+
+fn complete_interface_inventory(
+    facts: &super::emitability::EmitabilityFacts,
+    table: &DecisionTable,
+    lifetime_eligibility: &super::lifetime::LifetimeEligibility,
+    decisions: &FxHashMap<(LocalDefId, HirId), &Decision>,
+    params: &FxHashMap<(LocalDefId, usize), (LocalDefId, HirId)>,
+    plan: &mut SeamPlan,
+) {
+    let Some(web) = lifetime_eligibility.fnptr_web() else {
+        return;
+    };
+    for mir_site in web.mir_call_sites() {
+        let hir_site = facts.call_args.get(&mir_site.callee).and_then(|sites| {
+            sites.iter().find(|site| {
+                site.caller == mir_site.caller && call_spans_match(site.span, mir_site.span)
+            })
+        });
+        for index in 0..mir_site.argument_count {
+            let Some(expected) = params
+                .get(&(mir_site.callee, index))
+                .and_then(|node| decisions.get(node))
+                .map(|decision| form_of(decision))
+                .filter(|form| *form != Form::Raw)
+            else {
+                continue;
+            };
+            let key = InterfaceInventoryKey {
+                caller: SignatureClassId::of(mir_site.caller),
+                callee: SignatureClassId::of(mir_site.callee),
+                block: mir_site.block,
+                argument_index: index,
+            };
+            plan.interface_required_sites.insert(key);
+            let argument =
+                hir_site.and_then(|site| site.args.iter().find(|arg| arg.index == index));
+            let argument_span = argument.map_or(mir_site.span, |arg| arg.span);
+            let non_subject = argument.is_none_or(|arg| {
+                !matches!(
+                    arg.shape,
+                    ArgShape::BareLocal(hir) if decisions.contains_key(&(mir_site.caller, hir))
+                )
+            });
+
+            let disposition = if let Some(disposition) =
+                existing_interface_disposition(plan, mir_site.caller, mir_site.callee, index)
+            {
+                disposition
+            } else if let Some(argument) = argument {
+                let found = argument_form(mir_site.caller, argument, decisions);
+                if matches!(glue(expected, found, None), Ok(None)) {
+                    plan.zero_bridges.push(ZeroBridgeSite {
+                        owner_class: SignatureClassId::of(mir_site.callee),
+                        caller: mir_site.caller,
+                        span: Some(argument.span),
+                        arm: receipt_arm(expected, found),
+                        position: format!("arg{index}"),
+                        bridge_kind: "interface-call-zero-syntax",
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                    });
+                    if matches!(
+                        argument.shape,
+                        ArgShape::BareLocal(_) | ArgShape::CastOfLocal { .. }
+                    ) && found != Form::Raw
+                        && mir_site.caller != mir_site.callee
+                    {
+                        plan.interface_dependencies.push((
+                            SignatureClassId::of(mir_site.callee),
+                            SignatureClassId::of(mir_site.caller),
+                        ));
+                    }
+                    "zero-syntax"
+                } else {
+                    plan.raw_boundary_blocked.push(BlockedRawBoundary {
+                        owner_class: SignatureClassId::of(mir_site.callee),
+                        bridge: BridgeSitePlan::local(
+                            mir_site.caller,
+                            mir_site.callee,
+                            receipt_arm(expected, found),
+                            format!("arg{index}"),
+                            "inventory-non-subject-held",
+                        ),
+                        span: argument.span,
+                        reason: "inventory-missing-expression-bridge".to_owned(),
+                    });
+                    "held"
+                }
+            } else if table.exposure.as_ref().is_some_and(|exposure| {
+                matches!(
+                    exposure.plan(mir_site.callee),
+                    super::exposure::ExposureSurfacePlan::PositiveSeedShim
+                        | super::exposure::ExposureSurfacePlan::FnPtrRawWrapper
+                )
+            }) {
+                plan.zero_bridges.push(ZeroBridgeSite {
+                    owner_class: SignatureClassId::of(mir_site.callee),
+                    caller: mir_site.caller,
+                    span: Some(mir_site.span),
+                    arm: "surface",
+                    position: format!("arg{index}"),
+                    bridge_kind: "interface-fnptr-raw-wrapper",
+                    retention: BridgeRetentionTier::None,
+                    waiver_id: None,
+                });
+                "raw-wrapper"
+            } else {
+                plan.raw_boundary_blocked.push(BlockedRawBoundary {
+                    owner_class: SignatureClassId::of(mir_site.callee),
+                    bridge: BridgeSitePlan::local(
+                        mir_site.caller,
+                        mir_site.callee,
+                        receipt_arm(expected, Form::Raw),
+                        format!("arg{index}"),
+                        "inventory-non-subject-held",
+                    ),
+                    span: mir_site.span,
+                    reason: "inventory-missing-hir-argument-site".to_owned(),
+                });
+                "held"
+            };
+            plan.interface_inventory.push(InterfaceInventorySite {
+                key,
+                call_span: mir_site.span,
+                argument_span,
+                source_shape: argument.map_or("mir-only", |arg| arg.shape.key()),
+                non_subject,
+                disposition,
+            });
+        }
+    }
+    plan.interface_inventory.sort_by_key(|site| site.key);
+    plan.interface_inventory.dedup_by_key(|site| site.key);
+    plan.interface_dependencies.sort();
+    plan.interface_dependencies.dedup();
 }
 
 /// Compute every seam adapter the crate needs.
@@ -3858,6 +4128,14 @@ pub(crate) fn synthesize_with_raw_boundary(
             }),
         }
     }
+    complete_interface_inventory(
+        facts,
+        table,
+        lifetime_eligibility,
+        &decision_of,
+        &param_key,
+        &mut plan,
+    );
     plan
 }
 

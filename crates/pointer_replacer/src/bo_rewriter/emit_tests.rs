@@ -5112,6 +5112,17 @@ mod attribution_and_escapes {
                     atom_covered: false,
                 },
                 EditSite {
+                    owner_class: Some(*right),
+                    file: "/crate/caller.rs".to_owned(),
+                    fn_path: "same-display".to_owned(),
+                    lo_line: 21,
+                    hi_line: 21,
+                    edit_id: "mir-interface-inventory".to_owned(),
+                    site_kind: "interface-inventory-site",
+                    atom_ids: Vec::new(),
+                    atom_covered: false,
+                },
+                EditSite {
                     owner_class: Some(*left),
                     file: "/crate/caller.rs".to_owned(),
                     fn_path: "left".to_owned(),
@@ -5152,6 +5163,11 @@ mod attribution_and_escapes {
             let seam = run(diag("/crate/caller.rs", 20));
             assert_eq!(seam.rule, AttributionRule::ExactSeam);
             assert_eq!(seam.classes, BTreeSet::from([*right]));
+            assert_eq!(
+                run(diag("/crate/caller.rs", 21)).rule,
+                AttributionRule::ExactSeam,
+                "MIR inventory intervals are exact seam sites"
+            );
             let mut related = diag("/crate/caller.rs", 99);
             related.related.push(super::super::verify::RelatedDiag {
                 file: "/crate/caller.rs".to_owned(),
@@ -6460,6 +6476,151 @@ fn br_w1_raw_scalar_inbound_reborrows_and_receipts_are_exact() {
         }));
     }
     super::bridge_receipt::reconcile_bridge_events(&events).expect("BR-W1 bridge events reconcile");
+}
+
+const INV_W1_NON_SUBJECT_CALL: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub struct Holder { pub value: *mut i32 }\n\
+     pub unsafe fn target(p: *mut i32) -> i32 { *p }\n\
+     pub unsafe fn caller(holder: &mut Holder) -> i32 {\n\
+         target(holder.value)\n\
+     }\n";
+
+fn force_inv_w1_target_ref(table: &mut super::decision::DecisionTable) {
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("target::p") {
+            *decision = super::decision::Decision::Ref { mutable: true };
+        }
+    }
+}
+
+/// INV-W1 — a non-subject field projection at a statically targeted MIR call
+/// is still one required site in the converted callee's class.  It must either
+/// receive an expression-level bridge or hold that whole class.
+#[test]
+fn inv_w1_non_subject_mir_call_is_bridged_or_holds_the_class() {
+    use super::bridge_receipt::{BridgeReceiptStage, BridgeReceiptState};
+
+    let fixture = Fixture::new(&[("lib.rs", INV_W1_NON_SUBJECT_CALL)]);
+    let (emission, receipt) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (mut table, mut ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("INV-W1 decision table");
+            force_inv_w1_target_ref(&mut table);
+            let target = ctx
+                .subjects
+                .iter()
+                .find(|subject| subject.label.ends_with("target::p"))
+                .expect("target parameter subject")
+                .fn_did;
+            assert!(
+                ctx.facts.call_args.remove(&target).is_some(),
+                "fixture must remove one legacy HIR call carrier"
+            );
+            table.seams = super::decision::seam::synthesize_with_raw_boundary(
+                tcx,
+                &ctx.facts,
+                &ctx.subjects,
+                &table,
+                &ctx.retained_c9_plans,
+                &ctx.a5_site_proofs,
+                &ctx.raw_boundary,
+                &ctx.coconv,
+                &ctx.retention,
+                &ctx.lifetime_eligibility,
+            );
+            assert_eq!(table.seams.interface_inventory.len(), 1);
+            assert_eq!(table.seams.sites_from_non_subject_arguments(), 1);
+            assert_eq!(table.seams.converted_callee_without_site_receipt(), 0);
+            let inventory = table.seams.interface_inventory_tsv(tcx);
+            assert!(
+                inventory.contains("\ttarget\t")
+                    && inventory.contains("\tmir-only\t1\theld"),
+                "{inventory}"
+            );
+            table.arm_requirements = super::derive_arm_requirements(
+                &ctx.subjects,
+                &table,
+                &ctx.coconv,
+                &ctx.raw_boundary,
+                &ctx.exposure,
+            );
+            let receipt = super::seam_tsv_from_table(tcx, &table);
+            let emission = emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )
+            .expect("INV-W1 attempted emission");
+            (emission, receipt)
+        })
+        .expect("INV-W1 fixture compiles before rewriting");
+    let attempt = E2Attempt {
+        fixture,
+        emission,
+        receipt,
+    };
+    let source = text_for(&attempt.emission, "lib.rs")
+        .cloned()
+        .unwrap_or_else(|| fs::read_to_string(attempt.fixture.root()).expect("fixture source"));
+    let events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    assert_eq!(attempt.emission.plan.class_finalization.classes.len(), 1);
+    assert_eq!(
+        attempt
+            .emission
+            .plan
+            .class_finalization
+            .classes
+            .values()
+            .filter(|class| !class.is_ready())
+            .count(),
+        1,
+        "the unplaceable MIR-only argument must hold exactly its callee class"
+    );
+    let sites = events
+        .iter()
+        .filter(|event| {
+            event.site.position == "arg0"
+                && matches!(
+                    event.site.bridge_kind.as_str(),
+                    "c-raw-reborrow-mut" | "inventory-non-subject-held"
+                )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        sites.len(),
+        2,
+        "missing INV-W1 plan/terminal receipt:\n{source}"
+    );
+    assert!(sites.iter().any(|event| {
+        event.stage == BridgeReceiptStage::Terminal
+            && matches!(
+                event.state,
+                BridgeReceiptState::Applied | BridgeReceiptState::Dropped
+            )
+    }));
+    assert!(
+        source.contains("target(unsafe { &mut *holder.value })")
+            || source.contains("fn target(p: *mut i32)"),
+        "neither expression bridge nor atomic class hold was emitted:\n{source}"
+    );
+    assert!(
+        e2_type_checks(&attempt),
+        "INV-W1 emitted tree must type-check"
+    );
+    super::bridge_receipt::reconcile_bridge_events(&events).expect("INV-W1 receipts reconcile");
 }
 
 const BR_W2_RAW_OPTIONALS: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\

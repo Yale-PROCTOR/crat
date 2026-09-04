@@ -30,7 +30,7 @@ use crate::{
     analyses::borrow_ownership::{
         SlotKind,
         a5_overlap::WholeProgramAttestation,
-        a5_producer::resolve_closed_world_call_world,
+        a5_producer::{ClosedWorldCallWorld, resolve_closed_world_call_world},
         crate_slots::CrateSlots,
         origin_summary::{
             OriginSlot, OriginSummaries, OriginSummary, SignatureRoot, SignatureSlot,
@@ -1115,6 +1115,7 @@ pub(crate) struct FnPtrWeb {
     members: FxHashSet<LocalDefId>,
     reasons: FxHashMap<LocalDefId, WebDerivation>,
     static_seeds: Vec<StaticFnPtrSeed>,
+    mir_call_sites: Vec<MirCallTargetSite>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1123,6 +1124,18 @@ pub(crate) struct StaticFnPtrSeed {
     pub(crate) function: LocalDefId,
     pub(crate) block: u32,
     pub(crate) statement: usize,
+    pub(crate) span: Span,
+}
+
+/// One resolved target of one function-body MIR call terminator.  Unlike the
+/// older HIR argument carrier, this inventory is independent of whether an
+/// argument expression maps to a pointer-ledger subject.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MirCallTargetSite {
+    pub(crate) caller: LocalDefId,
+    pub(crate) callee: LocalDefId,
+    pub(crate) block: u32,
+    pub(crate) argument_count: usize,
     pub(crate) span: Span,
 }
 
@@ -1147,6 +1160,10 @@ impl FnPtrWeb {
 
     pub(crate) fn static_seeds(&self) -> &[StaticFnPtrSeed] {
         &self.static_seeds
+    }
+
+    pub(crate) fn mir_call_sites(&self) -> &[MirCallTargetSite] {
+        &self.mir_call_sites
     }
 
     pub(crate) fn root_count(&self) -> usize {
@@ -1347,6 +1364,59 @@ fn collect_const_mir_fn_ptr_seeds(program: &RustProgram<'_>) -> Vec<StaticFnPtrS
     hits
 }
 
+fn collect_mir_call_target_sites(
+    program: &RustProgram<'_>,
+    call_world: &ClosedWorldCallWorld,
+) -> Vec<MirCallTargetSite> {
+    let functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
+    let mut sites = Vec::new();
+    for (&(caller, block), targets) in &call_world.resolved {
+        if !functions.contains(&caller) {
+            continue;
+        }
+        // `caller` is drawn only from `RustProgram::functions`, so this query
+        // is a function-body read; unlike const/static owners, rustc does not
+        // steal it for CTFE.
+        let body_ref = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(caller)
+            .borrow();
+        let terminator = body_ref.basic_blocks[block].terminator();
+        let argument_count = match &terminator.kind {
+            TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } => args.len(),
+            _ => continue,
+        };
+        for &callee in targets {
+            if functions.contains(&callee) {
+                sites.push(MirCallTargetSite {
+                    caller,
+                    callee,
+                    block: block.as_u32(),
+                    argument_count,
+                    span: terminator.source_info.span,
+                });
+            }
+        }
+    }
+    sites.sort_by_key(|site| {
+        (
+            site.caller.local_def_index.as_u32(),
+            site.block,
+            site.callee.local_def_index.as_u32(),
+            site.span.lo().0,
+            site.span.hi().0,
+        )
+    });
+    sites.dedup_by_key(|site| {
+        (
+            site.caller.local_def_index.as_u32(),
+            site.block,
+            site.callee.local_def_index.as_u32(),
+        )
+    });
+    sites
+}
+
 fn web_reason_order(reason: &WebDerivation) -> (u8, u32, u32) {
     match *reason {
         WebDerivation::AdjustedFnPtr => (0, 0, 0),
@@ -1404,6 +1474,7 @@ pub(crate) fn derive_fn_ptr_web(
     // query below consumes the `Steal`; the const-root collector is the
     // terminal reader and itself uses only `mir_for_ctfe`.
     let call_world = resolve_closed_world_call_world(program, attestation);
+    let mir_call_sites = collect_mir_call_target_sites(program, &call_world);
     let mut roots = collect_fn_ptr_roots(program);
     let static_seeds = collect_const_mir_fn_ptr_seeds(program);
     roots.extend(static_seeds.iter().map(|seed| seed.function));
@@ -1457,6 +1528,7 @@ pub(crate) fn derive_fn_ptr_web(
         members,
         reasons,
         static_seeds,
+        mir_call_sites,
     })
 }
 
