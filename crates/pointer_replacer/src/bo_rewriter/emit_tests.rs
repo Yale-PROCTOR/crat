@@ -10339,3 +10339,89 @@ fn c_w4_fnptr_web_uses_raw_surfaces_and_safe_inner_calls() {
         "{source}"
     );
 }
+
+/// D3-W1 — lil's missing-generated-item shape. A surfaced caller names the
+/// callee's generated safe inner, so holding the defining callee class must
+/// hold the caller class before either surface is emitted.
+#[test]
+fn d3_w1_generated_inner_use_depends_on_ready_defining_class() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn leaf(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn root(p: *const i32) -> *const i32 { leaf(p) }\n\
+         pub unsafe fn install() {\n\
+             let _callback: unsafe fn(*const i32) -> *const i32 = root;\n\
+         }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let (emitted, leaf_held, root_held) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let capture = super::ast_transform::capture_ast(tcx)?;
+            let (mut table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )?;
+            let leaf = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with("leaf::p"))
+                .map(|(subject, _)| (subject.fn_did, subject.hir_id))
+                .expect("leaf parameter subject");
+            let root = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with("root::p"))
+                .map(|(subject, _)| subject.fn_did)
+                .expect("root parameter subject");
+            assert!(table.seams.generated_item_dependencies.contains(&(
+                super::bridge_receipt::SignatureClassId::of(root),
+                super::bridge_receipt::SignatureClassId::of(leaf.0),
+            )));
+            table
+                .arm_requirements
+                .entry(leaf)
+                .or_default()
+                .insert(super::decision::Arm::C);
+            let emission = emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )?;
+            let held = emission.plan.held_classes();
+            let leaf_held = held.contains(&super::bridge_receipt::SignatureClassId::of(leaf.0));
+            let root_held = held.contains(&super::bridge_receipt::SignatureClassId::of(root));
+            let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+                &held,
+                &std::collections::BTreeSet::new(),
+                &table,
+            )?;
+            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+                tcx, &capture, &reverts, None, &table,
+            )?;
+            let emitted = files
+                .values()
+                .find(|text| text.contains("fn leaf"))
+                .cloned()
+                .ok_or_else(|| "D3-W1 emitted root missing".to_owned())?;
+            Ok::<_, String>((emitted, leaf_held, root_held))
+        })
+        .expect("D3-W1 input compiles")
+        .expect("D3-W1 emission");
+
+    assert!(leaf_held, "the defining class was not held:\n{emitted}");
+    assert!(
+        root_held,
+        "the generated-item use stayed Ready after its definition was held:\n{emitted}"
+    );
+    assert!(!emitted.contains("__crat_safe_leaf"), "{emitted}");
+    assert!(!emitted.contains("__crat_safe_root"), "{emitted}");
+    let emitted_fixture = Fixture::new(&[("lib.rs", &emitted)]);
+    assert!(
+        ::utils::compilation::run_compiler_on_path(&emitted_fixture.root(), |_| ()).is_ok(),
+        "D3-W1 emitted tree must not name a missing generated item:\n{emitted}"
+    );
+}

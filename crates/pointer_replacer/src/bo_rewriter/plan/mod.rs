@@ -512,7 +512,7 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
         }
     }
 
-    let classes = merged
+    let mut classes = merged
         .into_iter()
         .map(|(id, mut input)| {
             let missing_arms = Arm::ALL
@@ -570,7 +570,41 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
                 },
             )
         })
-        .collect();
+        .collect::<BTreeMap<_, _>>();
+
+    // Readiness follows dependency edges, not only recovery order. In
+    // particular, a surfaced caller that names a generated safe inner cannot
+    // remain Ready after the defining callee class is held.
+    loop {
+        let newly_held = classes
+            .iter()
+            .filter(|(_, class)| class.is_ready())
+            .filter_map(|(&id, class)| {
+                class
+                    .depends_on
+                    .iter()
+                    .copied()
+                    .find(|dependency| {
+                        classes
+                            .get(dependency)
+                            .is_some_and(|dependency| !dependency.is_ready())
+                    })
+                    .map(|dependency| (id, dependency))
+            })
+            .collect::<Vec<_>>();
+        if newly_held.is_empty() {
+            break;
+        }
+        for (id, dependency) in newly_held {
+            classes
+                .get_mut(&id)
+                .expect("dependent class came from finalized inputs")
+                .disposition = SignatureClassDisposition::Held(vec![format!(
+                "dependency-class-held:{}",
+                dependency.order_key()
+            )]);
+        }
+    }
     ClassFinalization {
         classes,
         collisions,
@@ -692,6 +726,7 @@ pub(crate) fn finalize_signature_classes(
         .map(|edit| (SignatureClassId::of(edit.bridge.caller), edit.owner_class))
         .collect::<Vec<_>>();
     dependency_edges.extend(table.seams.interface_dependencies.iter().copied());
+    dependency_edges.extend(table.seams.generated_item_dependencies.iter().copied());
     dependency_edges.extend(table.entries.iter().filter_map(
         |(subject, decision)| match decision {
             Decision::InferredRef { callee, .. } => Some((

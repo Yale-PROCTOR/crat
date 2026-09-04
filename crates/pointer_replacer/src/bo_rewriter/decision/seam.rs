@@ -2498,6 +2498,9 @@ pub(crate) struct SeamPlan {
     /// A zero-syntax safe/safe site relies on the caller class remaining live.
     /// The callee therefore depends on that caller and follows its reversion.
     pub interface_dependencies: Vec<(SignatureClassId, SignatureClassId)>,
+    /// A surfaced caller body names the callee's generated safe inner. The
+    /// caller is therefore Ready only while the defining callee class is Ready.
+    pub generated_item_dependencies: Vec<(SignatureClassId, SignatureClassId)>,
 }
 
 impl SeamPlan {
@@ -2796,6 +2799,24 @@ fn complete_interface_inventory(
         }));
     }
     for mir_site in web.mir_call_sites() {
+        if let Some(exposure) = table.exposure.as_ref()
+            && matches!(
+                exposure.plan(mir_site.caller),
+                super::exposure::ExposureSurfacePlan::PositiveSeedShim
+                    | super::exposure::ExposureSurfacePlan::FnPtrRawWrapper
+            )
+            && matches!(
+                exposure.plan(mir_site.callee),
+                super::exposure::ExposureSurfacePlan::PositiveSeedShim
+                    | super::exposure::ExposureSurfacePlan::FnPtrRawWrapper
+            )
+            && mir_site.caller != mir_site.callee
+        {
+            plan.generated_item_dependencies.push((
+                SignatureClassId::of(mir_site.caller),
+                SignatureClassId::of(mir_site.callee),
+            ));
+        }
         if !emitted_signature_classes.contains(&mir_site.callee) {
             continue;
         }
@@ -2940,6 +2961,8 @@ fn complete_interface_inventory(
     plan.interface_inventory.dedup_by_key(|site| site.key);
     plan.interface_dependencies.sort();
     plan.interface_dependencies.dedup();
+    plan.generated_item_dependencies.sort();
+    plan.generated_item_dependencies.dedup();
 }
 
 /// Compute every seam adapter the crate needs.
