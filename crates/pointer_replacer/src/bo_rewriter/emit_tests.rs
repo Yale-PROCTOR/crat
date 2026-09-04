@@ -5812,6 +5812,76 @@ fn e2_attempt(
     }
 }
 
+fn raw_boundary_attempt_with(
+    src: &str,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> E2Attempt {
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    let (emission, receipt) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (mut table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("raw-boundary fixture decision table");
+            inject(&mut table);
+            let raw_boundary =
+                super::decision::raw_boundary::RawBoundaryDispositionIndex::derive(
+                    &ctx.raw_boundary_sites,
+                    &ctx.retention,
+                    &table,
+                    &ctx.facts,
+                );
+            table.depth2_npo_storages = super::decision::plan_depth2_npo_storages(
+                tcx,
+                &table,
+                &ctx.facts,
+                &ctx.constructions,
+            );
+            table.seams = super::decision::seam::synthesize_with_raw_boundary(
+                tcx,
+                &ctx.facts,
+                &ctx.subjects,
+                &table,
+                &ctx.retained_c9_plans,
+                &ctx.a5_site_proofs,
+                &raw_boundary,
+                &ctx.coconv,
+                &ctx.retention,
+            );
+            table.arm_requirements = super::derive_arm_requirements(
+                &ctx.subjects,
+                &ctx.coconv,
+                &raw_boundary,
+                &ctx.exposure,
+            );
+            let receipt = format!(
+                "{}\n-- seams --\n{}",
+                raw_boundary.receipts_tsv(),
+                super::seam_tsv_from_table(tcx, &table)
+            );
+            let emission = emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )
+            .expect("raw-boundary attempted emission");
+            (emission, receipt)
+        })
+        .expect("raw-boundary fixture compiles before rewriting");
+    E2Attempt {
+        fixture,
+        emission,
+        receipt,
+    }
+}
+
 fn force_body_forms(
     table: &mut super::decision::DecisionTable,
     raw_suffixes: &[&str],
@@ -6959,6 +7029,125 @@ fn br_w5b_fat_and_non_variable_depth2_storage_are_typed_holds() {
         !receipt.contains("\tdepth2-npo-bridge\t"),
         "a negative branch must not receive the admitted template:\n{receipt}"
     );
+}
+
+/// BR-W6 RED: a generic void pointer keeps its raw signature and receives an
+/// explicit pointee-erasing raw view from each safe source.
+#[test]
+fn br_w6_void_generic_boundary_uses_from_ref_mut_then_cast() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         unsafe extern \"C\" {\n\
+             fn consume(p: *mut core::ffi::c_void);\n\
+             fn observe(p: *const core::ffi::c_void);\n\
+         }\n\
+         pub unsafe fn caller(write: *mut i32, read: *const i32) {\n\
+             consume(write as *mut core::ffi::c_void);\n\
+             observe(read as *const core::ffi::c_void);\n\
+         }\n";
+    let attempt = raw_boundary_attempt_with(source, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("caller::write") {
+                *decision = super::decision::Decision::Ref { mutable: true };
+            } else if subject.label.ends_with("caller::read") {
+                *decision = super::decision::Decision::Ref { mutable: false };
+            }
+        }
+    });
+    let source = e2_root_text(&attempt);
+    assert!(
+        source.contains("consume(core::ptr::from_mut(write).cast::<std::ffi::c_void>())"),
+        "mutable void bridge missing:\n{source}"
+    );
+    assert!(
+        source.contains("observe(core::ptr::from_ref(read).cast::<std::ffi::c_void>())"),
+        "shared void bridge missing:\n{source}"
+    );
+    assert!(
+        e2_type_checks(&attempt),
+        "BR-W6 emitted tree must type-check"
+    );
+    let all_events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    let events = all_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "void-generic-raw")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events.len(),
+        4,
+        "two sites, each plan+terminal: {events:#?}"
+    );
+    assert!(events.iter().all(|event| {
+        event.state != super::bridge_receipt::BridgeReceiptState::Dropped
+            && matches!(
+                event.retention,
+                super::bridge_receipt::BridgeRetentionTier::T1
+                    | super::bridge_receipt::BridgeRetentionTier::T2
+            )
+    }));
+    super::bridge_receipt::reconcile_bridge_events(&all_events)
+        .expect("BR-W6 bridge events reconcile");
+}
+
+/// BR-W7 RED: explicit raw-pointer mutability changes use the direction-named
+/// pointer methods and never reverse them.
+#[test]
+fn br_w7_raw_const_mut_casts_use_the_exact_direction() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         unsafe extern \"C\" {\n\
+             fn wants_mut(p: *mut i32);\n\
+             fn wants_const(p: *const i32);\n\
+         }\n\
+         pub unsafe fn caller(mutable: *mut i32, shared: *const i32) {\n\
+             wants_const(mutable as *const i32);\n\
+             wants_mut(shared as *mut i32);\n\
+         }\n";
+    let attempt = raw_boundary_attempt_with(source, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("caller::mutable")
+                || subject.label.ends_with("caller::shared")
+            {
+                *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                    subject: subject.label.clone(),
+                    site: "<br-w7-injected>".to_owned(),
+                    reason: super::decision::DegradeReason::KindRaw,
+                });
+            }
+        }
+    });
+    let source = e2_root_text(&attempt);
+    assert!(
+        source.contains("wants_const(mutable.cast_const())"),
+        "{source}"
+    );
+    assert!(source.contains("wants_mut(shared.cast_mut())"), "{source}");
+    assert!(!source.contains("mutable.cast_mut()"), "{source}");
+    assert!(!source.contains("shared.cast_const()"), "{source}");
+    assert!(
+        e2_type_checks(&attempt),
+        "BR-W7 emitted tree must type-check"
+    );
+    let events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    for kind in ["raw-cast-const", "raw-cast-mut"] {
+        let pair = events
+            .iter()
+            .filter(|event| event.site.bridge_kind == kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pair.len(),
+            2,
+            "exact plan/terminal pair for {kind}: {events:#?}"
+        );
+        assert!(pair.iter().all(|event| {
+            event.retention == super::bridge_receipt::BridgeRetentionTier::T1
+                && event.waiver_id.is_none()
+        }));
+    }
 }
 
 /// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,

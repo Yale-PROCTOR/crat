@@ -108,6 +108,12 @@ pub(crate) struct Depth2Target {
     pub thin: bool,
 }
 
+impl RawTargetType {
+    pub(crate) fn is_void_pointee(&self) -> bool {
+        self.pointee.rsplit("::").next() == Some("c_void")
+    }
+}
+
 pub(crate) fn raw_target_type(ty: Ty<'_>) -> Option<RawTargetType> {
     let TyKind::RawPtr(pointee, mutability) = ty.kind() else {
         return None;
@@ -163,6 +169,8 @@ pub(crate) struct ForeignCallArgFact {
     pub source_type: String,
     pub target: RawTargetType,
     pub direct_storage: Option<(HirId, Span)>,
+    pub adapter_operand_span: Span,
+    pub adapter_operand_mutability: Option<RawMutability>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +191,8 @@ pub(crate) struct RawBoundarySiteFact {
     pub source_type: String,
     pub target: RawTargetType,
     pub direct_storage_span: Option<Span>,
+    pub adapter_operand_span: Span,
+    pub adapter_operand_mutability: Option<RawMutability>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -302,6 +312,8 @@ impl RawBoundarySiteFacts {
                     source_type: fact.source_type.clone(),
                     target: fact.target.clone(),
                     direct_storage_span: fact.direct_storage.map(|(_, span)| span),
+                    adapter_operand_span: fact.adapter_operand_span,
+                    adapter_operand_mutability: fact.adapter_operand_mutability,
                 }),
                 Err(reason) => out.failures.push(RawBoundarySiteFailure {
                     caller: tcx.def_path_str(fact.caller.to_def_id()),
@@ -369,6 +381,8 @@ impl RawBoundarySiteFacts {
                             source_type: argument.source_type.clone(),
                             target,
                             direct_storage_span: argument.direct_storage.map(|(_, span)| span),
+                            adapter_operand_span: argument.adapter_operand_span,
+                            adapter_operand_mutability: argument.adapter_operand_mutability,
                         }),
                         Err(reason) => out.failures.push(RawBoundarySiteFailure {
                             caller: tcx.def_path_str(call.caller.to_def_id()),
@@ -1111,6 +1125,11 @@ pub(crate) const RAW_BOUNDARY_WAIVER_TEXT: &str = "C-aliasing semantics at unsaf
 pub(crate) enum BridgeTemplate {
     Depth2NpoConst,
     Depth2NpoMut,
+    VoidFromMut,
+    VoidFromRef,
+    VoidFromMutAsConst,
+    RawCastMut,
+    RawCastConst,
     RefMutToRawMut,
     RefMutToRawConst,
     RefSharedToRawConst,
@@ -1131,6 +1150,9 @@ impl BridgeTemplate {
     pub(crate) fn key(self) -> &'static str {
         match self {
             Self::Depth2NpoConst | Self::Depth2NpoMut => "depth2-npo-bridge",
+            Self::VoidFromMut | Self::VoidFromRef | Self::VoidFromMutAsConst => "void-generic-raw",
+            Self::RawCastMut => "raw-cast-mut",
+            Self::RawCastConst => "raw-cast-const",
             Self::RefMutToRawMut => "ref-mut-to-raw-mut",
             Self::RefMutToRawConst => "ref-mut-to-raw-const",
             Self::RefSharedToRawConst => "ref-shared-to-raw-const",
@@ -1188,6 +1210,20 @@ impl BridgeTemplate {
                     "core::ptr::from_mut(&mut {argument}).cast::<*{inner} {pointee}>()"
                 )))
             }
+            Self::VoidFromMut | Self::VoidFromRef | Self::VoidFromMutAsConst => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                let source = match self {
+                    Self::VoidFromMut => format!("core::ptr::from_mut({argument})"),
+                    Self::VoidFromRef => format!("core::ptr::from_ref({argument})"),
+                    Self::VoidFromMutAsConst => {
+                        format!("core::ptr::from_ref(&*{argument})")
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(BridgeRender::Edit(format!("{source}.cast::<{pointee}>()")))
+            }
+            Self::RawCastMut => Ok(BridgeRender::Edit(format!("{argument}.cast_mut()"))),
+            Self::RawCastConst => Ok(BridgeRender::Edit(format!("{argument}.cast_const()"))),
             Self::RefMutToRawMut if force_explicit => Ok(BridgeRender::Edit(format!(
                 "core::ptr::from_mut(&mut *{argument})"
             ))),
@@ -1310,6 +1346,7 @@ pub(crate) enum RawBoundaryDisposition {
 pub(crate) struct RawBoundaryRenderSite {
     pub span: Span,
     pub direct_storage_span: Option<Span>,
+    pub adapter_operand_span: Span,
     pub call_span: Span,
     pub target: RawTargetType,
     pub box_slice: bool,
@@ -1430,6 +1467,30 @@ pub(crate) fn template_for(
             | Decision::Degraded(_) => Err(RawBoundaryBlockReason::TemplateUnavailable),
         };
     }
+    if target.is_void_pointee() {
+        return match decision {
+            Decision::Ref { mutable: true } | Decision::InferredRef { mutable: true, .. }
+                if target.mutability == RawMutability::Mut =>
+            {
+                Ok(BridgeTemplate::VoidFromMut)
+            }
+            Decision::Ref { mutable: true } | Decision::InferredRef { mutable: true, .. } => {
+                Ok(BridgeTemplate::VoidFromMutAsConst)
+            }
+            Decision::Ref { mutable: false } | Decision::InferredRef { mutable: false, .. }
+                if target.mutability == RawMutability::Const =>
+            {
+                Ok(BridgeTemplate::VoidFromRef)
+            }
+            Decision::Ref { mutable: false } | Decision::InferredRef { mutable: false, .. } => {
+                Err(RawBoundaryBlockReason::SharedToMut)
+            }
+            Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => Err(RawBoundaryBlockReason::TemplateUnavailable),
+        };
+    }
     match decision {
         Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => {
             match (*mutable, target.mutability) {
@@ -1534,6 +1595,28 @@ impl RawBoundaryDispositionIndex {
                             "hypothetical has no safe subject decision".to_owned(),
                         )
                     })?;
+                    let source_stays_raw = match decision {
+                        super::Decision::Degraded(_) => true,
+                        super::Decision::Ref { .. }
+                        | super::Decision::InferredRef { .. }
+                        | super::Decision::Slice { .. }
+                        | super::Decision::Opt { .. }
+                        | super::Decision::Box(_) => false,
+                    };
+                    if source_stays_raw
+                        && let Some(source_mutability) = site.adapter_operand_mutability
+                        && source_mutability != site.target.mutability
+                    {
+                        let template = if site.target.mutability == RawMutability::Mut {
+                            BridgeTemplate::RawCastMut
+                        } else {
+                            BridgeTemplate::RawCastConst
+                        };
+                        return Ok(RawBoundaryDisposition::T1 {
+                            template,
+                            evidence: "raw-pointer-mutability-cast".to_owned(),
+                        });
+                    }
                     if let Some((owner, reason)) = box_site_owner(decision, site) {
                         return Ok(RawBoundaryDisposition::OwnedByOtherArm { owner, reason });
                     }
@@ -1668,6 +1751,7 @@ impl RawBoundaryDispositionIndex {
                 RawBoundaryRenderSite {
                     span: site.source_span,
                     direct_storage_span: site.direct_storage_span,
+                    adapter_operand_span: site.adapter_operand_span,
                     call_span: site.call_span,
                     target: site.target.clone(),
                     box_slice,

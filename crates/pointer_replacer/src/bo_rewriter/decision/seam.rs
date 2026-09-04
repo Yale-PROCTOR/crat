@@ -788,7 +788,8 @@ impl GlueSpec {
             .cast_pointee = target
             .depth2
             .as_ref()
-            .map(|depth2| depth2.inner_pointee.clone());
+            .map(|depth2| depth2.inner_pointee.clone())
+            .or_else(|| target.is_void_pointee().then(|| target.pointee.clone()));
         spec
     }
 
@@ -2946,6 +2947,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     for (key, disposition, site) in raw_boundary.emission_sites() {
         let Some(template) = disposition.template() else {
             if let super::raw_boundary::RawBoundaryDisposition::Blocked { reason, .. } = disposition
+                && site.target.depth2.is_some()
                 && let Some((owner_did, node)) = site.node
                 && decision_of
                     .get(&(owner_did, node))
@@ -2976,7 +2978,9 @@ pub(crate) fn synthesize_with_raw_boundary(
             }
             continue;
         };
-        let argument_span = site.direct_storage_span.unwrap_or(site.span);
+        let argument_span = site
+            .direct_storage_span
+            .unwrap_or(site.adapter_operand_span);
         let Ok(argument) = sm.span_to_snippet(argument_span) else {
             continue;
         };
@@ -3011,7 +3015,12 @@ pub(crate) fn synthesize_with_raw_boundary(
             site.target
                 .depth2
                 .as_ref()
-                .map(|depth2| depth2.inner_pointee.as_str()),
+                .map(|depth2| depth2.inner_pointee.as_str())
+                .or_else(|| {
+                    site.target
+                        .is_void_pointee()
+                        .then_some(site.target.pointee.as_str())
+                }),
         ) {
             Ok(super::raw_boundary::BridgeRender::Edit(_)) => {}
             Ok(

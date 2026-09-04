@@ -252,6 +252,8 @@ pub(crate) struct Arg {
     /// Exact variable-local storage under `&mut local` (optionally beneath raw
     /// casts). Projections, dereferences, fields, and temporaries are absent.
     pub direct_storage: Option<(HirId, Span)>,
+    pub adapter_operand_span: Span,
+    pub adapter_operand_mutability: Option<super::raw_boundary::RawMutability>,
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -691,6 +693,22 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             .copied()
                                             .and_then(raw_target_type);
                                         let shape = classify_arg(self.tcx, arg);
+                                        let adapter_operand_span = match shape {
+                                            ArgShape::AddrOfCast { inner, .. }
+                                            | ArgShape::CastOfLocal { inner, .. } => inner,
+                                            _ => arg.span,
+                                        };
+                                        let adapter_operand_mutability =
+                                            match typeck.expr_ty(peel_casts(arg)).kind() {
+                                                rustc_middle::ty::TyKind::RawPtr(_, mutability) => {
+                                                    Some(if mutability.is_mut() {
+                                                        super::raw_boundary::RawMutability::Mut
+                                                    } else {
+                                                        super::raw_boundary::RawMutability::Const
+                                                    })
+                                                }
+                                                _ => None,
+                                            };
                                         Arg {
                                             index,
                                             span: arg.span,
@@ -698,6 +716,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             source_type: format!("{:?}", typeck.expr_ty(arg)),
                                             target,
                                             direct_storage: direct_mutable_storage(arg),
+                                            adapter_operand_span,
+                                            adapter_operand_mutability,
                                         }
                                     })
                                     .collect(),
@@ -720,6 +740,22 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 continue;
                             };
                             let shape = classify_arg(self.tcx, arg);
+                            let adapter_operand_span = match shape {
+                                ArgShape::AddrOfCast { inner, .. }
+                                | ArgShape::CastOfLocal { inner, .. } => inner,
+                                _ => arg.span,
+                            };
+                            let adapter_operand_mutability =
+                                match typeck.expr_ty(peel_casts(arg)).kind() {
+                                    rustc_middle::ty::TyKind::RawPtr(_, mutability) => {
+                                        Some(if mutability.is_mut() {
+                                            super::raw_boundary::RawMutability::Mut
+                                        } else {
+                                            super::raw_boundary::RawMutability::Const
+                                        })
+                                    }
+                                    _ => None,
+                                };
                             self.facts.foreign_call_args.push(ForeignCallArgFact {
                                 caller: self.fn_did,
                                 callee: symbol.clone(),
@@ -731,6 +767,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 source_type: format!("{source_ty:?}"),
                                 target,
                                 direct_storage: direct_mutable_storage(arg),
+                                adapter_operand_span,
+                                adapter_operand_mutability,
                             });
                         }
                     }
