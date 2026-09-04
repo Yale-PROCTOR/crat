@@ -129,13 +129,40 @@ impl RawTargetType {
     }
 }
 
-pub(crate) fn raw_target_type(ty: Ty<'_>) -> Option<RawTargetType> {
+fn bridge_type_path(tcx: TyCtxt<'_>, ty: Ty<'_>) -> String {
+    let rendered = format!("{ty:?}");
+    if rendered.rsplit("::").next() == Some("c_void") {
+        return "core::ffi::c_void".to_owned();
+    }
+    let local_def = match ty.kind() {
+        TyKind::Adt(def, _) => def.did().as_local(),
+        TyKind::Foreign(def_id) => def_id.as_local(),
+        _ => None,
+    };
+    let Some(local_def) = local_def else {
+        return rendered;
+    };
+    let full_path = tcx.def_path_str(local_def.to_def_id());
+    let crate_prefix = format!("{}::", tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE));
+    let relative = full_path.strip_prefix(&crate_prefix).unwrap_or(&full_path);
+    if rendered == relative || rendered.starts_with(&format!("{relative}<")) {
+        format!("crate::{rendered}")
+    } else if rendered == full_path || rendered.starts_with(&format!("{full_path}<")) {
+        format!("crate::{}", &rendered[crate_prefix.len()..])
+    } else {
+        // A local definition must never be emitted as an apparent extern
+        // crate. The DefId path is the stable, in-program fallback.
+        format!("crate::{relative}")
+    }
+}
+
+pub(crate) fn raw_target_type(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<RawTargetType> {
     let TyKind::RawPtr(pointee, mutability) = ty.kind() else {
         return None;
     };
     let depth2 = match pointee.kind() {
         TyKind::RawPtr(inner_pointee, inner_mutability) => Some(Depth2Target {
-            inner_pointee: format!("{inner_pointee:?}"),
+            inner_pointee: bridge_type_path(tcx, *inner_pointee),
             inner_mutability: if inner_mutability.is_mut() {
                 RawMutability::Mut
             } else {
@@ -159,7 +186,7 @@ pub(crate) fn raw_target_type(ty: Ty<'_>) -> Option<RawTargetType> {
     };
     Some(RawTargetType {
         rendered: format!("{ty:?}"),
-        pointee: format!("{pointee:?}"),
+        pointee: bridge_type_path(tcx, *pointee),
         mutability: if mutability.is_mut() {
             RawMutability::Mut
         } else {
@@ -856,8 +883,12 @@ fn collect_retention_facts<'tcx>(
                 .inputs()
                 .get(index)
                 .copied()
-                .and_then(raw_target_type)
-                .or_else(|| sig.c_variadic.then(|| raw_target_type(source_ty)).flatten());
+                .and_then(|ty| raw_target_type(tcx, ty))
+                .or_else(|| {
+                    sig.c_variadic
+                        .then(|| raw_target_type(tcx, source_ty))
+                        .flatten()
+                });
             let Some(target) = target else {
                 let step = retention_step(
                     location,

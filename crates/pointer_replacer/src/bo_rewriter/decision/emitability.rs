@@ -578,7 +578,7 @@ impl BodyFacts<'_, '_> {
     fn address_operand(&self, expr: &Expr<'_>) -> Option<AddressOperand> {
         let expr = peel_casts(expr);
         let hir_id = Self::resolved_local(expr)?;
-        let target = raw_target_type(self.tcx.typeck(self.fn_did).expr_ty(expr))?;
+        let target = raw_target_type(self.tcx, self.tcx.typeck(self.fn_did).expr_ty(expr))?;
         Some(AddressOperand {
             node: (self.fn_did, hir_id),
             span: expr.span,
@@ -651,7 +651,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                 if matches!(parent.kind, ExprKind::Ret(Some(value)) if value.hir_id == expr.hir_id)
         );
         if (self.tail == Some(expr.hir_id) || explicit_return)
-            && let Some(source_type) = raw_target_type(self.tcx.typeck(self.fn_did).expr_ty(expr))
+            && let Some(source_type) =
+                raw_target_type(self.tcx, self.tcx.typeck(self.fn_did).expr_ty(expr))
         {
             let shape = classify_arg(self.tcx, expr);
             self.facts.return_sites.push(ReturnSiteFact {
@@ -799,7 +800,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             .inputs()
                                             .get(index)
                                             .copied()
-                                            .and_then(raw_target_type);
+                                            .and_then(|ty| raw_target_type(self.tcx, ty));
                                         let shape = classify_arg(self.tcx, arg);
                                         let adapter_operand_span = match shape {
                                             ArgShape::AddrOfCast { inner, .. }
@@ -841,9 +842,11 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 .inputs()
                                 .get(index)
                                 .copied()
-                                .and_then(raw_target_type)
+                                .and_then(|ty| raw_target_type(self.tcx, ty))
                                 .or_else(|| {
-                                    sig.c_variadic.then(|| raw_target_type(source_ty)).flatten()
+                                    sig.c_variadic
+                                        .then(|| raw_target_type(self.tcx, source_ty))
+                                        .flatten()
                                 });
                             let Some(target) = target else {
                                 continue;

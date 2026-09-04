@@ -7369,11 +7369,11 @@ fn br_w6_void_generic_boundary_uses_from_ref_mut_then_cast() {
     });
     let source = e2_root_text(&attempt);
     assert!(
-        source.contains("consume(core::ptr::from_mut(write).cast::<std::ffi::c_void>())"),
+        source.contains("consume(core::ptr::from_mut(write).cast::<core::ffi::c_void>())"),
         "mutable void bridge missing:\n{source}"
     );
     assert!(
-        source.contains("observe(core::ptr::from_ref(read).cast::<std::ffi::c_void>())"),
+        source.contains("observe(core::ptr::from_ref(read).cast::<core::ffi::c_void>())"),
         "shared void bridge missing:\n{source}"
     );
     assert!(
@@ -7403,6 +7403,54 @@ fn br_w6_void_generic_boundary_uses_from_ref_mut_then_cast() {
     }));
     super::bridge_receipt::reconcile_bridge_events(&all_events)
         .expect("BR-W6 bridge events reconcile");
+}
+
+/// D4-W1 — bridge-only type paths must resolve in the emitted program. This
+/// fixture has no `libc` crate: the local pointee must use `crate::`, while the
+/// universal void spelling must use `core::ffi::c_void`.
+#[test]
+fn d4_w1_bridge_pointee_paths_resolve_without_libc_crate() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub mod types { pub struct Widget(pub i32); }\n\
+         pub mod api {\n\
+             use crate::types::Widget;\n\
+             unsafe extern \"C\" {\n\
+                 fn take_widget(p: *const Widget);\n\
+                 fn take_void(p: *const core::ffi::c_void);\n\
+             }\n\
+             pub unsafe fn caller(widget: *const Widget, opaque: *const core::ffi::c_void) {\n\
+                 take_widget(widget);\n\
+                 take_void(opaque);\n\
+             }\n\
+         }\n";
+    let attempt = raw_boundary_attempt_with(source, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("caller::widget") {
+                *decision = super::decision::Decision::Opt {
+                    mutable: false,
+                    slice: false,
+                    uses: Vec::new(),
+                };
+            } else if subject.label.ends_with("caller::opaque") {
+                *decision = super::decision::Decision::Ref { mutable: false };
+            }
+        }
+    });
+    let source = e2_root_text(&attempt);
+    assert!(
+        source.contains("core::ptr::null::<crate::types::Widget>()"),
+        "local pointee path is not crate-relative:\n{source}"
+    );
+    assert!(
+        source.contains(".cast::<core::ffi::c_void>()"),
+        "void pointee path is not dependency-free:\n{source}"
+    );
+    assert!(!source.contains("::<src::"), "{source}");
+    assert!(!source.contains("::<libc::c_void>"), "{source}");
+    assert!(
+        e2_type_checks(&attempt),
+        "D4-W1 emitted tree must type-check without a libc dependency"
+    );
 }
 
 /// BR-W7 RED: explicit raw-pointer mutability changes use the direction-named
