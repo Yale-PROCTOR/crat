@@ -20828,6 +20828,25 @@ fn raw_boundary_rows_have_data(rows: &[report::Row]) -> bool {
     rows.iter().all(|row| !raw_boundary_typed_failure(row))
 }
 
+fn raw_boundary_attribution_control(unresolved: usize, exact_seam: usize) -> bool {
+    unresolved == 0 || exact_seam > 0
+}
+
+/// R175-W1 — a program with no unresolved attribution needs no historical
+/// exact-seam hit.  Any remaining unresolved attribution still requires one.
+#[test]
+fn r175_w1_exact_seam_is_required_only_while_attribution_is_unresolved() {
+    assert!(
+        raw_boundary_attribution_control(0, 0),
+        "the sealed bzip2 row has no diagnostics left and must pass"
+    );
+    assert!(
+        !raw_boundary_attribution_control(1, 0),
+        "unresolved attribution without an exact seam must fail"
+    );
+    assert!(raw_boundary_attribution_control(1, 1));
+}
+
 #[test]
 fn worker_abort_w1_is_typed_and_row_collection_continues() {
     let panic = orchestrate::ChildOutcome {
@@ -20978,28 +20997,72 @@ fn raw_boundary_wave2_corpus_census() {
     let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
     let diagnostic_run =
         std::env::var("CRAT_RAW_BOUNDARY_RUN_KIND").is_ok_and(|kind| kind == "diagnostic");
-    let mut rows = Vec::new();
-    for program in CORPUS {
-        let outcome = orchestrate::run_child_env_with_memory_limit_mib(
-            program.name,
-            &recipe.workspace_program_file(&root, *program),
-            "raw-boundary-census",
-            Duration::from_secs(recipe.timeout_secs),
-            recipe.memory_mib,
-            &recipe.raw_boundary_child_env(&cache_dir, &artifact_dir, &code_frame),
+    let reaggregation_rows = std::env::var_os("CRAT_RAW_BOUNDARY_REAGGREGATE_ROWS");
+    let ledger_dir = if reaggregation_rows.is_some() {
+        PathBuf::from(
+            std::env::var_os("CRAT_RAW_BOUNDARY_REAGGREGATE_LEDGER_DIR")
+                .expect("re-aggregation requires the sealed ledger directory"),
+        )
+    } else {
+        artifact_dir.clone()
+    };
+    if reaggregation_rows.is_some() {
+        let manifest =
+            fs::read(ledger_dir.join("SHA256SUMS")).expect("read sealed re-aggregation manifest");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&manifest)),
+            std::env::var("CRAT_RAW_BOUNDARY_REAGGREGATE_MANIFEST_SHA256")
+                .expect("re-aggregation requires the sealed manifest digest"),
+            "sealed re-aggregation manifest drift"
         );
-        let row = raw_boundary_worker_row(program.name, &outcome);
-        if raw_boundary_typed_failure(&row)
-            && (row.get(raw_schema::STATUS) == Some("worker-abort") || diagnostic_run)
-        {
-            eprintln!(
-                "RAW-BOUNDARY-CENSUS program={} stage={} rc=1 wall={:.3} rss={}",
+    }
+    let mut rows = if let Some(path) = reaggregation_rows {
+        fs::read_to_string(path)
+            .expect("read sealed re-aggregation rows")
+            .lines()
+            .map(|line| report::parse_kv_line(line).expect("parse sealed re-aggregation row"))
+            .collect::<Vec<_>>()
+    } else {
+        let mut rows = Vec::new();
+        for program in CORPUS {
+            let outcome = orchestrate::run_child_env_with_memory_limit_mib(
                 program.name,
-                row.get(raw_schema::STATUS).unwrap_or("typed-failure"),
+                &recipe.workspace_program_file(&root, *program),
+                "raw-boundary-census",
+                Duration::from_secs(recipe.timeout_secs),
+                recipe.memory_mib,
+                &recipe.raw_boundary_child_env(&cache_dir, &artifact_dir, &code_frame),
+            );
+            let row = raw_boundary_worker_row(program.name, &outcome);
+            if raw_boundary_typed_failure(&row)
+                && (row.get(raw_schema::STATUS) == Some("worker-abort") || diagnostic_run)
+            {
+                eprintln!(
+                    "RAW-BOUNDARY-CENSUS program={} stage={} rc=1 wall={:.3} rss={}",
+                    program.name,
+                    row.get(raw_schema::STATUS).unwrap_or("typed-failure"),
+                    outcome.wall_s,
+                    outcome.peak_rss_kb
+                );
+                rows.push(row);
+                continue;
+            }
+            eprintln!(
+                "RAW-BOUNDARY-CENSUS program={} stage=complete rc=0 wall={:.3} rss={} digest={}",
+                program.name,
                 outcome.wall_s,
-                outcome.peak_rss_kb
+                outcome.peak_rss_kb,
+                row.get(raw_schema::CACHE_FINGERPRINT).unwrap_or("missing")
             );
             rows.push(row);
+        }
+        rows
+    };
+    assert_eq!(rows.len(), 20);
+    for row in &rows {
+        if raw_boundary_typed_failure(row)
+            && (row.get(raw_schema::STATUS) == Some("worker-abort") || diagnostic_run)
+        {
             continue;
         }
         assert_eq!(row.get(raw_schema::STATUS), Some("ok"), "{row:?}");
@@ -21020,16 +21083,7 @@ fn raw_boundary_wave2_corpus_census() {
             Some(recipe.attestation),
             "{row:?}"
         );
-        eprintln!(
-            "RAW-BOUNDARY-CENSUS program={} stage=complete rc=0 wall={:.3} rss={} digest={}",
-            program.name,
-            outcome.wall_s,
-            outcome.peak_rss_kb,
-            row.get(raw_schema::CACHE_FINGERPRINT).unwrap_or("missing")
-        );
-        rows.push(row);
     }
-    assert_eq!(rows.len(), 20);
     if !raw_boundary_rows_have_data(&rows) {
         let per_program = rows
             .iter()
@@ -21108,37 +21162,30 @@ fn raw_boundary_wave2_corpus_census() {
         raw_boundary_write_manifest(&artifact_dir).expect("write typed-failure artifact manifest");
         return;
     }
+    let mut corpus_unresolved = 0usize;
     for row in &rows {
         assert_eq!(
             row.get(raw_schema::CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT),
             Some("0"),
             "converted callee lacks a required call-site receipt: {row:?}"
         );
-        if matches!(
-            row.get("program"),
-            Some(
-                "binn"
-                    | "brotli"
-                    | "buffer"
-                    | "bzip2"
-                    | "heman"
-                    | "json.h"
-                    | "libzahl"
-                    | "lil"
-                    | "lodepng"
-                    | "robotfindskitten"
-                    | "tulipindicators"
-                    | "urlparser"
-            )
-        ) {
-            assert!(
-                row.get(raw_schema::ATTRIBUTION_HITS_EXACT_SEAM)
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .is_some_and(|value| value > 0),
-                "checkpoint-unresolved program has no exact-seam attribution: {row:?}"
-            );
-        }
+        let unresolved = row
+            .get(raw_schema::ATTRIBUTION_HITS_UNRESOLVED)
+            .expect("program attribution-unresolved stamp")
+            .parse::<usize>()
+            .expect("program attribution-unresolved count");
+        let exact_seam = row
+            .get(raw_schema::ATTRIBUTION_HITS_EXACT_SEAM)
+            .expect("program exact-seam stamp")
+            .parse::<usize>()
+            .expect("program exact-seam count");
+        assert!(
+            raw_boundary_attribution_control(unresolved, exact_seam),
+            "unresolved attribution has no exact-seam attribution: {row:?}"
+        );
+        corpus_unresolved += unresolved;
     }
+    assert_eq!(corpus_unresolved, 0, "corpus unresolved attribution drift");
 
     #[derive(Clone, Copy, Debug, Default)]
     struct DeliveryCounts {
@@ -21212,7 +21259,7 @@ fn raw_boundary_wave2_corpus_census() {
     }
     let baseline_digest = format!("{:x}", baseline_digest.finalize());
     let current_artifacts =
-        raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-subject-outcomes.tsv")
+        raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-subject-outcomes.tsv")
             .expect("read current subject outcomes");
     let mut current = BTreeMap::<(String, String), BTreeMap<String, String>>::new();
     for (program, text) in current_artifacts {
@@ -21466,7 +21513,7 @@ fn raw_boundary_wave2_corpus_census() {
             .iter()
             .find(|row| row.get("program") == Some(program.name))
             .expect("program row");
-        let patch_path = artifact_dir.join(format!("{}.raw-boundary-emitted.patch", program.name));
+        let patch_path = ledger_dir.join(format!("{}.raw-boundary-emitted.patch", program.name));
         let patch = fs::read(&patch_path)
             .unwrap_or_else(|error| panic!("read {}: {error}", patch_path.display()));
         assert_eq!(
@@ -21526,7 +21573,7 @@ fn raw_boundary_wave2_corpus_census() {
     fs::write(artifact_dir.join("emitted-source-ledger.tsv"), &tree_ledger)
         .expect("write emitted-source ledger");
 
-    let d4_artifacts = raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-d4-edges.tsv")
+    let d4_artifacts = raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-d4-edges.tsv")
         .expect("read D4 edge artifacts");
     let mut d4_join = String::from(
         "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tedges\tsource_subjects\ttarget_subjects\ttemporary_endpoints\tunmatched\n",
@@ -21568,11 +21615,10 @@ fn raw_boundary_wave2_corpus_census() {
     fs::write(artifact_dir.join("d4-edge-subject-join.tsv"), &d4_join)
         .expect("write D4 edge/subject join");
 
-    let subjects = raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-subject-index.tsv")
+    let subjects = raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-subject-index.tsv")
         .expect("read current subjects");
-    let dispositions =
-        raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-dispositions.tsv")
-            .expect("read current dispositions");
+    let dispositions = raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-dispositions.tsv")
+        .expect("read current dispositions");
     let box_control = raw_boundary_control_box_rows(&box_control_dir).expect("Box controls");
     let controls =
         reconcile_raw_boundary_controls(&primary, &box_control, &subjects, &dispositions)
@@ -21629,7 +21675,7 @@ fn raw_boundary_wave2_corpus_census() {
         raw_boundary_program_artifacts(&diagnostic_control_dir, "compiler-diagnostics.tsv")
             .expect("read baseline diagnostics");
     let current_diagnostics =
-        raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-compiler-diagnostics.tsv")
+        raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-compiler-diagnostics.tsv")
             .expect("read current diagnostics");
     let diagnostic_recon =
         reconcile_raw_boundary_diagnostics(&baseline_diagnostics, &current_diagnostics)
@@ -21663,9 +21709,8 @@ fn raw_boundary_wave2_corpus_census() {
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(expected_pair_sites.len(), 73, "PAIR site control drift");
-    let current_adapters =
-        raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-adapters.tsv")
-            .expect("read current adapter receipts");
+    let current_adapters = raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-adapters.tsv")
+        .expect("read current adapter receipts");
     let mut observed_pair_sites = BTreeSet::new();
     for (program, text) in current_adapters {
         for row in named_tsv_rows(&text) {
