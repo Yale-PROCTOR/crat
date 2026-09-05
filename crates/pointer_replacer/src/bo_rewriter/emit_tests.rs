@@ -3009,18 +3009,16 @@ fn one_comparison_opens_its_parameter_and_local_operand_alike() {
 ///
 /// This is the instrument's whole purpose, so it is what the witness tests. The
 /// fixture's local is **unannotated**, so it degrades at
-/// `slice-local-construction` — a slice value would have to be built at its
-/// initializer — and the A1 op fact never reaches the reason field. A
+/// `copy-source-coupled` after the missing type-splice target prevents its
+/// placement, and the A1 op fact never reaches the reason field. A
 /// reason-field tally therefore records nothing about its `.offset()` use, and
 /// would report the op population as smaller than it is.
 ///
-/// **The dissolution amended the expected key, not the witness.** Before it,
-/// the fixture stopped at `no-declared-type`, the first predicate, and never
-/// consulted A1 at all; now it reaches A1, selects the slice form, and is
-/// stopped by the construction-site gate. Either way the degradation is
-/// upstream of the reported fact, which is the property under test — and the
-/// amended key makes the fixture a STRICTLY harder case, because the decision
-/// now does consult the op it must not be the source of.
+/// Migration receipt: loop-2 §39 addendum 205(B)(2), approved wave-3b
+/// micro-plan §10. Item 2 removes the former `slice-local-construction`
+/// wall; the unannotated local still lacks a type-splice target. Only the
+/// upstream expected reason moves. The independent `annotated=0` and
+/// `raw_op=offset` assertions below remain unchanged.
 ///
 /// The join must still report `annotated=0` **and** `raw_op=offset` on that
 /// same subject. If it cannot, it has inherited the ordering it exists to
@@ -3050,7 +3048,7 @@ fn the_facts_join_reports_facts_the_decision_never_reached() {
         .expect("fixture compiles");
 
     assert_eq!(
-        reason, "slice-local-construction",
+        reason, "copy-source-coupled",
         "the fixture must degrade UPSTREAM of the reported fact, or it \
          witnesses nothing"
     );
@@ -3435,30 +3433,64 @@ fn an_unfreed_subject_carries_a_present_false_not_an_absent_column() {
 // S3.2′-2 — borrowed slices
 // ---------------------------------------------------------------------------
 
-/// **An arithmetic op on a LOCAL takes the slice arm, and stops at
-/// construction.**
+/// **An arithmetic op on a local takes the slice construction adapter.**
 ///
-/// The counterpart to `a_raw_only_method_on_a_local_degrades_it`: the same
-/// shape, an arithmetic op instead of a non-arithmetic one, landing on a
-/// different reason. A parameter needs no construction — the caller supplies the
-/// slice — but a local's initializer is a raw-pointer expression that would need
-/// `from_raw_parts` and a length. Scoped out and counted, not attempted.
-///
-/// *Mutation-tested (Rider 0, deletion first):* deleting the `SubjectKind::Local`
-/// arm in `decide_one` makes this read `slice-use-unsupported` (the local's own
-/// initializer use is not `*p.offset(e)`), so the local would be silently
-/// reclassified rather than named.
+/// Migration receipt: loop-2 §39 addendum 205(B)(1), approved wave-3b
+/// micro-plan §10. Item 2 replaces the old construction hold with `<emitted>`.
+/// This copy initializer has no length evidence, so its exact construction
+/// identity must carry the named fallback and §77 waiver in both receipt rows.
 #[test]
 fn an_arithmetic_op_on_a_local_stops_at_slice_construction() {
-    let got = decisions_of(
-        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
-         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; *p.offset(1) }\n",
-    );
+    use super::mechanical_receipt::{
+        FALLBACK_EXTENT_RECEIPT, MechanicalExtent, MechanicalStage, MechanicalState,
+        SLICE_EXTENT_WAIVER_ID,
+    };
+    let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; *p.offset(1) }\n";
+    let got = decisions_of(src);
     assert_eq!(
         reason_of(&got, "p", false),
-        "slice-local-construction",
-        "an arithmetic use on a local must take the slice arm and stop at \
-         construction, with its own reason: {got:?}"
+        "<emitted>",
+        "the local must take the item-2 construction adapter: {got:?}"
+    );
+    let (events, rows) = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(src),
+        |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx(tcx)?;
+            assert_eq!(table.slice_constructions.len(), 1);
+            assert_eq!(table.slice_constructions[0].initializer_kind, "copy");
+            let emission = emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )?;
+            let (events, _, rows) = emission.plan.mechanical_receipts(&BTreeSet::new());
+            Ok::<_, String>((events, rows))
+        },
+    )
+    .expect("local arithmetic fixture compiles")
+    .expect("local arithmetic fixture plans");
+    assert_eq!(
+        super::mechanical_receipt::reconcile_slice_construction_rows(&rows, &events)
+            .expect("construction identity reconciles"),
+        1
+    );
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| {
+        row.extent
+            == MechanicalExtent::Fallback {
+                receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
+            }
+            && row.element_type == "i32"
+            && row.length_expression == "crate::FALLBACK_SLICE_EXTENT"
+    }));
+    assert!(
+        rows.iter()
+            .any(|row| row.terminal.stage == MechanicalStage::Terminal
+                && row.terminal.state == MechanicalState::Applied),
+        "construction must have an applied terminal receipt: {rows:?}"
     );
 }
 
@@ -10320,7 +10352,7 @@ fn a5_w1_proof_site_absent_from_pair_inventory_uses_t2_raw_view() {
             .values()
             .all(|class| class.is_ready())
     );
-    let (events, rows) = attempt
+    let (events, rows, _) = attempt
         .emission
         .plan
         .mechanical_receipts(&std::collections::BTreeSet::new());
@@ -10389,7 +10421,7 @@ fn a5_w1_r_b_and_positive_retention_reclassify_under_their_own_evidence() {
         "{}",
         missing.receipt
     );
-    let (missing_events, missing_rows) = missing
+    let (missing_events, missing_rows, _) = missing
         .emission
         .plan
         .mechanical_receipts(&std::collections::BTreeSet::new());
@@ -10405,7 +10437,7 @@ fn a5_w1_r_b_and_positive_retention_reclassify_under_their_own_evidence() {
         "{foster_source}\n{}",
         foster.receipt
     );
-    let (foster_events, foster_rows) = foster
+    let (foster_events, foster_rows, _) = foster
         .emission
         .plan
         .mechanical_receipts(&std::collections::BTreeSet::new());
@@ -10422,7 +10454,7 @@ fn a5_w1_r_b_and_positive_retention_reclassify_under_their_own_evidence() {
 
     let retained = e3_attempt_with_foster(A5_POSITIVE_RETENTION, true, &force_a5_rb_forms);
     assert!(!e2_root_text(&retained).contains("__crat_a5_raw_"));
-    let (retained_events, _) = retained
+    let (retained_events, _, _) = retained
         .emission
         .plan
         .mechanical_receipts(&std::collections::BTreeSet::new());
@@ -10464,7 +10496,7 @@ fn a5_term_w1_addr_of_classless_source_emits() {
         "{:#?}",
         attempt.emission.plan.terminal_a5_raw_calls,
     );
-    let (events, rows) = attempt
+    let (events, rows, _) = attempt
         .emission
         .plan
         .mechanical_receipts(&std::collections::BTreeSet::new());
@@ -10553,7 +10585,7 @@ fn a5_term_w2_held_bare_local_replans_or_holds_owner_class() {
             view.expected_form,
             super::decision::seam::Form::Slice { mutable: true }
         );
-        let (events, rows) = attempt
+        let (events, rows, _) = attempt
             .emission
             .plan
             .mechanical_receipts(&std::collections::BTreeSet::new());
@@ -10605,7 +10637,7 @@ fn a5_term_w2_unavailable_replan_holds_only_the_owner_class() {
     );
     assert!(reasons[0].contains("planned=ref-mut<-ref-shared"));
     assert!(reasons[0].contains("terminal=ref-mut<-ref-shared"));
-    let (events, _) = attempt
+    let (events, _, _) = attempt
         .emission
         .plan
         .mechanical_receipts(&std::collections::BTreeSet::new());
@@ -11778,5 +11810,161 @@ fn d13_w3_pair_parse_failure_does_not_abort_program_emission() {
             && reason.contains(r#"b"\x1B[1;36m\0""#)
             && reason.contains("argument-hex="),
         "{reason}"
+    );
+}
+
+const SLC_W1: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    pub unsafe fn with_evidence() -> i32 {\n\
+        let mut values = [0i32, 1i32, 2i32, 3i32];\n\
+        let p: *mut i32 = values.as_mut_ptr();\n\
+        *p.offset(1)\n\
+    }\n\
+    pub unsafe fn with_fallback(src: *mut i32) -> i32 {\n\
+        let p: *mut i32 = src as *mut i32;\n\
+        *p.offset(1)\n\
+    }\n";
+
+/// SLC-W1(a) migration receipt: addendum 206 E11, micro-plan §10. Adjacency
+/// is unlicensed; the evidence half now uses the sealed array-length contract.
+#[test]
+fn slc_w1_evidence_length_constructs_the_local_slice() {
+    let before = decisions_of(SLC_W1);
+    let emitted = ast_emitted_source_of(SLC_W1).expect("SLC-W1 evidence emission");
+    assert!(
+        emitted.contains("core::slice::from_raw_parts(") && emitted.contains("4usize"),
+        "SLC-W1 evidence half stayed RED; decisions={before:?}\n{emitted}"
+    );
+}
+
+/// SLC-W1(b) — absence of length evidence selects the named §77 fallback and
+/// never silently re-labels it as evidence-backed.
+#[test]
+fn slc_w1_missing_length_uses_the_named_fallback_once() {
+    let before = decisions_of(SLC_W1);
+    let emitted = ast_emitted_source_of(SLC_W1).expect("SLC-W1 fallback emission");
+    assert!(
+        emitted.contains("core::slice::from_raw_parts(")
+            && emitted.contains("crate::FALLBACK_SLICE_EXTENT"),
+        "SLC-W1 fallback half stayed RED; decisions={before:?}\n{emitted}"
+    );
+    assert_eq!(
+        emitted.matches("const FALLBACK_SLICE_EXTENT").count(),
+        1,
+        "the survivor-derived fallback constant must be emitted exactly once: {emitted}"
+    );
+}
+
+#[test]
+fn slc_w1_mutable_access_uses_from_raw_parts_mut() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+        pub unsafe fn write(src: *mut i32, len: usize) {\n\
+            let p: *mut i32 = src as *mut i32;\n\
+            *p.offset((len - 1) as isize) = 7;\n\
+        }\n";
+    let emitted = ast_emitted_source_of(source).expect("SLC-W1 mutable emission");
+    assert!(
+        // Migration receipt: addendum 206 E11, micro-plan §10. Mutable
+        // construction stays admitted; the adjacent len now selects fallback.
+        emitted.contains("core::slice::from_raw_parts_mut(")
+            && emitted.contains("crate::FALLBACK_SLICE_EXTENT"),
+        "{emitted}"
+    );
+}
+
+#[test]
+fn slc_w1_common_and_specialized_receipts_are_exact() {
+    let (events, rows, rendered) = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(SLC_W1),
+        |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx(tcx)?;
+            let emission = super::emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )?;
+            let (events, _, rows) = emission
+                .plan
+                .mechanical_receipts(&std::collections::BTreeSet::new());
+            let rendered = super::mechanical_receipt::render_slice_construction_rows(&rows);
+            Ok::<_, String>((events, rows, rendered))
+        },
+    )
+    .expect("SLC-W1 fixture compiles")
+    .expect("SLC-W1 plans");
+    assert_eq!(
+        super::mechanical_receipt::reconcile_slice_construction_rows(&rows, &events)
+            .expect("specialized/common reconciliation"),
+        2
+    );
+    let planned = rows
+        .iter()
+        .filter(|row| row.terminal.stage == super::mechanical_receipt::MechanicalStage::Plan)
+        .collect::<Vec<_>>();
+    assert_eq!(planned.len(), 2);
+    assert_eq!(
+        planned
+            .iter()
+            .filter(|row| row.extent.is_fallback())
+            .count(),
+        1,
+        "exactly the no-evidence half carries the fabricated extent"
+    );
+    assert!(rendered.contains("slice-extent-out-of-scope@addendum-77"));
+    assert!(rendered.contains("sealed-contract:array-length:"));
+    assert!(rendered.contains("\tfallback\t"));
+    assert!(rendered.contains("\tevidence\t"));
+    assert!(rows.iter().all(|row| {
+        let key = row.terminal.obligation_key.receipt_key();
+        !key.contains("FALLBACK_SLICE_EXTENT") && !key.contains("(len)")
+    }));
+}
+
+#[test]
+fn slc_w1_array_and_projection_initializers_keep_one_evaluation() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+        pub struct Holder { pub ptr: *mut i32 }\n\
+        pub unsafe fn array_source() -> i32 {\n\
+            let mut values = [1i32, 2i32, 3i32];\n\
+            let p: *mut i32 = values.as_mut_ptr();\n\
+            *p.offset(2)\n\
+        }\n\
+        pub unsafe fn projected(holder: *mut Holder) -> i32 {\n\
+            let p: *mut i32 = (*holder).ptr;\n\
+            *p.offset(1)\n\
+        }\n";
+    let emitted = ast_emitted_source_of(source).expect("SLC initializer-shape emission");
+    assert!(
+        emitted.contains("values.as_mut_ptr(), 3usize"),
+        "array length contract missing: {emitted}"
+    );
+    assert_eq!(
+        emitted.matches("values.as_mut_ptr()").count(),
+        1,
+        "array initializer evaluated more than once: {emitted}"
+    );
+    assert!(
+        emitted.contains("core::slice::from_raw_parts((*holder).ptr")
+            || emitted.contains("core::slice::from_raw_parts(holder.ptr"),
+        "projected raw result was not constructed as a slice: {emitted}"
+    );
+}
+
+#[test]
+fn slc_w1_non_slice_and_negative_offset_controls_remain_outside_item2() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+        pub unsafe fn raw_read(src: *const i32) -> i32 {\n\
+            let p: *const i32 = src; p.read()\n\
+        }\n\
+        pub unsafe fn negative(src: *const i32, i: isize) -> i32 {\n\
+            let p: *const i32 = src; *p.offset(-i)\n\
+        }\n";
+    let decisions = decisions_of(source);
+    assert_eq!(reason_of(&decisions, "p", false), "raw-pointer-operation");
+    assert!(
+        decisions.iter().any(|(name, is_param, reason)| !is_param
+            && name == "p"
+            && reason == "slice-neg-or-unknown-offset"),
+        "cursor/negative-offset boundary moved: {decisions:?}"
     );
 }

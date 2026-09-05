@@ -32,7 +32,10 @@
 //! type. [`Justification`] is shaped against all ten goldens' expected text so
 //! the breadth in S2–S3 fills arms rather than reshaping the type.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use super::{
     bridge_receipt::{
@@ -444,6 +447,11 @@ fn nested_ast_composition(
             && inner.key.hi <= outer.key.hi
             && (outer.key.lo < inner.key.lo || inner.key.hi < outer.key.hi)
     };
+    let contains = |outer: &ClassSite, inner: &ClassSite| {
+        outer.key.file == inner.key.file
+            && outer.key.lo <= inner.key.lo
+            && inner.key.hi <= outer.key.hi
+    };
     let composable = |outer: &ClassSite, inner: &ClassSite| {
         let bridge_over_subject = matches!(outer.key.arm.as_str(), "c" | "glue")
             && inner.key.bridge_kind == "subject-use";
@@ -455,7 +463,11 @@ fn nested_ast_composition(
             && outer.key.arm == "pair"
             && outer.key.bridge_kind == "a5-site-proof-t2-fallback"
             && matches!(inner.key.arm.as_str(), "c" | "glue");
-        (bridge_over_subject || pair_over_c || a5_over_inner) && strictly_contains(outer, inner)
+        let slice_construction_over_inner = outer.key.bridge_kind == "slice-local-construction"
+            && inner.key.bridge_kind != "slice-local-construction"
+            && contains(outer, inner);
+        ((bridge_over_subject || pair_over_c || a5_over_inner) && strictly_contains(outer, inner))
+            || slice_construction_over_inner
     };
     if composable(left, right) {
         Some((left.key.owner_class, right.key.owner_class))
@@ -1105,6 +1117,10 @@ pub(crate) struct Plan {
     /// Proof-site-owned wave-3b A5 obligations. The common and specialized
     /// ledgers are materialized from this one carrier after class finalization.
     pub a5_receipt_plans: Vec<super::mechanical_receipt::A5ProofSiteReceiptPlan>,
+    /// Item-2 local-slice construction obligations, sharing one identity with
+    /// the common mechanical ledger.
+    pub slice_construction_receipt_plans:
+        Vec<super::mechanical_receipt::SliceConstructionReceiptPlan>,
     pub unowned_a5_proof_sites: usize,
     /// A5 calls after terminal-interface validation/re-planning. The AST graft
     /// consumes this sealed plan; it never recomputes the terminal verdict.
@@ -1320,9 +1336,11 @@ impl Plan {
     ) -> (
         Vec<super::mechanical_receipt::MechanicalObligationEvent>,
         Vec<super::mechanical_receipt::A5ProofSiteFallbackReceiptRow>,
+        Vec<super::mechanical_receipt::SliceConstructionReceiptRow>,
     ) {
         let mut events = Vec::new();
         let mut a5_rows = Vec::new();
+        let mut slice_rows = Vec::new();
         for receipt in &self.a5_receipt_plans {
             let class_live = self
                 .class_finalization
@@ -1334,7 +1352,18 @@ impl Plan {
             events.extend(pair);
             a5_rows.extend(rows);
         }
-        (events, a5_rows)
+        for receipt in &self.slice_construction_receipt_plans {
+            let class_live = self
+                .class_finalization
+                .classes
+                .get(&receipt.owner_class)
+                .is_some_and(SignatureClassPlan::is_ready);
+            let (pair, rows) =
+                receipt.materialize(class_live, reverted.contains(&receipt.owner_class));
+            events.extend(pair);
+            slice_rows.extend(rows);
+        }
+        (events, a5_rows, slice_rows)
     }
 }
 
@@ -1412,6 +1441,7 @@ pub(crate) fn plan(
     let mut unplaceable = Vec::new();
     let mut preclass_sites = Vec::new();
     let mut a5_receipt_plans = Vec::new();
+    let mut slice_construction_receipt_plans = Vec::new();
     let unowned_a5_proof_sites = table
         .seams
         .overlap_proofs
@@ -1710,6 +1740,166 @@ pub(crate) fn plan(
                 subject: subject_id,
             }),
         }
+    }
+
+    for construction in &table.slice_constructions {
+        use super::mechanical_receipt::{
+            CanonicalLocation, CanonicalSiteKey, HoistSafety, MechanicalEvidence, MechanicalFamily,
+            MechanicalMechanism, MechanicalObligationEvent, MechanicalObligationKey,
+            MechanicalObligationPlan, MechanicalRetention, MechanicalStage, MechanicalState,
+            MechanicalSubjectKey, MechanicalTerminalReason, NegativeWriteEvidence,
+            SliceConstructionReceiptPlan, TerminalContract,
+        };
+
+        let Some((subject, _)) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| (subject.fn_did, subject.hir_id) == construction.node)
+        else {
+            continue;
+        };
+        let owner = SignatureClassId::of(subject.fn_did);
+        let subject_id = subject.identity_key(&owner_of(subject));
+        let mechanical_subject = MechanicalSubjectKey::Local {
+            owner: subject.fn_did,
+            mir_local: subject.local.as_u32(),
+            slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+        };
+        let extent = construction.length.extent();
+        let bridge_extent = if extent.is_fallback() {
+            BridgeExtentKind::Fallback
+        } else {
+            BridgeExtentKind::Evidence(construction.length.source.receipt_key())
+        };
+        let expected_form = if construction.mutable {
+            if construction.nullable {
+                "option-slice-mut"
+            } else {
+                "slice-mut"
+            }
+        } else if construction.nullable {
+            "option-slice-shared"
+        } else {
+            "slice-shared"
+        };
+        let mut bridge = BridgeSitePlan::local(
+            subject.fn_did,
+            subject.fn_did,
+            Arm::Surface.key(),
+            format!("slice-init:hir{}", construction.init_hir.local_id.as_u32()),
+            "slice-local-construction",
+        )
+        .with_extent(bridge_extent)
+        .with_forms(expected_form, "raw", construction.initializer_kind);
+        bridge.unsafe_context = Some(construction.unsafe_context);
+
+        let located = span_to_loc(construction.init_span);
+        let placement_failure = construction
+            .hold_reason
+            .clone()
+            .or_else(|| located.as_ref().err().map(|reason| (*reason).to_owned()));
+        if let (Some(replacement), Ok((file, lo, hi))) =
+            (construction.replacement.as_ref(), located)
+            && placement_failure.is_none()
+        {
+            by_file.entry(file).or_default().push(Edit {
+                lo,
+                hi,
+                replacement: replacement.clone(),
+                justification: Justification::SeamAdapter {
+                    family: "slice-construction",
+                    fabricated: extent.is_fallback(),
+                },
+                owner_class: Some(owner),
+                owner_path: owner_of(subject),
+                bridge: Some(bridge.clone()),
+                atom_ids: Vec::new(),
+                subject_id: subject_id.clone(),
+                required_arms: owner_arms.get(&owner).copied().unwrap_or_default().render(),
+                edit_kind: "slice-local-construction",
+            });
+        } else {
+            unplaceable.push(Unplaceable {
+                owner_class: owner,
+                bridge: bridge.clone(),
+                reason: "slice construction unavailable",
+                detail: format!(
+                    "{}: {}",
+                    subject_id,
+                    placement_failure
+                        .clone()
+                        .unwrap_or_else(|| "no replacement".to_owned())
+                ),
+                subject: subject_id.clone(),
+            });
+        }
+
+        let intended_terminal_state = if placement_failure.is_some() {
+            MechanicalState::HeldNonmechanical
+        } else {
+            MechanicalState::Applied
+        };
+        let intended_terminal_reason = placement_failure.clone().map(|reason| {
+            if let Some(detail) = reason.strip_prefix("composition-crossing-unhoistable:") {
+                MechanicalTerminalReason::CompositionCrossingUnhoistable(detail.to_owned())
+            } else {
+                MechanicalTerminalReason::EvidenceMissing(reason)
+            }
+        });
+        let site = CanonicalSiteKey {
+            owner: subject.fn_did,
+            location: CanonicalLocation::Hir {
+                owner: subject.fn_did,
+                item_local_id: construction.init_hir.local_id.as_u32(),
+            },
+            callee: None,
+            argument_index: None,
+            slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+        };
+        let event = MechanicalObligationEvent {
+            key: MechanicalObligationKey {
+                owner_class: owner,
+                subject: mechanical_subject.clone(),
+                site,
+                family: MechanicalFamily::SliceLocalConstruction,
+            },
+            owner_path: owner_of(subject),
+            prior_reason: "slice-local-construction".to_owned(),
+            expected_form: expected_form.to_owned(),
+            found_form: "raw".to_owned(),
+            argument_kind: "local-initializer".to_owned(),
+            source_shape: construction.initializer_kind.to_owned(),
+            required_arms: owner_arms.get(&owner).copied().unwrap_or_default().render(),
+            mechanism: MechanicalMechanism::SliceConstruction,
+            composition_parent: None,
+            dependency_classes: BTreeSet::new(),
+            evidence: MechanicalEvidence {
+                extent: extent.clone(),
+                retention: MechanicalRetention::None,
+                negative_write: NegativeWriteEvidence::NotApplicable,
+                terminal_contract: TerminalContract::NotApplicable,
+                hoist: HoistSafety::NotApplicable,
+                unsafe_context: Some(construction.unsafe_context),
+            },
+            stage: MechanicalStage::Plan,
+            state: MechanicalState::Planned,
+            terminal_reason: None,
+        };
+        slice_construction_receipt_plans.push(SliceConstructionReceiptPlan {
+            obligation: MechanicalObligationPlan {
+                planned: event,
+                intended_terminal_state,
+                intended_terminal_reason,
+            },
+            allocation_result: mechanical_subject,
+            element_type: construction.element_type.clone(),
+            mutable: construction.mutable,
+            nullable: construction.nullable,
+            length_expression: construction.length.expression.clone(),
+            length_provenance: construction.length.provenance_receipt(),
+            extent,
+            owner_class: owner,
+        });
     }
 
     for (subject, decision) in &table.entries {
@@ -2597,6 +2787,7 @@ pub(crate) fn plan(
         class_finalization: ClassFinalization::default(),
         attribution_intervals,
         a5_receipt_plans,
+        slice_construction_receipt_plans,
         unowned_a5_proof_sites,
         terminal_a5_raw_calls: Vec::new(),
     }
@@ -2659,6 +2850,7 @@ mod tests {
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
+            slice_constructions: Vec::new(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -2714,6 +2906,7 @@ mod tests {
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
+            slice_constructions: Vec::new(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

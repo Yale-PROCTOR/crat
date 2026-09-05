@@ -3925,6 +3925,21 @@ pub(crate) fn filtered_inputs(
         statement_deletes: FxHashSet::default(),
         box_fabricated: 0,
     };
+    let active_slice_constructions = table
+        .slice_constructions
+        .iter()
+        .filter(|plan| {
+            plan.replacement.is_some() && reverts.keeps_subject(plan.node.0, plan.node.1)
+        })
+        .collect::<Vec<_>>();
+    let composed_slice_edits = active_slice_constructions
+        .iter()
+        .flat_map(|plan| {
+            plan.composed_edit_spans
+                .iter()
+                .map(|span| (span.lo().0, span.hi().0))
+        })
+        .collect::<FxHashSet<_>>();
     for (subject, decision) in &table.entries {
         let use_edits = match decision {
             super::decision::Decision::Ref { .. }
@@ -3956,6 +3971,9 @@ pub(crate) fn filtered_inputs(
             );
         }
         for u in use_edits.into_iter().flatten() {
+            if composed_slice_edits.contains(&(u.span.lo().0, u.span.hi().0)) {
+                continue;
+            }
             insert_counting(
                 &mut out.uses,
                 (u.span.lo().0, u.span.hi().0),
@@ -3975,9 +3993,25 @@ pub(crate) fn filtered_inputs(
             &mut out.use_key_collisions,
         );
     }
+    for plan in active_slice_constructions {
+        let replacement = plan
+            .replacement
+            .as_ref()
+            .expect("active slice construction has a replacement");
+        insert_counting(
+            &mut out.uses,
+            (plan.init_span.lo().0, plan.init_span.hi().0),
+            replacement.clone(),
+            &mut out.use_key_collisions,
+        );
+        out.box_fabricated += usize::from(plan.length.is_fallback());
+    }
     for edit in &table.seams.edits {
         // ARM 3's filter, on the CALLEE's direct class ID.
         if !reverts.keeps_edit(edit.owner_class, &edit.atom_ids) {
+            continue;
+        }
+        if composed_slice_edits.contains(&(edit.span.lo().0, edit.span.hi().0)) {
             continue;
         }
         let key = (edit.span.lo().0, edit.span.hi().0);
@@ -4015,6 +4049,9 @@ pub(crate) fn filtered_inputs(
     }
     for edit in &table.seams.body_edits {
         if !reverts.keeps(edit.owner_class) {
+            continue;
+        }
+        if composed_slice_edits.contains(&(edit.span.lo().0, edit.span.hi().0)) {
             continue;
         }
         insert_counting(

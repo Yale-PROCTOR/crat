@@ -517,6 +517,17 @@ impl MechanicalExtent {
         }
     }
 
+    fn waiver(&self) -> &str {
+        match self {
+            Self::Fallback { waiver_id, .. } => waiver_id,
+            Self::None | Self::Evidence(_) => "-",
+        }
+    }
+
+    pub(crate) fn is_fallback(&self) -> bool {
+        matches!(self, Self::Fallback { .. })
+    }
+
     fn validate(&self) -> Result<(), String> {
         match self {
             Self::Evidence(source) if source.is_empty() => {
@@ -1346,7 +1357,140 @@ pub(crate) struct SliceConstructionReceiptRow {
     pub(crate) mutable: bool,
     pub(crate) nullable: bool,
     pub(crate) length_expression: String,
+    pub(crate) length_provenance: String,
     pub(crate) extent: MechanicalExtent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SliceConstructionReceiptPlan {
+    pub(crate) obligation: MechanicalObligationPlan,
+    pub(crate) allocation_result: MechanicalSubjectKey,
+    pub(crate) element_type: String,
+    pub(crate) mutable: bool,
+    pub(crate) nullable: bool,
+    pub(crate) length_expression: String,
+    pub(crate) length_provenance: String,
+    pub(crate) extent: MechanicalExtent,
+    pub(crate) owner_class: SignatureClassId,
+}
+
+impl SliceConstructionReceiptPlan {
+    pub(crate) fn materialize(
+        &self,
+        owner_class_live: bool,
+        runtime_reverted: bool,
+    ) -> (
+        [MechanicalObligationEvent; 2],
+        [SliceConstructionReceiptRow; 2],
+    ) {
+        let events = self.obligation.events(owner_class_live, runtime_reverted);
+        let row = |event: &MechanicalObligationEvent| SliceConstructionReceiptRow {
+            terminal: SpecializedReceiptTerminal {
+                obligation_key: event.key.clone(),
+                stage: event.stage,
+                state: event.state,
+                reason: event.terminal_reason.clone(),
+            },
+            allocation_result: self.allocation_result.clone(),
+            element_type: self.element_type.clone(),
+            mutable: self.mutable,
+            nullable: self.nullable,
+            length_expression: self.length_expression.clone(),
+            length_provenance: self.length_provenance.clone(),
+            extent: self.extent.clone(),
+        };
+        let rows = [row(&events[0]), row(&events[1])];
+        (events, rows)
+    }
+}
+
+pub(crate) fn reconcile_slice_construction_rows(
+    rows: &[SliceConstructionReceiptRow],
+    common: &[MechanicalObligationEvent],
+) -> Result<usize, String> {
+    let common = common
+        .iter()
+        .filter(|event| event.key.family == MechanicalFamily::SliceLocalConstruction)
+        .map(|event| {
+            (
+                format!("{}:{}", event.key.receipt_key(), event.stage.key()),
+                event,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut specialized = BTreeMap::<String, &SliceConstructionReceiptRow>::new();
+    for row in rows {
+        let key = format!(
+            "{}:{}",
+            row.terminal.obligation_key.receipt_key(),
+            row.terminal.stage.key()
+        );
+        if specialized.insert(key.clone(), row).is_some() {
+            return Err(format!(
+                "duplicate slice-construction specialized row {key}"
+            ));
+        }
+        let Some(event) = common.get(&key) else {
+            return Err(format!("unowned slice-construction specialized row {key}"));
+        };
+        if row.allocation_result != row.terminal.obligation_key.subject
+            || row.terminal.state != event.state
+            || row.terminal.reason != event.terminal_reason
+            || row.extent != event.evidence.extent
+        {
+            return Err(format!(
+                "slice-construction specialized/common drift at {key}"
+            ));
+        }
+        row.extent.validate()?;
+    }
+    for key in common.keys() {
+        if !specialized.contains_key(key) {
+            return Err(format!(
+                "slice-construction common row lacks specialized row {key}"
+            ));
+        }
+    }
+    Ok(rows
+        .iter()
+        .filter(|row| row.terminal.stage == MechanicalStage::Plan)
+        .count())
+}
+
+pub(crate) fn render_slice_construction_rows(rows: &[SliceConstructionReceiptRow]) -> String {
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                row.terminal.obligation_key.receipt_key(),
+                row.allocation_result.receipt_key(),
+                row.element_type,
+                if row.mutable { "mut" } else { "shared" },
+                if row.nullable { "nullable" } else { "required" },
+                row.length_expression,
+                row.length_provenance,
+                row.extent.evidence(),
+                row.extent.kind(),
+                row.extent.waiver(),
+                row.terminal.stage.key(),
+                row.terminal.state.key(),
+                row.terminal
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), MechanicalTerminalReason::key),
+            )
+        })
+        .collect::<Vec<_>>();
+    rendered.sort();
+    let mut out =
+        specialized_receipt_headers()[raw_schema::SLICE_CONSTRUCTION_RECEIPT_ROWS].join("\t");
+    out.push('\n');
+    for row in rendered {
+        out.push_str(&row);
+        out.push('\n');
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1637,6 +1781,7 @@ pub(crate) fn specialized_receipt_headers() -> BTreeMap<&'static str, &'static [
                 "mutability",
                 "nullability",
                 "length_expression",
+                "length_provenance",
                 "evidence_source",
                 "extent_kind",
                 "waiver_id",
@@ -1870,6 +2015,25 @@ mod tests {
         assert_eq!(mechanical_obligation_header(), COMMON);
 
         let schemas = specialized_receipt_headers();
+        // R206 adds provenance detail without changing extent source kind.
+        assert_eq!(
+            schemas[raw_schema::SLICE_CONSTRUCTION_RECEIPT_ROWS],
+            &[
+                "obligation_key",
+                "allocation_result_identity",
+                "element_type",
+                "mutability",
+                "nullability",
+                "length_expression",
+                "length_provenance",
+                "evidence_source",
+                "extent_kind",
+                "waiver_id",
+                "stage",
+                "state",
+                "drop_reason",
+            ]
+        );
         let required = [
             "a5-proof-site-fallback.tsv",
             "composition-dependency.tsv",

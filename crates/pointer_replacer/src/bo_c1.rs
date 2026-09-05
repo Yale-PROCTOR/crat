@@ -10610,6 +10610,11 @@ mod run {
             &artifact.mechanical_events,
         )
         .expect("A5 proof-site fallback reconciliation");
+        crate::bo_rewriter::mechanical_receipt::reconcile_slice_construction_rows(
+            &artifact.slice_construction_rows,
+            &artifact.mechanical_events,
+        )
+        .expect("slice-construction receipt reconciliation");
         let mechanical_receipts =
             crate::bo_rewriter::mechanical_receipt::render_mechanical_obligations(
                 &artifact.mechanical_events,
@@ -10617,6 +10622,10 @@ mod run {
         let a5_proof_site_fallback_receipts =
             crate::bo_rewriter::mechanical_receipt::render_a5_proof_site_fallback_rows(
                 &artifact.a5_proof_site_fallback_rows,
+            );
+        let slice_construction_receipts =
+            crate::bo_rewriter::mechanical_receipt::render_slice_construction_rows(
+                &artifact.slice_construction_rows,
             );
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
@@ -10660,6 +10669,14 @@ mod run {
             stamp(&a5_proof_site_fallback_receipts),
         )
         .expect("write A5 proof-site fallback receipts");
+        std::fs::write(
+            directory.join(format!(
+                "{name}.{}",
+                raw_schema::SLICE_CONSTRUCTION_RECEIPT_ROWS
+            )),
+            stamp(&slice_construction_receipts),
+        )
+        .expect("write slice-construction receipts");
         let mut diagnostics = String::from(RAW_BOUNDARY_DIAGNOSTIC_HEADER);
         for diagnostic in &capture.reverts {
             diagnostics.push_str(&format!(
@@ -20869,6 +20886,7 @@ fn raw_boundary_wave2_preflight() {
         raw_schema::BRIDGE_RECEIPT_FILE,
         raw_schema::MECHANICAL_OBLIGATION_ROWS,
         raw_schema::A5_PROOF_SITE_FALLBACK_ROWS,
+        raw_schema::SLICE_CONSTRUCTION_RECEIPT_ROWS,
         raw_schema::CLASS_COST_ROWS,
         raw_schema::CROSS_CLASS_COLLISION_ROWS,
         raw_schema::UNRESOLVED_CLASS_ROWS,

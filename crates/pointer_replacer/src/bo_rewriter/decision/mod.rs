@@ -859,6 +859,8 @@ pub(crate) struct DecisionTable {
     /// R-A storage presentations whose declaration is an existing `Opt`
     /// decision but whose initializer also needs to become an Option value.
     pub depth2_npo_storages: Vec<Depth2NpoStoragePlan>,
+    /// Item-2 raw-result definitions that construct settled local slices.
+    pub slice_constructions: Vec<construction::SliceConstructionPlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1001,6 +1003,7 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
         // filled by the driver, which is also where the analyses live.
         seams: Default::default(),
         depth2_npo_storages: Vec::new(),
+        slice_constructions: Vec::new(),
     }
 }
 
@@ -1661,10 +1664,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         };
     }
 
-    // A local would need the slice VALUE constructed at its initializer —
-    // `from_raw_parts` and a length. Different mechanism, different soundness
-    // argument; scoped out of this slice and counted rather than attempted.
-    if matches!(subject.kind, SubjectKind::Local) {
+    // Item 2 owns the local slice VALUE at its initializer. Absence of a typed
+    // initializer identity still fails closed under the historical reason;
+    // otherwise the sealed construction plan carries evidence or §77 fallback.
+    if matches!(subject.kind, SubjectKind::Local)
+        && !construction::slice_constructor_available(
+            constructions,
+            (subject.fn_did, subject.hir_id),
+        )
+    {
         return degrade(subject, decl_site, DegradeReason::SliceLocalConstruction);
     }
     let uses = slice_uses
@@ -1816,6 +1824,7 @@ mod self_consistency_tests {
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
+            slice_constructions: Vec::new(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

@@ -209,6 +209,7 @@ mod tests {
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
+            slice_constructions: Vec::new(),
         }
     }
 

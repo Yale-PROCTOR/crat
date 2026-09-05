@@ -219,6 +219,7 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) unsafe_context_events: Vec<mechanical_receipt::UnsafeContextReceiptEvent>,
     pub(crate) mechanical_events: Vec<mechanical_receipt::MechanicalObligationEvent>,
     pub(crate) a5_proof_site_fallback_rows: Vec<mechanical_receipt::A5ProofSiteFallbackReceiptRow>,
+    pub(crate) slice_construction_rows: Vec<mechanical_receipt::SliceConstructionReceiptRow>,
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
@@ -1179,9 +1180,10 @@ fn refresh_raw_boundary_receipt_events(
     );
     artifacts.bridge_events = emission_plan.bridge_events(reverted);
     artifacts.unsafe_context_events = emission_plan.unsafe_context_events(reverted);
-    let (mechanical_events, a5_rows) = emission_plan.mechanical_receipts(reverted);
+    let (mechanical_events, a5_rows, slice_rows) = emission_plan.mechanical_receipts(reverted);
     artifacts.mechanical_events = mechanical_events;
     artifacts.a5_proof_site_fallback_rows = a5_rows;
+    artifacts.slice_construction_rows = slice_rows;
 }
 
 fn verify_and_revert(
@@ -3191,6 +3193,14 @@ impl OutcomeFacts {
                 );
             }
         }
+        for row in &mut self.raw_boundary_artifacts.slice_construction_rows {
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
         self.stamp_class_costs();
         RewriteOutcome::Degraded {
             reason,
@@ -4277,6 +4287,7 @@ pub(crate) fn validate_plan(
                         plan::Justification::KindDecision { .. }
                     ) || !exact_kind_composed_by_seam(kept, *inner_index))
                     && !nested_c9_over_seam(kept, *inner_index)
+                    && !composed_by_slice_constructor(kept, *inner_index)
             })
             .map(|(_, edit)| edit.clone())
             .collect::<Vec<_>>();
@@ -4286,6 +4297,21 @@ pub(crate) fn validate_plan(
         files.insert(key.clone(), applied.source);
     }
     (files, rollbacks, maps)
+}
+
+/// Item-2 constructors seal the already-rendered inner adapter text into the
+/// outer initializer replacement. The validation-only byte projection cannot
+/// apply both ranges, so it omits exactly those inner ranges owned by the same
+/// class while retaining both plan sites and receipts.
+fn composed_by_slice_constructor(edits: &[plan::Edit], inner_index: usize) -> bool {
+    let inner = &edits[inner_index];
+    edits.iter().enumerate().any(|(outer_index, outer)| {
+        outer_index != inner_index
+            && outer.edit_kind == "slice-local-construction"
+            && outer.owner_class == inner.owner_class
+            && outer.lo <= inner.lo
+            && inner.hi <= outer.hi
+    })
 }
 
 /// Exactly the one nested plan class the AST pass orders deliberately:
@@ -5652,6 +5678,11 @@ fn finish_decide<'tcx>(
             &mut_facts,
         );
     }
+    // Item 2 renders local raw-result constructors only after the terminal
+    // seam set exists, so a contained raw-view/cast edit is composed into the
+    // initializer rather than overwritten by an outer constructor.
+    table.slice_constructions =
+        decision::construction::plan_slice_constructions(tcx, &table, &ctors);
     append_surface_declaration_plans(tcx, &exposure, &mut table);
     append_inferred_local_declaration_plans(tcx, &mut table);
     table.c9_marks = retained_c9_plans.clone();
@@ -5702,6 +5733,7 @@ fn finish_decide<'tcx>(
         unsafe_context_events: Vec::new(),
         mechanical_events: Vec::new(),
         a5_proof_site_fallback_rows: Vec::new(),
+        slice_construction_rows: Vec::new(),
         class_costs: bridge_receipt::class_cost_header(),
         class_collisions: bridge_receipt::class_collision_header(),
         unresolved_classes: bridge_receipt::unresolved_class_header(),
