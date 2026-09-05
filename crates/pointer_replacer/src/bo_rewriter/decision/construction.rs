@@ -319,17 +319,6 @@ fn allocation_length(construction: &Construction, element_type: &str) -> Option<
             provenance: Vec::new(),
         });
     }
-    if count.is_none() && exact_element_size(size, element_type) {
-        return Some(SliceLengthPlan {
-            expression: "1usize".to_owned(),
-            source: SliceLengthSource::AllocationByteCount {
-                allocator: callee.clone(),
-                argument_index: u32::from(callee == "realloc"),
-                element_type: element_type.to_owned(),
-            },
-            provenance: Vec::new(),
-        });
-    }
     None
 }
 
