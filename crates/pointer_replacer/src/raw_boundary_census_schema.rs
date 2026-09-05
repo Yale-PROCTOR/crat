@@ -173,6 +173,10 @@ pub(crate) const IO_DOMAIN_OBSERVED_COUNT: &str = "raw_boundary_io_domain_observ
 pub(crate) const IO_DOMAIN_MISSING_COUNT: &str = "raw_boundary_io_domain_missing_count";
 pub(crate) const IO_DOMAIN_UNEXPECTED_COUNT: &str = "raw_boundary_io_domain_unexpected_count";
 pub(crate) const IO_DOMAIN_DUPLICATE_COUNT: &str = "raw_boundary_io_domain_duplicate_count";
+pub(crate) const UNSAFE_CONTEXT_SITE_COUNT: &str = "raw_boundary_unsafe_context_site_count";
+pub(crate) const UNSAFE_CONTEXT_INSERTED_COUNT: &str = "raw_boundary_unsafe_context_inserted_count";
+pub(crate) const UNSAFE_CONTEXT_OMITTED_COUNT: &str = "raw_boundary_unsafe_context_omitted_count";
+pub(crate) const UNSAFE_CONTEXT_DROPPED_COUNT: &str = "raw_boundary_unsafe_context_dropped_count";
 pub(crate) const STATUS: &str = "raw_boundary_status";
 
 pub(crate) const BRIDGE_RECEIPT_FILE: &str = "raw-boundary-bridge-receipts.tsv";
@@ -359,5 +363,9 @@ pub(crate) const ALL: &[&str] = &[
     IO_DOMAIN_MISSING_COUNT,
     IO_DOMAIN_UNEXPECTED_COUNT,
     IO_DOMAIN_DUPLICATE_COUNT,
+    UNSAFE_CONTEXT_SITE_COUNT,
+    UNSAFE_CONTEXT_INSERTED_COUNT,
+    UNSAFE_CONTEXT_OMITTED_COUNT,
+    UNSAFE_CONTEXT_DROPPED_COUNT,
     STATUS,
 ];

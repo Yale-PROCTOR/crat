@@ -216,6 +216,7 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) atom_outcomes: String,
     pub(crate) final_reverts: String,
     pub(crate) bridge_events: Vec<bridge_receipt::BridgeReceiptEvent>,
+    pub(crate) unsafe_context_events: Vec<mechanical_receipt::UnsafeContextReceiptEvent>,
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
@@ -1180,6 +1181,8 @@ fn verify_and_revert(
         .count();
     raw_boundary_artifacts.bridge_events =
         emission_plan.bridge_events(&std::collections::BTreeSet::new());
+    raw_boundary_artifacts.unsafe_context_events =
+        emission_plan.unsafe_context_events(&std::collections::BTreeSet::new());
     raw_boundary_artifacts.class_collisions = render_class_collisions(&emission_plan);
     raw_boundary_artifacts.arm_outcomes = atomic_arm_outcomes_tsv(tcx, table, &emission_plan);
     let mut class_paths = std::collections::BTreeMap::new();
@@ -1677,6 +1680,8 @@ fn verify_and_revert(
             if !reverted.is_empty() && all_ready_classes.is_subset(&reverted) {
                 facts.reverted_count = reverted.len();
                 facts.raw_boundary_artifacts.bridge_events = emission_plan.bridge_events(&reverted);
+                facts.raw_boundary_artifacts.unsafe_context_events =
+                    emission_plan.unsafe_context_events(&reverted);
                 record_unresolved_classes(
                     &mut facts.raw_boundary_artifacts,
                     &all_ready_classes,
@@ -1712,6 +1717,8 @@ fn verify_and_revert(
             facts.raw_boundary_artifacts.final_reverts =
                 render_raw_boundary_final_reverts(&reverted, &reverted_atoms, &class_paths);
             facts.raw_boundary_artifacts.bridge_events = emission_plan.bridge_events(&reverted);
+            facts.raw_boundary_artifacts.unsafe_context_events =
+                emission_plan.unsafe_context_events(&reverted);
             return facts.emitted(source, files);
         }
 
@@ -2007,6 +2014,8 @@ fn verify_and_revert(
         facts.reverted_count = final_reverted.len();
         facts.escalated = Some(escalation.clone());
         facts.raw_boundary_artifacts.bridge_events = emission_plan.bridge_events(&final_reverted);
+        facts.raw_boundary_artifacts.unsafe_context_events =
+            emission_plan.unsafe_context_events(&final_reverted);
         record_unresolved_classes(
             &mut facts.raw_boundary_artifacts,
             &unresolved,
@@ -2122,6 +2131,8 @@ fn verify_and_revert(
                 render_raw_boundary_final_reverts(&final_reverted, &reverted_atoms, &class_paths);
             facts.raw_boundary_artifacts.bridge_events =
                 emission_plan.bridge_events(&final_reverted);
+            facts.raw_boundary_artifacts.unsafe_context_events =
+                emission_plan.unsafe_context_events(&final_reverted);
             facts.emitted(source, final_files)
         }
         _ => {
@@ -3076,6 +3087,13 @@ impl OutcomeFacts {
             if event.stage == bridge_receipt::BridgeReceiptStage::Terminal {
                 event.state = bridge_receipt::BridgeReceiptState::Dropped;
                 event.drop_reason = Some("program-degraded-unmodified-input".to_owned());
+            }
+        }
+        for event in &mut self.raw_boundary_artifacts.unsafe_context_events {
+            if event.stage == bridge_receipt::BridgeReceiptStage::Terminal {
+                event.state = bridge_receipt::BridgeReceiptState::Dropped;
+                event.drop_reason = Some("program-degraded-unmodified-input".to_owned());
+                event.terminal_class_disposition = "degraded".to_owned();
             }
         }
         self.stamp_class_costs();
@@ -4277,6 +4295,7 @@ fn pair_raw_view_failure_site(
         extent: bridge_receipt::BridgeExtentKind::None,
         retention: bridge_receipt::BridgeRetentionTier::None,
         waiver_id: None,
+        unsafe_context: None,
     };
     plan::ClassSite {
         key: bridge.materialize(
@@ -4298,6 +4317,7 @@ fn pair_raw_view_failure_site(
         extent: bridge_receipt::BridgeExtentKind::None,
         retention: bridge_receipt::BridgeRetentionTier::None,
         waiver_id: None,
+        unsafe_context: bridge.unsafe_context,
     }
 }
 
@@ -4411,6 +4431,7 @@ pub(crate) fn emit_files<'tcx>(
                 extent: bridge_receipt::BridgeExtentKind::None,
                 retention: bridge_receipt::BridgeRetentionTier::T2,
                 waiver_id: Some(bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+                unsafe_context: None,
             }),
             atom_ids: call.atom_ids.clone(),
             subject_id: format!(
@@ -4458,6 +4479,7 @@ pub(crate) fn emit_files<'tcx>(
                 extent: bridge_receipt::BridgeExtentKind::None,
                 retention: bridge_receipt::BridgeRetentionTier::T1,
                 waiver_id: None,
+                unsafe_context: None,
             }),
             atom_ids: Vec::new(),
             subject_id: mark.owner_fn.clone(),
@@ -5219,6 +5241,7 @@ fn finish_decide<'tcx>(
         },
         final_reverts: String::from("kind\tidentity\tclass_id\n"),
         bridge_events: Vec::new(),
+        unsafe_context_events: Vec::new(),
         class_costs: bridge_receipt::class_cost_header(),
         class_collisions: bridge_receipt::class_collision_header(),
         unresolved_classes: bridge_receipt::unresolved_class_header(),
@@ -5301,6 +5324,17 @@ fn append_surface_declaration_plans(
             continue;
         }
         let owner = SignatureClassId::of(function.did);
+        let unsafe_fn = tcx
+            .fn_sig(function.did.to_def_id())
+            .skip_binder()
+            .skip_binder()
+            .safety
+            .is_unsafe();
+        let presentation = mechanical_receipt::UnsafeContextPresentation {
+            unsafe_fn,
+            wrapper_inserted: !unsafe_fn,
+            edition: 2018,
+        };
         let raw_signature = format!(
             "{:?}",
             tcx.fn_sig(function.did.to_def_id())
@@ -5320,6 +5354,57 @@ fn append_surface_declaration_plans(
                 replacement: None,
                 arm: "surface",
             });
+
+        for (subject, decision) in &table.entries {
+            let decision_form = match decision {
+                decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => "ref",
+                decision::Decision::Slice { .. } => "slice",
+                decision::Decision::Opt { .. } => "optional",
+                decision::Decision::Box(_) | decision::Decision::Degraded(_) => continue,
+            };
+            let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                continue;
+            };
+            if subject.fn_did != function.did {
+                continue;
+            }
+            table
+                .seams
+                .zero_bridges
+                .push(decision::seam::ZeroBridgeSite {
+                    owner_class: owner,
+                    caller: function.did,
+                    span: None,
+                    arm: "surface",
+                    position: format!("generated-wrapper-arg{hir_index}"),
+                    bridge_kind: "surface-unsafe-context-parameter",
+                    expected_form: decision_form,
+                    found_form: "raw",
+                    argument_kind: "generated-wrapper-argument",
+                    retention: bridge_receipt::BridgeRetentionTier::T1,
+                    waiver_id: None,
+                    unsafe_context: Some(presentation),
+                });
+        }
+        if unsafe_fn {
+            table
+                .seams
+                .zero_bridges
+                .push(decision::seam::ZeroBridgeSite {
+                    owner_class: owner,
+                    caller: function.did,
+                    span: None,
+                    arm: "surface",
+                    position: "generated-wrapper-inner-call".to_owned(),
+                    bridge_kind: "surface-unsafe-context-inner-call",
+                    expected_form: "raw-wrapper",
+                    found_form: "unsafe-safe-inner",
+                    argument_kind: "generated-wrapper-call",
+                    retention: bridge_receipt::BridgeRetentionTier::None,
+                    waiver_id: None,
+                    unsafe_context: Some(presentation),
+                });
+        }
 
         let return_plan_digest = table
             .lifetime_plan
@@ -5372,6 +5457,7 @@ fn append_surface_declaration_plans(
                         argument_kind: "return-seam",
                         retention: bridge_receipt::BridgeRetentionTier::T1,
                         waiver_id: None,
+                        unsafe_context: None,
                     });
             }
         }
@@ -5453,6 +5539,7 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
                 argument_kind: "return-call-result",
                 retention: bridge_receipt::BridgeRetentionTier::None,
                 waiver_id: None,
+                unsafe_context: None,
             });
         }
     }

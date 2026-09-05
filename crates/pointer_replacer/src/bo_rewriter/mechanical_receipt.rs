@@ -4,13 +4,28 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_hir::def_id::{DefId, LocalDefId};
 
-use super::bridge_receipt::{RAW_BOUNDARY_T2_WAIVER_ID, SignatureClassId};
+use super::bridge_receipt::{
+    BridgeReceiptStage, BridgeReceiptState, BridgeSiteKey, RAW_BOUNDARY_T2_WAIVER_ID,
+    SignatureClassId,
+};
 use crate::raw_boundary_census_schema as raw_schema;
 
 pub(crate) const FALLBACK_SLICE_EXTENT: usize = 1024;
 pub(crate) const SLICE_EXTENT_WAIVER_ID: &str = "slice-extent-out-of-scope@addendum-77";
 pub(crate) const FALLBACK_EXTENT_RECEIPT: &str =
     "fabricated-extent:slice-extent-out-of-scope@addendum-77:FALLBACK_SLICE_EXTENT=1024";
+
+pub(crate) fn present_unsafe_text(
+    expression: impl Into<String>,
+    enclosing_unsafe_fn: bool,
+) -> String {
+    let expression = expression.into();
+    if enclosing_unsafe_fn {
+        expression
+    } else {
+        format!("unsafe {{ {expression} }}")
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum MechanicalFamily {
@@ -648,6 +663,126 @@ impl UnsafeContextPresentation {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnsafeContextReceiptEvent {
+    pub(crate) site: BridgeSiteKey,
+    pub(crate) enclosing: LocalDefId,
+    pub(crate) presentation: UnsafeContextPresentation,
+    pub(crate) terminal_class_disposition: String,
+    pub(crate) stage: BridgeReceiptStage,
+    pub(crate) state: BridgeReceiptState,
+    pub(crate) drop_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnsafeContextReceiptSummary {
+    pub(crate) sites: usize,
+    pub(crate) inserted: usize,
+    pub(crate) omitted: usize,
+    pub(crate) dropped: usize,
+}
+
+pub(crate) fn reconcile_unsafe_context_events(
+    events: &[UnsafeContextReceiptEvent],
+) -> Result<UnsafeContextReceiptSummary, String> {
+    let mut by_site = BTreeMap::<
+        String,
+        (
+            Option<&UnsafeContextReceiptEvent>,
+            Option<&UnsafeContextReceiptEvent>,
+        ),
+    >::new();
+    for event in events {
+        event.presentation.validate()?;
+        let valid_stage = matches!(
+            (event.stage, event.state),
+            (BridgeReceiptStage::Plan, BridgeReceiptState::Planned)
+                | (
+                    BridgeReceiptStage::Terminal,
+                    BridgeReceiptState::Applied | BridgeReceiptState::Dropped
+                )
+        );
+        if !valid_stage {
+            return Err("invalid unsafe-context stage/state".to_owned());
+        }
+        if (event.state == BridgeReceiptState::Dropped) != event.drop_reason.is_some() {
+            return Err("unsafe-context drop reason/state mismatch".to_owned());
+        }
+        let slot = by_site.entry(event.site.receipt_key()).or_default();
+        let target = match event.stage {
+            BridgeReceiptStage::Plan => &mut slot.0,
+            BridgeReceiptStage::Terminal => &mut slot.1,
+        };
+        if target.replace(event).is_some() {
+            return Err("duplicate unsafe-context receipt stage".to_owned());
+        }
+    }
+
+    let mut summary = UnsafeContextReceiptSummary {
+        sites: by_site.len(),
+        ..UnsafeContextReceiptSummary::default()
+    };
+    for (site, (plan, terminal)) in by_site {
+        let (Some(plan), Some(terminal)) = (plan, terminal) else {
+            return Err(format!("unsafe-context site {site} lacks plan or terminal"));
+        };
+        if plan.enclosing != terminal.enclosing || plan.presentation != terminal.presentation {
+            return Err(format!("unsafe-context site {site} changed between stages"));
+        }
+        if terminal.state == BridgeReceiptState::Dropped {
+            summary.dropped += 1;
+        } else if terminal.presentation.wrapper_inserted {
+            summary.inserted += 1;
+        } else {
+            summary.omitted += 1;
+        }
+    }
+    Ok(summary)
+}
+
+pub(crate) fn render_unsafe_context_events(events: &[UnsafeContextReceiptEvent]) -> String {
+    let mut rows = events
+        .iter()
+        .map(|event| {
+            let stage = match event.stage {
+                BridgeReceiptStage::Plan => "plan",
+                BridgeReceiptStage::Terminal => "terminal",
+            };
+            let state = match event.state {
+                BridgeReceiptState::Planned => "planned",
+                BridgeReceiptState::Applied => "applied",
+                BridgeReceiptState::Dropped => "dropped",
+            };
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                event.site.receipt_key(),
+                event.site.receipt_key(),
+                event.enclosing.local_def_index.as_u32(),
+                u8::from(event.presentation.unsafe_fn),
+                if event.presentation.wrapper_inserted {
+                    "inserted"
+                } else {
+                    "omitted"
+                },
+                event.presentation.edition,
+                event.terminal_class_disposition,
+                stage,
+                state,
+                event.drop_reason.as_deref().unwrap_or("-"),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    let columns = specialized_receipt_headers()[raw_schema::UNSAFE_CONTEXT_PRESENTATION_ROWS];
+    let mut out = columns.join("\t");
+    out.push('\n');
+    for row in rows {
+        out.push_str(&row);
+        out.push('\n');
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

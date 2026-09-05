@@ -5790,7 +5790,7 @@ fn e_adapt_w2_optional_maps_null_to_none_without_unwrap() {
         "null must become None:\n{emitted}"
     );
     assert!(
-        emitted.contains("unsafe { base.offset(1).as_ref() }"),
+        emitted.contains("base.offset(1).as_ref()"),
         "a maybe-null raw expression must use the one-evaluation pointer Option API:\n{emitted}"
     );
     let caller_line = emitted
@@ -5886,7 +5886,7 @@ fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
         "the raw-expression bridge must be typed as the scalar template:\n{seams}"
     );
     assert!(
-        emitted.contains("scalar(unsafe { &*base.offset(1) })"),
+        emitted.contains("scalar(&*base.offset(1))"),
         "the call-scoped shared reborrow must surround the whole expression:\n{emitted}"
     );
 }
@@ -6181,7 +6181,7 @@ fn e2_body_w2_assignment_uses_the_production_scalar_adapter() {
         attempt.receipt
     );
     assert!(
-        e2_root_text(&attempt).contains("q = unsafe { &mut *p }"),
+        e2_root_text(&attempt).contains("q = &mut *p"),
         "{}",
         e2_root_text(&attempt)
     );
@@ -6541,8 +6541,122 @@ fn force_br_w1_scalar_targets(table: &mut super::decision::DecisionTable) {
     }
 }
 
-/// BR-W1 RED: both raw-scalar inbound directions are explicit unsafe
-/// reborrows, owned and receipted by the converted callee's signature class.
+const U0_W1_CONTEXT_PAIR: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub unsafe fn target(p: *const i32) -> i32 { *p }\n\
+     pub unsafe fn unsafe_caller(p: *const i32) -> i32 { target(p) }\n\
+     pub fn safe_caller(p: *const i32) -> i32 { unsafe { target(p) } }\n";
+
+fn force_u0_w1_target(table: &mut super::decision::DecisionTable) {
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("target::p") {
+            *decision = super::decision::Decision::Ref { mutable: false };
+        } else if subject.label.ends_with("unsafe_caller::p")
+            || subject.label.ends_with("safe_caller::p")
+        {
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: subject.label.clone(),
+                site: "<u0-w1-injected>".to_owned(),
+                reason: super::decision::DegradeReason::CallSiteNotAdapted,
+            });
+        }
+    }
+}
+
+/// U0-W1 RED: the same raw-to-reference bridge is bare inside an existing
+/// unsafe function and explicitly wrapped inside a safe function. Function
+/// safety headers are observations and must remain byte/token unchanged.
+#[test]
+fn u0_w1_bridge_wrapper_tracks_enclosing_function_safety() {
+    let attempt = e3_attempt_with(U0_W1_CONTEXT_PAIR, true, &force_u0_w1_target);
+    let source = e2_root_text(&attempt);
+    assert!(
+        source.contains("unsafe fn unsafe_caller(p: *const i32) -> i32 { target(&*p) }"),
+        "unsafe caller must emit a bare legacy-edition bridge:\n{source}"
+    );
+    assert!(
+        source
+            .contains("fn safe_caller(p: *const i32) -> i32 { unsafe { target(unsafe { &*p }) } }"),
+        "safe caller must retain the bridge wrapper:\n{source}"
+    );
+    assert!(source.contains("pub unsafe fn unsafe_caller("), "{source}");
+    assert!(source.contains("pub fn safe_caller("), "{source}");
+    assert_eq!(source.matches("unsafe fn").count(), 2, "{source}");
+
+    let events = attempt
+        .emission
+        .plan
+        .unsafe_context_events(&std::collections::BTreeSet::new());
+    let summary = super::mechanical_receipt::reconcile_unsafe_context_events(&events)
+        .expect("U0-W1 unsafe-context receipts reconcile");
+    assert_eq!(summary.sites, 2, "{events:#?}");
+    assert_eq!(summary.omitted, 1, "{events:#?}");
+    assert_eq!(summary.inserted, 1, "{events:#?}");
+    let rendered = super::mechanical_receipt::render_unsafe_context_events(&events);
+    assert!(
+        rendered.starts_with("obligation_key\tsite_key\tenclosing_local_def_id\tunsafe_fn\t"),
+        "{rendered}"
+    );
+}
+
+fn u0_remove_generated_unsafe_wrappers(mut text: String) -> Option<String> {
+    while let Some(start) = text.find("unsafe {") {
+        let open = start + "unsafe ".len();
+        let mut depth = 0_u32;
+        let mut close = None;
+        for (offset, byte) in text.as_bytes()[open..].iter().copied().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close?;
+        text.replace_range(close..=close, "");
+        text.replace_range(start..=open, "");
+    }
+    Some(text.chars().filter(|ch| !ch.is_whitespace()).collect())
+}
+
+/// U0-C1's local differential: deleting generated `unsafe {}` delimiters is
+/// accepted, while changing the bridge operation is rejected.
+#[test]
+fn u0_w1_differential_allows_only_generated_unsafe_wrappers() {
+    for (wrapped, bare) in [
+        ("unsafe { &*p }", "&*p"),
+        ("Some(unsafe { &mut *p })", "Some(&mut *p)"),
+        (
+            "unsafe { core::slice::from_raw_parts(p, n) }",
+            "core::slice::from_raw_parts(p, n)",
+        ),
+        (
+            "g21_aliased(unsafe { &mut *q }, __crat_pair_raw_418_1)",
+            "g21_aliased(&mut *q, __crat_pair_raw_418_1)",
+        ),
+        (
+            "let _b = g22_probe(unsafe { node.as_ref() });",
+            "let _b = g22_probe(node.as_ref());",
+        ),
+    ] {
+        assert_eq!(
+            u0_remove_generated_unsafe_wrappers(wrapped.to_owned()),
+            u0_remove_generated_unsafe_wrappers(bare.to_owned())
+        );
+    }
+    assert_ne!(
+        u0_remove_generated_unsafe_wrappers("unsafe { core::ptr::from_ref(p) }".to_owned()),
+        u0_remove_generated_unsafe_wrappers("core::ptr::from_mut(p)".to_owned())
+    );
+}
+
+/// BR-W1: both raw-scalar inbound directions are reborrows owned and receipted
+/// by the converted callee's signature class. This fixture's caller is already
+/// unsafe, so item 0 emits the operations without redundant inner blocks.
 #[test]
 fn br_w1_raw_scalar_inbound_reborrows_and_receipts_are_exact() {
     use super::bridge_receipt::{
@@ -6552,11 +6666,11 @@ fn br_w1_raw_scalar_inbound_reborrows_and_receipts_are_exact() {
     let attempt = e3_attempt_with(BR_W1_RAW_SCALARS, true, &force_br_w1_scalar_targets);
     let source = e2_root_text(&attempt);
     assert!(
-        source.contains("read_target(unsafe { &*read_p })"),
+        source.contains("read_target(&*read_p)"),
         "shared raw inbound bridge must be explicit and evaluate its operand once:\n{source}"
     );
     assert!(
-        source.contains("write_target(unsafe { &mut *write_p })"),
+        source.contains("write_target(&mut *write_p)"),
         "mutable raw inbound bridge must be explicit and evaluate its operand once:\n{source}"
     );
 
@@ -6757,8 +6871,7 @@ fn inv_w1_non_subject_mir_call_is_bridged_or_holds_the_class() {
             )
     }));
     assert!(
-        source.contains("target(unsafe { &mut *holder.value })")
-            || source.contains("fn target(p: *mut i32)"),
+        source.contains("target(&mut *holder.value)") || source.contains("fn target(p: *mut i32)"),
         "neither expression bridge nor atomic class hold was emitted:\n{source}"
     );
     assert!(
@@ -6911,11 +7024,11 @@ fn br_w2_raw_optional_inbound_uses_as_ref_and_as_mut_once() {
     let attempt = e3_attempt_with(BR_W2_RAW_OPTIONALS, true, &force_br_w2_optional_targets);
     let source = e2_root_text(&attempt);
     assert!(
-        source.contains("maybe_shared(unsafe { read_p.as_ref() })"),
+        source.contains("maybe_shared(read_p.as_ref())"),
         "shared optional bridge must use as_ref exactly once:\n{source}"
     );
     assert!(
-        source.contains("maybe_mut(unsafe { write_p.as_mut() })"),
+        source.contains("maybe_mut(write_p.as_mut())"),
         "mutable optional bridge must use as_mut exactly once:\n{source}"
     );
     assert!(
@@ -7042,20 +7155,16 @@ fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
     let attempt = e3_attempt_with(BR_W3_RAW_SLICES, true, &force_br_w3_slice_targets);
     let source = e2_root_text(&attempt);
     assert!(
-        source.contains(
-            "licensed_shared(unsafe { core::slice::from_raw_parts(read_p, (n) as usize) }, n)"
-        ),
+        source.contains("licensed_shared(core::slice::from_raw_parts(read_p, (n) as usize), n)"),
+        "{source}"
+    );
+    assert!(
+        source.contains("licensed_mut(core::slice::from_raw_parts_mut(write_p, (n) as usize), n)"),
         "{source}"
     );
     assert!(
         source.contains(
-            "licensed_mut(unsafe { core::slice::from_raw_parts_mut(write_p, (n) as usize) }, n)"
-        ),
-        "{source}"
-    );
-    assert!(
-        source.contains(
-            "fallback_shared(unsafe { core::slice::from_raw_parts(read_p, crate::FALLBACK_SLICE_EXTENT) })"
+            "fallback_shared(core::slice::from_raw_parts(read_p, crate::FALLBACK_SLICE_EXTENT))"
         ),
         "{source}"
     );
@@ -7071,7 +7180,7 @@ fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
         "{source}"
     );
     assert!(
-        source.contains("Some(unsafe { core::slice::from_raw_parts(__crat_call_adapter_ptr, crate::FALLBACK_SLICE_EXTENT) })"),
+        source.contains("Some(core::slice::from_raw_parts(__crat_call_adapter_ptr, crate::FALLBACK_SLICE_EXTENT))"),
         "{source}"
     );
     assert!(
@@ -7079,7 +7188,7 @@ fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
         "{source}"
     );
     assert!(
-        source.contains("Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, crate::FALLBACK_SLICE_EXTENT) })"),
+        source.contains("Some(core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, crate::FALLBACK_SLICE_EXTENT))"),
         "{source}"
     );
 
@@ -8110,7 +8219,8 @@ fn br_w13_raw_tail_to_safe_return_reuses_reborrow_and_lifetime_permit() {
     else {
         panic!("BR-W13 inbound return must emit: {outcome:#?}");
     };
-    assert!(emitted.contains("unsafe { &*p }"), "{emitted}");
+    assert!(emitted.contains("&*p"), "{emitted}");
+    assert!(!emitted.contains("unsafe { &*p }"), "{emitted}");
     let pair = raw_boundary_artifacts
         .bridge_events
         .iter()
@@ -8322,7 +8432,8 @@ fn life_w1_kazmath_return_reuses_the_origin_parameter_lifetime() {
     );
     assert!(source.contains(") -> &'a mut i32"), "{source}");
     assert!(!source.contains("'b"), "{source}");
-    assert!(source.contains("unsafe { &mut *p_out }"), "{source}");
+    assert!(source.contains("&mut *p_out"), "{source}");
+    assert!(!source.contains("unsafe { &mut *p_out }"), "{source}");
 }
 
 /// LIFE-W2 RED: every permitted source of a multi-branch return joins the
@@ -9066,7 +9177,7 @@ fn e2_w1_production_emits_named_signature_lifetimes() {
         .find(|line| line.contains("fn id"))
         .expect("E2-W1 emitted signature line");
     assert_eq!(
-        signature, "pub unsafe fn id<'a>(p: &'a i32) -> &'a i32 { unsafe { &*p } }",
+        signature, "pub unsafe fn id<'a>(p: &'a i32) -> &'a i32 { &*p }",
         "the lifetime and return bridge must move this exact structural line",
     );
 }
@@ -10422,7 +10533,12 @@ fn c_w5_surface_emission_separates_seed_shim_from_closed_world_direct() {
         ),
         &run_config,
     );
-    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+    let super::RewriteOutcome::Emitted {
+        files,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
         panic!("C-W5 surface fixture must emit: {outcome:#?}")
     };
     let source = files
@@ -10434,6 +10550,21 @@ fn c_w5_surface_emission_separates_seed_shim_from_closed_world_direct() {
         "{source}"
     );
     assert!(source.contains("fn __crat_safe_api<'"), "{source}");
+    assert!(source.contains("__crat_safe_api(&*p)"), "{source}");
+    assert!(!source.contains("unsafe { &*p }"), "{source}");
+    assert!(!source.contains("unsafe { __crat_safe_api"), "{source}");
+    let surface_context = raw_boundary_artifacts
+        .unsafe_context_events
+        .iter()
+        .filter(|event| event.site.bridge_kind.starts_with("surface-unsafe-context"))
+        .collect::<Vec<_>>();
+    assert_eq!(surface_context.len(), 4, "{surface_context:#?}");
+    assert!(
+        surface_context
+            .iter()
+            .all(|event| event.presentation.unsafe_fn && !event.presentation.wrapper_inserted),
+        "{surface_context:#?}"
+    );
     assert!(
         source.contains("core::ptr::from_ref(__crat_result)"),
         "{source}"

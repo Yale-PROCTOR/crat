@@ -1395,7 +1395,10 @@ fn checked_optional(
 /// Wrap one already-built inbound bridge payload in an explicit `unsafe`
 /// block while retaining that payload as an AST subtree. Only the fixed block
 /// syntax is parsed; the operand is neither printed nor reparsed.
-fn unsafe_payload(payload: rustc_ast::Expr) -> Option<rustc_ast::Expr> {
+fn unsafe_payload(payload: rustc_ast::Expr, enclosing_unsafe_fn: bool) -> Option<rustc_ast::Expr> {
+    if enclosing_unsafe_fn {
+        return Some(payload);
+    }
     const PAYLOAD: &str = "__CRAT_UNSAFE_BRIDGE_PAYLOAD";
     let mut parsed = graft_expr(&format!("unsafe {{ {PAYLOAD} }}")).ok()?;
 
@@ -1424,10 +1427,19 @@ fn unsafe_payload(payload: rustc_ast::Expr) -> Option<rustc_ast::Expr> {
     (replace.hits == 1).then_some(parsed)
 }
 
-fn raw_option_expr(argument: rustc_ast::Expr, mutable: bool) -> Option<rustc_ast::ExprKind> {
+fn raw_option_expr(
+    argument: rustc_ast::Expr,
+    mutable: bool,
+    enclosing_unsafe_fn: bool,
+) -> Option<rustc_ast::ExprKind> {
     const ARG: &str = "__CRAT_RAW_OPTION_ARG";
     let method = if mutable { "as_mut" } else { "as_ref" };
-    let mut parsed = graft_expr(&format!("unsafe {{ {ARG}.{method}() }}")).ok()?;
+    let rendered = format!("{ARG}.{method}()");
+    let mut parsed = if enclosing_unsafe_fn {
+        graft_expr(&rendered).ok()?
+    } else {
+        graft_expr(&format!("unsafe {{ {rendered} }}")).ok()?
+    };
 
     struct Replace {
         argument: rustc_ast::Expr,
@@ -1554,6 +1566,9 @@ fn raw_boundary_expr(
 pub(crate) struct SeamGraftVisitor<'a> {
     seams: &'a FxHashMap<(u32, u32), SeamTarget>,
     guard: &'a mut Composition,
+    global_map: Option<&'a rustc_ast::node_id::NodeMap<LocalDefId>>,
+    current_fn: Option<LocalDefId>,
+    current_unsafe_fn: bool,
     stats: SeamGraftStats,
     consumed: FxHashSet<(u32, u32)>,
 }
@@ -1621,8 +1636,22 @@ impl<'a> SeamGraftVisitor<'a> {
         Self {
             seams,
             guard,
+            global_map: None,
+            current_fn: None,
+            current_unsafe_fn: false,
             stats: SeamGraftStats::default(),
             consumed: FxHashSet::default(),
+        }
+    }
+
+    pub(crate) fn new_with_global_map(
+        seams: &'a FxHashMap<(u32, u32), SeamTarget>,
+        guard: &'a mut Composition,
+        global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    ) -> Self {
+        Self {
+            global_map: Some(global_map),
+            ..Self::new(seams, guard)
         }
     }
 
@@ -1743,7 +1772,7 @@ impl<'a> SeamGraftVisitor<'a> {
 
         let source_arg = (*arg).clone();
         if matches!(spec.core, GlueCore::RawOption) {
-            return raw_option_expr(source_arg, spec.mutable);
+            return raw_option_expr(source_arg, spec.mutable, self.current_unsafe_fn);
         }
         let arg = if let Some(found_mutable) = spec.unwrap {
             let suffix = if found_mutable {
@@ -1781,7 +1810,7 @@ impl<'a> SeamGraftVisitor<'a> {
             }
         };
         let core = if matches!(spec.core, GlueCore::Reborrow | GlueCore::FromRawParts) {
-            P(unsafe_payload((*core).clone())?)
+            P(unsafe_payload((*core).clone(), self.current_unsafe_fn)?)
         } else {
             core
         };
@@ -1801,6 +1830,40 @@ impl<'a> SeamGraftVisitor<'a> {
 }
 
 impl MutVisitor for SeamGraftVisitor<'_> {
+    fn visit_item(&mut self, item: &mut rustc_ast::Item) {
+        let previous_fn = self.current_fn;
+        let previous_unsafe = self.current_unsafe_fn;
+        if let rustc_ast::ItemKind::Fn(function) = &item.kind {
+            self.current_fn = self
+                .global_map
+                .and_then(|global_map| global_map.get(&item.id).copied());
+            self.current_unsafe_fn =
+                matches!(function.sig.header.safety, rustc_ast::Safety::Unsafe(_));
+        }
+        rustc_ast::mut_visit::walk_item(self, item);
+        self.current_fn = previous_fn;
+        self.current_unsafe_fn = previous_unsafe;
+    }
+
+    fn visit_assoc_item(
+        &mut self,
+        item: &mut rustc_ast::AssocItem,
+        ctxt: rustc_ast::visit::AssocCtxt,
+    ) {
+        let previous_fn = self.current_fn;
+        let previous_unsafe = self.current_unsafe_fn;
+        if let rustc_ast::AssocItemKind::Fn(function) = &item.kind {
+            self.current_fn = self
+                .global_map
+                .and_then(|global_map| global_map.get(&item.id).copied());
+            self.current_unsafe_fn =
+                matches!(function.sig.header.safety, rustc_ast::Safety::Unsafe(_));
+        }
+        rustc_ast::mut_visit::walk_assoc_item(self, item, ctxt);
+        self.current_fn = previous_fn;
+        self.current_unsafe_fn = previous_unsafe;
+    }
+
     fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
         // A grafted node's spans are the fragment's own and alias real offsets
         // in this crate's first source file — the hazard task 0 landed the
@@ -2292,34 +2355,48 @@ fn transform_inner(
     transform_with(&capture, &table, reverts)
 }
 
-fn surface_argument(param: &rustc_ast::Param) -> Result<String, String> {
+fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Result<String, String> {
     let rustc_ast::PatKind::Ident(_, ident, None) = &param.pat.kind else {
         return Err("inbound-wrapper-unplaceable: non-identifier parameter".to_owned());
     };
     let name = ident.name.to_string();
     let ty = rustc_ast_pretty::pprust::ty_to_string(&param.ty);
     let expression = if ty.starts_with("Option<&mut [") {
-        format!(
-            "if {name}.is_null() {{ None }} else {{ Some(unsafe {{ core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT) }}) }}"
-        )
+        let inner = super::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT)"),
+            enclosing_unsafe_fn,
+        );
+        format!("if {name}.is_null() {{ None }} else {{ Some({inner}) }}")
     } else if ty.starts_with("Option<&[") {
-        format!(
-            "if {name}.is_null() {{ None }} else {{ Some(unsafe {{ core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT) }}) }}"
-        )
+        let inner = super::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT)"),
+            enclosing_unsafe_fn,
+        );
+        format!("if {name}.is_null() {{ None }} else {{ Some({inner}) }}")
     } else if ty.starts_with("Option<&mut ") {
-        format!("unsafe {{ {name}.as_mut() }}")
+        super::mechanical_receipt::present_unsafe_text(
+            format!("{name}.as_mut()"),
+            enclosing_unsafe_fn,
+        )
     } else if ty.starts_with("Option<&") {
-        format!("unsafe {{ {name}.as_ref() }}")
+        super::mechanical_receipt::present_unsafe_text(
+            format!("{name}.as_ref()"),
+            enclosing_unsafe_fn,
+        )
     } else if ty.starts_with("&mut [") {
-        format!(
-            "unsafe {{ core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT) }}"
+        super::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT)"),
+            enclosing_unsafe_fn,
         )
     } else if ty.starts_with("&[") {
-        format!("unsafe {{ core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT) }}")
+        super::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT)"),
+            enclosing_unsafe_fn,
+        )
     } else if ty.starts_with("&mut ") {
-        format!("unsafe {{ &mut *{name} }}")
+        super::mechanical_receipt::present_unsafe_text(format!("&mut *{name}"), enclosing_unsafe_fn)
     } else if ty.starts_with('&') {
-        format!("unsafe {{ &*{name} }}")
+        super::mechanical_receipt::present_unsafe_text(format!("&*{name}"), enclosing_unsafe_fn)
     } else if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
         return Err("inbound-wrapper-unplaceable: owning parameter held by Arm B".to_owned());
     } else {
@@ -2354,15 +2431,16 @@ fn surface_wrapper_block(
     if function.sig.decl.c_variadic() {
         return Err("inbound-wrapper-unplaceable: variadic function".to_owned());
     }
+    let enclosing_unsafe_fn = matches!(function.sig.header.safety, rustc_ast::Safety::Unsafe(_));
     let arguments = function
         .sig
         .decl
         .inputs
         .iter()
-        .map(surface_argument)
+        .map(|parameter| surface_argument(parameter, enclosing_unsafe_fn))
         .collect::<Result<Vec<_>, _>>()?
         .join(", ");
-    let call = format!("unsafe {{ {inner_name}({arguments}) }}");
+    let call = format!("{inner_name}({arguments})");
     let body = match &function.sig.decl.output {
         rustc_ast::FnRetTy::Default(_) => call,
         rustc_ast::FnRetTy::Ty(ty) => {
@@ -2901,7 +2979,8 @@ fn transform_with(
     // pass must have finished before the subtree is moved.
     let seam_targets = filtered.seams;
     let seam_key_collisions = filtered.seam_key_collisions;
-    let mut s = SeamGraftVisitor::new(&seam_targets, &mut guard);
+    let mut s =
+        SeamGraftVisitor::new_with_global_map(&seam_targets, &mut guard, &capture.map.global_map);
     s.visit_crate(&mut krate);
     let mut seams = s.finish();
     seams.key_collisions = seam_key_collisions;

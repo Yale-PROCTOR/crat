@@ -20,6 +20,6 @@ pub unsafe fn g21_clean() {
 pub unsafe fn g21_dirty(q: *mut i32) {
     {
         let __crat_pair_raw_418_1: *mut i32 = q;
-        g21_aliased(unsafe { &mut *q }, __crat_pair_raw_418_1)
+        g21_aliased(&mut *q, __crat_pair_raw_418_1)
     };
 }

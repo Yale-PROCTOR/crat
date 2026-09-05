@@ -219,6 +219,7 @@ pub(crate) struct ClassSite {
     pub extent: BridgeExtentKind,
     pub retention: BridgeRetentionTier,
     pub waiver_id: Option<String>,
+    pub unsafe_context: Option<super::mechanical_receipt::UnsafeContextPresentation>,
 }
 
 impl ClassSite {
@@ -256,6 +257,7 @@ impl ClassSite {
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
+            unsafe_context: None,
         }
     }
 
@@ -285,6 +287,7 @@ impl ClassSite {
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
+            unsafe_context: None,
         }
     }
 
@@ -830,6 +833,7 @@ pub(crate) fn finalize_signature_classes(
                 extent: bridge.extent.clone(),
                 retention: bridge.retention,
                 waiver_id: bridge.waiver_id.clone(),
+                unsafe_context: bridge.unsafe_context,
             });
         }
     }
@@ -1177,6 +1181,62 @@ impl Plan {
         }
         events
     }
+
+    pub(crate) fn unsafe_context_events(
+        &self,
+        reverted: &std::collections::BTreeSet<SignatureClassId>,
+    ) -> Vec<super::mechanical_receipt::UnsafeContextReceiptEvent> {
+        use super::{
+            bridge_receipt::{BridgeReceiptStage, BridgeReceiptState},
+            mechanical_receipt::UnsafeContextReceiptEvent,
+        };
+
+        let mut events = Vec::new();
+        for class in self.class_finalization.classes.values() {
+            let terminal_drop = if reverted.contains(&class.id) {
+                Some("class-reverted-after-verify".to_owned())
+            } else if !class.is_ready() {
+                Some(class.hold_reasons().join(";"))
+            } else {
+                None
+            };
+            let disposition = if reverted.contains(&class.id) {
+                "reverted"
+            } else if class.is_ready() {
+                "ready"
+            } else {
+                "held"
+            };
+            for site in &class.sites {
+                let Some(presentation) = site.unsafe_context else {
+                    continue;
+                };
+                events.push(UnsafeContextReceiptEvent {
+                    site: site.key.clone(),
+                    enclosing: site.key.caller,
+                    presentation,
+                    terminal_class_disposition: disposition.to_owned(),
+                    stage: BridgeReceiptStage::Plan,
+                    state: BridgeReceiptState::Planned,
+                    drop_reason: None,
+                });
+                events.push(UnsafeContextReceiptEvent {
+                    site: site.key.clone(),
+                    enclosing: site.key.caller,
+                    presentation,
+                    terminal_class_disposition: disposition.to_owned(),
+                    stage: BridgeReceiptStage::Terminal,
+                    state: if terminal_drop.is_some() {
+                        BridgeReceiptState::Dropped
+                    } else {
+                        BridgeReceiptState::Applied
+                    },
+                    drop_reason: terminal_drop.clone(),
+                });
+            }
+        }
+        events
+    }
 }
 
 /// Turn decisions into edits.
@@ -1279,6 +1339,7 @@ pub(crate) fn plan(
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
+            unsafe_context: None,
         };
         if let (Some(span), Some(replacement)) = (declaration.span, &declaration.replacement) {
             match span_to_loc(span) {
@@ -1356,6 +1417,7 @@ pub(crate) fn plan(
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
+            unsafe_context: bridge.unsafe_context,
         });
     }
 
@@ -1372,6 +1434,7 @@ pub(crate) fn plan(
             extent: BridgeExtentKind::None,
             retention: site.retention,
             waiver_id: site.waiver_id.clone(),
+            unsafe_context: site.unsafe_context,
         };
         let (file, lo, hi, state) = match site.span {
             None => (
@@ -1405,6 +1468,7 @@ pub(crate) fn plan(
             extent: BridgeExtentKind::None,
             retention: site.retention,
             waiver_id: site.waiver_id.clone(),
+            unsafe_context: bridge.unsafe_context,
         });
     }
 
@@ -1504,13 +1568,14 @@ pub(crate) fn plan(
             .find(|(subject, _)| (subject.fn_did, subject.hir_id) == storage.node)
             .map(|(subject, _)| subject.identity_key(&owner_of(subject)))
             .unwrap_or_else(|| format!("depth2-storage:{}", storage.node.1.local_id.as_u32()));
-        let bridge = BridgeSitePlan::local(
+        let mut bridge = BridgeSitePlan::local(
             storage.node.0,
             storage.node.0,
             Arm::C.key(),
             format!("storage-init:hir{}", storage.node.1.local_id.as_u32()),
             "depth2-npo-storage",
         );
+        bridge.unsafe_context = storage.unsafe_context;
         match span_to_loc(storage.init_span) {
             Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
                 lo,
@@ -1946,6 +2011,7 @@ pub(crate) fn plan(
             extent: site.bridge.extent.clone(),
             retention: site.bridge.retention,
             waiver_id: site.bridge.waiver_id.clone(),
+            unsafe_context: site.bridge.unsafe_context,
         }
     }));
     if let Some(exposure) = table.exposure.as_ref() {
@@ -1981,6 +2047,7 @@ pub(crate) fn plan(
                     extent: BridgeExtentKind::None,
                     retention: BridgeRetentionTier::None,
                     waiver_id: None,
+                    unsafe_context: None,
                 },
                 Err(reason) => ClassSite {
                     key: bridge.materialize(owner, "<unplaceable>".to_owned(), 0, 0),
@@ -1992,6 +2059,7 @@ pub(crate) fn plan(
                     extent: BridgeExtentKind::None,
                     retention: BridgeRetentionTier::None,
                     waiver_id: None,
+                    unsafe_context: None,
                 },
             };
             preclass_sites.push(site);
@@ -2057,6 +2125,7 @@ pub(crate) fn plan(
             extent: BridgeExtentKind::None,
             retention: resolution.retention,
             waiver_id: resolution.waiver_id,
+            unsafe_context: None,
         });
     }
     for blocked in &table.seams.blocked {
@@ -2101,6 +2170,7 @@ pub(crate) fn plan(
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
+            unsafe_context: None,
         });
     }
     for blocked in &table.seams.body_blocked {
@@ -2130,6 +2200,7 @@ pub(crate) fn plan(
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
+            unsafe_context: None,
         });
     }
     for blocked in &table.seams.raw_boundary_blocked {
@@ -2154,6 +2225,7 @@ pub(crate) fn plan(
             extent: blocked.bridge.extent.clone(),
             retention: blocked.bridge.retention,
             waiver_id: blocked.bridge.waiver_id.clone(),
+            unsafe_context: blocked.bridge.unsafe_context,
         });
     }
     for pair in &table.seams.pair_sites {
@@ -2202,6 +2274,7 @@ pub(crate) fn plan(
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
+            unsafe_context: None,
         };
         site.retention = match pair.tier {
             PairTier::T2 => BridgeRetentionTier::T2,

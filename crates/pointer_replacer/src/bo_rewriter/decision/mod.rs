@@ -867,6 +867,7 @@ pub(crate) struct Depth2NpoStoragePlan {
     pub(crate) init_span: Span,
     pub(crate) replacement: String,
     pub(crate) target: raw_boundary::Depth2Target,
+    pub(crate) unsafe_context: Option<super::mechanical_receipt::UnsafeContextPresentation>,
 }
 
 impl DecisionTable {
@@ -1051,48 +1052,72 @@ pub(crate) fn plan_depth2_npo_storages(
         } else {
             format!("*const {}", target.inner_pointee)
         };
-        let replacement = if matches!(subject.ctor, Some(construction::Construction::NullLit)) {
-            "None".to_owned()
-        } else if let Some(&source) = constructions.init_sources.get(&node) {
-            let source_node = (subject.fn_did, source);
-            let source_text = labels
-                .get(&source_node)
-                .cloned()
-                .unwrap_or_else(|| init_text.clone());
-            match decisions.get(&source_node).copied() {
-                Some(
-                    Decision::Ref { mutable: true } | Decision::InferredRef { mutable: true, .. },
-                ) => {
-                    if target.inner_mutability == raw_boundary::RawMutability::Mut {
-                        format!("Some(&mut *{source_text})")
-                    } else {
-                        format!("Some(&*{source_text})")
+        let enclosing_unsafe_fn = tcx
+            .fn_sig(subject.fn_did.to_def_id())
+            .skip_binder()
+            .skip_binder()
+            .safety
+            .is_unsafe();
+        let (replacement, requires_unsafe) =
+            if matches!(subject.ctor, Some(construction::Construction::NullLit)) {
+                ("None".to_owned(), false)
+            } else if let Some(&source) = constructions.init_sources.get(&node) {
+                let source_node = (subject.fn_did, source);
+                let source_text = labels
+                    .get(&source_node)
+                    .cloned()
+                    .unwrap_or_else(|| init_text.clone());
+                match decisions.get(&source_node).copied() {
+                    Some(
+                        Decision::Ref { mutable: true }
+                        | Decision::InferredRef { mutable: true, .. },
+                    ) => {
+                        if target.inner_mutability == raw_boundary::RawMutability::Mut {
+                            (format!("Some(&mut *{source_text})"), false)
+                        } else {
+                            (format!("Some(&*{source_text})"), false)
+                        }
                     }
+                    Some(
+                        Decision::Ref { mutable: false }
+                        | Decision::InferredRef { mutable: false, .. },
+                    ) => (format!("Some({source_text})"), false),
+                    Some(Decision::Opt { mutable: true, .. })
+                        if target.inner_mutability == raw_boundary::RawMutability::Mut =>
+                    {
+                        (format!("{source_text}.as_deref_mut()"), false)
+                    }
+                    Some(Decision::Opt { .. }) => (format!("{source_text}.as_deref()"), false),
+                    Some(Decision::Slice { .. } | Decision::Box(_)) => continue,
+                    Some(Decision::Degraded(_)) | None => (
+                        super::mechanical_receipt::present_unsafe_text(
+                            format!("(({init_text}) as {raw_inner}).{method}()"),
+                            enclosing_unsafe_fn,
+                        ),
+                        true,
+                    ),
                 }
-                Some(
-                    Decision::Ref { mutable: false } | Decision::InferredRef { mutable: false, .. },
-                ) => {
-                    format!("Some({source_text})")
-                }
-                Some(Decision::Opt { mutable: true, .. })
-                    if target.inner_mutability == raw_boundary::RawMutability::Mut =>
-                {
-                    format!("{source_text}.as_deref_mut()")
-                }
-                Some(Decision::Opt { .. }) => format!("{source_text}.as_deref()"),
-                Some(Decision::Slice { .. } | Decision::Box(_)) => continue,
-                Some(Decision::Degraded(_)) | None => {
-                    format!("unsafe {{ (({init_text}) as {raw_inner}).{method}() }}")
-                }
-            }
-        } else {
-            format!("unsafe {{ (({init_text}) as {raw_inner}).{method}() }}")
-        };
+            } else {
+                (
+                    super::mechanical_receipt::present_unsafe_text(
+                        format!("(({init_text}) as {raw_inner}).{method}()"),
+                        enclosing_unsafe_fn,
+                    ),
+                    true,
+                )
+            };
         plans.push(Depth2NpoStoragePlan {
             node,
             init_span,
             replacement,
             target,
+            unsafe_context: requires_unsafe.then_some(
+                super::mechanical_receipt::UnsafeContextPresentation {
+                    unsafe_fn: enclosing_unsafe_fn,
+                    wrapper_inserted: !enclosing_unsafe_fn,
+                    edition: 2018,
+                },
+            ),
         });
     }
     plans.sort_by_key(|plan| {

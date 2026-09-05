@@ -591,6 +591,7 @@ pub(crate) struct ZeroBridgeSite {
     pub argument_kind: &'static str,
     pub retention: BridgeRetentionTier,
     pub waiver_id: Option<String>,
+    pub unsafe_context: Option<super::super::mechanical_receipt::UnsafeContextPresentation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -772,6 +773,14 @@ pub(crate) struct GlueSpec {
 }
 
 impl GlueSpec {
+    pub(crate) fn requires_unsafe(&self) -> bool {
+        self.raw_boundary.is_none()
+            && matches!(
+                self.core,
+                GlueCore::Reborrow | GlueCore::RawOption | GlueCore::FromRawParts
+            )
+    }
+
     pub(crate) fn core(core: GlueCore, mutable: bool) -> Self {
         Self {
             core,
@@ -1063,6 +1072,20 @@ impl GlueSpec {
     /// first — so this is fail-closed structure rather than a live path, and it
     /// moves no corpus line.
     pub(crate) fn render(&self, text: &str) -> Option<String> {
+        self.render_in_context(text, false)
+    }
+
+    /// Render with the enclosing function's preserved safety qualifier.
+    /// Edition-2018 legacy output omits a redundant inner `unsafe` block in an
+    /// existing `unsafe fn`; safe functions retain exactly one wrapper.
+    pub(crate) fn render_in_context(
+        &self,
+        text: &str,
+        enclosing_unsafe_fn: bool,
+    ) -> Option<String> {
+        let unsafe_expr = |inner: String| {
+            super::super::mechanical_receipt::present_unsafe_text(inner, enclosing_unsafe_fn)
+        };
         if let Some(raw) = self.raw_boundary.as_ref() {
             let rendered = if raw.force_explicit {
                 raw.template.render_explicit(
@@ -1091,7 +1114,7 @@ impl GlueSpec {
         let argument = text;
         if self.null_arm == NullArm::PointerApi && matches!(self.core, GlueCore::RawOption) {
             let method = if self.mutable { "as_mut" } else { "as_ref" };
-            return Some(format!("unsafe {{ {argument}.{method}() }}"));
+            return Some(unsafe_expr(format!("{argument}.{method}()")));
         }
         let checked_name = "__crat_call_adapter_ptr";
         let text = if self.null_arm == NullArm::Checked {
@@ -1105,12 +1128,10 @@ impl GlueSpec {
         };
         let inner = match self.core {
             GlueCore::Bare => base,
-            GlueCore::Reborrow => {
-                format!("unsafe {{ {}*{base} }}", amp(self.mutable))
-            }
+            GlueCore::Reborrow => unsafe_expr(format!("{}*{base}", amp(self.mutable))),
             GlueCore::RawOption => {
                 let method = if self.mutable { "as_mut" } else { "as_ref" };
-                format!("unsafe {{ {base}.{method}() }}")
+                unsafe_expr(format!("{base}.{method}()"))
             }
             GlueCore::First => {
                 let method = if self.mutable { "first_mut" } else { "first" };
@@ -1139,7 +1160,7 @@ impl GlueSpec {
                         format!("core::slice::{ctor}({base}, {FABRICATED_LEN_PATH})")
                     }
                 };
-                format!("unsafe {{ {call} }}")
+                unsafe_expr(call)
             }
             GlueCore::FromRefMut => {
                 let ctor = if self.mutable { "from_mut" } else { "from_ref" };
@@ -1538,6 +1559,43 @@ mod tests {
                 "renderer must be byte-identical to the arm it replaces: {spec:?}"
             );
         }
+    }
+
+    #[test]
+    fn u0_w1_all_unsafe_glue_cores_share_the_enclosing_context_rule() {
+        let cases = [
+            (
+                GlueSpec::core(GlueCore::Reborrow, false),
+                "&*p",
+                "unsafe { &*p }",
+            ),
+            (
+                GlueSpec::core(GlueCore::RawOption, false),
+                "p.as_ref()",
+                "unsafe { p.as_ref() }",
+            ),
+            (
+                GlueSpec::core(GlueCore::FromRawParts, false).with_len("n"),
+                "core::slice::from_raw_parts(p, (n) as usize)",
+                "unsafe { core::slice::from_raw_parts(p, (n) as usize) }",
+            ),
+            (
+                GlueSpec::core(GlueCore::Reborrow, false).wrapped(),
+                "Some(&*p)",
+                "Some(unsafe { &*p })",
+            ),
+        ];
+        for (spec, unsafe_body, safe_body) in cases {
+            assert_eq!(
+                spec.render_in_context("p", true).as_deref(),
+                Some(unsafe_body)
+            );
+            assert_eq!(
+                spec.render_in_context("p", false).as_deref(),
+                Some(safe_body)
+            );
+        }
+        // DF3B-00 (`always_wrap=true`) is killed by every unsafe-body row.
     }
 
     fn g(expected: Form, found: Form) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
@@ -2796,6 +2854,7 @@ fn block_pair_raw_view(
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::T2,
             waiver_id: Some(RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+            unsafe_context: None,
         },
         span: pair.span,
         reason: reason.to_owned(),
@@ -3007,6 +3066,7 @@ fn complete_interface_inventory(
                         argument_kind: argument.shape.key(),
                         retention: BridgeRetentionTier::None,
                         waiver_id: None,
+                        unsafe_context: None,
                     });
                     if matches!(
                         argument.shape,
@@ -3059,6 +3119,7 @@ fn complete_interface_inventory(
                     argument_kind: "mir-only",
                     retention: BridgeRetentionTier::None,
                     waiver_id: None,
+                    unsafe_context: None,
                 });
                 "raw-wrapper"
             } else {
@@ -3124,6 +3185,29 @@ pub(crate) fn synthesize(
         retention,
         lifetime_eligibility,
     )
+}
+
+fn enclosing_function_is_unsafe(tcx: TyCtxt<'_>, owner: LocalDefId) -> bool {
+    tcx.fn_sig(owner.to_def_id())
+        .skip_binder()
+        .skip_binder()
+        .safety
+        .is_unsafe()
+}
+
+fn unsafe_context_for(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    spec: &GlueSpec,
+) -> Option<super::super::mechanical_receipt::UnsafeContextPresentation> {
+    spec.requires_unsafe().then(|| {
+        let unsafe_fn = enclosing_function_is_unsafe(tcx, owner);
+        super::super::mechanical_receipt::UnsafeContextPresentation {
+            unsafe_fn,
+            wrapper_inserted: !unsafe_fn,
+            edition: 2018,
+        }
+    })
 }
 
 pub(crate) fn synthesize_with_raw_boundary(
@@ -3391,8 +3475,12 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 } else {
                                     spec
                                 };
-                                let replacement =
-                                    spec.render(text).ok_or(SeamBlock::LengthUnknown)?;
+                                let replacement = spec
+                                    .render_in_context(
+                                        text,
+                                        enclosing_function_is_unsafe(tcx, site.caller),
+                                    )
+                                    .ok_or(SeamBlock::LengthUnknown)?;
                                 let len_arm = spec.len.as_ref().zip(len_evidence).map(|(l, e)| {
                                     if l.is_fabricated() {
                                         LenArm::Fabricated(e)
@@ -3628,6 +3716,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 extent: receipt_extent(&candidate.spec),
                                 retention: candidate.retention,
                                 waiver_id: candidate.waiver_id.clone(),
+                                unsafe_context: unsafe_context_for(
+                                    tcx,
+                                    site.caller,
+                                    &candidate.spec,
+                                ),
                             },
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
                             lifetime_plan_digest: table
@@ -3726,6 +3819,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                         extent: BridgeExtentKind::None,
                         retention: BridgeRetentionTier::None,
                         waiver_id: None,
+                        unsafe_context: None,
                     },
                     span: site.span,
                     reason: reason.key().to_owned(),
@@ -3760,7 +3854,11 @@ pub(crate) fn synthesize_with_raw_boundary(
             ));
             continue;
         }
-        let Some(replacement) = spec.render(&argument) else {
+        let Some(replacement) = spec.render_in_context(
+            &argument,
+            site.node
+                .is_some_and(|(owner, _)| enclosing_function_is_unsafe(tcx, owner)),
+        ) else {
             continue;
         };
         match template.render(
@@ -3821,6 +3919,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 extent: receipt_extent(&spec),
                 retention,
                 waiver_id,
+                unsafe_context: None,
             },
             owner_fn: key.caller.clone(),
             lifetime_plan_digest: None,
@@ -3910,7 +4009,9 @@ pub(crate) fn synthesize_with_raw_boundary(
             continue;
         };
         let spec = GlueSpec::raw_boundary_target(site.template, &site.target, false, true);
-        let Some(replacement) = spec.render(&argument) else {
+        let Some(replacement) =
+            spec.render_in_context(&argument, enclosing_function_is_unsafe(tcx, site.node.0))
+        else {
             continue;
         };
         let found = decision_of
@@ -3956,6 +4057,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 extent: receipt_extent(&spec),
                 retention: BridgeRetentionTier::None,
                 waiver_id: None,
+                unsafe_context: None,
             },
             owner_fn: site.owner.clone(),
             lifetime_plan_digest: None,
@@ -4100,7 +4202,9 @@ pub(crate) fn synthesize_with_raw_boundary(
             continue;
         };
         let spec = GlueSpec::core(GlueCore::Reborrow, expected_mutable);
-        let Some(replacement) = spec.render(&text) else {
+        let Some(replacement) =
+            spec.render_in_context(&text, enclosing_function_is_unsafe(tcx, site.owner))
+        else {
             continue;
         };
         let digest = function_plan.digest();
@@ -4126,6 +4230,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 extent: BridgeExtentKind::None,
                 retention: BridgeRetentionTier::T1,
                 waiver_id: None,
+                unsafe_context: unsafe_context_for(tcx, site.owner, &spec),
             },
             owner_fn: tcx.def_path_str(site.owner.to_def_id()),
             lifetime_plan_digest: Some(digest),
@@ -4275,7 +4380,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                     });
                     continue;
                 };
-                let Some(replacement) = spec.render(text) else {
+                let Some(replacement) =
+                    spec.render_in_context(text, enclosing_function_is_unsafe(tcx, site.owner))
+                else {
                     plan.body_blocked.push(BlockedBody {
                         owner_class: SignatureClassId::of(site.owner),
                         owner_fn,
@@ -4308,6 +4415,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                         extent: receipt_extent(&spec),
                         retention: BridgeRetentionTier::None,
                         waiver_id: None,
+                        unsafe_context: unsafe_context_for(tcx, site.owner, &spec),
                     },
                     owner_fn,
                     destination,

@@ -148,6 +148,7 @@ pub(crate) struct BridgeSitePlan {
     pub(crate) extent: BridgeExtentKind,
     pub(crate) retention: BridgeRetentionTier,
     pub(crate) waiver_id: Option<String>,
+    pub(crate) unsafe_context: Option<super::mechanical_receipt::UnsafeContextPresentation>,
 }
 
 impl BridgeSitePlan {
@@ -170,6 +171,7 @@ impl BridgeSitePlan {
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
+            unsafe_context: None,
         }
     }
 

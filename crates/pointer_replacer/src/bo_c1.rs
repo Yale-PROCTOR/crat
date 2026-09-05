@@ -10589,6 +10589,15 @@ mod run {
                 .expect("bridge receipt reconciliation");
         let bridge_receipts =
             crate::bo_rewriter::bridge_receipt::render_bridge_events(&artifact.bridge_events);
+        let unsafe_context_summary =
+            crate::bo_rewriter::mechanical_receipt::reconcile_unsafe_context_events(
+                &artifact.unsafe_context_events,
+            )
+            .expect("unsafe-context receipt reconciliation");
+        let unsafe_context_receipts =
+            crate::bo_rewriter::mechanical_receipt::render_unsafe_context_events(
+                &artifact.unsafe_context_events,
+            );
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
             ("d4-edges", artifact.d4_edges.as_str()),
@@ -10605,6 +10614,10 @@ mod run {
             ("atom-outcomes", artifact.atom_outcomes.as_str()),
             ("final-reverts", artifact.final_reverts.as_str()),
             ("bridge-receipts", bridge_receipts.as_str()),
+            (
+                "unsafe-context-presentation",
+                unsafe_context_receipts.as_str(),
+            ),
             ("class-costs", artifact.class_costs.as_str()),
             ("class-collisions", artifact.class_collisions.as_str()),
             ("unresolved-classes", artifact.unresolved_classes.as_str()),
@@ -11317,6 +11330,22 @@ mod run {
         row.set(
             raw_schema::BRIDGE_DROPPED_EVENTS,
             bridge_summary.dropped_events,
+        );
+        row.set(
+            raw_schema::UNSAFE_CONTEXT_SITE_COUNT,
+            unsafe_context_summary.sites,
+        );
+        row.set(
+            raw_schema::UNSAFE_CONTEXT_INSERTED_COUNT,
+            unsafe_context_summary.inserted,
+        );
+        row.set(
+            raw_schema::UNSAFE_CONTEXT_OMITTED_COUNT,
+            unsafe_context_summary.omitted,
+        );
+        row.set(
+            raw_schema::UNSAFE_CONTEXT_DROPPED_COUNT,
+            unsafe_context_summary.dropped,
         );
         row.set(
             raw_schema::SIGNATURE_CLASS_COUNT,
@@ -22221,6 +22250,10 @@ fn raw_boundary_wave3b_mechanical_schema_is_shared_and_sealed() {
         schema::IO_DOMAIN_MISSING_COUNT,
         schema::IO_DOMAIN_UNEXPECTED_COUNT,
         schema::IO_DOMAIN_DUPLICATE_COUNT,
+        schema::UNSAFE_CONTEXT_SITE_COUNT,
+        schema::UNSAFE_CONTEXT_INSERTED_COUNT,
+        schema::UNSAFE_CONTEXT_OMITTED_COUNT,
+        schema::UNSAFE_CONTEXT_DROPPED_COUNT,
     ] {
         assert!(schema::ALL.contains(&key), "missing wave-3b wire key {key}");
     }
