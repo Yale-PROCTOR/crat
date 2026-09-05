@@ -164,12 +164,35 @@ pub(crate) const WORKER_ABORT_FILE: &str = "raw_boundary_worker_abort_file";
 pub(crate) const WORKER_ABORT_LINE: &str = "raw_boundary_worker_abort_line";
 pub(crate) const WORKER_ABORT_MESSAGE: &str = "raw_boundary_worker_abort_message";
 pub(crate) const WORKER_ABORT_COUNT: &str = "raw_boundary_worker_abort_count";
+pub(crate) const MECHANICAL_OBLIGATION_COUNT: &str = "raw_boundary_mechanical_obligation_count";
+pub(crate) const MECHANICAL_APPLIED_COUNT: &str = "raw_boundary_mechanical_applied_count";
+pub(crate) const MECHANICAL_DROPPED_COUNT: &str = "raw_boundary_mechanical_dropped_count";
+pub(crate) const MECHANICAL_HELD_COUNT: &str = "raw_boundary_mechanical_held_count";
+pub(crate) const MECHANICAL_RECLASSIFIED_COUNT: &str = "raw_boundary_mechanical_reclassified_count";
+pub(crate) const IO_DOMAIN_OBSERVED_COUNT: &str = "raw_boundary_io_domain_observed_count";
+pub(crate) const IO_DOMAIN_MISSING_COUNT: &str = "raw_boundary_io_domain_missing_count";
+pub(crate) const IO_DOMAIN_UNEXPECTED_COUNT: &str = "raw_boundary_io_domain_unexpected_count";
+pub(crate) const IO_DOMAIN_DUPLICATE_COUNT: &str = "raw_boundary_io_domain_duplicate_count";
 pub(crate) const STATUS: &str = "raw_boundary_status";
 
 pub(crate) const BRIDGE_RECEIPT_FILE: &str = "raw-boundary-bridge-receipts.tsv";
 pub(crate) const CLASS_COST_ROWS: &str = "raw-boundary-class-costs.tsv";
 pub(crate) const CROSS_CLASS_COLLISION_ROWS: &str = "raw-boundary-class-collisions.tsv";
 pub(crate) const UNRESOLVED_CLASS_ROWS: &str = "raw-boundary-unresolved-classes.tsv";
+pub(crate) const MECHANICAL_OBLIGATION_ROWS: &str = "raw-boundary-mechanical-obligations.tsv";
+pub(crate) const UNSAFE_CONTEXT_PRESENTATION_ROWS: &str = "unsafe-context-presentation.tsv";
+pub(crate) const A5_PROOF_SITE_FALLBACK_ROWS: &str = "a5-proof-site-fallback.tsv";
+pub(crate) const SLICE_CONSTRUCTION_RECEIPT_ROWS: &str = "slice-construction-receipt.tsv";
+pub(crate) const SLICE_USE_ADAPTER_ROWS: &str = "slice-use-adapter.tsv";
+pub(crate) const OPTION_PRESENTATION_RECEIPT_ROWS: &str = "option-presentation-receipt.tsv";
+pub(crate) const DECLARATION_SHAPE_RECEIPT_ROWS: &str = "declaration-shape-receipt.tsv";
+pub(crate) const OUTBOUND_RETURN_BRIDGE_ROWS: &str = "outbound-return-bridge.tsv";
+pub(crate) const RAW_SINK_ADAPTER_ROWS: &str = "raw-sink-adapter.tsv";
+pub(crate) const COMPOSITION_DEPENDENCY_ROWS: &str = "composition-dependency.tsv";
+pub(crate) const MISSING_C_SHAPE_ROWS: &str = "missing-c-shapes.tsv";
+pub(crate) const DIAGNOSTIC_PRIMARY_MESSAGE_ROWS: &str = "diagnostic-primary-message.tsv";
+pub(crate) const JSON_H_RECOVERY_ROWS: &str = "json-h-recovery.tsv";
+pub(crate) const IO_DOMAIN_IDENTITY_ROWS: &str = "io-domain-identities.tsv";
 pub(crate) const ALL: &[&str] = &[
     CORPUS,
     ANALYSIS_FRAME,
@@ -327,5 +350,14 @@ pub(crate) const ALL: &[&str] = &[
     WORKER_ABORT_LINE,
     WORKER_ABORT_MESSAGE,
     WORKER_ABORT_COUNT,
+    MECHANICAL_OBLIGATION_COUNT,
+    MECHANICAL_APPLIED_COUNT,
+    MECHANICAL_DROPPED_COUNT,
+    MECHANICAL_HELD_COUNT,
+    MECHANICAL_RECLASSIFIED_COUNT,
+    IO_DOMAIN_OBSERVED_COUNT,
+    IO_DOMAIN_MISSING_COUNT,
+    IO_DOMAIN_UNEXPECTED_COUNT,
+    IO_DOMAIN_DUPLICATE_COUNT,
     STATUS,
 ];

@@ -22207,6 +22207,51 @@ fn raw_boundary_census_schema_is_one_shared_authority() {
     }
 }
 
+#[test]
+fn raw_boundary_wave3b_mechanical_schema_is_shared_and_sealed() {
+    use crate::raw_boundary_census_schema as schema;
+
+    for key in [
+        schema::MECHANICAL_OBLIGATION_COUNT,
+        schema::MECHANICAL_APPLIED_COUNT,
+        schema::MECHANICAL_DROPPED_COUNT,
+        schema::MECHANICAL_HELD_COUNT,
+        schema::MECHANICAL_RECLASSIFIED_COUNT,
+        schema::IO_DOMAIN_OBSERVED_COUNT,
+        schema::IO_DOMAIN_MISSING_COUNT,
+        schema::IO_DOMAIN_UNEXPECTED_COUNT,
+        schema::IO_DOMAIN_DUPLICATE_COUNT,
+    ] {
+        assert!(schema::ALL.contains(&key), "missing wave-3b wire key {key}");
+    }
+
+    let schemas = crate::bo_rewriter::mechanical_receipt::specialized_receipt_headers();
+    for file in [
+        schema::UNSAFE_CONTEXT_PRESENTATION_ROWS,
+        schema::A5_PROOF_SITE_FALLBACK_ROWS,
+        schema::SLICE_CONSTRUCTION_RECEIPT_ROWS,
+        schema::SLICE_USE_ADAPTER_ROWS,
+        schema::OPTION_PRESENTATION_RECEIPT_ROWS,
+        schema::DECLARATION_SHAPE_RECEIPT_ROWS,
+        schema::OUTBOUND_RETURN_BRIDGE_ROWS,
+        schema::RAW_SINK_ADAPTER_ROWS,
+        schema::COMPOSITION_DEPENDENCY_ROWS,
+        schema::MISSING_C_SHAPE_ROWS,
+        schema::DIAGNOSTIC_PRIMARY_MESSAGE_ROWS,
+        schema::JSON_H_RECOVERY_ROWS,
+    ] {
+        assert!(
+            schemas.contains_key(file),
+            "missing wave-3b receipt schema {file}"
+        );
+    }
+    assert_eq!(
+        schema::MECHANICAL_OBLIGATION_ROWS,
+        "raw-boundary-mechanical-obligations.tsv"
+    );
+    assert_eq!(schema::IO_DOMAIN_IDENTITY_ROWS, "io-domain-identities.tsv");
+}
+
 /// RCP-W1 — every required bridge site has one plan event and exactly one
 /// terminal event. Duplicate or missing events must fail before aggregation.
 #[test]
@@ -22468,6 +22513,23 @@ fn raw_boundary_census_schema_renamed_identifier_is_a_compile_error() {
     assert!(
         result.is_err(),
         "a stale raw-boundary schema consumer unexpectedly compiled"
+    );
+}
+
+#[test]
+fn raw_boundary_wave3b_schema_renamed_identifier_is_a_compile_error() {
+    let schema =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/raw_boundary_census_schema.rs");
+    let source = format!(
+        "#![allow(dead_code)]\n#[path = {:?}] mod schema;\nconst _: &str = schema::MECHANICAL_OBLIGATION_ROWS_RENAMED;\n",
+        schema
+    );
+    let result = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        ::utils::type_check(tcx);
+    });
+    assert!(
+        result.is_err(),
+        "a stale wave-3b schema consumer unexpectedly compiled"
     );
 }
 

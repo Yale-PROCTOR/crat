@@ -316,6 +316,11 @@ fn raw_boundary_wave2_runtime_input_offense(line: &str) -> Option<String> {
         "masked-reason-reconciliation.tsv",
         "diagnostic-arm-clusters.tsv",
         "adapter-overlap-153.tsv",
+        "category-a-not-placed-identities.tsv",
+        "a5-member-subjects.tsv",
+        "formal-comparators.tsv",
+        "json-h-formal-identities.tsv",
+        "2026-09-04-raw-boundary-wave3b-remaining-mechanical-classes-design",
     ];
     FORBIDDEN_INPUTS
         .iter()
@@ -353,6 +358,12 @@ fn raw_boundary_wave2_runtime_input_ratchet_matches_synthetic_breaches() {
     assert!(
         raw_boundary_wave2_runtime_input_offense(
             "let exposed = crate::rewriter::transform::is_c_exposed_fn(tcx, did, names);"
+        )
+        .is_some()
+    );
+    assert!(
+        raw_boundary_wave2_runtime_input_offense(
+            "let rows = std::fs::read_to_string(\"category-a-not-placed-identities.tsv\");"
         )
         .is_some()
     );

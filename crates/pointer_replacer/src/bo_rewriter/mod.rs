@@ -75,6 +75,7 @@ pub(crate) mod bridge_receipt;
 pub(crate) mod c9;
 pub(crate) mod decision;
 pub(crate) mod fat_facts;
+pub(crate) mod mechanical_receipt;
 pub(crate) mod plan;
 pub(crate) mod sign_facts;
 pub(crate) mod use_census;
