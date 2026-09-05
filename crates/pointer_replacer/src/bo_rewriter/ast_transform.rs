@@ -1950,6 +1950,70 @@ struct PairRawGraftVisitor<'a> {
     failure: Option<String>,
 }
 
+struct A5RawGraftVisitor<'a> {
+    calls: &'a FxHashMap<(u32, u32), &'a super::decision::seam::A5RawViewCall>,
+    guard: &'a mut Composition,
+    consumed: FxHashSet<(u32, u32)>,
+    failure: Option<String>,
+}
+
+impl MutVisitor for A5RawGraftVisitor<'_> {
+    fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+        if expression.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        }
+        let key = (expression.span.lo().0, expression.span.hi().0);
+        let Some(call) = self.calls.get(&key).copied() else {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        };
+        if !matches!(expression.kind, rustc_ast::ExprKind::Call(..)) {
+            self.failure = Some(format!(
+                "A5 raw-view call at {}..{} resolved to a non-call AST node",
+                key.0, key.1
+            ));
+            return;
+        }
+        rustc_ast::mut_visit::walk_expr(self, expression);
+        let source = rustc_ast_pretty::pprust::expr_to_string(expression);
+        let views = call
+            .views
+            .iter()
+            .map(|view| {
+                (
+                    view.argument_index,
+                    view.raw_expression.clone(),
+                    view.target_type.clone(),
+                    view.adapted_expression.clone(),
+                    view.extent_expression.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let stem = format!("__crat_a5_raw_{}", call.call_span.lo().0);
+        let rendered = match super::c9::render_a5_raw_view_source(&source, &stem, &views) {
+            Ok(rendered) => rendered,
+            Err(why) => {
+                self.failure = Some(format!("could not render A5 raw-view call: {why}"));
+                return;
+            }
+        };
+        let parsed = match graft_expr(&rendered) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.failure = Some("A5 raw-view call did not round-trip".to_owned());
+                return;
+            }
+        };
+        if !self.guard.claim(expression.id, expression.span, "a5-raw") {
+            self.failure = Some("A5 raw-view call collided with another AST transform".to_owned());
+            return;
+        }
+        self.consumed.insert(key);
+        expression.kind = parsed.kind;
+    }
+}
+
 impl MutVisitor for PairRawGraftVisitor<'_> {
     fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
         if expression.span.is_dummy() {
@@ -2986,6 +3050,81 @@ fn transform_with(
     seams.key_collisions = seam_key_collisions;
     seams.len_fabricated += box_fabricated;
 
+    let mut a5_raw_calls = FxHashMap::default();
+    for call in table
+        .seams
+        .a5_raw_calls
+        .iter()
+        .filter(|call| reverts.keeps(call.owner_class))
+    {
+        for view in &call.views {
+            let decided_target = table
+                .entries
+                .iter()
+                .find(|(subject, _)| {
+                    subject.fn_did == call.callee
+                        && matches!(
+                            subject.kind,
+                            super::decision::SubjectKind::Param { hir_index }
+                                if hir_index == view.argument_index
+                        )
+                })
+                .map_or(super::decision::seam::Form::Raw, |(_, decision)| {
+                    super::decision::seam::form_of(decision)
+                });
+            let terminal_target =
+                super::terminalized_form(decided_target, reverts.keeps(call.owner_class));
+            let terminal_source = view.source_node.map_or(view.found_form, |source| {
+                let live = reverts.keeps(super::bridge_receipt::SignatureClassId::of(source.0));
+                let decided = table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| subject.fn_did == source.0 && subject.hir_id == source.1)
+                    .map_or(super::decision::seam::Form::Raw, |(_, decision)| {
+                        super::decision::seam::form_of(decision)
+                    });
+                super::terminalized_form(decided, live)
+            });
+            if terminal_target != view.expected_form || terminal_source != view.found_form {
+                return Err(format!(
+                    "A5 terminal-interface mismatch at {}: planned {}<-{}, terminal {}<-{}",
+                    view.proof_site_key.receipt_key(),
+                    view.expected_form.key(),
+                    view.found_form.key(),
+                    terminal_target.key(),
+                    terminal_source.key(),
+                ));
+            }
+        }
+        let key = (call.call_span.lo().0, call.call_span.hi().0);
+        if a5_raw_calls.insert(key, call).is_some() {
+            return Err(format!(
+                "multiple A5 raw-view plans target call span {}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    let mut a5_raw = A5RawGraftVisitor {
+        calls: &a5_raw_calls,
+        guard: &mut guard,
+        consumed: FxHashSet::default(),
+        failure: None,
+    };
+    a5_raw.visit_crate(&mut krate);
+    if let Some(why) = a5_raw.failure.take() {
+        return Err(why);
+    }
+    let unmatched_a5_raw = a5_raw_calls
+        .keys()
+        .filter(|key| !a5_raw.consumed.contains(key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unmatched_a5_raw.is_empty() {
+        return Err(format!(
+            "unmatched A5 raw-view call spans: {unmatched_a5_raw:?}"
+        ));
+    }
+
     let mut pair_raw_calls = FxHashMap::default();
     for call in table
         .seams
@@ -2994,6 +3133,12 @@ fn transform_with(
         .filter(|call| reverts.keeps_edit(call.owner_class, &call.atom_ids))
     {
         let key = (call.call_span.lo().0, call.call_span.hi().0);
+        if a5_raw_calls.contains_key(&key) {
+            return Err(format!(
+                "A5 and PAIR raw-view plans collide at call span {}..{}",
+                key.0, key.1
+            ));
+        }
         if pair_raw_calls.insert(key, call).is_some() {
             return Err(format!(
                 "multiple PAIR raw-view plans target call span {}..{}",
@@ -3483,6 +3628,7 @@ pub(crate) struct JustificationCensus {
     pub drop_form: usize,
     pub store_form: usize,
     pub c9_mark: usize,
+    pub a5_raw_view: usize,
     /// E2 structural signatures are not byte-splice edits, so this stays zero
     /// in `of_plan`; the exhaustive arm prevents a future explicit receipt
     /// from vanishing into an unnamed bucket.
@@ -3520,6 +3666,7 @@ impl JustificationCensus {
             + self.drop_form
             + self.store_form
             + self.c9_mark
+            + self.a5_raw_view
             + self.lifetime_plan
     }
 
@@ -3575,6 +3722,7 @@ impl JustificationCensus {
             J::DropForm { .. } => self.drop_form += 1,
             J::StoreForm { .. } => self.store_form += 1,
             J::C9Mark => self.c9_mark += 1,
+            J::A5RawView => self.a5_raw_view += 1,
             J::LifetimePlan { .. } => self.lifetime_plan += 1,
         }
     }
@@ -6612,6 +6760,7 @@ mod arm2_witnesses {
                 selector_site: "s".to_owned(),
             },
             J::StoreForm { form: "N-raw" },
+            J::A5RawView,
         ] {
             c.count(&j);
         }
@@ -6626,6 +6775,7 @@ mod arm2_witnesses {
                 drop_form: 1,
                 store_form: 1,
                 c9_mark: 0,
+                a5_raw_view: 1,
                 lifetime_plan: 0,
             },
             "each variant must land in its OWN bucket — an arm-4 edit counted \
@@ -6634,7 +6784,7 @@ mod arm2_witnesses {
         );
         assert_eq!(
             c.total(),
-            8,
+            9,
             "the denominator is the sum of the parts — and `fabricated` is a \
              SUBSET flag, not a bucket, so it must not appear in it"
         );
@@ -6707,6 +6857,7 @@ mod arm2_witnesses {
                 drop_form: 1,
                 store_form: 0,
                 c9_mark: 0,
+                a5_raw_view: 0,
                 lifetime_plan: 0,
             },
             "the walk must reach EVERY file — the second file's edits are the \

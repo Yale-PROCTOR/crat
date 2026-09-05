@@ -140,6 +140,8 @@ pub(crate) enum Justification {
     },
     /// A5 C-9 snapshot temp at one retained marked call site.
     C9Mark,
+    /// A5 proof-site T2 raw temporary plus terminal safe re-entry.
+    A5RawView,
     /// E2-FN structural signature emission, keyed to the finalized plan bytes.
     /// The AST pass owns node placement; this typed justification keeps the
     /// receipt vocabulary aligned with span/seam ownership.
@@ -449,7 +451,11 @@ fn nested_ast_composition(
             && outer.key.arm == "pair"
             && outer.key.bridge_kind == "pair-t2-raw-view"
             && inner.key.arm == "c";
-        (bridge_over_subject || pair_over_c) && strictly_contains(outer, inner)
+        let a5_over_inner = outer.key.owner_class == inner.key.owner_class
+            && outer.key.arm == "pair"
+            && outer.key.bridge_kind == "a5-site-proof-t2-fallback"
+            && matches!(inner.key.arm.as_str(), "c" | "glue");
+        (bridge_over_subject || pair_over_c || a5_over_inner) && strictly_contains(outer, inner)
     };
     if composable(left, right) {
         Some((left.key.owner_class, right.key.owner_class))
@@ -468,51 +474,33 @@ struct A5ProofResolution {
     waiver_id: Option<String>,
 }
 
-fn a5_proof_resolution(
-    verdict: super::decision::a5_site_proof::A5SiteProofVerdict,
-    pair: Option<(
-        super::decision::co_conversion::PairRole,
-        super::decision::co_conversion::PairTier,
-    )>,
-    reason: &str,
-) -> A5ProofResolution {
-    use super::decision::{
-        a5_site_proof::A5SiteProofVerdict,
-        co_conversion::{PairRole, PairTier},
-    };
-    match (verdict, pair) {
-        (A5SiteProofVerdict::Clear, _) => A5ProofResolution {
+fn a5_proof_resolution(fallback: &super::decision::seam::A5ProofSiteFallback) -> A5ProofResolution {
+    use super::decision::seam::A5ProofSiteFallback;
+    match fallback {
+        A5ProofSiteFallback::Clear => A5ProofResolution {
             kind: "a5-site-proof-clear",
             state: ClassSiteState::ZeroSyntaxReady,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
         },
-        (
-            A5SiteProofVerdict::Overlapping | A5SiteProofVerdict::Undeterminable,
-            Some((PairRole::RawView, PairTier::T2)),
-        ) => A5ProofResolution {
+        A5ProofSiteFallback::T2RawView { .. } => A5ProofResolution {
             kind: "a5-site-proof-t2-fallback",
             state: ClassSiteState::ZeroSyntaxReady,
             retention: BridgeRetentionTier::T2,
             waiver_id: Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
         },
-        (
-            A5SiteProofVerdict::Overlapping | A5SiteProofVerdict::Undeterminable,
-            Some((PairRole::Primary, PairTier::None)),
-        ) => A5ProofResolution {
+        A5ProofSiteFallback::Primary => A5ProofResolution {
             kind: "a5-site-proof-pair-primary",
             state: ClassSiteState::ZeroSyntaxReady,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
         },
-        (A5SiteProofVerdict::Overlapping | A5SiteProofVerdict::Undeterminable, _) => {
-            A5ProofResolution {
-                kind: "a5-site-proof-blocked",
-                state: ClassSiteState::Dropped(reason.to_owned()),
-                retention: BridgeRetentionTier::None,
-                waiver_id: None,
-            }
-        }
+        A5ProofSiteFallback::Held { reason } => A5ProofResolution {
+            kind: "a5-site-proof-reclassified",
+            state: ClassSiteState::Dropped(reason.clone()),
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        },
     }
 }
 
@@ -1114,6 +1102,10 @@ pub(crate) struct Plan {
     /// Whole-call/generated-site intervals used for diagnostics that land
     /// outside an edited argument or declaration.
     pub attribution_intervals: Vec<ClassAttributionInterval>,
+    /// Proof-site-owned wave-3b A5 obligations. The common and specialized
+    /// ledgers are materialized from this one carrier after class finalization.
+    pub a5_receipt_plans: Vec<super::mechanical_receipt::A5ProofSiteReceiptPlan>,
+    pub unowned_a5_proof_sites: usize,
 }
 
 impl Plan {
@@ -1237,6 +1229,29 @@ impl Plan {
         }
         events
     }
+
+    pub(crate) fn mechanical_receipts(
+        &self,
+        reverted: &std::collections::BTreeSet<SignatureClassId>,
+    ) -> (
+        Vec<super::mechanical_receipt::MechanicalObligationEvent>,
+        Vec<super::mechanical_receipt::A5ProofSiteFallbackReceiptRow>,
+    ) {
+        let mut events = Vec::new();
+        let mut a5_rows = Vec::new();
+        for receipt in &self.a5_receipt_plans {
+            let class_live = self
+                .class_finalization
+                .classes
+                .get(&receipt.owner_class)
+                .is_some_and(SignatureClassPlan::is_ready);
+            let (pair, rows) =
+                receipt.materialize(class_live, reverted.contains(&receipt.owner_class));
+            events.extend(pair);
+            a5_rows.extend(rows);
+        }
+        (events, a5_rows)
+    }
 }
 
 /// Turn decisions into edits.
@@ -1312,6 +1327,16 @@ pub(crate) fn plan(
     let mut by_file: BTreeMap<FileKey, Vec<Edit>> = BTreeMap::new();
     let mut unplaceable = Vec::new();
     let mut preclass_sites = Vec::new();
+    let mut a5_receipt_plans = Vec::new();
+    let unowned_a5_proof_sites = table
+        .seams
+        .overlap_proofs
+        .iter()
+        .filter(|proof| {
+            proof.verdict != super::decision::a5_site_proof::A5SiteProofVerdict::Clear
+                && proof.proof_site_key.is_none()
+        })
+        .count();
     let mut owner_arms = BTreeMap::<SignatureClassId, super::decision::RequiredArmSet>::new();
     for (subject, _) in &table.entries {
         let owner = SignatureClassId::of(subject.fn_did);
@@ -2067,33 +2092,164 @@ pub(crate) fn plan(
     }
     for proof in &table.seams.overlap_proofs {
         let owner = SignatureClassId::of(proof.callee);
-        let pair = table
-            .seams
-            .pair_sites
-            .iter()
-            .find(|pair| {
-                pair.caller == proof.caller
-                    && pair.callee == proof.callee
-                    && pair.argument_index == proof.index
-                    && (pair.span.source_callsite() == proof.span.source_callsite()
-                        || pair
-                            .call_span
-                            .source_callsite()
-                            .contains(proof.span.source_callsite()))
+        let resolution = a5_proof_resolution(&proof.fallback);
+        if let Some(proof_site_key) = proof.proof_site_key
+            && let Some((subject, _)) = table.entries.iter().find(|(subject, _)| {
+                subject.fn_did == proof.callee
+                    && matches!(
+                        subject.kind,
+                        super::decision::SubjectKind::Param { hir_index }
+                            if hir_index == proof.index
+                    )
             })
-            .and_then(|pair| {
-                let primary_has_t2_peer = pair.role
-                    != super::decision::co_conversion::PairRole::Primary
-                    || table.seams.pair_sites.iter().any(|peer| {
-                        peer.caller == pair.caller
-                            && peer.callee == pair.callee
-                            && peer.call_span.source_callsite() == pair.call_span.source_callsite()
-                            && peer.role == super::decision::co_conversion::PairRole::RawView
-                            && peer.tier == super::decision::co_conversion::PairTier::T2
-                    });
-                primary_has_t2_peer.then_some((pair.role, pair.tier))
+        {
+            use super::mechanical_receipt::{
+                A5ProofSiteReceiptPlan, CanonicalCallee, CanonicalLocation, CanonicalSiteKey,
+                MechanicalEvidence, MechanicalFamily, MechanicalMechanism,
+                MechanicalObligationEvent, MechanicalObligationKey, MechanicalObligationPlan,
+                MechanicalRetention, MechanicalStage, MechanicalState, MechanicalSubjectKey,
+                MechanicalTerminalReason, NegativeWriteEvidence,
+            };
+
+            let site = CanonicalSiteKey {
+                owner: proof_site_key.caller,
+                location: CanonicalLocation::Mir {
+                    basic_block: proof_site_key.location.block,
+                    statement_index: u32::try_from(proof_site_key.location.statement_index)
+                        .unwrap_or(u32::MAX),
+                    terminator: true,
+                },
+                callee: Some(CanonicalCallee::Local(proof_site_key.callee)),
+                argument_index: Some(
+                    u32::try_from(proof_site_key.argument_index).unwrap_or(u32::MAX),
+                ),
+                slot_depth: u32::try_from(proof_site_key.slot_depth).unwrap_or(u32::MAX),
+            };
+            let (intended_terminal_state, intended_terminal_reason, retention, negative_write) =
+                match &proof.fallback {
+                    super::decision::seam::A5ProofSiteFallback::T2RawView {
+                        negative_write,
+                        ..
+                    } => (
+                        MechanicalState::Applied,
+                        None,
+                        MechanicalRetention::T2 {
+                            waiver_id: super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
+                        },
+                        match negative_write {
+                            Some(super::decision::raw_boundary::NegativeWriteEvidence::FosterImmutable) => {
+                                NegativeWriteEvidence::FosterImmutable
+                            }
+                            Some(super::decision::raw_boundary::NegativeWriteEvidence::LibcReadOnly) => {
+                                NegativeWriteEvidence::LibcReadOnly("local-a5".to_owned())
+                            }
+                            None => NegativeWriteEvidence::NotApplicable,
+                        },
+                    ),
+                    super::decision::seam::A5ProofSiteFallback::Held { reason }
+                        if reason == super::decision::seam::SeamBlock::A5NegativeWriteAbsent.key() =>
+                    {
+                        (
+                            MechanicalState::HeldNonmechanical,
+                            Some(MechanicalTerminalReason::RbNegativeWriteAbsent),
+                            MechanicalRetention::None,
+                            NegativeWriteEvidence::Missing,
+                        )
+                    }
+                    super::decision::seam::A5ProofSiteFallback::Held { reason }
+                        if reason == super::decision::seam::SeamBlock::PositiveRetention.key() =>
+                    {
+                        (
+                            MechanicalState::HeldNonmechanical,
+                            Some(MechanicalTerminalReason::PositiveRetention),
+                            MechanicalRetention::PositiveRetention,
+                            NegativeWriteEvidence::NotApplicable,
+                        )
+                    }
+                    super::decision::seam::A5ProofSiteFallback::Held { reason } => (
+                        MechanicalState::Reclassified,
+                        Some(MechanicalTerminalReason::EvidenceMissing(reason.clone())),
+                        MechanicalRetention::None,
+                        NegativeWriteEvidence::NotApplicable,
+                    ),
+                    super::decision::seam::A5ProofSiteFallback::Clear
+                    | super::decision::seam::A5ProofSiteFallback::Primary => continue,
+                };
+            let template = match &proof.fallback {
+                super::decision::seam::A5ProofSiteFallback::T2RawView { template, .. } => {
+                    template.clone()
+                }
+                _ => "-".to_owned(),
+            };
+            let mechanism = if matches!(
+                &negative_write,
+                NegativeWriteEvidence::FosterImmutable
+                    | NegativeWriteEvidence::LibcReadOnly(_)
+                    | NegativeWriteEvidence::Missing
+                    | NegativeWriteEvidence::Writes
+            ) {
+                MechanicalMechanism::SharedRefToMutRaw
+            } else {
+                MechanicalMechanism::A5RawView
+            };
+            let event = MechanicalObligationEvent {
+                key: MechanicalObligationKey {
+                    owner_class: owner,
+                    subject: MechanicalSubjectKey::Local {
+                        owner: subject.fn_did,
+                        mir_local: subject.local.as_u32(),
+                        slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                    },
+                    site: site.clone(),
+                    family: MechanicalFamily::A5ProofSiteFallback,
+                },
+                owner_path: owner_of(subject),
+                prior_reason: format!("a5-site-proof-blocked:{}", proof.reason),
+                expected_form: proof.expected_form.key().to_owned(),
+                found_form: proof.found_form.key().to_owned(),
+                argument_kind: proof.argument_shape.to_owned(),
+                source_shape: proof.found_form.key().to_owned(),
+                required_arms: Arm::Pair.key().to_owned(),
+                mechanism,
+                composition_parent: Some(format!(
+                    "call:{}:{}",
+                    proof_site_key.location.block, proof_site_key.location.statement_index
+                )),
+                dependency_classes: table
+                    .seams
+                    .interface_dependencies
+                    .iter()
+                    .filter_map(|(dependent, dependency)| {
+                        (*dependent == owner).then_some(*dependency)
+                    })
+                    .collect(),
+                evidence: MechanicalEvidence {
+                    extent: super::mechanical_receipt::MechanicalExtent::None,
+                    retention: retention.clone(),
+                    negative_write,
+                    terminal_contract: super::mechanical_receipt::TerminalContract::NotApplicable,
+                    hoist: super::mechanical_receipt::HoistSafety::Place,
+                    unsafe_context: None,
+                },
+                stage: MechanicalStage::Plan,
+                state: MechanicalState::Planned,
+                terminal_reason: None,
+            };
+            a5_receipt_plans.push(A5ProofSiteReceiptPlan {
+                obligation: MechanicalObligationPlan {
+                    planned: event,
+                    intended_terminal_state,
+                    intended_terminal_reason,
+                },
+                proof_site_key: site,
+                verdict: proof.verdict.key().to_owned(),
+                argument_shape: proof.argument_shape.to_owned(),
+                settled_form: proof.found_form.key().to_owned(),
+                raw_view_template: template,
+                retention,
+                owner_class: owner,
             });
-        let resolution = a5_proof_resolution(proof.verdict, pair, &proof.reason);
+        }
         let bridge = BridgeSitePlan::local(
             proof.caller,
             proof.callee,
@@ -2119,9 +2275,9 @@ pub(crate) fn plan(
             key: bridge.materialize(owner, file, lo, hi),
             edit_key: "-".to_owned(),
             state,
-            expected_form: "safe-parameter".to_owned(),
-            found_form: "pair-site".to_owned(),
-            argument_kind: "a5-proof".to_owned(),
+            expected_form: proof.expected_form.key().to_owned(),
+            found_form: proof.found_form.key().to_owned(),
+            argument_kind: proof.argument_shape.to_owned(),
             extent: BridgeExtentKind::None,
             retention: resolution.retention,
             waiver_id: resolution.waiver_id,
@@ -2356,6 +2512,8 @@ pub(crate) fn plan(
         preclass_sites,
         class_finalization: ClassFinalization::default(),
         attribution_intervals,
+        a5_receipt_plans,
+        unowned_a5_proof_sites,
     }
 }
 
@@ -2837,15 +2995,11 @@ mod wave3_class_tests {
     /// zero-syntax proof receipt.  A blocked PAIR outcome remains dropped.
     #[test]
     fn d14_w1_a5_block_falls_through_to_the_pair_t2_receipt() {
-        use crate::bo_rewriter::decision::{
-            a5_site_proof::A5SiteProofVerdict,
-            co_conversion::{PairRole, PairTier},
-        };
-        let resolved = a5_proof_resolution(
-            A5SiteProofVerdict::Overlapping,
-            Some((PairRole::RawView, PairTier::T2)),
-            "at-least-one-peer-overlapping",
-        );
+        use crate::bo_rewriter::decision::seam::A5ProofSiteFallback;
+        let resolved = a5_proof_resolution(&A5ProofSiteFallback::T2RawView {
+            template: "slice-mut-to-raw-mut->from-raw-parts-mut".to_owned(),
+            negative_write: None,
+        });
         assert_eq!(resolved.kind, "a5-site-proof-t2-fallback");
         assert_eq!(resolved.state, ClassSiteState::ZeroSyntaxReady);
         assert_eq!(resolved.retention, BridgeRetentionTier::T2);
@@ -2854,12 +3008,10 @@ mod wave3_class_tests {
             Some(super::super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
         );
 
-        let blocked = a5_proof_resolution(
-            A5SiteProofVerdict::Overlapping,
-            Some((PairRole::Blocked, PairTier::Blocked)),
-            "at-least-one-peer-overlapping",
-        );
-        assert_eq!(blocked.kind, "a5-site-proof-blocked");
+        let blocked = a5_proof_resolution(&A5ProofSiteFallback::Held {
+            reason: "pair-positive-retention".to_owned(),
+        });
+        assert_eq!(blocked.kind, "a5-site-proof-reclassified");
         assert!(matches!(blocked.state, ClassSiteState::Dropped(_)));
         assert_eq!(blocked.retention, BridgeRetentionTier::None);
         assert!(blocked.waiver_id.is_none());

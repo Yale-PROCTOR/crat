@@ -449,6 +449,7 @@ impl MechanicalMechanism {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MechanicalTerminalReason {
     ClassReverted(String),
+    ProgramDegradedUnmodifiedInput,
     PreCompileDegraded(String),
     RbNegativeWriteAbsent,
     CalleeWrites,
@@ -469,6 +470,7 @@ impl MechanicalTerminalReason {
     fn key(&self) -> String {
         match self {
             Self::ClassReverted(reason) => format!("class-reverted:{reason}"),
+            Self::ProgramDegradedUnmodifiedInput => "program-degraded-unmodified-input".to_owned(),
             Self::PreCompileDegraded(reason) => format!("degraded-pre-compile:{reason}"),
             Self::RbNegativeWriteAbsent => {
                 "raw-boundary-shared-to-mut:negative-write-absent".to_owned()
@@ -827,6 +829,45 @@ pub(crate) struct MechanicalObligationEvent {
     pub(crate) terminal_reason: Option<MechanicalTerminalReason>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MechanicalObligationPlan {
+    pub(crate) planned: MechanicalObligationEvent,
+    pub(crate) intended_terminal_state: MechanicalState,
+    pub(crate) intended_terminal_reason: Option<MechanicalTerminalReason>,
+}
+
+impl MechanicalObligationPlan {
+    pub(crate) fn events(
+        &self,
+        owner_class_live: bool,
+        runtime_reverted: bool,
+    ) -> [MechanicalObligationEvent; 2] {
+        let mut planned = self.planned.clone();
+        planned.stage = MechanicalStage::Plan;
+        planned.state = MechanicalState::Planned;
+        planned.terminal_reason = None;
+
+        let mut terminal = self.planned.clone();
+        terminal.stage = MechanicalStage::Terminal;
+        if self.intended_terminal_state == MechanicalState::Applied
+            && (!owner_class_live || runtime_reverted)
+        {
+            terminal.state = MechanicalState::Dropped;
+            terminal.terminal_reason = Some(MechanicalTerminalReason::ClassReverted(
+                if runtime_reverted {
+                    "compiler-verify".to_owned()
+                } else {
+                    "class-finalization".to_owned()
+                },
+            ));
+        } else {
+            terminal.state = self.intended_terminal_state;
+            terminal.terminal_reason = self.intended_terminal_reason.clone();
+        }
+        [planned, terminal]
+    }
+}
+
 impl MechanicalObligationEvent {
     #[cfg(test)]
     pub(crate) fn for_test(
@@ -1162,6 +1203,139 @@ pub(crate) struct A5ProofSiteFallbackReceiptRow {
     pub(crate) raw_view_template: String,
     pub(crate) retention: MechanicalRetention,
     pub(crate) owner_class: SignatureClassId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5ProofSiteReceiptPlan {
+    pub(crate) obligation: MechanicalObligationPlan,
+    pub(crate) proof_site_key: CanonicalSiteKey,
+    pub(crate) verdict: String,
+    pub(crate) argument_shape: String,
+    pub(crate) settled_form: String,
+    pub(crate) raw_view_template: String,
+    pub(crate) retention: MechanicalRetention,
+    pub(crate) owner_class: SignatureClassId,
+}
+
+impl A5ProofSiteReceiptPlan {
+    pub(crate) fn materialize(
+        &self,
+        owner_class_live: bool,
+        runtime_reverted: bool,
+    ) -> (
+        [MechanicalObligationEvent; 2],
+        [A5ProofSiteFallbackReceiptRow; 2],
+    ) {
+        let events = self.obligation.events(owner_class_live, runtime_reverted);
+        let row = |event: &MechanicalObligationEvent| A5ProofSiteFallbackReceiptRow {
+            terminal: SpecializedReceiptTerminal {
+                obligation_key: event.key.clone(),
+                stage: event.stage,
+                state: event.state,
+                reason: event.terminal_reason.clone(),
+            },
+            proof_site_key: self.proof_site_key.clone(),
+            verdict: self.verdict.clone(),
+            argument_shape: self.argument_shape.clone(),
+            settled_form: self.settled_form.clone(),
+            raw_view_template: self.raw_view_template.clone(),
+            retention: self.retention.clone(),
+            owner_class: self.owner_class,
+        };
+        let rows = [row(&events[0]), row(&events[1])];
+        (events, rows)
+    }
+}
+
+pub(crate) fn reconcile_a5_proof_site_fallback_rows(
+    rows: &[A5ProofSiteFallbackReceiptRow],
+    common: &[MechanicalObligationEvent],
+) -> Result<usize, String> {
+    let common = common
+        .iter()
+        .filter(|event| event.key.family == MechanicalFamily::A5ProofSiteFallback)
+        .map(|event| {
+            (
+                format!("{}:{}", event.key.receipt_key(), event.stage.key()),
+                event,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut specialized = BTreeMap::<String, &A5ProofSiteFallbackReceiptRow>::new();
+    for row in rows {
+        let event_key = format!(
+            "{}:{}",
+            row.terminal.obligation_key.receipt_key(),
+            row.terminal.stage.key()
+        );
+        if specialized.insert(event_key.clone(), row).is_some() {
+            return Err(format!("duplicate A5 specialized row {event_key}"));
+        }
+        let Some(event) = common.get(&event_key) else {
+            return Err(format!("unowned A5 specialized row {event_key}"));
+        };
+        if row.proof_site_key != row.terminal.obligation_key.site
+            || row.owner_class != row.terminal.obligation_key.owner_class
+            || row.terminal.state != event.state
+            || row.terminal.reason != event.terminal_reason
+        {
+            return Err(format!("A5 specialized/common drift at {event_key}"));
+        }
+        if row.terminal.stage == MechanicalStage::Terminal
+            && row.terminal.state == MechanicalState::Applied
+            && row.retention
+                != (MechanicalRetention::T2 {
+                    waiver_id: RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
+                })
+        {
+            return Err(format!(
+                "A5 applied row lacks exact T2 waiver at {event_key}"
+            ));
+        }
+    }
+    for key in common.keys() {
+        if !specialized.contains_key(key) {
+            return Err(format!("A5 common row lacks specialized row {key}"));
+        }
+    }
+    Ok(rows
+        .iter()
+        .filter(|row| row.terminal.stage == MechanicalStage::Plan)
+        .count())
+}
+
+pub(crate) fn render_a5_proof_site_fallback_rows(rows: &[A5ProofSiteFallbackReceiptRow]) -> String {
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                row.terminal.obligation_key.receipt_key(),
+                row.proof_site_key.receipt_key(),
+                row.verdict,
+                row.argument_shape,
+                row.settled_form,
+                row.raw_view_template,
+                row.retention.tier(),
+                row.retention.waiver(),
+                row.owner_class.order_key(),
+                row.terminal.stage.key(),
+                row.terminal.state.key(),
+                row.terminal
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), MechanicalTerminalReason::key),
+            )
+        })
+        .collect::<Vec<_>>();
+    rendered.sort();
+    let mut out = specialized_receipt_headers()[raw_schema::A5_PROOF_SITE_FALLBACK_ROWS].join("\t");
+    out.push('\n');
+    for row in rendered {
+        out.push_str(&row);
+        out.push('\n');
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1908,5 +2082,60 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn a5_specialized_rows_share_identity_state_and_exact_t2_waiver_with_common_rows() {
+        let planned = MechanicalObligationEvent::for_test(
+            "a5-specialized",
+            MechanicalFamily::A5ProofSiteFallback,
+            MechanicalStage::Plan,
+            MechanicalState::Planned,
+        )
+        .with_evidence(MechanicalEvidence {
+            retention: MechanicalRetention::T2 {
+                waiver_id: RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
+            },
+            hoist: HoistSafety::Place,
+            ..MechanicalEvidence::default()
+        });
+        let site = planned.key.site.clone();
+        let owner = planned.key.owner_class;
+        let receipt = A5ProofSiteReceiptPlan {
+            obligation: MechanicalObligationPlan {
+                planned,
+                intended_terminal_state: MechanicalState::Applied,
+                intended_terminal_reason: None,
+            },
+            proof_site_key: site,
+            verdict: "overlapping".to_owned(),
+            argument_shape: "bare-local".to_owned(),
+            settled_form: "slice-mut".to_owned(),
+            raw_view_template: "slice-mut-to-raw-mut->c-raw-slice-mut".to_owned(),
+            retention: MechanicalRetention::T2 {
+                waiver_id: RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
+            },
+            owner_class: owner,
+        };
+        let (events, rows) = receipt.materialize(true, false);
+        assert_eq!(
+            reconcile_mechanical_obligations(&events).unwrap().applied,
+            1
+        );
+        assert_eq!(reconcile_a5_proof_site_fallback_rows(&rows, &events), Ok(1));
+        assert!(
+            render_a5_proof_site_fallback_rows(&rows)
+                .contains("\tT2\tc-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01\t")
+        );
+
+        let mut wrong_waiver = rows.clone();
+        wrong_waiver[1].retention = MechanicalRetention::T2 {
+            waiver_id: "wrong".to_owned(),
+        };
+        assert!(reconcile_a5_proof_site_fallback_rows(&wrong_waiver, &events).is_err());
+        assert!(reconcile_a5_proof_site_fallback_rows(&rows, &[]).is_err());
+        let mut duplicate = rows.to_vec();
+        duplicate.push(rows[1].clone());
+        assert!(reconcile_a5_proof_site_fallback_rows(&duplicate, &events).is_err());
     }
 }

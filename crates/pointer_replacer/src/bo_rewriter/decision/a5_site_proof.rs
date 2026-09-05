@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::{mir::BasicBlock, ty::TyCtxt};
 use rustc_span::Span;
 
@@ -23,6 +24,48 @@ use crate::{
 
 pub(crate) const ATTESTED_WORLD: &str = "closed_world_frozen_graph";
 pub(crate) const ATTESTED_GUARD: &str = "permitted:measurement-frozen-graph-attested";
+
+/// Compiler identity of one argument position covered by an A5 site proof.
+/// Source spans are deliberately absent: the same MIR operand can have
+/// distinct HIR spans in the co-conversion and seam inventories.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct A5ProofSiteKey {
+    pub(crate) caller: LocalDefId,
+    pub(crate) location: MirLocationKey,
+    pub(crate) callee: DefId,
+    pub(crate) argument_index: usize,
+    pub(crate) slot_depth: usize,
+}
+
+impl A5ProofSiteKey {
+    fn new(
+        caller: LocalDefId,
+        location: MirLocationKey,
+        callee: DefId,
+        argument_index: usize,
+        slot_depth: usize,
+    ) -> Self {
+        Self {
+            caller,
+            location,
+            callee,
+            argument_index,
+            slot_depth,
+        }
+    }
+
+    pub(crate) fn receipt_key(self) -> String {
+        format!(
+            "caller={}:bb={}:stmt={}:terminator=1:callee={:?}:arg={}:depth={}",
+            self.caller.local_def_index.as_u32(),
+            self.location.block,
+            self.location.statement_index,
+            self.callee,
+            self.argument_index,
+            self.slot_depth,
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum A5SiteProofVerdict {
@@ -47,6 +90,8 @@ pub(crate) struct A5PeerProof {
     pub(crate) reason: &'static str,
     pub(crate) family: &'static str,
     pub(crate) location: Option<MirLocationKey>,
+    pub(crate) left_site: Option<A5ProofSiteKey>,
+    pub(crate) right_site: Option<A5ProofSiteKey>,
 }
 
 impl A5PeerProof {
@@ -56,7 +101,16 @@ impl A5PeerProof {
             reason,
             family: reason,
             location: None,
+            left_site: None,
+            right_site: None,
         }
+    }
+
+    pub(crate) fn site_key(&self, argument_index: usize) -> Option<A5ProofSiteKey> {
+        [self.left_site, self.right_site]
+            .into_iter()
+            .flatten()
+            .find(|key| key.argument_index == argument_index)
     }
 
     pub(crate) fn receipt(&self, left: usize, right: usize) -> String {
@@ -163,7 +217,8 @@ impl A5SeamProofIndex {
             let data = &body.basic_blocks[block];
             let call_span = data.terminator().source_info.span.source_callsite();
             let location = MirLocationKey::new(audit.block, data.statements.len());
-            let proof = proof_from_audit(&audit, location);
+            let callee = functions[&audit.target];
+            let proof = proof_from_audit(&audit, caller, callee.to_def_id(), location);
             rows.entry((
                 audit.caller,
                 audit.target,
@@ -233,7 +288,12 @@ impl A5SeamProofIndex {
     }
 }
 
-fn proof_from_audit(audit: &A5SiteBranchAudit, location: MirLocationKey) -> A5PeerProof {
+fn proof_from_audit(
+    audit: &A5SiteBranchAudit,
+    caller: LocalDefId,
+    callee: DefId,
+    location: MirLocationKey,
+) -> A5PeerProof {
     let (verdict, reason) = if audit.family == "projection-disjoint" {
         (A5SiteProofVerdict::Clear, "projection-disjoint")
     } else {
@@ -250,6 +310,20 @@ fn proof_from_audit(audit: &A5SiteBranchAudit, location: MirLocationKey) -> A5Pe
         reason,
         family: audit.family,
         location: Some(location),
+        left_site: Some(A5ProofSiteKey::new(
+            caller,
+            location,
+            callee,
+            audit.left_parameter.saturating_sub(1) as usize,
+            0,
+        )),
+        right_site: Some(A5ProofSiteKey::new(
+            caller,
+            location,
+            callee,
+            audit.right_parameter.saturating_sub(1) as usize,
+            0,
+        )),
     }
 }
 
@@ -275,11 +349,41 @@ mod tests {
             reason: "a5-proven-disjoint",
             family: "excluded-proven-disjoint",
             location: Some(MirLocationKey::new(4, 7)),
+            left_site: None,
+            right_site: None,
         };
         assert_eq!(
             proof.receipt(1, 0),
             "0/1->1/2:clear:a5-proven-disjoint:excluded-proven-disjoint"
         );
+    }
+
+    #[test]
+    fn a5_proof_site_key_uses_compiler_identity_not_source_spans() {
+        let caller = rustc_hir::def_id::CRATE_DEF_ID;
+        let key = A5ProofSiteKey::new(caller, MirLocationKey::new(4, 7), caller.to_def_id(), 1, 0);
+        assert_eq!(key, key);
+        let receipt = key.receipt_key();
+        assert!(
+            receipt.starts_with("caller=0:bb=4:stmt=7:terminator=1:callee=DefId(0:0"),
+            "{receipt}"
+        );
+        assert!(receipt.ends_with(":arg=1:depth=0"), "{receipt}");
+        let later =
+            A5ProofSiteKey::new(caller, MirLocationKey::new(4, 7), caller.to_def_id(), 2, 0);
+        assert_ne!(key, later);
+        assert!(key.receipt_key() < later.receipt_key());
+        let proof = A5PeerProof {
+            verdict: A5SiteProofVerdict::Overlapping,
+            reason: "a5-not-proven-disjoint",
+            family: "recorded-risky",
+            location: Some(key.location),
+            left_site: Some(key),
+            right_site: Some(later),
+        };
+        assert_eq!(proof.site_key(1), Some(key));
+        assert_eq!(proof.site_key(2), Some(later));
+        assert_eq!(proof.site_key(3), None);
     }
 
     #[test]

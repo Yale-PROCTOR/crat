@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_span::Span;
 
-use super::a5_site_proof::{A5PeerProof, A5SeamProofIndex, A5SiteProofVerdict};
+use super::a5_site_proof::{A5PeerProof, A5ProofSiteKey, A5SeamProofIndex, A5SiteProofVerdict};
 use crate::bo_rewriter::bridge_receipt::{
     BridgeCalleeId, BridgeExtentKind, BridgeRetentionTier, BridgeSitePlan,
     RAW_BOUNDARY_T2_WAIVER_ID, SignatureClassId,
@@ -117,6 +117,12 @@ pub(crate) enum SeamBlock {
     /// A raw expression cannot enter a safe return without the typed origin
     /// permit that supplies the emitted return lifetime.
     ReturnLifetimeAbsent,
+    /// A5 selected a raw-view fallback from a shared safe value to a mutable
+    /// raw parameter, but the callee has no Foster/libc negative-write proof.
+    A5NegativeWriteAbsent,
+    /// The proof-site identity is sound but the settled safe form has no
+    /// mechanical raw-view template in this wave.
+    A5RawViewUnavailable,
 }
 
 impl SeamBlock {
@@ -130,6 +136,8 @@ impl SeamBlock {
             SeamBlock::PositiveRetention => "seam-positive-retention",
             SeamBlock::NonemptyUnknown => "seam-nonempty-unknown",
             SeamBlock::ReturnLifetimeAbsent => "return-lifetime-permit-absent",
+            SeamBlock::A5NegativeWriteAbsent => "raw-boundary-shared-to-mut:negative-write-absent",
+            SeamBlock::A5RawViewUnavailable => "a5-raw-view-template-unavailable",
         }
     }
 }
@@ -401,10 +409,14 @@ pub(crate) struct PeerConflict {
 /// remains in `SeamPlan::overlap_proofs` so it cannot vanish from the control.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct A5PositionProof {
+    pub proof_site_key: Option<A5ProofSiteKey>,
     pub caller: LocalDefId,
     pub callee: LocalDefId,
     pub index: usize,
     pub span: Span,
+    pub expected_form: Form,
+    pub found_form: Form,
+    pub argument_shape: &'static str,
     pub candidate_template: String,
     pub verdict: A5SiteProofVerdict,
     pub reason: String,
@@ -412,6 +424,31 @@ pub(crate) struct A5PositionProof {
     pub peer_receipts: String,
     pub world: &'static str,
     pub guard: &'static str,
+    pub fallback: A5ProofSiteFallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum A5ProofSiteFallback {
+    Clear,
+    Primary,
+    T2RawView {
+        template: String,
+        negative_write: Option<super::raw_boundary::NegativeWriteEvidence>,
+    },
+    Held {
+        reason: String,
+    },
+}
+
+impl A5ProofSiteFallback {
+    pub(crate) fn key(&self) -> &'static str {
+        match self {
+            Self::Clear => "a5-site-proof-clear",
+            Self::Primary => "a5-site-proof-pair-primary",
+            Self::T2RawView { .. } => "a5-site-proof-t2-fallback",
+            Self::Held { .. } => "a5-site-proof-reclassified",
+        }
+    }
 }
 
 impl A5PositionProof {
@@ -420,6 +457,9 @@ impl A5PositionProof {
         callee: LocalDefId,
         index: usize,
         span: Span,
+        expected_form: Form,
+        found_form: Form,
+        argument_shape: &'static str,
         candidate_template: String,
         conflicts: &[PeerConflict],
         proofs: &A5SeamProofIndex,
@@ -464,11 +504,30 @@ impl A5PositionProof {
             .into_iter()
             .collect::<Vec<_>>()
             .join(";");
+        let mut proof_site_key = None;
+        let mut ambiguous_site_key = false;
+        for key in conflicts
+            .iter()
+            .filter_map(|conflict| conflict.proof.site_key(index))
+        {
+            match proof_site_key {
+                None => proof_site_key = Some(key),
+                Some(existing) if existing == key => {}
+                Some(_) => ambiguous_site_key = true,
+            }
+        }
+        if ambiguous_site_key {
+            proof_site_key = None;
+        }
         Self {
+            proof_site_key,
             caller,
             callee,
             index,
             span,
+            expected_form,
+            found_form,
+            argument_shape,
             candidate_template,
             verdict,
             reason,
@@ -476,6 +535,13 @@ impl A5PositionProof {
             peer_receipts,
             world: proofs.world(),
             guard: proofs.guard(),
+            fallback: if verdict == A5SiteProofVerdict::Clear {
+                A5ProofSiteFallback::Clear
+            } else {
+                A5ProofSiteFallback::Held {
+                    reason: "a5-proof-site-fallback-unplanned".to_owned(),
+                }
+            },
         }
     }
 
@@ -610,6 +676,31 @@ pub(crate) struct PairRawViewCall {
     pub views: Vec<PairRawViewTemp>,
     pub reasons: Vec<String>,
     pub atom_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5RawViewTemp {
+    pub argument_index: usize,
+    pub raw_expression: String,
+    pub target_type: String,
+    pub adapted_expression: String,
+    pub extent_expression: Option<String>,
+    pub template: String,
+    pub proof_site_key: A5ProofSiteKey,
+    pub unsafe_context: Option<super::super::mechanical_receipt::UnsafeContextPresentation>,
+    pub negative_write: Option<super::raw_boundary::NegativeWriteEvidence>,
+    pub expected_form: Form,
+    pub found_form: Form,
+    pub source_node: Option<(LocalDefId, HirId)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5RawViewCall {
+    pub owner_class: SignatureClassId,
+    pub caller: LocalDefId,
+    pub callee: LocalDefId,
+    pub call_span: Span,
+    pub views: Vec<A5RawViewTemp>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2659,6 +2750,10 @@ pub(crate) struct SeamPlan {
     /// Same-object T2 raw views grouped by call so every raw temp is created
     /// before any surviving safe borrow in the call expression.
     pub pair_raw_calls: Vec<PairRawViewCall>,
+    /// A5 proof-site T2 views for non-plain safe forms. Like PAIR views, these
+    /// are grouped at the call so raw/extent temporaries are evaluated before
+    /// the safe primary argument.
+    pub a5_raw_calls: Vec<A5RawViewCall>,
     /// Every resolved MIR call position whose callee parameter is emitted in a
     /// safe form. This inventory is independent of pointer-subject membership.
     pub interface_inventory: Vec<InterfaceInventorySite>,
@@ -2720,7 +2815,7 @@ impl SeamPlan {
 }
 
 /// The form a decision emits.
-fn form_of(decision: &Decision) -> Form {
+pub(crate) fn form_of(decision: &Decision) -> Form {
     match decision {
         Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => {
             Form::Ref { mutable: *mutable }
@@ -2775,6 +2870,134 @@ struct Candidate {
     len_arm: Option<LenArm>,
     retention: BridgeRetentionTier,
     waiver_id: Option<String>,
+}
+
+fn decision_for_safe_form(form: Form) -> Option<super::Decision> {
+    match form {
+        Form::Raw => None,
+        Form::Ref { mutable } => Some(super::Decision::Ref { mutable }),
+        Form::Slice { mutable } => Some(super::Decision::Slice {
+            mutable,
+            uses: Vec::new(),
+        }),
+        Form::Opt { mutable, slice } => Some(super::Decision::Opt {
+            mutable,
+            slice,
+            uses: Vec::new(),
+        }),
+    }
+}
+
+fn a5_extent_from_safe_form(found: Form, argument: &str) -> (Option<String>, Option<&'static str>) {
+    match found {
+        Form::Slice { .. } => (
+            Some(format!("({argument}).len()")),
+            Some(super::super::c9::A5_EXTENT_VALUE_PLACEHOLDER),
+        ),
+        Form::Opt { slice: true, .. } => (
+            Some(format!(
+                "({argument}).as_deref().map_or(0usize, |slice| slice.len())"
+            )),
+            Some(super::super::c9::A5_EXTENT_VALUE_PLACEHOLDER),
+        ),
+        Form::Ref { .. } => (None, Some("1")),
+        Form::Opt { slice: false, .. } | Form::Raw => (None, None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_a5_raw_view(
+    tcx: TyCtxt<'_>,
+    mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    argument_index: usize,
+    expected: Form,
+    found: Form,
+    argument: &str,
+    source_shape: &str,
+    target: Option<&super::raw_boundary::RawTargetType>,
+    proof_site_key: A5ProofSiteKey,
+    source_node: Option<(LocalDefId, HirId)>,
+) -> Result<A5RawViewTemp, SeamBlock> {
+    use rustc_middle::mir::Local;
+
+    use super::raw_boundary::{BridgeRender, RawBoundaryBlockReason};
+
+    if !matches!(
+        source_shape,
+        "bare-local"
+            | "cast-of-local"
+            | "addr-of"
+            | "addr-of-mut"
+            | "addr-of-cast"
+            | "addr-of-mut-cast"
+    ) {
+        return Err(SeamBlock::A5RawViewUnavailable);
+    }
+    let target = target.ok_or(SeamBlock::A5RawViewUnavailable)?;
+    let source_decision = decision_for_safe_form(found).ok_or(SeamBlock::A5RawViewUnavailable)?;
+    let parameter = Local::from_usize(argument_index + 1);
+    let negative_write =
+        !mut_facts.is_defaulted(callee, parameter) && !mut_facts.is_mutable(callee, parameter);
+    let raw_template =
+        super::raw_boundary::template_for(&source_decision, target, None, negative_write).map_err(
+            |reason| match reason {
+                RawBoundaryBlockReason::SharedToMut => SeamBlock::A5NegativeWriteAbsent,
+                _ => SeamBlock::A5RawViewUnavailable,
+            },
+        )?;
+    let raw_expression = match raw_template
+        .render_explicit(
+            argument,
+            target.mutability,
+            false,
+            Some(target.pointee.as_str()),
+        )
+        .map_err(|_| SeamBlock::A5RawViewUnavailable)?
+    {
+        BridgeRender::Edit(expression) => expression,
+        BridgeRender::ZeroSyntax => argument.to_owned(),
+        BridgeRender::Lifecycle => return Err(SeamBlock::A5RawViewUnavailable),
+    };
+    let (extent_expression, len) = a5_extent_from_safe_form(found, argument);
+    let Some((mut safe_spec, _)) = glue(expected, Form::Raw, len)? else {
+        return Err(SeamBlock::A5RawViewUnavailable);
+    };
+    if safe_spec.null_arm == NullArm::Checked {
+        safe_spec = safe_spec.with_checked_binding_type(target.rendered.clone());
+    }
+    let adapted_expression = safe_spec
+        .render_in_context(
+            super::super::c9::A5_RAW_VALUE_PLACEHOLDER,
+            enclosing_function_is_unsafe(tcx, caller),
+        )
+        .ok_or(SeamBlock::A5RawViewUnavailable)?;
+    let template = format!(
+        "{}->{}{}",
+        raw_template.key(),
+        safe_spec.template_key(),
+        if negative_write {
+            ":negative-write=foster-immutable"
+        } else {
+            ""
+        }
+    );
+    Ok(A5RawViewTemp {
+        argument_index,
+        raw_expression,
+        target_type: target.rendered.clone(),
+        adapted_expression,
+        extent_expression,
+        template,
+        proof_site_key,
+        unsafe_context: unsafe_context_for(tcx, caller, &safe_spec),
+        negative_write: negative_write
+            .then_some(super::raw_boundary::NegativeWriteEvidence::FosterImmutable),
+        expected_form: expected,
+        found_form: found,
+        source_node,
+    })
 }
 
 fn inbound_retention(
@@ -2881,6 +3104,14 @@ fn existing_interface_disposition(
             && call_spans_match(edit.call_span, call_span)
     }) {
         return Some("bridged");
+    }
+    if plan.a5_raw_calls.iter().any(|call| {
+        call.caller == caller
+            && call.callee == callee
+            && call_spans_match(call.call_span, call_span)
+            && call.views.iter().any(|view| view.argument_index == index)
+    }) {
+        return Some("a5-t2-raw-view");
     }
     if plan.blocked.iter().any(|site| {
         site.caller == caller
@@ -3184,6 +3415,7 @@ pub(crate) fn synthesize(
         &coconv,
         retention,
         lifetime_eligibility,
+        &crate::analyses::borrow_ownership::mutability_facts::MutFacts::all_mut(),
     )
 }
 
@@ -3221,10 +3453,12 @@ pub(crate) fn synthesize_with_raw_boundary(
     coconv: &super::co_conversion::CoConv,
     retention: &super::raw_boundary::RetentionSummaries,
     lifetime_eligibility: &super::lifetime::LifetimeEligibility,
+    mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
 ) -> SeamPlan {
     let sm = tcx.sess.source_map();
     let mut plan = SeamPlan::default();
     plan.pair_sites = coconv.pair_sites().to_vec();
+    let mut a5_raw_calls = BTreeMap::<(u32, u32, u32, u32), A5RawViewCall>::new();
 
     // subject key -> decision, and (fn, param index) -> subject key.
     let mut decision_of: FxHashMap<(LocalDefId, HirId), &Decision> = FxHashMap::default();
@@ -3290,6 +3524,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 raw_boundary_observation: bool,
                 source_shape: &'static str,
                 source_type: String,
+                target: Option<super::raw_boundary::RawTargetType>,
             }
             let mut positions: Vec<Pos> = Vec::new();
             for arg in &site.args {
@@ -3427,6 +3662,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     raw_boundary_observation,
                     source_shape: arg.shape.key(),
                     source_type: arg.source_type.clone(),
+                    target: arg.target.clone(),
                 });
             }
 
@@ -3435,7 +3671,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             // The old tuple receipt was poor because the gate ran before the
             // only `glue` call. Building here is observational: no AST node is
             // claimed and no edit is emitted until pass 3.
-            let candidates = positions
+            let mut candidates = positions
                 .iter()
                 .map(|pos| {
                     let Some(text) = pos.text.as_deref() else {
@@ -3536,6 +3772,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 )
             };
             let mut conflicts = vec![Vec::<PeerConflict>::new(); positions.len()];
+            let mut conflict_edges = Vec::<(usize, usize, A5PeerProof)>::new();
             for i in 0..positions.len() {
                 for j in (i + 1)..positions.len() {
                     if !positions[i].borrows || !positions[j].borrows {
@@ -3589,13 +3826,38 @@ pub(crate) fn synthesize_with_raw_boundary(
                             same_root,
                             left_blind,
                             right_blind,
-                            proof,
+                            proof: proof.clone(),
                         };
                         conflicts[i].push(conflict.clone());
                         conflicts[j].push(conflict);
+                        conflict_edges.push((i, j, proof));
                     }
                 }
             }
+
+            let role_entries = conflict_edges
+                .iter()
+                .flat_map(|(left, right, proof)| {
+                    let left_index = positions[*left].index;
+                    let right_index = positions[*right].index;
+                    let positive = |index| {
+                        matches!(
+                            retention.get(*callee, index),
+                            Some(super::raw_boundary::RetentionVerdict::Retains { .. })
+                        )
+                    };
+                    [
+                        (left_index, right_index, proof.verdict, positive(left_index)),
+                        (
+                            right_index,
+                            left_index,
+                            proof.verdict,
+                            positive(right_index),
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let a5_roles = super::co_conversion::resolve_pair_roles(&role_entries);
 
             // ---- pass 3: emit ----
             for (idx, pos) in positions.iter().enumerate() {
@@ -3618,12 +3880,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                         "unavailable".to_owned(),
                     ),
                 };
-                let overlap = (!conflicts[idx].is_empty()).then(|| {
+                let mut overlap = (!conflicts[idx].is_empty()).then(|| {
                     A5PositionProof::from_conflicts(
                         site.caller,
                         *callee,
                         pos.index,
                         pos.span,
+                        pos.expected,
+                        pos.found,
+                        pos.source_shape,
                         candidate_template.clone(),
                         &conflicts[idx],
                         a5_site_proofs,
@@ -3639,13 +3904,161 @@ pub(crate) fn synthesize_with_raw_boundary(
                             .contains(site.span.source_callsite())
                         && pair.role != super::co_conversion::PairRole::Blocked
                 });
+                let mut a5_call_owns_argument = false;
+                let mut a5_block = None;
+                if let Some(proof) = overlap.as_mut()
+                    && proof.verdict != A5SiteProofVerdict::Clear
+                    && !pair_owned
+                {
+                    let positive_retention = matches!(
+                        retention.get(*callee, pos.index),
+                        Some(super::raw_boundary::RetentionVerdict::Retains { .. })
+                    );
+                    let role = a5_roles
+                        .get(&pos.index)
+                        .copied()
+                        .unwrap_or(super::co_conversion::PairRole::Blocked);
+                    if positive_retention {
+                        proof.fallback = A5ProofSiteFallback::Held {
+                            reason: SeamBlock::PositiveRetention.key().to_owned(),
+                        };
+                        a5_block = Some(SeamBlock::PositiveRetention);
+                    } else {
+                        match role {
+                            super::co_conversion::PairRole::Clear
+                            | super::co_conversion::PairRole::Primary => {
+                                proof.fallback = A5ProofSiteFallback::Primary;
+                            }
+                            super::co_conversion::PairRole::RawView => {
+                                if pos.found == Form::Raw {
+                                    match &mut candidates[idx] {
+                                        Ok(Some(candidate)) => {
+                                            candidate.retention = BridgeRetentionTier::T2;
+                                            candidate.waiver_id =
+                                                Some(RAW_BOUNDARY_T2_WAIVER_ID.to_owned());
+                                            proof.fallback = A5ProofSiteFallback::T2RawView {
+                                                template: candidate.spec.template_key().to_owned(),
+                                                negative_write: None,
+                                            };
+                                        }
+                                        Ok(None) if pos.expected == Form::Raw => {
+                                            proof.fallback = A5ProofSiteFallback::T2RawView {
+                                                template: "raw-passthrough".to_owned(),
+                                                negative_write: None,
+                                            };
+                                        }
+                                        Ok(None) => {
+                                            proof.fallback = A5ProofSiteFallback::Held {
+                                                reason: SeamBlock::A5RawViewUnavailable
+                                                    .key()
+                                                    .to_owned(),
+                                            };
+                                            a5_block = Some(SeamBlock::A5RawViewUnavailable);
+                                        }
+                                        Err(block) => {
+                                            proof.fallback = A5ProofSiteFallback::Held {
+                                                reason: block.key().to_owned(),
+                                            };
+                                            a5_block = Some(*block);
+                                        }
+                                    }
+                                } else if let (Some(proof_site_key), Some(argument)) =
+                                    (proof.proof_site_key, pos.text.as_deref())
+                                {
+                                    match build_a5_raw_view(
+                                        tcx,
+                                        mut_facts,
+                                        site.caller,
+                                        *callee,
+                                        pos.index,
+                                        pos.expected,
+                                        pos.found,
+                                        argument,
+                                        pos.source_shape,
+                                        pos.target.as_ref(),
+                                        proof_site_key,
+                                        pos.root.map(|root| (site.caller, root)),
+                                    ) {
+                                        Ok(view) => {
+                                            proof.fallback = A5ProofSiteFallback::T2RawView {
+                                                template: view.template.clone(),
+                                                negative_write: view.negative_write,
+                                            };
+                                            let key = (
+                                                site.caller.local_def_index.as_u32(),
+                                                callee.local_def_index.as_u32(),
+                                                site.span.lo().0,
+                                                site.span.hi().0,
+                                            );
+                                            a5_raw_calls
+                                                .entry(key)
+                                                .or_insert_with(|| A5RawViewCall {
+                                                    owner_class: SignatureClassId::of(*callee),
+                                                    caller: site.caller,
+                                                    callee: *callee,
+                                                    call_span: site.span,
+                                                    views: Vec::new(),
+                                                })
+                                                .views
+                                                .push(view);
+                                            if site.caller != *callee {
+                                                plan.interface_dependencies.push((
+                                                    SignatureClassId::of(*callee),
+                                                    SignatureClassId::of(site.caller),
+                                                ));
+                                            }
+                                            a5_call_owns_argument = true;
+                                        }
+                                        Err(block) => {
+                                            proof.fallback = A5ProofSiteFallback::Held {
+                                                reason: block.key().to_owned(),
+                                            };
+                                            a5_block = Some(block);
+                                        }
+                                    }
+                                } else {
+                                    proof.fallback = A5ProofSiteFallback::Held {
+                                        reason: "a5-proof-site-key-unavailable".to_owned(),
+                                    };
+                                    a5_block = Some(SeamBlock::A5RawViewUnavailable);
+                                }
+                            }
+                            super::co_conversion::PairRole::Blocked => {
+                                proof.fallback = A5ProofSiteFallback::Held {
+                                    reason: "a5-primary-ambiguous".to_owned(),
+                                };
+                                a5_block = Some(SeamBlock::SiteOverlap);
+                            }
+                        }
+                    }
+                }
                 if !pair_owned && let Some(proof) = &overlap {
                     plan.overlap_proofs.push(proof.clone());
                 }
-                if overlap
-                    .as_ref()
-                    .is_some_and(|proof| !proof.clears_site_overlap())
-                    && !pos.raw_boundary_observation
+                if let Some(block) = a5_block {
+                    plan.blocked.push(BlockedSeam {
+                        caller: site.caller,
+                        callee: *callee,
+                        index: pos.index,
+                        span: pos.span,
+                        block,
+                        expected: Some(pos.expected),
+                        found: Some(pos.found),
+                        source_shape: pos.source_shape,
+                        candidate_template: candidate_template.clone(),
+                        null_arm: null_arm.clone(),
+                        extent_arm: extent_arm.clone(),
+                        root_identity: root_label(&labels, site.caller, pos.root),
+                        blind: pos.blind,
+                        peers: conflicts[idx].clone(),
+                        overlap,
+                    });
+                    continue;
+                }
+                if overlap.as_ref().is_some_and(|proof| {
+                    !proof.clears_site_overlap()
+                        && matches!(proof.fallback, A5ProofSiteFallback::Held { .. })
+                }) && !pos.raw_boundary_observation
                     && !pair_owned
                 {
                     plan.blocked.push(BlockedSeam {
@@ -3665,6 +4078,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                         peers: conflicts[idx].clone(),
                         overlap,
                     });
+                    continue;
+                }
+                if a5_call_owns_argument {
                     continue;
                 }
                 match &candidates[idx] {
@@ -3764,6 +4180,13 @@ pub(crate) fn synthesize_with_raw_boundary(
                 }
             }
         }
+    }
+
+    plan.a5_raw_calls = a5_raw_calls.into_values().collect();
+    for call in &mut plan.a5_raw_calls {
+        call.views.sort_by_key(|view| view.argument_index);
+        call.views
+            .dedup_by_key(|view| (view.argument_index, view.proof_site_key));
     }
 
     // Raw-boundary wave 1 — explicit safe-to-raw sites. Zero-syntax and

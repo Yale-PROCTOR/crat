@@ -352,7 +352,7 @@ impl PairSiteDecision {
     }
 }
 
-fn resolve_pair_roles(
+pub(crate) fn resolve_pair_roles(
     entries: &[(usize, usize, A5SiteProofVerdict, bool)],
 ) -> BTreeMap<usize, PairRole> {
     let mut vertices = BTreeSet::new();

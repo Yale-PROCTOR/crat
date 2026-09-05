@@ -6042,6 +6042,7 @@ fn raw_boundary_attempt_with(
                 &ctx.coconv,
                 &ctx.retention,
                 &ctx.lifetime_eligibility,
+                &ctx.mut_facts,
             );
             let arm_requirements = super::derive_arm_requirements(
                 &ctx.subjects,
@@ -6268,8 +6269,9 @@ fn e2_body_scope_adapts_only_the_enumerated_function_identity() {
     );
 }
 
-/// E2-SCHEMA-W1 — a refusal retains the candidate and the peer pair that made
-/// the pre-gate decision possible.
+/// E2-SCHEMA-W1 — expectation migration under addendum 182 §5 and addendum
+/// 200. The former blocked rows are now placed raw-to-safe adapters plus one
+/// proof-site primary and one exact-waiver T2 raw-view role.
 #[test]
 fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
     let src = format!(
@@ -6299,27 +6301,33 @@ fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
     let expected = column("expected_form");
     let found = column("found_form");
     let candidate = column("candidate_template");
-    let peers = column("peer_pairs");
     let root = column("root_identity");
     let blind = column("blind");
     let context = column("context");
-    let blocked = lines
-        .filter(|line| line.starts_with("blocked\t"))
+    let placed = lines
+        .filter(|line| line.starts_with("placed\t"))
         .map(|line| line.split('\t').collect::<Vec<_>>())
         .collect::<Vec<_>>();
-    assert_eq!(blocked.len(), 2, "{}", attempt.receipt);
-    for row in blocked {
+    assert_eq!(placed.len(), 2, "{}", attempt.receipt);
+    for row in placed {
         assert_eq!(row[expected], "ref-mut", "{row:?}");
         assert_eq!(row[found], "raw", "{row:?}");
         assert_eq!(row[candidate], "c-raw-reborrow-mut", "{row:?}");
-        assert_eq!(
-            row[peers], "0/1[same_root=1,left_blind=0,right_blind=0]",
-            "{row:?}"
-        );
         assert!(row[root].ends_with("caller::p"), "{row:?}");
         assert_eq!(row[blind], "0", "{row:?}");
         assert_eq!(row[context], "call-argument", "{row:?}");
     }
+    assert_eq!(
+        attempt
+            .receipt
+            .lines()
+            .filter(|line| line.starts_with("blocked\t"))
+            .count(),
+        0,
+        "{}",
+        attempt.receipt
+    );
+    assert_d14_primary_and_t2_receipt(&attempt, "undeterminable", 1);
 
     let no_edit = e2_attempt(&src, &|table| {
         force_body_forms(
@@ -6346,12 +6354,28 @@ fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
         .filter(|line| line.starts_with("blocked\t"))
         .map(|line| line.split('\t').collect::<Vec<_>>())
         .collect::<Vec<_>>();
-    assert_eq!(no_edit_rows.len(), 2, "{}", no_edit.receipt);
+    assert_eq!(no_edit_rows.len(), 1, "{}", no_edit.receipt);
     assert!(
         no_edit_rows
             .iter()
             .all(|row| row[no_edit_candidate] == "none"),
         "a computed no-edit candidate must not collapse back to missing: {no_edit_rows:?}"
+    );
+    assert!(
+        no_edit_rows[0].iter().any(|field| {
+            *field == super::decision::seam::SeamBlock::A5RawViewUnavailable.key()
+        }),
+        "addendum-200 no-edit reclassification: {no_edit_rows:?}"
+    );
+    assert_eq!(
+        no_edit
+            .receipt
+            .lines()
+            .filter(|line| line.contains("\ta5-site-proof-pair-primary\t"))
+            .count(),
+        1,
+        "{}",
+        no_edit.receipt
     );
 }
 
@@ -6402,6 +6426,58 @@ const E3_OVERLAP: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_
     pub unsafe fn target(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
     pub unsafe fn caller(p: *mut i32) { target(p, p); }\n";
 
+const A5_OPTION_OVERLAP: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub unsafe fn target(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
+     pub unsafe fn caller(mut p: *mut i32) { target(p, p); }\n";
+
+const A5_RB_OVERLAP: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub unsafe fn target(a: *mut i32, b: *mut i32) { let _ = *a + *b; }\n\
+     pub unsafe fn caller(p: *mut i32) { target(p, p); }\n";
+
+const A5_POSITIVE_RETENTION: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     static mut HOLD: *mut i32 = core::ptr::null_mut();\n\
+     pub unsafe fn target(a: *mut i32, b: *mut i32) { let _ = *a; HOLD = b; }\n\
+     pub unsafe fn caller(p: *mut i32) { target(p, p); }\n";
+
+fn force_a5_same_form(
+    table: &mut super::decision::DecisionTable,
+    replacement: super::decision::Decision,
+) {
+    let mut injected = Vec::new();
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("target::a")
+            || subject.label.ends_with("target::b")
+            || subject.label.ends_with("caller::p")
+        {
+            *decision = replacement.clone();
+            injected.push((subject.fn_did, subject.hir_id));
+        }
+    }
+    for key in injected {
+        if let Some(required) = table.arm_requirements.get_mut(&key) {
+            required.remove(super::decision::Arm::C);
+        }
+    }
+}
+
+fn force_a5_rb_forms(table: &mut super::decision::DecisionTable) {
+    let mut injected = Vec::new();
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("target::a") || subject.label.ends_with("caller::p") {
+            *decision = super::decision::Decision::Ref { mutable: false };
+            injected.push((subject.fn_did, subject.hir_id));
+        } else if subject.label.ends_with("target::b") {
+            *decision = super::decision::Decision::Ref { mutable: true };
+            injected.push((subject.fn_did, subject.hir_id));
+        }
+    }
+    for key in injected {
+        if let Some(required) = table.arm_requirements.get_mut(&key) {
+            required.remove(super::decision::Arm::C);
+        }
+    }
+}
+
 fn force_wave3_target_forms(table: &mut super::decision::DecisionTable, slice: bool) {
     for (subject, decision) in &mut table.entries {
         if subject.label.ends_with("caller::left")
@@ -6450,6 +6526,28 @@ fn force_wave3_target_slices(table: &mut super::decision::DecisionTable) {
     }
 }
 
+const CLEAR_EXTENT_PAIR_RECEIPT: &str =
+    "pair_required=false:clear-extent control injects terminal forms after the production arm set";
+
+/// Fixture-only receipt, authorized by addendum 200 under addendum 182 §5.
+/// These controls test clear/no-op or extent selection, not D14′ ownership.
+/// Their post-decision form injection cannot inherit a production PAIR arm
+/// without also reconstructing the whole production class inventory.
+fn declare_pair_not_required_for_clear_extent_control(table: &mut super::decision::DecisionTable) {
+    let mut declarations = 0;
+    for (subject, _) in &table.entries {
+        if (subject.label.ends_with("target::a") || subject.label.ends_with("target::b"))
+            && let Some(required) = table
+                .arm_requirements
+                .get_mut(&(subject.fn_did, subject.hir_id))
+        {
+            required.remove(super::decision::Arm::Pair);
+            declarations += 1;
+        }
+    }
+    assert_eq!(declarations, 2, "{CLEAR_EXTENT_PAIR_RECEIPT}");
+}
+
 /// Drive an injected form decision through the production proof derivation and
 /// the production seam synthesis. The only test seam is the form injection;
 /// site facts, attestation, lookup, candidate construction, and emission are
@@ -6457,6 +6555,9 @@ fn force_wave3_target_slices(table: &mut super::decision::DecisionTable) {
 fn e3_attempt(src: &str, attested: bool, slice: bool) -> E2Attempt {
     e3_attempt_with(src, attested, &|table| {
         force_wave3_target_forms(table, slice);
+        if attested {
+            declare_pair_not_required_for_clear_extent_control(table);
+        }
     })
 }
 
@@ -6464,6 +6565,23 @@ fn e3_attempt_with(
     src: &str,
     attested: bool,
     inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> E2Attempt {
+    e3_attempt_with_mutability(src, attested, inject, false)
+}
+
+fn e3_attempt_with_foster(
+    src: &str,
+    attested: bool,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> E2Attempt {
+    e3_attempt_with_mutability(src, attested, inject, true)
+}
+
+fn e3_attempt_with_mutability(
+    src: &str,
+    attested: bool,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+    use_foster: bool,
 ) -> E2Attempt {
     let fixture = Fixture::new(&[("lib.rs", src)]);
     let (emission, receipt) = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
@@ -6488,16 +6606,32 @@ fn e3_attempt_with(
         );
         assert_eq!(ctx.analysis.attestation, attestation);
         inject(&mut table);
-        table.seams = super::decision::seam::synthesize(
-            tcx,
-            &ctx.facts,
-            &ctx.subjects,
-            &table,
-            &ctx.retained_c9_plans,
-            &ctx.a5_site_proofs,
-            &ctx.retention,
-            &ctx.lifetime_eligibility,
-        );
+        table.seams = if use_foster {
+            super::decision::seam::synthesize_with_raw_boundary(
+                tcx,
+                &ctx.facts,
+                &ctx.subjects,
+                &table,
+                &ctx.retained_c9_plans,
+                &ctx.a5_site_proofs,
+                &super::decision::raw_boundary::RawBoundaryDispositionIndex::default(),
+                &super::decision::co_conversion::CoConv::default(),
+                &ctx.retention,
+                &ctx.lifetime_eligibility,
+                &ctx.mut_facts,
+            )
+        } else {
+            super::decision::seam::synthesize(
+                tcx,
+                &ctx.facts,
+                &ctx.subjects,
+                &table,
+                &ctx.retained_c9_plans,
+                &ctx.a5_site_proofs,
+                &ctx.retention,
+                &ctx.lifetime_eligibility,
+            )
+        };
         let receipt = super::seam_tsv_from_table(tcx, &table);
         let emission = emit_files(
             tcx,
@@ -6794,6 +6928,7 @@ fn inv_w1_non_subject_mir_call_is_bridged_or_holds_the_class() {
                 &ctx.coconv,
                 &ctx.retention,
                 &ctx.lifetime_eligibility,
+                &ctx.mut_facts,
             );
             assert_eq!(table.seams.interface_inventory.len(), 1);
             assert_eq!(table.seams.sites_from_non_subject_arguments(), 1);
@@ -6932,6 +7067,7 @@ fn d1_w1_base_parameter_callee_requires_each_mir_call_site() {
                 &ctx.coconv,
                 &ctx.retention,
                 &ctx.lifetime_eligibility,
+                &ctx.mut_facts,
             );
             let mut omitted = table.seams.clone();
             omitted.interface_inventory.clear();
@@ -7458,6 +7594,7 @@ fn br_w5b_thin_const_and_mut_depth2_storage_use_npo_bridge() {
             &ctx.coconv,
             &ctx.retention,
             &ctx.lifetime_eligibility,
+            &ctx.mut_facts,
         );
         let arm_requirements = super::derive_arm_requirements(
             &ctx.subjects,
@@ -8360,6 +8497,7 @@ fn br_w13_raw_to_safe_return_without_exact_permit_holds_class() {
             &ctx.coconv,
             &ctx.retention,
             &eligibility,
+            &ctx.mut_facts,
         );
         let arm_requirements = super::derive_arm_requirements(
             &ctx.subjects,
@@ -9776,6 +9914,128 @@ fn receipt_column(receipt: &str, name: &str) -> usize {
         .unwrap_or_else(|| panic!("missing receipt column {name}: {receipt}"))
 }
 
+/// Expectation-migration receipt: addendum 182 §5 (D14′ design) plus
+/// addendum 200. A non-clear proof site now has one safe primary and one T2
+/// raw-view position. The seam row carries the exact proof-site/peer identity
+/// and verdict; the finalized class site carries tier and waiver.
+fn assert_d14_primary_and_t2_receipt(
+    attempt: &E2Attempt,
+    verdict: &str,
+    expected_primary_class_sites: usize,
+) {
+    let header = attempt
+        .receipt
+        .lines()
+        .next()
+        .expect("D14 receipt header")
+        .split('\t')
+        .collect::<Vec<_>>();
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|column| *column == name)
+            .unwrap_or_else(|| panic!("missing D14 column {name}: {header:?}"))
+    };
+    let family = column("family_or_reason");
+    let site_key = column("adapter_key");
+    let observed_verdict = column("overlap_verdict");
+    let peer_proofs = column("a5_peer_proofs");
+    let rows = attempt
+        .receipt
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .filter(|row| row.first() == Some(&"overlap-proof"))
+        .filter(|row| {
+            matches!(
+                row[family],
+                "a5-site-proof-pair-primary" | "a5-site-proof-t2-fallback"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "{}", attempt.receipt);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row[family] == "a5-site-proof-pair-primary")
+            .count(),
+        1,
+        "{}",
+        attempt.receipt
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row[family] == "a5-site-proof-t2-fallback")
+            .count(),
+        1,
+        "{}",
+        attempt.receipt
+    );
+    assert!(rows.iter().all(|row| row[observed_verdict] == verdict));
+    assert!(rows.iter().all(|row| row[site_key] != "-"));
+    assert!(rows.iter().all(|row| row[peer_proofs] != "-"));
+    assert_eq!(
+        rows.iter()
+            .map(|row| row[site_key])
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        2,
+        "proof-site keys must be position-distinct: {rows:?}"
+    );
+
+    let class_sites = attempt
+        .emission
+        .plan
+        .class_finalization
+        .classes
+        .values()
+        .flat_map(|class| class.sites.iter())
+        .filter(|site| {
+            matches!(
+                site.key.bridge_kind.as_str(),
+                "a5-site-proof-pair-primary" | "a5-site-proof-t2-fallback"
+            )
+        })
+        .collect::<Vec<_>>();
+    let primary = class_sites
+        .iter()
+        .filter(|site| site.key.bridge_kind == "a5-site-proof-pair-primary")
+        .collect::<Vec<_>>();
+    let t2 = class_sites
+        .iter()
+        .filter(|site| site.key.bridge_kind == "a5-site-proof-t2-fallback")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary.len(),
+        expected_primary_class_sites,
+        "{class_sites:#?}"
+    );
+    assert_eq!(t2.len(), 1, "{class_sites:#?}");
+    assert!(
+        primary
+            .iter()
+            .all(|site| site.retention == super::bridge_receipt::BridgeRetentionTier::None)
+    );
+    assert_eq!(
+        t2[0].retention,
+        super::bridge_receipt::BridgeRetentionTier::T2
+    );
+    assert_eq!(
+        t2[0].waiver_id.as_deref(),
+        Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
+    );
+    assert!(
+        primary
+            .iter()
+            .all(|site| site.key.position.starts_with("arg"))
+    );
+    assert!(t2[0].key.position.starts_with("arg"));
+    assert!(
+        primary
+            .iter()
+            .all(|site| site.key.receipt_key() != t2[0].key.receipt_key())
+    );
+}
+
 /// E-ADAPT-W3-W1 — a same-root field pair that the frozen A5 site producer
 /// proves disjoint discharges SiteOverlap and reaches the existing slice seam.
 #[test]
@@ -9820,20 +10080,36 @@ fn e_adapt_w3_w1_proven_disjoint_site_emits_its_slice_adapter() {
     );
 }
 
-/// E-ADAPT-W3-N1 — a genuine overlap remains closed even under attestation.
+/// A5-W1 — a non-clear proof site whose safe slice arguments have no PAIR
+/// inventory entry must use the proof-site-owned T2 raw view.  The raw view is
+/// hoisted before the surviving safe primary, so the call retains one safe
+/// argument without asking borrowck to accept two simultaneous mutable views.
 #[test]
-fn e_adapt_w3_n1_overlapping_site_stays_closed() {
-    let attempt = e3_attempt(E3_OVERLAP, true, true);
+fn a5_w1_proof_site_absent_from_pair_inventory_uses_t2_raw_view() {
+    let attempt = e3_attempt_with(E3_OVERLAP, true, &|table| {
+        force_a5_same_form(
+            table,
+            super::decision::Decision::Slice {
+                mutable: true,
+                uses: Vec::new(),
+            },
+        );
+    });
     assert!(
         attempt.receipt.lines().any(|line| {
-            line.starts_with("blocked\t")
+            line.contains("a5-site-proof-t2-fallback")
                 && line.contains("\toverlapping\t")
                 && line.contains("a5-not-proven-disjoint")
         }),
         "{}",
         attempt.receipt
     );
-    assert!(attempt.emission.files.is_empty());
+    let source = e2_root_text(&attempt);
+    assert!(source.contains("let __crat_a5_raw_"), "{source}");
+    assert!(
+        source.contains("core::slice::from_raw_parts_mut"),
+        "{source}"
+    );
     assert!(
         attempt
             .emission
@@ -9841,7 +10117,132 @@ fn e_adapt_w3_n1_overlapping_site_stays_closed() {
             .class_finalization
             .classes
             .values()
-            .all(|class| !class.is_ready())
+            .all(|class| class.is_ready())
+    );
+    let (events, rows) = attempt
+        .emission
+        .plan
+        .mechanical_receipts(&std::collections::BTreeSet::new());
+    let summary = super::mechanical_receipt::reconcile_mechanical_obligations(&events)
+        .expect("A5 common receipt reconciliation");
+    assert_eq!(summary.obligations, 1);
+    assert_eq!(summary.applied, 1);
+    assert_eq!(summary.dropped, 0);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        super::mechanical_receipt::reconcile_a5_proof_site_fallback_rows(&rows, &events),
+        Ok(1)
+    );
+    let rendered = super::mechanical_receipt::render_a5_proof_site_fallback_rows(&rows);
+    assert!(rendered.contains("\tT2\tc-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01\t"));
+    assert!(rendered.contains("slice-mut-to-raw-mut->c-raw-slice-mut"));
+    assert!(!rendered.contains("a5-site-proof-blocked"));
+}
+
+#[test]
+fn a5_w1_ref_and_option_forms_share_the_proof_site_raw_view_renderer() {
+    let reference = e3_attempt_with(E3_OVERLAP, true, &|table| {
+        force_a5_same_form(table, super::decision::Decision::Ref { mutable: true });
+    });
+    let reference_source = e2_root_text(&reference);
+    assert!(
+        reference_source.contains("let __crat_a5_raw_"),
+        "{reference_source}"
+    );
+    assert!(
+        reference_source.contains("core::ptr::from_mut(&mut *p)"),
+        "{reference_source}"
+    );
+    assert!(reference_source.contains("&mut *__crat_a5_raw_"));
+
+    let optional = e3_attempt_with(A5_OPTION_OVERLAP, true, &|table| {
+        force_a5_same_form(
+            table,
+            super::decision::Decision::Opt {
+                mutable: true,
+                slice: false,
+                uses: Vec::new(),
+            },
+        );
+    });
+    let optional_source = e2_root_text(&optional);
+    assert!(
+        optional_source.contains("let __crat_a5_raw_"),
+        "{optional_source}"
+    );
+    assert!(
+        optional_source.contains("as_deref_mut().map_or"),
+        "{optional_source}"
+    );
+    assert!(optional_source.contains(".as_mut()"), "{optional_source}");
+}
+
+#[test]
+fn a5_w1_r_b_and_positive_retention_reclassify_under_their_own_evidence() {
+    let missing = e3_attempt_with(A5_RB_OVERLAP, true, &force_a5_rb_forms);
+    assert!(!e2_root_text(&missing).contains("__crat_a5_raw_"));
+    assert!(
+        missing
+            .receipt
+            .contains("raw-boundary-shared-to-mut:negative-write-absent"),
+        "{}",
+        missing.receipt
+    );
+    let (missing_events, missing_rows) = missing
+        .emission
+        .plan
+        .mechanical_receipts(&std::collections::BTreeSet::new());
+    let missing_summary =
+        super::mechanical_receipt::reconcile_mechanical_obligations(&missing_events).unwrap();
+    assert_eq!(missing_summary.held_nonmechanical, 1);
+    assert_eq!(missing_rows.len(), 2);
+
+    let foster = e3_attempt_with_foster(A5_RB_OVERLAP, true, &force_a5_rb_forms);
+    let foster_source = e2_root_text(&foster);
+    assert!(
+        foster_source.contains("core::ptr::from_ref(p).cast_mut()"),
+        "{foster_source}\n{}",
+        foster.receipt
+    );
+    let (foster_events, foster_rows) = foster
+        .emission
+        .plan
+        .mechanical_receipts(&std::collections::BTreeSet::new());
+    let foster_summary =
+        super::mechanical_receipt::reconcile_mechanical_obligations(&foster_events).unwrap();
+    assert_eq!(foster_summary.applied, 1);
+    assert_eq!(
+        super::mechanical_receipt::reconcile_a5_proof_site_fallback_rows(
+            &foster_rows,
+            &foster_events,
+        ),
+        Ok(1)
+    );
+
+    let retained = e3_attempt_with_foster(A5_POSITIVE_RETENTION, true, &force_a5_rb_forms);
+    assert!(!e2_root_text(&retained).contains("__crat_a5_raw_"));
+    let (retained_events, _) = retained
+        .emission
+        .plan
+        .mechanical_receipts(&std::collections::BTreeSet::new());
+    let retained_summary =
+        super::mechanical_receipt::reconcile_mechanical_obligations(&retained_events).unwrap();
+    assert_eq!(retained_summary.held_nonmechanical, 1);
+    assert_eq!(retained_summary.dropped, 1);
+    assert!(
+        super::mechanical_receipt::render_mechanical_obligations(&retained_events)
+            .contains("positive-retention")
+    );
+}
+
+#[test]
+fn a1_terminal_interface_accessor_never_exposes_a_held_decided_form() {
+    let decided = super::decision::seam::Form::Slice { mutable: true };
+    assert_eq!(super::terminalized_form(decided, true), decided);
+    assert_eq!(
+        super::terminalized_form(decided, false),
+        super::decision::seam::Form::Raw,
+        "a held class exposes its unmodified input interface, not the decided one"
     );
 }
 
@@ -9867,28 +10268,34 @@ fn e_adapt_w3_n2_clear_template_none_is_untouched() {
     assert!(!e2_root_text(&attempt).contains("core::slice::"));
 }
 
-/// E-ADAPT-W3-N3 — the identical closed-world-dependent site fails closed when
-/// the attestation is absent. Product default remains refusal.
+/// E-ADAPT-W3-N3 — expectation migration under addendum 182 §5 and addendum
+/// 200. An unattested proof is Undeterminable, which now selects one safe
+/// primary and one exact-waiver T2 raw-view role rather than the old block.
 #[test]
 fn e_adapt_w3_n3_unattested_site_fails_closed_with_typed_reason() {
     let attempt = e3_attempt(E3_CLEAR_RAW, false, true);
-    assert!(
-        attempt.receipt.lines().any(|line| {
-            line.starts_with("blocked\t")
-                && line.contains("\tundeterminable\t")
-                && line.contains("seam-a5-attestation-absent")
-        }),
+    assert_eq!(
+        attempt
+            .receipt
+            .lines()
+            .filter(|line| line.starts_with("placed\t"))
+            .count(),
+        2,
         "{}",
         attempt.receipt
     );
-    assert!(attempt.emission.files.is_empty());
+    assert_d14_primary_and_t2_receipt(&attempt, "undeterminable", 1);
+    assert!(e2_root_text(&attempt).contains("core::slice::from_raw_parts_mut"));
 }
 
 /// E-ADAPT-W3-N6 — evidence-backed extents remain preferred after the overlap
 /// gate opens. Both raw slice arguments have their own following count.
 #[test]
 fn e_adapt_w3_n6_clear_site_prefers_licensed_extent() {
-    let attempt = e3_attempt_with(E3_CLEAR_LICENSED, true, &force_wave3_target_slices);
+    let attempt = e3_attempt_with(E3_CLEAR_LICENSED, true, &|table| {
+        force_wave3_target_slices(table);
+        declare_pair_not_required_for_clear_extent_control(table);
+    });
     let len_arm = receipt_column(&attempt.receipt, "len_arm");
     let placed = attempt
         .receipt
@@ -9925,8 +10332,9 @@ fn e_adapt_w3_n7_clear_site_receipts_named_fallback_extent() {
     );
 }
 
-/// E-ADAPT-W3-N8 — two calls to the same target receive independent site
-/// verdicts: the clear site opens and the overlapping neighbor stays closed.
+/// E-ADAPT-W3-N8 — expectation migration under addendum 182 §5 and addendum
+/// 200. Two calls retain independent verdicts: the clear site stays clear and
+/// the overlapping neighbor now receives its own primary/T2 proof-site pair.
 #[test]
 fn e_adapt_w3_n8_site_key_does_not_license_an_overlapping_neighbor() {
     let attempt = e3_attempt_with(E3_SCOPED_PAIR, true, &force_wave3_target_slices);
@@ -9950,9 +10358,13 @@ fn e_adapt_w3_n8_site_key_does_not_license_an_overlapping_neighbor() {
             .count(),
         2
     );
+    assert_d14_primary_and_t2_receipt(&attempt, "overlapping", 0);
+    let source = e2_root_text(&attempt);
+    assert!(source.contains("clear_caller"), "{source}");
+    assert!(source.contains("overlap_caller"), "{source}");
     assert!(
-        attempt.emission.files.is_empty(),
-        "one blocked site holds the callee signature and both call-site adapters"
+        source.contains("core::slice::from_raw_parts_mut"),
+        "{source}"
     );
 }
 

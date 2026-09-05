@@ -217,6 +217,8 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) final_reverts: String,
     pub(crate) bridge_events: Vec<bridge_receipt::BridgeReceiptEvent>,
     pub(crate) unsafe_context_events: Vec<mechanical_receipt::UnsafeContextReceiptEvent>,
+    pub(crate) mechanical_events: Vec<mechanical_receipt::MechanicalObligationEvent>,
+    pub(crate) a5_proof_site_fallback_rows: Vec<mechanical_receipt::A5ProofSiteFallbackReceiptRow>,
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
@@ -1135,6 +1137,22 @@ fn round_files(
     Ok((files, Vec::new(), stats.files_with_edits, maps))
 }
 
+fn refresh_raw_boundary_receipt_events(
+    artifacts: &mut RawBoundaryArtifacts,
+    emission_plan: &plan::Plan,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+) {
+    assert_eq!(
+        emission_plan.unowned_a5_proof_sites, 0,
+        "unowned A5 proof-site receipt identities"
+    );
+    artifacts.bridge_events = emission_plan.bridge_events(reverted);
+    artifacts.unsafe_context_events = emission_plan.unsafe_context_events(reverted);
+    let (mechanical_events, a5_rows) = emission_plan.mechanical_receipts(reverted);
+    artifacts.mechanical_events = mechanical_events;
+    artifacts.a5_proof_site_fallback_rows = a5_rows;
+}
+
 fn verify_and_revert(
     tcx: TyCtxt<'_>,
     capture: &ast_transform::AstCapture,
@@ -1179,10 +1197,11 @@ fn verify_and_revert(
         .collect::<std::collections::BTreeSet<_>>()
         .difference(&site_owners)
         .count();
-    raw_boundary_artifacts.bridge_events =
-        emission_plan.bridge_events(&std::collections::BTreeSet::new());
-    raw_boundary_artifacts.unsafe_context_events =
-        emission_plan.unsafe_context_events(&std::collections::BTreeSet::new());
+    refresh_raw_boundary_receipt_events(
+        &mut raw_boundary_artifacts,
+        &emission_plan,
+        &std::collections::BTreeSet::new(),
+    );
     raw_boundary_artifacts.class_collisions = render_class_collisions(&emission_plan);
     raw_boundary_artifacts.arm_outcomes = atomic_arm_outcomes_tsv(tcx, table, &emission_plan);
     let mut class_paths = std::collections::BTreeMap::new();
@@ -1679,9 +1698,11 @@ fn verify_and_revert(
             }
             if !reverted.is_empty() && all_ready_classes.is_subset(&reverted) {
                 facts.reverted_count = reverted.len();
-                facts.raw_boundary_artifacts.bridge_events = emission_plan.bridge_events(&reverted);
-                facts.raw_boundary_artifacts.unsafe_context_events =
-                    emission_plan.unsafe_context_events(&reverted);
+                refresh_raw_boundary_receipt_events(
+                    &mut facts.raw_boundary_artifacts,
+                    &emission_plan,
+                    &reverted,
+                );
                 record_unresolved_classes(
                     &mut facts.raw_boundary_artifacts,
                     &all_ready_classes,
@@ -1716,9 +1737,11 @@ fn verify_and_revert(
             facts.files_touched = files_edited;
             facts.raw_boundary_artifacts.final_reverts =
                 render_raw_boundary_final_reverts(&reverted, &reverted_atoms, &class_paths);
-            facts.raw_boundary_artifacts.bridge_events = emission_plan.bridge_events(&reverted);
-            facts.raw_boundary_artifacts.unsafe_context_events =
-                emission_plan.unsafe_context_events(&reverted);
+            refresh_raw_boundary_receipt_events(
+                &mut facts.raw_boundary_artifacts,
+                &emission_plan,
+                &reverted,
+            );
             return facts.emitted(source, files);
         }
 
@@ -2013,9 +2036,11 @@ fn verify_and_revert(
         facts.files_touched = files_edited;
         facts.reverted_count = final_reverted.len();
         facts.escalated = Some(escalation.clone());
-        facts.raw_boundary_artifacts.bridge_events = emission_plan.bridge_events(&final_reverted);
-        facts.raw_boundary_artifacts.unsafe_context_events =
-            emission_plan.unsafe_context_events(&final_reverted);
+        refresh_raw_boundary_receipt_events(
+            &mut facts.raw_boundary_artifacts,
+            &emission_plan,
+            &final_reverted,
+        );
         record_unresolved_classes(
             &mut facts.raw_boundary_artifacts,
             &unresolved,
@@ -2129,10 +2154,11 @@ fn verify_and_revert(
             facts.escalated = Some(escalation);
             facts.raw_boundary_artifacts.final_reverts =
                 render_raw_boundary_final_reverts(&final_reverted, &reverted_atoms, &class_paths);
-            facts.raw_boundary_artifacts.bridge_events =
-                emission_plan.bridge_events(&final_reverted);
-            facts.raw_boundary_artifacts.unsafe_context_events =
-                emission_plan.unsafe_context_events(&final_reverted);
+            refresh_raw_boundary_receipt_events(
+                &mut facts.raw_boundary_artifacts,
+                &emission_plan,
+                &final_reverted,
+            );
             facts.emitted(source, final_files)
         }
         _ => {
@@ -3094,6 +3120,22 @@ impl OutcomeFacts {
                 event.state = bridge_receipt::BridgeReceiptState::Dropped;
                 event.drop_reason = Some("program-degraded-unmodified-input".to_owned());
                 event.terminal_class_disposition = "degraded".to_owned();
+            }
+        }
+        for event in &mut self.raw_boundary_artifacts.mechanical_events {
+            if event.stage == mechanical_receipt::MechanicalStage::Terminal {
+                event.state = mechanical_receipt::MechanicalState::Dropped;
+                event.terminal_reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
+        for row in &mut self.raw_boundary_artifacts.a5_proof_site_fallback_rows {
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
             }
         }
         self.stamp_class_costs();
@@ -4236,14 +4278,16 @@ fn exact_kind_composed_by_seam(edits: &[plan::Edit], kind_index: usize) -> bool 
 /// and keep both edits in the authoritative plan and receipts.
 fn nested_c9_over_seam(edits: &[plan::Edit], c9_index: usize) -> bool {
     let c9 = &edits[c9_index];
-    matches!(c9.justification, plan::Justification::C9Mark)
-        && edits.iter().enumerate().any(|(seam_index, seam)| {
-            seam_index != c9_index
-                && matches!(seam.justification, plan::Justification::SeamAdapter { .. })
-                && c9.lo <= seam.lo
-                && seam.hi <= c9.hi
-                && (c9.lo < seam.lo || seam.hi < c9.hi)
-        })
+    matches!(
+        c9.justification,
+        plan::Justification::C9Mark | plan::Justification::A5RawView
+    ) && edits.iter().enumerate().any(|(seam_index, seam)| {
+        seam_index != c9_index
+            && matches!(seam.justification, plan::Justification::SeamAdapter { .. })
+            && c9.lo <= seam.lo
+            && seam.hi <= c9.hi
+            && (c9.lo < seam.lo || seam.hi < c9.hi)
+    })
 }
 
 /// A source file's identity for editing. `None` for anything not written back
@@ -4321,6 +4365,73 @@ fn pair_raw_view_failure_site(
     }
 }
 
+#[derive(Clone)]
+struct PendingA5RawViewCall {
+    call: decision::seam::A5RawViewCall,
+    file: plan::FileKey,
+    lo: usize,
+    hi: usize,
+    source: String,
+    bridge: bridge_receipt::BridgeSitePlan,
+}
+
+pub(crate) fn terminalized_form(
+    decided: decision::seam::Form,
+    owner_class_live: bool,
+) -> decision::seam::Form {
+    if owner_class_live {
+        decided
+    } else {
+        decision::seam::Form::Raw
+    }
+}
+
+fn terminal_subject_form(
+    table: &decision::DecisionTable,
+    finalization: &plan::ClassFinalization,
+    key: (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+) -> decision::seam::Form {
+    let class = bridge_receipt::SignatureClassId::of(key.0);
+    let live = finalization
+        .classes
+        .get(&class)
+        .is_some_and(plan::SignatureClassPlan::is_ready);
+    let decided = table
+        .entries
+        .iter()
+        .find(|(subject, _)| subject.fn_did == key.0 && subject.hir_id == key.1)
+        .map_or(decision::seam::Form::Raw, |(_, decision)| {
+            decision::seam::form_of(decision)
+        });
+    terminalized_form(decided, live)
+}
+
+fn terminal_parameter_form(
+    table: &decision::DecisionTable,
+    finalization: &plan::ClassFinalization,
+    callee: rustc_hir::def_id::LocalDefId,
+    argument_index: usize,
+) -> decision::seam::Form {
+    let live = finalization
+        .classes
+        .get(&bridge_receipt::SignatureClassId::of(callee))
+        .is_some_and(plan::SignatureClassPlan::is_ready);
+    let decided = table
+        .entries
+        .iter()
+        .find(|(subject, _)| {
+            subject.fn_did == callee
+                && matches!(
+                    subject.kind,
+                    decision::SubjectKind::Param { hir_index } if hir_index == argument_index
+                )
+        })
+        .map_or(decision::seam::Form::Raw, |(_, decision)| {
+            decision::seam::form_of(decision)
+        });
+    terminalized_form(decided, live)
+}
+
 /// Plan and apply, **grouped by file**.
 ///
 /// Grouping is what makes the offsets meaningful: `lookup_byte_offset` yields
@@ -4372,6 +4483,90 @@ pub(crate) fn emit_files<'tcx>(
         |subject| tcx.def_path_str(subject.fn_did.to_def_id()),
         &|subject: &decision::Subject| reverted.contains(&subject.fn_did),
     );
+    let mut pending_a5_raw_calls = Vec::new();
+    for call in &table.seams.a5_raw_calls {
+        if reverted.contains(&call.owner_class.local_def_id()) {
+            continue;
+        }
+        let (file, lo, hi) = span_to_loc(call.call_span)
+            .map_err(|why| format!("unplaceable A5 raw-view call: {why}"))?;
+        let source = text_of(&file)
+            .ok_or_else(|| format!("no source text for A5 raw-view file {file:?}"))?;
+        let original = source
+            .get(lo..hi)
+            .ok_or_else(|| "A5 raw-view span is outside its source file".to_owned())?
+            .to_owned();
+        let proof_keys = call
+            .views
+            .iter()
+            .map(|view| view.proof_site_key.receipt_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let bridge = bridge_receipt::BridgeSitePlan {
+            caller: call.caller,
+            callee: bridge_receipt::BridgeCalleeId::Local(call.callee),
+            arm: decision::Arm::Pair.key().to_owned(),
+            position: format!("args={proof_keys}"),
+            bridge_kind: "a5-site-proof-t2-fallback".to_owned(),
+            expected_form: call
+                .views
+                .iter()
+                .map(|view| view.expected_form.key())
+                .collect::<Vec<_>>()
+                .join(","),
+            found_form: call
+                .views
+                .iter()
+                .map(|view| view.found_form.key())
+                .collect::<Vec<_>>()
+                .join(","),
+            argument_kind: "a5-proof-call".to_owned(),
+            extent: if call
+                .views
+                .iter()
+                .any(|view| view.extent_expression.is_some())
+            {
+                bridge_receipt::BridgeExtentKind::Evidence("settled-safe-length".to_owned())
+            } else {
+                bridge_receipt::BridgeExtentKind::None
+            },
+            retention: bridge_receipt::BridgeRetentionTier::T2,
+            waiver_id: Some(bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+            unsafe_context: call.views.iter().find_map(|view| view.unsafe_context),
+        };
+        let file_label = match &file {
+            plan::FileKey::Real(path) => path.display().to_string(),
+            plan::FileKey::Virtual(name) => name.clone(),
+        };
+        planned.preclass_sites.push(plan::ClassSite {
+            key: bridge.materialize(
+                call.owner_class,
+                file_label.clone(),
+                u32::try_from(lo).unwrap_or(u32::MAX),
+                u32::try_from(hi).unwrap_or(u32::MAX),
+            ),
+            edit_key: format!(
+                "class={}|arm=PAIR|interval={file_label}:{lo}:{hi}|kind=a5-site-proof-t2-fallback|proofs={proof_keys}",
+                call.owner_class.order_key(),
+            ),
+            state: plan::ClassSiteState::EditReady,
+            expected_form: bridge.expected_form.clone(),
+            found_form: bridge.found_form.clone(),
+            argument_kind: bridge.argument_kind.clone(),
+            extent: bridge.extent.clone(),
+            retention: bridge.retention,
+            waiver_id: bridge.waiver_id.clone(),
+            unsafe_context: bridge.unsafe_context,
+        });
+        pending_a5_raw_calls.push(PendingA5RawViewCall {
+            call: call.clone(),
+            file,
+            lo,
+            hi,
+            source: original,
+            bridge,
+        });
+    }
     for call in &table.seams.pair_raw_calls {
         if reverted.contains(&call.owner_class.local_def_id()) {
             continue;
@@ -4488,6 +4683,74 @@ pub(crate) fn emit_files<'tcx>(
         });
     }
     plan::finalize_signature_classes(&mut planned, table, reverted);
+    for pending in pending_a5_raw_calls {
+        if !planned
+            .class_finalization
+            .classes
+            .get(&pending.call.owner_class)
+            .is_some_and(plan::SignatureClassPlan::is_ready)
+        {
+            continue;
+        }
+        for view in &pending.call.views {
+            let terminal_target = terminal_parameter_form(
+                table,
+                &planned.class_finalization,
+                pending.call.callee,
+                view.argument_index,
+            );
+            let terminal_source = view.source_node.map_or(view.found_form, |source| {
+                terminal_subject_form(table, &planned.class_finalization, source)
+            });
+            if terminal_target != view.expected_form || terminal_source != view.found_form {
+                return Err(format!(
+                    "A5 terminal-interface mismatch at {}: planned {}<-{}, terminal {}<-{}",
+                    view.proof_site_key.receipt_key(),
+                    view.expected_form.key(),
+                    view.found_form.key(),
+                    terminal_target.key(),
+                    terminal_source.key(),
+                ));
+            }
+        }
+        let views = pending
+            .call
+            .views
+            .iter()
+            .map(|view| {
+                (
+                    view.argument_index,
+                    view.raw_expression.clone(),
+                    view.target_type.clone(),
+                    view.adapted_expression.clone(),
+                    view.extent_expression.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let stem = format!("__crat_a5_raw_{}", pending.call.call_span.lo().0);
+        let replacement = c9::render_a5_raw_view_source(&pending.source, &stem, &views)?;
+        planned
+            .by_file
+            .entry(pending.file)
+            .or_default()
+            .push(plan::Edit {
+                lo: pending.lo,
+                hi: pending.hi,
+                replacement,
+                justification: plan::Justification::A5RawView,
+                owner_class: Some(pending.call.owner_class),
+                owner_path: tcx.def_path_str(pending.call.callee.to_def_id()),
+                bridge: Some(pending.bridge),
+                atom_ids: Vec::new(),
+                subject_id: format!(
+                    "a5-proof-call:{}..{}",
+                    pending.call.call_span.lo().0,
+                    pending.call.call_span.hi().0
+                ),
+                required_arms: "PAIR".to_owned(),
+                edit_kind: "a5-proof-site-raw-view",
+            });
+    }
     // **The crate root, asked of the compiler rather than guessed** — not
     // `files()[0]`, which is source-map insertion order, and not the first
     // planned file, which is whichever file happened to hold an edit.
@@ -5147,6 +5410,7 @@ fn finish_decide<'tcx>(
         &coconv,
         &retention,
         &lifetime_eligibility,
+        &mut_facts,
     );
     let arm_requirements =
         derive_arm_requirements(&subjects, &table, &coconv, &raw_boundary, &exposure);
@@ -5192,6 +5456,7 @@ fn finish_decide<'tcx>(
             &coconv,
             &retention,
             &lifetime_eligibility,
+            &mut_facts,
         );
     }
     append_surface_declaration_plans(tcx, &exposure, &mut table);
@@ -5242,6 +5507,8 @@ fn finish_decide<'tcx>(
         final_reverts: String::from("kind\tidentity\tclass_id\n"),
         bridge_events: Vec::new(),
         unsafe_context_events: Vec::new(),
+        mechanical_events: Vec::new(),
+        a5_proof_site_fallback_rows: Vec::new(),
         class_costs: bridge_receipt::class_cost_header(),
         class_collisions: bridge_receipt::class_collision_header(),
         unresolved_classes: bridge_receipt::unresolved_class_header(),
@@ -5606,6 +5873,17 @@ fn derive_arm_requirements(
                     }
             }) {
                 required.insert(Arm::Addr);
+            }
+            if let SubjectKind::Param { hir_index } = subject.kind
+                && table.seams.a5_raw_calls.iter().any(|call| {
+                    call.callee == subject.fn_did
+                        && call
+                            .views
+                            .iter()
+                            .any(|view| view.argument_index == hir_index)
+                })
+            {
+                required.insert(Arm::Pair);
             }
             (key, required)
         })
@@ -7743,13 +8021,17 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
         let callee = tcx.def_path_str(proof.callee.to_def_id());
         let site = sm.span_to_diagnostic_string(proof.span);
         let adapter_key = format!("{caller}=>{callee}#{}@{site}", proof.index);
+        let fallback_template = match &proof.fallback {
+            decision::seam::A5ProofSiteFallback::T2RawView { template, .. } => template.as_str(),
+            _ => proof.candidate_template.as_str(),
+        };
         out.push_str(&format!(
             "overlap-proof\t{callee}\t{}\t{site}\t-\t-\t{caller}\t{}\t{}\t-\t-\t{adapter_key}\t-\tcall-argument\tparam:{}\t-\t-\t{}\t-\t-\t-",
-            proof.reason,
+            proof.fallback.key(),
             proof.index,
-            proof.candidate_template,
+            fallback_template,
             proof.index,
-            proof.candidate_template,
+            fallback_template,
         ));
         push_overlap_columns(&mut out, Some(proof), "-");
     }

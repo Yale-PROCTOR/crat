@@ -8454,6 +8454,7 @@ mod run {
                     drop_form,
                     store_form,
                     c9_mark,
+                    a5_raw_view,
                     lifetime_plan,
                 } = jc;
                 let jp = dir.join(format!("{name}.just.tsv"));
@@ -8465,6 +8466,7 @@ mod run {
                          reroute\t{reroute}\ndrop_form\t{drop_form}\n\
                          store_form\t{store_form}\n\
                          c9_mark\t{c9_mark}\n\
+                         a5_raw_view\t{a5_raw_view}\n\
                          lifetime_plan\t{lifetime_plan}\n\
                          fabricated_len_const\t{fabricated_len_const}\n\
                          subset:seam_adapter_fabricated\t{seam_adapter_fabricated}\n",
@@ -10598,6 +10600,24 @@ mod run {
             crate::bo_rewriter::mechanical_receipt::render_unsafe_context_events(
                 &artifact.unsafe_context_events,
             );
+        let mechanical_summary =
+            crate::bo_rewriter::mechanical_receipt::reconcile_mechanical_obligations(
+                &artifact.mechanical_events,
+            )
+            .expect("mechanical obligation reconciliation");
+        crate::bo_rewriter::mechanical_receipt::reconcile_a5_proof_site_fallback_rows(
+            &artifact.a5_proof_site_fallback_rows,
+            &artifact.mechanical_events,
+        )
+        .expect("A5 proof-site fallback reconciliation");
+        let mechanical_receipts =
+            crate::bo_rewriter::mechanical_receipt::render_mechanical_obligations(
+                &artifact.mechanical_events,
+            );
+        let a5_proof_site_fallback_receipts =
+            crate::bo_rewriter::mechanical_receipt::render_a5_proof_site_fallback_rows(
+                &artifact.a5_proof_site_fallback_rows,
+            );
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
             ("d4-edges", artifact.d4_edges.as_str()),
@@ -10618,6 +10638,7 @@ mod run {
                 "unsafe-context-presentation",
                 unsafe_context_receipts.as_str(),
             ),
+            ("mechanical-obligations", mechanical_receipts.as_str()),
             ("class-costs", artifact.class_costs.as_str()),
             ("class-collisions", artifact.class_collisions.as_str()),
             ("unresolved-classes", artifact.unresolved_classes.as_str()),
@@ -10631,6 +10652,14 @@ mod run {
             )
             .unwrap_or_else(|error| panic!("write raw-boundary {suffix}: {error}"));
         }
+        std::fs::write(
+            directory.join(format!(
+                "{name}.{}",
+                raw_schema::A5_PROOF_SITE_FALLBACK_ROWS
+            )),
+            stamp(&a5_proof_site_fallback_receipts),
+        )
+        .expect("write A5 proof-site fallback receipts");
         let mut diagnostics = String::from(RAW_BOUNDARY_DIAGNOSTIC_HEADER);
         for diagnostic in &capture.reverts {
             diagnostics.push_str(&format!(
@@ -11346,6 +11375,26 @@ mod run {
         row.set(
             raw_schema::UNSAFE_CONTEXT_DROPPED_COUNT,
             unsafe_context_summary.dropped,
+        );
+        row.set(
+            raw_schema::MECHANICAL_OBLIGATION_COUNT,
+            mechanical_summary.obligations,
+        );
+        row.set(
+            raw_schema::MECHANICAL_APPLIED_COUNT,
+            mechanical_summary.applied,
+        );
+        row.set(
+            raw_schema::MECHANICAL_DROPPED_COUNT,
+            mechanical_summary.dropped,
+        );
+        row.set(
+            raw_schema::MECHANICAL_HELD_COUNT,
+            mechanical_summary.held_nonmechanical,
+        );
+        row.set(
+            raw_schema::MECHANICAL_RECLASSIFIED_COUNT,
+            mechanical_summary.reclassified,
         );
         row.set(
             raw_schema::SIGNATURE_CLASS_COUNT,
@@ -20814,6 +20863,8 @@ fn raw_boundary_wave2_preflight() {
         "raw-boundary-subject-index.tsv",
         "raw-boundary-atoms.tsv",
         raw_schema::BRIDGE_RECEIPT_FILE,
+        raw_schema::MECHANICAL_OBLIGATION_ROWS,
+        raw_schema::A5_PROOF_SITE_FALLBACK_ROWS,
         raw_schema::CLASS_COST_ROWS,
         raw_schema::CROSS_CLASS_COLLISION_ROWS,
         raw_schema::UNRESOLVED_CLASS_ROWS,
@@ -22050,6 +22101,11 @@ fn raw_boundary_wave2_corpus_census() {
         raw_schema::BRIDGE_PLANNED_EVENTS,
         raw_schema::BRIDGE_APPLIED_EVENTS,
         raw_schema::BRIDGE_DROPPED_EVENTS,
+        raw_schema::MECHANICAL_OBLIGATION_COUNT,
+        raw_schema::MECHANICAL_APPLIED_COUNT,
+        raw_schema::MECHANICAL_DROPPED_COUNT,
+        raw_schema::MECHANICAL_HELD_COUNT,
+        raw_schema::MECHANICAL_RECLASSIFIED_COUNT,
         raw_schema::SIGNATURE_CLASS_COUNT,
         raw_schema::ATTRIBUTION_HITS_EXACT_EDIT,
         raw_schema::ATTRIBUTION_HITS_EXACT_SEAM,

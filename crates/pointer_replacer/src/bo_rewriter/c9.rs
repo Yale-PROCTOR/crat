@@ -66,10 +66,41 @@ pub(crate) fn render_marked_source(mark: &C9MarkKey, source: &str) -> Result<Str
     Ok(format!("{rendered}{}", &source[close + 1..]))
 }
 
+pub(crate) const A5_RAW_VALUE_PLACEHOLDER: &str = "__crat_a5_raw_value";
+pub(crate) const A5_EXTENT_VALUE_PLACEHOLDER: &str = "__crat_a5_extent_value";
+
 pub(crate) fn render_pair_raw_view_source(
     source: &str,
     temp_stem: &str,
     views: &[(usize, String, String)],
+) -> Result<String, String> {
+    let views = views
+        .iter()
+        .map(|(index, raw_expression, target_type)| {
+            (
+                *index,
+                raw_expression.clone(),
+                target_type.clone(),
+                A5_RAW_VALUE_PLACEHOLDER.to_owned(),
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    render_raw_view_source(source, temp_stem, &views)
+}
+
+pub(crate) fn render_a5_raw_view_source(
+    source: &str,
+    temp_stem: &str,
+    views: &[(usize, String, String, String, Option<String>)],
+) -> Result<String, String> {
+    render_raw_view_source(source, temp_stem, views)
+}
+
+fn render_raw_view_source(
+    source: &str,
+    temp_stem: &str,
+    views: &[(usize, String, String, String, Option<String>)],
 ) -> Result<String, String> {
     let open = source
         .char_indices()
@@ -108,13 +139,30 @@ pub(crate) fn render_pair_raw_view_source(
         )
     })?;
     let mut declarations = Vec::new();
-    for (argument_index, raw_expression, target_type) in views {
+    for (argument_index, raw_expression, target_type, adapted_expression, extent_expression) in
+        views
+    {
         let Some(argument) = arguments.get_mut(*argument_index) else {
             return Err("PAIR raw-view argument is outside the call arity".to_owned());
         };
         let temp = format!("{temp_stem}_{argument_index}");
+        let extent = format!("{temp}_extent");
+        if let Some(expression) = extent_expression {
+            declarations.push(format!("let {extent}: usize = {expression};"));
+        }
         declarations.push(format!("let {temp}: {target_type} = {raw_expression};"));
-        *argument = temp;
+        if adapted_expression.matches(A5_RAW_VALUE_PLACEHOLDER).count() != 1 {
+            return Err("raw-view adapter must name its raw temporary exactly once".to_owned());
+        }
+        let mut adapted = adapted_expression.replace(A5_RAW_VALUE_PLACEHOLDER, &temp);
+        let extent_uses = adapted.matches(A5_EXTENT_VALUE_PLACEHOLDER).count();
+        if extent_expression.is_some() != (extent_uses == 1) {
+            return Err("raw-view adapter extent placeholder mismatch".to_owned());
+        }
+        if extent_uses == 1 {
+            adapted = adapted.replace(A5_EXTENT_VALUE_PLACEHOLDER, &extent);
+        }
+        *argument = adapted;
     }
     Ok(format!(
         "{{ {} {callee}({}) }}{}",
