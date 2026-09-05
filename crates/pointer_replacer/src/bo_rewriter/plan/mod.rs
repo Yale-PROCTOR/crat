@@ -1106,9 +1106,93 @@ pub(crate) struct Plan {
     /// ledgers are materialized from this one carrier after class finalization.
     pub a5_receipt_plans: Vec<super::mechanical_receipt::A5ProofSiteReceiptPlan>,
     pub unowned_a5_proof_sites: usize,
+    /// A5 calls after terminal-interface validation/re-planning. The AST graft
+    /// consumes this sealed plan; it never recomputes the terminal verdict.
+    pub terminal_a5_raw_calls: Vec<super::decision::seam::A5RawViewCall>,
 }
 
 impl Plan {
+    /// Hold exactly one terminally stale owner class, then apply the already
+    /// declared dependency rule and remove every edit belonging to the newly
+    /// held closure. This is class recovery, never a program-level failure.
+    pub(crate) fn hold_terminal_a5_class(&mut self, owner: SignatureClassId, reason: String) {
+        let Some(class) = self.class_finalization.classes.get_mut(&owner) else {
+            return;
+        };
+        let site = ClassSite::dropped(
+            owner,
+            owner,
+            Arm::Pair,
+            "a5-terminal-replan-unavailable",
+            reason.clone(),
+        );
+        class.site_keys.push(site.key.clone());
+        class.edit_keys.push(site.edit_key.clone());
+        class.sites.push(site);
+        class.site_keys.sort_by_key(BridgeSiteKey::receipt_key);
+        class.site_keys.dedup();
+        class.edit_keys.sort();
+        class.edit_keys.dedup();
+        class.sites.sort_by_key(|site| site.key.receipt_key());
+        class.sites.dedup_by(|left, right| left.key == right.key);
+        let mut reasons = class.hold_reasons().to_vec();
+        reasons.push(reason);
+        reasons.sort();
+        reasons.dedup();
+        class.disposition = SignatureClassDisposition::Held(reasons);
+
+        loop {
+            let newly_held = self
+                .class_finalization
+                .classes
+                .iter()
+                .filter(|(_, class)| class.is_ready())
+                .filter_map(|(&id, class)| {
+                    class
+                        .depends_on
+                        .iter()
+                        .copied()
+                        .find(|dependency| {
+                            self.class_finalization
+                                .classes
+                                .get(dependency)
+                                .is_some_and(|dependency| !dependency.is_ready())
+                        })
+                        .map(|dependency| (id, dependency))
+                })
+                .collect::<Vec<_>>();
+            if newly_held.is_empty() {
+                break;
+            }
+            for (id, dependency) in newly_held {
+                self.class_finalization
+                    .classes
+                    .get_mut(&id)
+                    .expect("dependent terminal A5 class exists")
+                    .disposition = SignatureClassDisposition::Held(vec![format!(
+                    "dependency-class-held:{}",
+                    dependency.order_key()
+                )]);
+            }
+        }
+
+        let ready = self
+            .class_finalization
+            .classes
+            .values()
+            .filter(|class| class.is_ready())
+            .map(|class| class.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.by_file.retain(|_, edits| {
+            edits.retain(|edit| edit.owner_class.is_none_or(|class| ready.contains(&class)));
+            !edits.is_empty()
+        });
+        self.attribution_intervals
+            .retain(|site| ready.contains(&site.owner_class));
+        self.terminal_a5_raw_calls
+            .retain(|call| ready.contains(&call.owner_class));
+    }
+
     pub(crate) fn class_hold_reason(&self, class: SignatureClassId) -> Option<String> {
         self.class_finalization
             .classes
@@ -2514,6 +2598,7 @@ pub(crate) fn plan(
         attribution_intervals,
         a5_receipt_plans,
         unowned_a5_proof_sites,
+        terminal_a5_raw_calls: Vec::new(),
     }
 }
 

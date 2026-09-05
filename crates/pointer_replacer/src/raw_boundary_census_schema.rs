@@ -145,6 +145,8 @@ pub(crate) const ATTRIBUTION_HITS_ENCLOSING_REGION: &str =
     "raw_boundary_attribution_hits_enclosing_region";
 pub(crate) const ATTRIBUTION_HITS_UNRESOLVED: &str = "raw_boundary_attribution_hits_unresolved";
 pub(crate) const CLASS_BISECT_PROBES: &str = "raw_boundary_class_bisect_probes";
+pub(crate) const REVERT_FOUND_FORM_LATE_CLASSES: &str =
+    "raw_boundary_revert_found_form_late_classes";
 pub(crate) const VERIFY_WALL_S: &str = "raw_boundary_verify_wall_s";
 pub(crate) const EMIT_BUDGET_S: &str = "raw_boundary_emit_budget_s";
 pub(crate) const PER_ARM_TIMERS_STATUS: &str = "raw_boundary_per_arm_timers_status";
@@ -339,6 +341,7 @@ pub(crate) const ALL: &[&str] = &[
     ATTRIBUTION_HITS_ENCLOSING_REGION,
     ATTRIBUTION_HITS_UNRESOLVED,
     CLASS_BISECT_PROBES,
+    REVERT_FOUND_FORM_LATE_CLASSES,
     VERIFY_WALL_S,
     EMIT_BUDGET_S,
     PER_ARM_TIMERS_STATUS,

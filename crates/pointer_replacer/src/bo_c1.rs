@@ -11424,6 +11424,10 @@ mod run {
             raw_schema::CLASS_BISECT_PROBES,
             artifact.class_bisect_probes,
         );
+        row.set(
+            raw_schema::REVERT_FOUND_FORM_LATE_CLASSES,
+            artifact.revert_found_form_late_classes,
+        );
         row.set(raw_schema::VERIFY_WALL_S, &artifact.verify_wall_s);
         row.set(raw_schema::EMIT_BUDGET_S, &artifact.emit_budget_s);
         row.set(
@@ -22306,6 +22310,7 @@ fn raw_boundary_wave3b_mechanical_schema_is_shared_and_sealed() {
         schema::IO_DOMAIN_MISSING_COUNT,
         schema::IO_DOMAIN_UNEXPECTED_COUNT,
         schema::IO_DOMAIN_DUPLICATE_COUNT,
+        schema::REVERT_FOUND_FORM_LATE_CLASSES,
         schema::UNSAFE_CONTEXT_SITE_COUNT,
         schema::UNSAFE_CONTEXT_INSERTED_COUNT,
         schema::UNSAFE_CONTEXT_OMITTED_COUNT,

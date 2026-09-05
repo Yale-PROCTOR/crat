@@ -230,6 +230,9 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) attribution_hits: AttributionHits,
     pub(crate) signature_class_count: usize,
     pub(crate) class_bisect_probes: usize,
+    /// Classes first reverted in verify rounds >=2 whose diagnostic lies in a
+    /// function reverted during an earlier round.
+    pub(crate) revert_found_form_late_classes: usize,
     pub(crate) class_verify_rounds: usize,
     pub(crate) verify_wall_s: String,
     pub(crate) emit_budget_s: String,
@@ -645,6 +648,28 @@ fn exact_diagnostic_classes(
     _ready_universe: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
 ) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
     exact
+}
+
+pub(crate) fn record_revert_found_form_late_classes<T: Copy + Ord>(
+    round: usize,
+    enclosing: &std::collections::BTreeSet<T>,
+    reverted_before_round: &std::collections::BTreeSet<T>,
+    attributed: &std::collections::BTreeSet<T>,
+    recorded: &mut std::collections::BTreeSet<T>,
+) {
+    if round < 2
+        || !enclosing
+            .iter()
+            .any(|class| reverted_before_round.contains(class))
+    {
+        return;
+    }
+    recorded.extend(
+        attributed
+            .iter()
+            .copied()
+            .filter(|class| !reverted_before_round.contains(class)),
+    );
 }
 
 fn recovery_budget_deferred(projected_probes: f64, probe_secs: f64, budget_secs: f64) -> bool {
@@ -1132,8 +1157,14 @@ fn round_files(
     // verify loop's own end-to-end witnesses, which ARE multi-file, and which
     // it silently collapsed. The corpus emission is unchanged by this: a
     // single-file crate yields a single-entry map either way.
-    let (files, stats, maps) =
-        ast_transform::ast_emitted_files_from(tcx, capture, &reverts, root_key, table)?;
+    let (files, stats, maps) = ast_transform::ast_emitted_files_from(
+        tcx,
+        capture,
+        &reverts,
+        root_key,
+        table,
+        Some(&emission_plan.terminal_a5_raw_calls),
+    )?;
     Ok((files, Vec::new(), stats.files_with_edits, maps))
 }
 
@@ -1341,6 +1372,8 @@ fn verify_and_revert(
     let mut pending_atom_retry: Option<(String, Vec<String>)> = None;
     let mut class_attempts =
         std::collections::BTreeMap::<bridge_receipt::SignatureClassId, usize>::new();
+    let mut revert_found_form_late_classes =
+        std::collections::BTreeSet::<bridge_receipt::SignatureClassId>::new();
     let mut census_captured = false;
     // **ROUND 0 THROUGH THE SWITCH — the FOURTH site** (ruling 2026-08-18).
     //
@@ -1873,6 +1906,26 @@ fn verify_and_revert(
                 .raw_boundary_artifacts
                 .attribution_hits
                 .record(result.rule);
+            if rounds >= 2 {
+                let enclosing = attribute_with_rule(
+                    diagnostic,
+                    &line_maps,
+                    &observed_root,
+                    &facts.emitted_sites,
+                    &[],
+                    &std::collections::BTreeSet::new(),
+                    crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+                );
+                record_revert_found_form_late_classes(
+                    rounds,
+                    &enclosing.classes,
+                    &reverted,
+                    &result.classes,
+                    &mut revert_found_form_late_classes,
+                );
+                facts.raw_boundary_artifacts.revert_found_form_late_classes =
+                    revert_found_form_late_classes.len();
+            }
             attributed.extend(exact_diagnostic_classes(result.classes, &all_ready_classes));
         }
         let newly = attributed
@@ -4375,14 +4428,15 @@ struct PendingA5RawViewCall {
     bridge: bridge_receipt::BridgeSitePlan,
 }
 
-pub(crate) fn terminalized_form(
-    decided: decision::seam::Form,
+pub(crate) fn terminal_interface_form(
+    input: decision::seam::Form,
+    placed: Option<decision::seam::Form>,
     owner_class_live: bool,
 ) -> decision::seam::Form {
     if owner_class_live {
-        decided
+        placed.unwrap_or(input)
     } else {
-        decision::seam::Form::Raw
+        input
     }
 }
 
@@ -4396,14 +4450,19 @@ fn terminal_subject_form(
         .classes
         .get(&class)
         .is_some_and(plan::SignatureClassPlan::is_ready);
-    let decided = table
+    let placed = table
         .entries
         .iter()
         .find(|(subject, _)| subject.fn_did == key.0 && subject.hir_id == key.1)
-        .map_or(decision::seam::Form::Raw, |(_, decision)| {
-            decision::seam::form_of(decision)
+        .and_then(|(_, decision)| match decision {
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => Some(decision::seam::form_of(decision)),
+            decision::Decision::Degraded(_) => None,
         });
-    terminalized_form(decided, live)
+    terminal_interface_form(decision::seam::Form::Raw, placed, live)
 }
 
 fn terminal_parameter_form(
@@ -4416,7 +4475,7 @@ fn terminal_parameter_form(
         .classes
         .get(&bridge_receipt::SignatureClassId::of(callee))
         .is_some_and(plan::SignatureClassPlan::is_ready);
-    let decided = table
+    let placed = table
         .entries
         .iter()
         .find(|(subject, _)| {
@@ -4426,10 +4485,40 @@ fn terminal_parameter_form(
                     decision::SubjectKind::Param { hir_index } if hir_index == argument_index
                 )
         })
-        .map_or(decision::seam::Form::Raw, |(_, decision)| {
-            decision::seam::form_of(decision)
+        .and_then(|(_, decision)| match decision {
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => Some(decision::seam::form_of(decision)),
+            decision::Decision::Degraded(_) => None,
         });
-    terminalized_form(decided, live)
+    terminal_interface_form(decision::seam::Form::Raw, placed, live)
+}
+
+fn canonical_a5_site_matches(
+    canonical: &mechanical_receipt::CanonicalSiteKey,
+    proof: decision::a5_site_proof::A5ProofSiteKey,
+) -> bool {
+    canonical.owner == proof.caller
+        && matches!(
+            &canonical.location,
+            mechanical_receipt::CanonicalLocation::Mir {
+                basic_block,
+                statement_index,
+                terminator: true,
+            } if *basic_block == proof.location.block
+                && usize::try_from(*statement_index).ok() == Some(proof.location.statement_index)
+        )
+        && matches!(
+            &canonical.callee,
+            Some(mechanical_receipt::CanonicalCallee::Local(callee)) if *callee == proof.callee
+        )
+        && canonical
+            .argument_index
+            .and_then(|index| usize::try_from(index).ok())
+            == Some(proof.argument_index)
+        && usize::try_from(canonical.slot_depth).ok() == Some(proof.slot_depth)
 }
 
 /// Plan and apply, **grouped by file**.
@@ -4683,7 +4772,8 @@ pub(crate) fn emit_files<'tcx>(
         });
     }
     plan::finalize_signature_classes(&mut planned, table, reverted);
-    for pending in pending_a5_raw_calls {
+    let mut terminal_a5_raw_calls = Vec::new();
+    for mut pending in pending_a5_raw_calls {
         if !planned
             .class_finalization
             .classes
@@ -4692,6 +4782,8 @@ pub(crate) fn emit_files<'tcx>(
         {
             continue;
         }
+        let mut terminal_views = Vec::new();
+        let mut terminal_hold = None;
         for view in &pending.call.views {
             let terminal_target = terminal_parameter_form(
                 table,
@@ -4699,20 +4791,111 @@ pub(crate) fn emit_files<'tcx>(
                 pending.call.callee,
                 view.argument_index,
             );
-            let terminal_source = view.source_node.map_or(view.found_form, |source| {
-                terminal_subject_form(table, &planned.class_finalization, source)
-            });
-            if terminal_target != view.expected_form || terminal_source != view.found_form {
-                return Err(format!(
-                    "A5 terminal-interface mismatch at {}: planned {}<-{}, terminal {}<-{}",
-                    view.proof_site_key.receipt_key(),
-                    view.expected_form.key(),
-                    view.found_form.key(),
-                    terminal_target.key(),
-                    terminal_source.key(),
-                ));
+            let terminal_subject = view
+                .source_node
+                .map_or(decision::seam::Form::Raw, |source| {
+                    terminal_subject_form(table, &planned.class_finalization, source)
+                });
+            let terminal_source =
+                decision::seam::a5_argument_expression_form(view.argument_shape, terminal_subject)
+                    .unwrap_or(terminal_subject);
+            match decision::seam::replan_a5_raw_view(view, terminal_target, terminal_source) {
+                Ok(mut replanned) => {
+                    if view.source_node.is_some() {
+                        let input_found = decision::seam::a5_argument_expression_form(
+                            view.argument_shape,
+                            decision::seam::Form::Raw,
+                        )
+                        .unwrap_or(decision::seam::Form::Raw);
+                        match decision::seam::replan_a5_raw_view(
+                            &replanned,
+                            terminal_target,
+                            input_found,
+                        ) {
+                            Ok(input) => {
+                                replanned.input_rendering =
+                                    Some(decision::seam::A5RawViewRendering::from_view(&input));
+                            }
+                            Err(_) => {
+                                terminal_hold = Some(format!(
+                                    "a5-terminal-replan-unavailable:planned={}<-{};terminal={}<-{}",
+                                    view.expected_form.key(),
+                                    view.found_form.key(),
+                                    terminal_target.key(),
+                                    input_found.key(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    let mut receipt_matches = 0usize;
+                    for receipt in &mut planned.a5_receipt_plans {
+                        if canonical_a5_site_matches(&receipt.proof_site_key, view.proof_site_key) {
+                            receipt_matches += 1;
+                            receipt.settled_form = replanned.found_form.key().to_owned();
+                            receipt.raw_view_template = replanned.template.clone();
+                        }
+                    }
+                    if receipt_matches != 1 {
+                        return Err(format!(
+                            "A5 terminal receipt identity mismatch at {}: matches={receipt_matches}",
+                            view.proof_site_key.receipt_key(),
+                        ));
+                    }
+                    terminal_views.push(replanned);
+                }
+                Err(_) => {
+                    terminal_hold = Some(format!(
+                        "a5-terminal-replan-unavailable:planned={}<-{};terminal={}<-{}",
+                        view.expected_form.key(),
+                        view.found_form.key(),
+                        terminal_target.key(),
+                        terminal_source.key(),
+                    ));
+                    break;
+                }
             }
         }
+        if let Some(reason) = terminal_hold {
+            for view in &pending.call.views {
+                let mut receipt_matches = 0usize;
+                for receipt in &mut planned.a5_receipt_plans {
+                    if canonical_a5_site_matches(&receipt.proof_site_key, view.proof_site_key) {
+                        receipt_matches += 1;
+                        receipt.obligation.intended_terminal_state =
+                            mechanical_receipt::MechanicalState::HeldNonmechanical;
+                        receipt.obligation.intended_terminal_reason = Some(
+                            mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
+                                reason.clone(),
+                            ),
+                        );
+                    }
+                }
+                if receipt_matches != 1 {
+                    return Err(format!(
+                        "A5 terminal receipt identity mismatch at {}: matches={receipt_matches}",
+                        view.proof_site_key.receipt_key(),
+                    ));
+                }
+            }
+            planned.hold_terminal_a5_class(pending.call.owner_class, reason);
+            continue;
+        }
+        pending.call.views = terminal_views;
+        pending.bridge.expected_form = pending
+            .call
+            .views
+            .iter()
+            .map(|view| view.expected_form.key())
+            .collect::<Vec<_>>()
+            .join(",");
+        pending.bridge.found_form = pending
+            .call
+            .views
+            .iter()
+            .map(|view| view.found_form.key())
+            .collect::<Vec<_>>()
+            .join(",");
         let views = pending
             .call
             .views
@@ -4750,7 +4933,17 @@ pub(crate) fn emit_files<'tcx>(
                 required_arms: "PAIR".to_owned(),
                 edit_kind: "a5-proof-site-raw-view",
             });
+        terminal_a5_raw_calls.push(pending.call);
     }
+    let ready_a5_classes = planned
+        .class_finalization
+        .classes
+        .values()
+        .filter(|class| class.is_ready())
+        .map(|class| class.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    terminal_a5_raw_calls.retain(|call| ready_a5_classes.contains(&call.owner_class));
+    planned.terminal_a5_raw_calls = terminal_a5_raw_calls;
     // **The crate root, asked of the compiler rather than guessed** — not
     // `files()[0]`, which is source-map insertion order, and not the first
     // planned file, which is whichever file happened to hold an edit.
@@ -5520,6 +5713,7 @@ fn finish_decide<'tcx>(
         attribution_hits: AttributionHits::default(),
         signature_class_count: 0,
         class_bisect_probes: 0,
+        revert_found_form_late_classes: 0,
         class_verify_rounds: 0,
         verify_wall_s: "pending".to_owned(),
         emit_budget_s: "900".to_owned(),

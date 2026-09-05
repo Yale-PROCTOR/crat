@@ -44,6 +44,7 @@ pub(super) fn ast_emitted_source_of(input: &str) -> Result<String, String> {
                 &reverts,
                 emission.plan.root_file.as_ref(),
                 &table,
+                Some(&emission.plan.terminal_a5_raw_calls),
             )?;
             files
                 .into_values()
@@ -1523,10 +1524,18 @@ fn the_round_cap_stops_the_loop() {
 /// culprit is the CALLEE, while the error lands inside the caller.
 const INVERTED: &str = "pub unsafe fn callee(p: *mut i32) -> i32 {\n    *p\n}\npub unsafe fn caller(q: *mut i32, r: *mut i32) -> i32 {\n    *q + callee(r)\n}\n";
 
-/// Force `caller`'s `r` to stay raw, so the rewritten `callee` is reached with a
-/// raw pointer. A1's `CallSiteNotAdapted` normally prevents this — which is why
-/// it is injected at the phase boundary rather than written as source.
-fn keep_r_raw(table: &mut super::decision::DecisionTable) {
+const CLS_W2_MIGRATION_RECEIPT: &str = "authority=addendum-204;\
+    witnesses=W3,W4;\
+    corpus=heman:diag-0243:kmMat4Fill->kmMat3Inverse:E0308@lib.rs:543;\
+    old-disposition=bridged:callee(&*r);\
+    injected-breach=stale-zero-syntax-with-input-twin-suppressed;\
+    r204-1=input-twin-is-existing-c-arm-template";
+
+/// Force `caller`'s `r` to stay raw, then suppress exactly the latent input
+/// twin that would now bridge it. This is a between-phase test breach: the
+/// ordinary W3/W4 path correctly emits `callee(&*r)` for the input form.
+fn inject_cls_w2_stale_call_without_input_twin(table: &mut super::decision::DecisionTable) {
+    let mut raw_source = None;
     for (subject, decision) in &mut table.entries {
         // Force the CALLEE to be rewritten — A1 degrades it precisely because
         // its call site is unadapted, which is the guard this injection exists
@@ -1538,6 +1547,7 @@ fn keep_r_raw(table: &mut super::decision::DecisionTable) {
             *decision = super::decision::Decision::Ref { mutable: false };
         }
         if subject.param_name.as_deref() == Some("r") {
+            raw_source = Some((subject.fn_did, subject.hir_id));
             *decision = super::decision::Decision::Degraded(super::decision::Degradation {
                 subject: "caller::r".to_owned(),
                 site: "<injected>".to_owned(),
@@ -1545,6 +1555,17 @@ fn keep_r_raw(table: &mut super::decision::DecisionTable) {
             });
         }
     }
+    let raw_source = raw_source.expect("CLS-W2 raw source identity");
+    let before = table.seams.revert_found_form_edits.len();
+    table
+        .seams
+        .revert_found_form_edits
+        .retain(|edit| edit.source_node != raw_source);
+    assert_eq!(
+        before - table.seams.revert_found_form_edits.len(),
+        1,
+        "CLS-W2 must suppress exactly one W4 input twin: {CLS_W2_MIGRATION_RECEIPT}"
+    );
 }
 
 /// **CLS-W2 — an error in an unedited caller names the converted callee class.**
@@ -1555,13 +1576,22 @@ fn keep_r_raw(table: &mut super::decision::DecisionTable) {
 /// class, so the first round takes back exactly that class and converges
 /// without bisection.
 ///
-/// **Why injection is legitimate here.** This is a DERIVED breach shape, not an
-/// invention: reality emits it (1 of 86 corpus diagnostics, in heman), and A1's
-/// `CallSiteNotAdapted` is exactly what normally prevents it — so it cannot be
-/// written as ordinary source. The between-phase hook exists to test downstream
-/// phases against shapes the upstream guard suppresses.
+/// **Addendum-204 migration.** The old injected raw argument is now correctly
+/// bridged in round 0 by W3/W4. The between-phase hook therefore suppresses
+/// exactly that test site's latent input twin, leaving a stale zero-syntax call
+/// that the dual renderer cannot repair. The callee-owned whole-call interval
+/// remains present, so the control still tests downstream attribution rather
+/// than the bridge matrix. This corresponds to heman `diag-0243` (the E0308 in
+/// `kmMat4Fill` attributed to `kmMat3Inverse`), whose production disposition is
+/// now `bridged`.
+///
+/// R204-1 is unchanged: a real input twin is the existing C-arm template, with
+/// its existing nullability, extent/fallback, and R-B evidence. This test-only
+/// suppression introduces no production template family.
 #[test]
 fn an_unedited_caller_error_reverts_only_converted_callee_class() {
+    assert!(CLS_W2_MIGRATION_RECEIPT.contains("authority=addendum-204"));
+    assert!(CLS_W2_MIGRATION_RECEIPT.contains("old-disposition=bridged"));
     let fixture = Fixture::new(&[
         (
             "lib.rs",
@@ -1569,7 +1599,11 @@ fn an_unedited_caller_error_reverts_only_converted_callee_class() {
         ),
         ("m.rs", INVERTED),
     ]);
-    match super::rewrite_m1_path_injected(&fixture.root(), 8, &keep_r_raw) {
+    match super::rewrite_m1_path_injected(
+        &fixture.root(),
+        8,
+        &inject_cls_w2_stale_call_without_input_twin,
+    ) {
         super::RewriteOutcome::Emitted {
             escalated,
             bisect_probes,
@@ -5959,6 +5993,8 @@ struct E2Attempt {
     fixture: Fixture,
     emission: Emission,
     receipt: String,
+    ast_source: Option<String>,
+    reverted_ast_source: Option<String>,
 }
 
 /// Inject only the form decision, then re-run the SAME seam/body synthesis and
@@ -5996,6 +6032,8 @@ fn e2_attempt(
         fixture,
         emission,
         receipt,
+        ast_source: None,
+        reverted_ast_source: None,
     }
 }
 
@@ -6073,6 +6111,8 @@ fn raw_boundary_attempt_with(
         fixture,
         emission,
         receipt,
+        ast_source: None,
+        reverted_ast_source: None,
     }
 }
 
@@ -6439,6 +6479,14 @@ const A5_POSITIVE_RETENTION: &str = "#![allow(dead_code, unused_unsafe, unused_m
      pub unsafe fn target(a: *mut i32, b: *mut i32) { let _ = *a; HOLD = b; }\n\
      pub unsafe fn caller(p: *mut i32) { target(p, p); }\n";
 
+const A5_TERM_ADDR_OF: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub unsafe fn target(a: *mut u8, b: *const u8) { let _ = *a + *b; }\n\
+     pub unsafe fn caller(data: *mut u8) { target(&mut *data, &*data); }\n";
+
+const REVERT_FOUND_FORM_W4: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+     pub unsafe fn callee(p: *mut i32) { *p += 1; }\n\
+     pub unsafe fn caller(self_0: *mut i32) { callee(self_0); }\n";
+
 fn force_a5_same_form(
     table: &mut super::decision::DecisionTable,
     replacement: super::decision::Decision,
@@ -6467,6 +6515,52 @@ fn force_a5_rb_forms(table: &mut super::decision::DecisionTable) {
             *decision = super::decision::Decision::Ref { mutable: false };
             injected.push((subject.fn_did, subject.hir_id));
         } else if subject.label.ends_with("target::b") {
+            *decision = super::decision::Decision::Ref { mutable: true };
+            injected.push((subject.fn_did, subject.hir_id));
+        }
+    }
+    for key in injected {
+        if let Some(required) = table.arm_requirements.get_mut(&key) {
+            required.remove(super::decision::Arm::C);
+        }
+    }
+}
+
+fn force_a5_term_addr_of_forms(table: &mut super::decision::DecisionTable) {
+    let mut injected = Vec::new();
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("target::a") {
+            *decision = super::decision::Decision::Slice {
+                mutable: true,
+                uses: Vec::new(),
+            };
+            injected.push((subject.fn_did, subject.hir_id));
+        } else if subject.label.ends_with("target::b") {
+            *decision = super::decision::Decision::Slice {
+                mutable: false,
+                uses: Vec::new(),
+            };
+            injected.push((subject.fn_did, subject.hir_id));
+        } else if subject.label.ends_with("caller::data") {
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: subject.label.clone(),
+                site: "<a5-term-w1-injected>".to_owned(),
+                reason: super::decision::DegradeReason::PairRawView,
+            });
+            injected.push((subject.fn_did, subject.hir_id));
+        }
+    }
+    for key in injected {
+        if let Some(required) = table.arm_requirements.get_mut(&key) {
+            required.remove(super::decision::Arm::C);
+        }
+    }
+}
+
+fn force_revert_found_form_w4(table: &mut super::decision::DecisionTable) {
+    let mut injected = Vec::new();
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("callee::p") || subject.label.ends_with("caller::self_0") {
             *decision = super::decision::Decision::Ref { mutable: true };
             injected.push((subject.fn_did, subject.hir_id));
         }
@@ -6566,7 +6660,7 @@ fn e3_attempt_with(
     attested: bool,
     inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
 ) -> E2Attempt {
-    e3_attempt_with_mutability(src, attested, inject, false)
+    e3_attempt_with_mutability(src, attested, inject, &|_| {}, None, false)
 }
 
 fn e3_attempt_with_foster(
@@ -6574,17 +6668,55 @@ fn e3_attempt_with_foster(
     attested: bool,
     inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
 ) -> E2Attempt {
-    e3_attempt_with_mutability(src, attested, inject, true)
+    e3_attempt_with_mutability(src, attested, inject, &|_| {}, None, true)
+}
+
+fn e3_attempt_with_foster_post(
+    src: &str,
+    attested: bool,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+    post_synthesize: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> E2Attempt {
+    e3_attempt_with_mutability(src, attested, inject, post_synthesize, None, true)
+}
+
+fn e3_attempt_with_post(
+    src: &str,
+    attested: bool,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+    post_synthesize: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> E2Attempt {
+    e3_attempt_with_mutability(src, attested, inject, post_synthesize, None, false)
+}
+
+fn e3_attempt_with_runtime_revert(
+    src: &str,
+    attested: bool,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+    reverted_subject_suffix: &'static str,
+) -> E2Attempt {
+    e3_attempt_with_mutability(
+        src,
+        attested,
+        inject,
+        &|_| {},
+        Some(reverted_subject_suffix),
+        false,
+    )
 }
 
 fn e3_attempt_with_mutability(
     src: &str,
     attested: bool,
     inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+    post_synthesize: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+    reverted_subject_suffix: Option<&'static str>,
     use_foster: bool,
 ) -> E2Attempt {
     let fixture = Fixture::new(&[("lib.rs", src)]);
-    let (emission, receipt) = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+    let (emission, receipt, ast_source, reverted_ast_source) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("wave-3 AST capture");
         let attestation = attested.then_some(
             crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         );
@@ -6632,6 +6764,7 @@ fn e3_attempt_with_mutability(
                 &ctx.lifetime_eligibility,
             )
         };
+        post_synthesize(&mut table);
         let receipt = super::seam_tsv_from_table(tcx, &table);
         let emission = emit_files(
             tcx,
@@ -6640,13 +6773,70 @@ fn e3_attempt_with_mutability(
             &ctx.retained_c9_plans,
         )
         .expect("wave-3 attempted emission");
-        (emission, receipt)
+        let held = emission.plan.held_classes();
+        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+            &held,
+            &std::collections::BTreeSet::new(),
+            &table,
+        )
+        .expect("wave-3 terminal revert set");
+        let (ast_files, _, _) = super::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_a5_raw_calls),
+        )
+        .expect("wave-3 AST emission from sealed A5 plan");
+        let ast_source = emission
+            .plan
+            .root_file
+            .as_ref()
+            .and_then(|root| ast_files.get(root))
+            .cloned()
+            .expect("wave-3 AST root source");
+        let reverted_ast_source = reverted_subject_suffix.map(|suffix| {
+            let reverted_owner = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with(suffix))
+                .map(|(subject, _)| super::bridge_receipt::SignatureClassId::of(subject.fn_did))
+                .expect("runtime-reverted fixture subject");
+            let mut runtime_held = held.clone();
+            runtime_held.insert(reverted_owner);
+            let runtime_reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+                &runtime_held,
+                &std::collections::BTreeSet::new(),
+                &table,
+            )
+            .expect("runtime-reverted fixture set");
+            let (runtime_files, _, _) = super::ast_transform::ast_emitted_files_from(
+                tcx,
+                &capture,
+                &runtime_reverts,
+                emission.plan.root_file.as_ref(),
+                &table,
+                Some(&emission.plan.terminal_a5_raw_calls),
+            )
+            .expect("runtime-reverted AST emission");
+            emission
+                .plan
+                .root_file
+                .as_ref()
+                .and_then(|root| runtime_files.get(root))
+                .cloned()
+                .expect("runtime-reverted AST root source")
+        });
+        (emission, receipt, ast_source, reverted_ast_source)
     })
     .expect("wave-3 fixture compiles before rewriting");
     E2Attempt {
         fixture,
         emission,
         receipt,
+        ast_source: Some(ast_source),
+        reverted_ast_source,
     }
 }
 
@@ -6961,6 +7151,8 @@ fn inv_w1_non_subject_mir_call_is_bridged_or_holds_the_class() {
         fixture,
         emission,
         receipt,
+        ast_source: None,
+        reverted_ast_source: None,
     };
     let source = text_for(&attempt.emission, "lib.rs")
         .cloned()
@@ -7095,6 +7287,8 @@ fn d1_w1_base_parameter_callee_requires_each_mir_call_site() {
         fixture,
         emission,
         receipt,
+        ast_source: None,
+        reverted_ast_source: None,
     };
     let held = attempt
         .emission
@@ -9727,6 +9921,7 @@ fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
                     &super::ast_transform::RevertSet::default(),
                     None,
                     &table,
+                    None,
                 )?;
                 let provenance =
                     crate::analyses::borrow_ownership::model_cache::last_solve()
@@ -9785,6 +9980,7 @@ fn e2_n5_two_roots_share_plan_receipts_and_unowned_source_bytes() {
                 &super::ast_transform::RevertSet::default(),
                 None,
                 &table,
+                None,
             )?;
             let emitted = files
                 .values()
@@ -10105,7 +10301,12 @@ fn a5_w1_proof_site_absent_from_pair_inventory_uses_t2_raw_view() {
         attempt.receipt
     );
     let source = e2_root_text(&attempt);
-    assert!(source.contains("let __crat_a5_raw_"), "{source}");
+    assert!(
+        source.contains("let __crat_a5_raw_"),
+        "{source}\nreceipt={}\nterminal={:#?}",
+        attempt.receipt,
+        attempt.emission.plan.terminal_a5_raw_calls,
+    );
     assert!(
         source.contains("core::slice::from_raw_parts_mut"),
         "{source}"
@@ -10235,13 +10436,273 @@ fn a5_w1_r_b_and_positive_retention_reclassify_under_their_own_evidence() {
     );
 }
 
+/// A5-TERM-W1 (addendum 201): the argument-expression form of an address-of
+/// remains a reference even when its root subject is class-less and remains
+/// raw. The terminal guard must re-run the shape derivation, not substitute the
+/// root subject's form and abort the whole program.
+#[test]
+fn a5_term_w1_addr_of_classless_source_emits() {
+    let attempt = e3_attempt_with(A5_TERM_ADDR_OF, true, &force_a5_term_addr_of_forms);
+    let source = e2_root_text(&attempt);
+    assert!(
+        !attempt.emission.plan.terminal_a5_raw_calls.is_empty(),
+        "source={source}\nreceipt={}\nclasses={:#?}",
+        attempt.receipt,
+        attempt.emission.plan.class_finalization,
+    );
+    assert!(
+        attempt
+            .emission
+            .plan
+            .terminal_a5_raw_calls
+            .iter()
+            .flat_map(|call| &call.views)
+            .any(|view| {
+                matches!(view.argument_shape, "addr-of" | "addr-of-mut")
+                    && matches!(view.found_form, super::decision::seam::Form::Ref { .. })
+            }),
+        "{:#?}",
+        attempt.emission.plan.terminal_a5_raw_calls,
+    );
+    let (events, rows) = attempt
+        .emission
+        .plan
+        .mechanical_receipts(&std::collections::BTreeSet::new());
+    assert!(
+        super::mechanical_receipt::reconcile_mechanical_obligations(&events)
+            .expect("W1 receipt reconciliation")
+            .applied
+            > 0
+    );
+    assert!(rows.iter().any(|row| {
+        row.argument_shape.starts_with("addr-of")
+            && row.terminal.stage == super::mechanical_receipt::MechanicalStage::Terminal
+            && row.terminal.state == super::mechanical_receipt::MechanicalState::Applied
+    }));
+    let ast_source = attempt.ast_source.as_deref().expect("W1 AST source");
+    assert!(ast_source.contains("let __crat_a5_raw_"), "{ast_source}");
+}
+
+/// A5-TERM-W2 (addendum 201): a view planned from a safe bare local can see a
+/// raw terminal source after its source class is held. The site must re-plan
+/// through raw passthrough and the existing raw-to-safe template, or hold only
+/// its owner class; it may never return a program-level emission error.
+#[test]
+fn a5_term_w2_held_bare_local_replans_or_holds_owner_class() {
+    let attempt = e3_attempt_with_post(
+        E3_OVERLAP,
+        true,
+        &|table| {
+            force_a5_same_form(
+                table,
+                super::decision::Decision::Slice {
+                    mutable: true,
+                    uses: Vec::new(),
+                },
+            );
+        },
+        &|table| {
+            let caller = table
+                .entries
+                .iter_mut()
+                .find(|(subject, _)| subject.label.ends_with("caller::p"))
+                .map(|(subject, decision)| {
+                    *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                        subject: subject.label.clone(),
+                        site: "<a5-term-w2-held-after-plan>".to_owned(),
+                        reason: super::decision::DegradeReason::PairRawView,
+                    });
+                    subject.fn_did
+                })
+                .expect("W2 caller subject");
+            // Fixture receipt: isolate terminal re-planning from the separate
+            // generated/interface dependency rule. Production dependencies
+            // remain untouched.
+            table
+                .seams
+                .interface_dependencies
+                .retain(|(_, dependency)| dependency.local_def_id() != caller);
+        },
+    );
+    let source = e2_root_text(&attempt);
+    let replanned = attempt
+        .emission
+        .plan
+        .terminal_a5_raw_calls
+        .iter()
+        .flat_map(|call| &call.views)
+        .find(|view| view.found_form == super::decision::seam::Form::Raw);
+    let held_reason = attempt
+        .emission
+        .plan
+        .class_finalization
+        .classes
+        .values()
+        .flat_map(|class| class.hold_reasons())
+        .any(|reason| reason.starts_with("a5-terminal-replan-unavailable:"));
+    assert!(
+        replanned.is_some_and(|view| {
+            view.template.starts_with("raw-passthrough->c-raw-")
+                && view.adapted_expression.contains("from_raw_parts_mut")
+        }) || held_reason,
+        "source={source}\nplan={:#?}",
+        attempt.emission.plan.class_finalization,
+    );
+    if let Some(view) = replanned {
+        assert_eq!(
+            view.expected_form,
+            super::decision::seam::Form::Slice { mutable: true }
+        );
+        let (events, rows) = attempt
+            .emission
+            .plan
+            .mechanical_receipts(&std::collections::BTreeSet::new());
+        assert!(
+            super::mechanical_receipt::reconcile_mechanical_obligations(&events)
+                .expect("W2 receipt reconciliation")
+                .applied
+                > 0
+        );
+        assert!(rows.iter().any(|row| {
+            row.raw_view_template.starts_with("raw-passthrough->c-raw-")
+                && row.retention
+                    == super::mechanical_receipt::MechanicalRetention::T2 {
+                        waiver_id: super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
+                    }
+        }));
+        let ast_source = attempt.ast_source.as_deref().expect("W2 AST source");
+        assert!(ast_source.contains("let __crat_a5_raw_"), "{ast_source}");
+        assert!(
+            ast_source.contains("core::slice::from_raw_parts_mut"),
+            "{ast_source}"
+        );
+    }
+}
+
+#[test]
+fn a5_term_w2_unavailable_replan_holds_only_the_owner_class() {
+    let attempt = e3_attempt_with_foster_post(A5_RB_OVERLAP, true, &force_a5_rb_forms, &|table| {
+        for call in &mut table.seams.a5_raw_calls {
+            for view in &mut call.views {
+                view.negative_write = None;
+            }
+        }
+    });
+    let reasons = attempt
+        .emission
+        .plan
+        .class_finalization
+        .classes
+        .values()
+        .flat_map(|class| class.hold_reasons())
+        .filter(|reason| reason.starts_with("a5-terminal-replan-unavailable:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons.len(),
+        1,
+        "{:#?}",
+        attempt.emission.plan.class_finalization
+    );
+    assert!(reasons[0].contains("planned=ref-mut<-ref-shared"));
+    assert!(reasons[0].contains("terminal=ref-mut<-ref-shared"));
+    let (events, _) = attempt
+        .emission
+        .plan
+        .mechanical_receipts(&std::collections::BTreeSet::new());
+    assert!(events.iter().any(|event| {
+        event.stage == super::mechanical_receipt::MechanicalStage::Terminal
+            && event.state == super::mechanical_receipt::MechanicalState::HeldNonmechanical
+            && matches!(
+                &event.terminal_reason,
+                Some(super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
+                    reason
+                )) if reason.starts_with("a5-terminal-replan-unavailable:")
+            )
+    }));
+}
+
+/// REVERT-FOUND-FORM W4 (addendum 202): after a standing caller failure
+/// reverts that function, a surviving safe callee consumes the input-form
+/// rendering captured with the original zero-syntax safe/safe seam.
+#[test]
+fn revert_found_form_w4_reverted_caller_uses_raw_to_safe_twin() {
+    let attempt = e3_attempt_with_runtime_revert(
+        REVERT_FOUND_FORM_W4,
+        true,
+        &force_revert_found_form_w4,
+        "caller::self_0",
+    );
+    let source = attempt
+        .reverted_ast_source
+        .as_deref()
+        .expect("W4 round-2 source");
+    assert!(source.contains("fn callee(p: &mut i32)"), "{source}");
+    assert!(source.contains("fn caller(self_0: *mut i32)"), "{source}");
+    assert!(source.contains("callee(&mut *self_0)"), "{source}");
+}
+
+/// REVERT-FOUND-FORM W5: sealed A5 views select their input-form twin when the
+/// source subject is reverted; a stale safe-source renderer must not survive.
+#[test]
+fn revert_found_form_w5_reverted_a5_source_uses_input_twin() {
+    let attempt = e3_attempt_with_runtime_revert(
+        E3_OVERLAP,
+        true,
+        &|table| {
+            force_a5_same_form(
+                table,
+                super::decision::Decision::Slice {
+                    mutable: true,
+                    uses: Vec::new(),
+                },
+            );
+        },
+        "caller::p",
+    );
+    let source = attempt
+        .reverted_ast_source
+        .as_deref()
+        .expect("W5 round-2 source");
+    assert!(source.contains("fn caller(p: *mut i32)"), "{source}");
+    assert!(source.contains("let __crat_a5_raw_"), "{source}");
+    assert!(source.contains(" = p;"), "{source}");
+    assert!(source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
+    assert!(!source.contains("p.as_mut_ptr()"), "{source}");
+}
+
+#[test]
+fn revert_found_form_round2_metric_is_identity_deduplicated() {
+    let prior = std::collections::BTreeSet::from([1_u32]);
+    let enclosing = std::collections::BTreeSet::from([1_u32]);
+    let attributed = std::collections::BTreeSet::from([2_u32]);
+    let mut recorded = std::collections::BTreeSet::new();
+    super::record_revert_found_form_late_classes(1, &enclosing, &prior, &attributed, &mut recorded);
+    assert!(recorded.is_empty(), "round 1 is not a late revert");
+    super::record_revert_found_form_late_classes(2, &enclosing, &prior, &attributed, &mut recorded);
+    super::record_revert_found_form_late_classes(3, &enclosing, &prior, &attributed, &mut recorded);
+    assert_eq!(
+        recorded, attributed,
+        "the per-program metric is a class set"
+    );
+}
+
 #[test]
 fn a1_terminal_interface_accessor_never_exposes_a_held_decided_form() {
+    let input = super::decision::seam::Form::Ref { mutable: false };
     let decided = super::decision::seam::Form::Slice { mutable: true };
-    assert_eq!(super::terminalized_form(decided, true), decided);
     assert_eq!(
-        super::terminalized_form(decided, false),
-        super::decision::seam::Form::Raw,
+        super::terminal_interface_form(input, Some(decided), true),
+        decided,
+        "a placed subject in a live class exposes its placed form"
+    );
+    assert_eq!(
+        super::terminal_interface_form(input, None, true),
+        input,
+        "an unplaced subject in a live class exposes its input form"
+    );
+    assert_eq!(
+        super::terminal_interface_form(input, Some(decided), false),
+        input,
         "a held class exposes its unmodified input interface, not the decided one"
     );
 }
@@ -11136,7 +11597,12 @@ fn d3_w1_generated_inner_use_depends_on_ready_defining_class() {
                 &table,
             )?;
             let (files, _, _) = super::ast_transform::ast_emitted_files_from(
-                tcx, &capture, &reverts, None, &table,
+                tcx,
+                &capture,
+                &reverts,
+                None,
+                &table,
+                Some(&emission.plan.terminal_a5_raw_calls),
             )?;
             let emitted = files
                 .values()

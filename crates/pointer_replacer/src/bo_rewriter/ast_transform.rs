@@ -1614,6 +1614,26 @@ impl SeamTarget {
         }
     }
 
+    fn of_input(
+        input: &super::decision::seam::SeamInputRendering,
+        arg_span: rustc_span::Span,
+        exact_use_composition: bool,
+    ) -> Option<Self> {
+        use super::decision::seam::{SeamFamily, SeamInputRendering};
+        let SeamInputRendering::Adapter { spec, family, .. } = input else {
+            return None;
+        };
+        Some(Self {
+            spec: spec.clone(),
+            arg_span,
+            reborrow: match family {
+                SeamFamily::Reborrow => true,
+                SeamFamily::Safe => false,
+            },
+            exact_use_composition,
+        })
+    }
+
     fn of_body(edit: &super::decision::seam::BodyEdit) -> Self {
         use super::decision::seam::SeamFamily;
         Self {
@@ -1952,6 +1972,7 @@ struct PairRawGraftVisitor<'a> {
 
 struct A5RawGraftVisitor<'a> {
     calls: &'a FxHashMap<(u32, u32), &'a super::decision::seam::A5RawViewCall>,
+    reverts: &'a RevertSet,
     guard: &'a mut Composition,
     consumed: FxHashSet<(u32, u32)>,
     failure: Option<String>,
@@ -1977,17 +1998,47 @@ impl MutVisitor for A5RawGraftVisitor<'_> {
         }
         rustc_ast::mut_visit::walk_expr(self, expression);
         let source = rustc_ast_pretty::pprust::expr_to_string(expression);
+        for view in &call.views {
+            if view
+                .source_node
+                .is_some_and(|(owner, hir)| !self.reverts.keeps_subject(owner, hir))
+                && view.input_rendering.is_none()
+            {
+                self.failure = Some(format!(
+                    "A5 input-form rendering unavailable at {}",
+                    view.proof_site_key.receipt_key(),
+                ));
+                return;
+            }
+        }
         let views = call
             .views
             .iter()
             .map(|view| {
-                (
-                    view.argument_index,
-                    view.raw_expression.clone(),
-                    view.target_type.clone(),
-                    view.adapted_expression.clone(),
-                    view.extent_expression.clone(),
-                )
+                let input = view
+                    .source_node
+                    .is_some_and(|(owner, hir)| !self.reverts.keeps_subject(owner, hir));
+                if input {
+                    let rendering = view
+                        .input_rendering
+                        .as_ref()
+                        .expect("A5 input rendering checked above");
+                    (
+                        view.argument_index,
+                        rendering.raw_expression.clone(),
+                        rendering.target_type.clone(),
+                        rendering.adapted_expression.clone(),
+                        rendering.extent_expression.clone(),
+                    )
+                } else {
+                    (
+                        view.argument_index,
+                        view.raw_expression.clone(),
+                        view.target_type.clone(),
+                        view.adapted_expression.clone(),
+                        view.extent_expression.clone(),
+                    )
+                }
             })
             .collect::<Vec<_>>();
         let stem = format!("__crat_a5_raw_{}", call.call_span.lo().0);
@@ -2416,7 +2467,7 @@ fn transform_inner(
 > {
     let capture = capture_ast(tcx)?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    transform_with(&capture, &table, reverts)
+    transform_with(&capture, &table, reverts, None)
 }
 
 fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Result<String, String> {
@@ -2841,6 +2892,7 @@ fn transform_with(
     capture: &AstCapture,
     table: &super::decision::DecisionTable,
     reverts: &RevertSet,
+    terminal_a5_raw_calls: Option<&[super::decision::seam::A5RawViewCall]>,
 ) -> Result<
     (
         RefDeclStats,
@@ -3051,51 +3103,11 @@ fn transform_with(
     seams.len_fabricated += box_fabricated;
 
     let mut a5_raw_calls = FxHashMap::default();
-    for call in table
-        .seams
-        .a5_raw_calls
+    for call in terminal_a5_raw_calls
+        .unwrap_or(&table.seams.a5_raw_calls)
         .iter()
         .filter(|call| reverts.keeps(call.owner_class))
     {
-        for view in &call.views {
-            let decided_target = table
-                .entries
-                .iter()
-                .find(|(subject, _)| {
-                    subject.fn_did == call.callee
-                        && matches!(
-                            subject.kind,
-                            super::decision::SubjectKind::Param { hir_index }
-                                if hir_index == view.argument_index
-                        )
-                })
-                .map_or(super::decision::seam::Form::Raw, |(_, decision)| {
-                    super::decision::seam::form_of(decision)
-                });
-            let terminal_target =
-                super::terminalized_form(decided_target, reverts.keeps(call.owner_class));
-            let terminal_source = view.source_node.map_or(view.found_form, |source| {
-                let live = reverts.keeps(super::bridge_receipt::SignatureClassId::of(source.0));
-                let decided = table
-                    .entries
-                    .iter()
-                    .find(|(subject, _)| subject.fn_did == source.0 && subject.hir_id == source.1)
-                    .map_or(super::decision::seam::Form::Raw, |(_, decision)| {
-                        super::decision::seam::form_of(decision)
-                    });
-                super::terminalized_form(decided, live)
-            });
-            if terminal_target != view.expected_form || terminal_source != view.found_form {
-                return Err(format!(
-                    "A5 terminal-interface mismatch at {}: planned {}<-{}, terminal {}<-{}",
-                    view.proof_site_key.receipt_key(),
-                    view.expected_form.key(),
-                    view.found_form.key(),
-                    terminal_target.key(),
-                    terminal_source.key(),
-                ));
-            }
-        }
         let key = (call.call_span.lo().0, call.call_span.hi().0);
         if a5_raw_calls.insert(key, call).is_some() {
             return Err(format!(
@@ -3106,6 +3118,7 @@ fn transform_with(
     }
     let mut a5_raw = A5RawGraftVisitor {
         calls: &a5_raw_calls,
+        reverts,
         guard: &mut guard,
         consumed: FxHashSet::default(),
         failure: None,
@@ -3343,6 +3356,9 @@ pub(crate) fn ast_emitted_files_from(
     // table, the re-derived one never saw the injection, and the AST layer
     // emitted a program without the very edit the test exists to break on.
     table: &super::decision::DecisionTable,
+    // Sealed by `emit_files` after class finalization. Production always
+    // supplies it; `None` is retained for isolated AST-layer parity tests.
+    terminal_a5_raw_calls: Option<&[super::decision::seam::A5RawViewCall]>,
 ) -> Result<
     (
         std::collections::BTreeMap<super::plan::FileKey, String>,
@@ -3352,7 +3368,8 @@ pub(crate) fn ast_emitted_files_from(
     ),
     String,
 > {
-    let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, table, reverts)?;
+    let (_, _, seams, _, _, _, _, krate, edited) =
+        transform_with(capture, table, reverts, terminal_a5_raw_calls)?;
     let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
     let (mut files, stats, maps) =
         super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&edited));
@@ -3379,7 +3396,7 @@ pub(crate) fn ast_emitted_source_from(
     reverts: &RevertSet,
 ) -> Result<(String, super::ast_bridge::SubstStats), String> {
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, &table, reverts)?;
+    let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, &table, reverts, None)?;
     let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
     let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate, Some(&edited));
     // **The fabricated-extent const** (marker ruling, 2026-08-15): emitted when
@@ -3965,12 +3982,36 @@ pub(crate) fn filtered_inputs(
         }
         let key = (edit.span.lo().0, edit.span.hi().0);
         let exact_use_composition = out.uses.contains_key(&key);
-        insert_counting(
-            &mut out.seams,
-            key,
-            SeamTarget::of(edit, exact_use_composition),
-            &mut out.seam_key_collisions,
-        );
+        let input_selected = edit
+            .source_node
+            .is_some_and(|(owner, hir)| !reverts.keeps_subject(owner, hir));
+        let target = if input_selected {
+            let Some(input) = edit.input_rendering.as_ref() else {
+                continue;
+            };
+            let Some(target) = SeamTarget::of_input(input, edit.arg_span, exact_use_composition)
+            else {
+                continue;
+            };
+            target
+        } else {
+            SeamTarget::of(edit, exact_use_composition)
+        };
+        insert_counting(&mut out.seams, key, target, &mut out.seam_key_collisions);
+    }
+    for edit in &table.seams.revert_found_form_edits {
+        if !reverts.keeps(edit.owner_class)
+            || reverts.keeps_subject(edit.source_node.0, edit.source_node.1)
+        {
+            continue;
+        }
+        let key = (edit.span.lo().0, edit.span.hi().0);
+        let exact_use_composition = out.uses.contains_key(&key);
+        let Some(target) = SeamTarget::of_input(&edit.input, edit.arg_span, exact_use_composition)
+        else {
+            continue;
+        };
+        insert_counting(&mut out.seams, key, target, &mut out.seam_key_collisions);
     }
     for edit in &table.seams.body_edits {
         if !reverts.keeps(edit.owner_class) {
@@ -4289,7 +4330,7 @@ pub(crate) fn edit_dump(
     };
 
     // ---- AST layer -------------------------------------------------------
-    let (_, _, _, _, _, _, _, krate, edited) = transform_with(&capture, &table, &reverts)?;
+    let (_, _, _, _, _, _, _, krate, edited) = transform_with(&capture, &table, &reverts, None)?;
     let spans: Vec<rustc_span::Span> = edited.iter().map(|(sp, _)| *sp).collect();
     let (files, stats, _) = super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&spans));
     let _ = writeln!(
@@ -6587,6 +6628,8 @@ mod arm2_witnesses {
                 arg_span: DUMMY_SP,
                 expected: super::super::decision::seam::Form::Ref { mutable: true },
                 found: super::super::decision::seam::Form::Raw,
+                source_node: None,
+                input_rendering: None,
                 root_identity: "f::p".to_owned(),
                 blind: false,
                 overlap: None,
