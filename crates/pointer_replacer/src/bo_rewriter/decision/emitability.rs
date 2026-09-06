@@ -1413,7 +1413,15 @@ pub(crate) fn collect_opt_uses(
                 {
                     return; // the destination-owned RHS operation is above
                 }
-                if self.raw_boundary_arguments.contains(&(
+                // A boundary on `(*p).field` owns the projected pointer value.
+                // Evaluating that value still requires opening the Option at
+                // `p`; leave its one native use edit beneath the outer adapter.
+                let dereferences_root = matches!(
+                    self.tcx.parent_hir_node(expr.hir_id),
+                    rustc_hir::Node::Expr(parent)
+                        if matches!(parent.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                );
+                let deferred = self.raw_boundary_arguments.contains(&(
                     self.fn_did,
                     hir_id,
                     expr.span.lo().0,
@@ -1423,7 +1431,8 @@ pub(crate) fn collect_opt_uses(
                     hir_id,
                     expr.span.lo().0,
                     expr.span.hi().0,
-                )) {
+                ));
+                if deferred && !dereferences_root {
                     let entry = self.out.entry(key).or_default();
                     entry.non_test_uses += 1;
                     entry.sites.push(OptUseSite {

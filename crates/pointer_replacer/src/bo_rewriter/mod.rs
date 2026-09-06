@@ -98,6 +98,12 @@ mod goldens;
 #[cfg(test)]
 mod import_denylist;
 #[cfg(test)]
+mod option_projection_tests;
+#[cfg(test)]
+mod r216_boundary_tests;
+#[cfg(test)]
+mod revert_input_tests;
+#[cfg(test)]
 mod slice_use_inventory_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -886,7 +892,7 @@ fn rewrite_core_injected_with_config(
             // the plan defect it reports was undiagnosable from the row that
             // reported it. Each rollback now names its owner and byte range.
             return Err(format!(
-                "apply rolled back {} edit(s): [{}]",
+                "apply-invariant: unresolved rollback after owner recovery: {} edit(s): [{}]",
                 emission.rollbacks.len(),
                 emission
                     .rollbacks
@@ -1170,6 +1176,49 @@ fn round_files(
         table,
         Some(&emission_plan.terminal_a5_raw_calls),
     )?;
+    if !emission_plan.class_finalization.classes.is_empty()
+        && emission_plan
+            .class_finalization
+            .classes
+            .keys()
+            .all(|owner| withheld.contains(owner))
+    {
+        // Reverting every class is an identity invariant, not an alternative
+        // rendering path. Compare the actual candidate with source-map bytes
+        // for the pristine capture's file universe after rendering it.
+        let mut spans = Vec::new();
+        ast_bridge::collect_fn_spans(&capture.krate.items, &mut spans);
+        let mut original = std::collections::BTreeMap::new();
+        for span in spans {
+            let source = tcx.sess.source_map().lookup_source_file(span.lo());
+            if let (Some(key), Some(text)) = (file_key(&source.name), source.src.as_ref()) {
+                original.insert(key, text.to_string());
+            }
+        }
+        if files != original {
+            let owners = table
+                .entries
+                .iter()
+                .filter(|(subject, _)| {
+                    !withheld.contains(&bridge_receipt::SignatureClassId::of(subject.fn_did))
+                })
+                .map(|(subject, _)| tcx.def_path_str(subject.fn_did.to_def_id()))
+                .collect::<std::collections::BTreeSet<_>>();
+            let owner = if owners.is_empty() {
+                "unowned".to_owned()
+            } else {
+                owners.into_iter().collect::<Vec<_>>().join(",")
+            };
+            let changed = original
+                .keys()
+                .chain(files.keys())
+                .filter(|key| original.get(*key) != files.get(*key))
+                .collect::<std::collections::BTreeSet<_>>();
+            return Err(format!(
+                "revert-all-input-mismatch:{owner}:files={changed:?}"
+            ));
+        }
+    }
     Ok((files, Vec::new(), stats.files_with_edits, maps))
 }
 
@@ -4239,6 +4288,20 @@ pub(crate) fn validate_plan(
     // subject that justifies it has not been taken back.
     let mut kept_by_file: std::collections::BTreeMap<plan::FileKey, Vec<plan::Edit>> =
         planned.by_file.clone();
+    let held = planned.held_classes();
+    for edits in kept_by_file.values_mut() {
+        edits.retain(|edit| edit.owner_class.is_none_or(|owner| !held.contains(&owner)));
+        // Exact duplicate edits have one semantic effect and one owner.
+        // Keep their first occurrence; differing replacements still reach the
+        // owned-conflict path rather than selecting an arbitrary winner.
+        let mut unique = Vec::new();
+        for edit in std::mem::take(edits) {
+            if !unique.contains(&edit) {
+                unique.push(edit);
+            }
+        }
+        *edits = unique;
+    }
     // **The fabricated-extent const is DERIVED FROM THE SURVIVORS** (marker
     // ruling, 2026-08-15), which is why it is computed here and not in `plan`:
     // this is the one place that knows which adapters a given revert set
@@ -4329,9 +4392,22 @@ pub(crate) fn validate_plan(
 fn composed_by_slice_constructor(edits: &[plan::Edit], inner_index: usize) -> bool {
     let inner = &edits[inner_index];
     edits.iter().enumerate().any(|(outer_index, outer)| {
+        let slice =
+            outer.edit_kind == "slice-local-construction" && outer.owner_class == inner.owner_class;
+        let option = outer
+            .bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.bridge_kind == "option-value-composed")
+            && inner
+                .bridge
+                .as_ref()
+                .is_none_or(|bridge| bridge.bridge_kind != "option-value-composed")
+            && matches!(
+                inner.justification,
+                plan::Justification::KindDecision { .. } | plan::Justification::SeamAdapter { .. }
+            );
         outer_index != inner_index
-            && outer.edit_kind == "slice-local-construction"
-            && outer.owner_class == inner.owner_class
+            && (slice || option)
             && outer.lo <= inner.lo
             && inner.hi <= outer.hi
     })
@@ -4559,10 +4635,12 @@ fn validate_terminal_option_calls(
     loop {
         let mut holds = std::collections::BTreeMap::<_, Vec<String>>::new();
         for receipt in &mut planned.option_receipt_plans {
-            if !matches!(
-                receipt.operation.as_str(),
-                "call-required" | "call-optional"
-            ) {
+            if receipt.obligation.intended_terminal_state == MechanicalState::Reclassified
+                || !matches!(
+                    receipt.operation.as_str(),
+                    "call-required" | "call-optional"
+                )
+            {
                 continue;
             }
             let site = &receipt.obligation.planned.key.site;
@@ -4685,6 +4763,29 @@ pub(crate) fn emit_files<'tcx>(
     reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
     retained_c9_plans: &[PlannedC9Mark],
 ) -> Result<Emission, String> {
+    prepare_plan_files(tcx, table, reverted, retained_c9_plans)
+}
+
+/// Pure planning, class finalization and structural validation shared with
+/// additive-family preflight. The AST is emitted only through round_files.
+fn prepare_plan_files<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    table: &decision::DecisionTable,
+    reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
+    retained_c9_plans: &[PlannedC9Mark],
+) -> Result<Emission, String> {
+    // Repeated edits can have one licensed effect; repeated subjects corrupt
+    // placement and receipt accounting and are an input invariant violation.
+    let mut subject_keys = rustc_hash::FxHashSet::default();
+    for (subject, _) in &table.entries {
+        if !subject_keys.insert((subject.fn_did, subject.hir_id)) {
+            return Err(format!(
+                "decision-table-invariant:duplicate-subject:{}:hir={}",
+                subject.identity_key(&tcx.def_path_str(subject.fn_did.to_def_id())),
+                subject.hir_id.local_id.as_u32(),
+            ));
+        }
+    }
     let source_map = tcx.sess.source_map();
     let text_of = |key: &plan::FileKey| -> Option<String> {
         source_map
@@ -5137,7 +5238,46 @@ pub(crate) fn emit_files<'tcx>(
     {
         texts.insert(root, source);
     }
-    let (files, rollbacks, _) = validate_plan(&planned, &texts);
+    let (files, rollbacks) = loop {
+        let (files, rollbacks, _) = validate_plan(&planned, &texts);
+        if rollbacks.is_empty() {
+            break (files, rollbacks);
+        }
+        let mut holds = std::collections::BTreeMap::<_, Vec<String>>::new();
+        for rollback in &rollbacks {
+            let owner = rollback.edit.owner_class.ok_or_else(|| {
+                format!(
+                    "apply-invariant:unowned-rollback:{}@{}..{}",
+                    rollback.reason, rollback.edit.lo, rollback.edit.hi,
+                )
+            })?;
+            if !planned
+                .class_finalization
+                .classes
+                .get(&owner)
+                .is_some_and(plan::SignatureClassPlan::is_ready)
+            {
+                return Err(format!(
+                    "apply-invariant:rollback-owner-not-ready:{}",
+                    owner.order_key()
+                ));
+            }
+            holds.entry(owner).or_default().push(format!(
+                "apply-site-rollback:{}@{}..{}:{}",
+                rollback.edit.edit_kind, rollback.edit.lo, rollback.edit.hi, rollback.reason,
+            ));
+        }
+        // Each pass withdraws at least one ready owner. No new edit or class
+        // is admitted by recovery, so this reaches a fixed point finitely.
+        for (owner, reasons) in holds {
+            planned.hold_terminal_class(
+                owner,
+                decision::Arm::Surface,
+                "apply-site-rollback",
+                reasons.join(";"),
+            );
+        }
+    };
     Ok(Emission {
         files,
         rollbacks,
@@ -5536,24 +5676,6 @@ fn finish_decide<'tcx>(
         &raw_boundary_argument_paths,
         &opt_deferred_uses,
     );
-    let ctx_of = |gate, coconv, lifetime_eligibility, raw_boundary, exposure| decision::Ctx {
-        tcx,
-        model: &model,
-        slots: &slots,
-        facts: &facts,
-        fat: &fat,
-        sign: &sign,
-        slice_uses: &slice_uses,
-        opt_uses: &opt_uses,
-        box_facts: &box_facts,
-        constructions: &ctors,
-        subjects: &subjects,
-        gate,
-        coconv,
-        lifetime_eligibility,
-        raw_boundary,
-        exposure,
-    };
 
     // Complete the frozen A5 site's legacy drops-elaborated reads before the
     // const-MIR fn-pointer collector becomes the terminal const-body reader
@@ -5603,205 +5725,188 @@ fn finish_decide<'tcx>(
     // task 2 only.** Production has passed `LiftAdaptable` since S3.6-1 and the
     // `BlockAll` variant was deleted at M-3 (X-3). Task 3 is where the verdict
     // reaches a gate.
-    let hypothetical = decision::decide(
-        &ctx_of(
-            decision::RefGate::LiftAdaptable,
-            None,
-            None,
-            None,
-            Some(&preliminary_exposure),
-        ),
-        &subjects,
-    );
-    // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
-    // report, so `build` consumes them rather than the census reading them
-    // alongside.
-    let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
-    let lifetime_eligibility = decision::lifetime::derive_return_eligibility(
-        &program,
-        &slots,
-        &model,
-        analysis.origins.as_ref(),
-        &hypothetical,
-        &subjects,
-        &ctors,
-        &escapes,
-        fnptr_web.clone(),
-        fnptr_web_wall_s,
-        &preliminary_exposure,
-    );
-    let e2_hypothetical = decision::decide(
-        &ctx_of(
-            decision::RefGate::LiftAdaptable,
-            None,
-            Some(&lifetime_eligibility),
-            None,
-            Some(&preliminary_exposure),
-        ),
-        &subjects,
-    );
-    let converting_signature_functions = e2_hypothetical
-        .entries
-        .iter()
-        .filter(|(subject, decision)| {
-            matches!(subject.kind, decision::SubjectKind::Param { .. })
-                && decision_is_safe(decision)
-        })
-        .map(|(subject, _)| subject.fn_did)
-        .collect::<rustc_hash::FxHashSet<_>>();
-    let no_surface_functions = rustc_hash::FxHashSet::default();
-    let candidate_surface_functions = if surface_world_attested {
-        &converting_signature_functions
-    } else {
-        &no_surface_functions
-    };
-    let candidate_exposure = decision::exposure::ExposurePolicy::derive(
-        &program,
-        &exposure_seed,
-        fnptr_web.as_ref().ok(),
-        candidate_surface_functions,
-    );
-    let raw_boundary_sites_started = std::time::Instant::now();
-    let raw_boundary_sites = decision::raw_boundary::RawBoundarySiteFacts::derive(&program, &facts);
-    let raw_boundary_site_derivation_wall_s = raw_boundary_sites_started.elapsed().as_secs_f64();
-    let retention_started = std::time::Instant::now();
-    let retention = decision::raw_boundary::RetentionSummaries::derive(
-        &program,
-        analysis.origins.as_ref(),
-        analysis.attestation,
-    );
-    let retention_fixpoint_wall_s = retention_started.elapsed().as_secs_f64();
-    let raw_boundary_decision_started = std::time::Instant::now();
-    let raw_boundary = decision::raw_boundary::RawBoundaryDispositionIndex::derive(
-        &raw_boundary_sites,
-        &retention,
-        &e2_hypothetical,
-        &facts,
-        &mut_facts,
-    );
-    let raw_boundary_decision_wall_s = raw_boundary_decision_started.elapsed().as_secs_f64();
-    let coconv =
-        decision::co_conversion::build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
-            &facts,
+    let mut option_fallbacks = rustc_hash::FxHashMap::default();
+    let mut fallback_receipts = Vec::new();
+    let original_c9_plans = retained_c9_plans.clone();
+    loop {
+        retained_c9_plans = original_c9_plans.clone();
+        let ctx_of = |gate, coconv, lifetime_eligibility, raw_boundary, exposure| decision::Ctx {
+            tcx,
+            model: &model,
+            slots: &slots,
+            facts: &facts,
+            fat: &fat,
+            sign: &sign,
+            slice_uses: &slice_uses,
+            opt_uses: &opt_uses,
+            box_facts: &box_facts,
+            constructions: &ctors,
+            subjects: &subjects,
+            gate,
+            coconv,
+            lifetime_eligibility,
+            raw_boundary,
+            exposure,
+        };
+
+        let hypothetical = decision::decide_with_raw_fallbacks(
+            &ctx_of(
+                decision::RefGate::LiftAdaptable,
+                None,
+                None,
+                None,
+                Some(&preliminary_exposure),
+            ),
             &subjects,
-            &e2_hypothetical,
-            &escapes,
-            decision::co_conversion::OverlapRule::BlindOnly,
-            &retained_c9_plans,
-            &lifetime_eligibility,
-            &raw_boundary,
-            Some(&a5_site_proofs),
-            &retention,
+            &option_fallbacks,
         );
-    // **Production is decided AFTER the classes**, because step 2's gate reads
-    // them. No cycle: the hypothetical above was decided with `None`.
-    // **S3.6-1 step 3 — THE LIFT.** Production decides under `LiftAdaptable`
-    // with the class verdict in hand: the adaptable population passes the
-    // `referenced` gate, and the class gate then governs every node uniformly.
-    // The pinned population still blocks inside `LiftAdaptable`.
-    let mut table = decision::decide(
-        &ctx_of(
-            decision::RefGate::LiftAdaptable,
-            Some(&coconv),
-            Some(&lifetime_eligibility),
-            Some(&raw_boundary),
-            Some(&candidate_exposure),
-        ),
-        &subjects,
-    );
-    // Surface policies are provisional until the full ladder settles. A raw
-    // wrapper or entry shim exists only when at least one signature subject
-    // survives every arm; blocked functions retain their seed/web evidence but
-    // receive NotApplicable and therefore no pointless surface edit.
-    let settled_signature_functions = table
-        .entries
-        .iter()
-        .filter(|(subject, decision)| {
-            matches!(subject.kind, decision::SubjectKind::Param { .. })
-                && decision_is_safe(decision)
-        })
-        .map(|(subject, _)| subject.fn_did)
-        .collect::<rustc_hash::FxHashSet<_>>();
-    let exposure = decision::exposure::ExposurePolicy::derive(
-        &program,
-        &exposure_seed,
-        fnptr_web.as_ref().ok(),
-        if surface_world_attested {
-            &settled_signature_functions
+        // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
+        // report, so `build` consumes them rather than the census reading them
+        // alongside.
+        let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
+        let lifetime_eligibility = decision::lifetime::derive_return_eligibility(
+            &program,
+            &slots,
+            &model,
+            analysis.origins.as_ref(),
+            &hypothetical,
+            &subjects,
+            &ctors,
+            &escapes,
+            fnptr_web.clone(),
+            fnptr_web_wall_s,
+            &preliminary_exposure,
+        );
+        let e2_hypothetical = decision::decide_with_raw_fallbacks(
+            &ctx_of(
+                decision::RefGate::LiftAdaptable,
+                None,
+                Some(&lifetime_eligibility),
+                None,
+                Some(&preliminary_exposure),
+            ),
+            &subjects,
+            &option_fallbacks,
+        );
+        let converting_signature_functions = e2_hypothetical
+            .entries
+            .iter()
+            .filter(|(subject, decision)| {
+                matches!(subject.kind, decision::SubjectKind::Param { .. })
+                    && decision_is_safe(decision)
+            })
+            .map(|(subject, _)| subject.fn_did)
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let no_surface_functions = rustc_hash::FxHashSet::default();
+        let candidate_surface_functions = if surface_world_attested {
+            &converting_signature_functions
         } else {
             &no_surface_functions
-        },
-    );
-    table.exposure = Some(exposure.clone());
-
-    // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by
-    // `decide_one`, which is handed one subject at a time. Runs here, over the
-    // finished table, where both the within-subject and the cross-subject case
-    // are visible — a per-subject check left 15 of brotli's 17 collisions
-    // standing, measured.
-    decision::refuse_nested_use_edits(tcx, &mut table);
-    table.depth2_npo_storages = decision::plan_depth2_npo_storages(tcx, &table, &facts, &ctors);
-
-    let finalization_started = std::time::Instant::now();
-    table.lifetime_plan = decision::lifetime::finalize(
-        &program,
-        analysis.origins.as_ref(),
-        &lifetime_eligibility,
-        &table,
-    )?;
-    let finalization_wall_s = finalization_started.elapsed().as_secs_f64();
-
-    // **S3.6-1 seam adapters.** Runs AFTER every gate that can still refuse a
-    // subject, including the nesting pass above: a seam is computed from the
-    // forms both ends actually settle on, so a subject withdrawn later would
-    // leave glue bridging to a form that no longer exists.
-    let seam_started = std::time::Instant::now();
-    table.seams = decision::seam::synthesize_with_raw_boundary(
-        tcx,
-        &facts,
-        &subjects,
-        &table,
-        &retained_c9_plans,
-        &a5_site_proofs,
-        &raw_boundary,
-        &coconv,
-        &retention,
-        &lifetime_eligibility,
-        &mut_facts,
-    );
-    let arm_requirements =
-        derive_arm_requirements(&subjects, &table, &coconv, &raw_boundary, &exposure);
-    table.arm_requirements = arm_requirements;
-    let seam_wall_s = seam_started.elapsed().as_secs_f64();
-    let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
-    let c9_before_final_filter = retained_c9_plans.len();
-    retained_c9_plans.retain(|mark| {
-        let call_span = mark.call_span.source_callsite();
-        let caller = tcx.def_path_str(mark.caller_did.to_def_id());
-        let nested_reborrow = table.seams.edits.iter().any(|edit| {
-            edit.caller_fn == caller
-                && edit.family == decision::seam::SeamFamily::Reborrow
-                && call_span.contains(edit.span.source_callsite())
-        });
-        let params = mark.key.pair.params();
-        !nested_reborrow
-            && [params.first(), params.second()].into_iter().all(|param| {
-                let local = Local::from_usize(param as usize);
-                table.entries.iter().any(|(subject, decision)| {
-                    let is_ref = match decision {
-                        decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => {
-                            true
-                        }
-                        decision::Decision::Slice { .. }
-                        | decision::Decision::Opt { .. }
-                        | decision::Decision::Box(_)
-                        | decision::Decision::Degraded(_) => false,
-                    };
-                    subject.fn_did == mark.owner_did && subject.local == local && is_ref
-                })
+        };
+        let candidate_exposure = decision::exposure::ExposurePolicy::derive(
+            &program,
+            &exposure_seed,
+            fnptr_web.as_ref().ok(),
+            candidate_surface_functions,
+        );
+        let raw_boundary_sites_started = std::time::Instant::now();
+        let raw_boundary_sites =
+            decision::raw_boundary::RawBoundarySiteFacts::derive(&program, &facts);
+        let raw_boundary_site_derivation_wall_s =
+            raw_boundary_sites_started.elapsed().as_secs_f64();
+        let retention_started = std::time::Instant::now();
+        let retention = decision::raw_boundary::RetentionSummaries::derive(
+            &program,
+            analysis.origins.as_ref(),
+            analysis.attestation,
+        );
+        let retention_fixpoint_wall_s = retention_started.elapsed().as_secs_f64();
+        let raw_boundary_decision_started = std::time::Instant::now();
+        let raw_boundary = decision::raw_boundary::RawBoundaryDispositionIndex::derive(
+            &raw_boundary_sites,
+            &retention,
+            &e2_hypothetical,
+            &facts,
+            &mut_facts,
+        );
+        let raw_boundary_decision_wall_s = raw_boundary_decision_started.elapsed().as_secs_f64();
+        let coconv =
+            decision::co_conversion::build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
+                &facts,
+                &subjects,
+                &e2_hypothetical,
+                &escapes,
+                decision::co_conversion::OverlapRule::BlindOnly,
+                &retained_c9_plans,
+                &lifetime_eligibility,
+                &raw_boundary,
+                Some(&a5_site_proofs),
+                &retention,
+            );
+        // **Production is decided AFTER the classes**, because step 2's gate reads
+        // them. No cycle: the hypothetical above was decided with `None`.
+        // **S3.6-1 step 3 — THE LIFT.** Production decides under `LiftAdaptable`
+        // with the class verdict in hand: the adaptable population passes the
+        // `referenced` gate, and the class gate then governs every node uniformly.
+        // The pinned population still blocks inside `LiftAdaptable`.
+        let mut table = decision::decide_with_raw_fallbacks(
+            &ctx_of(
+                decision::RefGate::LiftAdaptable,
+                Some(&coconv),
+                Some(&lifetime_eligibility),
+                Some(&raw_boundary),
+                Some(&candidate_exposure),
+            ),
+            &subjects,
+            &option_fallbacks,
+        );
+        // Surface policies are provisional until the full ladder settles. A raw
+        // wrapper or entry shim exists only when at least one signature subject
+        // survives every arm; blocked functions retain their seed/web evidence but
+        // receive NotApplicable and therefore no pointless surface edit.
+        let settled_signature_functions = table
+            .entries
+            .iter()
+            .filter(|(subject, decision)| {
+                matches!(subject.kind, decision::SubjectKind::Param { .. })
+                    && decision_is_safe(decision)
             })
-    });
-    if retained_c9_plans.len() != c9_before_final_filter {
+            .map(|(subject, _)| subject.fn_did)
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let exposure = decision::exposure::ExposurePolicy::derive(
+            &program,
+            &exposure_seed,
+            fnptr_web.as_ref().ok(),
+            if surface_world_attested {
+                &settled_signature_functions
+            } else {
+                &no_surface_functions
+            },
+        );
+        table.exposure = Some(exposure.clone());
+
+        // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by
+        // `decide_one`, which is handed one subject at a time. Runs here, over the
+        // finished table, where both the within-subject and the cross-subject case
+        // are visible — a per-subject check left 15 of brotli's 17 collisions
+        // standing, measured.
+        decision::refuse_nested_use_edits(tcx, &mut table);
+        table.depth2_npo_storages = decision::plan_depth2_npo_storages(tcx, &table, &facts, &ctors);
+
+        let finalization_started = std::time::Instant::now();
+        table.lifetime_plan = decision::lifetime::finalize(
+            &program,
+            analysis.origins.as_ref(),
+            &lifetime_eligibility,
+            &table,
+        )?;
+        let finalization_wall_s = finalization_started.elapsed().as_secs_f64();
+
+        // **S3.6-1 seam adapters.** Runs AFTER every gate that can still refuse a
+        // subject, including the nesting pass above: a seam is computed from the
+        // forms both ends actually settle on, so a subject withdrawn later would
+        // leave glue bridging to a form that no longer exists.
+        let seam_started = std::time::Instant::now();
         table.seams = decision::seam::synthesize_with_raw_boundary(
             tcx,
             &facts,
@@ -5815,257 +5920,367 @@ fn finish_decide<'tcx>(
             &lifetime_eligibility,
             &mut_facts,
         );
-    }
-    // Item 2 renders local raw-result constructors only after the terminal
-    // seam set exists, so a contained raw-view/cast edit is composed into the
-    // initializer rather than overwritten by an outer constructor.
-    (
-        table.option_receipts,
-        table.option_value_initializers,
-        table.option_composed_uses,
-    ) = decision::option::plan_values(tcx, &mut table, &ctors, &opt_uses);
-    table.slice_use_receipts = decision::slice_use::receipt_plans(
-        &program,
-        &mut table,
-        &slice_uses,
-        &raw_boundary,
-        &retention,
-        &mut_facts,
-    );
-    let option_operations = decision::option::plan_operations(
-        &program,
-        &mut table,
-        &opt_uses,
-        &raw_boundary,
-        &slice_uses,
-        &retention,
-        &mut_facts,
-    );
-    table.option_receipts.extend(option_operations);
-    for (subject, decision) in &table.entries {
-        let unsupported = match decision {
-            decision::Decision::Degraded(record) => {
-                record.reason == decision::DegradeReason::OptUseUnsupported
-            }
-            decision::Decision::Ref { .. }
-            | decision::Decision::InferredRef { .. }
-            | decision::Decision::Slice { .. }
-            | decision::Decision::Opt { .. }
-            | decision::Decision::Box(_) => false,
-        };
-        if !unsupported {
-            continue;
-        }
-        let node = (subject.fn_did, subject.hir_id);
-        let Some(uses) = opt_uses.get(&node) else { continue };
-        let slice = opt_fat.contains(&node)
-            && facts.raw_only_uses.get(&node).is_some_and(|uses| {
-                uses.iter().any(|(op, _)| {
-                    decision::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
-                })
+        let arm_requirements =
+            derive_arm_requirements(&subjects, &table, &coconv, &raw_boundary, &exposure);
+        table.arm_requirements = arm_requirements;
+        let seam_wall_s = seam_started.elapsed().as_secs_f64();
+        let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
+        let c9_before_final_filter = retained_c9_plans.len();
+        retained_c9_plans.retain(|mark| {
+            let call_span = mark.call_span.source_callsite();
+            let caller = tcx.def_path_str(mark.caller_did.to_def_id());
+            let nested_reborrow = table.seams.edits.iter().any(|edit| {
+                edit.caller_fn == caller
+                    && edit.family == decision::seam::SeamFamily::Reborrow
+                    && call_span.contains(edit.span.source_callsite())
             });
-        for site in uses.sites.iter().filter(|site| {
-            matches!(
-                site.operation,
-                "excluded-cursor" | "handoff-return" | "handoff-use"
-            )
-        }) {
-            let reason = if site.operation == "excluded-cursor" {
-                mechanical_receipt::MechanicalTerminalReason::Cursor
-            } else {
-                mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(format!(
-                    "{}:later-return-or-sink-wave",
-                    site.operation
-                ))
-            };
-            table.option_receipts.push(decision::option::receipt(
-                tcx,
-                subject,
-                site.hir_id,
-                mechanical_receipt::MechanicalFamily::OptUseUnsupported,
-                site.operation,
-                decision::seam::Form::Raw,
-                decision::seam::Form::Opt {
-                    mutable: subject.mutable,
-                    slice,
-                },
-                site.operation.to_owned(),
-                Some(reason),
-                mechanical_receipt::MechanicalEvidence::default(),
-            ));
-        }
-    }
-    for receipt in &mut table.option_receipts {
-        let mechanical_receipt::MechanicalSubjectKey::Local {
-            owner, mir_local, ..
-        } = receipt.obligation.planned.key.subject
-        else {
-            continue;
-        };
-        let Some((subject, _)) = table
-            .entries
-            .iter()
-            .find(|(subject, _)| subject.fn_did == owner && subject.local.as_u32() == mir_local)
-        else {
-            continue;
-        };
-        let node = (subject.fn_did, subject.hir_id);
-        receipt.obligation.planned.required_arms = table
-            .arm_requirements
-            .get(&node)
-            .copied()
-            .unwrap_or_default()
-            .render();
-        let mut nullability = Vec::new();
-        if let Some(hir) = ctors.init_hirs.get(&node)
-            && decision::emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
-        {
-            nullability.push(format!("null-initializer:hir{}", hir.local_id.as_u32()));
-        }
-        if let Some(uses) = opt_uses.get(&node) {
-            nullability.extend(
-                uses.sites
-                    .iter()
-                    .filter(|site| site.operation == "null-test")
-                    .map(|site| format!("is-null:hir{}", site.hir_id.local_id.as_u32())),
-            );
-            nullability.extend(
-                uses.assignments
-                    .iter()
-                    .filter(|site| {
-                        decision::emitability::is_zero_literal(tcx.hir_node(site.rhs).expect_expr())
+            let params = mark.key.pair.params();
+            !nested_reborrow
+                && [params.first(), params.second()].into_iter().all(|param| {
+                    let local = Local::from_usize(param as usize);
+                    table.entries.iter().any(|(subject, decision)| {
+                        let is_ref = match decision {
+                            decision::Decision::Ref { .. }
+                            | decision::Decision::InferredRef { .. } => true,
+                            decision::Decision::Slice { .. }
+                            | decision::Decision::Opt { .. }
+                            | decision::Decision::Box(_)
+                            | decision::Decision::Degraded(_) => false,
+                        };
+                        subject.fn_did == mark.owner_did && subject.local == local && is_ref
                     })
-                    .map(|site| format!("null-assignment:hir{}", site.rhs.local_id.as_u32())),
+                })
+        });
+        if retained_c9_plans.len() != c9_before_final_filter {
+            table.seams = decision::seam::synthesize_with_raw_boundary(
+                tcx,
+                &facts,
+                &subjects,
+                &table,
+                &retained_c9_plans,
+                &a5_site_proofs,
+                &raw_boundary,
+                &coconv,
+                &retention,
+                &lifetime_eligibility,
+                &mut_facts,
             );
         }
-        nullability.sort();
-        nullability.dedup();
-        receipt.nullability_fact = if nullability.is_empty() {
-            "existing-layout-option-carrier".to_owned()
-        } else {
-            nullability.join(";")
-        };
-    }
-    table.slice_constructions =
-        decision::construction::plan_slice_constructions(tcx, &table, &ctors);
-    append_surface_declaration_plans(tcx, &exposure, &mut table);
-    append_inferred_local_declaration_plans(tcx, &mut table);
-    table.c9_marks = retained_c9_plans.clone();
-    let table = table;
-
-    // Structural self-check: the table matches the subjects it was handed. NOT
-    // the coverage gate — every comparison in it is against the collector's own
-    // output.
-    if let Err(why) = table.is_self_consistent_over(&subjects) {
-        return Err(format!("decision table self-consistency: {why}"));
-    }
-    let receipt_started = std::time::Instant::now();
-    let mut e2_artifacts =
-        e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility)?;
-    e2_artifacts.timings = E2Timings {
-        cache_load_wall_s: format!("{:.6}", analysis.cache_load_wall_s),
-        origin_derivation_wall_s: format!("{:.6}", analysis.origin_derivation_wall_s),
-        pb_web_wall_s: format!("{:.6}", lifetime_eligibility.web_wall_s()),
-        eligibility_wall_s: format!("{:.6}", lifetime_eligibility.derive_wall_s()),
-        finalization_wall_s: format!("{finalization_wall_s:.6}"),
-        seam_wall_s: format!("{seam_wall_s:.6}"),
-        ast_placement_wall_s: "pending".to_owned(),
-        receipt_render_wall_s: format!("{:.6}", receipt_started.elapsed().as_secs_f64()),
-        compiler_verification_wall_s: "pending".to_owned(),
-    };
-    let raw_boundary_receipt_started = std::time::Instant::now();
-    let raw_boundary_artifacts = RawBoundaryArtifacts {
-        exposure: exposure.receipts_tsv(),
-        d4_edges: coconv.edge_receipts_tsv(tcx, &subjects),
-        pairs: coconv.pair_receipts_tsv(tcx),
-        addresses: raw_boundary.addresses_tsv(tcx),
-        arm_outcomes: arm_outcomes_tsv(tcx, &subjects, &table, &coconv, &raw_boundary),
-        edit_keys: String::from("edit_key\n"),
-        sites: raw_boundary_sites.to_tsv(),
-        retention: retention.to_tsv(),
-        dispositions: raw_boundary.receipts_tsv(),
-        subjects: raw_boundary_subjects_tsv(tcx, &hypothetical, &table, &coconv, &raw_boundary),
-        atoms: raw_boundary.atoms_tsv(),
-        atom_outcomes: {
-            let mut out = String::from("outcome\treason\tatoms\n");
-            for (atom, reason) in &table.seams.raw_boundary_edit_region_owned {
-                out.push_str(&format!("edit-region-owned\t{reason}\t{atom}\n"));
+        // Item 2 renders local raw-result constructors only after the terminal
+        // seam set exists, so a contained raw-view/cast edit is composed into the
+        // initializer rather than overwritten by an outer constructor.
+        (
+            table.option_receipts,
+            table.option_value_initializers,
+            table.option_composed_uses,
+        ) = decision::option::plan_values(tcx, &mut table, &ctors, &opt_uses);
+        table.slice_use_receipts = decision::slice_use::receipt_plans(
+            &program,
+            &mut table,
+            &slice_uses,
+            &raw_boundary,
+            &retention,
+            &mut_facts,
+        );
+        let option_operations = decision::option::plan_operations(
+            &program,
+            &mut table,
+            &opt_uses,
+            &raw_boundary,
+            &slice_uses,
+            &retention,
+            &mut_facts,
+        );
+        table.option_receipts.extend(option_operations);
+        for (subject, decision) in &table.entries {
+            let unsupported = match decision {
+                decision::Decision::Degraded(record) => {
+                    record.reason == decision::DegradeReason::OptUseUnsupported
+                }
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_) => false,
+            };
+            if !unsupported {
+                continue;
             }
-            out
-        },
-        final_reverts: String::from("kind\tidentity\tclass_id\n"),
-        bridge_events: Vec::new(),
-        unsafe_context_events: Vec::new(),
-        mechanical_events: Vec::new(),
-        a5_proof_site_fallback_rows: Vec::new(),
-        slice_construction_rows: Vec::new(),
-        slice_use_rows: Vec::new(),
-        option_rows: Vec::new(),
-        class_costs: bridge_receipt::class_cost_header(),
-        class_collisions: bridge_receipt::class_collision_header(),
-        unresolved_classes: bridge_receipt::unresolved_class_header(),
-        interface_inventory: table.seams.interface_inventory_tsv(tcx),
-        sites_from_non_subject_arguments: table.seams.sites_from_non_subject_arguments(),
-        converted_callee_without_site_receipt: table.seams.converted_callee_without_site_receipt(),
-        degraded_output_receipt: "not-applicable".to_owned(),
-        per_arm_timers_status: "queued-no-free-column".to_owned(),
-        attribution_hits: AttributionHits::default(),
-        signature_class_count: 0,
-        class_bisect_probes: 0,
-        revert_found_form_late_classes: 0,
-        class_verify_rounds: 0,
-        verify_wall_s: "pending".to_owned(),
-        emit_budget_s: "900".to_owned(),
-        timings: RawBoundaryTimings {
-            site_derivation_wall_s: format!("{raw_boundary_site_derivation_wall_s:.6}"),
-            retention_fixpoint_wall_s: format!("{retention_fixpoint_wall_s:.6}"),
-            certificate_replay_wall_s: format!("{:.6}", raw_boundary.certificate_replay_wall_s()),
-            decision_wall_s: format!("{raw_boundary_decision_wall_s:.6}"),
-            render_wall_s: format!("{raw_boundary_render_wall_s:.6}"),
-            receipt_wall_s: format!(
-                "{:.6}",
-                raw_boundary_receipt_started.elapsed().as_secs_f64()
-            ),
-            initial_verify_wall_s: "pending".to_owned(),
-            atom_reverify_wall_s: "0.000000".to_owned(),
-        },
-    };
+            let node = (subject.fn_did, subject.hir_id);
+            let Some(uses) = opt_uses.get(&node) else { continue };
+            let slice = opt_fat.contains(&node)
+                && facts.raw_only_uses.get(&node).is_some_and(|uses| {
+                    uses.iter().any(|(op, _)| {
+                        decision::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
+                    })
+                });
+            for site in uses.sites.iter().filter(|site| {
+                matches!(
+                    site.operation,
+                    "excluded-cursor" | "handoff-return" | "handoff-use"
+                )
+            }) {
+                let reason = if site.operation == "excluded-cursor" {
+                    mechanical_receipt::MechanicalTerminalReason::Cursor
+                } else {
+                    mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(format!(
+                        "{}:later-return-or-sink-wave",
+                        site.operation
+                    ))
+                };
+                table.option_receipts.push(decision::option::receipt(
+                    tcx,
+                    subject,
+                    site.hir_id,
+                    mechanical_receipt::MechanicalFamily::OptUseUnsupported,
+                    site.operation,
+                    decision::seam::Form::Raw,
+                    decision::seam::Form::Opt {
+                        mutable: subject.mutable,
+                        slice,
+                    },
+                    site.operation.to_owned(),
+                    Some(reason),
+                    mechanical_receipt::MechanicalEvidence::default(),
+                ));
+            }
+        }
+        for receipt in &mut table.option_receipts {
+            let mechanical_receipt::MechanicalSubjectKey::Local {
+                owner, mir_local, ..
+            } = receipt.obligation.planned.key.subject
+            else {
+                continue;
+            };
+            let Some((subject, _)) = table.entries.iter().find(|(subject, _)| {
+                subject.fn_did == owner && subject.local.as_u32() == mir_local
+            }) else {
+                continue;
+            };
+            let node = (subject.fn_did, subject.hir_id);
+            receipt.obligation.planned.required_arms = table
+                .arm_requirements
+                .get(&node)
+                .copied()
+                .unwrap_or_default()
+                .render();
+            let mut nullability = Vec::new();
+            if let Some(hir) = ctors.init_hirs.get(&node)
+                && decision::emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
+            {
+                nullability.push(format!("null-initializer:hir{}", hir.local_id.as_u32()));
+            }
+            if let Some(uses) = opt_uses.get(&node) {
+                nullability.extend(
+                    uses.sites
+                        .iter()
+                        .filter(|site| site.operation == "null-test")
+                        .map(|site| format!("is-null:hir{}", site.hir_id.local_id.as_u32())),
+                );
+                nullability.extend(
+                    uses.assignments
+                        .iter()
+                        .filter(|site| {
+                            decision::emitability::is_zero_literal(
+                                tcx.hir_node(site.rhs).expect_expr(),
+                            )
+                        })
+                        .map(|site| format!("null-assignment:hir{}", site.rhs.local_id.as_u32())),
+                );
+            }
+            nullability.sort();
+            nullability.dedup();
+            receipt.nullability_fact = if nullability.is_empty() {
+                "existing-layout-option-carrier".to_owned()
+            } else {
+                nullability.join(";")
+            };
+        }
+        table.slice_constructions =
+            decision::construction::plan_slice_constructions(tcx, &table, &ctors);
+        append_surface_declaration_plans(tcx, &exposure, &mut table);
+        append_inferred_local_declaration_plans(tcx, &mut table);
+        table.c9_marks = retained_c9_plans.clone();
+        let mut table = table;
 
-    // C.2: the in-process coverage gate is GONE. Its replacement is the
-    // harness reconciliation in `coverage_recon`, driven from outside this
-    // module — see `recon_fixtures` (C.1) and the corpus mode (C.4).
-    //
-    // Deleted rather than demoted to a smoke check: a weakened gate that still
-    // READS like a coverage gate is the hazard itself. Four rounds of this
-    // milestone were spent on apparatus that claimed more than it checked, and
-    // leaving a demoted version behind preserves the claim while removing the
-    // substance.
-    Ok((
-        table,
-        DecideCtx {
-            slots,
-            model,
-            mut_facts,
-            facts,
-            coconv,
-            lifetime_eligibility,
-            escapes,
-            subjects,
-            hypothetical,
-            retained_c9_plans,
-            a5_receipt,
-            analysis,
-            a5_site_proofs,
-            box_facts,
-            constructions: ctors,
-            raw_boundary_sites,
-            retention,
-            raw_boundary,
-            exposure,
-            raw_boundary_artifacts,
-            e2_artifacts,
-        },
-    ))
+        // Structural self-check: the table matches the subjects it was handed. NOT
+        // the coverage gate — every comparison in it is against the collector's own
+        // This is the same pure plan/class/terminal-interface preparation used
+        // by emit_files. It performs no AST emission or analysis derivation.
+        let prepared = prepare_plan_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &retained_c9_plans,
+        )?;
+        let requests = plan::additive_option_fallbacks(&table, &prepared.plan);
+        if !requests.is_empty() {
+            let old_count = option_fallbacks.len();
+            for (index, prior_reason) in requests {
+                let mut receipt = prepared.plan.option_receipt_plans[index].clone();
+                let subject_key = &receipt.obligation.planned.key.subject;
+                let (subject, _) = table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| {
+                        *subject_key
+                            == mechanical_receipt::MechanicalSubjectKey::Local {
+                                owner: subject.fn_did,
+                                mir_local: subject.local.as_u32(),
+                                slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                            }
+                    })
+                    .expect("class fallback retains its subject");
+                option_fallbacks.insert((subject.fn_did, subject.hir_id), prior_reason.clone());
+                let cause = receipt
+                    .obligation
+                    .intended_terminal_reason
+                    .as_ref()
+                    .map_or_else(
+                        || "unsatisfied-site".to_owned(),
+                        mechanical_receipt::MechanicalTerminalReason::key,
+                    );
+                receipt.source_form = "raw".to_owned();
+                receipt.obligation.planned.found_form = "raw".to_owned();
+                receipt.obligation.intended_terminal_state =
+                    mechanical_receipt::MechanicalState::Reclassified;
+                receipt.obligation.intended_terminal_reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(format!(
+                        "additive-family-fallback:{};site-cause={cause}",
+                        prior_reason.key()
+                    )),
+                );
+                receipt.adapter = format!("prior-raw-disposition:{}", prior_reason.key());
+                fallback_receipts.push(receipt);
+            }
+            if option_fallbacks.len() <= old_count || option_fallbacks.len() > subjects.len() {
+                return Err(
+                    "additive-family-fallback-invariant:no-strict-subject-progress".to_owned(),
+                );
+            }
+            // Rebuild all dependent forms, lifetime plans, C/PAIR/raw adapters and
+            // receipts from the same frozen inputs. No solve or cache operation
+            // lies inside this finite, monotonically growing fallback loop.
+            continue;
+        }
+        table.option_receipts.extend(fallback_receipts);
+        // output.
+        if let Err(why) = table.is_self_consistent_over(&subjects) {
+            return Err(format!("decision table self-consistency: {why}"));
+        }
+        let receipt_started = std::time::Instant::now();
+        let mut e2_artifacts =
+            e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility)?;
+        e2_artifacts.timings = E2Timings {
+            cache_load_wall_s: format!("{:.6}", analysis.cache_load_wall_s),
+            origin_derivation_wall_s: format!("{:.6}", analysis.origin_derivation_wall_s),
+            pb_web_wall_s: format!("{:.6}", lifetime_eligibility.web_wall_s()),
+            eligibility_wall_s: format!("{:.6}", lifetime_eligibility.derive_wall_s()),
+            finalization_wall_s: format!("{finalization_wall_s:.6}"),
+            seam_wall_s: format!("{seam_wall_s:.6}"),
+            ast_placement_wall_s: "pending".to_owned(),
+            receipt_render_wall_s: format!("{:.6}", receipt_started.elapsed().as_secs_f64()),
+            compiler_verification_wall_s: "pending".to_owned(),
+        };
+        let raw_boundary_receipt_started = std::time::Instant::now();
+        let raw_boundary_artifacts = RawBoundaryArtifacts {
+            exposure: exposure.receipts_tsv(),
+            d4_edges: coconv.edge_receipts_tsv(tcx, &subjects),
+            pairs: coconv.pair_receipts_tsv(tcx),
+            addresses: raw_boundary.addresses_tsv(tcx),
+            arm_outcomes: arm_outcomes_tsv(tcx, &subjects, &table, &coconv, &raw_boundary),
+            edit_keys: String::from("edit_key\n"),
+            sites: raw_boundary_sites.to_tsv(),
+            retention: retention.to_tsv(),
+            dispositions: raw_boundary.receipts_tsv(),
+            subjects: raw_boundary_subjects_tsv(tcx, &hypothetical, &table, &coconv, &raw_boundary),
+            atoms: raw_boundary.atoms_tsv(),
+            atom_outcomes: {
+                let mut out = String::from("outcome\treason\tatoms\n");
+                for (atom, reason) in &table.seams.raw_boundary_edit_region_owned {
+                    out.push_str(&format!("edit-region-owned\t{reason}\t{atom}\n"));
+                }
+                out
+            },
+            final_reverts: String::from("kind\tidentity\tclass_id\n"),
+            bridge_events: Vec::new(),
+            unsafe_context_events: Vec::new(),
+            mechanical_events: Vec::new(),
+            a5_proof_site_fallback_rows: Vec::new(),
+            slice_construction_rows: Vec::new(),
+            slice_use_rows: Vec::new(),
+            option_rows: Vec::new(),
+            class_costs: bridge_receipt::class_cost_header(),
+            class_collisions: bridge_receipt::class_collision_header(),
+            unresolved_classes: bridge_receipt::unresolved_class_header(),
+            interface_inventory: table.seams.interface_inventory_tsv(tcx),
+            sites_from_non_subject_arguments: table.seams.sites_from_non_subject_arguments(),
+            converted_callee_without_site_receipt: table
+                .seams
+                .converted_callee_without_site_receipt(),
+            degraded_output_receipt: "not-applicable".to_owned(),
+            per_arm_timers_status: "queued-no-free-column".to_owned(),
+            attribution_hits: AttributionHits::default(),
+            signature_class_count: 0,
+            class_bisect_probes: 0,
+            revert_found_form_late_classes: 0,
+            class_verify_rounds: 0,
+            verify_wall_s: "pending".to_owned(),
+            emit_budget_s: "900".to_owned(),
+            timings: RawBoundaryTimings {
+                site_derivation_wall_s: format!("{raw_boundary_site_derivation_wall_s:.6}"),
+                retention_fixpoint_wall_s: format!("{retention_fixpoint_wall_s:.6}"),
+                certificate_replay_wall_s: format!(
+                    "{:.6}",
+                    raw_boundary.certificate_replay_wall_s()
+                ),
+                decision_wall_s: format!("{raw_boundary_decision_wall_s:.6}"),
+                render_wall_s: format!("{raw_boundary_render_wall_s:.6}"),
+                receipt_wall_s: format!(
+                    "{:.6}",
+                    raw_boundary_receipt_started.elapsed().as_secs_f64()
+                ),
+                initial_verify_wall_s: "pending".to_owned(),
+                atom_reverify_wall_s: "0.000000".to_owned(),
+            },
+        };
+
+        // C.2: the in-process coverage gate is GONE. Its replacement is the
+        // harness reconciliation in `coverage_recon`, driven from outside this
+        // module — see `recon_fixtures` (C.1) and the corpus mode (C.4).
+        //
+        // Deleted rather than demoted to a smoke check: a weakened gate that still
+        // READS like a coverage gate is the hazard itself. Four rounds of this
+        // milestone were spent on apparatus that claimed more than it checked, and
+        // leaving a demoted version behind preserves the claim while removing the
+        // substance.
+        return Ok((
+            table,
+            DecideCtx {
+                slots,
+                model,
+                mut_facts,
+                facts,
+                coconv,
+                lifetime_eligibility,
+                escapes,
+                subjects,
+                hypothetical,
+                retained_c9_plans,
+                a5_receipt,
+                analysis,
+                a5_site_proofs,
+                box_facts,
+                constructions: ctors,
+                raw_boundary_sites,
+                retention,
+                raw_boundary,
+                exposure,
+                raw_boundary_artifacts,
+                e2_artifacts,
+            },
+        ));
+    }
 }
 
 fn append_surface_declaration_plans(

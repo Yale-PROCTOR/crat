@@ -999,9 +999,29 @@ pub(crate) struct Ctx<'a, 'tcx> {
 }
 
 pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
+    decide_with_raw_fallbacks(ctx, subjects, &FxHashMap::default())
+}
+
+/// Emission-only fallback requests. The accepted model and its facts remain
+/// unchanged; every dependent form is decided again with these subjects raw.
+pub(crate) fn decide_with_raw_fallbacks(
+    ctx: &Ctx<'_, '_>,
+    subjects: &[Subject],
+    fallbacks: &FxHashMap<(LocalDefId, rustc_hir::HirId), DegradeReason>,
+) -> DecisionTable {
     let mut entries = subjects
         .iter()
-        .map(|subject| (subject.clone(), decide_one(ctx, subject)))
+        .map(|subject| {
+            let decision = match fallbacks.get(&(subject.fn_did, subject.hir_id)) {
+                Some(reason) => degrade(
+                    subject,
+                    EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                    reason.clone(),
+                ),
+                None => decide_one(ctx, subject),
+            };
+            (subject.clone(), decision)
+        })
         .collect::<Vec<_>>();
     option::inherit_wrapped_payloads(ctx, &mut entries);
     let option_mut_bindings = entries

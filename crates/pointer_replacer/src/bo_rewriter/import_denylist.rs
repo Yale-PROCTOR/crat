@@ -1554,16 +1554,233 @@ fn emission_call_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String>
 /// Whole-file test modules: these are `#[cfg(test)] mod x;` at their parent, so
 /// there is no `#[cfg(test)]` line inside them to truncate at.
 fn is_test_only_file(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some(
-            "goldens.rs"
-                | "emit_tests.rs"
-                | "import_denylist.rs"
-                | "lifetime_oracle_tests.rs"
-                | "slice_use_inventory_tests.rs"
-        )
-    )
+    static FILES: std::sync::OnceLock<std::collections::BTreeSet<std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+    let files = FILES.get_or_init(|| test_only_files(module_root()));
+    path.canonicalize().is_ok_and(|path| files.contains(&path))
+}
+
+/// R218's shared registry: a file is excluded only when all discovered module
+/// routes to it carry an explicit `cfg(test)` gate. Unreferenced files remain
+/// scanned, and an ungated alias of a test module keeps that file in scope.
+fn test_only_files(root: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    use std::{collections::BTreeSet, path::PathBuf};
+
+    use syn::visit::Visit;
+
+    fn test_gate(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Path>()
+                    .is_ok_and(|path| path.is_ident("test"))
+        })
+    }
+
+    fn explicit_path(attrs: &[syn::Attribute]) -> Option<PathBuf> {
+        // An unresolved conditional path could conceal a production route to
+        // a file also reached through a test gate. Refuse that ambiguity.
+        assert!(
+            !attrs.iter().any(|attr| attr.path().is_ident("cfg_attr")),
+            "conditional module attributes need explicit test-file registry resolution"
+        );
+        attrs
+            .iter()
+            .find(|attr| attr.path().is_ident("path"))
+            .map(|attr| {
+                let syn::Meta::NameValue(value) = &attr.meta else {
+                    panic!("module path attribute must name a literal source path")
+                };
+                let syn::Expr::Lit(value) = &value.value else {
+                    panic!("module path attribute must be a string literal")
+                };
+                let syn::Lit::Str(path) = &value.lit else {
+                    panic!("module path attribute must be a string literal")
+                };
+                PathBuf::from(path.value())
+            })
+    }
+
+    // The directory and optional relative component mirror Rust's module
+    // loading rules: foo.rs adds foo/ for default children; explicit #[path]
+    // files behave as mod.rs, and inline modules consume that component.
+    struct Modules<'a> {
+        directory: PathBuf,
+        relative: Option<String>,
+        gated: bool,
+        pending: &'a mut Vec<(PathBuf, Option<String>, bool)>,
+    }
+
+    impl<'ast> Visit<'ast> for Modules<'_> {
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            let ident = module.ident.to_string();
+            let name = ident.strip_prefix("r#").unwrap_or(&ident);
+            let gated = self.gated || test_gate(&module.attrs);
+            let explicit = explicit_path(&module.attrs);
+            let default_directory = self.relative.as_ref().map_or_else(
+                || self.directory.clone(),
+                |relative| self.directory.join(relative),
+            );
+            if let Some((_, items)) = &module.content {
+                let directory = explicit.map_or_else(
+                    || default_directory.join(name),
+                    |path| self.directory.join(path),
+                );
+                let mut nested = Modules {
+                    directory,
+                    relative: None,
+                    gated,
+                    pending: &mut *self.pending,
+                };
+                for item in items {
+                    nested.visit_item(item);
+                }
+                return;
+            }
+            let (file, relative) = if let Some(path) = explicit {
+                (self.directory.join(path), None)
+            } else {
+                let direct = default_directory.join(format!("{name}.rs"));
+                let nested = default_directory.join(name).join("mod.rs");
+                assert!(
+                    !(direct.is_file() && nested.is_file()),
+                    "ambiguous module source files: {direct:?} and {nested:?}"
+                );
+                if direct.is_file() {
+                    (direct, Some(name.to_owned()))
+                } else {
+                    (nested, None)
+                }
+            };
+            // A missing conditional module excludes no file. Existing but
+            // unregistered files remain in every production scanner's walk.
+            if file.is_file() {
+                self.pending.push((file, relative, gated));
+            }
+        }
+    }
+
+    let entry = ["mod.rs", "lib.rs", "main.rs"]
+        .into_iter()
+        .map(|name| root.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("test-file registry has no module entry under {root:?}"));
+    let mut pending = vec![(entry, None, false)];
+    let mut seen = BTreeSet::new();
+    let mut gated_files = BTreeSet::new();
+    let mut production_files = BTreeSet::new();
+    while let Some((file, relative, inherited_gate)) = pending.pop() {
+        let identity = file.canonicalize().expect("module file identity resolves");
+        let directory = file
+            .parent()
+            .expect("module source parent")
+            .canonicalize()
+            .expect("module directory resolves");
+        if !seen.insert((
+            identity.clone(),
+            directory.clone(),
+            relative.clone(),
+            inherited_gate,
+        )) {
+            continue;
+        }
+        let text = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("module source unreadable at {file:?}: {error}"));
+        let syntax = syn::parse_file(&text)
+            .unwrap_or_else(|error| panic!("module registry could not parse {file:?}: {error}"));
+        let gated = inherited_gate || test_gate(&syntax.attrs);
+        if gated {
+            gated_files.insert(identity);
+        } else {
+            production_files.insert(identity);
+        }
+        Modules {
+            directory,
+            relative,
+            gated,
+            pending: &mut pending,
+        }
+        .visit_file(&syntax);
+    }
+    gated_files.difference(&production_files).cloned().collect()
+}
+
+#[test]
+fn cfg_test_module_files_are_excluded_by_declaration_identity() {
+    let root = temp_corpus(
+        "cfg-test-file-scope",
+        &[
+            (
+                "mod.rs",
+                "pub mod production;\n#[cfg(test)]\nmod fresh_checks;\n#[cfg(test)]\n#[path = \"support/renamed.rs\"]\nmod differently_named;\n#[cfg(test)]\nmod inline_checks { mod nested; }\nmod ordinary_inline { #[cfg(test)] mod selected; mod ordinary; }\n",
+            ),
+            (
+                "production.rs",
+                "#[cfg(test)]\nmod deeply_named;\nmod ordinary;\n",
+            ),
+            ("production/deeply_named.rs", "fn check() {}\n"),
+            ("production/ordinary.rs", "fn production() {}\n"),
+            ("fresh_checks.rs", "mod child;\nfn check() {}\n"),
+            ("fresh_checks/child.rs", "fn inherited_test_scope() {}\n"),
+            ("support/renamed.rs", "fn path_selected_test() {}\n"),
+            (
+                "inline_checks/nested.rs",
+                "fn inline_parent_test_scope() {}\n",
+            ),
+            (
+                "ordinary_inline/selected.rs",
+                "fn individually_gated_test() {}\n",
+            ),
+            ("ordinary_inline/ordinary.rs", "fn production() {}\n"),
+        ],
+    );
+    let expected: std::collections::BTreeSet<_> = [
+        "production/deeply_named.rs",
+        "fresh_checks.rs",
+        "fresh_checks/child.rs",
+        "support/renamed.rs",
+        "inline_checks/nested.rs",
+        "ordinary_inline/selected.rs",
+    ]
+    .into_iter()
+    .map(|relative| root.join(relative))
+    .collect();
+    assert_eq!(
+        test_only_files(&root),
+        expected,
+        "every outlined module gated by cfg(test), including inherited gates, must share the test-only file selection"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn nongated_module_files_are_never_excluded_by_basename() {
+    let root = temp_corpus(
+        "nongated-file-scope",
+        &[
+            (
+                "mod.rs",
+                "pub mod emit_tests;\n#[cfg(not(test))]\nmod goldens;\n#[cfg(any(test, feature = \"production\"))]\nmod import_denylist;\n#[cfg(test)]\n#[path = \"shared.rs\"]\nmod test_view;\n#[path = \"shared.rs\"]\nmod production_view;\n",
+            ),
+            ("emit_tests.rs", "fn production_despite_its_name() {}\n"),
+            ("goldens.rs", "fn explicitly_non_test() {}\n"),
+            (
+                "import_denylist.rs",
+                "fn also_reachable_without_test() {}\n",
+            ),
+            ("shared.rs", "fn both_contexts() {}\n"),
+            (
+                "lifetime_oracle_tests.rs",
+                "fn unregistered_file_is_not_proven_test_only() {}\n",
+            ),
+        ],
+    );
+    assert!(
+        test_only_files(&root).is_empty(),
+        "a familiar filename or one gated path must not hide production-reachable or unregistered source files: {:?}",
+        test_only_files(&root)
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 /// **Production check — ONE EMISSION PATH.** Exactly one production call site

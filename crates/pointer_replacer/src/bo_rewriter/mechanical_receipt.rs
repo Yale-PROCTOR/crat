@@ -468,7 +468,7 @@ pub(crate) enum MechanicalTerminalReason {
 }
 
 impl MechanicalTerminalReason {
-    fn key(&self) -> String {
+    pub(crate) fn key(&self) -> String {
         match self {
             Self::ClassReverted(reason) => format!("class-reverted:{reason}"),
             Self::ProgramDegradedUnmodifiedInput => "program-degraded-unmodified-input".to_owned(),

@@ -1660,29 +1660,16 @@ fn an_unedited_caller_error_reverts_only_converted_callee_class() {
     }
 }
 
-/// Duplicate every entry, so `plan` emits two identical edits per subject and
-/// `apply` must reject the second as overlapping.
+/// Duplicate every subject identity to violate the plan-input invariant.
 fn duplicate_entries(table: &mut super::decision::DecisionTable) {
     let cloned = table.entries.clone();
     table.entries.extend(cloned);
 }
 
-/// **S2b.1.3 — the ROLLBACK guard, witnessed where it actually fires.**
-///
-/// An incoherent plan (two identical edits per subject) is rejected by the
-/// PRE-LOOP structural gate, before any revert round and before bisect —
-/// `bisect_probes == 0` is what proves it never got that far.
-///
-/// **This also locates the arm.** The post-bisect guard's `rollbacks` check was
-/// suspected unwitnessed; measuring shows it is *unreachable* rather than
-/// untested, because `render` applies a SUBSET of edits that already produced no
-/// rollbacks, and dropping edits cannot create an overlap, an out-of-bounds
-/// range, or a char-boundary violation. That arm is a stated control at its
-/// guard; this witness covers the arm that can fire.
-///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the
-/// `emission.rollbacks` check and this fails — the deduped edit set emits and
-/// type-checks, so an incoherent plan passes silently.
+/// R216/R218 permit licensed duplicate edits, but duplicate canonical subjects
+/// remain an instrument invariant. Keep the original rejection and zero-bisect
+/// checks; the diagnostic now names the violated subject identity directly.
+/// Migration receipt: cp2-repair/addendum218/migration-receipts.md.
 #[test]
 fn an_incoherent_plan_is_rejected_before_the_loop() {
     let fixture = Fixture::new(&[
@@ -1699,7 +1686,7 @@ fn an_incoherent_plan_is_rejected_before_the_loop() {
             ..
         } => {
             assert!(
-                reason.contains("rolled back"),
+                reason.contains("decision-table-invariant:duplicate-subject:"),
                 "rejected for the wrong reason: {reason}"
             );
             assert_eq!(
@@ -13260,14 +13247,24 @@ fn opt_w1_writing_through_shared_outbound_view_stays_held() {
             .option_receipts
     })
     .expect("OPT writing input compiles");
+    // R216/R217/R218: preserve the typed refusal through site-local raw fallback.
     assert!(
         plans
             .iter()
-            .any(|plan| plan.obligation.intended_terminal_reason
+            .any(|plan| plan.source_form == "raw"
+                && plan.obligation.intended_terminal_state == super::mechanical_receipt::MechanicalState::Reclassified
+                && plan.obligation.intended_terminal_reason
                 == Some(
-                    super::mechanical_receipt::MechanicalTerminalReason::RbNegativeWriteAbsent
+                    super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
+                        "additive-family-fallback:opt-use-unsupported;site-cause=raw-boundary-shared-to-mut:negative-write-absent".to_owned()
+                    )
                 )),
         "Option writing view lacks its typed hold: {plans:?}"
+    );
+    let emitted = ast_emitted_source_of(input).expect("raw fallback emission");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "raw fallback must type/borrow check: {emitted}"
     );
 }
 
@@ -13382,16 +13379,24 @@ fn opt_w1_safe_source_pointee_cast_has_an_attributed_hold() {
             .option_receipts
     })
     .expect("OPT pointee-cast input compiles");
+    // R216/R217/R218: preserve the typed refusal through site-local raw fallback.
     assert!(
         plans
             .iter()
-            .any(|plan| plan.obligation.intended_terminal_reason
+            .any(|plan| plan.source_form == "raw"
+                && plan.obligation.intended_terminal_state == super::mechanical_receipt::MechanicalState::Reclassified
+                && plan.obligation.intended_terminal_reason
                 == Some(
                     super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
-                        "option-value-cast-pointee-unbuilt".to_owned()
+                        "additive-family-fallback:opt-local-construction;site-cause=evidence-missing:option-value-cast-pointee-unbuilt".to_owned()
                     )
                 )),
         "safe source lost its pointee cast: {plans:?}"
+    );
+    let emitted = ast_emitted_source_of(input).expect("raw fallback emission");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "raw fallback must type/borrow check: {emitted}"
     );
 }
 
@@ -13432,12 +13437,22 @@ fn opt_w1_thin_optional_copy_to_retained_raw_local_is_held() {
             .option_receipts
     })
     .expect("OPT retained raw local input compiles");
+    // R216/R217/R218: preserve the typed refusal through site-local raw fallback.
     assert!(
         plans
             .iter()
-            .any(|plan| plan.obligation.intended_terminal_reason
-                == Some(super::mechanical_receipt::MechanicalTerminalReason::PositiveRetention)),
+            .any(|plan| plan.source_form == "raw"
+                && plan.obligation.intended_terminal_state == super::mechanical_receipt::MechanicalState::Reclassified
+                && plan.obligation.intended_terminal_reason
+                == Some(super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
+                        "additive-family-fallback:opt-use-unsupported;site-cause=positive-retention".to_owned()
+                    ))),
         "retained thin raw view was not attributed: {plans:?}"
+    );
+    let emitted = ast_emitted_source_of(input).expect("raw fallback emission");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "raw fallback must type/borrow check: {emitted}"
     );
 }
 

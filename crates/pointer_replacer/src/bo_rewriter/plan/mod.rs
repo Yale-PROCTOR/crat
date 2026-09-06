@@ -737,6 +737,94 @@ fn arm_from_key(key: &str) -> Option<Arm> {
 /// Finalize the real plan into atomic signature classes and remove every edit
 /// whose class is held. All inputs are rewriter-side carriers; no analysis or
 /// cache key is consulted here.
+/// An Option receipt can hold a class only while an actual changed Option
+/// subject requires its operation. A candidate for an already-raw slot is
+/// additive evidence, not a new consistency requirement for its neighbors.
+fn option_receipt_requires_changed_form(
+    table: &DecisionTable,
+    receipt: &super::mechanical_receipt::OptionPresentationReceiptPlan,
+) -> bool {
+    table
+        .entries
+        .iter()
+        .find(|(subject, _)| {
+            receipt.obligation.planned.key.subject
+                == super::mechanical_receipt::MechanicalSubjectKey::Local {
+                    owner: subject.fn_did,
+                    mir_local: subject.local.as_u32(),
+                    slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                }
+        })
+        .is_some_and(|(_, decision)| match decision {
+            Decision::Opt { .. } => true,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => false,
+        })
+}
+
+/// Class-consistency preflight for the new Option family. A failed optional
+/// operation requests its prior raw disposition; a changed callee interface
+/// remains a load-bearing requirement and keeps the existing class hold.
+pub(crate) fn additive_option_fallbacks(
+    table: &DecisionTable,
+    planned: &Plan,
+) -> Vec<(usize, super::decision::DegradeReason)> {
+    use super::mechanical_receipt::{CanonicalCallee, MechanicalState};
+    let mut requests = Vec::new();
+    for (index, receipt) in planned.option_receipt_plans.iter().enumerate() {
+        if receipt.obligation.intended_terminal_state != MechanicalState::HeldNonmechanical
+            || matches!(
+                receipt.operation.as_str(),
+                "excluded-cursor" | "handoff-return" | "handoff-use"
+            )
+            || !option_receipt_requires_changed_form(table, receipt)
+        {
+            continue;
+        }
+        let site = &receipt.obligation.planned.key.site;
+        let changed_callee = match (&site.callee, site.argument_index) {
+            (Some(CanonicalCallee::Local(callee)), Some(argument)) => {
+                callee.as_local().is_some_and(|callee| {
+                    super::terminal_parameter_form(
+                        table,
+                        &planned.class_finalization,
+                        callee,
+                        argument as usize,
+                    ) != super::decision::seam::Form::Raw
+                })
+            }
+            _ => false,
+        };
+        if changed_callee {
+            continue;
+        }
+        let (subject, _) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| {
+                receipt.obligation.planned.key.subject
+                    == super::mechanical_receipt::MechanicalSubjectKey::Local {
+                        owner: subject.fn_did,
+                        mir_local: subject.local.as_u32(),
+                        slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                    }
+            })
+            .expect("changed Option obligation has its subject");
+        let prior_reason = if subject.null_init {
+            super::decision::DegradeReason::NullInit
+        } else if matches!(subject.kind, super::decision::SubjectKind::Local) {
+            super::decision::DegradeReason::OptLocalConstruction
+        } else {
+            super::decision::DegradeReason::OptUseUnsupported
+        };
+        requests.push((index, prior_reason));
+    }
+    requests
+}
+
 pub(crate) fn finalize_signature_classes(
     planned: &mut Plan,
     table: &DecisionTable,
@@ -855,10 +943,12 @@ pub(crate) fn finalize_signature_classes(
             .option_receipt_plans
             .iter()
             .filter(|receipt| {
-                matches!(
-                    receipt.operation.as_str(),
-                    "call-required" | "call-optional"
-                )
+                receipt.obligation.intended_terminal_state
+                    != super::mechanical_receipt::MechanicalState::Reclassified
+                    && matches!(
+                        receipt.operation.as_str(),
+                        "call-required" | "call-optional"
+                    )
             })
             .flat_map(|receipt| {
                 receipt
@@ -1908,6 +1998,7 @@ pub(crate) fn plan(
     for receipt in &option_receipt_plans {
         if receipt.obligation.intended_terminal_state
             == super::mechanical_receipt::MechanicalState::HeldNonmechanical
+            && option_receipt_requires_changed_form(table, receipt)
             && !matches!(
                 receipt.operation.as_str(),
                 "excluded-cursor" | "handoff-return" | "handoff-use"
