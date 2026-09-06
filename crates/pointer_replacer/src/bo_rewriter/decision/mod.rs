@@ -40,6 +40,7 @@ pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
 pub(crate) mod seam;
+pub(crate) mod slice_use;
 pub(crate) mod universe;
 
 use emitability::EmitabilityFacts;
@@ -586,6 +587,8 @@ pub(crate) enum DegradeReason {
     /// the type at every occurrence, so rewriting the recognized uses and
     /// leaving the rest is an ill-typed crate rather than a partial win.
     SliceUseUnsupported,
+    /// Pointer movement used as a raw value requires the separate cursor wave.
+    SliceCursorUse,
     /// **S3.2′-5 — the offset may be negative, so no `&[T]` form may emit.**
     ///
     /// `*p.offset(e)` becomes `p[(e) as usize]`. Where `e` is negative at
@@ -744,6 +747,7 @@ impl DegradeReason {
             DegradeReason::CopySourceCoupled => "copy-source-coupled",
             DegradeReason::FreedSlot => "freed-slot",
             DegradeReason::SliceUseUnsupported => "slice-use-unsupported",
+            DegradeReason::SliceCursorUse => "slice-cursor-use",
             DegradeReason::NestedUseEdits => "nested-use-edits",
             DegradeReason::SliceNegOrUnknownOffset => "slice-neg-or-unknown-offset",
             DegradeReason::SliceLocalConstruction => "slice-local-construction",
@@ -861,6 +865,7 @@ pub(crate) struct DecisionTable {
     pub depth2_npo_storages: Vec<Depth2NpoStoragePlan>,
     /// Item-2 raw-result definitions that construct settled local slices.
     pub slice_constructions: Vec<construction::SliceConstructionPlan>,
+    pub slice_use_receipts: Vec<super::mechanical_receipt::SliceUseReceiptPlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1004,6 +1009,7 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
         seams: Default::default(),
         depth2_npo_storages: Vec::new(),
         slice_constructions: Vec::new(),
+        slice_use_receipts: Vec::new(),
     }
 }
 
@@ -1683,7 +1689,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         return degrade(
             subject,
             EmitabilityFacts::site(tcx, span),
-            DegradeReason::SliceUseUnsupported,
+            if uses.unsupported_is_cursor {
+                DegradeReason::SliceCursorUse
+            } else {
+                DegradeReason::SliceUseUnsupported
+            },
         );
     }
     // The same gate as the plain arm: a slice form is still not an optional one,
@@ -1825,6 +1835,7 @@ mod self_consistency_tests {
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
+            slice_use_receipts: Vec::new(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

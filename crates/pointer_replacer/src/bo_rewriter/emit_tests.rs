@@ -3873,8 +3873,12 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
         // let ANY negative control drift onto ANY of the three unnoticed, which
         // is exactly the coverage this guard exists to deny.
         let allowed: &[&str] = match label {
+            // Addendum 210 A / item-3 design: this cursor-derived use remains
+            // refused. Each neighbour retains its own observed attribution.
+            "borrow of deref" => &["slice-cursor-use"],
+            "rebind" => &["slice-cursor-use"],
             "may-be-negative offset" => &["slice-neg-or-unknown-offset"],
-            _ => &["slice-use-unsupported", "raw-pointer-operation"],
+            _ => unreachable!("every negative neighbour has its own attribution"),
         };
         assert!(
             allowed.contains(&got.as_str()),
@@ -11967,4 +11971,614 @@ fn slc_w1_non_slice_and_negative_offset_controls_remain_outside_item2() {
             && reason == "slice-neg-or-unknown-offset"),
         "cursor/negative-offset boundary moved: {decisions:?}"
     );
+}
+
+// Wave-3b item 3, F02–F03: syntax shapes come from the sealed F01 identity
+// inventory. The raw reader remains raw because `read` is an item-7 sink;
+// its caller's slice must receive a use-site bridge without waiting for that.
+fn slu_w1_source(body: &str) -> String {
+    format!(
+        "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+         unsafe fn raw_read(q: *const i32) -> i32 {{ q.read() }}\n\
+         pub unsafe fn target(p: *const i32) -> i32 {{ {body} }}\n"
+    )
+}
+
+#[test]
+fn slu_w1_bare_local_raw_call_keeps_the_slice() {
+    let input = slu_w1_source("*p.offset(1) + raw_read(p)");
+    let decisions = decisions_of(&input);
+    let emitted = ast_emitted_source_of(&input).expect("SLU bare call emission");
+    assert!(
+        emitted.contains("p: &[i32]") && emitted.contains("p.as_ptr()"),
+        "SLU bare call remains blocked: {decisions:?}\n{emitted}"
+    );
+}
+
+#[test]
+fn slu_w1_cast_argument_has_an_owned_raw_view() {
+    let input = slu_w1_source("*p.offset(1) + raw_read(p as *const i32)");
+    let decisions = decisions_of(&input);
+    let emitted = ast_emitted_source_of(&input).expect("SLU cast emission");
+    assert!(
+        emitted.contains("p: &[i32]") && emitted.contains("p.as_ptr()"),
+        "SLU cast argument remains blocked: {decisions:?}\n{emitted}"
+    );
+    slu_w1_assert_use_receipts(&input);
+}
+
+#[test]
+fn slu_w1_non_subject_raw_temporary_is_inventoried() {
+    let input = slu_w1_source("let _: *const i32 = p; *p.offset(1)");
+    let decisions = decisions_of(&input);
+    let emitted = ast_emitted_source_of(&input).expect("SLU temporary emission");
+    assert!(
+        emitted.contains("p: &[i32]") && emitted.contains("p.as_ptr()"),
+        "SLU non-subject temporary has no adapter: {decisions:?}\n{emitted}"
+    );
+    slu_w1_assert_use_receipts(&input);
+}
+
+#[test]
+fn slu_w1_projection_raw_argument_preserves_the_element_view() {
+    let input = slu_w1_source("*p.offset(1) + raw_read(&*p)");
+    let decisions = decisions_of(&input);
+    let emitted = ast_emitted_source_of(&input).expect("SLU projection emission");
+    assert!(
+        emitted.contains("p: &[i32]")
+            && (emitted.contains("&p[0]") || emitted.contains("p.as_ptr()")),
+        "SLU projected argument lacks its slice element view: {decisions:?}\n{emitted}"
+    );
+    slu_w1_assert_use_receipts(&input);
+}
+
+#[test]
+fn slu_w1_mutable_raw_call_keeps_mutable_access() {
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        unsafe fn raw_write(q: *mut i32) { q.write(7); }\n\
+        pub unsafe fn target(p: *mut i32) -> i32 {\n\
+            raw_write(p); *p.offset(1)\n\
+        }\n";
+    let decisions = decisions_of(input);
+    let emitted = ast_emitted_source_of(input).expect("SLU mutable emission");
+    assert!(
+        emitted.contains("p: &mut [i32]") && emitted.contains("p.as_mut_ptr()"),
+        "SLU mutable raw view remains blocked: {decisions:?}\n{emitted}"
+    );
+    slu_w1_assert_use_receipts(input);
+}
+
+#[test]
+fn slu_w1_optional_raw_sink_has_null_mapping_and_a_use_receipt() {
+    let input = slu_w1_source("if p.is_null() { 0 } else { *p.offset(1) + raw_read(p) }");
+    let emitted = ast_emitted_source_of(&input).expect("SLU optional emission");
+    assert!(
+        emitted.contains("map_or(") && emitted.contains("as_ptr()"),
+        "{emitted}"
+    );
+    slu_w1_assert_use_receipts(&input);
+}
+
+fn slu_w1_assert_use_receipts(
+    input: &str,
+) -> Vec<super::mechanical_receipt::MechanicalObligationEvent> {
+    slu_w1_assert_use_receipt_count(input, 1)
+}
+
+fn slu_w1_assert_use_receipt_count(
+    input: &str,
+    expected: usize,
+) -> Vec<super::mechanical_receipt::MechanicalObligationEvent> {
+    let (events, rows, emitted) = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let capture = super::ast_transform::capture_ast(tcx)?;
+            let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )))?;
+            let emission = emit_files(
+                tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans,
+            )?;
+            let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+                &emission.plan.held_classes(), &BTreeSet::new(), &table,
+            )?;
+            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+                tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
+                Some(&emission.plan.terminal_a5_raw_calls),
+            )?;
+            Ok::<_, String>((
+                emission.plan.mechanical_receipts(&BTreeSet::new()).0,
+                emission.plan.slice_use_receipt_rows(&BTreeSet::new()),
+                files.into_values().next().expect("single-file SLU fixture"),
+            ))
+        },
+    ).expect("SLU fixture compiles").expect("SLU fixture plans");
+    let uses = events
+        .iter()
+        .filter(|event| {
+            event.key.family == super::mechanical_receipt::MechanicalFamily::SliceUseUnsupported
+        })
+        .collect::<Vec<_>>();
+    assert!(!uses.is_empty(), "SLU use inventory is absent: {events:?}");
+    assert!(
+        uses.iter().any(|event| {
+            event.stage == super::mechanical_receipt::MechanicalStage::Terminal
+                && event.state == super::mechanical_receipt::MechanicalState::Applied
+        }),
+        "SLU use has no applied terminal receipt: {uses:?}"
+    );
+    assert_eq!(
+        super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
+            .expect("SLU exact common/specialized join"),
+        expected
+    );
+    assert_eq!(
+        rows.len(),
+        2 * expected,
+        "one plan and one terminal row per use"
+    );
+    let rendered = super::mechanical_receipt::render_slice_use_rows(&rows);
+    let width = rendered.lines().next().expect("header").split('\t').count();
+    assert!(
+        rendered
+            .lines()
+            .skip(1)
+            .all(|line| line.split('\t').count() == width)
+    );
+    ::utils::compilation::run_compiler_on_str(&emitted, |_| ()).expect("SLU output compiles");
+    events
+}
+
+#[test]
+fn slu_w1_common_use_receipt_is_not_just_a_declaration_change() {
+    slu_w1_assert_use_receipts(&slu_w1_source("*p.offset(1) + raw_read(p)"));
+}
+
+#[test]
+fn slu_w1_cursor_argument_remains_outside_slice_use_adapters() {
+    let input = slu_w1_source("*p.offset(1) + raw_read(p.offset(-1))");
+    let decisions = decisions_of(&input);
+    assert_ne!(
+        reason_of(&decisions, "p", true),
+        "<emitted>",
+        "{decisions:?}"
+    );
+    let emitted = ast_emitted_source_of(&input).expect("SLU cursor control");
+    assert!(
+        !emitted.contains("p.as_ptr()"),
+        "cursor operand was consumed: {emitted}"
+    );
+    let plans = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        super::decide_table(tcx)
+            .expect("cursor table")
+            .slice_use_receipts
+    })
+    .expect("cursor fixture compiles");
+    assert!(
+        plans.iter().any(|plan| {
+            plan.obligation.intended_terminal_reason
+                == Some(super::mechanical_receipt::MechanicalTerminalReason::Cursor)
+        }),
+        "cursor identity lacks its typed reclassification: {plans:?}"
+    );
+}
+
+#[test]
+fn slu_w1_shared_to_mut_view_requires_negative_write_evidence() {
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        type Ptr = *mut i32;\n\
+        unsafe fn raw_read(q: Ptr) -> i32 { *q }\n\
+        pub unsafe fn target(p: *const i32) -> i32 {\n\
+            *p.offset(1) + raw_read(p as *mut i32)\n\
+        }\n";
+    let events = slu_w1_assert_use_receipts(input);
+    assert!(
+        events.iter().any(|event| {
+            event.mechanism == super::mechanical_receipt::MechanicalMechanism::SharedRefToMutRaw
+                && event.evidence.negative_write
+                    == super::mechanical_receipt::NegativeWriteEvidence::FosterImmutable
+        }),
+        "SLU R-B proof is absent: {events:?}"
+    );
+
+    // The alias keeps this callee's declaration in item 5's held family;
+    // direct dereferencing supplies actual Foster read/write evidence.
+    let writing = input.replace("{ *q }", "{ *q = 7; 0 }");
+    let artifacts = ::utils::compilation::run_compiler_on_str(&writing, |tcx| {
+        super::raw_boundary_trace_artifacts(tcx).expect("R-B writing trace")
+    })
+    .expect("R-B writing fixture compiles");
+    assert!(
+        artifacts
+            .dispositions
+            .contains("raw-boundary-shared-to-mut"),
+        "{}",
+        artifacts.dispositions
+    );
+    let emitted = ast_emitted_source_of(&writing).expect("R-B writing hold");
+    assert!(
+        emitted.contains("p: *const i32"),
+        "writing through a shared slice was admitted: {emitted}"
+    );
+}
+
+#[test]
+fn slu_w1_unknown_retention_uses_the_exact_t2_waiver() {
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        extern \"C\" { fn unknown_sink(q: *const i32); }\n\
+        pub unsafe fn target(p: *const i32) -> i32 {\n\
+            let value = *p.offset(1); unknown_sink(p); value\n\
+        }\n";
+    let events = slu_w1_assert_use_receipts(input);
+    assert!(
+        events.iter().any(|event| {
+            event.key.family == super::mechanical_receipt::MechanicalFamily::SliceUseUnsupported
+                && event.evidence.retention
+                    == super::mechanical_receipt::MechanicalRetention::T2 {
+                        waiver_id: super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
+                    }
+        }),
+        "SLU T2 waiver is absent: {events:?}"
+    );
+}
+
+#[test]
+fn slu_w1_positive_retention_stays_held() {
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        type Ptr = *const i32;\n\
+        static mut SAVED: *const i32 = 0 as *const i32;\n\
+        unsafe fn raw_keep(q: Ptr) { SAVED = q; }\n\
+        pub unsafe fn target(p: *const i32) -> i32 {\n\
+            let value = *p.offset(1); raw_keep(p); value\n\
+        }\n";
+    let (artifacts, emitted) = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx)?;
+        let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
+            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )))?;
+        let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)?;
+        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+            &emission.plan.held_classes(), &BTreeSet::new(), &table,
+        )?;
+        let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
+            Some(&emission.plan.terminal_a5_raw_calls),
+        )?;
+        Ok::<_, String>((ctx.raw_boundary_artifacts, files.into_values().next().expect("retention fixture root")))
+    }).expect("retention fixture compiles").expect("attested retention emission");
+    assert!(
+        artifacts
+            .dispositions
+            .contains("raw-boundary-positive-retention"),
+        "{}",
+        artifacts.dispositions
+    );
+    assert!(
+        emitted.contains("p: *const i32"),
+        "positive retention admitted: {emitted}"
+    );
+}
+
+#[test]
+fn slu_w1_local_construction_and_raw_use_share_the_class() {
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        unsafe fn raw_read(q: *const i32) -> i32 { q.read() }\n\
+        pub unsafe fn target(src: *const i32) -> i32 {\n\
+            let p: *const i32 = src as *const i32;\n\
+            *p.offset(1) + raw_read(p)\n\
+        }\n";
+    let events = slu_w1_assert_use_receipts(input);
+    assert!(
+        events.iter().any(|event| {
+            event.key.family == super::mechanical_receipt::MechanicalFamily::SliceLocalConstruction
+                && event.stage == super::mechanical_receipt::MechanicalStage::Terminal
+                && event.state == super::mechanical_receipt::MechanicalState::Applied
+        }),
+        "slice construction/use did not compose: {events:?}"
+    );
+}
+
+#[test]
+fn slu_w1_named_copy_keeps_an_input_form_raw_alias() {
+    // The first draft passed the alias to an opaque pointer read and its
+    // frozen model was Raw. This is the measured strlen-style copy/schedule.
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        pub unsafe fn target(mut p: *const i32) -> isize {\n\
+            let base = p;\n\
+            while *p != 0 { p = p.offset(1); }\n\
+            p.offset_from(base)\n\
+        }\n";
+    let emitted = ast_emitted_source_of(input).expect("SLU named-copy emission");
+    assert!(
+        emitted.contains("p: &[i32]") && emitted.contains("let base = p.as_ptr()"),
+        "{emitted}"
+    );
+    slu_w1_assert_use_receipt_count(input, 2);
+}
+
+#[test]
+fn slu_w1_pointer_distance_uses_an_ephemeral_const_view() {
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        pub unsafe fn target(p: *const i32, base: *const i32) -> isize {\n\
+            let _ = *p.offset(1); p.offset_from(base)\n\
+        }\n";
+    let emitted = ast_emitted_source_of(input).expect("SLU pointer-distance emission");
+    assert!(
+        emitted.contains("p: &[i32]") && emitted.contains("p.as_ptr().offset_from("),
+        "{emitted}"
+    );
+    slu_w1_assert_use_receipts(input);
+}
+
+#[test]
+fn slu_w1_assignment_keeps_a_named_raw_alias() {
+    let input = "#![allow(dead_code, unused_unsafe, unused_assignments)]\n\
+        pub unsafe fn target(mut p: *const i32) -> isize {\n\
+            let mut base: *const i32 = 0 as *const i32;\n\
+            base = p;\n\
+            while *p != 0 { p = p.offset(1); }\n\
+            p.offset_from(base)\n\
+        }\n";
+    let emitted = ast_emitted_source_of(input).expect("SLU assignment emission");
+    assert!(
+        emitted.contains("p: &[i32]") && emitted.contains("base = p.as_ptr()"),
+        "{emitted}"
+    );
+    slu_w1_assert_use_receipt_count(input, 2);
+}
+
+// Addendum 210 A: input and candidate forms have separate receipt meanings.
+#[test]
+fn slu_r210_cursor_receipt_reports_input_and_candidate_forms() {
+    let input = slu_w1_source("*p.offset(1) + raw_read(p.offset(-1))");
+    let plans = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        super::decide_table(tcx)
+            .expect("cursor table")
+            .slice_use_receipts
+    })
+    .expect("cursor fixture compiles");
+    let cursor = plans
+        .iter()
+        .find(|plan| {
+            plan.obligation.intended_terminal_reason
+                == Some(super::mechanical_receipt::MechanicalTerminalReason::Cursor)
+        })
+        .expect("nonvacuous cursor receipt");
+    assert_eq!(
+        cursor.source_form, "raw",
+        "actual input form, not the rejected candidate"
+    );
+    assert_eq!(cursor.obligation.planned.found_form, "raw");
+    let (events, rows) = cursor.materialize(false, false);
+    super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events).expect("cursor join");
+    let rendered = super::mechanical_receipt::render_slice_use_rows(&rows);
+    let mut lines = rendered.lines();
+    let columns = lines.next().unwrap().split('\t').collect::<Vec<_>>();
+    let candidate = columns
+        .iter()
+        .position(|name| *name == "candidate_form")
+        .expect("slice candidate needs its own column");
+    assert!(lines.all(|line| line.split('\t').nth(candidate) == Some("slice-shared")));
+}
+
+#[test]
+fn slu_r210_same_form_slice_copy_has_a_safe_carrier() {
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        pub unsafe fn target(p: *const i32) -> i32 {\n\
+            let q: *const i32 = p;\n\
+            *p.offset(1) + *q.offset(1)\n\
+        }\n";
+    let table = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        super::decide_table(tcx).expect("same-form table")
+    })
+    .expect("same-form fixture compiles");
+    for name in ["p", "q"] {
+        assert!(
+            table.entries.iter().any(|(subject, decision)| {
+                subject.param_name.as_deref() == Some(name)
+                    && matches!(
+                        decision,
+                        super::decision::Decision::Slice { mutable: false, .. }
+                    )
+            }),
+            "{name} must actually settle as a shared slice: {:?}",
+            table.entries
+        );
+    }
+    let copy = table
+        .slice_use_receipts
+        .iter()
+        .find(|plan| plan.obligation.planned.source_shape == "body-copy")
+        .expect("same-form copy must have its own receipt");
+    assert_eq!(
+        copy.adapter, "body-slice-same-form",
+        "safe destination must not take a raw view"
+    );
+    assert_eq!(copy.target_form, "slice-shared");
+    assert_eq!(
+        copy.retention,
+        super::mechanical_receipt::MechanicalRetention::None
+    );
+    let emitted = ast_emitted_source_of(input).expect("same-form emission");
+    assert!(emitted.contains("q: &[i32] = p"), "{emitted}");
+    assert!(
+        !emitted.contains("from_raw_parts"),
+        "safe copy needs no raw construction: {emitted}"
+    );
+    ::utils::compilation::run_compiler_on_str(&emitted, |_| ()).expect("safe-copy output compiles");
+}
+
+#[test]
+fn slu_r210_other_safe_destination_stays_held() {
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        pub unsafe fn target(p: *const i32) -> i32 {\n\
+            let q: *const i32 = p; *p.offset(1) + *q\n\
+        }\n";
+    let table = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        super::decide_table(tcx).expect("different-safe-form table")
+    })
+    .expect("different-safe-form fixture compiles");
+    let copy = table
+        .slice_use_receipts
+        .iter()
+        .find(|plan| plan.obligation.planned.source_shape == "body-copy")
+        .expect("nonvacuous safe-destination receipt");
+    assert_eq!(
+        copy.target_form, "ref-shared",
+        "fixture must select the different safe destination"
+    );
+    assert_eq!(
+        copy.obligation.intended_terminal_reason,
+        Some(
+            super::mechanical_receipt::MechanicalTerminalReason::SliceUseDestinationUnbuilt(
+                "ref-shared".to_owned()
+            )
+        )
+    );
+    assert_ne!(copy.adapter, "body-slice-raw-view");
+    let (events, rows) = copy.materialize(false, false);
+    super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
+        .expect("destination-hold join");
+    assert!(
+        super::mechanical_receipt::render_slice_use_rows(&rows)
+            .contains("slice-use-destination-unbuilt:ref-shared")
+    );
+}
+
+#[test]
+fn slu_r210_same_form_copy_preserves_mutable_and_cast_views() {
+    for (label, input, form) in [
+        (
+            "mutable",
+            "pub unsafe fn target(p: *mut i32) { let q: *mut i32 = p; *q.offset(1) = 7; *p.offset(1) = 9; }",
+            "slice-mut",
+        ),
+        (
+            "cast",
+            "pub unsafe fn target(p: *const i32) -> i32 { let q: *const i32 = p as *const i32; *p.offset(1) + *q.offset(1) }",
+            "slice-shared",
+        ),
+    ] {
+        let table = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+            super::decide_table(tcx).expect("same-form contrast table")
+        })
+        .expect("same-form contrast input compiles");
+        let copy = table
+            .slice_use_receipts
+            .iter()
+            .find(|plan| plan.obligation.planned.source_shape == "body-copy")
+            .unwrap_or_else(|| panic!("{label}: missing copy receipt: {:?}", table.entries));
+        assert_eq!(copy.source_form, form, "{label}: source admission");
+        assert_eq!(copy.target_form, form, "{label}: destination admission");
+        assert_eq!(copy.adapter, "body-slice-same-form", "{label}");
+        assert_eq!(
+            copy.retention,
+            super::mechanical_receipt::MechanicalRetention::None
+        );
+        let emitted = ast_emitted_source_of(input).expect("same-form contrast emission");
+        assert!(!emitted.contains("from_raw_parts"), "{label}: {emitted}");
+        assert!(
+            !emitted.contains(".as_ptr()"),
+            "{label}: raw view into safe copy: {emitted}"
+        );
+        ::utils::compilation::run_compiler_on_str(&emitted, |_| ())
+            .expect("same-form contrast output compiles");
+    }
+}
+
+#[test]
+fn slu_r210_settled_option_destinations_use_same_form_or_typed_hold() {
+    // Item 4 owns OptUseUnsupported/OptLocalConstruction admission. R210
+    // tests the carrier on settled forms here without advancing that phase.
+    // The ordinary Slice->Slice witness separately verifies real admission
+    // and compiled emission through the complete production pipeline.
+    for same_form in [true, false] {
+        let input = "pub unsafe fn target(p: *const i32) -> i32 { let q: *const i32 = p; *p.offset(1) + *q.offset(1) }";
+        ::utils::compilation::run_compiler_on_str(input, |tcx| {
+            let (mut table, ctx) = super::decide_table_with_ctx(tcx).expect("settled-form fixture");
+            let program = super::collect_program(tcx);
+            let names = table.entries.iter().filter_map(|(subject, _)| {
+                subject.param_name.clone().map(|name| ((subject.fn_did, subject.hir_id), name))
+            }).collect();
+            let uses = super::decision::emitability::collect_slice_uses(
+                tcx, &program.functions, &names, &rustc_hash::FxHashSet::default(),
+                &rustc_hash::FxHashSet::default(), &ctx.facts.raw_boundary_argument_paths(),
+            );
+            for (subject, decision) in &mut table.entries {
+                let name = subject.param_name.as_deref();
+                if name == Some("q") || (same_form && name == Some("p")) {
+                    *decision = super::decision::Decision::Opt {
+                        mutable: false, slice: same_form, uses: Vec::new(),
+                    };
+                }
+            }
+            table.slice_use_receipts = super::decision::slice_use::receipt_plans(
+                &program, &mut table, &uses, &ctx.raw_boundary, &ctx.retention, &ctx.mut_facts,
+            );
+            let copy = table.slice_use_receipts.iter().find(|plan| {
+                plan.obligation.planned.source_shape == "body-copy"
+            }).expect("settled optional destination receipt");
+            assert_ne!(copy.adapter, "body-slice-raw-view");
+            let (events, rows) = copy.materialize(same_form, false);
+            super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events).expect("settled-form join");
+            if same_form {
+                assert_eq!(copy.source_form, "opt-slice-shared");
+                assert_eq!(copy.target_form, "opt-slice-shared");
+                assert_eq!(copy.adapter, "body-slice-same-form");
+                assert_eq!(copy.retention, super::mechanical_receipt::MechanicalRetention::None);
+                assert!(copy.same_form_initializer.is_some());
+            } else {
+                assert_eq!(copy.target_form, "opt-ref-shared");
+                assert_eq!(copy.obligation.intended_terminal_reason,
+                    Some(super::mechanical_receipt::MechanicalTerminalReason::SliceUseDestinationUnbuilt("opt-ref-shared".to_owned())));
+                let owner = copy.owner_class;
+                let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+                    .expect("different-safe-form hold plans");
+                assert!(emission.plan.held_classes().contains(&owner));
+            }
+        }).expect("settled Option carrier fixture compiles");
+    }
+}
+
+#[test]
+fn slu_r210_local_copy_to_field_has_a_positive_retention_hold() {
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        type Ptr = *const i32;\n\
+        pub struct Holder { saved: Ptr }\n\
+        pub unsafe fn target(src: *const i32, out: *mut Holder) -> i32 {\n\
+            let p: *const i32 = src as *const i32;\n\
+            let q: Ptr = p; (*out).saved = q; *p.offset(1)\n\
+        }\n";
+    let table = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        super::decide_table(tcx).expect("local-retention table")
+    })
+    .expect("local-retention fixture compiles");
+    assert!(
+        table.entries.iter().any(|(subject, decision)| {
+            subject.param_name.as_deref() == Some("p")
+                && matches!(subject.kind, super::decision::SubjectKind::Local)
+                && matches!(decision, super::decision::Decision::Slice { .. })
+        }),
+        "the source must actually be an admitted local slice: {:?}",
+        table.entries
+    );
+    let copy = table
+        .slice_use_receipts
+        .iter()
+        .find(|plan| plan.obligation.planned.source_shape == "body-copy")
+        .expect("nonvacuous local-copy receipt");
+    assert_eq!(
+        copy.obligation.intended_terminal_reason,
+        Some(super::mechanical_receipt::MechanicalTerminalReason::PositiveRetention)
+    );
+    assert_eq!(
+        copy.retention,
+        super::mechanical_receipt::MechanicalRetention::PositiveRetention
+    );
+    assert_ne!(copy.adapter, "body-slice-raw-view");
+    let (events, rows) = copy.materialize(false, false);
+    super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
+        .expect("local-retention hold join");
 }

@@ -1121,6 +1121,7 @@ pub(crate) struct Plan {
     /// the common mechanical ledger.
     pub slice_construction_receipt_plans:
         Vec<super::mechanical_receipt::SliceConstructionReceiptPlan>,
+    pub slice_use_receipt_plans: Vec<super::mechanical_receipt::SliceUseReceiptPlan>,
     pub unowned_a5_proof_sites: usize,
     /// A5 calls after terminal-interface validation/re-planning. The AST graft
     /// consumes this sealed plan; it never recomputes the terminal verdict.
@@ -1363,7 +1364,46 @@ impl Plan {
             events.extend(pair);
             slice_rows.extend(rows);
         }
+        for receipt in &self.slice_use_receipt_plans {
+            let live = self.slice_use_class_live(receipt, reverted);
+            let (pair, _) = receipt.materialize(live, reverted.contains(&receipt.owner_class));
+            events.extend(pair);
+        }
         (events, a5_rows, slice_rows)
+    }
+
+    fn slice_use_class_live(
+        &self,
+        receipt: &super::mechanical_receipt::SliceUseReceiptPlan,
+        reverted: &BTreeSet<SignatureClassId>,
+    ) -> bool {
+        std::iter::once(&receipt.owner_class)
+            .chain(receipt.obligation.planned.dependency_classes.iter())
+            .all(|owner| {
+                !reverted.contains(owner)
+                    && self
+                        .class_finalization
+                        .classes
+                        .get(owner)
+                        .is_some_and(SignatureClassPlan::is_ready)
+            })
+    }
+
+    pub(crate) fn slice_use_receipt_rows(
+        &self,
+        reverted: &BTreeSet<SignatureClassId>,
+    ) -> Vec<super::mechanical_receipt::SliceUseAdapterReceiptRow> {
+        self.slice_use_receipt_plans
+            .iter()
+            .flat_map(|receipt| {
+                receipt
+                    .materialize(
+                        self.slice_use_class_live(receipt, reverted),
+                        reverted.contains(&receipt.owner_class),
+                    )
+                    .1
+            })
+            .collect()
     }
 }
 
@@ -1442,6 +1482,7 @@ pub(crate) fn plan(
     let mut preclass_sites = Vec::new();
     let mut a5_receipt_plans = Vec::new();
     let mut slice_construction_receipt_plans = Vec::new();
+    let slice_use_receipt_plans = table.slice_use_receipts.clone();
     let unowned_a5_proof_sites = table
         .seams
         .overlap_proofs
@@ -1739,6 +1780,49 @@ pub(crate) fn plan(
                 detail: subject_id.clone(),
                 subject: subject_id,
             }),
+        }
+    }
+
+    for receipt in &slice_use_receipt_plans {
+        if receipt.obligation.intended_terminal_state
+            == super::mechanical_receipt::MechanicalState::HeldNonmechanical
+            && receipt.obligation.intended_terminal_reason
+                != Some(super::mechanical_receipt::MechanicalTerminalReason::Cursor)
+        {
+            let site = &receipt.obligation.planned.key.site;
+            let subject = table
+                .entries
+                .iter()
+                .find(|(subject, _)| {
+                    receipt.obligation.planned.key.subject
+                        == super::mechanical_receipt::MechanicalSubjectKey::Local {
+                            owner: subject.fn_did,
+                            mir_local: subject.local.as_u32(),
+                            slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                        }
+                })
+                .expect("slice-use receipt retains its source subject")
+                .0
+                .clone();
+            let bridge = BridgeSitePlan::local(
+                receipt.owner_class.local_def_id(),
+                receipt.owner_class.local_def_id(),
+                Arm::Surface.key(),
+                site.receipt_key(),
+                "slice-use-adapter",
+            )
+            .with_forms(
+                &receipt.target_form,
+                &receipt.source_form,
+                &receipt.obligation.planned.source_shape,
+            );
+            unplaceable.push(Unplaceable {
+                owner_class: receipt.owner_class,
+                bridge,
+                reason: "slice-use-evidence-held",
+                detail: format!("{:?}", receipt.obligation.intended_terminal_reason),
+                subject: subject.identity_key(&owner_of(&subject)),
+            });
         }
     }
 
@@ -2788,6 +2872,7 @@ pub(crate) fn plan(
         attribution_intervals,
         a5_receipt_plans,
         slice_construction_receipt_plans,
+        slice_use_receipt_plans,
         unowned_a5_proof_sites,
         terminal_a5_raw_calls: Vec::new(),
     }
@@ -2851,6 +2936,7 @@ mod tests {
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
+            slice_use_receipts: Vec::new(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -2907,6 +2993,7 @@ mod tests {
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
+            slice_use_receipts: Vec::new(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

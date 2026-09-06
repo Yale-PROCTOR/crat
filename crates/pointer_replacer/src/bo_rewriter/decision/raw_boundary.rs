@@ -3,7 +3,7 @@
 //! This module is rewriter-side by design. It consumes the frozen model/MIR and
 //! never contributes a solver constraint or cache field.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{HirId, def_id::LocalDefId};
@@ -707,7 +707,8 @@ struct RetentionDependency {
 struct RetentionBodyFacts {
     function: LocalDefId,
     function_path: String,
-    argument_index: usize,
+    /// Only parameter-rooted facts can mint a parameter certificate.
+    argument_index: Option<usize>,
     steps: Vec<RetentionStep>,
     retains: Vec<RetentionStep>,
     unknowns: BTreeMap<RetentionUnknownReason, Vec<RetentionStep>>,
@@ -755,12 +756,12 @@ fn plain_operand_local(operand: &Operand<'_>) -> Option<Local> {
 fn collect_retention_facts<'tcx>(
     program: &RustProgram<'tcx>,
     function: LocalDefId,
-    argument_index: usize,
+    root: Local,
+    argument_index: Option<usize>,
     body: &Body<'tcx>,
 ) -> RetentionBodyFacts {
     let tcx = program.tcx;
     let function_path = tcx.def_path_str(function.to_def_id());
-    let root = Local::from_usize(argument_index + 1);
     let mut definitions = vec![0usize; body.local_decls.len()];
     let mut aliases = Vec::<(Local, Local, RetentionStep)>::new();
 
@@ -854,6 +855,29 @@ fn collect_retention_facts<'tcx>(
                     RetentionEventKind::DereferenceOnly,
                     format!("access through _{}", lhs.local.as_u32()),
                 ));
+            }
+            // R210(c)'s local query treats an aggregate operand as stored
+            // pointer evidence even if a later whole-aggregate move hides
+            // the field write. Parameter-summary behavior stays unchanged;
+            // the local query also uses this mode for dependency roots.
+            if argument_index.is_none()
+                && let Rvalue::Aggregate(_, operands) = rhs
+            {
+                for operand in operands {
+                    if let Some(source) =
+                        plain_operand_local(operand).filter(|source| is_reachable(*source))
+                    {
+                        facts.retains.push(retention_step(
+                            location,
+                            RetentionEventKind::FieldOrGlobalStore,
+                            format!(
+                                "store _{} in aggregate _{}",
+                                source.as_u32(),
+                                lhs.local.as_u32()
+                            ),
+                        ));
+                    }
+                }
             }
             let Some(source_place) = transparent_operand(rhs).and_then(Operand::place) else {
                 continue;
@@ -1044,10 +1068,16 @@ fn direct_verdict(facts: &RetentionBodyFacts, attested: bool) -> RetentionVerdic
             frontier: frontier.clone(),
         };
     }
+    let Some(argument_index) = facts.argument_index else {
+        return RetentionVerdict::Unknown {
+            reason: RetentionUnknownReason::LocalSummaryUnknown,
+            frontier: facts.steps.clone(),
+        };
+    };
     RetentionVerdict::NoRetain {
         certificate: RetentionCertificate {
             function: facts.function_path.clone(),
-            argument_index: facts.argument_index,
+            argument_index,
             steps: facts.steps.clone(),
             attestation: "closed_world_frozen_graph",
         },
@@ -1129,7 +1159,7 @@ impl RetentionSummaries {
                 }
                 facts.insert(
                     (function, argument_index),
-                    collect_retention_facts(program, function, argument_index, &body),
+                    collect_retention_facts(program, function, local, Some(argument_index), &body),
                 );
             }
         }
@@ -1163,6 +1193,78 @@ impl RetentionSummaries {
         argument_index: usize,
     ) -> Option<&RetentionVerdict> {
         self.rows.get(&(function, argument_index))
+    }
+
+    /// R210(c): outward retention rooted at the copied destination, rather
+    /// than at a parameter. This query never licenses a local alias schedule.
+    pub(crate) fn copied_local_retention(
+        &self,
+        program: &RustProgram<'_>,
+        function: LocalDefId,
+        destination: Local,
+    ) -> RetentionVerdict {
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(function)
+            .borrow();
+        let facts = collect_retention_facts(program, function, destination, None, &body);
+        let unknown_reason = if !self.attested {
+            RetentionUnknownReason::AttestationAbsent
+        } else {
+            facts.unknowns.first_key_value().map_or(
+                RetentionUnknownReason::LocalSummaryUnknown,
+                |(&reason, _)| reason,
+            )
+        };
+        let mut frontier = facts.steps.clone();
+        frontier.extend(facts.unknowns.values().flatten().cloned());
+        frontier.sort();
+        frontier.dedup();
+
+        let mut pending = VecDeque::from([(facts, Vec::<RetentionStep>::new())]);
+        let mut visited = FxHashSet::default();
+        while let Some((facts, mut path)) = pending.pop_front() {
+            // A visible positive sink is sufficient to hold the bridge. It
+            // cannot be erased by missing attestation, unknown origin facts,
+            // or a second definition on another path.
+            if let Some(sink) = facts.retains.first() {
+                path.push(sink.clone());
+                return RetentionVerdict::Retains {
+                    sink: sink.clone(),
+                    path,
+                };
+            }
+            for dependency in &facts.dependencies {
+                let key = (dependency.callee, dependency.argument_index);
+                if !visited.insert(key) || !self.facts.contains_key(&key) {
+                    continue;
+                }
+                // Only the reachable parameter roots are inspected. Existing
+                // summary rows can be Unknown solely because attestation or
+                // origins were absent; they must not conceal a positive sink.
+                let body = program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(dependency.callee)
+                    .borrow();
+                let dependency_facts = collect_retention_facts(
+                    program,
+                    dependency.callee,
+                    Local::from_usize(dependency.argument_index + 1),
+                    None,
+                    &body,
+                );
+                let mut dependency_path = path.clone();
+                dependency_path.push(dependency.step.clone());
+                pending.push_back((dependency_facts, dependency_path));
+            }
+        }
+
+        // Absence of an outward sink says nothing about later uses of this
+        // raw alias beside the parent reference, so this is never T1 evidence.
+        RetentionVerdict::Unknown {
+            reason: unknown_reason,
+            frontier,
+        }
     }
 
     pub(crate) fn verify_certificate(
@@ -1728,6 +1830,7 @@ fn template_for_source_form(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RawBoundaryDispositionIndex {
     by_site: BTreeMap<RawBoundarySiteKey, RawBoundaryDisposition>,
+    negative_write: BTreeMap<RawBoundarySiteKey, NegativeWriteEvidence>,
     render_sites: BTreeMap<RawBoundarySiteKey, RawBoundaryRenderSite>,
     site_lookup: Vec<((LocalDefId, HirId), Span, usize, RawBoundarySiteKey)>,
     open_nodes: FxHashSet<(LocalDefId, HirId)>,
@@ -1889,6 +1992,9 @@ impl RawBoundaryDispositionIndex {
                                 ));
                             }
                         };
+                    if let Some(evidence) = negative_write {
+                        out.negative_write.insert(site.key.clone(), evidence);
+                    }
                     let mut template =
                         template_for(decision, &site.target, ownership, negative_write.is_some())
                             .map_err(|reason| {
@@ -2145,12 +2251,31 @@ impl RawBoundaryDispositionIndex {
             &RawBoundaryRenderSite,
         ),
     > {
+        self.inventoried_sites()
+            .filter(|(_, _, site)| site.target_stays_raw)
+    }
+
+    pub(crate) fn inventoried_sites(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &RawBoundarySiteKey,
+            &RawBoundaryDisposition,
+            &RawBoundaryRenderSite,
+        ),
+    > {
         self.by_site.iter().filter_map(|(key, disposition)| {
             self.render_sites
                 .get(key)
-                .filter(|site| site.target_stays_raw)
                 .map(|site| (key, disposition, site))
         })
+    }
+
+    pub(crate) fn negative_write_evidence(
+        &self,
+        key: &RawBoundarySiteKey,
+    ) -> Option<NegativeWriteEvidence> {
+        self.negative_write.get(key).copied()
     }
 
     pub(crate) fn receipts_tsv(&self) -> String {
@@ -2486,6 +2611,161 @@ mod tests {
             (verdict, verification)
         })
         .expect("fixture compiles")
+    }
+
+    fn copied_local_retention_of(
+        source: &str,
+        attestation: Option<WholeProgramAttestation>,
+    ) -> RetentionVerdict {
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let function = program
+                .functions
+                .iter()
+                .copied()
+                .find(|function| tcx.item_name(function.to_def_id()).as_str() == "target")
+                .expect("copied-local fixture function");
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let destination = body
+                .var_debug_info
+                .iter()
+                .find_map(|info| {
+                    if info.name.as_str() != "copied" {
+                        return None;
+                    }
+                    match &info.value {
+                        rustc_middle::mir::VarDebugInfoContents::Place(place) => place.as_local(),
+                        _ => None,
+                    }
+                })
+                .expect("named copied destination retains its MIR identity");
+            assert!(
+                destination.as_usize() > body.arg_count,
+                "control must query a local, not a parameter"
+            );
+            // Positive MIR sinks do not need an origin solve or a whole-graph
+            // no-retention certificate. Missing origins keeps ordinary
+            // parameter rows Unknown, including the dependency controls.
+            let summaries = RetentionSummaries::derive(&program, None, attestation);
+            summaries.copied_local_retention(&program, function, destination)
+        })
+        .expect("copied-local retention fixture compiles")
+    }
+
+    #[test]
+    fn rb_r210_local_copy_field_store_is_positive_unattested() {
+        let verdict = copied_local_retention_of(
+            "#![allow(dead_code, unused_assignments)]\n\
+             struct Holder { saved: *const i32 }\n\
+             unsafe fn target(seed: *const i32) -> Holder {\n\
+                 let copied = seed; let alias = copied;\n\
+                 let mut holder = Holder { saved: core::ptr::null() };\n\
+                 holder.saved = alias; holder\n\
+             }",
+            None,
+        );
+        assert!(
+            matches!(
+                verdict,
+                RetentionVerdict::Retains {
+                    sink: RetentionStep {
+                        kind: RetentionEventKind::FieldOrGlobalStore,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "local-to-local field escape became unknown: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn rb_r210_local_copy_return_is_positive_unattested() {
+        let verdict = copied_local_retention_of(
+            "unsafe fn target(seed: *const i32) -> *const i32 {\n\
+                 let copied = seed; let alias = copied; alias\n\
+             }",
+            None,
+        );
+        assert!(
+            matches!(
+                verdict,
+                RetentionVerdict::Retains {
+                    sink: RetentionStep {
+                        kind: RetentionEventKind::Return,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "local-to-local return escape became unknown: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn rb_r210_local_copy_aggregate_store_is_positive_unattested() {
+        let verdict = copied_local_retention_of(
+            "#![allow(dead_code)]\n\
+             struct Holder { saved: *const i32 }\n\
+             unsafe fn target(seed: *const i32) -> Holder {\n\
+                 let copied = seed; let alias = copied; Holder { saved: alias }\n\
+             }",
+            None,
+        );
+        assert!(
+            matches!(
+                verdict,
+                RetentionVerdict::Retains {
+                    sink: RetentionStep {
+                        kind: RetentionEventKind::FieldOrGlobalStore,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "aggregate field escape became unknown: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn rb_r210_local_copy_retaining_dependency_is_positive_unattested() {
+        let verdict = copied_local_retention_of(
+            "#![allow(dead_code)]\n\
+             struct Holder { saved: *const i32 }\n\
+             unsafe fn store(p: *const i32, out: *mut Holder) { (*out).saved = p; }\n\
+             unsafe fn relay(p: *const i32, out: *mut Holder) { store(p, out); }\n\
+             unsafe fn target(seed: *const i32, out: *mut Holder) {\n\
+                 let copied = seed; let alias = copied; relay(alias, out);\n\
+             }",
+            None,
+        );
+        let RetentionVerdict::Retains { sink, path } = &verdict else {
+            panic!("local-call field escape became unknown: {verdict:?}");
+        };
+        assert_eq!(sink.kind, RetentionEventKind::OutputStorage);
+        assert_eq!(
+            path.iter()
+                .filter(|step| step.kind == RetentionEventKind::LocalCall)
+                .count(),
+            2,
+            "both calls must retain their positive-sink provenance: {path:?}"
+        );
+    }
+
+    #[test]
+    fn rb_r210_local_copy_never_mints_a_no_retention_certificate() {
+        let verdict = copied_local_retention_of(
+            "unsafe fn target(seed: *const i32) -> i32 {\n\
+                 let copied = seed; *copied\n\
+             }",
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        assert!(
+            matches!(verdict, RetentionVerdict::Unknown { .. }),
+            "absence of outward retention cannot license the local alias schedule: {verdict:?}"
+        );
     }
 
     fn symbol(name: &str, foreign: bool) -> ForeignSymbolKey {

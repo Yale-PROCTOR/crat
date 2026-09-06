@@ -1120,12 +1120,26 @@ pub(crate) struct UseEdit {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SliceUses {
     pub rewrites: Vec<UseEdit>,
+    pub raw_uses: Vec<SliceRawUse>,
     /// A use that is **not** `*p.offset(e)`.
     ///
     /// Any such use blocks the whole subject. `&[T]` changes the type at every
     /// occurrence, so a rewrite that fixes the uses it recognizes and leaves the
     /// rest is not a partial win — it is an ill-typed crate.
     pub unsupported: Option<Span>,
+    pub unsupported_is_cursor: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SliceRawUse {
+    pub hir_id: HirId,
+    pub span: Span,
+    pub boundary_span: Option<Span>,
+    pub source_shape: &'static str,
+    pub target: RawTargetType,
+    pub native_element: bool,
+    pub destination: Option<HirId>,
+    pub contract: Option<String>,
 }
 
 /// Is `rhs` this binding's own pointer arithmetic — the right-hand side of a
@@ -1504,6 +1518,7 @@ pub(crate) fn collect_slice_uses(
     name_of: &FxHashMap<(LocalDefId, HirId), String>,
     mutable_of: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
     advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
 ) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
@@ -1516,6 +1531,7 @@ pub(crate) fn collect_slice_uses(
         /// binding (`p = …` needs one). Both gates are decided where the facts
         /// live and handed here as one set.
         advance_ok: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+        raw_boundary_arguments: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1523,9 +1539,26 @@ pub(crate) fn collect_slice_uses(
                 && let Res::Local(hir_id) = path.res
             {
                 let key = (self.fn_did, hir_id);
+                // Item 3: this exact operand is owned by the existing boundary
+                // planner. Its final T1/T2/R-B verdict still gates the class;
+                // the slice-use collector must not preempt it with a use wall.
+                if let Some((site, edit)) = self.raw_use(expr, key) {
+                    let entry = self.out.entry(key).or_default();
+                    entry.raw_uses.push(site);
+                    if let Some(edit) = edit {
+                        entry.rewrites.push(edit);
+                    }
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
                 // Classify BEFORE taking the entry: `classify` reads `self`, and
                 // holding the map entry across it would be a borrow conflict.
                 let classified = self.classify(expr, key);
+                let cursor = if classified.is_none() {
+                    self.cursor_use(expr, key)
+                } else {
+                    None
+                };
                 let entry = self.out.entry(key).or_default();
                 match classified {
                     // **S3.2′-2b — three outcomes, not two.** The self-advance
@@ -1539,6 +1572,10 @@ pub(crate) fn collect_slice_uses(
                     None => {
                         if entry.unsupported.is_none() {
                             entry.unsupported = Some(expr.span);
+                            entry.unsupported_is_cursor = cursor.is_some();
+                        }
+                        if let Some(cursor) = cursor {
+                            entry.raw_uses.push(cursor);
                         }
                     }
                 }
@@ -1547,6 +1584,215 @@ pub(crate) fn collect_slice_uses(
         }
     }
     impl V<'_, '_> {
+        fn cursor_use(
+            &self,
+            expression: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<SliceRawUse> {
+            self.name_of.get(&key)?;
+            let mut operand = expression;
+            loop {
+                let rustc_hir::Node::Expr(parent) = self.tcx.parent_hir_node(operand.hir_id) else {
+                    return None;
+                };
+                match parent.kind {
+                    ExprKind::Cast(inner, _) if inner.hir_id == operand.hir_id => operand = parent,
+                    ExprKind::MethodCall(segment, receiver, _, _)
+                        if receiver.hir_id == operand.hir_id
+                            && matches!(
+                                segment.ident.name.as_str(),
+                                "offset"
+                                    | "add"
+                                    | "sub"
+                                    | "wrapping_offset"
+                                    | "wrapping_add"
+                                    | "wrapping_sub"
+                            ) =>
+                    {
+                        return Some(SliceRawUse {
+                            hir_id: expression.hir_id,
+                            span: expression.span,
+                            boundary_span: None,
+                            source_shape: "cursor",
+                            target: raw_target_type(
+                                self.tcx,
+                                self.tcx.typeck(key.0).expr_ty(operand),
+                            )?,
+                            native_element: false,
+                            destination: None,
+                            contract: None,
+                        });
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        fn raw_use(
+            &self,
+            use_expr: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<(SliceRawUse, Option<UseEdit>)> {
+            let name = self.name_of.get(&key)?;
+            let mut operand = use_expr;
+            loop {
+                if self.raw_boundary_arguments.contains(&(
+                    key.0,
+                    key.1,
+                    operand.span.lo().0,
+                    operand.span.hi().0,
+                )) {
+                    let target = raw_target_type(
+                        self.tcx,
+                        self.tcx.typeck(key.0).expr_ty_adjusted(operand),
+                    )?;
+                    let parent = self.tcx.parent_hir_node(use_expr.hir_id);
+                    let element = match parent {
+                        rustc_hir::Node::Expr(deref)
+                            if matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) =>
+                        {
+                            Some(UseEdit {
+                                span: deref.span,
+                                replacement: format!("{name}[0]"),
+                                bridge_kind: "subject-use",
+                            })
+                        }
+                        _ => None,
+                    };
+                    return Some((
+                        SliceRawUse {
+                            hir_id: use_expr.hir_id,
+                            span: use_expr.span,
+                            boundary_span: Some(operand.span),
+                            source_shape: classify_arg(self.tcx, operand).key(),
+                            target,
+                            native_element: element.is_some(),
+                            destination: None,
+                            contract: None,
+                        },
+                        element,
+                    ));
+                }
+                match self.tcx.parent_hir_node(operand.hir_id) {
+                    rustc_hir::Node::Expr(parent) => match parent.kind {
+                        ExprKind::MethodCall(segment, receiver, arguments, _)
+                            if segment.ident.name.as_str() == "offset_from"
+                                && (receiver.hir_id == operand.hir_id
+                                    || arguments
+                                        .iter()
+                                        .any(|arg| arg.hir_id == operand.hir_id)) =>
+                        {
+                            let typeck = self.tcx.typeck(key.0);
+                            let callee = typeck.type_dependent_def_id(parent.hir_id)?;
+                            if !typeck.expr_ty(receiver).is_raw_ptr()
+                                || self.tcx.crate_name(callee.krate).as_str() != "core"
+                            {
+                                return None;
+                            }
+                            let mut target = raw_target_type(self.tcx, typeck.expr_ty(operand))?;
+                            target.mutability = RawMutability::Const;
+                            target.rendered = format!("*const {}", target.pointee);
+                            return Some((
+                                SliceRawUse {
+                                    hir_id: use_expr.hir_id,
+                                    span: use_expr.span,
+                                    boundary_span: None,
+                                    source_shape: "pointer-distance",
+                                    target,
+                                    native_element: false,
+                                    destination: None,
+                                    contract: Some(format!(
+                                        "core-pointer-distance-no-retention:{}",
+                                        self.tcx.def_path_str(callee)
+                                    )),
+                                },
+                                Some(UseEdit {
+                                    span: use_expr.span,
+                                    replacement: format!("{name}.as_ptr()"),
+                                    bridge_kind: "subject-use",
+                                }),
+                            ));
+                        }
+                        ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == operand.hir_id => {
+                            let target =
+                                raw_target_type(self.tcx, self.tcx.typeck(key.0).expr_ty(lhs))?;
+                            let destination = match lhs.kind {
+                                ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                                    Res::Local(binding) => Some(binding),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            return Some((
+                                SliceRawUse {
+                                    hir_id: use_expr.hir_id,
+                                    span: use_expr.span,
+                                    boundary_span: None,
+                                    source_shape: if destination.is_some() {
+                                        "body-copy"
+                                    } else {
+                                        "field-store"
+                                    },
+                                    target,
+                                    native_element: false,
+                                    destination,
+                                    contract: None,
+                                },
+                                None,
+                            ));
+                        }
+                        ExprKind::Cast(inner, _)
+                        | ExprKind::AddrOf(_, _, inner)
+                        | ExprKind::Unary(rustc_hir::UnOp::Deref, inner)
+                        | ExprKind::Field(inner, _)
+                            if inner.hir_id == operand.hir_id =>
+                        {
+                            operand = parent
+                        }
+                        // Pointer arithmetic is never traversed to obtain a
+                        // boundary operand. Those uses stay in the cursor set.
+                        _ => return None,
+                    },
+                    rustc_hir::Node::LetStmt(local)
+                        if local.init.is_some_and(|init| init.hir_id == operand.hir_id) =>
+                    {
+                        let target =
+                            raw_target_type(self.tcx, self.tcx.typeck(key.0).pat_ty(local.pat))?;
+                        let discarded = matches!(local.pat.kind, rustc_hir::PatKind::Wild);
+                        if discarded && target.mutability != RawMutability::Const {
+                            return None;
+                        }
+                        if !discarded && !matches!(local.pat.kind, rustc_hir::PatKind::Binding(..))
+                        {
+                            return None;
+                        }
+                        return Some((
+                            SliceRawUse {
+                                hir_id: use_expr.hir_id,
+                                span: use_expr.span,
+                                boundary_span: None,
+                                source_shape: if discarded {
+                                    "raw-discard"
+                                } else {
+                                    "body-copy"
+                                },
+                                target,
+                                native_element: false,
+                                destination: (!discarded).then_some(local.pat.hir_id),
+                                contract: None,
+                            },
+                            discarded.then(|| UseEdit {
+                                span: use_expr.span,
+                                replacement: format!("{name}.as_ptr()"),
+                                bridge_kind: "subject-use",
+                            }),
+                        ));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
         /// `*p.offset(e)` — and nothing else — yields an edit.
         fn classify(
             &self,
@@ -1699,6 +1945,7 @@ pub(crate) fn collect_slice_uses(
             name_of,
             mutable_of,
             advance_ok,
+            raw_boundary_arguments,
         };
         v.visit_body(tcx.hir_body(body_id));
     }

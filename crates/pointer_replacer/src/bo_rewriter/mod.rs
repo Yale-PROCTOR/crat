@@ -222,6 +222,7 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) mechanical_events: Vec<mechanical_receipt::MechanicalObligationEvent>,
     pub(crate) a5_proof_site_fallback_rows: Vec<mechanical_receipt::A5ProofSiteFallbackReceiptRow>,
     pub(crate) slice_construction_rows: Vec<mechanical_receipt::SliceConstructionReceiptRow>,
+    pub(crate) slice_use_rows: Vec<mechanical_receipt::SliceUseAdapterReceiptRow>,
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
@@ -1186,6 +1187,7 @@ fn refresh_raw_boundary_receipt_events(
     artifacts.mechanical_events = mechanical_events;
     artifacts.a5_proof_site_fallback_rows = a5_rows;
     artifacts.slice_construction_rows = slice_rows;
+    artifacts.slice_use_rows = emission_plan.slice_use_receipt_rows(reverted);
 }
 
 fn verify_and_revert(
@@ -3196,6 +3198,15 @@ impl OutcomeFacts {
             }
         }
         for row in &mut self.raw_boundary_artifacts.slice_construction_rows {
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
+        for row in &mut self.raw_boundary_artifacts.slice_use_rows {
+            row.terminal_class_state = mechanical_receipt::MechanicalState::Dropped;
             if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
                 row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
                 row.terminal.reason = Some(
@@ -5347,12 +5358,14 @@ fn finish_decide<'tcx>(
         .filter(|s| s.mut_binding && !sign.may_be_negative(s.fn_did, s.local))
         .map(|s| (s.fn_did, s.hir_id))
         .collect();
+    let raw_boundary_argument_paths = facts.raw_boundary_argument_paths();
     let slice_uses = decision::emitability::collect_slice_uses(
         tcx,
         &program.functions,
         &names,
         &mutable_of,
         &advance_ok,
+        &raw_boundary_argument_paths,
     );
     // **S3.2′-3.** The accessor a subject's uses are rewritten through, chosen
     // per subject by the idiom rule (micro-plan §9c): `unwrap()` where the
@@ -5391,7 +5404,6 @@ fn finish_decide<'tcx>(
         .filter(|s| fat.is_array(s.fn_did, s.local))
         .map(|s| (s.fn_did, s.hir_id))
         .collect();
-    let raw_boundary_argument_paths = facts.raw_boundary_argument_paths();
     let opt_uses = decision::emitability::collect_opt_uses(
         tcx,
         &program.functions,
@@ -5683,6 +5695,14 @@ fn finish_decide<'tcx>(
     // Item 2 renders local raw-result constructors only after the terminal
     // seam set exists, so a contained raw-view/cast edit is composed into the
     // initializer rather than overwritten by an outer constructor.
+    table.slice_use_receipts = decision::slice_use::receipt_plans(
+        &program,
+        &mut table,
+        &slice_uses,
+        &raw_boundary,
+        &retention,
+        &mut_facts,
+    );
     table.slice_constructions =
         decision::construction::plan_slice_constructions(tcx, &table, &ctors);
     append_surface_declaration_plans(tcx, &exposure, &mut table);
@@ -5736,6 +5756,7 @@ fn finish_decide<'tcx>(
         mechanical_events: Vec::new(),
         a5_proof_site_fallback_rows: Vec::new(),
         slice_construction_rows: Vec::new(),
+        slice_use_rows: Vec::new(),
         class_costs: bridge_receipt::class_cost_header(),
         class_collisions: bridge_receipt::class_collision_header(),
         unresolved_classes: bridge_receipt::unresolved_class_header(),

@@ -10615,6 +10615,11 @@ mod run {
             &artifact.mechanical_events,
         )
         .expect("slice-construction receipt reconciliation");
+        crate::bo_rewriter::mechanical_receipt::reconcile_slice_use_rows(
+            &artifact.slice_use_rows,
+            &artifact.mechanical_events,
+        )
+        .expect("slice-use receipt reconciliation");
         let mechanical_receipts =
             crate::bo_rewriter::mechanical_receipt::render_mechanical_obligations(
                 &artifact.mechanical_events,
@@ -10627,6 +10632,8 @@ mod run {
             crate::bo_rewriter::mechanical_receipt::render_slice_construction_rows(
                 &artifact.slice_construction_rows,
             );
+        let slice_use_receipts =
+            crate::bo_rewriter::mechanical_receipt::render_slice_use_rows(&artifact.slice_use_rows);
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
             ("d4-edges", artifact.d4_edges.as_str()),
@@ -10677,6 +10684,11 @@ mod run {
             stamp(&slice_construction_receipts),
         )
         .expect("write slice-construction receipts");
+        std::fs::write(
+            directory.join(format!("{name}.{}", raw_schema::SLICE_USE_ADAPTER_ROWS)),
+            stamp(&slice_use_receipts),
+        )
+        .expect("write slice-use receipts");
         let mut diagnostics = String::from(RAW_BOUNDARY_DIAGNOSTIC_HEADER);
         for diagnostic in &capture.reverts {
             diagnostics.push_str(&format!(

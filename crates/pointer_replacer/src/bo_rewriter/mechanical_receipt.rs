@@ -454,6 +454,7 @@ pub(crate) enum MechanicalTerminalReason {
     RbNegativeWriteAbsent,
     CalleeWrites,
     PositiveRetention,
+    SliceUseDestinationUnbuilt(String),
     TerminalContractMissing,
     CompositionCrossingUnhoistable(String),
     Cursor,
@@ -477,6 +478,9 @@ impl MechanicalTerminalReason {
             }
             Self::CalleeWrites => "raw-boundary-shared-to-mut:callee-writes".to_owned(),
             Self::PositiveRetention => "positive-retention".to_owned(),
+            Self::SliceUseDestinationUnbuilt(form) => {
+                format!("slice-use-destination-unbuilt:{form}")
+            }
             Self::TerminalContractMissing => "terminal-contract-missing".to_owned(),
             Self::CompositionCrossingUnhoistable(reason) => {
                 format!("composition-crossing-unhoistable:{reason}")
@@ -1023,6 +1027,7 @@ impl MechanicalObligationEvent {
                     MechanicalTerminalReason::RbNegativeWriteAbsent
                         | MechanicalTerminalReason::CalleeWrites
                         | MechanicalTerminalReason::PositiveRetention
+                        | MechanicalTerminalReason::SliceUseDestinationUnbuilt(_)
                         | MechanicalTerminalReason::TerminalContractMissing
                         | MechanicalTerminalReason::CompositionCrossingUnhoistable(_)
                         | MechanicalTerminalReason::Cursor
@@ -1498,11 +1503,159 @@ pub(crate) struct SliceUseAdapterReceiptRow {
     pub(crate) terminal: SpecializedReceiptTerminal,
     pub(crate) use_site: CanonicalSiteKey,
     pub(crate) source_form: String,
+    pub(crate) candidate_form: String,
     pub(crate) target_form: String,
     pub(crate) access_mutability: String,
     pub(crate) adapter: String,
+    pub(crate) boundary_site: String,
+    pub(crate) boundary_evidence: String,
     pub(crate) retention: MechanicalRetention,
     pub(crate) terminal_class_state: MechanicalState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SliceUseReceiptPlan {
+    pub(crate) obligation: MechanicalObligationPlan,
+    pub(crate) use_site: CanonicalSiteKey,
+    pub(crate) source_form: String,
+    pub(crate) candidate_form: String,
+    /// A safe copy/reborrow already supplies this local's complete value.
+    pub(crate) same_form_initializer: Option<(LocalDefId, rustc_hir::HirId)>,
+    pub(crate) target_form: String,
+    pub(crate) access_mutability: String,
+    pub(crate) adapter: String,
+    pub(crate) boundary_site: String,
+    pub(crate) boundary_evidence: String,
+    pub(crate) retention: MechanicalRetention,
+    pub(crate) owner_class: SignatureClassId,
+}
+
+impl SliceUseReceiptPlan {
+    pub(crate) fn materialize(
+        &self,
+        class_live: bool,
+        runtime_reverted: bool,
+    ) -> (
+        [MechanicalObligationEvent; 2],
+        [SliceUseAdapterReceiptRow; 2],
+    ) {
+        let events = self.obligation.events(class_live, runtime_reverted);
+        let terminal_class_state = if runtime_reverted {
+            MechanicalState::Dropped
+        } else if class_live {
+            MechanicalState::Applied
+        } else {
+            MechanicalState::HeldNonmechanical
+        };
+        let row = |event: &MechanicalObligationEvent| SliceUseAdapterReceiptRow {
+            terminal: SpecializedReceiptTerminal {
+                obligation_key: event.key.clone(),
+                stage: event.stage,
+                state: event.state,
+                reason: event.terminal_reason.clone(),
+            },
+            use_site: self.use_site.clone(),
+            source_form: self.source_form.clone(),
+            candidate_form: self.candidate_form.clone(),
+            target_form: self.target_form.clone(),
+            access_mutability: self.access_mutability.clone(),
+            adapter: self.adapter.clone(),
+            boundary_site: self.boundary_site.clone(),
+            boundary_evidence: self.boundary_evidence.clone(),
+            retention: self.retention.clone(),
+            terminal_class_state,
+        };
+        let rows = [row(&events[0]), row(&events[1])];
+        (events, rows)
+    }
+}
+
+pub(crate) fn reconcile_slice_use_rows(
+    rows: &[SliceUseAdapterReceiptRow],
+    events: &[MechanicalObligationEvent],
+) -> Result<usize, String> {
+    let mut common = BTreeMap::new();
+    for event in events
+        .iter()
+        .filter(|event| event.key.family == MechanicalFamily::SliceUseUnsupported)
+    {
+        let key = format!("{}:{}", event.key.receipt_key(), event.stage.key());
+        if common.insert(key.clone(), event).is_some() {
+            return Err(format!("duplicate slice-use common row {key}"));
+        }
+    }
+    let mut specialized = BTreeSet::new();
+    for row in rows {
+        let key = format!(
+            "{}:{}",
+            row.terminal.obligation_key.receipt_key(),
+            row.terminal.stage.key()
+        );
+        if !specialized.insert(key.clone()) {
+            return Err(format!("duplicate slice-use specialized row {key}"));
+        }
+        let event = common
+            .get(&key)
+            .ok_or_else(|| format!("unowned slice-use row {key}"))?;
+        if row.use_site != event.key.site
+            || row.source_form != event.found_form
+            || (event.source_shape == "cursor"
+                && (row.source_form != "raw"
+                    || !matches!(row.candidate_form.as_str(), "slice-shared" | "slice-mut")))
+            || (event.source_shape != "cursor" && row.source_form != row.candidate_form)
+            || row.target_form != event.expected_form
+            || row.retention != event.evidence.retention
+            || row.terminal.state != event.state
+            || row.terminal.reason != event.terminal_reason
+        {
+            return Err(format!("slice-use specialized/common drift at {key}"));
+        }
+        event.validate()?;
+    }
+    if common.keys().any(|key| !specialized.contains(key)) {
+        return Err("slice-use common row lacks specialized row".to_owned());
+    }
+    Ok(rows
+        .iter()
+        .filter(|row| row.terminal.stage == MechanicalStage::Plan)
+        .count())
+}
+
+pub(crate) fn render_slice_use_rows(rows: &[SliceUseAdapterReceiptRow]) -> String {
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                row.terminal.obligation_key.receipt_key(),
+                row.use_site.receipt_key(),
+                row.source_form,
+                row.candidate_form,
+                row.target_form,
+                row.access_mutability,
+                row.adapter,
+                row.boundary_site,
+                row.boundary_evidence,
+                row.retention.tier(),
+                row.retention.waiver(),
+                row.terminal_class_state.key(),
+                row.terminal.stage.key(),
+                row.terminal.state.key(),
+                row.terminal
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), MechanicalTerminalReason::key),
+            )
+        })
+        .collect::<Vec<_>>();
+    rendered.sort();
+    let mut output = specialized_receipt_headers()[raw_schema::SLICE_USE_ADAPTER_ROWS].join("\t");
+    output.push('\n');
+    for row in rendered {
+        output.push_str(&row);
+        output.push('\n');
+    }
+    output
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1796,9 +1949,12 @@ pub(crate) fn specialized_receipt_headers() -> BTreeMap<&'static str, &'static [
                 "obligation_key",
                 "use_site_key",
                 "source_form",
+                "candidate_form",
                 "target_form",
                 "access_mutability",
                 "adapter",
+                "boundary_site",
+                "boundary_evidence",
                 "retention_tier",
                 "waiver_id",
                 "terminal_class_state",

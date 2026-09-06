@@ -753,6 +753,15 @@ pub(crate) fn plan_slice_constructions(
             | Decision::Degraded(_) => continue,
         };
         let node = (subject.fn_did, subject.hir_id);
+        if table
+            .slice_use_receipts
+            .iter()
+            .any(|receipt| receipt.same_form_initializer == Some(node))
+        {
+            // R210: item 3 already owns this value as a safe copy/reborrow;
+            // wrapping it in a raw-result constructor would cross forms twice.
+            continue;
+        }
         let Some(&init_span) = facts.init_spans.get(&node) else {
             continue;
         };
@@ -1279,6 +1288,13 @@ mod slice_construction_tests {
                             },
                         };
                     }
+                }
+                // R210 same-form copies are tested through the production
+                // pipeline. This helper injects raw-constructor decisions to
+                // isolate R206's extent/provenance assertions, so it also
+                // clears the earlier production same-form initializer claims.
+                for receipt in &mut table.slice_use_receipts {
+                    receipt.same_form_initializer = None;
                 }
                 plan_slice_constructions(tcx, &table, &facts)
             },
