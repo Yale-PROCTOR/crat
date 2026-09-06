@@ -97,6 +97,8 @@ mod emit_tests;
 mod goldens;
 #[cfg(test)]
 mod import_denylist;
+#[cfg(test)]
+mod slice_use_inventory_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct E1EditContext {
