@@ -23746,7 +23746,11 @@ fn rs_crown_catalog_contract() {
             .all(|program| !is_resource_deferred(program.sloc))
     );
 
-    let root = orchestrate::workspace_root();
+    // Isolated analysis worktrees reuse fixture artifacts through the same
+    // DIR setting as utils::compilation; this test only checks their presence.
+    let root = std::env::var_os("DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(orchestrate::workspace_root);
     for program in CORPUS {
         let input = program.input_path(&root);
         assert!(
