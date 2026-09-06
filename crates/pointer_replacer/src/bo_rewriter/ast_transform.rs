@@ -804,6 +804,9 @@ pub(crate) struct RefDeclVisitor<'a> {
     /// `(fn_did, hir_id)` → which form this subject's declaration becomes, and
     /// whether it is mutable.
     pub decisions: &'a FxHashMap<(LocalDefId, HirId), (DeclForm, bool, Option<String>)>,
+    /// Option bindings whose selected borrowed uses require a mutable binding.
+    /// The declaration must be placed before its binding is changed.
+    pub mutable_option_bindings: &'a FxHashSet<(LocalDefId, HirId)>,
     /// AST `NodeId` → `LocalDefId`, used to set `current_fn` at each item.
     pub global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
     /// **THE REVERT SET, CONSULTED AT THE SITE** — the F2 repair.
@@ -944,6 +947,19 @@ impl RefDeclVisitor<'_> {
             }
         }
     }
+
+    fn rewrite_option_binding(&self, pat: &mut rustc_ast::Pat, previous_placements: usize) {
+        if self.stats.placed_ids.len() != previous_placements + 1 {
+            return;
+        }
+        let Some(node) = self.stats.placed_ids.last() else { return };
+        if self.mutable_option_bindings.contains(node)
+            && matches!(self.decisions.get(node), Some((DeclForm::Opt { .. }, _, _)))
+            && let rustc_ast::PatKind::Ident(mode, _, _) = &mut pat.kind
+        {
+            mode.1 = Mutability::Mut;
+        }
+    }
 }
 
 impl MutVisitor for RefDeclVisitor<'_> {
@@ -962,14 +978,18 @@ impl MutVisitor for RefDeclVisitor<'_> {
 
     fn visit_param(&mut self, param: &mut rustc_ast::Param) {
         let binding = param.pat.id;
+        let previous_placements = self.stats.placed_ids.len();
         self.rewrite_decl(binding, &mut param.ty);
+        self.rewrite_option_binding(&mut param.pat, previous_placements);
         rustc_ast::mut_visit::walk_param(self, param);
     }
 
     fn visit_local(&mut self, local: &mut rustc_ast::Local) {
         let binding = local.pat.id;
         if let Some(ty) = local.ty.as_mut() {
+            let previous_placements = self.stats.placed_ids.len();
             self.rewrite_decl(binding, ty);
+            self.rewrite_option_binding(&mut local.pat, previous_placements);
         }
         rustc_ast::mut_visit::walk_local(self, local);
     }
@@ -3020,6 +3040,7 @@ fn transform_with(
     let mut v = RefDeclVisitor {
         local_map: &map.local_map,
         decisions: &decisions,
+        mutable_option_bindings: &table.option_mut_bindings,
         global_map: &map.global_map,
         reverted_fns: &reverts.fns,
         subject_hirs: &subject_hirs,
@@ -3940,6 +3961,12 @@ pub(crate) fn filtered_inputs(
                 .map(|span| (span.lo().0, span.hi().0))
         })
         .collect::<FxHashSet<_>>();
+    let composed_option_edits = table
+        .option_composed_uses
+        .iter()
+        .filter(|(node, _)| reverts.keeps_subject(node.0, node.1))
+        .map(|(_, span)| (span.lo().0, span.hi().0))
+        .collect::<FxHashSet<_>>();
     for (subject, decision) in &table.entries {
         let use_edits = match decision {
             super::decision::Decision::Ref { .. }
@@ -3971,7 +3998,11 @@ pub(crate) fn filtered_inputs(
             );
         }
         for u in use_edits.into_iter().flatten() {
-            if composed_slice_edits.contains(&(u.span.lo().0, u.span.hi().0)) {
+            let key = (u.span.lo().0, u.span.hi().0);
+            if composed_slice_edits.contains(&key)
+                || (composed_option_edits.contains(&key)
+                    && u.bridge_kind != "option-value-composed")
+            {
                 continue;
             }
             insert_counting(
@@ -3993,6 +4024,56 @@ pub(crate) fn filtered_inputs(
             &mut out.use_key_collisions,
         );
     }
+    // A nullable slice may start at None and acquire a fabricated extent only
+    // at a later assignment. Count that surviving obligation independently of
+    // the initializer, using its compiler identity rather than emitted text.
+    let mut option_fallback_keys = FxHashSet::default();
+    for receipt in &table.option_receipts {
+        let event = &receipt.obligation.planned;
+        if !event.evidence.extent.is_fallback()
+            || receipt.obligation.intended_terminal_state
+                != super::mechanical_receipt::MechanicalState::Applied
+            || !reverts.keeps(receipt.owner_class)
+            || event
+                .dependency_classes
+                .iter()
+                .any(|owner| !reverts.keeps(*owner))
+        {
+            continue;
+        }
+        let Some((subject, decision)) = table.entries.iter().find(|(subject, _)| {
+            event.key.subject
+                == super::mechanical_receipt::MechanicalSubjectKey::Local {
+                    owner: subject.fn_did,
+                    mir_local: subject.local.as_u32(),
+                    slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                }
+        }) else {
+            continue;
+        };
+        match decision {
+            super::decision::Decision::Opt { .. } => {}
+            super::decision::Decision::Ref { .. }
+            | super::decision::Decision::InferredRef { .. }
+            | super::decision::Decision::Slice { .. }
+            | super::decision::Decision::Box(_)
+            | super::decision::Decision::Degraded(_) => continue,
+        }
+        if !reverts.keeps_subject(subject.fn_did, subject.hir_id) {
+            continue;
+        }
+        let delegated_constructor = active_slice_constructions.iter().any(|plan| {
+            plan.node == (subject.fn_did, subject.hir_id)
+                && event.key.site.location
+                    == super::mechanical_receipt::CanonicalLocation::Hir {
+                        owner: plan.init_hir.owner.def_id,
+                        item_local_id: plan.init_hir.local_id.as_u32(),
+                    }
+        });
+        if !delegated_constructor && option_fallback_keys.insert(event.key.clone()) {
+            out.box_fabricated += 1;
+        }
+    }
     for plan in active_slice_constructions {
         let replacement = plan
             .replacement
@@ -4011,7 +4092,9 @@ pub(crate) fn filtered_inputs(
         if !reverts.keeps_edit(edit.owner_class, &edit.atom_ids) {
             continue;
         }
-        if composed_slice_edits.contains(&(edit.span.lo().0, edit.span.hi().0)) {
+        if composed_slice_edits.contains(&(edit.span.lo().0, edit.span.hi().0))
+            || composed_option_edits.contains(&(edit.span.lo().0, edit.span.hi().0))
+        {
             continue;
         }
         let key = (edit.span.lo().0, edit.span.hi().0);
@@ -4051,7 +4134,9 @@ pub(crate) fn filtered_inputs(
         if !reverts.keeps(edit.owner_class) {
             continue;
         }
-        if composed_slice_edits.contains(&(edit.span.lo().0, edit.span.hi().0)) {
+        if composed_slice_edits.contains(&(edit.span.lo().0, edit.span.hi().0))
+            || composed_option_edits.contains(&(edit.span.lo().0, edit.span.hi().0))
+        {
             continue;
         }
         insert_counting(
@@ -5280,6 +5365,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,
                 subject_hirs: &subject_hirs,
@@ -5366,6 +5452,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,
                 subject_hirs: &subject_hirs,
@@ -5533,6 +5620,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,
                 subject_hirs: &subject_hirs,
@@ -5768,6 +5856,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &reverted,
                 subject_hirs: &subject_hirs,
@@ -5879,6 +5968,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,
                 subject_hirs: &subject_hirs,
@@ -5902,6 +5992,7 @@ mod arm2_witnesses {
             let mut v2 = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &reverted,
                 subject_hirs: &subject_hirs,
@@ -5962,6 +6053,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,
                 subject_hirs: &subject_hirs,

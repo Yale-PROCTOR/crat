@@ -2942,26 +2942,25 @@ fn a_raw_only_method_on_a_local_degrades_it() {
     );
 }
 
-/// **An optional LOCAL is refused at its construction site.**
-///
-/// `let p: Option<&i32> = <raw pointer>` is `E0308` however the uses read, so
-/// the blocker is the initializer — the arm the slice forms already have.
-///
-/// **This arm exists because a fixture found it.** Every subject in S3.2′-3's
-/// measured market is a parameter, so the corpus could not have exercised it,
-/// and the first thing to reach it would have been an emitted crate that does
-/// not compile.
+/// G05/G06 own the previously refused optional-local value. Migration receipt:
+/// wave3b item4/g05-optional-local-migration.md, approved micro-plan §12.
 #[test]
-fn an_optional_local_is_refused_at_its_construction_site() {
-    let got = decisions_of(
-        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
-         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; if p.is_null() { return 0; } *p }\n",
-    );
+fn an_optional_local_constructs_its_option_value() {
+    let input = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; if p.is_null() { return 0; } *p }\n";
+    let got = decisions_of(input);
     assert_eq!(
         reason_of(&got, "p", false),
-        "opt-local-construction",
-        "an optional local was not stopped at its construction site: {got:?}"
+        "<emitted>",
+        "optional construction must now be placed: {got:?}"
     );
+    let emitted = ast_emitted_source_of(input).expect("migrated optional-local emission");
+    assert!(emitted.contains("p: Option<"), "{emitted}");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "migrated optional value compiles"
+    );
+    opt_w1_assert_receipted(input);
 }
 
 /// **Both operands of ONE comparison use the address-observation arm.**
@@ -11657,9 +11656,8 @@ fn d3_w1_generated_inner_use_depends_on_ready_defining_class() {
     );
     assert!(!emitted.contains("__crat_safe_leaf"), "{emitted}");
     assert!(!emitted.contains("__crat_safe_root"), "{emitted}");
-    let emitted_fixture = Fixture::new(&[("lib.rs", &emitted)]);
     assert!(
-        ::utils::compilation::run_compiler_on_path(&emitted_fixture.root(), |_| ()).is_ok(),
+        verify::type_checks_str(&emitted),
         "D3-W1 emitted tree must not name a missing generated item:\n{emitted}"
     );
 }
@@ -11695,9 +11693,8 @@ fn d8_w1_ordinary_caller_uses_terminal_safe_inner_interface() {
     assert!(emitted.contains("fn target(p: *const i32)"), "{emitted}");
     assert!(emitted.contains("fn __crat_safe_target"), "{emitted}");
     assert!(emitted.contains("__crat_safe_target(p)"), "{emitted}");
-    let emitted_fixture = Fixture::new(&[("lib.rs", emitted)]);
     assert!(
-        ::utils::compilation::run_compiler_on_path(&emitted_fixture.root(), |_| ()).is_ok(),
+        verify::type_checks_str(emitted),
         "D8-W1 terminal wrapper/inner pairing must type-check:\n{emitted}"
     );
 }
@@ -12126,7 +12123,7 @@ fn slu_w1_assert_use_receipt_count(
             .skip(1)
             .all(|line| line.split('\t').count() == width)
     );
-    ::utils::compilation::run_compiler_on_str(&emitted, |_| ()).expect("SLU output compiles");
+    assert!(verify::type_checks_str(&emitted), "SLU output compiles");
     events
 }
 
@@ -12314,6 +12311,8 @@ fn slu_w1_pointer_distance_uses_an_ephemeral_const_view() {
 
 #[test]
 fn slu_w1_assignment_keeps_a_named_raw_alias() {
+    // R213 / item-4 design §8: the null-initialized base is an Option slice.
+    // Its raw pointer-distance view replaces the old permanently raw alias.
     let input = "#![allow(dead_code, unused_unsafe, unused_assignments)]\n\
         pub unsafe fn target(mut p: *const i32) -> isize {\n\
             let mut base: *const i32 = 0 as *const i32;\n\
@@ -12323,10 +12322,222 @@ fn slu_w1_assignment_keeps_a_named_raw_alias() {
         }\n";
     let emitted = ast_emitted_source_of(input).expect("SLU assignment emission");
     assert!(
-        emitted.contains("p: &[i32]") && emitted.contains("base = p.as_ptr()"),
+        emitted.contains("p: &[i32]")
+            && emitted.contains("base: Option<&[i32]> = None")
+            && emitted.contains("base = Some(p)")
+            && emitted.contains("base.as_deref().map_or("),
         "{emitted}"
     );
-    slu_w1_assert_use_receipt_count(input, 2);
+    // Observed R213 count: Some destination, p distance view, base distance view.
+    slu_w1_assert_use_receipt_count(input, 3);
+    assert!(
+        verify::type_checks_str(&emitted),
+        "R213 migrated output must type/borrow check: {emitted}"
+    );
+}
+
+#[test]
+fn opt_r213_slice_assignment_wraps_the_view_and_preserves_pointer_distance() {
+    let input = "#![allow(unused_assignments)]\n\
+        pub unsafe fn target(mut p: *const i32) -> isize {\n\
+            let mut base: *const i32 = 0 as *const i32; base = p;\n\
+            while *p != 0 { p = p.offset(1); } p.offset_from(base)\n\
+        }";
+    let table =
+        ::utils::compilation::run_compiler_on_str(input, |tcx| super::decide_table(tcx).unwrap())
+            .unwrap();
+    assert!(
+        table
+            .entries
+            .iter()
+            .any(
+                |(subject, decision)| subject.param_name.as_deref() == Some("base")
+                    && matches!(
+                        decision,
+                        super::decision::Decision::Opt {
+                            slice: true,
+                            mutable: false,
+                            ..
+                        }
+                    )
+            ),
+        "the wrapped destination must inherit the settled slice view: {:?}",
+        table.entries
+    );
+    let emitted = ast_emitted_source_of(input).expect("R213 slice wrapper");
+    assert!(emitted.contains("base: Option<&[i32]> = None"), "{emitted}");
+    assert!(emitted.contains("base = Some("), "{emitted}");
+    assert!(
+        emitted.contains("base.as_deref().map_or(") && emitted.contains("slice.as_ptr()"),
+        "{emitted}"
+    );
+    assert!(
+        !emitted.contains("base.unwrap()"),
+        "raw pointer-distance sink needs a nullable view: {emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "R213 composed output must type/borrow check: {emitted}"
+    );
+    opt_w1_assert_receipted(input);
+    let observed = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx(tcx).unwrap();
+        let emission = emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .unwrap();
+        let rows = emission.plan.slice_use_receipt_rows(&BTreeSet::new());
+        let events = emission.plan.mechanical_receipts(&BTreeSet::new()).0;
+        let count = super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events).unwrap();
+        let plans = rows
+            .iter()
+            .filter(|row| row.terminal.stage == super::mechanical_receipt::MechanicalStage::Plan)
+            .map(|row| {
+                (
+                    row.source_form.clone(),
+                    row.target_form.clone(),
+                    row.adapter.clone(),
+                    row.retention.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (count, plans)
+    })
+    .unwrap();
+    eprintln!("R213 observed slice-use obligations: {observed:?}");
+}
+
+#[test]
+fn opt_r213_reference_assignment_wraps_some_and_null_store_is_none() {
+    for (pointer, payload, use_body) in [
+        ("*const i32", "&i32", "*dst"),
+        ("*mut i32", "&mut i32", "*dst += 1; *dst"),
+    ] {
+        let input = format!(
+            "#![allow(unused_assignments)] pub unsafe fn target(src: {pointer}, clear: bool) -> i32 {{ let mut dst: {pointer} = 0 as {pointer}; dst = src; if clear {{ dst = 0 as {pointer}; }} if dst.is_null() {{ 0 }} else {{ {use_body} }} }}"
+        );
+        if pointer == "*mut i32" {
+            // This mutable/reset shape is analysis-Raw at the frozen model.
+            // R213 changes presentation only; it must not promote either slot.
+            let decisions = decisions_of(&input);
+            assert_eq!(reason_of(&decisions, "src", true), "kind-raw");
+            assert_eq!(reason_of(&decisions, "dst", false), "kind-raw");
+            continue;
+        }
+        let emitted = ast_emitted_source_of(&input).expect("R213 Ref wrapping");
+        assert!(
+            emitted.contains(&format!("dst: Option<{payload}> = None")),
+            "{emitted}\n{:?}",
+            decisions_of(&input)
+        );
+        assert!(
+            emitted.contains("dst = Some(") && emitted.contains("dst = None"),
+            "{emitted}"
+        );
+        assert!(
+            verify::type_checks_str(&emitted),
+            "R213 Ref/null output must type/borrow check: {emitted}"
+        );
+        opt_w1_assert_receipted(&input);
+    }
+}
+
+#[test]
+fn opt_r213_pointer_distance_cast_preserves_operand_pointee() {
+    let input = "#![allow(unused_assignments)] pub unsafe fn target(mut p: *const i32) -> isize { let mut base: *const i32 = 0 as *const i32; base = p; while *p != 0 { p = p.offset(1); } (p as *const u8).offset_from(base as *const u8) }";
+    let view = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx(tcx).unwrap();
+        let (subject, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.param_name.as_deref() == Some("base"))
+            .unwrap();
+        let super::decision::Decision::Opt {
+            slice: true, uses, ..
+        } = decision
+        else {
+            panic!("the actual source must be an admitted optional slice: {decision:?}");
+        };
+        let carrier = table
+            .slice_use_receipts
+            .iter()
+            .find(|row| {
+                row.source_form == "opt-slice-shared" && row.adapter == "optional-slice-const-view"
+            })
+            .unwrap();
+        assert_eq!(carrier.target_form, "*const u8");
+        assert_eq!(
+            carrier.retention,
+            super::mechanical_receipt::MechanicalRetention::T1
+        );
+        let view = uses
+            .iter()
+            .find(|edit| edit.replacement.contains("map_or("))
+            .unwrap()
+            .replacement
+            .clone();
+        // Preserve the independent class-composition hold while checking
+        // the selected Option carrier's pointee preservation.
+        let emission = emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .unwrap();
+        let hold = emission
+            .plan
+            .class_hold_reason(super::bridge_receipt::SignatureClassId::of(subject.fn_did))
+            .unwrap();
+        assert_eq!(hold, "intra-class-interval-overlap");
+        eprintln!("R213 cast carrier: {view}; terminal hold: {hold}");
+        view
+    })
+    .unwrap();
+    // Compile the exact selected view beneath the original outer cast. The
+    // None arm and Some arm must agree before that outer cast is applied.
+    let companion = format!(
+        "pub unsafe fn selected(base: Option<&[i32]>, other: *const u8) -> isize {{ ({view} as *const u8).offset_from(other) }}"
+    );
+    assert!(
+        verify::type_checks_str(&companion),
+        "R213 selected nullable cast view must type/borrow check: {companion}"
+    );
+    let emitted = ast_emitted_source_of(input).unwrap();
+    assert!(
+        !emitted.contains("Option<"),
+        "independent class-composition hold must survive: {emitted}"
+    );
+}
+
+#[test]
+fn opt_r213_inherited_slice_payload_refreshes_native_dereferences() {
+    for input in [
+        "#![allow(unused_assignments)] pub unsafe fn target(p: *const i32) -> i32 { let mut base: *const i32 = 0 as *const i32; base = p; *p.offset(1) + if base.is_null() { 0 } else { *base } }",
+        "pub unsafe fn target(p: *const i32) -> i32 { let base: *const i32 = p; *p.offset(1) + if base.is_null() { 0 } else { *base } }",
+    ] {
+        let emitted = ast_emitted_source_of(input).expect("R213 native payload use");
+        assert!(
+            emitted.contains("base: Option<&[i32]>") && emitted.contains("Some(p)"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("base.unwrap()[0]"),
+            "native read retained a thin accessor: {emitted}"
+        );
+        assert!(
+            !emitted.contains("from_raw_parts"),
+            "safe slice value was reconstructed from raw: {emitted}"
+        );
+        assert!(
+            verify::type_checks_str(&emitted),
+            "R213 inherited native use must type/borrow check: {emitted}"
+        );
+        opt_w1_assert_receipted(input);
+    }
 }
 
 // Addendum 210 A: input and candidate forms have separate receipt meanings.
@@ -12407,7 +12618,10 @@ fn slu_r210_same_form_slice_copy_has_a_safe_carrier() {
         !emitted.contains("from_raw_parts"),
         "safe copy needs no raw construction: {emitted}"
     );
-    ::utils::compilation::run_compiler_on_str(&emitted, |_| ()).expect("safe-copy output compiles");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "safe-copy output compiles"
+    );
 }
 
 #[test]
@@ -12483,8 +12697,10 @@ fn slu_r210_same_form_copy_preserves_mutable_and_cast_views() {
             !emitted.contains(".as_ptr()"),
             "{label}: raw view into safe copy: {emitted}"
         );
-        ::utils::compilation::run_compiler_on_str(&emitted, |_| ())
-            .expect("same-form contrast output compiles");
+        assert!(
+            verify::type_checks_str(&emitted),
+            "same-form contrast output compiles"
+        );
     }
 }
 
@@ -12581,4 +12797,694 @@ fn slu_r210_local_copy_to_field_has_a_positive_retention_hold() {
     let (events, rows) = copy.materialize(false, false);
     super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
         .expect("local-retention hold join");
+}
+
+fn opt_w1_assert_receipted(
+    input: &str,
+) -> Vec<super::mechanical_receipt::MechanicalObligationEvent> {
+    let (events, rows) = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx(tcx).expect("OPT table");
+        let emission = emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .expect("OPT plan");
+        (
+            emission.plan.mechanical_receipts(&BTreeSet::new()).0,
+            emission.plan.option_receipt_rows(&BTreeSet::new()),
+        )
+    })
+    .expect("OPT input compiles");
+    let count = super::mechanical_receipt::reconcile_option_presentation_rows(&rows, &events)
+        .expect("OPT exact common/specialized join");
+    assert_eq!(rows.len(), 2 * count);
+    let rendered = super::mechanical_receipt::render_option_presentation_rows(&rows);
+    let width = rendered.lines().next().unwrap().split('\t').count();
+    assert!(
+        rendered
+            .lines()
+            .skip(1)
+            .all(|line| line.split('\t').count() == width)
+    );
+    let option = events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.key.family,
+                super::mechanical_receipt::MechanicalFamily::NullInit
+                    | super::mechanical_receipt::MechanicalFamily::OptLocalConstruction
+                    | super::mechanical_receipt::MechanicalFamily::OptUseUnsupported
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        option.iter().any(|event| {
+            event.stage == super::mechanical_receipt::MechanicalStage::Terminal
+                && event.state == super::mechanical_receipt::MechanicalState::Applied
+        }),
+        "Option operations need applied receipts: {option:?}"
+    );
+    let emitted = ast_emitted_source_of(input).expect("OPT receipt fixture emits");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT receipt fixture must type/borrow check: {emitted}"
+    );
+    option
+}
+
+#[test]
+fn opt_w1_null_initialization_and_assignment_preserve_option_kind() {
+    let input = "#![allow(dead_code, unused_assignments)]\n\
+        pub unsafe fn target(src: *const i32) -> i32 {\n\
+            let mut p: *const i32 = 0 as *const i32; p = src;\n\
+            if p.is_null() { 0 } else { *p }\n\
+        }\n";
+    let emitted = ast_emitted_source_of(input).expect("OPT null initialization");
+    assert!(emitted.contains("Option<&i32> = None"), "{emitted}");
+    assert!(emitted.contains("p.is_none()"), "{emitted}");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT null output compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_raw_nullable_shared_local_is_constructed() {
+    let input = "pub unsafe fn target(src: *const i32) -> i32 {\n\
+        if !src.is_null() { let _ = src.read(); }\n\
+        let p: *const i32 = src; if p.is_null() { 0 } else { *p }\n\
+    }";
+    let emitted = ast_emitted_source_of(input).expect("OPT shared raw result");
+    assert!(emitted.contains("p: Option<&i32>"), "{emitted}");
+    assert!(emitted.contains(".as_ref()"), "{emitted}");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT shared output compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_raw_nullable_mutable_local_reborrows_repeated_uses() {
+    let input = "pub unsafe fn target(src: *mut i32) -> i32 {\n\
+        if !src.is_null() { src.write(1); }\n\
+        let mut p: *mut i32 = src;\n\
+        if p.is_null() { 0 } else { *p = 3; *p += 4; *p }\n\
+    }";
+    let emitted = ast_emitted_source_of(input).expect("OPT mutable raw result");
+    assert!(emitted.contains("p: Option<&mut i32>"), "{emitted}");
+    assert!(emitted.contains(".as_mut()"), "{emitted}");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT repeated-use output compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_nullable_slice_local_checks_before_construction() {
+    let input = "pub unsafe fn target(src: *const i32) -> i32 {\n\
+        if !src.is_null() { let _ = src.read(); }\n\
+        let p: *const i32 = src; if p.is_null() { 0 } else { *p.offset(1) }\n\
+    }";
+    let emitted = ast_emitted_source_of(input).expect("OPT nullable slice");
+    assert!(emitted.contains("p: Option<&[i32]>"), "{emitted}");
+    let checked = emitted
+        .find(".as_ref()")
+        .expect("null check before constructing slice");
+    let constructed = emitted.find("from_raw_parts").expect("slice construction");
+    assert!(
+        checked < constructed,
+        "nullable pointer was dereferenced before its check: {emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT slice output compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_null_assignment_after_nonnull_construction_uses_none() {
+    let input = "pub unsafe fn target(src: *const i32, clear: bool) -> i32 {\n\
+        let mut p: *const i32 = src; if clear { p = 0 as *const i32; }\n\
+        if p.is_null() { 0 } else { *p }\n\
+    }";
+    let emitted = ast_emitted_source_of(input).expect("OPT null assignment");
+    assert!(emitted.contains("p = None"), "{emitted}");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT assignment output compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_required_callee_unwrap_has_a_terminal_contract() {
+    let input = "unsafe fn required(q: *const i32) -> i32 { *q }\n\
+        pub unsafe fn target(p: *const i32) -> i32 {\n\
+            if p.is_null() { 0 } else { required(p) }\n\
+        }";
+    let events = opt_w1_assert_receipted(input);
+    assert!(
+        events.iter().any(|event| {
+            event.mechanism == super::mechanical_receipt::MechanicalMechanism::OptionUnwrapRequired
+                && matches!(
+                    event.evidence.terminal_contract,
+                    super::mechanical_receipt::TerminalContract::Required { .. }
+                )
+        }),
+        "required unwrap lacks a terminal interface contract: {events:?}"
+    );
+    let emitted = ast_emitted_source_of(input).expect("OPT required call");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT required output compiles"
+    );
+}
+
+#[test]
+fn opt_w1_raw_callee_keeps_the_nullable_outbound_view() {
+    let input = "type Ptr = *const i32;\n\
+        unsafe fn raw_read(q: Ptr) -> i32 { *q }\n\
+        pub unsafe fn target(p: *const i32) -> i32 {\n\
+            if p.is_null() { 0 } else { raw_read(p) }\n\
+        }";
+    let emitted = ast_emitted_source_of(input).expect("OPT raw callee");
+    assert!(emitted.contains("map_or("), "{emitted}");
+    assert!(
+        !emitted.contains("p.unwrap()"),
+        "raw terminal interface cannot license unwrap: {emitted}"
+    );
+    let events = opt_w1_assert_receipted(input);
+    assert!(events.iter().all(|event| event.mechanism
+        != super::mechanical_receipt::MechanicalMechanism::OptionUnwrapRequired));
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT outbound output compiles"
+    );
+}
+
+#[test]
+fn opt_w1_same_form_optional_slice_copy_reaches_production() {
+    let input = "pub unsafe fn target(p: *const i32) -> i32 {\n\
+        let q: *const i32 = p; if p.is_null() || q.is_null() { 0 }\n\
+        else { *p.offset(1) + *q.offset(1) }\n\
+    }";
+    let emitted = ast_emitted_source_of(input).expect("OPT safe copy");
+    assert!(emitted.contains("q: Option<&[i32]> = p"), "{emitted}");
+    assert!(
+        !emitted.contains("from_raw_parts"),
+        "same-form safe value needs no raw constructor: {emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT same-form output compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_held_terminal_callee_cannot_license_unwrap() {
+    let input = "unsafe fn required(q: *const i32) -> i32 { *q }\n\
+        pub unsafe fn target(p: *const i32) -> i32 { if p.is_null() { 0 } else { required(p) } }";
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx(tcx).expect("TERM-W1 Option table");
+        let callee = table
+            .entries
+            .iter()
+            .find(|(subject, _)| tcx.item_name(subject.fn_did.to_def_id()).as_str() == "required")
+            .expect("required callee")
+            .0
+            .fn_did;
+        let caller = table
+            .entries
+            .iter()
+            .find(|(subject, _)| tcx.item_name(subject.fn_did.to_def_id()).as_str() == "target")
+            .expect("optional caller")
+            .0
+            .fn_did;
+        let emission = emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::from_iter([callee]),
+            &ctx.retained_c9_plans,
+        )
+        .expect("held terminal callee plans");
+        let call = emission
+            .plan
+            .option_receipt_plans
+            .iter()
+            .find(|receipt| receipt.operation == "call-required")
+            .expect("nonvacuous required-call obligation");
+        assert_eq!(
+            call.obligation.intended_terminal_reason,
+            Some(super::mechanical_receipt::MechanicalTerminalReason::TerminalContractMissing)
+        );
+        assert!(
+            emission
+                .plan
+                .held_classes()
+                .contains(&super::bridge_receipt::SignatureClassId::of(caller)),
+            "caller must not execute the stale unwrap"
+        );
+        let rows = emission.plan.option_receipt_rows(&BTreeSet::new());
+        let events = emission.plan.mechanical_receipts(&BTreeSet::new()).0;
+        super::mechanical_receipt::reconcile_option_presentation_rows(&rows, &events)
+            .expect("held Option contract join");
+    })
+    .expect("TERM-W1 Option input compiles");
+}
+
+#[test]
+fn opt_w1_mutable_outbound_views_add_the_required_binding_reborrow() {
+    let input = "type Ptr = *mut i32;\n\
+        unsafe fn raw_write(q: Ptr) { *q += 1; }\n\
+        pub unsafe fn target(p: *mut i32) -> i32 {\n\
+            if p.is_null() { return 0; } raw_write(p); raw_write(p); *p\n\
+        }";
+    let emitted = ast_emitted_source_of(input).expect("OPT repeated mutable outbound");
+    assert!(emitted.contains("mut p: Option<&mut i32>"), "{emitted}");
+    assert_eq!(emitted.matches("p.as_deref_mut()").count(), 2, "{emitted}");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT repeated outbound compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_nonzero_pointer_literal_stays_raw() {
+    let input =
+        "pub unsafe fn target() -> bool { let p: *const i32 = 1usize as *const i32; p.is_null() }";
+    let emitted = ast_emitted_source_of(input).expect("OPT integer-pointer contrast");
+    assert!(emitted.contains("1usize as *const i32"), "{emitted}");
+    assert!(
+        !emitted.contains("None") && !emitted.contains(".as_ref()"),
+        "integer pointer became a reference: {emitted}"
+    );
+}
+
+#[test]
+fn opt_w1_mutable_option_copy_is_a_scoped_reborrow() {
+    let input = "pub unsafe fn target(mut p: *mut i32) -> i32 {\n\
+        let mut q: *mut i32 = p; if !q.is_null() { *q = 7; }\n\
+        if p.is_null() { 0 } else { *p }\n\
+    }";
+    let emitted = ast_emitted_source_of(input).expect("OPT mutable same-form copy");
+    assert!(
+        emitted.contains("q: Option<&mut i32> = p.as_deref_mut()"),
+        "{emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT mutable copy preserves later parent use"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_address_construction_keeps_the_original_pointer_coercion() {
+    let input = "pub unsafe fn target() -> i32 { let value = 5; let p: *const i32 = &value; if p.is_null() { 0 } else { *p } }";
+    let emitted = ast_emitted_source_of(input).expect("OPT address construction");
+    assert!(
+        emitted.contains("p: Option<&i32> = Some(&value)"),
+        "{emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT pointer coercion output compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_r214_raw_address_construction_keeps_the_raw_operand_form() {
+    for initializer in ["&raw const value", "&raw const value as *const i32"] {
+        let input = format!(
+            "pub unsafe fn target() -> i32 {{ let value = 5; let p: *const i32 = {initializer}; if p.is_null() {{ 0 }} else {{ *p }} }}"
+        );
+        let emitted = ast_emitted_source_of(&input).expect("raw address Option emission");
+        assert!(
+            emitted.contains("p: Option<&i32>"),
+            "raw address must reach Option construction: {emitted}"
+        );
+        assert!(
+            verify::type_checks_str(&emitted),
+            "raw address output must type/borrow check: {emitted}"
+        );
+        opt_w1_assert_receipted(&input);
+    }
+}
+
+#[test]
+fn opt_r214_address_temporary_preserves_its_storage_lifetime() {
+    let input = "fn make_value() -> i32 { 5 } pub unsafe fn target() -> i32 { let p: *const i32 = &make_value(); if p.is_null() { 0 } else { *p } }";
+    assert!(
+        verify::type_checks_str(input),
+        "original extending address compiles"
+    );
+    let emitted = ast_emitted_source_of(input).expect("temporary address emission");
+    eprintln!(
+        "R214 temporary address decisions: {:?}; output: {emitted}",
+        decisions_of(input)
+    );
+    assert!(
+        emitted.contains("p: Option<&i32> = Some(&make_value())"),
+        "temporary control must exercise Option wrapping: {emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "temporary address output must type/borrow check: {emitted}"
+    );
+}
+
+#[test]
+fn opt_w1_nested_raw_result_preserves_the_inner_outbound_adapter() {
+    // Returning the input pointer is the positive-retention OUT contrast.
+    // This non-retaining callee isolates construction/inner-adapter ownership.
+    let input = "type Ptr = *const i32; static RESULT: i32 = 7; unsafe fn raw_result(_q: Ptr) -> Ptr { &RESULT }\n\
+        pub unsafe fn target(p: *const i32) -> i32 { if p.is_null() { return 0; }\n\
+            let q: *const i32 = raw_result(p); if q.is_null() { 0 } else { *q }\n\
+        }";
+    let emitted = ast_emitted_source_of(input).expect("OPT nested construction");
+    assert!(
+        emitted.contains("q: Option<&i32>"),
+        "{emitted}\n{:?}\n{:?}",
+        decisions_of(input),
+        ::utils::compilation::run_compiler_on_str(input, |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx(tcx).expect("nested table");
+            let emission = emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )
+            .expect("nested plan");
+            emission
+                .plan
+                .class_finalization
+                .classes
+                .iter()
+                .map(|(id, class)| (id.order_key(), class.hold_reasons().to_vec()))
+                .collect::<Vec<_>>()
+        })
+    );
+    assert!(
+        emitted.contains("map_or("),
+        "inner raw adapter was lost: {emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT contained adapter output compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_null_argument_has_its_own_presentation_receipt() {
+    let input = "unsafe fn optional(p: *const i32) -> i32 { if p.is_null() { 0 } else { *p } }\n\
+        pub unsafe fn target() -> i32 { optional(0 as *const i32) }";
+    let emitted = ast_emitted_source_of(input).expect("OPT null argument");
+    assert!(emitted.contains("optional(None)"), "{emitted}");
+    let events = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx(tcx).expect("null argument table");
+        emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .expect("null argument plan")
+        .plan
+        .mechanical_receipts(&BTreeSet::new())
+        .0
+    })
+    .expect("null argument input compiles");
+    assert!(
+        events.iter().any(|event| event.key.family
+            == super::mechanical_receipt::MechanicalFamily::ArgNullLiteral
+            && event.stage == super::mechanical_receipt::MechanicalStage::Terminal
+            && event.state == super::mechanical_receipt::MechanicalState::Applied),
+        "literal argument receipt absent: {events:?}"
+    );
+}
+
+#[test]
+fn opt_w1_shared_to_mut_outbound_view_keeps_its_negative_write_evidence() {
+    let input = "type Ptr = *mut i32; unsafe fn raw_read(q: Ptr) -> i32 { *q }\n\
+        pub unsafe fn target(p: *const i32) -> i32 { if p.is_null() { 0 } else { raw_read(p as *mut i32) } }";
+    let events = opt_w1_assert_receipted(input);
+    assert!(
+        events.iter().any(|event| event.mechanism
+            == super::mechanical_receipt::MechanicalMechanism::SharedRefToMutRaw
+            && event.evidence.negative_write
+                == super::mechanical_receipt::NegativeWriteEvidence::FosterImmutable),
+        "Option R-B evidence was lost: {events:?}"
+    );
+    let emitted = ast_emitted_source_of(input).expect("OPT shared-to-mut outbound");
+    assert!(emitted.contains("cast_mut()"), "{emitted}");
+    assert!(verify::type_checks_str(&emitted), "OPT R-B output compiles");
+}
+
+#[test]
+fn opt_w1_writing_through_shared_outbound_view_stays_held() {
+    let input = "type Ptr = *mut i32; unsafe fn raw_write(q: Ptr) { *q = 9; }\n\
+        pub unsafe fn target(p: *const i32) { if !p.is_null() { raw_write(p as *mut i32); } }";
+    let plans = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        super::decide_table(tcx)
+            .expect("OPT writing contrast")
+            .option_receipts
+    })
+    .expect("OPT writing input compiles");
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.obligation.intended_terminal_reason
+                == Some(
+                    super::mechanical_receipt::MechanicalTerminalReason::RbNegativeWriteAbsent
+                )),
+        "Option writing view lacks its typed hold: {plans:?}"
+    );
+}
+
+#[test]
+fn opt_w1_nullable_slice_assignment_supplies_its_fallback_constant() {
+    let input = "#![allow(unused_assignments)]\n\
+        pub unsafe fn target(src: *const i32) -> i32 {\n\
+            if !src.is_null() { let _ = src.read(); }\n\
+            let mut p: *const i32 = 0 as *const i32; p = src;\n\
+            if p.is_null() { 0 } else { *p.offset(1) }\n\
+        }";
+    let emitted = ast_emitted_source_of(input).expect("OPT nullable slice assignment");
+    assert!(emitted.contains("p: Option<&[i32]> = None"), "{emitted}");
+    assert!(
+        emitted.contains("const FALLBACK_SLICE_EXTENT"),
+        "assignment omitted its extent definition: {emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT slice assignment output compiles"
+    );
+    opt_w1_assert_receipted(input);
+}
+
+#[test]
+fn opt_w1_exact_span_composition_keeps_the_completed_option_value() {
+    let input = "pub unsafe fn target(src: *const i32) -> i32 { if !src.is_null() { let _ = src.read(); } let p: *const i32 = src; if p.is_null() { 0 } else { *p } }";
+    let emitted = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("exact-span AST");
+        let (mut table, ctx) = super::decide_table_with_ctx(tcx).expect("exact-span table");
+        let subject = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.param_name.as_deref() == Some("p"))
+            .unwrap()
+            .0
+            .clone();
+        let node = (subject.fn_did, subject.hir_id);
+        let span = ctx.constructions.init_spans[&node];
+        for (candidate, decision) in &mut table.entries {
+            if (candidate.fn_did, candidate.hir_id) == node {
+                let super::decision::Decision::Opt { uses, .. } = decision else {
+                    panic!("exact-span destination must be optional")
+                };
+                uses.retain(|edit| {
+                    !matches!(edit.bridge_kind, "option-value" | "option-value-composed")
+                });
+                // A pre-existing exact-span raw adapter, injected only at the
+                // constructor boundary. Its identity must not suppress the new
+                // outer Option value produced by the real composer.
+                uses.push(super::decision::emitability::UseEdit {
+                    span,
+                    replacement: "src".to_owned(),
+                    bridge_kind: "subject-use",
+                });
+            }
+        }
+        (
+            table.option_receipts,
+            table.option_value_initializers,
+            table.option_composed_uses,
+        ) = super::decision::option::plan_values(
+            tcx,
+            &mut table,
+            &ctx.constructions,
+            &rustc_hash::FxHashMap::default(),
+        );
+        let emission = emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .expect("exact-span plan");
+        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+            &emission.plan.held_classes(),
+            &BTreeSet::new(),
+            &table,
+        )
+        .unwrap();
+        let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_a5_raw_calls),
+        )
+        .unwrap();
+        files.into_values().next().unwrap()
+    })
+    .expect("exact-span input compiles");
+    assert!(
+        emitted.contains(".as_ref()"),
+        "completed Option constructor was suppressed: {emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "exact-span Option output compiles"
+    );
+}
+
+#[test]
+fn opt_w1_safe_source_pointee_cast_has_an_attributed_hold() {
+    let input = "pub unsafe fn target(src: *const u32) -> i32 {\n\
+        if src.is_null() { return 0; } let p: *const i32 = src as *const i32;\n\
+        if p.is_null() { 0 } else { *p }\n\
+    }";
+    let plans = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        super::decide_table(tcx)
+            .expect("OPT pointee-cast table")
+            .option_receipts
+    })
+    .expect("OPT pointee-cast input compiles");
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.obligation.intended_terminal_reason
+                == Some(
+                    super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
+                        "option-value-cast-pointee-unbuilt".to_owned()
+                    )
+                )),
+        "safe source lost its pointee cast: {plans:?}"
+    );
+}
+
+#[test]
+fn opt_w1_thin_optional_copy_to_raw_local_gets_a_t2_view() {
+    let input = "type Ptr = *const i32; pub unsafe fn target(p: *const i32) -> i32 {\n\
+        if p.is_null() { return 0; } let q: Ptr = p; *q\n\
+    }";
+    let emitted = ast_emitted_source_of(input).expect("OPT thin raw local");
+    assert!(
+        emitted.contains("p: Option<&i32>") && emitted.contains("map_or("),
+        "{emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "OPT thin raw view compiles"
+    );
+    let events = opt_w1_assert_receipted(input);
+    assert!(
+        events.iter().any(|event| event.argument_kind == "body-use"
+            && matches!(
+                event.evidence.retention,
+                super::mechanical_receipt::MechanicalRetention::T2 { .. }
+            )),
+        "body alias schedule needs its T2 receipt: {events:?}"
+    );
+}
+
+#[test]
+fn opt_w1_thin_optional_copy_to_retained_raw_local_is_held() {
+    let input = "type Ptr = *const i32; pub struct Holder { saved: Ptr }\n\
+        pub unsafe fn target(p: *const i32, out: *mut Holder) {\n\
+            if !p.is_null() { let q: Ptr = p; (*out).saved = q; }\n\
+        }";
+    let plans = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        super::decide_table(tcx)
+            .expect("OPT retained raw local table")
+            .option_receipts
+    })
+    .expect("OPT retained raw local input compiles");
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.obligation.intended_terminal_reason
+                == Some(super::mechanical_receipt::MechanicalTerminalReason::PositiveRetention)),
+        "retained thin raw view was not attributed: {plans:?}"
+    );
+}
+
+#[test]
+fn opt_w1_unbuilt_return_and_cursor_uses_keep_their_handoff_receipts() {
+    for (body, operation) in [
+        (
+            "if p.is_null() { return core::ptr::null(); } return p;",
+            "handoff-return",
+        ),
+        (
+            "if p.is_null() { return core::ptr::null(); } return p.offset(1);",
+            "excluded-cursor",
+        ),
+    ] {
+        let input = format!("pub unsafe fn target(p: *const i32) -> *const i32 {{ {body} }}");
+        let table = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+            super::decide_table(tcx).expect("Option handoff table")
+        })
+        .expect("Option handoff input compiles");
+        assert!(
+            table
+                .entries
+                .iter()
+                .any(
+                    |(subject, decision)| subject.param_name.as_deref() == Some("p")
+                        && matches!(decision, super::decision::Decision::Degraded(_))
+                ),
+            "handoff must not build the later wave"
+        );
+        let plan = table
+            .option_receipts
+            .iter()
+            .find(|plan| plan.operation == operation)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{operation}: required use disappeared: {:?}",
+                    table.option_receipts
+                )
+            });
+        assert_eq!(plan.source_form, "raw");
+        assert_eq!(
+            plan.obligation.intended_terminal_state,
+            super::mechanical_receipt::MechanicalState::HeldNonmechanical
+        );
+        let (events, rows) = plan.materialize(false, false);
+        super::mechanical_receipt::reconcile_option_presentation_rows(&rows, &events)
+            .expect("handoff common/specialized join");
+    }
 }

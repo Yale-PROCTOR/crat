@@ -381,7 +381,7 @@ fn peel_casts<'e>(mut expr: &'e Expr<'e>) -> &'e Expr<'e> {
     expr
 }
 
-fn is_zero_literal(expr: &Expr<'_>) -> bool {
+pub(crate) fn is_zero_literal(expr: &Expr<'_>) -> bool {
     matches!(
         &peel_casts(expr).kind,
         ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v == 0)
@@ -392,7 +392,7 @@ fn is_zero_literal(expr: &Expr<'_>) -> bool {
 /// type. The type check is what keeps `Other` fail-closed: wave 1 admits a
 /// complex expression only when rustc says the expression itself is a raw
 /// pointer, never because its spelling merely resembles one.
-fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
+pub(crate) fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
     let raw_pointer = matches!(
         tcx.typeck(expr.hir_id.owner.def_id).expr_ty(expr).kind(),
         rustc_middle::ty::TyKind::RawPtr(..)
@@ -403,7 +403,14 @@ fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
         ExprKind::Cast(inner, _) => {
             if is_zero_literal(inner) {
                 ArgShape::NullLit
-            } else if let ExprKind::AddrOf(_, mutability, _) = &peel_casts(expr).kind {
+            } else if let ExprKind::AddrOf(_, mutability, _) = &peel_casts(expr).kind
+                && matches!(
+                    tcx.typeck(expr.hir_id.owner.def_id)
+                        .expr_ty(peel_casts(expr))
+                        .kind(),
+                    rustc_middle::ty::TyKind::Ref(..)
+                )
+            {
                 ArgShape::AddrOfCast {
                     mutable: matches!(mutability, Mutability::Mut),
                     inner: peel_casts(expr).span,
@@ -421,7 +428,9 @@ fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
                 ArgShape::Cast { inner: inner.span }
             }
         }
-        ExprKind::AddrOf(_, mutability, operand) => {
+        // Raw borrows retain a raw-pointer value; only an ordinary borrow
+        // supplies the reference form used by address-view glue.
+        ExprKind::AddrOf(_, mutability, operand) if !raw_pointer => {
             let (base, through_deref) = place_root(operand);
             ArgShape::AddrOf {
                 mutable: matches!(mutability, Mutability::Mut),
@@ -1317,6 +1326,22 @@ pub(crate) struct OptUses {
     /// Uses that are not the null test — the multiplicity half of the idiom
     /// rule (micro-plan §9c).
     pub non_test_uses: usize,
+    pub assignments: Vec<OptAssignment>,
+    pub null_assigned: bool,
+    pub sites: Vec<OptUseSite>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OptAssignment {
+    pub rhs: HirId,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OptUseSite {
+    pub hir_id: HirId,
+    pub span: Span,
+    pub operation: &'static str,
 }
 
 /// Collect, per binding, the uses an **optional** form must rewrite.
@@ -1351,6 +1376,7 @@ pub(crate) fn collect_opt_uses(
     accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
     fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
     raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
 ) -> FxHashMap<(LocalDefId, HirId), OptUses> {
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
@@ -1360,21 +1386,51 @@ pub(crate) fn collect_opt_uses(
         accessor_of: &'a FxHashMap<(LocalDefId, HirId), Accessor>,
         fat: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
         raw_boundary_arguments: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+        deferred_uses: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let ExprKind::Path(QPath::Resolved(_, path)) = lhs.kind
+                && let Res::Local(binding) = path.res
+                && self.name_of.contains_key(&(self.fn_did, binding))
+            {
+                let entry = self.out.entry((self.fn_did, binding)).or_default();
+                entry.assignments.push(OptAssignment {
+                    rhs: rhs.hir_id,
+                    span: rhs.span,
+                });
+                entry.null_assigned |= is_zero_literal(rhs);
+            }
             if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind
                 && let Res::Local(hir_id) = path.res
                 && self.name_of.contains_key(&(self.fn_did, hir_id))
             {
                 let key = (self.fn_did, hir_id);
+                if matches!(self.tcx.parent_hir_node(expr.hir_id),
+                    rustc_hir::Node::Expr(parent) if matches!(parent.kind,
+                        ExprKind::Assign(lhs, _, _) if lhs.hir_id == expr.hir_id))
+                {
+                    return; // the destination-owned RHS operation is above
+                }
                 if self.raw_boundary_arguments.contains(&(
                     self.fn_did,
                     hir_id,
                     expr.span.lo().0,
                     expr.span.hi().0,
+                )) || self.deferred_uses.contains(&(
+                    self.fn_did,
+                    hir_id,
+                    expr.span.lo().0,
+                    expr.span.hi().0,
                 )) {
-                    self.out.entry(key).or_default().non_test_uses += 1;
+                    let entry = self.out.entry(key).or_default();
+                    entry.non_test_uses += 1;
+                    entry.sites.push(OptUseSite {
+                        hir_id: expr.hir_id,
+                        span: expr.span,
+                        operation: "deferred-boundary-or-copy",
+                    });
                     intravisit::walk_expr(self, expr);
                     return;
                 }
@@ -1382,10 +1438,37 @@ pub(crate) fn collect_opt_uses(
                 let entry = self.out.entry(key).or_default();
                 match classified {
                     Some((edit, is_non_test)) => {
+                        entry.sites.push(OptUseSite {
+                            hir_id: expr.hir_id,
+                            span: edit.span,
+                            operation: if is_non_test {
+                                "required-dereference"
+                            } else {
+                                "null-test"
+                            },
+                        });
                         entry.rewrites.push(edit);
                         entry.non_test_uses += usize::from(is_non_test);
                     }
                     None => {
+                        let operation = match self.tcx.parent_hir_node(expr.hir_id) {
+                            rustc_hir::Node::Expr(parent) => match parent.kind {
+                                ExprKind::MethodCall(segment, _, _, _)
+                                    if SLICE_ARITHMETIC_OPS
+                                        .contains(&segment.ident.name.as_str()) =>
+                                {
+                                    "excluded-cursor"
+                                }
+                                ExprKind::Ret(_) => "handoff-return",
+                                _ => "handoff-use",
+                            },
+                            _ => "handoff-use",
+                        };
+                        entry.sites.push(OptUseSite {
+                            hir_id: expr.hir_id,
+                            span: expr.span,
+                            operation,
+                        });
                         entry.non_test_uses += 1;
                         if entry.unsupported.is_none() {
                             entry.unsupported = Some(expr.span);
@@ -1499,6 +1582,7 @@ pub(crate) fn collect_opt_uses(
             accessor_of,
             fat,
             raw_boundary_arguments,
+            deferred_uses,
         };
         v.visit_body(tcx.hir_body(body_id));
     }

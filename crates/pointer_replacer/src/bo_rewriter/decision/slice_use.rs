@@ -47,6 +47,7 @@ fn same_form_copy(
     subject: &super::Subject,
     observed: &emitability::SliceRawUse,
     source: Form,
+    binding_will_be_mutable: bool,
 ) -> Option<(emitability::UseEdit, bool)> {
     use rustc_hir::{ExprKind, Node};
     use rustc_middle::ty::TyKind;
@@ -86,7 +87,9 @@ fn same_form_copy(
     let replacement = match source {
         Form::Slice { mutable: false } | Form::Opt { mutable: false, .. } => name.to_owned(),
         Form::Slice { mutable: true } => format!("&mut *{name}"),
-        Form::Opt { mutable: true, .. } if subject.mut_binding => format!("{name}.as_deref_mut()"),
+        Form::Opt { mutable: true, .. } if subject.mut_binding || binding_will_be_mutable => {
+            format!("{name}.as_deref_mut()")
+        }
         Form::Raw | Form::Ref { .. } | Form::Opt { mutable: true, .. } => return None,
     };
     Some((
@@ -419,7 +422,46 @@ pub(crate) fn receipt_plans(
                     }
                 }
             } else if observed.source_shape == "pointer-distance" && observed.contract.is_some() {
-                adapter = "slice-as-ptr".to_owned();
+                adapter = match source {
+                    Form::Opt { slice: true, .. } => {
+                        let name = subject
+                            .param_name
+                            .as_deref()
+                            .expect("named optional distance operand");
+                        // This edit replaces the binding beneath any existing cast.
+                        // Both map_or arms must retain that binding's pointee;
+                        // the surrounding source cast still supplies the sink type.
+                        let expression = tcx.hir_node(observed.hir_id).expect_expr();
+                        let mut binding_target = raw_boundary::raw_target_type(
+                            tcx,
+                            tcx.typeck(subject.fn_did).expr_ty(expression),
+                        )
+                        .expect("raw optional distance binding");
+                        binding_target.mutability = raw_boundary::RawMutability::Const;
+                        binding_target.rendered = format!("*const {}", binding_target.pointee);
+                        let replacement = raw_boundary::pair_raw_view_expression(
+                            Some(decision),
+                            &binding_target,
+                            name,
+                            "bare-local",
+                        )
+                        .expect("optional slice has a const raw view");
+                        body_edits.push((
+                            node,
+                            emitability::UseEdit {
+                                span: observed.span,
+                                replacement,
+                                bridge_kind: "subject-use",
+                            },
+                        ));
+                        "optional-slice-const-view"
+                    }
+                    Form::Slice { .. } => "slice-as-ptr",
+                    Form::Raw | Form::Ref { .. } | Form::Opt { slice: false, .. } => {
+                        unreachable!("slice source selected above")
+                    }
+                }
+                .to_owned();
                 retention = MechanicalRetention::T1;
                 boundary_evidence = observed
                     .contract
@@ -437,9 +479,53 @@ pub(crate) fn receipt_plans(
                     })
                 {
                     target_form_override = Some(target_form.to_owned());
-                    if target_form == source.key()
-                        && let Some((edit, initializer)) =
-                            same_form_copy(tcx, subject, observed, source)
+                    let mut rhs = tcx.hir_node(observed.hir_id).expect_expr();
+                    while let rustc_hir::Node::Expr(parent) = tcx.parent_hir_node(rhs.hir_id)
+                        && matches!(parent.kind, rustc_hir::ExprKind::Cast(inner, _) if inner.hir_id == rhs.hir_id)
+                    {
+                        rhs = parent;
+                    }
+                    let wrapping = table
+                        .option_receipts
+                        .iter()
+                        .filter(|receipt| {
+                            receipt.source_form == source.key()
+                                && receipt.target_form == target_form
+                                && receipt.obligation.planned.key.subject
+                                    == MechanicalSubjectKey::Local {
+                                        owner: destination.fn_did,
+                                        mir_local: destination.local.as_u32(),
+                                        slot_depth: u32::from(
+                                            destination.ptr_depth.saturating_sub(1),
+                                        ),
+                                    }
+                                && receipt.obligation.planned.key.site.location
+                                    == CanonicalLocation::Hir {
+                                        owner: rhs.hir_id.owner.def_id,
+                                        item_local_id: rhs.hir_id.local_id.as_u32(),
+                                    }
+                                && matches!(
+                                    receipt.operation.as_str(),
+                                    "nullable-construction" | "nullable-assignment"
+                                )
+                        })
+                        .collect::<Vec<_>>();
+                    if target_form != source.key()
+                        && let [carrier] = wrapping.as_slice()
+                    {
+                        // Item 4 owns Some(view) at the destination. Reuse its
+                        // exact RHS carrier; never add a second raw-alias edit.
+                        adapter = "owned-option-wrapping-destination".to_owned();
+                        reason = carrier.obligation.intended_terminal_reason.clone();
+                        boundary_evidence = "destination-owned-option-value".to_owned();
+                    } else if target_form == source.key()
+                        && let Some((edit, initializer)) = same_form_copy(
+                            tcx,
+                            subject,
+                            observed,
+                            source,
+                            table.option_mut_bindings.contains(&node),
+                        )
                     {
                         adapter = "body-slice-same-form".to_owned();
                         boundary_evidence = "same-form-safe-copy-or-reborrow".to_owned();

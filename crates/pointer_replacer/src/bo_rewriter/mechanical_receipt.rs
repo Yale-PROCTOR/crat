@@ -1671,6 +1671,141 @@ pub(crate) struct OptionPresentationReceiptRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OptionPresentationReceiptPlan {
+    pub(crate) obligation: MechanicalObligationPlan,
+    pub(crate) nullability_fact: String,
+    pub(crate) source_form: String,
+    pub(crate) target_form: String,
+    pub(crate) operation: String,
+    pub(crate) terminal_contract: TerminalContract,
+    pub(crate) retention: MechanicalRetention,
+    pub(crate) adapter: String,
+    pub(crate) owner_class: SignatureClassId,
+}
+
+impl OptionPresentationReceiptPlan {
+    pub(crate) fn materialize(
+        &self,
+        class_live: bool,
+        runtime_reverted: bool,
+    ) -> (
+        [MechanicalObligationEvent; 2],
+        [OptionPresentationReceiptRow; 2],
+    ) {
+        let events = self.obligation.events(class_live, runtime_reverted);
+        let row = |event: &MechanicalObligationEvent| OptionPresentationReceiptRow {
+            terminal: SpecializedReceiptTerminal {
+                obligation_key: event.key.clone(),
+                stage: event.stage,
+                state: event.state,
+                reason: event.terminal_reason.clone(),
+            },
+            nullability_fact: self.nullability_fact.clone(),
+            source_form: self.source_form.clone(),
+            target_form: self.target_form.clone(),
+            operation: self.operation.clone(),
+            terminal_contract: self.terminal_contract.clone(),
+            retention: self.retention.clone(),
+            adapter: self.adapter.clone(),
+        };
+        let rows = [row(&events[0]), row(&events[1])];
+        (events, rows)
+    }
+}
+
+pub(crate) fn reconcile_option_presentation_rows(
+    rows: &[OptionPresentationReceiptRow],
+    events: &[MechanicalObligationEvent],
+) -> Result<usize, String> {
+    let mut common = BTreeMap::new();
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.key.family,
+            MechanicalFamily::NullInit
+                | MechanicalFamily::OptLocalConstruction
+                | MechanicalFamily::OptUseUnsupported
+                | MechanicalFamily::ArgNullLiteral
+        )
+    }) {
+        let key = format!("{}:{}", event.key.receipt_key(), event.stage.key());
+        if common.insert(key.clone(), event).is_some() {
+            return Err(format!("duplicate option-presentation common row {key}"));
+        }
+    }
+    let mut specialized = BTreeSet::new();
+    for row in rows {
+        let key = format!(
+            "{}:{}",
+            row.terminal.obligation_key.receipt_key(),
+            row.terminal.stage.key()
+        );
+        if !specialized.insert(key.clone()) {
+            return Err(format!(
+                "duplicate option-presentation specialized row {key}"
+            ));
+        }
+        let event = common
+            .get(&key)
+            .ok_or_else(|| format!("unowned option-presentation row {key}"))?;
+        if row.terminal.obligation_key != event.key
+            || row.source_form != event.found_form
+            || row.target_form != event.expected_form
+            || row.terminal_contract != event.evidence.terminal_contract
+            || row.retention != event.evidence.retention
+            || row.terminal.state != event.state
+            || row.terminal.reason != event.terminal_reason
+        {
+            return Err(format!(
+                "option-presentation specialized/common drift at {key}"
+            ));
+        }
+        event.validate()?;
+    }
+    if common.keys().any(|key| !specialized.contains(key)) {
+        return Err("option-presentation common row lacks specialized row".to_owned());
+    }
+    Ok(rows
+        .iter()
+        .filter(|row| row.terminal.stage == MechanicalStage::Plan)
+        .count())
+}
+
+pub(crate) fn render_option_presentation_rows(rows: &[OptionPresentationReceiptRow]) -> String {
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                row.terminal.obligation_key.receipt_key(),
+                row.nullability_fact,
+                row.source_form,
+                row.target_form,
+                row.operation,
+                row.terminal_contract.key(),
+                row.retention.tier(),
+                row.retention.waiver(),
+                row.adapter,
+                row.terminal.stage.key(),
+                row.terminal.state.key(),
+                row.terminal
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), MechanicalTerminalReason::key),
+            )
+        })
+        .collect::<Vec<_>>();
+    rendered.sort();
+    let mut output =
+        specialized_receipt_headers()[raw_schema::OPTION_PRESENTATION_RECEIPT_ROWS].join("\t");
+    output.push('\n');
+    for row in rendered {
+        output.push_str(&row);
+        output.push('\n');
+    }
+    output
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeclarationShapeReceiptRow {
     pub(crate) terminal: SpecializedReceiptTerminal,
     pub(crate) declaration_site: CanonicalSiteKey,

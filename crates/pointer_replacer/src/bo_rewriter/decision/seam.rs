@@ -3355,12 +3355,12 @@ fn existing_interface_disposition(
     None
 }
 
-fn argument_form(
+pub(crate) fn argument_form(
     caller: LocalDefId,
-    arg: &super::emitability::Arg,
+    shape: &ArgShape,
     decisions: &FxHashMap<(LocalDefId, HirId), &Decision>,
 ) -> Form {
-    match arg.shape {
+    match *shape {
         ArgShape::BareLocal(hir) | ArgShape::CastOfLocal { binding: hir, .. } => decisions
             .get(&(caller, hir))
             .map_or(Form::Raw, |decision| form_of(decision)),
@@ -3491,7 +3491,7 @@ fn complete_interface_inventory(
             ) {
                 disposition
             } else if let Some(argument) = argument {
-                let found = argument_form(mir_site.caller, argument, decisions);
+                let found = argument_form(mir_site.caller, &argument.shape, decisions);
                 if matches!(glue(expected, found, None), Ok(None)) {
                     plan.zero_bridges.push(ZeroBridgeSite {
                         owner_class: SignatureClassId::of(mir_site.callee),

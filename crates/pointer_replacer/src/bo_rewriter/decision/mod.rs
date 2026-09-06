@@ -37,6 +37,7 @@ pub(crate) mod exposure;
 pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
+pub(crate) mod option;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
 pub(crate) mod seam;
@@ -866,6 +867,10 @@ pub(crate) struct DecisionTable {
     /// Item-2 raw-result definitions that construct settled local slices.
     pub slice_constructions: Vec<construction::SliceConstructionPlan>,
     pub slice_use_receipts: Vec<super::mechanical_receipt::SliceUseReceiptPlan>,
+    pub option_receipts: Vec<super::mechanical_receipt::OptionPresentationReceiptPlan>,
+    pub option_value_initializers: Vec<(LocalDefId, rustc_hir::HirId)>,
+    pub option_mut_bindings: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    pub option_composed_uses: Vec<((LocalDefId, rustc_hir::HirId), Span)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -994,9 +999,37 @@ pub(crate) struct Ctx<'a, 'tcx> {
 }
 
 pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
-    let entries = subjects
+    let mut entries = subjects
         .iter()
         .map(|subject| (subject.clone(), decide_one(ctx, subject)))
+        .collect::<Vec<_>>();
+    option::inherit_wrapped_payloads(ctx, &mut entries);
+    let option_mut_bindings = entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let needed = match decision {
+                Decision::Opt { mutable, .. } => {
+                    *mutable
+                        && !subject.mut_binding
+                        && ctx
+                            .opt_uses
+                            .get(&(subject.fn_did, subject.hir_id))
+                            .is_some_and(|uses| {
+                                uses.non_test_uses > 1
+                                    || uses
+                                        .sites
+                                        .iter()
+                                        .any(|site| site.operation == "deferred-boundary-or-copy")
+                            })
+                }
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => false,
+            };
+            needed.then_some((subject.fn_did, subject.hir_id))
+        })
         .collect();
     DecisionTable {
         entries,
@@ -1010,6 +1043,10 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
         depth2_npo_storages: Vec::new(),
         slice_constructions: Vec::new(),
         slice_use_receipts: Vec::new(),
+        option_receipts: Vec::new(),
+        option_value_initializers: Vec::new(),
+        option_mut_bindings,
+        option_composed_uses: Vec::new(),
     }
 }
 
@@ -1422,6 +1459,14 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // enough. It runs opposite to -2's conjunction on purpose: there the unsafe
     // direction was ADOPTING a form (fatness alone would invent a length), here
     // it is REFUSING one (an optional costs ergonomics, never soundness).
+    let null_constructed = constructions
+        .init_hirs
+        .get(&(subject.fn_did, subject.hir_id))
+        .is_some_and(|hir| emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr()));
+    let nullable_value = null_constructed
+        || opt_uses
+            .get(&(subject.fn_did, subject.hir_id))
+            .is_some_and(|uses| uses.null_assigned);
     let form = match raw_uses {
         Some(uses) => {
             let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);
@@ -1434,15 +1479,9 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             // wrapper, and admitting it would be the mixed-use hazard again.
             let rest_arithmetic = uses.iter().all(|(op, _)| op == "is_null" || arith(op));
 
-            if all_arithmetic && is_array {
-                Form::Slice
-            } else if null_tested
+            if (null_tested || nullable_value)
                 && rest_arithmetic
-                // A null-initialized binding needs its INITIALIZER rewritten to
-                // `None`, which is a construction-site edit this slice does not
-                // own. Falling through to the existing degrade leaves such a
-                // subject exactly where it is today.
-                && !subject.null_init
+                // Item 4 owns None at exact null initializers/assignments.
                 // A thin optional has no image for arithmetic; the fat twin does,
                 // and fatness is the licence for it — the -2 rule, unchanged.
                 && (!has_arithmetic || is_array)
@@ -1450,6 +1489,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 Form::Opt {
                     slice: has_arithmetic && is_array,
                 }
+            } else if all_arithmetic && is_array {
+                Form::Slice
             } else {
                 let (op, span) = uses.first().expect("a recorded use vector is non-empty");
                 return degrade(
@@ -1459,6 +1500,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 );
             }
         }
+        None if nullable_value => Form::Opt { slice: false },
         None => Form::Plain,
     };
     if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
@@ -1603,9 +1645,6 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                     DegradeReason::OptUseUnsupported,
                 );
             }
-            if subject.mutable && uses.non_test_uses > 1 && !subject.mut_binding {
-                return degrade(subject, decl_site, DegradeReason::OptNeedsMutBinding);
-            }
             return Decision::Opt {
                 mutable: subject.mutable,
                 slice: false,
@@ -1618,10 +1657,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     }
 
     if let Form::Opt { slice } = form {
-        // The construction-site guard, exactly as the slice arm has one: an
-        // optional's VALUE has to be built at the initializer, and this phase
-        // owns declarations and uses, not initializers.
-        if matches!(subject.kind, SubjectKind::Local) && depth2_npo.is_none() {
+        // The Option value planner needs a real initializer identity. Existing
+        // depth-2 layout carriers retain their separate ownership.
+        if matches!(subject.kind, SubjectKind::Local)
+            && depth2_npo.is_none()
+            && !construction::slice_constructor_available(
+                constructions,
+                (subject.fn_did, subject.hir_id),
+            )
+        {
             return degrade(subject, decl_site, DegradeReason::OptLocalConstruction);
         }
         let uses = opt_uses
@@ -1638,15 +1682,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // The idiom rule, from the corpus (micro-plan §9c): multiplicity ×
         // mutability. One use of a mutable optional takes `unwrap()` — g02's
         // ratified text, and the move is fine exactly once. More than one needs
-        // `as_mut()`, and `as_mut()` needs a `mut` binding, which is one edit
-        // away in a phase that does not own the binding pattern.
-        if subject.mutable && uses.non_test_uses > 1 && !subject.mut_binding {
-            return degrade(subject, decl_site, DegradeReason::OptNeedsMutBinding);
-        }
+        // `as_mut()`. G15 schedules its required mutable binding atomically
+        // with the Option declaration and use edits.
         // **S3.2′-5 hardening — LAST in this arm**, the same placement rule the
         // plain-slice twin uses, so it can only ever convert a would-be `Opt`
-        // emission and never displace `OptUseUnsupported` or
-        // `OptNeedsMutBinding`.
+        // emission and never displace `OptUseUnsupported`.
         //
         // **Gated on `slice`** — the narrowest arm that owns the hazard. The
         // index is what can wrap, and only the FAT twin forms one: form
@@ -1836,6 +1876,10 @@ mod self_consistency_tests {
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
             slice_use_receipts: Vec::new(),
+            option_receipts: Vec::new(),
+            option_value_initializers: Vec::new(),
+            option_mut_bindings: rustc_hash::FxHashSet::default(),
+            option_composed_uses: Vec::new(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

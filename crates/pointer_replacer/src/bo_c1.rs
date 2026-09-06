@@ -10620,6 +10620,11 @@ mod run {
             &artifact.mechanical_events,
         )
         .expect("slice-use receipt reconciliation");
+        crate::bo_rewriter::mechanical_receipt::reconcile_option_presentation_rows(
+            &artifact.option_rows,
+            &artifact.mechanical_events,
+        )
+        .expect("Option-presentation receipt reconciliation");
         let mechanical_receipts =
             crate::bo_rewriter::mechanical_receipt::render_mechanical_obligations(
                 &artifact.mechanical_events,
@@ -10634,6 +10639,10 @@ mod run {
             );
         let slice_use_receipts =
             crate::bo_rewriter::mechanical_receipt::render_slice_use_rows(&artifact.slice_use_rows);
+        let option_receipts =
+            crate::bo_rewriter::mechanical_receipt::render_option_presentation_rows(
+                &artifact.option_rows,
+            );
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
             ("d4-edges", artifact.d4_edges.as_str()),
@@ -10689,6 +10698,14 @@ mod run {
             stamp(&slice_use_receipts),
         )
         .expect("write slice-use receipts");
+        std::fs::write(
+            directory.join(format!(
+                "{name}.{}",
+                raw_schema::OPTION_PRESENTATION_RECEIPT_ROWS
+            )),
+            stamp(&option_receipts),
+        )
+        .expect("write Option-presentation receipts");
         let mut diagnostics = String::from(RAW_BOUNDARY_DIAGNOSTIC_HEADER);
         for diagnostic in &capture.reverts {
             diagnostics.push_str(&format!(

@@ -466,8 +466,12 @@ fn nested_ast_composition(
         let slice_construction_over_inner = outer.key.bridge_kind == "slice-local-construction"
             && inner.key.bridge_kind != "slice-local-construction"
             && contains(outer, inner);
+        let option_value_over_inner = outer.key.bridge_kind == "option-value-composed"
+            && inner.key.bridge_kind != "option-value-composed"
+            && contains(outer, inner);
         ((bridge_over_subject || pair_over_c || a5_over_inner) && strictly_contains(outer, inner))
             || slice_construction_over_inner
+            || option_value_over_inner
     };
     if composable(left, right) {
         Some((left.key.owner_class, right.key.owner_class))
@@ -846,6 +850,25 @@ pub(crate) fn finalize_signature_classes(
         .collect::<Vec<_>>();
     dependency_edges.extend(table.seams.interface_dependencies.iter().copied());
     dependency_edges.extend(table.seams.generated_item_dependencies.iter().copied());
+    dependency_edges.extend(
+        planned
+            .option_receipt_plans
+            .iter()
+            .filter(|receipt| {
+                matches!(
+                    receipt.operation.as_str(),
+                    "call-required" | "call-optional"
+                )
+            })
+            .flat_map(|receipt| {
+                receipt
+                    .obligation
+                    .planned
+                    .dependency_classes
+                    .iter()
+                    .map(move |&dependency| (receipt.owner_class, dependency))
+            }),
+    );
     dependency_edges.extend(table.entries.iter().filter_map(
         |(subject, decision)| match decision {
             Decision::InferredRef { callee, .. } => Some((
@@ -1122,6 +1145,7 @@ pub(crate) struct Plan {
     pub slice_construction_receipt_plans:
         Vec<super::mechanical_receipt::SliceConstructionReceiptPlan>,
     pub slice_use_receipt_plans: Vec<super::mechanical_receipt::SliceUseReceiptPlan>,
+    pub option_receipt_plans: Vec<super::mechanical_receipt::OptionPresentationReceiptPlan>,
     pub unowned_a5_proof_sites: usize,
     /// A5 calls after terminal-interface validation/re-planning. The AST graft
     /// consumes this sealed plan; it never recomputes the terminal verdict.
@@ -1133,16 +1157,20 @@ impl Plan {
     /// declared dependency rule and remove every edit belonging to the newly
     /// held closure. This is class recovery, never a program-level failure.
     pub(crate) fn hold_terminal_a5_class(&mut self, owner: SignatureClassId, reason: String) {
+        self.hold_terminal_class(owner, Arm::Pair, "a5-terminal-replan-unavailable", reason);
+    }
+
+    pub(crate) fn hold_terminal_class(
+        &mut self,
+        owner: SignatureClassId,
+        arm: Arm,
+        bridge_kind: &'static str,
+        reason: String,
+    ) {
         let Some(class) = self.class_finalization.classes.get_mut(&owner) else {
             return;
         };
-        let site = ClassSite::dropped(
-            owner,
-            owner,
-            Arm::Pair,
-            "a5-terminal-replan-unavailable",
-            reason.clone(),
-        );
+        let site = ClassSite::dropped(owner, owner, arm, bridge_kind, reason.clone());
         class.site_keys.push(site.key.clone());
         class.edit_keys.push(site.edit_key.clone());
         class.sites.push(site);
@@ -1185,7 +1213,7 @@ impl Plan {
                 self.class_finalization
                     .classes
                     .get_mut(&id)
-                    .expect("dependent terminal A5 class exists")
+                    .expect("dependent terminal class exists")
                     .disposition = SignatureClassDisposition::Held(vec![format!(
                     "dependency-class-held:{}",
                     dependency.order_key()
@@ -1369,6 +1397,14 @@ impl Plan {
             let (pair, _) = receipt.materialize(live, reverted.contains(&receipt.owner_class));
             events.extend(pair);
         }
+        for receipt in &self.option_receipt_plans {
+            let live = self.option_class_live(receipt, reverted);
+            events.extend(
+                receipt
+                    .materialize(live, reverted.contains(&receipt.owner_class))
+                    .0,
+            );
+        }
         (events, a5_rows, slice_rows)
     }
 
@@ -1399,6 +1435,40 @@ impl Plan {
                 receipt
                     .materialize(
                         self.slice_use_class_live(receipt, reverted),
+                        reverted.contains(&receipt.owner_class),
+                    )
+                    .1
+            })
+            .collect()
+    }
+
+    fn option_class_live(
+        &self,
+        receipt: &super::mechanical_receipt::OptionPresentationReceiptPlan,
+        reverted: &BTreeSet<SignatureClassId>,
+    ) -> bool {
+        std::iter::once(&receipt.owner_class)
+            .chain(receipt.obligation.planned.dependency_classes.iter())
+            .all(|owner| {
+                !reverted.contains(owner)
+                    && self
+                        .class_finalization
+                        .classes
+                        .get(owner)
+                        .is_some_and(SignatureClassPlan::is_ready)
+            })
+    }
+
+    pub(crate) fn option_receipt_rows(
+        &self,
+        reverted: &BTreeSet<SignatureClassId>,
+    ) -> Vec<super::mechanical_receipt::OptionPresentationReceiptRow> {
+        self.option_receipt_plans
+            .iter()
+            .flat_map(|receipt| {
+                receipt
+                    .materialize(
+                        self.option_class_live(receipt, reverted),
                         reverted.contains(&receipt.owner_class),
                     )
                     .1
@@ -1483,6 +1553,7 @@ pub(crate) fn plan(
     let mut a5_receipt_plans = Vec::new();
     let mut slice_construction_receipt_plans = Vec::new();
     let slice_use_receipt_plans = table.slice_use_receipts.clone();
+    let option_receipt_plans = table.option_receipts.clone();
     let unowned_a5_proof_sites = table
         .seams
         .overlap_proofs
@@ -1783,6 +1854,100 @@ pub(crate) fn plan(
         }
     }
 
+    for node in &table.option_mut_bindings {
+        let Some((subject, decision)) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| (subject.fn_did, subject.hir_id) == *node)
+        else {
+            continue;
+        };
+        match decision {
+            Decision::Opt { .. } => {}
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => continue,
+        }
+        let owner = SignatureClassId::of(subject.fn_did);
+        let Some(name) = &subject.param_name else { continue };
+        let bridge = BridgeSitePlan::local(
+            subject.fn_did,
+            subject.fn_did,
+            Arm::Surface.key(),
+            format!("option-binding:hir{}", subject.hir_id.local_id.as_u32()),
+            "option-mut-binding",
+        );
+        match span_to_loc(subject.binding_span) {
+            Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
+                lo,
+                hi,
+                replacement: format!("mut {name}"),
+                justification: Justification::SeamAdapter {
+                    family: "safe",
+                    fabricated: false,
+                },
+                owner_class: Some(owner),
+                owner_path: owner_of(subject),
+                bridge: Some(bridge),
+                atom_ids: Vec::new(),
+                subject_id: subject.identity_key(&owner_of(subject)),
+                required_arms: owner_arms.get(&owner).copied().unwrap_or_default().render(),
+                edit_kind: "option-mut-binding",
+            }),
+            Err(reason) => unplaceable.push(Unplaceable {
+                owner_class: owner,
+                bridge,
+                reason,
+                detail: "Option binding mutability".to_owned(),
+                subject: subject.identity_key(&owner_of(subject)),
+            }),
+        }
+    }
+    for receipt in &option_receipt_plans {
+        if receipt.obligation.intended_terminal_state
+            == super::mechanical_receipt::MechanicalState::HeldNonmechanical
+            && !matches!(
+                receipt.operation.as_str(),
+                "excluded-cursor" | "handoff-return" | "handoff-use"
+            )
+        {
+            let subject = table
+                .entries
+                .iter()
+                .find(|(subject, _)| {
+                    receipt.obligation.planned.key.subject
+                        == super::mechanical_receipt::MechanicalSubjectKey::Local {
+                            owner: subject.fn_did,
+                            mir_local: subject.local.as_u32(),
+                            slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                        }
+                })
+                .expect("Option receipt retains its subject")
+                .0
+                .clone();
+            let bridge = BridgeSitePlan::local(
+                receipt.owner_class.local_def_id(),
+                receipt.owner_class.local_def_id(),
+                Arm::Surface.key(),
+                receipt.obligation.planned.key.site.receipt_key(),
+                "option-presentation",
+            )
+            .with_forms(
+                &receipt.target_form,
+                &receipt.source_form,
+                &receipt.operation,
+            );
+            unplaceable.push(Unplaceable {
+                owner_class: receipt.owner_class,
+                bridge,
+                reason: "option-evidence-held",
+                detail: format!("{:?}", receipt.obligation.intended_terminal_reason),
+                subject: subject.identity_key(&owner_of(&subject)),
+            });
+        }
+    }
     for receipt in &slice_use_receipt_plans {
         if receipt.obligation.intended_terminal_state
             == super::mechanical_receipt::MechanicalState::HeldNonmechanical
@@ -2873,6 +3038,7 @@ pub(crate) fn plan(
         a5_receipt_plans,
         slice_construction_receipt_plans,
         slice_use_receipt_plans,
+        option_receipt_plans,
         unowned_a5_proof_sites,
         terminal_a5_raw_calls: Vec::new(),
     }
@@ -2937,6 +3103,10 @@ mod tests {
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
             slice_use_receipts: Vec::new(),
+            option_receipts: Vec::new(),
+            option_value_initializers: Vec::new(),
+            option_mut_bindings: rustc_hash::FxHashSet::default(),
+            option_composed_uses: Vec::new(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -2994,6 +3164,10 @@ mod tests {
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
             slice_use_receipts: Vec::new(),
+            option_receipts: Vec::new(),
+            option_value_initializers: Vec::new(),
+            option_mut_bindings: rustc_hash::FxHashSet::default(),
+            option_composed_uses: Vec::new(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

@@ -1995,16 +1995,39 @@ impl RawBoundaryDispositionIndex {
                     if let Some(evidence) = negative_write {
                         out.negative_write.insert(site.key.clone(), evidence);
                     }
-                    let mut template =
-                        template_for(decision, &site.target, ownership, negative_write.is_some())
-                            .map_err(|reason| {
-                            let detail = if reason == RawBoundaryBlockReason::SharedToMut {
-                                format!("negative-write-absent:{negative_detail}")
-                            } else {
-                                "template-preflight".to_owned()
-                            };
-                            (reason, detail)
-                        })?;
+                    // A borrowed element/projection is a reference view even
+                    // when its owning subject is a slice or Option slice.
+                    // Select its template before applying the R-B gate, so a
+                    // shared projection cannot inherit the base's mutability.
+                    let reference_view = match decision {
+                        super::Decision::Ref { .. }
+                        | super::Decision::InferredRef { .. }
+                        | super::Decision::Slice { .. }
+                        | super::Decision::Opt { .. } => match site.source_shape {
+                            "addr-of" | "addr-of-cast" => {
+                                Some(super::Decision::Ref { mutable: false })
+                            }
+                            "addr-of-mut" | "addr-of-mut-cast" => {
+                                Some(super::Decision::Ref { mutable: true })
+                            }
+                            _ => None,
+                        },
+                        super::Decision::Box(_) | super::Decision::Degraded(_) => None,
+                    };
+                    let mut template = template_for(
+                        reference_view.as_ref().unwrap_or(decision),
+                        &site.target,
+                        ownership,
+                        negative_write.is_some(),
+                    )
+                    .map_err(|reason| {
+                        let detail = if reason == RawBoundaryBlockReason::SharedToMut {
+                            format!("negative-write-absent:{negative_detail}")
+                        } else {
+                            "template-preflight".to_owned()
+                        };
+                        (reason, detail)
+                    })?;
                     template = template_for_source_form(
                         template,
                         site.source_shape,

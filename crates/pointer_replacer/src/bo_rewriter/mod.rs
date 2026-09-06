@@ -223,6 +223,7 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) a5_proof_site_fallback_rows: Vec<mechanical_receipt::A5ProofSiteFallbackReceiptRow>,
     pub(crate) slice_construction_rows: Vec<mechanical_receipt::SliceConstructionReceiptRow>,
     pub(crate) slice_use_rows: Vec<mechanical_receipt::SliceUseAdapterReceiptRow>,
+    pub(crate) option_rows: Vec<mechanical_receipt::OptionPresentationReceiptRow>,
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
@@ -1188,6 +1189,7 @@ fn refresh_raw_boundary_receipt_events(
     artifacts.a5_proof_site_fallback_rows = a5_rows;
     artifacts.slice_construction_rows = slice_rows;
     artifacts.slice_use_rows = emission_plan.slice_use_receipt_rows(reverted);
+    artifacts.option_rows = emission_plan.option_receipt_rows(reverted);
 }
 
 fn verify_and_revert(
@@ -3214,6 +3216,14 @@ impl OutcomeFacts {
                 );
             }
         }
+        for row in &mut self.raw_boundary_artifacts.option_rows {
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
         self.stamp_class_costs();
         RewriteOutcome::Degraded {
             reason,
@@ -4535,6 +4545,109 @@ fn terminal_parameter_form(
     terminal_interface_form(decision::seam::Form::Raw, placed, live)
 }
 
+fn validate_terminal_option_calls(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    planned: &mut plan::Plan,
+) {
+    use mechanical_receipt::{
+        CanonicalCallee, MechanicalState, MechanicalTerminalReason, TerminalContract,
+    };
+
+    // Every nonempty pass holds at least one ready class. Holds are monotone,
+    // so caller/callee chains reach a fixed point in finitely many passes.
+    loop {
+        let mut holds = std::collections::BTreeMap::<_, Vec<String>>::new();
+        for receipt in &mut planned.option_receipt_plans {
+            if !matches!(
+                receipt.operation.as_str(),
+                "call-required" | "call-optional"
+            ) {
+                continue;
+            }
+            let site = &receipt.obligation.planned.key.site;
+            let callee = site.callee.as_ref().and_then(|callee| match callee {
+                CanonicalCallee::Local(callee) => callee.as_local(),
+                CanonicalCallee::Foreign(_) | CanonicalCallee::Generated { .. } => None,
+            });
+            let terminal = callee
+                .zip(
+                    site.argument_index
+                        .and_then(|index| usize::try_from(index).ok()),
+                )
+                .map(|(callee, argument_index)| {
+                    (
+                        callee,
+                        argument_index,
+                        terminal_parameter_form(
+                            table,
+                            &planned.class_finalization,
+                            callee,
+                            argument_index,
+                        ),
+                    )
+                });
+            let contract = terminal.and_then(|(callee, argument_index, form)| {
+                if form.key() != receipt.target_form
+                    || receipt.target_form != receipt.obligation.planned.expected_form
+                {
+                    return None;
+                }
+                let interface = format!(
+                    "{}:arg{}:{}",
+                    tcx.def_path_str(callee.to_def_id()),
+                    argument_index,
+                    form.key(),
+                );
+                match (receipt.operation.as_str(), form) {
+                    (
+                        "call-required",
+                        decision::seam::Form::Ref { .. } | decision::seam::Form::Slice { .. },
+                    ) => Some(TerminalContract::Required { interface }),
+                    ("call-optional", decision::seam::Form::Opt { .. }) => {
+                        Some(TerminalContract::Optional { interface })
+                    }
+                    _ => None,
+                }
+            });
+            receipt.terminal_contract = contract.clone().unwrap_or(TerminalContract::Missing);
+            receipt.obligation.planned.evidence.terminal_contract =
+                receipt.terminal_contract.clone();
+            if contract.is_none() {
+                receipt.obligation.intended_terminal_state = MechanicalState::HeldNonmechanical;
+                receipt.obligation.intended_terminal_reason =
+                    Some(MechanicalTerminalReason::TerminalContractMissing);
+                if planned
+                    .class_finalization
+                    .classes
+                    .get(&receipt.owner_class)
+                    .is_some_and(plan::SignatureClassPlan::is_ready)
+                {
+                    holds.entry(receipt.owner_class).or_default().push(format!(
+                        "option-terminal-contract-missing:site={};expected={};terminal={}",
+                        site.receipt_key(),
+                        receipt.target_form,
+                        terminal.map_or("missing", |(_, _, form)| form.key()),
+                    ));
+                }
+            }
+        }
+        if holds.is_empty() {
+            break;
+        }
+        for (owner, mut reasons) in holds {
+            reasons.sort();
+            reasons.dedup();
+            planned.hold_terminal_class(
+                owner,
+                decision::Arm::Surface,
+                "option-terminal-contract-missing",
+                reasons.join(";"),
+            );
+        }
+    }
+}
+
 fn canonical_a5_site_matches(
     canonical: &mechanical_receipt::CanonicalSiteKey,
     proof: decision::a5_site_proof::A5ProofSiteKey,
@@ -4974,6 +5087,7 @@ pub(crate) fn emit_files<'tcx>(
             });
         terminal_a5_raw_calls.push(pending.call);
     }
+    validate_terminal_option_calls(tcx, table, &mut planned);
     let ready_a5_classes = planned
         .class_finalization
         .classes
@@ -5404,6 +5518,15 @@ fn finish_decide<'tcx>(
         .filter(|s| fat.is_array(s.fn_did, s.local))
         .map(|s| (s.fn_did, s.hir_id))
         .collect();
+    let opt_deferred_uses = slice_uses
+        .iter()
+        .flat_map(|(node, uses)| {
+            uses.raw_uses
+                .iter()
+                .filter(|site| site.source_shape != "cursor")
+                .map(move |site| (node.0, node.1, site.span.lo().0, site.span.hi().0))
+        })
+        .collect();
     let opt_uses = decision::emitability::collect_opt_uses(
         tcx,
         &program.functions,
@@ -5411,6 +5534,7 @@ fn finish_decide<'tcx>(
         &opt_accessors,
         &opt_fat,
         &raw_boundary_argument_paths,
+        &opt_deferred_uses,
     );
     let ctx_of = |gate, coconv, lifetime_eligibility, raw_boundary, exposure| decision::Ctx {
         tcx,
@@ -5695,6 +5819,11 @@ fn finish_decide<'tcx>(
     // Item 2 renders local raw-result constructors only after the terminal
     // seam set exists, so a contained raw-view/cast edit is composed into the
     // initializer rather than overwritten by an outer constructor.
+    (
+        table.option_receipts,
+        table.option_value_initializers,
+        table.option_composed_uses,
+    ) = decision::option::plan_values(tcx, &mut table, &ctors, &opt_uses);
     table.slice_use_receipts = decision::slice_use::receipt_plans(
         &program,
         &mut table,
@@ -5703,6 +5832,120 @@ fn finish_decide<'tcx>(
         &retention,
         &mut_facts,
     );
+    let option_operations = decision::option::plan_operations(
+        &program,
+        &mut table,
+        &opt_uses,
+        &raw_boundary,
+        &slice_uses,
+        &retention,
+        &mut_facts,
+    );
+    table.option_receipts.extend(option_operations);
+    for (subject, decision) in &table.entries {
+        let unsupported = match decision {
+            decision::Decision::Degraded(record) => {
+                record.reason == decision::DegradeReason::OptUseUnsupported
+            }
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => false,
+        };
+        if !unsupported {
+            continue;
+        }
+        let node = (subject.fn_did, subject.hir_id);
+        let Some(uses) = opt_uses.get(&node) else { continue };
+        let slice = opt_fat.contains(&node)
+            && facts.raw_only_uses.get(&node).is_some_and(|uses| {
+                uses.iter().any(|(op, _)| {
+                    decision::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
+                })
+            });
+        for site in uses.sites.iter().filter(|site| {
+            matches!(
+                site.operation,
+                "excluded-cursor" | "handoff-return" | "handoff-use"
+            )
+        }) {
+            let reason = if site.operation == "excluded-cursor" {
+                mechanical_receipt::MechanicalTerminalReason::Cursor
+            } else {
+                mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(format!(
+                    "{}:later-return-or-sink-wave",
+                    site.operation
+                ))
+            };
+            table.option_receipts.push(decision::option::receipt(
+                tcx,
+                subject,
+                site.hir_id,
+                mechanical_receipt::MechanicalFamily::OptUseUnsupported,
+                site.operation,
+                decision::seam::Form::Raw,
+                decision::seam::Form::Opt {
+                    mutable: subject.mutable,
+                    slice,
+                },
+                site.operation.to_owned(),
+                Some(reason),
+                mechanical_receipt::MechanicalEvidence::default(),
+            ));
+        }
+    }
+    for receipt in &mut table.option_receipts {
+        let mechanical_receipt::MechanicalSubjectKey::Local {
+            owner, mir_local, ..
+        } = receipt.obligation.planned.key.subject
+        else {
+            continue;
+        };
+        let Some((subject, _)) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.fn_did == owner && subject.local.as_u32() == mir_local)
+        else {
+            continue;
+        };
+        let node = (subject.fn_did, subject.hir_id);
+        receipt.obligation.planned.required_arms = table
+            .arm_requirements
+            .get(&node)
+            .copied()
+            .unwrap_or_default()
+            .render();
+        let mut nullability = Vec::new();
+        if let Some(hir) = ctors.init_hirs.get(&node)
+            && decision::emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
+        {
+            nullability.push(format!("null-initializer:hir{}", hir.local_id.as_u32()));
+        }
+        if let Some(uses) = opt_uses.get(&node) {
+            nullability.extend(
+                uses.sites
+                    .iter()
+                    .filter(|site| site.operation == "null-test")
+                    .map(|site| format!("is-null:hir{}", site.hir_id.local_id.as_u32())),
+            );
+            nullability.extend(
+                uses.assignments
+                    .iter()
+                    .filter(|site| {
+                        decision::emitability::is_zero_literal(tcx.hir_node(site.rhs).expect_expr())
+                    })
+                    .map(|site| format!("null-assignment:hir{}", site.rhs.local_id.as_u32())),
+            );
+        }
+        nullability.sort();
+        nullability.dedup();
+        receipt.nullability_fact = if nullability.is_empty() {
+            "existing-layout-option-carrier".to_owned()
+        } else {
+            nullability.join(";")
+        };
+    }
     table.slice_constructions =
         decision::construction::plan_slice_constructions(tcx, &table, &ctors);
     append_surface_declaration_plans(tcx, &exposure, &mut table);
@@ -5757,6 +6000,7 @@ fn finish_decide<'tcx>(
         a5_proof_site_fallback_rows: Vec::new(),
         slice_construction_rows: Vec::new(),
         slice_use_rows: Vec::new(),
+        option_rows: Vec::new(),
         class_costs: bridge_receipt::class_cost_header(),
         class_collisions: bridge_receipt::class_collision_header(),
         unresolved_classes: bridge_receipt::unresolved_class_header(),

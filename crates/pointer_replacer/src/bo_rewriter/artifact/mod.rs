@@ -211,6 +211,10 @@ mod tests {
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
             slice_use_receipts: Vec::new(),
+            option_receipts: Vec::new(),
+            option_value_initializers: Vec::new(),
+            option_mut_bindings: rustc_hash::FxHashSet::default(),
+            option_composed_uses: Vec::new(),
         }
     }
 

@@ -639,7 +639,10 @@ fn bind_allocation_arguments(
     ))
 }
 
-fn collect_composable_edits(table: &DecisionTable, init_span: Span) -> Vec<(Span, String)> {
+pub(crate) fn collect_composable_edits(
+    table: &DecisionTable,
+    init_span: Span,
+) -> Vec<(Span, String)> {
     let init = init_span.source_callsite();
     let contains = |span: Span| {
         let span = span.source_callsite();
@@ -682,7 +685,7 @@ fn collect_composable_edits(table: &DecisionTable, init_span: Span) -> Vec<(Span
     edits
 }
 
-fn compose_initializer(
+pub(crate) fn compose_initializer(
     init_span: Span,
     initializer: &str,
     edits: &[(Span, String)],
@@ -753,6 +756,9 @@ pub(crate) fn plan_slice_constructions(
             | Decision::Degraded(_) => continue,
         };
         let node = (subject.fn_did, subject.hir_id);
+        if table.option_value_initializers.contains(&node) {
+            continue;
+        }
         if table
             .slice_use_receipts
             .iter()
