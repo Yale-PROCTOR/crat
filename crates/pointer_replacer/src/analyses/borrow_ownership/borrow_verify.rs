@@ -859,6 +859,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    super::source_events::record_replay();
     // §NB-R guard (release-active): a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
     // accepted model meaningless. Tracked instances belong to the explain path.
@@ -1251,6 +1252,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    super::source_events::record_replay();
     // D17: re-assert the load-bearing precondition at the door, not only at the
     // env entry. `debug_assert!` rather than `assert!` so the release-path cost
     // and behaviour of the existing single choke point are unchanged.

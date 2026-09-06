@@ -201,6 +201,7 @@ pub(crate) struct CopyLendPairCandidate {
 }
 
 pub(crate) struct BoConstruction {
+    pub(crate) source_events: std::sync::Arc<super::source_events::SourceEvents>,
     pub(crate) mode: CopyLendMode,
     pub(crate) nullability: super::nullability::NullabilityFacts,
     pub(crate) field_ref_plan: FieldRefPlan,
@@ -714,6 +715,8 @@ fn construct_bo_into_with_esc(
     mode: CopyLendMode,
     enable_esc_minimal: bool,
 ) -> anyhow::Result<BoConstruction> {
+    let source_events = super::source_events::for_construction(program);
+    super::export::record(|export| export.source_events = Some(source_events.clone()));
     let crate_ctxt = CrateCtxt::new(program);
     let esc_minimal = if enable_esc_minimal {
         super::esc_minimal::select(program, slots)
@@ -768,6 +771,7 @@ fn construct_bo_into_with_esc(
     );
     let coherence_elapsed = t.elapsed();
     Ok(BoConstruction {
+        source_events,
         mode,
         nullability,
         field_ref_plan,
@@ -936,6 +940,8 @@ pub(crate) fn construct_tracked_census_baseline(
     origins: &OriginSummaries,
     solver: &KindSolver,
 ) -> anyhow::Result<BoConstruction> {
+    let source_events = super::source_events::for_construction(program);
+    super::export::record(|export| export.source_events = Some(source_events.clone()));
     let crate_ctxt = CrateCtxt::new(program);
     let t = Instant::now();
     let (stats, selectors) = emit_crate_ownership_constraints(&crate_ctxt, slots, origins, solver)?;
@@ -953,6 +959,7 @@ pub(crate) fn construct_tracked_census_baseline(
         add_coherence_tagging_uses(solver, slots, fn_did, &body);
     }
     Ok(BoConstruction {
+        source_events,
         mode: CopyLendMode::Baseline,
         nullability: super::nullability::NullabilityFacts::default(),
         field_ref_plan: FieldRefPlan::default(),
@@ -1024,15 +1031,23 @@ pub(crate) fn verify_bo_construction_with_flows(
         CopyLendMode::LendArm,
         "a lend-arm construction must replay the same native flows that produced eligibility"
     );
-    verify_to_fixpoint_counting_with_flows(
-        program,
-        slots,
-        origin_flows,
-        solver,
-        &construction.selectors,
-        mut_facts,
-    )
-    .0
+    super::source_events::with_inventory(&construction.source_events, || {
+        verify_to_fixpoint_counting_with_flows(
+            program,
+            slots,
+            origin_flows,
+            solver,
+            &construction.selectors,
+            mut_facts,
+        )
+        .0
+    })
+}
+
+fn with_construction_replay<T>(construction: &BoConstruction, f: impl FnOnce() -> T) -> T {
+    super::source_events::with_inventory(&construction.source_events, || {
+        super::esc_minimal::with_presentations(&construction.esc_minimal, f)
+    })
 }
 
 pub(crate) fn verify_bo_construction_with_parameter_overlaps(
@@ -1052,7 +1067,7 @@ pub(crate) fn verify_bo_construction_with_parameter_overlaps(
         CopyLendMode::Baseline,
         "A5 focused replay must keep the independent CopyLend switch at baseline"
     );
-    super::esc_minimal::with_presentations(&construction.esc_minimal, || {
+    with_construction_replay(construction, || {
         verify_constructed_to_fixpoint(
             program,
             slots,
@@ -1104,7 +1119,7 @@ pub(crate) fn verify_bo_construction_counting(
     Option<FxHashMap<SlotRef, SlotKind>>,
     super::borrow_verify::RoundStats,
 ) {
-    super::esc_minimal::with_presentations(&construction.esc_minimal, || {
+    with_construction_replay(construction, || {
         verify_constructed_to_fixpoint(
             program,
             slots,
@@ -1152,7 +1167,7 @@ pub(crate) fn verify_bo_construction_counting_for_test(
 ) {
     let copy_lends =
         (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
-    super::esc_minimal::with_presentations(&construction.esc_minimal, || {
+    with_construction_replay(construction, || {
         verify_to_fixpoint_counting_with_flows_impl(
             program,
             slots,
@@ -1185,7 +1200,7 @@ pub(crate) fn verify_bo_construction_l2_for_test(
 ) {
     let copy_lends =
         (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
-    super::esc_minimal::with_presentations(&construction.esc_minimal, || {
+    with_construction_replay(construction, || {
         verify_l2_to_fixpoint_counting_impl(
             program,
             slots,
@@ -1277,6 +1292,31 @@ fn stamp_a16_refined_receipt(mut verified: VerifiedBo, refined: bool) -> Verifie
 }
 
 fn solve_bo_a5_config_inner(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+    refined: bool,
+    enable_esc_minimal: bool,
+) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
+    let inventory = std::sync::Arc::new(super::source_events::collect(program));
+    super::source_events::with_inventory(&inventory, || {
+        solve_bo_a5_config_with_source_events(
+            program,
+            slots,
+            origins,
+            mut_facts,
+            mode,
+            attestation,
+            refined,
+            enable_esc_minimal,
+        )
+    })
+}
+
+fn solve_bo_a5_config_with_source_events(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origins: &OriginSummaries,

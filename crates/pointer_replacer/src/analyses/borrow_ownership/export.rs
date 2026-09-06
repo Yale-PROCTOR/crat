@@ -469,6 +469,10 @@ pub(crate) struct CallSite {
 /// and called it "byte-identical").
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BoExport {
+    /// One carried source-event inventory from construction, independent of
+    /// kind selection and the optional export recorder.
+    pub source_events: Option<std::sync::Arc<super::source_events::SourceEvents>>,
+    pub replay_source_events: Option<std::sync::Arc<super::source_events::SourceEvents>>,
     /// E-R2 consume sites, in emission order.
     pub version_sites: Vec<VersionSite>,
     /// E-R2 per-`Var` ownership, evaluated from the accepted model.

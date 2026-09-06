@@ -165,6 +165,60 @@ unsafe fn f(c: i32) -> i32 {
 }
 "#;
 
+#[test]
+fn e5_p_sink_construction_carries_inventory_to_export() {
+    ::utils::compilation::run_compiler_on_str(MALLOC_FREE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let (construction, captured) = with_bo_export(|| {
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("construction");
+            assert!(
+                verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &construction,
+                    &facts,
+                )
+                .0
+                .is_some()
+            );
+            construction
+        });
+        let events = captured
+            .source_events
+            .expect("E5-P-SINK missing carried source inventory");
+        assert_eq!(events, construction.source_events);
+        assert_eq!(
+            captured.replay_source_events.as_ref(),
+            Some(&events),
+            "replay must receive the carried inventory"
+        );
+        assert_eq!(
+            events
+                .retirements
+                .values()
+                .filter(|event| event.key.role
+                    == crate::analyses::borrow_ownership::source_events::SourceRole::Free)
+                .count(),
+            1
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
 const CALL_ARG: &str = r#"
 unsafe fn g(p: *mut i32) { *p = 9; }
 unsafe fn f(p: *mut i32) -> i32 {

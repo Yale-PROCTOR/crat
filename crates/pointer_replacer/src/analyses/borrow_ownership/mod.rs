@@ -39,6 +39,7 @@ pub(crate) mod safety_mono;
 pub(crate) mod slot_key;
 pub mod slots;
 pub mod solver;
+pub(crate) mod source_events;
 pub(crate) mod sources;
 pub mod ssa;
 mod struct_ctxt;
