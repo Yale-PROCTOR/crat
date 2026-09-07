@@ -521,6 +521,9 @@ pub(crate) struct BoExport {
     /// kind selection and the optional export recorder.
     pub source_events: Option<std::sync::Arc<super::source_events::SourceEvents>>,
     pub replay_source_events: Option<std::sync::Arc<super::source_events::SourceEvents>>,
+    pub entry_protection: Option<std::sync::Arc<super::protected_entry::EntryAnalysis>>,
+    pub entry_accesses: Vec<super::protected_entry::SourceAccess>,
+    pub entry_fact_witnesses: Vec<super::protected_entry::evidence::FactWitness>,
     pub realloc_version_sites: Vec<ReallocVersionSite>,
     pub realloc_cases: Vec<ReallocCaseReceipt>,
     /// E-R2 consume sites, in emission order.
@@ -943,6 +946,9 @@ pub(crate) fn record_loan(identity: LoanIdentity) {
 pub(crate) fn begin_round() {
     record(|export| {
         export.loans.clear();
+        export.entry_protection = None;
+        export.entry_accesses.clear();
+        export.entry_fact_witnesses.clear();
         // Back to "not recorded this round" — NOT to "recorded, none found".
         export.residual_conflicts = None;
     });

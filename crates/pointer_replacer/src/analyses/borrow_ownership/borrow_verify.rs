@@ -221,6 +221,7 @@ fn revalidate_with_flows(
     is_ref: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
+    let _entry_scope = super::protected_entry::for_model(program, slots, &is_ref);
     let is_ref = &is_ref;
     let cand = move |fn_did| {
         let universe = slots.fn_local_slots.get(&fn_did);
@@ -309,6 +310,7 @@ fn revalidate_replaying_with_flows(
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
+    let _entry_scope = super::protected_entry::for_model(program, slots, &is_ref);
     let is_ref = &is_ref;
     let is_raw = &is_raw;
     let cand = move |fn_did| {
@@ -413,6 +415,7 @@ fn revalidate_replaying_witnessed(
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>> {
+    let _entry_scope = super::protected_entry::for_model(program, slots, &is_ref);
     let is_ref = &is_ref;
     let is_raw = &is_raw;
     let cand = move |fn_did| {

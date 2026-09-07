@@ -436,6 +436,46 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         kind: AccessKind,
         copy_lends_only: bool,
     ) {
+        use crate::analyses::borrow_ownership::{
+            export::PlaceKey,
+            protected_entry::{self, AccessCause, AccessExtent, AccessMode, SourceAccess},
+            source_events::SourcePhase,
+        };
+        let data = &self.body.basic_blocks[location.block];
+        let phase = if location.statement_index < data.statements.len() {
+            SourcePhase::Statement
+        } else {
+            match data.terminator().kind {
+                TerminatorKind::Return => SourcePhase::Return,
+                TerminatorKind::UnwindResume => SourcePhase::Unwind,
+                TerminatorKind::Call { .. }
+                | TerminatorKind::TailCall { .. }
+                | TerminatorKind::Drop { .. }
+                | TerminatorKind::InlineAsm { .. } => SourcePhase::Call,
+                _ => SourcePhase::Statement,
+            }
+        };
+        // Observe the source operation even when the ordinary BorrowSet has
+        // no entry loan, or a later immutable/CopyLend filter skips that loan.
+        protected_entry::record_access(SourceAccess {
+            function: self.body.source.def_id().expect_local(),
+            location,
+            phase,
+            place: PlaceKey::from_place(place),
+            extent: match access_depth {
+                AccessDepth::Shallow => AccessExtent::Shallow,
+                AccessDepth::Deep => AccessExtent::Deep,
+            },
+            mode: match kind {
+                AccessKind::Read => AccessMode::Read,
+                AccessKind::Write => AccessMode::Write,
+            },
+            cause: if copy_lends_only {
+                AccessCause::DeallocationCandidate
+            } else {
+                AccessCause::Ordinary
+            },
+        });
         if place.projection.first() == Some(&PlaceElem::Deref)
             && self
                 .parameter_overlap

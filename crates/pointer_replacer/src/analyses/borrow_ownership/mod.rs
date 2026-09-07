@@ -30,6 +30,7 @@ pub(crate) mod nullability;
 pub(crate) mod origin_flow;
 pub(crate) mod origin_summary;
 pub(crate) mod origins;
+pub(crate) mod protected_entry;
 #[cfg(not(test))]
 mod ptr;
 #[cfg(test)]

@@ -764,6 +764,7 @@ where
         // construction — `None` keeps it on the whole-body predicate, which is what it compares.
         let inference = NativeInference {
             facts: inference,
+            entry_facts: None,
             copy_lends,
             escaped_lends,
             escaped_presentations: FxHashMap::default(),
