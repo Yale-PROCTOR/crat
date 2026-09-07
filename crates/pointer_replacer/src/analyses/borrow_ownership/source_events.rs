@@ -12,6 +12,8 @@ use rustc_middle::{
 };
 
 use super::export::PlaceKey;
+
+pub(crate) mod call_targets;
 use crate::{
     analyses::mir::{CallKind, TerminatorExt},
     utils::rustc::RustProgram,
@@ -38,6 +40,7 @@ pub(crate) enum SourceRole {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SourceCondition {
     Unconditional,
+    IndirectTarget,
     StorageLive,
     ReallocSuccess,
     ReallocZeroSizePossible,
@@ -121,6 +124,7 @@ pub(crate) struct SourceEvents {
     pub(crate) retirements: BTreeMap<SourceEventKey, SourceRetirement>,
     pub(crate) calls: Vec<SourceCallRoute>,
     pub(crate) reallocations: Vec<super::realloc::ReallocSite>,
+    pub(crate) call_targets: call_targets::CallTargets,
 }
 
 thread_local! {
@@ -418,9 +422,35 @@ pub(super) fn addressed_locals(body: &Body<'_>) -> BTreeSet<Local> {
             .collect()
 }
 
+/// Exact compiler contracts for explicit source destruction. Dropping a raw
+/// pointer or another trivially droppable value creates no retirement effect.
+pub(crate) fn library_drop_effect<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    target: rustc_span::def_id::DefId,
+    argument: Option<&Operand<'tcx>>,
+) -> bool {
+    let in_place = tcx.lang_items().drop_in_place_fn() == Some(target);
+    if !in_place && !tcx.is_diagnostic_item(rustc_span::Symbol::intern("mem_drop"), target) {
+        return false;
+    }
+    let Some(argument) = argument else {
+        return false;
+    };
+    let mut payload = argument.ty(&body.local_decls, tcx);
+    if in_place {
+        let rustc_middle::ty::TyKind::RawPtr(pointee, _) = payload.kind() else {
+            return false;
+        };
+        payload = *pointee;
+    }
+    payload.needs_drop(tcx, body.typing_env(tcx))
+}
+
 pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
     let tcx = program.tcx;
     let mut events = SourceEvents::default();
+    events.call_targets = call_targets::analyze(program);
     events.reallocations = super::realloc::collect_sites(program);
     for &function in &program.functions {
         let function_path = tcx.def_path_str(function.to_def_id());
@@ -471,126 +501,196 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
             }
             let index = data.statements.len();
             let terminator = data.terminator();
-            if let Some(call) = terminator.as_call(tcx) {
-                match call.func {
-                    CallKind::LibC(name) if name.as_str() == "free" => {
-                        let object = match call.args.first().map(|argument| &argument.node) {
-                            Some(operand) if operand_is_null(operand, &state, tcx) => {
-                                SourceObject::Null
-                            }
-                            Some(Operand::Copy(place) | Operand::Move(place)) => {
-                                SourceObject::HeapThrough(PlaceKey::from_place(*place))
-                            }
-                            _ => SourceObject::UnknownOperand,
-                        };
-                        let coverage = if object == SourceObject::Null {
-                            Coverage::IrrelevantNull
-                        } else {
-                            Coverage::UnresolvedWholeObject
-                        };
-                        let (generation, region) = if object == SourceObject::Null {
-                            (SourceGeneration::None, SourceRegion::NoObject)
-                        } else {
-                            (
-                                SourceGeneration::UnresolvedHeapEpoch,
-                                SourceRegion::WholeAllocation,
-                            )
-                        };
-                        insert(
-                            &mut events,
-                            SourceRetirement {
-                                key: key(index, SourcePhase::Call, SourceRole::Free, None),
-                                object,
-                                coverage,
-                                generation,
-                                region,
-                            },
-                        );
-                    }
-                    CallKind::LibC(name) if name.as_str() == "realloc" => {
-                        let site = events
-                            .reallocations
-                            .iter()
-                            .find(|site| {
-                                site.key.function == function_path
-                                    && site.key.block == block.as_u32()
-                                    && site.key.statement == index
-                            })
-                            .expect("shared source realloc inventory");
-                        if site.old_input != super::realloc::OldInput::KnownNull {
-                            let zero_retirement = super::realloc::classify(site).is_ok_and(|cases| cases.iter().any(|case| {
-                                super::realloc::retirement_availability(site, case)
-                                    == super::realloc::ReallocRetirementAvailability::MayRetireOnZero
-                            }));
-                            let (condition, coverage) = match super::realloc::classify(site) {
-                                Ok(cases) => {
-                                    assert!(cases.iter().any(|case| case.outcome == super::realloc::ReallocOutcome::Success && case.old == super::realloc::OldResponsibility::RetireIfPresent));
-                                    (
-                                        SourceCondition::ReallocSuccess,
-                                        Coverage::UnresolvedWholeObject,
-                                    )
-                                }
-                                Err(_) => (
-                                    SourceCondition::UnresolvedRealloc,
-                                    Coverage::UnresolvedReallocLifecycle,
-                                ),
-                            };
-                            let object = call
-                                .args
-                                .first()
-                                .and_then(|argument| argument.node.place())
-                                .map(|place| SourceObject::HeapThrough(PlaceKey::from_place(place)))
-                                .unwrap_or(SourceObject::UnknownOperand);
+            if let TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } = &terminator.kind
+            {
+                let location = rustc_middle::mir::Location {
+                    block,
+                    statement_index: index,
+                };
+                let mut targets: Vec<_> = events.call_targets[&(function, location)]
+                    .known
+                    .iter()
+                    .copied()
+                    .collect();
+                targets.sort_by_key(|target| tcx.def_path_str(*target));
+                for target in targets {
+                    match call_targets::kind_for_target(tcx, target) {
+                        CallKind::LibC(name) if name.as_str() == "free" => {
                             let mut event_key =
-                                key(index, SourcePhase::Call, SourceRole::ReallocOld, None);
-                            event_key.condition = condition;
-                            if zero_retirement {
-                                let mut zero_key = event_key.clone();
-                                zero_key.condition = SourceCondition::ReallocZeroSizePossible;
-                                insert(
-                                    &mut events,
-                                    SourceRetirement {
-                                        key: zero_key,
-                                        object: object.clone(),
-                                        coverage: Coverage::UnresolvedWholeObject,
-                                        generation: SourceGeneration::UnresolvedHeapEpoch,
-                                        region: SourceRegion::WholeAllocation,
-                                    },
-                                );
+                                key(index, SourcePhase::Call, SourceRole::Free, None);
+                            if func.constant().is_none() {
+                                event_key.condition = SourceCondition::IndirectTarget;
                             }
+                            let object = match args.first().map(|argument| &argument.node) {
+                                Some(operand) if operand_is_null(operand, &state, tcx) => {
+                                    SourceObject::Null
+                                }
+                                Some(Operand::Copy(place) | Operand::Move(place)) => {
+                                    SourceObject::HeapThrough(PlaceKey::from_place(*place))
+                                }
+                                _ => SourceObject::UnknownOperand,
+                            };
+                            let coverage = if object == SourceObject::Null {
+                                Coverage::IrrelevantNull
+                            } else {
+                                Coverage::UnresolvedWholeObject
+                            };
+                            let (generation, region) = if object == SourceObject::Null {
+                                (SourceGeneration::None, SourceRegion::NoObject)
+                            } else {
+                                (
+                                    SourceGeneration::UnresolvedHeapEpoch,
+                                    SourceRegion::WholeAllocation,
+                                )
+                            };
                             insert(
                                 &mut events,
                                 SourceRetirement {
                                     key: event_key,
                                     object,
                                     coverage,
-                                    generation: SourceGeneration::UnresolvedHeapEpoch,
-                                    region: SourceRegion::WholeAllocation,
+                                    generation,
+                                    region,
                                 },
                             );
                         }
-                    }
-                    CallKind::FreeStanding(callee) | CallKind::Impl(callee) => {
-                        let arguments = call
-                            .args
-                            .iter()
-                            .map(|argument| match argument.node {
-                                Operand::Copy(place) | Operand::Move(place) => {
-                                    Some(PlaceKey::from_place(place))
+                        CallKind::LibC(name) if name.as_str() == "realloc" => {
+                            let site = events.reallocations.iter().find(|site| {
+                                site.key.function == function_path
+                                    && site.key.block == block.as_u32()
+                                    && site.key.statement == index
+                            });
+                            let Some(site) = site else {
+                                // The current ownership SSA split has no indirect
+                                // primitive-call adapter. Keep its source role and
+                                // explicit lifecycle uncertainty; never choose S.
+                                if args.first().is_some_and(|argument| {
+                                    operand_is_null(&argument.node, &state, tcx)
+                                }) {
+                                    continue;
                                 }
-                                _ => None,
-                            })
-                            .collect();
-                        events.calls.push(SourceCallRoute {
-                            caller: function_path.clone(),
-                            block: block.as_u32(),
-                            callee: tcx.def_path_str(callee.to_def_id()),
-                            events: Vec::new(),
-                            arguments,
-                            storage_relation_missing: true,
-                        });
+                                let object = args
+                                    .first()
+                                    .and_then(|argument| argument.node.place())
+                                    .map(|place| {
+                                        SourceObject::HeapThrough(PlaceKey::from_place(place))
+                                    })
+                                    .unwrap_or(SourceObject::UnknownOperand);
+                                let mut event_key =
+                                    key(index, SourcePhase::Call, SourceRole::ReallocOld, None);
+                                event_key.condition = SourceCondition::UnresolvedRealloc;
+                                insert(
+                                    &mut events,
+                                    SourceRetirement {
+                                        key: event_key,
+                                        object,
+                                        coverage: Coverage::UnresolvedReallocLifecycle,
+                                        generation: SourceGeneration::Missing,
+                                        region: SourceRegion::WholeAllocation,
+                                    },
+                                );
+                                continue;
+                            };
+                            if site.old_input != super::realloc::OldInput::KnownNull {
+                                let zero_retirement = super::realloc::classify(site).is_ok_and(|cases| cases.iter().any(|case| {
+                                super::realloc::retirement_availability(site, case)
+                                    == super::realloc::ReallocRetirementAvailability::MayRetireOnZero
+                            }));
+                                let (condition, coverage) = match super::realloc::classify(site) {
+                                    Ok(cases) => {
+                                        assert!(cases.iter().any(|case| case.outcome == super::realloc::ReallocOutcome::Success && case.old == super::realloc::OldResponsibility::RetireIfPresent));
+                                        (
+                                            SourceCondition::ReallocSuccess,
+                                            Coverage::UnresolvedWholeObject,
+                                        )
+                                    }
+                                    Err(_) => (
+                                        SourceCondition::UnresolvedRealloc,
+                                        Coverage::UnresolvedReallocLifecycle,
+                                    ),
+                                };
+                                let object = args
+                                    .first()
+                                    .and_then(|argument| argument.node.place())
+                                    .map(|place| {
+                                        SourceObject::HeapThrough(PlaceKey::from_place(place))
+                                    })
+                                    .unwrap_or(SourceObject::UnknownOperand);
+                                let mut event_key =
+                                    key(index, SourcePhase::Call, SourceRole::ReallocOld, None);
+                                event_key.condition = condition;
+                                if zero_retirement {
+                                    let mut zero_key = event_key.clone();
+                                    zero_key.condition = SourceCondition::ReallocZeroSizePossible;
+                                    insert(
+                                        &mut events,
+                                        SourceRetirement {
+                                            key: zero_key,
+                                            object: object.clone(),
+                                            coverage: Coverage::UnresolvedWholeObject,
+                                            generation: SourceGeneration::UnresolvedHeapEpoch,
+                                            region: SourceRegion::WholeAllocation,
+                                        },
+                                    );
+                                }
+                                insert(
+                                    &mut events,
+                                    SourceRetirement {
+                                        key: event_key,
+                                        object,
+                                        coverage,
+                                        generation: SourceGeneration::UnresolvedHeapEpoch,
+                                        region: SourceRegion::WholeAllocation,
+                                    },
+                                );
+                            }
+                        }
+                        CallKind::RustLib(target)
+                            if library_drop_effect(
+                                tcx,
+                                &body,
+                                target,
+                                args.first().map(|argument| &argument.node),
+                            ) =>
+                        {
+                            let mut event_key =
+                                key(index, SourcePhase::Call, SourceRole::Drop, None);
+                            if func.constant().is_none() {
+                                event_key.condition = SourceCondition::IndirectTarget;
+                            }
+                            insert(
+                                &mut events,
+                                SourceRetirement {
+                                    key: event_key,
+                                    object: SourceObject::UnknownOperand,
+                                    coverage: Coverage::UnresolvedDropEffects,
+                                    generation: SourceGeneration::Missing,
+                                    region: SourceRegion::Missing,
+                                },
+                            );
+                        }
+                        CallKind::FreeStanding(callee) | CallKind::Impl(callee) => {
+                            let arguments = args
+                                .iter()
+                                .map(|argument| match argument.node {
+                                    Operand::Copy(place) | Operand::Move(place) => {
+                                        Some(PlaceKey::from_place(place))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            events.calls.push(SourceCallRoute {
+                                caller: function_path.clone(),
+                                block: block.as_u32(),
+                                callee: tcx.def_path_str(callee.to_def_id()),
+                                events: Vec::new(),
+                                arguments,
+                                storage_relation_missing: true,
+                            });
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             match terminator.kind {
@@ -669,11 +769,12 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
     // Resolve call routes over the finite static graph, deduplicating by the
     // original body event. Recursion does not manufacture new generations.
     let mut reachable = BTreeMap::<String, BTreeSet<SourceEventKey>>::new();
-    for event in events
-        .retirements
-        .keys()
-        .filter(|key| matches!(key.role, SourceRole::Free | SourceRole::ReallocOld))
-    {
+    for event in events.retirements.keys().filter(|key| {
+        matches!(
+            key.role,
+            SourceRole::Free | SourceRole::ReallocOld | SourceRole::Drop
+        )
+    }) {
         reachable
             .entry(event.function.clone())
             .or_default()

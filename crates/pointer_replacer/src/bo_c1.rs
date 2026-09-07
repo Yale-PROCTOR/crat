@@ -13506,14 +13506,15 @@ fn nb5m_native_round_stats_contract() {
     );
     assert_eq!(commit.dropped_sinks, 0);
     assert_eq!(commit.dropped_sources, 0);
-    // (c) sink drop: the delete-node witness commits 3 conflicts, then the final solve leaks its two
+    // (c) R213-1/R217-2(a) migration: delete-node now commits 11 conflicts with source-retirement
+    // coverage, then the final solve leaks its two
     // free sinks. `dropped_sources == 0` here guards the `record_dropped` is_sink split (a regression
     // counting the 2 sinks as sources would make this 2). Genuine source-leak COUNTING
     // (`dropped_sources > 0`) is exercised across the corpus and was verified at the NB5-M parity gate.
     let sink = stats_of(DELETE_NODE_WITNESS);
     assert_eq!(sink.rounds, 2);
-    assert_eq!(sink.commits_conflict, 3);
-    assert_eq!(sink.commits_per_round, vec![3, 0]);
+    assert_eq!(sink.commits_conflict, 11);
+    assert_eq!(sink.commits_per_round, vec![11, 0]);
     assert_eq!(
         sink.dropped_sinks, 2,
         "delete-node leaks its two free sinks"
@@ -13523,8 +13524,9 @@ fn nb5m_native_round_stats_contract() {
         "the two dropped selectors are BOTH sinks (is_sink split)"
     );
     // (d) POSITIVE source drop (Codex RR-2): `&raw mut p` escapes the address of a malloc'd local,
-    // so the alloc cannot be proven Owning; the eager `¬ref(source)` round-1 model surfaces one
-    // conflict, committed into the accepting round-2 model, and the final solve DROPS the source
+    // so the alloc cannot be proven Owning; the eager `¬ref(source)` round-1 model now surfaces two
+    // conflicts, including the receipted source-storage retirement (R213-1/R217-2(a)), committed
+    // into the same accepting round-2 model, and the final solve DROPS the source
     // selector. This is the ONLY shape that pins `dropped_sources > 0` (the others pin it at 0).
     let source = stats_of(
         "unsafe extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; } \
@@ -13534,8 +13536,11 @@ fn nb5m_native_round_stats_contract() {
         source.rounds, 2,
         "source-drop: eager ¬ref round-1 + accepting round-2"
     );
-    assert_eq!(source.commits_conflict, 1, "source-drop: one commit");
-    assert_eq!(source.commits_per_round, vec![1, 0]);
+    assert_eq!(
+        source.commits_conflict, 2,
+        "source-drop: two receipted commits"
+    );
+    assert_eq!(source.commits_per_round, vec![2, 0]);
     assert_eq!(source.dropped_sinks, 0, "no free in this shape");
     assert_eq!(
         source.dropped_sources, 1,
@@ -28793,10 +28798,14 @@ fn l2_red_feature_off_matches_base_ae6f334() {
     }
 
     let (actual_snapshot, actual_output, actual_bytemuck) = l2_feature_off_capture();
+    // R213-1/R217-2(a): the original ae6f334 snapshot remains the historical
+    // comparator. Era-5 retirement changes only the receipted counters and
+    // delete_node::_12/_19/_38@d0 kinds in both mutability arms. `base.sha`
+    // identifies the historical fixture anchor, not unchanged ae6f334 semantics.
     assert_eq!(
         actual_snapshot,
-        include_str!("analyses/borrow_ownership/testdata/l2_feature_off_base_ae6f334.snap"),
-        "feature-off Mode-A semantics drifted from the approved ae6f334 base"
+        include_str!("analyses/borrow_ownership/testdata/l2_feature_off_era5_retirement.snap"),
+        "feature-off Mode-A analysis drifted from the receipted era-5 retirement expectations"
     );
     assert_eq!(
         actual_bytemuck,

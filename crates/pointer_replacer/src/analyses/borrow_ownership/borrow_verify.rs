@@ -200,6 +200,43 @@ struct WitnessedSlotConflict {
     invalidators: Vec<SlotRef>,
 }
 
+struct Revalidated<T> {
+    conflicts: T,
+    retirement: super::retirement::RetirementReview,
+}
+
+fn finish_retirement(
+    scope: super::retirement::RetirementScope,
+) -> super::retirement::RetirementReview {
+    let review = scope.finish();
+    super::export::record(|export| {
+        export.retirement_rounds.push(review.clone());
+        export.source_retirement = Some(review.clone());
+    });
+    review
+}
+
+fn append_retirement_targets(
+    conflicts: &mut FxHashMap<LocalDefId, Vec<SlotConflict>>,
+    review: &super::retirement::RetirementReview,
+) {
+    for target in review.targets() {
+        let row = review
+            .conflicts
+            .iter()
+            .find(|row| row.target == target)
+            .expect("retirement target witness");
+        conflicts
+            .entry(row.function)
+            .or_default()
+            .push(SlotConflict {
+                issuer: Some(target),
+                requirers: Vec::new(),
+                esc_issuer_first: false,
+            });
+    }
+}
+
 /// Run the production borrow verifier with a ref-candidacy where a pointer local is a
 /// candidate iff its depth-0 slot satisfies `is_ref`, and map the conflict edges back
 /// to `SlotRef`s. `is_mutable` is applied to every pointer local (a clean conflict
@@ -222,6 +259,7 @@ fn revalidate_with_flows(
     is_mutable: impl MutProvider + Copy,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let _entry_scope = super::protected_entry::for_model(program, slots, &is_ref);
+    let retirement_scope = super::retirement::begin(program, slots, &is_ref);
     let is_ref = &is_ref;
     let cand = move |fn_did| {
         let universe = slots.fn_local_slots.get(&fn_did);
@@ -246,7 +284,15 @@ fn revalidate_with_flows(
         }
     };
 
-    map_edges_to_slots(slots, edges)
+    let mut conflicts = map_edges_to_slots(slots, edges);
+    let retirement = finish_retirement(retirement_scope);
+    assert!(
+        retirement.unresolved.is_empty(),
+        "unresolved source retirement in diagnostic revalidation: {:?}",
+        retirement.unresolved
+    );
+    append_retirement_targets(&mut conflicts, &retirement);
+    conflicts
 }
 
 /// §8 BB2-i — the CEGAR validate seam **with union replay**. Like `revalidate` but
@@ -310,7 +356,39 @@ fn revalidate_replaying_with_flows(
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
+    let mut reviewed = revalidate_replaying_reviewed(
+        program,
+        slots,
+        origin_flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        selected_copy_lends,
+        escaped_copy_lends,
+        parameter_overlaps,
+    );
+    assert!(
+        reviewed.retirement.unresolved.is_empty(),
+        "unresolved source retirement in diagnostic replay: {:?}",
+        reviewed.retirement.unresolved
+    );
+    append_retirement_targets(&mut reviewed.conflicts, &reviewed.retirement);
+    reviewed.conflicts
+}
+
+fn revalidate_replaying_reviewed(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    is_ref: impl Fn(SlotRef) -> bool,
+    is_raw: impl Fn(SlotRef) -> bool,
+    is_mutable: impl MutProvider + Copy,
+    selected_copy_lends: Option<&SelectedCopyLendLoans>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
+    parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
+) -> Revalidated<FxHashMap<LocalDefId, Vec<SlotConflict>>> {
     let _entry_scope = super::protected_entry::for_model(program, slots, &is_ref);
+    let retirement_scope = super::retirement::begin(program, slots, &is_ref);
     let is_ref = &is_ref;
     let is_raw = &is_raw;
     let cand = move |fn_did| {
@@ -399,7 +477,10 @@ fn revalidate_replaying_with_flows(
         }
     };
 
-    map_edges_to_slots(slots, edges)
+    Revalidated {
+        conflicts: map_edges_to_slots(slots, edges),
+        retirement: finish_retirement(retirement_scope),
+    }
 }
 
 /// L2-only replay adapter carrying the invalidating access roots captured by
@@ -414,8 +495,9 @@ fn revalidate_replaying_witnessed(
     is_mutable: impl MutProvider + Copy,
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
-) -> FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>> {
+) -> Revalidated<FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>>> {
     let _entry_scope = super::protected_entry::for_model(program, slots, &is_ref);
+    let retirement_scope = super::retirement::begin(program, slots, &is_ref);
     let is_ref = &is_ref;
     let is_raw = &is_raw;
     let cand = move |fn_did| {
@@ -474,7 +556,7 @@ fn revalidate_replaying_witnessed(
         ),
     };
 
-    edges
+    let conflicts = edges
         .into_iter()
         .map(|(fn_did, fn_edges)| {
             let translated = fn_edges
@@ -519,7 +601,11 @@ fn revalidate_replaying_witnessed(
                 .collect();
             (fn_did, translated)
         })
-        .collect()
+        .collect();
+    Revalidated {
+        conflicts,
+        retirement: finish_retirement(retirement_scope),
+    }
 }
 
 /// Translate borrow `ConflictEdge`s (keyed by function) into BO `SlotConflict`s,
@@ -691,6 +777,8 @@ pub(crate) struct RoundStats {
     /// L2 feature-on controlled decline. The legacy feature-off Mode-A and
     /// Lemmas paths leave this unset.
     pub l2_decline: Option<L2DeclineReason>,
+    /// Typed source-retirement coverage failure, separate from solver outcome.
+    pub source_retirement_decline: Vec<super::retirement::RetirementUnresolved>,
 }
 
 fn record_dropped(stats: &mut RoundStats, selectors: &Selectors, dropped: &[Bool]) {
@@ -862,6 +950,8 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    let source_inventory = super::source_events::for_construction(program);
+    let _source_scope = super::source_events::enter_inventory(&source_inventory);
     super::source_events::record_replay();
     // §NB-R guard (release-active): a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
@@ -927,7 +1017,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
         let selected_copy_lends =
             (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
-        let conflicts = revalidate_replaying_with_flows(
+        let reviewed = revalidate_replaying_reviewed(
             program,
             slots,
             origin_flows,
@@ -972,6 +1062,12 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             active_escaped_copy_lends.as_ref(),
             parameter_overlaps,
         );
+        if !reviewed.retirement.unresolved.is_empty() {
+            stats.source_retirement_decline = reviewed.retirement.unresolved;
+            return (None, stats);
+        }
+        let mut conflicts = reviewed.conflicts;
+        append_retirement_targets(&mut conflicts, &reviewed.retirement);
         // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
         // residual is the A′ principle extended to field requirers: the field is a live requirer the
         // Local-only replay candidacy cannot soundly demote (committing it just regenerates the
@@ -1255,6 +1351,8 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    let source_inventory = super::source_events::for_construction(program);
+    let _source_scope = super::source_events::enter_inventory(&source_inventory);
     super::source_events::record_replay();
     // D17: re-assert the load-bearing precondition at the door, not only at the
     // env entry. `debug_assert!` rather than `assert!` so the release-path cost
@@ -1327,7 +1425,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
         stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
         let selected_copy_lends =
             (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
-        let conflicts = revalidate_replaying_witnessed(
+        let reviewed = revalidate_replaying_witnessed(
             program,
             slots,
             origin_flows,
@@ -1340,7 +1438,29 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             selected_copy_lends.as_ref(),
             active_escaped_copy_lends.as_ref(),
         );
+        if !reviewed.retirement.unresolved.is_empty() {
+            stats.source_retirement_decline = reviewed.retirement.unresolved;
+            emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
+            return (None, stats);
+        }
+        let conflicts = reviewed.conflicts;
         let mut observations = Vec::new();
+        for target in reviewed.retirement.targets() {
+            let row = reviewed
+                .retirement
+                .conflicts
+                .iter()
+                .find(|row| row.target == target)
+                .expect("retirement target");
+            // An obligation-only observation has an empty peer guard, hence
+            // an unconditional exclusion. It invents no legacy loan identity.
+            observations.push(ConflictObservation::new(
+                row.function.local_def_index.as_u32(),
+                target,
+                Some(target),
+                Vec::new(),
+            ));
+        }
         for (did, conflicts) in &conflicts {
             for witnessed in conflicts {
                 let Some(target) = representative(&witnessed.conflict, &model) else {
@@ -1599,7 +1719,7 @@ fn model_accepts_with_flows_impl(
          region. Capture must be armed only around the accepted run; move the \
          arm, do not suspend here."
     );
-    let conflicts = revalidate_replaying_with_flows(
+    let reviewed = revalidate_replaying_reviewed(
         program,
         slots,
         origin_flows,
@@ -1613,6 +1733,10 @@ fn model_accepts_with_flows_impl(
         None,
         None,
     );
+    if !reviewed.retirement.unresolved.is_empty() || !reviewed.retirement.conflicts.is_empty() {
+        return false;
+    }
+    let conflicts = reviewed.conflicts;
     // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
     // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`
     // invariant (a residual whose owners are not all `Ref`, which the release-active loop treats as a

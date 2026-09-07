@@ -1356,11 +1356,15 @@ fn solve_bo_a5_config_with_source_events(
         let first = baseline_solver
             .round_model_failure()
             .map(|failure| failure.summary())
-            .unwrap_or_else(|| "untyped-round-decline".to_owned());
+            .unwrap_or_else(|| if baseline_round_stats.source_retirement_decline.is_empty() {
+                "untyped-round-decline".to_owned()
+            } else {
+                "source-retirement-coverage".to_owned()
+            });
         A5PreledgerDecline::with_detail(
             A5PreledgerDeclineReason::BaselineVerification,
             format!(
-                "expected=accepted-model got={first} rounds={} commits={} selected_copy_lends={} dropped_sources={} dropped_sinks={} field_conflict={:?} field_kind={:?} cap_exhausted={} l2_decline={:?}",
+                "expected=accepted-model got={first} rounds={} commits={} selected_copy_lends={} dropped_sources={} dropped_sinks={} field_conflict={:?} field_kind={:?} cap_exhausted={} l2_decline={:?} source_retirement={:?}",
                 baseline_round_stats.rounds,
                 baseline_round_stats.commits_conflict,
                 baseline_round_stats.copy_lend_replay_selections,
@@ -1370,6 +1374,7 @@ fn solve_bo_a5_config_with_source_events(
                 baseline_round_stats.field_conflict_kind,
                 baseline_round_stats.cap_exhausted,
                 baseline_round_stats.l2_decline,
+                baseline_round_stats.source_retirement_decline,
             ),
         )
     })?;

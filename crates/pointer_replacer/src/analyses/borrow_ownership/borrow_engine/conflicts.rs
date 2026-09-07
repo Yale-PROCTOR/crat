@@ -140,6 +140,66 @@ fn invalid_loan_set(inference: &BorrowInferenceResults<'_>) -> DenseBitSet<Loan>
     invalid_loans
 }
 
+/// Retirement has its own event/phase channel. Reuse the ordinary point-keyed
+/// requirements while keeping A′ priority and ②'s resolved-source ownership.
+fn record_retirement_review(
+    function: LocalDefId,
+    inference: &NativeInference<'_>,
+    provenances: &ProvenanceSet,
+) {
+    use crate::analyses::borrow_ownership::retirement;
+    let statuses = retirement::owner_ref_status(function);
+    retirement::record_function(
+        function,
+        &inference.facts,
+        inference.entry_facts.as_deref(),
+        |loan, point| {
+            if let Some(&(source, _)) = inference.escaped_presentations.get(&loan) {
+                return vec![source];
+            }
+            let issuer = match inference.borrow_set.loans[loan].assigned {
+                Borrower::Assign(owner) => Some(owner),
+                Borrower::CallArg(..) => None,
+            };
+            let mut requiring = Vec::new();
+            if let Some(live) = inference.provenance_liveness.row(point) {
+                for provenance in live.iter() {
+                    let required = match &inference.localized_requires {
+                        Some(localized) => localized.contains(point, provenance, loan),
+                        None => inference.requires.contains(provenance, loan),
+                    };
+                    let owner = provenances.provenance_data[provenance].owner();
+                    if required && !requiring.contains(&owner) {
+                        requiring.push(owner);
+                    }
+                }
+            }
+            let mut preferred: Vec<_> = requiring
+                .iter()
+                .copied()
+                .filter(|owner| Some(*owner) != issuer && statuses.get(owner) != Some(&false))
+                .collect();
+            if !preferred.is_empty() {
+                // An unmapped issuer is still a coverage residual, never lost by
+                // selecting a mapped requirer. Known non-Ref issuers are not targets.
+                if let Some(owner) = issuer
+                    && !statuses.contains_key(&owner)
+                {
+                    preferred.push(owner);
+                }
+                return preferred;
+            }
+            let mut owners: Vec<_> = issuer.into_iter().collect();
+            for owner in requiring {
+                if !owners.contains(&owner) {
+                    owners.push(owner);
+                }
+            }
+            owners
+        },
+    );
+}
+
 /// E-R4 capture: record loan-level identity for the COMPLETE final `BorrowSet`.
 ///
 /// Deliberately NOT folded into `extract_conflict_edges`: that function is a
@@ -622,6 +682,7 @@ where
             &inference.copy_lends,
             None,
         );
+        record_retirement_review(f, &inference, ctxt.borrow.provenances.get(&f).unwrap());
         let invalid_loans = invalid_loan_set(&inference);
         if invalid_loans.is_empty() {
             continue;
@@ -1034,6 +1095,7 @@ where
                 &inference.copy_lends,
                 parameter_overlaps.and_then(|overlaps| overlaps.get(&f)),
             );
+            record_retirement_review(f, &inference, ctxt.borrow.provenances.get(&f).unwrap());
             let parameter_edges = parameter_conflicts
                 .into_iter()
                 .filter(|(left, right)| is_ref_f(*left) && is_ref_f(*right))
@@ -1256,6 +1318,7 @@ where
                 &mut inference.facts,
                 &inference.copy_lends,
             );
+            record_retirement_review(f, &inference, ctxt.borrow.provenances.get(&f).unwrap());
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
                 // D2: the witnessed/L2 replay is structurally identical to the

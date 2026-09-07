@@ -524,6 +524,8 @@ pub(crate) struct BoExport {
     pub entry_protection: Option<std::sync::Arc<super::protected_entry::EntryAnalysis>>,
     pub entry_accesses: Vec<super::protected_entry::SourceAccess>,
     pub entry_fact_witnesses: Vec<super::protected_entry::evidence::FactWitness>,
+    pub source_retirement: Option<super::retirement::RetirementReview>,
+    pub retirement_rounds: Vec<super::retirement::RetirementReview>,
     pub realloc_version_sites: Vec<ReallocVersionSite>,
     pub realloc_cases: Vec<ReallocCaseReceipt>,
     /// E-R2 consume sites, in emission order.
@@ -949,6 +951,7 @@ pub(crate) fn begin_round() {
         export.entry_protection = None;
         export.entry_accesses.clear();
         export.entry_fact_witnesses.clear();
+        export.source_retirement = None;
         // Back to "not recorded this round" — NOT to "recorded, none found".
         export.residual_conflicts = None;
     });
