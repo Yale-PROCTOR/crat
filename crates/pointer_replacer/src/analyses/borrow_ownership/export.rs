@@ -526,6 +526,7 @@ pub(crate) struct BoExport {
     pub entry_fact_witnesses: Vec<super::protected_entry::evidence::FactWitness>,
     pub source_retirement: Option<super::retirement::RetirementReview>,
     pub retirement_rounds: Vec<super::retirement::RetirementReview>,
+    pub comparisons: Option<super::comparison::ComparisonLedger>,
     pub realloc_version_sites: Vec<ReallocVersionSite>,
     pub realloc_cases: Vec<ReallocCaseReceipt>,
     /// E-R2 consume sites, in emission order.

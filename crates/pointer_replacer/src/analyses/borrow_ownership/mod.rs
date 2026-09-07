@@ -15,6 +15,7 @@ pub(crate) mod borrow_verify;
 pub(crate) mod boundary_table;
 mod call_graph;
 pub mod coherence;
+pub(crate) mod comparison;
 pub(crate) mod construction;
 pub mod crate_slots;
 #[cfg(test)]
@@ -336,6 +337,12 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     };
     for slot in malloc_sources {
         kind_solver.add_borrow_exclusion(Some(slot), &[]);
+        comparison::record_guard(
+            crate_ctxt.tcx,
+            slots,
+            slot,
+            comparison::GuardRule::AllocationSource,
+        );
     }
 
     // §NB4-4c: MAY-SUPPLY demotion over the NO-BORROW-ORIGIN set. A monotone `¬ref` on every
@@ -359,6 +366,12 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     for slot in origins::collect_no_borrow_origin_slots(origins, slots) {
         if !nullability.contains(&slot) {
             kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
+            comparison::record_guard(
+                crate_ctxt.tcx,
+                slots,
+                slot,
+                comparison::GuardRule::NoBorrowOrigin,
+            );
         }
     }
 

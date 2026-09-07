@@ -717,6 +717,7 @@ fn construct_bo_into_with_esc(
 ) -> anyhow::Result<BoConstruction> {
     let source_events = super::source_events::for_construction(program);
     super::export::record(|export| export.source_events = Some(source_events.clone()));
+    super::comparison::record_sites(program, slots);
     let crate_ctxt = CrateCtxt::new(program);
     let esc_minimal = if enable_esc_minimal {
         super::esc_minimal::select(program, slots)
@@ -942,6 +943,7 @@ pub(crate) fn construct_tracked_census_baseline(
 ) -> anyhow::Result<BoConstruction> {
     let source_events = super::source_events::for_construction(program);
     super::export::record(|export| export.source_events = Some(source_events.clone()));
+    super::comparison::record_sites(program, slots);
     let crate_ctxt = CrateCtxt::new(program);
     let t = Instant::now();
     let (stats, selectors) = super::source_events::with_inventory(&source_events, || {

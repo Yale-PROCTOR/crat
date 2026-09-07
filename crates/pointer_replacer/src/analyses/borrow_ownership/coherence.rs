@@ -399,6 +399,22 @@ pub(crate) fn constrain_field_ref_worthiness(
         let safe = rhs.len() - opaque;
         if opaque > 0 || unresolved_unresolvable > 0 {
             solver.forbid_field_ref(field);
+            if opaque > 0 {
+                super::comparison::record_guard(
+                    program.tcx,
+                    slots,
+                    field,
+                    super::comparison::GuardRule::FieldOpaque,
+                );
+            }
+            if unresolved_unresolvable > 0 {
+                super::comparison::record_guard(
+                    program.tcx,
+                    slots,
+                    field,
+                    super::comparison::GuardRule::FieldUnresolved,
+                );
+            }
         } else {
             solver.constrain_field_ref(field, &rhs);
         }
