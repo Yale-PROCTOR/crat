@@ -14,6 +14,7 @@ mod assoc;
 pub(crate) mod borrow_engine;
 pub(crate) mod borrow_verify;
 pub(crate) mod boundary_table;
+pub(crate) mod cache_contract;
 mod call_graph;
 pub mod coherence;
 pub(crate) mod comparison;
@@ -23,7 +24,12 @@ pub(crate) mod demand_evidence;
 #[cfg(test)]
 mod dependency_ratchet;
 mod domain;
+pub(crate) mod emission_guard;
+pub(crate) mod era5_instruments;
+#[cfg(test)]
+mod era5_worker;
 pub(crate) mod esc_minimal;
+pub(crate) mod execution_guard;
 pub(crate) mod export;
 mod infer;
 pub(crate) mod l2;
@@ -34,6 +40,7 @@ pub(crate) mod origin_evidence;
 pub(crate) mod origin_flow;
 pub(crate) mod origin_summary;
 pub(crate) mod origins;
+pub(crate) mod portable_export;
 pub(crate) mod proof_evidence;
 pub(crate) mod protected_entry;
 #[cfg(not(test))]
@@ -52,6 +59,7 @@ pub mod solver;
 pub(crate) mod source_events;
 pub(crate) mod sources;
 pub mod ssa;
+pub(crate) mod strict_json;
 mod struct_ctxt;
 mod vec_vec;
 

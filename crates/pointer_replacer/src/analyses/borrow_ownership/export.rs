@@ -736,6 +736,17 @@ pub(crate) fn with_bo_export<T>(f: impl FnOnce() -> T) -> (T, BoExport) {
     (output, arm.finish())
 }
 
+/// Clone the current recording after an accepted model for complete cache
+/// transport. This leaves the caller's capture and AST ownership in place.
+pub(crate) fn snapshot() -> Option<BoExport> {
+    BO_EXPORT_CAPTURE
+        .with(|capture| capture.borrow().clone())
+        .map(|mut capture| {
+            capture.loans.sort_by(|a, b| a.key.cmp(&b.key));
+            capture
+        })
+}
+
 /// Whether capture is active.
 ///
 /// Active if and only if a scope is open — [`with_bo_export`] or

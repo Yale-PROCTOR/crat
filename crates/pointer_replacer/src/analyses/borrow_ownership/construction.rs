@@ -1270,6 +1270,9 @@ pub(crate) fn solve_bo_a5_config_reporting(
     // retained Baseline mode is a diagnostic A5 control, not another
     // production configuration.
     let refined = mode == A5Mode::PreciseReplay;
+    // Complete cache capture is owned here only when no caller already owns
+    // it; an existing caller must receive its original recording unchanged.
+    let owned_capture = (!super::export::capturing()).then(super::export::arm_scope);
     let (verified, _links) = solve_bo_a5_config_inner(
         program,
         slots,
@@ -1280,7 +1283,22 @@ pub(crate) fn solve_bo_a5_config_reporting(
         refined,
         true,
     )?;
-    Ok(stamp_a16_refined_receipt(verified, refined))
+    let verified = stamp_a16_refined_receipt(verified, refined);
+    let captured = if let Some(capture) = owned_capture {
+        capture.finish()
+    } else {
+        super::export::snapshot().expect("active accepted-model capture")
+    };
+    super::model_cache::prepare(
+        program,
+        slots,
+        origins,
+        &verified,
+        &captured,
+        mode,
+        attestation,
+    );
+    Ok(verified)
 }
 
 /// Measurement reference: accepted A5/A16 production semantics with Phase-2
@@ -1331,6 +1349,9 @@ fn solve_bo_a5_config_inner(
     refined: bool,
     enable_esc_minimal: bool,
 ) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
+    super::execution_guard::enter_model().map_err(|refusal| {
+        A5PreledgerDecline::from_error(A5PreledgerDeclineReason::BaselineConstruction, refusal)
+    })?;
     let inventory = std::sync::Arc::new(super::source_events::collect(program));
     super::source_events::with_inventory(&inventory, || {
         solve_bo_a5_config_with_source_events(

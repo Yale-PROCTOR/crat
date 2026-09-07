@@ -11,6 +11,7 @@ use super::export::BoExport;
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Family {
     SourceRetirement,
+    InputTarget,
     Entry,
     Observation,
     Binding,
@@ -42,8 +43,9 @@ const MISSING: [Missing; 8] = [
     Missing::CompleteDescendantAncestry,
     Missing::NestedArrayStorageAddress,
 ];
-const FAMILIES: [Family; 7] = [
+const FAMILIES: [Family; 8] = [
     Family::SourceRetirement,
+    Family::InputTarget,
     Family::Entry,
     Family::Observation,
     Family::Binding,
@@ -76,7 +78,7 @@ pub(crate) struct ProofEvidence {
 impl Default for ProofEvidence {
     fn default() -> Self {
         Self {
-            schema: "era5a-proof-evidence-v1".into(),
+            schema: "era5a-proof-evidence-v2".into(),
             claim: Claim::SourceObservationsOnly,
             licensing_deferred: true,
             families: FAMILIES.into_iter().map(|f| (f, None)).collect(),
@@ -135,6 +137,43 @@ impl ProofEvidence {
             out.families.insert(Family::CallTargets, Some(rows));
         }
         if let Some(entry) = &export.entry_protection {
+            // A known incoming raw value is not necessarily a protected Ref.
+            // Keep target identity separate from the admitted entry obligation.
+            let targets = entry
+                .entries
+                .iter()
+                .map(|e| e.target)
+                .chain(entry.observations.iter().map(|o| o.target))
+                .chain(
+                    entry
+                        .observations
+                        .iter()
+                        .filter_map(|o| match o.current_binding {
+                            CurrentBinding::Incoming(target) => Some(target),
+                            CurrentBinding::Unknown => None,
+                        }),
+                )
+                .chain(entry.binding_facts.iter().map(|b| b.target));
+            let mut inputs = BTreeMap::new();
+            for value in targets {
+                let row = make(
+                    input_key(tcx, value.entry),
+                    vec![],
+                    [
+                        ("slot", slot(tcx, value.entry)),
+                        ("target", target(tcx, value)),
+                        ("existence", "not-proved".into()),
+                    ],
+                );
+                if let Some(previous) = inputs.insert(row.key.clone(), row.clone()) {
+                    assert_eq!(
+                        previous, row,
+                        "one incoming target per canonical input identity"
+                    );
+                }
+            }
+            out.families
+                .insert(Family::InputTarget, Some(inputs.into_values().collect()));
             out.families.insert(
                 Family::Entry,
                 Some(
@@ -144,7 +183,7 @@ impl ProofEvidence {
                         .map(|e| {
                             make(
                                 entry_key(tcx, e.key),
-                                vec![],
+                                vec![input_key(tcx, e.key)],
                                 [
                                     ("slot", slot(tcx, e.key)),
                                     ("target", target(tcx, e.target)),
@@ -165,7 +204,16 @@ impl ProofEvidence {
                         .map(|o| {
                             make(
                                 observation_key(tcx, o),
-                                vec![entry_key(tcx, o.entry)],
+                                {
+                                    let mut references = vec![
+                                        entry_key(tcx, o.entry),
+                                        input_key(tcx, o.target.entry),
+                                    ];
+                                    if let CurrentBinding::Incoming(value) = o.current_binding {
+                                        references.push(input_key(tcx, value.entry));
+                                    }
+                                    references
+                                },
                                 [
                                     ("entry", entry_key(tcx, o.entry)),
                                     ("target", target(tcx, o.target)),
@@ -201,9 +249,9 @@ impl ProofEvidence {
                         .map(|b| {
                             make(
                                 binding_key(tcx, b),
-                                vec![entry_key(tcx, b.target.entry)],
+                                vec![input_key(tcx, b.target.entry)],
                                 [
-                                    ("entry", entry_key(tcx, b.target.entry)),
+                                    ("input", input_key(tcx, b.target.entry)),
                                     ("target", target(tcx, b.target)),
                                     (
                                         "slot",
@@ -311,7 +359,7 @@ impl ProofEvidence {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.schema != "era5a-proof-evidence-v1"
+        if self.schema != "era5a-proof-evidence-v2"
             || !self.licensing_deferred
             || self.missing != MISSING.into_iter().collect()
         {
@@ -333,11 +381,12 @@ impl ProofEvidence {
                     "coverage",
                     "object",
                 ],
+                Family::InputTarget => &["slot", "target", "existence"],
                 Family::Entry => &["slot", "target", "condition", "representation"],
                 Family::Observation => &[
                     "entry", "target", "location", "phase", "moment", "live", "demand", "binding",
                 ],
-                Family::Binding => &["entry", "target", "slot", "location", "phase", "moment"],
+                Family::Binding => &["input", "target", "slot", "location", "phase", "moment"],
                 Family::Access => &[
                     "function", "place", "location", "phase", "extent", "mode", "cause",
                 ],
@@ -357,10 +406,21 @@ impl ProofEvidence {
                 {
                     return Err(format!("unexpected fact schema: {}", row.key));
                 }
-                if matches!(family, Family::Observation | Family::Binding)
-                    && !row.references.contains(&row.facts["entry"])
-                {
+                if family == Family::Observation && !row.references.contains(&row.facts["entry"]) {
                     return Err("missing entry relation".into());
+                }
+                if family == Family::Entry
+                    && !row
+                        .references
+                        .contains(&format!("input/{}", row.facts["slot"]))
+                {
+                    return Err("missing entry input-target relation".into());
+                }
+                if family == Family::InputTarget && row.facts["existence"] != "not-proved" {
+                    return Err("input identity cannot prove object existence".into());
+                }
+                if family == Family::Binding && !row.references.contains(&row.facts["input"]) {
+                    return Err("missing incoming-value relation".into());
                 }
                 if family == Family::Witness && !row.references.contains(&row.facts["fact"]) {
                     return Err("missing witnessed-fact relation".into());
@@ -403,13 +463,16 @@ fn loc(location: rustc_middle::mir::Location) -> String {
 fn slot(tcx: TyCtxt<'_>, entry: super::protected_entry::EntryKey) -> String {
     super::slot_key::local_key(tcx, entry.function, entry.parameter.as_usize(), entry.depth)
 }
+fn input_key(tcx: TyCtxt<'_>, entry: super::protected_entry::EntryKey) -> String {
+    format!("input/{}", slot(tcx, entry))
+}
 fn entry_key(tcx: TyCtxt<'_>, entry: super::protected_entry::EntryKey) -> String {
     format!("entry/{}", slot(tcx, entry))
 }
 fn target(tcx: TyCtxt<'_>, target: super::protected_entry::IncomingTarget) -> String {
     format!(
         "incoming({})/deref{}",
-        entry_key(tcx, target.entry),
+        input_key(tcx, target.entry),
         target.dereferences
     )
 }

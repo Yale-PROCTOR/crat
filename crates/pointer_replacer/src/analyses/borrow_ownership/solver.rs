@@ -16,6 +16,7 @@ use super::{
         self, ConstructionId, EndpointKey, EpochId, EventId, FinalSelection, QueryEvent,
         QueryOutcome, QueryPhase,
     },
+    execution_guard::{self, Operation, QueryStage},
     l2::{
         CommitAction, CommitActionKind, GUARDED_COMMIT_CORE_FAMILY,
         RECURRENCE_ESCALATION_CORE_FAMILY,
@@ -23,6 +24,13 @@ use super::{
     slots::{SlotId, SlotUniverse},
     ssa::constraint::{Database, Gen, Var},
 };
+
+/// Parameters shared by every production backend and subsequent setter.
+fn fixed_query_params() -> z3::Params {
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", execution_guard::QUERY_TIMEOUT_MS);
+    params
+}
 
 /// Global identity for a flattened pointer slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -648,7 +656,9 @@ impl KindSolver {
     }
 
     fn build(slots: &CrateSlots, tracker: Option<CoreTracker>, add_objective: bool) -> Self {
+        execution_guard::require(Operation::SolverBuild);
         let solver = Optimize::new();
+        solver.set_params(&fixed_query_params());
         let mut vars = FxHashMap::default();
 
         add_universe(
@@ -1309,6 +1319,7 @@ impl KindSolver {
     }
 
     pub fn check(&self) -> SatResult {
+        execution_guard::require(Operation::Query(QueryStage::OptimizeCheck));
         // §NB-R guard: a no-assumption check on a tracked solver is vacuously
         // SAT (all hard constraints are track-gated) — refuse, like the other
         // production solve paths.
@@ -1367,11 +1378,13 @@ impl KindSolver {
     }
 
     pub(crate) fn hard_loop_solver(&self) -> HardLoopSolver {
+        execution_guard::require(Operation::SolverBuild);
         assert!(
             !self.is_diagnostic_tracked(),
             "diagnostic-tracked KindSolver must not enter the production hard loop"
         );
         let solver = Solver::new();
+        solver.set_params(&fixed_query_params());
         let assertions = self.solver.get_assertions();
         for assertion in &assertions {
             solver.assert(assertion);
@@ -1383,19 +1396,25 @@ impl KindSolver {
     }
 
     pub(crate) fn check_with_assumptions(&self, assumptions: &[Bool]) -> SatResult {
+        execution_guard::require(Operation::Query(QueryStage::OptimizeCheck));
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
         let bundle = self.assumption_bundle(assumptions);
         let outcome = self.solver.check(&bundle);
+        let query_reason = (outcome == SatResult::Unknown)
+            .then(|| self.solver.get_reason_unknown())
+            .flatten();
+        let _ = execution_guard::known_query_result(
+            QueryStage::OptimizeCheck,
+            outcome,
+            query_reason.clone(),
+        );
         if self.demand_query_pending() {
             let core = (outcome == SatResult::Unsat)
                 .then(|| self.solver.get_unsat_core())
                 .unwrap_or_default();
-            let reason = (outcome == SatResult::Unknown).then(|| {
-                self.solver
-                    .get_reason_unknown()
-                    .unwrap_or_else(|| "-".to_owned())
-            });
+            let reason = (outcome == SatResult::Unknown)
+                .then(|| query_reason.clone().unwrap_or_else(|| "-".to_owned()));
             self.note_demand_query(assumptions, outcome, &core, reason);
         }
         #[cfg(test)]
@@ -1413,6 +1432,7 @@ impl KindSolver {
         hard: &HardLoopSolver,
         assumptions: &[Bool],
     ) -> SatResult {
+        execution_guard::require(Operation::Query(QueryStage::HardCheck));
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
         self.hard_check_count
@@ -1430,34 +1450,45 @@ impl KindSolver {
             hard.solver.assert(literal);
         }
         let initial = hard.solver.check();
-        let initial_unknown_reason = (initial == SatResult::Unknown).then(|| {
-            hard.solver
-                .get_reason_unknown()
-                .unwrap_or_else(|| "-".to_owned())
-        });
+        let query_reason = (initial == SatResult::Unknown)
+            .then(|| hard.solver.get_reason_unknown())
+            .flatten();
+        let _ = execution_guard::known_query_result(
+            QueryStage::HardCheck,
+            initial,
+            query_reason.clone(),
+        );
+        let initial_unknown_reason =
+            (initial == SatResult::Unknown).then(|| query_reason.unwrap_or_else(|| "-".to_owned()));
         hard.solver.pop(1);
         let outcome = if initial == SatResult::Unsat {
+            execution_guard::require(Operation::Query(QueryStage::HardTrackedRecheck));
             self.lazy_tracked_recheck_count
                 .set(self.lazy_tracked_recheck_count.get().saturating_add(1));
             let tracked = hard.solver.check_assumptions(&bundle);
-            if tracked == SatResult::Unknown {
-                // Preserve the actual exceptional result before the existing
-                // reproduction assertion below rejects this execution.
-                let reason = hard.solver.get_reason_unknown();
-                self.note_demand_query(assumptions, tracked, &[], reason);
-                self.record_round_model_failure(RoundModelFailure::HardUnknown {
-                    active_t2: assumptions.len(),
-                    reason: hard
-                        .solver
-                        .get_reason_unknown()
-                        .unwrap_or_else(|| "-".to_owned()),
-                });
-            }
-            assert_eq!(
+            let reason = (tracked == SatResult::Unknown)
+                .then(|| hard.solver.get_reason_unknown())
+                .flatten();
+            match execution_guard::known_query_result(
+                QueryStage::HardTrackedRecheck,
                 tracked,
-                SatResult::Unsat,
-                "lazy plain-hard UNSAT must reproduce on the tracked core backend"
-            );
+                reason,
+            ) {
+                Err(unknown) => {
+                    // Unknown cannot provide a retraction core. Keep the
+                    // exceptional query once, then run normal housekeeping.
+                    self.note_demand_query(assumptions, tracked, &[], unknown.reason.clone());
+                    self.record_round_model_failure(RoundModelFailure::HardUnknown {
+                        active_t2: assumptions.len(),
+                        reason: unknown.reason.unwrap_or_else(|| "-".to_owned()),
+                    });
+                }
+                Ok(known) => assert_eq!(
+                    known,
+                    SatResult::Unsat,
+                    "lazy plain-hard UNSAT must reproduce on the tracked core backend"
+                ),
+            }
             tracked
         } else {
             initial
@@ -1485,23 +1516,26 @@ impl KindSolver {
     }
 
     pub(crate) fn optimize(&self) -> &Optimize {
+        // The raw backend handle grants query authority to its caller.
+        execution_guard::require(Operation::Query(QueryStage::OptimizeCheck));
         &self.solver
     }
 
     #[cfg(test)]
     pub(crate) fn set_random_seed(&self, seed: u32) {
-        let mut params = z3::Params::new();
+        let mut params = fixed_query_params();
         params.set_u32("random_seed", seed);
         self.solver.set_params(&params);
     }
 
     #[cfg(test)]
     pub(crate) fn set_query_timeout(&self, timeout: Duration) {
-        let millis = u32::try_from(timeout.as_millis())
-            .expect("diagnostic query timeout must fit a Z3 u32 millisecond parameter");
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", millis);
-        self.solver.set_params(&params);
+        assert_eq!(
+            timeout.as_millis(),
+            u128::from(execution_guard::QUERY_TIMEOUT_MS),
+            "the sealed query cap cannot be changed by a diagnostic setter"
+        );
+        self.solver.set_params(&fixed_query_params());
     }
 
     #[cfg(test)]
@@ -1533,6 +1567,7 @@ impl KindSolver {
     }
 
     pub fn model_kinds(&self) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        execution_guard::require(Operation::Query(QueryStage::OptimizeCheck));
         // §NB-R guard (release-active, BB3-c style): a tracked solver's hard
         // constraints are `track ⇒ c` — without the tracks assumed they are
         // vacuously satisfiable, so this path would return a silently wrong
@@ -1743,6 +1778,7 @@ impl KindSolver {
         &self,
         relaxed: &RelaxedSelectors,
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        execution_guard::require(Operation::Query(QueryStage::OptimizeMaterialization));
         self.optimize_materialization_count
             .set(self.optimize_materialization_count.get().saturating_add(1));
         let started = Instant::now();
@@ -1760,11 +1796,16 @@ impl KindSolver {
         }
         self.prepare_demand_query(QueryPhase::Materialization, None);
         let outcome = self.solver.check(&[]);
-        let unknown_reason = (outcome == SatResult::Unknown).then(|| {
-            self.solver
-                .get_reason_unknown()
-                .unwrap_or_else(|| "-".to_owned())
-        });
+        let query_reason = (outcome == SatResult::Unknown)
+            .then(|| self.solver.get_reason_unknown())
+            .flatten();
+        let _ = execution_guard::known_query_result(
+            QueryStage::OptimizeMaterialization,
+            outcome,
+            query_reason.clone(),
+        );
+        let unknown_reason =
+            (outcome == SatResult::Unknown).then(|| query_reason.unwrap_or_else(|| "-".to_owned()));
         if self.demand_query_pending() {
             let core = (outcome == SatResult::Unsat)
                 .then(|| self.solver.get_unsat_core())

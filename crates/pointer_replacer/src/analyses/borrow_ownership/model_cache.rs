@@ -1,37 +1,19 @@
-//! **The analysis model cache.** The BO solve, serialized under session-
-//! independent keys, for DEV ITERATION ONLY.
+//! Complete era5a model cache and unchanged three-field consumer view.
 //!
-//! # What is cached, and what deliberately is not
+//! New entries contain portable semantic inputs, the complete model and A5
+//! planning baseline, the accepted receipt, and every required captured export.
+//! Accepted legacy namespaces are never rewritten or relabelled into era5a.
+//! Publication validates a staged body and atomically links it without overwrite.
 //!
-//! The **accepted model** — `SlotRef → SlotKind` — and nothing else. The
-//! rustc front-end is the residual floor the rewriter always pays; the
-//! emitability and construction facts are HIR passes keyed by `HirId`, which is
-//! **not path-addressable**, so caching them would need a second key scheme for
-//! a cheap computation. Caching a cheap thing under a fragile key is how a
-//! cache becomes a correctness liability.
+//! The existing consumer still tries memo, disk, then production analysis.
+//! CacheOnly execution scopes reject that final fallback before a solver exists;
+//! normal derivation scopes may solve. The historical memo counter counts loads
+//! and solves, while execution_guard records actual outer model entries.
 //!
-//! # Fail-closed BY CONSTRUCTION
-//!
-//! [`load`] returns `Option`, and **every** failure path — absent file, unreadable
-//! file, parse error, fingerprint mismatch, a key that does not resolve in this
-//! session — returns `None`, which the caller can only answer by solving for
-//! real. There is no "assume valid" arm to reach, so *loading stale silently*
-//! is not a behaviour this module can express. That is the one forbidden
-//! behaviour, and it is excluded structurally rather than by discipline.
-//!
-//! # Usage policy (recorded here because the code is where it binds)
-//!
-//! Dev iteration may read the cache. **Slice-close verdict sweeps and every
-//! pre-registered gate sweep run a real solve with the cache bypassed**, and
-//! say `solve: real` in their record. Any interim number produced under cache
-//! cites `solve: cache@<fingerprint>`. This is the staleness rule extended to
-//! solve provenance: the reader cannot tell by looking, so the record must say.
-//!
-//! # Single-writer
-//!
-//! The cache directory is the ladder lane's write surface, the same rule as
-//! `target/boc1/**`. Cross-lane consumption, if ever, goes via published
-//! manifests.
+//! Host/launch/transport attestations accompany the portable semantic key.
+//! Batch workers bind their logical input root and sealed toolchain/dependency
+//! digests explicitly; ordinary local use derives a common input root and uses
+//! repository toolchain/lockfile identities. Sources stay frozen for a process.
 
 use std::{
     collections::BTreeMap,
@@ -57,7 +39,7 @@ use crate::utils::rustc::RustProgram;
 
 /// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
 /// changes after this commit do not advance this identity.
-pub(crate) const ANALYSIS_FRAME: &str = "borrow-ownership@782663881fe7d1d463414aa9236aab09b1c21b0d";
+pub(crate) const ANALYSIS_FRAME: &str = "era5a-p1s-realloc219-array-v1";
 
 const CACHE_SCHEMA: &str = "bo-model-cache-v2";
 const A14_MARKER: &str = "positive-opacity-v1";
@@ -77,6 +59,27 @@ pub(crate) fn solver_identity(
     attestation: Option<WholeProgramAttestation>,
 ) -> String {
     let mut fields = BTreeMap::new();
+    fields.insert("era5_schema", super::cache_contract::SCHEMA.to_owned());
+    fields.insert(
+        "query_timeout_ms",
+        super::execution_guard::QUERY_TIMEOUT_MS.to_string(),
+    );
+    if let Ok(digest) = std::env::var("CRAT_ERA5_LAUNCH_DIGEST") {
+        fields.insert("era5_launch_digest", digest);
+    }
+    fields.insert("protected_entry", "p1-prime-s-v1".to_owned());
+    fields.insert(
+        "realloc_outcomes",
+        "r219-success-implied-loss-v1".to_owned(),
+    );
+    fields.insert(
+        "comparison",
+        "source-cause-no-comparison-cause-v1".to_owned(),
+    );
+    fields.insert("field_inner_facts", "explicit-availability-v1".to_owned());
+    fields.insert("array_fields", "uniform-element-raw-holds-v1".to_owned());
+    fields.insert("proof_evidence", "source-only-v2".to_owned());
+    fields.insert("ownership_licensing", "deferred-era5b".to_owned());
     fields.insert("a14", A14_MARKER.to_owned());
     fields.insert("a16", A16_MARKER.to_owned());
     fields.insert("a2_mode", A2Mode::current().label().to_owned());
@@ -209,37 +212,92 @@ pub(crate) fn fingerprint(
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
 ) -> String {
-    // §39 addendum 74: the accepted analysis frame and the complete resolved
-    // solver configuration are key material, not a launch-time convention.
-    let solver = solver_identity(a5_mode, attestation);
+    super::cache_contract::semantic_key(
+        &semantic_inputs(program, a5_mode, attestation)
+            .expect("complete semantic inputs before any cache lookup"),
+    )
+    .expect("valid portable semantic input identity")
+}
 
-    // 1. The program's own source. Per-program, not the whole-corpus digest, so
-    //    one program changing does not void the other nineteen.
-    let tcx = program.tcx;
-    let mut files = Vec::new();
-    for f in tcx.sess.source_map().files().iter() {
-        if let rustc_span::FileName::Real(rp) = &f.name
-            && let Some(p) = rp.local_path()
+pub(crate) fn semantic_inputs(
+    program: &RustProgram<'_>,
+    a5_mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) -> Result<super::cache_contract::SemanticInputs, String> {
+    let mut real = BTreeMap::<PathBuf, String>::new();
+    let mut files = BTreeMap::new();
+    for file in program.tcx.sess.source_map().files().iter() {
+        // Imported source text is covered by the dependency/toolchain recipe.
+        // Every locally loaded source, including virtual inputs, is content keyed.
+        let Some(source) = file.src.as_ref() else { continue };
+        let hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+        if let rustc_span::FileName::Real(path) = &file.name
+            && let Some(path) = path.local_path()
         {
-            files.push((canonical_program_path(p), f.src_hash.hash_bytes().to_vec()));
+            let path = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+            if let Some(previous) = real.insert(path, hash.clone())
+                && previous != hash
+            {
+                return Err("source changed within compiler session".into());
+            }
+        } else {
+            files.insert(format!("virtual/{hash}.rs"), hash);
         }
     }
-    let program = program_identity(tcx.crate_name(LOCAL_CRATE).as_str(), files);
-
-    // 2. The analysis code. Any edit under `analyses/` changes what a solve
-    //    means, so a cache written by the old code must not be read by the new.
-    let code = code_fingerprint_cached();
-
-    // 3. The toolchain.
+    if !real.is_empty() {
+        let mut root = if let Some(root) = std::env::var_os("CRAT_ERA5_INPUT_ROOT") {
+            std::fs::canonicalize(root).map_err(|e| e.to_string())?
+        } else {
+            let mut root = real
+                .keys()
+                .next()
+                .unwrap()
+                .parent()
+                .ok_or("source has no parent")?
+                .to_path_buf();
+            for path in real.keys() {
+                while !path.starts_with(&root) {
+                    if !root.pop() {
+                        return Err("no common source root".into());
+                    }
+                }
+            }
+            root
+        };
+        if root.as_os_str().is_empty() {
+            root = PathBuf::from("/");
+        }
+        let mapped =
+            super::cache_contract::logical_files(&root, &real.into_iter().collect::<Vec<_>>())?;
+        for (path, hash) in mapped {
+            if files.insert(path, hash).is_some() {
+                return Err("duplicate source manifest path".into());
+            }
+        }
+    }
     let toolchain = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../rust-toolchain.toml"
     ))
-    .unwrap_or_default();
-
-    fingerprint_components(&solver, &program, code, &toolchain)
+    .map_err(|e| e.to_string())?;
+    let dependencies = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+        .map_err(|e| e.to_string())?;
+    let recipe_digest = |name: &str, fallback: &[u8]| {
+        std::env::var(name).unwrap_or_else(|_| format!("{:x}", Sha256::digest(fallback)))
+    };
+    Ok(super::cache_contract::SemanticInputs {
+        program: std::env::var("CRAT_ERA5_PROGRAM")
+            .unwrap_or_else(|_| program.tcx.crate_name(LOCAL_CRATE).to_string()),
+        files,
+        analysis: code_fingerprint_cached().to_owned(),
+        toolchain: recipe_digest("CRAT_ERA5_TOOLCHAIN_DIGEST", &toolchain),
+        dependencies: recipe_digest("CRAT_ERA5_DEPENDENCY_DIGEST", &dependencies),
+        configuration: format!(
+            "{:x}",
+            Sha256::digest(solver_identity(a5_mode, attestation).as_bytes())
+        ),
+    })
 }
-
 fn fingerprint_components(solver: &str, program: &str, code: &str, toolchain: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(solver.as_bytes());
@@ -256,12 +314,12 @@ fn fingerprint_components(solver: &str, program: &str, code: &str, toolchain: &[
 /// file, which is the failure mode it exists to prevent.
 fn analysis_code_fingerprint_at(root: &Path) -> String {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
+        let rd = std::fs::read_dir(dir).expect("complete analyses tree");
+        for e in rd {
+            let p = e.expect("read analysis entry").path();
             if p.is_dir() {
                 walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
+            } else if p.is_file() {
                 out.push(p);
             }
         }
@@ -286,13 +344,17 @@ fn analysis_code_fingerprint_at(root: &Path) -> String {
             .map(|component| component.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        let content = std::fs::read(f).unwrap_or_default();
+        let content = std::fs::read(f).expect("read every frozen analysis asset");
         let content_hash = Sha256::digest(content);
         h.update((relative.len() as u64).to_le_bytes());
         h.update(relative.as_bytes());
         h.update(content_hash);
     }
     format!("{:x}", h.finalize())
+}
+
+pub(crate) fn current_analysis_digest() -> String {
+    analysis_code_fingerprint()
 }
 
 fn analysis_code_fingerprint() -> String {
@@ -303,62 +365,17 @@ fn analysis_code_fingerprint() -> String {
 }
 
 fn entry_path(d: &Path, fingerprint: &str) -> PathBuf {
-    d.join(format!("{fingerprint}.model.tsv"))
+    d.join("era5a-model-cache-v1")
+        .join(format!("{fingerprint}.json"))
 }
 
-/// Stage one accepted entry under a new key without touching the source.
-/// RED-first placeholder: addendum 88 requires line 1 to move too.
+/// Retained API for explicit refusal of legacy key-only migration into era5a.
 pub(crate) fn rekey_entry(
-    old_path: &Path,
-    new_dir: &Path,
-    new_fingerprint: &str,
+    _old_path: &Path,
+    _new_dir: &Path,
+    _new_fingerprint: &str,
 ) -> Result<PathBuf, String> {
-    if new_fingerprint.len() != 64 || !new_fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(format!("invalid new fingerprint {new_fingerprint:?}"));
-    }
-    let bytes = std::fs::read(old_path).map_err(|error| error.to_string())?;
-    let newline = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .ok_or_else(|| "cache entry has no fingerprint line".to_owned())?;
-    let first = std::str::from_utf8(&bytes[..newline]).map_err(|error| error.to_string())?;
-    let old_fingerprint = first
-        .strip_prefix("# fingerprint ")
-        .ok_or_else(|| format!("invalid cache fingerprint line {first:?}"))?;
-    let old_name = old_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".model.tsv"))
-        .ok_or_else(|| format!("invalid cache entry path {}", old_path.display()))?;
-    if old_name != old_fingerprint {
-        return Err(format!(
-            "source cache key mismatch: filename={old_name} header={old_fingerprint}"
-        ));
-    }
-    std::fs::create_dir_all(new_dir).map_err(|error| error.to_string())?;
-    let new_path = entry_path(new_dir, new_fingerprint);
-    let mut staged = format!("# fingerprint {new_fingerprint}\n").into_bytes();
-    staged.extend_from_slice(&bytes[newline + 1..]);
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&new_path)
-        .map_err(|error| error.to_string())?;
-    std::io::Write::write_all(&mut output, &staged).map_err(|error| error.to_string())?;
-    let permissions = std::fs::metadata(old_path)
-        .map_err(|error| error.to_string())?
-        .permissions();
-    std::fs::set_permissions(&new_path, permissions).map_err(|error| error.to_string())?;
-    let check = std::fs::read(&new_path).map_err(|error| error.to_string())?;
-    let staged_newline = check
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .ok_or_else(|| "staged cache entry has no fingerprint line".to_owned())?;
-    if check[staged_newline + 1..] != bytes[newline + 1..] {
-        return Err("re-key changed bytes after line 1".to_owned());
-    }
-    Ok(new_path)
+    Err("key-only migration cannot create a complete era5a model entry".into())
 }
 
 pub(crate) fn configured_entry_path(fingerprint: &str) -> Option<PathBuf> {
@@ -374,6 +391,120 @@ pub(crate) struct CachedModel {
     pub(crate) baseline_model: FxHashMap<SlotRef, SlotKind>,
     /// The construction receipt from the solve that produced `model`.
     pub(crate) a5_receipt: String,
+}
+
+#[derive(Clone)]
+struct Prepared {
+    entry: super::cache_contract::CompleteEntry,
+    cached: CachedModel,
+}
+thread_local! {
+    static PREPARED: std::cell::RefCell<Option<Prepared>> = const { std::cell::RefCell::new(None) };
+    static PREPARE_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn prepare_error() -> Option<String> {
+    PREPARE_ERROR.with(|error| error.borrow().clone())
+}
+
+fn universe(tcx: TyCtxt<'_>, slots: &CrateSlots) -> Option<BTreeMap<String, SlotRef>> {
+    let mut keys = BTreeMap::new();
+    for (&function, locals) in &slots.fn_local_slots {
+        for index in 0..locals.len() {
+            let slot = SlotRef::Local(function, super::slots::SlotId::from_usize(index));
+            if keys.insert(render_key(tcx, slots, slot)?, slot).is_some() {
+                return None;
+            }
+        }
+    }
+    for index in 0..slots.field_slots.len() {
+        let slot = SlotRef::Field(super::slots::SlotId::from_usize(index));
+        if keys.insert(render_key(tcx, slots, slot)?, slot).is_some() {
+            return None;
+        }
+    }
+    Some(keys)
+}
+fn model_map(
+    tcx: TyCtxt<'_>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> Option<BTreeMap<String, String>> {
+    model
+        .iter()
+        .map(|(&slot, &kind)| Some((render_key(tcx, slots, slot)?, kind_label(kind).to_owned())))
+        .collect()
+}
+
+/// Preserve the complete accepted capture before the unchanged consumer drops
+/// its recording. Serialization failure affects cache completeness, not kinds.
+pub(crate) fn prepare(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &super::origin_summary::OriginSummaries,
+    verified: &super::construction::VerifiedBo,
+    captured: &super::export::BoExport,
+    mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) {
+    let result = (|| -> Result<Prepared, String> {
+        let inputs = semantic_inputs(program, mode, attestation)?;
+        let key = super::cache_contract::semantic_key(&inputs)?;
+        let portable = super::portable_export::collect(program, slots, captured)?;
+        let origin = super::origin_evidence::collect(program, slots, origins, Some(captured));
+        let mut functions: Vec<_> = program
+            .functions
+            .iter()
+            .map(|did| program.tcx.def_path_str(did.to_def_id()))
+            .collect();
+        functions.sort();
+        let entry = super::cache_contract::CompleteEntry {
+            schema: super::cache_contract::SCHEMA.into(),
+            key,
+            inputs,
+            functions,
+            universe: universe(program.tcx, slots)
+                .ok_or("invalid slot universe")?
+                .into_keys()
+                .collect(),
+            model: model_map(program.tcx, slots, &verified.model)
+                .ok_or("invalid accepted model keys")?,
+            baseline: model_map(program.tcx, slots, &verified.baseline_model)
+                .ok_or("invalid baseline model keys")?,
+            receipt: verified.receipt.clone(),
+            exports: serde_json::from_str(&portable.canonical_json()?)
+                .map_err(|e| e.to_string())?,
+            origin: serde_json::from_str(&origin.canonical_json()).map_err(|e| e.to_string())?,
+        };
+        entry.validate()?;
+        Ok(Prepared {
+            entry,
+            cached: CachedModel {
+                model: verified.model.clone(),
+                baseline_model: verified.baseline_model.clone(),
+                a5_receipt: verified.receipt.clone(),
+            },
+        })
+    })();
+    match result {
+        Ok(value) => {
+            PREPARED.with(|p| *p.borrow_mut() = Some(value));
+            PREPARE_ERROR.with(|e| *e.borrow_mut() = None);
+        }
+        Err(error) => {
+            PREPARED.with(|p| *p.borrow_mut() = None);
+            PREPARE_ERROR.with(|e| *e.borrow_mut() = Some(error));
+        }
+    }
+}
+
+pub(crate) fn prepared_entry(fingerprint: &str) -> Option<super::cache_contract::CompleteEntry> {
+    PREPARED.with(|p| {
+        p.borrow()
+            .as_ref()
+            .filter(|p| p.entry.key == fingerprint)
+            .map(|p| p.entry.clone())
+    })
 }
 
 fn kind_label(kind: SlotKind) -> &'static str {
@@ -430,48 +561,34 @@ fn attestation_label(attestation: Option<WholeProgramAttestation>) -> &'static s
 /// Serialize the accepted model and its minimum precise-replay rehydration
 /// payload under canonical slot keys.
 pub(crate) fn store(
-    tcx: TyCtxt<'_>,
+    _tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
-    slots: &CrateSlots,
+    _slots: &CrateSlots,
     cached: &CachedModel,
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Option<PathBuf> {
-    let d = dir()?;
+    let directory = dir()?.join("era5a-model-cache-v1");
     let fp = fingerprint(program, a5_mode, attestation);
-    if std::fs::create_dir_all(&d).is_err() {
-        return None;
-    };
-    let mut payload = Vec::new();
-    for row in canonical_model_rows(tcx, slots, &cached.model)? {
-        payload.push(format!("M\t{row}"));
-    }
-    for row in canonical_model_rows(tcx, slots, &cached.baseline_model)? {
-        payload.push(format!("B\t{row}"));
-    }
-    for line in cached.a5_receipt.lines() {
-        if line.contains(['\t', '\r']) {
-            return None;
+    let entry = PREPARED.with(|prepared| {
+        prepared
+            .borrow()
+            .as_ref()
+            .filter(|p| {
+                p.entry.key == fp
+                    && p.cached.model == cached.model
+                    && p.cached.baseline_model == cached.baseline_model
+                    && p.cached.a5_receipt == cached.a5_receipt
+            })
+            .map(|p| p.entry.clone())
+    })?;
+    match super::cache_contract::publish(&directory, &entry) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            PREPARE_ERROR.with(|e| *e.borrow_mut() = Some(error));
+            None
         }
-        payload.push(format!("R\t{line}"));
     }
-    if cached.a5_receipt.is_empty() {
-        return None;
-    }
-    let payload = payload.join("\n");
-    let identity = solver_identity(a5_mode, attestation);
-    let identity_sha = format!("{:x}", Sha256::digest(identity.as_bytes()));
-    let payload_sha = format!("{:x}", Sha256::digest(payload.as_bytes()));
-    let body = format!(
-        "# fingerprint {fp}\n# schema {CACHE_SCHEMA}\n# analysis_frame {ANALYSIS_FRAME}\n\
-         # solver_identity_sha256 {identity_sha}\n# a5_mode {}\n# a5_attestation {}\n\
-         # payload_sha256 {payload_sha}\n{payload}\n",
-        a5_mode.label(),
-        attestation_label(attestation),
-    );
-    let path = entry_path(&d, &fp);
-    std::fs::write(&path, body).ok()?;
-    Some(path)
 }
 
 fn render_key(tcx: TyCtxt<'_>, slots: &CrateSlots, r: SlotRef) -> Option<String> {
@@ -493,7 +610,7 @@ fn render_key(tcx: TyCtxt<'_>, slots: &CrateSlots, r: SlotRef) -> Option<String>
     }
 }
 
-/// **Load, or refuse.** Every failure is `None`, and `None` means solve.
+/// Load only a complete validated era5a envelope. CacheOnly guards block any fallback.
 pub(crate) fn load(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
@@ -504,90 +621,40 @@ pub(crate) fn load(
     if !read_enabled() {
         return None;
     }
-    let d = dir()?;
-    let fp = fingerprint(program, a5_mode, attestation);
-    let text = std::fs::read_to_string(entry_path(&d, &fp)).ok()?;
-
-    // The fingerprint is in the key AND in the body. The body check catches a
-    // file renamed or copied into place — the shape a manifest check exists for.
-    let mut lines = text.lines();
-    let first = lines.next()?;
-    if first != format!("# fingerprint {fp}") {
+    let expected = semantic_inputs(program, a5_mode, attestation).ok()?;
+    let fp = super::cache_contract::semantic_key(&expected).ok()?;
+    let body = std::fs::read(entry_path(&dir()?, &fp)).ok()?;
+    let entry = super::cache_contract::decode(&body).ok()?;
+    if entry.key != fp || entry.inputs != expected {
         return None;
     }
-    if lines.next()? != format!("# schema {CACHE_SCHEMA}")
-        || lines.next()? != format!("# analysis_frame {ANALYSIS_FRAME}")
+    let keys = universe(tcx, slots)?;
+    if entry
+        .universe
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        != keys.keys().cloned().collect()
     {
         return None;
     }
-    let identity = solver_identity(a5_mode, attestation);
-    let identity_sha = format!("{:x}", Sha256::digest(identity.as_bytes()));
-    if lines.next()? != format!("# solver_identity_sha256 {identity_sha}")
-        || lines.next()? != format!("# a5_mode {}", a5_mode.label())
-        || lines.next()? != format!("# a5_attestation {}", attestation_label(attestation))
-    {
-        return None;
-    }
-    let payload_sha_line = lines.next()?;
-    let payload = lines.collect::<Vec<_>>().join("\n");
-    let payload_sha = format!("{:x}", Sha256::digest(payload.as_bytes()));
-    if payload_sha_line != format!("# payload_sha256 {payload_sha}") {
-        return None;
-    }
-
-    // Rebuild the session-local keys by rendering every slot THIS session has
-    // and matching on the canonical name. A key in the file that no longer
-    // resolves is a refusal, not a skip.
-    let mut by_key: FxHashMap<String, SlotRef> = FxHashMap::default();
-    for (&fn_did, universe) in &slots.fn_local_slots {
-        for i in 0..universe.len() {
-            let id = super::slots::SlotId::from_usize(i);
-            if let Some(k) = render_key(tcx, slots, SlotRef::Local(fn_did, id)) {
-                if by_key.insert(k, SlotRef::Local(fn_did, id)).is_some() {
-                    return None;
-                }
-            }
-        }
-    }
-    for i in 0..slots.field_slots.len() {
-        let id = super::slots::SlotId::from_usize(i);
-        if let Some(k) = render_key(tcx, slots, SlotRef::Field(id)) {
-            if by_key.insert(k, SlotRef::Field(id)).is_some() {
-                return None;
-            }
-        }
-    }
-
-    let mut model = FxHashMap::default();
-    let mut baseline_model = FxHashMap::default();
-    let mut receipt = Vec::new();
-    for line in payload.lines() {
-        let mut fields = line.splitn(3, '\t');
-        match (fields.next()?, fields.next(), fields.next()) {
-            ("M", Some(key), Some(kind)) => {
-                let slot = *by_key.get(key)?;
-                if model.insert(slot, parse_kind(kind)?).is_some() {
-                    return None;
-                }
-            }
-            ("B", Some(key), Some(kind)) => {
-                let slot = *by_key.get(key)?;
-                if baseline_model.insert(slot, parse_kind(kind)?).is_some() {
-                    return None;
-                }
-            }
-            ("R", Some(line), None) => receipt.push(line.to_owned()),
-            _ => return None,
-        }
-    }
-    if model.len() != by_key.len() || baseline_model.len() != by_key.len() || receipt.is_empty() {
-        return None;
-    }
-    Some(CachedModel {
-        model,
-        baseline_model,
-        a5_receipt: format!("{}\n", receipt.join("\n")),
-    })
+    let decode = |rows: &BTreeMap<String, String>| -> Option<FxHashMap<SlotRef, SlotKind>> {
+        rows.iter()
+            .map(|(key, kind)| Some((*keys.get(key)?, parse_kind(kind)?)))
+            .collect()
+    };
+    let cached = CachedModel {
+        model: decode(&entry.model)?,
+        baseline_model: decode(&entry.baseline)?,
+        a5_receipt: entry.receipt.clone(),
+    };
+    PREPARED.with(|p| {
+        *p.borrow_mut() = Some(Prepared {
+            entry,
+            cached: cached.clone(),
+        })
+    });
+    Some(cached)
 }
 
 #[cfg(test)]
@@ -606,7 +673,15 @@ mod tests {
             Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         );
         for required in [
-            "analysis_frame=borrow-ownership@782663881fe7d1d463414aa9236aab09b1c21b0d",
+            "analysis_frame=era5a-p1s-realloc219-array-v1",
+            "era5_schema=era5a-model-cache-v1",
+            "protected_entry=p1-prime-s-v1",
+            "realloc_outcomes=r219-success-implied-loss-v1",
+            "field_inner_facts=explicit-availability-v1",
+            "array_fields=uniform-element-raw-holds-v1",
+            "proof_evidence=source-only-v2",
+            "ownership_licensing=deferred-era5b",
+            "query_timeout_ms=600000",
             "a5_mode=precise_replay",
             "a5_world=closed_world_frozen_graph",
             "a5_attestation=frozen_benchmark_graph",
@@ -726,69 +801,32 @@ mod tests {
         .unwrap_or_else(|error| error.raise());
     }
 
-    /// Addendum 88 / R1 — the permitted re-key changes only the filename and
-    /// first line, and the staged entry must then load through production.
+    /// The historical test identity is retained. Era5a supersedes the old
+    /// key-only migration contract: a complete new derivation is required.
     #[test]
     fn rekey_changes_only_the_key_line_and_round_trips_through_the_loader() {
-        struct TestDir(PathBuf);
-        impl Drop for TestDir {
+        let root =
+            std::env::temp_dir().join(format!("era5a-legacy-rekey-refusal-{}", std::process::id()));
+        struct Remove(PathBuf);
+        impl Drop for Remove {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let root =
-            std::env::temp_dir().join(format!("crat-cache-rekey-test-{}", std::process::id()));
-        let source_dir = TestDir(root.join("old"));
-        let staged_dir = TestDir(root.join("staged"));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&source_dir.0).expect("old cache dir");
-        std::fs::create_dir_all(&staged_dir.0).expect("staged cache dir");
-        let source = "pub unsafe fn read(p: *const i32) -> i32 { unsafe { *p } }";
-
-        ::utils::compilation::run_compiler_on_str(source, |tcx| {
-            reset_for_test();
-            let receipt = with_test_config(false, &source_dir.0, || {
-                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
-            })
-            .expect("fresh precise decision");
-            let provenance = last_solve().expect("fresh solve provenance");
-            let current_fp = provenance.fingerprint;
-            let current_model = provenance.model_sha256;
-            let current_path = provenance.cache_entry.expect("fresh cache entry");
-            let current_text = std::fs::read_to_string(&current_path).expect("fresh entry text");
-            let (_, tail) = current_text.split_once('\n').expect("fingerprint line");
-
-            let legacy_fp = "f".repeat(64);
-            assert_ne!(legacy_fp, current_fp);
-            let legacy_path = entry_path(&source_dir.0, &legacy_fp);
-            std::fs::write(&legacy_path, format!("# fingerprint {legacy_fp}\n{tail}"))
-                .expect("legacy entry");
-            std::fs::remove_file(&current_path).expect("remove current-key source entry");
-
-            let staged = rekey_entry(&legacy_path, &staged_dir.0, &current_fp)
-                .expect("stage re-keyed entry");
-            let staged_text = std::fs::read_to_string(&staged).expect("staged entry text");
-            let (staged_first, staged_tail) = staged_text.split_once('\n').expect("staged header");
-            assert_eq!(staged_first, format!("# fingerprint {current_fp}"));
-            assert_eq!(staged_tail.as_bytes(), tail.as_bytes());
-            assert!(
-                legacy_path.is_file(),
-                "the accepted source must be retained"
-            );
-
-            reset_for_test();
-            let loaded_receipt = with_test_config(true, &staged_dir.0, || {
-                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
-            })
-            .expect("staged precise decision");
-            let loaded = last_solve().expect("staged load provenance");
-            assert_eq!(loaded.source, "cache");
-            assert_eq!(loaded.cache_status, "hit");
-            assert_eq!(loaded.model_sha256, current_model);
-            assert_eq!(loaded_receipt, receipt);
-            reset_for_test();
-        })
-        .unwrap_or_else(|error| error.raise());
+        let _remove = Remove(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = root.join("legacy.model.tsv");
+        let bytes = format!(
+            "# fingerprint {}\n# schema bo-model-cache-v2\nM\tf::_1@d0\tref\n",
+            "f".repeat(64)
+        );
+        std::fs::write(&legacy, &bytes).unwrap();
+        assert!(rekey_entry(&legacy, &root.join("candidate"), &"a".repeat(64)).is_err());
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), bytes);
+        assert!(
+            !root.join("candidate").exists(),
+            "refusal must not stage an old body under a new key"
+        );
     }
 
     /// The three refusal shapes, at the level they are decidable without a
@@ -1038,7 +1076,17 @@ pub(crate) fn memo_get(fp: &str) -> Option<CachedModel> {
     MEMO.with(|m| {
         m.borrow()
             .as_ref()
-            .filter(|(k, _)| k == fp)
+            .filter(|(k, cached)| {
+                k == fp
+                    && PREPARED.with(|prepared| {
+                        prepared.borrow().as_ref().is_some_and(|p| {
+                            p.entry.key == fp
+                                && p.cached.model == cached.model
+                                && p.cached.baseline_model == cached.baseline_model
+                                && p.cached.a5_receipt == cached.a5_receipt
+                        })
+                    })
+            })
             .map(|(_, v)| v.clone())
     })
 }
@@ -1053,4 +1101,6 @@ pub(crate) fn reset_for_test() {
     MEMO.with(|memo| *memo.borrow_mut() = None);
     DERIVATIONS.with(|count| count.set(0));
     LAST_SOLVE.with(|last| *last.borrow_mut() = None);
+    PREPARED.with(|prepared| *prepared.borrow_mut() = None);
+    PREPARE_ERROR.with(|error| *error.borrow_mut() = None);
 }

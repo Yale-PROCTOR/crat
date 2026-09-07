@@ -30,7 +30,8 @@ mod objects;
 mod routes;
 
 use objects::{ObjectFacts, ObjectRoot, ObjectSet};
-use routes::{FrameEvent, RouteProblem, RouteStep, RoutedEvents};
+use routes::{FrameEvent, RoutedEvents};
+pub(crate) use routes::{RouteProblem, RouteReason, RouteStep};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlapReason {
