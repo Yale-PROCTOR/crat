@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::IndexVec;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
@@ -44,6 +44,7 @@ pub struct Slot {
 pub struct SlotUniverse {
     slots: IndexVec<SlotId, Slot>,
     owner_ranges: FxHashMap<SlotOwner, (SlotId, u8)>,
+    array_fields: FxHashSet<StructFieldSlot>,
 }
 
 impl SlotUniverse {
@@ -86,6 +87,20 @@ impl SlotUniverse {
 
     pub fn register_field(&mut self, field: StructFieldSlot, depth_count: u8) {
         self.register_owner(SlotOwner::Field(field), depth_count);
+    }
+
+    /// One uniform element chain; array length creates neither depth nor tokens.
+    pub fn register_array_field(&mut self, field: StructFieldSlot, depth_count: u8) {
+        self.register_field(field, depth_count);
+        self.array_fields.insert(field);
+    }
+
+    pub fn is_array_field(&self, field: StructFieldSlot) -> bool {
+        self.array_fields.contains(&field)
+    }
+
+    pub fn is_array_slot(&self, slot: SlotId) -> bool {
+        matches!(self.slot(slot).owner, SlotOwner::Field(field) if self.is_array_field(field))
     }
 
     pub fn slots_for_local(&self, local: Local) -> Option<Range<SlotId>> {

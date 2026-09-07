@@ -61,6 +61,7 @@ pub fn resolve_place<'tcx>(
 ) -> Option<ResolvedSlot> {
     let fn_locals = slots.fn_local_slots.get(&fn_did)?;
     let mut is_field = false;
+    let mut array_pending = false;
     let mut range: Option<Range<SlotId>> = fn_locals.slots_for_local(place.local);
     let mut base_ty = body.local_decls[place.local].ty;
     let mut depth = 0u8;
@@ -68,6 +69,9 @@ pub fn resolve_place<'tcx>(
     for elem in place.projection {
         match elem {
             ProjectionElem::Deref => {
+                if array_pending {
+                    return None;
+                }
                 push_layer(&mut layers, is_field, &range, depth);
                 depth = depth.checked_add(1)?;
                 base_ty = base_ty.builtin_deref(true)?;
@@ -96,15 +100,27 @@ pub fn resolve_place<'tcx>(
                 };
                 let field_range = slots.field_slots.slots_for_field(field)?;
                 is_field = true;
+                array_pending = slots.field_slots.is_array_field(field);
                 range = Some(field_range);
                 depth = 0;
                 base_ty = field_ty;
+            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } if array_pending => {
+                let TyKind::Array(element, _) = base_ty.kind() else {
+                    return None;
+                };
+                base_ty = *element;
+                array_pending = false;
             }
             ProjectionElem::OpaqueCast(ty) | ProjectionElem::Subtype(ty) => {
                 base_ty = ty;
             }
             _ => return None,
         }
+    }
+
+    if array_pending {
+        return None;
     }
 
     // Trailing `extra_deref`: the intermediate positions are traversed layers

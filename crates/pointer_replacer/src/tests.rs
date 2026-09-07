@@ -9706,10 +9706,9 @@ pub unsafe fn f(s: *mut S) {
         );
     }
 
-    // Arrays of pointers are a deferred shape per the §2 boundary contract in
-    // docs/agents/plan/2026-06-13-borrow-ownership-unified-plan-concrete.md;
-    // Phase 2's resolver must treat the absent slot as conservative Raw.
-    // TODO: descend arrays or mark owners unsupported in a later phase.
+    // ERA5a registers one uniform element chain for fixed array fields.
+    // Array locals remain outside this registration surface; G's construction
+    // controls separately prove the new field summaries carry explicit Raw holds.
     #[test]
     fn crate_slots_defers_array_of_pointer_shapes() {
         run_compiler(
@@ -9737,7 +9736,16 @@ pub unsafe fn takes_array(arr: [*mut i32; 4]) -> *mut i32 {
                     field_index: 1,
                 };
 
-                assert!(slots.field_slots.slots_for_field(arr).is_none());
+                assert!(slots.field_slots.is_array_field(arr));
+                assert_eq!(
+                    slot_range_len(
+                        slots
+                            .field_slots
+                            .slots_for_field(arr)
+                            .expect("array element summary")
+                    ),
+                    1
+                );
                 assert_eq!(
                     slot_range_len(
                         slots

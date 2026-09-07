@@ -190,7 +190,8 @@ fn add_coherence_impl<'tcx>(
                                 // skip the per-store equate here — equating multiple stores to one
                                 // global field slot is what transitively dragged a borrowed value
                                 // to `Owning`. (Field LOADS have a Local lhs and still equate.)
-                                if d == 0 && matches!(la, ResolvedSlot::Field(_)) {
+                                if matches!(la, ResolvedSlot::Field(id) if d == 0 || slots.field_slots.is_array_slot(id))
+                                {
                                     continue;
                                 }
                                 let lhs = to_slot_ref(la, fn_did);
@@ -214,6 +215,10 @@ fn add_coherence_impl<'tcx>(
                             resolve_place(slots, fn_did, body, *lhs, d + 1, None),
                             resolve_place(slots, fn_did, body, *rhs, d, None),
                         ) {
+                            if matches!(la, ResolvedSlot::Field(id) if slots.field_slots.is_array_slot(id))
+                            {
+                                continue;
+                            }
                             solver.equate(to_slot_ref(la, fn_did), to_slot_ref(ra, fn_did));
                         }
                     }
@@ -235,6 +240,9 @@ fn add_coherence_impl<'tcx>(
                             struct_did,
                             field_index: field_idx.index(),
                         };
+                        if slots.field_slots.is_array_field(field) {
+                            continue;
+                        }
 
                         for d in 0..MAX_SLOT_DEPTH {
                             // §9.10.2: an aggregate is a field INITIALIZER; its depth-0
@@ -378,6 +386,9 @@ pub(crate) fn constrain_field_ref_worthiness(
             .slots()
             .into_iter()
             .filter(|slot| matches!(slot, SlotRef::Field(_))),
+    );
+    fields.retain(
+        |field| !matches!(field, SlotRef::Field(id) if slots.field_slots.is_array_slot(*id)),
     );
     let mut rows = Vec::new();
     for field in fields {
@@ -593,6 +604,14 @@ fn scan_field_stores(
         }
     }
 
+    // An unlicensed array summary must not add scalar reverse-AND demands
+    // to the values stored into it. Its own holds are emitted separately.
+    owned_stores.retain(
+        |field, _| !matches!(field, SlotRef::Field(id) if slots.field_slots.is_array_slot(*id)),
+    );
+    blocked.retain(
+        |field| !matches!(field, SlotRef::Field(id) if slots.field_slots.is_array_slot(*id)),
+    );
     (owned_stores, blocked)
 }
 

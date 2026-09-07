@@ -38,7 +38,18 @@ impl CrateSlots {
 
             for (field_index, field_def) in adt_def.all_fields().enumerate() {
                 let field_ty = field_def.ty(tcx, substs);
-                if matches!(field_ty.kind(), TyKind::RawPtr(..)) {
+                if let TyKind::Array(element, _) = field_ty.kind()
+                    && matches!(element.kind(), TyKind::RawPtr(..))
+                    && adt_def.is_struct()
+                {
+                    field_slots.register_array_field(
+                        StructFieldSlot {
+                            struct_did: did,
+                            field_index,
+                        },
+                        ptr_chain_depth(*element),
+                    );
+                } else if matches!(field_ty.kind(), TyKind::RawPtr(..)) {
                     field_slots.register_field(
                         StructFieldSlot {
                             struct_did: did,

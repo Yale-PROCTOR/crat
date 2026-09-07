@@ -317,14 +317,18 @@ pub unsafe fn thin(p: *const i32) -> i32 { *p }
                 row(facts, &field_key(program, "Plain", "pointer", 0)).fatness,
                 Availability::Present(FatnessFact::PtrDefault)
             );
-            let unregistered = field_key(program, "Plain", "array", 0);
+            let element = field_key(program, "Plain", "array", 0);
+            assert_eq!(element, "Plain::field1::element@d0");
+            assert!(catalog(program, slots).contains_key(&element));
+            let added = row(facts, &element);
+            assert_eq!((added.depth, added.qualifier_offset), (0, 0));
+            assert_eq!(added.level, Some(PointerLevel::Raw));
             assert!(
-                !catalog(program, slots).contains_key(&unregistered),
-                "array registration belongs to G"
-            );
-            assert!(
-                facts.rows.iter().all(|row| row.slot != unregistered),
-                "F must not add an unconstrained array slot"
+                facts
+                    .rows
+                    .iter()
+                    .all(|row| row.slot != "Plain::field1::element@d1"),
+                "the array wrapper adds no pointer depth"
             );
         },
     );

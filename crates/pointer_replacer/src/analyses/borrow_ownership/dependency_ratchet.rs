@@ -80,6 +80,12 @@ mod tests {
     /// production and measurement callers in that file are intentionally absent and therefore RED
     /// until they migrate to `construction.rs`.
     const LEGACY_DIRECT_CALLER_ALLOW: &[(&str, &str)] = &[
+        // G's primitive constraint witness isolates scalar reverse-AND from
+        // ownership emission; the separate constructor witness uses the shared door.
+        (
+            "src/analyses/borrow_ownership/array_fields/tests.rs",
+            "e5_x_array_raw_summary_adds_no_reverse_ownership_demand",
+        ),
         (
             "src/analyses/borrow_ownership/borrow_verify.rs",
             "verify_to_fixpoint",

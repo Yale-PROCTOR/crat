@@ -37,8 +37,22 @@ pub(crate) fn field_key(
     field_index: usize,
     depth: u8,
 ) -> String {
+    let element = if tcx.def_kind(struct_did) == rustc_hir::def::DefKind::Struct {
+        let ty = tcx.type_of(struct_did).skip_binder();
+        if let rustc_middle::ty::TyKind::Adt(adt, args) = ty.kind() {
+            adt.all_fields().nth(field_index).is_some_and(|field| {
+                matches!(field.ty(tcx, args).kind(), rustc_middle::ty::TyKind::Array(inner, _)
+                    if matches!(inner.kind(), rustc_middle::ty::TyKind::RawPtr(..)))
+            })
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     format!(
-        "{}::field{field_index}@d{depth}",
-        tcx.def_path_str(struct_did.to_def_id())
+        "{}::field{field_index}{}@d{depth}",
+        tcx.def_path_str(struct_did.to_def_id()),
+        if element { "::element" } else { "" }
     )
 }
