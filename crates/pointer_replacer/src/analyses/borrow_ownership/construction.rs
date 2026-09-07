@@ -202,6 +202,7 @@ pub(crate) struct CopyLendPairCandidate {
 
 pub(crate) struct BoConstruction {
     pub(crate) source_events: std::sync::Arc<super::source_events::SourceEvents>,
+    pub(crate) qualifier_facts: super::qualifier_facts::QualifierFacts,
     pub(crate) mode: CopyLendMode,
     pub(crate) nullability: super::nullability::NullabilityFacts,
     pub(crate) field_ref_plan: FieldRefPlan,
@@ -771,8 +772,11 @@ fn construct_bo_into_with_esc(
         &nullability,
     );
     let coherence_elapsed = t.elapsed();
+    let qualifier_facts = super::qualifier_facts::collect(program, slots, mut_facts, &nullability);
+    super::export::record(|export| export.qualifier_facts = Some(qualifier_facts.clone()));
     Ok(BoConstruction {
         source_events,
+        qualifier_facts,
         mode,
         nullability,
         field_ref_plan,
@@ -962,10 +966,15 @@ pub(crate) fn construct_tracked_census_baseline(
             .borrow();
         add_coherence_tagging_uses(solver, slots, fn_did, &body);
     }
+    let nullability = super::nullability::NullabilityFacts::default();
+    let qualifier_facts =
+        super::qualifier_facts::collect_without_mutability(program, slots, &nullability);
+    super::export::record(|export| export.qualifier_facts = Some(qualifier_facts.clone()));
     Ok(BoConstruction {
         source_events,
+        qualifier_facts,
         mode: CopyLendMode::Baseline,
-        nullability: super::nullability::NullabilityFacts::default(),
+        nullability,
         field_ref_plan: FieldRefPlan::default(),
         a2_mode: A2Mode::Off,
         a2_killed_memberships: 0,
