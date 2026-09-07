@@ -733,11 +733,18 @@ pub(crate) fn plan_slice_constructions(
     tcx: TyCtxt<'_>,
     table: &DecisionTable,
     facts: &ConstructionFacts,
+    family_policy: &super::super::additive::FamilyPolicy,
 ) -> Vec<SliceConstructionPlan> {
     let sm = tcx.sess.source_map();
     let mut plans = Vec::new();
     let mut known_lengths = FxHashMap::default();
     for (subject, decision) in &table.entries {
+        if !family_policy.enabled(
+            subject.fn_did,
+            super::super::additive::FamilyStage::SliceConstruction,
+        ) {
+            continue;
+        }
         match subject.kind {
             SubjectKind::Local => {}
             SubjectKind::Param { .. } => continue,
@@ -1302,7 +1309,14 @@ mod slice_construction_tests {
                 for receipt in &mut table.slice_use_receipts {
                     receipt.same_form_initializer = None;
                 }
-                plan_slice_constructions(tcx, &table, &facts)
+                plan_slice_constructions(
+                    tcx,
+                    &table,
+                    &facts,
+                    &crate::bo_rewriter::additive::FamilyPolicy::at(
+                        crate::bo_rewriter::additive::FamilyStage::Option,
+                    ),
+                )
             },
         )
         .expect("construction fixture compiles")

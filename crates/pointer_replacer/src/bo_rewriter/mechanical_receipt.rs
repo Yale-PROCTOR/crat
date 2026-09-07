@@ -1597,12 +1597,29 @@ pub(crate) fn reconcile_slice_use_rows(
         let event = common
             .get(&key)
             .ok_or_else(|| format!("unowned slice-use row {key}"))?;
+        // R220 keeps the attempted slice candidate separately from the restored
+        // predecessor form. Only an exact retired terminal partner licenses
+        // that distinction; an ordinary applied row must still agree.
+        let retired = common
+            .get(&format!("{}:terminal", event.key.receipt_key()))
+            .is_some_and(|terminal| {
+                terminal.state == MechanicalState::Reclassified
+                    && matches!(&terminal.terminal_reason,
+                        Some(MechanicalTerminalReason::EvidenceMissing(reason))
+                            if reason.starts_with("additive-family-fallback:slice-use-unsupported;site-cause="))
+                    && matches!(row.adapter.as_str(),
+                        "prior-family-rendering:SliceConstruction"
+                        | "prior-family-rendering:SliceUse"
+                        | "prior-family-rendering:Option")
+                    && matches!(row.candidate_form.as_str(),
+                        "slice-shared" | "slice-mut" | "opt-slice-shared" | "opt-slice-mut")
+            });
         if row.use_site != event.key.site
             || row.source_form != event.found_form
             || (event.source_shape == "cursor"
                 && (row.source_form != "raw"
                     || !matches!(row.candidate_form.as_str(), "slice-shared" | "slice-mut")))
-            || (event.source_shape != "cursor" && row.source_form != row.candidate_form)
+            || (event.source_shape != "cursor" && !retired && row.source_form != row.candidate_form)
             || row.target_form != event.expected_form
             || row.retention != event.evidence.retention
             || row.terminal.state != event.state

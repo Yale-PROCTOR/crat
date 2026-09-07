@@ -46,6 +46,8 @@ pub(crate) mod universe;
 
 use emitability::EmitabilityFacts;
 
+use super::additive::FamilyStage;
+
 /// **S3.6-1 — what the `referenced` gate does on this pass.**
 ///
 /// The gate at `decide_one` position 8 degrades every subject of an in-crate
@@ -866,6 +868,7 @@ pub(crate) struct DecisionTable {
     pub depth2_npo_storages: Vec<Depth2NpoStoragePlan>,
     /// Item-2 raw-result definitions that construct settled local slices.
     pub slice_constructions: Vec<construction::SliceConstructionPlan>,
+    pub retired_slice_constructions: Vec<super::mechanical_receipt::SliceConstructionReceiptPlan>,
     pub slice_use_receipts: Vec<super::mechanical_receipt::SliceUseReceiptPlan>,
     pub option_receipts: Vec<super::mechanical_receipt::OptionPresentationReceiptPlan>,
     pub option_value_initializers: Vec<(LocalDefId, rustc_hir::HirId)>,
@@ -971,6 +974,7 @@ impl DecisionTable {
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) tcx: TyCtxt<'tcx>,
+    pub(crate) family_policy: &'a super::additive::FamilyPolicy,
     pub(crate) model: &'a FxHashMap<SlotRef, SlotKind>,
     pub(crate) slots: &'a CrateSlots,
     pub(crate) facts: &'a EmitabilityFacts,
@@ -1029,7 +1033,9 @@ pub(crate) fn decide_with_raw_fallbacks(
         .filter_map(|(subject, decision)| {
             let needed = match decision {
                 Decision::Opt { mutable, .. } => {
-                    *mutable
+                    ctx.family_policy
+                        .enabled(subject.fn_did, FamilyStage::Option)
+                        && *mutable
                         && !subject.mut_binding
                         && ctx
                             .opt_uses
@@ -1062,6 +1068,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         seams: Default::default(),
         depth2_npo_storages: Vec::new(),
         slice_constructions: Vec::new(),
+        retired_slice_constructions: Vec::new(),
         slice_use_receipts: Vec::new(),
         option_receipts: Vec::new(),
         option_value_initializers: Vec::new(),
@@ -1365,6 +1372,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
 fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
+        family_policy,
         model,
         slots,
         facts,
@@ -1382,6 +1390,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         exposure,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
+    let option_enabled = family_policy.enabled(subject.fn_did, FamilyStage::Option);
     let depth2_npo = matches!(subject.kind, SubjectKind::Local)
         .then(|| facts.depth2_npo_target((subject.fn_did, subject.hir_id)))
         .flatten();
@@ -1479,14 +1488,14 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // enough. It runs opposite to -2's conjunction on purpose: there the unsafe
     // direction was ADOPTING a form (fatness alone would invent a length), here
     // it is REFUSING one (an optional costs ergonomics, never soundness).
-    let null_constructed = constructions
-        .init_hirs
-        .get(&(subject.fn_did, subject.hir_id))
-        .is_some_and(|hir| emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr()));
-    let nullable_value = null_constructed
-        || opt_uses
+    let nullable_value = option_enabled
+        && (constructions
+            .init_hirs
             .get(&(subject.fn_did, subject.hir_id))
-            .is_some_and(|uses| uses.null_assigned);
+            .is_some_and(|hir| emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr()))
+            || opt_uses
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|uses| uses.null_assigned));
     let form = match raw_uses {
         Some(uses) => {
             let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);
@@ -1499,8 +1508,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             // wrapper, and admitting it would be the mixed-use hazard again.
             let rest_arithmetic = uses.iter().all(|(op, _)| op == "is_null" || arith(op));
 
-            if (null_tested || nullable_value)
+            if all_arithmetic && is_array && !nullable_value {
+                Form::Slice
+            } else if (null_tested || nullable_value)
                 && rest_arithmetic
+                && (option_enabled || !subject.null_init)
                 // Item 4 owns None at exact null initializers/assignments.
                 // A thin optional has no image for arithmetic; the fat twin does,
                 // and fatness is the licence for it — the -2 rule, unchanged.
@@ -1509,8 +1521,6 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 Form::Opt {
                     slice: has_arithmetic && is_array,
                 }
-            } else if all_arithmetic && is_array {
-                Form::Slice
             } else {
                 let (op, span) = uses.first().expect("a recorded use vector is non-empty");
                 return degrade(
@@ -1665,6 +1675,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                     DegradeReason::OptUseUnsupported,
                 );
             }
+            if !option_enabled && subject.mutable && uses.non_test_uses > 1 && !subject.mut_binding
+            {
+                return degrade(subject, decl_site, DegradeReason::OptNeedsMutBinding);
+            }
             return Decision::Opt {
                 mutable: subject.mutable,
                 slice: false,
@@ -1681,10 +1695,13 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // depth-2 layout carriers retain their separate ownership.
         if matches!(subject.kind, SubjectKind::Local)
             && depth2_npo.is_none()
-            && !construction::slice_constructor_available(
-                constructions,
-                (subject.fn_did, subject.hir_id),
-            )
+            && (!option_enabled
+                || (slice
+                    && !family_policy.enabled(subject.fn_did, FamilyStage::SliceConstruction))
+                || !construction::slice_constructor_available(
+                    constructions,
+                    (subject.fn_did, subject.hir_id),
+                ))
         {
             return degrade(subject, decl_site, DegradeReason::OptLocalConstruction);
         }
@@ -1704,6 +1721,9 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // ratified text, and the move is fine exactly once. More than one needs
         // `as_mut()`. G15 schedules its required mutable binding atomically
         // with the Option declaration and use edits.
+        if !option_enabled && subject.mutable && uses.non_test_uses > 1 && !subject.mut_binding {
+            return degrade(subject, decl_site, DegradeReason::OptNeedsMutBinding);
+        }
         // **S3.2′-5 hardening — LAST in this arm**, the same placement rule the
         // plain-slice twin uses, so it can only ever convert a would-be `Opt`
         // emission and never displace `OptUseUnsupported`.
@@ -1734,10 +1754,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // initializer identity still fails closed under the historical reason;
     // otherwise the sealed construction plan carries evidence or §77 fallback.
     if matches!(subject.kind, SubjectKind::Local)
-        && !construction::slice_constructor_available(
-            constructions,
-            (subject.fn_did, subject.hir_id),
-        )
+        && (!family_policy.enabled(subject.fn_did, FamilyStage::SliceConstruction)
+            || !construction::slice_constructor_available(
+                constructions,
+                (subject.fn_did, subject.hir_id),
+            ))
     {
         return degrade(subject, decl_site, DegradeReason::SliceLocalConstruction);
     }
@@ -1749,7 +1770,9 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         return degrade(
             subject,
             EmitabilityFacts::site(tcx, span),
-            if uses.unsupported_is_cursor {
+            if family_policy.enabled(subject.fn_did, FamilyStage::SliceUse)
+                && uses.unsupported_is_cursor
+            {
                 DegradeReason::SliceCursorUse
             } else {
                 DegradeReason::SliceUseUnsupported
@@ -1895,6 +1918,7 @@ mod self_consistency_tests {
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
+            retired_slice_constructions: Vec::new(),
             slice_use_receipts: Vec::new(),
             option_receipts: Vec::new(),
             option_value_initializers: Vec::new(),

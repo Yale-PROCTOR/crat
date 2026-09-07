@@ -1378,6 +1378,51 @@ pub(crate) fn collect_opt_uses(
     raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
     deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
 ) -> FxHashMap<(LocalDefId, HirId), OptUses> {
+    collect_opt_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        accessor_of,
+        fat,
+        raw_boundary_arguments,
+        deferred_uses,
+        true,
+    )
+}
+
+/// The pre-item-4 collector: keep core Option/NPO and raw-argument handling,
+/// without the newer assignment, copied-value or projected-use behavior.
+pub(crate) fn collect_opt_uses_before_family(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
+    fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+) -> FxHashMap<(LocalDefId, HirId), OptUses> {
+    collect_opt_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        accessor_of,
+        fat,
+        raw_boundary_arguments,
+        deferred_uses,
+        false,
+    )
+}
+
+fn collect_opt_uses_with_family(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
+    fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    expanded: bool,
+) -> FxHashMap<(LocalDefId, HirId), OptUses> {
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         fn_did: LocalDefId,
@@ -1387,10 +1432,12 @@ pub(crate) fn collect_opt_uses(
         fat: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
         raw_boundary_arguments: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
         deferred_uses: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+        expanded: bool,
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-            if let ExprKind::Assign(lhs, rhs, _) = expr.kind
+            if self.expanded
+                && let ExprKind::Assign(lhs, rhs, _) = expr.kind
                 && let ExprKind::Path(QPath::Resolved(_, path)) = lhs.kind
                 && let Res::Local(binding) = path.res
                 && self.name_of.contains_key(&(self.fn_did, binding))
@@ -1407,7 +1454,8 @@ pub(crate) fn collect_opt_uses(
                 && self.name_of.contains_key(&(self.fn_did, hir_id))
             {
                 let key = (self.fn_did, hir_id);
-                if matches!(self.tcx.parent_hir_node(expr.hir_id),
+                if self.expanded
+                    && matches!(self.tcx.parent_hir_node(expr.hir_id),
                     rustc_hir::Node::Expr(parent) if matches!(parent.kind,
                         ExprKind::Assign(lhs, _, _) if lhs.hir_id == expr.hir_id))
                 {
@@ -1416,30 +1464,34 @@ pub(crate) fn collect_opt_uses(
                 // A boundary on `(*p).field` owns the projected pointer value.
                 // Evaluating that value still requires opening the Option at
                 // `p`; leave its one native use edit beneath the outer adapter.
-                let dereferences_root = matches!(
-                    self.tcx.parent_hir_node(expr.hir_id),
-                    rustc_hir::Node::Expr(parent)
-                        if matches!(parent.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
-                );
+                let dereferences_root = self.expanded
+                    && matches!(
+                        self.tcx.parent_hir_node(expr.hir_id),
+                        rustc_hir::Node::Expr(parent)
+                            if matches!(parent.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                    );
                 let deferred = self.raw_boundary_arguments.contains(&(
                     self.fn_did,
                     hir_id,
                     expr.span.lo().0,
                     expr.span.hi().0,
-                )) || self.deferred_uses.contains(&(
-                    self.fn_did,
-                    hir_id,
-                    expr.span.lo().0,
-                    expr.span.hi().0,
-                ));
+                )) || (self.expanded
+                    && self.deferred_uses.contains(&(
+                        self.fn_did,
+                        hir_id,
+                        expr.span.lo().0,
+                        expr.span.hi().0,
+                    )));
                 if deferred && !dereferences_root {
                     let entry = self.out.entry(key).or_default();
                     entry.non_test_uses += 1;
-                    entry.sites.push(OptUseSite {
-                        hir_id: expr.hir_id,
-                        span: expr.span,
-                        operation: "deferred-boundary-or-copy",
-                    });
+                    if self.expanded {
+                        entry.sites.push(OptUseSite {
+                            hir_id: expr.hir_id,
+                            span: expr.span,
+                            operation: "deferred-boundary-or-copy",
+                        });
+                    }
                     intravisit::walk_expr(self, expr);
                     return;
                 }
@@ -1447,37 +1499,41 @@ pub(crate) fn collect_opt_uses(
                 let entry = self.out.entry(key).or_default();
                 match classified {
                     Some((edit, is_non_test)) => {
-                        entry.sites.push(OptUseSite {
-                            hir_id: expr.hir_id,
-                            span: edit.span,
-                            operation: if is_non_test {
-                                "required-dereference"
-                            } else {
-                                "null-test"
-                            },
-                        });
+                        if self.expanded {
+                            entry.sites.push(OptUseSite {
+                                hir_id: expr.hir_id,
+                                span: edit.span,
+                                operation: if is_non_test {
+                                    "required-dereference"
+                                } else {
+                                    "null-test"
+                                },
+                            });
+                        }
                         entry.rewrites.push(edit);
                         entry.non_test_uses += usize::from(is_non_test);
                     }
                     None => {
-                        let operation = match self.tcx.parent_hir_node(expr.hir_id) {
-                            rustc_hir::Node::Expr(parent) => match parent.kind {
-                                ExprKind::MethodCall(segment, _, _, _)
-                                    if SLICE_ARITHMETIC_OPS
-                                        .contains(&segment.ident.name.as_str()) =>
-                                {
-                                    "excluded-cursor"
-                                }
-                                ExprKind::Ret(_) => "handoff-return",
+                        if self.expanded {
+                            let operation = match self.tcx.parent_hir_node(expr.hir_id) {
+                                rustc_hir::Node::Expr(parent) => match parent.kind {
+                                    ExprKind::MethodCall(segment, _, _, _)
+                                        if SLICE_ARITHMETIC_OPS
+                                            .contains(&segment.ident.name.as_str()) =>
+                                    {
+                                        "excluded-cursor"
+                                    }
+                                    ExprKind::Ret(_) => "handoff-return",
+                                    _ => "handoff-use",
+                                },
                                 _ => "handoff-use",
-                            },
-                            _ => "handoff-use",
-                        };
-                        entry.sites.push(OptUseSite {
-                            hir_id: expr.hir_id,
-                            span: expr.span,
-                            operation,
-                        });
+                            };
+                            entry.sites.push(OptUseSite {
+                                hir_id: expr.hir_id,
+                                span: expr.span,
+                                operation,
+                            });
+                        }
                         entry.non_test_uses += 1;
                         if entry.unsupported.is_none() {
                             entry.unsupported = Some(expr.span);
@@ -1592,6 +1648,7 @@ pub(crate) fn collect_opt_uses(
             fat,
             raw_boundary_arguments,
             deferred_uses,
+            expanded,
         };
         v.visit_body(tcx.hir_body(body_id));
     }
@@ -1613,6 +1670,47 @@ pub(crate) fn collect_slice_uses(
     advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
     raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
 ) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
+    collect_slice_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        mutable_of,
+        advance_ok,
+        raw_boundary_arguments,
+        true,
+    )
+}
+
+/// Reuse the native slice walker with item-3 raw-boundary/cursor collection
+/// disabled, preserving the pre-family unsupported-use reason and edits.
+pub(crate) fn collect_slice_uses_before_family(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    mutable_of: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
+    collect_slice_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        mutable_of,
+        advance_ok,
+        raw_boundary_arguments,
+        false,
+    )
+}
+
+fn collect_slice_uses_with_family(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    mutable_of: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    expanded: bool,
+) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         fn_did: LocalDefId,
@@ -1625,6 +1723,7 @@ pub(crate) fn collect_slice_uses(
         /// live and handed here as one set.
         advance_ok: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
         raw_boundary_arguments: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+        expanded: bool,
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1635,7 +1734,9 @@ pub(crate) fn collect_slice_uses(
                 // Item 3: this exact operand is owned by the existing boundary
                 // planner. Its final T1/T2/R-B verdict still gates the class;
                 // the slice-use collector must not preempt it with a use wall.
-                if let Some((site, edit)) = self.raw_use(expr, key) {
+                if self.expanded
+                    && let Some((site, edit)) = self.raw_use(expr, key)
+                {
                     let entry = self.out.entry(key).or_default();
                     entry.raw_uses.push(site);
                     if let Some(edit) = edit {
@@ -1647,7 +1748,7 @@ pub(crate) fn collect_slice_uses(
                 // Classify BEFORE taking the entry: `classify` reads `self`, and
                 // holding the map entry across it would be a borrow conflict.
                 let classified = self.classify(expr, key);
-                let cursor = if classified.is_none() {
+                let cursor = if self.expanded && classified.is_none() {
                     self.cursor_use(expr, key)
                 } else {
                     None
@@ -2039,6 +2140,7 @@ pub(crate) fn collect_slice_uses(
             mutable_of,
             advance_ok,
             raw_boundary_arguments,
+            expanded,
         };
         v.visit_body(tcx.hir_body(body_id));
     }

@@ -69,6 +69,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+pub(crate) mod additive;
 pub(crate) mod apply;
 pub(crate) mod artifact;
 pub(crate) mod bridge_receipt;
@@ -81,6 +82,8 @@ pub(crate) mod sign_facts;
 pub(crate) mod use_census;
 pub(crate) mod verify;
 
+#[cfg(test)]
+mod additive_tests;
 /// **The AST application layer's bridge** — phases 1–2 of the migration back to
 /// standing decision 3. Test-only while the bar is measured; it becomes
 /// production when phase 3 ports the edit vocabulary onto it.
@@ -215,6 +218,7 @@ pub(crate) struct RawBoundaryArtifacts {
     /// R219: independent emitted-tree custody checks retain the exact decided
     /// form, including distinctions absent from the historical coarse seed.
     pub(crate) custody_expectations: Vec<DeliveryExpectation>,
+    pub(crate) additive_family_receipts: Vec<additive::FamilyFallbackReceipt>,
     pub(crate) exposure: String,
     pub(crate) d4_edges: String,
     pub(crate) pairs: String,
@@ -5579,6 +5583,66 @@ fn decide_table_perturbed_config<'tcx>(
 /// runs from one body, and a cache hit differs from a real solve **only** in
 /// where the model came from. That is what makes the byte-identity acceptance
 /// meaningful rather than a coincidence.
+fn restored_reference_copy_sites(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    constructions: &decision::construction::ConstructionFacts,
+    policy: &additive::FamilyPolicy,
+) -> Vec<decision::emitability::BodyAdapterSite> {
+    use decision::emitability::{ArgShape, BodyAdapterContext, BodyAdapterSite};
+    let mut sites = Vec::new();
+    for (destination, decided) in &table.entries {
+        let is_reference = match decided {
+            decision::Decision::Ref { .. } => true,
+            decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_)
+            | decision::Decision::Degraded(_) => false,
+        };
+        if !is_reference
+            || !policy
+                .withdrawn
+                .iter()
+                .any(|(_, owner)| owner.local_def_id() == destination.fn_did)
+        {
+            continue;
+        }
+        let node = (destination.fn_did, destination.hir_id);
+        let Some(&initializer) = constructions.init_hirs.get(&node) else { continue };
+        let expression = tcx.hir_node(initializer).expect_expr();
+        let shape = decision::emitability::classify_arg(tcx, expression);
+        let ArgShape::BareLocal(source) = shape else { continue };
+        let source_is_raw = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.fn_did == destination.fn_did && subject.hir_id == source)
+            .is_none_or(|(_, decision)| match decision {
+                decision::Decision::Degraded(_) => true,
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_) => false,
+            });
+        let typeck = tcx.typeck(destination.fn_did);
+        let exact_pointee = matches!((typeck.expr_ty(expression).kind(), typeck.node_type(destination.hir_id).kind()),
+            (TyKind::RawPtr(source, _), TyKind::RawPtr(target, _)) if source == target);
+        if !source_is_raw || !exact_pointee {
+            continue;
+        }
+        sites.push(BodyAdapterSite {
+            owner: destination.fn_did,
+            destination: destination.hir_id,
+            rhs_span: expression.span,
+            shape,
+            context: BodyAdapterContext::LocalInitializer,
+            side_effecting: false,
+        });
+    }
+    sites
+}
+
 fn finish_decide<'tcx>(
     tcx: TyCtxt<'tcx>,
     program: RustProgram<'tcx>,
@@ -5656,7 +5720,8 @@ fn finish_decide<'tcx>(
     }
 
     perturb(&mut subjects);
-    let facts = decision::emitability::collect(tcx, &program.functions);
+    let mut facts = decision::emitability::collect(tcx, &program.functions);
+    let original_body_adapters = facts.body_adapters.clone();
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
     // here in the decision phase and nowhere later — E1's rule that no phase
     // after this one asks an analysis a question.
@@ -5682,7 +5747,15 @@ fn finish_decide<'tcx>(
         .map(|s| (s.fn_did, s.hir_id))
         .collect();
     let raw_boundary_argument_paths = facts.raw_boundary_argument_paths();
-    let slice_uses = decision::emitability::collect_slice_uses(
+    let full_slice_uses = decision::emitability::collect_slice_uses(
+        tcx,
+        &program.functions,
+        &names,
+        &mutable_of,
+        &advance_ok,
+        &raw_boundary_argument_paths,
+    );
+    let prior_slice_uses = decision::emitability::collect_slice_uses_before_family(
         tcx,
         &program.functions,
         &names,
@@ -5727,7 +5800,7 @@ fn finish_decide<'tcx>(
         .filter(|s| fat.is_array(s.fn_did, s.local))
         .map(|s| (s.fn_did, s.hir_id))
         .collect();
-    let opt_deferred_uses = slice_uses
+    let opt_deferred_uses = full_slice_uses
         .iter()
         .flat_map(|(node, uses)| {
             uses.raw_uses
@@ -5736,11 +5809,58 @@ fn finish_decide<'tcx>(
                 .map(move |site| (node.0, node.1, site.span.lo().0, site.span.hi().0))
         })
         .collect();
-    let opt_uses = decision::emitability::collect_opt_uses(
+    let provisional_opt_uses = decision::emitability::collect_opt_uses(
         tcx,
         &program.functions,
         &names,
         &opt_accessors,
+        &opt_fat,
+        &raw_boundary_argument_paths,
+        &opt_deferred_uses,
+    );
+
+    let prior_opt_uses = decision::emitability::collect_opt_uses_before_family(
+        tcx,
+        &program.functions,
+        &names,
+        &opt_accessors,
+        &opt_fat,
+        &raw_boundary_argument_paths,
+        &opt_deferred_uses,
+    );
+    // Core keeps the predecessor's raw-path multiplicity rule. The expanded
+    // family counts its own deferrals/assignments before choosing reborrows.
+    let current_opt_accessors = subjects
+        .iter()
+        .filter_map(|subject| {
+            let name = subject.param_name.as_ref()?;
+            let node = (subject.fn_did, subject.hir_id);
+            let repeated = subject.mutable
+                && provisional_opt_uses
+                    .get(&node)
+                    .is_some_and(|uses| uses.non_test_uses > 1);
+            Some((
+                node,
+                decision::emitability::Accessor {
+                    deref: if repeated {
+                        format!("*{name}.as_mut().unwrap()")
+                    } else {
+                        format!("{name}.unwrap()")
+                    },
+                    index: if repeated {
+                        format!("{name}.as_mut().unwrap()")
+                    } else {
+                        format!("{name}.unwrap()")
+                    },
+                },
+            ))
+        })
+        .collect();
+    let full_opt_uses = decision::emitability::collect_opt_uses(
+        tcx,
+        &program.functions,
+        &names,
+        &current_opt_accessors,
         &opt_fat,
         &raw_boundary_argument_paths,
         &opt_deferred_uses,
@@ -5794,13 +5914,29 @@ fn finish_decide<'tcx>(
     // task 2 only.** Production has passed `LiftAdaptable` since S3.6-1 and the
     // `BlockAll` variant was deleted at M-3 (X-3). Task 3 is where the verdict
     // reaches a gate.
-    let mut option_fallbacks = rustc_hash::FxHashMap::default();
-    let mut fallback_receipts = Vec::new();
+    let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
+    let mut predecessor: Option<additive::StageSnapshot> = None;
+    let mut retired = additive::RetiredReceipts::default();
+    let mut family_receipts = Vec::new();
     let original_c9_plans = retained_c9_plans.clone();
     loop {
         retained_c9_plans = original_c9_plans.clone();
+        facts.body_adapters = original_body_adapters.clone();
+        let slice_uses = additive::select_uses(
+            &full_slice_uses,
+            &prior_slice_uses,
+            &family_policy,
+            additive::FamilyStage::SliceUse,
+        );
+        let opt_uses = additive::select_uses(
+            &full_opt_uses,
+            &prior_opt_uses,
+            &family_policy,
+            additive::FamilyStage::Option,
+        );
         let ctx_of = |gate, coconv, lifetime_eligibility, raw_boundary, exposure| decision::Ctx {
             tcx,
+            family_policy: &family_policy,
             model: &model,
             slots: &slots,
             facts: &facts,
@@ -5818,7 +5954,7 @@ fn finish_decide<'tcx>(
             exposure,
         };
 
-        let hypothetical = decision::decide_with_raw_fallbacks(
+        let hypothetical = decision::decide(
             &ctx_of(
                 decision::RefGate::LiftAdaptable,
                 None,
@@ -5827,7 +5963,6 @@ fn finish_decide<'tcx>(
                 Some(&preliminary_exposure),
             ),
             &subjects,
-            &option_fallbacks,
         );
         // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
         // report, so `build` consumes them rather than the census reading them
@@ -5846,7 +5981,7 @@ fn finish_decide<'tcx>(
             fnptr_web_wall_s,
             &preliminary_exposure,
         );
-        let e2_hypothetical = decision::decide_with_raw_fallbacks(
+        let e2_hypothetical = decision::decide(
             &ctx_of(
                 decision::RefGate::LiftAdaptable,
                 None,
@@ -5855,7 +5990,6 @@ fn finish_decide<'tcx>(
                 Some(&preliminary_exposure),
             ),
             &subjects,
-            &option_fallbacks,
         );
         let converting_signature_functions = e2_hypothetical
             .entries
@@ -5918,7 +6052,7 @@ fn finish_decide<'tcx>(
         // with the class verdict in hand: the adaptable population passes the
         // `referenced` gate, and the class gate then governs every node uniformly.
         // The pinned population still blocks inside `LiftAdaptable`.
-        let mut table = decision::decide_with_raw_fallbacks(
+        let mut table = decision::decide(
             &ctx_of(
                 decision::RefGate::LiftAdaptable,
                 Some(&coconv),
@@ -5927,7 +6061,6 @@ fn finish_decide<'tcx>(
                 Some(&candidate_exposure),
             ),
             &subjects,
-            &option_fallbacks,
         );
         // Surface policies are provisional until the full ladder settles. A raw
         // wrapper or entry shim exists only when at least one signature subject
@@ -5975,6 +6108,18 @@ fn finish_decide<'tcx>(
         // subject, including the nesting pass above: a seam is computed from the
         // forms both ends actually settle on, so a subject withdrawn later would
         // leave glue bridging to a form that no longer exists.
+        // A family rollback may restore a copied source to raw while its
+        // scalar-reference destination remains admitted. Reuse the existing
+        // typed body-glue path for that exact initializer and pointee.
+        for site in restored_reference_copy_sites(tcx, &table, &ctors, &family_policy) {
+            if !facts.body_adapters.iter().any(|old| {
+                old.owner == site.owner
+                    && old.destination == site.destination
+                    && old.rhs_span == site.rhs_span
+            }) {
+                facts.body_adapters.push(site);
+            }
+        }
         let seam_started = std::time::Instant::now();
         table.seams = decision::seam::synthesize_with_raw_boundary(
             tcx,
@@ -6042,7 +6187,7 @@ fn finish_decide<'tcx>(
             table.option_receipts,
             table.option_value_initializers,
             table.option_composed_uses,
-        ) = decision::option::plan_values(tcx, &mut table, &ctors, &opt_uses);
+        ) = decision::option::plan_values(tcx, &mut table, &ctors, &opt_uses, &family_policy);
         table.slice_use_receipts = decision::slice_use::receipt_plans(
             &program,
             &mut table,
@@ -6050,6 +6195,7 @@ fn finish_decide<'tcx>(
             &raw_boundary,
             &retention,
             &mut_facts,
+            &family_policy,
         );
         let option_operations = decision::option::plan_operations(
             &program,
@@ -6059,6 +6205,7 @@ fn finish_decide<'tcx>(
             &slice_uses,
             &retention,
             &mut_facts,
+            &family_policy,
         );
         table.option_receipts.extend(option_operations);
         for (subject, decision) in &table.entries {
@@ -6166,7 +6313,7 @@ fn finish_decide<'tcx>(
             };
         }
         table.slice_constructions =
-            decision::construction::plan_slice_constructions(tcx, &table, &ctors);
+            decision::construction::plan_slice_constructions(tcx, &table, &ctors, &family_policy);
         append_surface_declaration_plans(tcx, &exposure, &mut table);
         append_inferred_local_declaration_plans(tcx, &mut table);
         table.c9_marks = retained_c9_plans.clone();
@@ -6182,57 +6329,66 @@ fn finish_decide<'tcx>(
             &rustc_hash::FxHashSet::default(),
             &retained_c9_plans,
         )?;
-        let requests = plan::additive_option_fallbacks(&table, &prepared.plan);
-        if !requests.is_empty() {
-            let old_count = option_fallbacks.len();
-            for (index, prior_reason) in requests {
-                let mut receipt = prepared.plan.option_receipt_plans[index].clone();
-                let subject_key = &receipt.obligation.planned.key.subject;
-                let (subject, _) = table
-                    .entries
-                    .iter()
-                    .find(|(subject, _)| {
-                        *subject_key
-                            == mechanical_receipt::MechanicalSubjectKey::Local {
-                                owner: subject.fn_did,
-                                mir_local: subject.local.as_u32(),
-                                slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
-                            }
-                    })
-                    .expect("class fallback retains its subject");
-                option_fallbacks.insert((subject.fn_did, subject.hir_id), prior_reason.clone());
-                let cause = receipt
-                    .obligation
-                    .intended_terminal_reason
-                    .as_ref()
-                    .map_or_else(
-                        || "unsatisfied-site".to_owned(),
-                        mechanical_receipt::MechanicalTerminalReason::key,
+        let candidate = additive::StageSnapshot {
+            table: table.clone(),
+            plan: prepared.plan.clone(),
+        };
+        if let Some(prior) = &predecessor {
+            // No soundness withdrawal is registered by this mechanical repair.
+            // A future registration must prove its exact prior mis-rendering.
+            let requests = additive::withdrawals(prior, &candidate, &family_policy, &[]);
+            if !requests.is_empty() {
+                let old_count = family_policy.withdrawn.len();
+                for request in &requests {
+                    retired.capture(prior, &candidate, request, family_policy.stage);
+                    let owner = tcx.def_path_str(request.owner.local_def_id().to_def_id());
+                    let mut subject_rows = Vec::new();
+                    for (subject, current) in &table.entries {
+                        if subject.fn_did != request.owner.local_def_id() {
+                            continue;
+                        }
+                        let old = prior
+                            .table
+                            .entries
+                            .iter()
+                            .find(|(s, _)| s.fn_did == subject.fn_did && s.hir_id == subject.hir_id)
+                            .map(|(_, d)| decision::seam::form_of(d).key().to_owned())
+                            .unwrap_or_else(|| "absent".to_owned());
+                        subject_rows.push((
+                            subject.identity_key(&owner),
+                            old,
+                            decision::seam::form_of(current).key().to_owned(),
+                        ));
+                    }
+                    family_receipts.push(additive::FamilyFallbackReceipt {
+                        family: format!("{:?}", family_policy.stage),
+                        owner_local_def_id: request.owner.order_key(),
+                        owner_path: owner,
+                        cause: request.cause.clone(),
+                        subjects: subject_rows,
+                    });
+                    family_policy
+                        .withdrawn
+                        .insert((family_policy.stage, request.owner));
+                }
+                if family_policy.withdrawn.len() <= old_count {
+                    return Err(
+                        "additive-family-fallback-invariant:no-strict-transaction-progress"
+                            .to_owned(),
                     );
-                receipt.source_form = "raw".to_owned();
-                receipt.obligation.planned.found_form = "raw".to_owned();
-                receipt.obligation.intended_terminal_state =
-                    mechanical_receipt::MechanicalState::Reclassified;
-                receipt.obligation.intended_terminal_reason = Some(
-                    mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(format!(
-                        "additive-family-fallback:{};site-cause={cause}",
-                        prior_reason.key()
-                    )),
-                );
-                receipt.adapter = format!("prior-raw-disposition:{}", prior_reason.key());
-                fallback_receipts.push(receipt);
+                }
+                continue;
             }
-            if option_fallbacks.len() <= old_count || option_fallbacks.len() > subjects.len() {
-                return Err(
-                    "additive-family-fallback-invariant:no-strict-subject-progress".to_owned(),
-                );
+            if let Some(error) = additive::preservation_error(prior, &candidate, &[]) {
+                return Err(error);
             }
-            // Rebuild all dependent forms, lifetime plans, C/PAIR/raw adapters and
-            // receipts from the same frozen inputs. No solve or cache operation
-            // lies inside this finite, monotonically growing fallback loop.
+        }
+        if let Some(next) = family_policy.stage.next() {
+            predecessor = Some(candidate);
+            family_policy.stage = next;
             continue;
         }
-        table.option_receipts.extend(fallback_receipts);
+        retired.append(&mut table, &prepared.plan);
         // output.
         if let Err(why) = table.is_self_consistent_over(&subjects) {
             return Err(format!("decision table self-consistency: {why}"));
@@ -6254,6 +6410,7 @@ fn finish_decide<'tcx>(
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
             custody_expectations: Vec::new(),
+            additive_family_receipts: family_receipts,
             exposure: exposure.receipts_tsv(),
             d4_edges: coconv.edge_receipts_tsv(tcx, &subjects),
             pairs: coconv.pair_receipts_tsv(tcx),

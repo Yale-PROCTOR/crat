@@ -12169,22 +12169,90 @@ fn slu_w1_shared_to_mut_view_requires_negative_write_evidence() {
     // The alias keeps this callee's declaration in item 5's held family;
     // direct dereferencing supplies actual Foster read/write evidence.
     let writing = input.replace("{ *q }", "{ *q = 7; 0 }");
-    let artifacts = ::utils::compilation::run_compiler_on_str(&writing, |tcx| {
-        super::raw_boundary_trace_artifacts(tcx).expect("R-B writing trace")
+    let (artifacts, retired) = ::utils::compilation::run_compiler_on_str(&writing, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx(tcx).expect("R-B writing trace");
+        (ctx.raw_boundary_artifacts, table.slice_use_receipts)
     })
     .expect("R-B writing fixture compiles");
     assert!(
-        artifacts
-            .dispositions
-            .contains("raw-boundary-shared-to-mut"),
+        artifacts.dispositions.contains("raw-cast-mut"),
         "{}",
         artifacts.dispositions
+    );
+    // R220 restores the predecessor's raw slot. The missing R-B evidence is
+    // retained on the withdrawn safe-slice obligation, not its final raw cast.
+    let rejected = retired
+        .iter()
+        .find(|plan| {
+            plan.obligation.planned.evidence.negative_write
+                == super::mechanical_receipt::NegativeWriteEvidence::Missing
+        })
+        .expect("retired shared-to-mut evidence");
+    slu_r220_assert_retired_use_cause(
+        rejected,
+        super::mechanical_receipt::MechanicalTerminalReason::RbNegativeWriteAbsent,
+    );
+    assert!(
+        rejected
+            .boundary_evidence
+            .contains("raw-boundary-shared-to-mut")
     );
     let emitted = ast_emitted_source_of(&writing).expect("R-B writing hold");
     assert!(
         emitted.contains("p: *const i32"),
         "writing through a shared slice was admitted: {emitted}"
     );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "R-B raw fallback output compiles: {emitted}"
+    );
+}
+
+fn slu_r220_assert_retired_use_cause(
+    plan: &super::mechanical_receipt::SliceUseReceiptPlan,
+    cause: super::mechanical_receipt::MechanicalTerminalReason,
+) {
+    use super::mechanical_receipt::{MechanicalFamily, MechanicalState, MechanicalTerminalReason};
+    assert_eq!(
+        plan.obligation.planned.key.family,
+        MechanicalFamily::SliceUseUnsupported
+    );
+    assert_eq!(
+        plan.obligation.intended_terminal_state,
+        MechanicalState::Reclassified
+    );
+    assert_eq!(
+        plan.obligation.intended_terminal_reason,
+        Some(MechanicalTerminalReason::EvidenceMissing(format!(
+            "additive-family-fallback:slice-use-unsupported;site-cause={}",
+            cause.key(),
+        )))
+    );
+    let (events, rows) = plan.materialize(false, false);
+    super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
+        .expect("retired slice-use common/specialized join");
+    if plan.source_form != plan.candidate_form {
+        let mut bad_events = events.clone();
+        let mut bad_rows = rows.clone();
+        bad_events[1].state = MechanicalState::Applied;
+        bad_events[1].terminal_reason = None;
+        bad_rows[1].terminal.state = MechanicalState::Applied;
+        bad_rows[1].terminal.reason = None;
+        assert!(
+            super::mechanical_receipt::reconcile_slice_use_rows(&bad_rows, &bad_events).is_err(),
+            "a differing source/candidate pair cannot masquerade as applied"
+        );
+        bad_events[1].state = MechanicalState::Reclassified;
+        bad_events[1].terminal_reason = Some(MechanicalTerminalReason::EvidenceMissing(
+            "unrelated".to_owned(),
+        ));
+        bad_rows[1].terminal.state = MechanicalState::Reclassified;
+        bad_rows[1].terminal.reason = bad_events[1].terminal_reason.clone();
+        assert!(
+            super::mechanical_receipt::reconcile_slice_use_rows(&bad_rows, &bad_events).is_err(),
+            "retirement needs its exact typed fallback provenance"
+        );
+    }
 }
 
 #[test]
@@ -12216,7 +12284,7 @@ fn slu_w1_positive_retention_stays_held() {
         pub unsafe fn target(p: *const i32) -> i32 {\n\
             let value = *p.offset(1); raw_keep(p); value\n\
         }\n";
-    let (artifacts, emitted) = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+    let (artifacts, retired, emitted) = ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx)?;
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
             crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
@@ -12230,18 +12298,38 @@ fn slu_w1_positive_retention_stays_held() {
             tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
             Some(&emission.plan.terminal_a5_raw_calls),
         )?;
-        Ok::<_, String>((ctx.raw_boundary_artifacts, files.into_values().next().expect("retention fixture root")))
+        Ok::<_, String>((ctx.raw_boundary_artifacts, table.slice_use_receipts, files.into_values().next().expect("retention fixture root")))
     }).expect("retention fixture compiles").expect("attested retention emission");
     assert!(
         artifacts
             .dispositions
-            .contains("raw-boundary-positive-retention"),
+            .contains("raw-boundary-subject-not-safe"),
         "{}",
         artifacts.dispositions
+    );
+    // R220 keeps the retained source raw and carries the positive-retention
+    // finding on the retired safe-form obligation.
+    let rejected = retired
+        .iter()
+        .find(|plan| {
+            plan.retention == super::mechanical_receipt::MechanicalRetention::PositiveRetention
+        })
+        .expect("retired positive-retention evidence");
+    slu_r220_assert_retired_use_cause(
+        rejected,
+        super::mechanical_receipt::MechanicalTerminalReason::PositiveRetention,
+    );
+    assert_eq!(
+        rejected.obligation.planned.evidence.retention,
+        super::mechanical_receipt::MechanicalRetention::PositiveRetention
     );
     assert!(
         emitted.contains("p: *const i32"),
         "positive retention admitted: {emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "retained raw fallback output compiles: {emitted}"
     );
 }
 
@@ -12434,7 +12522,10 @@ fn opt_r213_reference_assignment_wraps_some_and_null_store_is_none() {
 
 #[test]
 fn opt_r213_pointer_distance_cast_preserves_operand_pointee() {
-    let input = "#![allow(unused_assignments)] pub unsafe fn target(mut p: *const i32) -> isize { let mut base: *const i32 = 0 as *const i32; base = p; while *p != 0 { p = p.offset(1); } (p as *const u8).offset_from(base as *const u8) }";
+    // R220 retires the original fixture's independent intra-class overlap.
+    // Exercise the actual Option distance carrier without that assignment/
+    // cursor composition, while retaining the original fallback contrast below.
+    let input = "pub unsafe fn target(base: *const i32, other: *const u8) -> isize { if base.is_null() { return 0; } let _ = *base.offset(1); (base as *const u8).offset_from(other) }";
     let view = ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (table, ctx) = super::decide_table_with_ctx(tcx).unwrap();
         let (subject, decision) = table
@@ -12466,8 +12557,6 @@ fn opt_r213_pointer_distance_cast_preserves_operand_pointee() {
             .unwrap()
             .replacement
             .clone();
-        // Preserve the independent class-composition hold while checking
-        // the selected Option carrier's pointee preservation.
         let emission = emit_files(
             tcx,
             &table,
@@ -12477,10 +12566,15 @@ fn opt_r213_pointer_distance_cast_preserves_operand_pointee() {
         .unwrap();
         let hold = emission
             .plan
-            .class_hold_reason(super::bridge_receipt::SignatureClassId::of(subject.fn_did))
-            .unwrap();
-        assert_eq!(hold, "intra-class-interval-overlap");
-        eprintln!("R213 cast carrier: {view}; terminal hold: {hold}");
+            .class_hold_reason(super::bridge_receipt::SignatureClassId::of(subject.fn_did));
+        assert!(
+            hold.is_none(),
+            "positive carrier must reach a ready class: {hold:?}"
+        );
+        assert!(
+            view.contains("null::<i32>()"),
+            "the None arm lost its source pointee: {view}"
+        );
         view
     })
     .unwrap();
@@ -12493,10 +12587,27 @@ fn opt_r213_pointer_distance_cast_preserves_operand_pointee() {
         verify::type_checks_str(&companion),
         "R213 selected nullable cast view must type/borrow check: {companion}"
     );
-    let emitted = ast_emitted_source_of(input).unwrap();
+    let positive = ast_emitted_source_of(input).expect("positive Option distance emission");
+    assert!(positive.contains("base: Option<&[i32]>"), "{positive}");
+    assert!(
+        verify::type_checks_str(&positive),
+        "positive Option distance output compiles: {positive}"
+    );
+    let fallback_input = "#![allow(unused_assignments)] pub unsafe fn target(mut p: *const i32) -> isize { let mut base: *const i32 = 0 as *const i32; base = p; while *p != 0 { p = p.offset(1); } (p as *const u8).offset_from(base as *const u8) }";
+    let observed = decisions_of(fallback_input);
+    assert_eq!(
+        reason_of(&observed, "base", false),
+        "null-init",
+        "{observed:?}"
+    );
+    let emitted = ast_emitted_source_of(fallback_input).unwrap();
     assert!(
         !emitted.contains("Option<"),
-        "independent class-composition hold must survive: {emitted}"
+        "independent composition failure must retain its predecessor: {emitted}"
+    );
+    assert!(
+        verify::type_checks_str(&emitted),
+        "original distance raw fallback compiles: {emitted}"
     );
 }
 
@@ -12630,13 +12741,13 @@ fn slu_r210_other_safe_destination_stays_held() {
         copy.target_form, "ref-shared",
         "fixture must select the different safe destination"
     );
-    assert_eq!(
-        copy.obligation.intended_terminal_reason,
-        Some(
-            super::mechanical_receipt::MechanicalTerminalReason::SliceUseDestinationUnbuilt(
-                "ref-shared".to_owned()
-            )
-        )
+    // R220 retires the unbuilt destination site without dropping the earlier
+    // delivered rendering; its precise destination refusal remains receipted.
+    slu_r220_assert_retired_use_cause(
+        copy,
+        super::mechanical_receipt::MechanicalTerminalReason::SliceUseDestinationUnbuilt(
+            "ref-shared".to_owned(),
+        ),
     );
     assert_ne!(copy.adapter, "body-slice-raw-view");
     let (events, rows) = copy.materialize(false, false);
@@ -12645,6 +12756,11 @@ fn slu_r210_other_safe_destination_stays_held() {
     assert!(
         super::mechanical_receipt::render_slice_use_rows(&rows)
             .contains("slice-use-destination-unbuilt:ref-shared")
+    );
+    let emitted = ast_emitted_source_of(input).expect("destination fallback emission");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "destination fallback output compiles: {emitted}"
     );
 }
 
@@ -12719,6 +12835,7 @@ fn slu_r210_settled_option_destinations_use_same_form_or_typed_hold() {
             }
             table.slice_use_receipts = super::decision::slice_use::receipt_plans(
                 &program, &mut table, &uses, &ctx.raw_boundary, &ctx.retention, &ctx.mut_facts,
+                &super::additive::FamilyPolicy::at(super::additive::FamilyStage::Option),
             );
             let copy = table.slice_use_receipts.iter().find(|plan| {
                 plan.obligation.planned.source_shape == "body-copy"
@@ -12762,19 +12879,30 @@ fn slu_r210_local_copy_to_field_has_a_positive_retention_hold() {
         table.entries.iter().any(|(subject, decision)| {
             subject.param_name.as_deref() == Some("p")
                 && matches!(subject.kind, super::decision::SubjectKind::Local)
-                && matches!(decision, super::decision::Decision::Slice { .. })
+                && matches!(decision, super::decision::Decision::Degraded(record)
+                    if record.reason == super::decision::DegradeReason::SliceUseUnsupported)
         }),
-        "the source must actually be an admitted local slice: {:?}",
+        "R220 must restore the predecessor raw local: {:?}",
         table.entries
     );
+    for name in ["src", "out"] {
+        assert!(
+            table.entries.iter().any(|(subject, decision)| {
+                subject.param_name.as_deref() == Some(name)
+                    && matches!(decision, super::decision::Decision::Ref { .. })
+            }),
+            "the earlier delivered neighbor {name} was lost: {:?}",
+            table.entries
+        );
+    }
     let copy = table
         .slice_use_receipts
         .iter()
         .find(|plan| plan.obligation.planned.source_shape == "body-copy")
         .expect("nonvacuous local-copy receipt");
-    assert_eq!(
-        copy.obligation.intended_terminal_reason,
-        Some(super::mechanical_receipt::MechanicalTerminalReason::PositiveRetention)
+    slu_r220_assert_retired_use_cause(
+        copy,
+        super::mechanical_receipt::MechanicalTerminalReason::PositiveRetention,
     );
     assert_eq!(
         copy.retention,
@@ -12784,6 +12912,16 @@ fn slu_r210_local_copy_to_field_has_a_positive_retention_hold() {
     let (events, rows) = copy.materialize(false, false);
     super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
         .expect("local-retention hold join");
+    assert_eq!(
+        copy.obligation.planned.evidence.retention,
+        super::mechanical_receipt::MechanicalRetention::PositiveRetention
+    );
+    assert_eq!(copy.boundary_evidence, "copied-local-destination-retains");
+    let emitted = ast_emitted_source_of(input).expect("local retained-copy fallback emission");
+    assert!(
+        verify::type_checks_str(&emitted),
+        "local retained-copy fallback compiles: {emitted}"
+    );
 }
 
 fn opt_w1_assert_receipted(
@@ -13331,6 +13469,7 @@ fn opt_w1_exact_span_composition_keeps_the_completed_option_value() {
             &mut table,
             &ctx.constructions,
             &rustc_hash::FxHashMap::default(),
+            &super::additive::FamilyPolicy::at(super::additive::FamilyStage::Option),
         );
         let emission = emit_files(
             tcx,

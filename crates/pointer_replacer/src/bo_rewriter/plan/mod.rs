@@ -1641,7 +1641,7 @@ pub(crate) fn plan(
     let mut unplaceable = Vec::new();
     let mut preclass_sites = Vec::new();
     let mut a5_receipt_plans = Vec::new();
-    let mut slice_construction_receipt_plans = Vec::new();
+    let mut slice_construction_receipt_plans = table.retired_slice_constructions.clone();
     let slice_use_receipt_plans = table.slice_use_receipts.clone();
     let option_receipt_plans = table.option_receipts.clone();
     let unowned_a5_proof_sites = table
@@ -3193,6 +3193,7 @@ mod tests {
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
+            retired_slice_constructions: Vec::new(),
             slice_use_receipts: Vec::new(),
             option_receipts: Vec::new(),
             option_value_initializers: Vec::new(),
@@ -3254,6 +3255,7 @@ mod tests {
             lifetime_plan: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
+            retired_slice_constructions: Vec::new(),
             slice_use_receipts: Vec::new(),
             option_receipts: Vec::new(),
             option_value_initializers: Vec::new(),

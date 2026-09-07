@@ -7,7 +7,10 @@ use rustc_hir::{ExprKind, HirId, QPath, def::Res, def_id::LocalDefId};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 
-use super::{Decision, DecisionTable, Subject, SubjectKind, construction, emitability, seam};
+use super::{
+    super::additive::{FamilyPolicy, FamilyStage},
+    Decision, DecisionTable, Subject, SubjectKind, construction, emitability, seam,
+};
 use crate::bo_rewriter::{bridge_receipt::SignatureClassId, mechanical_receipt::*};
 
 fn source_binding(mut expression: &rustc_hir::Expr<'_>) -> Option<HirId> {
@@ -84,7 +87,9 @@ pub(crate) fn inherit_wrapped_payloads(
     let thin_options = entries
         .iter()
         .filter(|(subject, decision)| {
-            matches!(subject.kind, SubjectKind::Local)
+            ctx.family_policy
+                .enabled(subject.fn_did, FamilyStage::Option)
+                && matches!(subject.kind, SubjectKind::Local)
                 && match decision {
                     Decision::Opt { slice: false, .. } => true,
                     Decision::Ref { .. }
@@ -114,7 +119,8 @@ pub(crate) fn inherit_wrapped_payloads(
     // Every successful round removes at least one thin Option candidate.
     for _ in 0..thin_options {
         let candidates = entries.iter().enumerate().filter_map(|(index, (subject, decision))| {
-            if !matches!(subject.kind, SubjectKind::Local) {
+            if !ctx.family_policy.enabled(subject.fn_did, FamilyStage::Option)
+                || !matches!(subject.kind, SubjectKind::Local) {
                 return None;
             }
             let mutable = match decision {
@@ -292,6 +298,7 @@ pub(crate) fn plan_values(
     table: &mut DecisionTable,
     constructions: &construction::ConstructionFacts,
     uses: &FxHashMap<(LocalDefId, HirId), emitability::OptUses>,
+    family_policy: &FamilyPolicy,
 ) -> (
     Vec<OptionPresentationReceiptPlan>,
     Vec<(LocalDefId, HirId)>,
@@ -307,6 +314,9 @@ pub(crate) fn plan_values(
         .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
         .collect();
     for (subject, decision) in &table.entries {
+        if !family_policy.enabled(subject.fn_did, FamilyStage::Option) {
+            continue;
+        }
         let (mutable, slice) = match decision {
             Decision::Opt { mutable, slice, .. } => (*mutable, *slice),
             Decision::Ref { .. }
@@ -597,6 +607,7 @@ pub(crate) fn plan_operations(
     slice_uses: &FxHashMap<(LocalDefId, HirId), emitability::SliceUses>,
     retention: &super::raw_boundary::RetentionSummaries,
     mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
+    family_policy: &FamilyPolicy,
 ) -> Vec<OptionPresentationReceiptPlan> {
     use super::raw_boundary::{self, RawMutability, RetentionVerdict};
     use crate::bo_rewriter::bridge_receipt::BridgeRetentionTier;
@@ -604,6 +615,9 @@ pub(crate) fn plan_operations(
     let mut out = Vec::new();
     let mut body_edits = Vec::new();
     for (subject, decision) in &table.entries {
+        if !family_policy.enabled(subject.fn_did, FamilyStage::Option) {
+            continue;
+        }
         let source = match decision {
             Decision::Opt { mutable, slice, .. } => seam::Form::Opt {
                 mutable: *mutable,
@@ -982,6 +996,9 @@ pub(crate) fn plan_operations(
         .iter()
         .filter(|edit| edit.spec.null_arm == seam::NullArm::LiteralNone)
     {
+        if !family_policy.enabled(edit.owner_class.local_def_id(), FamilyStage::Option) {
+            continue;
+        }
         let crate::bo_rewriter::bridge_receipt::BridgeCalleeId::Local(callee) = edit.bridge.callee
         else {
             continue;

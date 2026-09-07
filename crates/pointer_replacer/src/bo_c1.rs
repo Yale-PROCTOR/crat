@@ -11135,6 +11135,10 @@ mod run {
         // expectations and parser observations remain independently auditable.
         for (suffix, payload) in [
             (
+                "additive-family-fallbacks",
+                serde_json::json!({"stamp": &custody_stamp, "transactions": &artifact.additive_family_receipts}),
+            ),
+            (
                 "delivery-expectations",
                 serde_json::json!({"stamp": &custody_stamp, "expectations": &artifact.custody_expectations}),
             ),

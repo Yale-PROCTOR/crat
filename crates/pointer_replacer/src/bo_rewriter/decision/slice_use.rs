@@ -6,7 +6,11 @@ use rustc_hash::FxHashMap;
 use rustc_hir::{HirId, def_id::LocalDefId};
 use rustc_middle::ty::TyCtxt;
 
-use super::{Arm, Decision, DecisionTable, SubjectKind, emitability, raw_boundary, seam::Form};
+use super::{
+    super::additive::{FamilyPolicy, FamilyStage},
+    Arm, Decision, DecisionTable, SubjectKind, emitability, raw_boundary,
+    seam::Form,
+};
 use crate::bo_rewriter::{
     bridge_receipt::SignatureClassId,
     mechanical_receipt::{
@@ -138,11 +142,15 @@ pub(crate) fn receipt_plans(
     raw: &raw_boundary::RawBoundaryDispositionIndex,
     retention_summaries: &raw_boundary::RetentionSummaries,
     mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
+    family_policy: &FamilyPolicy,
 ) -> Vec<SliceUseReceiptPlan> {
     let tcx = program.tcx;
     let mut plans = Vec::new();
     let mut body_edits = Vec::new();
     for (subject, decision) in &table.entries {
+        if !family_policy.enabled(subject.fn_did, FamilyStage::SliceUse) {
+            continue;
+        }
         let mut cursor_only = false;
         let source = match decision {
             Decision::Slice { mutable, .. } => Form::Slice { mutable: *mutable },
