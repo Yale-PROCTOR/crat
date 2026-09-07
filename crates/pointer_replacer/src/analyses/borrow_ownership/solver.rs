@@ -12,6 +12,10 @@ use z3::{Model, Optimize, SatResult, Solver, ast::Bool};
 use super::{
     SlotKind,
     crate_slots::CrateSlots,
+    demand_evidence::{
+        self, ConstructionId, EndpointKey, EpochId, EventId, FinalSelection, QueryEvent,
+        QueryOutcome, QueryPhase,
+    },
     l2::{
         CommitAction, CommitActionKind, GUARDED_COMMIT_CORE_FAMILY,
         RECURRENCE_ESCALATION_CORE_FAMILY,
@@ -409,6 +413,17 @@ pub(crate) fn with_selector_trace<T>(f: impl FnOnce() -> T) -> (T, SelectorTrace
     (output, trace)
 }
 
+struct DemandCapture {
+    construction: ConstructionId,
+    endpoints: Vec<EndpointKey>,
+    selectors: Vec<Bool>,
+    next_epoch: u32,
+    epoch: Option<EpochId>,
+    next_event: u32,
+    last_event: Option<EventId>,
+    query: Option<(QueryPhase, Option<usize>)>,
+}
+
 pub struct KindSolver {
     solver: Optimize,
     vars: FxHashMap<SlotRef, KindVars>,
@@ -423,6 +438,7 @@ pub struct KindSolver {
     optimize_materialization_elapsed: Cell<Duration>,
     mandatory_scope_lengths: RefCell<Vec<usize>>,
     round_model_failure: RefCell<Option<RoundModelFailure>>,
+    demand_capture: RefCell<Option<DemandCapture>>,
 }
 
 /// R1a's private hard-query backend. It snapshots only `Optimize`'s hard
@@ -671,7 +687,158 @@ impl KindSolver {
             optimize_materialization_elapsed: Cell::new(Duration::ZERO),
             mandatory_scope_lengths: RefCell::new(Vec::new()),
             round_model_failure: RefCell::new(None),
+            demand_capture: RefCell::new(None),
         }
+    }
+
+    /// Bind recording to this solver's actual construction, never to the last
+    /// constructor that happened to run on the thread.
+    pub(crate) fn set_demand_capture(&self, construction: Option<ConstructionId>) {
+        *self.demand_capture.borrow_mut() = construction.map(|construction| DemandCapture {
+            construction,
+            endpoints: demand_evidence::endpoint_keys(construction)
+                .expect("registered demand construction"),
+            selectors: Vec::new(),
+            next_epoch: 0,
+            epoch: None,
+            next_event: 0,
+            last_event: None,
+            query: None,
+        });
+    }
+
+    fn begin_demand_epoch(&self, selectors: &Selectors) {
+        let mut capture = self.demand_capture.borrow_mut();
+        let Some(capture) = capture.as_mut() else { return };
+        assert_eq!(
+            capture.endpoints.len(),
+            selectors.all().len(),
+            "bound endpoint universe"
+        );
+        capture.selectors = selectors.all().to_vec();
+        capture.epoch = Some(EpochId {
+            construction: capture.construction,
+            ordinal: capture.next_epoch,
+        });
+        capture.next_epoch = capture
+            .next_epoch
+            .checked_add(1)
+            .expect("demand epoch ordinal");
+        capture.next_event = 0;
+        capture.last_event = None;
+        capture.query = None;
+    }
+
+    fn demand_query_pending(&self) -> bool {
+        self.demand_capture
+            .borrow()
+            .as_ref()
+            .is_some_and(|capture| capture.query.is_some())
+    }
+
+    fn prepare_demand_query(&self, phase: QueryPhase, candidate: Option<usize>) {
+        if let Some(capture) = self.demand_capture.borrow_mut().as_mut()
+            && capture.epoch.is_some()
+        {
+            capture.query = Some((phase, candidate));
+        }
+    }
+
+    fn note_demand_query(
+        &self,
+        active: &[Bool],
+        outcome: SatResult,
+        core: &[Bool],
+        reason: Option<String>,
+    ) {
+        let mut bound = self.demand_capture.borrow_mut();
+        let Some(capture) = bound.as_mut() else { return };
+        let Some((phase, candidate)) = capture.query.take() else { return };
+        let epoch = capture.epoch.expect("query epoch");
+        let id = EventId {
+            epoch,
+            ordinal: capture.next_event,
+        };
+        capture.next_event = capture
+            .next_event
+            .checked_add(1)
+            .expect("demand event ordinal");
+        capture.last_event = Some(id);
+        let endpoint = |literal: &Bool| {
+            capture
+                .selectors
+                .iter()
+                .position(|known| known == literal)
+                .map(|index| capture.endpoints[index].clone())
+        };
+        let core_endpoints: Vec<_> = core.iter().filter_map(endpoint).collect();
+        let mut mandatory_core_labels: Vec<_> = core
+            .iter()
+            .filter_map(|literal| {
+                self.tracker
+                    .as_ref()
+                    .and_then(|tracker| tracker.label_of(literal))
+            })
+            .collect();
+        mandatory_core_labels.sort();
+        mandatory_core_labels.dedup();
+        let result = match outcome {
+            SatResult::Sat => QueryOutcome::Sat,
+            SatResult::Unsat => QueryOutcome::Unsat,
+            SatResult::Unknown => QueryOutcome::Unknown {
+                reason: reason.unwrap_or_else(|| "reason-unavailable".to_owned()),
+            },
+        };
+        let terminal = outcome == SatResult::Unknown
+            || (outcome == SatResult::Unsat && core_endpoints.is_empty());
+        let event = QueryEvent {
+            id,
+            phase,
+            candidate: candidate.map(|index| capture.endpoints[index].clone()),
+            active: active.iter().filter_map(endpoint).collect(),
+            core_endpoints,
+            mandatory_core_labels,
+            outcome: result.clone(),
+        };
+        drop(bound);
+        demand_evidence::record_query(event);
+        if terminal {
+            demand_evidence::record_final_selection(FinalSelection {
+                epoch,
+                dropped: None,
+                outcome: result,
+            });
+        }
+    }
+
+    fn mark_demand_candidate(&self, index: usize) {
+        let bound = self.demand_capture.borrow();
+        let Some(capture) = bound.as_ref() else { return };
+        if let Some(id) = capture.last_event {
+            demand_evidence::mark_candidate(id, capture.endpoints[index].clone());
+        }
+    }
+
+    fn finish_demand_epoch(&self, dropped: &[Bool]) {
+        let bound = self.demand_capture.borrow();
+        let Some(capture) = bound.as_ref() else { return };
+        let epoch = capture.epoch.expect("completed selector epoch");
+        let dropped = dropped
+            .iter()
+            .map(|literal| {
+                let index = capture
+                    .selectors
+                    .iter()
+                    .position(|known| known == literal)
+                    .expect("dropped endpoint identity");
+                capture.endpoints[index].clone()
+            })
+            .collect();
+        demand_evidence::record_final_selection(FinalSelection {
+            epoch,
+            dropped: Some(dropped),
+            outcome: QueryOutcome::Sat,
+        });
     }
 
     pub fn assume(&self, slot: SlotRef, kind: SlotKind) {
@@ -1220,6 +1387,17 @@ impl KindSolver {
             .set(self.check_sat_count.get().saturating_add(1));
         let bundle = self.assumption_bundle(assumptions);
         let outcome = self.solver.check(&bundle);
+        if self.demand_query_pending() {
+            let core = (outcome == SatResult::Unsat)
+                .then(|| self.solver.get_unsat_core())
+                .unwrap_or_default();
+            let reason = (outcome == SatResult::Unknown).then(|| {
+                self.solver
+                    .get_reason_unknown()
+                    .unwrap_or_else(|| "-".to_owned())
+            });
+            self.note_demand_query(assumptions, outcome, &core, reason);
+        }
         #[cfg(test)]
         self.record_assumption_event(
             AssumptionCheckPhase::Optimize,
@@ -1263,6 +1441,10 @@ impl KindSolver {
                 .set(self.lazy_tracked_recheck_count.get().saturating_add(1));
             let tracked = hard.solver.check_assumptions(&bundle);
             if tracked == SatResult::Unknown {
+                // Preserve the actual exceptional result before the existing
+                // reproduction assertion below rejects this execution.
+                let reason = hard.solver.get_reason_unknown();
+                self.note_demand_query(assumptions, tracked, &[], reason);
                 self.record_round_model_failure(RoundModelFailure::HardUnknown {
                     active_t2: assumptions.len(),
                     reason: hard
@@ -1280,6 +1462,12 @@ impl KindSolver {
         } else {
             initial
         };
+        if self.demand_query_pending() {
+            let core = (outcome == SatResult::Unsat)
+                .then(|| hard.solver.get_unsat_core())
+                .unwrap_or_default();
+            self.note_demand_query(assumptions, outcome, &core, initial_unknown_reason.clone());
+        }
         if let Some(reason) = initial_unknown_reason {
             self.record_round_model_failure(RoundModelFailure::HardUnknown {
                 active_t2: assumptions.len(),
@@ -1397,6 +1585,7 @@ impl KindSolver {
             expected_hard,
             "T2 hard-loop mirror omitted or duplicated a tracked assertion"
         );
+        self.begin_demand_epoch(selectors);
         let mut assumptions = selectors.all().to_vec();
         let mut dropped = Vec::new();
         let trace_epoch = SELECTOR_TRACE_CAPTURE.with(|capture| {
@@ -1415,6 +1604,7 @@ impl KindSolver {
         });
 
         loop {
+            self.prepare_demand_query(QueryPhase::SelectorSearch, None);
             match self.hard_check_with_assumptions(hard, &assumptions) {
                 SatResult::Sat => break,
                 SatResult::Unsat => {
@@ -1451,6 +1641,7 @@ impl KindSolver {
                             .cmp(&selectors.keys[*right].sort_key())
                     });
                     let selector_index = t2_core[0];
+                    self.mark_demand_candidate(selector_index);
                     let index = assumptions
                         .iter()
                         .position(|selector| selectors.index_of(selector) == Some(selector_index))
@@ -1491,6 +1682,7 @@ impl KindSolver {
         while index < dropped.len() {
             let selector = dropped[index].clone();
             assumptions.push(selector.clone());
+            self.prepare_demand_query(QueryPhase::Restoration, selectors.index_of(&selector));
             let outcome = self.hard_check_with_assumptions(hard, &assumptions);
             if let Some(epoch) = trace_epoch {
                 let selector_index = selectors
@@ -1536,6 +1728,7 @@ impl KindSolver {
                 trace.epochs[epoch].final_dropped = selectors.indices_of(&dropped);
             });
         }
+        self.finish_demand_epoch(&dropped);
         HardRelaxResult::Sat(RelaxedSelectors {
             assumptions,
             dropped,
@@ -1565,12 +1758,19 @@ impl KindSolver {
         for literal in &bundle {
             self.solver.assert(literal);
         }
+        self.prepare_demand_query(QueryPhase::Materialization, None);
         let outcome = self.solver.check(&[]);
         let unknown_reason = (outcome == SatResult::Unknown).then(|| {
             self.solver
                 .get_reason_unknown()
                 .unwrap_or_else(|| "-".to_owned())
         });
+        if self.demand_query_pending() {
+            let core = (outcome == SatResult::Unsat)
+                .then(|| self.solver.get_unsat_core())
+                .unwrap_or_default();
+            self.note_demand_query(&relaxed.assumptions, outcome, &core, unknown_reason.clone());
+        }
         #[cfg(test)]
         self.record_assumption_event(
             AssumptionCheckPhase::OptimizeMaterialization,
@@ -1679,6 +1879,7 @@ impl KindSolver {
             self.tracker.is_none(),
             "tracked KindSolver must not enter model_kinds_relaxing (constraints are track-gated)"
         );
+        self.begin_demand_epoch(selectors);
         let mut assumptions: Vec<Bool> = selectors.all().to_vec();
         let mut leaked: Vec<Bool> = Vec::new();
         let trace_epoch = SELECTOR_TRACE_CAPTURE.with(|capture| {
@@ -1698,6 +1899,7 @@ impl KindSolver {
 
         // Phase 1: drop conflicting selectors until SAT (or give up).
         loop {
+            self.prepare_demand_query(QueryPhase::SelectorSearch, None);
             match self.check_with_assumptions(&assumptions) {
                 SatResult::Sat => break,
                 SatResult::Unsat => {
@@ -1716,6 +1918,11 @@ impl KindSolver {
                         .iter()
                         .position(|s| selectors.is_sink(s) && in_core(s))
                         .or_else(|| assumptions.iter().position(|s| in_core(s)))?;
+                    self.mark_demand_candidate(
+                        selectors
+                            .index_of(&assumptions[idx])
+                            .expect("selected endpoint"),
+                    );
                     if let Some(epoch) = trace_epoch {
                         let selector_index = selectors
                             .index_of(&assumptions[idx])
@@ -1748,6 +1955,7 @@ impl KindSolver {
         while i < leaked.len() {
             let selector = leaked[i].clone();
             assumptions.push(leaked[i].clone());
+            self.prepare_demand_query(QueryPhase::Restoration, selectors.index_of(&selector));
             let outcome = self.check_with_assumptions(&assumptions);
             if let Some(epoch) = trace_epoch {
                 let selector_index = selectors
@@ -1794,6 +2002,8 @@ impl KindSolver {
             });
         }
 
+        self.finish_demand_epoch(&leaked);
+        self.prepare_demand_query(QueryPhase::Materialization, None);
         // Final SAT model under the maximal-retention assumption set.
         match self.check_with_assumptions(&assumptions) {
             SatResult::Sat => {
@@ -1818,10 +2028,12 @@ impl KindSolver {
             self.tracker.is_none(),
             "tracked KindSolver must not enter model_kinds_relaxing (constraints are track-gated)"
         );
+        self.begin_demand_epoch(selectors);
         let mut assumptions = selectors.all().to_vec();
         let mut leaked = Vec::new();
 
         loop {
+            self.prepare_demand_query(QueryPhase::SelectorSearch, None);
             match self.check_with_assumptions(&assumptions) {
                 SatResult::Sat => break,
                 SatResult::Unsat => {
@@ -1834,6 +2046,11 @@ impl KindSolver {
                     else {
                         return L2SolveResult::Unsat;
                     };
+                    self.mark_demand_candidate(
+                        selectors
+                            .index_of(&assumptions[index])
+                            .expect("selected endpoint"),
+                    );
                     leaked.push(assumptions.swap_remove(index));
                 }
                 SatResult::Unknown => return L2SolveResult::Unknown,
@@ -1844,6 +2061,7 @@ impl KindSolver {
         let mut index = 0;
         while index < leaked.len() {
             assumptions.push(leaked[index].clone());
+            self.prepare_demand_query(QueryPhase::Restoration, selectors.index_of(&leaked[index]));
             match self.check_with_assumptions(&assumptions) {
                 SatResult::Sat => {
                     leaked.swap_remove(index);
@@ -1858,9 +2076,11 @@ impl KindSolver {
             }
         }
 
+        self.finish_demand_epoch(&leaked);
         let final_outcome = if final_model_ready {
             SatResult::Sat
         } else {
+            self.prepare_demand_query(QueryPhase::Materialization, None);
             self.check_with_assumptions(&assumptions)
         };
         match final_outcome {

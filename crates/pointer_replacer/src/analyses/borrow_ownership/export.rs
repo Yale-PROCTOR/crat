@@ -529,6 +529,7 @@ pub(crate) struct BoExport {
     pub comparisons: Option<super::comparison::ComparisonLedger>,
     pub qualifier_facts: Option<super::qualifier_facts::QualifierFacts>,
     pub array_fields: Option<super::array_fields::ArrayFieldFacts>,
+    pub demand_evidence: Option<super::demand_evidence::DemandEvidence>,
     pub realloc_version_sites: Vec<ReallocVersionSite>,
     pub realloc_cases: Vec<ReallocCaseReceipt>,
     /// E-R2 consume sites, in emission order.

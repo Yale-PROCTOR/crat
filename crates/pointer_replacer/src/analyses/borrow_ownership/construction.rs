@@ -777,6 +777,11 @@ fn construct_bo_into_with_esc(
     let coherence_elapsed = t.elapsed();
     let qualifier_facts = super::qualifier_facts::collect(program, slots, mut_facts, &nullability);
     super::export::record(|export| export.qualifier_facts = Some(qualifier_facts.clone()));
+    solver.set_demand_capture(super::demand_evidence::begin_construction(
+        program,
+        slots,
+        selectors.keys(),
+    ));
     Ok(BoConstruction {
         source_events,
         qualifier_facts,
@@ -976,6 +981,11 @@ pub(crate) fn construct_tracked_census_baseline(
     let qualifier_facts =
         super::qualifier_facts::collect_without_mutability(program, slots, &nullability);
     super::export::record(|export| export.qualifier_facts = Some(qualifier_facts.clone()));
+    solver.set_demand_capture(super::demand_evidence::begin_construction(
+        program,
+        slots,
+        selectors.keys(),
+    ));
     Ok(BoConstruction {
         source_events,
         qualifier_facts,

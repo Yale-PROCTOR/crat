@@ -13,6 +13,7 @@ use crate::utils::rustc::RustProgram;
 pub(crate) mod evidence;
 mod flow;
 mod validate;
+pub(crate) use validate::Fact as EntryFact;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct EntryKey {

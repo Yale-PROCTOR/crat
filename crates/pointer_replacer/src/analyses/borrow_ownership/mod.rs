@@ -19,6 +19,7 @@ pub mod coherence;
 pub(crate) mod comparison;
 pub(crate) mod construction;
 pub mod crate_slots;
+pub(crate) mod demand_evidence;
 #[cfg(test)]
 mod dependency_ratchet;
 mod domain;
@@ -29,9 +30,11 @@ pub(crate) mod l2;
 pub(crate) mod model_cache;
 pub(crate) mod mutability_facts;
 pub(crate) mod nullability;
+pub(crate) mod origin_evidence;
 pub(crate) mod origin_flow;
 pub(crate) mod origin_summary;
 pub(crate) mod origins;
+pub(crate) mod proof_evidence;
 pub(crate) mod protected_entry;
 #[cfg(not(test))]
 mod ptr;
