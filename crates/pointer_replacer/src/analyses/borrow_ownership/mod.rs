@@ -34,6 +34,8 @@ pub(crate) mod origins;
 mod ptr;
 #[cfg(test)]
 pub(crate) mod ptr;
+pub(crate) mod realloc;
+pub(crate) mod realloc_ssa;
 pub mod resolve;
 pub(crate) mod safety_mono;
 pub(crate) mod slot_key;
@@ -263,6 +265,19 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     kind_solver: &KindSolver,
     copy_lends: Option<&FxHashSet<coherence::CopyLendPair>>,
 ) -> anyhow::Result<(BoOwnEmissionStats, Selectors)> {
+    let inventory = source_events::current().unwrap_or_else(|| {
+        let program = RustProgram {
+            tcx: crate_ctxt.tcx,
+            functions: crate_ctxt
+                .fns()
+                .iter()
+                .map(|did| did.expect_local())
+                .collect(),
+            structs: Vec::new(),
+        };
+        std::sync::Arc::new(source_events::collect(&program))
+    });
+    let _source_scope = source_events::enter_inventory(&inventory);
     let mut var_gen = Gen::new();
     // §NB-R: hand the KindSolver's tracker (if any) to the database so the
     // ownership-version constraints are track-gated in tracked mode too.
@@ -293,7 +308,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
             &inter_ctxt,
             did.expect_local(),
             copy_lends,
-        );
+        )?;
     }
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("nb0-eager-source");
@@ -375,7 +390,7 @@ fn emit_fn_body_into<'tcx>(
     inter_ctxt: &InterCtxt,
     fn_did: LocalDefId,
     copy_lends: Option<&FxHashSet<coherence::CopyLendPair>>,
-) {
+) -> anyhow::Result<()> {
     const B1_PRECISION: Precision = BO_PRECISION;
 
     let body_ref = crate_ctxt
@@ -383,13 +398,19 @@ fn emit_fn_body_into<'tcx>(
         .mir_drops_elaborated_and_const_checked(fn_did)
         .borrow();
     let body = &*body_ref;
-    let ssa_state = initial_ssa_state(crate_ctxt, body);
+    let mut definitions = initial_definitions(body, crate_ctxt);
+    let inventory = source_events::current().expect("carried source inventory");
+    let realloc_plans =
+        realloc_ssa::plan_body(crate_ctxt, body, &mut definitions, &inventory.reallocations)
+            .map_err(|error| anyhow::anyhow!("realloc ownership coverage: {error:?}"))?;
+    let ssa_state = SSAState::new(body, &compute_dominance_frontier(body), definitions);
     let copy_lend_guards = copy_lends
         .map(|pairs| coherence::copy_lend_guards_for_body(kind_solver, slots, fn_did, body, pairs))
         .unwrap_or_default();
 
     let summary = {
-        let mut rn = ssa::constraint::infer::Renamer::new(body, ssa_state, crate_ctxt.tcx);
+        let mut rn = ssa::constraint::infer::Renamer::new(body, ssa_state, crate_ctxt.tcx)
+            .with_realloc_plans(realloc_plans.clone());
         let mut infer_cx = InferCtxt::new(
             crate_ctxt,
             B1_PRECISION,
@@ -399,7 +420,8 @@ fn emit_fn_body_into<'tcx>(
             inter_ctxt,
             global_assumptions,
             &copy_lend_guards,
-        );
+        )
+        .with_realloc_plans(realloc_plans);
 
         rn.go::<BoOwnershipProbe>(&mut infer_cx);
         FnSummary::new(rn, infer_cx)
@@ -407,6 +429,7 @@ fn emit_fn_body_into<'tcx>(
 
     // B2: solidify per-version ownership onto slots (depth 0; B1_PRECISION == 1).
     link_versions_to_slots(slots, fn_did, body, &summary, database, kind_solver);
+    Ok(())
 }
 
 /// B2 solidification linking: tie each local pointer slot's `own` bit to the
@@ -444,13 +467,33 @@ fn link_versions_to_slots<'tcx>(
                 // export needs, and the `Location` association is discarded
                 // immediately below when the vars are ORed into `depth0_owns`.
                 // Recording-only; a no-op unless a capture scope is active.
-                export::record_version_site(fn_did, local, location, use_var, def_var);
+                export::record_version_site(
+                    fn_did,
+                    local,
+                    location,
+                    use_var.filter(|var| !summary.realloc_ghosts.contains(var)),
+                    def_var.filter(|var| !summary.realloc_ghosts.contains(var)),
+                );
                 for var in [use_var, def_var].into_iter().flatten() {
                     depth0_owns.entry(local).or_default().push(var);
                 }
             }
         }
     }
+
+    for version in &summary.realloc_versions {
+        depth0_owns.entry(version.local).or_default().extend(
+            version
+                .use_var
+                .into_iter()
+                .chain(std::iter::once(version.def_var)),
+        );
+    }
+    export::record(|capture| {
+        capture
+            .realloc_version_sites
+            .extend(summary.realloc_versions.iter().cloned())
+    });
 
     // Only locals with at least one collected version var are linked; a slot
     // whose local is never consumed is left free (the soft objective makes it
@@ -529,12 +572,6 @@ fn initial_crate_inter_ctxt<'tcx>(
     }
 
     fn_sigs
-}
-
-fn initial_ssa_state<'tcx>(crate_ctxt: &CrateCtxt<'tcx>, body: &Body<'tcx>) -> SSAState {
-    let dominance_frontier = compute_dominance_frontier(body);
-    let definitions = initial_definitions(body, crate_ctxt);
-    SSAState::new(body, &dominance_frontier, definitions)
 }
 
 pub struct CrateCtxt<'tcx> {

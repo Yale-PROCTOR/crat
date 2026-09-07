@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
@@ -36,6 +36,7 @@ use crate::analyses::borrow_ownership::{
 };
 
 mod boundary;
+mod realloc_transition;
 
 pub type LocalSig = Range<Var>;
 pub type FnBodySig<LocalSig> = IndexVec<Local, IndexVec<SSAIdx, LocalSig>>;
@@ -43,6 +44,8 @@ pub type FnBodySig<LocalSig> = IndexVec<Local, IndexVec<SSAIdx, LocalSig>>;
 pub struct FnSummary {
     pub fn_body_sig: FnBodySig<LocalSig>,
     pub ssa_state: SSAState,
+    pub(crate) realloc_versions: Vec<super::export::ReallocVersionSite>,
+    pub(crate) realloc_ghosts: FxHashSet<Var>,
 }
 
 impl FnSummary {
@@ -53,6 +56,8 @@ impl FnSummary {
         FnSummary {
             fn_body_sig: infer_cx.fn_body_sig,
             ssa_state: rn.state,
+            realloc_versions: infer_cx.realloc_versions,
+            realloc_ghosts: infer_cx.realloc_ghosts,
         }
     }
 }
@@ -142,6 +147,11 @@ where
     call_args: Vec<CallArg<<Analysis as InferMode<'infercx, 'db, 'tcx>>::LocalSig>>,
     global_assumptions: &'infercx GlobalAssumptions,
     copy_lend_guards: &'infercx FxHashMap<Location, Bool>,
+    realloc_plans: Vec<super::realloc_ssa::ReallocSsaPlan>,
+    realloc_inputs:
+        std::collections::BTreeMap<super::l2::MirLocationKey, realloc_transition::ReallocInput>,
+    realloc_versions: Vec<super::export::ReallocVersionSite>,
+    realloc_ghosts: FxHashSet<Var>,
 }
 
 type CallArg<LocalSig> = (Local, (Consume<LocalSig>, bool));
@@ -196,6 +206,10 @@ where
             call_args: Vec::new(),
             global_assumptions,
             copy_lend_guards,
+            realloc_plans: Vec::new(),
+            realloc_inputs: std::collections::BTreeMap::new(),
+            realloc_versions: Vec::new(),
+            realloc_ghosts: FxHashSet::default(),
         }
     }
 
@@ -426,6 +440,18 @@ where
     type Ctxt = InferCtxt<'infercx, 'db, 'tcx, Analysis>;
     type LocalSig = LocalSig;
 
+    fn realloc_edge(
+        infer_cx: &mut Self::Ctxt,
+        plan: &super::realloc_ssa::ReallocSsaPlan,
+        outcome: super::realloc::ReallocOutcome,
+        edge: rustc_middle::mir::BasicBlock,
+        operation: &super::realloc_ssa::ReallocEdgeOperation,
+        versions: &[(Local, Consume<SSAIdx>)],
+        body: &Body<'tcx>,
+    ) {
+        infer_cx.apply_realloc_edge(plan, outcome, edge, operation, versions, body);
+    }
+
     #[inline]
     fn call_arg(
         infer_cx: &mut Self::Ctxt,
@@ -531,6 +557,12 @@ where
             }
             let r#use = infer_cx.fn_body_sig[base][consume.r#use].clone();
             let def = infer_cx.new_vars(base_ty);
+            if r#use
+                .clone()
+                .any(|var| infer_cx.realloc_ghosts.contains(&var))
+            {
+                infer_cx.realloc_ghosts.extend(def.clone());
+            }
             if base_offset != r#use.end.as_u32() - r#use.start.as_u32() {
                 tracing::debug!(
                     "mismatched base measure for {:?}: expected {}, got {}",
@@ -598,6 +630,14 @@ where
         location: Option<Location>,
     ) {
         tracing::debug!("transfer relation: {:?} ~ {:?}", lhs_result, rhs_result);
+        if rhs_result
+            .r#use
+            .clone()
+            .any(|var| infer_cx.realloc_ghosts.contains(&var))
+        {
+            infer_cx.realloc_ghosts.extend(lhs_result.def.clone());
+            infer_cx.realloc_ghosts.extend(rhs_result.def.clone());
+        }
 
         let copy_lend_guard = location.and_then(|location| infer_cx.copy_lend_guard(location));
         with_own_assume_site(OwnAssumeSite::SsaTransfer, || {

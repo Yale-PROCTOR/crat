@@ -823,6 +823,860 @@ fn sink_site_names_the_free_call() {
     );
 }
 
+const E5_REALLOC_FAILURE_FREE: &str = r#"
+unsafe extern "C" {
+    fn realloc(p: *mut u8, n: usize) -> *mut u8;
+    fn free(p: *mut u8);
+}
+pub unsafe fn resize(p: *mut u8) -> u8 {
+    let q = realloc(p, 8);
+    if q.is_null() {
+        let value = *p;
+        free(p);
+        value
+    } else {
+        free(q);
+        0
+    }
+}
+"#;
+
+fn check_e5_realloc_failure_free(backend: TestValidationBackend) {
+    check_e5_realloc_failure_free_code(backend, E5_REALLOC_FAILURE_FREE);
+}
+
+fn check_e5_realloc_failure_free_code(backend: TestValidationBackend, code: &str) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let function = function_named(&program, "resize");
+        let body = tcx.mir_drops_elaborated_and_const_checked(function).borrow();
+        let failure_free_sites: Vec<_> = body.basic_blocks.iter_enumerated().filter_map(|(block, data)| {
+            let snippet = tcx.sess.source_map().span_to_snippet(data.terminator().source_info.span).ok()?;
+            (snippet == "free(p)").then_some(MirLocationKey::new(block.as_u32(), data.statements.len()))
+        }).collect();
+        assert_eq!(failure_free_sites.len(), 1, "fixture must independently identify the failure-path free");
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(&program, &slots, &origins, &facts, &solver, CopyLendMode::Baseline).expect("construction");
+        let failure_free_index = construction.selectors.keys().iter().position(|key| key.fn_did == function && key.location == failure_free_sites[0] && key.callee == "free" && key.role == BoundaryRole::Sink).expect("typed failure-path free endpoint");
+        let ((model, _stats), trace) = with_selector_trace(|| verify_bo_construction_counting_for_test(&program, &slots, &origins, &solver, &construction, &facts, backend));
+        assert!(model.is_some(), "supported direct realloc split must remain analyzable");
+        let final_epoch = trace.epochs.last().expect("selector trace");
+        assert!(!final_epoch.final_dropped.contains(&failure_free_index), "E5-R-FAIL: failed realloc must preserve the old responsibility for its exact later free; key={:?}, trace={final_epoch:?}", construction.selectors.keys()[failure_free_index]);
+        assert!(final_epoch.final_dropped.is_empty(), "all four exact source/realloc/free endpoints should be retained in this linear two-outcome fixture: {final_epoch:?}");
+    }).unwrap_or_else(|error| error.raise());
+}
+
+#[test]
+fn e5_r_t2_failed_realloc_preserves_old_free_hard() {
+    check_e5_realloc_failure_free(TestValidationBackend::HardCheckRoundOptimize);
+}
+
+#[test]
+fn e5_r219_pipeline_admits_success_implied_and_unobserved_results() {
+    const PREAMBLE: &str =
+        "unsafe extern \"C\" { fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }";
+    for backend in [
+        TestValidationBackend::HardCheckRoundOptimize,
+        TestValidationBackend::LegacyOptimize,
+    ] {
+        for (body, expected_cases) in [
+            (
+                "pub unsafe fn f(p: *mut u8) -> u8 { let q = realloc(p, 8); let value = *q; free(q); value }",
+                1,
+            ),
+            (
+                "pub unsafe fn f(p: *mut u8) { let q = realloc(p, 8); free(q); }",
+                2,
+            ),
+        ] {
+            ::utils::compilation::run_compiler_on_str(&format!("{PREAMBLE} {body}"), |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let capture = arm_scope();
+            let construction = construct_bo_into(&program, &slots, &origins, &facts, &solver, CopyLendMode::Baseline).expect("R219 classifiable source continuation");
+            let site = &construction.source_events.reallocations[0];
+            let cases = crate::analyses::borrow_ownership::realloc::classify(site).expect("source cases");
+            assert_eq!(cases.len(), expected_cases);
+            let continuation = match &site.result {
+                crate::analyses::borrow_ownership::realloc::ReallocResult::SuccessImplied(continuation)
+                | crate::analyses::borrow_ownership::realloc::ReallocResult::Unobserved(continuation) => continuation,
+                other => panic!("R219 continuation: {other:?}"),
+            };
+            let keys: Vec<_> = construction.selectors.keys().iter().filter(|key| key.callee == "realloc").collect();
+            assert_eq!(keys.len(), 2, "exact old/result T2 endpoints");
+            for (role, endpoint) in [(BoundaryRole::Sink, continuation.old_place.as_ref().expect("old place")), (BoundaryRole::Source, &continuation.result_place)] {
+                assert_eq!(keys.iter().filter(|key| key.role == role && key.endpoint.as_ref() == Some(endpoint)
+                    && key.realloc_outcome == Some(crate::analyses::borrow_ownership::realloc::ReallocOutcome::Success)
+                    && key.location == MirLocationKey::new(site.key.block, site.key.statement)).count(), 1);
+            }
+            let ((model, _), trace) = with_selector_trace(|| verify_bo_construction_counting_for_test(&program, &slots, &origins, &solver, &construction, &facts, backend));
+            assert!(model.is_some());
+            assert!(trace.epochs.last().expect("T2 trace").final_dropped.is_empty(), "these closed source/continuation endpoints remain provable");
+            let export = capture.finish();
+            assert_eq!(export.realloc_cases.len(), expected_cases);
+            let owns = export.version_owns.as_ref().expect("valuation");
+            for receipt in &export.realloc_cases {
+                assert!(owns[receipt.old_before.expect("non-null-old input claim")]);
+                assert!(!owns[receipt.old_after.expect("non-null-old closed claim")]);
+                match receipt.case.outcome {
+                    crate::analyses::borrow_ownership::realloc::ReallocOutcome::Success => assert!(owns[receipt.result_claim.expect("success claim")]),
+                    crate::analyses::borrow_ownership::realloc::ReallocOutcome::Failure => {
+                        assert_eq!(receipt.result_claim, None);
+                        assert_eq!(receipt.case.old, crate::analyses::borrow_ownership::realloc::OldResponsibility::LoseClaimIfPresent);
+                    }
+                }
+            }
+        }).unwrap_or_else(|error| error.raise());
+        }
+    }
+}
+
+#[test]
+fn e5_r219_dynamic_null_and_distinct_site_receipts() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::analyses::{
+        borrow_ownership::{
+            realloc::{
+                ContentsRelation, OldInput, OldResponsibility, ReallocCase, ReallocOutcome,
+                ReallocResult, ReallocRetirementAvailability, ReallocSize, ResultResponsibility,
+                ZeroSizeFeasibility, retirement_availability,
+            },
+            source_events::{SourceCondition, SourcePhase, SourceRole},
+        },
+        mir::{CallKind, TerminatorExt},
+    };
+
+    const PREAMBLE: &str = "unsafe extern \"C\" { fn malloc(n: usize) -> *mut u8; fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }";
+    for backend in [
+        TestValidationBackend::HardCheckRoundOptimize,
+        TestValidationBackend::LegacyOptimize,
+    ] {
+        for (fixture, expected_sites, null_old) in [
+            (
+                "pub unsafe fn f(p: *mut u8, n: usize) { let q = realloc(p, n); free(q); }",
+                1,
+                false,
+            ),
+            (
+                "pub unsafe fn f(n: usize) { let q = realloc(0 as *mut u8, n); free(q); }",
+                1,
+                true,
+            ),
+            (
+                "pub unsafe fn f(n: usize) { let p = malloc(8); let q = realloc(p, n); free(q); let r = malloc(8); let s = realloc(r, n); free(s); }",
+                2,
+                false,
+            ),
+        ] {
+            ::utils::compilation::run_compiler_on_str(&format!("{PREAMBLE} {fixture}"), |tcx| {
+                let program = collect_program(tcx);
+                let function = function_named(&program, "f");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                // Derive endpoint identity from original MIR, independently of
+                // both the source-event inventory and the exported T2 keys.
+                let original: BTreeMap<_, _> = body
+                    .basic_blocks
+                    .iter_enumerated()
+                    .filter_map(|(block, data)| {
+                        let call = data.terminator().as_call(tcx)?;
+                        if !matches!(call.func, CallKind::LibC(name) if name.as_str() == "realloc")
+                        {
+                            return None;
+                        }
+                        Some((
+                            MirLocationKey::new(block.as_u32(), data.statements.len()),
+                            (
+                                call.args
+                                    .first()
+                                    .and_then(|arg| arg.node.place())
+                                    .map(PlaceKey::from_place),
+                                PlaceKey::from_place(call.destination),
+                            ),
+                        ))
+                    })
+                    .collect();
+                assert_eq!(original.len(), expected_sites, "fixture call identities");
+
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let solver = KindSolver::new(&slots);
+                let capture = arm_scope();
+                let construction = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    &solver,
+                    CopyLendMode::Baseline,
+                )
+                .expect("dynamic-byte unobserved continuation");
+                let sites = &construction.source_events.reallocations;
+                assert_eq!(sites.len(), expected_sites);
+                assert_eq!(
+                    sites
+                        .iter()
+                        .map(|site| MirLocationKey::new(site.key.block, site.key.statement))
+                        .collect::<BTreeSet<_>>(),
+                    original.keys().copied().collect::<BTreeSet<_>>()
+                );
+                let keys: Vec<_> = construction
+                    .selectors
+                    .keys()
+                    .iter()
+                    .filter(|key| key.callee == "realloc")
+                    .collect();
+                assert_eq!(keys.len(), expected_sites * if null_old { 1 } else { 2 });
+                let ((model, _), trace) = with_selector_trace(|| {
+                    verify_bo_construction_counting_for_test(
+                        &program,
+                        &slots,
+                        &origins,
+                        &solver,
+                        &construction,
+                        &facts,
+                        backend,
+                    )
+                });
+                assert!(model.is_some(), "{fixture}");
+                assert!(
+                    trace
+                        .epochs
+                        .last()
+                        .expect("T2 trace")
+                        .final_dropped
+                        .is_empty(),
+                    "closed endpoints: {fixture}"
+                );
+                let export = capture.finish();
+                assert_eq!(export.realloc_cases.len(), 2 * expected_sites);
+                let owns = export.version_owns.as_ref().expect("ownership valuation");
+
+                for site in sites {
+                    let location = MirLocationKey::new(site.key.block, site.key.statement);
+                    let (old_place, result_place) = &original[&location];
+                    assert_eq!(site.key.function, "f");
+                    assert_eq!(site.key.phase, SourcePhase::Call);
+                    assert_eq!(
+                        site.size,
+                        ReallocSize::ByteCount,
+                        "dynamic bytes are not nonzero evidence"
+                    );
+                    assert_eq!(site.zero_size, Some(ZeroSizeFeasibility::Possible));
+                    assert_eq!(
+                        site.old_input,
+                        if null_old {
+                            OldInput::KnownNull
+                        } else {
+                            OldInput::MayBeNonNull
+                        }
+                    );
+                    let ReallocResult::Unobserved(continuation) = &site.result else {
+                        panic!("expected both source alternatives: {:?}", site.result);
+                    };
+                    assert!(continuation.witness.is_none());
+                    assert_eq!(&continuation.old_place, old_place);
+                    assert_eq!(&continuation.result_place, result_place);
+
+                    let receipts: Vec<_> = export
+                        .realloc_cases
+                        .iter()
+                        .filter(|receipt| receipt.event == site.key)
+                        .collect();
+                    assert_eq!(receipts.len(), 2, "one pair per exact source site");
+                    assert_eq!(
+                        receipts
+                            .iter()
+                            .map(|receipt| receipt.case.outcome)
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from([ReallocOutcome::Success, ReallocOutcome::Failure])
+                    );
+                    let success = receipts
+                        .iter()
+                        .find(|receipt| receipt.case.outcome == ReallocOutcome::Success)
+                        .unwrap();
+                    let failure = receipts
+                        .iter()
+                        .find(|receipt| receipt.case.outcome == ReallocOutcome::Failure)
+                        .unwrap();
+                    assert_eq!(
+                        success.case,
+                        ReallocCase {
+                            outcome: ReallocOutcome::Success,
+                            old: if null_old {
+                                OldResponsibility::Absent
+                            } else {
+                                OldResponsibility::RetireIfPresent
+                            },
+                            result: ResultResponsibility::FreshGeneration,
+                            contents: if null_old {
+                                ContentsRelation::NoOldObject
+                            } else {
+                                ContentsRelation::RequiredPrefixPreserved
+                            },
+                        }
+                    );
+                    assert_eq!(
+                        failure.case,
+                        ReallocCase {
+                            outcome: ReallocOutcome::Failure,
+                            old: if null_old {
+                                OldResponsibility::Absent
+                            } else {
+                                OldResponsibility::LoseClaimIfPresent
+                            },
+                            result: ResultResponsibility::None,
+                            contents: if null_old {
+                                ContentsRelation::NoOldObject
+                            } else {
+                                ContentsRelation::TargetDependentZeroSize
+                            },
+                        }
+                    );
+                    assert_eq!(
+                        retirement_availability(site, &success.case),
+                        if null_old {
+                            ReallocRetirementAvailability::None
+                        } else {
+                            ReallocRetirementAvailability::WholeOldGeneration
+                        }
+                    );
+                    assert_eq!(
+                        retirement_availability(site, &failure.case),
+                        if null_old {
+                            ReallocRetirementAvailability::None
+                        } else {
+                            ReallocRetirementAvailability::MayRetireOnZero
+                        }
+                    );
+                    let retirement_conditions: BTreeSet<_> = construction
+                        .source_events
+                        .retirements
+                        .keys()
+                        .filter(|key| {
+                            key.function == site.key.function
+                                && key.block == site.key.block
+                                && key.statement == site.key.statement
+                                && key.role == SourceRole::ReallocOld
+                        })
+                        .map(|key| key.condition)
+                        .collect();
+                    assert_eq!(
+                        retirement_conditions,
+                        if null_old {
+                            BTreeSet::new()
+                        } else {
+                            BTreeSet::from([
+                                SourceCondition::ReallocSuccess,
+                                SourceCondition::ReallocZeroSizePossible,
+                            ])
+                        }
+                    );
+
+                    let site_keys: Vec<_> = keys
+                        .iter()
+                        .copied()
+                        .filter(|key| key.location == location)
+                        .collect();
+                    assert_eq!(site_keys.len(), if null_old { 1 } else { 2 });
+                    assert!(site_keys.iter().all(|key| key.fn_did == function
+                        && key.function_path == site.key.function
+                        && key.realloc_outcome == Some(ReallocOutcome::Success)));
+                    let sources: Vec<_> = site_keys
+                        .iter()
+                        .copied()
+                        .filter(|key| key.role == BoundaryRole::Source)
+                        .collect();
+                    let sinks: Vec<_> = site_keys
+                        .iter()
+                        .copied()
+                        .filter(|key| key.role == BoundaryRole::Sink)
+                        .collect();
+                    assert_eq!(sources.len(), 1);
+                    assert_eq!(sources[0].endpoint.as_ref(), Some(result_place));
+                    let result_claim = success.result_claim.expect("success result claim");
+                    assert_eq!(sources[0].var, result_claim);
+                    assert!(owns[result_claim]);
+                    assert_eq!(
+                        failure.result_claim, None,
+                        "failure creates no result claim"
+                    );
+                    assert_eq!(
+                        (failure.old_before, failure.old_after),
+                        (success.old_before, success.old_after)
+                    );
+                    if null_old {
+                        assert!(sinks.is_empty(), "None has no old sink endpoint");
+                        // A literal null can lack an SSA operand; a materialized
+                        // null must carry two explicitly non-owning versions.
+                        match (success.old_before, success.old_after) {
+                            (None, None) => {}
+                            (Some(before), Some(after)) => {
+                                assert!(!owns[before]);
+                                assert!(!owns[after]);
+                            }
+                            values => panic!("incomplete null operand versions: {values:?}"),
+                        }
+                    } else {
+                        assert_eq!(sinks.len(), 1);
+                        assert_eq!(sinks[0].endpoint.as_ref(), old_place.as_ref());
+                        let before = success.old_before.expect("old input claim");
+                        let after = success.old_after.expect("closed old claim");
+                        assert_eq!(sinks[0].var, before);
+                        assert!(owns[before]);
+                        assert!(!owns[after]);
+                    }
+                }
+            })
+            .unwrap_or_else(|error| error.raise());
+        }
+    }
+}
+
+#[test]
+fn e5_r_t2_failed_realloc_preserves_old_free_optimize() {
+    check_e5_realloc_failure_free(TestValidationBackend::LegacyOptimize);
+}
+
+#[test]
+fn e5_r_result_cast_transports_branch_responsibility() {
+    const CODE: &str = r#"
+unsafe extern "C" { fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }
+pub unsafe fn resize(p: *mut u8) -> u8 {
+    let q = realloc(p, 8);
+    let r = q as *mut i8;
+    if r.is_null() { let value = *p; free(p); value } else { free(r as *mut u8); 0 }
+}
+"#;
+    check_e5_realloc_failure_free_code(TestValidationBackend::HardCheckRoundOptimize, CODE);
+}
+
+#[test]
+fn e5_r_exported_edge_values_match_both_source_outcomes() {
+    ::utils::compilation::run_compiler_on_str(E5_REALLOC_FAILURE_FREE, |tcx| {
+        use crate::analyses::borrow_ownership::realloc::ReallocOutcome;
+        let program = collect_program(tcx);
+        let function = function_named(&program, "resize");
+        let p = named_local(&program, function, "p");
+        let q = named_local(&program, function, "q");
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let ((model, _stats), capture) = with_bo_export(|| {
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("construction");
+            verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &facts,
+            )
+        });
+        assert!(model.is_some());
+        let owns = capture.version_owns.as_ref().expect("ownership values");
+        for (local, outcome, expected) in [
+            (p, ReallocOutcome::Success, false),
+            (p, ReallocOutcome::Failure, true),
+            (q, ReallocOutcome::Success, true),
+            (q, ReallocOutcome::Failure, false),
+        ] {
+            let rows: Vec<_> = capture
+                .realloc_version_sites
+                .iter()
+                .filter(|row| {
+                    row.fn_did == function && row.local == local && row.outcome == outcome
+                })
+                .collect();
+            assert_eq!(
+                rows.len(),
+                1,
+                "exact entry definition for {local:?}/{outcome:?}"
+            );
+            assert_eq!(
+                owns[rows[0].def_var], expected,
+                "source outcome value {local:?}/{outcome:?}"
+            );
+        }
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+#[test]
+fn e5_r_t2_realloc_keys_are_guarded_by_success() {
+    ::utils::compilation::run_compiler_on_str(E5_REALLOC_FAILURE_FREE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("construction");
+        let keys: Vec<_> = construction
+            .selectors
+            .keys()
+            .iter()
+            .filter(|key| key.callee == "realloc")
+            .collect();
+        assert_eq!(keys.len(), 2, "success result and old-block endpoints");
+        assert!(
+            keys.iter().all(|key| key.realloc_outcome
+                == Some(crate::analyses::borrow_ownership::realloc::ReallocOutcome::Success)
+                && key.endpoint.is_some()),
+            "realloc endpoints require exact source outcome and operand identities: {keys:?}"
+        );
+        let ordinary: Vec<_> = construction
+            .selectors
+            .keys()
+            .iter()
+            .filter(|key| key.callee == "free")
+            .collect();
+        assert_eq!(ordinary.len(), 2);
+        assert!(
+            ordinary
+                .iter()
+                .all(|key| key.realloc_outcome.is_none() && key.endpoint.is_none()),
+            "ordinary free key contract stays unchanged"
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+#[test]
+fn e5_r_null_old_later_allocation_keeps_real_ownership_exports() {
+    const CODE: &str = r#"
+unsafe extern "C" { fn malloc(n: usize) -> *mut u8; fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }
+pub unsafe fn f() {
+    let mut p = 0 as *mut u8;
+    let q = realloc(p, 8);
+    if q.is_null() { p = malloc(8); free(p); } else { free(q); }
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let function = function_named(&program, "f");
+        let p = named_local(&program, function, "p");
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let ((model, _stats), capture) = with_bo_export(|| {
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("supported null-old branch");
+            assert!(
+                construction
+                    .selectors
+                    .keys()
+                    .iter()
+                    .all(|key| !(key.callee == "realloc" && key.role == BoundaryRole::Sink)),
+                "null old input has no old sink"
+            );
+            verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &facts,
+            )
+        });
+        assert!(model.is_some());
+        let owns = capture.version_owns.as_ref().expect("ownership valuation");
+        let owning_p_versions: Vec<_> = capture
+            .version_sites
+            .iter()
+            .filter(|site| site.fn_did == function && site.local == p)
+            .flat_map(|site| [site.use_var, site.def_var])
+            .flatten()
+            .filter(|var| owns[*var])
+            .collect();
+        assert!(
+            !owning_p_versions.is_empty(),
+            "real post-branch malloc/free ownership must not disappear as a realloc placeholder"
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+#[test]
+fn e5_r_live_outcome_join_is_explicitly_unsupported() {
+    const CODE: &str = r#"
+unsafe extern "C" { fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }
+pub unsafe fn f(p: *mut u8) -> u8 {
+    let q = realloc(p, 8);
+    let value = if q.is_null() { *p } else { *q };
+    if q.is_null() { free(p); } else { free(q); }
+    value
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let result = construct_bo_into(&program, &slots, &origins, &facts, &solver, CopyLendMode::Baseline);
+        assert!(result.is_err(), "live outcome correlation must not disappear through ordinary phi equality and T2 retraction");
+        assert!(result.err().unwrap().to_string().contains("LiveOutcomeJoin"));
+    }).unwrap_or_else(|error| error.raise());
+}
+
+/// B05/B17 closure: retracting realloc ownership assertions must neither erase
+/// the source retirement nor relax the mandatory laws that reject restoration.
+#[test]
+fn e5_r_t2_opaque_old_realloc_retracts_without_erasing_retirement() {
+    use std::collections::BTreeSet;
+
+    use crate::analyses::{
+        borrow_ownership::{
+            realloc::{OldResponsibility, ReallocOutcome, ReallocResult, ResultResponsibility},
+            solver::SelectorTracePhase,
+            source_events::{Coverage, SourceCondition, SourceObject, SourceRegion, SourceRole},
+        },
+        mir::TerminatorExt,
+    };
+
+    const CODE: &str = r#"
+unsafe extern "C" {
+    fn opaque() -> *mut u8;
+    fn realloc(p: *mut u8, n: usize) -> *mut u8;
+}
+unsafe fn resize() {
+    let p = opaque();
+    let _q = realloc(p, 8);
+}
+"#;
+    for backend in [
+        TestValidationBackend::HardCheckRoundOptimize,
+        TestValidationBackend::LegacyOptimize,
+    ] {
+        ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+            let program = collect_program(tcx);
+            let function = function_named(&program, "resize");
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let arm = arm_scope();
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("unobserved realloc construction");
+            let inventory = construction.source_events.clone();
+            assert_eq!(inventory.reallocations.len(), 1);
+            let site = &inventory.reallocations[0];
+            assert!(matches!(&site.result, ReallocResult::Unobserved(_)));
+            let location = MirLocationKey::new(site.key.block, site.key.statement);
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let call = body.basic_blocks[rustc_middle::mir::BasicBlock::from_u32(site.key.block)]
+                .terminator()
+                .as_call(tcx)
+                .expect("original realloc call");
+            let old_place =
+                PlaceKey::from_place(call.args[0].node.place().expect("opaque old operand"));
+            let result_place = PlaceKey::from_place(call.destination);
+
+            let keys = construction.selectors.keys();
+            assert_eq!(keys.len(), 2, "only the realloc Source and Sink exist");
+            let endpoint_index = |role, endpoint: &PlaceKey| {
+                let indices: Vec<_> = keys
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, key)| {
+                        (key.fn_did == function
+                            && key.function_path == site.key.function
+                            && key.location == location
+                            && key.callee == "realloc"
+                            && key.role == role
+                            && key.realloc_outcome == Some(ReallocOutcome::Success)
+                            && key.endpoint.as_ref() == Some(endpoint))
+                        .then_some(index)
+                    })
+                    .collect();
+                assert_eq!(indices.len(), 1, "exact outcome/operand endpoint");
+                indices[0]
+            };
+            let sink_index = endpoint_index(BoundaryRole::Sink, &old_place);
+            let source_index = endpoint_index(BoundaryRole::Source, &result_place);
+            assert_ne!(sink_index, source_index);
+            let sink_label = keys[sink_index].label();
+            let retirements: Vec<_> = inventory
+                .retirements
+                .values()
+                .filter(|event| {
+                    event.key.function == site.key.function
+                        && event.key.block == site.key.block
+                        && event.key.statement == site.key.statement
+                        && event.key.role == SourceRole::ReallocOld
+                })
+                .collect();
+            assert_eq!(retirements.len(), 1, "one source success retirement");
+            let retirement = retirements[0];
+            assert_eq!(retirement.key.condition, SourceCondition::ReallocSuccess);
+            assert_eq!(retirement.object, SourceObject::HeapThrough(old_place));
+            assert_eq!(retirement.region, SourceRegion::WholeAllocation);
+            assert_eq!(retirement.coverage, Coverage::UnresolvedWholeObject);
+
+            let ((model, _), trace) = with_selector_trace(|| {
+                verify_bo_construction_counting_for_test(
+                    &program,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &construction,
+                    &facts,
+                    backend,
+                )
+            });
+            let model = model.expect("T2 retraction preserves acceptance");
+            let epoch = trace.epochs.last().expect("T2 retraction epoch");
+            assert_eq!(
+                epoch.final_dropped.iter().copied().collect::<BTreeSet<_>>(),
+                BTreeSet::from([sink_index, source_index]),
+                "both unused/unlicensed endpoints must be dropped before full no-T2 comparison"
+            );
+            let dropped = epoch
+                .events
+                .iter()
+                .find(|event| {
+                    event.selector_index == sink_index
+                        && event.phase == SelectorTracePhase::Drop
+                        && event.outcome == SelectorTraceOutcome::Dropped
+                })
+                .expect("exact old Sink drop event");
+            assert!(dropped.active_before.contains(&sink_index));
+            assert!(dropped.core_selectors.contains(&sink_index));
+            assert!(dropped.core_labels.contains(&sink_label));
+            let is_license =
+                |label: &str| label.contains("own-assume") || label.contains("link-own");
+            let license_labels: Vec<_> = dropped
+                .core_labels
+                .iter()
+                .filter(|label| is_license(label))
+                .collect();
+            assert!(
+                !license_labels.is_empty(),
+                "old Sink has a mixed T2/licensing core"
+            );
+            let restored = epoch
+                .events
+                .iter()
+                .find(|event| {
+                    event.selector_index == sink_index
+                        && event.phase == SelectorTracePhase::Reenable
+                        && event.outcome == SelectorTraceOutcome::StayedDropped
+                })
+                .expect("mandatory licensing rejects the old Sink restoration attempt");
+            assert!(restored.active_before.contains(&sink_index));
+            assert!(restored.core_selectors.contains(&sink_index));
+            assert!(restored.core_labels.contains(&sink_label));
+            assert!(restored.core_labels.iter().any(|label| is_license(label)));
+
+            let export = arm.finish();
+            assert_eq!(construction.source_events, inventory);
+            assert_eq!(export.source_events.as_ref(), Some(&inventory));
+            assert_eq!(export.replay_source_events.as_ref(), Some(&inventory));
+            assert_eq!(export.realloc_cases.len(), 2);
+            assert_eq!(
+                export
+                    .realloc_cases
+                    .iter()
+                    .map(|receipt| receipt.case.outcome)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([ReallocOutcome::Success, ReallocOutcome::Failure])
+            );
+            let owns = export
+                .version_owns
+                .as_ref()
+                .expect("post-retraction ownership valuation");
+            for receipt in &export.realloc_cases {
+                assert_eq!(receipt.event, site.key);
+                let before = receipt
+                    .old_before
+                    .expect("opaque input has a tracked ownership version");
+                let after = receipt.old_after.expect("closed old ownership version");
+                assert_eq!(before, keys[sink_index].var);
+                assert!(
+                    !owns[before],
+                    "mandatory opaque-origin law survives the Sink retraction"
+                );
+                assert!(!owns[after]);
+                match receipt.case.outcome {
+                    ReallocOutcome::Success => {
+                        assert_eq!(receipt.case.old, OldResponsibility::RetireIfPresent);
+                        assert_eq!(receipt.case.result, ResultResponsibility::FreshGeneration);
+                        let result = receipt
+                            .result_claim
+                            .expect("tracked unused result qualifier");
+                        assert_eq!(result, keys[source_index].var);
+                        assert!(!owns[result], "unused result ownership remains unlicensed");
+                    }
+                    ReallocOutcome::Failure => {
+                        assert_eq!(receipt.case.old, OldResponsibility::LoseClaimIfPresent);
+                        assert_eq!(receipt.case.result, ResultResponsibility::None);
+                        assert_eq!(receipt.result_claim, None);
+                    }
+                }
+            }
+            let (baseline, checks) = with_assumption_check_trace(|| {
+                solver.model_without_t2_for_test(&construction.selectors)
+            });
+            assert_eq!(model, baseline.expect("mandatory no-T2 baseline accepts"));
+            assert!(
+                checks.iter().any(|check| {
+                    check.outcome == z3::SatResult::Sat
+                        && check.explicit.len() == keys.len()
+                        && check.bundle.len() > check.explicit.len()
+                        && license_labels
+                            .iter()
+                            .all(|label| check.labels.contains(label))
+                }),
+                "no-T2 baseline must still assume the mandatory laws from the mixed core"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+}
+
 /// T2-W2 (addendum-55 erratum): an exact free endpoint whose incoming value
 /// has no modeled origin cannot retain the endpoint assertion. The mandatory
 /// licensing clause appears beside the typed T2 label, T2 yields first,

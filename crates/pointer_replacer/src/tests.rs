@@ -15291,6 +15291,18 @@ pub unsafe fn leak_realloc() -> *mut *mut core::ffi::c_void {
             |tcx| {
                 let program = collect_program(tcx);
                 let f = function_by_name(&program, "leak_realloc");
+                // R219: taking the pointer local's address is not a use of the
+                // allocation. Keep both outcomes; null-old has no old claim.
+                let sites = crate::analyses::borrow_ownership::realloc::collect_sites(&program);
+                assert!(matches!(
+                    sites[0].result,
+                    crate::analyses::borrow_ownership::realloc::ReallocResult::Unobserved(_)
+                ));
+                let cases = crate::analyses::borrow_ownership::realloc::classify(&sites[0])
+                    .expect("R219 source cases");
+                assert_eq!(cases.len(), 2);
+                assert!(cases.iter().all(|case| case.old
+                    == crate::analyses::borrow_ownership::realloc::OldResponsibility::Absent));
                 let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
@@ -17098,6 +17110,22 @@ pub unsafe fn free_source() -> i32 {
                 )
                 .expect("production construction");
                 assert_eq!(production.eligibility, fixture);
+
+                // R219 preserves this negative eligibility row: reading an
+                // old alias does not imply that the realloc result succeeded.
+                let realloc = production
+                    .source_events
+                    .reallocations
+                    .iter()
+                    .find(|site| site.key.function == "realloc_source")
+                    .expect("realloc matrix row");
+                assert!(matches!(
+                    realloc.result,
+                    crate::analyses::borrow_ownership::realloc::ReallocResult::Unobserved(_)
+                ));
+                let cases = crate::analyses::borrow_ownership::realloc::classify(realloc)
+                    .expect("R219 matrix cases");
+                assert!(cases.iter().any(|case| case.outcome == crate::analyses::borrow_ownership::realloc::ReallocOutcome::Failure && case.old == crate::analyses::borrow_ownership::realloc::OldResponsibility::LoseClaimIfPresent));
 
                 for (name, expected) in [
                     ("plain", true),

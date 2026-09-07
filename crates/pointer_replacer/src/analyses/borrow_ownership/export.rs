@@ -386,6 +386,32 @@ pub(crate) struct VersionSite {
     pub def_var: Option<Var>,
 }
 
+/// Responsibility at a source operation, conditioned on a source realloc
+/// outcome. The edge is analysis state, not a new MIR/source assignment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReallocVersionSite {
+    pub(crate) fn_did: LocalDefId,
+    pub(crate) event: super::realloc::ReallocSiteKey,
+    pub(crate) outcome: super::realloc::ReallocOutcome,
+    pub(crate) edge: u32,
+    pub(crate) location: MirLocationKey,
+    pub(crate) local: Local,
+    pub(crate) use_var: Option<Var>,
+    pub(crate) def_var: Var,
+}
+
+/// Outcome-qualified responsibility for an unbranched R219 continuation.
+/// The ordinary SSA result bit is a potential-owning qualifier; failure has
+/// no result claim even when that qualifier permits an owner on success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReallocCaseReceipt {
+    pub(crate) event: super::realloc::ReallocSiteKey,
+    pub(crate) case: super::realloc::ReallocCase,
+    pub(crate) old_before: Option<Var>,
+    pub(crate) old_after: Option<Var>,
+    pub(crate) result_claim: Option<Var>,
+}
+
 // ---------------------------------------------------------------------------
 // §4 E-R3 — selector provenance
 // ---------------------------------------------------------------------------
@@ -407,15 +433,29 @@ pub(crate) struct T2AssertKey {
     pub(crate) callee: String,
     pub(crate) role: BoundaryRole,
     pub(crate) var: Var,
+    pub(crate) realloc_outcome: Option<super::realloc::ReallocOutcome>,
+    pub(crate) endpoint: Option<PlaceKey>,
 }
 
 impl T2AssertKey {
-    pub(crate) fn sort_key(&self) -> (&str, MirLocationKey, &str, BoundaryRole, u32) {
+    pub(crate) fn sort_key(
+        &self,
+    ) -> (
+        &str,
+        MirLocationKey,
+        &str,
+        BoundaryRole,
+        Option<super::realloc::ReallocOutcome>,
+        Option<&PlaceKey>,
+        u32,
+    ) {
         (
             self.function_path.as_str(),
             self.location,
             self.callee.as_str(),
             self.role,
+            self.realloc_outcome,
+            self.endpoint.as_ref(),
             self.var.as_u32(),
         )
     }
@@ -425,14 +465,22 @@ impl T2AssertKey {
             BoundaryRole::Source => "source",
             BoundaryRole::Sink => "sink",
         };
-        format!(
+        let mut label = format!(
             "t2-assert[{role}]({}:{}:{}:{},{:?})",
             self.function_path,
             self.location.block,
             self.location.statement_index,
             self.callee,
             self.var,
-        )
+        );
+        if let Some(outcome) = self.realloc_outcome {
+            let outcome = match outcome {
+                super::realloc::ReallocOutcome::Success => "success",
+                super::realloc::ReallocOutcome::Failure => "failure",
+            };
+            label.push_str(&format!(";realloc={outcome};endpoint={:?}", self.endpoint));
+        }
+        label
     }
 }
 
@@ -473,6 +521,8 @@ pub(crate) struct BoExport {
     /// kind selection and the optional export recorder.
     pub source_events: Option<std::sync::Arc<super::source_events::SourceEvents>>,
     pub replay_source_events: Option<std::sync::Arc<super::source_events::SourceEvents>>,
+    pub realloc_version_sites: Vec<ReallocVersionSite>,
+    pub realloc_cases: Vec<ReallocCaseReceipt>,
     /// E-R2 consume sites, in emission order.
     pub version_sites: Vec<VersionSite>,
     /// E-R2 per-`Var` ownership, evaluated from the accepted model.
@@ -717,6 +767,23 @@ thread_local! {
     static LOCATION_CURSOR: RefCell<Option<(LocalDefId, String, MirLocationKey)>> =
         const { RefCell::new(None) };
     static CALLEE_CURSOR: RefCell<Option<String>> = const { RefCell::new(None) };
+    static REALLOC_ENDPOINT: RefCell<Option<(super::realloc::ReallocOutcome, PlaceKey)>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn with_realloc_endpoint<T>(
+    outcome: super::realloc::ReallocOutcome,
+    endpoint: PlaceKey,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<(super::realloc::ReallocOutcome, PlaceKey)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REALLOC_ENDPOINT.with(|cursor| *cursor.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(REALLOC_ENDPOINT.with(|cursor| cursor.replace(Some((outcome, endpoint)))));
+    f()
 }
 
 /// Set the `(fn_did, location)` half for the duration of `f`.
@@ -777,6 +844,14 @@ pub(crate) fn current_t2_assert_key(role: BoundaryRole, var: Var) -> T2AssertKey
         callee: call.callee,
         role,
         var,
+        realloc_outcome: REALLOC_ENDPOINT
+            .with(|cursor| cursor.borrow().as_ref().map(|(outcome, _)| *outcome)),
+        endpoint: REALLOC_ENDPOINT.with(|cursor| {
+            cursor
+                .borrow()
+                .as_ref()
+                .map(|(_, endpoint)| endpoint.clone())
+        }),
     }
 }
 

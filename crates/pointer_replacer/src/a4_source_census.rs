@@ -15060,6 +15060,21 @@ mod tests {
                 )
                 .expect("fixture ownership emission")
             });
+            // R219: the later positive-sized element store is unconditional
+            // result use; the original field-flow assertions remain in force.
+            let inventory = captured_export
+                .source_events
+                .as_ref()
+                .expect("source inventory");
+            let realloc = inventory
+                .reallocations
+                .iter()
+                .find(|site| site.key.function == "install_live")
+                .expect("install_live realloc");
+            assert!(matches!(
+                realloc.result,
+                crate::analyses::borrow_ownership::realloc::ReallocResult::SuccessImplied(_)
+            ));
             let graph = build_source_graph(tcx, &slots, &captured_export);
             let fields = candidate_fields(tcx, &slots);
             let field = |suffix: &str| {

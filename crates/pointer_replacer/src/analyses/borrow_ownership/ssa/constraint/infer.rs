@@ -28,6 +28,16 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
 
     fn define_phi_node(infer_cx: &mut Self::Ctxt, local: Local, ty: Ty<'tcx>, def: SSAIdx);
 
+    fn realloc_edge(
+        infer_cx: &mut Self::Ctxt,
+        plan: &crate::analyses::borrow_ownership::realloc_ssa::ReallocSsaPlan,
+        outcome: crate::analyses::borrow_ownership::realloc::ReallocOutcome,
+        edge: BasicBlock,
+        operation: &crate::analyses::borrow_ownership::realloc_ssa::ReallocEdgeOperation,
+        versions: &[(Local, Consume<SSAIdx>)],
+        body: &Body<'tcx>,
+    );
+
     fn join_phi_nodes<'a>(
         infer_cx: &'a mut Self::Ctxt,
         phi_nodes: impl Iterator<Item = (Local, &'a mut PhiNode)>,
@@ -112,6 +122,8 @@ pub struct Renamer<'rn, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'rn Body<'tcx>,
     pub state: SSAState,
+    realloc_plans: Vec<crate::analyses::borrow_ownership::realloc_ssa::ReallocSsaPlan>,
+    realloc_pops: IndexVec<BasicBlock, Vec<Local>>,
 }
 
 // TODO implement this:
@@ -147,7 +159,21 @@ where
 
 impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
     pub fn new(body: &'rn Body<'tcx>, state: SSAState, tcx: TyCtxt<'tcx>) -> Self {
-        Renamer { body, state, tcx }
+        Renamer {
+            body,
+            state,
+            tcx,
+            realloc_plans: Vec::new(),
+            realloc_pops: IndexVec::from_elem(Vec::new(), &body.basic_blocks),
+        }
+    }
+
+    pub(crate) fn with_realloc_plans(
+        mut self,
+        plans: Vec<crate::analyses::borrow_ownership::realloc_ssa::ReallocSsaPlan>,
+    ) -> Self {
+        self.realloc_plans = plans;
+        self
     }
 
     pub fn go<'db, Infer>(&mut self, mut infer_cx: impl BorrowMut<Infer::Ctxt>)
@@ -194,6 +220,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                         .filter(|(_, consume)| !consume.is_use())
                         .map(|(local, _)| *local)
                         .chain(self.state.join_points[bb].iter().map(|(local, _)| *local))
+                        .chain(self.realloc_pops[bb].iter().copied())
                     {
                         let ssa_idx = self.state.name_state.pop(local);
                         tracing::debug!("popping at {:?}: {:?}~{:?}", bb, local, ssa_idx);
@@ -233,6 +260,49 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             );
             tracing::debug!("defining {:?} at Phi({:?}), def: {:?}", local, bb, ssa_idx);
             Infer::define_phi_node(infer_cx, local, self.body.local_decls[local].ty, ssa_idx);
+        }
+
+        // Both source successors are traversed by the ordinary dominator walk.
+        // Outcome is a source edge, never a Boolean chosen by the solver.
+        use crate::analyses::borrow_ownership::{
+            realloc::{ReallocOutcome, ReallocResult},
+            realloc_ssa::ReallocEdgeOperation,
+        };
+        for plan in self.realloc_plans.clone() {
+            let ReallocResult::DirectBranch(branch) = &plan.site.result else { continue };
+            let outcome = if bb == branch.success {
+                ReallocOutcome::Success
+            } else if bb == branch.failure {
+                ReallocOutcome::Failure
+            } else {
+                continue;
+            };
+            for operation in &plan.operations {
+                let locals = match operation {
+                    ReallocEdgeOperation::Old { local }
+                    | ReallocEdgeOperation::Result { local } => vec![*local],
+                    ReallocEdgeOperation::Transfer {
+                        source,
+                        destination,
+                        ..
+                    } => vec![*source, *destination],
+                };
+                let mut versions = Vec::new();
+                for local in locals {
+                    let r#use = self.state.name_state.get_name(local);
+                    let def = self.state.name_state.generate_fresh_name(local);
+                    assert_eq!(
+                        self.state.consume_chain.locs[local].push(RichLocation::ReallocEdge),
+                        def
+                    );
+                    Infer::define_phi_node(infer_cx, local, self.body.local_decls[local].ty, def);
+                    self.realloc_pops[bb].push(local);
+                    versions.push((local, Consume { r#use, def }));
+                }
+                Infer::realloc_edge(
+                    infer_cx, &plan, outcome, bb, operation, &versions, self.body,
+                );
+            }
         }
 
         let mut index = 0;

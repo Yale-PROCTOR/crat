@@ -28,6 +28,7 @@ pub(crate) enum SourcePhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SourceRole {
     Free,
+    ReallocOld,
     StorageDead,
     Drop,
     ReturnStorage,
@@ -38,6 +39,9 @@ pub(crate) enum SourceRole {
 pub(crate) enum SourceCondition {
     Unconditional,
     StorageLive,
+    ReallocSuccess,
+    ReallocZeroSizePossible,
+    UnresolvedRealloc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +90,7 @@ pub(crate) enum Coverage {
     UnresolvedWholeObject,
     UnresolvedStorage,
     UnresolvedDropEffects,
+    UnresolvedReallocLifecycle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +120,7 @@ pub(crate) struct SourceCallRoute {
 pub(crate) struct SourceEvents {
     pub(crate) retirements: BTreeMap<SourceEventKey, SourceRetirement>,
     pub(crate) calls: Vec<SourceCallRoute>,
+    pub(crate) reallocations: Vec<super::realloc::ReallocSite>,
 }
 
 thread_local! {
@@ -129,14 +135,20 @@ pub(crate) fn for_construction(program: &RustProgram<'_>) -> Arc<SourceEvents> {
     current().unwrap_or_else(|| Arc::new(collect(program)))
 }
 
-pub(crate) fn with_inventory<T>(inventory: &Arc<SourceEvents>, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<Arc<SourceEvents>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CARRIED.with(|inventory| *inventory.borrow_mut() = self.0.take());
-        }
+pub(crate) struct InventoryScope(Option<Arc<SourceEvents>>);
+
+impl Drop for InventoryScope {
+    fn drop(&mut self) {
+        CARRIED.with(|inventory| *inventory.borrow_mut() = self.0.take());
     }
-    let _restore = Restore(CARRIED.with(|carried| carried.replace(Some(inventory.clone()))));
+}
+
+pub(crate) fn enter_inventory(inventory: &Arc<SourceEvents>) -> InventoryScope {
+    InventoryScope(CARRIED.with(|carried| carried.replace(Some(inventory.clone()))))
+}
+
+pub(crate) fn with_inventory<T>(inventory: &Arc<SourceEvents>, f: impl FnOnce() -> T) -> T {
+    let _scope = enter_inventory(inventory);
     f()
 }
 
@@ -178,7 +190,7 @@ pub(crate) enum ReconciliationError {
     Mismatch(SourceEventKey),
 }
 
-fn operand_is_null(operand: &Operand<'_>, state: &[bool], tcx: TyCtxt<'_>) -> bool {
+pub(super) fn operand_is_null(operand: &Operand<'_>, state: &[bool], tcx: TyCtxt<'_>) -> bool {
     match operand {
         Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
             state[place.local.as_usize()]
@@ -202,7 +214,7 @@ fn operand_is_null(operand: &Operand<'_>, state: &[bool], tcx: TyCtxt<'_>) -> bo
     }
 }
 
-fn transfer_statement(
+pub(super) fn transfer_statement(
     statement: &StatementKind<'_>,
     state: &mut [bool],
     addressed: &BTreeSet<Local>,
@@ -251,7 +263,7 @@ fn transfer_call<'tcx>(
     }
 }
 
-fn null_entries<'tcx>(
+pub(super) fn null_entries<'tcx>(
     body: &Body<'tcx>,
     addressed: &BTreeSet<Local>,
     tcx: TyCtxt<'tcx>,
@@ -384,15 +396,8 @@ fn storage_event(
     }
 }
 
-pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
-    let tcx = program.tcx;
-    let mut events = SourceEvents::default();
-    for &function in &program.functions {
-        let function_path = tcx.def_path_str(function.to_def_id());
-        let body = tcx
-            .mir_drops_elaborated_and_const_checked(function)
-            .borrow();
-        let addressed: BTreeSet<_> = body
+pub(super) fn addressed_locals(body: &Body<'_>) -> BTreeSet<Local> {
+    body
             .basic_blocks
             .iter()
             .flat_map(|block| &block.statements)
@@ -410,7 +415,19 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
                     .any(|projection| matches!(projection, ProjectionElem::Deref)))
                 .then_some(place.local)
             })
-            .collect();
+            .collect()
+}
+
+pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
+    let tcx = program.tcx;
+    let mut events = SourceEvents::default();
+    events.reallocations = super::realloc::collect_sites(program);
+    for &function in &program.functions {
+        let function_path = tcx.def_path_str(function.to_def_id());
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(function)
+            .borrow();
+        let addressed = addressed_locals(&body);
         let entries = null_entries(&body, &addressed, tcx);
         let storage = storage_entries(&body);
         for (block, data) in body.basic_blocks.iter_enumerated() {
@@ -489,6 +506,69 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
                                 region,
                             },
                         );
+                    }
+                    CallKind::LibC(name) if name.as_str() == "realloc" => {
+                        let site = events
+                            .reallocations
+                            .iter()
+                            .find(|site| {
+                                site.key.function == function_path
+                                    && site.key.block == block.as_u32()
+                                    && site.key.statement == index
+                            })
+                            .expect("shared source realloc inventory");
+                        if site.old_input != super::realloc::OldInput::KnownNull {
+                            let zero_retirement = super::realloc::classify(site).is_ok_and(|cases| cases.iter().any(|case| {
+                                super::realloc::retirement_availability(site, case)
+                                    == super::realloc::ReallocRetirementAvailability::MayRetireOnZero
+                            }));
+                            let (condition, coverage) = match super::realloc::classify(site) {
+                                Ok(cases) => {
+                                    assert!(cases.iter().any(|case| case.outcome == super::realloc::ReallocOutcome::Success && case.old == super::realloc::OldResponsibility::RetireIfPresent));
+                                    (
+                                        SourceCondition::ReallocSuccess,
+                                        Coverage::UnresolvedWholeObject,
+                                    )
+                                }
+                                Err(_) => (
+                                    SourceCondition::UnresolvedRealloc,
+                                    Coverage::UnresolvedReallocLifecycle,
+                                ),
+                            };
+                            let object = call
+                                .args
+                                .first()
+                                .and_then(|argument| argument.node.place())
+                                .map(|place| SourceObject::HeapThrough(PlaceKey::from_place(place)))
+                                .unwrap_or(SourceObject::UnknownOperand);
+                            let mut event_key =
+                                key(index, SourcePhase::Call, SourceRole::ReallocOld, None);
+                            event_key.condition = condition;
+                            if zero_retirement {
+                                let mut zero_key = event_key.clone();
+                                zero_key.condition = SourceCondition::ReallocZeroSizePossible;
+                                insert(
+                                    &mut events,
+                                    SourceRetirement {
+                                        key: zero_key,
+                                        object: object.clone(),
+                                        coverage: Coverage::UnresolvedWholeObject,
+                                        generation: SourceGeneration::UnresolvedHeapEpoch,
+                                        region: SourceRegion::WholeAllocation,
+                                    },
+                                );
+                            }
+                            insert(
+                                &mut events,
+                                SourceRetirement {
+                                    key: event_key,
+                                    object,
+                                    coverage,
+                                    generation: SourceGeneration::UnresolvedHeapEpoch,
+                                    region: SourceRegion::WholeAllocation,
+                                },
+                            );
+                        }
                     }
                     CallKind::FreeStanding(callee) | CallKind::Impl(callee) => {
                         let arguments = call
@@ -592,7 +672,7 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
     for event in events
         .retirements
         .keys()
-        .filter(|key| key.role == SourceRole::Free)
+        .filter(|key| matches!(key.role, SourceRole::Free | SourceRole::ReallocOld))
     {
         reachable
             .entry(event.function.clone())
@@ -895,5 +975,72 @@ mod tests {
             "{prefix} pub unsafe fn f(other: *mut u8) {{ let mut p = 0 as *mut u8; let q = &raw mut p; *q = other; free(p); }}"
         ));
         assert_ne!(frees(&aliased)[0].object, SourceObject::Null);
+    }
+
+    #[test]
+    fn e5_r_retirement_contains_only_success_old_generation() {
+        let events = inventory(
+            "unsafe extern \"C\" { fn realloc(p: *mut u8, n: usize) -> *mut u8; } pub unsafe fn f(p: *mut u8) -> bool { let q = realloc(p, 16); q.is_null() }",
+        );
+        let unresolved: Vec<_> = events
+            .retirements
+            .values()
+            .filter(|event| event.key.role == SourceRole::ReallocOld)
+            .collect();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(
+            unresolved[0].key.condition,
+            SourceCondition::UnresolvedRealloc
+        );
+        let events = inventory(
+            "unsafe extern \"C\" { fn realloc(p: *mut u8, n: usize) -> *mut u8; } pub unsafe fn f(p: *mut u8) -> bool { let q = realloc(p, 16); if q.is_null() { true } else { false } }",
+        );
+        let retirements: Vec<_> = events
+            .retirements
+            .values()
+            .filter(|event| event.key.role == SourceRole::ReallocOld)
+            .collect();
+        assert_eq!(
+            retirements.len(),
+            1,
+            "failure must not introduce an old-generation retirement"
+        );
+        assert_eq!(
+            retirements[0].key.condition,
+            SourceCondition::ReallocSuccess
+        );
+        assert_eq!(retirements[0].region, SourceRegion::WholeAllocation);
+        assert_eq!(
+            retirements[0].generation,
+            SourceGeneration::UnresolvedHeapEpoch
+        );
+    }
+
+    #[test]
+    fn e5_r219_source_inventory_keeps_possible_zero_retirement() {
+        let events = inventory(
+            "unsafe extern \"C\" { fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); } pub unsafe fn f(p: *mut u8, bytes: usize) { let q = realloc(p, bytes); free(q); }",
+        );
+        assert!(
+            events
+                .retirements
+                .values()
+                .any(|event| event.key.condition == SourceCondition::ReallocZeroSizePossible),
+            "a byte contract does not exclude zero-size retirement"
+        );
+    }
+
+    #[test]
+    fn e5_r_retirement_null_old_has_no_old_generation_event() {
+        let events = inventory(
+            "unsafe extern \"C\" { fn realloc(p: *mut u8, n: usize) -> *mut u8; } pub unsafe fn f() -> bool { let q = realloc(0 as *mut u8, 16); if q.is_null() { true } else { false } }",
+        );
+        assert_eq!(events.reallocations.len(), 1);
+        assert!(
+            events
+                .retirements
+                .values()
+                .all(|event| event.key.role != SourceRole::ReallocOld)
+        );
     }
 }

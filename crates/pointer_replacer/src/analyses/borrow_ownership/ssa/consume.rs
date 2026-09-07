@@ -125,6 +125,7 @@ pub enum RichLocation {
     Entry,
     Phi,
     Mir,
+    ReallocEdge,
 }
 
 impl From<Location> for RichLocation {

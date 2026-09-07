@@ -731,18 +731,18 @@ fn construct_bo_into_with_esc(
     };
     let eligibility_elapsed = t.elapsed();
     let t = Instant::now();
-    let (stats, selectors) = match mode {
+    let (stats, selectors) = super::source_events::with_inventory(&source_events, || match mode {
         CopyLendMode::LendArm => emit_crate_ownership_constraints_with_copy_lends(
             &crate_ctxt,
             slots,
             origins,
             solver,
             &eligibility.pairs,
-        )?,
+        ),
         CopyLendMode::Baseline | CopyLendMode::RemovalOnly => {
-            emit_crate_ownership_constraints(&crate_ctxt, slots, origins, solver)?
+            emit_crate_ownership_constraints(&crate_ctxt, slots, origins, solver)
         }
-    };
+    })?;
     let emit_elapsed = t.elapsed();
     let t = Instant::now();
     if let Some(tracker) = solver.tracker() {
@@ -944,7 +944,9 @@ pub(crate) fn construct_tracked_census_baseline(
     super::export::record(|export| export.source_events = Some(source_events.clone()));
     let crate_ctxt = CrateCtxt::new(program);
     let t = Instant::now();
-    let (stats, selectors) = emit_crate_ownership_constraints(&crate_ctxt, slots, origins, solver)?;
+    let (stats, selectors) = super::source_events::with_inventory(&source_events, || {
+        emit_crate_ownership_constraints(&crate_ctxt, slots, origins, solver)
+    })?;
     let emit_elapsed = t.elapsed();
     let t = Instant::now();
     solver
