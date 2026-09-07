@@ -1236,6 +1236,7 @@ pub(crate) struct Plan {
         Vec<super::mechanical_receipt::SliceConstructionReceiptPlan>,
     pub slice_use_receipt_plans: Vec<super::mechanical_receipt::SliceUseReceiptPlan>,
     pub option_receipt_plans: Vec<super::mechanical_receipt::OptionPresentationReceiptPlan>,
+    pub declaration_receipt_plans: Vec<super::mechanical_receipt::DeclarationShapeReceiptPlan>,
     pub unowned_a5_proof_sites: usize,
     /// A5 calls after terminal-interface validation/re-planning. The AST graft
     /// consumes this sealed plan; it never recomputes the terminal verdict.
@@ -1495,7 +1496,38 @@ impl Plan {
                     .0,
             );
         }
+        for receipt in &self.declaration_receipt_plans {
+            let live = self
+                .class_finalization
+                .classes
+                .get(&receipt.owner_class)
+                .is_some_and(SignatureClassPlan::is_ready);
+            events.extend(
+                receipt
+                    .materialize(live, reverted.contains(&receipt.owner_class))
+                    .0,
+            );
+        }
         (events, a5_rows, slice_rows)
+    }
+
+    pub(crate) fn declaration_receipt_rows(
+        &self,
+        reverted: &BTreeSet<SignatureClassId>,
+    ) -> Vec<super::mechanical_receipt::DeclarationShapeReceiptRow> {
+        self.declaration_receipt_plans
+            .iter()
+            .flat_map(|receipt| {
+                let live = self
+                    .class_finalization
+                    .classes
+                    .get(&receipt.owner_class)
+                    .is_some_and(SignatureClassPlan::is_ready);
+                receipt
+                    .materialize(live, reverted.contains(&receipt.owner_class))
+                    .1
+            })
+            .collect()
     }
 
     fn slice_use_class_live(
@@ -1567,6 +1599,267 @@ impl Plan {
     }
 }
 
+fn declaration_lifetime<'a>(
+    table: &'a DecisionTable,
+    subject: &super::decision::Subject,
+) -> Option<&'a str> {
+    match subject.kind {
+        super::decision::SubjectKind::Param { hir_index } => table
+            .lifetime_plan
+            .function(subject.fn_did)
+            .and_then(|plan| {
+                plan.lifetime_for(super::decision::lifetime::FnSignatureSlot::arg(
+                    hir_index + 1,
+                    0,
+                    0,
+                ))
+            }),
+        super::decision::SubjectKind::Local => None,
+    }
+}
+
+fn declaration_receipts(
+    table: &DecisionTable,
+    owner_of: &impl Fn(&super::decision::Subject) -> String,
+) -> Vec<super::mechanical_receipt::DeclarationShapeReceiptPlan> {
+    use super::mechanical_receipt::*;
+    table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            if subject.decl_shape == super::decision::DeclShape::RawPtr
+                && !table
+                    .declaration_patterns
+                    .contains_key(&(subject.fn_did, subject.hir_id))
+            {
+                return None;
+            }
+            let owner = SignatureClassId::of(subject.fn_did);
+            let node = (subject.fn_did, subject.hir_id);
+            let original = table
+                .declaration_patterns
+                .get(&node)
+                .map(|pattern| pattern.input_type.clone())
+                .or_else(|| {
+                    table
+                        .declaration_pointees
+                        .get(&node)
+                        .map(|pointee| pointee.original_alias.clone())
+                })
+                .unwrap_or_else(|| subject.decl_shape.key().to_owned());
+            let pattern = table.declaration_patterns.get(&node);
+            let emitted = table
+                .declaration_pointees
+                .get(&node)
+                .map(|ty| ty.pointee.as_str())
+                .or_else(|| pattern.map(|carrier| carrier.pointee.as_str()))
+                .and_then(|pointee| {
+                    super::decision::declaration::emitted_type(
+                        decision,
+                        pointee,
+                        declaration_lifetime(table, subject),
+                    )
+                });
+            let (settled, state, reason) = match decision {
+                Decision::Degraded(record) => (
+                    original.clone(),
+                    MechanicalState::Reclassified,
+                    Some(MechanicalTerminalReason::EvidenceMissing(
+                        record.reason.key().to_owned(),
+                    )),
+                ),
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_) => match emitted {
+                    Some(ty) => (ty, MechanicalState::Applied, None),
+                    None => (
+                        original.clone(),
+                        MechanicalState::HeldNonmechanical,
+                        Some(MechanicalTerminalReason::EvidenceMissing(
+                            "declaration-pointee-unavailable".to_owned(),
+                        )),
+                    ),
+                },
+            };
+            let initializer_kind = match subject.kind {
+                super::decision::SubjectKind::Param { .. } => "parameter".to_owned(),
+                super::decision::SubjectKind::Local => table
+                    .slice_constructions
+                    .iter()
+                    .find(|construction| construction.node == node)
+                    .map_or_else(
+                        || {
+                            subject
+                                .ctor
+                                .as_ref()
+                                .map_or(
+                                    "local-expression",
+                                    super::decision::construction::Construction::key,
+                                )
+                                .to_owned()
+                        },
+                        |construction| construction.initializer_kind.to_owned(),
+                    ),
+            };
+            let site = CanonicalSiteKey {
+                owner: subject.fn_did,
+                location: CanonicalLocation::Hir {
+                    owner: subject.fn_did,
+                    item_local_id: subject.hir_id.local_id.as_u32(),
+                },
+                callee: None,
+                argument_index: None,
+                slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+            };
+            let event = MechanicalObligationEvent {
+                key: MechanicalObligationKey {
+                    owner_class: owner,
+                    subject: MechanicalSubjectKey::Local {
+                        owner: subject.fn_did,
+                        mir_local: subject.local.as_u32(),
+                        slot_depth: site.slot_depth,
+                    },
+                    site: site.clone(),
+                    family: MechanicalFamily::UnsupportedDeclShape,
+                },
+                owner_path: owner_of(subject),
+                prior_reason: format!("unsupported-decl-shape:{}", subject.decl_shape.key()),
+                expected_form: settled.clone(),
+                found_form: original.clone(),
+                argument_kind: initializer_kind.clone(),
+                source_shape: subject.decl_shape.key().to_owned(),
+                required_arms: table
+                    .arm_requirements
+                    .get(&node)
+                    .copied()
+                    .unwrap_or_default()
+                    .render(),
+                mechanism: MechanicalMechanism::DeclarationExplicitType,
+                composition_parent: None,
+                dependency_classes: BTreeSet::new(),
+                evidence: MechanicalEvidence {
+                    extent: MechanicalExtent::None,
+                    retention: MechanicalRetention::None,
+                    negative_write: NegativeWriteEvidence::NotApplicable,
+                    terminal_contract: TerminalContract::NotApplicable,
+                    hoist: HoistSafety::NotApplicable,
+                    unsafe_context: None,
+                },
+                stage: MechanicalStage::Plan,
+                state: MechanicalState::Planned,
+                terminal_reason: None,
+            };
+            Some(DeclarationShapeReceiptPlan {
+                obligation: MechanicalObligationPlan {
+                    planned: event,
+                    intended_terminal_state: state,
+                    intended_terminal_reason: reason,
+                },
+                declaration_site: site,
+                original_type_form: original,
+                settled_emitted_type: settled,
+                initializer_kind,
+                typed_temporary: pattern.map(|carrier| carrier.temporary.clone()),
+                evaluation_order: HoistSafety::NotApplicable,
+                owner_class: owner,
+            })
+        })
+        .collect()
+}
+
+fn explicit_declaration_receipt(
+    declaration: &super::decision::seam::ExplicitDeclarationSite,
+    table: &DecisionTable,
+    owner_of: &impl Fn(&super::decision::Subject) -> String,
+) -> super::mechanical_receipt::DeclarationShapeReceiptPlan {
+    use super::mechanical_receipt::*;
+    let owner = declaration.owner_class;
+    let identity = format!(
+        "{}:{}",
+        declaration.category,
+        declaration.span.map_or_else(
+            || "generated".to_owned(),
+            |span| format!("{}..{}", span.lo().0, span.hi().0)
+        )
+    );
+    let source = declaration.node.and_then(|node| {
+        table
+            .entries
+            .iter()
+            .find(|(subject, _)| (subject.fn_did, subject.hir_id) == node)
+            .map(|(subject, _)| subject)
+    });
+    let subject = source.map_or_else(
+        || MechanicalSubjectKey::Generated {
+            owner: declaration.caller,
+            key: identity.clone(),
+            slot_depth: 0,
+        },
+        |subject| MechanicalSubjectKey::Local {
+            owner: subject.fn_did,
+            mir_local: subject.local.as_u32(),
+            slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+        },
+    );
+    let site = CanonicalSiteKey {
+        owner: declaration.caller,
+        location: CanonicalLocation::Generated {
+            defining_class: owner,
+            key: identity.clone(),
+        },
+        callee: None,
+        argument_index: None,
+        slot_depth: 0,
+    };
+    let original = if declaration.category == "local" {
+        "inferred-call-result"
+    } else {
+        "input-raw-interface"
+    }
+    .to_owned();
+    let kind = declaration.category.to_owned();
+    let temporary =
+        matches!(declaration.category, "local-temp" | "return-temp").then_some(identity);
+    let event = MechanicalObligationEvent {
+        key: MechanicalObligationKey {
+            owner_class: owner,
+            subject,
+            site: site.clone(),
+            family: MechanicalFamily::UnsupportedDeclShape,
+        },
+        owner_path: source.map_or_else(|| format!("class#{}", owner.order_key()), owner_of),
+        prior_reason: "declaration-explicit-type".to_owned(),
+        expected_form: declaration.emitted_type.clone(),
+        found_form: original.clone(),
+        argument_kind: kind.clone(),
+        source_shape: declaration.category.to_owned(),
+        required_arms: declaration.arm.to_owned(),
+        mechanism: MechanicalMechanism::DeclarationExplicitType,
+        composition_parent: None,
+        dependency_classes: BTreeSet::new(),
+        evidence: MechanicalEvidence::default(),
+        stage: MechanicalStage::Plan,
+        state: MechanicalState::Planned,
+        terminal_reason: None,
+    };
+    DeclarationShapeReceiptPlan {
+        obligation: MechanicalObligationPlan {
+            planned: event,
+            intended_terminal_state: MechanicalState::Applied,
+            intended_terminal_reason: None,
+        },
+        declaration_site: site,
+        original_type_form: original,
+        settled_emitted_type: declaration.emitted_type.clone(),
+        initializer_kind: kind,
+        typed_temporary: temporary,
+        evaluation_order: HoistSafety::NotApplicable,
+        owner_class: owner,
+    }
+}
+
 /// Turn decisions into edits.
 ///
 /// `source` is read only to copy the pointee's text verbatim: an emitted
@@ -1623,13 +1916,9 @@ impl Plan {
 /// meaningful on FAIL rows only because `RewriteOutcome::Degraded` carries the
 /// count as of S2b.3; before that it reported a constant.
 ///
-/// **Where alias-typed subjects land today:** a parameter whose *resolved* type
-/// is a pointer but whose declaration is a type alias is collected (R-A) with
-/// `DeclShape::Alias`, and `decide_one` degrades it as
-/// `UnsupportedDeclShape { shape: "alias" }` — a reason named for the declaration
-/// shape, which is true but says nothing about what BO concluded for it. The
-/// alias-specific relabel is **registered**, to ride whichever slice first makes
-/// alias emission live (S3 at the earliest).
+/// Alias declarations use a compiler-resolved pointee carrier sealed by the
+/// declaration decision stage. Only the binding's annotation is replaced;
+/// the shared typedef and every subject retaining its raw form stay unchanged.
 pub(crate) fn plan(
     table: &DecisionTable,
     source_of: impl Fn(&FileKey) -> Option<String>,
@@ -1644,6 +1933,7 @@ pub(crate) fn plan(
     let mut slice_construction_receipt_plans = table.retired_slice_constructions.clone();
     let slice_use_receipt_plans = table.slice_use_receipts.clone();
     let option_receipt_plans = table.option_receipts.clone();
+    let mut declaration_receipt_plans = declaration_receipts(table, &owner_of);
     let unowned_a5_proof_sites = table
         .seams
         .overlap_proofs
@@ -1668,6 +1958,7 @@ pub(crate) fn plan(
     }
 
     for declaration in &table.seams.explicit_declarations {
+        declaration_receipt_plans.push(explicit_declaration_receipt(declaration, table, &owner_of));
         let bridge = BridgeSitePlan {
             caller: declaration.caller,
             callee: BridgeCalleeId::Local(declaration.owner_class.local_def_id()),
@@ -2329,7 +2620,10 @@ pub(crate) fn plan(
         // edits, but deliberately has no declaration splice. Every other form
         // retains the long-standing syntactic-pointee requirement.
         let inferred_box = box_plan.is_some_and(|plan| plan.inferred_binding);
-        let (ty_file, declaration_edit) = if inferred_box {
+        let typed_pattern = table
+            .declaration_patterns
+            .contains_key(&(subject.fn_did, subject.hir_id));
+        let (ty_file, declaration_edit) = if inferred_box || typed_pattern {
             match span_to_loc(subject.binding_span) {
                 Ok((file, _, _)) => (file, None),
                 Err(reason) => {
@@ -2343,6 +2637,42 @@ pub(crate) fn plan(
                     continue;
                 }
             }
+        } else if let Some(resolved) = table
+            .declaration_pointees
+            .get(&(subject.fn_did, subject.hir_id))
+        {
+            let located = subject
+                .ty_span
+                .ok_or("alias declaration has no type span")
+                .and_then(&span_to_loc);
+            let (file, lo, hi) = match located {
+                Ok(located) => located,
+                Err(reason) => {
+                    unplaceable.push(Unplaceable {
+                        owner_class: SignatureClassId::of(subject.fn_did),
+                        bridge: surface_bridge(),
+                        reason,
+                        detail: attribution(),
+                        subject: identity(),
+                    });
+                    continue;
+                }
+            };
+            let Some(replacement) = super::decision::declaration::emitted_type(
+                decision,
+                &resolved.pointee,
+                declaration_lifetime(table, subject),
+            ) else {
+                unplaceable.push(Unplaceable {
+                    owner_class: SignatureClassId::of(subject.fn_did),
+                    bridge: surface_bridge(),
+                    reason: "alias declaration has no licensed borrowed form",
+                    detail: attribution(),
+                    subject: identity(),
+                });
+                continue;
+            };
+            (file, Some((lo, hi, replacement)))
         } else {
             let Some(pointee_span) = subject.pointee_span else {
                 unplaceable.push(Unplaceable {
@@ -3130,6 +3460,7 @@ pub(crate) fn plan(
         slice_construction_receipt_plans,
         slice_use_receipt_plans,
         option_receipt_plans,
+        declaration_receipt_plans,
         unowned_a5_proof_sites,
         terminal_a5_raw_calls: Vec::new(),
     }
@@ -3186,6 +3517,8 @@ mod tests {
     #[test]
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
+            declaration_pointees: Default::default(),
+            declaration_patterns: Default::default(),
             arm_requirements: Default::default(),
             exposure: None,
             seams: Default::default(),
@@ -3248,6 +3581,8 @@ mod tests {
     #[test]
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
+            declaration_pointees: Default::default(),
+            declaration_patterns: Default::default(),
             arm_requirements: Default::default(),
             exposure: None,
             seams: Default::default(),

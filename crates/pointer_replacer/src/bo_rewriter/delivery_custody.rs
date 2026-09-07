@@ -67,6 +67,38 @@ pub(crate) struct Declaration {
     pub(crate) type_shape: TypeShape,
     /// Whether the complete declared type is present without inference holes.
     pub(crate) type_is_fully_explicit: bool,
+    /// Exact syntax connecting a by-value let-pattern component to an inline
+    /// explicitly typed temporary. The binding's own type remains inferred.
+    pub(crate) typed_component: Option<TypedComponentCustody>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct TypedComponentCustody {
+    pub(crate) temporary: String,
+    pub(crate) component_path: Vec<u32>,
+    pub(crate) component_span: ByteSpan,
+    pub(crate) pattern_span: ByteSpan,
+    pub(crate) temporary_declaration_span: ByteSpan,
+    pub(crate) temporary_binding_span: ByteSpan,
+    pub(crate) returned_binding_span: ByteSpan,
+    pub(crate) type_span: ByteSpan,
+    pub(crate) explicit_type: String,
+    pub(crate) rendered_type: String,
+    pub(crate) type_shape: TypeShape,
+    pub(crate) type_is_fully_explicit: bool,
+}
+
+impl Declaration {
+    pub(crate) fn effective_type_shape(&self) -> Option<&TypeShape> {
+        if self.type_is_fully_explicit {
+            Some(&self.type_shape)
+        } else {
+            self.typed_component
+                .as_ref()
+                .filter(|carrier| carrier.type_is_fully_explicit)
+                .map(|carrier| &carrier.type_shape)
+        }
+    }
 }
 
 fn observed_type(ty: &ast::Ty) -> TypeShape {
@@ -235,7 +267,160 @@ impl DeclarationVisitor<'_> {
                 rendered_type: rendered_type.clone(),
                 type_shape: type_shape.clone(),
                 type_is_fully_explicit: ty.is_some_and(declared_type_is_fully_explicit),
+                typed_component: None,
             });
+        }
+        Ok(())
+    }
+
+    fn typed_component(
+        &self,
+        pattern: &ast::Pat,
+        expression: &ast::Expr,
+        component_path: &[u32],
+    ) -> Result<Option<TypedComponentCustody>, String> {
+        let ast::PatKind::Ident(mode, _, None) = &pattern.kind else {
+            return Ok(None);
+        };
+        if mode.0 != ast::ByRef::No || !expression.attrs.is_empty() {
+            return Ok(None);
+        }
+        let ast::ExprKind::Block(block, None) = &expression.kind else {
+            return Ok(None);
+        };
+        if block.rules != ast::BlockCheckMode::Default {
+            return Ok(None);
+        }
+        let [binding, tail] = block.stmts.as_slice() else {
+            return Ok(None);
+        };
+        let (ast::StmtKind::Let(local), ast::StmtKind::Expr(returned)) =
+            (&binding.kind, &tail.kind)
+        else {
+            return Ok(None);
+        };
+        let ast::PatKind::Ident(mode, temporary, None) = &local.pat.kind else {
+            return Ok(None);
+        };
+        if mode.0 != ast::ByRef::No
+            || mode.1.is_mut()
+            || local.super_.is_some()
+            || !local.attrs.is_empty()
+            || !returned.attrs.is_empty()
+            || !matches!(&local.kind, ast::LocalKind::Init(_))
+        {
+            return Ok(None);
+        }
+        let Some(ty) = local.ty.as_deref() else {
+            return Ok(None);
+        };
+        if !declared_type_is_fully_explicit(ty) {
+            return Ok(None);
+        }
+        let ast::ExprKind::Path(None, path) = &returned.kind else {
+            return Ok(None);
+        };
+        let [segment] = path.segments.as_slice() else {
+            return Ok(None);
+        };
+        if segment.ident.name != temporary.name || segment.args.is_some() {
+            return Ok(None);
+        }
+        let type_span = self.range(ty.span)?;
+        Ok(Some(TypedComponentCustody {
+            temporary: temporary.name.to_string(),
+            component_path: component_path.to_vec(),
+            component_span: self.range(expression.span)?,
+            pattern_span: self.range(pattern.span)?,
+            temporary_declaration_span: self.range(local.span)?,
+            temporary_binding_span: self.range(temporary.span)?,
+            returned_binding_span: self.range(segment.ident.span)?,
+            type_span,
+            explicit_type: self.source[type_span.lo as usize..type_span.hi as usize].to_owned(),
+            rendered_type: pprust::ty_to_string(ty),
+            type_shape: observed_type(ty),
+            type_is_fully_explicit: true,
+        }))
+    }
+
+    fn pair_typed_components(
+        &self,
+        pattern: &ast::Pat,
+        expression: &ast::Expr,
+        path: &mut Vec<u32>,
+        carriers: &mut Vec<TypedComponentCustody>,
+    ) -> Result<(), String> {
+        let pattern_span = pattern.span;
+        let component_span = expression.span;
+        let mut pattern = pattern;
+        while let ast::PatKind::Paren(inner) = &pattern.kind {
+            pattern = inner;
+        }
+        let mut expression = expression;
+        loop {
+            if !expression.attrs.is_empty() {
+                return Ok(());
+            }
+            let ast::ExprKind::Paren(inner) = &expression.kind else {
+                break;
+            };
+            expression = inner;
+        }
+        match (&pattern.kind, &expression.kind) {
+            (ast::PatKind::Tuple(patterns), ast::ExprKind::Tup(expressions))
+                if patterns.len() == expressions.len()
+                    && !patterns
+                        .iter()
+                        .any(|pattern| matches!(&pattern.kind, ast::PatKind::Rest)) =>
+            {
+                for (index, (pattern, expression)) in patterns.iter().zip(expressions).enumerate() {
+                    path.push(u32::try_from(index).map_err(|_| "tuple component index overflow")?);
+                    self.pair_typed_components(pattern, expression, path, carriers)?;
+                    path.pop();
+                }
+            }
+            (ast::PatKind::Ident(..), _) => {
+                if let Some(mut carrier) = self.typed_component(pattern, expression, path)? {
+                    // Pair through transparent parentheses while retaining the
+                    // exact original component ranges. The block recognizer
+                    // still requires its unparenthesized temporary-path tail.
+                    carrier.pattern_span = self.range(pattern_span)?;
+                    carrier.component_span = self.range(component_span)?;
+                    carriers.push(carrier);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn record_let_expression(
+        &mut self,
+        pattern: &ast::Pat,
+        expression: &ast::Expr,
+        declaration_span: Span,
+    ) -> Result<(), String> {
+        let first = self.declarations.len();
+        self.record(pattern, None, declaration_span, None)?;
+        let mut carriers = Vec::new();
+        self.pair_typed_components(pattern, expression, &mut Vec::new(), &mut carriers)?;
+        for carrier in carriers {
+            let matches = self.declarations[first..]
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| {
+                    (row.binding_span.lo >= carrier.pattern_span.lo
+                        && row.binding_span.hi <= carrier.pattern_span.hi)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let [index] = matches.as_slice() else {
+                return Err("typed component does not own exactly one pattern binding".to_owned());
+            };
+            let row = &mut self.declarations[first + *index];
+            if row.typed_component.replace(carrier).is_some() {
+                return Err("duplicate typed component for pattern binding".to_owned());
+            }
         }
         Ok(())
     }
@@ -319,6 +504,12 @@ impl<'ast> Visitor<'ast> for DeclarationVisitor<'_> {
                 "{kind}@{}",
                 expression.span.lo().0 - self.source_start
             ));
+        }
+        if !self.local_counts.is_empty()
+            && let ast::ExprKind::Let(pattern, initializer, ..) = &expression.kind
+            && let Err(error) = self.record_let_expression(pattern, initializer, expression.span)
+        {
+            self.error.get_or_insert(error);
         }
         visit::walk_expr(self, expression);
         if anonymous.is_some() {
@@ -422,6 +613,194 @@ fn custody_manifest_inventory() {
         serde_json::to_vec_pretty(&outputs).expect("custody output schema"),
     )
     .expect("custody output");
+}
+
+#[test]
+fn custody_typed_component_preserves_inferred_binding_and_exact_provenance() {
+    let source = "fn f() { if let (p, 0) = ({ let tmp: Option<&i32> = None; tmp }, 0) {} }";
+    let rows = inventory_source("component.rs", source).expect("component syntax");
+    let matches = rows
+        .iter()
+        .filter(|row| row.binding == "p")
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1);
+    let row = matches[0];
+    assert_eq!(row.owner, "f");
+    assert_eq!(row.local_ordinal, Some(1));
+    assert_eq!(row.type_shape, TypeShape::Inferred);
+    assert!(!row.type_is_fully_explicit);
+    assert!(row.type_span.is_none());
+    assert!(row.explicit_type.is_none());
+    assert!(row.rendered_type.is_none());
+    let carrier = row
+        .typed_component
+        .as_ref()
+        .expect("exact component carrier");
+    assert_eq!(carrier.temporary, "tmp");
+    assert_eq!(carrier.component_path, vec![0]);
+    assert_eq!(carrier.rendered_type, "Option<&i32>");
+    assert!(
+        matches!(row.effective_type_shape(), Some(TypeShape::Option { payload, .. })
+        if matches!(payload.as_ref(), TypeShape::Reference { mutable: false, .. }))
+    );
+    for span in [
+        carrier.temporary_binding_span,
+        carrier.returned_binding_span,
+    ] {
+        assert_eq!(&source[span.lo as usize..span.hi as usize], "tmp");
+    }
+    assert_eq!(
+        &source[carrier.type_span.lo as usize..carrier.type_span.hi as usize],
+        "Option<&i32>"
+    );
+    assert_eq!(
+        &source[carrier.pattern_span.lo as usize..carrier.pattern_span.hi as usize],
+        "p"
+    );
+    assert_eq!(
+        &source[carrier.component_span.lo as usize..carrier.component_span.hi as usize],
+        "{ let tmp: Option<&i32> = None; tmp }"
+    );
+}
+
+#[test]
+fn custody_typed_component_pairs_nested_tuple_positions_exactly() {
+    let source = "fn f() { if let ((p,), 0) = (({ let tmp: Option<&[i32]> = None; tmp },), 0) {} }";
+    let rows = inventory_source("nested-component.rs", source).expect("nested component syntax");
+    let row = rows.iter().find(|row| row.binding == "p").unwrap();
+    assert_eq!(
+        row.typed_component.as_ref().unwrap().component_path,
+        vec![0, 0]
+    );
+    assert!(
+        matches!(row.effective_type_shape(), Some(TypeShape::Option { payload, .. })
+        if matches!(payload.as_ref(), TypeShape::Reference { pointee, .. }
+            if matches!(pointee.as_ref(), TypeShape::Slice { .. })))
+    );
+}
+
+#[test]
+fn custody_typed_component_accepts_transparent_pattern_and_scrutinee_parentheses() {
+    // HIR erases these parentheses around the source pattern/component. The
+    // producer still emits a plain temporary path as the inline block's tail;
+    // this witness does not license a different generated tail shape.
+    let source = "fn f() { if let ((p), 0) = (({ let tmp: Option<&i32> = None; tmp }), 0) {} }";
+    let rows = inventory_source("parenthesized-component.rs", source)
+        .expect("transparent parenthesis syntax");
+    let matching = rows
+        .iter()
+        .filter(|row| row.binding == "p")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "the exact pattern binding must remain inventoried"
+    );
+    let row = matching[0];
+    assert_eq!(row.owner, "f");
+    assert_eq!(row.type_shape, TypeShape::Inferred);
+    assert!(row.type_span.is_none());
+    assert!(!row.type_is_fully_explicit);
+    assert!(
+        matches!(row.effective_type_shape(), Some(TypeShape::Option { payload, .. })
+        if matches!(payload.as_ref(), TypeShape::Reference { mutable: false, .. })),
+        "transparent source parentheses must preserve the exact typed-component proof: {row:?}"
+    );
+    let carrier = row
+        .typed_component
+        .as_ref()
+        .expect("parenthesized component provenance");
+    assert_eq!(carrier.component_path, vec![0]);
+    assert_eq!(carrier.temporary, "tmp");
+    assert_eq!(carrier.rendered_type, "Option<&i32>");
+    assert!(carrier.type_is_fully_explicit);
+    assert_eq!(
+        &source[carrier.type_span.lo as usize..carrier.type_span.hi as usize],
+        "Option<&i32>"
+    );
+    assert_eq!(
+        &source[carrier.temporary_binding_span.lo as usize
+            ..carrier.temporary_binding_span.hi as usize],
+        "tmp"
+    );
+    assert_eq!(
+        &source
+            [carrier.returned_binding_span.lo as usize..carrier.returned_binding_span.hi as usize],
+        "tmp"
+    );
+    let pattern = &source[carrier.pattern_span.lo as usize..carrier.pattern_span.hi as usize];
+    assert_eq!(pattern.trim_matches(['(', ')', ' ']), "p");
+    let component = &source[carrier.component_span.lo as usize..carrier.component_span.hi as usize];
+    assert_eq!(
+        component.trim_matches(['(', ')', ' ']),
+        "{ let tmp: Option<&i32> = None; tmp }"
+    );
+}
+
+#[test]
+fn custody_typed_component_rejects_unproved_pattern_or_block_shapes() {
+    for (label, pattern, component) in [
+        ("wrong tail", "p", "{ let tmp: Option<&i32> = None; other }"),
+        ("missing type", "p", "{ let tmp = None; tmp }"),
+        (
+            "extra statement",
+            "p",
+            "{ let tmp: Option<&i32> = None; touch(); tmp }",
+        ),
+        (
+            "by-reference pattern",
+            "ref p",
+            "{ let tmp: Option<&i32> = None; tmp }",
+        ),
+        (
+            "mutable temporary",
+            "p",
+            "{ let mut tmp: Option<&i32> = None; tmp }",
+        ),
+        (
+            "nested inference",
+            "p",
+            "{ let tmp: Option<&_> = None; tmp }",
+        ),
+        (
+            "changed tail view",
+            "p",
+            "{ let tmp: Option<&i32> = None; &tmp }",
+        ),
+    ] {
+        let source = format!("fn f() {{ if let ({pattern}, 0) = ({component}, 0) {{}} }}");
+        let rows = inventory_source("rejected-component.rs", &source)
+            .expect("parser-only negative syntax");
+        let row = rows.iter().find(|row| row.binding == "p").unwrap();
+        assert!(row.typed_component.is_none(), "{label}: {row:?}");
+        assert!(row.effective_type_shape().is_none(), "{label}: {row:?}");
+    }
+    for source in [
+        "fn f() { if let (p, 0, _) = ({ let tmp: Option<&i32> = None; tmp }, 0) {} }",
+        "fn f() { if let (p, ..) = ({ let tmp: Option<&i32> = None; tmp }, 0) {} }",
+    ] {
+        let rows =
+            inventory_source("unpaired-component.rs", source).expect("unpaired tuple syntax");
+        let row = rows.iter().find(|row| row.binding == "p").unwrap();
+        assert!(
+            row.effective_type_shape().is_none(),
+            "tuple pairing must be exact: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn custody_typed_component_does_not_generalize_ordinary_local_inference() {
+    let source = "fn f() { let p = { let tmp: Option<&i32> = None; tmp }; let q: &i32 = &1; }";
+    let rows = inventory_source("ordinary-local.rs", source).expect("ordinary local syntax");
+    let inferred = rows.iter().find(|row| row.binding == "p").unwrap();
+    assert!(inferred.typed_component.is_none());
+    assert!(inferred.effective_type_shape().is_none());
+    let explicit = rows.iter().find(|row| row.binding == "q").unwrap();
+    assert!(matches!(
+        explicit.effective_type_shape(),
+        Some(TypeShape::Reference { mutable: false, .. })
+    ));
 }
 
 #[test]

@@ -32,6 +32,8 @@ pub(crate) mod a5_site_proof;
 pub(crate) mod box_facts;
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
+pub(crate) mod declaration;
+pub(crate) mod declaration_pattern;
 pub(crate) mod emitability;
 pub(crate) mod exposure;
 pub(crate) mod lifetime;
@@ -218,7 +220,7 @@ pub(crate) enum DeclShape {
 }
 
 impl DeclShape {
-    fn key(self) -> &'static str {
+    pub(crate) fn key(self) -> &'static str {
         match self {
             DeclShape::RawPtr => "raw-ptr",
             DeclShape::Alias => "alias",
@@ -845,6 +847,8 @@ pub(crate) enum Decision {
 /// The finished, immutable table handed to [`super::plan`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
+    pub(crate) declaration_pointees: declaration::DeclarationPointees,
+    pub(crate) declaration_patterns: declaration_pattern::PatternDeclarations,
     pub entries: Vec<(Subject, Decision)>,
     pub(crate) exposure: Option<exposure::ExposurePolicy>,
     pub(crate) arm_requirements: FxHashMap<(LocalDefId, HirId), RequiredArmSet>,
@@ -973,6 +977,8 @@ impl DecisionTable {
 /// next phase a finished value, so a context that could not be mutated is the
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
+    pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
+    pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
     pub(crate) tcx: TyCtxt<'tcx>,
     pub(crate) family_policy: &'a super::additive::FamilyPolicy,
     pub(crate) model: &'a FxHashMap<SlotRef, SlotKind>,
@@ -1058,6 +1064,18 @@ pub(crate) fn decide_with_raw_fallbacks(
         })
         .collect();
     DecisionTable {
+        declaration_patterns: ctx
+            .declaration_patterns
+            .iter()
+            .filter(|(node, _)| ctx.family_policy.enabled(node.0, FamilyStage::Declaration))
+            .map(|(node, carrier)| (*node, carrier.clone()))
+            .collect(),
+        declaration_pointees: ctx
+            .declaration_pointees
+            .iter()
+            .filter(|(node, _)| ctx.family_policy.enabled(node.0, FamilyStage::Declaration))
+            .map(|(node, pointee)| (*node, pointee.clone()))
+            .collect(),
         entries,
         exposure: None,
         arm_requirements: FxHashMap::default(),
@@ -1337,6 +1355,13 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if subject.ty_span.is_some() {
         return decision;
     }
+    let typed_pattern = ctx
+        .family_policy
+        .enabled(subject.fn_did, FamilyStage::Declaration)
+        && ctx
+            .declaration_patterns
+            .contains_key(&(subject.fn_did, subject.hir_id));
+
     // EXHAUSTIVE, not `matches!(.., Degraded(_))` — the import denylist rejects
     // the bypass shape and is right to: a new emitting disposition must be a
     // compile error here, because a form this veto does not name is a form that
@@ -1360,6 +1385,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         }
         Decision::InferredRef { .. } => decision,
         Decision::Box(ref plan) if plan.inferred_binding => decision,
+        Decision::Opt { .. } if typed_pattern => decision,
         Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => degrade(
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
@@ -1372,6 +1398,8 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
 fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
+        declaration_pointees,
+        declaration_patterns,
         family_policy,
         model,
         slots,
@@ -1395,35 +1423,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         .then(|| facts.depth2_npo_target((subject.fn_did, subject.hir_id)))
         .flatten();
 
-    // The declaration's SHAPE comes FIRST, before any analysis is consulted.
-    //
-    // R-A collects alias-typed parameters so they are decided rather than
-    // dropped; this is where that collection turns into an attributed reason.
-    // It is checked ahead of BO's kind because it is knowable without any
-    // analysis at all — the plan copies the pointee's source text and an alias
-    // has none to copy, whatever BO concluded. Ordering it first also keeps the
-    // witness for this class independent of the solver's verdict, which is the
-    // §5.3 rule: test the layer you name, not a composition that routes through
-    // it.
-    //
-    // The cost, stated: an alias-typed parameter's BO kind does not reach the
-    // counters. That is S2b's question to reopen with a reason if it wants the
-    // "how many alias params would have been Ref" breakdown.
-    //
-    // **The dissolution removed an earlier gate from ahead of this one.** Every
-    // vintage before it returned `no-declared-type` here for a missing
-    // `ty_span`, ahead of the shape test and ahead of every analysis — one
-    // reason over 1,196 subjects, naming the splice mechanism rather than
-    // anything about the subject. The ladder now speaks for them, and the
-    // measured result is that 1,084 of the 1,196 hit a gate that was already
-    // there. Only 112 reach the residue.
-    //
-    // The shape test comes first for them too, and it is correct for them
-    // because the collector derives the shape from the RESOLVED type when there
-    // is no annotation: 51 of these locals are `let ref mut fresh…`
-    // temporaries whose type is already `&mut T`, and this is the arm that says
-    // so.
-    if subject.decl_shape != DeclShape::RawPtr {
+    // The declaration family can name an alias pointee from this binding's
+    // compiler type. Every other shape keeps its prior refusal, including
+    // existing reference patterns. Passing this representation gate does not
+    // bypass the frozen kind, use, borrowing or lifetime gates below. Earlier
+    // family stages deliberately retain the pre-item alias disposition.
+    let alias_supported = subject.decl_shape == DeclShape::Alias
+        && family_policy.enabled(subject.fn_did, FamilyStage::Declaration)
+        && declaration_pointees.contains_key(&(subject.fn_did, subject.hir_id));
+    if subject.decl_shape != DeclShape::RawPtr && !alias_supported {
         return degrade(
             subject,
             decl_site,
@@ -1445,6 +1453,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         Some(SlotKind::Ref) => {}
         Some(SlotKind::Raw) => return degrade(subject, decl_site, DegradeReason::KindRaw),
         Some(SlotKind::Owning) => {
+            // Item 5 opens borrowed declaration forms. Owning alias emission
+            // remains in the separately chartered Box family.
+            if alias_supported {
+                return degrade(
+                    subject,
+                    decl_site,
+                    DegradeReason::UnsupportedDeclShape { shape: "alias" },
+                );
+            }
             return match box_facts.plan_for_subject(
                 tcx,
                 subject,
@@ -1626,6 +1643,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // gate that is not blocking them, 121 of them in functions that are not
         // even pinned.
         if subject.ty_span.is_none()
+            && !(family_policy.enabled(subject.fn_did, FamilyStage::Declaration)
+                && declaration_patterns.contains_key(&(subject.fn_did, subject.hir_id)))
             && !lifetime_eligibility.is_some_and(|eligibility| {
                 eligibility
                     .inferred_permit((subject.fn_did, subject.hir_id))
@@ -1911,6 +1930,8 @@ mod self_consistency_tests {
 
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
+            declaration_pointees: Default::default(),
+            declaration_patterns: Default::default(),
             exposure: None,
             arm_requirements: FxHashMap::default(),
             seams: Default::default(),

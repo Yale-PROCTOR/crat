@@ -212,6 +212,37 @@ fn rewrite_raw_layer(ty: &mut Ty, depth: u8, lifetime: &str) -> bool {
     rewrite_raw_layer(&mut mut_ty.ty, depth - 1, lifetime)
 }
 
+struct ResolvedRawSignature {
+    inputs: Vec<Option<String>>,
+    output: Option<String>,
+}
+
+fn expand_signature_alias(ty: &mut Ty, depth: u8, resolved: Option<&str>) -> bool {
+    let mut layer = &*ty;
+    let mut needs_expansion = false;
+    for current in 0..=depth {
+        match &layer.kind {
+            TyKind::Path(..) => {
+                needs_expansion = true;
+                break;
+            }
+            TyKind::Ptr(inner) if current < depth => layer = &inner.ty,
+            _ => break,
+        }
+    }
+    if !needs_expansion {
+        return true;
+    }
+    let Some(resolved) = resolved else { return false };
+    let Ok(parsed) = graft_ty(resolved) else { return false };
+    if !matches!(parsed.kind, TyKind::Ptr(_)) {
+        return false;
+    }
+    // Retain the original signature node's identity and attribution span.
+    ty.kind = parsed.kind.clone();
+    true
+}
+
 /// Structural E2 signature pass. It owns generated lifetime parameters,
 /// return layers, and nested output-storage layers. Depth-zero input layers
 /// remain owned by [`RefDeclVisitor`], which receives the same plan below.
@@ -219,6 +250,7 @@ struct LifetimeSignatureVisitor<'a> {
     global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
     plans: &'a super::decision::lifetime::LifetimePlan,
     reverted_fns: &'a FxHashSet<LocalDefId>,
+    resolved_signatures: &'a FxHashMap<LocalDefId, ResolvedRawSignature>,
     unplaceable: Vec<(LocalDefId, super::decision::lifetime::FnSignatureSlot)>,
 }
 
@@ -257,6 +289,7 @@ impl LifetimeSignatureVisitor<'_> {
         // Deepest first: converting an outer raw pointer to a reference must
         // not hide a still-raw nested layer from this pass.
         layers.sort_by_key(|(slot, _)| std::cmp::Reverse(slot.deref_depth + slot.depth));
+        let mut expanded = FxHashSet::default();
         for (slot, lifetime) in layers {
             let effective_depth = slot.deref_depth.saturating_add(slot.depth);
             let placed = match slot.root {
@@ -264,7 +297,15 @@ impl LifetimeSignatureVisitor<'_> {
                     match &mut function.sig.decl.output {
                         rustc_ast::FnRetTy::Default(_) => false,
                         rustc_ast::FnRetTy::Ty(ty) => {
-                            rewrite_raw_layer(ty, effective_depth, &lifetime)
+                            (!expanded.insert(None)
+                                || expand_signature_alias(
+                                    ty,
+                                    effective_depth,
+                                    self.resolved_signatures
+                                        .get(&did)
+                                        .and_then(|signature| signature.output.as_deref()),
+                                ))
+                                && rewrite_raw_layer(ty, effective_depth, &lifetime)
                         }
                     }
                 }
@@ -281,7 +322,16 @@ impl LifetimeSignatureVisitor<'_> {
                             .inputs
                             .get_mut(input)
                             .is_some_and(|param| {
-                                rewrite_raw_layer(&mut param.ty, effective_depth, &lifetime)
+                                (!expanded.insert(Some(input))
+                                    || expand_signature_alias(
+                                        &mut param.ty,
+                                        effective_depth,
+                                        self.resolved_signatures
+                                            .get(&did)
+                                            .and_then(|signature| signature.inputs.get(input))
+                                            .and_then(|ty| ty.as_deref()),
+                                    ))
+                                    && rewrite_raw_layer(&mut param.ty, effective_depth, &lifetime)
                             })
                 }
             };
@@ -740,6 +790,8 @@ pub(crate) struct RefDeclStats {
     pub not_a_pointer_decl: usize,
     /// Refused by the composition guard.
     pub refused: usize,
+    /// An exact alias carrier could not be parsed without recovery or loss.
+    pub type_parse_failed: usize,
     /// **THE IDENTITIES the walk actually rewrote**, one per realized rewrite.
     ///
     /// A `Vec` and not a set on purpose: the *duplicate* is itself a failure
@@ -804,6 +856,7 @@ pub(crate) struct RefDeclVisitor<'a> {
     /// `(fn_did, hir_id)` → which form this subject's declaration becomes, and
     /// whether it is mutable.
     pub decisions: &'a FxHashMap<(LocalDefId, HirId), (DeclForm, bool, Option<String>)>,
+    pub declaration_pointees: &'a super::decision::declaration::DeclarationPointees,
     /// Option bindings whose selected borrowed uses require a mutable binding.
     /// The declaration must be placed before its binding is changed.
     pub mutable_option_bindings: &'a FxHashSet<(LocalDefId, HirId)>,
@@ -900,10 +953,26 @@ impl RefDeclVisitor<'_> {
         // OWNERSHIP of the node, so a later transform that legitimately wanted
         // it would be refused on behalf of work that never happened. Ownership
         // now follows the transform rather than the attempt.
-        if !matches!(ty.kind, TyKind::Ptr(_)) {
-            self.stats.not_a_pointer_decl += 1;
-            return;
-        }
+        let pointee = match &ty.kind {
+            TyKind::Ptr(mut_ty) => mut_ty.ty.clone(),
+            TyKind::Path(..) => {
+                let Some(carrier) = self.declaration_pointees.get(&(fn_did, hir_id)) else {
+                    self.stats.not_a_pointer_decl += 1;
+                    return;
+                };
+                match graft_ty(&carrier.pointee) {
+                    Ok(pointee) => pointee,
+                    Err(_) => {
+                        self.stats.type_parse_failed += 1;
+                        return;
+                    }
+                }
+            }
+            _ => {
+                self.stats.not_a_pointer_decl += 1;
+                return;
+            }
+        };
         let claimant = match form {
             DeclForm::Ref => "decl:ref",
             DeclForm::Slice => "decl:slice",
@@ -914,13 +983,8 @@ impl RefDeclVisitor<'_> {
             self.stats.refused += 1;
             return;
         }
-        // The POINTEE MOVES ACROSS. No text is copied and none is re-rendered:
-        // `mut_ty.ty` is the same subtree, reattached under a reference — and
-        // under a `[…]` and an `Option<…>` too, for the forms that need them.
-        let TyKind::Ptr(mut_ty) = &mut ty.kind else {
-            unreachable!("shape checked immediately above")
-        };
-        let pointee = mut_ty.ty.clone();
+        // Written pointer pointees retain their subtree. An alias uses only
+        // its exact, compiler-resolved and span-erased declaration carrier.
         ty.kind = decl_ty_kind_with_lifetime(form, mutable, pointee, lifetime.as_deref());
         let render = (ty.span.lo().0, rustc_ast_pretty::pprust::ty_to_string(ty));
         // **RECORDED AT THE REALIZED REWRITE, not at the attempt.** Every early
@@ -2487,7 +2551,7 @@ fn transform_inner(
 > {
     let capture = capture_ast(tcx)?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    transform_with(&capture, &table, reverts, None)
+    transform_with(tcx, &capture, &table, reverts, None)
 }
 
 fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Result<String, String> {
@@ -2908,7 +2972,8 @@ pub(crate) fn capture_ast(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<AstCaptur
 
 /// One transform pass over a CLONE of the pristine capture, under one revert
 /// set. Called once per verify/revert round.
-fn transform_with(
+fn transform_with<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
     capture: &AstCapture,
     table: &super::decision::DecisionTable,
     reverts: &RevertSet,
@@ -2933,10 +2998,43 @@ fn transform_with(
 > {
     let mut krate = capture.krate.clone();
     let map = &capture.map;
+    // Original signature type metadata supplies syntax for admitted aliases.
+    // Only layers already selected by the lifetime plan can be rewritten;
+    // resolving an alias here does not admit a return or change a decision.
+    let alias_owners = table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let node = (subject.fn_did, subject.hir_id);
+            (table.declaration_pointees.contains_key(&node)
+                && reverts.keeps_subject(node.0, node.1)
+                && super::terminal_application(decision, true).is_some())
+            .then_some(subject.fn_did)
+        })
+        .collect::<FxHashSet<_>>();
+    let resolved_signatures = alias_owners
+        .into_iter()
+        .map(|owner| {
+            let signature = tcx.fn_sig(owner).skip_binder().skip_binder();
+            let render = |ty: rustc_middle::ty::Ty<'tcx>| {
+                (matches!(ty.kind(), rustc_middle::ty::TyKind::RawPtr(..))
+                    && super::decision::declaration::pointee_is_nameable(tcx, owner, ty))
+                .then(|| super::decision::declaration::pointee_source(tcx, ty))
+            };
+            (
+                owner,
+                ResolvedRawSignature {
+                    inputs: signature.inputs().iter().map(|&ty| render(ty)).collect(),
+                    output: render(signature.output()),
+                },
+            )
+        })
+        .collect::<FxHashMap<_, _>>();
     let mut lifetime_visitor = LifetimeSignatureVisitor {
         global_map: &map.global_map,
         plans: &table.lifetime_plan,
         reverted_fns: &reverts.fns,
+        resolved_signatures: &resolved_signatures,
         unplaceable: Vec::new(),
     };
     lifetime_visitor.visit_crate(&mut krate);
@@ -3006,12 +3104,20 @@ fn transform_with(
                 .map(str::to_owned),
             super::decision::SubjectKind::Local => None,
         };
-        insert_counting(
-            &mut decisions,
-            (subject.fn_did, subject.hir_id),
-            (form, mutable, lifetime),
-            &mut decision_key_collisions,
-        );
+        // I10 supplies this binding's type through an explicit component-local
+        // temporary. There is no annotation for RefDeclVisitor to claim. Its
+        // use edit still participates in grafting and the final AST check.
+        if !table
+            .declaration_patterns
+            .contains_key(&(subject.fn_did, subject.hir_id))
+        {
+            insert_counting(
+                &mut decisions,
+                (subject.fn_did, subject.hir_id),
+                (form, mutable, lifetime),
+                &mut decision_key_collisions,
+            );
+        }
         for u in use_edits.into_iter().flatten() {
             // A returned `Some` means two use edits carried the SAME span and
             // one was overwritten — the map would then hold fewer edits than
@@ -3028,10 +3134,9 @@ fn transform_with(
         }
     }
 
-    // The hir-only index of the population, so an `impl`-method subject that
-    // reaches the walk with no owning function is COUNTED rather than dropped.
-    // `arms_full` applies no revert set, so here the population is every
-    // decided subject.
+    // The direct-annotation population, including orphaned impl subjects.
+    // I10 pattern bindings instead owe a typed component temporary, checked
+    // independently in the final grafted AST; they have no annotation here.
     let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
     // **ARM 1 takes the revert set through its own site check** (M-2). Callers
     // that want the un-reverted population — `arms_full` and the parity gates —
@@ -3040,6 +3145,7 @@ fn transform_with(
     let mut v = RefDeclVisitor {
         local_map: &map.local_map,
         decisions: &decisions,
+        declaration_pointees: &table.declaration_pointees,
         mutable_option_bindings: &table.option_mut_bindings,
         global_map: &map.global_map,
         reverted_fns: &reverts.fns,
@@ -3357,13 +3463,11 @@ fn transform_with(
 /// and named as `crate::FALLBACK_SLICE_EXTENT`, so a copy per file would be a
 /// duplicate-definition error, not redundancy.
 ///
-/// ⚠ **`tcx` IS STILL REQUIRED, and only for one thing: the source map.**
-/// `splice_fn_prints_per_file` needs it to resolve spans to files, offsets and
-/// original text. It is NOT used to derive anything — `transform_with` takes
-/// the capture, the table and the reverts, all as parameters. Narrowing the
-/// signature to make re-derivation unrepresentable was considered and is not
-/// available here; do not widen `tcx`'s use back beyond the source map without
-/// re-reading why this note exists.
+/// `tcx` supplies the source map and original compiler-resolved signature types
+/// for owners with a surviving admitted alias declaration. That metadata lets
+/// the existing lifetime plan address an alias-spelled raw layer. It grants no
+/// return admission and recomputes neither decisions nor model facts: the
+/// capture, finished table, lifetime plan and reverts remain caller-owned.
 pub(crate) fn ast_emitted_files_from(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     capture: &AstCapture,
@@ -3389,8 +3493,21 @@ pub(crate) fn ast_emitted_files_from(
     ),
     String,
 > {
-    let (_, _, seams, _, _, _, _, krate, edited) =
-        transform_with(capture, table, reverts, terminal_a5_raw_calls)?;
+    let (decls, _, seams, _, _, _, _, krate, edited) =
+        transform_with(tcx, capture, table, reverts, terminal_a5_raw_calls)?;
+    let expected_aliases = table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let node = (subject.fn_did, subject.hir_id);
+            (table.declaration_pointees.contains_key(&node)
+                && reverts.keeps_subject(node.0, node.1)
+                && super::terminal_application(decision, true).is_some())
+            .then_some(node)
+        })
+        .collect::<Vec<_>>();
+    validate_alias_declaration_placements(&expected_aliases, &decls.placed_ids)?;
+    validate_pattern_declaration_temporaries(&krate, &capture.map.global_map, table, reverts)?;
     let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
     let (mut files, stats, maps) =
         super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&edited));
@@ -3417,7 +3534,8 @@ pub(crate) fn ast_emitted_source_from(
     reverts: &RevertSet,
 ) -> Result<(String, super::ast_bridge::SubstStats), String> {
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, &table, reverts, None)?;
+    let (_, _, seams, _, _, _, _, krate, edited) =
+        transform_with(tcx, capture, &table, reverts, None)?;
     let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
     let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate, Some(&edited));
     // **The fabricated-extent const** (marker ruling, 2026-08-15): emitted when
@@ -4452,7 +4570,8 @@ pub(crate) fn edit_dump(
     };
 
     // ---- AST layer -------------------------------------------------------
-    let (_, _, _, _, _, _, _, krate, edited) = transform_with(&capture, &table, &reverts, None)?;
+    let (_, _, _, _, _, _, _, krate, edited) =
+        transform_with(tcx, &capture, &table, &reverts, None)?;
     let spans: Vec<rustc_span::Span> = edited.iter().map(|(sp, _)| *sp).collect();
     let (files, stats, _) = super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&spans));
     let _ = writeln!(
@@ -4964,6 +5083,209 @@ impl MutVisitor for SpanEraser {
     }
 }
 
+fn validate_alias_declaration_placements(
+    expected: &[(LocalDefId, HirId)],
+    placed: &[(LocalDefId, HirId)],
+) -> Result<(), String> {
+    let mut counts = FxHashMap::default();
+    for &node in placed {
+        *counts.entry(node).or_insert(0usize) += 1;
+    }
+    for &node in expected {
+        let count = counts.get(&node).copied().unwrap_or(0);
+        if count != 1 {
+            return Err(format!(
+                "declaration-explicit-type-placement-mismatch:{}:hir{}:count={count}",
+                node.0.local_def_index.as_u32(),
+                node.1.local_id.as_u32(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pattern_declaration_temporaries(
+    krate: &rustc_ast::Crate,
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    table: &super::decision::DecisionTable,
+    reverts: &RevertSet,
+) -> Result<(), String> {
+    use rustc_ast::visit::{self, Visitor};
+
+    let mismatch = |node: (LocalDefId, HirId), detail: &str| {
+        format!(
+            "declaration-explicit-type-placement-mismatch:{}:hir{}:{detail}",
+            node.0.local_def_index.as_u32(),
+            node.1.local_id.as_u32(),
+        )
+    };
+    let mut expected = FxHashMap::default();
+    for (subject, decision) in &table.entries {
+        let node = (subject.fn_did, subject.hir_id);
+        let Some(carrier) = table.declaration_patterns.get(&node) else { continue };
+        if !reverts.keeps_subject(node.0, node.1)
+            || super::terminal_application(decision, true).is_none()
+        {
+            continue;
+        }
+        let ty = super::decision::declaration::emitted_type(decision, &carrier.pointee, None)
+            .ok_or_else(|| mismatch(node, "unsupported-pattern-form"))?;
+        let parsed = graft_ty(&ty).map_err(|_| mismatch(node, "unrenderable-pattern-type"))?;
+        let ty = rustc_ast_pretty::pprust::ty_to_string(&parsed);
+        if expected
+            .insert((node.0, carrier.temporary.clone()), (node, ty))
+            .is_some()
+        {
+            return Err(mismatch(node, "temporary-claimed-by-multiple-bindings"));
+        }
+    }
+    if expected.is_empty() {
+        return Ok(());
+    }
+
+    struct BindingNames(Vec<Symbol>);
+    impl<'ast> Visitor<'ast> for BindingNames {
+        fn visit_pat(&mut self, pattern: &'ast rustc_ast::Pat) {
+            if let rustc_ast::PatKind::Ident(_, ident, _) = &pattern.kind {
+                self.0.push(ident.name);
+            }
+            visit::walk_pat(self, pattern);
+        }
+    }
+    struct ActualTemporaries<'a> {
+        global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+        current_fn: Option<LocalDefId>,
+        expected: &'a FxHashMap<(LocalDefId, String), ((LocalDefId, HirId), String)>,
+        observed: FxHashMap<(LocalDefId, String), Vec<Option<String>>>,
+    }
+    impl<'ast> Visitor<'ast> for ActualTemporaries<'_> {
+        fn visit_item(&mut self, item: &'ast rustc_ast::Item) {
+            let previous = self.current_fn;
+            if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+                self.current_fn = self.global_map.get(&item.id).copied();
+            }
+            visit::walk_item(self, item);
+            self.current_fn = previous;
+        }
+
+        fn visit_assoc_item(
+            &mut self,
+            item: &'ast rustc_ast::AssocItem,
+            context: visit::AssocCtxt,
+        ) {
+            let previous = self.current_fn;
+            if matches!(item.kind, rustc_ast::AssocItemKind::Fn(_)) {
+                self.current_fn = self.global_map.get(&item.id).copied();
+            }
+            visit::walk_assoc_item(self, item, context);
+            self.current_fn = previous;
+        }
+
+        fn visit_expr(&mut self, expression: &'ast rustc_ast::Expr) {
+            let previous = self.current_fn;
+            if matches!(expression.kind, rustc_ast::ExprKind::Closure(_)) {
+                self.current_fn = self.global_map.get(&expression.id).copied();
+            }
+            visit::walk_expr(self, expression);
+            self.current_fn = previous;
+        }
+
+        fn visit_local(&mut self, local: &'ast rustc_ast::Local) {
+            if let Some(owner) = self.current_fn {
+                let mut names = BindingNames(Vec::new());
+                names.visit_pat(&local.pat);
+                let by_value = matches!(&local.pat.kind,
+                    rustc_ast::PatKind::Ident(mode, _, None) if mode.0 == rustc_ast::ByRef::No);
+                let ty = by_value
+                    .then(|| {
+                        local
+                            .ty
+                            .as_ref()
+                            .map(|ty| rustc_ast_pretty::pprust::ty_to_string(ty))
+                    })
+                    .flatten();
+                for name in names.0 {
+                    let key = (owner, name.to_string());
+                    if self.expected.contains_key(&key) {
+                        self.observed.entry(key).or_default().push(ty.clone());
+                    }
+                }
+            }
+            visit::walk_local(self, local);
+        }
+    }
+    let mut actual = ActualTemporaries {
+        global_map,
+        current_fn: None,
+        expected: &expected,
+        observed: FxHashMap::default(),
+    };
+    visit::walk_crate(&mut actual, krate);
+    for (key, (node, expected_type)) in &expected {
+        let observed = actual.observed.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        if observed.len() != 1 || observed[0].as_deref() != Some(expected_type.as_str()) {
+            return Err(mismatch(
+                *node,
+                &format!(
+                    "temporary={};expected={expected_type};observed={observed:?}",
+                    key.1,
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn graft_ty(text: &str) -> Result<P<Ty>, String> {
+    let psess =
+        rustc_session::parse::ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
+    let mut parser = match rustc_parse::new_parser_from_source_str(
+        &psess,
+        rustc_span::FileName::Custom("declaration-type.rs".to_owned()),
+        text.to_owned(),
+    ) {
+        Ok(parser) => parser,
+        Err(errors) => {
+            for error in errors {
+                error.cancel();
+            }
+            return Err(text.to_owned());
+        }
+    };
+    let mut parsed = match parser.parse_ty() {
+        Ok(ty) => ty,
+        Err(error) => {
+            error.cancel();
+            return Err(text.to_owned());
+        }
+    };
+    if parser.token.kind != rustc_ast::token::TokenKind::Eof || psess.dcx().has_errors().is_some() {
+        return Err(text.to_owned());
+    }
+    let printed = rustc_ast_pretty::pprust::ty_to_string(&parsed);
+    let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    if strip(&printed) != strip(text) {
+        return Err(text.to_owned());
+    }
+    SpanEraser.visit_ty(&mut parsed);
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod alias_declaration_placement_tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_duplicate_alias_declaration_is_not_delivery() {
+        let node = (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID);
+        for placements in [Vec::new(), vec![node, node]] {
+            let error = validate_alias_declaration_placements(&[node], &placements).unwrap_err();
+            assert!(error.starts_with("declaration-explicit-type-placement-mismatch:"));
+        }
+        assert!(validate_alias_declaration_placements(&[node], &[node]).is_ok());
+    }
+}
+
 pub(crate) fn graft_expr(text: &str) -> Result<rustc_ast::Expr, String> {
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ::utils::ast::parse_expr(text.to_owned())
@@ -5365,6 +5687,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                declaration_pointees: &Default::default(),
                 mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,
@@ -5452,6 +5775,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                declaration_pointees: &Default::default(),
                 mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,
@@ -5620,6 +5944,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                declaration_pointees: &Default::default(),
                 mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,
@@ -5856,6 +6181,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                declaration_pointees: &Default::default(),
                 mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &reverted,
@@ -5968,6 +6294,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                declaration_pointees: &Default::default(),
                 mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,
@@ -5992,6 +6319,7 @@ mod arm2_witnesses {
             let mut v2 = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                declaration_pointees: &Default::default(),
                 mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &reverted,
@@ -6053,6 +6381,7 @@ mod arm2_witnesses {
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
+                declaration_pointees: &Default::default(),
                 mutable_option_bindings: &FxHashSet::default(),
                 global_map: &global_map,
                 reverted_fns: &no_reverts,

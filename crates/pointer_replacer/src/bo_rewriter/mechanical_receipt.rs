@@ -1610,7 +1610,8 @@ pub(crate) fn reconcile_slice_use_rows(
                     && matches!(row.adapter.as_str(),
                         "prior-family-rendering:SliceConstruction"
                         | "prior-family-rendering:SliceUse"
-                        | "prior-family-rendering:Option")
+                        | "prior-family-rendering:Option"
+                        | "prior-family-rendering:Declaration")
                     && matches!(row.candidate_form.as_str(),
                         "slice-shared" | "slice-mut" | "opt-slice-shared" | "opt-slice-mut")
             });
@@ -1832,6 +1833,153 @@ pub(crate) struct DeclarationShapeReceiptRow {
     pub(crate) typed_temporary: Option<String>,
     pub(crate) evaluation_order: HoistSafety,
     pub(crate) terminal_class_result: MechanicalState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeclarationShapeReceiptPlan {
+    pub(crate) obligation: MechanicalObligationPlan,
+    pub(crate) declaration_site: CanonicalSiteKey,
+    pub(crate) original_type_form: String,
+    pub(crate) settled_emitted_type: String,
+    pub(crate) initializer_kind: String,
+    pub(crate) typed_temporary: Option<String>,
+    pub(crate) evaluation_order: HoistSafety,
+    pub(crate) owner_class: SignatureClassId,
+}
+
+impl DeclarationShapeReceiptPlan {
+    pub(crate) fn materialize(
+        &self,
+        class_live: bool,
+        runtime_reverted: bool,
+    ) -> (
+        [MechanicalObligationEvent; 2],
+        [DeclarationShapeReceiptRow; 2],
+    ) {
+        let events = self.obligation.events(class_live, runtime_reverted);
+        let row = |event: &MechanicalObligationEvent| DeclarationShapeReceiptRow {
+            terminal: SpecializedReceiptTerminal {
+                obligation_key: event.key.clone(),
+                stage: event.stage,
+                state: event.state,
+                reason: event.terminal_reason.clone(),
+            },
+            declaration_site: self.declaration_site.clone(),
+            original_type_form: self.original_type_form.clone(),
+            settled_emitted_type: self.settled_emitted_type.clone(),
+            initializer_kind: self.initializer_kind.clone(),
+            typed_temporary: self.typed_temporary.clone(),
+            evaluation_order: self.evaluation_order.clone(),
+            terminal_class_result: events[1].state,
+        };
+        let rows = [row(&events[0]), row(&events[1])];
+        (events, rows)
+    }
+}
+
+pub(crate) fn reconcile_declaration_shape_rows(
+    rows: &[DeclarationShapeReceiptRow],
+    events: &[MechanicalObligationEvent],
+) -> Result<usize, String> {
+    let declaration_events = events
+        .iter()
+        .filter(|event| event.key.family == MechanicalFamily::UnsupportedDeclShape)
+        .cloned()
+        .collect::<Vec<_>>();
+    reconcile_mechanical_obligations(&declaration_events)?;
+    let common = declaration_events
+        .iter()
+        .map(|event| {
+            (
+                format!("{}:{}", event.key.receipt_key(), event.stage.key()),
+                event,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut specialized = BTreeMap::new();
+    for row in rows {
+        let obligation = row.terminal.obligation_key.receipt_key();
+        let key = format!("{}:{}", obligation, row.terminal.stage.key());
+        if specialized.insert(key.clone(), row).is_some() {
+            return Err(format!("duplicate declaration-shape specialized row {key}"));
+        }
+        let event = common
+            .get(&key)
+            .ok_or_else(|| format!("unowned declaration-shape row {key}"))?;
+        let terminal = common
+            .get(&format!("{obligation}:terminal"))
+            .ok_or_else(|| format!("declaration-shape row lacks common terminal {key}"))?;
+        if row.terminal.obligation_key != event.key
+            || row.declaration_site != event.key.site
+            || row.original_type_form != event.found_form
+            || row.settled_emitted_type != event.expected_form
+            || row.initializer_kind != event.argument_kind
+            || row.evaluation_order != event.evidence.hoist
+            || row.terminal_class_result != terminal.state
+            || row.terminal.state != event.state
+            || row.terminal.reason != event.terminal_reason
+            || event.mechanism != MechanicalMechanism::DeclarationExplicitType
+        {
+            return Err(format!(
+                "declaration-shape specialized/common drift at {key}"
+            ));
+        }
+    }
+    if common.keys().any(|key| !specialized.contains_key(key)) {
+        return Err("declaration-shape common row lacks specialized row".to_owned());
+    }
+    for row in rows
+        .iter()
+        .filter(|row| row.terminal.stage == MechanicalStage::Plan)
+    {
+        let key = format!("{}:terminal", row.terminal.obligation_key.receipt_key());
+        let terminal = specialized
+            .get(&key)
+            .ok_or_else(|| format!("declaration-shape row lacks specialized terminal {key}"))?;
+        if row.typed_temporary != terminal.typed_temporary {
+            return Err(format!(
+                "declaration-shape temporary identity drift at {key}"
+            ));
+        }
+    }
+    Ok(rows
+        .iter()
+        .filter(|row| row.terminal.stage == MechanicalStage::Plan)
+        .count())
+}
+
+pub(crate) fn render_declaration_shape_rows(rows: &[DeclarationShapeReceiptRow]) -> String {
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                row.terminal.obligation_key.receipt_key(),
+                row.declaration_site.receipt_key(),
+                row.original_type_form,
+                row.settled_emitted_type,
+                row.initializer_kind,
+                row.typed_temporary.as_deref().unwrap_or("-"),
+                row.evaluation_order.key(),
+                row.terminal_class_result.key(),
+                row.terminal.stage.key(),
+                row.terminal.state.key(),
+                row.terminal
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), MechanicalTerminalReason::key),
+            )
+        })
+        .collect::<Vec<_>>();
+    rendered.sort();
+    let mut output =
+        specialized_receipt_headers()[raw_schema::DECLARATION_SHAPE_RECEIPT_ROWS].join("\t");
+    output.push('\n');
+    for row in rendered {
+        output.push_str(&row);
+        output.push('\n');
+    }
+    output
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2204,6 +2352,82 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    fn declaration_receipt_for_test() -> DeclarationShapeReceiptPlan {
+        let mut planned = MechanicalObligationEvent::for_test(
+            "declaration",
+            MechanicalFamily::UnsupportedDeclShape,
+            MechanicalStage::Plan,
+            MechanicalState::Planned,
+        );
+        planned.found_form = "PointerAlias".to_owned();
+        planned.expected_form = "&i32".to_owned();
+        planned.argument_kind = "parameter".to_owned();
+        DeclarationShapeReceiptPlan {
+            declaration_site: planned.key.site.clone(),
+            original_type_form: planned.found_form.clone(),
+            settled_emitted_type: planned.expected_form.clone(),
+            initializer_kind: planned.argument_kind.clone(),
+            typed_temporary: None,
+            evaluation_order: planned.evidence.hoist.clone(),
+            owner_class: planned.key.owner_class,
+            obligation: MechanicalObligationPlan {
+                planned,
+                intended_terminal_state: MechanicalState::Applied,
+                intended_terminal_reason: None,
+            },
+        }
+    }
+
+    #[test]
+    fn decl_receipt_reconciles_exact_plan_and_terminal_rows() {
+        let (events, rows) = declaration_receipt_for_test().materialize(true, false);
+        assert_eq!(reconcile_declaration_shape_rows(&rows, &events), Ok(1));
+        let rendered = render_declaration_shape_rows(&rows);
+        let expected = specialized_receipt_headers()[raw_schema::DECLARATION_SHAPE_RECEIPT_ROWS];
+        assert_eq!(rendered.lines().next().unwrap(), expected.join("\t"));
+        assert_eq!(rendered.lines().count(), 3);
+        assert!(
+            rendered
+                .lines()
+                .all(|line| line.split('\t').count() == expected.len())
+        );
+    }
+
+    #[test]
+    fn decl_receipt_rejects_missing_common_or_specialized_partner() {
+        let (events, rows) = declaration_receipt_for_test().materialize(true, false);
+        assert!(reconcile_declaration_shape_rows(&rows, &events[..1]).is_err());
+        assert!(reconcile_declaration_shape_rows(&rows[..1], &events).is_err());
+        assert!(reconcile_declaration_shape_rows(&rows, &[]).is_err());
+    }
+
+    #[test]
+    fn decl_receipt_rejects_duplicate_and_wrong_settled_type() {
+        let (events, rows) = declaration_receipt_for_test().materialize(true, false);
+        let duplicate = [rows[0].clone(), rows[1].clone(), rows[1].clone()];
+        assert!(reconcile_declaration_shape_rows(&duplicate, &events).is_err());
+        let mut wrong = rows.clone();
+        wrong[1].settled_emitted_type = "*mut i32".to_owned();
+        assert!(reconcile_declaration_shape_rows(&wrong, &events).is_err());
+        let mut wrong = rows.clone();
+        wrong[1].typed_temporary = Some("unplanned-temporary".to_owned());
+        assert!(reconcile_declaration_shape_rows(&wrong, &events).is_err());
+    }
+
+    #[test]
+    fn decl_receipt_reverted_class_cannot_report_applied_declaration() {
+        let (events, rows) = declaration_receipt_for_test().materialize(true, true);
+        assert_eq!(reconcile_declaration_shape_rows(&rows, &events), Ok(1));
+        assert!(
+            rows.iter()
+                .all(|row| row.terminal_class_result == MechanicalState::Dropped)
+        );
+        assert_eq!(rows[1].terminal.state, MechanicalState::Dropped);
+        let mut wrong = rows;
+        wrong[0].terminal_class_result = MechanicalState::Applied;
+        assert!(reconcile_declaration_shape_rows(&wrong, &events).is_err());
+    }
 
     /// OBL-W1 — every category-(A) obligation owns exactly one plan and one
     /// terminal event; neither omission nor duplication may aggregate.

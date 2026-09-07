@@ -335,11 +335,10 @@ fn raw_boundary_delivery_custody(
             "ambiguous"
         } else if let Some(&index) = candidates.first() {
             let declaration = &report.declarations[index].1;
-            let observed_form = if declaration.type_is_fully_explicit {
-                raw_boundary_custody_observed_form(&declaration.type_shape)
-            } else {
-                Err("inferred-type")
-            };
+            let observed_form = declaration
+                .effective_type_shape()
+                .ok_or("inferred-type")
+                .and_then(raw_boundary_custody_observed_form);
             match observed_form {
                 Ok(Some(form)) if form == expected.expected_form => {
                     if let Some(previous) = claimed.insert(index, expected.subject_key.clone()) {
@@ -8546,6 +8545,7 @@ mod run {
                     placed_ids: _,
                     rendered: _,
                     rendered_arm2: _,
+                    type_parse_failed: _,
                 } = &st;
                 let crate::bo_rewriter::ast_transform::UseGraftStats {
                     grafted: _,
@@ -10907,6 +10907,11 @@ mod run {
             &artifact.mechanical_events,
         )
         .expect("Option-presentation receipt reconciliation");
+        crate::bo_rewriter::mechanical_receipt::reconcile_declaration_shape_rows(
+            &artifact.declaration_rows,
+            &artifact.mechanical_events,
+        )
+        .expect("declaration-shape receipt reconciliation");
         let mechanical_receipts =
             crate::bo_rewriter::mechanical_receipt::render_mechanical_obligations(
                 &artifact.mechanical_events,
@@ -10924,6 +10929,10 @@ mod run {
         let option_receipts =
             crate::bo_rewriter::mechanical_receipt::render_option_presentation_rows(
                 &artifact.option_rows,
+            );
+        let declaration_receipts =
+            crate::bo_rewriter::mechanical_receipt::render_declaration_shape_rows(
+                &artifact.declaration_rows,
             );
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
@@ -10988,6 +10997,14 @@ mod run {
             stamp(&option_receipts),
         )
         .expect("write Option-presentation receipts");
+        std::fs::write(
+            directory.join(format!(
+                "{name}.{}",
+                raw_schema::DECLARATION_SHAPE_RECEIPT_ROWS
+            )),
+            stamp(&declaration_receipts),
+        )
+        .expect("write declaration-shape receipts");
         let mut diagnostics = String::from(RAW_BOUNDARY_DIAGNOSTIC_HEADER);
         for diagnostic in &capture.reverts {
             diagnostics.push_str(&format!(
@@ -30333,4 +30350,36 @@ fn m1_pprint_substitution_compiles() {
         failed.len(),
         failed
     );
+}
+
+/// I12/DF3B-05: inspect the final tree independently of the AST placement
+/// recorder, including when a later edit deletes a local's annotation.
+#[test]
+fn decl_w1_final_tree_requires_the_changed_alias_annotation() {
+    let input = "type Ptr = *const i32; pub unsafe fn null_count() -> u32 { let p: Ptr = 0 as *const i32; if p.is_null() { 0 } else { (*p).count_ones() } }";
+    let source = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let capture = crate::bo_rewriter::ast_transform::capture_ast(tcx).unwrap();
+        crate::bo_rewriter::ast_transform::ast_emitted_source_from(
+            tcx,
+            &capture,
+            &Default::default(),
+        )
+        .unwrap()
+        .0
+    })
+    .unwrap();
+    let mut expected = r219_custody_expectation("null_count", "p");
+    expected.parameter_index = None;
+    expected.expected_form = crate::bo_rewriter::DeliveryForm::Borrowed {
+        mutable: false,
+        optional: true,
+        slice: false,
+    };
+    let report = r219_custody_observe(&[expected], &["null_count::p#1"], &source, &[]);
+    let type_checks = crate::bo_rewriter::verify::type_checks_str(&source);
+    assert!(
+        type_checks && report.issues.is_empty(),
+        "missing declaration adapter: type_checks={type_checks}, custody={report:?}, source={source}"
+    );
+    assert_eq!(report.delivered_by_tree, report.delivered_by_ledger);
 }

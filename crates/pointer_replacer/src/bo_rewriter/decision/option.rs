@@ -481,6 +481,12 @@ pub(crate) fn plan_values(
                 let element = subject
                     .pointee_span
                     .and_then(|span| tcx.sess.source_map().span_to_snippet(span).ok())
+                    .or_else(|| {
+                        table
+                            .declaration_pointees
+                            .get(&node)
+                            .map(|ty| ty.pointee.clone())
+                    })
                     .unwrap_or_else(|| "_".to_owned());
                 evidence.extent = MechanicalExtent::Fallback {
                     receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
@@ -550,6 +556,20 @@ pub(crate) fn plan_values(
                     }
                 }
             };
+            let replacement = replacement.map(|replacement| {
+                if initializer && let Some(pattern) = table.declaration_patterns.get(&node) {
+                    let explicit =
+                        super::declaration::emitted_type(decision, &pattern.pointee, None)
+                            .expect("pattern construction has a decided borrowed form");
+                    adapter = "typed-pattern-component".to_owned();
+                    format!(
+                        "{{ let {}: {explicit} = {replacement}; {} }}",
+                        pattern.temporary, pattern.temporary
+                    )
+                } else {
+                    replacement
+                }
+            });
             if let Some(replacement) = replacement {
                 edits.push((
                     node,

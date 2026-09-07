@@ -202,6 +202,8 @@ mod tests {
 
     fn table(entries: Vec<(Subject, Decision)>) -> DecisionTable {
         DecisionTable {
+            declaration_pointees: Default::default(),
+            declaration_patterns: Default::default(),
             entries,
             exposure: None,
             arm_requirements: Default::default(),

@@ -1083,38 +1083,62 @@ fn exclusion_counts_reach_the_outcome() {
 /// the "unrewritten and unattributed" class the A1 layer exists to retire, and
 /// it is present in the evaluation corpus.
 ///
-/// R-A rules these **collected, not excluded**. They are real C pointer
-/// parameters; what they get is a decision and an attributed reason, because
-/// emitting *through* an alias is a separate design question — the alias
-/// already contains the `*mut`, so `&mut lil_value_t` would be wrong.
-///
-/// *Mutation-tested (Rider 0, deletion first):* revert `collect_subjects` to
-/// the syntactic `let rustc_hir::TyKind::Ptr(..) = input.kind else { continue }`
-/// predicate and this fails — no subject is produced, so no degradation is
-/// attributed and the parameter is invisible again.
+/// Item 5 retains collection and gives each admitted binding an explicit
+/// expanded type plus a canonical declaration receipt. The shared alias itself
+/// remains unchanged. Removing the alias-aware collector still fails this
+/// control because the required subject and receipt disappear.
+/// Migration: R217-2(a), R220 continuation, item-5 design §9 and micro-plan I12.
 #[test]
 fn alias_typed_pointer_params_are_collected_and_attributed() {
-    use super::decision::DegradeReason;
     let src = format!(
         "{PREAMBLE}pub struct _lil_value_t {{ pub n: i32 }}\n\
          pub type lil_value_t = *mut _lil_value_t;\n\
          pub unsafe fn take(val: lil_value_t) -> i32 {{ (*val).n }}\n"
     );
-    let records = reasons_for_source(&src);
-    let hit = records
+    ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        let table = super::decide_table(tcx).unwrap();
+        let subjects = table
+            .entries
+            .iter()
+            .filter(|(subject, _)| {
+                tcx.def_path_str(subject.fn_did.to_def_id()) == "take"
+                    && subject.param_name.as_deref() == Some("val")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(subjects.len(), 1, "alias subject must remain collected");
+        assert!(matches!(
+            subjects[0].1,
+            super::decision::Decision::Ref { mutable: false }
+        ));
+    })
+    .unwrap();
+    let RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = rewrite_m1(&src)
+    else {
+        panic!("admitted alias must emit");
+    };
+    assert!(source.contains("pub type lil_value_t = *mut _lil_value_t;"));
+    assert!(source.contains("val: &crate::_lil_value_t"), "{source}");
+    assert!(super::verify::type_checks_str(&source));
+    let count = super::mechanical_receipt::reconcile_declaration_shape_rows(
+        &raw_boundary_artifacts.declaration_rows,
+        &raw_boundary_artifacts.mechanical_events,
+    )
+    .unwrap();
+    assert_eq!(count, 1);
+    let row = raw_boundary_artifacts
+        .declaration_rows
         .iter()
-        .find(|d| d.reason == DegradeReason::UnsupportedDeclShape { shape: "alias" })
-        .unwrap_or_else(|| {
-            panic!(
-                "the alias-typed parameter produced no attributed degradation — \
-                 it is invisible to the rewriter again; got {records:#?}"
-            )
-        });
-    assert!(
-        hit.subject.contains("take::val"),
-        "degradation names the wrong subject: {hit:?}"
+        .find(|row| row.terminal.stage == super::mechanical_receipt::MechanicalStage::Terminal)
+        .unwrap();
+    assert_eq!(row.original_type_form, "lil_value_t");
+    assert_eq!(
+        row.terminal.state,
+        super::mechanical_receipt::MechanicalState::Applied
     );
-    assert!(hit.site.contains(':'), "no site: {hit:?}");
 }
 
 /// **The other half of the shared-predicate consequence: reference params.**

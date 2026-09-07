@@ -95,6 +95,10 @@ pub(crate) mod ast_bridge;
 /// composition guard built beside its first arm.
 pub(crate) mod ast_transform;
 #[cfg(test)]
+mod declaration_pattern_tests;
+#[cfg(test)]
+mod declaration_tests;
+#[cfg(test)]
 pub(crate) mod delivery_custody;
 #[cfg(test)]
 mod emit_tests;
@@ -239,6 +243,7 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) slice_construction_rows: Vec<mechanical_receipt::SliceConstructionReceiptRow>,
     pub(crate) slice_use_rows: Vec<mechanical_receipt::SliceUseAdapterReceiptRow>,
     pub(crate) option_rows: Vec<mechanical_receipt::OptionPresentationReceiptRow>,
+    pub(crate) declaration_rows: Vec<mechanical_receipt::DeclarationShapeReceiptRow>,
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
@@ -1306,6 +1311,7 @@ fn refresh_raw_boundary_receipt_events(
     artifacts.slice_construction_rows = slice_rows;
     artifacts.slice_use_rows = emission_plan.slice_use_receipt_rows(reverted);
     artifacts.option_rows = emission_plan.option_receipt_rows(reverted);
+    artifacts.declaration_rows = emission_plan.declaration_receipt_rows(reverted);
 }
 
 fn verify_and_revert(
@@ -3333,6 +3339,15 @@ impl OutcomeFacts {
             }
         }
         for row in &mut self.raw_boundary_artifacts.option_rows {
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
+        for row in &mut self.raw_boundary_artifacts.declaration_rows {
+            row.terminal_class_result = mechanical_receipt::MechanicalState::Dropped;
             if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
                 row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
                 row.terminal.reason = Some(
@@ -5720,6 +5735,8 @@ fn finish_decide<'tcx>(
     }
 
     perturb(&mut subjects);
+    let declaration_pointees = decision::declaration::collect(tcx, &subjects);
+    let declaration_patterns = decision::declaration_pattern::collect(tcx, &subjects);
     let mut facts = decision::emitability::collect(tcx, &program.functions);
     let original_body_adapters = facts.body_adapters.clone();
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
@@ -5920,6 +5937,14 @@ fn finish_decide<'tcx>(
     let mut family_receipts = Vec::new();
     let original_c9_plans = retained_c9_plans.clone();
     loop {
+        let mut ctors = ctors.clone();
+        let mut subjects = subjects.clone();
+        decision::declaration_pattern::augment(
+            &declaration_patterns,
+            &family_policy,
+            &mut ctors,
+            &mut subjects,
+        );
         retained_c9_plans = original_c9_plans.clone();
         facts.body_adapters = original_body_adapters.clone();
         let slice_uses = additive::select_uses(
@@ -5937,6 +5962,8 @@ fn finish_decide<'tcx>(
         let ctx_of = |gate, coconv, lifetime_eligibility, raw_boundary, exposure| decision::Ctx {
             tcx,
             family_policy: &family_policy,
+            declaration_pointees: &declaration_pointees,
+            declaration_patterns: &declaration_patterns,
             model: &model,
             slots: &slots,
             facts: &facts,
@@ -6437,6 +6464,7 @@ fn finish_decide<'tcx>(
             slice_construction_rows: Vec::new(),
             slice_use_rows: Vec::new(),
             option_rows: Vec::new(),
+            declaration_rows: Vec::new(),
             class_costs: bridge_receipt::class_cost_header(),
             class_collisions: bridge_receipt::class_collision_header(),
             unresolved_classes: bridge_receipt::unresolved_class_header(),
@@ -6626,7 +6654,7 @@ fn append_surface_declaration_plans(
                     } else {
                         ""
                     },
-                    pointee,
+                    decision::declaration::pointee_source(tcx, pointee),
                 );
                 table
                     .seams
@@ -6712,7 +6740,11 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
         let TyKind::RawPtr(pointee, _) = *signature.output().kind() else {
             continue;
         };
-        let emitted_type = format!("&{}{}", if *mutable { "mut " } else { "" }, pointee);
+        let emitted_type = format!(
+            "&{}{}",
+            if *mutable { "mut " } else { "" },
+            decision::declaration::pointee_source(tcx, pointee)
+        );
         let owner_class = SignatureClassId::of(*callee);
         declarations.push(decision::seam::ExplicitDeclarationSite {
             owner_class,

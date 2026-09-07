@@ -8549,6 +8549,87 @@ fn br_w12_local_static_wrapper_and_return_temp_types_are_explicit() {
     );
 }
 
+/// I11: a raw wrapper's explicit return temporary must name the resolved
+/// generic pointee in its own module, which imports only the pointer alias.
+#[test]
+fn br_w12_cross_module_alias_return_temp_keeps_its_generic_pointee() {
+    let input = r#"#![allow(dead_code, unused_unsafe)]
+mod definitions {
+    #[repr(C)]
+    pub struct Cell<T> { pub value: T }
+    pub type Handle = *const Cell<u16>;
+}
+mod client {
+    use crate::definitions::Handle;
+    pub type Callback = unsafe fn(Handle) -> Handle;
+    pub unsafe fn target(p: Handle) -> Handle { p }
+    pub static TABLE: [Option<Callback>; 1] = [Some(target as Callback)];
+}
+"#;
+    assert!(
+        verify::type_checks_str(input),
+        "I11 alias callback input must type-check"
+    );
+    let fixture = Fixture::new(&[("lib.rs", input)]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+        &|table| {
+            let (_, decision) = table.entries.iter().find(|(subject, _)|
+                subject.label == "target::p").expect("I11 target parameter");
+            assert!(matches!(decision, super::decision::Decision::Ref { mutable: false }),
+                "the generated-return witness needs actual Ref admission: {decision:?}");
+        },
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = outcome else {
+        panic!("I11 generic alias wrapper must emit: {outcome:#?}");
+    };
+    assert!(
+        source.contains("fn __crat_safe_target"),
+        "the safe inner must survive: {source}"
+    );
+    assert!(
+        source.contains("fn target(p: Handle) -> Handle"),
+        "the raw wrapper keeps its alias signature: {source}"
+    );
+    assert!(
+        source.contains("static TABLE: [Option<Callback>; 1]"),
+        "{source}"
+    );
+    assert!(
+        source.contains("pub type Handle = *const Cell<u16>;"),
+        "the typedef stays unchanged: {source}"
+    );
+    let declarations = super::delivery_custody::inventory_source("generic-return.rs", &source)
+        .expect("I11 emitted declaration inventory");
+    let temporaries = declarations
+        .iter()
+        .filter(|row| row.owner == "client::target" && row.binding == "__crat_result")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        temporaries.len(),
+        1,
+        "one explicit return temporary in the raw wrapper: {source}"
+    );
+    let temporary = temporaries[0];
+    assert!(
+        temporary.explicit_type.is_some() && temporary.type_is_fully_explicit,
+        "{temporary:?}"
+    );
+    assert!(
+        matches!(&temporary.type_shape,
+        super::delivery_custody::TypeShape::Reference { mutable: false, pointee }
+            if matches!(pointee.as_ref(), super::delivery_custody::TypeShape::Named { path }
+                if path.ends_with("definitions::Cell<u16>"))),
+        "the return temporary must retain the qualified pointee and its generic argument: {temporary:?}\n{source}"
+    );
+    assert!(
+        verify::type_checks_str(&source),
+        "I11 generated wrapper must type/borrow-check: {source}"
+    );
+}
+
 /// BR-W13 RED: a raw tail entering a lifetime-permitted safe return reuses the
 /// inbound bridge algebra and belongs to the returning function's class.
 #[test]
@@ -12166,11 +12247,26 @@ fn slu_w1_shared_to_mut_view_requires_negative_write_evidence() {
         "SLU R-B proof is absent: {events:?}"
     );
 
-    // The alias keeps this callee's declaration in item 5's held family;
-    // direct dereferencing supplies actual Foster read/write evidence.
+    // Direct dereferencing supplies actual Foster read/write evidence. Item 5
+    // now lets the alias reach the ordinary call/cast gates.
     let writing = input.replace("{ *q }", "{ *q = 7; 0 }");
     let (artifacts, retired) = ::utils::compilation::run_compiler_on_str(&writing, |tcx| {
         let (table, ctx) = super::decide_table_with_ctx(tcx).expect("R-B writing trace");
+        for label in ["raw_read::q", "target::p"] {
+            let (subject, _) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label == label)
+                .expect("frozen writing subject");
+            assert!(
+                !ctx.mut_facts.is_defaulted(subject.fn_did, subject.local),
+                "{label} needs actual frozen read/write evidence"
+            );
+            assert!(
+                ctx.mut_facts.is_mutable(subject.fn_did, subject.local),
+                "{label} cannot supply FosterImmutable evidence for this writing input"
+            );
+        }
         (ctx.raw_boundary_artifacts, table.slice_use_receipts)
     })
     .expect("R-B writing fixture compiles");
@@ -12179,23 +12275,35 @@ fn slu_w1_shared_to_mut_view_requires_negative_write_evidence() {
         "{}",
         artifacts.dispositions
     );
-    // R220 restores the predecessor's raw slot. The missing R-B evidence is
-    // retained on the withdrawn safe-slice obligation, not its final raw cast.
+    // Item-5/I14 migration under R217-2/R220: the latest Declaration attempt
+    // stops at the callee's ordinary gate before a raw-view proof is consumed.
+    // RetiredReceipts keeps that latest attempt for this canonical site; the
+    // independent frozen writing evidence above remains load-bearing.
+    assert!(
+        artifacts
+            .additive_family_receipts
+            .iter()
+            .any(|row| row.family == "Declaration"
+                && row.owner_path == "raw_read"
+                && row.cause == "unwitnessed-family-refusal:blocked-subject:arg-cast-form-unbuilt")
+    );
     let rejected = retired
         .iter()
-        .find(|plan| {
-            plan.obligation.planned.evidence.negative_write
-                == super::mechanical_receipt::NegativeWriteEvidence::Missing
-        })
-        .expect("retired shared-to-mut evidence");
+        .find(|plan| plan.adapter == "prior-family-rendering:Declaration")
+        .expect("latest Declaration-stage slice-use refusal");
     slu_r220_assert_retired_use_cause(
         rejected,
-        super::mechanical_receipt::MechanicalTerminalReason::RbNegativeWriteAbsent,
+        super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
+            "slice-use-existing-c-callee-not-settled-safe:parameters=1".to_owned(),
+        ),
     );
-    assert!(
-        rejected
-            .boundary_evidence
-            .contains("raw-boundary-shared-to-mut")
+    assert_eq!(
+        rejected.obligation.planned.evidence.negative_write,
+        super::mechanical_receipt::NegativeWriteEvidence::NotApplicable
+    );
+    assert_eq!(
+        rejected.boundary_evidence,
+        "hypothetical-target-stays-raw=false"
     );
     let emitted = ast_emitted_source_of(&writing).expect("R-B writing hold");
     assert!(
@@ -12298,6 +12406,13 @@ fn slu_w1_positive_retention_stays_held() {
             tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
             Some(&emission.plan.terminal_a5_raw_calls),
         )?;
+        for label in ["raw_keep::q", "target::p"] {
+            let (subject, _) = table.entries.iter().find(|(subject, _)| subject.label == label)
+                .expect("frozen retaining subject");
+            assert!(matches!(ctx.retention.get(subject.fn_did, 0),
+                Some(super::decision::raw_boundary::RetentionVerdict::Retains { .. })),
+                "{label} must retain its independent positive-retention summary");
+        }
         Ok::<_, String>((ctx.raw_boundary_artifacts, table.slice_use_receipts, files.into_values().next().expect("retention fixture root")))
     }).expect("retention fixture compiles").expect("attested retention emission");
     assert!(
@@ -12307,21 +12422,39 @@ fn slu_w1_positive_retention_stays_held() {
         "{}",
         artifacts.dispositions
     );
-    // R220 keeps the retained source raw and carries the positive-retention
-    // finding on the retired safe-form obligation.
+    // Item-5/I14 migration under R217-2/R220: alias admission exposes the
+    // callee's static-store gate. The latest canonical retirement therefore
+    // reports the upstream callee refusal; frozen retention is checked above.
+    assert!(
+        artifacts
+            .additive_family_receipts
+            .iter()
+            .any(|row| row.family == "Declaration"
+                && row.owner_path == "raw_keep"
+                && row.cause
+                    == "unwitnessed-family-refusal:blocked-subject:escapes-via-static-store")
+    );
     let rejected = retired
         .iter()
-        .find(|plan| {
-            plan.retention == super::mechanical_receipt::MechanicalRetention::PositiveRetention
-        })
-        .expect("retired positive-retention evidence");
+        .find(|plan| plan.adapter == "prior-family-rendering:Declaration")
+        .expect("latest Declaration-stage retaining-call refusal");
     slu_r220_assert_retired_use_cause(
         rejected,
-        super::mechanical_receipt::MechanicalTerminalReason::PositiveRetention,
+        super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
+            "slice-use-existing-c-callee-not-settled-safe:parameters=1".to_owned(),
+        ),
     );
     assert_eq!(
         rejected.obligation.planned.evidence.retention,
-        super::mechanical_receipt::MechanicalRetention::PositiveRetention
+        super::mechanical_receipt::MechanicalRetention::None
+    );
+    assert_eq!(
+        rejected.retention,
+        super::mechanical_receipt::MechanicalRetention::None
+    );
+    assert_eq!(
+        rejected.boundary_evidence,
+        "hypothetical-target-stays-raw=false"
     );
     assert!(
         emitted.contains("p: *const i32"),
@@ -13093,23 +13226,90 @@ fn opt_w1_required_callee_unwrap_has_a_terminal_contract() {
 
 #[test]
 fn opt_w1_raw_callee_keeps_the_nullable_outbound_view() {
+    use super::mechanical_receipt::{
+        CanonicalCallee, MechanicalMechanism, MechanicalStage, MechanicalState, TerminalContract,
+    };
     let input = "type Ptr = *const i32;\n\
         unsafe fn raw_read(q: Ptr) -> i32 { *q }\n\
         pub unsafe fn target(p: *const i32) -> i32 {\n\
             if p.is_null() { 0 } else { raw_read(p) }\n\
         }";
     let emitted = ast_emitted_source_of(input).expect("OPT raw callee");
-    assert!(emitted.contains("map_or("), "{emitted}");
+    // R217-2(a), item 5: this unchanged alias-spelled callee now has its
+    // model-admitted reference declaration and required terminal interface.
+    let declarations = super::delivery_custody::inventory_source("option-alias.rs", &emitted)
+        .expect("observed alias callee declarations");
+    let callee = declarations
+        .iter()
+        .filter(|row| {
+            row.owner == "raw_read" && row.binding == "q" && row.parameter_index == Some(1)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(callee.len(), 1);
     assert!(
-        !emitted.contains("p.unwrap()"),
-        "raw terminal interface cannot license unwrap: {emitted}"
+        matches!(
+            callee[0].effective_type_shape(),
+            Some(super::delivery_custody::TypeShape::Reference { mutable: false, .. })
+        ),
+        "{emitted}"
     );
+    assert!(emitted.contains("raw_read(p.unwrap())"), "{emitted}");
     let events = opt_w1_assert_receipted(input);
-    assert!(events.iter().all(|event| event.mechanism
-        != super::mechanical_receipt::MechanicalMechanism::OptionUnwrapRequired));
+    let required = events
+        .iter()
+        .filter(|event| {
+            event.stage == MechanicalStage::Terminal && event.argument_kind == "call-required"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(required.len(), 1, "{events:?}");
+    assert!(required.iter().all(|event| event.state == MechanicalState::Applied
+        && event.mechanism == MechanicalMechanism::OptionUnwrapRequired
+        && event.expected_form == "ref-shared" && event.key.site.argument_index == Some(0)
+        && matches!(event.key.site.callee, Some(CanonicalCallee::Local(_)))
+        && matches!(&event.evidence.terminal_contract, TerminalContract::Required { interface } if !interface.is_empty())),
+        "the observed safe callee needs its actual required-interface receipt: {events:?}");
     assert!(
         verify::type_checks_str(&emitted),
         "OPT outbound output compiles"
+    );
+
+    let raw_input = "extern \"C\" { fn raw_read(q: *const i32) -> i32; }\n\
+        pub unsafe fn target(p: *const i32) -> i32 { if p.is_null() { 0 } else { raw_read(p) } }";
+    let raw_output = ast_emitted_source_of(raw_input).expect("true-raw shared foreign twin");
+    assert!(
+        raw_output.contains("fn raw_read(q: *const i32)"),
+        "{raw_output}"
+    );
+    assert!(
+        raw_output.contains("map_or(") && !raw_output.contains("unwrap"),
+        "{raw_output}"
+    );
+    assert!(
+        verify::type_checks_str(&raw_output),
+        "true-raw shared twin must type-check: {raw_output}"
+    );
+    let raw_events = opt_w1_assert_receipted(raw_input);
+    let raw_calls = raw_events
+        .iter()
+        .filter(|event| {
+            event.stage == MechanicalStage::Terminal && event.argument_kind == "call-raw"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(raw_calls.len(), 1, "{raw_events:?}");
+    assert!(
+        raw_calls
+            .iter()
+            .all(|event| event.state == MechanicalState::Applied
+                && event.expected_form == "raw"
+                && matches!(event.key.site.callee, Some(CanonicalCallee::Foreign(_)))
+                && event.evidence.terminal_contract == TerminalContract::NotApplicable),
+        "{raw_events:?}"
+    );
+    assert!(
+        raw_events
+            .iter()
+            .all(|event| event.mechanism != MechanicalMechanism::OptionUnwrapRequired),
+        "{raw_events:?}"
     );
 }
 
@@ -13186,6 +13386,9 @@ fn opt_w1_held_terminal_callee_cannot_license_unwrap() {
 
 #[test]
 fn opt_w1_mutable_outbound_views_add_the_required_binding_reborrow() {
+    use super::mechanical_receipt::{
+        CanonicalCallee, MechanicalMechanism, MechanicalStage, MechanicalState, TerminalContract,
+    };
     let input = "type Ptr = *mut i32;\n\
         unsafe fn raw_write(q: Ptr) { *q += 1; }\n\
         pub unsafe fn target(p: *mut i32) -> i32 {\n\
@@ -13193,12 +13396,101 @@ fn opt_w1_mutable_outbound_views_add_the_required_binding_reborrow() {
         }";
     let emitted = ast_emitted_source_of(input).expect("OPT repeated mutable outbound");
     assert!(emitted.contains("mut p: Option<&mut i32>"), "{emitted}");
-    assert_eq!(emitted.matches("p.as_deref_mut()").count(), 2, "{emitted}");
+    // R217-2(a), item 5: the alias parameter is now an observed mutable
+    // reference, so both calls use required-interface reborrows.
+    let declarations = super::delivery_custody::inventory_source("option-mut-alias.rs", &emitted)
+        .expect("observed mutable alias callee");
+    let callee = declarations
+        .iter()
+        .filter(|row| {
+            row.owner == "raw_write" && row.binding == "q" && row.parameter_index == Some(1)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(callee.len(), 1);
+    assert!(
+        matches!(
+            callee[0].effective_type_shape(),
+            Some(super::delivery_custody::TypeShape::Reference { mutable: true, .. })
+        ),
+        "{emitted}"
+    );
+    assert_eq!(
+        emitted.matches("raw_write(p.as_mut().unwrap())").count(),
+        2,
+        "{emitted}"
+    );
     assert!(
         verify::type_checks_str(&emitted),
         "OPT repeated outbound compiles"
     );
-    opt_w1_assert_receipted(input);
+    let events = opt_w1_assert_receipted(input);
+    let required = events
+        .iter()
+        .filter(|event| {
+            event.stage == MechanicalStage::Terminal && event.argument_kind == "call-required"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(required.len(), 2, "{events:?}");
+    assert_eq!(
+        required
+            .iter()
+            .map(|event| event.key.receipt_key())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2
+    );
+    assert!(required.iter().all(|event| event.state == MechanicalState::Applied
+        && event.mechanism == MechanicalMechanism::OptionUnwrapRequired
+        && event.expected_form == "ref-mut" && event.key.site.argument_index == Some(0)
+        && matches!(event.key.site.callee, Some(CanonicalCallee::Local(_)))
+        && matches!(&event.evidence.terminal_contract, TerminalContract::Required { interface } if !interface.is_empty())),
+        "each required reborrow needs its own terminal contract: {events:?}");
+
+    let raw_input = "extern \"C\" { fn raw_write(q: *mut i32); }\n\
+        pub unsafe fn target(p: *mut i32) { if !p.is_null() { raw_write(p); raw_write(p); } }";
+    let raw_output =
+        ast_emitted_source_of(raw_input).expect("true-raw repeated mutable foreign twin");
+    assert!(
+        raw_output.contains("mut p: Option<&mut i32>"),
+        "{raw_output}"
+    );
+    assert!(
+        raw_output.contains("fn raw_write(q: *mut i32)"),
+        "{raw_output}"
+    );
+    assert_eq!(
+        raw_output.matches("p.as_deref_mut().map_or").count(),
+        2,
+        "{raw_output}"
+    );
+    assert!(!raw_output.contains("unwrap"), "{raw_output}");
+    assert!(
+        verify::type_checks_str(&raw_output),
+        "true-raw repeated twin must type-check: {raw_output}"
+    );
+    let raw_events = opt_w1_assert_receipted(raw_input);
+    let raw_calls = raw_events
+        .iter()
+        .filter(|event| {
+            event.stage == MechanicalStage::Terminal && event.argument_kind == "call-raw"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(raw_calls.len(), 2, "{raw_events:?}");
+    assert!(
+        raw_calls
+            .iter()
+            .all(|event| event.state == MechanicalState::Applied
+                && event.expected_form == "raw"
+                && matches!(event.key.site.callee, Some(CanonicalCallee::Foreign(_)))
+                && event.evidence.terminal_contract == TerminalContract::NotApplicable),
+        "{raw_events:?}"
+    );
+    assert!(
+        raw_events
+            .iter()
+            .all(|event| event.mechanism != MechanicalMechanism::OptionUnwrapRequired),
+        "{raw_events:?}"
+    );
 }
 
 #[test]
@@ -13289,6 +13581,9 @@ fn opt_r214_address_temporary_preserves_its_storage_lifetime() {
 
 #[test]
 fn opt_w1_nested_raw_result_preserves_the_inner_outbound_adapter() {
+    use super::mechanical_receipt::{
+        CanonicalCallee, MechanicalMechanism, MechanicalStage, MechanicalState, TerminalContract,
+    };
     // Returning the input pointer is the positive-retention OUT contrast.
     // This non-retaining callee isolates construction/inner-adapter ownership.
     let input = "type Ptr = *const i32; static RESULT: i32 = 7; unsafe fn raw_result(_q: Ptr) -> Ptr { &RESULT }\n\
@@ -13318,15 +13613,48 @@ fn opt_w1_nested_raw_result_preserves_the_inner_outbound_adapter() {
                 .collect::<Vec<_>>()
         })
     );
+    // R217-2(a), item 5: the input alias parameter now admits a required
+    // reference; its raw return still needs the outer coercion/construction.
+    let declarations =
+        super::delivery_custody::inventory_source("option-nested-alias.rs", &emitted)
+            .expect("observed nested alias callee");
+    let callee = declarations
+        .iter()
+        .filter(|row| {
+            row.owner == "raw_result" && row.binding == "_q" && row.parameter_index == Some(1)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(callee.len(), 1);
     assert!(
-        emitted.contains("map_or("),
-        "inner raw adapter was lost: {emitted}"
+        matches!(
+            callee[0].effective_type_shape(),
+            Some(super::delivery_custody::TypeShape::Reference { mutable: false, .. })
+        ),
+        "{emitted}"
+    );
+    assert!(emitted.contains("raw_result(_q: &i32) -> Ptr"), "{emitted}");
+    assert!(
+        emitted.contains("(raw_result(p.unwrap()) as *const i32).as_ref()"),
+        "required inner call and explicit outer raw-result coercion must compose: {emitted}"
     );
     assert!(
         verify::type_checks_str(&emitted),
         "OPT contained adapter output compiles"
     );
-    opt_w1_assert_receipted(input);
+    let events = opt_w1_assert_receipted(input);
+    let required = events
+        .iter()
+        .filter(|event| {
+            event.stage == MechanicalStage::Terminal && event.argument_kind == "call-required"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(required.len(), 1, "{events:?}");
+    assert!(required.iter().all(|event| event.state == MechanicalState::Applied
+        && event.mechanism == MechanicalMechanism::OptionUnwrapRequired
+        && event.expected_form == "ref-shared" && event.key.site.argument_index == Some(0)
+        && matches!(event.key.site.callee, Some(CanonicalCallee::Local(_)))
+        && matches!(&event.evidence.terminal_contract, TerminalContract::Required { interface } if !interface.is_empty())),
+        "the contained required call needs its own terminal contract: {events:?}");
 }
 
 #[test]

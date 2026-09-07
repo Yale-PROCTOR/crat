@@ -120,7 +120,7 @@ impl Construction {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ConstructionFacts {
     pub by_binding: FxHashMap<(LocalDefId, HirId), Construction>,
     /// Typed target of a non-allocator call-result construction.  This is a
@@ -787,6 +787,12 @@ pub(crate) fn plan_slice_constructions(
         let element_type = subject
             .pointee_span
             .and_then(|span| sm.span_to_snippet(span).ok())
+            .or_else(|| {
+                table
+                    .declaration_pointees
+                    .get(&node)
+                    .map(|ty| ty.pointee.clone())
+            })
             .unwrap_or_else(|| "_".to_owned());
         let mut length = select_length(
             tcx,
