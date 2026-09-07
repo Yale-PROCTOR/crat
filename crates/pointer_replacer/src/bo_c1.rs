@@ -174,6 +174,280 @@ fn raw_boundary_subject_delivery(
     }
 }
 
+fn raw_boundary_subject_delivery_with_exclusion(
+    outcome: RawBoundaryProgramOutcome,
+    placed: bool,
+    exclusion: &str,
+    function_reverted: bool,
+    atom_reverted: bool,
+) -> RawBoundarySubjectDelivery {
+    let terminal_hold = raw_boundary_exclusion_is_degradation(exclusion);
+    raw_boundary_subject_delivery(
+        outcome,
+        placed && !terminal_hold,
+        exclusion != "-" && !terminal_hold,
+        function_reverted,
+        atom_reverted,
+    )
+}
+
+fn raw_boundary_exclusion_is_degradation(exclusion: &str) -> bool {
+    exclusion
+        .strip_prefix("terminal-not-applied:")
+        .is_some_and(|reason| !reason.is_empty())
+        || exclusion
+            .strip_prefix("unplaceable:")
+            .and_then(|reason| reason.strip_suffix("-evidence-held"))
+            .is_some_and(|family| !family.is_empty())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RawBoundaryDeliveryCustody {
+    delivered_by_ledger: std::collections::BTreeSet<String>,
+    delivered_by_tree: std::collections::BTreeSet<String>,
+    declarations: Vec<(String, crate::bo_rewriter::delivery_custody::Declaration)>,
+    observations: Vec<RawBoundaryCustodyObservation>,
+    issues: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RawBoundaryCustodyObservation {
+    subject_key: String,
+    state: &'static str,
+    declaration_indices: Vec<usize>,
+}
+
+fn raw_boundary_custody_observed_form(
+    shape: &crate::bo_rewriter::delivery_custody::TypeShape,
+) -> Result<Option<crate::bo_rewriter::DeliveryForm>, &'static str> {
+    use crate::bo_rewriter::{DeliveryForm, delivery_custody::TypeShape};
+    let (optional, payload) = match shape {
+        TypeShape::Option { path, payload } => {
+            if !matches!(
+                path.trim_start_matches("::"),
+                "Option" | "std::option::Option" | "core::option::Option"
+            ) {
+                return Err("unresolved-option-path");
+            }
+            (true, payload.as_ref())
+        }
+        _ => (false, shape),
+    };
+    match payload {
+        TypeShape::Reference { mutable, pointee } => Ok(Some(DeliveryForm::Borrowed {
+            mutable: *mutable,
+            optional,
+            slice: matches!(pointee.as_ref(), TypeShape::Slice { .. }),
+        })),
+        TypeShape::OwningBox { path, payload } => {
+            if !matches!(
+                path.trim_start_matches("::"),
+                "Box" | "std::boxed::Box" | "alloc::boxed::Box"
+            ) {
+                return Err("unresolved-box-path");
+            }
+            Ok(Some(DeliveryForm::Owning {
+                optional,
+                slice: matches!(payload.as_ref(), TypeShape::Slice { .. }),
+            }))
+        }
+        TypeShape::Named { .. } => Err("unresolved-type"),
+        TypeShape::RawPointer { .. } | TypeShape::Slice { .. } | TypeShape::Option { .. } => {
+            Ok(None)
+        }
+        TypeShape::Other { .. } | TypeShape::Inferred => Err("unresolved-type"),
+    }
+}
+
+fn raw_boundary_delivery_custody(
+    expectations: &[crate::bo_rewriter::DeliveryExpectation],
+    delivered_by_ledger: &std::collections::BTreeSet<String>,
+    sources: &std::collections::BTreeMap<String, String>,
+    reverted_owners: &std::collections::BTreeSet<String>,
+) -> RawBoundaryDeliveryCustody {
+    let mut report = RawBoundaryDeliveryCustody {
+        delivered_by_ledger: delivered_by_ledger.clone(),
+        delivered_by_tree: std::collections::BTreeSet::new(),
+        declarations: Vec::new(),
+        observations: Vec::new(),
+        issues: Vec::new(),
+    };
+    // This call is deliberately outside the emission compiler callback. It
+    // observes only the final returned source tree and creates parser globals
+    // independently; no type/model query or placement bit enters its inventory.
+    for (file, source) in sources {
+        match crate::bo_rewriter::delivery_custody::inventory_source(file, source) {
+            Ok(declarations) => report
+                .declarations
+                .extend(declarations.into_iter().map(|row| (file.clone(), row))),
+            Err(error) => report
+                .issues
+                .push(format!("delivery-custody:parse:{file}:{error}")),
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut claimed = std::collections::BTreeMap::<usize, String>::new();
+    for expected in expectations {
+        if !seen.insert(expected.subject_key.clone()) {
+            report.issues.push(format!(
+                "delivery-custody:duplicate-expectation:{}",
+                expected.subject_key
+            ));
+            continue;
+        }
+        let Some(source_file) = expected
+            .source_file
+            .as_deref()
+            .filter(|file| sources.contains_key(*file))
+        else {
+            report.issues.push(format!(
+                "delivery-custody:unmapped-source-file:{}:source={:?}",
+                expected.subject_key, expected.source_file,
+            ));
+            report.observations.push(RawBoundaryCustodyObservation {
+                subject_key: expected.subject_key.clone(),
+                state: "unmapped-source-file",
+                declaration_indices: Vec::new(),
+            });
+            continue;
+        };
+        let candidates = report
+            .declarations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (file, row))| {
+                (file == source_file
+                    && row.owner == expected.emitted_owner
+                    && row.binding == expected.binding
+                    && row.parameter_index == expected.parameter_index)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let state = if reverted_owners.contains(&expected.owner_fn)
+            || reverted_owners.contains(&expected.emitted_owner)
+        {
+            "owner-reverted"
+        } else if candidates.len() > 1 {
+            report.issues.push(format!(
+                "delivery-custody:ambiguous:{}:owner={}:binding={}:candidates={candidates:?}",
+                expected.subject_key, expected.emitted_owner, expected.binding
+            ));
+            "ambiguous"
+        } else if let Some(&index) = candidates.first() {
+            let declaration = &report.declarations[index].1;
+            let observed_form = if declaration.type_is_fully_explicit {
+                raw_boundary_custody_observed_form(&declaration.type_shape)
+            } else {
+                Err("inferred-type")
+            };
+            match observed_form {
+                Ok(Some(form)) if form == expected.expected_form => {
+                    if let Some(previous) = claimed.insert(index, expected.subject_key.clone()) {
+                        report.delivered_by_tree.remove(&previous);
+                        report.issues.push(format!(
+                            "delivery-custody:declaration-claimed-twice:{previous}:{}",
+                            expected.subject_key
+                        ));
+                        "ambiguous"
+                    } else {
+                        report
+                            .delivered_by_tree
+                            .insert(expected.subject_key.clone());
+                        "expected-form-observed"
+                    }
+                }
+                Ok(_) => "different-form",
+                Err(reason) => {
+                    report.issues.push(format!(
+                        "delivery-custody:{reason}:{}:owner={}:binding={}",
+                        expected.subject_key, expected.emitted_owner, expected.binding
+                    ));
+                    reason
+                }
+            }
+        } else {
+            "missing-declaration"
+        };
+        report.observations.push(RawBoundaryCustodyObservation {
+            subject_key: expected.subject_key.clone(),
+            state,
+            declaration_indices: candidates,
+        });
+    }
+    let ledger_only = report
+        .delivered_by_ledger
+        .difference(&report.delivered_by_tree)
+        .cloned()
+        .collect::<Vec<_>>();
+    let tree_only = report
+        .delivered_by_tree
+        .difference(&report.delivered_by_ledger)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !ledger_only.is_empty() || !tree_only.is_empty() {
+        report.issues.push(format!(
+            "delivery-custody:identity-mismatch:ledger-only={ledger_only:?}:tree-only={tree_only:?}"
+        ));
+    }
+    report
+}
+
+fn raw_boundary_custody_failure(mut row: report::Row, detail: &str) -> report::Row {
+    row.set(raw_schema::DATA, "false");
+    row.set(raw_schema::STATUS, "instrument-error");
+    row.set("detail", report::sanitize(detail));
+    row
+}
+
+fn raw_boundary_delivery_custody_for_outcome(
+    outcome: RawBoundaryProgramOutcome,
+    expectations: &[crate::bo_rewriter::DeliveryExpectation],
+    delivered_by_ledger: &std::collections::BTreeSet<String>,
+    sources: Option<&std::collections::BTreeMap<String, String>>,
+    reverted_owners: &std::collections::BTreeSet<String>,
+) -> RawBoundaryDeliveryCustody {
+    match sources {
+        Some(sources) => raw_boundary_delivery_custody(
+            expectations,
+            delivered_by_ledger,
+            sources,
+            reverted_owners,
+        ),
+        None => {
+            // A degraded program intentionally supplies no delivered tree.
+            // An emitted program missing its tree is an instrument invariant,
+            // even when both identity sets would otherwise be empty.
+            let mut report = raw_boundary_delivery_custody(
+                &[],
+                delivered_by_ledger,
+                &std::collections::BTreeMap::new(),
+                reverted_owners,
+            );
+            let state = match outcome {
+                RawBoundaryProgramOutcome::Emitted => {
+                    report
+                        .issues
+                        .push("delivery-custody:missing-emitted-tree".to_owned());
+                    "missing-emitted-tree"
+                }
+                RawBoundaryProgramOutcome::Degraded => "no-tree-degraded",
+            };
+            report
+                .observations
+                .extend(
+                    expectations
+                        .iter()
+                        .map(|expected| RawBoundaryCustodyObservation {
+                            subject_key: expected.subject_key.clone(),
+                            state,
+                            declaration_indices: Vec::new(),
+                        }),
+                );
+            report
+        }
+    }
+}
+
 fn raw_boundary_delivery_verdict(
     any_degraded_program: bool,
     any_unwaived_regression: bool,
@@ -9394,47 +9668,55 @@ mod run {
                     .or_default() += 1;
             }
 
-            let (disposition, disposition_reason) = if decision == "excluded" {
-                if exclusion == "-" {
-                    return Err(format!("{subject_key}: excluded row lacks a typed reason"));
-                }
-                counts.excluded += 1;
-                ("typed-excluded", exclusion.to_owned())
-            } else if decision == "degraded" {
-                if reason == "-" {
-                    return Err(format!("{subject_key}: degraded row lacks a typed reason"));
-                }
-                let typed_reason = if reason == "class-blocked" && reason_detail != "-" {
-                    format!("class-blocked:{reason_detail}")
-                } else {
-                    reason.to_owned()
-                };
-                counts.degraded += 1;
-                *counts
-                    .degraded_reasons
-                    .entry(typed_reason.clone())
-                    .or_default() += 1;
-                ("degraded", typed_reason)
-            } else if placed == "0" {
-                if exclusion == "-" {
-                    return Err(format!("{subject_key}: unplaced row lacks a typed reason"));
-                }
-                counts.excluded += 1;
-                ("typed-excluded", exclusion.to_owned())
-            } else if let Some(class) = revert_classes.get(owner_fn) {
-                matched_reverts.insert(owner_fn.to_owned());
-                counts.reverted += 1;
-                ("reverted", class.clone())
-            } else {
-                counts.realized += 1;
-                if DEGRADED_MASS_FAMILIES.contains(&family) {
+            let (disposition, disposition_reason) =
+                if super::raw_boundary_exclusion_is_degradation(exclusion) {
+                    counts.degraded += 1;
                     *counts
-                        .realized_by_family
-                        .entry(family.to_owned())
+                        .degraded_reasons
+                        .entry(exclusion.to_owned())
                         .or_default() += 1;
-                }
-                ("realized-as-predicted", "-".to_owned())
-            };
+                    ("degraded", exclusion.to_owned())
+                } else if decision == "excluded" {
+                    if exclusion == "-" {
+                        return Err(format!("{subject_key}: excluded row lacks a typed reason"));
+                    }
+                    counts.excluded += 1;
+                    ("typed-excluded", exclusion.to_owned())
+                } else if decision == "degraded" {
+                    if reason == "-" {
+                        return Err(format!("{subject_key}: degraded row lacks a typed reason"));
+                    }
+                    let typed_reason = if reason == "class-blocked" && reason_detail != "-" {
+                        format!("class-blocked:{reason_detail}")
+                    } else {
+                        reason.to_owned()
+                    };
+                    counts.degraded += 1;
+                    *counts
+                        .degraded_reasons
+                        .entry(typed_reason.clone())
+                        .or_default() += 1;
+                    ("degraded", typed_reason)
+                } else if placed == "0" {
+                    if exclusion == "-" {
+                        return Err(format!("{subject_key}: unplaced row lacks a typed reason"));
+                    }
+                    counts.excluded += 1;
+                    ("typed-excluded", exclusion.to_owned())
+                } else if let Some(class) = revert_classes.get(owner_fn) {
+                    matched_reverts.insert(owner_fn.to_owned());
+                    counts.reverted += 1;
+                    ("reverted", class.clone())
+                } else {
+                    counts.realized += 1;
+                    if DEGRADED_MASS_FAMILIES.contains(&family) {
+                        *counts
+                            .realized_by_family
+                            .entry(family.to_owned())
+                            .or_default() += 1;
+                    }
+                    ("realized-as-predicted", "-".to_owned())
+                };
             let lifetime =
                 disposition == "degraded" && degraded_mass_lifetime_cause(&disposition_reason);
             counts.lifetime_degraded += usize::from(lifetime);
@@ -10764,20 +11046,23 @@ mod run {
         let mut reverted_function_subjects = 0usize;
         let mut reverted_program_subjects = 0usize;
         let mut typed_excluded_subjects = 0usize;
+        let mut delivered_by_ledger = BTreeSet::new();
         for subject in named_tsv_rows(&capture.subject_receipt) {
             let subject_key = subject.get("subject_key").map_or("-", String::as_str);
             let owner_fn = subject.get("owner_fn").map_or("-", String::as_str);
             let family = subject.get("family").map_or("-", String::as_str);
             let placed = subject.get("placed").is_some_and(|value| value == "1");
             let exclusion = subject.get("exclusion").map_or("-", String::as_str);
-            let excluded = exclusion != "-";
-            let delivery = super::raw_boundary_subject_delivery(
+            let delivery = super::raw_boundary_subject_delivery_with_exclusion(
                 program_outcome,
                 placed,
-                excluded,
+                exclusion,
                 reverted_functions.contains(owner_fn),
                 false,
             );
+            if delivery == super::RawBoundarySubjectDelivery::Realized {
+                delivered_by_ledger.insert(subject_key.to_owned());
+            }
             if matches!(family, "ref" | "slice" | "optional" | "box") {
                 match delivery {
                     super::RawBoundarySubjectDelivery::Realized => realized_subjects += 1,
@@ -10820,6 +11105,73 @@ mod run {
             reverted_program_subjects,
         );
         row.set(raw_schema::TYPED_EXCLUDED_SUBJECTS, typed_excluded_subjects);
+
+        let custody_sources = capture.emitted_files.as_ref().map(|files| {
+            files
+                .iter()
+                .map(|(file, source)| (format!("{file:?}"), source.clone()))
+                .collect::<BTreeMap<_, _>>()
+        });
+        let mut custody = super::raw_boundary_delivery_custody_for_outcome(
+            program_outcome,
+            &artifact.custody_expectations,
+            &delivered_by_ledger,
+            custody_sources.as_ref(),
+            &reverted_functions,
+        );
+        let custody_data = if custody.issues.is_empty() {
+            data
+        } else {
+            "false"
+        };
+        let custody_stamp = serde_json::json!({
+            "corpus": "rs-crown", "analysis_frame": model_cache::ANALYSIS_FRAME,
+            "code_frame": code_frame, "program": name, "data": custody_data,
+            "cache_manifest_sha256": cache_manifest_sha256, "launch_env_sha256": launch_env_sha256,
+            "emitted_tree_sha256": tree_receipt.emitted_tree_sha256,
+            "emitted_tree_present": capture.emitted_files.is_some(),
+        });
+        // Sidecars preserve the sealed common/specialized TSV schemas. Exact
+        // expectations and parser observations remain independently auditable.
+        for (suffix, payload) in [
+            (
+                "delivery-expectations",
+                serde_json::json!({"stamp": &custody_stamp, "expectations": &artifact.custody_expectations}),
+            ),
+            (
+                "delivery-declarations",
+                serde_json::json!({"stamp": &custody_stamp, "declarations": &custody.declarations}),
+            ),
+            (
+                "delivery-custody",
+                serde_json::json!({"stamp": &custody_stamp, "comparison": &custody}),
+            ),
+        ] {
+            let path = directory.join(format!("{name}.raw-boundary-{suffix}.json"));
+            let written = serde_json::to_vec_pretty(&payload)
+                .map_err(|error| format!("serialize {suffix}: {error}"))
+                .and_then(|mut bytes| {
+                    bytes.push(b'\n');
+                    std::fs::write(&path, bytes)
+                        .map_err(|error| format!("write {}: {error}", path.display()))
+                });
+            if let Err(error) = written {
+                custody
+                    .issues
+                    .push(format!("delivery-custody:sidecar:{error}"));
+            }
+        }
+        if !custody.issues.is_empty() {
+            row.set(raw_schema::CORPUS, "rs-crown");
+            row.set(raw_schema::ANALYSIS_FRAME, model_cache::ANALYSIS_FRAME);
+            row.set(raw_schema::CODE_FRAME, &code_frame);
+            row.set(raw_schema::CACHE_STATUS, &solve.cache_status);
+            row.set(raw_schema::SOLVE_WALL_S, &solve.solve_wall_s);
+            row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+            // Return before the ordinary final data/status writes: a parser,
+            // identity or sidecar failure cannot be overwritten as success.
+            return super::raw_boundary_custody_failure(row, &custody.issues.join(" | "));
+        }
         #[derive(Default)]
         struct SubjectOutcome {
             has_t1: bool,
@@ -23305,6 +23657,559 @@ fn degraded_mass_lifetime_market_registry_is_explicit() {
             "{reason}"
         );
     }
+}
+
+#[test]
+fn r219_evidence_hold_worker_rows_are_degraded() {
+    for exclusion in [
+        "unplaceable:slice-use-evidence-held",
+        "unplaceable:option-evidence-held",
+        "unplaceable:a5-evidence-held",
+        "unplaceable:slice-construction-evidence-held",
+    ] {
+        assert_eq!(
+            raw_boundary_subject_delivery_with_exclusion(
+                RawBoundaryProgramOutcome::Emitted,
+                false,
+                exclusion,
+                false,
+                false,
+            ),
+            RawBoundarySubjectDelivery::Degraded,
+            "mechanical hold is not a denominator exclusion: {exclusion}",
+        );
+    }
+}
+
+#[test]
+fn r219_evidence_hold_degraded_mass_rows_are_degraded() {
+    for exclusion in [
+        "unplaceable:slice-use-evidence-held",
+        "unplaceable:option-evidence-held",
+        "unplaceable:a5-evidence-held",
+        "unplaceable:slice-construction-evidence-held",
+    ] {
+        let seed = format!(
+            "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n\
+             f::p#1\tf\t1\t1\t0\tslice\tref\tslice\t-\t-\tf.rs:1\t0\t{exclusion}\n"
+        );
+        let ledger = run::degraded_mass_ledger_for_test(&seed, &[]).expect("exact ledger");
+        let rows = ledger.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        let columns = rows[0].split('\t').collect::<Vec<_>>();
+        assert_eq!(columns[13], "degraded", "{exclusion}: {}", rows[0]);
+        assert_eq!(columns[14], exclusion, "the typed hold reason survives");
+    }
+}
+
+#[test]
+fn r219_evidence_hold_classification_preserves_genuine_exclusions() {
+    for (decision, family, exclusion) in [
+        ("excluded", "unmodeled", "foreign-item"),
+        ("excluded", "unmodeled", "impl-item"),
+        ("ref", "ref", "unplaceable:unannotated-local"),
+    ] {
+        assert_eq!(
+            raw_boundary_subject_delivery_with_exclusion(
+                RawBoundaryProgramOutcome::Emitted,
+                false,
+                exclusion,
+                false,
+                false,
+            ),
+            RawBoundarySubjectDelivery::TypedExcluded,
+            "{exclusion}",
+        );
+        let seed = format!(
+            "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n\
+             f::p#1\tf\t1\t1\t0\t{family}\tref\t{decision}\t-\t-\tf.rs:1\t0\t{exclusion}\n"
+        );
+        let ledger = run::degraded_mass_ledger_for_test(&seed, &[]).expect("exact ledger");
+        let row = ledger.lines().nth(1).expect("subject row");
+        let columns = row.split('\t').collect::<Vec<_>>();
+        assert_eq!(columns[13], "typed-excluded", "{exclusion}: {row}");
+        assert_eq!(columns[14], exclusion);
+    }
+}
+
+#[test]
+fn r219_evidence_hold_terminal_not_applied_is_degraded_in_both_paths() {
+    for exclusion in [
+        "terminal-not-applied:option-evidence-held",
+        "terminal-not-applied:missing-owner-class",
+    ] {
+        assert_eq!(
+            raw_boundary_subject_delivery_with_exclusion(
+                RawBoundaryProgramOutcome::Emitted,
+                false,
+                exclusion,
+                false,
+                false,
+            ),
+            RawBoundarySubjectDelivery::Degraded,
+            "{exclusion}",
+        );
+        let seed = format!(
+            "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n\
+             f::p#1\tf\t1\t1\t0\toptional\tref\toptional\t-\t-\tf.rs:1\t0\t{exclusion}\n"
+        );
+        let ledger = run::degraded_mass_ledger_for_test(&seed, &[]).expect("exact ledger");
+        let row = ledger.lines().nth(1).expect("subject row");
+        let columns = row.split('\t').collect::<Vec<_>>();
+        assert_eq!(columns[13], "degraded", "{exclusion}: {row}");
+        assert_eq!(columns[14], exclusion);
+    }
+}
+
+#[cfg(test)]
+fn r219_custody_expectation(owner: &str, binding: &str) -> crate::bo_rewriter::DeliveryExpectation {
+    crate::bo_rewriter::DeliveryExpectation {
+        subject_key: format!("{owner}::{binding}#1"),
+        owner_fn: owner.to_owned(),
+        emitted_owner: owner.to_owned(),
+        source_file: Some("fixture.rs".to_owned()),
+        binding: binding.to_owned(),
+        parameter_index: Some(1),
+        expected_form: crate::bo_rewriter::DeliveryForm::Borrowed {
+            mutable: false,
+            optional: false,
+            slice: false,
+        },
+    }
+}
+
+#[cfg(test)]
+fn r219_custody_observe(
+    expectations: &[crate::bo_rewriter::DeliveryExpectation],
+    ledger: &[&str],
+    source: &str,
+    reverted: &[&str],
+) -> RawBoundaryDeliveryCustody {
+    raw_boundary_delivery_custody(
+        expectations,
+        &ledger
+            .iter()
+            .map(|identity| (*identity).to_owned())
+            .collect(),
+        &std::collections::BTreeMap::from([("fixture.rs".to_owned(), source.to_owned())]),
+        &reverted.iter().map(|owner| (*owner).to_owned()).collect(),
+    )
+}
+
+#[test]
+fn r219_custody_missing_declaration_is_not_delivered() {
+    let expectation = r219_custody_expectation("f", "p");
+    let report = r219_custody_observe(&[expectation], &["f::p#1"], "fn f() {}", &[]);
+    assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("ledger-only") && issue.contains("f::p#1")),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn r219_custody_extra_expected_declaration_is_tree_only() {
+    let expectation = r219_custody_expectation("f", "p");
+    let report = r219_custody_observe(&[expectation], &[], "fn f(p: &i32) {}", &[]);
+    assert!(report.delivered_by_tree.contains("f::p#1"), "{report:?}");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("tree-only") && issue.contains("f::p#1")),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn r219_custody_equal_counts_do_not_hide_identity_swap() {
+    let expectations = [
+        r219_custody_expectation("f", "p"),
+        r219_custody_expectation("g", "q"),
+    ];
+    let report = r219_custody_observe(
+        &expectations,
+        &["f::p#1"],
+        "fn f(p: *const i32) {} fn g(q: &i32) {}",
+        &[],
+    );
+    assert_eq!(report.delivered_by_ledger.len(), 1);
+    assert_eq!(report.delivered_by_tree.len(), 1);
+    assert!(report.delivered_by_tree.contains("g::q#1"), "{report:?}");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("ledger-only")
+                && issue.contains("f::p#1")
+                && issue.contains("tree-only")
+                && issue.contains("g::q#1")),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn r219_custody_exact_mutability_optional_slice_and_box_are_required() {
+    use crate::bo_rewriter::DeliveryForm;
+    for (expected_form, actual_type) in [
+        (
+            DeliveryForm::Borrowed {
+                mutable: true,
+                optional: false,
+                slice: false,
+            },
+            "&i32",
+        ),
+        (
+            DeliveryForm::Borrowed {
+                mutable: false,
+                optional: true,
+                slice: false,
+            },
+            "&i32",
+        ),
+        (
+            DeliveryForm::Borrowed {
+                mutable: false,
+                optional: true,
+                slice: true,
+            },
+            "Option<&i32>",
+        ),
+        (
+            DeliveryForm::Borrowed {
+                mutable: false,
+                optional: false,
+                slice: false,
+            },
+            "&[i32]",
+        ),
+        (
+            DeliveryForm::Owning {
+                optional: false,
+                slice: false,
+            },
+            "*mut i32",
+        ),
+        (
+            DeliveryForm::Owning {
+                optional: false,
+                slice: true,
+            },
+            "Box<i32>",
+        ),
+        (
+            DeliveryForm::Owning {
+                optional: true,
+                slice: false,
+            },
+            "Box<i32>",
+        ),
+    ] {
+        let mut expectation = r219_custody_expectation("f", "p");
+        expectation.expected_form = expected_form;
+        let source = format!("fn f(p: {actual_type}) {{}}");
+        let report = r219_custody_observe(&[expectation], &["f::p#1"], &source, &[]);
+        assert!(
+            report.delivered_by_tree.is_empty(),
+            "{actual_type}: {report:?}"
+        );
+        assert!(!report.issues.is_empty(), "{actual_type}: {report:?}");
+    }
+}
+
+#[test]
+fn r219_custody_generated_owner_must_match_its_qualified_path() {
+    let mut expectation = r219_custody_expectation("src::tree::f", "p");
+    expectation.emitted_owner = "src::tree::__crat_f".to_owned();
+    let report = r219_custody_observe(
+        &[expectation],
+        &["src::tree::f::p#1"],
+        "mod src { mod tree { fn f(p: *const i32) {} } mod other { fn __crat_f(p: &i32) {} } }",
+        &[],
+    );
+    assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    assert!(!report.issues.is_empty(), "{report:?}");
+}
+
+#[test]
+fn r219_custody_invalid_parse_fails_closed() {
+    let report = r219_custody_observe(&[], &[], "fn broken( {", &[]);
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.starts_with("delivery-custody:parse:")),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn r219_custody_ambiguous_and_inferred_locals_fail_closed() {
+    for (source, reason) in [
+        (
+            "fn f() { let p: &i32 = &1; { let p: &i32 = &2; } }",
+            "ambiguous",
+        ),
+        ("fn f() { let p = &1; }", "inferred-type"),
+    ] {
+        let mut expectation = r219_custody_expectation("f", "p");
+        expectation.parameter_index = None;
+        let report = r219_custody_observe(&[expectation], &["f::p#1"], source, &[]);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.starts_with(&format!("delivery-custody:{reason}:"))),
+            "{report:?}"
+        );
+        assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    }
+}
+
+#[test]
+fn r219_custody_reverted_owner_never_delivers() {
+    let mut expectation = r219_custody_expectation("f", "p");
+    expectation.emitted_owner = "__crat_f".to_owned();
+    let report = r219_custody_observe(
+        &[expectation],
+        &["f::p#1"],
+        "fn __crat_f(p: &i32) {}",
+        &["f"],
+    );
+    assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    assert!(!report.issues.is_empty(), "{report:?}");
+}
+
+#[test]
+fn r219_custody_class_hold_cannot_hide_a_safe_tree_declaration() {
+    let delivery = raw_boundary_subject_delivery_with_exclusion(
+        RawBoundaryProgramOutcome::Emitted,
+        false,
+        "terminal-not-applied:option-evidence-held",
+        false,
+        false,
+    );
+    assert_eq!(delivery, RawBoundarySubjectDelivery::Degraded);
+    let ledger = if delivery == RawBoundarySubjectDelivery::Realized {
+        vec!["f::p#1"]
+    } else {
+        vec![]
+    };
+    let report = r219_custody_observe(
+        &[r219_custody_expectation("f", "p")],
+        &ledger,
+        "fn f(p: &i32) {}",
+        &[],
+    );
+    assert!(report.delivered_by_tree.contains("f::p#1"), "{report:?}");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("tree-only")),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn r219_custody_matching_declaration_has_no_residual() {
+    use crate::bo_rewriter::DeliveryForm;
+    for (expected_form, actual_type) in [
+        (
+            DeliveryForm::Borrowed {
+                mutable: false,
+                optional: false,
+                slice: false,
+            },
+            "&i32",
+        ),
+        (
+            DeliveryForm::Borrowed {
+                mutable: true,
+                optional: false,
+                slice: false,
+            },
+            "&mut i32",
+        ),
+        (
+            DeliveryForm::Borrowed {
+                mutable: false,
+                optional: false,
+                slice: true,
+            },
+            "&[i32]",
+        ),
+        (
+            DeliveryForm::Borrowed {
+                mutable: false,
+                optional: false,
+                slice: false,
+            },
+            "&[i32; 4]",
+        ),
+        (
+            DeliveryForm::Borrowed {
+                mutable: true,
+                optional: true,
+                slice: false,
+            },
+            "Option<&mut i32>",
+        ),
+        (
+            DeliveryForm::Borrowed {
+                mutable: false,
+                optional: true,
+                slice: true,
+            },
+            "core::option::Option<&[i32]>",
+        ),
+        (
+            DeliveryForm::Owning {
+                optional: false,
+                slice: false,
+            },
+            "Box<i32>",
+        ),
+        (
+            DeliveryForm::Owning {
+                optional: false,
+                slice: true,
+            },
+            "std::boxed::Box<[i32]>",
+        ),
+        (
+            DeliveryForm::Owning {
+                optional: true,
+                slice: false,
+            },
+            "Option<Box<i32>>",
+        ),
+        (
+            DeliveryForm::Owning {
+                optional: true,
+                slice: true,
+            },
+            "Option<Box<[i32]>>",
+        ),
+    ] {
+        let mut expectation = r219_custody_expectation("f", "p");
+        expectation.expected_form = expected_form;
+        let source = format!("fn f(p: {actual_type}) {{}}");
+        let report = r219_custody_observe(&[expectation], &["f::p#1"], &source, &[]);
+        assert_eq!(
+            report.delivered_by_ledger, report.delivered_by_tree,
+            "{actual_type}: {report:?}"
+        );
+        assert!(report.issues.is_empty(), "{actual_type}: {report:?}");
+    }
+}
+
+#[test]
+fn r219_custody_failure_row_cannot_supply_aggregate_data() {
+    let mut row = report::Row::default();
+    row.set(raw_schema::DATA, "provisional");
+    row.set(raw_schema::STATUS, "ok");
+    let row = raw_boundary_custody_failure(
+        row,
+        "delivery-custody:identity-mismatch:ledger-only=[f::p#1]:tree-only=[]",
+    );
+    assert_eq!(row.get(raw_schema::DATA), Some("false"));
+    assert_eq!(row.get(raw_schema::STATUS), Some("instrument-error"));
+    assert!(!raw_boundary_rows_have_data(&[row]));
+}
+
+#[test]
+fn r219_custody_review_a_different_file_cannot_supply_the_declaration() {
+    let mut expectation = r219_custody_expectation("f", "p");
+    expectation.source_file = Some("lib.rs".to_owned());
+    let sources = std::collections::BTreeMap::from([
+        ("lib.rs".to_owned(), "fn unrelated() {}".to_owned()),
+        ("nested.rs".to_owned(), "fn f(p: &i32) {}".to_owned()),
+    ]);
+    let report = raw_boundary_delivery_custody(
+        &[expectation],
+        &std::collections::BTreeSet::from(["f::p#1".to_owned()]),
+        &sources,
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("ledger-only") && issue.contains("f::p#1")),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn r219_custody_review_unmapped_source_file_is_an_instrument_issue() {
+    for source_file in [None, Some("absent.rs".to_owned())] {
+        let mut expectation = r219_custody_expectation("f", "p");
+        expectation.source_file = source_file;
+        let report = r219_custody_observe(&[expectation], &["f::p#1"], "fn f(p: &i32) {}", &[]);
+        assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.starts_with("delivery-custody:unmapped-source-file:")),
+            "{report:?}"
+        );
+    }
+}
+
+#[test]
+fn r219_custody_review_missing_emitted_tree_cannot_pass_empty_identity_sets() {
+    let report = raw_boundary_delivery_custody_for_outcome(
+        RawBoundaryProgramOutcome::Emitted,
+        &[],
+        &std::collections::BTreeSet::new(),
+        None,
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.starts_with("delivery-custody:missing-emitted-tree")),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn r219_custody_review_degraded_outcome_may_have_no_tree() {
+    let report = raw_boundary_delivery_custody_for_outcome(
+        RawBoundaryProgramOutcome::Degraded,
+        &[],
+        &std::collections::BTreeSet::new(),
+        None,
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(report.delivered_by_tree.is_empty());
+    assert!(report.issues.is_empty(), "{report:?}");
+}
+
+#[test]
+fn r219_custody_review_nested_inference_cannot_prove_an_exact_form() {
+    let report = r219_custody_observe(
+        &[r219_custody_expectation("f", "p")],
+        &["f::p#1"],
+        "fn f(p: &[_; 4]) {}",
+        &[],
+    );
+    assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.starts_with("delivery-custody:inferred-type:")),
+        "{report:?}"
+    );
 }
 
 // Worker (one program, one mode, one process).

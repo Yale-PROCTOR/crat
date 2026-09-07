@@ -52,7 +52,11 @@ struct OutputFile {
     shapes: Vec<Shape>,
 }
 
-fn parse_crate(psess: &ParseSess, name: &str, source: &str) -> Result<ast::Crate, String> {
+pub(crate) fn parse_crate(
+    psess: &ParseSess,
+    name: &str,
+    source: &str,
+) -> Result<ast::Crate, String> {
     let mut parser = match rustc_parse::new_parser_from_source_str(
         psess,
         FileName::Custom(name.to_owned()),

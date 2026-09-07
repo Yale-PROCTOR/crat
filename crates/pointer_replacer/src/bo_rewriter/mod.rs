@@ -92,6 +92,8 @@ pub(crate) mod ast_bridge;
 /// composition guard built beside its first arm.
 pub(crate) mod ast_transform;
 #[cfg(test)]
+pub(crate) mod delivery_custody;
+#[cfg(test)]
 mod emit_tests;
 #[cfg(test)]
 mod goldens;
@@ -210,6 +212,9 @@ pub(crate) struct E2Timings {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RawBoundaryArtifacts {
+    /// R219: independent emitted-tree custody checks retain the exact decided
+    /// form, including distinctions absent from the historical coarse seed.
+    pub(crate) custody_expectations: Vec<DeliveryExpectation>,
     pub(crate) exposure: String,
     pub(crate) d4_edges: String,
     pub(crate) pairs: String,
@@ -248,6 +253,62 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) verify_wall_s: String,
     pub(crate) emit_budget_s: String,
     pub(crate) timings: RawBoundaryTimings,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DeliveryExpectation {
+    pub(crate) subject_key: String,
+    pub(crate) owner_fn: String,
+    pub(crate) emitted_owner: String,
+    /// Exact source-map file identity; an unmapped file is a custody failure.
+    pub(crate) source_file: Option<String>,
+    pub(crate) binding: String,
+    pub(crate) parameter_index: Option<usize>,
+    pub(crate) expected_form: DeliveryForm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum DeliveryForm {
+    Borrowed {
+        mutable: bool,
+        optional: bool,
+        slice: bool,
+    },
+    Owning {
+        optional: bool,
+        slice: bool,
+    },
+}
+
+fn delivery_form(decision: &decision::Decision) -> Option<DeliveryForm> {
+    match decision {
+        decision::Decision::Ref { mutable } | decision::Decision::InferredRef { mutable, .. } => {
+            Some(DeliveryForm::Borrowed {
+                mutable: *mutable,
+                optional: false,
+                slice: false,
+            })
+        }
+        decision::Decision::Slice { mutable, .. } => Some(DeliveryForm::Borrowed {
+            mutable: *mutable,
+            optional: false,
+            slice: true,
+        }),
+        decision::Decision::Opt { mutable, slice, .. } => Some(DeliveryForm::Borrowed {
+            mutable: *mutable,
+            optional: true,
+            slice: *slice,
+        }),
+        decision::Decision::Box(plan) => Some(DeliveryForm::Owning {
+            optional: plan.optional,
+            slice: match plan.shape {
+                decision::box_facts::BoxShape::Sized => false,
+                decision::box_facts::BoxShape::Slice => true,
+            },
+        }),
+        decision::Decision::Degraded(_) => None,
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -846,7 +907,7 @@ fn rewrite_core_injected_with_config(
         //
         // ⚠ Nothing may run a query ahead of this line.
         let capture = ast_transform::capture_ast(tcx)?;
-        let (mut table, decide_ctx) =
+        let (mut table, mut decide_ctx) =
             decide_table_with_emission_config(tcx, a5_override, run_config)?;
         let retained_c9_plans = decide_ctx.retained_c9_plans.clone();
         let a5_receipt = decide_ctx.a5_receipt.clone();
@@ -906,7 +967,9 @@ fn rewrite_core_injected_with_config(
             ));
         }
         let e1_subject_receipt = if census_once {
-            e1_subject_seed_tsv(tcx, &table, &decide_ctx, &emission.unplaceable)?
+            decide_ctx.raw_boundary_artifacts.custody_expectations =
+                delivery_expectations(tcx, &table);
+            e1_subject_seed_tsv(tcx, &table, &decide_ctx, &emission_plan)?
         } else {
             String::new()
         };
@@ -4565,6 +4628,24 @@ pub(crate) fn terminal_interface_form(
     }
 }
 
+/// The application decision used by both terminal interfaces and census custody.
+fn terminal_application(
+    decision: &decision::Decision,
+    owner_class_live: bool,
+) -> Option<&decision::Decision> {
+    if !owner_class_live {
+        return None;
+    }
+    match decision {
+        decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Box(_) => Some(decision),
+        decision::Decision::Degraded(_) => None,
+    }
+}
+
 fn terminal_subject_form(
     table: &decision::DecisionTable,
     finalization: &plan::ClassFinalization,
@@ -4579,14 +4660,8 @@ fn terminal_subject_form(
         .entries
         .iter()
         .find(|(subject, _)| subject.fn_did == key.0 && subject.hir_id == key.1)
-        .and_then(|(_, decision)| match decision {
-            decision::Decision::Ref { .. }
-            | decision::Decision::InferredRef { .. }
-            | decision::Decision::Slice { .. }
-            | decision::Decision::Opt { .. }
-            | decision::Decision::Box(_) => Some(decision::seam::form_of(decision)),
-            decision::Decision::Degraded(_) => None,
-        });
+        .and_then(|(_, decision)| terminal_application(decision, live))
+        .map(decision::seam::form_of);
     terminal_interface_form(decision::seam::Form::Raw, placed, live)
 }
 
@@ -4610,14 +4685,8 @@ fn terminal_parameter_form(
                     decision::SubjectKind::Param { hir_index } if hir_index == argument_index
                 )
         })
-        .and_then(|(_, decision)| match decision {
-            decision::Decision::Ref { .. }
-            | decision::Decision::InferredRef { .. }
-            | decision::Decision::Slice { .. }
-            | decision::Decision::Opt { .. }
-            | decision::Decision::Box(_) => Some(decision::seam::form_of(decision)),
-            decision::Decision::Degraded(_) => None,
-        });
+        .and_then(|(_, decision)| terminal_application(decision, live))
+        .map(decision::seam::form_of);
     terminal_interface_form(decision::seam::Form::Raw, placed, live)
 }
 
@@ -6184,6 +6253,7 @@ fn finish_decide<'tcx>(
         };
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
+            custody_expectations: Vec::new(),
             exposure: exposure.receipts_tsv(),
             d4_edges: coconv.edge_receipts_tsv(tcx, &subjects),
             pairs: coconv.pair_receipts_tsv(tcx),
@@ -7543,6 +7613,55 @@ fn e2_artifacts_from_table(
     })
 }
 
+/// R219 descriptors come from the same immutable decisions consumed by emission.
+/// Held subjects remain in this independent inventory so a false zero placement
+/// bit cannot hide a safe declaration from the custody comparator.
+fn delivery_expectations(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+) -> Vec<DeliveryExpectation> {
+    table
+        .entries
+        .iter()
+        .filter_map(|(subject, decided)| {
+            let expected_form = delivery_form(decided)?;
+            let owner_fn = tcx.def_path_str(subject.fn_did.to_def_id());
+            let emitted_owner = match table.exposure.as_ref().map(|e| e.plan(subject.fn_did)) {
+                Some(
+                    decision::exposure::ExposureSurfacePlan::PositiveSeedShim
+                    | decision::exposure::ExposureSurfacePlan::FnPtrRawWrapper,
+                ) => match owner_fn.rsplit_once("::") {
+                    Some((parent, name)) => format!("{parent}::__crat_safe_{name}"),
+                    None => format!("__crat_safe_{owner_fn}"),
+                },
+                Some(
+                    decision::exposure::ExposureSurfacePlan::ClosedWorldDirect
+                    | decision::exposure::ExposureSurfacePlan::NotApplicable,
+                )
+                | None => owner_fn.clone(),
+            };
+            Some(DeliveryExpectation {
+                subject_key: subject.identity_key(&owner_fn),
+                owner_fn,
+                emitted_owner,
+                source_file: file_key(
+                    &tcx.sess
+                        .source_map()
+                        .lookup_source_file(subject.attribution_span().lo())
+                        .name,
+                )
+                .map(|key| format!("{key:?}")),
+                binding: subject.param_name.clone().unwrap_or_default(),
+                parameter_index: match subject.kind {
+                    decision::SubjectKind::Param { hir_index } => Some(hir_index + 1),
+                    decision::SubjectKind::Local => None,
+                },
+                expected_form,
+            })
+        })
+        .collect()
+}
+
 /// Addendum 90's identity seed, produced inside the one E1 compiler callback
 /// from the exact table and plan that emission consumes.  Classification of
 /// first-pass reverts happens after verification, but no subject or model fact
@@ -7551,9 +7670,10 @@ fn e1_subject_seed_tsv(
     tcx: TyCtxt<'_>,
     table: &decision::DecisionTable,
     ctx: &DecideCtx,
-    unplaceable: &[plan::Unplaceable],
+    emission_plan: &plan::Plan,
 ) -> Result<String, String> {
-    let mut unplaced = unplaceable
+    let mut unplaced = emission_plan
+        .unplaceable
         .iter()
         .map(|row| (row.subject.as_str(), row.reason))
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -7625,17 +7745,26 @@ fn e1_subject_seed_tsv(
             ),
         };
         let unplaced_reason = unplaced.remove(key.as_str());
-        let emits = match decision {
-            decision::Decision::Ref { .. }
-            | decision::Decision::InferredRef { .. }
-            | decision::Decision::Slice { .. }
-            | decision::Decision::Opt { .. }
-            | decision::Decision::Box(_) => true,
-            decision::Decision::Degraded(_) => false,
-        };
-        let placed = emits && unplaced_reason.is_none();
+        let class = bridge_receipt::SignatureClassId::of(subject.fn_did);
+        let live = emission_plan
+            .class_finalization
+            .classes
+            .get(&class)
+            .is_some_and(plan::SignatureClassPlan::is_ready);
+        let applied = terminal_application(decision, live).is_some();
+        let placed = applied && unplaced_reason.is_none();
         let exclusion = unplaced_reason
             .map(|reason| format!("unplaceable:{reason}"))
+            .or_else(|| {
+                (terminal_application(decision, true).is_some() && !live).then(|| {
+                    format!(
+                        "terminal-not-applied:{}",
+                        emission_plan
+                            .class_hold_reason(class)
+                            .unwrap_or_else(|| "missing-owner-class".to_owned())
+                    )
+                })
+            })
             .unwrap_or_else(|| "-".to_owned());
         let arg_index = match subject.kind {
             decision::SubjectKind::Param { hir_index } => (hir_index + 1).to_string(),

@@ -13503,3 +13503,73 @@ fn opt_w1_unbuilt_return_and_cursor_uses_keep_their_handoff_receipts() {
             .expect("handoff common/specialized join");
     }
 }
+
+#[test]
+fn custody_terminal_application_subtracts_class_holds() {
+    let decision = super::decision::Decision::Ref { mutable: false };
+    assert!(super::terminal_application(&decision, true).is_some());
+    assert!(
+        super::terminal_application(&decision, false).is_none(),
+        "a safe plan in a held owner has no terminal application"
+    );
+}
+
+#[test]
+fn custody_terminal_application_keeps_optional_shape() {
+    let decision = super::decision::Decision::Opt {
+        mutable: true,
+        slice: true,
+        uses: Vec::new(),
+    };
+    assert_eq!(
+        super::terminal_application(&decision, true),
+        Some(&decision)
+    );
+    assert_eq!(super::terminal_application(&decision, false), None);
+}
+
+#[test]
+fn custody_decision_descriptor_preserves_full_safe_form() {
+    use super::{
+        DeliveryForm,
+        decision::{
+            Decision,
+            box_facts::{BoxPlan, BoxShape},
+        },
+    };
+    let option = Decision::Opt {
+        mutable: true,
+        slice: true,
+        uses: Vec::new(),
+    };
+    assert_eq!(
+        super::delivery_form(&option),
+        Some(DeliveryForm::Borrowed {
+            mutable: true,
+            optional: true,
+            slice: true,
+        })
+    );
+    let boxed = Decision::Box(BoxPlan {
+        shape: BoxShape::Slice,
+        optional: true,
+        expr_edits: Vec::new(),
+        delete_statements: Vec::new(),
+        receipts: Vec::new(),
+        fabricated_extent: false,
+        pointee_override: None,
+        inferred_binding: false,
+        overwrite_spans: Vec::new(),
+        retained_sink: false,
+        implicit_scope_close: false,
+    });
+    assert_eq!(
+        super::delivery_form(&boxed),
+        Some(DeliveryForm::Owning {
+            optional: true,
+            slice: true,
+        })
+    );
+    assert!(super::terminal_application(&boxed, true).is_some());
+    assert!(super::terminal_application(&boxed, false).is_none());
+}
