@@ -79,6 +79,9 @@ pub fn libc_call<'tcx>(
                 database,
             );
         }
+        "strtod" | "strtof" | "strtold" | "strtol" | "strtoll" | "strtoul" | "strtoull" => {
+            call_strto(args, local_decls, locals, struct_fields, database);
+        }
         // TODO generate constraints when the first argument is not 1
         "calloc" => {
             let dest_vars = place_vars(destination, local_decls, locals, struct_fields);
@@ -254,5 +257,31 @@ fn call_scanf<'tcx>(
             assert!(!ptr_vars.is_empty());
             database.bottom(ptr_vars.start);
         }
+    }
+}
+
+fn call_strto<'tcx>(
+    args: &[Spanned<Operand<'tcx>>],
+    local_decls: &impl HasLocalDecls<'tcx>,
+    locals: &[Var],
+    struct_fields: &StructFields,
+    database: &mut BooleanSystem<Fatness>,
+) {
+    let nptr_vars = place_vars(
+        &args[0].node.place().unwrap(),
+        local_decls,
+        locals,
+        struct_fields,
+    );
+    database.bottom(nptr_vars.start);
+
+    let endptr_vars = place_vars(
+        &args[1].node.place().unwrap(),
+        local_decls,
+        locals,
+        struct_fields,
+    );
+    if endptr_vars.end.index() - endptr_vars.start.index() >= 2 {
+        database.bottom(endptr_vars.start + 1);
     }
 }
