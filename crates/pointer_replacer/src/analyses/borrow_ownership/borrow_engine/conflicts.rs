@@ -684,6 +684,13 @@ where
         );
         record_retirement_review(f, &inference, ctxt.borrow.provenances.get(&f).unwrap());
         let invalid_loans = invalid_loan_set(&inference);
+        record_loan_identities(
+            f,
+            &inference,
+            ctxt.borrow.provenances.get(&f).unwrap(),
+            &invalid_loans,
+            &inference.copy_lends,
+        );
         if invalid_loans.is_empty() {
             continue;
         }

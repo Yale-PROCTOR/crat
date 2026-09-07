@@ -1058,3 +1058,6 @@ mod tests_call_targets;
 
 #[cfg(test)]
 mod tests_library_drop;
+
+#[cfg(test)]
+mod tests_owner_guards;
