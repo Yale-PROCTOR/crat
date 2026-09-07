@@ -152,6 +152,24 @@ fn e5_i_actual_cache_requires_complete_payload_and_cache_only_never_falls_back()
             incomplete,
             "refusal must not overwrite the entry"
         );
+        // Coordinated deletion must not make two incomplete lists validate
+        // each other while losing the compiler's actual function evidence.
+        let mut missing_functions: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        missing_functions["functions"] = serde_json::json!([]);
+        missing_functions["origin"]["functions"] = serde_json::json!([]);
+        std::fs::write(&path, serde_json::to_vec(&missing_functions).unwrap()).unwrap();
+        model_cache::reset_for_test();
+        let before = execution_guard::model_entries();
+        let refused = execution_guard::with_role(ExecutionRole::CacheOnly, || {
+            model_cache::with_test_config(true, &directory.0, || {
+                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
+            })
+        });
+        assert!(
+            refused.is_err(),
+            "actual compiler function evidence cannot be co-deleted"
+        );
+        assert_eq!(execution_guard::model_entries(), before);
         model_cache::reset_for_test();
     })
     .unwrap_or_else(|error| error.raise());

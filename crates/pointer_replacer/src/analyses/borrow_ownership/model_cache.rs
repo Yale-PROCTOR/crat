@@ -628,6 +628,20 @@ pub(crate) fn load(
     if entry.key != fp || entry.inputs != expected {
         return None;
     }
+    let actual_functions: std::collections::BTreeSet<_> = program
+        .functions
+        .iter()
+        .map(|function| tcx.def_path_str(function.to_def_id()))
+        .collect();
+    if entry
+        .functions
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        != actual_functions
+    {
+        return None;
+    }
     let keys = universe(tcx, slots)?;
     if entry
         .universe
