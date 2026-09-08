@@ -50,9 +50,7 @@ where
             })
             .cloned()
             .expect("realloc requires a validated source outcome plan");
-        if let ReallocResult::SuccessImplied(continuation)
-        | ReallocResult::Unobserved(continuation) = &plan.site.result
-        {
+        if let Some(continuation) = plan.site.result.continuation() {
             let cases = realloc::classify(&plan.site).expect("validated R219 cases");
             let old_argument = args.first().cloned().flatten();
             let old_before = old_argument

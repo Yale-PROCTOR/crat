@@ -39,7 +39,7 @@ use crate::utils::rustc::RustProgram;
 
 /// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
 /// changes after this commit do not advance this identity.
-pub(crate) const ANALYSIS_FRAME: &str = "era5a-p1s-realloc219-array-v1";
+pub(crate) const ANALYSIS_FRAME: &str = "era5a-p1s-realloc243-field-result-v1";
 
 const CACHE_SCHEMA: &str = "bo-model-cache-v2";
 const A14_MARKER: &str = "positive-opacity-v1";
@@ -70,7 +70,7 @@ pub(crate) fn solver_identity(
     fields.insert("protected_entry", "p1-prime-s-v1".to_owned());
     fields.insert(
         "realloc_outcomes",
-        "r219-success-implied-loss-v1".to_owned(),
+        "r243-field-test-fallback-both-v1".to_owned(),
     );
     fields.insert(
         "comparison",
@@ -687,10 +687,10 @@ mod tests {
             Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         );
         for required in [
-            "analysis_frame=era5a-p1s-realloc219-array-v1",
+            "analysis_frame=era5a-p1s-realloc243-field-result-v1",
             "era5_schema=era5a-model-cache-v1",
             "protected_entry=p1-prime-s-v1",
-            "realloc_outcomes=r219-success-implied-loss-v1",
+            "realloc_outcomes=r243-field-test-fallback-both-v1",
             "field_inner_facts=explicit-availability-v1",
             "array_fields=uniform-element-raw-holds-v1",
             "proof_evidence=source-only-v2",

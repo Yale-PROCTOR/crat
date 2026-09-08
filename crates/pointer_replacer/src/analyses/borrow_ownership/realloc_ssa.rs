@@ -160,57 +160,54 @@ pub(crate) fn plan_body<'tcx>(
         .iter()
         .filter(|site| site.key.function == function)
         .collect();
-    if !continuations
-        .iter()
-        .any(|site| matches!(site.result, ReallocResult::DirectBranch(_)))
-    {
-        return continuations
-            .into_iter()
-            .map(|site| {
-                let error = |reason| ReallocSsaError {
-                    site: site.key.clone(),
-                    reason,
-                };
-                realloc::classify(site)
-                    .map_err(|reason| error(ReallocSsaUnsupported::Lifecycle(reason)))?;
-                let continuation = match &site.result {
-                    ReallocResult::SuccessImplied(continuation)
-                    | ReallocResult::Unobserved(continuation) => continuation,
-                    _ => return Err(error(ReallocSsaUnsupported::StaleSite)),
-                };
-                let block = BasicBlock::from_u32(site.key.block);
-                let Some(data) = body.basic_blocks.get(block) else {
-                    return Err(error(ReallocSsaUnsupported::StaleSite));
-                };
-                let Some(call) = data.terminator().as_call(crate_ctxt.tcx) else {
-                    return Err(error(ReallocSsaUnsupported::StaleSite));
-                };
-                if site.key.statement != data.statements.len()
-                    || !matches!(call.func, CallKind::LibC(name) if name.as_str() == "realloc")
-                    || super::export::PlaceKey::from_place(call.destination)
-                        != continuation.result_place
-                    || call
-                        .args
-                        .first()
-                        .and_then(|arg| arg.node.place())
-                        .map(super::export::PlaceKey::from_place)
-                        != continuation.old_place
-                {
-                    return Err(error(ReallocSsaUnsupported::StaleSite));
-                }
-                // R219 continuations have no conditional CFG edge to rename. The
-                // ordinary ownership boundary carries a success qualifier plus
-                // explicit source-case/loss receipts, including projected places.
-                Ok(ReallocSsaPlan {
-                    site: site.clone(),
-                    old: continuation.old,
-                    operations: Vec::new(),
-                })
+    let mut continuation_plans = continuations
+        .into_iter()
+        .filter(|site| !matches!(site.result, ReallocResult::DirectBranch(_)))
+        .map(|site| {
+            let error = |reason| ReallocSsaError {
+                site: site.key.clone(),
+                reason,
+            };
+            realloc::classify(site)
+                .map_err(|reason| error(ReallocSsaUnsupported::Lifecycle(reason)))?;
+            let continuation = site
+                .result
+                .continuation()
+                .ok_or_else(|| error(ReallocSsaUnsupported::StaleSite))?;
+            let block = BasicBlock::from_u32(site.key.block);
+            let Some(data) = body.basic_blocks.get(block) else {
+                return Err(error(ReallocSsaUnsupported::StaleSite));
+            };
+            let Some(call) = data.terminator().as_call(crate_ctxt.tcx) else {
+                return Err(error(ReallocSsaUnsupported::StaleSite));
+            };
+            if site.key.statement != data.statements.len()
+                || !matches!(call.func, CallKind::LibC(name) if name.as_str() == "realloc")
+                || super::export::PlaceKey::from_place(call.destination)
+                    != continuation.result_place
+                || call
+                    .args
+                    .first()
+                    .and_then(|arg| arg.node.place())
+                    .map(super::export::PlaceKey::from_place)
+                    != continuation.old_place
+            {
+                return Err(error(ReallocSsaUnsupported::StaleSite));
+            }
+            // R219 continuations have no conditional CFG edge to rename. The
+            // ordinary ownership boundary carries a success qualifier plus
+            // explicit source-case/loss receipts, including projected places.
+            Ok(ReallocSsaPlan {
+                site: site.clone(),
+                old: continuation.old,
+                operations: Vec::new(),
             })
-            .collect();
-    }
-    let mut sites = sites.iter().filter(|site| site.key.function == function);
-    let Some(site) = sites.next() else { return Ok(Vec::new()) };
+        })
+        .collect::<Result<Vec<_>, ReallocSsaError>>()?;
+    let mut sites = sites.iter().filter(|site| {
+        site.key.function == function && matches!(site.result, ReallocResult::DirectBranch(_))
+    });
+    let Some(site) = sites.next() else { return Ok(continuation_plans) };
     let error = |reason| ReallocSsaError {
         site: site.key.clone(),
         reason,
@@ -457,9 +454,10 @@ pub(crate) fn plan_body<'tcx>(
         definitions.def_sites[local].insert(branch.success);
         definitions.def_sites[local].insert(branch.failure);
     }
-    Ok(vec![ReallocSsaPlan {
+    continuation_plans.push(ReallocSsaPlan {
         site: site.clone(),
         old,
         operations,
-    }])
+    });
+    Ok(continuation_plans)
 }

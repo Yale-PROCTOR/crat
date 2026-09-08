@@ -24,7 +24,11 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+mod field_result;
 mod use_evidence;
+
+#[cfg(test)]
+mod coverage_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum ReallocOutcome {
@@ -140,14 +144,61 @@ pub(crate) struct ReallocContinuation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FieldResultTransport {
+    pub(crate) location: Location,
+    pub(crate) source: PlaceKey,
+    pub(crate) destination: PlaceKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReallocResultTestReceipt {
+    FallbackBothOutcomes,
+}
+impl ReallocResultTestReceipt {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::FallbackBothOutcomes => "realloc-result-test:fallback-both-outcomes",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReallocResult {
     DirectBranch(ReallocBranch),
     /// R219 B: an unconditional dereferencing use excludes failure under P0.
     SuccessImplied(ReallocContinuation),
     /// R219 B: no test/use selects an outcome; both source cases remain.
     Unobserved(ReallocContinuation),
+    /// Source test is known, while field storage uses the conservative call
+    /// boundary representation rather than invented bare-local SSA versions.
+    FieldBranch {
+        branch: ReallocBranch,
+        continuation: ReallocContinuation,
+        field_transports: Vec<FieldResultTransport>,
+    },
+    /// R243: unclassified result control keeps both outcomes and a source-site receipt.
+    FallbackBothOutcomes(ReallocContinuation),
     Discarded,
     UnresolvedTest,
+}
+
+impl ReallocResult {
+    pub(crate) fn continuation(&self) -> Option<&ReallocContinuation> {
+        match self {
+            Self::SuccessImplied(row)
+            | Self::Unobserved(row)
+            | Self::FallbackBothOutcomes(row)
+            | Self::FieldBranch {
+                continuation: row, ..
+            } => Some(row),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn result_test_receipt(&self) -> Option<ReallocResultTestReceipt> {
+        matches!(self, Self::FallbackBothOutcomes(_) | Self::UnresolvedTest)
+            .then_some(ReallocResultTestReceipt::FallbackBothOutcomes)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -577,14 +628,41 @@ pub(crate) fn collect_sites(program: &RustProgram<'_>) -> Vec<ReallocSite> {
                 } = &terminator.kind
                 && call.args.len() == 2
             {
-                result = use_evidence::continuation(
-                    program,
-                    &body,
-                    block,
-                    *normal,
-                    call.args.first().and_then(|argument| argument.node.place()),
-                    call.destination,
-                );
+                let old_place = call.args.first().and_then(|argument| argument.node.place());
+                result = if let Some(result_local) = call.destination.as_local()
+                    && let Some((branch, field_transports)) = field_result::branch(
+                        &body,
+                        block,
+                        old,
+                        result_local,
+                        *normal,
+                        &entries,
+                        &addressed,
+                        tcx,
+                    ) {
+                    ReallocResult::FieldBranch {
+                        branch,
+                        continuation: ReallocContinuation {
+                            old,
+                            old_place: old_place.map(PlaceKey::from_place),
+                            result: Some(result_local),
+                            result_place: PlaceKey::from_place(call.destination),
+                            normal: *normal,
+                            transports: Vec::new(),
+                            witness: None,
+                        },
+                        field_transports,
+                    }
+                } else {
+                    use_evidence::continuation(
+                        program,
+                        &body,
+                        block,
+                        *normal,
+                        old_place,
+                        call.destination,
+                    )
+                };
             }
             sites.push(ReallocSite {
                 key: ReallocSiteKey {
@@ -620,7 +698,10 @@ pub(crate) fn classify(site: &ReallocSite) -> Result<Vec<ReallocCase>, ReallocUn
     match &site.result {
         ReallocResult::Discarded => return Err(ReallocUnsupported::DiscardedResult),
         ReallocResult::UnresolvedTest => {
-            return Err(ReallocUnsupported::UnresolvedResultTest);
+            lose_failure_claim = true;
+        }
+        ReallocResult::FallbackBothOutcomes(_) | ReallocResult::FieldBranch { .. } => {
+            lose_failure_claim = true;
         }
         ReallocResult::SuccessImplied(continuation) => {
             let access_bytes = match &continuation.witness {
@@ -736,6 +817,33 @@ mod tests {
             "one source realloc call must be inventoried"
         );
         sites.pop().unwrap()
+    }
+
+    fn assert_result_test_fallback(site: &ReallocSite) {
+        assert!(matches!(
+            site.result,
+            ReallocResult::FallbackBothOutcomes(_)
+        ));
+        assert_eq!(
+            site.result.result_test_receipt(),
+            Some(ReallocResultTestReceipt::FallbackBothOutcomes)
+        );
+        let cases = classify(site).expect("R243 keeps both source outcomes");
+        assert_eq!(cases.len(), 2);
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.outcome == ReallocOutcome::Success
+                    && case.old == OldResponsibility::RetireIfPresent
+                    && case.result == ResultResponsibility::FreshGeneration)
+        );
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.outcome == ReallocOutcome::Failure
+                    && case.old == OldResponsibility::LoseClaimIfPresent
+                    && case.result == ResultResponsibility::None)
+        );
     }
 
     fn synthetic_site() -> ReallocSite {
@@ -918,10 +1026,7 @@ mod tests {
         // R219: the byte contract is present, while a returned null predicate
         // still supplies no direct source-outcome control edge.
         assert_eq!(site.size, ReallocSize::ByteCount);
-        assert_eq!(
-            classify(&site),
-            Err(ReallocUnsupported::UnresolvedResultTest)
-        );
+        assert_result_test_fallback(&site);
     }
 
     #[test]
@@ -945,11 +1050,8 @@ mod tests {
         let site = one_site(
             "pub unsafe fn unresolved(p: *mut u8) -> bool { let q = realloc(p, 16); q == p }",
         );
-        assert_eq!(site.result, ReallocResult::UnresolvedTest);
-        assert_eq!(
-            classify(&site),
-            Err(ReallocUnsupported::UnresolvedResultTest)
-        );
+        // R243 supersedes the historical unsupported-result expectation.
+        assert_result_test_fallback(&site);
     }
 
     fn success_continuation(site: &ReallocSite) -> &ReallocContinuation {
@@ -1116,10 +1218,7 @@ mod tests {
             "unsafe fn maybe_read(value: *mut u8, read: bool) -> u8 { if read { *value } else { 0 } } pub unsafe fn conditional_reader(p: *mut u8, read: bool) -> u8 { let q = realloc(p, 16); maybe_read(q, read) }",
         );
         assert!(!matches!(site.result, ReallocResult::SuccessImplied(_)));
-        assert_eq!(
-            classify(&site),
-            Err(ReallocUnsupported::UnresolvedResultTest)
-        );
+        assert_result_test_fallback(&site);
     }
 
     #[test]
@@ -1128,10 +1227,7 @@ mod tests {
             "pub unsafe fn conditional_use(p: *mut u8, read: bool) -> u8 { let q = realloc(p, 16); if read { *q } else { 0 } }",
         );
         assert!(!matches!(site.result, ReallocResult::SuccessImplied(_)));
-        assert_eq!(
-            classify(&site),
-            Err(ReallocUnsupported::UnresolvedResultTest)
-        );
+        assert_result_test_fallback(&site);
     }
 
     #[test]
@@ -1140,10 +1236,7 @@ mod tests {
             "unsafe extern \"C\" { fn opaque_decision(value: *mut u8) -> bool; } pub unsafe fn opaque_control(p: *mut u8) -> bool { let q = realloc(p, 16); opaque_decision(q) }",
         );
         assert!(!matches!(site.result, ReallocResult::SuccessImplied(_)));
-        assert_eq!(
-            classify(&site),
-            Err(ReallocUnsupported::UnresolvedResultTest)
-        );
+        assert_result_test_fallback(&site);
     }
 
     fn synthetic_byte_continuation(access_bytes: Option<u64>) -> ReallocSite {

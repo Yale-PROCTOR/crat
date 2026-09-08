@@ -1089,10 +1089,16 @@ mod tests {
             .filter(|event| event.key.role == SourceRole::ReallocOld)
             .collect();
         assert_eq!(unresolved.len(), 1);
+        // R243: an unclassified result test retains both outcomes, with only
+        // success retiring the old generation and failure losing its claim.
         assert_eq!(
-            unresolved[0].key.condition,
-            SourceCondition::UnresolvedRealloc
+            events.reallocations[0]
+                .result
+                .result_test_receipt()
+                .map(|receipt| receipt.label()),
+            Some("realloc-result-test:fallback-both-outcomes")
         );
+        assert_eq!(unresolved[0].key.condition, SourceCondition::ReallocSuccess);
         let events = inventory(
             "unsafe extern \"C\" { fn realloc(p: *mut u8, n: usize) -> *mut u8; } pub unsafe fn f(p: *mut u8) -> bool { let q = realloc(p, 16); if q.is_null() { true } else { false } }",
         );

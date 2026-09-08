@@ -446,7 +446,7 @@ pub(super) fn continuation<'tcx>(
             ReallocResult::SuccessImplied(continuation)
         }
         Evidence::Unobserved => ReallocResult::Unobserved(continuation),
-        Evidence::Unsupported => ReallocResult::UnresolvedTest,
+        Evidence::Unsupported => ReallocResult::FallbackBothOutcomes(continuation),
     }
 }
 

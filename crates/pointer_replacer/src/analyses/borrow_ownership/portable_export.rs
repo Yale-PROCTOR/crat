@@ -305,6 +305,16 @@ fn realloc_site(site: &ra::ReallocSite) -> Value {
         ra::ReallocResult::Unobserved(row) => {
             json!({"kind":"unobserved","continuation":continuation(row)})
         }
+        ra::ReallocResult::FieldBranch {
+            branch,
+            continuation: row,
+            field_transports,
+        } => {
+            json!({"kind":"field-branch","branch":{"old":branch.old.map(Local::as_u32),"result":branch.result.as_u32(),"test":location(branch.test),"success":branch.success.as_u32(),"failure":branch.failure.as_u32()},"continuation":continuation(row),"field_transports":field_transports.iter().map(|r|json!({"location":location(r.location),"source":place(&r.source),"destination":place(&r.destination)})).collect::<Vec<_>>()})
+        }
+        ra::ReallocResult::FallbackBothOutcomes(row) => {
+            json!({"kind":"fallback-both-outcomes","receipt":site.result.result_test_receipt().map(|r|r.label()),"continuation":continuation(row)})
+        }
         ra::ReallocResult::Discarded => json!({"kind":"discarded"}),
         ra::ReallocResult::UnresolvedTest => json!({"kind":"unresolved-test"}),
     };
