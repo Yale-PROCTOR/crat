@@ -286,6 +286,7 @@ name = "finders"
 version = "0.1.0"
 dependencies = [
  "etrace",
+ "serde",
  "utils",
 ]
 
