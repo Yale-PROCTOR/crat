@@ -31,6 +31,19 @@ use rustc_middle::ty::TyCtxt;
 use super::decision::{Decision, DecisionTable, DeclShape, emitability::EmitabilityFacts};
 use crate::coverage_recon::schema::{DeclShape as WireShape, Outcome, PairingConfidence, Row};
 
+/// Owned instrument data exported from the same AST/table/plan as emission.
+/// Parser comparison remains outside the compiler callback.
+#[cfg(test)]
+pub(crate) fn bridge_custody_export(
+    tcx: TyCtxt<'_>,
+    capture: &super::ast_transform::AstCapture,
+    table: &DecisionTable,
+    plan: &super::plan::Plan,
+    original_files: &std::collections::BTreeMap<super::plan::FileKey, String>,
+) -> super::bridge_custody_export::Export {
+    super::bridge_custody_export::capture(tcx, capture, table, plan, original_files)
+}
+
 fn wire_shape(shape: DeclShape) -> WireShape {
     // Exhaustive by construction: no `_` arm here either.
     match shape {
@@ -202,8 +215,10 @@ mod tests {
 
     fn table(entries: Vec<(Subject, Decision)>) -> DecisionTable {
         DecisionTable {
+            sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),
+            input_interfaces: Default::default(),
             entries,
             exposure: None,
             arm_requirements: Default::default(),

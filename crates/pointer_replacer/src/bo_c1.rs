@@ -398,6 +398,428 @@ fn raw_boundary_custody_failure(mut row: report::Row, detail: &str) -> report::R
     row
 }
 
+fn raw_boundary_bridge_custody_gate(
+    row: report::Row,
+    custody: &crate::bo_rewriter::bridge_custody_export::CheckpointReport,
+) -> report::Row {
+    if custody.data {
+        row
+    } else {
+        let detail = if custody.issues.is_empty() {
+            "bridge-custody:data=false".to_owned()
+        } else {
+            custody.issues.join(" | ")
+        };
+        raw_boundary_custody_failure(row, &detail)
+    }
+}
+
+fn raw_boundary_publish_custody_sidecars(
+    payloads: &mut [(String, serde_json::Value)],
+    issues: &mut Vec<String>,
+    mut publish: impl FnMut(&str, Option<&serde_json::Value>) -> Result<(), String>,
+) {
+    fn invalidate(payload: &mut serde_json::Value, issues: &[String]) {
+        payload["stamp"]["data"] = serde_json::json!("false");
+        if let Some(comparison) = payload.get_mut("comparison") {
+            if comparison.get("data").is_some() {
+                comparison["data"] = serde_json::json!(false);
+            }
+            if let Some(existing) = comparison
+                .get_mut("issues")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                existing.extend(issues.iter().map(|issue| serde_json::json!(issue)));
+            }
+        }
+        if let Some(replay) = payload.get_mut("replay") {
+            replay["comparison"]["data"] = serde_json::json!(false);
+        }
+    }
+    if !issues.is_empty() {
+        for (_, payload) in payloads.iter_mut() {
+            invalidate(payload, issues);
+        }
+    }
+    for (name, payload) in payloads.iter() {
+        if let Err(error) = publish(name, Some(payload)) {
+            issues.push(error);
+        }
+    }
+    if !issues.is_empty() {
+        // Revoke every previously published success after any late failure.
+        // If a false replacement cannot be written, remove that sidecar.
+        for (name, payload) in payloads.iter_mut() {
+            invalidate(payload, issues);
+            if let Err(error) = publish(name, Some(payload)) {
+                issues.push(error);
+                if let Err(error) = publish(name, None) {
+                    issues.push(format!("custody-sidecar-revocation:{name}:{error}"));
+                }
+            }
+        }
+    }
+}
+
+/// Reaggregation is parser-only replay of sealed worker bytes. It never enters
+/// the compiler worker or resolves source paths in the current checkout.
+fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Path) -> report::Row {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use sha2::{Digest, Sha256};
+
+    use crate::bo_rewriter::bridge_custody_export::{self, ReplayFrame, RetainedReplay};
+
+    if raw_boundary_typed_failure(&row) {
+        return row;
+    }
+    let checked = (|| -> Result<(), String> {
+        let required = |key: &str| {
+            row.get(key)
+                .filter(|value| !value.is_empty() && *value != "missing")
+                .map(str::to_owned)
+                .ok_or_else(|| format!("bridge-custody:retained-row-missing:{key}"))
+        };
+        let frame = ReplayFrame {
+            program: required("program")?,
+            analysis_frame: required(raw_schema::ANALYSIS_FRAME)?,
+            code_frame: required(raw_schema::CODE_FRAME)?,
+            input_tree_sha256: required(raw_schema::INPUT_TREE_SHA256)?,
+            emitted_tree_sha256: required(raw_schema::EMITTED_TREE_SHA256)?,
+            cache_manifest_sha256: required(raw_schema::CACHE_MANIFEST_SHA256)?,
+            launch_env_sha256: required(raw_schema::LAUNCH_ENV_SHA256)?,
+        };
+        if !matches!(row.get(raw_schema::DATA), Some("true" | "provisional")) {
+            return Err("bridge-custody:retained-row-not-data".into());
+        }
+        let manifest = std::fs::read_to_string(directory.join("SHA256SUMS"))
+            .map_err(|error| format!("bridge-custody:retained-manifest:{error}"))?;
+        let read = |suffix: &str| -> Result<Vec<u8>, String> {
+            let name = format!("{}.raw-boundary-{suffix}", frame.program);
+            let entries = manifest
+                .lines()
+                .filter_map(|line| line.split_once("  "))
+                .filter(|(_, path)| *path == name)
+                .collect::<Vec<_>>();
+            let [(expected, _)] = entries.as_slice() else {
+                return Err(format!("bridge-custody:retained-manifest-entry:{name}"));
+            };
+            let bytes = std::fs::read(directory.join(&name))
+                .map_err(|error| format!("bridge-custody:retained-sidecar:{name}:{error}"))?;
+            if format!("{:x}", Sha256::digest(&bytes)) != *expected {
+                return Err(format!("bridge-custody:retained-sidecar-digest:{name}"));
+            }
+            Ok(bytes)
+        };
+        let expected_stamp = serde_json::to_value(&frame).map_err(|error| error.to_string())?;
+        let mut sidecars = BTreeMap::new();
+        for suffix in [
+            "bridge-replay",
+            "bridge-custody",
+            "bridge-expectations",
+            "pending-sibling-overlap",
+            "sibling-coverage-gaps",
+            "delivery-custody",
+            "delivery-expectations",
+            "delivery-declarations",
+        ] {
+            let value: serde_json::Value =
+                serde_json::from_slice(&read(&format!("{suffix}.json"))?).map_err(|error| {
+                    format!("bridge-custody:retained-sidecar-json:{suffix}:{error}")
+                })?;
+            let stamp = &value["stamp"];
+            if stamp["corpus"] != "rs-crown"
+                || !matches!(stamp["data"].as_str(), Some("true" | "provisional"))
+                || expected_stamp
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .any(|(key, value)| stamp.get(key) != Some(value))
+            {
+                return Err(format!("bridge-custody:retained-sidecar-frame:{suffix}"));
+            }
+            sidecars.insert(suffix, value);
+        }
+        let packet = &sidecars["bridge-replay"];
+        let retained: RetainedReplay = serde_json::from_value(packet["replay"].clone())
+            .map_err(|error| format!("bridge-custody:retained-replay-json:{error}"))?;
+        if row.get(raw_schema::OUTCOME_KIND)
+            != Some(if retained.emitted_outcome {
+                "emitted"
+            } else {
+                "degraded"
+            })
+        {
+            return Err("bridge-custody:retained-outcome-mismatch".into());
+        }
+        if sidecars["bridge-custody"]["comparison"]
+            != serde_json::to_value(&retained.comparison).map_err(|error| error.to_string())?
+            || sidecars["delivery-custody"]["comparison"]["issues"]
+                .as_array()
+                .is_none_or(|issues| !issues.is_empty())
+            || sidecars["sibling-coverage-gaps"]["count"] != 0
+            || sidecars["pending-sibling-overlap"]["descriptors"]
+                != serde_json::to_value(&retained.export.pending)
+                    .map_err(|error| error.to_string())?
+        {
+            return Err("bridge-custody:retained-sidecar-comparison-mismatch".into());
+        }
+        let read_table = |suffix: &str| -> Result<Vec<BTreeMap<String, String>>, String> {
+            let bytes = read(suffix)?;
+            let text = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+            let mut lines = text.lines();
+            let header = lines
+                .next()
+                .ok_or("retained table has no header")?
+                .split('\t')
+                .collect::<Vec<_>>();
+            if header.iter().copied().collect::<BTreeSet<_>>().len() != header.len() {
+                return Err(format!(
+                    "bridge-custody:retained-table-duplicate-header:{suffix}"
+                ));
+            }
+            lines
+                .map(|line| {
+                    let fields = line.split('\t').collect::<Vec<_>>();
+                    if fields.len() != header.len() {
+                        return Err(format!("bridge-custody:retained-table-width:{suffix}"));
+                    }
+                    let record = header
+                        .iter()
+                        .zip(fields)
+                        .map(|(key, value)| ((*key).to_owned(), value.to_owned()))
+                        .collect::<BTreeMap<_, _>>();
+                    for key in [
+                        "program",
+                        "analysis_frame",
+                        "code_frame",
+                        "cache_manifest_sha256",
+                        "launch_env_sha256",
+                    ] {
+                        if record.get(key).map(String::as_str) != expected_stamp[key].as_str() {
+                            return Err(format!(
+                                "bridge-custody:retained-table-frame:{suffix}:{key}"
+                            ));
+                        }
+                    }
+                    if !matches!(
+                        record.get("data").map(String::as_str),
+                        Some("true" | "provisional")
+                    ) {
+                        return Err(format!("bridge-custody:retained-table-data:{suffix}"));
+                    }
+                    Ok(record)
+                })
+                .collect()
+        };
+        let tree = read_table("emitted-tree.tsv")?;
+        let paths: BTreeMap<String, String> =
+            serde_json::from_value(packet["source_paths"].clone())
+                .map_err(|error| format!("bridge-custody:retained-source-paths:{error}"))?;
+        if paths.keys().collect::<BTreeSet<_>>() != retained.export.files.keys().collect()
+            || paths.values().collect::<BTreeSet<_>>().len() != paths.len()
+        {
+            return Err("bridge-custody:retained-source-path-set".into());
+        }
+        if retained.emitted_outcome {
+            let mut files = BTreeMap::new();
+            for record in &tree {
+                let file = record.get("file").ok_or("retained tree missing file")?;
+                if !std::path::Path::new(file)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                    || files.insert(file.clone(), record).is_some()
+                {
+                    return Err("bridge-custody:retained-tree-path".into());
+                }
+            }
+            for (source, relative) in paths {
+                let record = files
+                    .get(&relative)
+                    .ok_or_else(|| format!("bridge-custody:retained-tree-source:{source}"))?;
+                let original = &retained.export.files[&source];
+                let emitted = retained
+                    .emitted_sources
+                    .as_ref()
+                    .and_then(|sources| sources.get(&source))
+                    .ok_or("bridge-custody:retained-emitted-source-missing")?;
+                if record.get("input_sha256") != Some(&original.sha256)
+                    || record.get("emitted_sha256")
+                        != Some(&format!("{:x}", Sha256::digest(emitted.as_bytes())))
+                {
+                    return Err(format!(
+                        "bridge-custody:retained-tree-source-digest:{source}"
+                    ));
+                }
+            }
+        } else if frame.emitted_tree_sha256 != "absent"
+            || tree.len() != 1
+            || tree[0].get("state").map(String::as_str) != Some("absent-tree")
+        {
+            return Err("bridge-custody:retained-absent-tree-mismatch".into());
+        }
+        // Compare the typed active-key set with the sealed renderer's exact
+        // opaque keys. The explicit map records prefix normalization only.
+        let ledger_keys: BTreeMap<String, String> =
+            serde_json::from_value(packet["receipt_ledger_keys"].clone())
+                .map_err(|error| format!("bridge-custody:retained-ledger-keys:{error}"))?;
+        let expected_keys = retained
+            .applied
+            .iter()
+            .map(|event| event.receipt_key.clone())
+            .collect::<BTreeSet<_>>();
+        if ledger_keys.keys().cloned().collect::<BTreeSet<_>>() != expected_keys {
+            return Err("bridge-custody:retained-ledger-key-map".into());
+        }
+        let receipts = read_table("bridge-receipts.tsv")?;
+        let active = receipts
+            .iter()
+            .filter(|record| {
+                record.get("stage").map(String::as_str) == Some("terminal")
+                    && record.get("state").map(String::as_str) == Some("applied")
+                    && matches!(
+                        record.get("bridge_kind").map(String::as_str),
+                        Some(
+                            "pair-t2-raw-view" | "a5-site-proof-t2-fallback" | "pair-copy-snapshot"
+                        )
+                    )
+            })
+            .map(|record| {
+                record
+                    .get("site_key")
+                    .cloned()
+                    .ok_or("retained bridge missing site key")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if active.iter().collect::<BTreeSet<_>>().len() != active.len()
+            || active.into_iter().collect::<BTreeSet<_>>()
+                != ledger_keys.values().cloned().collect()
+        {
+            return Err("bridge-custody:retained-active-ledger-mismatch".into());
+        }
+        let comparison = bridge_custody_export::compare_retained(Some(&retained), &frame)?;
+        if !comparison.data {
+            return Err(format!(
+                "bridge-custody:retained-replay-failed:{comparison:?}"
+            ));
+        }
+        Ok(())
+    })();
+    match checked {
+        Ok(()) => row,
+        Err(error) => raw_boundary_custody_failure(row, &error),
+    }
+}
+
+#[test]
+fn r231_checkpoint_sidecars_validation_failure_cannot_leave_success() {
+    let mut payloads = vec![
+        (
+            "bridge-custody".into(),
+            serde_json::json!({
+                "stamp": {"data": "provisional"}, "comparison": {"data": true, "issues": []}
+            }),
+        ),
+        (
+            "pending".into(),
+            serde_json::json!({
+                "stamp": {"data": "provisional"}, "classification": "WAIVED"
+            }),
+        ),
+    ];
+    let mut issues = vec!["pending-anchor-not-argument".into()];
+    let mut published = std::collections::BTreeMap::new();
+    raw_boundary_publish_custody_sidecars(&mut payloads, &mut issues, |name, payload| {
+        match payload {
+            Some(payload) => {
+                published.insert(name.to_owned(), payload.clone());
+            }
+            None => {
+                published.remove(name);
+            }
+        }
+        Ok(())
+    });
+    for value in published.values() {
+        assert_eq!(value["stamp"]["data"], "false", "{value}");
+    }
+    assert_eq!(published["bridge-custody"]["comparison"]["data"], false);
+    assert_eq!(published["pending"]["classification"], "WAIVED");
+}
+
+#[test]
+fn r231_checkpoint_sidecars_late_write_error_revokes_earlier_success() {
+    let mut payloads = vec![
+        (
+            "bridge-custody".into(),
+            serde_json::json!({
+                "stamp": {"data": "provisional"}, "comparison": {"data": true, "issues": []}
+            }),
+        ),
+        (
+            "pending".into(),
+            serde_json::json!({"stamp": {"data": "provisional"}}),
+        ),
+    ];
+    let mut issues = Vec::new();
+    let mut published = std::collections::BTreeMap::new();
+    raw_boundary_publish_custody_sidecars(&mut payloads, &mut issues, |name, payload| {
+        if name == "pending" && payload.is_some() {
+            return Err("injected pending-sidecar write failure".into());
+        }
+        match payload {
+            Some(payload) => {
+                published.insert(name.to_owned(), payload.clone());
+            }
+            None => {
+                published.remove(name);
+            }
+        }
+        Ok(())
+    });
+    assert!(!issues.is_empty());
+    for value in published.values() {
+        assert_eq!(value["stamp"]["data"], "false", "{value}");
+        if let Some(data) = value
+            .get("comparison")
+            .and_then(|comparison| comparison.get("data"))
+        {
+            assert_eq!(data, false);
+        }
+    }
+}
+
+#[test]
+fn r231_checkpoint_sidecars_success_preserves_final_status() {
+    let mut payloads = vec![(
+        "bridge-custody".into(),
+        serde_json::json!({
+            "stamp": {"data": "provisional"}, "comparison": {"data": true, "issues": []}
+        }),
+    )];
+    let expected = payloads.clone();
+    let mut issues = Vec::new();
+    raw_boundary_publish_custody_sidecars(&mut payloads, &mut issues, |_, _| Ok(()));
+    assert!(issues.is_empty());
+    assert_eq!(payloads, expected);
+}
+
+#[test]
+fn r231_checkpoint_export_failure_row_cannot_supply_aggregate_data() {
+    let mut row = report::Row::default();
+    row.set(raw_schema::DATA, "provisional");
+    row.set(raw_schema::STATUS, "ok");
+    let custody = crate::bo_rewriter::bridge_custody_export::CheckpointReport {
+        data: false,
+        issues: vec!["bridge-custody:missing-descriptor:site".into()],
+        ..Default::default()
+    };
+    let row = raw_boundary_bridge_custody_gate(row, &custody);
+    assert_eq!(row.get(raw_schema::DATA), Some("false"));
+    assert_eq!(row.get(raw_schema::STATUS), Some("instrument-error"));
+    assert!(!raw_boundary_rows_have_data(&[row]));
+}
+
 fn raw_boundary_delivery_custody_for_outcome(
     outcome: RawBoundaryProgramOutcome,
     expectations: &[crate::bo_rewriter::DeliveryExpectation],
@@ -10777,7 +11199,7 @@ mod run {
                     .map(|path| path.display().to_string()),
             )
             .collect::<BTreeSet<_>>();
-        let stamp = |raw: &str| {
+        let stamp_as = |raw: &str, stamp_data: &str| {
             let mut lines = raw.lines();
             let header = lines.next().unwrap_or_default();
             let prefix_header = "corpus\tanalysis_frame\tcode_frame\traw_boundary_wave\tdata\tbuild_profile\tresource_configured_mib\tresource_effective_mib\ta5_mode\ta5_world\ta5_attestation\tcache_manifest_sha256\tlaunch_env_sha256\tprogram";
@@ -10785,7 +11207,7 @@ mod run {
                 "rs-crown\t{}\t{}\twave2\t{}\t{}\t{}\t{}\tprecise_replay\tclosed_world_frozen_graph\t{}\t{}\t{}\t{}",
                 model_cache::ANALYSIS_FRAME,
                 code_frame,
-                data,
+                stamp_data,
                 build_profile,
                 configured_memory,
                 effective_memory,
@@ -10803,6 +11225,7 @@ mod run {
             }
             output
         };
+        let stamp = |raw: &str| stamp_as(raw, data);
         let readable_escalation = if capture.escalation.is_empty() {
             "-".to_owned()
         } else {
@@ -11136,7 +11559,27 @@ mod run {
             custody_sources.as_ref(),
             &reverted_functions,
         );
-        let custody_data = if custody.issues.is_empty() {
+        // R231/R233: this is outside the compiler callback and consumes the
+        // exact owned export plus final events. Bridge file keys use the same
+        // Real(path)/Virtual(name) labels as their typed source locations.
+        let bridge_sources = capture.emitted_files.as_ref().map(|files| {
+            files
+                .iter()
+                .map(|(file, source)| {
+                    (
+                        crate::bo_rewriter::bridge_custody_export::file_label(file),
+                        source.clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        });
+        let mut bridge_custody = crate::bo_rewriter::bridge_custody_export::compare_capture(
+            &artifact.bridge_custody_export,
+            &artifact.bridge_events,
+            bridge_sources.as_ref(),
+            capture.outcome_kind,
+        );
+        let custody_data = if custody.issues.is_empty() && bridge_custody.data {
             data
         } else {
             "false"
@@ -11145,12 +11588,59 @@ mod run {
             "corpus": "rs-crown", "analysis_frame": model_cache::ANALYSIS_FRAME,
             "code_frame": code_frame, "program": name, "data": custody_data,
             "cache_manifest_sha256": cache_manifest_sha256, "launch_env_sha256": launch_env_sha256,
+            "input_tree_sha256": tree_receipt.input_tree_sha256,
             "emitted_tree_sha256": tree_receipt.emitted_tree_sha256,
             "emitted_tree_present": capture.emitted_files.is_some(),
         });
+        let bridge_source_manifest = artifact
+            .bridge_custody_export
+            .files
+            .iter()
+            .map(|(file, original)| {
+                (
+                    file.clone(),
+                    serde_json::json!({"sha256": &original.sha256,
+                "source_global_start": original.global_start, "bytes": original.source.len()}),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut pending_rows = String::from(
+            "receipt_key\tcaller\tcallee\targument_index\tsource_file\tlo\thi\treason\ttier\twaiver\tclassification\tcustody_valid\n",
+        );
+        for descriptor in &artifact.bridge_custody_export.pending {
+            let crate::bo_rewriter::bridge_custody_match::SiteAnchor::Argument {
+                span,
+                argument_index,
+            } = &descriptor.expectation.anchor
+            else {
+                bridge_custody.data = false;
+                bridge_custody.issues.push(format!(
+                    "bridge-custody:pending-anchor-not-argument:{}",
+                    descriptor.receipt_key
+                ));
+                continue;
+            };
+            let valid = bridge_custody.files.values().flat_map(|file| &file.rows).any(|row|
+                row.identity == descriptor.receipt_key
+                    && row.status == crate::bo_rewriter::bridge_custody_match::ReceiptStatus::WaivedPending);
+            pending_rows.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tWAIVED\t{}\n",
+                full_tsv_field(&descriptor.receipt_key),
+                full_tsv_field(&descriptor.expectation.caller),
+                full_tsv_field(&descriptor.expectation.callee),
+                argument_index,
+                full_tsv_field(&descriptor.source_file),
+                span.lo,
+                span.hi,
+                crate::bo_rewriter::decision::sibling_overlap::PENDING_REASON,
+                full_tsv_field(&descriptor.expectation.tier),
+                full_tsv_field(descriptor.expectation.waiver_id.as_deref().unwrap_or("-")),
+                valid
+            ));
+        }
         // Sidecars preserve the sealed common/specialized TSV schemas. Exact
         // expectations and parser observations remain independently auditable.
-        for (suffix, payload) in [
+        let mut custody_payloads = vec![
             (
                 "additive-family-fallbacks",
                 serde_json::json!({"stamp": &custody_stamp, "transactions": &artifact.additive_family_receipts}),
@@ -11167,22 +11657,154 @@ mod run {
                 "delivery-custody",
                 serde_json::json!({"stamp": &custody_stamp, "comparison": &custody}),
             ),
-        ] {
-            let path = directory.join(format!("{name}.raw-boundary-{suffix}.json"));
-            let written = serde_json::to_vec_pretty(&payload)
-                .map_err(|error| format!("serialize {suffix}: {error}"))
-                .and_then(|mut bytes| {
-                    bytes.push(b'\n');
-                    std::fs::write(&path, bytes)
-                        .map_err(|error| format!("write {}: {error}", path.display()))
-                });
-            if let Err(error) = written {
-                custody
+            (
+                "bridge-expectations",
+                serde_json::json!({"stamp": &custody_stamp, "sources": &bridge_source_manifest,
+                    "functions": &artifact.bridge_custody_export.functions,
+                    "descriptors": &artifact.bridge_custody_export.descriptors,
+                    "descriptor_issues": &artifact.bridge_custody_export.descriptor_issues,
+                    "capture_issues": &artifact.bridge_custody_export.issues,
+                    "terminal_issues": &artifact.bridge_custody_export.terminal_issues}),
+            ),
+            (
+                "bridge-custody",
+                serde_json::json!({"stamp": &custody_stamp, "comparison": &bridge_custody}),
+            ),
+            (
+                "pending-sibling-overlap",
+                serde_json::json!({"stamp": &custody_stamp, "classification": "WAIVED",
+                    "count": artifact.bridge_custody_export.pending.len(),
+                    "selected_count": artifact.bridge_custody_export.pending_subject_records.len(),
+                    "descriptors": &artifact.bridge_custody_export.pending,
+                    "subjects": &artifact.bridge_custody_export.pending_subject_records,
+                    "typed_records": &artifact.bridge_custody_export.pending_records}),
+            ),
+            (
+                "sibling-coverage-gaps",
+                serde_json::json!({"stamp": &custody_stamp,
+                    "count": artifact.bridge_custody_export.coverage_gap_records.len(),
+                    "typed_records": &artifact.bridge_custody_export.coverage_gap_records}),
+            ),
+            (
+                "pending-sibling-overlap-tsv",
+                serde_json::json!({"stamp": &custody_stamp, "rows": &pending_rows}),
+            ),
+        ].into_iter().map(|(name, payload)| (name.to_owned(), payload)).collect::<Vec<_>>();
+        let frame = crate::bo_rewriter::bridge_custody_export::ReplayFrame {
+            program: name.clone(),
+            analysis_frame: model_cache::ANALYSIS_FRAME.into(),
+            code_frame: code_frame.clone(),
+            input_tree_sha256: tree_receipt.input_tree_sha256.clone(),
+            emitted_tree_sha256: tree_receipt.emitted_tree_sha256.clone(),
+            cache_manifest_sha256: cache_manifest_sha256.clone(),
+            launch_env_sha256: launch_env_sha256.clone(),
+        };
+        let mut source_paths = BTreeMap::new();
+        for file in artifact.bridge_custody_export.files.keys() {
+            let key = crate::bo_rewriter::plan::FileKey::Real(std::path::PathBuf::from(file));
+            match super::raw_boundary_emitted_relative_path(input.parent().unwrap(), &key) {
+                Ok(relative) => {
+                    source_paths.insert(file.clone(), relative.display().to_string());
+                }
+                Err(error) => bridge_custody
                     .issues
-                    .push(format!("delivery-custody:sidecar:{error}"));
+                    .push(format!("bridge-custody:source-tree-mapping:{error}")),
             }
         }
-        if !custody.issues.is_empty() {
+        bridge_custody.data &= bridge_custody.issues.is_empty();
+        let replay = crate::bo_rewriter::bridge_custody_export::RetainedReplay {
+            frame,
+            export: artifact.bridge_custody_export.clone(),
+            applied: crate::bo_rewriter::bridge_custody_export::applied_receipts(
+                &artifact.bridge_events,
+            ),
+            emitted_sources: bridge_sources.clone(),
+            emitted_outcome: capture.outcome_kind == crate::bo_rewriter::CensusOutcomeKind::Emitted,
+            comparison: bridge_custody.clone(),
+        };
+        let receipt_ledger_keys = replay
+            .applied
+            .iter()
+            .map(|event| {
+                let normalized = roots.iter().fold(event.receipt_key.clone(), |key, root| {
+                    key.replace(root, "<program>")
+                });
+                (event.receipt_key.clone(), normalized)
+            })
+            .collect::<BTreeMap<_, _>>();
+        custody_payloads.push((
+            "bridge-replay".into(),
+            serde_json::json!({
+                "stamp": &custody_stamp, "replay": replay, "source_paths": source_paths,
+                "receipt_ledger_keys": receipt_ledger_keys,
+            }),
+        ));
+        let mut sidecar_issues = custody.issues.clone();
+        sidecar_issues.extend(bridge_custody.issues.iter().cloned());
+        if !bridge_custody.data && sidecar_issues.is_empty() {
+            sidecar_issues.push("bridge-custody:data=false".into());
+        }
+        super::raw_boundary_publish_custody_sidecars(
+            &mut custody_payloads,
+            &mut sidecar_issues,
+            |suffix, payload| {
+                let tsv = suffix == "pending-sibling-overlap-tsv";
+                let path = directory.join(if tsv {
+                    format!("{name}.raw-boundary-pending-sibling-overlap.tsv")
+                } else {
+                    format!("{name}.raw-boundary-{suffix}.json")
+                });
+                let Some(payload) = payload else {
+                    return match std::fs::remove_file(&path) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(format!("remove {}: {error}", path.display())),
+                    };
+                };
+                let bytes = if tsv {
+                    let status = payload["stamp"]["data"]
+                        .as_str()
+                        .ok_or("pending sidecar status missing")?;
+                    let rows = payload["rows"]
+                        .as_str()
+                        .ok_or("pending sidecar rows missing")?;
+                    let rows = if status == "false" {
+                        rows.lines()
+                            .enumerate()
+                            .map(|(index, row)| {
+                                Ok(if index == 0 {
+                                    row.to_owned()
+                                } else {
+                                    format!(
+                                        "{}\tfalse",
+                                        row.rsplit_once('\t')
+                                            .ok_or("pending sidecar row malformed")?
+                                            .0
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>, &str>>()?
+                            .join("\n")
+                            + "\n"
+                    } else {
+                        rows.to_owned()
+                    };
+                    stamp_as(&rows, status).into_bytes()
+                } else {
+                    let mut bytes = serde_json::to_vec_pretty(payload)
+                        .map_err(|error| format!("serialize {suffix}: {error}"))?;
+                    bytes.push(b'\n');
+                    bytes
+                };
+                std::fs::write(&path, bytes)
+                    .map_err(|error| format!("write {}: {error}", path.display()))
+            },
+        );
+        if !sidecar_issues.is_empty() {
+            custody.issues = sidecar_issues;
+            bridge_custody.data = false;
+        }
+        if !custody.issues.is_empty() || !bridge_custody.data {
             row.set(raw_schema::CORPUS, "rs-crown");
             row.set(raw_schema::ANALYSIS_FRAME, model_cache::ANALYSIS_FRAME);
             row.set(raw_schema::CODE_FRAME, &code_frame);
@@ -11191,7 +11813,9 @@ mod run {
             row.set(raw_schema::SOLVER_INVOCATIONS, 0);
             // Return before the ordinary final data/status writes: a parser,
             // identity or sidecar failure cannot be overwritten as success.
-            return super::raw_boundary_custody_failure(row, &custody.issues.join(" | "));
+            bridge_custody.issues.extend(custody.issues);
+            bridge_custody.data = false;
+            return super::raw_boundary_bridge_custody_gate(row, &bridge_custody);
         }
         #[derive(Default)]
         struct SubjectOutcome {
@@ -21443,6 +22067,63 @@ fn raw_boundary_rows_have_data(rows: &[report::Row]) -> bool {
     rows.iter().all(|row| !raw_boundary_typed_failure(row))
 }
 
+fn raw_boundary_census_rows_have_data(
+    rows: &[report::Row],
+    diagnostic_run: bool,
+    attestation: &str,
+) -> bool {
+    for row in rows {
+        if raw_boundary_typed_failure(row)
+            && (matches!(
+                row.get(raw_schema::STATUS),
+                Some("worker-abort" | "instrument-error")
+            ) || diagnostic_run)
+        {
+            continue;
+        }
+        assert_eq!(row.get(raw_schema::STATUS), Some("ok"), "{row:?}");
+        assert_eq!(row.get(raw_schema::CACHE_STATUS), Some("hit"), "{row:?}");
+        assert_eq!(
+            row.get(raw_schema::SOLVE_WALL_S),
+            Some("0.000000"),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.get(raw_schema::SOLVER_INVOCATIONS),
+            Some("0"),
+            "{row:?}"
+        );
+        assert_eq!(row.get(raw_schema::WAVE), Some("wave2"), "{row:?}");
+        assert_eq!(
+            row.get(raw_schema::A5_ATTESTATION),
+            Some(attestation),
+            "{row:?}"
+        );
+    }
+    raw_boundary_rows_have_data(rows)
+}
+
+#[test]
+fn r231_checkpoint_formal_custody_failure_reaches_aggregate_writer() {
+    let row = raw_boundary_custody_failure(
+        report::Row::default(),
+        "bridge-custody:retained-sidecar-missing",
+    );
+    assert!(
+        !raw_boundary_census_rows_have_data(&[row], false, "fixture"),
+        "formal instrument failure must enter the existing data=false aggregate writer"
+    );
+}
+
+#[test]
+fn r231_checkpoint_diagnostic_custody_failure_reaches_aggregate_writer() {
+    let row = raw_boundary_custody_failure(
+        report::Row::default(),
+        "bridge-custody:retained-sidecar-missing",
+    );
+    assert!(!raw_boundary_census_rows_have_data(&[row], true, "fixture"));
+}
+
 fn raw_boundary_attribution_control(unresolved: usize, exact_seam: usize) -> bool {
     unresolved == 0 || exact_seam > 0
 }
@@ -21636,6 +22317,7 @@ fn raw_boundary_wave2_corpus_census() {
             .expect("read sealed re-aggregation rows")
             .lines()
             .map(|line| report::parse_kv_line(line).expect("parse sealed re-aggregation row"))
+            .map(|row| raw_boundary_reaggregate_custody(row, &ledger_dir))
             .collect::<Vec<_>>()
     } else {
         let mut rows = Vec::new();
@@ -21674,32 +22356,7 @@ fn raw_boundary_wave2_corpus_census() {
         rows
     };
     assert_eq!(rows.len(), 20);
-    for row in &rows {
-        if raw_boundary_typed_failure(row)
-            && (row.get(raw_schema::STATUS) == Some("worker-abort") || diagnostic_run)
-        {
-            continue;
-        }
-        assert_eq!(row.get(raw_schema::STATUS), Some("ok"), "{row:?}");
-        assert_eq!(row.get(raw_schema::CACHE_STATUS), Some("hit"), "{row:?}");
-        assert_eq!(
-            row.get(raw_schema::SOLVE_WALL_S),
-            Some("0.000000"),
-            "{row:?}"
-        );
-        assert_eq!(
-            row.get(raw_schema::SOLVER_INVOCATIONS),
-            Some("0"),
-            "{row:?}"
-        );
-        assert_eq!(row.get(raw_schema::WAVE), Some("wave2"), "{row:?}");
-        assert_eq!(
-            row.get(raw_schema::A5_ATTESTATION),
-            Some(recipe.attestation),
-            "{row:?}"
-        );
-    }
-    if !raw_boundary_rows_have_data(&rows) {
+    if !raw_boundary_census_rows_have_data(&rows, diagnostic_run, recipe.attestation) {
         let per_program = rows
             .iter()
             .map(report::to_kv_line)

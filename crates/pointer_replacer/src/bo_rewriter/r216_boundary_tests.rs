@@ -83,7 +83,7 @@ fn r218_reclassified_option_call_stays_inactive_on_plan_replay() {
             &reverts,
             emission.plan.root_file.as_ref(),
             &table,
-            Some(&emission.plan.terminal_a5_raw_calls),
+            Some(&emission.plan.terminal_call_plans),
         )
         .unwrap()
         .0;
@@ -158,7 +158,7 @@ fn r216_unsatisfied_additive_option_site_keeps_the_delivered_class() {
             &emission.plan.held_classes(), &std::collections::BTreeSet::new(), &table,
         ).unwrap();
         super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
-            Some(&emission.plan.terminal_a5_raw_calls)).unwrap().0.into_values().next().unwrap()
+            Some(&emission.plan.terminal_call_plans)).unwrap().0.into_values().next().unwrap()
     }).unwrap();
     assert_eq!(
         emitted, baseline,

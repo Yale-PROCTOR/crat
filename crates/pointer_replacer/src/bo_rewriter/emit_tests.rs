@@ -44,7 +44,7 @@ pub(super) fn ast_emitted_source_of(input: &str) -> Result<String, String> {
                 &reverts,
                 emission.plan.root_file.as_ref(),
                 &table,
-                Some(&emission.plan.terminal_a5_raw_calls),
+                Some(&emission.plan.terminal_call_plans),
             )?;
             files
                 .into_values()
@@ -6509,6 +6509,137 @@ const REVERT_FOUND_FORM_W4: &str = "#![allow(dead_code, unused_unsafe, unused_mu
      pub unsafe fn callee(p: *mut i32) { *p += 1; }\n\
      pub unsafe fn caller(self_0: *mut i32) { callee(self_0); }\n";
 
+/// R231 migration: these are consumer-level injected-plan controls. The
+/// canonical T2 view requires its selected parameter to be raw; the unchanged
+/// real-model S companion independently tests production role assignment.
+fn seal_injected_a5_raw_roles(table: &mut super::decision::DecisionTable) {
+    for call in &table.seams.a5_raw_calls {
+        for view in &call.views {
+            assert_eq!(view.expected_form, super::decision::seam::Form::Raw);
+            let (subject, decision) = table.entries.iter_mut().find(|(subject, _)|
+                subject.fn_did == call.callee && matches!(subject.kind,
+                    super::decision::SubjectKind::Param { hir_index } if hir_index == view.argument_index))
+                .expect("exact selected A5 parameter in the constructed consumer plan");
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: subject.label.clone(),
+                site: "<r231-consumer-raw-role>".into(),
+                reason: super::decision::DegradeReason::PairRawView,
+            });
+            for proof in &mut table.seams.overlap_proofs {
+                if proof.proof_site_key == Some(view.proof_site_key) {
+                    proof.expected_form = super::decision::seam::Form::Raw;
+                }
+            }
+        }
+    }
+    // A constructed Slice/Option decision must also carry its native body
+    // uses; an empty payload was never a complete decision for `*a += 1`.
+    rustc_middle::ty::tls::with(|tcx| {
+        use super::decision::emitability::{self, Accessor};
+        let functions = tcx.hir_body_owners().collect::<Vec<_>>();
+        let names = table
+            .entries
+            .iter()
+            .filter_map(|(subject, _)| {
+                subject
+                    .param_name
+                    .clone()
+                    .map(|name| ((subject.fn_did, subject.hir_id), name))
+            })
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        let mutable = table
+            .entries
+            .iter()
+            .filter_map(|(subject, decision)| {
+                matches!(
+                    decision,
+                    super::decision::Decision::Slice { mutable: true, .. }
+                        | super::decision::Decision::Opt { mutable: true, .. }
+                )
+                .then_some((subject.fn_did, subject.hir_id))
+            })
+            .collect();
+        let accessors = table
+            .entries
+            .iter()
+            .filter_map(|(subject, _)| {
+                let name = subject.param_name.as_ref()?;
+                let repeated = subject.mutable
+                    && emitability::non_test_use_count(tcx, subject.fn_did, subject.hir_id) > 1;
+                Some((
+                    (subject.fn_did, subject.hir_id),
+                    Accessor {
+                        deref: if repeated {
+                            format!("*{name}.as_mut().unwrap()")
+                        } else {
+                            format!("{name}.unwrap()")
+                        },
+                        index: if repeated {
+                            format!("{name}.as_mut().unwrap()")
+                        } else {
+                            format!("{name}.unwrap()")
+                        },
+                    },
+                ))
+            })
+            .collect();
+        let slices = emitability::collect_slice_uses(
+            tcx,
+            &functions,
+            &names,
+            &mutable,
+            &Default::default(),
+            &Default::default(),
+        );
+        let optional = emitability::collect_opt_uses(
+            tcx,
+            &functions,
+            &names,
+            &accessors,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        for (subject, decision) in &mut table.entries {
+            let key = (subject.fn_did, subject.hir_id);
+            match decision {
+                super::decision::Decision::Slice { uses, .. } => {
+                    *uses = slices
+                        .get(&key)
+                        .map(|row| row.rewrites.clone())
+                        .unwrap_or_default();
+                }
+                super::decision::Decision::Opt { uses, .. } => {
+                    *uses = optional
+                        .get(&key)
+                        .map(|row| row.rewrites.clone())
+                        .unwrap_or_default();
+                }
+                super::decision::Decision::Ref { .. }
+                | super::decision::Decision::InferredRef { .. }
+                | super::decision::Decision::Box(_)
+                | super::decision::Decision::Degraded(_) => {}
+            }
+        }
+    });
+}
+
+fn e3_a5_raw_role_attempt(
+    src: &str,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+    reverted_subject: Option<&'static str>,
+    use_foster: bool,
+) -> E2Attempt {
+    e3_attempt_with_mutability(
+        src,
+        true,
+        inject,
+        &seal_injected_a5_raw_roles,
+        reverted_subject,
+        use_foster,
+    )
+}
+
 fn force_a5_same_form(
     table: &mut super::decision::DecisionTable,
     replacement: super::decision::Decision,
@@ -6685,14 +6816,6 @@ fn e3_attempt_with(
     e3_attempt_with_mutability(src, attested, inject, &|_| {}, None, false)
 }
 
-fn e3_attempt_with_foster(
-    src: &str,
-    attested: bool,
-    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
-) -> E2Attempt {
-    e3_attempt_with_mutability(src, attested, inject, &|_| {}, None, true)
-}
-
 fn e3_attempt_with_foster_post(
     src: &str,
     attested: bool,
@@ -6700,15 +6823,6 @@ fn e3_attempt_with_foster_post(
     post_synthesize: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
 ) -> E2Attempt {
     e3_attempt_with_mutability(src, attested, inject, post_synthesize, None, true)
-}
-
-fn e3_attempt_with_post(
-    src: &str,
-    attested: bool,
-    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
-    post_synthesize: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
-) -> E2Attempt {
-    e3_attempt_with_mutability(src, attested, inject, post_synthesize, None, false)
 }
 
 fn e3_attempt_with_runtime_revert(
@@ -6750,6 +6864,9 @@ fn e3_attempt_with_mutability(
             )),
         )
         .expect("wave-3 decision table");
+        let fixture_solve = super::model_cache::solve_receipt();
+        println!("E3 fixture solve receipt: {fixture_solve:#?}");
+        assert!(fixture_solve.is_some(), "fixture evidence carries its solve receipt");
         assert!(
             ctx.analysis.origins.is_some(),
             "the consumer-neutral E2-X1 carrier must retain full OriginSummaries"
@@ -6808,7 +6925,7 @@ fn e3_attempt_with_mutability(
             &reverts,
             emission.plan.root_file.as_ref(),
             &table,
-            Some(&emission.plan.terminal_a5_raw_calls),
+            Some(&emission.plan.terminal_call_plans),
         )
         .expect("wave-3 AST emission from sealed A5 plan");
         let ast_source = emission
@@ -6839,7 +6956,7 @@ fn e3_attempt_with_mutability(
                 &runtime_reverts,
                 emission.plan.root_file.as_ref(),
                 &table,
-                Some(&emission.plan.terminal_a5_raw_calls),
+                Some(&emission.plan.terminal_call_plans),
             )
             .expect("runtime-reverted AST emission");
             emission
@@ -10385,15 +10502,20 @@ fn e_adapt_w3_w1_proven_disjoint_site_emits_its_slice_adapter() {
 /// argument without asking borrowck to accept two simultaneous mutable views.
 #[test]
 fn a5_w1_proof_site_absent_from_pair_inventory_uses_t2_raw_view() {
-    let attempt = e3_attempt_with(E3_OVERLAP, true, &|table| {
-        force_a5_same_form(
-            table,
-            super::decision::Decision::Slice {
-                mutable: true,
-                uses: Vec::new(),
-            },
-        );
-    });
+    let attempt = e3_a5_raw_role_attempt(
+        E3_OVERLAP,
+        &|table| {
+            force_a5_same_form(
+                table,
+                super::decision::Decision::Slice {
+                    mutable: true,
+                    uses: Vec::new(),
+                },
+            );
+        },
+        None,
+        false,
+    );
     assert!(
         attempt.receipt.lines().any(|line| {
             line.contains("a5-site-proof-t2-fallback")
@@ -10408,12 +10530,10 @@ fn a5_w1_proof_site_absent_from_pair_inventory_uses_t2_raw_view() {
         source.contains("let __crat_a5_raw_"),
         "{source}\nreceipt={}\nterminal={:#?}",
         attempt.receipt,
-        attempt.emission.plan.terminal_a5_raw_calls,
+        attempt.emission.plan.terminal_call_plans.a5_raw_calls,
     );
-    assert!(
-        source.contains("core::slice::from_raw_parts_mut"),
-        "{source}"
-    );
+    assert!(source.contains("b: *mut i32"), "{source}");
+    assert!(super::verify::type_checks_str(&source));
     assert!(
         attempt
             .emission
@@ -10439,15 +10559,20 @@ fn a5_w1_proof_site_absent_from_pair_inventory_uses_t2_raw_view() {
     );
     let rendered = super::mechanical_receipt::render_a5_proof_site_fallback_rows(&rows);
     assert!(rendered.contains("\tT2\tc-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01\t"));
-    assert!(rendered.contains("slice-mut-to-raw-mut->c-raw-slice-mut"));
+    assert!(rendered.contains("slice-mut-to-raw-mut"));
     assert!(!rendered.contains("a5-site-proof-blocked"));
 }
 
 #[test]
 fn a5_w1_ref_and_option_forms_share_the_proof_site_raw_view_renderer() {
-    let reference = e3_attempt_with(E3_OVERLAP, true, &|table| {
-        force_a5_same_form(table, super::decision::Decision::Ref { mutable: true });
-    });
+    let reference = e3_a5_raw_role_attempt(
+        E3_OVERLAP,
+        &|table| {
+            force_a5_same_form(table, super::decision::Decision::Ref { mutable: true });
+        },
+        None,
+        false,
+    );
     let reference_source = e2_root_text(&reference);
     assert!(
         reference_source.contains("let __crat_a5_raw_"),
@@ -10457,18 +10582,25 @@ fn a5_w1_ref_and_option_forms_share_the_proof_site_raw_view_renderer() {
         reference_source.contains("core::ptr::from_mut(&mut *p)"),
         "{reference_source}"
     );
-    assert!(reference_source.contains("&mut *__crat_a5_raw_"));
+    assert!(!reference_source.contains("&mut *__crat_a5_raw_"));
+    assert!(reference_source.contains("b: *mut i32"));
+    assert!(super::verify::type_checks_str(&reference_source));
 
-    let optional = e3_attempt_with(A5_OPTION_OVERLAP, true, &|table| {
-        force_a5_same_form(
-            table,
-            super::decision::Decision::Opt {
-                mutable: true,
-                slice: false,
-                uses: Vec::new(),
-            },
-        );
-    });
+    let optional = e3_a5_raw_role_attempt(
+        A5_OPTION_OVERLAP,
+        &|table| {
+            force_a5_same_form(
+                table,
+                super::decision::Decision::Opt {
+                    mutable: true,
+                    slice: false,
+                    uses: Vec::new(),
+                },
+            );
+        },
+        None,
+        false,
+    );
     let optional_source = e2_root_text(&optional);
     assert!(
         optional_source.contains("let __crat_a5_raw_"),
@@ -10478,12 +10610,13 @@ fn a5_w1_ref_and_option_forms_share_the_proof_site_raw_view_renderer() {
         optional_source.contains("as_deref_mut().map_or"),
         "{optional_source}"
     );
-    assert!(optional_source.contains(".as_mut()"), "{optional_source}");
+    assert!(optional_source.contains("b: *mut i32"), "{optional_source}");
+    assert!(super::verify::type_checks_str(&optional_source));
 }
 
 #[test]
 fn a5_w1_r_b_and_positive_retention_reclassify_under_their_own_evidence() {
-    let missing = e3_attempt_with(A5_RB_OVERLAP, true, &force_a5_rb_forms);
+    let missing = e3_a5_raw_role_attempt(A5_RB_OVERLAP, &force_a5_rb_forms, None, false);
     assert!(!e2_root_text(&missing).contains("__crat_a5_raw_"));
     assert!(
         missing
@@ -10501,7 +10634,7 @@ fn a5_w1_r_b_and_positive_retention_reclassify_under_their_own_evidence() {
     assert_eq!(missing_summary.held_nonmechanical, 1);
     assert_eq!(missing_rows.len(), 2);
 
-    let foster = e3_attempt_with_foster(A5_RB_OVERLAP, true, &force_a5_rb_forms);
+    let foster = e3_a5_raw_role_attempt(A5_RB_OVERLAP, &force_a5_rb_forms, None, true);
     let foster_source = e2_root_text(&foster);
     assert!(
         foster_source.contains("core::ptr::from_ref(p).cast_mut()"),
@@ -10523,7 +10656,7 @@ fn a5_w1_r_b_and_positive_retention_reclassify_under_their_own_evidence() {
         Ok(1)
     );
 
-    let retained = e3_attempt_with_foster(A5_POSITIVE_RETENTION, true, &force_a5_rb_forms);
+    let retained = e3_a5_raw_role_attempt(A5_POSITIVE_RETENTION, &force_a5_rb_forms, None, true);
     assert!(!e2_root_text(&retained).contains("__crat_a5_raw_"));
     let (retained_events, _, _) = retained
         .emission
@@ -10545,10 +10678,16 @@ fn a5_w1_r_b_and_positive_retention_reclassify_under_their_own_evidence() {
 /// root subject's form and abort the whole program.
 #[test]
 fn a5_term_w1_addr_of_classless_source_emits() {
-    let attempt = e3_attempt_with(A5_TERM_ADDR_OF, true, &force_a5_term_addr_of_forms);
+    let attempt =
+        e3_a5_raw_role_attempt(A5_TERM_ADDR_OF, &force_a5_term_addr_of_forms, None, false);
     let source = e2_root_text(&attempt);
     assert!(
-        !attempt.emission.plan.terminal_a5_raw_calls.is_empty(),
+        !attempt
+            .emission
+            .plan
+            .terminal_call_plans
+            .a5_raw_calls
+            .is_empty(),
         "source={source}\nreceipt={}\nclasses={:#?}",
         attempt.receipt,
         attempt.emission.plan.class_finalization,
@@ -10557,7 +10696,8 @@ fn a5_term_w1_addr_of_classless_source_emits() {
         attempt
             .emission
             .plan
-            .terminal_a5_raw_calls
+            .terminal_call_plans
+            .a5_raw_calls
             .iter()
             .flat_map(|call| &call.views)
             .any(|view| {
@@ -10565,7 +10705,7 @@ fn a5_term_w1_addr_of_classless_source_emits() {
                     && matches!(view.found_form, super::decision::seam::Form::Ref { .. })
             }),
         "{:#?}",
-        attempt.emission.plan.terminal_a5_raw_calls,
+        attempt.emission.plan.terminal_call_plans.a5_raw_calls,
     );
     let (events, rows, _) = attempt
         .emission
@@ -10586,15 +10726,13 @@ fn a5_term_w1_addr_of_classless_source_emits() {
     assert!(ast_source.contains("let __crat_a5_raw_"), "{ast_source}");
 }
 
-/// A5-TERM-W2 (addendum 201): a view planned from a safe bare local can see a
-/// raw terminal source after its source class is held. The site must re-plan
-/// through raw passthrough and the existing raw-to-safe template, or hold only
-/// its owner class; it may never return a program-level emission error.
+/// A5-TERM-W2, migrated under R231: actually revert the caller class.
+/// The old post-synthesis Decision mutation left a class-less Raw subject,
+/// not the held safe source this control claims to exercise.
 #[test]
 fn a5_term_w2_held_bare_local_replans_or_holds_owner_class() {
-    let attempt = e3_attempt_with_post(
+    let attempt = e3_a5_raw_role_attempt(
         E3_OVERLAP,
-        true,
         &|table| {
             force_a5_same_form(
                 table,
@@ -10604,87 +10742,62 @@ fn a5_term_w2_held_bare_local_replans_or_holds_owner_class() {
                 },
             );
         },
-        &|table| {
-            let caller = table
-                .entries
-                .iter_mut()
-                .find(|(subject, _)| subject.label.ends_with("caller::p"))
-                .map(|(subject, decision)| {
-                    *decision = super::decision::Decision::Degraded(super::decision::Degradation {
-                        subject: subject.label.clone(),
-                        site: "<a5-term-w2-held-after-plan>".to_owned(),
-                        reason: super::decision::DegradeReason::PairRawView,
-                    });
-                    subject.fn_did
-                })
-                .expect("W2 caller subject");
-            // Fixture receipt: isolate terminal re-planning from the separate
-            // generated/interface dependency rule. Production dependencies
-            // remain untouched.
-            table
-                .seams
-                .interface_dependencies
-                .retain(|(_, dependency)| dependency.local_def_id() != caller);
-        },
+        Some("caller::p"),
+        false,
     );
-    let source = e2_root_text(&attempt);
-    let replanned = attempt
+    let source = attempt
+        .reverted_ast_source
+        .as_deref()
+        .expect("actual caller-class revert source");
+    assert!(
+        super::verify::type_checks_str(source),
+        "terminal primary/source interface: {source}"
+    );
+    assert!(source.contains("fn caller(p: *mut i32)"), "{source}");
+    let selected = attempt
         .emission
         .plan
-        .terminal_a5_raw_calls
+        .terminal_call_plans
+        .a5_raw_calls
         .iter()
         .flat_map(|call| &call.views)
-        .find(|view| view.found_form == super::decision::seam::Form::Raw);
-    let held_reason = attempt
+        .filter_map(|view| view.input_rendering.as_ref())
+        .find(|view| view.found_form == super::decision::seam::Form::Raw)
+        .expect("the reverted source selects a sealed input-form twin");
+    assert_eq!(selected.expected_form, super::decision::seam::Form::Raw);
+    assert_eq!(selected.template, "raw-passthrough");
+    assert_eq!(
+        selected.adapted_expression,
+        super::c9::A5_RAW_VALUE_PLACEHOLDER
+    );
+    assert!(
+        source.contains("let __crat_a5_raw_") && source.contains(" = p;"),
+        "{source}"
+    );
+    assert!(
+        source.contains("core::slice::from_raw_parts_mut"),
+        "the surviving safe primary retains its own input adapter: {source}"
+    );
+    let (events, rows, _) = attempt
         .emission
         .plan
-        .class_finalization
-        .classes
-        .values()
-        .flat_map(|class| class.hold_reasons())
-        .any(|reason| reason.starts_with("a5-terminal-replan-unavailable:"));
+        .mechanical_receipts(&std::collections::BTreeSet::new());
     assert!(
-        replanned.is_some_and(|view| {
-            view.template.starts_with("raw-passthrough->c-raw-")
-                && view.adapted_expression.contains("from_raw_parts_mut")
-        }) || held_reason,
-        "source={source}\nplan={:#?}",
-        attempt.emission.plan.class_finalization,
+        super::mechanical_receipt::reconcile_mechanical_obligations(&events)
+            .unwrap()
+            .applied
+            > 0
     );
-    if let Some(view) = replanned {
-        assert_eq!(
-            view.expected_form,
-            super::decision::seam::Form::Slice { mutable: true }
-        );
-        let (events, rows, _) = attempt
-            .emission
-            .plan
-            .mechanical_receipts(&std::collections::BTreeSet::new());
-        assert!(
-            super::mechanical_receipt::reconcile_mechanical_obligations(&events)
-                .expect("W2 receipt reconciliation")
-                .applied
-                > 0
-        );
-        assert!(rows.iter().any(|row| {
-            row.raw_view_template.starts_with("raw-passthrough->c-raw-")
-                && row.retention
-                    == super::mechanical_receipt::MechanicalRetention::T2 {
-                        waiver_id: super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
-                    }
+    assert!(rows.iter().any(|row| row.retention
+        == super::mechanical_receipt::MechanicalRetention::T2 {
+            waiver_id: super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.into(),
         }));
-        let ast_source = attempt.ast_source.as_deref().expect("W2 AST source");
-        assert!(ast_source.contains("let __crat_a5_raw_"), "{ast_source}");
-        assert!(
-            ast_source.contains("core::slice::from_raw_parts_mut"),
-            "{ast_source}"
-        );
-    }
 }
 
 #[test]
 fn a5_term_w2_unavailable_replan_holds_only_the_owner_class() {
     let attempt = e3_attempt_with_foster_post(A5_RB_OVERLAP, true, &force_a5_rb_forms, &|table| {
+        seal_injected_a5_raw_roles(table);
         for call in &mut table.seams.a5_raw_calls {
             for view in &mut call.views {
                 view.negative_write = None;
@@ -10698,7 +10811,7 @@ fn a5_term_w2_unavailable_replan_holds_only_the_owner_class() {
         .classes
         .values()
         .flat_map(|class| class.hold_reasons())
-        .filter(|reason| reason.starts_with("a5-terminal-replan-unavailable:"))
+        .filter(|reason| reason.starts_with("a5-fallback-unrenderable:terminal-replan;"))
         .collect::<Vec<_>>();
     assert_eq!(
         reasons.len(),
@@ -10706,8 +10819,8 @@ fn a5_term_w2_unavailable_replan_holds_only_the_owner_class() {
         "{:#?}",
         attempt.emission.plan.class_finalization
     );
-    assert!(reasons[0].contains("planned=ref-mut<-ref-shared"));
-    assert!(reasons[0].contains("terminal=ref-mut<-ref-shared"));
+    assert!(reasons[0].contains("planned=raw<-ref-shared"));
+    assert!(reasons[0].contains("terminal=raw<-ref-shared"));
     let (events, _, _) = attempt
         .emission
         .plan
@@ -10719,7 +10832,7 @@ fn a5_term_w2_unavailable_replan_holds_only_the_owner_class() {
                 &event.terminal_reason,
                 Some(super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
                     reason
-                )) if reason.starts_with("a5-terminal-replan-unavailable:")
+                )) if reason.starts_with("a5-fallback-unrenderable:terminal-replan;")
             )
     }));
 }
@@ -10748,9 +10861,8 @@ fn revert_found_form_w4_reverted_caller_uses_raw_to_safe_twin() {
 /// source subject is reverted; a stale safe-source renderer must not survive.
 #[test]
 fn revert_found_form_w5_reverted_a5_source_uses_input_twin() {
-    let attempt = e3_attempt_with_runtime_revert(
+    let attempt = e3_a5_raw_role_attempt(
         E3_OVERLAP,
-        true,
         &|table| {
             force_a5_same_form(
                 table,
@@ -10760,7 +10872,8 @@ fn revert_found_form_w5_reverted_a5_source_uses_input_twin() {
                 },
             );
         },
-        "caller::p",
+        Some("caller::p"),
+        false,
     );
     let source = attempt
         .reverted_ast_source
@@ -11705,7 +11818,7 @@ fn d3_w1_generated_inner_use_depends_on_ready_defining_class() {
                 &reverts,
                 None,
                 &table,
-                Some(&emission.plan.terminal_a5_raw_calls),
+                Some(&emission.plan.terminal_call_plans),
             )?;
             let emitted = files
                 .values()
@@ -11785,6 +11898,16 @@ fn d13_w2_pair_parse_failure_is_a_source_carrying_class_site() {
                 argument_index: 1,
                 raw_expression: "p".to_owned(),
                 target_type: "*const i8".to_owned(),
+                source_node: None,
+                argument_expression: "p".into(),
+                argument_shape: "raw-expr",
+                target: super::decision::raw_boundary::RawTargetType {
+                    rendered: "*const i8".into(),
+                    pointee: "i8".into(),
+                    mutability: super::decision::raw_boundary::RawMutability::Const,
+                    depth2: None,
+                },
+                input_rendering: None,
             }],
             reasons: vec!["pair-t2".to_owned()],
             atom_ids: vec!["site".to_owned()],
@@ -11856,6 +11979,13 @@ fn d13_w3_pair_parse_failure_does_not_abort_program_emission() {
                     argument_index: 0,
                     raw_expression: "p".to_owned(),
                     target_type: "*mut i32".to_owned(),
+                    source_node: None,
+                    argument_expression: "p".into(), argument_shape: "raw-expr",
+                    target: super::decision::raw_boundary::RawTargetType {
+                        rendered: "*mut i32".into(), pointee: "i32".into(),
+                        mutability: super::decision::raw_boundary::RawMutability::Mut, depth2: None,
+                    },
+                    input_rendering: None,
                 }],
                 reasons: vec!["pair-t2".to_owned()],
                 atom_ids: vec!["d13-site".to_owned()],
@@ -12150,7 +12280,7 @@ fn slu_w1_assert_use_receipt_count(
             )?;
             let (files, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
-                Some(&emission.plan.terminal_a5_raw_calls),
+                Some(&emission.plan.terminal_call_plans),
             )?;
             Ok::<_, String>((
                 emission.plan.mechanical_receipts(&BTreeSet::new()).0,
@@ -12404,7 +12534,7 @@ fn slu_w1_positive_retention_stays_held() {
         )?;
         let (files, _, _) = super::ast_transform::ast_emitted_files_from(
             tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
-            Some(&emission.plan.terminal_a5_raw_calls),
+            Some(&emission.plan.terminal_call_plans),
         )?;
         for label in ["raw_keep::q", "target::p"] {
             let (subject, _) = table.entries.iter().find(|(subject, _)| subject.label == label)
@@ -13818,7 +13948,7 @@ fn opt_w1_exact_span_composition_keeps_the_completed_option_value() {
             &reverts,
             emission.plan.root_file.as_ref(),
             &table,
-            Some(&emission.plan.terminal_a5_raw_calls),
+            Some(&emission.plan.terminal_call_plans),
         )
         .unwrap();
         files.into_values().next().unwrap()

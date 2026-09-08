@@ -95,6 +95,14 @@ pub(crate) mod ast_bridge;
 /// composition guard built beside its first arm.
 pub(crate) mod ast_transform;
 #[cfg(test)]
+pub(crate) mod bridge_custody_export;
+#[cfg(test)]
+pub(crate) mod bridge_custody_match;
+#[cfg(test)]
+pub(crate) mod bridge_custody_syntax;
+#[cfg(test)]
+mod bridge_custody_tests;
+#[cfg(test)]
 mod declaration_pattern_tests;
 #[cfg(test)]
 mod declaration_tests;
@@ -111,9 +119,31 @@ mod option_projection_tests;
 #[cfg(test)]
 mod r216_boundary_tests;
 #[cfg(test)]
+mod r233_shape_emission_tests;
+#[cfg(test)]
+mod retalias_semantics_tests;
+#[cfg(test)]
+mod return_alias_tests;
+#[cfg(test)]
+mod return_atom_lifetime_tests;
+#[cfg(test)]
+mod return_family_premise_tests;
+#[cfg(test)]
+mod return_terminal_tests;
+#[cfg(test)]
+mod returned_child_terminal_view_tests;
+#[cfg(test)]
+mod returned_child_tests;
+#[cfg(test)]
 mod revert_input_tests;
 #[cfg(test)]
+mod seam_terminal_tests;
+#[cfg(test)]
+mod sibling_overlap_tests;
+#[cfg(test)]
 mod slice_use_inventory_tests;
+#[cfg(test)]
+mod zero_syntax_custody_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct E1EditContext {
@@ -219,6 +249,10 @@ pub(crate) struct E2Timings {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RawBoundaryArtifacts {
+    #[cfg(test)]
+    pub(crate) bridge_custody_export: bridge_custody_export::Export,
+    pub(crate) pending_sibling_receipts: Vec<plan::sibling_overlap::PendingSite>,
+    pub(crate) sibling_coverage_gaps: Vec<decision::sibling_overlap::CoverageGapReceipt>,
     /// R219: independent emitted-tree custody checks retain the exact decided
     /// form, including distinctions absent from the historical coarse seed.
     pub(crate) custody_expectations: Vec<DeliveryExpectation>,
@@ -975,6 +1009,17 @@ fn rewrite_core_injected_with_config(
                     .join(" | ")
             ));
         }
+        #[cfg(test)]
+        if census_once || raw_boundary_full {
+            decide_ctx.raw_boundary_artifacts.bridge_custody_export =
+                artifact::bridge_custody_export(
+                    tcx,
+                    &capture,
+                    &table,
+                    &emission_plan,
+                    &original_files,
+                );
+        }
         let e1_subject_receipt = if census_once {
             decide_ctx.raw_boundary_artifacts.custody_expectations =
                 delivery_expectations(tcx, &table);
@@ -1246,7 +1291,7 @@ fn round_files(
         &reverts,
         root_key,
         table,
-        Some(&emission_plan.terminal_a5_raw_calls),
+        Some(&emission_plan.terminal_call_plans),
     )?;
     if !emission_plan.class_finalization.classes.is_empty()
         && emission_plan
@@ -1298,12 +1343,25 @@ fn refresh_raw_boundary_receipt_events(
     artifacts: &mut RawBoundaryArtifacts,
     emission_plan: &plan::Plan,
     reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
 ) {
     assert_eq!(
         emission_plan.unowned_a5_proof_sites, 0,
         "unowned A5 proof-site receipt identities"
     );
-    artifacts.bridge_events = emission_plan.bridge_events(reverted);
+    artifacts.bridge_events = emission_plan.bridge_events_with_atoms(reverted, reverted_atoms);
+    artifacts.pending_sibling_receipts =
+        emission_plan.pending_sibling_receipts_with_atoms(reverted, reverted_atoms);
+    artifacts.sibling_coverage_gaps =
+        emission_plan.sibling_coverage_gaps_with_atoms(reverted, reverted_atoms);
+    #[cfg(test)]
+    bridge_custody_export::refresh(
+        &mut artifacts.bridge_custody_export,
+        emission_plan,
+        reverted,
+        &artifacts.pending_sibling_receipts,
+        &artifacts.sibling_coverage_gaps,
+    );
     artifacts.unsafe_context_events = emission_plan.unsafe_context_events(reverted);
     let (mechanical_events, a5_rows, slice_rows) = emission_plan.mechanical_receipts(reverted);
     artifacts.mechanical_events = mechanical_events;
@@ -1361,6 +1419,7 @@ fn verify_and_revert(
     refresh_raw_boundary_receipt_events(
         &mut raw_boundary_artifacts,
         &emission_plan,
+        &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
     );
     raw_boundary_artifacts.class_collisions = render_class_collisions(&emission_plan);
@@ -1865,6 +1924,7 @@ fn verify_and_revert(
                     &mut facts.raw_boundary_artifacts,
                     &emission_plan,
                     &reverted,
+                    &reverted_atoms,
                 );
                 record_unresolved_classes(
                     &mut facts.raw_boundary_artifacts,
@@ -1904,6 +1964,7 @@ fn verify_and_revert(
                 &mut facts.raw_boundary_artifacts,
                 &emission_plan,
                 &reverted,
+                &reverted_atoms,
             );
             return facts.emitted(source, files);
         }
@@ -2223,6 +2284,7 @@ fn verify_and_revert(
             &mut facts.raw_boundary_artifacts,
             &emission_plan,
             &final_reverted,
+            &reverted_atoms,
         );
         record_unresolved_classes(
             &mut facts.raw_boundary_artifacts,
@@ -2341,6 +2403,7 @@ fn verify_and_revert(
                 &mut facts.raw_boundary_artifacts,
                 &emission_plan,
                 &final_reverted,
+                &reverted_atoms,
             );
             facts.emitted(source, final_files)
         }
@@ -4609,6 +4672,7 @@ fn pair_raw_view_failure_site(
             u32::try_from(hi).unwrap_or(u32::MAX),
         ),
         edit_key: "-".to_owned(),
+        atom_ids: Vec::new(),
         state: plan::ClassSiteState::Dropped(format!(
             "c9-source-held:{}:argument-text={}:argument-hex={}",
             error.replace(['\t', '\r', '\n'], " "),
@@ -4681,7 +4745,13 @@ fn terminal_subject_form(
         .find(|(subject, _)| subject.fn_did == key.0 && subject.hir_id == key.1)
         .and_then(|(_, decision)| terminal_application(decision, live))
         .map(decision::seam::form_of);
-    terminal_interface_form(decision::seam::Form::Raw, placed, live)
+    let input = table
+        .input_interfaces
+        .subject_forms
+        .get(&key)
+        .copied()
+        .unwrap_or(decision::seam::Form::Raw);
+    terminal_interface_form(input, placed, live)
 }
 
 fn terminal_parameter_form(
@@ -4706,7 +4776,224 @@ fn terminal_parameter_form(
         })
         .and_then(|(_, decision)| terminal_application(decision, live))
         .map(decision::seam::form_of);
-    terminal_interface_form(decision::seam::Form::Raw, placed, live)
+    let input = table
+        .input_interfaces
+        .parameter_forms
+        .get(&(callee, argument_index))
+        .copied()
+        .unwrap_or(decision::seam::Form::Raw);
+    terminal_interface_form(input, placed, live)
+}
+
+fn seal_terminal_outbound_calls(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    planned: &mut plan::Plan,
+) -> Result<(), String> {
+    use decision::{
+        raw_boundary::BridgeTemplate,
+        seam::{Form, GlueCore, GlueSpec, SeamInputRendering},
+    };
+    loop {
+        let before = planned.held_classes();
+        let candidates = planned.terminal_call_plans.seam_edits.clone();
+        for (index, old) in candidates.iter().enumerate() {
+            let Some(endpoint) = old.raw_outbound.as_ref() else { continue };
+            let live = planned
+                .class_finalization
+                .classes
+                .get(&old.owner_class)
+                .is_some_and(plan::SignatureClassPlan::is_ready);
+            if !live {
+                continue;
+            }
+            let Some(node) = old.source_node else {
+                planned.hold_terminal_class(
+                    old.owner_class,
+                    decision::Arm::C,
+                    "outbound-terminal-source",
+                    "outbound-terminal-source-missing".to_owned(),
+                );
+                continue;
+            };
+            let terminal = terminal_subject_form(table, &planned.class_finalization, node);
+            if let Err(permission) = decision::seam::terminal_returned_child_permission(
+                endpoint.returned_child.as_ref(),
+                old.source_shape,
+                terminal,
+            ) {
+                let reason = match permission {
+                    decision::raw_boundary::ReturnedChildPermissionFailure::Writes => {
+                        "returned-child-writes"
+                    }
+                    decision::raw_boundary::ReturnedChildPermissionFailure::Unknown => {
+                        "returned-child-permission-unknown"
+                    }
+                };
+                planned.hold_terminal_class(
+                    old.owner_class,
+                    decision::Arm::C,
+                    "outbound-returned-child-permission",
+                    format!("outbound-terminal:{reason}"),
+                );
+                continue;
+            }
+            let current = table
+                .entries
+                .iter()
+                .find(|(subject, _)| (subject.fn_did, subject.hir_id) == node)
+                .and_then(|(_, decision)| terminal_application(decision, live));
+            let mut sealed = old.clone();
+            sealed.found = terminal;
+            sealed.bridge.found_form = terminal.key().to_owned();
+            sealed.input_rendering = Some(SeamInputRendering::ZeroSyntax { found: Form::Raw });
+            if let Some(current) = current {
+                let reference_view =
+                    decision::raw_boundary::outbound_reference_view(current, old.source_shape);
+                let effective_source = reference_view.as_ref().unwrap_or(current);
+                if let Some(view) = &reference_view {
+                    sealed.found = decision::seam::form_of(view);
+                    sealed.bridge.found_form = sealed.found.key().to_owned();
+                }
+                let template = if old
+                    .spec
+                    .raw_boundary
+                    .as_ref()
+                    .is_some_and(|raw| raw.template == BridgeTemplate::TypedRawTemporary)
+                {
+                    Ok(BridgeTemplate::TypedRawTemporary)
+                } else {
+                    decision::raw_boundary::template_for(
+                        effective_source,
+                        &endpoint.target,
+                        endpoint.ownership,
+                        endpoint.negative_write,
+                    )
+                };
+                let template = match template {
+                    Ok(template) => template,
+                    Err(reason) => {
+                        planned.hold_terminal_class(
+                            old.owner_class,
+                            decision::Arm::C,
+                            "outbound-terminal-template",
+                            format!("outbound-terminal-template:{}", reason.key()),
+                        );
+                        continue;
+                    }
+                };
+                let template = if let Some(child) = endpoint
+                    .returned_child
+                    .as_ref()
+                    .filter(|child| !(child.raw_field_parent && old.source_shape == "raw-expr"))
+                {
+                    let selected = decision::raw_boundary::returned_child_template(
+                        effective_source,
+                        &endpoint.target,
+                        child.child.as_ref().ok().map(|child| &child.access),
+                        template,
+                    );
+                    match selected {
+                        Ok(selected)
+                            if !selected.mutable_binding_required
+                                || table.option_mut_bindings.contains(&node) =>
+                        {
+                            selected.template
+                        }
+                        Ok(_) => {
+                            planned.hold_terminal_class(
+                                old.owner_class,
+                                decision::Arm::C,
+                                "outbound-terminal-mutable-binding",
+                                "outbound-terminal-mutable-binding-unplanned".into(),
+                            );
+                            continue;
+                        }
+                        Err(reason) => {
+                            planned.hold_terminal_class(
+                                old.owner_class,
+                                decision::Arm::C,
+                                "outbound-returned-child-view",
+                                format!("outbound-terminal:{}", reason.key()),
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    template
+                };
+                let spec = GlueSpec::raw_boundary_target(
+                    template,
+                    &endpoint.target,
+                    endpoint.box_slice,
+                    false,
+                );
+                let Some(replacement) = spec
+                    .render_in_context(&endpoint.operand_expression, endpoint.enclosing_unsafe_fn)
+                else {
+                    planned.hold_terminal_class(
+                        old.owner_class,
+                        decision::Arm::C,
+                        "outbound-terminal-render",
+                        "outbound-terminal-render-unavailable".to_owned(),
+                    );
+                    continue;
+                };
+                sealed.spec = spec;
+                sealed.replacement = replacement;
+                sealed.bridge.bridge_kind = template.key().to_owned();
+                // Existing borrowed-to-raw coercions still count as sites,
+                // while needing no syntax edit at the original argument.
+                sealed.zero_syntax = matches!(
+                    template.render(
+                        &endpoint.operand_expression,
+                        endpoint.target.mutability,
+                        endpoint.box_slice,
+                        sealed
+                            .spec
+                            .raw_boundary
+                            .as_ref()
+                            .and_then(|raw| raw.cast_pointee.as_deref())
+                    ),
+                    Ok(decision::raw_boundary::BridgeRender::ZeroSyntax)
+                );
+            } else {
+                // No safe declaration was applied for this source. The input
+                // argument already obeys the original raw ABI, including its
+                // pointee cast. A view through the earlier Ref is invalid.
+                sealed.spec = GlueSpec::core(GlueCore::Bare, false);
+                sealed.arg_span = sealed.span;
+                sealed.replacement = endpoint.original_expression.clone();
+                sealed.zero_syntax = true;
+                sealed.bridge.bridge_kind = "outbound-input-form".to_owned();
+                sealed.bridge.retention = bridge_receipt::BridgeRetentionTier::None;
+                sealed.bridge.waiver_id = None;
+                sealed.bridge.extent = bridge_receipt::BridgeExtentKind::None;
+            }
+            if sealed != *old {
+                let source = tcx.sess.source_map().lookup_source_file(old.span.lo());
+                let file = file_key(&source.name).ok_or("terminal-outbound-file-unmapped")?;
+                let lo = old
+                    .span
+                    .lo()
+                    .0
+                    .checked_sub(source.start_pos.0)
+                    .ok_or("terminal-outbound-span-before-file")? as usize;
+                let hi = old
+                    .span
+                    .hi()
+                    .0
+                    .checked_sub(source.start_pos.0)
+                    .ok_or("terminal-outbound-span-before-file")? as usize;
+                planned.replace_terminal_seam(old, &sealed, (file, lo, hi))?;
+                planned.terminal_call_plans.seam_edits[index] = sealed;
+            }
+        }
+        if planned.held_classes() == before {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn validate_terminal_option_calls(
@@ -4964,30 +5251,65 @@ fn prepare_plan_files<'tcx>(
             waiver_id: Some(bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
             unsafe_context: call.views.iter().find_map(|view| view.unsafe_context),
         };
-        let file_label = match &file {
-            plan::FileKey::Real(path) => path.display().to_string(),
-            plan::FileKey::Virtual(name) => name.clone(),
+        let views = call
+            .views
+            .iter()
+            .map(|view| {
+                (
+                    view.argument_index,
+                    view.raw_expression.clone(),
+                    view.target_type.clone(),
+                    view.adapted_expression.clone(),
+                    view.extent_expression.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let stem = format!("__crat_a5_raw_{}", call.call_span.lo().0);
+        let replacement = match c9::render_a5_raw_view_source(&original, &stem, &views) {
+            Ok(replacement)
+                if call.views.iter().all(|view| {
+                    view.expected_form == decision::seam::Form::Raw
+                        && view.adapted_expression == c9::A5_RAW_VALUE_PLACEHOLDER
+                }) =>
+            {
+                replacement
+            }
+            result => {
+                let reason = match result {
+                    Ok(_) => "non-raw-target-or-argument".to_owned(),
+                    Err(why) => why,
+                };
+                planned.preclass_sites.push(plan::ClassSite::dropped(
+                    call.owner_class,
+                    call.owner_class,
+                    decision::Arm::Pair,
+                    "a5-fallback-unrenderable",
+                    format!("a5-fallback-unrenderable:{reason}"),
+                ));
+                continue;
+            }
         };
-        planned.preclass_sites.push(plan::ClassSite {
-            key: bridge.materialize(
-                call.owner_class,
-                file_label.clone(),
-                u32::try_from(lo).unwrap_or(u32::MAX),
-                u32::try_from(hi).unwrap_or(u32::MAX),
-            ),
-            edit_key: format!(
-                "class={}|arm=PAIR|interval={file_label}:{lo}:{hi}|kind=a5-site-proof-t2-fallback|proofs={proof_keys}",
-                call.owner_class.order_key(),
-            ),
-            state: plan::ClassSiteState::EditReady,
-            expected_form: bridge.expected_form.clone(),
-            found_form: bridge.found_form.clone(),
-            argument_kind: bridge.argument_kind.clone(),
-            extent: bridge.extent.clone(),
-            retention: bridge.retention,
-            waiver_id: bridge.waiver_id.clone(),
-            unsafe_context: bridge.unsafe_context,
-        });
+        planned
+            .by_file
+            .entry(file.clone())
+            .or_default()
+            .push(plan::Edit {
+                lo,
+                hi,
+                replacement,
+                justification: plan::Justification::A5RawView,
+                owner_class: Some(call.owner_class),
+                owner_path: tcx.def_path_str(call.callee.to_def_id()),
+                bridge: Some(bridge.clone()),
+                atom_ids: Vec::new(),
+                subject_id: format!(
+                    "a5-proof-call:{}..{}",
+                    call.call_span.lo().0,
+                    call.call_span.hi().0
+                ),
+                required_arms: "PAIR".to_owned(),
+                edit_kind: "a5-proof-site-raw-view",
+            });
         pending_a5_raw_calls.push(PendingA5RawViewCall {
             call: call.clone(),
             file,
@@ -5112,6 +5434,7 @@ fn prepare_plan_files<'tcx>(
             edit_kind: "pair-copy-snapshot",
         });
     }
+    plan::link_a5_fallback_carriers(&mut planned, table, span_to_loc);
     plan::finalize_signature_classes(&mut planned, table, reverted);
     let mut terminal_a5_raw_calls = Vec::new();
     for mut pending in pending_a5_raw_calls {
@@ -5143,9 +5466,19 @@ fn prepare_plan_files<'tcx>(
             match decision::seam::replan_a5_raw_view(view, terminal_target, terminal_source) {
                 Ok(mut replanned) => {
                     if view.source_node.is_some() {
+                        let original_subject = view.source_node.and_then(|node| {
+                            table.input_interfaces.subject_forms.get(&node).copied()
+                        });
+                        if matches!(view.argument_shape, "bare-local" | "cast-of-local")
+                            && original_subject.is_none()
+                        {
+                            terminal_hold =
+                                Some("a5-fallback-unrenderable:input-subject-form-absent".into());
+                            break;
+                        }
                         let input_found = decision::seam::a5_argument_expression_form(
                             view.argument_shape,
-                            decision::seam::Form::Raw,
+                            original_subject.unwrap_or(decision::seam::Form::Raw),
                         )
                         .unwrap_or(decision::seam::Form::Raw);
                         match decision::seam::replan_a5_raw_view(
@@ -5159,7 +5492,7 @@ fn prepare_plan_files<'tcx>(
                             }
                             Err(_) => {
                                 terminal_hold = Some(format!(
-                                    "a5-terminal-replan-unavailable:planned={}<-{};terminal={}<-{}",
+                                    "a5-fallback-unrenderable:terminal-replan;planned={}<-{};terminal={}<-{}",
                                     view.expected_form.key(),
                                     view.found_form.key(),
                                     terminal_target.key(),
@@ -5187,7 +5520,7 @@ fn prepare_plan_files<'tcx>(
                 }
                 Err(_) => {
                     terminal_hold = Some(format!(
-                        "a5-terminal-replan-unavailable:planned={}<-{};terminal={}<-{}",
+                        "a5-fallback-unrenderable:terminal-replan;planned={}<-{};terminal={}<-{}",
                         view.expected_form.key(),
                         view.found_form.key(),
                         terminal_target.key(),
@@ -5253,30 +5586,34 @@ fn prepare_plan_files<'tcx>(
             .collect::<Vec<_>>();
         let stem = format!("__crat_a5_raw_{}", pending.call.call_span.lo().0);
         let replacement = c9::render_a5_raw_view_source(&pending.source, &stem, &views)?;
-        planned
-            .by_file
-            .entry(pending.file)
-            .or_default()
-            .push(plan::Edit {
-                lo: pending.lo,
-                hi: pending.hi,
-                replacement,
-                justification: plan::Justification::A5RawView,
-                owner_class: Some(pending.call.owner_class),
-                owner_path: tcx.def_path_str(pending.call.callee.to_def_id()),
-                bridge: Some(pending.bridge),
-                atom_ids: Vec::new(),
-                subject_id: format!(
-                    "a5-proof-call:{}..{}",
-                    pending.call.call_span.lo().0,
-                    pending.call.call_span.hi().0
-                ),
-                required_arms: "PAIR".to_owned(),
-                edit_kind: "a5-proof-site-raw-view",
-            });
+        let edit = plan::Edit {
+            lo: pending.lo,
+            hi: pending.hi,
+            replacement,
+            justification: plan::Justification::A5RawView,
+            owner_class: Some(pending.call.owner_class),
+            owner_path: tcx.def_path_str(pending.call.callee.to_def_id()),
+            bridge: Some(pending.bridge.clone()),
+            atom_ids: Vec::new(),
+            subject_id: format!(
+                "a5-proof-call:{}..{}",
+                pending.call.call_span.lo().0,
+                pending.call.call_span.hi().0
+            ),
+            required_arms: "PAIR".to_owned(),
+            edit_kind: "a5-proof-site-raw-view",
+        };
+        planned.replace_terminal_a5_edit(&pending.file, edit, &pending.call.views)?;
         terminal_a5_raw_calls.push(pending.call);
     }
-    validate_terminal_option_calls(tcx, table, &mut planned);
+    loop {
+        let before = planned.held_classes();
+        validate_terminal_option_calls(tcx, table, &mut planned);
+        seal_terminal_outbound_calls(tcx, table, &mut planned)?;
+        if planned.held_classes() == before {
+            break;
+        }
+    }
     let ready_a5_classes = planned
         .class_finalization
         .classes
@@ -5285,7 +5622,7 @@ fn prepare_plan_files<'tcx>(
         .map(|class| class.id)
         .collect::<std::collections::BTreeSet<_>>();
     terminal_a5_raw_calls.retain(|call| ready_a5_classes.contains(&call.owner_class));
-    planned.terminal_a5_raw_calls = terminal_a5_raw_calls;
+    planned.terminal_call_plans.a5_raw_calls = terminal_a5_raw_calls;
     // **The crate root, asked of the compiler rather than guessed** — not
     // `files()[0]`, which is source-map insertion order, and not the first
     // planned file, which is whichever file happened to hold an edit.
@@ -5365,6 +5702,8 @@ fn prepare_plan_files<'tcx>(
                 reasons.join(";"),
             );
         }
+        validate_terminal_option_calls(tcx, table, &mut planned);
+        seal_terminal_outbound_calls(tcx, table, &mut planned)?;
     };
     Ok(Emission {
         files,
@@ -5737,6 +6076,7 @@ fn finish_decide<'tcx>(
     perturb(&mut subjects);
     let declaration_pointees = decision::declaration::collect(tcx, &subjects);
     let declaration_patterns = decision::declaration_pattern::collect(tcx, &subjects);
+    let input_interfaces = decision::interface::collect(tcx, &subjects, &program.functions);
     let mut facts = decision::emitability::collect(tcx, &program.functions);
     let original_body_adapters = facts.body_adapters.clone();
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
@@ -5936,7 +6276,22 @@ fn finish_decide<'tcx>(
     let mut retired = additive::RetiredReceipts::default();
     let mut family_receipts = Vec::new();
     let original_c9_plans = retained_c9_plans.clone();
+    let mut a5_role_profile = None;
+    let mut a5_roles: Vec<decision::co_conversion::PairSiteDecision> = Vec::new();
+    let mut a5_role_proofs: Vec<decision::seam::A5PositionProof> = Vec::new();
+    let a5_role_bound = facts
+        .call_args
+        .values()
+        .flatten()
+        .map(|site| site.args.len())
+        .sum::<usize>();
     loop {
+        let profile = (family_policy.stage, family_policy.withdrawn.clone());
+        if a5_role_profile.as_ref() != Some(&profile) {
+            a5_roles.clear();
+            a5_role_proofs.clear();
+            a5_role_profile = Some(profile);
+        }
         let mut ctors = ctors.clone();
         let mut subjects = subjects.clone();
         decision::declaration_pattern::augment(
@@ -5964,6 +6319,7 @@ fn finish_decide<'tcx>(
             family_policy: &family_policy,
             declaration_pointees: &declaration_pointees,
             declaration_patterns: &declaration_patterns,
+            input_interfaces: &input_interfaces,
             model: &model,
             slots: &slots,
             facts: &facts,
@@ -6052,16 +6408,17 @@ fn finish_decide<'tcx>(
         );
         let retention_fixpoint_wall_s = retention_started.elapsed().as_secs_f64();
         let raw_boundary_decision_started = std::time::Instant::now();
+        let boundary_hypothesis = a5_role_target_hypothesis(tcx, &e2_hypothetical, &a5_roles);
         let raw_boundary = decision::raw_boundary::RawBoundaryDispositionIndex::derive(
             &raw_boundary_sites,
             &retention,
-            &e2_hypothetical,
+            &boundary_hypothesis,
             &facts,
             &mut_facts,
         );
         let raw_boundary_decision_wall_s = raw_boundary_decision_started.elapsed().as_secs_f64();
         let coconv =
-            decision::co_conversion::build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
+            decision::co_conversion::build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_roles(
                 &facts,
                 &subjects,
                 &e2_hypothetical,
@@ -6072,6 +6429,7 @@ fn finish_decide<'tcx>(
                 &raw_boundary,
                 Some(&a5_site_proofs),
                 &retention,
+                &a5_roles,
             );
         // **Production is decided AFTER the classes**, because step 2's gate reads
         // them. No cycle: the hypothetical above was decided with `None`.
@@ -6207,6 +6565,53 @@ fn finish_decide<'tcx>(
                 &mut_facts,
             );
         }
+        // C-9 filtering can reveal a fallback only after co-conversion ran.
+        // Learn all exact raw roles together, then rebuild this profile's
+        // decision/planning suffix from the same frozen facts.
+        let mut a5_role_growth = false;
+        for (role, proof) in learn_a5_fallback_roles(&facts, &subjects, &mut table) {
+            if a5_roles.iter().any(|old| {
+                old.caller == role.caller
+                    && old.callee == role.callee
+                    && old.argument_index == role.argument_index
+                    && old.call_span == role.call_span
+            }) {
+                continue;
+            }
+            a5_roles.push(role);
+            a5_role_proofs.push(proof);
+            a5_role_growth = true;
+        }
+        if a5_role_growth {
+            if a5_roles.len() > a5_role_bound {
+                return Err("a5-fallback-role-invariant:call-argument-bound-exceeded".into());
+            }
+            continue;
+        }
+        restore_a5_role_obligations(
+            tcx,
+            &mut_facts,
+            &facts,
+            &a5_roles,
+            &a5_role_proofs,
+            &coconv,
+            &mut table,
+        );
+        let returned_child_mut_bindings = table
+            .seams
+            .edits
+            .iter()
+            .filter(|edit| {
+                edit.raw_outbound
+                    .as_ref()
+                    .is_some_and(|endpoint| endpoint.mutable_binding_required)
+            })
+            .filter_map(|edit| edit.source_node)
+            .collect::<Vec<_>>();
+        table
+            .option_mut_bindings
+            .extend(returned_child_mut_bindings);
+
         // Item 2 renders local raw-result constructors only after the terminal
         // seam set exists, so a contained raw-view/cast edit is composed into the
         // initializer rather than overwritten by an outer constructor.
@@ -6436,6 +6841,10 @@ fn finish_decide<'tcx>(
         };
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
+            #[cfg(test)]
+            bridge_custody_export: Default::default(),
+            pending_sibling_receipts: Vec::new(),
+            sibling_coverage_gaps: Vec::new(),
             custody_expectations: Vec::new(),
             additive_family_receipts: family_receipts,
             exposure: exposure.receipts_tsv(),
@@ -6509,32 +6918,321 @@ fn finish_decide<'tcx>(
         // milestone were spent on apparatus that claimed more than it checked, and
         // leaving a demoted version behind preserves the claim while removing the
         // substance.
-        return Ok((
-            table,
-            DecideCtx {
-                slots,
-                model,
-                mut_facts,
-                facts,
-                coconv,
-                lifetime_eligibility,
-                escapes,
-                subjects,
-                hypothetical,
-                retained_c9_plans,
-                a5_receipt,
-                analysis,
-                a5_site_proofs,
-                box_facts,
-                constructions: ctors,
-                raw_boundary_sites,
-                retention,
-                raw_boundary,
-                exposure,
-                raw_boundary_artifacts,
-                e2_artifacts,
+        let context = DecideCtx {
+            slots,
+            model,
+            mut_facts,
+            facts,
+            coconv,
+            lifetime_eligibility,
+            escapes,
+            subjects,
+            hypothetical,
+            retained_c9_plans,
+            a5_receipt,
+            analysis,
+            a5_site_proofs,
+            box_facts,
+            constructions: ctors,
+            raw_boundary_sites,
+            retention,
+            raw_boundary,
+            exposure,
+            raw_boundary_artifacts,
+            e2_artifacts,
+        };
+        table.sibling_overlap_inventory =
+            decision::sibling_overlap::collect_inventory(tcx, &context);
+        return Ok((table, context));
+    }
+}
+
+/// Feed a late seam's exact A5 raw-view obligation back to the ordinary
+/// parameter-role ladder. This reads compiler call facts, never receipt text.
+fn learn_a5_fallback_roles(
+    facts: &decision::emitability::EmitabilityFacts,
+    subjects: &[decision::Subject],
+    table: &mut decision::DecisionTable,
+) -> Vec<(
+    decision::co_conversion::PairSiteDecision,
+    decision::seam::A5PositionProof,
+)> {
+    use decision::{
+        Decision, SubjectKind,
+        co_conversion::{PairRole, PairTier},
+        seam::A5ProofSiteFallback,
+    };
+    let mut learned = Vec::new();
+    for proof in &mut table.seams.overlap_proofs {
+        if !matches!(proof.fallback, A5ProofSiteFallback::T2RawView { .. }) {
+            continue;
+        }
+        if proof.proof_site_key.is_none() {
+            proof.fallback = A5ProofSiteFallback::Held {
+                reason: "a5-fallback-unrenderable:proof-key-absent".into(),
+            };
+            continue;
+        }
+        let Some(subject) = subjects.iter().find(|subject| subject.fn_did == proof.callee
+            && matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == proof.index))
+        else {
+            proof.fallback = A5ProofSiteFallback::Held { reason: "a5-fallback-unrenderable:parameter-absent".into() };
+            continue;
+        };
+        let Some((_, current)) = table.entries.iter().find(|(candidate, _)| {
+            candidate.fn_did == subject.fn_did && candidate.hir_id == subject.hir_id
+        }) else {
+            continue;
+        };
+        match current {
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. } => {}
+            // Already-raw targets need a materialized call view but no new
+            // parameter presentation. Owning admission is never changed here.
+            Decision::Degraded(_) => continue,
+            Decision::Box(_) => {
+                proof.fallback = A5ProofSiteFallback::Held {
+                    reason: "a5-fallback-unrenderable:owning-parameter".into(),
+                };
+                continue;
+            }
+        }
+        let (caller, index, span) = (proof.caller, proof.index, proof.span.source_callsite());
+        let matches = facts
+            .call_args
+            .get(&proof.callee)
+            .into_iter()
+            .flatten()
+            .filter(|site| site.caller == caller)
+            .flat_map(|site| {
+                site.args
+                    .iter()
+                    .filter(move |argument| {
+                        argument.index == index && argument.span.source_callsite() == span
+                    })
+                    .map(move |argument| (site, argument))
+            })
+            .collect::<Vec<_>>();
+        let [(site, argument)] = matches.as_slice() else {
+            proof.fallback = A5ProofSiteFallback::Held {
+                reason: "a5-fallback-unrenderable:call-site-not-unique".into(),
+            };
+            continue;
+        };
+        let Some(target) = argument.target.clone() else {
+            proof.fallback = A5ProofSiteFallback::Held {
+                reason: "a5-fallback-unrenderable:raw-target-absent".into(),
+            };
+            continue;
+        };
+        learned.push((
+            decision::co_conversion::PairSiteDecision {
+                caller: proof.caller,
+                callee: proof.callee,
+                argument_index: proof.index,
+                span: proof.span,
+                call_span: site.span,
+                subject: (subject.fn_did, subject.hir_id),
+                source_node: argument.shape.place_root().map(|root| (site.caller, root)),
+                target: Some(target),
+                source_shape: argument.shape.key(),
+                role: PairRole::RawView,
+                tier: PairTier::T2,
+                verdict: proof.verdict,
+                reason: "a5-fallback-raw-view-role".into(),
+                peer_receipts: proof.peer_receipts.clone(),
+                a5_fallback: proof.proof_site_key,
             },
+            proof.clone(),
         ));
+    }
+    learned
+}
+
+fn a5_role_target_hypothesis(
+    tcx: TyCtxt<'_>,
+    original: &decision::DecisionTable,
+    roles: &[decision::co_conversion::PairSiteDecision],
+) -> decision::DecisionTable {
+    let mut adjusted = original.clone();
+    for (subject, choice) in &mut adjusted.entries {
+        if !roles.iter().any(|role| {
+            role.subject == (subject.fn_did, subject.hir_id)
+                && role.role == decision::co_conversion::PairRole::RawView
+        }) {
+            continue;
+        }
+        match choice {
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. } => {
+                *choice = decision::Decision::Degraded(decision::Degradation {
+                    subject: subject.identity_key(&tcx.def_path_str(subject.fn_did.to_def_id())),
+                    site: decision::emitability::EmitabilityFacts::site(
+                        tcx,
+                        subject.attribution_span(),
+                    ),
+                    reason: decision::DegradeReason::PairRawView,
+                });
+            }
+            decision::Decision::Box(_) | decision::Decision::Degraded(_) => {}
+        }
+    }
+    adjusted
+}
+
+fn a5_role_operand_span(argument: &decision::emitability::Arg) -> rustc_span::Span {
+    use decision::emitability::ArgShape;
+    match argument.shape {
+        ArgShape::AddrOfCast { inner, .. } | ArgShape::CastOfLocal { inner, .. } => inner,
+        _ => argument.span,
+    }
+}
+
+fn restore_a5_role_obligations(
+    tcx: TyCtxt<'_>,
+    mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
+    facts: &decision::emitability::EmitabilityFacts,
+    roles: &[decision::co_conversion::PairSiteDecision],
+    originals: &[decision::seam::A5PositionProof],
+    coconv: &decision::co_conversion::CoConv,
+    table: &mut decision::DecisionTable,
+) {
+    use decision::{
+        co_conversion::{PairRole, PairTier},
+        seam::{A5ProofSiteFallback, Form},
+    };
+    for (role, original) in roles.iter().zip(originals) {
+        let mut proof = original.clone();
+        proof.expected_form = Form::Raw;
+        let active = coconv.pair_sites().iter().find(|candidate| {
+            candidate.caller == role.caller
+                && candidate.callee == role.callee
+                && candidate.argument_index == role.argument_index
+                && candidate.call_span == role.call_span
+        });
+        let target_raw = table
+            .entries
+            .iter()
+            .find(|(subject, _)| (subject.fn_did, subject.hir_id) == role.subject)
+            .is_some_and(|(_, choice)| decision::seam::form_of(choice) == Form::Raw);
+        let built = (|| {
+            if !target_raw
+                || !active
+                    .is_some_and(|pair| pair.role == PairRole::RawView && pair.tier == PairTier::T2)
+            {
+                return Err("a5-fallback-unrenderable:raw-role-not-settled".to_owned());
+            }
+            let source_form = role
+                .source_node
+                .and_then(|node| {
+                    table
+                        .entries
+                        .iter()
+                        .find(|(subject, _)| (subject.fn_did, subject.hir_id) == node)
+                        .map(|(_, choice)| decision::seam::form_of(choice))
+                })
+                .unwrap_or(Form::Raw);
+            let found = decision::seam::a5_argument_expression_form(role.source_shape, source_form)
+                .unwrap_or(Form::Raw);
+            // Proof identity owns the whole argument. Rendering uses the
+            // same peeled operand as discovery, including address/local casts.
+            let arguments = facts
+                .call_args
+                .get(&role.callee)
+                .into_iter()
+                .flatten()
+                .filter(|site| site.caller == role.caller && site.span == role.call_span)
+                .flat_map(|site| {
+                    site.args.iter().filter(|argument| {
+                        argument.index == role.argument_index
+                            && argument.span.source_callsite() == role.span.source_callsite()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let [argument] = arguments.as_slice() else {
+                return Err("a5-fallback-unrenderable:argument-source-not-unique".to_owned());
+            };
+            let text = tcx
+                .sess
+                .source_map()
+                .span_to_snippet(a5_role_operand_span(argument))
+                .map_err(|_| "a5-fallback-unrenderable:argument-source-unavailable".to_owned())?;
+            let key = proof
+                .proof_site_key
+                .ok_or("a5-fallback-unrenderable:proof-key-absent")?;
+            let view = decision::seam::build_a5_raw_view(
+                tcx,
+                mut_facts,
+                role.caller,
+                role.callee,
+                role.argument_index,
+                Form::Raw,
+                found,
+                &text,
+                role.source_shape,
+                role.target.as_ref(),
+                key,
+                role.source_node,
+            )
+            .map_err(|why| format!("a5-fallback-unrenderable:{}", why.key()))?;
+            Ok(view)
+        })();
+        match built {
+            Ok(view) => {
+                proof.found_form = view.found_form;
+                proof.candidate_template = view.template.clone();
+                proof.fallback = A5ProofSiteFallback::T2RawView {
+                    template: view.template.clone(),
+                    negative_write: view.negative_write,
+                };
+                let index = table.seams.a5_raw_calls.iter().position(|call| {
+                    call.caller == role.caller
+                        && call.callee == role.callee
+                        && call.call_span == role.call_span
+                });
+                let call = if let Some(index) = index {
+                    &mut table.seams.a5_raw_calls[index]
+                } else {
+                    table
+                        .seams
+                        .a5_raw_calls
+                        .push(decision::seam::A5RawViewCall {
+                            owner_class: bridge_receipt::SignatureClassId::of(role.callee),
+                            caller: role.caller,
+                            callee: role.callee,
+                            call_span: role.call_span,
+                            views: Vec::new(),
+                        });
+                    table.seams.a5_raw_calls.last_mut().unwrap()
+                };
+                if let Some(old) = call
+                    .views
+                    .iter_mut()
+                    .find(|old| old.proof_site_key == view.proof_site_key)
+                {
+                    *old = view;
+                } else {
+                    call.views.push(view);
+                }
+            }
+            Err(reason) => {
+                proof.fallback = A5ProofSiteFallback::Held { reason };
+            }
+        }
+        if let Some(old) = table
+            .seams
+            .overlap_proofs
+            .iter_mut()
+            .find(|old| old.proof_site_key == proof.proof_site_key)
+        {
+            *old = proof;
+        } else {
+            table.seams.overlap_proofs.push(proof);
+        }
     }
 }
 

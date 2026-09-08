@@ -738,6 +738,90 @@ pub(crate) struct LifetimePlan {
     functions: FxHashMap<LocalDefId, FunctionPlan>,
 }
 
+/// Atom custody for already-planned parameter-origin returns. These edges
+/// contain no origin proof: they preserve the exact dependency of an existing
+/// return lifetime reuse when its source declaration is reverted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReturnOriginAtomDependencies {
+    owners_by_atom: BTreeMap<String, BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>>,
+    dependents_by_class: BTreeMap<
+        crate::bo_rewriter::bridge_receipt::SignatureClassId,
+        BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
+    >,
+}
+
+impl ReturnOriginAtomDependencies {
+    /// `dependency_edges` use the finalized planner's `(dependent, dependency)`
+    /// ordering. Every origin in a multi-parameter return reuse is retained.
+    pub(crate) fn derive(
+        table: &DecisionTable,
+        dependency_edges: &[(
+            crate::bo_rewriter::bridge_receipt::SignatureClassId,
+            crate::bo_rewriter::bridge_receipt::SignatureClassId,
+        )],
+    ) -> Self {
+        use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+
+        let mut result = Self::default();
+        for (function, plan) in table.lifetime_plan.functions() {
+            let owner = SignatureClassId::of(function);
+            for reuse in &plan.return_reuses {
+                if reuse.target.root != FnSignatureRoot::Return {
+                    continue;
+                }
+                for source in &reuse.sources {
+                    let FnSignatureRoot::Arg(argument_index) = source.root else { continue };
+                    for (subject, _) in &table.entries {
+                        if subject.fn_did != function {
+                            continue;
+                        }
+                        let super::SubjectKind::Param { hir_index } = subject.kind else { continue };
+                        if hir_index.checked_add(1).and_then(|index| u32::try_from(index).ok())
+                            != Some(argument_index)
+                        {
+                            continue;
+                        }
+                        let node = (subject.fn_did, subject.hir_id);
+                        if let Some(atoms) = table.seams.raw_boundary_atom_groups.get(&node) {
+                            for atom in atoms {
+                                result.owners_by_atom.entry(atom.id.clone()).or_default().insert(owner);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for &(dependent, dependency) in dependency_edges {
+            result.dependents_by_class.entry(dependency).or_default().insert(dependent);
+        }
+        result
+    }
+
+    pub(crate) fn effective_reverted_classes(
+        &self,
+        classes: &BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId> {
+        let mut pending = atoms.iter().filter_map(|atom| self.owners_by_atom.get(atom))
+            .flat_map(|owners| owners.iter().copied()).collect::<Vec<_>>();
+        if pending.is_empty() {
+            return classes.clone();
+        }
+        let mut affected = BTreeSet::new();
+        while let Some(owner) = pending.pop() {
+            if !affected.insert(owner) {
+                continue;
+            }
+            if let Some(dependents) = self.dependents_by_class.get(&owner) {
+                pending.extend(dependents.iter().copied());
+            }
+        }
+        let mut effective = classes.clone();
+        effective.extend(affected);
+        effective
+    }
+}
+
 impl LifetimePlan {
     pub(crate) fn function(&self, did: LocalDefId) -> Option<&FunctionPlan> {
         self.functions.get(&did)

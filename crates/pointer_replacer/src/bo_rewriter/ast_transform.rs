@@ -34,7 +34,7 @@ use thin_vec::ThinVec;
 // The length's provenance is a DECISION-layer type: `finish_len` is the only
 // place in this file that branches on it, and it branches on the carried value
 // rather than on a re-derivation of it.
-use super::decision::seam::SeamLen;
+use super::decision::seam::{Form, SeamLen};
 
 /// **ARM 2 — which declared form a decision asks for.**
 ///
@@ -2049,6 +2049,7 @@ impl MutVisitor for SeamGraftVisitor<'_> {
 /// so no generated raw-pointer construction occurs after a surviving `&mut`.
 struct PairRawGraftVisitor<'a> {
     calls: &'a FxHashMap<(u32, u32), &'a super::decision::seam::PairRawViewCall>,
+    reverts: &'a RevertSet,
     guard: &'a mut Composition,
     consumed: FxHashSet<(u32, u32)>,
     failure: Option<String>,
@@ -2167,6 +2168,19 @@ impl MutVisitor for PairRawGraftVisitor<'_> {
             ));
             return;
         }
+        for view in &call.views {
+            if view
+                .source_node
+                .is_some_and(|(owner, hir)| !self.reverts.keeps_subject(owner, hir))
+                && view.input_rendering.is_none()
+            {
+                self.failure = Some(format!(
+                    "PAIR input-form rendering unavailable at {}..{} argument {}",
+                    key.0, key.1, view.argument_index,
+                ));
+                return;
+            }
+        }
         // First realize any argument-level seams nested in this call. Their
         // rendered forms are what the call wrapper must preserve.
         rustc_ast::mut_visit::walk_expr(self, expression);
@@ -2175,11 +2189,26 @@ impl MutVisitor for PairRawGraftVisitor<'_> {
             .views
             .iter()
             .map(|view| {
-                (
-                    view.argument_index,
-                    view.raw_expression.clone(),
-                    view.target_type.clone(),
-                )
+                if view
+                    .source_node
+                    .is_some_and(|(owner, hir)| !self.reverts.keeps_subject(owner, hir))
+                {
+                    let input = view
+                        .input_rendering
+                        .as_ref()
+                        .expect("PAIR input rendering checked above");
+                    (
+                        view.argument_index,
+                        input.raw_expression.clone(),
+                        input.target_type.clone(),
+                    )
+                } else {
+                    (
+                        view.argument_index,
+                        view.raw_expression.clone(),
+                        view.target_type.clone(),
+                    )
+                }
             })
             .collect::<Vec<_>>();
         let stem = format!("__crat_pair_raw_{}", call.call_span.lo().0);
@@ -2554,47 +2583,104 @@ fn transform_inner(
     transform_with(tcx, &capture, &table, reverts, None)
 }
 
+/// Inspect the already transformed signature structurally. A lifetime is
+/// orthogonal to mutability and to the slice/Option shape of a borrowed type.
+fn surface_borrowed_type(ty: &Ty) -> Option<(Form, &Ty)> {
+    let (optional, ty) = match &ty.kind {
+        TyKind::Path(None, path)
+            if path.segments.len() == 1 && path.segments[0].ident.name.as_str() == "Option" =>
+        {
+            let Some(args) = &path.segments[0].args else { return None };
+            let GenericArgs::AngleBracketed(args) = &**args else { return None };
+            let [AngleBracketedArg::Arg(GenericArg::Type(inner))] = args.args.as_slice() else {
+                return None;
+            };
+            (true, &**inner)
+        }
+        _ => (false, ty),
+    };
+    let TyKind::Ref(_, borrowed) = &ty.kind else { return None };
+    let mutable = borrowed.mutbl == Mutability::Mut;
+    let (slice, pointee) = match &borrowed.ty.kind {
+        TyKind::Slice(element) => (true, &**element),
+        _ => (false, &*borrowed.ty),
+    };
+    let form = if optional {
+        Form::Opt { mutable, slice }
+    } else if slice {
+        Form::Slice { mutable }
+    } else {
+        Form::Ref { mutable }
+    };
+    Some((form, pointee))
+}
+
 fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Result<String, String> {
     let rustc_ast::PatKind::Ident(_, ident, None) = &param.pat.kind else {
         return Err("inbound-wrapper-unplaceable: non-identifier parameter".to_owned());
     };
     let name = ident.name.to_string();
     let ty = rustc_ast_pretty::pprust::ty_to_string(&param.ty);
-    let expression = if ty.starts_with("Option<&mut [") {
+    let form = surface_borrowed_type(&param.ty).map(|(form, _)| form);
+    let expression = if matches!(
+        form,
+        Some(Form::Opt {
+            mutable: true,
+            slice: true
+        })
+    ) {
         let inner = super::mechanical_receipt::present_unsafe_text(
             format!("core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT)"),
             enclosing_unsafe_fn,
         );
         format!("if {name}.is_null() {{ None }} else {{ Some({inner}) }}")
-    } else if ty.starts_with("Option<&[") {
+    } else if matches!(
+        form,
+        Some(Form::Opt {
+            mutable: false,
+            slice: true
+        })
+    ) {
         let inner = super::mechanical_receipt::present_unsafe_text(
             format!("core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT)"),
             enclosing_unsafe_fn,
         );
         format!("if {name}.is_null() {{ None }} else {{ Some({inner}) }}")
-    } else if ty.starts_with("Option<&mut ") {
+    } else if matches!(
+        form,
+        Some(Form::Opt {
+            mutable: true,
+            slice: false
+        })
+    ) {
         super::mechanical_receipt::present_unsafe_text(
             format!("{name}.as_mut()"),
             enclosing_unsafe_fn,
         )
-    } else if ty.starts_with("Option<&") {
+    } else if matches!(
+        form,
+        Some(Form::Opt {
+            mutable: false,
+            slice: false
+        })
+    ) {
         super::mechanical_receipt::present_unsafe_text(
             format!("{name}.as_ref()"),
             enclosing_unsafe_fn,
         )
-    } else if ty.starts_with("&mut [") {
+    } else if matches!(form, Some(Form::Slice { mutable: true })) {
         super::mechanical_receipt::present_unsafe_text(
             format!("core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT)"),
             enclosing_unsafe_fn,
         )
-    } else if ty.starts_with("&[") {
+    } else if matches!(form, Some(Form::Slice { mutable: false })) {
         super::mechanical_receipt::present_unsafe_text(
             format!("core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT)"),
             enclosing_unsafe_fn,
         )
-    } else if ty.starts_with("&mut ") {
+    } else if matches!(form, Some(Form::Ref { mutable: true })) {
         super::mechanical_receipt::present_unsafe_text(format!("&mut *{name}"), enclosing_unsafe_fn)
-    } else if ty.starts_with('&') {
+    } else if matches!(form, Some(Form::Ref { mutable: false })) {
         super::mechanical_receipt::present_unsafe_text(format!("&*{name}"), enclosing_unsafe_fn)
     } else if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
         return Err("inbound-wrapper-unplaceable: owning parameter held by Arm B".to_owned());
@@ -2604,25 +2690,13 @@ fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Resu
     Ok(expression)
 }
 
-fn surface_return_pointee(ty: &str) -> Option<&str> {
-    let mut ty = ty.trim();
-    if let Some(inner) = ty
-        .strip_prefix("Option<")
-        .and_then(|ty| ty.strip_suffix('>'))
-    {
-        ty = inner.trim();
-    }
-    ty = ty
-        .strip_prefix("&mut ")
-        .or_else(|| ty.strip_prefix('&'))?
-        .trim();
-    if let Some(inner) = ty.strip_prefix('[').and_then(|ty| ty.strip_suffix(']')) {
-        ty = inner.trim();
-    }
-    Some(ty)
+fn surface_return_pointee(ty: &str) -> Option<String> {
+    let parsed = graft_ty(ty).ok()?;
+    let (_, pointee) = surface_borrowed_type(&parsed)?;
+    Some(rustc_ast_pretty::pprust::ty_to_string(pointee))
 }
 
-fn surface_wrapper_block(
+pub(super) fn surface_wrapper_block(
     inner_name: &str,
     function: &rustc_ast::Fn,
     return_temp_type: Option<&str>,
@@ -2643,8 +2717,15 @@ fn surface_wrapper_block(
     let body = match &function.sig.decl.output {
         rustc_ast::FnRetTy::Default(_) => call,
         rustc_ast::FnRetTy::Ty(ty) => {
+            let form = surface_borrowed_type(ty).map(|(form, _)| form);
             let ty = rustc_ast_pretty::pprust::ty_to_string(ty);
-            if ty.starts_with("Option<&mut [") {
+            if matches!(
+                form,
+                Some(Form::Opt {
+                    mutable: true,
+                    slice: true
+                })
+            ) {
                 let result_ty = return_temp_type
                     .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
                 let pointee = surface_return_pointee(result_ty)
@@ -2652,7 +2733,13 @@ fn surface_wrapper_block(
                 format!(
                     "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null_mut::<{pointee}>(), |value| value.as_mut_ptr()) }}"
                 )
-            } else if ty.starts_with("Option<&[") {
+            } else if matches!(
+                form,
+                Some(Form::Opt {
+                    mutable: false,
+                    slice: true
+                })
+            ) {
                 let result_ty = return_temp_type
                     .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
                 let pointee = surface_return_pointee(result_ty)
@@ -2660,7 +2747,13 @@ fn surface_wrapper_block(
                 format!(
                     "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null::<{pointee}>(), |value| value.as_ptr()) }}"
                 )
-            } else if ty.starts_with("Option<&mut ") {
+            } else if matches!(
+                form,
+                Some(Form::Opt {
+                    mutable: true,
+                    slice: false
+                })
+            ) {
                 let result_ty = return_temp_type
                     .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
                 let pointee = surface_return_pointee(result_ty)
@@ -2668,7 +2761,13 @@ fn surface_wrapper_block(
                 format!(
                     "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null_mut::<{pointee}>(), core::ptr::from_mut) }}"
                 )
-            } else if ty.starts_with("Option<&") {
+            } else if matches!(
+                form,
+                Some(Form::Opt {
+                    mutable: false,
+                    slice: false
+                })
+            ) {
                 let result_ty = return_temp_type
                     .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
                 let pointee = surface_return_pointee(result_ty)
@@ -2676,21 +2775,21 @@ fn surface_wrapper_block(
                 format!(
                     "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null::<{pointee}>(), core::ptr::from_ref) }}"
                 )
-            } else if ty.starts_with("&mut [") {
+            } else if matches!(form, Some(Form::Slice { mutable: true })) {
                 let result_ty = return_temp_type
                     .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
                 format!("{{ let __crat_result: {result_ty} = {call}; __crat_result.as_mut_ptr() }}")
-            } else if ty.starts_with("&[") {
+            } else if matches!(form, Some(Form::Slice { mutable: false })) {
                 let result_ty = return_temp_type
                     .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
                 format!("{{ let __crat_result: {result_ty} = {call}; __crat_result.as_ptr() }}")
-            } else if ty.starts_with("&mut ") {
+            } else if matches!(form, Some(Form::Ref { mutable: true })) {
                 let result_ty = return_temp_type
                     .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
                 format!(
                     "{{ let __crat_result: {result_ty} = {call}; core::ptr::from_mut(__crat_result) }}"
                 )
-            } else if ty.starts_with('&') {
+            } else if matches!(form, Some(Form::Ref { mutable: false })) {
                 let result_ty = return_temp_type
                     .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
                 format!(
@@ -2977,7 +3076,7 @@ fn transform_with<'tcx>(
     capture: &AstCapture,
     table: &super::decision::DecisionTable,
     reverts: &RevertSet,
-    terminal_a5_raw_calls: Option<&[super::decision::seam::A5RawViewCall]>,
+    terminal_call_plans: Option<&super::decision::seam::TerminalCallPlans>,
 ) -> Result<
     (
         RefDeclStats,
@@ -2996,6 +3095,24 @@ fn transform_with<'tcx>(
     ),
     String,
 > {
+    // The finalizer's complete collections replace the earlier adapter plans.
+    // In particular, a sealed empty collection must not resurrect an adapter
+    // from the decision table. The shared filters still own all revert rules.
+    let terminal_table = terminal_call_plans.map(|plans| {
+        let mut sealed = table.clone();
+        sealed.seams.a5_raw_calls.clone_from(&plans.a5_raw_calls);
+        sealed
+            .seams
+            .pair_raw_calls
+            .clone_from(&plans.pair_raw_calls);
+        sealed.seams.edits.clone_from(&plans.seam_edits);
+        sealed
+            .seams
+            .revert_found_form_edits
+            .clone_from(&plans.revert_found_form_edits);
+        sealed
+    });
+    let table = terminal_table.as_ref().unwrap_or(table);
     let mut krate = capture.krate.clone();
     let map = &capture.map;
     // Original signature type metadata supplies syntax for admitted aliases.
@@ -3202,7 +3319,7 @@ fn transform_with<'tcx>(
     // **ARMS 2 AND 3 CONSUME THE SHARED BUILDER** (M-2). Their visitors carry no
     // site check, so their revert semantics live entirely in how these maps are
     // built — and production builds them in exactly ONE place.
-    let filtered = filtered_inputs(&table, reverts);
+    let filtered = filtered_inputs(table, reverts);
     let box_fabricated = filtered.box_fabricated;
     let uses = filtered.uses;
     let statement_deletes = filtered.statement_deletes;
@@ -3230,8 +3347,9 @@ fn transform_with<'tcx>(
     seams.len_fabricated += box_fabricated;
 
     let mut a5_raw_calls = FxHashMap::default();
-    for call in terminal_a5_raw_calls
-        .unwrap_or(&table.seams.a5_raw_calls)
+    for call in table
+        .seams
+        .a5_raw_calls
         .iter()
         .filter(|call| reverts.keeps(call.owner_class))
     {
@@ -3288,6 +3406,7 @@ fn transform_with<'tcx>(
     }
     let mut pair_raw = PairRawGraftVisitor {
         calls: &pair_raw_calls,
+        reverts,
         guard: &mut guard,
         consumed: FxHashSet::default(),
         failure: None,
@@ -3482,8 +3601,9 @@ pub(crate) fn ast_emitted_files_from(
     // emitted a program without the very edit the test exists to break on.
     table: &super::decision::DecisionTable,
     // Sealed by `emit_files` after class finalization. Production always
-    // supplies it; `None` is retained for isolated AST-layer parity tests.
-    terminal_a5_raw_calls: Option<&[super::decision::seam::A5RawViewCall]>,
+    // supplies it; all four collections are authoritative, including empty
+    // ones. `None` is retained for isolated AST-layer parity tests.
+    terminal_call_plans: Option<&super::decision::seam::TerminalCallPlans>,
 ) -> Result<
     (
         std::collections::BTreeMap<super::plan::FileKey, String>,
@@ -3494,7 +3614,7 @@ pub(crate) fn ast_emitted_files_from(
     String,
 > {
     let (decls, _, seams, _, _, _, _, krate, edited) =
-        transform_with(tcx, capture, table, reverts, terminal_a5_raw_calls)?;
+        transform_with(tcx, capture, table, reverts, terminal_call_plans)?;
     let expected_aliases = table
         .entries
         .iter()
@@ -4206,6 +4326,9 @@ pub(crate) fn filtered_inputs(
         out.box_fabricated += usize::from(plan.length.is_fallback());
     }
     for edit in &table.seams.edits {
+        if edit.zero_syntax {
+            continue;
+        }
         // ARM 3's filter, on the CALLEE's direct class ID.
         if !reverts.keeps_edit(edit.owner_class, &edit.atom_ids) {
             continue;
@@ -7062,6 +7185,8 @@ mod arm2_witnesses {
     fn the_seam_family_survives_the_projection_in_both_directions() {
         rustc_span::create_default_session_globals_then(|| {
             let edit = |family| super::super::decision::seam::SeamEdit {
+                raw_outbound: None,
+                zero_syntax: false,
                 span: DUMMY_SP,
                 call_span: DUMMY_SP,
                 replacement: String::new(),

@@ -13,7 +13,7 @@ use rustc_span::{Span, edition::Edition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ByteSpan {
     pub(crate) lo: u32,
     pub(crate) hi: u32,

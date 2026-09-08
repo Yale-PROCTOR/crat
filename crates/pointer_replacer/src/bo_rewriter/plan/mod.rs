@@ -32,6 +32,8 @@
 //! type. [`Justification`] is shaped against all ten goldens' expected text so
 //! the breadth in S2–S3 fills arms rather than reshaping the type.
 
+pub(crate) mod sibling_overlap;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -143,7 +145,7 @@ pub(crate) enum Justification {
     },
     /// A5 C-9 snapshot temp at one retained marked call site.
     C9Mark,
-    /// A5 proof-site T2 raw temporary plus terminal safe re-entry.
+    /// A5 proof-site T2 raw temporary consumed by a raw callee position.
     A5RawView,
     /// E2-FN structural signature emission, keyed to the finalized plan bytes.
     /// The AST pass owns node placement; this typed justification keeps the
@@ -215,6 +217,8 @@ pub(crate) enum ClassSiteState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClassSite {
+    /// Logical atom dependencies survive even when this site has no text edit.
+    pub atom_ids: Vec<String>,
     pub key: BridgeSiteKey,
     pub edit_key: String,
     pub state: ClassSiteState,
@@ -249,6 +253,7 @@ impl ClassSite {
             bridge_kind: kind.to_owned(),
         };
         Self {
+            atom_ids: Vec::new(),
             edit_key: format!(
                 "class={}|arm={}|interval={file}:{lo}:{hi}|kind={kind}",
                 owner.order_key(),
@@ -273,6 +278,7 @@ impl ClassSite {
         kind: &str,
     ) -> Self {
         Self {
+            atom_ids: Vec::new(),
             key: BridgeSiteKey {
                 owner_class: owner,
                 caller: caller.local_def_id(),
@@ -427,6 +433,19 @@ fn intervals_overlap(left: &ClassSite, right: &ClassSite) -> bool {
     if left.key.file != right.key.file {
         return false;
     }
+    // A logical position receipt can be attached to its enclosing physical
+    // call edit. The exact physical identity is produced only after that edit
+    // materializes; two such receipts do not introduce two splices.
+    if left.key.owner_class == right.key.owner_class
+        && left.key.caller == right.key.caller
+        && left.edit_key != "-"
+        && !left.edit_key.is_empty()
+        && left.edit_key == right.edit_key
+        && ((left.key.lo <= right.key.lo && right.key.hi <= left.key.hi)
+            || (right.key.lo <= left.key.lo && left.key.hi <= right.key.hi))
+    {
+        return false;
+    }
     if left.key.lo == left.key.hi && right.key.lo == right.key.hi {
         return left.key.lo == right.key.lo;
     }
@@ -501,7 +520,9 @@ fn a5_proof_resolution(fallback: &super::decision::seam::A5ProofSiteFallback) ->
         },
         A5ProofSiteFallback::T2RawView { .. } => A5ProofResolution {
             kind: "a5-site-proof-t2-fallback",
-            state: ClassSiteState::ZeroSyntaxReady,
+            state: ClassSiteState::Dropped(
+                "a5-fallback-unrenderable:carrier-not-materialized".into(),
+            ),
             retention: BridgeRetentionTier::T2,
             waiver_id: Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
         },
@@ -517,6 +538,132 @@ fn a5_proof_resolution(fallback: &super::decision::seam::A5ProofSiteFallback) ->
             retention: BridgeRetentionTier::None,
             waiver_id: None,
         },
+    }
+}
+
+pub(crate) fn physical_edit_key(file: &FileKey, edit: &Edit) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let owner = edit.owner_class?;
+    let bridge = edit.bridge.as_ref()?;
+    Some(format!(
+        "class={}|arm={}|interval={}:{}:{}|kind={}|replacement_sha256={:x}",
+        owner.order_key(),
+        bridge.arm,
+        file_key_label(file),
+        edit.lo,
+        edit.hi,
+        bridge.bridge_kind,
+        Sha256::digest(edit.replacement.as_bytes())
+    ))
+}
+
+/// Logical A5 position receipts borrow the identity of their one already
+/// materialized whole-call edit. They never create another argument edit.
+pub(crate) fn link_a5_fallback_carriers(
+    plan: &mut Plan,
+    table: &DecisionTable,
+    locate: impl Fn(rustc_span::Span) -> Result<(FileKey, usize, usize), &'static str>,
+) {
+    use super::decision::{
+        SubjectKind,
+        seam::{A5ProofSiteFallback, Form},
+    };
+    for proof in &table.seams.overlap_proofs {
+        if !matches!(proof.fallback, A5ProofSiteFallback::T2RawView { .. }) {
+            continue;
+        }
+        let raw = table.entries.iter().find(|(subject, _)| subject.fn_did == proof.callee
+            && matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == proof.index))
+            .is_some_and(|(_, decision)| super::decision::seam::form_of(decision) == Form::Raw);
+        let mut calls = Vec::new();
+        if raw {
+            for call in &table.seams.a5_raw_calls {
+                if call.caller == proof.caller
+                    && call.callee == proof.callee
+                    && call.views.iter().any(|view| {
+                        Some(view.proof_site_key) == proof.proof_site_key
+                            && view.argument_index == proof.index
+                            && view.expected_form == Form::Raw
+                            && view.adapted_expression == super::c9::A5_RAW_VALUE_PLACEHOLDER
+                    })
+                {
+                    if let Ok((file, lo, hi)) = locate(call.call_span) {
+                        calls.push((file, lo, hi, "a5-proof-site-raw-view"));
+                    }
+                }
+            }
+            for call in &table.seams.pair_raw_calls {
+                if call.caller == proof.caller
+                    && call.callee == proof.callee
+                    && call
+                        .call_span
+                        .source_callsite()
+                        .contains(proof.span.source_callsite())
+                    && call
+                        .views
+                        .iter()
+                        .any(|view| view.argument_index == proof.index)
+                {
+                    if let Ok((file, lo, hi)) = locate(call.call_span) {
+                        calls.push((file, lo, hi, "pair-raw-view"));
+                    }
+                }
+            }
+        }
+        let Ok((proof_file, proof_lo, proof_hi)) = locate(proof.span) else { continue };
+        let sites = plan
+            .preclass_sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| {
+                site.key.bridge_kind == "a5-site-proof-t2-fallback"
+                    && site.key.caller == proof.caller
+                    && site.key.owner_class == SignatureClassId::of(proof.callee)
+                    && site.key.position == format!("arg{}", proof.index)
+                    && site.key.file == file_key_label(&proof_file)
+                    && site.key.lo as usize == proof_lo
+                    && site.key.hi as usize == proof_hi
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in sites {
+            let site = &plan.preclass_sites[index];
+            let calls_ref = &calls;
+            let candidates = plan
+                .by_file
+                .iter()
+                .flat_map(|(file, edits)| {
+                    edits.iter().filter_map(move |edit| {
+                        let b = edit.bridge.as_ref()?;
+                        (edit.owner_class == Some(site.key.owner_class)
+                            && b.caller == proof.caller
+                            && file_key_label(file) == site.key.file
+                            && edit.lo <= site.key.lo as usize
+                            && site.key.hi as usize <= edit.hi
+                            && calls_ref.iter().any(|(f, lo, hi, kind)| {
+                                f == file
+                                    && edit.lo == *lo
+                                    && edit.hi == *hi
+                                    && edit.edit_kind == *kind
+                            }))
+                        .then(|| physical_edit_key(file, edit))
+                        .flatten()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let site = &mut plan.preclass_sites[index];
+            site.expected_form = Form::Raw.key().into();
+            if calls.len() == 1 && candidates.len() == 1 {
+                site.state = ClassSiteState::EditReady;
+                site.edit_key = candidates[0].clone();
+            } else {
+                site.state = ClassSiteState::Dropped(format!(
+                    "a5-fallback-unrenderable:raw={raw};carriers={};edits={}",
+                    calls.len(),
+                    candidates.len()
+                ));
+            }
+        }
     }
 }
 
@@ -916,6 +1063,7 @@ pub(crate) fn finalize_signature_classes(
                     .push(format!("unknown-site-arm:{}", bridge.arm));
             }
             class.sites.push(ClassSite {
+                atom_ids: edit.atom_ids.clone(),
                 key,
                 edit_key,
                 state: ClassSiteState::EditReady,
@@ -1193,6 +1341,7 @@ pub(crate) fn strict_recovery_subset(
 /// which is why the flat shape could not survive contact with the corpus.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
+    pub sibling_receipt_plans: Vec<sibling_overlap::SiblingReceiptPlan>,
     pub by_file: BTreeMap<FileKey, Vec<Edit>>,
     /// Decisions that produced no placed edit, with attribution.
     pub unplaceable: Vec<Unplaceable>,
@@ -1240,15 +1389,211 @@ pub(crate) struct Plan {
     pub unowned_a5_proof_sites: usize,
     /// A5 calls after terminal-interface validation/re-planning. The AST graft
     /// consumes this sealed plan; it never recomputes the terminal verdict.
-    pub terminal_a5_raw_calls: Vec<super::decision::seam::A5RawViewCall>,
+    pub terminal_call_plans: super::decision::seam::TerminalCallPlans,
+}
+
+fn terminal_seam_site(
+    seam: &super::decision::seam::SeamEdit,
+    file: &FileKey,
+    lo: usize,
+    hi: usize,
+    edit: Option<&Edit>,
+) -> ClassSite {
+    use sha2::{Digest, Sha256};
+    let file = file_key_label(file);
+    ClassSite {
+        atom_ids: seam.atom_ids.clone(),
+        key: seam
+            .bridge
+            .materialize(seam.owner_class, file.clone(), lo as u32, hi as u32),
+        edit_key: edit.map_or_else(
+            || "-".to_owned(),
+            |edit| {
+                format!(
+                    "class={}|arm={}|interval={}:{}:{}|kind={}|replacement_sha256={:x}",
+                    seam.owner_class.order_key(),
+                    seam.bridge.arm,
+                    file,
+                    lo,
+                    hi,
+                    seam.bridge.bridge_kind,
+                    Sha256::digest(edit.replacement.as_bytes()),
+                )
+            },
+        ),
+        state: if edit.is_some() {
+            ClassSiteState::EditReady
+        } else {
+            ClassSiteState::ZeroSyntaxReady
+        },
+        expected_form: seam.bridge.expected_form.clone(),
+        found_form: seam.bridge.found_form.clone(),
+        argument_kind: seam.bridge.argument_kind.clone(),
+        extent: seam.bridge.extent.clone(),
+        retention: seam.bridge.retention,
+        waiver_id: seam.bridge.waiver_id.clone(),
+        unsafe_context: seam.bridge.unsafe_context,
+    }
 }
 
 impl Plan {
+    pub(crate) fn replace_terminal_seam(
+        &mut self,
+        old: &super::decision::seam::SeamEdit,
+        new: &super::decision::seam::SeamEdit,
+        located: (FileKey, usize, usize),
+    ) -> Result<(), String> {
+        let (file, lo, hi) = located;
+        let old_key =
+            old.bridge
+                .materialize(old.owner_class, file_key_label(&file), lo as u32, hi as u32);
+        let Some(class) = self.class_finalization.classes.get_mut(&old.owner_class) else {
+            return Err("terminal-seam-owner-missing".to_owned());
+        };
+        let matches = class
+            .sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| site.key == old_key)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(format!(
+                "terminal-seam-site-cardinality:{}:{}",
+                old.owner_class.order_key(),
+                matches.len()
+            ));
+        }
+        let mut removed = Vec::new();
+        if let Some(edits) = self.by_file.get_mut(&file) {
+            let mut index = 0;
+            while index < edits.len() {
+                if edits[index].lo == lo
+                    && edits[index].hi == hi
+                    && edits[index].owner_class == Some(old.owner_class)
+                    && edits[index].bridge.as_ref() == Some(&old.bridge)
+                {
+                    removed.push(edits.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        if removed.len() != usize::from(!old.zero_syntax) {
+            return Err(format!(
+                "terminal-seam-edit-cardinality:{}:{}",
+                old.owner_class.order_key(),
+                removed.len()
+            ));
+        }
+        let replacement = if new.zero_syntax {
+            None
+        } else {
+            let mut edit = removed.pop().ok_or("terminal-seam-zero-to-edit-unbuilt")?;
+            edit.replacement = new.replacement.clone();
+            edit.bridge = Some(new.bridge.clone());
+            edit.justification = Justification::SeamAdapter {
+                family: match new.family {
+                    super::decision::seam::SeamFamily::Safe => "safe",
+                    super::decision::seam::SeamFamily::Reborrow => "reborrow",
+                },
+                fabricated: new.spec.len.as_ref().is_some_and(|len| len.is_fabricated()),
+            };
+            Some(edit)
+        };
+        let site = terminal_seam_site(new, &file, lo, hi, replacement.as_ref());
+        class.sites[matches[0]] = site.clone();
+        class.site_keys = class.sites.iter().map(|site| site.key.clone()).collect();
+        class.edit_keys = class
+            .sites
+            .iter()
+            .filter(|site| site.edit_key != "-")
+            .map(|site| site.edit_key.clone())
+            .collect();
+        self.preclass_sites.retain(|site| site.key != old_key);
+        if let Some(edit) = replacement {
+            self.by_file.entry(file).or_default().push(edit);
+        } else {
+            self.preclass_sites.push(site);
+        }
+        Ok(())
+    }
+
     /// Hold exactly one terminally stale owner class, then apply the already
     /// declared dependency rule and remove every edit belonging to the newly
     /// held closure. This is class recovery, never a program-level failure.
     pub(crate) fn hold_terminal_a5_class(&mut self, owner: SignatureClassId, reason: String) {
-        self.hold_terminal_class(owner, Arm::Pair, "a5-terminal-replan-unavailable", reason);
+        self.hold_terminal_class(owner, Arm::Pair, "a5-fallback-unrenderable", reason);
+    }
+
+    pub(crate) fn replace_terminal_a5_edit(
+        &mut self,
+        file: &FileKey,
+        replacement: Edit,
+        views: &[super::decision::seam::A5RawViewTemp],
+    ) -> Result<(), String> {
+        let bridge = replacement
+            .bridge
+            .clone()
+            .ok_or("a5-fallback-unrenderable:bridge-absent")?;
+        let new_key = physical_edit_key(file, &replacement)
+            .ok_or("a5-fallback-unrenderable:edit-key-absent")?;
+        let edits = self
+            .by_file
+            .get_mut(file)
+            .ok_or("a5-fallback-unrenderable:materialized-file-absent")?;
+        let matching = edits
+            .iter()
+            .enumerate()
+            .filter(|(_, old)| {
+                old.owner_class == replacement.owner_class
+                    && old.lo == replacement.lo
+                    && old.hi == replacement.hi
+                    && old.edit_kind == replacement.edit_kind
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [index] = matching.as_slice() else {
+            return Err("a5-fallback-unrenderable:materialized-edit-not-unique".into());
+        };
+        let old_key = physical_edit_key(file, &edits[*index])
+            .ok_or("a5-fallback-unrenderable:old-edit-key-absent")?;
+        edits[*index] = replacement;
+        let update = |site: &mut ClassSite| {
+            if site.edit_key != old_key {
+                return;
+            }
+            site.edit_key.clone_from(&new_key);
+            if let Some(view) = views
+                .iter()
+                .find(|view| site.key.position == format!("arg{}", view.argument_index))
+            {
+                site.expected_form = super::decision::seam::Form::Raw.key().into();
+                site.found_form = view.found_form.key().into();
+                site.extent = BridgeExtentKind::None;
+            } else {
+                site.expected_form.clone_from(&bridge.expected_form);
+                site.found_form.clone_from(&bridge.found_form);
+                site.extent.clone_from(&bridge.extent);
+                site.unsafe_context = bridge.unsafe_context;
+            }
+        };
+        for site in &mut self.preclass_sites {
+            update(site);
+        }
+        for class in self.class_finalization.classes.values_mut() {
+            for site in &mut class.sites {
+                update(site);
+            }
+            for key in &mut class.edit_keys {
+                if *key == old_key {
+                    key.clone_from(&new_key);
+                }
+            }
+            class.edit_keys.sort();
+            class.edit_keys.dedup();
+        }
+        Ok(())
     }
 
     pub(crate) fn hold_terminal_class(
@@ -1325,7 +1670,8 @@ impl Plan {
         });
         self.attribution_intervals
             .retain(|site| ready.contains(&site.owner_class));
-        self.terminal_a5_raw_calls
+        self.terminal_call_plans
+            .a5_raw_calls
             .retain(|call| ready.contains(&call.owner_class));
     }
 
@@ -1348,12 +1694,38 @@ impl Plan {
 
     pub(crate) fn bridge_events(
         &self,
+        reverted: &BTreeSet<SignatureClassId>,
+    ) -> Vec<super::bridge_receipt::BridgeReceiptEvent> {
+        self.bridge_events_with_atoms(reverted, &BTreeSet::new())
+    }
+
+    pub(crate) fn bridge_events_with_atoms(
+        &self,
         reverted: &std::collections::BTreeSet<SignatureClassId>,
+        reverted_atoms: &BTreeSet<String>,
     ) -> Vec<super::bridge_receipt::BridgeReceiptEvent> {
         use super::bridge_receipt::{BridgeReceiptEvent, BridgeReceiptStage, BridgeReceiptState};
+        let return_origin_reverted = self.effective_reverted_classes(&BTreeSet::new(), reverted_atoms);
+        let reverted = self.effective_reverted_classes(reverted, reverted_atoms);
+        let atom_dropped = self
+            .by_file
+            .iter()
+            .flat_map(|(file, edits)| {
+                edits
+                    .iter()
+                    .filter(|edit| {
+                        edit.atom_ids
+                            .iter()
+                            .any(|atom| reverted_atoms.contains(atom))
+                    })
+                    .filter_map(move |edit| physical_edit_key(file, edit))
+            })
+            .collect::<BTreeSet<_>>();
         let mut events = Vec::new();
         for class in self.class_finalization.classes.values() {
-            let terminal_drop = if reverted.contains(&class.id) {
+            let terminal_drop = if return_origin_reverted.contains(&class.id) {
+                Some("return-origin-atom-reverted".to_owned())
+            } else if reverted.contains(&class.id) {
                 Some("class-reverted-after-verify".to_owned())
             } else if !class.is_ready() {
                 Some(class.hold_reasons().join(";"))
@@ -1361,6 +1733,18 @@ impl Plan {
                 None
             };
             for site in &class.sites {
+                // Logical dependencies also govern sites without a text edit.
+                // Receipts sharing a physical carrier share its atom fate.
+                // A5/C9 carriers have no atom dependencies and stay Applied
+                // with their source input rendering while their class survives.
+                let terminal_drop = terminal_drop.clone().or_else(|| {
+                    (site
+                        .atom_ids
+                        .iter()
+                        .any(|atom| reverted_atoms.contains(atom))
+                        || atom_dropped.contains(&site.edit_key))
+                    .then(|| "atom-reverted-after-verify".to_owned())
+                });
                 events.push(BridgeReceiptEvent {
                     site: site.key.clone(),
                     expected_form: site.expected_form.clone(),
@@ -2040,6 +2424,7 @@ pub(crate) fn plan(
             },
         };
         preclass_sites.push(ClassSite {
+            atom_ids: Vec::new(),
             key: bridge.materialize(declaration.owner_class, file, lo, hi),
             edit_key: "-".to_owned(),
             state,
@@ -2091,6 +2476,7 @@ pub(crate) fn plan(
             },
         };
         preclass_sites.push(ClassSite {
+            atom_ids: Vec::new(),
             key: bridge.materialize(site.owner_class, file, lo, hi),
             edit_key: "-".to_owned(),
             state,
@@ -2118,6 +2504,10 @@ pub(crate) fn plan(
     for seam in &table.seams.edits {
         match span_to_loc(seam.span) {
             Ok((file, lo, hi)) => {
+                if seam.zero_syntax {
+                    preclass_sites.push(terminal_seam_site(seam, &file, lo, hi, None));
+                    continue;
+                }
                 by_file.entry(file).or_default().push(Edit {
                     lo,
                     hi,
@@ -2969,6 +3359,7 @@ pub(crate) fn plan(
     }
     preclass_sites.extend(unplaceable.iter().map(|site| {
         ClassSite {
+            atom_ids: Vec::new(),
             key: site
                 .bridge
                 .materialize(site.owner_class, "<unplaceable>".to_owned(), 0, 0),
@@ -3002,6 +3393,7 @@ pub(crate) fn plan(
             );
             let site = match span_to_loc(seed.span) {
                 Ok((file, lo, hi)) => ClassSite {
+                    atom_ids: Vec::new(),
                     key: bridge.materialize(
                         owner,
                         file_key_label(&file),
@@ -3019,6 +3411,7 @@ pub(crate) fn plan(
                     unsafe_context: None,
                 },
                 Err(reason) => ClassSite {
+                    atom_ids: Vec::new(),
                     key: bridge.materialize(owner, "<unplaceable>".to_owned(), 0, 0),
                     edit_key: "-".to_owned(),
                     state: ClassSiteState::Dropped(reason.to_owned()),
@@ -3091,7 +3484,8 @@ pub(crate) fn plan(
                         },
                     ),
                     super::decision::seam::A5ProofSiteFallback::Held { reason }
-                        if reason == super::decision::seam::SeamBlock::A5NegativeWriteAbsent.key() =>
+                        if reason.strip_prefix("a5-fallback-unrenderable:").unwrap_or(reason)
+                            == super::decision::seam::SeamBlock::A5NegativeWriteAbsent.key() =>
                     {
                         (
                             MechanicalState::HeldNonmechanical,
@@ -3101,7 +3495,8 @@ pub(crate) fn plan(
                         )
                     }
                     super::decision::seam::A5ProofSiteFallback::Held { reason }
-                        if reason == super::decision::seam::SeamBlock::PositiveRetention.key() =>
+                        if reason.strip_prefix("a5-fallback-unrenderable:").unwrap_or(reason)
+                            == super::decision::seam::SeamBlock::PositiveRetention.key() =>
                     {
                         (
                             MechanicalState::HeldNonmechanical,
@@ -3216,6 +3611,7 @@ pub(crate) fn plan(
             ),
         };
         preclass_sites.push(ClassSite {
+            atom_ids: Vec::new(),
             key: bridge.materialize(owner, file, lo, hi),
             edit_key: "-".to_owned(),
             state,
@@ -3261,6 +3657,7 @@ pub(crate) fn plan(
             })
             .unwrap_or_else(|_| ("<unplaceable>".to_owned(), 0, 0));
         preclass_sites.push(ClassSite {
+            atom_ids: Vec::new(),
             key: bridge.materialize(SignatureClassId::of(blocked.callee), file, lo, hi),
             edit_key: "-".to_owned(),
             state: ClassSiteState::Dropped(blocked.block.key().to_owned()),
@@ -3291,6 +3688,7 @@ pub(crate) fn plan(
             })
             .unwrap_or_else(|_| ("<unplaceable>".to_owned(), 0, 0));
         preclass_sites.push(ClassSite {
+            atom_ids: Vec::new(),
             key: bridge.materialize(blocked.owner_class, file, lo, hi),
             edit_key: "-".to_owned(),
             state: ClassSiteState::Dropped(blocked.block.key().to_owned()),
@@ -3314,6 +3712,7 @@ pub(crate) fn plan(
             })
             .unwrap_or_else(|_| ("<unplaceable>".to_owned(), 0, 0));
         preclass_sites.push(ClassSite {
+            atom_ids: Vec::new(),
             key: blocked
                 .bridge
                 .materialize(blocked.owner_class, file, lo, hi),
@@ -3365,6 +3764,7 @@ pub(crate) fn plan(
             ),
         };
         let mut site = ClassSite {
+            atom_ids: Vec::new(),
             key: bridge.materialize(owner, file, lo, hi),
             edit_key: "-".to_owned(),
             state,
@@ -3447,6 +3847,7 @@ pub(crate) fn plan(
     attribution_intervals.dedup();
 
     Plan {
+        sibling_receipt_plans: sibling_overlap::plans(table, &span_to_loc),
         by_file,
         unplaceable,
         // Both filled by the caller; `plan` has no `TyCtxt`, so it can ask
@@ -3462,7 +3863,7 @@ pub(crate) fn plan(
         option_receipt_plans,
         declaration_receipt_plans,
         unowned_a5_proof_sites,
-        terminal_a5_raw_calls: Vec::new(),
+        terminal_call_plans: super::decision::seam::TerminalCallPlans::candidates(&table.seams),
     }
 }
 
@@ -3517,8 +3918,10 @@ mod tests {
     #[test]
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
+            sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),
+            input_interfaces: Default::default(),
             arm_requirements: Default::default(),
             exposure: None,
             seams: Default::default(),
@@ -3581,8 +3984,10 @@ mod tests {
     #[test]
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
+            sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),
+            input_interfaces: Default::default(),
             arm_requirements: Default::default(),
             exposure: None,
             seams: Default::default(),
@@ -3658,6 +4063,71 @@ mod wave3_class_tests {
             out.insert(arm);
         }
         out
+    }
+
+    #[test]
+    fn r231_selected_pair_atom_drops_only_its_physical_bridge_receipt() {
+        with_classes(1, |ids| {
+            let owner = ids[0];
+            let file = FileKey::Virtual("main.rs".into());
+            let mut input = ClassInput::new(owner, RequiredArmSet::default());
+            let mut edits = Vec::new();
+            for (lo, kind, atoms) in [
+                (10, "pair-t2-raw-view", vec!["selected-pair".to_owned()]),
+                (30, "a5-site-proof-t2-fallback", Vec::new()),
+            ] {
+                let mut site =
+                    ClassSite::edit(owner, owner, Arm::Pair, "main.rs", lo, lo + 5, kind);
+                let edit = Edit {
+                    lo: lo as usize,
+                    hi: (lo + 5) as usize,
+                    replacement: "carrier".into(),
+                    justification: Justification::A5RawView,
+                    owner_class: Some(owner),
+                    owner_path: "fixture".into(),
+                    bridge: Some(BridgeSitePlan::local(
+                        owner.local_def_id(),
+                        owner.local_def_id(),
+                        "pair",
+                        "arg1",
+                        kind,
+                    )),
+                    atom_ids: atoms,
+                    subject_id: "fixture-subject".into(),
+                    required_arms: "pair".into(),
+                    edit_kind: kind,
+                };
+                site.edit_key = physical_edit_key(&file, &edit).unwrap();
+                input.sites.push(site);
+                edits.push(edit);
+            }
+            let plan = Plan {
+                by_file: BTreeMap::from([(file, edits)]),
+                class_finalization: finalize_class_inputs(vec![input]),
+                ..Default::default()
+            };
+            let events = plan.bridge_events_with_atoms(
+                &BTreeSet::new(),
+                &BTreeSet::from(["selected-pair".into()]),
+            );
+            let terminal = events
+                .iter()
+                .filter(|event| {
+                    event.stage == super::super::bridge_receipt::BridgeReceiptStage::Terminal
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(terminal.len(), 2);
+            assert!(
+                terminal
+                    .iter()
+                    .any(|event| event.site.bridge_kind == "pair-t2-raw-view"
+                        && event.state
+                            == super::super::bridge_receipt::BridgeReceiptState::Dropped)
+            );
+            assert!(terminal.iter().any(|event| event.site.bridge_kind
+                == "a5-site-proof-t2-fallback"
+                && event.state == super::super::bridge_receipt::BridgeReceiptState::Applied));
+        });
     }
 
     #[test]
@@ -3837,6 +4307,53 @@ mod wave3_class_tests {
         });
     }
 
+    #[test]
+    fn r231_logical_position_and_call_share_one_physical_edit() {
+        with_classes(1, |ids| {
+            let owner = ids[0];
+            let outer = ClassSite::edit(
+                owner,
+                owner,
+                Arm::Pair,
+                "main.rs",
+                10,
+                40,
+                "a5-site-proof-t2-fallback",
+            );
+            let mut position = ClassSite::edit(
+                owner,
+                owner,
+                Arm::Pair,
+                "main.rs",
+                30,
+                33,
+                "a5-site-proof-t2-fallback",
+            );
+            position.edit_key.clone_from(&outer.edit_key);
+            let result = finalize_class_inputs(vec![
+                ClassInput::new(owner, arms(&[Arm::Pair]))
+                    .with_site(outer)
+                    .with_site(position),
+            ]);
+            assert!(result.classes[&owner].is_ready(), "{result:#?}");
+        });
+    }
+
+    #[test]
+    fn r231_shared_key_does_not_license_crossing_or_other_owners() {
+        with_classes(2, |ids| {
+            let mut left =
+                ClassSite::edit(ids[0], ids[0], Arm::Pair, "main.rs", 10, 30, "physical-a");
+            let mut right =
+                ClassSite::edit(ids[0], ids[0], Arm::Pair, "main.rs", 20, 40, "physical-b");
+            right.edit_key.clone_from(&left.edit_key);
+            assert!(intervals_overlap(&left, &right));
+            left.key.hi = 50;
+            right.key.owner_class = ids[1];
+            assert!(intervals_overlap(&left, &right));
+        });
+    }
+
     /// D10-W1 — lil's 204/260 shape.  A call-level C bridge owns an outer AST
     /// node while a subject-use rewrite owns a strict descendant.  The AST
     /// pipeline applies the descendant first and then moves that rewritten
@@ -3958,8 +4475,8 @@ mod wave3_class_tests {
     }
 
     /// D14-W1 — a non-clear A5 proof is not itself a hold once PAIR has
-    /// selected a receipted T2 raw view.  The exact waiver moves onto the
-    /// zero-syntax proof receipt.  A blocked PAIR outcome remains dropped.
+    /// selected a receipted T2 raw view. R231 requires an actual linked
+    /// carrier before this logical receipt is ready; the waiver remains exact.
     #[test]
     fn d14_w1_a5_block_falls_through_to_the_pair_t2_receipt() {
         use crate::bo_rewriter::decision::seam::A5ProofSiteFallback;
@@ -3968,7 +4485,10 @@ mod wave3_class_tests {
             negative_write: None,
         });
         assert_eq!(resolved.kind, "a5-site-proof-t2-fallback");
-        assert_eq!(resolved.state, ClassSiteState::ZeroSyntaxReady);
+        assert_eq!(
+            resolved.state,
+            ClassSiteState::Dropped("a5-fallback-unrenderable:carrier-not-materialized".into())
+        );
         assert_eq!(resolved.retention, BridgeRetentionTier::T2);
         assert_eq!(
             resolved.waiver_id.as_deref(),

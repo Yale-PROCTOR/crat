@@ -48,7 +48,7 @@ use rustc_span::Span;
 
 use super::{
     Arm, Decision, DecisionTable, RequiredArmSet, Subject, SubjectKind,
-    a5_site_proof::{A5PeerProof, A5SeamProofIndex, A5SiteProofVerdict},
+    a5_site_proof::{A5PeerProof, A5ProofSiteKey, A5SeamProofIndex, A5SiteProofVerdict},
     emitability::{ArgShape, EmitabilityFacts, RefKind},
     lifetime::LifetimeEligibility,
     raw_boundary::{
@@ -337,6 +337,8 @@ pub(crate) struct PairSiteDecision {
     pub(crate) verdict: A5SiteProofVerdict,
     pub(crate) reason: String,
     pub(crate) peer_receipts: String,
+    /// A5-owned whole-call carrier; ordinary PAIR rows leave this absent.
+    pub(crate) a5_fallback: Option<A5ProofSiteKey>,
 }
 
 impl PairSiteDecision {
@@ -733,6 +735,35 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
     a5_site_proofs: Option<&A5SeamProofIndex>,
     retention: &RetentionSummaries,
 ) -> CoConv {
+    build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_roles(
+        facts,
+        subjects,
+        hypothetical,
+        escapes,
+        overlap,
+        c9_marks,
+        lifetime_eligibility,
+        raw_boundary,
+        a5_site_proofs,
+        retention,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_roles(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedC9Mark],
+    lifetime_eligibility: &LifetimeEligibility,
+    raw_boundary: &RawBoundaryDispositionIndex,
+    a5_site_proofs: Option<&A5SeamProofIndex>,
+    retention: &RetentionSummaries,
+    a5_roles: &[PairSiteDecision],
+) -> CoConv {
     // ---- 1. the node set: subjects that would emit a PLAIN reference ----
     //
     // Slice and optional forms are deliberately excluded. `&mut [T]` and
@@ -797,6 +828,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
     }
 
     let mut dsu = Dsu::new(order.len());
+    let mut pending_unions = Vec::new();
     let mut node_block: FxHashMap<NodeKey, BlockReason> = FxHashMap::default();
     let mut edge_candidates = Vec::<EdgeCandidate>::new();
     let mut pair_sites = Vec::<PairSiteDecision>::new();
@@ -1136,6 +1168,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                         verdict,
                         reason,
                         peer_receipts,
+                        a5_fallback: None,
                     });
                 }
                 let _ = proofs;
@@ -1151,6 +1184,29 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                 }
                 let callee_subject = param_key.get(&(*callee, arg.index)).copied();
                 let callee_node = callee_subject.filter(|k| converts.contains(k));
+                // This exact late A5 endpoint will stay raw. Its materialized
+                // carrier owns the cast, so neither end owes cast stripping.
+                // The proof key and call identity keep ordinary cast gates
+                // unchanged at every unlicensed position.
+                let late_a5_raw_cast = matches!(
+                    arg.shape,
+                    ArgShape::CastOfLocal { .. } | ArgShape::AddrOfCast { .. }
+                ) && a5_roles.iter().any(|role| {
+                    role.caller == site.caller
+                        && role.callee == *callee
+                        && role.argument_index == arg.index
+                        && role.call_span == site.span
+                        && role.span.source_callsite() == arg.span.source_callsite()
+                        && Some(role.subject) == callee_subject
+                        && role.role == PairRole::RawView
+                        && role.tier == PairTier::T2
+                        && role.a5_fallback.is_some_and(|key| {
+                            key.caller == site.caller
+                                && key.callee == callee.to_def_id()
+                                && key.argument_index == arg.index
+                                && key.slot_depth == 0
+                        })
+                });
 
                 // The CALLER side of this argument: the binding whose own
                 // conversion this argument would carry.
@@ -1208,7 +1264,8 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                             BlockReason::FlowsIntoRawParam
                         };
                         block(&mut node_block, caller, reason);
-                    } else if matches!(arg.shape, ArgShape::CastOfLocal { .. }) {
+                    } else if matches!(arg.shape, ArgShape::CastOfLocal { .. }) && !late_a5_raw_cast
+                    {
                         // The parameter converts, but the argument casts the
                         // binding on the way in — `q as *mut T` where `q` is
                         // now `&mut T` is a silent coercion in the other
@@ -1225,7 +1282,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                     ArgShape::BareLocal(_) => match caller_node {
                         // The edge. Undirected: converting either alone is
                         // `E0308`, so neither end is the cause of the other.
-                        Some(caller) => dsu.union(index[&callee_key], index[&caller]),
+                        Some(caller) => pending_unions.push((callee_key, caller)),
                         None if caller_subject.is_some() => {}
                         None => block(&mut node_block, callee_key, BlockReason::ArgStaysRaw),
                     },
@@ -1238,7 +1295,9 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                         }
                     }
                     ArgShape::AddrOfCast { .. } | ArgShape::CastOfLocal { .. } => {
-                        block(&mut node_block, callee_key, BlockReason::ArgCastFormUnbuilt);
+                        if !late_a5_raw_cast {
+                            block(&mut node_block, callee_key, BlockReason::ArgCastFormUnbuilt);
+                        }
                     }
                     // Wave 1's type-aware, nameable raw-expression arm. It
                     // forms no caller/callee class edge: an offset/call/field
@@ -1261,6 +1320,49 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
         }
     }
 
+    // Late seam A5 obligations enter the same parameter-role mechanism before
+    // either global role consistency or caller/callee unions are finalized.
+    // One exact call argument has one row even when both producers observe it.
+    let a5_subjects = a5_roles
+        .iter()
+        .filter(|row| row.a5_fallback.is_some())
+        .map(|row| row.subject)
+        .collect::<FxHashSet<_>>();
+    let mut same_site_conflicts = FxHashSet::default();
+    for extra in a5_roles {
+        if let Some(existing) = pair_sites.iter_mut().find(|row| {
+            row.caller == extra.caller
+                && row.callee == extra.callee
+                && row.argument_index == extra.argument_index
+                && row.call_span == extra.call_span
+        }) {
+            if extra.a5_fallback.is_some() {
+                existing.a5_fallback = extra.a5_fallback;
+            }
+            match (existing.role, extra.role) {
+                (PairRole::Blocked, _) | (_, PairRole::Clear) => {}
+                (PairRole::Primary, PairRole::RawView) | (PairRole::RawView, PairRole::Primary) => {
+                    same_site_conflicts.insert(existing.subject);
+                    *existing = extra.clone();
+                }
+                (PairRole::Clear, _) | (_, PairRole::Blocked) => *existing = extra.clone(),
+                (PairRole::Primary, PairRole::Primary) | (PairRole::RawView, PairRole::RawView) => {
+                }
+            }
+        } else {
+            pair_sites.push(extra.clone());
+        }
+    }
+    for row in &pair_sites {
+        if matches!(row.role, PairRole::RawView | PairRole::Blocked) {
+            block(
+                &mut node_block,
+                row.subject,
+                BlockReason::DuplicatePlaceRoot,
+            );
+        }
+    }
+
     // A parameter kind is crate-global. If one call site selects it as a raw
     // view while another selects it as the safe primary, there is no coherent
     // per-site presentation in this wave. Fail the affected caller/callee
@@ -1270,21 +1372,34 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
         .filter(|row| row.role == PairRole::RawView)
         .map(|row| row.subject)
         .collect::<FxHashSet<_>>();
-    let conflicting_subjects = pair_sites
+    let mut conflicting_subjects = pair_sites
         .iter()
         .filter(|row| row.role == PairRole::Primary && raw_view_subjects.contains(&row.subject))
         .map(|row| row.subject)
         .collect::<FxHashSet<_>>();
+    conflicting_subjects.extend(same_site_conflicts);
     let affected_surfaces = pair_sites
         .iter()
         .filter(|row| conflicting_subjects.contains(&row.subject))
+        .map(|row| (row.caller, row.callee))
+        .collect::<FxHashSet<_>>();
+    let a5_affected_surfaces = pair_sites
+        .iter()
+        .filter(|row| {
+            conflicting_subjects.contains(&row.subject) && a5_subjects.contains(&row.subject)
+        })
         .map(|row| (row.caller, row.callee))
         .collect::<FxHashSet<_>>();
     for row in &mut pair_sites {
         if affected_surfaces.contains(&(row.caller, row.callee)) {
             row.role = PairRole::Blocked;
             row.tier = PairTier::Blocked;
-            row.reason = "pair-primary-ambiguous".to_owned();
+            row.reason = if a5_affected_surfaces.contains(&(row.caller, row.callee)) {
+                "a5-fallback-unrenderable:pair-primary-ambiguous"
+            } else {
+                "pair-primary-ambiguous"
+            }
+            .to_owned();
             block(
                 &mut node_block,
                 row.subject,
@@ -1301,6 +1416,17 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
             row.argument_index,
         )
     });
+
+    let raw_view_subjects = pair_sites
+        .iter()
+        .filter(|row| row.role == PairRole::RawView)
+        .map(|row| row.subject)
+        .collect::<FxHashSet<_>>();
+    for (callee, caller) in pending_unions {
+        if !raw_view_subjects.contains(&callee) && !raw_view_subjects.contains(&caller) {
+            dsu.union(index[&callee], index[&caller]);
+        }
+    }
 
     // ---- 3. components, then ONE blocked member blocks the class ----
     let mut class_id: FxHashMap<usize, usize> = FxHashMap::default();
@@ -1325,7 +1451,9 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
     }
 
     let settled = |key: NodeKey, form: EdgeForm| {
-        if form == EdgeForm::Ref && node_block.contains_key(&key) {
+        if raw_view_subjects.contains(&key)
+            || (form == EdgeForm::Ref && node_block.contains_key(&key))
+        {
             EdgeForm::Raw
         } else {
             form
@@ -1745,5 +1873,217 @@ mod pair_plan_tests {
             ]),
             ["raw-view", "primary"]
         );
+    }
+}
+
+#[cfg(test)]
+mod a5_cast_role_tests {
+    use rustc_hir::{ItemLocalId, OwnerId, def_id::DefIndex};
+    use rustc_middle::mir::Local;
+    use rustc_span::{BytePos, edition::Edition};
+
+    use super::{
+        super::{
+            DeclShape,
+            emitability::{Arg, CallSite},
+            raw_boundary::RawMutability,
+        },
+        *,
+    };
+    use crate::analyses::borrow_ownership::l2::MirLocationKey;
+
+    // Construct the same owned Subject/DecisionTable/call-facts inputs used by
+    // the production builder. No compiler, analysis, or model run is needed.
+    fn fixture(
+        check: impl FnOnce(&EmitabilityFacts, &[Subject], &DecisionTable, PairSiteDecision),
+    ) {
+        rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
+            let caller = LocalDefId {
+                local_def_index: DefIndex::from_u32(1),
+            };
+            let callee = LocalDefId {
+                local_def_index: DefIndex::from_u32(2),
+            };
+            let argument_span = Span::with_root_ctxt(BytePos(110), BytePos(130));
+            let call_span = Span::with_root_ctxt(BytePos(100), BytePos(140));
+            let inner = Span::with_root_ctxt(BytePos(110), BytePos(113));
+            let subject = |owner, label: &str| Subject {
+                fn_did: owner,
+                local: Local::from_u32(1),
+                hir_id: HirId {
+                    owner: OwnerId { def_id: owner },
+                    local_id: ItemLocalId::from_u32(1),
+                },
+                param_name: Some(label.rsplit("::").next().unwrap().to_owned()),
+                kind: SubjectKind::Param { hir_index: 0 },
+                ptr_depth: 1,
+                label: label.to_owned(),
+                ty_span: Some(argument_span),
+                binding_span: argument_span,
+                pointee_span: Some(inner),
+                decl_shape: DeclShape::RawPtr,
+                mutable: false,
+                freed_at: None,
+                len_recovered: false,
+                null_init: false,
+                mut_binding: false,
+                ctor: None,
+            };
+            let subjects = vec![
+                subject(caller, "caller::src"),
+                subject(callee, "target::src"),
+            ];
+            let source = (caller, subjects[0].hir_id);
+            let target_node = (callee, subjects[1].hir_id);
+            let target = RawTargetType {
+                rendered: "*const i32".into(),
+                pointee: "i32".into(),
+                mutability: RawMutability::Const,
+                depth2: None,
+            };
+            let mut facts = EmitabilityFacts::default();
+            facts.call_args.insert(
+                callee,
+                vec![CallSite {
+                    caller,
+                    span: call_span,
+                    args: vec![Arg {
+                        index: 0,
+                        span: argument_span,
+                        shape: ArgShape::CastOfLocal {
+                            binding: source.1,
+                            inner,
+                        },
+                        source_type: "*const i32".into(),
+                        target: Some(target.clone()),
+                        direct_storage: None,
+                        adapter_operand_span: inner,
+                        adapter_operand_mutability: Some(RawMutability::Const),
+                        place_identity: None,
+                    }],
+                }],
+            );
+            let table = DecisionTable {
+                entries: subjects
+                    .iter()
+                    .cloned()
+                    .map(|subject| (subject, Decision::Ref { mutable: false }))
+                    .collect(),
+                ..DecisionTable::default()
+            };
+            let role = PairSiteDecision {
+                caller,
+                callee,
+                argument_index: 0,
+                span: argument_span,
+                call_span,
+                subject: target_node,
+                source_node: Some(source),
+                target: Some(target),
+                source_shape: "cast-of-local",
+                role: PairRole::RawView,
+                tier: PairTier::T2,
+                verdict: A5SiteProofVerdict::Undeterminable,
+                reason: "a5-fallback-raw-view-role".into(),
+                peer_receipts: "fixture".into(),
+                a5_fallback: Some(A5ProofSiteKey {
+                    caller,
+                    location: MirLocationKey::new(0, 0),
+                    callee: callee.to_def_id(),
+                    argument_index: 0,
+                    slot_depth: 0,
+                }),
+            };
+            check(&facts, &subjects, &table, role);
+        });
+    }
+
+    fn build_case(
+        facts: &EmitabilityFacts,
+        subjects: &[Subject],
+        table: &DecisionTable,
+        roles: &[PairSiteDecision],
+    ) -> CoConv {
+        build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_roles(
+            facts,
+            subjects,
+            table,
+            &[],
+            OverlapRule::BlindOnly,
+            &[],
+            &LifetimeEligibility::default(),
+            &RawBoundaryDispositionIndex::default(),
+            None,
+            &RetentionSummaries::default(),
+            roles,
+        )
+    }
+
+    #[test]
+    fn a5_cast_role_keeps_the_exact_licensed_caller() {
+        fixture(|facts, subjects, table, role| {
+            let source = role.source_node.unwrap();
+            let result = build_case(facts, subjects, table, &[role]);
+            assert_eq!(
+                result.node_block(source),
+                None,
+                "an exact A5 raw endpoint has no cast-of-converting-local obligation"
+            );
+            assert!(result.admits(source));
+        });
+    }
+
+    #[test]
+    fn a5_cast_role_target_uses_the_raw_role_gate() {
+        fixture(|facts, subjects, table, role| {
+            let target = role.subject;
+            let result = build_case(facts, subjects, table, &[role]);
+            assert!(result.is_pair_raw_view(target));
+            assert_eq!(
+                result.node_block(target),
+                Some(BlockReason::DuplicatePlaceRoot),
+                "the selected raw parameter does not require cast stripping"
+            );
+        });
+    }
+
+    #[test]
+    fn a5_cast_role_does_not_open_an_unlicensed_cast() {
+        fixture(|facts, subjects, table, role| {
+            let source = role.source_node.unwrap();
+            let target = role.subject;
+            let result = build_case(facts, subjects, table, &[]);
+            assert_eq!(
+                result.node_block(source),
+                Some(BlockReason::CastOfConvertingLocal)
+            );
+            assert_eq!(
+                result.node_block(target),
+                Some(BlockReason::ArgCastFormUnbuilt)
+            );
+        });
+    }
+
+    #[test]
+    fn a5_cast_role_requires_the_exact_call_and_typed_origin() {
+        fixture(|facts, subjects, table, role| {
+            let source = role.source_node.unwrap();
+            let target = role.subject;
+            let mut other_call = role.clone();
+            other_call.call_span = Span::with_root_ctxt(BytePos(200), BytePos(240));
+            let mut untyped = role;
+            untyped.a5_fallback = None;
+            for role in [other_call, untyped] {
+                let result = build_case(facts, subjects, table, &[role]);
+                assert_eq!(
+                    result.node_block(source),
+                    Some(BlockReason::CastOfConvertingLocal)
+                );
+                assert_eq!(
+                    result.node_block(target),
+                    Some(BlockReason::ArgCastFormUnbuilt)
+                );
+            }
+        });
     }
 }

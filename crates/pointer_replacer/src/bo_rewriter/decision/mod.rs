@@ -36,13 +36,17 @@ pub(crate) mod declaration;
 pub(crate) mod declaration_pattern;
 pub(crate) mod emitability;
 pub(crate) mod exposure;
+pub(crate) mod interface;
 pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod option;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
+pub(crate) mod return_alias;
+pub(crate) mod returned_child;
 pub(crate) mod seam;
+pub(crate) mod sibling_overlap;
 pub(crate) mod slice_use;
 pub(crate) mod universe;
 
@@ -847,8 +851,10 @@ pub(crate) enum Decision {
 /// The finished, immutable table handed to [`super::plan`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
+    pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
     pub(crate) declaration_pointees: declaration::DeclarationPointees,
     pub(crate) declaration_patterns: declaration_pattern::PatternDeclarations,
+    pub(crate) input_interfaces: interface::InputInterfaces,
     pub entries: Vec<(Subject, Decision)>,
     pub(crate) exposure: Option<exposure::ExposurePolicy>,
     pub(crate) arm_requirements: FxHashMap<(LocalDefId, HirId), RequiredArmSet>,
@@ -979,6 +985,7 @@ impl DecisionTable {
 pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
     pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
+    pub(crate) input_interfaces: &'a interface::InputInterfaces,
     pub(crate) tcx: TyCtxt<'tcx>,
     pub(crate) family_policy: &'a super::additive::FamilyPolicy,
     pub(crate) model: &'a FxHashMap<SlotRef, SlotKind>,
@@ -1064,6 +1071,8 @@ pub(crate) fn decide_with_raw_fallbacks(
         })
         .collect();
     DecisionTable {
+        sibling_overlap_inventory: Default::default(),
+        input_interfaces: ctx.input_interfaces.clone(),
         declaration_patterns: ctx
             .declaration_patterns
             .iter()
@@ -1400,6 +1409,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         tcx,
         declaration_pointees,
         declaration_patterns,
+        input_interfaces: _,
         family_policy,
         model,
         slots,
@@ -1606,6 +1616,13 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         );
     }
 
+    // PAIR selects a raw callee endpoint before the form-specific renderers.
+    // A late A5 obligation can concern a borrowed slice or Option as well as
+    // a thin reference; all still pass the model and ordinary gates above.
+    if coconv.is_some_and(|cc| cc.is_pair_raw_view((subject.fn_did, subject.hir_id))) {
+        return degrade(subject, decl_site, DegradeReason::PairRawView);
+    }
+
     // **S3.2′-3 — the null-init gate.** Positive evidence of nullness, so no
     // PLAIN form may emit.
     //
@@ -1662,22 +1679,18 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         if let Some(cc) = coconv {
             let key = (subject.fn_did, subject.hir_id);
             if !cc.admits(key) {
-                let reason = if cc.is_pair_raw_view(key) {
-                    DegradeReason::PairRawView
-                } else {
-                    match cc.node_block(key) {
-                        Some(via) => DegradeReason::SilentCoercion { via },
-                        None => match cc.class_block(key) {
-                            Some(via) => DegradeReason::ClassBlocked { via },
-                            // Not a node. Unreachable through the pipeline —
-                            // production and the hypothetical differ ONLY by
-                            // `coconv` — and attributed rather than silently
-                            // emitted, because an unreachable arm that falls
-                            // through is how a subject escapes its own gate once
-                            // the premise stops holding.
-                            None => DegradeReason::CallSiteNotAdapted,
-                        },
-                    }
+                let reason = match cc.node_block(key) {
+                    Some(via) => DegradeReason::SilentCoercion { via },
+                    None => match cc.class_block(key) {
+                        Some(via) => DegradeReason::ClassBlocked { via },
+                        // Not a node. Unreachable through the pipeline —
+                        // production and the hypothetical differ ONLY by
+                        // `coconv` — and attributed rather than silently
+                        // emitted, because an unreachable arm that falls
+                        // through is how a subject escapes its own gate once
+                        // the premise stops holding.
+                        None => DegradeReason::CallSiteNotAdapted,
+                    },
                 };
                 return degrade(subject, decl_site, reason);
             }
@@ -1930,8 +1943,10 @@ mod self_consistency_tests {
 
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
+            sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),
+            input_interfaces: Default::default(),
             exposure: None,
             arm_requirements: FxHashMap::default(),
             seams: Default::default(),

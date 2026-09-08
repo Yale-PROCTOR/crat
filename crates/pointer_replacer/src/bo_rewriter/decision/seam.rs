@@ -327,9 +327,49 @@ pub(crate) struct RevertFoundFormEdit {
     pub input: SeamInputRendering,
 }
 
+/// Frozen input and evidence needed to seal an outbound operand after class
+/// finalization. Text is carried from the exact original AST spans.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawOutboundEndpoint {
+    pub(crate) returned_child: Option<super::raw_boundary::ReturnedChildSiteEvidence>,
+    pub(crate) mutable_binding_required: bool,
+    pub(crate) target: super::raw_boundary::RawTargetType,
+    pub(crate) original_expression: String,
+    pub(crate) operand_expression: String,
+    pub(crate) ownership: Option<super::raw_boundary_contracts::OwnershipContract>,
+    pub(crate) negative_write: bool,
+    pub(crate) box_slice: bool,
+    pub(crate) enclosing_unsafe_fn: bool,
+}
+
+/// Recheck only frozen returned-child evidence against the terminal view.
+/// A source form change cannot reuse an earlier shared-write permission bit.
+pub(crate) fn terminal_returned_child_permission(
+    evidence: Option<&super::raw_boundary::ReturnedChildSiteEvidence>,
+    source_shape: &str,
+    terminal_source: Form,
+) -> Result<(), super::raw_boundary::ReturnedChildPermissionFailure> {
+    let Some(evidence) = evidence else { return Ok(()) };
+    if evidence.raw_field_parent && source_shape == "raw-expr" {
+        return Ok(());
+    }
+    let actual_view = match source_shape {
+        "addr-of" | "addr-of-cast" => Form::Ref { mutable: false },
+        "addr-of-mut" | "addr-of-mut-cast" => Form::Ref { mutable: true },
+        _ => terminal_source,
+    };
+    let Some(source) = decision_for_safe_form(actual_view) else { return Ok(()) };
+    super::raw_boundary::returned_child_permission(
+        &source,
+        evidence.child.as_ref().ok().map(|child| &child.access),
+    )
+}
+
 /// One placed adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SeamEdit {
+    pub(crate) raw_outbound: Option<RawOutboundEndpoint>,
+    pub(crate) zero_syntax: bool,
     /// The **argument expression's** span, in the CALLER's file.
     pub span: Span,
     /// Whole call expression used only for class attribution.
@@ -692,9 +732,43 @@ pub(crate) struct ZeroBridgeSite {
     pub unsafe_context: Option<super::super::mechanical_receipt::UnsafeContextPresentation>,
 }
 
+/// Adapter collections sealed against finalized interfaces. Supplying this
+/// carrier makes every collection authoritative, including an empty one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TerminalCallPlans {
+    pub(crate) return_origin_dependencies: super::lifetime::ReturnOriginAtomDependencies,
+    pub(crate) a5_raw_calls: Vec<A5RawViewCall>,
+    pub(crate) pair_raw_calls: Vec<PairRawViewCall>,
+    pub(crate) seam_edits: Vec<SeamEdit>,
+    pub(crate) revert_found_form_edits: Vec<RevertFoundFormEdit>,
+}
+
+impl TerminalCallPlans {
+    pub(crate) fn candidates(seams: &SeamPlan) -> Self {
+        Self {
+            return_origin_dependencies: Default::default(),
+            a5_raw_calls: seams.a5_raw_calls.clone(),
+            pair_raw_calls: seams.pair_raw_calls.clone(),
+            seam_edits: seams.edits.clone(),
+            revert_found_form_edits: seams.revert_found_form_edits.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PairRawViewTemp {
     pub argument_index: usize,
+    pub raw_expression: String,
+    pub target_type: String,
+    pub source_node: Option<(LocalDefId, HirId)>,
+    pub argument_expression: String,
+    pub argument_shape: &'static str,
+    pub target: super::raw_boundary::RawTargetType,
+    pub input_rendering: Option<PairRawViewRendering>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PairRawViewRendering {
     pub raw_expression: String,
     pub target_type: String,
 }
@@ -1061,6 +1135,10 @@ impl GlueSpec {
                     || matches!(
                         template,
                         super::raw_boundary::BridgeTemplate::OptRefMutToRawMut
+                            | super::raw_boundary::BridgeTemplate::RefMutToWritableRawConst
+                            | super::raw_boundary::BridgeTemplate::SliceMutToWritableRawConst
+                            | super::raw_boundary::BridgeTemplate::OptRefMutToWritableRawConst
+                            | super::raw_boundary::BridgeTemplate::OptSliceMutToWritableRawConst
                             | super::raw_boundary::BridgeTemplate::TypedRawTemporary
                             | super::raw_boundary::BridgeTemplate::OptRefToRawConst
                             | super::raw_boundary::BridgeTemplate::OptRefToRawMut
@@ -3027,23 +3105,6 @@ fn decision_for_safe_form(form: Form) -> Option<super::Decision> {
     }
 }
 
-fn a5_extent_from_safe_form(found: Form, argument: &str) -> (Option<String>, Option<&'static str>) {
-    match found {
-        Form::Slice { .. } => (
-            Some(format!("({argument}).len()")),
-            Some(super::super::c9::A5_EXTENT_VALUE_PLACEHOLDER),
-        ),
-        Form::Opt { slice: true, .. } => (
-            Some(format!(
-                "({argument}).as_deref().map_or(0usize, |slice| slice.len())"
-            )),
-            Some(super::super::c9::A5_EXTENT_VALUE_PLACEHOLDER),
-        ),
-        Form::Ref { .. } => (None, Some("1")),
-        Form::Opt { slice: false, .. } | Form::Raw => (None, None),
-    }
-}
-
 /// Replays the plan-time argument-expression form derivation over a terminal
 /// subject form. An address-of expression is a reference regardless of whether
 /// its root subject was itself placed; bare/cast locals inherit the terminal
@@ -3069,6 +3130,11 @@ pub(crate) fn replan_a5_raw_view(
     terminal_found: Form,
 ) -> Result<A5RawViewTemp, SeamBlock> {
     use super::raw_boundary::{BridgeRender, RawBoundaryBlockReason};
+
+    // R231: a raw-view obligation cannot reconstruct a protected target.
+    if terminal_expected != Form::Raw {
+        return Err(SeamBlock::A5RawViewUnavailable);
+    }
 
     let (raw_expression, raw_template) = if terminal_found == Form::Raw {
         (
@@ -3101,50 +3167,17 @@ pub(crate) fn replan_a5_raw_view(
         (rendered, template.key().to_owned())
     };
 
-    let (extent_expression, len) =
-        a5_extent_from_safe_form(terminal_found, &view.argument_expression);
-    let (adapted_expression, safe_template, unsafe_context) = if terminal_expected == Form::Raw {
-        (
-            super::super::c9::A5_RAW_VALUE_PLACEHOLDER.to_owned(),
-            None,
-            None,
-        )
-    } else {
-        let Some((mut safe_spec, _)) = glue(terminal_expected, Form::Raw, len)? else {
-            return Err(SeamBlock::A5RawViewUnavailable);
-        };
-        if safe_spec.null_arm == NullArm::Checked {
-            safe_spec = safe_spec.with_checked_binding_type(view.target.rendered.clone());
-        }
-        let adapted = safe_spec
-            .render_in_context(
-                super::super::c9::A5_RAW_VALUE_PLACEHOLDER,
-                view.enclosing_unsafe_fn,
-            )
-            .ok_or(SeamBlock::A5RawViewUnavailable)?;
-        let context = safe_spec.requires_unsafe().then_some(
-            super::super::mechanical_receipt::UnsafeContextPresentation {
-                unsafe_fn: view.enclosing_unsafe_fn,
-                wrapper_inserted: !view.enclosing_unsafe_fn,
-                edition: 2018,
-            },
-        );
-        (adapted, Some(safe_spec.template_key().to_owned()), context)
-    };
-    let mut template = safe_template.map_or_else(
-        || raw_template.clone(),
-        |safe| format!("{raw_template}->{safe}"),
-    );
+    let mut template = raw_template;
     if terminal_found != Form::Raw && view.negative_write.is_some() {
         template.push_str(":negative-write=foster-immutable");
     }
 
     let mut replanned = view.clone();
     replanned.raw_expression = raw_expression;
-    replanned.adapted_expression = adapted_expression;
-    replanned.extent_expression = extent_expression;
+    replanned.adapted_expression = super::super::c9::A5_RAW_VALUE_PLACEHOLDER.to_owned();
+    replanned.extent_expression = None;
     replanned.template = template;
-    replanned.unsafe_context = unsafe_context;
+    replanned.unsafe_context = None;
     replanned.negative_write = (terminal_found != Form::Raw)
         .then_some(view.negative_write)
         .flatten();
@@ -3154,7 +3187,7 @@ pub(crate) fn replan_a5_raw_view(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_a5_raw_view(
+pub(crate) fn build_a5_raw_view(
     tcx: TyCtxt<'_>,
     mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
     caller: LocalDefId,
@@ -3205,7 +3238,8 @@ fn build_a5_raw_view(
         enclosing_unsafe_fn: enclosing_function_is_unsafe(tcx, caller),
         input_rendering: None,
     };
-    replan_a5_raw_view(&seed, expected, found)
+    // Discovery requests Raw; role feedback settles that endpoint before planning.
+    replan_a5_raw_view(&seed, Form::Raw, found)
 }
 
 fn inbound_retention(
@@ -4129,39 +4163,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 proof.fallback = A5ProofSiteFallback::Primary;
                             }
                             super::co_conversion::PairRole::RawView => {
-                                if pos.found == Form::Raw {
-                                    match &mut candidates[idx] {
-                                        Ok(Some(candidate)) => {
-                                            candidate.retention = BridgeRetentionTier::T2;
-                                            candidate.waiver_id =
-                                                Some(RAW_BOUNDARY_T2_WAIVER_ID.to_owned());
-                                            proof.fallback = A5ProofSiteFallback::T2RawView {
-                                                template: candidate.spec.template_key().to_owned(),
-                                                negative_write: None,
-                                            };
-                                        }
-                                        Ok(None) if pos.expected == Form::Raw => {
-                                            proof.fallback = A5ProofSiteFallback::T2RawView {
-                                                template: "raw-passthrough".to_owned(),
-                                                negative_write: None,
-                                            };
-                                        }
-                                        Ok(None) => {
-                                            proof.fallback = A5ProofSiteFallback::Held {
-                                                reason: SeamBlock::A5RawViewUnavailable
-                                                    .key()
-                                                    .to_owned(),
-                                            };
-                                            a5_block = Some(SeamBlock::A5RawViewUnavailable);
-                                        }
-                                        Err(block) => {
-                                            proof.fallback = A5ProofSiteFallback::Held {
-                                                reason: block.key().to_owned(),
-                                            };
-                                            a5_block = Some(*block);
-                                        }
-                                    }
-                                } else if let (Some(proof_site_key), Some(argument)) =
+                                if let (Some(proof_site_key), Some(argument)) =
                                     (proof.proof_site_key, pos.text.as_deref())
                                 {
                                     match build_a5_raw_view(
@@ -4210,14 +4212,19 @@ pub(crate) fn synthesize_with_raw_boundary(
                                         }
                                         Err(block) => {
                                             proof.fallback = A5ProofSiteFallback::Held {
-                                                reason: block.key().to_owned(),
+                                                reason: format!(
+                                                    "a5-fallback-unrenderable:{}",
+                                                    block.key()
+                                                ),
                                             };
                                             a5_block = Some(block);
                                         }
                                     }
                                 } else {
                                     proof.fallback = A5ProofSiteFallback::Held {
-                                        reason: "a5-proof-site-key-unavailable".to_owned(),
+                                        reason:
+                                            "a5-fallback-unrenderable:proof-site-key-unavailable"
+                                                .to_owned(),
                                     };
                                     a5_block = Some(SeamBlock::A5RawViewUnavailable);
                                 }
@@ -4350,6 +4357,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                             ));
                         }
                         plan.edits.push(SeamEdit {
+                            raw_outbound: None,
+                            zero_syntax: false,
                             span: pos.span,
                             call_span: site.span,
                             replacement: candidate.replacement.clone(),
@@ -4520,7 +4529,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         ) else {
             continue;
         };
-        match template.render(
+        let zero_syntax = match template.render(
             &argument,
             site.target.mutability,
             site.box_slice,
@@ -4528,13 +4537,10 @@ pub(crate) fn synthesize_with_raw_boundary(
                 .as_ref()
                 .and_then(|raw| raw.cast_pointee.as_deref()),
         ) {
-            Ok(super::raw_boundary::BridgeRender::Edit(_)) => {}
-            Ok(
-                super::raw_boundary::BridgeRender::ZeroSyntax
-                | super::raw_boundary::BridgeRender::Lifecycle,
-            ) => continue,
-            Err(_) => continue,
-        }
+            Ok(super::raw_boundary::BridgeRender::Edit(_)) => false,
+            Ok(super::raw_boundary::BridgeRender::ZeroSyntax) => true,
+            Ok(super::raw_boundary::BridgeRender::Lifecycle) | Err(_) => continue,
+        };
         let found = site
             .node
             .and_then(|node| decision_of.get(&node).copied())
@@ -4558,7 +4564,29 @@ pub(crate) fn synthesize_with_raw_boundary(
             super::raw_boundary::RawBoundaryDisposition::Blocked { .. }
             | super::raw_boundary::RawBoundaryDisposition::OwnedByOtherArm { .. } => continue,
         };
+        let ownership = super::raw_boundary_contracts::classify_contract(
+            &key.callee,
+            key.argument_index,
+            &site.target,
+        )
+        .ok()
+        .map(|contract| contract.ownership);
+        let original_expression = sm
+            .span_to_snippet(site.span)
+            .expect("located outbound argument has original source");
         plan.edits.push(SeamEdit {
+            raw_outbound: Some(RawOutboundEndpoint {
+                returned_child: raw_boundary.returned_child_evidence(key).cloned(),
+                mutable_binding_required: site.mutable_binding_required,
+                target: site.target.clone(),
+                original_expression,
+                operand_expression: argument.clone(),
+                ownership,
+                negative_write: raw_boundary.negative_write_evidence(key).is_some(),
+                box_slice: site.box_slice,
+                enclosing_unsafe_fn: enclosing_function_is_unsafe(tcx, owner_did),
+            }),
+            zero_syntax,
             span: site.span,
             call_span: site.call_span,
             replacement,
@@ -4591,8 +4619,8 @@ pub(crate) fn synthesize_with_raw_boundary(
             arg_span: argument_span,
             expected: Form::Raw,
             found,
-            source_node: None,
-            input_rendering: None,
+            source_node: site.node,
+            input_rendering: Some(SeamInputRendering::ZeroSyntax { found: Form::Raw }),
             root_identity: key.subject.clone(),
             blind: false,
             overlap: None,
@@ -4603,11 +4631,9 @@ pub(crate) fn synthesize_with_raw_boundary(
     // PAIR raw views are grouped by call. Their temps must be evaluated before
     // any surviving safe borrow, so an argument-local edit is insufficient.
     let mut pair_raw_calls = BTreeMap::<(u32, u32, u32, u32), PairRawViewCall>::new();
-    for pair in coconv
-        .pair_sites()
-        .iter()
-        .filter(|pair| pair.role == super::co_conversion::PairRole::RawView)
-    {
+    for pair in coconv.pair_sites().iter().filter(|pair| {
+        pair.role == super::co_conversion::PairRole::RawView && pair.a5_fallback.is_none()
+    }) {
         if pair.tier != super::co_conversion::PairTier::T2 {
             continue;
         }
@@ -4632,6 +4658,50 @@ pub(crate) fn synthesize_with_raw_boundary(
             block_pair_raw_view(&mut plan, pair, "pair-raw-view-template-unavailable");
             continue;
         };
+        let input_rendering = if let Some(source_node) = pair.source_node {
+            let input_subject = table
+                .input_interfaces
+                .subject_forms
+                .get(&source_node)
+                .copied();
+            let input_form = match pair.source_shape {
+                "bare-local" | "cast-of-local" => input_subject
+                    .and_then(|form| a5_argument_expression_form(pair.source_shape, form)),
+                // These expressions supply their own reference form even if
+                // the root is an ordinary scalar, not a pointer subject.
+                "addr-of" | "addr-of-cast" | "addr-of-mut" | "addr-of-mut-cast" => {
+                    a5_argument_expression_form(pair.source_shape, Form::Raw)
+                }
+                // The collector classifies these original expressions as
+                // raw-pointer values; their root's type is not their result.
+                "raw-expr" | "cast" => Some(Form::Raw),
+                _ => None,
+            };
+            let rendering = input_form.and_then(|form| {
+                let input_decision = decision_for_safe_form(form);
+                super::raw_boundary::pair_raw_view_expression(
+                    input_decision.as_ref(),
+                    target,
+                    &argument,
+                    pair.source_shape,
+                )
+                .map(|raw_expression| PairRawViewRendering {
+                    raw_expression,
+                    target_type: target.rendered.clone(),
+                })
+            });
+            let Some(rendering) = rendering else {
+                block_pair_raw_view(
+                    &mut plan,
+                    pair,
+                    "a5-fallback-unrenderable:pair-input-form-unavailable",
+                );
+                continue;
+            };
+            Some(rendering)
+        } else {
+            None
+        };
         let key = (
             pair.caller.local_def_index.as_u32(),
             pair.callee.local_def_index.as_u32(),
@@ -4653,6 +4723,11 @@ pub(crate) fn synthesize_with_raw_boundary(
             argument_index: pair.argument_index,
             raw_expression,
             target_type: target.rendered.clone(),
+            source_node: pair.source_node,
+            argument_expression: argument,
+            argument_shape: pair.source_shape,
+            target: target.clone(),
+            input_rendering,
         });
         call.reasons.push(pair.reason.clone());
         call.atom_ids.push(pair.atom_id());
@@ -4685,6 +4760,8 @@ pub(crate) fn synthesize_with_raw_boundary(
             .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect())
             .unwrap_or_default();
         plan.edits.push(SeamEdit {
+            raw_outbound: None,
+            zero_syntax: false,
             span: site.span,
             call_span: site.span,
             replacement,
@@ -4872,6 +4949,8 @@ pub(crate) fn synthesize_with_raw_boundary(
         };
         let digest = function_plan.digest();
         plan.edits.push(SeamEdit {
+            raw_outbound: None,
+            zero_syntax: false,
             span: site.span,
             call_span: site.span,
             replacement,

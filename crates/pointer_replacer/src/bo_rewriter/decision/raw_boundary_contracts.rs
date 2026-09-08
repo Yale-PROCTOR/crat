@@ -49,6 +49,10 @@ pub(crate) struct ArgumentContract {
     pub retention: RetentionContract,
     pub access: PointeeAccess,
     pub ownership: OwnershipContract,
+    /// Function-level relation: a non-null returned view derives from this
+    /// zero-based argument. Consumers must compare it with their own argument
+    /// index; its presence does not make every argument the returned parent.
+    pub returns_alias_of: Option<usize>,
     pub provenance: &'static str,
 }
 
@@ -80,6 +84,7 @@ struct ContractRow {
     position: Position,
     access: PointeeAccess,
     ownership: OwnershipContract,
+    returns_alias_of: Option<usize>,
 }
 
 const fn row(symbol: &'static str, position: usize, access: PointeeAccess) -> ContractRow {
@@ -88,6 +93,26 @@ const fn row(symbol: &'static str, position: usize, access: PointeeAccess) -> Co
         position: Position::Exact(position),
         access,
         ownership: OwnershipContract::BorrowView,
+        returns_alias_of: None,
+    }
+}
+
+/// Only existing table symbols are annotated. Primary source: WG14 N1570
+/// <https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf>:
+/// fgets §7.21.7.2 p3; strcpy §7.24.2.3 p3; strncpy §7.24.2.4 p4;
+/// strcat §7.24.3.1 p3; strncat §7.24.3.2 p3;
+/// strchr §7.24.5.2 p3; strstr §7.24.5.7 p3.
+/// The copy/concatenation functions return argument 0 itself. fgets may return
+/// null; the search functions may return null or an interior view of argument
+/// 0. This records lineage metadata without changing the access/retention rule.
+const fn return_alias_row(
+    symbol: &'static str,
+    position: usize,
+    access: PointeeAccess,
+) -> ContractRow {
+    ContractRow {
+        returns_alias_of: Some(0),
+        ..row(symbol, position, access)
     }
 }
 
@@ -95,7 +120,7 @@ const fn row(symbol: &'static str, position: usize, access: PointeeAccess) -> Co
 /// are explicit so a destination never inherits a source's access mode.
 const TABLE: &[ContractRow] = &[
     row("fdopen", 1, PointeeAccess::Read),
-    row("fgets", 0, PointeeAccess::Write),
+    return_alias_row("fgets", 0, PointeeAccess::Write),
     row("fopen", 0, PointeeAccess::Read),
     row("fopen", 1, PointeeAccess::Read),
     row("fprintf", 1, PointeeAccess::Read),
@@ -118,22 +143,22 @@ const TABLE: &[ContractRow] = &[
     row("sscanf", 1, PointeeAccess::Read),
     row("stat", 0, PointeeAccess::Read),
     row("stat", 1, PointeeAccess::Write),
-    row("strcat", 0, PointeeAccess::Write),
-    row("strcat", 1, PointeeAccess::Read),
-    row("strchr", 0, PointeeAccess::Read),
+    return_alias_row("strcat", 0, PointeeAccess::Write),
+    return_alias_row("strcat", 1, PointeeAccess::Read),
+    return_alias_row("strchr", 0, PointeeAccess::Read),
     row("strcmp", 0, PointeeAccess::Read),
     row("strcmp", 1, PointeeAccess::Read),
-    row("strcpy", 0, PointeeAccess::Write),
-    row("strcpy", 1, PointeeAccess::Read),
+    return_alias_row("strcpy", 0, PointeeAccess::Write),
+    return_alias_row("strcpy", 1, PointeeAccess::Read),
     row("strlen", 0, PointeeAccess::Read),
     row("strncasecmp", 0, PointeeAccess::Read),
     row("strncasecmp", 1, PointeeAccess::Read),
-    row("strncat", 0, PointeeAccess::Write),
-    row("strncat", 1, PointeeAccess::Read),
-    row("strncpy", 0, PointeeAccess::Write),
-    row("strncpy", 1, PointeeAccess::Read),
-    row("strstr", 0, PointeeAccess::Read),
-    row("strstr", 1, PointeeAccess::Read),
+    return_alias_row("strncat", 0, PointeeAccess::Write),
+    return_alias_row("strncat", 1, PointeeAccess::Read),
+    return_alias_row("strncpy", 0, PointeeAccess::Write),
+    return_alias_row("strncpy", 1, PointeeAccess::Read),
+    return_alias_row("strstr", 0, PointeeAccess::Read),
+    return_alias_row("strstr", 1, PointeeAccess::Read),
     row("utime", 0, PointeeAccess::Read),
     row("utime", 1, PointeeAccess::Read),
     ContractRow {
@@ -141,20 +166,30 @@ const TABLE: &[ContractRow] = &[
         position: Position::Exact(0),
         access: PointeeAccess::Lifecycle,
         ownership: OwnershipContract::Consume,
+        returns_alias_of: None,
     },
     ContractRow {
         symbol: "free",
         position: Position::Exact(0),
         access: PointeeAccess::Lifecycle,
         ownership: OwnershipContract::Consume,
+        returns_alias_of: None,
     },
     ContractRow {
         symbol: "realloc",
         position: Position::Exact(0),
         access: PointeeAccess::Lifecycle,
         ownership: OwnershipContract::AtomicSourceSink,
+        returns_alias_of: None,
     },
 ];
+
+fn function_return_alias(symbol: &str) -> Option<usize> {
+    TABLE
+        .iter()
+        .find(|row| row.symbol == symbol)
+        .and_then(|row| row.returns_alias_of)
+}
 
 fn printf_tail_first(symbol: &str) -> Option<usize> {
     match symbol {
@@ -211,6 +246,7 @@ fn family_contract(
         retention: RetentionContract::NoRetain,
         access,
         ownership: OwnershipContract::BorrowView,
+        returns_alias_of: function_return_alias(symbol),
         provenance,
     }))
 }
@@ -247,6 +283,7 @@ pub(crate) fn classify_contract(
         retention: RetentionContract::NoRetain,
         access: row.access,
         ownership: row.ownership,
+        returns_alias_of: row.returns_alias_of,
         provenance: "pinned-libc-0.2.184",
     })
 }
@@ -283,6 +320,7 @@ mod tests {
                 retention: RetentionContract::NoRetain,
                 access: PointeeAccess::Read,
                 ownership: OwnershipContract::BorrowView,
+                returns_alias_of: None,
                 provenance: "pinned-libc-0.2.184",
             })
         );
@@ -294,6 +332,75 @@ mod tests {
         let source = classify_contract(&callee("strcpy", true), 1, &target(RawMutability::Const));
         assert_eq!(dest.expect("destination").access, PointeeAccess::Write);
         assert_eq!(source.expect("source").access, PointeeAccess::Read);
+    }
+
+    #[test]
+    fn rb_retalias_metadata_is_exactly_the_seven_existing_symbols() {
+        let expected = std::collections::BTreeSet::from([
+            "fgets", "strcat", "strchr", "strcpy", "strncat", "strncpy", "strstr",
+        ]);
+        let observed = TABLE
+            .iter()
+            .filter(|row| row.returns_alias_of.is_some())
+            .map(|row| row.symbol)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(observed, expected);
+        for row in TABLE {
+            let relation = expected.contains(row.symbol).then_some(0);
+            assert_eq!(row.returns_alias_of, relation, "{row:?}");
+            let Position::Exact(argument_index) = row.position;
+            let contract = classify_contract(
+                &callee(row.symbol, true),
+                argument_index,
+                &target(RawMutability::Mut),
+            )
+            .expect("existing exact row");
+            assert_eq!(contract.returns_alias_of, relation, "{row:?}");
+            assert_eq!(contract.retention, RetentionContract::NoRetain);
+            assert_eq!(contract.access, row.access);
+            assert_eq!(contract.ownership, row.ownership);
+        }
+    }
+
+    #[test]
+    fn rb_retalias_source_argument_does_not_own_the_function_result() {
+        for symbol in ["strcpy", "strstr"] {
+            let parent =
+                classify_contract(&callee(symbol, true), 0, &target(RawMutability::Mut)).unwrap();
+            let source =
+                classify_contract(&callee(symbol, true), 1, &target(RawMutability::Const)).unwrap();
+            assert_eq!(parent.returns_alias_of, Some(0));
+            assert_eq!(source.returns_alias_of, Some(0), "function-level relation");
+            assert_ne!(
+                source.returns_alias_of,
+                Some(1),
+                "argument 1 is not the returned parent"
+            );
+            assert_eq!(source.access, PointeeAccess::Read);
+        }
+        let stream =
+            classify_contract(&callee("fgets", true), 2, &target(RawMutability::Mut)).unwrap();
+        assert_eq!(
+            stream.returns_alias_of,
+            Some(0),
+            "family rows retain the same function relation"
+        );
+        assert_ne!(stream.returns_alias_of, Some(2));
+        assert_eq!(stream.access, PointeeAccess::Stream);
+    }
+
+    #[test]
+    fn rb_retalias_lifecycle_contracts_have_no_borrowed_return_alias() {
+        for (symbol, ownership) in [
+            ("free", OwnershipContract::Consume),
+            ("fclose", OwnershipContract::Consume),
+            ("realloc", OwnershipContract::AtomicSourceSink),
+        ] {
+            let contract =
+                classify_contract(&callee(symbol, true), 0, &target(RawMutability::Mut)).unwrap();
+            assert_eq!(contract.returns_alias_of, None, "{symbol}");
+            assert_eq!(contract.ownership, ownership);
+        }
     }
 
     /// RB-X3 variadic-family witness. Mutation: moving the printf tail start

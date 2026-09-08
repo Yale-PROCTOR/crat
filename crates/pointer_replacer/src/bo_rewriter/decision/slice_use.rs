@@ -124,6 +124,10 @@ fn shared_to_mut(template: raw_boundary::BridgeTemplate) -> bool {
         | BridgeTemplate::TypedRawTemporary
         | BridgeTemplate::RefMutToRawMut
         | BridgeTemplate::RefMutToRawConst
+        | BridgeTemplate::RefMutToWritableRawConst
+        | BridgeTemplate::SliceMutToWritableRawConst
+        | BridgeTemplate::OptRefMutToWritableRawConst
+        | BridgeTemplate::OptSliceMutToWritableRawConst
         | BridgeTemplate::RefSharedToRawConst
         | BridgeTemplate::SliceMutToRawMut
         | BridgeTemplate::SliceToRawConst

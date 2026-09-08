@@ -284,7 +284,7 @@ fn alias_return_output(attested: bool) -> String {
             &reverts,
             emission.plan.root_file.as_ref(),
             &table,
-            Some(&emission.plan.terminal_a5_raw_calls),
+            Some(&emission.plan.terminal_call_plans),
         )
         .expect("configured alias-return emission")
         .0

@@ -1,0 +1,853 @@
+//! R233 caller-side sibling-overlap evidence, carried to terminal receipts.
+//!
+//! This consumer never changes the model, a declaration, an adapter, or a hold.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    Expr, ExprKind, HirId, QPath,
+    def::Res,
+    def_id::{DefId, LocalDefId},
+    intravisit,
+};
+use rustc_index::bit_set::DenseBitSet;
+use rustc_middle::{
+    mir::{
+        BasicBlock, Body, Local, Location, Operand, ProjectionElem, RETURN_PLACE, Rvalue,
+        StatementKind, TerminatorKind, visit::Visitor,
+    },
+    ty::{TyCtxt, TyKind},
+};
+use rustc_mir_dataflow::Analysis;
+use rustc_span::Span;
+
+use super::{
+    Subject, SubjectKind,
+    a5_site_proof::{A5PeerProof, A5SiteProofVerdict},
+    raw_boundary::{RawBoundarySiteKey, RetentionVerdict, raw_target_type, site_atom_id},
+    raw_boundary_contracts::{PointeeAccess, RetentionContract, classify_contract},
+    seam::Form,
+};
+use crate::analyses::{
+    borrow_ownership::{l2::MirLocationKey, slots::SlotOwner},
+    liveness::MaybeLiveLocals,
+};
+
+pub(crate) const PENDING_REASON: &str = "t1-sibling-overlap:pending";
+pub(crate) const PENDING_TIER: &str = "T2-pending";
+pub(crate) const PENDING_WAIVER: &str = "c-aliasing-semantics-at-unsafe-bridges/v2-pending";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SiblingAccess {
+    Foster {
+        local: Local,
+        mutable: bool,
+        defaulted: bool,
+    },
+    Contract {
+        access: PointeeAccess,
+        provenance: &'static str,
+    },
+    Unknown(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SiblingEvidence {
+    pub argument_index: usize,
+    pub proof: A5PeerProof,
+    pub access: SiblingAccess,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LocalPostCallEvidence {
+    ParameterProtected,
+    ParameterOrigin {
+        parameters: Vec<usize>,
+    },
+    Live {
+        locals: Vec<Local>,
+    },
+    /// Only complete frozen provenance and MIR exit-liveness can mint this.
+    DeadUnprotected {
+        checked_locals: Vec<Local>,
+    },
+    Unknown(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SiblingPotential {
+    pub site: RawBoundarySiteKey,
+    pub caller: LocalDefId,
+    pub callee: DefId,
+    pub source: Subject,
+    pub argument_span: Span,
+    pub call_span: Span,
+    pub source_shape: &'static str,
+    pub siblings: Vec<SiblingEvidence>,
+    pub local_post_call: LocalPostCallEvidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SourceBridgeEvidence {
+    WholeSubject,
+    ProjectedReferent { use_hir_id: HirId },
+    TypedView { use_hir_id: HirId, method: DefId },
+    RawFieldValue,
+    BindingStorage,
+    UnknownShape(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceBridgeCoverage {
+    pub potential: SiblingPotential,
+    pub evidence: SourceBridgeEvidence,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SiblingInventory {
+    pub potentials: Vec<SiblingPotential>,
+    pub coverage: Vec<SourceBridgeCoverage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CoverageGapReceipt {
+    pub potential: SiblingPotential,
+    pub source_form: Form,
+    pub target_form: Form,
+    pub reason: &'static str,
+}
+
+pub(crate) fn select_coverage_gaps(
+    coverage: &[SourceBridgeCoverage],
+    mut terminal: impl FnMut(&SiblingPotential) -> TerminalSiteState,
+) -> Vec<CoverageGapReceipt> {
+    coverage
+        .iter()
+        .filter_map(|record| {
+            if !matches!(record.evidence, SourceBridgeEvidence::UnknownShape(_)) {
+                return None;
+            }
+            let state = terminal(&record.potential);
+            if !pending_site_eligible(&record.potential, state) {
+                return None;
+            }
+            Some(CoverageGapReceipt {
+                potential: record.potential.clone(),
+                source_form: state.source_form,
+                target_form: state.target_form,
+                reason: "sibling-source-bridge-custody-unresolved",
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalSiteState {
+    pub source_form: Form,
+    pub target_form: Form,
+    /// Actual declaration custody, not the hypothetical decision alone.
+    pub source_delivered: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingSiblingReceipt {
+    pub potential: SiblingPotential,
+    pub source_form: Form,
+    pub target_form: Form,
+    pub risky_siblings: Vec<SiblingEvidence>,
+    pub reason: &'static str,
+    pub tier: &'static str,
+    pub waiver: &'static str,
+}
+
+impl PendingSiblingReceipt {
+    pub(crate) fn site_id(&self) -> String {
+        site_atom_id(&self.potential.site)
+    }
+}
+
+pub(crate) fn collect(tcx: TyCtxt<'_>, ctx: &super::super::DecideCtx) -> Vec<SiblingPotential> {
+    collect_inventory(tcx, ctx).potentials
+}
+
+pub(crate) fn collect_inventory(
+    tcx: TyCtxt<'_>,
+    ctx: &super::super::DecideCtx,
+) -> SiblingInventory {
+    let mut potentials = Vec::new();
+    let mut coverage = Vec::new();
+    let mut exit_liveness = FxHashMap::default();
+    let mut expressions = FxHashMap::default();
+    for site in &ctx.raw_boundary_sites.sites {
+        let Some((caller, binding)) = site.node else { continue };
+        let Some(source) = ctx
+            .subjects
+            .iter()
+            .find(|subject| subject.fn_did == caller && subject.hir_id == binding)
+        else {
+            continue;
+        };
+        let model_kind = ctx
+            .slots
+            .fn_local_slots
+            .get(&caller)
+            .and_then(|slots| slots.slot_for_local_depth(source.local, 0))
+            .and_then(|slot| ctx.model.get(&super::super::SlotRef::Local(caller, slot)));
+        if model_kind != Some(&super::super::SlotKind::Ref) {
+            continue;
+        }
+        let expressions = expressions
+            .entry(caller)
+            .or_insert_with(|| expression_index(tcx, caller));
+        let source_evidence = source_bridge_evidence(
+            tcx,
+            source,
+            site.source_span,
+            site.direct_storage_span.is_some(),
+            expressions,
+        );
+        let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+        let block = BasicBlock::from_u32(site.key.block);
+        let Some(data) = body.basic_blocks.get(block) else { continue };
+        if site.key.statement_index as usize != data.statements.len() {
+            continue;
+        }
+        let (func, args) = match &data.terminator().kind {
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => (func, args),
+            _ => continue,
+        };
+        let Some(constant) = func.constant() else { continue };
+        let TyKind::FnDef(callee, _) = *constant.ty().kind() else { continue };
+        if tcx.def_path_str(callee) != site.key.callee.path {
+            continue;
+        }
+        let location = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        let mut siblings = Vec::new();
+        for (argument_index, argument) in args.iter().enumerate() {
+            if argument_index == site.key.argument_index {
+                continue;
+            }
+            let argument_type = argument.node.ty(&*body, tcx);
+            let target = raw_target_type(tcx, argument_type);
+            if target.is_none() && !matches!(argument_type.kind(), TyKind::Ref(..)) {
+                continue;
+            }
+            let sibling_sites = ctx
+                .raw_boundary_sites
+                .sites
+                .iter()
+                .filter(|sibling| {
+                    sibling.key.caller == site.key.caller
+                        && sibling.key.callee == site.key.callee
+                        && sibling.key.block == site.key.block
+                        && sibling.key.statement_index == site.key.statement_index
+                        && sibling.key.argument_index == argument_index
+                })
+                .collect::<Vec<_>>();
+            let proof = if let ([sibling], Some(local_callee)) =
+                (sibling_sites.as_slice(), callee.as_local())
+            {
+                let proof = ctx.a5_site_proofs.lookup(
+                    caller.local_def_index.as_u32(),
+                    local_callee.local_def_index.as_u32(),
+                    site.key.argument_index,
+                    argument_index,
+                    site.source_span,
+                    sibling.source_span,
+                );
+                if proof.location.is_some_and(|found| {
+                    found
+                        != MirLocationKey {
+                            block: site.key.block,
+                            statement_index: site.key.statement_index as usize,
+                        }
+                }) {
+                    unknown_proof("sibling-a5-location-mismatch")
+                } else {
+                    proof
+                }
+            } else {
+                unknown_proof("sibling-a5-operand-inventory-unresolved")
+            };
+            let access = if let Some(local_callee) = site.callee_local {
+                let callee_body = tcx
+                    .mir_drops_elaborated_and_const_checked(local_callee)
+                    .borrow();
+                let parameters = ctx
+                    .subjects
+                    .iter()
+                    .filter(|subject| {
+                        subject.fn_did == local_callee
+                            && matches!(subject.kind, SubjectKind::Param { hir_index }
+                            if hir_index == argument_index)
+                    })
+                    .collect::<Vec<_>>();
+                match (
+                    callee_body.args_iter().nth(argument_index),
+                    parameters.as_slice(),
+                ) {
+                    (Some(local), [] | [_])
+                        if parameters
+                            .first()
+                            .is_none_or(|parameter| parameter.local == local)
+                            && matches!(
+                                callee_body.local_decls[local].ty.kind(),
+                                TyKind::RawPtr(..) | TyKind::Ref(..)
+                            ) =>
+                    {
+                        SiblingAccess::Foster {
+                            local,
+                            mutable: ctx.mut_facts.is_mutable(local_callee, local),
+                            defaulted: ctx.mut_facts.is_defaulted(local_callee, local),
+                        }
+                    }
+                    _ => SiblingAccess::Unknown("sibling-parameter-identity-unresolved"),
+                }
+            } else if let Some(target) = target.as_ref() {
+                match classify_contract(&site.key.callee, argument_index, target) {
+                    Ok(contract) => SiblingAccess::Contract {
+                        access: contract.access,
+                        provenance: contract.provenance,
+                    },
+                    Err(_) => SiblingAccess::Unknown("sibling-library-access-unresolved"),
+                }
+            } else {
+                SiblingAccess::Unknown("sibling-library-native-reference-access-unresolved")
+            };
+            siblings.push(SiblingEvidence {
+                argument_index,
+                proof,
+                access,
+            });
+        }
+        if siblings.is_empty() {
+            continue;
+        }
+        let local_post_call = match source.kind {
+            SubjectKind::Param { .. } => LocalPostCallEvidence::ParameterProtected,
+            SubjectKind::Local => {
+                let live = exit_liveness
+                    .entry(caller)
+                    .or_insert_with(|| call_exit_liveness(tcx, &body));
+                local_evidence(tcx, ctx, source, &body, location, live.get(&location))
+            }
+        };
+        let potential = SiblingPotential {
+            site: site.key.clone(),
+            caller,
+            callee,
+            source: source.clone(),
+            argument_span: site.source_span,
+            call_span: site.call_span,
+            source_shape: site.source_shape,
+            siblings,
+            local_post_call,
+        };
+        match source_evidence {
+            SourceBridgeEvidence::WholeSubject
+            | SourceBridgeEvidence::ProjectedReferent { .. }
+            | SourceBridgeEvidence::TypedView { .. } => potentials.push(potential.clone()),
+            SourceBridgeEvidence::RawFieldValue
+            | SourceBridgeEvidence::BindingStorage
+            | SourceBridgeEvidence::UnknownShape(_) => {}
+        }
+        coverage.push(SourceBridgeCoverage {
+            potential,
+            evidence: source_evidence,
+        });
+    }
+    potentials.sort_by(|left, right| left.site.cmp(&right.site));
+    coverage.sort_by(|left, right| left.potential.site.cmp(&right.potential.site));
+    SiblingInventory {
+        potentials,
+        coverage,
+    }
+}
+
+type ExpressionIndex<'tcx> = BTreeMap<(u32, u32), Vec<&'tcx Expr<'tcx>>>;
+
+fn expression_index<'tcx>(tcx: TyCtxt<'tcx>, caller: LocalDefId) -> ExpressionIndex<'tcx> {
+    struct Expressions<'tcx> {
+        by_span: ExpressionIndex<'tcx>,
+    }
+    impl<'tcx> intravisit::Visitor<'tcx> for Expressions<'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
+            let span = expression.span.source_callsite();
+            self.by_span
+                .entry((span.lo().0, span.hi().0))
+                .or_default()
+                .push(expression);
+            intravisit::walk_expr(self, expression);
+        }
+    }
+    let mut expressions = Expressions {
+        by_span: BTreeMap::new(),
+    };
+    intravisit::Visitor::visit_body(&mut expressions, tcx.hir_body_owned_by(caller));
+    expressions.by_span
+}
+
+fn source_bridge_evidence(
+    tcx: TyCtxt<'_>,
+    source: &Subject,
+    span: Span,
+    direct_storage: bool,
+    expressions: &ExpressionIndex<'_>,
+) -> SourceBridgeEvidence {
+    if direct_storage {
+        return SourceBridgeEvidence::BindingStorage;
+    }
+    let span = span.source_callsite();
+    let Some(candidates) = expressions.get(&(span.lo().0, span.hi().0)) else {
+        return SourceBridgeEvidence::UnknownShape("source-expression-span-missing");
+    };
+    let typeck = tcx.typeck(source.fn_did);
+    let mut normalized = Vec::new();
+    for &candidate in candidates {
+        let mut expression = candidate;
+        loop {
+            match expression.kind {
+                ExprKind::DropTemps(inner) => expression = inner,
+                ExprKind::Cast(inner, _)
+                    if matches!(typeck.expr_ty(expression).kind(), TyKind::RawPtr(..))
+                        && matches!(
+                            typeck.expr_ty(inner).kind(),
+                            TyKind::RawPtr(..) | TyKind::Ref(..)
+                        ) =>
+                {
+                    expression = inner
+                }
+                _ => break,
+            }
+        }
+        if !normalized
+            .iter()
+            .any(|old: &&Expr<'_>| old.hir_id == expression.hir_id)
+        {
+            normalized.push(expression);
+        }
+    }
+    let [expression] = normalized.as_slice() else {
+        return SourceBridgeEvidence::UnknownShape("source-expression-span-ambiguous");
+    };
+    fn root(expression: &Expr<'_>, binding: HirId) -> bool {
+        matches!(expression.kind, ExprKind::Path(QPath::Resolved(_, path))
+            if path.res == Res::Local(binding))
+    }
+    if root(expression, source.hir_id) {
+        return SourceBridgeEvidence::WholeSubject;
+    }
+    if matches!(expression.kind, ExprKind::Field(..))
+        && matches!(typeck.expr_ty(expression).kind(), TyKind::RawPtr(..))
+    {
+        return SourceBridgeEvidence::RawFieldValue;
+    }
+    if let ExprKind::AddrOf(_, _, mut place) = expression.kind {
+        let mut dereferences = 0;
+        loop {
+            match place.kind {
+                ExprKind::Field(base, _) | ExprKind::DropTemps(base) => place = base,
+                ExprKind::Index(base, _, _)
+                    if typeck.type_dependent_def_id(place.hir_id).is_none() =>
+                {
+                    place = base
+                }
+                ExprKind::Unary(rustc_hir::UnOp::Deref, base) => {
+                    dereferences += 1;
+                    place = base;
+                }
+                _ => break,
+            }
+        }
+        if root(place, source.hir_id) {
+            return match dereferences {
+                0 => SourceBridgeEvidence::BindingStorage,
+                1 => SourceBridgeEvidence::ProjectedReferent {
+                    use_hir_id: expression.hir_id,
+                },
+                _ => SourceBridgeEvidence::UnknownShape("source-projection-depth-unlicensed"),
+            };
+        }
+    }
+    if let ExprKind::MethodCall(_, receiver, _, _) = expression.kind
+        && root(receiver, source.hir_id)
+        && matches!(typeck.expr_ty(receiver).kind(), TyKind::RawPtr(..))
+        && let Some(method) = typeck.type_dependent_def_id(expression.hir_id)
+        && !method.is_local()
+        && tcx.crate_name(method.krate).as_str() == "core"
+        && tcx.def_kind(method) == rustc_hir::def::DefKind::AssocFn
+        && matches!(
+            tcx.item_name(method).as_str(),
+            "offset"
+                | "add"
+                | "sub"
+                | "wrapping_offset"
+                | "wrapping_add"
+                | "wrapping_sub"
+                | "byte_offset"
+                | "wrapping_byte_offset"
+                | "cast"
+                | "cast_const"
+                | "cast_mut"
+        )
+    {
+        return SourceBridgeEvidence::TypedView {
+            use_hir_id: expression.hir_id,
+            method,
+        };
+    }
+    SourceBridgeEvidence::UnknownShape("source-expression-not-a-sealed-reference-view")
+}
+
+pub(crate) fn select_pending(
+    potentials: &[SiblingPotential],
+    mut terminal: impl FnMut(&SiblingPotential) -> TerminalSiteState,
+) -> Vec<PendingSiblingReceipt> {
+    potentials
+        .iter()
+        .filter_map(|potential| {
+            let state = terminal(potential);
+            if !pending_site_eligible(potential, state) {
+                return None;
+            }
+            let risky_siblings = potential
+                .siblings
+                .iter()
+                .filter(|sibling| risky_sibling(sibling))
+                .cloned()
+                .collect();
+            Some(PendingSiblingReceipt {
+                potential: potential.clone(),
+                source_form: state.source_form,
+                target_form: state.target_form,
+                risky_siblings,
+                reason: PENDING_REASON,
+                tier: PENDING_TIER,
+                waiver: PENDING_WAIVER,
+            })
+        })
+        .collect()
+}
+
+fn pending_site_eligible(potential: &SiblingPotential, state: TerminalSiteState) -> bool {
+    let borrowed_source = match state.source_form {
+        Form::Raw => false,
+        Form::Ref { .. } | Form::Slice { .. } | Form::Opt { .. } => true,
+    };
+    state.source_delivered
+        && borrowed_source
+        && state.target_form == Form::Raw
+        && !matches!(
+            potential.local_post_call,
+            LocalPostCallEvidence::DeadUnprotected { .. }
+        )
+        && potential.siblings.iter().any(risky_sibling)
+}
+
+fn risky_sibling(sibling: &SiblingEvidence) -> bool {
+    if sibling.proof.verdict == A5SiteProofVerdict::Clear {
+        return false;
+    }
+    match sibling.access {
+        SiblingAccess::Foster {
+            mutable: writes,
+            defaulted,
+            ..
+        } => writes || defaulted,
+        // This pending waiver covers sibling writes. A read-only sibling
+        // receives no new soundness certificate here. Stream state remains
+        // with the existing io-domain interception.
+        SiblingAccess::Contract {
+            access: PointeeAccess::None | PointeeAccess::Read | PointeeAccess::Stream,
+            ..
+        } => false,
+        SiblingAccess::Contract {
+            access: PointeeAccess::Write | PointeeAccess::Lifecycle,
+            ..
+        }
+        | SiblingAccess::Unknown(_) => true,
+    }
+}
+
+fn unknown_proof(reason: &'static str) -> A5PeerProof {
+    A5PeerProof {
+        verdict: A5SiteProofVerdict::Undeterminable,
+        reason,
+        family: "sibling-unresolved",
+        location: None,
+        left_site: None,
+        right_site: None,
+    }
+}
+
+fn call_exit_liveness<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+) -> FxHashMap<Location, DenseBitSet<Local>> {
+    let mut cursor = MaybeLiveLocals
+        .iterate_to_fixpoint(tcx, body, None)
+        .into_results_cursor(body);
+    let mut live = FxHashMap::default();
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        let location = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        // Backward analysis: before the effect in analysis order is exit in
+        // program order, including the union of normal and unwind successors.
+        cursor.seek_before_primary_effect(location);
+        live.insert(location, cursor.get().clone());
+    }
+    live
+}
+
+fn local_evidence<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ctx: &super::super::DecideCtx,
+    source: &Subject,
+    body: &Body<'tcx>,
+    call: Location,
+    live: Option<&DenseBitSet<Local>>,
+) -> LocalPostCallEvidence {
+    if source.ptr_depth != 1 {
+        return LocalPostCallEvidence::Unknown("local-proof-depth-not-one");
+    }
+    let Some(flow) = ctx
+        .analysis
+        .origins
+        .as_ref()
+        .and_then(|origins| origins.try_native_flows())
+        .and_then(|flows| flows.get(&source.fn_did))
+        .map(|flow| &flow.body)
+    else {
+        return LocalPostCallEvidence::Unknown("local-proof-origins-unavailable");
+    };
+    let Some((parameters, complete)) = flow.depth0_argument_origins(body, source.local) else {
+        return LocalPostCallEvidence::Unknown("local-proof-origin-slot-unavailable");
+    };
+    if !parameters.is_empty() {
+        return LocalPostCallEvidence::ParameterOrigin {
+            parameters: parameters.into_iter().collect(),
+        };
+    }
+    if !complete {
+        return LocalPostCallEvidence::Unknown("local-proof-origin-incomplete");
+    }
+    // This existing closed relation includes storage aliases. Follow both
+    // directions: a live ancestor or another descendant of that ancestor can
+    // retain the same reference capability after this source local dies.
+    // The component is a may set; over-inclusion keeps uncertain locals pending.
+    let flows = flow.depth0_value_flows();
+    let mut closure = FxHashSet::from_iter([SlotOwner::Local(source.local)]);
+    let mut frontier = vec![SlotOwner::Local(source.local)];
+    while let Some(owner) = frontier.pop() {
+        for &(from, to) in &flows {
+            let related = if from == owner {
+                Some(to)
+            } else if to == owner {
+                Some(from)
+            } else {
+                None
+            };
+            if let Some(related) = related
+                && closure.insert(related)
+            {
+                frontier.push(related);
+            }
+        }
+    }
+    if closure
+        .iter()
+        .any(|owner| matches!(owner, SlotOwner::Field(_)))
+    {
+        return LocalPostCallEvidence::Unknown("local-proof-field-alias");
+    }
+    if flow
+        .unknown_owner_depths()
+        .iter()
+        .any(|(owner, depth)| *depth == 0 && closure.contains(owner))
+    {
+        return LocalPostCallEvidence::Unknown("local-proof-descendant-origin-incomplete");
+    }
+    let locals = closure
+        .iter()
+        .filter_map(|owner| match owner {
+            SlotOwner::Local(local) => Some(*local),
+            SlotOwner::Field(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let parameters = body
+        .args_iter()
+        .filter(|local| locals.contains(local))
+        .map(|local| local.as_u32() as usize)
+        .collect::<Vec<_>>();
+    if !parameters.is_empty() {
+        return LocalPostCallEvidence::ParameterOrigin { parameters };
+    }
+    if locals.contains(&RETURN_PLACE) {
+        return LocalPostCallEvidence::Unknown("local-proof-returned-alias");
+    }
+    let Some(live) = live else {
+        return LocalPostCallEvidence::Unknown("local-proof-liveness-unavailable");
+    };
+    let live_locals = locals
+        .iter()
+        .copied()
+        .filter(|local| live.contains(*local))
+        .collect::<Vec<_>>();
+    if !live_locals.is_empty() {
+        return LocalPostCallEvidence::Live {
+            locals: live_locals,
+        };
+    }
+    // Local liveness cannot see a stored pointer or an outstanding borrow of
+    // the pointer slot. Retain only the transparent depth-zero subset here.
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let StatementKind::Assign(assignment) = &statement.kind else { continue };
+            let (destination, rvalue) = &**assignment;
+            if let Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) = rvalue
+                && locals.contains(&place.local)
+            {
+                // The observed constructor `_dst = &raw const (*_ref)`
+                // transfers the pointer value, rather than borrowing the
+                // pointer slot. Its complete tracked component was already
+                // proved dead above. Keep every other address/reborrow shape
+                // conservative, including bare slots and field projections.
+                let pointer_value_transfer = matches!(rvalue, Rvalue::RawPtr(..))
+                    && matches!(&place.projection[..], [ProjectionElem::Deref])
+                    && destination.as_local().is_some_and(|local| {
+                        locals.contains(&local)
+                            && flows
+                                .contains(&(SlotOwner::Local(place.local), SlotOwner::Local(local)))
+                    })
+                    && match (
+                        body.local_decls[place.local].ty.kind(),
+                        destination.ty(body, tcx).ty.kind(),
+                    ) {
+                        (
+                            TyKind::Ref(_, source_pointee, _),
+                            TyKind::RawPtr(target_pointee, mutability),
+                        ) => source_pointee == target_pointee && !mutability.is_mut(),
+                        _ => false,
+                    };
+                if !pointer_value_transfer {
+                    return LocalPostCallEvidence::Unknown(
+                        "local-proof-outstanding-address-or-reborrow",
+                    );
+                }
+            }
+            let mut mentions = PointerOperands {
+                locals: &locals,
+                found: false,
+            };
+            mentions.visit_rvalue(rvalue, call);
+            if !mentions.found {
+                continue;
+            }
+            let transparent = matches!(rvalue, Rvalue::Use(_) | Rvalue::Cast(_, _, _))
+                && destination
+                    .as_local()
+                    .is_some_and(|local| locals.contains(&local))
+                && matches!(
+                    destination.ty(body, tcx).ty.kind(),
+                    TyKind::RawPtr(..) | TyKind::Ref(..)
+                );
+            if !transparent {
+                return LocalPostCallEvidence::Unknown("local-proof-nontransparent-pointer-use");
+            }
+        }
+    }
+    // Every call receiving a descendant must retain the existing positive
+    // no-retention certificate. This does not infer no-retention from a
+    // missing export, and return-alias children need their own use evidence.
+    let functions = ctx.slots.fn_local_slots.keys().copied().collect::<Vec<_>>();
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        let (func, arguments) = match &data.terminator().kind {
+            TerminatorKind::Call { func, args, .. } => (func, args),
+            TerminatorKind::InlineAsm { .. } | TerminatorKind::Yield { .. } => {
+                return LocalPostCallEvidence::Unknown("local-proof-opaque-control");
+            }
+            TerminatorKind::TailCall { args, .. }
+                if args.iter().any(|arg| operand_in(&arg.node, &locals)) =>
+            {
+                return LocalPostCallEvidence::Unknown("local-proof-tail-call");
+            }
+            _ => continue,
+        };
+        for (index, argument) in arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| operand_in(&arg.node, &locals))
+        {
+            let Some(constant) = func.constant() else {
+                return LocalPostCallEvidence::Unknown("local-proof-indirect-call");
+            };
+            let TyKind::FnDef(callee, _) = *constant.ty().kind() else {
+                return LocalPostCallEvidence::Unknown("local-proof-indirect-call");
+            };
+            if let Some(callee) = callee
+                .as_local()
+                .filter(|callee| functions.contains(callee))
+            {
+                if !matches!(
+                    ctx.retention.get(callee, index),
+                    Some(RetentionVerdict::NoRetain { .. })
+                ) {
+                    return LocalPostCallEvidence::Unknown("local-proof-callee-retention");
+                }
+            } else {
+                let key = super::raw_boundary::symbol_key(tcx, callee, &functions);
+                let Some(target) = raw_target_type(tcx, argument.node.ty(body, tcx)) else {
+                    return LocalPostCallEvidence::Unknown("local-proof-library-target");
+                };
+                let Ok(contract) = classify_contract(&key, index, &target) else {
+                    return LocalPostCallEvidence::Unknown("local-proof-library-contract");
+                };
+                if contract.retention != RetentionContract::NoRetain {
+                    return LocalPostCallEvidence::Unknown("local-proof-library-retention");
+                }
+                if contract.returns_alias_of == Some(index) {
+                    let observation = super::return_alias::observe(
+                        body,
+                        Location {
+                            block,
+                            statement_index: data.statements.len(),
+                        },
+                    );
+                    if observation.state != super::return_alias::ReturnUseState::Unused {
+                        return LocalPostCallEvidence::Unknown("local-proof-return-alias-child");
+                    }
+                }
+            }
+        }
+    }
+    LocalPostCallEvidence::DeadUnprotected {
+        checked_locals: locals.into_iter().collect(),
+    }
+}
+
+fn operand_in(operand: &Operand<'_>, locals: &BTreeSet<Local>) -> bool {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => place
+            .as_local()
+            .is_some_and(|local| locals.contains(&local)),
+        Operand::Constant(_) => false,
+    }
+}
+
+struct PointerOperands<'a> {
+    locals: &'a BTreeSet<Local>,
+    found: bool,
+}
+
+impl<'tcx> Visitor<'tcx> for PointerOperands<'_> {
+    fn visit_operand(&mut self, operand: &Operand<'tcx>, _location: Location) {
+        self.found |= operand_in(operand, self.locals);
+    }
+}

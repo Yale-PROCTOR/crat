@@ -615,10 +615,12 @@ pub(crate) enum RetentionUnknownReason {
     LocalSummaryUnknown,
     AttestationAbsent,
     AnalysisIncomplete,
+    ReturnedAliasUsed,
+    ReturnedAliasUnknown,
 }
 
 impl RetentionUnknownReason {
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::CalleeUnresolved,
         Self::FnPtrWeb,
         Self::OpenBoundary,
@@ -631,6 +633,8 @@ impl RetentionUnknownReason {
         Self::LocalSummaryUnknown,
         Self::AttestationAbsent,
         Self::AnalysisIncomplete,
+        Self::ReturnedAliasUsed,
+        Self::ReturnedAliasUnknown,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -647,6 +651,8 @@ impl RetentionUnknownReason {
             Self::LocalSummaryUnknown => "retention-local-summary-unknown",
             Self::AttestationAbsent => "retention-attestation-absent",
             Self::AnalysisIncomplete => "retention-analysis-incomplete",
+            Self::ReturnedAliasUsed => "retention-returned-alias-used",
+            Self::ReturnedAliasUnknown => "retention-returned-alias-unknown",
         }
     }
 }
@@ -664,6 +670,8 @@ pub(crate) enum RetentionEventKind {
     Free,
     MultiDef,
     Nontransparent,
+    ReturnedAlias,
+    ReturnedChildSink,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -720,6 +728,20 @@ pub(crate) struct RetentionSummaries {
     rows: FxHashMap<(LocalDefId, usize), RetentionVerdict>,
     facts: FxHashMap<(LocalDefId, usize), RetentionBodyFacts>,
     attested: bool,
+    returned_children: FxHashMap<LocalDefId, Vec<ReturnedChildRecord>>,
+}
+
+#[derive(Clone, Debug)]
+struct ReturnedChildRecord {
+    callee: ForeignSymbolKey,
+    evidence: super::returned_child::ReturnedChildEvidence,
+    raw_field_parent: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReturnedChildSiteEvidence {
+    pub(crate) child: Result<super::returned_child::ReturnedChildEvidence, &'static str>,
+    pub(crate) raw_field_parent: bool,
 }
 
 fn location_label(location: Location) -> String {
@@ -753,12 +775,97 @@ fn plain_operand_local(operand: &Operand<'_>) -> Option<Local> {
     operand.place().and_then(|place| place.as_local())
 }
 
+fn returned_parent_is_raw_field_load<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    call: Location,
+    mut parent: Local,
+) -> bool {
+    fn before(body: &Body<'_>, definition: Location, call: Location) -> bool {
+        if definition.block == call.block {
+            return definition.statement_index < call.statement_index;
+        }
+        let mut block = call.block;
+        let mut visited = FxHashSet::default();
+        while visited.insert(block) {
+            let predecessors = body
+                .basic_blocks
+                .iter_enumerated()
+                .filter_map(|(candidate, data)| {
+                    data.terminator()
+                        .successors()
+                        .any(|successor| successor == block)
+                        .then_some(candidate)
+                })
+                .collect::<Vec<_>>();
+            let [predecessor] = predecessors.as_slice() else { return false };
+            if *predecessor == definition.block {
+                return true;
+            }
+            block = *predecessor;
+        }
+        false
+    }
+    let mut visited = FxHashSet::default();
+    while visited.insert(parent) {
+        if !matches!(body.local_decls[parent].ty.kind(), TyKind::RawPtr(..)) {
+            return false;
+        }
+        let mut definitions = Vec::new();
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            for (statement_index, statement) in data.statements.iter().enumerate() {
+                if let StatementKind::Assign(box (lhs, rhs)) = &statement.kind
+                    && lhs.as_local() == Some(parent)
+                {
+                    definitions.push((
+                        Location {
+                            block,
+                            statement_index,
+                        },
+                        Some(rhs),
+                    ));
+                }
+            }
+            if let TerminatorKind::Call { destination, .. } = &data.terminator().kind
+                && destination.as_local() == Some(parent)
+            {
+                definitions.push((
+                    Location {
+                        block,
+                        statement_index: data.statements.len(),
+                    },
+                    None,
+                ));
+            }
+        }
+        let [(definition, Some(rhs))] = definitions.as_slice() else { return false };
+        if !before(body, *definition, call) {
+            return false;
+        }
+        let Some(operand) = transparent_operand(rhs) else { return false };
+        if !matches!(operand.ty(body, tcx).kind(), TyKind::RawPtr(..)) {
+            return false;
+        }
+        let Some(place) = operand.place() else { return false };
+        if let Some(local) = place.as_local() {
+            parent = local;
+        } else {
+            return place
+                .projection
+                .iter()
+                .any(|projection| matches!(projection, ProjectionElem::Field(..)));
+        }
+    }
+    false
+}
+
 fn collect_retention_facts<'tcx>(
     program: &RustProgram<'tcx>,
     function: LocalDefId,
     root: Local,
     argument_index: Option<usize>,
     body: &Body<'tcx>,
+    children: &[ReturnedChildRecord],
 ) -> RetentionBodyFacts {
     let tcx = program.tcx;
     let function_path = tcx.def_path_str(function.to_def_id());
@@ -792,6 +899,57 @@ fn collect_retention_facts<'tcx>(
                 }
             }
         }
+        if let TerminatorKind::Call { destination, .. } = &data.terminator().kind
+            && let Some(destination) = destination.as_local()
+        {
+            definitions[destination.index()] += 1;
+        }
+    }
+    for record in children {
+        let child = &record.evidence;
+        if let (
+            super::returned_child::ChildRoot::Local(parent),
+            super::returned_child::ChildRoot::Local(destination),
+        ) = (&child.parent, &child.destination)
+            && matches!(body.local_decls[*parent].ty.kind(), TyKind::RawPtr(..))
+            && matches!(body.local_decls[*destination].ty.kind(), TyKind::RawPtr(..))
+        {
+            aliases.push((
+                *parent,
+                *destination,
+                retention_step(
+                    child.key.call,
+                    RetentionEventKind::ReturnedAlias,
+                    format!(
+                        "{} arg{} _{}->_{}",
+                        record.callee.path,
+                        child.key.parent_argument_index,
+                        parent.as_u32(),
+                        destination.as_u32()
+                    ),
+                ),
+            ));
+        }
+        for edge in &child.edges {
+            if matches!(body.local_decls[edge.from].ty.kind(), TyKind::RawPtr(..))
+                && matches!(body.local_decls[edge.to].ty.kind(), TyKind::RawPtr(..))
+            {
+                aliases.push((
+                    edge.from,
+                    edge.to,
+                    retention_step(
+                        edge.location,
+                        RetentionEventKind::ReturnedAlias,
+                        format!(
+                            "child-edge:{:?}:_{}->_{}",
+                            edge.kind,
+                            edge.from.as_u32(),
+                            edge.to.as_u32()
+                        ),
+                    ),
+                ));
+            }
+        }
     }
 
     let mut reachable = BTreeSet::from([root.as_u32()]);
@@ -821,6 +979,55 @@ fn collect_retention_facts<'tcx>(
         unknowns: BTreeMap::new(),
         dependencies: Vec::new(),
     };
+    for record in children {
+        let child = &record.evidence;
+        let parent = match &child.parent {
+            super::returned_child::ChildRoot::Local(parent) => Some(*parent),
+            super::returned_child::ChildRoot::Unknown { local, .. } => *local,
+        };
+        if !parent.is_some_and(is_reachable) {
+            continue;
+        }
+        for sink in &child.outward_sinks {
+            facts.retains.push(retention_step(
+                sink.location,
+                RetentionEventKind::ReturnedChildSink,
+                format!(
+                    "{} arg{} child _{} {:?}",
+                    record.callee.path,
+                    child.key.parent_argument_index,
+                    sink.local.as_u32(),
+                    sink.kind
+                ),
+            ));
+        }
+        let reason = match child.initial.state {
+            super::return_alias::ReturnUseState::Unused => None,
+            super::return_alias::ReturnUseState::Used => {
+                Some(RetentionUnknownReason::ReturnedAliasUsed)
+            }
+            super::return_alias::ReturnUseState::Unknown => {
+                Some(RetentionUnknownReason::ReturnedAliasUnknown)
+            }
+        };
+        if let Some(reason) = reason {
+            facts
+                .unknowns
+                .entry(reason)
+                .or_default()
+                .push(retention_step(
+                    child.key.call,
+                    RetentionEventKind::ReturnedAlias,
+                    format!(
+                        "{} arg{} result={};access={:?}",
+                        record.callee.path,
+                        child.key.parent_argument_index,
+                        child.initial.state.key(),
+                        child.access
+                    ),
+                ));
+        }
+    }
 
     for local in body.local_decls.indices() {
         if local != root && is_reachable(local) && definitions[local.index()] > 1 {
@@ -1001,6 +1208,30 @@ fn collect_retention_facts<'tcx>(
             };
             match super::raw_boundary_contracts::classify_contract(&key, index, &target) {
                 Ok(contract) => {
+                    if contract.returns_alias_of == Some(index)
+                        && children
+                            .iter()
+                            .filter(|record| {
+                                record.callee == key
+                                    && record.evidence.key.call == location
+                                    && record.evidence.key.parent_argument_index == index
+                            })
+                            .count()
+                            != 1
+                    {
+                        facts
+                            .unknowns
+                            .entry(RetentionUnknownReason::ReturnedAliasUnknown)
+                            .or_default()
+                            .push(retention_step(
+                                location,
+                                RetentionEventKind::ReturnedAlias,
+                                format!(
+                                    "{} arg{index} child-evidence-missing-or-ambiguous",
+                                    key.path
+                                ),
+                            ));
+                    }
                     let (kind, detail) = match contract.ownership {
                         super::raw_boundary_contracts::OwnershipContract::Consume => {
                             (RetentionEventKind::Free, "consume")
@@ -1050,16 +1281,16 @@ fn collect_retention_facts<'tcx>(
 }
 
 fn direct_verdict(facts: &RetentionBodyFacts, attested: bool) -> RetentionVerdict {
-    if !attested {
-        return RetentionVerdict::Unknown {
-            reason: RetentionUnknownReason::AttestationAbsent,
-            frontier: facts.steps.clone(),
-        };
-    }
     if let Some(sink) = facts.retains.first().cloned() {
         return RetentionVerdict::Retains {
             sink: sink.clone(),
             path: vec![sink],
+        };
+    }
+    if !attested {
+        return RetentionVerdict::Unknown {
+            reason: RetentionUnknownReason::AttestationAbsent,
+            frontier: facts.steps.clone(),
         };
     }
     if let Some((&reason, frontier)) = facts.unknowns.first_key_value() {
@@ -1147,11 +1378,38 @@ impl RetentionSummaries {
     ) -> Self {
         let attested = attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
         let mut facts = FxHashMap::default();
+        let mut returned_children = FxHashMap::default();
         for &function in &program.functions {
             let body = program
                 .tcx
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
+            let mut children = Vec::new();
+            for (block, data) in body.basic_blocks.iter_enumerated() {
+                if !matches!(
+                    data.terminator().kind,
+                    TerminatorKind::Call { .. } | TerminatorKind::TailCall { .. }
+                ) {
+                    continue;
+                }
+                let call = Location {
+                    block,
+                    statement_index: data.statements.len(),
+                };
+                for evidence in super::returned_child::derive(program.tcx, function, call) {
+                    let raw_field_parent = match &evidence.parent {
+                        super::returned_child::ChildRoot::Local(parent) => {
+                            returned_parent_is_raw_field_load(program.tcx, &body, call, *parent)
+                        }
+                        super::returned_child::ChildRoot::Unknown { .. } => false,
+                    };
+                    children.push(ReturnedChildRecord {
+                        callee: symbol_key(program.tcx, evidence.key.callee, &program.functions),
+                        evidence,
+                        raw_field_parent,
+                    });
+                }
+            }
             for argument_index in 0..body.arg_count {
                 let local = Local::from_usize(argument_index + 1);
                 if !matches!(body.local_decls[local].ty.kind(), TyKind::RawPtr(..)) {
@@ -1159,20 +1417,31 @@ impl RetentionSummaries {
                 }
                 facts.insert(
                     (function, argument_index),
-                    collect_retention_facts(program, function, local, Some(argument_index), &body),
+                    collect_retention_facts(
+                        program,
+                        function,
+                        local,
+                        Some(argument_index),
+                        &body,
+                        &children,
+                    ),
                 );
             }
+            returned_children.insert(function, children);
         }
         let rows = if origins.is_none() {
-            facts
-                .keys()
-                .copied()
-                .map(|key| {
+            evaluate_retention(&facts, false)
+                .into_iter()
+                .map(|(key, verdict)| {
                     (
                         key,
-                        RetentionVerdict::Unknown {
-                            reason: RetentionUnknownReason::AnalysisIncomplete,
-                            frontier: Vec::new(),
+                        if matches!(verdict, RetentionVerdict::Retains { .. }) {
+                            verdict
+                        } else {
+                            RetentionVerdict::Unknown {
+                                reason: RetentionUnknownReason::AnalysisIncomplete,
+                                frontier: Vec::new(),
+                            }
                         },
                     )
                 })
@@ -1184,6 +1453,7 @@ impl RetentionSummaries {
             rows,
             facts,
             attested,
+            returned_children,
         }
     }
 
@@ -1193,6 +1463,40 @@ impl RetentionSummaries {
         argument_index: usize,
     ) -> Option<&RetentionVerdict> {
         self.rows.get(&(function, argument_index))
+    }
+
+    fn returned_child_at(
+        &self,
+        caller: LocalDefId,
+        site: &RawBoundarySiteKey,
+    ) -> ReturnedChildSiteEvidence {
+        let matches = self
+            .returned_children
+            .get(&caller)
+            .into_iter()
+            .flatten()
+            .filter(|record| {
+                record.evidence.key.caller == caller
+                    && record.evidence.key.call.block.as_u32() == site.block
+                    && record.evidence.key.call.statement_index == site.statement_index as usize
+                    && record.evidence.key.parent_argument_index == site.argument_index
+                    && record.callee == site.callee
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [record] => ReturnedChildSiteEvidence {
+                child: Ok(record.evidence.clone()),
+                raw_field_parent: record.raw_field_parent,
+            },
+            [] => ReturnedChildSiteEvidence {
+                child: Err("returned-child-evidence-missing"),
+                raw_field_parent: false,
+            },
+            _ => ReturnedChildSiteEvidence {
+                child: Err("returned-child-evidence-ambiguous"),
+                raw_field_parent: false,
+            },
+        }
     }
 
     /// R210(c): outward retention rooted at the copied destination, rather
@@ -1207,7 +1511,16 @@ impl RetentionSummaries {
             .tcx
             .mir_drops_elaborated_and_const_checked(function)
             .borrow();
-        let facts = collect_retention_facts(program, function, destination, None, &body);
+        let facts = collect_retention_facts(
+            program,
+            function,
+            destination,
+            None,
+            &body,
+            self.returned_children
+                .get(&function)
+                .map_or(&[], Vec::as_slice),
+        );
         let unknown_reason = if !self.attested {
             RetentionUnknownReason::AttestationAbsent
         } else {
@@ -1252,6 +1565,9 @@ impl RetentionSummaries {
                     Local::from_usize(dependency.argument_index + 1),
                     None,
                     &body,
+                    self.returned_children
+                        .get(&dependency.callee)
+                        .map_or(&[], Vec::as_slice),
                 );
                 let mut dependency_path = path.clone();
                 dependency_path.push(dependency.step.clone());
@@ -1354,15 +1670,19 @@ pub(crate) enum BridgeTemplate {
     TypedRawTemporary,
     RefMutToRawMut,
     RefMutToRawConst,
+    RefMutToWritableRawConst,
     RefSharedToRawConst,
     RefSharedToRawMut,
     SliceMutToRawMut,
     SliceToRawConst,
+    SliceMutToWritableRawConst,
     SliceToRawMut,
     OptRefMutToRawMut,
     OptRefToRawConst,
+    OptRefMutToWritableRawConst,
     OptRefToRawMut,
     OptSliceToRaw,
+    OptSliceMutToWritableRawConst,
     OptSliceToRawMut,
     BoxBorrowViewToRaw,
     KnownFreeDrop,
@@ -1379,16 +1699,21 @@ impl BridgeTemplate {
             Self::TypedRawTemporary => "typed-raw-temporary",
             Self::RefMutToRawMut => "ref-mut-to-raw-mut",
             Self::RefMutToRawConst => "ref-mut-to-raw-const",
+            Self::RefMutToWritableRawConst => "returned-child-ref-mut-to-raw-const",
             Self::RefSharedToRawConst => "ref-shared-to-raw-const",
             Self::RefSharedToRawMut => "shared-ref-to-mut-raw",
             Self::SliceMutToRawMut => "slice-mut-to-raw-mut",
             Self::SliceToRawConst => "slice-to-raw-const",
+            Self::SliceMutToWritableRawConst => "returned-child-slice-mut-to-raw-const",
             Self::SliceToRawMut => "slice-to-raw-mut",
             Self::OptRefMutToRawMut
             | Self::OptRefToRawConst
             | Self::OptRefToRawMut
             | Self::OptSliceToRaw
             | Self::OptSliceToRawMut => "option-to-raw-null-map",
+            Self::OptRefMutToWritableRawConst | Self::OptSliceMutToWritableRawConst => {
+                "returned-child-option-mut-to-raw-const"
+            }
             Self::BoxBorrowViewToRaw => "box-borrow-view-to-raw",
             Self::KnownFreeDrop => "known-free-drop",
         }
@@ -1463,6 +1788,28 @@ impl BridgeTemplate {
                 Ok(BridgeRender::Edit(format!(
                     "{{ let __crat_raw: {target} = ({argument}) as {target}; __crat_raw }}"
                 )))
+            }
+            Self::RefMutToWritableRawConst
+            | Self::SliceMutToWritableRawConst
+            | Self::OptRefMutToWritableRawConst
+            | Self::OptSliceMutToWritableRawConst => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                let expression = match self {
+                    Self::RefMutToWritableRawConst => format!(
+                        "core::ptr::from_mut(&mut *{argument}).cast::<{pointee}>().cast_const()"
+                    ),
+                    Self::SliceMutToWritableRawConst => {
+                        format!("{argument}.as_mut_ptr().cast::<{pointee}>().cast_const()")
+                    }
+                    Self::OptRefMutToWritableRawConst => format!(
+                        "{argument}.as_deref_mut().map_or(core::ptr::null::<{pointee}>(), |value| core::ptr::from_mut(value).cast::<{pointee}>().cast_const())"
+                    ),
+                    Self::OptSliceMutToWritableRawConst => format!(
+                        "{argument}.as_deref_mut().map_or(core::ptr::null::<{pointee}>(), |slice| slice.as_mut_ptr().cast::<{pointee}>().cast_const())"
+                    ),
+                    _ => unreachable!("selected returned-child writable view"),
+                };
+                Ok(BridgeRender::Edit(expression))
             }
             Self::RefMutToRawMut if force_explicit => Ok(BridgeRender::Edit(format!(
                 "core::ptr::from_mut(&mut *{argument})"
@@ -1554,6 +1901,131 @@ pub(crate) enum RawBoundaryBlockReason {
     ContractInvalid,
     TemplateUnavailable,
     WaiverUnconfirmed,
+    ReturnedChildPermission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReturnedChildPermissionFailure {
+    Writes,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReturnedChildBridge {
+    pub(crate) template: BridgeTemplate,
+    pub(crate) mutable_binding_required: bool,
+}
+
+pub(crate) fn returned_child_template(
+    source: &super::Decision,
+    target: &RawTargetType,
+    access: Option<&super::returned_child::ChildAccess>,
+    base: BridgeTemplate,
+) -> Result<ReturnedChildBridge, RawBoundaryBlockReason> {
+    let unchanged = ReturnedChildBridge {
+        template: base,
+        mutable_binding_required: false,
+    };
+    if target.mutability != RawMutability::Const
+        || matches!(
+            access,
+            Some(
+                super::returned_child::ChildAccess::Unused
+                    | super::returned_child::ChildAccess::ReadOnly { .. }
+            )
+        )
+    {
+        return Ok(unchanged);
+    }
+    returned_child_permission(source, access)
+        .map_err(|_| RawBoundaryBlockReason::ReturnedChildPermission)?;
+    if target.depth2.is_some() {
+        return Err(RawBoundaryBlockReason::TemplateUnavailable);
+    }
+    let (template, mutable_binding_required) = match source {
+        super::Decision::Ref { mutable: true }
+        | super::Decision::InferredRef { mutable: true, .. } => {
+            (BridgeTemplate::RefMutToWritableRawConst, false)
+        }
+        super::Decision::Slice { mutable: true, .. } => {
+            (BridgeTemplate::SliceMutToWritableRawConst, false)
+        }
+        super::Decision::Opt {
+            mutable: true,
+            slice: false,
+            ..
+        } => (BridgeTemplate::OptRefMutToWritableRawConst, true),
+        super::Decision::Opt {
+            mutable: true,
+            slice: true,
+            ..
+        } => (BridgeTemplate::OptSliceMutToWritableRawConst, true),
+        super::Decision::Degraded(_) => return Ok(unchanged),
+        super::Decision::Ref { mutable: false }
+        | super::Decision::InferredRef { mutable: false, .. }
+        | super::Decision::Slice { mutable: false, .. }
+        | super::Decision::Opt { mutable: false, .. }
+        | super::Decision::Box(_) => return Err(RawBoundaryBlockReason::ReturnedChildPermission),
+    };
+    if base == BridgeTemplate::TypedRawTemporary {
+        // A raw expression derived from a safe root needs its own operation
+        // adapter; applying a slice/reference method to that raw value cannot
+        // preserve permission. Proven field values bypass this selector.
+        return Err(RawBoundaryBlockReason::TemplateUnavailable);
+    }
+    Ok(ReturnedChildBridge {
+        template,
+        mutable_binding_required,
+    })
+}
+
+/// An address expression borrows its selected place, independently of the
+/// reference, slice or Option form of the binding containing that place.
+pub(crate) fn outbound_reference_view(
+    source: &super::Decision,
+    source_shape: &str,
+) -> Option<super::Decision> {
+    match source {
+        super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::Slice { .. }
+        | super::Decision::Opt { .. } => match source_shape {
+            "addr-of" | "addr-of-cast" => Some(super::Decision::Ref { mutable: false }),
+            "addr-of-mut" | "addr-of-mut-cast" => Some(super::Decision::Ref { mutable: true }),
+            _ => None,
+        },
+        super::Decision::Box(_) | super::Decision::Degraded(_) => None,
+    }
+}
+
+/// Policy seam over an already selected expression form. The target raw
+/// pointer's mutability cannot establish permission for subsequent child uses.
+pub(crate) fn returned_child_permission(
+    source: &super::Decision,
+    access: Option<&super::returned_child::ChildAccess>,
+) -> Result<(), ReturnedChildPermissionFailure> {
+    let shared = match source {
+        super::Decision::Ref { mutable }
+        | super::Decision::InferredRef { mutable, .. }
+        | super::Decision::Slice { mutable, .. }
+        | super::Decision::Opt { mutable, .. } => !*mutable,
+        super::Decision::Box(_) | super::Decision::Degraded(_) => false,
+    };
+    if !shared {
+        return Ok(());
+    }
+    match access {
+        Some(
+            super::returned_child::ChildAccess::Unused
+            | super::returned_child::ChildAccess::ReadOnly { .. },
+        ) => Ok(()),
+        Some(super::returned_child::ChildAccess::Writes { .. }) => {
+            Err(ReturnedChildPermissionFailure::Writes)
+        }
+        Some(super::returned_child::ChildAccess::Unknown { .. }) | None => {
+            Err(ReturnedChildPermissionFailure::Unknown)
+        }
+    }
 }
 
 impl RawBoundaryBlockReason {
@@ -1570,6 +2042,7 @@ impl RawBoundaryBlockReason {
             Self::ContractInvalid => "raw-boundary-contract-invalid",
             Self::TemplateUnavailable => "raw-boundary-template-unavailable",
             Self::WaiverUnconfirmed => "raw-boundary-waiver-unconfirmed",
+            Self::ReturnedChildPermission => "raw-boundary-returned-child-permission",
         }
     }
 }
@@ -1612,6 +2085,7 @@ pub(crate) struct RawBoundaryRenderSite {
     pub callee_local: Option<LocalDefId>,
     pub target_stays_raw: bool,
     pub subject_identity: String,
+    pub mutable_binding_required: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1840,9 +2314,17 @@ pub(crate) struct RawBoundaryDispositionIndex {
     address_sites: Vec<AddressViewSite>,
     address_classes: FxHashMap<(LocalDefId, HirId), super::emitability::AddressUseClass>,
     certificate_replay_wall_s: f64,
+    returned_children: BTreeMap<RawBoundarySiteKey, ReturnedChildSiteEvidence>,
 }
 
 impl RawBoundaryDispositionIndex {
+    pub(crate) fn returned_child_evidence(
+        &self,
+        key: &RawBoundarySiteKey,
+    ) -> Option<&ReturnedChildSiteEvidence> {
+        self.returned_children.get(key)
+    }
+
     pub(crate) fn derive(
         site_facts: &RawBoundarySiteFacts,
         retention: &RetentionSummaries,
@@ -1860,6 +2342,7 @@ impl RawBoundaryDispositionIndex {
         let mut open_nodes = FxHashMap::<(LocalDefId, HirId), Vec<bool>>::default();
         let mut handled_nodes = FxHashMap::<(LocalDefId, HirId), Vec<bool>>::default();
         for site in &site_facts.sites {
+            let mut mutable_binding_required = false;
             let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
                 (|| {
                     let node = site.node.ok_or_else(|| {
@@ -1910,37 +2393,58 @@ impl RawBoundaryDispositionIndex {
                         site.key.argument_index,
                         &site.target,
                     );
-                    let (retention_verdict, ownership, negative_write, evidence, negative_detail) =
-                        match contract {
-                            Ok(contract) => (
-                                RetentionVerdict::NoRetain {
-                                    certificate: RetentionCertificate {
-                                        function: site.key.callee.path.clone(),
-                                        argument_index: site.key.argument_index,
-                                        steps: Vec::new(),
-                                        attestation: "boundary-contract",
-                                    },
+                    let returned_child = contract
+                        .as_ref()
+                        .ok()
+                        .filter(|contract| {
+                            contract.returns_alias_of == Some(site.key.argument_index)
+                        })
+                        .map(|_| {
+                            let mut child = retention.returned_child_at(node.0, &site.key);
+                            // A local that was initialized from a raw field may
+                            // itself have been converted. Exemption belongs to
+                            // the original field-load expression at this call.
+                            child.raw_field_parent &= site.source_shape == "raw-expr";
+                            out.returned_children
+                                .insert(site.key.clone(), child.clone());
+                            child
+                        });
+                    let (
+                        mut retention_verdict,
+                        ownership,
+                        negative_write,
+                        mut evidence,
+                        negative_detail,
+                    ) = match contract {
+                        Ok(contract) => (
+                            RetentionVerdict::NoRetain {
+                                certificate: RetentionCertificate {
+                                    function: site.key.callee.path.clone(),
+                                    argument_index: site.key.argument_index,
+                                    steps: Vec::new(),
+                                    attestation: "boundary-contract",
                                 },
-                                Some(contract.ownership),
-                                (contract.access
-                                    == super::raw_boundary_contracts::PointeeAccess::Read)
-                                    .then_some(NegativeWriteEvidence::LibcReadOnly),
-                                format!(
-                                    "contract:{};negative-write={}",
-                                    contract.provenance,
-                                    if contract.access
-                                        == super::raw_boundary_contracts::PointeeAccess::Read
-                                    {
-                                        NegativeWriteEvidence::LibcReadOnly.key()
-                                    } else {
-                                        "none"
-                                    }
-                                ),
-                                format!("libc-access={}", contract.access.key()),
+                            },
+                            Some(contract.ownership),
+                            (contract.access == super::raw_boundary_contracts::PointeeAccess::Read)
+                                .then_some(NegativeWriteEvidence::LibcReadOnly),
+                            format!(
+                                "contract:{};negative-write={}",
+                                contract.provenance,
+                                if contract.access
+                                    == super::raw_boundary_contracts::PointeeAccess::Read
+                                {
+                                    NegativeWriteEvidence::LibcReadOnly.key()
+                                } else {
+                                    "none"
+                                }
                             ),
-                            Err(
-                                super::raw_boundary_contracts::ContractFailure::PositionUnmodeled,
-                            ) if site.callee_local.is_none() => (
+                            format!("libc-access={}", contract.access.key()),
+                        ),
+                        Err(super::raw_boundary_contracts::ContractFailure::PositionUnmodeled)
+                            if site.callee_local.is_none() =>
+                        {
+                            (
                                 RetentionVerdict::Unknown {
                                     reason: RetentionUnknownReason::OpenBoundary,
                                     frontier: Vec::new(),
@@ -1949,49 +2453,49 @@ impl RawBoundaryDispositionIndex {
                                 None,
                                 "foreign-retention-unknown".to_owned(),
                                 "foreign-contract-missing".to_owned(),
-                            ),
-                            Err(super::raw_boundary_contracts::ContractFailure::NotForeign)
-                                if site.callee_local.is_some() =>
-                            {
-                                let callee = site.callee_local.expect("guarded local callee");
-                                let local = Local::from_usize(site.key.argument_index + 1);
-                                let foster_immutable = !mut_facts.is_defaulted(callee, local)
-                                    && !mut_facts.is_mutable(callee, local);
-                                (
-                                    retention
-                                        .get(callee, site.key.argument_index)
-                                        .cloned()
-                                        .unwrap_or(RetentionVerdict::Unknown {
-                                            reason: RetentionUnknownReason::LocalSummaryUnknown,
-                                            frontier: Vec::new(),
-                                        }),
-                                    None,
-                                    foster_immutable
-                                        .then_some(NegativeWriteEvidence::FosterImmutable),
-                                    format!(
-                                        "local-retention-summary;negative-write={}",
-                                        if foster_immutable {
-                                            NegativeWriteEvidence::FosterImmutable.key()
-                                        } else {
-                                            "none"
-                                        }
-                                    ),
-                                    if mut_facts.is_defaulted(callee, local) {
-                                        "foster-defaulted".to_owned()
-                                    } else if mut_facts.is_mutable(callee, local) {
-                                        "foster-mutable".to_owned()
+                            )
+                        }
+                        Err(super::raw_boundary_contracts::ContractFailure::NotForeign)
+                            if site.callee_local.is_some() =>
+                        {
+                            let callee = site.callee_local.expect("guarded local callee");
+                            let local = Local::from_usize(site.key.argument_index + 1);
+                            let foster_immutable = !mut_facts.is_defaulted(callee, local)
+                                && !mut_facts.is_mutable(callee, local);
+                            (
+                                retention
+                                    .get(callee, site.key.argument_index)
+                                    .cloned()
+                                    .unwrap_or(RetentionVerdict::Unknown {
+                                        reason: RetentionUnknownReason::LocalSummaryUnknown,
+                                        frontier: Vec::new(),
+                                    }),
+                                None,
+                                foster_immutable.then_some(NegativeWriteEvidence::FosterImmutable),
+                                format!(
+                                    "local-retention-summary;negative-write={}",
+                                    if foster_immutable {
+                                        NegativeWriteEvidence::FosterImmutable.key()
                                     } else {
-                                        "foster-immutable".to_owned()
-                                    },
-                                )
-                            }
-                            Err(error) => {
-                                return Err((
-                                    RawBoundaryBlockReason::ContractInvalid,
-                                    format!("{error:?}"),
-                                ));
-                            }
-                        };
+                                        "none"
+                                    }
+                                ),
+                                if mut_facts.is_defaulted(callee, local) {
+                                    "foster-defaulted".to_owned()
+                                } else if mut_facts.is_mutable(callee, local) {
+                                    "foster-mutable".to_owned()
+                                } else {
+                                    "foster-immutable".to_owned()
+                                },
+                            )
+                        }
+                        Err(error) => {
+                            return Err((
+                                RawBoundaryBlockReason::ContractInvalid,
+                                format!("{error:?}"),
+                            ));
+                        }
+                    };
                     if let Some(evidence) = negative_write {
                         out.negative_write.insert(site.key.clone(), evidence);
                     }
@@ -1999,27 +2503,67 @@ impl RawBoundaryDispositionIndex {
                     // when its owning subject is a slice or Option slice.
                     // Select its template before applying the R-B gate, so a
                     // shared projection cannot inherit the base's mutability.
-                    let reference_view = match decision {
-                        super::Decision::Ref { .. }
-                        | super::Decision::InferredRef { .. }
-                        | super::Decision::Slice { .. }
-                        | super::Decision::Opt { .. } => match site.source_shape {
-                            "addr-of" | "addr-of-cast" => {
-                                Some(super::Decision::Ref { mutable: false })
+                    let reference_view = outbound_reference_view(decision, site.source_shape);
+                    if let Some(returned) = &returned_child {
+                        let child = returned.child.as_ref().ok();
+                        if let Some(sink) = child.and_then(|child| child.outward_sinks.first()) {
+                            return Err((
+                                RawBoundaryBlockReason::PositiveRetention,
+                                format!(
+                                    "returned-child-sink:{}:_{}:{:?}",
+                                    location_label(sink.location),
+                                    sink.local.as_u32(),
+                                    sink.kind
+                                ),
+                            ));
+                        }
+                        if !returned.raw_field_parent {
+                            returned_child_permission(
+                                reference_view.as_ref().unwrap_or(decision),
+                                child.map(|child| &child.access),
+                            )
+                            .map_err(|failure| {
+                                (
+                                    RawBoundaryBlockReason::ReturnedChildPermission,
+                                    format!("returned-child-permission:{failure:?}"),
+                                )
+                            })?;
+                        }
+                        let state = child
+                            .map(|child| child.initial.state)
+                            .unwrap_or(super::return_alias::ReturnUseState::Unknown);
+                        evidence.push_str(&format!(";returned-alias-parent={};returned-use={};child-permission={};lookup={}",
+                            site.key.argument_index, state.key(), if returned.raw_field_parent { "raw-field-value" } else { "checked-effective-source" },
+                            returned.child.as_ref().err().copied().unwrap_or("exact")));
+                        let reason = match state {
+                            super::return_alias::ReturnUseState::Unused => None,
+                            super::return_alias::ReturnUseState::Used => {
+                                Some(RetentionUnknownReason::ReturnedAliasUsed)
                             }
-                            "addr-of-mut" | "addr-of-mut-cast" => {
-                                Some(super::Decision::Ref { mutable: true })
+                            super::return_alias::ReturnUseState::Unknown => {
+                                Some(RetentionUnknownReason::ReturnedAliasUnknown)
                             }
-                            _ => None,
-                        },
-                        super::Decision::Box(_) | super::Decision::Degraded(_) => None,
-                    };
-                    let mut template = template_for(
-                        reference_view.as_ref().unwrap_or(decision),
-                        &site.target,
-                        ownership,
-                        negative_write.is_some(),
-                    )
+                        };
+                        if let Some(reason) = reason {
+                            retention_verdict = RetentionVerdict::Unknown {
+                                reason,
+                                frontier: Vec::new(),
+                            };
+                        }
+                    }
+                    let mut template = if returned_child
+                        .as_ref()
+                        .is_some_and(|child| child.raw_field_parent)
+                    {
+                        Ok(BridgeTemplate::TypedRawTemporary)
+                    } else {
+                        template_for(
+                            reference_view.as_ref().unwrap_or(decision),
+                            &site.target,
+                            ownership,
+                            negative_write.is_some(),
+                        )
+                    }
                     .map_err(|reason| {
                         let detail = if reason == RawBoundaryBlockReason::SharedToMut {
                             format!("negative-write-absent:{negative_detail}")
@@ -2034,6 +2578,24 @@ impl RawBoundaryDispositionIndex {
                         &site.source_type,
                         &site.target,
                     );
+                    if let Some(returned) = &returned_child
+                        && !returned.raw_field_parent
+                    {
+                        let selected = returned_child_template(
+                            reference_view.as_ref().unwrap_or(decision),
+                            &site.target,
+                            returned.child.as_ref().ok().map(|child| &child.access),
+                            template,
+                        )
+                        .map_err(|reason| {
+                            (
+                                reason,
+                                "returned-child-writable-const-view-unavailable".to_owned(),
+                            )
+                        })?;
+                        template = selected.template;
+                        mutable_binding_required = selected.mutable_binding_required;
+                    }
                     match retention_verdict {
                         RetentionVerdict::NoRetain { certificate } => {
                             let certificate_started = std::time::Instant::now();
@@ -2117,6 +2679,7 @@ impl RawBoundaryDispositionIndex {
                     node: site.node,
                     callee_local: site.callee_local,
                     target_stays_raw,
+                    mutable_binding_required,
                     subject_identity: site
                         .node
                         .and_then(|node| decisions.get(&node).map(|(subject, _)| *subject))
@@ -2603,6 +3166,464 @@ pub(crate) fn select_unique_site(
 mod tests {
     use super::*;
 
+    fn constructed_child_access() -> (
+        super::super::returned_child::ChildAccess,
+        super::super::returned_child::ChildAccess,
+        super::super::returned_child::ChildAccess,
+    ) {
+        use super::super::returned_child::*;
+        let location = Location {
+            block: rustc_middle::mir::BasicBlock::from_u32(1),
+            statement_index: 0,
+        };
+        let local = Local::from_u32(2);
+        (
+            ChildAccess::Writes {
+                sites: vec![ChildWriteSite {
+                    location,
+                    local,
+                    kind: ChildWriteKind::PointeeStore,
+                }],
+                unknown_frontiers: Vec::new(),
+            },
+            ChildAccess::Unknown {
+                frontiers: vec![ChildFrontier {
+                    location,
+                    local: Some(local),
+                    reason: ChildUnknownReason::OpaquePointerUse,
+                    callee: None,
+                    argument_index: None,
+                }],
+            },
+            ChildAccess::ReadOnly {
+                checked_uses: vec![CheckedChildUse {
+                    location,
+                    local,
+                    kind: ChildUseKind::PointeeRead,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn rb_retalias_policy_shared_const_target_forbids_child_writes() {
+        // Constructed policy input, not a model-admission or emitted-output claim.
+        let source = super::super::Decision::Ref { mutable: false };
+        let target = RawTargetType {
+            rendered: "*const i8".into(),
+            pointee: "i8".into(),
+            mutability: RawMutability::Const,
+            depth2: None,
+        };
+        assert!(
+            template_for(&source, &target, None, true).is_ok(),
+            "the immediate const view alone permits this source"
+        );
+        let (writes, _, _) = constructed_child_access();
+        assert_eq!(
+            returned_child_permission(&source, Some(&writes)),
+            Err(ReturnedChildPermissionFailure::Writes)
+        );
+    }
+
+    #[test]
+    fn rb_retalias_policy_shared_const_target_forbids_unknown_child_access() {
+        // Constructed policy input, independent of whether this model admits a shared source.
+        let source = super::super::Decision::Ref { mutable: false };
+        let target = RawTargetType {
+            rendered: "*const i8".into(),
+            pointee: "i8".into(),
+            mutability: RawMutability::Const,
+            depth2: None,
+        };
+        assert!(template_for(&source, &target, None, true).is_ok());
+        let (_, unknown, _) = constructed_child_access();
+        assert_eq!(
+            returned_child_permission(&source, Some(&unknown)),
+            Err(ReturnedChildPermissionFailure::Unknown)
+        );
+        assert_eq!(
+            returned_child_permission(&source, None),
+            Err(ReturnedChildPermissionFailure::Unknown)
+        );
+    }
+
+    #[test]
+    fn rb_retalias_policy_complete_readonly_and_unused_children_preserve_permission() {
+        // A complete typed access witness is required; absence of a write row is insufficient.
+        let source = super::super::Decision::Ref { mutable: false };
+        let (_, _, readonly) = constructed_child_access();
+        assert_eq!(returned_child_permission(&source, Some(&readonly)), Ok(()));
+        assert_eq!(
+            returned_child_permission(
+                &source,
+                Some(&super::super::returned_child::ChildAccess::Unused)
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rb_retalias_policy_mutable_and_raw_sources_have_no_shared_parent_obligation() {
+        // Both forms are explicit policy inputs, not forced frozen decisions.
+        let mutable = super::super::Decision::Ref { mutable: true };
+        let raw = super::super::Decision::Degraded(super::super::Degradation {
+            subject: "constructed-raw-policy-input".into(),
+            site: "policy".into(),
+            reason: super::super::DegradeReason::KindRaw,
+        });
+        let (writes, unknown, _) = constructed_child_access();
+        for source in [&mutable, &raw] {
+            assert_eq!(returned_child_permission(source, Some(&writes)), Ok(()));
+            assert_eq!(returned_child_permission(source, Some(&unknown)), Ok(()));
+        }
+    }
+
+    fn constructed_writable_const_bridge(
+        source: super::super::Decision,
+        declaration: &str,
+        unknown: bool,
+        expected_view: &str,
+        mutable_binding_required: bool,
+    ) {
+        // This is a constructed consumer input, not a frozen-model admission.
+        let target = RawTargetType {
+            rendered: "*const i8".into(),
+            pointee: "i8".into(),
+            mutability: RawMutability::Const,
+            depth2: None,
+        };
+        let (writes, unknown_access, _) = constructed_child_access();
+        let access = if unknown { &unknown_access } else { &writes };
+        assert_eq!(returned_child_permission(&source, Some(access)), Ok(()));
+        let base =
+            template_for(&source, &target, None, true).expect("existing const-target template");
+        let selected = returned_child_template(&source, &target, Some(access), base)
+            .expect("mutable consumer permission");
+        let BridgeRender::Edit(expression) = selected
+            .template
+            .render_explicit("p", RawMutability::Const, false, Some("i8"))
+            .unwrap()
+        else {
+            panic!("writable returned-child origin requires an explicit adapter");
+        };
+        let emitted = format!(
+            "#![allow(unused_mut, dead_code)]\nextern \"C\" {{ fn strchr(p: *const i8, c: i32) -> *mut i8; }}\nunsafe fn caller({declaration}) {{ let child = strchr({expression}, 0); if !child.is_null() {{ *child = 1; }} }}"
+        );
+        assert!(
+            crate::bo_rewriter::verify::type_checks_str(&emitted),
+            "{emitted}"
+        );
+        assert!(
+            expression.contains(expected_view) && expression.contains(".cast_const()"),
+            "const ABI adapter discarded writable provenance: {expression}"
+        );
+        assert!(
+            !expression.contains("from_ref") && !expression.contains(".as_deref()"),
+            "shared view remains: {expression}"
+        );
+        assert_eq!(
+            selected.mutable_binding_required, mutable_binding_required,
+            "mutable Option view must expose its binding requirement"
+        );
+    }
+
+    #[test]
+    fn rb_retalias_writable_const_ref_child_write_keeps_mutable_origin() {
+        constructed_writable_const_bridge(
+            super::super::Decision::Ref { mutable: true },
+            "p: &mut i8",
+            false,
+            "core::ptr::from_mut",
+            false,
+        );
+    }
+
+    #[test]
+    fn rb_retalias_writable_const_slice_unknown_child_keeps_mutable_origin() {
+        constructed_writable_const_bridge(
+            super::super::Decision::Slice {
+                mutable: true,
+                uses: Vec::new(),
+            },
+            "p: &mut [i8]",
+            true,
+            ".as_mut_ptr()",
+            false,
+        );
+    }
+
+    #[test]
+    fn rb_retalias_writable_const_option_ref_child_write_requires_mutable_binding() {
+        constructed_writable_const_bridge(
+            super::super::Decision::Opt {
+                mutable: true,
+                slice: false,
+                uses: Vec::new(),
+            },
+            "mut p: Option<&mut i8>",
+            false,
+            ".as_deref_mut()",
+            true,
+        );
+    }
+
+    #[test]
+    fn rb_retalias_writable_const_option_slice_unknown_child_requires_mutable_binding() {
+        constructed_writable_const_bridge(
+            super::super::Decision::Opt {
+                mutable: true,
+                slice: true,
+                uses: Vec::new(),
+            },
+            "mut p: Option<&mut [i8]>",
+            true,
+            ".as_deref_mut()",
+            true,
+        );
+    }
+
+    #[test]
+    fn rb_retalias_writable_const_readonly_child_keeps_existing_adapter() {
+        let source = super::super::Decision::Ref { mutable: true };
+        let target = RawTargetType {
+            rendered: "*const i8".into(),
+            pointee: "i8".into(),
+            mutability: RawMutability::Const,
+            depth2: None,
+        };
+        let (_, _, readonly) = constructed_child_access();
+        let base = template_for(&source, &target, None, true).unwrap();
+        let selected = returned_child_template(&source, &target, Some(&readonly), base).unwrap();
+        assert_eq!(selected.template, base);
+        assert!(!selected.mutable_binding_required);
+    }
+
+    #[test]
+    fn rb_retalias_source_proven_field_load_is_distinct_from_slice_and_offset_views() {
+        let source = r#"
+            extern "C" { fn strchr(p: *const i8, needle: i32) -> *mut i8; }
+            pub struct Holder { pub p: *const i8 }
+            pub unsafe fn raw_field(holder: *const Holder) { let _ = strchr((*holder).p as *const i8, 0); }
+            pub unsafe fn slice_view(slice: &[i8]) { let _ = strchr(slice.as_ptr(), 0); }
+            pub unsafe fn offset_view(pointer: *const i8) { let _ = strchr(pointer.offset(1), 0); }
+        "#;
+        let observed = ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let mut observed = BTreeMap::new();
+            for function in &program.functions {
+                let name = tcx.item_name(function.to_def_id()).to_string();
+                if !matches!(name.as_str(), "raw_field" | "slice_view" | "offset_view") {
+                    continue;
+                }
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(*function)
+                    .borrow();
+                let calls = body
+                    .basic_blocks
+                    .iter_enumerated()
+                    .filter_map(|(block, data)| {
+                        let TerminatorKind::Call { func, args, .. } = &data.terminator().kind
+                        else {
+                            return None;
+                        };
+                        let callee = operand_callee(func)?;
+                        (tcx.item_name(callee).as_str() == "strchr").then_some((
+                            Location {
+                                block,
+                                statement_index: data.statements.len(),
+                            },
+                            plain_operand_local(&args[0].node)
+                                .expect("real pointer argument local"),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let [(call, parent)] = calls.as_slice() else {
+                    panic!("one real strchr call required for {name}")
+                };
+                assert!(matches!(
+                    body.local_decls[*parent].ty.kind(),
+                    TyKind::RawPtr(..)
+                ));
+                observed.insert(
+                    name,
+                    returned_parent_is_raw_field_load(tcx, &body, *call, *parent),
+                );
+            }
+            observed
+        })
+        .expect("source-form provenance controls compile");
+        assert_eq!(
+            observed.get("slice_view"),
+            Some(&false),
+            "existing Slice borrow cannot be treated as a raw field value"
+        );
+        assert_eq!(
+            observed.get("offset_view"),
+            Some(&false),
+            "offset provenance cannot be treated as a raw field value"
+        );
+        assert_eq!(
+            observed.get("raw_field"),
+            Some(&true),
+            "exact projected pointer-value load must not inherit container permission"
+        );
+    }
+
+    #[test]
+    fn rb_retalias_returned_child_sink_is_positive_without_attestation() {
+        let source = r#"
+            extern "C" { fn strchr(p: *const i8, needle: i32) -> *mut i8; }
+            pub unsafe fn keep(p: *const i8, output: *mut *mut i8) {
+                let child = strchr(p, 0);
+                let copied = child;
+                *output = copied;
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let function = program
+                .functions
+                .iter()
+                .copied()
+                .find(|function| tcx.item_name(function.to_def_id()).as_str() == "keep")
+                .unwrap();
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let calls = body
+                .basic_blocks
+                .iter_enumerated()
+                .filter_map(|(block, data)| {
+                    let TerminatorKind::Call {
+                        func,
+                        args,
+                        destination,
+                        ..
+                    } = &data.terminator().kind
+                    else {
+                        return None;
+                    };
+                    let callee = operand_callee(func)?;
+                    (tcx.item_name(callee).as_str() == "strchr").then_some((
+                        block,
+                        args,
+                        destination,
+                        callee,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let [(call_block, args, destination, callee)] = calls.as_slice() else {
+                panic!("one real strchr call required")
+            };
+            let mut parent =
+                plain_operand_local(&args[0].node).expect("plain compiler argument temporary");
+            let mut visited = BTreeSet::new();
+            while parent != Local::from_u32(1) {
+                assert!(
+                    visited.insert(parent.as_u32()),
+                    "parent copy chain must be acyclic"
+                );
+                let definitions = body.basic_blocks[*call_block]
+                    .statements
+                    .iter()
+                    .filter_map(|statement| {
+                        let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else {
+                            return None;
+                        };
+                        (lhs.as_local() == Some(parent)).then_some(rhs)
+                    })
+                    .collect::<Vec<_>>();
+                let [rhs] = definitions.as_slice() else {
+                    panic!(
+                        "parent temporary requires one pre-call definition: _{}",
+                        parent.as_u32()
+                    )
+                };
+                let source = transparent_operand(rhs)
+                    .and_then(plain_operand_local)
+                    .expect("transparent parent copy/cast");
+                assert!(
+                    matches!(body.local_decls[source].ty.kind(), TyKind::RawPtr(..))
+                        && matches!(body.local_decls[parent].ty.kind(), TyKind::RawPtr(..))
+                );
+                parent = source;
+            }
+            let child = destination
+                .as_local()
+                .expect("real plain-local returned child");
+            assert!(matches!(
+                body.local_decls[child].ty.kind(),
+                TyKind::RawPtr(..)
+            ));
+            let key = symbol_key(tcx, *callee, &program.functions);
+            let target = raw_target_type(
+                tcx,
+                tcx.fn_sig(*callee).skip_binder().skip_binder().inputs()[0],
+            )
+            .unwrap();
+            assert_eq!(
+                super::super::raw_boundary_contracts::classify_contract(&key, 0, &target)
+                    .unwrap()
+                    .returns_alias_of,
+                Some(0)
+            );
+            let mut copies = Vec::new();
+            let mut stores = Vec::new();
+            for data in body.basic_blocks.iter() {
+                for statement in &data.statements {
+                    let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else { continue };
+                    let Some(source) = transparent_operand(rhs).and_then(plain_operand_local)
+                    else {
+                        continue;
+                    };
+                    if let Some(destination) = lhs.as_local() {
+                        if matches!(body.local_decls[source].ty.kind(), TyKind::RawPtr(..))
+                            && matches!(body.local_decls[destination].ty.kind(), TyKind::RawPtr(..))
+                        {
+                            copies.push((source, destination));
+                        }
+                    } else if lhs.local == Local::from_u32(2) && !lhs.projection.is_empty() {
+                        stores.push(source);
+                    }
+                }
+            }
+            let mut reachable = BTreeSet::from([child.as_u32()]);
+            loop {
+                let before = reachable.len();
+                for (source, destination) in &copies {
+                    if reachable.contains(&source.as_u32()) {
+                        reachable.insert(destination.as_u32());
+                    }
+                }
+                if before == reachable.len() {
+                    break;
+                }
+            }
+            assert!(
+                copies.iter().any(|(source, _)| *source == child),
+                "real child-copy edge required"
+            );
+            assert!(
+                stores
+                    .iter()
+                    .any(|source| reachable.contains(&source.as_u32())),
+                "copied returned child must reach real outward storage"
+            );
+            let origins = crate::analyses::borrow_ownership::origins::compute_origins(&program);
+            let summaries = RetentionSummaries::derive(&program, Some(&origins), None);
+            assert!(
+                matches!(
+                    summaries.get(function, 0),
+                    Some(RetentionVerdict::Retains { .. })
+                ),
+                "positive returned-child sink was hidden by absent attestation: {:?}",
+                summaries.get(function, 0)
+            );
+        })
+        .expect("returned-child sink fixture compiles");
+    }
+
     fn retention_of(
         src: &str,
         function_suffix: &str,
@@ -3068,6 +4089,8 @@ mod tests {
                 "retention-local-summary-unknown",
                 "retention-attestation-absent",
                 "retention-analysis-incomplete",
+                "retention-returned-alias-used",
+                "retention-returned-alias-unknown",
             ]
         );
     }
