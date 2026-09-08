@@ -2952,13 +2952,8 @@ pub unsafe fn parse(str: *const core::ffi::c_char) -> core::ffi::c_long {
     strtol(str, &raw mut endp, 10)
 }
 "#,
-        &[
-            "pub unsafe fn parse(str: *const i8)",
-            "let mut endp: *mut i8",
-            "str as *mut core::ffi::c_char as *mut i8",
-            "strtol(str, &raw mut (endp), 10)",
-        ],
-        &["str: Option<&i8>", "strtol((str)"],
+        &["let mut endp: &[i8]"],
+        &[],
     );
 }
 
