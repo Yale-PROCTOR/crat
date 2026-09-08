@@ -122,7 +122,7 @@ def sealed(runtime, seal):
 def validate_job(runtime, job, after_process=False):
     require(job["schema"] == "era5a-model-job-v1"
             and job["admission"] == "era5a-freeze-seat-accepted", "seat-accepted era5a freeze admission")
-    require(job["host_role"] == "evaluation" and not job["host"].split(".")[0].startswith("lambda7")
+    require(job["host_role"] == "evaluation" and job["host"] == "lambda7"
             and runtime.host() == job["host"] == job["resources"]["host"], "evaluation host guard")
     require(runtime.physical_mib() == job["resources"]["physical_mib"], "physical host changed")
     require(job["program"] in PROGRAMS and job["cache_namespace"] == "era5a-candidate", "candidate namespace")

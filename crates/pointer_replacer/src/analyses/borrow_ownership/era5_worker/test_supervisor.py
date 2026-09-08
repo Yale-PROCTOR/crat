@@ -21,7 +21,7 @@ class MemoryRuntime:
         self.files = {}
         self.calls = []
         self.writes = []
-        self.actual_host = "synthetic-evaluation"
+        self.actual_host = "lambda7"
         self.memory = 1024
         self.outcome = "complete"
         self.after_launch = lambda runtime, job: None
@@ -155,7 +155,7 @@ class SupervisorTests(unittest.TestCase):
     def test_host_admission_launch_digest_and_input_refuse_before_launch(self):
         edits = [lambda f: f.job.update(admission="accepted-w3b-landing-and-era5-freeze"),
                  lambda f: f.job.update(host_role="development"),
-                 lambda f: f.job.update(host="lambda7"),
+                 lambda f: f.job.update(host="other-evaluation-host"),
                  lambda f: f.job["environment"].clear(),
                  lambda f: f.job["resources"]["guards"].update(query_seconds=601),
                  lambda f: f.runtime.files.update({"/input/unused.rs": b"drift"})]

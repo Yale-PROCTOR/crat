@@ -89,11 +89,7 @@ fn validate(job: &Job) -> Result<BTreeMap<String, String>, String> {
         || job.admission != "era5a-freeze-seat-accepted"
         || !REQUIRED_PROGRAMS.contains(&job.program.as_str())
         || job.host_role != "evaluation"
-        || job
-            .host
-            .split('.')
-            .next()
-            .is_some_and(|host| host.starts_with("lambda7"))
+        || job.host != "lambda7"
         || job.cache_namespace != "era5a-candidate"
         || !job.cache_dir.is_absolute()
         || !job.receipt.is_absolute()
