@@ -9023,14 +9023,59 @@ fn e1_subject_seed_tsv(
             return Err(format!("duplicate E1 subject seed identity {key}"));
         }
     }
+    let sole_flags = e1_sole_blocker_flags(rows.iter().map(|(_, row)| row.as_str()));
     let mut out = String::from(
-        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n",
+        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\tsole_blocker\n",
     );
-    for (_, row) in rows {
-        out.push_str(&row);
+    for ((_, row), sole) in rows.iter().zip(sole_flags) {
+        out.push_str(row);
+        out.push('\t');
+        out.push_str(&sole);
         out.push('\n');
     }
     Ok(out)
+}
+
+/// **R261-2 — the sole-blocker column.**
+///
+/// `decide_one` returns at the FIRST failing predicate, so `reason` names the
+/// earliest test that fired, not the cause that would still block if that test
+/// were repaired. Reading a family's population off `reason` alone therefore
+/// overstates its market whenever the family is merely co-located with a deeper
+/// blocker: of the 34 J-double-prime functions holding a `ptr-comparison`
+/// subject, 24 also hold another degraded family. This column carries the
+/// distinction into every consumer instead of leaving it to be rediscovered.
+///
+/// A degraded row is a sole blocker when its owner function has exactly one
+/// distinct degraded reason. Rows that are not degraded carry `-`.
+pub(crate) fn e1_sole_blocker_flags<'a>(
+    rows: impl Iterator<Item = &'a str> + Clone,
+) -> Vec<String> {
+    const OWNER: usize = 1;
+    const REASON: usize = 8;
+    let mut reasons_by_owner =
+        std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+    for row in rows.clone() {
+        let cols = row.split('\t').collect::<Vec<_>>();
+        let (Some(owner), Some(reason)) = (cols.get(OWNER), cols.get(REASON)) else { continue };
+        if *reason == "-" {
+            continue;
+        }
+        reasons_by_owner.entry(owner).or_default().insert(reason);
+    }
+    rows.map(|row| {
+        let cols = row.split('\t').collect::<Vec<_>>();
+        match (cols.get(OWNER), cols.get(REASON)) {
+            (Some(owner), Some(reason)) if *reason != "-" => u8::from(
+                reasons_by_owner
+                    .get(owner)
+                    .is_some_and(|reasons| reasons.len() == 1),
+            )
+            .to_string(),
+            _ => "-".to_owned(),
+        }
+    })
+    .collect()
 }
 
 /// **Producer A's artifact** for the crate in `tcx`.

@@ -10138,7 +10138,12 @@ mod run {
         seed: &str,
         revert_classes: &BTreeMap<String, String>,
     ) -> Result<DegradedMassLedger, String> {
-        const HEADER: [&str; 13] = [
+        // R261-2 added `sole_blocker` as the fourteenth column: whether this
+        // subject's family is the only degraded family in its owner function.
+        // This ledger reports first-reason mass, so it carries the column
+        // through rather than reading it -- the two counts sit side by side in
+        // the consumer, which is the point of the ruling.
+        const HEADER: [&str; 14] = [
             "subject_key",
             "owner_fn",
             "mir_local",
@@ -10152,6 +10157,7 @@ mod run {
             "site",
             "placed",
             "exclusion",
+            "sole_blocker",
         ];
         let mut lines = seed.lines();
         let header = lines
@@ -24460,14 +24466,14 @@ fn e2_candidate_receipts_do_not_enter_placed_adapter_counters() {
 /// lifetime-market split before the corpus worker can emit its first row.
 #[test]
 fn degraded_mass_ledger_is_exact_once_and_lifetime_typed() {
-    let seed = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n\
-f::p#1\tf\t1\t1\t0\tref\tref\tref\t-\t-\tf.rs:1\t1\t-\n\
-g::s#1\tg\t1\t1\t0\tslice\tref\tslice\t-\t-\tg.rs:1\t1\t-\n\
-h::o#1\th\t1\t1\t0\toptional\tref\tdegraded\treturn-not-adapted\t-\th.rs:1\t0\t-\n\
-i::b#1\ti\t1\t1\t0\tbox\towning\tdegraded\tkind-owning\t-\ti.rs:1\t0\t-\n\
-j::r#1\tj\t1\t1\t0\traw\traw\tdegraded\tkind-raw\t-\tj.rs:1\t0\t-\n\
-k::c#1\tk\t1\t1\t0\tref\tref\tdegraded\tclass-blocked\tescapes-via-return\tk.rs:1\t0\t-\n\
-extern::arg#1\textern\t1\t1\t0\tunmodeled\tunmodeled\texcluded\t-\t-\t-\t0\tforeign-item\n";
+    let seed = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\tsole_blocker\n\
+f::p#1\tf\t1\t1\t0\tref\tref\tref\t-\t-\tf.rs:1\t1\t-\t-\n\
+g::s#1\tg\t1\t1\t0\tslice\tref\tslice\t-\t-\tg.rs:1\t1\t-\t-\n\
+h::o#1\th\t1\t1\t0\toptional\tref\tdegraded\treturn-not-adapted\t-\th.rs:1\t0\t-\t-\n\
+i::b#1\ti\t1\t1\t0\tbox\towning\tdegraded\tkind-owning\t-\ti.rs:1\t0\t-\t-\n\
+j::r#1\tj\t1\t1\t0\traw\traw\tdegraded\tkind-raw\t-\tj.rs:1\t0\t-\t-\n\
+k::c#1\tk\t1\t1\t0\tref\tref\tdegraded\tclass-blocked\tescapes-via-return\tk.rs:1\t0\t-\t-\n\
+extern::arg#1\textern\t1\t1\t0\tunmodeled\tunmodeled\texcluded\t-\t-\t-\t0\tforeign-item\t-\n";
     let ledger = run::degraded_mass_ledger_for_test(seed, &[("g", "call-site-not-adapted")])
         .expect("exact ledger");
     let rows = ledger.lines().skip(1).collect::<Vec<_>>();
@@ -24546,15 +24552,15 @@ fn r219_evidence_hold_degraded_mass_rows_are_degraded() {
         "unplaceable:slice-construction-evidence-held",
     ] {
         let seed = format!(
-            "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n\
-             f::p#1\tf\t1\t1\t0\tslice\tref\tslice\t-\t-\tf.rs:1\t0\t{exclusion}\n"
+            "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\tsole_blocker\n\
+             f::p#1\tf\t1\t1\t0\tslice\tref\tslice\t-\t-\tf.rs:1\t0\t{exclusion}\t-\n"
         );
         let ledger = run::degraded_mass_ledger_for_test(&seed, &[]).expect("exact ledger");
         let rows = ledger.lines().skip(1).collect::<Vec<_>>();
         assert_eq!(rows.len(), 1);
         let columns = rows[0].split('\t').collect::<Vec<_>>();
-        assert_eq!(columns[13], "degraded", "{exclusion}: {}", rows[0]);
-        assert_eq!(columns[14], exclusion, "the typed hold reason survives");
+        assert_eq!(columns[14], "degraded", "{exclusion}: {}", rows[0]);
+        assert_eq!(columns[15], exclusion, "the typed hold reason survives");
     }
 }
 
@@ -24577,14 +24583,14 @@ fn r219_evidence_hold_classification_preserves_genuine_exclusions() {
             "{exclusion}",
         );
         let seed = format!(
-            "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n\
-             f::p#1\tf\t1\t1\t0\t{family}\tref\t{decision}\t-\t-\tf.rs:1\t0\t{exclusion}\n"
+            "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\tsole_blocker\n\
+             f::p#1\tf\t1\t1\t0\t{family}\tref\t{decision}\t-\t-\tf.rs:1\t0\t{exclusion}\t-\n"
         );
         let ledger = run::degraded_mass_ledger_for_test(&seed, &[]).expect("exact ledger");
         let row = ledger.lines().nth(1).expect("subject row");
         let columns = row.split('\t').collect::<Vec<_>>();
-        assert_eq!(columns[13], "typed-excluded", "{exclusion}: {row}");
-        assert_eq!(columns[14], exclusion);
+        assert_eq!(columns[14], "typed-excluded", "{exclusion}: {row}");
+        assert_eq!(columns[15], exclusion);
     }
 }
 
@@ -24606,14 +24612,14 @@ fn r219_evidence_hold_terminal_not_applied_is_degraded_in_both_paths() {
             "{exclusion}",
         );
         let seed = format!(
-            "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n\
-             f::p#1\tf\t1\t1\t0\toptional\tref\toptional\t-\t-\tf.rs:1\t0\t{exclusion}\n"
+            "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\tsole_blocker\n\
+             f::p#1\tf\t1\t1\t0\toptional\tref\toptional\t-\t-\tf.rs:1\t0\t{exclusion}\t-\n"
         );
         let ledger = run::degraded_mass_ledger_for_test(&seed, &[]).expect("exact ledger");
         let row = ledger.lines().nth(1).expect("subject row");
         let columns = row.split('\t').collect::<Vec<_>>();
-        assert_eq!(columns[13], "degraded", "{exclusion}: {row}");
-        assert_eq!(columns[14], exclusion);
+        assert_eq!(columns[14], "degraded", "{exclusion}: {row}");
+        assert_eq!(columns[15], exclusion);
     }
 }
 

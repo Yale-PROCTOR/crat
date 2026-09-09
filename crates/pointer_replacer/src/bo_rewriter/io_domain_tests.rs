@@ -103,3 +103,68 @@ fn io_domain_type_names_are_pinned() {
         );
     }
 }
+
+/// R261-2 — the sole-blocker column. The ruling exists because a family's
+/// first-reason count overstates its market whenever the family is merely
+/// co-located with a deeper blocker, and the count that matters for sizing an
+/// adapter is how often it is the ONLY thing in the way.
+mod sole_blocker {
+    fn row(owner: &str, subject: &str, reason: &str) -> String {
+        format!(
+            "{owner}::{subject}#1\t{owner}\t1\t1\t0\tref\tref\tdegraded\t{reason}\t-\tf.rs:1\t0\t-"
+        )
+    }
+
+    #[test]
+    fn a_family_alone_in_its_function_is_a_sole_blocker() {
+        let rows = [row("alone", "p", "ptr-comparison")];
+        let flags = super::super::e1_sole_blocker_flags(rows.iter().map(String::as_str));
+        assert_eq!(flags, vec!["1".to_owned()]);
+    }
+
+    /// Two families in one function: neither is the sole blocker, even though
+    /// each is still counted once under its own first reason.
+    #[test]
+    fn co_located_families_are_not_sole_blockers() {
+        let rows = [
+            row("together", "p", "ptr-comparison"),
+            row("together", "q", "raw-pointer-operation"),
+        ];
+        let flags = super::super::e1_sole_blocker_flags(rows.iter().map(String::as_str));
+        assert_eq!(flags, vec!["0".to_owned(), "0".to_owned()]);
+    }
+
+    /// Two subjects blocked for the SAME reason are still a sole blocker: the
+    /// column is about distinct causes in the function, not about how many
+    /// subjects carry them.
+    #[test]
+    fn repeats_of_one_family_remain_a_sole_blocker() {
+        let rows = [
+            row("twice", "p", "ptr-comparison"),
+            row("twice", "q", "ptr-comparison"),
+        ];
+        let flags = super::super::e1_sole_blocker_flags(rows.iter().map(String::as_str));
+        assert_eq!(flags, vec!["1".to_owned(), "1".to_owned()]);
+    }
+
+    /// An undegraded row has no blocker to be sole about.
+    #[test]
+    fn undegraded_rows_carry_no_flag() {
+        let rows = [row("mixed", "p", "-"), row("mixed", "q", "ptr-comparison")];
+        let flags = super::super::e1_sole_blocker_flags(rows.iter().map(String::as_str));
+        assert_eq!(flags, vec!["-".to_owned(), "1".to_owned()]);
+    }
+
+    /// Functions are independent: one function's second family does not make
+    /// another function's single family stop being sole.
+    #[test]
+    fn functions_do_not_leak_into_each_other() {
+        let rows = [
+            row("alone", "p", "ptr-comparison"),
+            row("together", "q", "ptr-comparison"),
+            row("together", "r", "raw-pointer-operation"),
+        ];
+        let flags = super::super::e1_sole_blocker_flags(rows.iter().map(String::as_str));
+        assert_eq!(flags, vec!["1".to_owned(), "0".to_owned(), "0".to_owned()]);
+    }
+}
