@@ -73,8 +73,20 @@ fn print_dead_local_mir(
         .expect("existing dead-local flow export")
         .body;
     let edges = flow.depth0_value_flows();
-    let mut component = rustc_hash::FxHashSet::from_iter([SlotOwner::Local(source.source.local)]);
-    let mut frontier = vec![SlotOwner::Local(source.source.local)];
+    let mut component = rustc_hash::FxHashSet::from_iter([SlotOwner::Local(
+        source
+            .source
+            .declared()
+            .expect("banked declared source")
+            .local,
+    )]);
+    let mut frontier = vec![SlotOwner::Local(
+        source
+            .source
+            .declared()
+            .expect("banked declared source")
+            .local,
+    )];
     while let Some(owner) = frontier.pop() {
         for &(from, to) in &edges {
             let peer = if from == owner {
@@ -108,7 +120,11 @@ fn print_dead_local_mir(
     cursor.seek_before_primary_effect(call);
     println!(
         "R233 dead-local READ: source={:?}, call={call:?}, component={component:?}",
-        source.source.local
+        source
+            .source
+            .declared()
+            .expect("banked declared source")
+            .local
     );
     for local in &locals {
         println!(
@@ -155,7 +171,7 @@ fn source_site<'a>(potentials: &'a [SiblingPotential], label: &str) -> &'a Sibli
     let sites = potentials
         .iter()
         .filter(|potential| {
-            potential.source.label == label && potential.site.callee.symbol == "update"
+            potential.source.label() == label && potential.site.callee.symbol == "update"
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -179,7 +195,11 @@ fn sibling_r233_parameter_pending_keeps_paired_frozen_evidence() {
     let potentials = potentials(PARAMETER_CASE, "caller::src");
     let source = source_site(&potentials, "caller::src");
     assert!(matches!(
-        source.source.kind,
+        source
+            .source
+            .declared()
+            .expect("banked declared source")
+            .kind,
         SubjectKind::Param { hir_index: 1 }
     ));
     assert_eq!(
@@ -229,7 +249,7 @@ fn sibling_r233_field_loaded_raw_pointer_is_not_a_holder_pointee_bridge() {
     );
     assert!(
         !potentials.iter().any(|potential| {
-            potential.source.label == "caller::holder" && potential.site.callee.symbol == "update"
+            potential.source.label() == "caller::holder" && potential.site.callee.symbol == "update"
         }),
         "the Holder root does not denote the field-loaded raw pointer's pointee: {potentials:#?}"
     );
@@ -278,10 +298,17 @@ fn local_case(after: &str) -> String {
 fn sibling_r233_local_without_post_call_use_requires_complete_dead_evidence() {
     let potentials = potentials(&local_case("0"), "caller::src");
     let source = source_site(&potentials, "caller::src");
-    assert!(matches!(source.source.kind, SubjectKind::Local));
+    assert!(matches!(
+        source
+            .source
+            .declared()
+            .expect("banked declared source")
+            .kind,
+        SubjectKind::Local
+    ));
     assert!(
         matches!(&source.local_post_call,
-        LocalPostCallEvidence::DeadUnprotected { checked_locals } if checked_locals.contains(&source.source.local)),
+        LocalPostCallEvidence::DeadUnprotected { checked_locals } if checked_locals.contains(&source.source.declared().expect("banked declared source").local)),
         "a genuine local exception has explicit, complete MIR/protector evidence: {source:?}"
     );
     assert!(sibling_overlap::select_pending(std::slice::from_ref(source), raw_terminal).is_empty());
@@ -293,7 +320,7 @@ fn sibling_r233_live_local_with_an_exported_clear_pair_has_no_pending_waiver() {
     let source = source_site(&potentials, "caller::src");
     assert!(
         matches!(&source.local_post_call, LocalPostCallEvidence::Live { locals }
-        if locals.contains(&source.source.local)),
+        if locals.contains(&source.source.declared().expect("banked declared source").local)),
         "actual post-call read remains live: {source:?}"
     );
     assert!(
@@ -325,7 +352,14 @@ fn sibling_r233_local_copy_of_a_parameter_keeps_the_parameter_protector() {
     );
     let potentials = potentials(&input, "caller::local");
     let source = source_site(&potentials, "caller::local");
-    assert!(matches!(source.source.kind, SubjectKind::Local));
+    assert!(matches!(
+        source
+            .source
+            .declared()
+            .expect("banked declared source")
+            .kind,
+        SubjectKind::Local
+    ));
     assert!(
         matches!(&source.local_post_call, LocalPostCallEvidence::ParameterOrigin { parameters }
         if parameters.contains(&2)),
@@ -379,7 +413,7 @@ fn sibling_r233_sealed_read_only_sibling_does_not_mint_pending_write_waiver() {
     let sites = potentials
         .iter()
         .filter(|potential| {
-            potential.source.label == "caller::src" && potential.site.callee.symbol == "strcmp"
+            potential.source.label() == "caller::src" && potential.site.callee.symbol == "strcmp"
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -419,7 +453,7 @@ fn covered<'a>(
         .coverage
         .iter()
         .filter(|record| {
-            record.potential.source.label == label
+            record.potential.source.label() == label
                 && record.potential.site.callee.symbol == callee
                 && record.potential.site.argument_index == index
         })

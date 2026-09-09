@@ -150,6 +150,14 @@ pub(crate) struct InferredLifetimePermit {
     callee: LocalDefId,
 }
 
+/// A model-Ref annotated Slice local receiving a native borrowed return.
+/// This token does not grant the inferred-local declaration exception.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AnnotatedReceiverPermit {
+    subject: NodeKey,
+    callee: LocalDefId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OutputStorageLifetimePermit {
     function: LocalDefId,
@@ -194,6 +202,16 @@ impl InferredLifetimePermit {
     }
 }
 
+impl AnnotatedReceiverPermit {
+    fn new(subject: NodeKey, callee: LocalDefId) -> Self {
+        Self { subject, callee }
+    }
+
+    pub(crate) fn callee(self) -> LocalDefId {
+        self.callee
+    }
+}
+
 impl ReturnLifetimePermit {
     fn new(
         subject: NodeKey,
@@ -227,6 +245,7 @@ impl ReturnLifetimePermit {
 pub(crate) struct LifetimeEligibility {
     return_permits: FxHashMap<NodeKey, ReturnLifetimePermit>,
     inferred_permits: FxHashMap<NodeKey, InferredLifetimePermit>,
+    annotated_receiver_permits: FxHashMap<NodeKey, AnnotatedReceiverPermit>,
     output_storage_permits: FxHashMap<(LocalDefId, FnSignatureSlot), OutputStorageLifetimePermit>,
     output_storage_escapes: FxHashSet<(NodeKey, NodeKey)>,
     failures: FxHashMap<NodeKey, LifetimeFailure>,
@@ -253,6 +272,13 @@ impl LifetimeEligibility {
 
     pub(crate) fn inferred_permit(&self, subject: NodeKey) -> Option<InferredLifetimePermit> {
         self.inferred_permits.get(&subject).copied()
+    }
+
+    pub(crate) fn annotated_receiver_permit(
+        &self,
+        subject: NodeKey,
+    ) -> Option<AnnotatedReceiverPermit> {
+        self.annotated_receiver_permits.get(&subject).copied()
     }
 
     #[cfg(test)]
@@ -329,6 +355,7 @@ impl LifetimeEligibility {
         Self {
             return_permits: [(subject, permit)].into_iter().collect(),
             inferred_permits: FxHashMap::default(),
+            annotated_receiver_permits: FxHashMap::default(),
             output_storage_permits: FxHashMap::default(),
             output_storage_escapes: FxHashSet::default(),
             failures: FxHashMap::default(),
@@ -364,6 +391,8 @@ fn model_is_ref(
 
 pub(crate) fn derive_return_eligibility(
     program: &RustProgram<'_>,
+    return_family_functions: &FxHashSet<LocalDefId>,
+    return_sites: &[super::emitability::ReturnSiteFact],
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
     origins: Option<&OriginSummaries>,
@@ -407,6 +436,28 @@ pub(crate) fn derive_return_eligibility(
         .filter(|escape| escape.kind == EscapeKind::Return)
         .map(|escape| escape.subject)
         .collect::<Vec<_>>();
+    // The legacy escape inventory sees bare returned uses. A licensed
+    // reslice has its base inside the returned method expression instead.
+    // Add only that owned parameter candidate to the same native proof path.
+    return_subjects.extend(
+        return_sites
+            .iter()
+            .filter(|site| {
+                return_family_functions.contains(&site.owner)
+                    && matches!(
+                        site.expression_shape,
+                        super::emitability::ReturnExprShape::ConstantReslice { .. }
+                    )
+            })
+            .filter_map(|site| site.root.map(|root| (site.owner, root)))
+            .filter(|node| {
+                subjects.iter().any(|subject| {
+                    (subject.fn_did, subject.hir_id) == *node
+                        && subject.ptr_depth == 1
+                        && matches!(subject.kind, super::SubjectKind::Param { .. })
+                })
+            }),
+    );
     return_subjects
         .sort_unstable_by_key(|(did, hir)| (did.local_def_index.as_u32(), hir.local_id.as_u32()));
     return_subjects.dedup();
@@ -414,9 +465,10 @@ pub(crate) fn derive_return_eligibility(
     for subject in return_subjects {
         let candidate = match decisions.get(&subject) {
             Some(Decision::Ref { .. }) => true,
+            Some(Decision::Slice { .. } | Decision::Opt { .. }) => {
+                return_family_functions.contains(&subject.0)
+            }
             Some(Decision::InferredRef { .. }) => false,
-            Some(Decision::Slice { .. }) => false,
-            Some(Decision::Opt { .. }) => false,
             Some(Decision::Box(_)) => false,
             Some(Decision::Degraded(_)) => false,
             None => false,
@@ -632,7 +684,17 @@ pub(crate) fn derive_return_eligibility(
                     if record.reason == DegradeReason::ReturnNotAdapted
             )
         });
-        if !is_return_residual {
+        let is_annotated_slice = subject.kind == super::SubjectKind::Local
+            && subject.ty_span.is_some()
+            && decisions.get(&key).is_some_and(|decision| match decision {
+                Decision::Slice { .. } => true,
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => false,
+            });
+        if !is_return_residual && !is_annotated_slice {
             continue;
         }
         if matches!(subject.ctor, Some(Construction::Alloc { .. })) {
@@ -685,9 +747,17 @@ pub(crate) fn derive_return_eligibility(
             result.failures.insert(key, LifetimeFailure::OriginAbsent);
             continue;
         }
-        result
-            .inferred_permits
-            .insert(key, InferredLifetimePermit::new(key, callee));
+        // Both tokens require the same direct-callee, web, frozen model and
+        // native-return checks above. Their declaration authority is distinct.
+        if is_annotated_slice {
+            result
+                .annotated_receiver_permits
+                .insert(key, AnnotatedReceiverPermit::new(key, callee));
+        } else {
+            result
+                .inferred_permits
+                .insert(key, InferredLifetimePermit::new(key, callee));
+        }
     }
 
     result.derive_wall_s = derive_started.elapsed().as_secs_f64();
@@ -743,7 +813,8 @@ pub(crate) struct LifetimePlan {
 /// return lifetime reuse when its source declaration is reverted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReturnOriginAtomDependencies {
-    owners_by_atom: BTreeMap<String, BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>>,
+    owners_by_atom:
+        BTreeMap<String, BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>>,
     dependents_by_class: BTreeMap<
         crate::bo_rewriter::bridge_receipt::SignatureClassId,
         BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
@@ -775,8 +846,12 @@ impl ReturnOriginAtomDependencies {
                         if subject.fn_did != function {
                             continue;
                         }
-                        let super::SubjectKind::Param { hir_index } = subject.kind else { continue };
-                        if hir_index.checked_add(1).and_then(|index| u32::try_from(index).ok())
+                        let super::SubjectKind::Param { hir_index } = subject.kind else {
+                            continue;
+                        };
+                        if hir_index
+                            .checked_add(1)
+                            .and_then(|index| u32::try_from(index).ok())
                             != Some(argument_index)
                         {
                             continue;
@@ -784,7 +859,11 @@ impl ReturnOriginAtomDependencies {
                         let node = (subject.fn_did, subject.hir_id);
                         if let Some(atoms) = table.seams.raw_boundary_atom_groups.get(&node) {
                             for atom in atoms {
-                                result.owners_by_atom.entry(atom.id.clone()).or_default().insert(owner);
+                                result
+                                    .owners_by_atom
+                                    .entry(atom.id.clone())
+                                    .or_default()
+                                    .insert(owner);
                             }
                         }
                     }
@@ -792,7 +871,11 @@ impl ReturnOriginAtomDependencies {
             }
         }
         for &(dependent, dependency) in dependency_edges {
-            result.dependents_by_class.entry(dependency).or_default().insert(dependent);
+            result
+                .dependents_by_class
+                .entry(dependency)
+                .or_default()
+                .insert(dependent);
         }
         result
     }
@@ -802,8 +885,11 @@ impl ReturnOriginAtomDependencies {
         classes: &BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
         atoms: &BTreeSet<String>,
     ) -> BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId> {
-        let mut pending = atoms.iter().filter_map(|atom| self.owners_by_atom.get(atom))
-            .flat_map(|owners| owners.iter().copied()).collect::<Vec<_>>();
+        let mut pending = atoms
+            .iter()
+            .filter_map(|atom| self.owners_by_atom.get(atom))
+            .flat_map(|owners| owners.iter().copied())
+            .collect::<Vec<_>>();
         if pending.is_empty() {
             return classes.clone();
         }
@@ -819,6 +905,25 @@ impl ReturnOriginAtomDependencies {
         let mut effective = classes.clone();
         effective.extend(affected);
         effective
+    }
+
+    /// Follow the same finalized consistency edges for a newly held interface.
+    /// Existing unrelated class reverts are not seeds for this closure.
+    pub(crate) fn dependents_of(
+        &self,
+        owners: &BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
+    ) -> BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId> {
+        let mut pending = owners.iter().copied().collect::<Vec<_>>();
+        let mut affected = BTreeSet::new();
+        while let Some(owner) = pending.pop() {
+            if !affected.insert(owner) {
+                continue;
+            }
+            if let Some(dependents) = self.dependents_by_class.get(&owner) {
+                pending.extend(dependents.iter().copied());
+            }
+        }
+        affected
     }
 }
 
@@ -855,6 +960,14 @@ impl LifetimePlan {
 }
 
 impl FunctionPlan {
+    pub(crate) fn return_sources(&self) -> BTreeSet<FnSignatureSlot> {
+        self.return_reuses
+            .iter()
+            .filter(|reuse| reuse.target == FnSignatureSlot::RETURN)
+            .flat_map(|reuse| reuse.sources.iter().copied())
+            .collect()
+    }
+
     pub(crate) fn lifetime_for(&self, slot: FnSignatureSlot) -> Option<&str> {
         self.lifetimes.get(&slot).map(String::as_str)
     }

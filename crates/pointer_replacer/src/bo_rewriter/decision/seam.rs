@@ -117,6 +117,7 @@ pub(crate) enum SeamBlock {
     /// A raw expression cannot enter a safe return without the typed origin
     /// permit that supplies the emitted return lifetime.
     ReturnLifetimeAbsent,
+    ReturnInterfaceUnavailable,
     /// A5 selected a raw-view fallback from a shared safe value to a mutable
     /// raw parameter, but the callee has no Foster/libc negative-write proof.
     A5NegativeWriteAbsent,
@@ -136,6 +137,7 @@ impl SeamBlock {
             SeamBlock::PositiveRetention => "seam-positive-retention",
             SeamBlock::NonemptyUnknown => "seam-nonempty-unknown",
             SeamBlock::ReturnLifetimeAbsent => "return-lifetime-permit-absent",
+            SeamBlock::ReturnInterfaceUnavailable => "return-interface-unavailable",
             SeamBlock::A5NegativeWriteAbsent => "raw-boundary-shared-to-mut:negative-write-absent",
             SeamBlock::A5RawViewUnavailable => "a5-raw-view-template-unavailable",
         }
@@ -736,6 +738,12 @@ pub(crate) struct ZeroBridgeSite {
 /// carrier makes every collection authoritative, including an empty one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TerminalCallPlans {
+    pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
+    pub(crate) outbound_expressions: super::outbound_expression::OutboundExpressionPlans,
+    pub(crate) raw_receivers: super::raw_receiver::RawReceiverPlans,
+    pub(crate) receiver_inputs: super::receiver_input::ReceiverInputMap,
+    pub(crate) callee_parameter_inputs: super::callee_parameter_input::InputPlans,
+    pub(crate) surface_arguments: Vec<super::surface_argument::SurfaceArgumentPlan>,
     pub(crate) return_origin_dependencies: super::lifetime::ReturnOriginAtomDependencies,
     pub(crate) a5_raw_calls: Vec<A5RawViewCall>,
     pub(crate) pair_raw_calls: Vec<PairRawViewCall>,
@@ -744,8 +752,80 @@ pub(crate) struct TerminalCallPlans {
 }
 
 impl TerminalCallPlans {
+    pub(crate) fn effective_reverted_classes(
+        &self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> BTreeSet<SignatureClassId> {
+        self.input_reversion_closure(classes, atoms).0
+    }
+
+    pub(crate) fn input_reversion_closure(
+        &self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> (
+        BTreeSet<SignatureClassId>,
+        BTreeMap<SignatureClassId, BTreeSet<String>>,
+    ) {
+        let mut effective = self
+            .return_origin_dependencies
+            .effective_reverted_classes(classes, atoms);
+        let mut reasons = BTreeMap::<SignatureClassId, BTreeSet<String>>::new();
+        loop {
+            let mut owners = BTreeSet::new();
+            for (&key, input) in &self.callee_parameter_inputs {
+                let Some(Err(reason)) = input.select(&effective, atoms) else { continue };
+                for owner in input.unavailable_owners() {
+                    if effective.contains(&owner) {
+                        continue;
+                    }
+                    owners.insert(owner);
+                    reasons.entry(owner).or_default().insert(format!(
+                        "callee-parameter-input-unavailable:class={}:arg={}..{}:{reason}",
+                        key.0.order_key(),
+                        key.1,
+                        key.2,
+                    ));
+                }
+            }
+            for unavailable in self.receiver_inputs.unavailable.values() {
+                if unavailable.selection.active(&effective, atoms) {
+                    let owner = unavailable.selection.callee;
+                    owners.insert(owner);
+                    reasons.entry(owner).or_default().insert(format!(
+                        "return-receiver-input-unavailable:caller={}:hir={}:{:?}",
+                        unavailable.selection.node.0.local_def_index.as_u32(),
+                        unavailable.selection.node.1.local_id.as_u32(),
+                        unavailable.reason,
+                    ));
+                }
+            }
+            if owners.is_empty() {
+                return (effective, reasons);
+            }
+            let affected = self.return_origin_dependencies.dependents_of(&owners);
+            for owner in affected
+                .difference(&owners)
+                .filter(|owner| !effective.contains(*owner))
+            {
+                reasons
+                    .entry(*owner)
+                    .or_default()
+                    .insert("input-interface-dependency-reverted".to_owned());
+            }
+            effective.extend(affected);
+        }
+    }
+
     pub(crate) fn candidates(seams: &SeamPlan) -> Self {
         Self {
+            native_return_sites: seams.native_return_sites.clone(),
+            outbound_expressions: seams.outbound_expressions.clone(),
+            raw_receivers: seams.raw_receivers.clone(),
+            receiver_inputs: seams.receiver_inputs.clone(),
+            surface_arguments: seams.surface_arguments.clone(),
+            callee_parameter_inputs: seams.callee_parameter_inputs.clone(),
             return_origin_dependencies: Default::default(),
             a5_raw_calls: seams.a5_raw_calls.clone(),
             pair_raw_calls: seams.pair_raw_calls.clone(),
@@ -942,6 +1022,8 @@ pub(crate) enum GlueCore {
     First,
     /// `&mut X[0]` / `&X[0]`
     Index0,
+    /// `&mut X[OFFSET..]` / `&X[OFFSET..]`, preserving a native return origin.
+    Suffix { offset: u64 },
     /// `core::slice::from_raw_parts{_mut}(X, (LEN) as usize)`
     FromRawParts,
     /// `core::slice::from_mut(X)` / `core::slice::from_ref(X)`
@@ -1184,6 +1266,7 @@ impl GlueSpec {
                 | GlueCore::Reborrow
                 | GlueCore::First
                 | GlueCore::Index0
+                | GlueCore::Suffix { .. }
                 | GlueCore::FromRefMut => "optional",
             };
         }
@@ -1200,7 +1283,7 @@ impl GlueSpec {
                 GlueCore::FromRawParts if self.mutable => return "c-raw-slice-mut",
                 GlueCore::FromRawParts => return "c-raw-slice-shared",
                 GlueCore::Bare | GlueCore::RawOption | GlueCore::Index0 | GlueCore::FromRefMut => {}
-                GlueCore::First => {}
+                GlueCore::First | GlueCore::Suffix { .. } => {}
             }
         }
         if self.optional {
@@ -1212,6 +1295,8 @@ impl GlueSpec {
                 GlueCore::FromRefMut => "thin-to-slice-shared",
                 GlueCore::First if self.mutable => "slice-to-thin-mut",
                 GlueCore::First => "slice-to-thin-shared",
+                GlueCore::Suffix { .. } if self.mutable => "slice-suffix-mut",
+                GlueCore::Suffix { .. } => "slice-suffix-shared",
                 GlueCore::Reborrow | GlueCore::RawOption | GlueCore::Index0 | GlueCore::Bare => {
                     "scalar-reference"
                 }
@@ -1266,6 +1351,7 @@ impl GlueSpec {
             (true, GlueCore::RawOption) => "checked_optional",
             (true, GlueCore::First) => "some_wrap",
             (true, GlueCore::FromRefMut) => "some_from_ref_mut",
+            (true, GlueCore::Suffix { .. }) => "some_suffix",
             // `Some(&X[0])` matches neither `Some(&mut *` nor `Some(&*`.
             (true, GlueCore::Bare | GlueCore::Index0) => "some_wrap",
             (false, GlueCore::FromRawParts) => "from_raw_parts",
@@ -1273,6 +1359,7 @@ impl GlueSpec {
             (false, GlueCore::RawOption) => "checked_optional",
             (false, GlueCore::First) => "first",
             (false, GlueCore::FromRefMut) => "from_ref_mut",
+            (false, GlueCore::Suffix { .. }) => "suffix",
             // `index` is the classifier's FALLBACK arm, and the two cores that
             // land in it are **not** in the same position — a distinction this
             // comment previously got wrong, in the direction this track calls
@@ -1377,6 +1464,7 @@ impl GlueSpec {
                 format!("{base}.{method}().unwrap()")
             }
             GlueCore::Index0 => format!("{}{base}[0]", amp(self.mutable)),
+            GlueCore::Suffix { offset } => format!("{}{base}[{offset}..]", amp(self.mutable)),
             GlueCore::FromRawParts => {
                 let ctor = if self.mutable {
                     "from_raw_parts_mut"
@@ -2838,6 +2926,13 @@ use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape
 /// reason is a yield number nobody can attribute.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
+    pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
+    pub(crate) outbound_expressions: super::outbound_expression::OutboundExpressionPlans,
+    pub(crate) raw_receivers: super::raw_receiver::RawReceiverPlans,
+    pub(crate) receiver_inputs: super::receiver_input::ReceiverInputMap,
+    pub(crate) callee_parameter_inputs: super::callee_parameter_input::InputPlans,
+    pub(crate) surface_arguments: Vec<super::surface_argument::SurfaceArgumentPlan>,
+    pub(crate) surface_argument_failures: Vec<super::surface_argument::SurfaceArgumentFailure>,
     pub edits: Vec<SeamEdit>,
     pub body_edits: Vec<BodyEdit>,
     pub body_blocked: Vec<BlockedBody>,
@@ -2980,7 +3075,7 @@ pub(crate) fn form_of(decision: &Decision) -> Form {
     }
 }
 
-fn receipt_arm(expected: Form, found: Form) -> &'static str {
+pub(crate) fn receipt_arm(expected: Form, found: Form) -> &'static str {
     if expected != Form::Raw && found != Form::Raw {
         "glue"
     } else {
@@ -2988,7 +3083,7 @@ fn receipt_arm(expected: Form, found: Form) -> &'static str {
     }
 }
 
-fn receipt_extent(spec: &GlueSpec) -> BridgeExtentKind {
+pub(crate) fn receipt_extent(spec: &GlueSpec) -> BridgeExtentKind {
     match spec.len.as_ref() {
         Some(SeamLen::Licensed(source)) => BridgeExtentKind::Evidence(source.clone()),
         Some(SeamLen::Fabricated) => BridgeExtentKind::Fallback,
@@ -3089,7 +3184,7 @@ fn build_candidate(
     }))
 }
 
-fn decision_for_safe_form(form: Form) -> Option<super::Decision> {
+pub(crate) fn decision_for_safe_form(form: Form) -> Option<super::Decision> {
     match form {
         Form::Raw => None,
         Form::Ref { mutable } => Some(super::Decision::Ref { mutable }),
@@ -3669,7 +3764,7 @@ fn enclosing_function_is_unsafe(tcx: TyCtxt<'_>, owner: LocalDefId) -> bool {
         .is_unsafe()
 }
 
-fn unsafe_context_for(
+pub(crate) fn unsafe_context_for(
     tcx: TyCtxt<'_>,
     owner: LocalDefId,
     spec: &GlueSpec,
@@ -4847,10 +4942,92 @@ pub(crate) fn synthesize_with_raw_boundary(
         let rustc_middle::ty::TyKind::RawPtr(_, output_mutability) = *output.kind() else {
             continue;
         };
-        let expected_mutable = output_mutability == rustc_middle::ty::Mutability::Mut;
-        let expected = Form::Ref {
-            mutable: expected_mutable,
+        let expected = table
+            .return_interfaces
+            .functions
+            .get(&site.owner)
+            .map(|interface| interface.form)
+            .unwrap_or(Form::Ref {
+                mutable: output_mutability == rustc_middle::ty::Mutability::Mut,
+            });
+        let expected_mutable = match expected {
+            Form::Ref { mutable } | Form::Slice { mutable } | Form::Opt { mutable, .. } => mutable,
+            Form::Raw => false,
         };
+        if table.return_interfaces.failures.contains_key(&site.owner) {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::ReturnInterfaceUnavailable,
+                expected: Some(expected),
+                found: None,
+                source_shape: "return-seam",
+                candidate_template: "return-interface".into(),
+                null_arm: "none".into(),
+                extent_arm: "none".into(),
+                root_identity: root_label(&labels, site.owner, site.root),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        }
+        if site.source_shape == "null-lit"
+            && matches!(expected, Form::Opt { .. })
+            && table.return_interfaces.functions.contains_key(&site.owner)
+        {
+            // None creates no borrowed origin. The selected optional interface
+            // and native RETURN lifetime above own this exact branch.
+            let spec = GlueSpec::literal_none(expected_mutable);
+            let digest = function_plan.digest();
+            plan.edits.push(SeamEdit {
+                raw_outbound: None,
+                zero_syntax: false,
+                span: site.span,
+                call_span: site.span,
+                replacement: "None".to_owned(),
+                owner_class: SignatureClassId::of(site.owner),
+                bridge: BridgeSitePlan {
+                    caller: site.owner,
+                    callee: BridgeCalleeId::Local(site.owner),
+                    arm: "glue".to_owned(),
+                    position: format!(
+                        "return@{}..{}:target={}:lifetime_plan={digest}",
+                        site.span.lo().0,
+                        site.span.hi().0,
+                        site.source_type.rendered,
+                    ),
+                    bridge_kind: "return-null-to-option".to_owned(),
+                    expected_form: expected.key().to_owned(),
+                    found_form: Form::Raw.key().to_owned(),
+                    argument_kind: "null-lit".to_owned(),
+                    extent: BridgeExtentKind::None,
+                    retention: BridgeRetentionTier::None,
+                    waiver_id: None,
+                    unsafe_context: unsafe_context_for(tcx, site.owner, &spec),
+                },
+                owner_fn: tcx.def_path_str(site.owner.to_def_id()),
+                lifetime_plan_digest: Some(digest),
+                caller_fn: tcx.def_path_str(site.owner.to_def_id()),
+                param_index: usize::MAX,
+                source_shape: "null-lit",
+                family: SeamFamily::Safe,
+                len_arm: None,
+                spec,
+                arg_span: site.span,
+                expected,
+                found: Form::Raw,
+                source_node: None,
+                input_rendering: None,
+                root_identity: "-".to_owned(),
+                blind: false,
+                overlap: None,
+                atom_ids: Vec::new(),
+            });
+            continue;
+        }
         let Some(root) = site.root else {
             plan.blocked.push(BlockedSeam {
                 caller: site.owner,
@@ -4921,7 +5098,15 @@ pub(crate) fn synthesize_with_raw_boundary(
             });
             continue;
         }
-        let Ok(text) = sm.span_to_snippet(site.span) else {
+        let (operand_span, suffix_offset) = match site.expression_shape {
+            super::emitability::ReturnExprShape::Other => (site.span, None),
+            super::emitability::ReturnExprShape::ConstantReslice {
+                receiver_span,
+                offset,
+                ..
+            } => (receiver_span, Some(offset)),
+        };
+        let Ok(text) = sm.span_to_snippet(operand_span) else {
             plan.blocked.push(BlockedSeam {
                 caller: site.owner,
                 callee: site.owner,
@@ -4941,7 +5126,76 @@ pub(crate) fn synthesize_with_raw_boundary(
             });
             continue;
         };
-        let spec = GlueSpec::core(GlueCore::Reborrow, expected_mutable);
+        let same_borrowed_family = matches!(expected, Form::Slice { .. } | Form::Opt { .. });
+        let found = if same_borrowed_family {
+            decision_of
+                .get(&node)
+                .map(|decision| form_of(decision))
+                .unwrap_or(Form::Raw)
+        } else {
+            Form::Raw
+        };
+        let wrap_borrowed_payload = match (expected, found) {
+            (
+                Form::Opt {
+                    mutable: target,
+                    slice: false,
+                },
+                Form::Ref { mutable: source },
+            )
+            | (
+                Form::Opt {
+                    mutable: target,
+                    slice: true,
+                },
+                Form::Slice { mutable: source },
+            ) => target == source,
+            _ => false,
+        };
+        let suffix_compatible = suffix_offset.is_none()
+            || matches!(
+                (expected, found),
+                (Form::Slice { mutable: target }, Form::Slice { mutable: source })
+                    | (Form::Opt { mutable: target, slice: true }, Form::Slice { mutable: source })
+                    if target == source
+            );
+        if !suffix_compatible
+            || (same_borrowed_family && found != expected && !wrap_borrowed_payload)
+        {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::ReturnInterfaceUnavailable,
+                expected: Some(expected),
+                found: Some(found),
+                source_shape: "return-seam",
+                candidate_template: "return-interface".into(),
+                null_arm: "none".into(),
+                extent_arm: "none".into(),
+                root_identity: root_label(&labels, site.owner, Some(root)),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        }
+        // Move the existing borrowed value into its return slot, optionally
+        // adding Some. Borrowing a local wrapper would lose the origin lifetime.
+        let mut spec = GlueSpec::core(
+            if let Some(offset) = suffix_offset {
+                GlueCore::Suffix { offset }
+            } else if same_borrowed_family {
+                GlueCore::Bare
+            } else {
+                GlueCore::Reborrow
+            },
+            expected_mutable,
+        );
+        if wrap_borrowed_payload {
+            spec = spec.wrapped();
+        }
         let Some(replacement) =
             spec.render_in_context(&text, enclosing_function_is_unsafe(tcx, site.owner))
         else {
@@ -4950,7 +5204,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         let digest = function_plan.digest();
         plan.edits.push(SeamEdit {
             raw_outbound: None,
-            zero_syntax: false,
+            zero_syntax: same_borrowed_family && !wrap_borrowed_payload && suffix_offset.is_none(),
             span: site.span,
             call_span: site.span,
             replacement,
@@ -4967,7 +5221,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 ),
                 bridge_kind: "return-raw-to-ref".to_owned(),
                 expected_form: expected.key().to_owned(),
-                found_form: Form::Raw.key().to_owned(),
+                found_form: found.key().to_owned(),
                 argument_kind: "return-seam".to_owned(),
                 extent: BridgeExtentKind::None,
                 retention: BridgeRetentionTier::T1,
@@ -4979,18 +5233,31 @@ pub(crate) fn synthesize_with_raw_boundary(
             caller_fn: tcx.def_path_str(site.owner.to_def_id()),
             param_index: usize::MAX,
             source_shape: "return-seam",
-            family: SeamFamily::Reborrow,
+            family: if same_borrowed_family {
+                SeamFamily::Safe
+            } else {
+                SeamFamily::Reborrow
+            },
             len_arm: None,
             spec,
-            arg_span: site.span,
+            arg_span: operand_span,
             expected,
-            found: Form::Raw,
-            source_node: None,
+            found,
+            source_node: same_borrowed_family.then_some(node),
             input_rendering: None,
             root_identity: root_label(&labels, site.owner, Some(root)),
             blind: false,
             overlap: None,
-            atom_ids: Vec::new(),
+            atom_ids: if same_borrowed_family {
+                plan.raw_boundary_atom_groups
+                    .get(&node)
+                    .into_iter()
+                    .flatten()
+                    .map(|atom| atom.id.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            },
         });
     }
 

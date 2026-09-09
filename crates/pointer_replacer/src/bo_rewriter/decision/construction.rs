@@ -763,6 +763,13 @@ pub(crate) fn plan_slice_constructions(
             | Decision::Degraded(_) => continue,
         };
         let node = (subject.fn_did, subject.hir_id);
+        if let (Some(&hir), Some(&span)) = (facts.init_hirs.get(&node), facts.init_spans.get(&node))
+            && super::return_receiver::active_initializer(table, node, hir, span).is_some()
+        {
+            // The callee already returns the complete borrowed slice value.
+            // Receiver declaration/terminal ownership is carried separately.
+            continue;
+        }
         if table.option_value_initializers.contains(&node) {
             continue;
         }

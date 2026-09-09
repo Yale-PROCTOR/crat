@@ -322,13 +322,59 @@ pub(crate) struct AddressObservationFact {
     pub operands: Vec<AddressOperand>,
 }
 
+/// Exact syntax a return seam may consume after its native origin permit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReturnExprShape {
+    Other,
+    ConstantReslice {
+        receiver_hir: HirId,
+        receiver_span: Span,
+        offset: u64,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReturnSiteFact {
+    pub hir_id: HirId,
     pub owner: LocalDefId,
     pub span: Span,
     pub root: Option<HirId>,
     pub source_shape: &'static str,
     pub source_type: RawTargetType,
+    pub expression_shape: ReturnExprShape,
+}
+
+fn return_expression_shape(tcx: TyCtxt<'_>, expression: &Expr<'_>) -> ReturnExprShape {
+    let ExprKind::MethodCall(_, receiver, arguments, _) = expression.kind else {
+        return ReturnExprShape::Other;
+    };
+    let ExprKind::Path(QPath::Resolved(_, path)) = receiver.kind else {
+        return ReturnExprShape::Other;
+    };
+    if !matches!(path.res, Res::Local(_)) {
+        return ReturnExprShape::Other;
+    }
+    let typeck = tcx.typeck(expression.hir_id.owner.def_id);
+    let Some(method) = typeck.type_dependent_def_id(expression.hir_id) else {
+        return ReturnExprShape::Other;
+    };
+    if !typeck.expr_ty(receiver).is_raw_ptr()
+        || tcx.crate_name(method.krate).as_str() != "core"
+        || tcx.item_name(method).as_str() != "offset"
+    {
+        return ReturnExprShape::Other;
+    }
+    let [argument] = arguments else { return ReturnExprShape::Other };
+    let ExprKind::Lit(literal) = argument.kind else { return ReturnExprShape::Other };
+    let rustc_ast::LitKind::Int(offset, _) = literal.node else {
+        return ReturnExprShape::Other;
+    };
+    let Ok(offset) = u64::try_from(offset.get()) else { return ReturnExprShape::Other };
+    ReturnExprShape::ConstantReslice {
+        receiver_hir: receiver.hir_id,
+        receiver_span: receiver.span,
+        offset,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,6 +443,21 @@ pub(crate) fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
         tcx.typeck(expr.hir_id.owner.def_id).expr_ty(expr).kind(),
         rustc_middle::ty::TyKind::RawPtr(..)
     );
+    if raw_pointer
+        && let ExprKind::Call(callee, arguments) = &peel_casts(expr).kind
+        && arguments.is_empty()
+        && let rustc_middle::ty::TyKind::FnDef(definition, _) = *tcx
+            .typeck(callee.hir_id.owner.def_id)
+            .expr_ty(callee)
+            .kind()
+        && ["ptr_null", "ptr_null_mut"]
+            .into_iter()
+            .any(|item| tcx.is_diagnostic_item(rustc_span::Symbol::intern(item), definition))
+    {
+        // Compiler-identified, argument-free null constructors are pure None
+        // values. A same-spelled user function keeps its ordinary call.
+        return ArgShape::NullLit;
+    }
     match &expr.kind {
         // Casts first: both the null form and the strip-the-cast forms are
         // casts, and testing the operand is the only way to tell them apart.
@@ -665,11 +726,13 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
         {
             let shape = classify_arg(self.tcx, expr);
             self.facts.return_sites.push(ReturnSiteFact {
+                hir_id: expr.hir_id,
                 owner: self.fn_did,
                 span: expr.span,
                 root: shape.place_root(),
                 source_shape: shape.key(),
                 source_type,
+                expression_shape: return_expression_shape(self.tcx, expr),
             });
         }
         if wave2_body_owner(self.tcx, self.fn_did)
@@ -1130,6 +1193,7 @@ pub(crate) struct UseEdit {
 pub(crate) struct SliceUses {
     pub rewrites: Vec<UseEdit>,
     pub raw_uses: Vec<SliceRawUse>,
+    pub return_handoffs: Vec<ReturnSiteFact>,
     /// A use that is **not** `*p.offset(e)`.
     ///
     /// Any such use blocks the whole subject. `&[T]` changes the type at every
@@ -1321,6 +1385,7 @@ pub(crate) struct Accessor {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OptUses {
     pub rewrites: Vec<UseEdit>,
+    pub return_handoffs: Vec<ReturnSiteFact>,
     /// A use with no image under the wrapper.
     pub unsupported: Option<Span>,
     /// Uses that are not the null test — the multiplicity half of the idiom
@@ -1342,6 +1407,45 @@ pub(crate) struct OptUseSite {
     pub hir_id: HirId,
     pub span: Span,
     pub operation: &'static str,
+}
+
+fn bare_parameter_return<'a>(
+    expression: &Expr<'_>,
+    node: (LocalDefId, HirId),
+    return_sites: &'a [ReturnSiteFact],
+    parameter_nodes: Option<&rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
+) -> Option<&'a ReturnSiteFact> {
+    if !parameter_nodes.is_some_and(|parameters| parameters.contains(&node)) {
+        return None;
+    }
+    let mut sites = return_sites.iter().filter(|site| {
+        site.owner == node.0
+            && site.root == Some(node.1)
+            && site.source_shape == "bare-local"
+            && site.span == expression.span
+    });
+    let site = sites.next()?;
+    sites.next().is_none().then_some(site)
+}
+
+fn parameter_reslice_return<'a>(
+    expression: &Expr<'_>,
+    node: (LocalDefId, HirId),
+    return_sites: &'a [ReturnSiteFact],
+    parameter_nodes: Option<&rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
+) -> Option<&'a ReturnSiteFact> {
+    if !parameter_nodes.is_some_and(|parameters| parameters.contains(&node)) {
+        return None;
+    }
+    let mut sites = return_sites.iter().filter(|site| {
+        site.owner == node.0
+            && site.root == Some(node.1)
+            && matches!(site.expression_shape,
+                ReturnExprShape::ConstantReslice { receiver_hir, receiver_span, .. }
+                    if receiver_hir == expression.hir_id && receiver_span == expression.span)
+    });
+    let site = sites.next()?;
+    sites.next().is_none().then_some(site)
 }
 
 /// Collect, per binding, the uses an **optional** form must rewrite.
@@ -1387,6 +1491,35 @@ pub(crate) fn collect_opt_uses(
         raw_boundary_arguments,
         deferred_uses,
         true,
+        &[],
+        None,
+    )
+}
+
+/// Return-aware family collector. Bare parameter returns are retained as
+/// typed handoffs; the decision layer still requires the exact return permit.
+pub(crate) fn collect_opt_uses_with_returns(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
+    fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    return_sites: &[ReturnSiteFact],
+    parameter_nodes: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+) -> FxHashMap<(LocalDefId, HirId), OptUses> {
+    collect_opt_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        accessor_of,
+        fat,
+        raw_boundary_arguments,
+        deferred_uses,
+        true,
+        return_sites,
+        Some(parameter_nodes),
     )
 }
 
@@ -1410,6 +1543,8 @@ pub(crate) fn collect_opt_uses_before_family(
         raw_boundary_arguments,
         deferred_uses,
         false,
+        &[],
+        None,
     )
 }
 
@@ -1422,6 +1557,8 @@ fn collect_opt_uses_with_family(
     raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
     deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
     expanded: bool,
+    return_sites: &[ReturnSiteFact],
+    parameter_nodes: Option<&rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
 ) -> FxHashMap<(LocalDefId, HirId), OptUses> {
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
@@ -1433,6 +1570,8 @@ fn collect_opt_uses_with_family(
         raw_boundary_arguments: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
         deferred_uses: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
         expanded: bool,
+        return_sites: &'a [ReturnSiteFact],
+        parameter_nodes: Option<&'a rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1454,6 +1593,20 @@ fn collect_opt_uses_with_family(
                 && self.name_of.contains_key(&(self.fn_did, hir_id))
             {
                 let key = (self.fn_did, hir_id);
+                if let Some(site) =
+                    bare_parameter_return(expr, key, self.return_sites, self.parameter_nodes)
+                {
+                    let entry = self.out.entry(key).or_default();
+                    entry.return_handoffs.push(site.clone());
+                    entry.sites.push(OptUseSite {
+                        hir_id: expr.hir_id,
+                        span: site.span,
+                        operation: "handoff-return",
+                    });
+                    entry.non_test_uses += 1;
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
                 if self.expanded
                     && matches!(self.tcx.parent_hir_node(expr.hir_id),
                     rustc_hir::Node::Expr(parent) if matches!(parent.kind,
@@ -1649,6 +1802,8 @@ fn collect_opt_uses_with_family(
             raw_boundary_arguments,
             deferred_uses,
             expanded,
+            return_sites,
+            parameter_nodes,
         };
         v.visit_body(tcx.hir_body(body_id));
     }
@@ -1678,6 +1833,31 @@ pub(crate) fn collect_slice_uses(
         advance_ok,
         raw_boundary_arguments,
         true,
+        &[],
+        None,
+    )
+}
+
+pub(crate) fn collect_slice_uses_with_returns(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    mutable_of: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    return_sites: &[ReturnSiteFact],
+    parameter_nodes: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
+    collect_slice_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        mutable_of,
+        advance_ok,
+        raw_boundary_arguments,
+        true,
+        return_sites,
+        Some(parameter_nodes),
     )
 }
 
@@ -1699,6 +1879,8 @@ pub(crate) fn collect_slice_uses_before_family(
         advance_ok,
         raw_boundary_arguments,
         false,
+        &[],
+        None,
     )
 }
 
@@ -1710,6 +1892,8 @@ fn collect_slice_uses_with_family(
     advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
     raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
     expanded: bool,
+    return_sites: &[ReturnSiteFact],
+    parameter_nodes: Option<&rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
 ) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
@@ -1724,6 +1908,8 @@ fn collect_slice_uses_with_family(
         advance_ok: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
         raw_boundary_arguments: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
         expanded: bool,
+        return_sites: &'a [ReturnSiteFact],
+        parameter_nodes: Option<&'a rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1731,6 +1917,26 @@ fn collect_slice_uses_with_family(
                 && let Res::Local(hir_id) = path.res
             {
                 let key = (self.fn_did, hir_id);
+                if self.name_of.contains_key(&key)
+                    && let Some(site) =
+                        bare_parameter_return(expr, key, self.return_sites, self.parameter_nodes)
+                            .or_else(|| {
+                                parameter_reslice_return(
+                                    expr,
+                                    key,
+                                    self.return_sites,
+                                    self.parameter_nodes,
+                                )
+                            })
+                {
+                    self.out
+                        .entry(key)
+                        .or_default()
+                        .return_handoffs
+                        .push(site.clone());
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
                 // Item 3: this exact operand is owned by the existing boundary
                 // planner. Its final T1/T2/R-B verdict still gates the class;
                 // the slice-use collector must not preempt it with a use wall.
@@ -2141,6 +2347,8 @@ fn collect_slice_uses_with_family(
             advance_ok,
             raw_boundary_arguments,
             expanded,
+            return_sites,
+            parameter_nodes,
         };
         v.visit_body(tcx.hir_body(body_id));
     }

@@ -225,6 +225,8 @@ mod tests {
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
+            return_interfaces: Default::default(),
+            return_receivers: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
             retired_slice_constructions: Vec::new(),

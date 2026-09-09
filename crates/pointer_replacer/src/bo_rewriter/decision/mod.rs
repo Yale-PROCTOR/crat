@@ -30,6 +30,7 @@ use crate::analyses::borrow_ownership::{
 
 pub(crate) mod a5_site_proof;
 pub(crate) mod box_facts;
+pub(crate) mod callee_parameter_input;
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
 pub(crate) mod declaration;
@@ -41,13 +42,19 @@ pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod option;
+pub(crate) mod outbound_expression;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
+pub(crate) mod raw_receiver;
+pub(crate) mod receiver_input;
 pub(crate) mod return_alias;
+pub(crate) mod return_interface;
+pub(crate) mod return_receiver;
 pub(crate) mod returned_child;
 pub(crate) mod seam;
 pub(crate) mod sibling_overlap;
 pub(crate) mod slice_use;
+pub(crate) mod surface_argument;
 pub(crate) mod universe;
 
 use emitability::EmitabilityFacts;
@@ -860,6 +867,8 @@ pub(crate) struct DecisionTable {
     pub(crate) arm_requirements: FxHashMap<(LocalDefId, HirId), RequiredArmSet>,
     /// Final E2 carrier; later phases consume it without origin facts.
     pub(crate) lifetime_plan: lifetime::LifetimePlan,
+    pub(crate) return_interfaces: return_interface::ReturnInterfaces,
+    pub(crate) return_receivers: return_receiver::ReceiverMap,
     /// Retained post-solve C-9 call-site emission plans. These are construction
     /// outputs, carried beside the subject decisions so both the span planner
     /// and the structural AST emitter consume the same typed population.
@@ -986,6 +995,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
     pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
     pub(crate) input_interfaces: &'a interface::InputInterfaces,
+    pub(crate) return_receivers: Option<&'a return_receiver::ReceiverMap>,
     pub(crate) tcx: TyCtxt<'tcx>,
     pub(crate) family_policy: &'a super::additive::FamilyPolicy,
     pub(crate) model: &'a FxHashMap<SlotRef, SlotKind>,
@@ -1089,6 +1099,8 @@ pub(crate) fn decide_with_raw_fallbacks(
         exposure: None,
         arm_requirements: FxHashMap::default(),
         lifetime_plan: Default::default(),
+        return_interfaces: Default::default(),
+        return_receivers: ctx.return_receivers.cloned().unwrap_or_default(),
         c9_marks: Vec::new(),
         // `decide` stays PURE over subjects; seams need the call graph and are
         // filled by the driver, which is also where the analyses live.
@@ -1370,6 +1382,13 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         && ctx
             .declaration_patterns
             .contains_key(&(subject.fn_did, subject.hir_id));
+    let receiver_node = (subject.fn_did, subject.hir_id);
+    let receiver = ctx
+        .return_receivers
+        .and_then(|receivers| receivers.plans.get(&receiver_node));
+    let receiver_failed = ctx
+        .return_receivers
+        .is_some_and(|receivers| receivers.failures.contains_key(&receiver_node));
 
     // EXHAUSTIVE, not `matches!(.., Degraded(_))` — the import denylist rejects
     // the bypass shape and is right to: a new emitting disposition must be a
@@ -1377,7 +1396,13 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // escapes it.
     match decision {
         Decision::Ref { mutable } => {
-            if let Some(permit) = ctx.lifetime_eligibility.and_then(|eligibility| {
+            if receiver_failed {
+                degrade(
+                    subject,
+                    EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                    DegradeReason::ReturnNotAdapted,
+                )
+            } else if let Some(permit) = ctx.lifetime_eligibility.and_then(|eligibility| {
                 eligibility.inferred_permit((subject.fn_did, subject.hir_id))
             }) {
                 Decision::InferredRef {
@@ -1395,6 +1420,20 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         Decision::InferredRef { .. } => decision,
         Decision::Box(ref plan) if plan.inferred_binding => decision,
         Decision::Opt { .. } if typed_pattern => decision,
+        Decision::Slice { mutable, .. }
+            if receiver.is_some_and(|receiver| {
+                receiver.receiver_form == seam::Form::Slice { mutable }
+            }) =>
+        {
+            decision
+        }
+        Decision::Opt { mutable, slice, .. }
+            if receiver.is_some_and(|receiver| {
+                receiver.receiver_form == seam::Form::Opt { mutable, slice }
+            }) =>
+        {
+            decision
+        }
         Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => degrade(
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
@@ -1410,6 +1449,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         declaration_pointees,
         declaration_patterns,
         input_interfaces: _,
+        return_receivers,
         family_policy,
         model,
         slots,
@@ -1523,7 +1563,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             || opt_uses
                 .get(&(subject.fn_did, subject.hir_id))
                 .is_some_and(|uses| uses.null_assigned));
-    let form = match raw_uses {
+    let mut form = match raw_uses {
         Some(uses) => {
             let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);
             let all_arithmetic = uses.iter().all(|(op, _)| arith(op));
@@ -1560,6 +1600,26 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         None if nullable_value => Form::Opt { slice: false },
         None => Form::Plain,
     };
+    if let Some(receiver) = return_receivers
+        .and_then(|receivers| receivers.plans.get(&(subject.fn_did, subject.hir_id)))
+    {
+        // Existing raw-use classification above still rejects unsupported
+        // operations. The actual borrowed return supplies the remaining
+        // presentation, including Option when q has no local null test.
+        let incompatible = match (receiver.receiver_form, &form) {
+            (seam::Form::Opt { slice: false, .. }, Form::Slice | Form::Opt { slice: true }) => true,
+            (seam::Form::Slice { .. }, Form::Opt { .. }) => true,
+            _ => false,
+        };
+        if incompatible {
+            return degrade(subject, decl_site, DegradeReason::ReturnNotAdapted);
+        }
+        form = match receiver.receiver_form {
+            seam::Form::Slice { .. } => Form::Slice,
+            seam::Form::Opt { slice, .. } => Form::Opt { slice },
+            seam::Form::Raw | seam::Form::Ref { .. } => form,
+        };
+    }
     if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
         let node = (subject.fn_did, subject.hir_id);
         let address_candidate = facts.is_value_observation_candidate(node);
@@ -1775,6 +1835,19 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         if slice && sign.may_be_negative(subject.fn_did, subject.local) {
             return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
         }
+        if let Some(site) = uses.return_handoffs.first()
+            && lifetime_eligibility.is_some_and(|eligibility| {
+                eligibility
+                    .return_permit((subject.fn_did, subject.hir_id))
+                    .is_none()
+            })
+        {
+            return degrade(
+                subject,
+                EmitabilityFacts::site(tcx, site.span),
+                DegradeReason::OptUseUnsupported,
+            );
+        }
         return Decision::Opt {
             mutable: subject.mutable,
             slice,
@@ -1831,6 +1904,19 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // emitted on absent evidence.
     if sign.may_be_negative(subject.fn_did, subject.local) {
         return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
+    }
+    if let Some(site) = uses.return_handoffs.first()
+        && lifetime_eligibility.is_some_and(|eligibility| {
+            eligibility
+                .return_permit((subject.fn_did, subject.hir_id))
+                .is_none()
+        })
+    {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, site.span),
+            DegradeReason::SliceUseUnsupported,
+        );
     }
     Decision::Slice {
         mutable: subject.mutable,
@@ -1952,6 +2038,8 @@ mod self_consistency_tests {
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
+            return_interfaces: Default::default(),
+            return_receivers: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
             retired_slice_constructions: Vec::new(),

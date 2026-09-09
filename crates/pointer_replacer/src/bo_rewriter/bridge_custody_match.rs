@@ -48,13 +48,23 @@ pub(crate) struct C9Stamp {
 pub(crate) enum PendingSourceShape {
     WholeSubject,
     ProjectedReferent,
+    NativeReturnExpression {
+        argument_span: ByteSpan,
+        source_call_span: ByteSpan,
+        source_owner: u32,
+        source_function: String,
+        source_form: String,
+        source_type: String,
+        temporary: String,
+        template: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingSource {
-    pub(crate) binding: String,
+    pub(crate) binding: Option<String>,
     /// Original compiler binding-pattern span, not a guessed expression root.
-    pub(crate) binding_span: ByteSpan,
+    pub(crate) binding_span: Option<ByteSpan>,
     pub(crate) shape: PendingSourceShape,
 }
 
@@ -1302,28 +1312,40 @@ fn pending_original_source(
         return PendingScalarRead::binding(input.original, &original.owner, span, &name)
             .ok_or_else(|| "pending-original-source-binding-unresolved".into());
     };
+    if matches!(
+        &metadata.shape,
+        PendingSourceShape::NativeReturnExpression { .. }
+    ) {
+        return Err("pending-native-expression-carrier-unbuilt".into());
+    }
+    let name = metadata
+        .binding
+        .as_deref()
+        .ok_or("pending-source-binding-name-absent")?;
+    let binding_span = metadata
+        .binding_span
+        .ok_or("pending-source-binding-span-absent")?;
     let candidates = input
         .original
         .bindings
         .iter()
         .filter(|binding| {
             binding.owner == original.owner
-                && binding.name == metadata.binding
-                && metadata.binding_span.lo <= binding.binding_span.lo
-                && binding.binding_span.hi <= metadata.binding_span.hi
+                && binding.name == name
+                && binding_span.lo <= binding.binding_span.lo
+                && binding.binding_span.hi <= binding_span.hi
         })
         .collect::<Vec<_>>();
     let [binding] = candidates.as_slice() else {
         return Err("pending-protected-binding-metadata-not-unique".into());
     };
-    let used = PendingScalarRead::binding(input.original, &original.owner, span, &metadata.binding)
+    let used = PendingScalarRead::binding(input.original, &original.owner, span, name)
         .is_some_and(|used| used.id == binding.id && used == **binding);
-    let shape_matches = match metadata.shape {
-        PendingSourceShape::WholeSubject => {
-            path(expression).as_deref() == Some(metadata.binding.as_str())
-        }
-        PendingSourceShape::ProjectedReferent => {
-            projected_referent_uses(expression, &metadata.binding)
+    let shape_matches = match &metadata.shape {
+        PendingSourceShape::WholeSubject => path(expression).as_deref() == Some(name),
+        PendingSourceShape::ProjectedReferent => projected_referent_uses(expression, name),
+        PendingSourceShape::NativeReturnExpression { .. } => {
+            return Err("pending-native-expression-carrier-unbuilt".into());
         }
     };
     if !used || !shape_matches {
@@ -1351,6 +1373,14 @@ fn pending_selected_argument(
         PointerType::Raw(_)
     ) {
         return Err("pending-target-is-not-raw".into());
+    }
+    if expected.pending_source.as_ref().is_some_and(|source| {
+        matches!(
+            &source.shape,
+            PendingSourceShape::NativeReturnExpression { .. }
+        )
+    }) {
+        return pending_native_expression(input, expected, original, call, index);
     }
     let original_argument = &original.arguments[index];
     let original_expression = expression(&original_argument.text)?;
@@ -1398,6 +1428,366 @@ fn pending_selected_argument(
         return Err("pending-protected-source-declaration-correspondence-unresolved".into());
     }
     Ok(witnesses)
+}
+
+fn pending_native_view(
+    template: &str,
+    form: &str,
+    temporary: &str,
+    target: &ast::Ty,
+) -> MatchResult<String> {
+    let ast::TyKind::Ptr(pointer) = &target.kind else {
+        return Err("pending-native-expression-view-target-not-raw".into());
+    };
+    let mutable = pointer.mutbl.is_mut();
+    let pointee = pprust::ty_to_string(&pointer.ty);
+    let text = match (template, form, mutable) {
+        ("ref-shared-to-raw-const", "ref-shared", false) => {
+            format!("core::ptr::from_ref({temporary})")
+        }
+        ("ref-mut-to-raw-const", "ref-mut", false) => format!("core::ptr::from_ref(&*{temporary})"),
+        ("ref-mut-to-raw-mut", "ref-mut", true) => {
+            format!("core::ptr::from_mut(&mut *{temporary})")
+        }
+        ("shared-ref-to-mut-raw", "ref-shared", true) => {
+            format!("core::ptr::from_ref({temporary}).cast_mut()")
+        }
+        ("slice-mut-to-raw-mut", "slice-mut", true) => format!("{temporary}.as_mut_ptr()"),
+        ("slice-to-raw-const", "slice-shared" | "slice-mut", false) => {
+            format!("{temporary}.as_ptr()")
+        }
+        ("slice-to-raw-mut", "slice-shared", true) => format!("{temporary}.as_ptr().cast_mut()"),
+        ("option-to-raw-null-map", "opt-ref-mut", true) => format!(
+            "{temporary}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), core::ptr::from_mut)"
+        ),
+        ("option-to-raw-null-map", "opt-ref-shared" | "opt-ref-mut", false) => format!(
+            "{temporary}.as_deref().map_or(core::ptr::null::<{pointee}>(), core::ptr::from_ref)"
+        ),
+        ("option-to-raw-null-map", "opt-ref-shared", true) => format!(
+            "{temporary}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |value| core::ptr::from_ref(value).cast_mut())"
+        ),
+        ("option-to-raw-null-map", "opt-slice-mut", true) => format!(
+            "{temporary}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_mut_ptr())"
+        ),
+        ("option-to-raw-null-map", "opt-slice-shared" | "opt-slice-mut", false) => format!(
+            "{temporary}.as_deref().map_or(core::ptr::null::<{pointee}>(), |slice| slice.as_ptr())"
+        ),
+        ("option-to-raw-null-map", "opt-slice-shared", true) => format!(
+            "{temporary}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_ptr().cast_mut())"
+        ),
+        _ => return Err("pending-native-expression-view-template-unbuilt".into()),
+    };
+    Ok(text)
+}
+
+/// Correspondence for the existing raw-to-slice source-call adapter. The
+/// named fallback extent remains owned by its adapter receipt and waiver;
+/// recognizing this syntax creates no slice-length evidence.
+fn pending_native_slice_argument(
+    input: &BridgeCustodyInput<'_>,
+    source_function: &str,
+    original: &Call,
+    emitted: &Call,
+    position: usize,
+    target: &super::bridge_custody_syntax::Function,
+) -> MatchResult<bool> {
+    let before = &original.arguments[position];
+    let after = &emitted.arguments[position];
+    let after_expression = expression(&after.text)?;
+    let ast::ExprKind::Call(callee, arguments) = &unparen(&after_expression).kind else {
+        return Ok(false);
+    };
+    let constructor_mutable = match path(callee).as_deref() {
+        Some("core::slice::from_raw_parts") => false,
+        Some("core::slice::from_raw_parts_mut") => true,
+        _ => return Ok(false),
+    };
+    let [operand, extent] = arguments.as_slice() else { return Ok(false) };
+    if path(extent).as_deref() != Some("crate::FALLBACK_SLICE_EXTENT")
+        || expression_key(operand) != expression_key(&*expression(&before.text)?)
+    {
+        return Ok(false);
+    }
+    let original_targets = input
+        .original
+        .functions
+        .iter()
+        .filter(|function| function.owner == source_function)
+        .collect::<Vec<_>>();
+    let [original_target] = original_targets.as_slice() else { return Ok(false) };
+    let (Some(before_parameter), Some(after_parameter)) = (
+        original_target.parameters.get(position),
+        target.parameters.get(position),
+    ) else {
+        return Ok(false);
+    };
+    let before_type = parsed_type(&before_parameter.type_text)?;
+    let after_type = parsed_type(&after_parameter.type_text)?;
+    let (ast::TyKind::Ptr(pointer), ast::TyKind::Ref(_, reference)) =
+        (&before_type.kind, &after_type.kind)
+    else {
+        return Ok(false);
+    };
+    let ast::TyKind::Slice(element) = &reference.ty.kind else { return Ok(false) };
+    if reference.mutbl.is_mut() != constructor_mutable
+        || (constructor_mutable && !pointer.mutbl.is_mut())
+        || pprust::ty_to_string(&pointer.ty) != pprust::ty_to_string(element)
+    {
+        return Ok(false);
+    }
+    // Use the pinned inventory's actual operand span for scope correspondence,
+    // never the fresh fragment parser's offsets or a guessed binding name.
+    let constructors = input
+        .emitted
+        .calls
+        .iter()
+        .filter(|call| {
+            call.owner == emitted.owner
+                && after.span.lo <= call.span.lo
+                && call.span.hi <= after.span.hi
+                && call.callee_path.as_deref() == path(callee).as_deref()
+                && call.arguments.len() == 2
+        })
+        .collect::<Vec<_>>();
+    let [constructor] = constructors.as_slice() else { return Ok(false) };
+    let text = input
+        .emitted_source
+        .get(constructor.span.lo as usize..constructor.span.hi as usize)
+        .ok_or("pending-native-slice-constructor-span-invalid")?;
+    if !same_expression(text, &after.text)?
+        || !same_expression(&constructor.arguments[0].text, &before.text)?
+    {
+        return Ok(false);
+    }
+    Ok(span_bindings_correspond(
+        input,
+        &original.owner,
+        before.span,
+        &emitted.owner,
+        constructor.arguments[0].span,
+        &mut BTreeSet::new(),
+    ))
+}
+
+fn pending_native_expression(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    call: &Call,
+    index: usize,
+) -> MatchResult<Vec<BindingWitness>> {
+    let metadata = expected
+        .pending_source
+        .as_ref()
+        .ok_or("pending-native-expression-source-missing")?;
+    let PendingSourceShape::NativeReturnExpression {
+        argument_span,
+        source_call_span,
+        source_function,
+        source_form,
+        source_type,
+        temporary,
+        template,
+        ..
+    } = &metadata.shape
+    else {
+        return Err("pending-native-expression-source-kind".into());
+    };
+    if metadata.binding.is_some()
+        || metadata.binding_span.is_some()
+        || *argument_span != original.arguments[index].span
+        || source_call_span != argument_span
+        || !temporary.starts_with("__crat_outbound_return_")
+    {
+        return Err("pending-native-expression-source-identity-mismatch".into());
+    }
+    let sources = input
+        .original
+        .calls
+        .iter()
+        .filter(|source| source.owner == original.owner && source.span == *source_call_span)
+        .collect::<Vec<_>>();
+    let [source] = sources.as_slice() else {
+        return Err("pending-native-expression-source-call-not-unique".into());
+    };
+    let source_path = path(&*expression(&source.callee_text)?)
+        .ok_or("pending-native-expression-source-not-direct")?;
+    let relative = original
+        .owner
+        .rsplit_once("::")
+        .map(|(module, _)| format!("{module}::{source_path}"));
+    if source_path != *source_function && relative.as_ref() != Some(source_function)
+        || input
+            .original
+            .functions
+            .iter()
+            .filter(|function| function.owner == *source_function)
+            .count()
+            != 1
+    {
+        return Err("pending-native-expression-source-callee-mismatch".into());
+    }
+    let argument = &call.arguments[index];
+    if input
+        .emitted_source
+        .get(argument.span.lo as usize..argument.span.hi as usize)
+        != Some(argument.text.as_str())
+    {
+        return Err("pending-native-expression-argument-source-mismatch".into());
+    }
+    let parsed = expression(&argument.text)?;
+    let ast::ExprKind::Block(block, None) = &unparen(&parsed).kind else {
+        return Err("pending-native-expression-argument-block-missing".into());
+    };
+    let [declaration, tail] = block.stmts.as_slice() else {
+        return Err("pending-native-expression-carrier-statements".into());
+    };
+    let (ast::StmtKind::Let(local), ast::StmtKind::Expr(tail)) = (&declaration.kind, &tail.kind)
+    else {
+        return Err("pending-native-expression-carrier-shape".into());
+    };
+    let ast::PatKind::Ident(_, name, None) = &local.pat.kind else {
+        return Err("pending-native-expression-temporary-pattern".into());
+    };
+    let (Some(local_type), ast::LocalKind::Init(initializer)) = (&local.ty, &local.kind) else {
+        return Err("pending-native-expression-typed-initializer-missing".into());
+    };
+    let native_type = parsed_type(source_type)?;
+    if name.name.as_str() != temporary
+        || pprust::ty_to_string(local_type) != pprust::ty_to_string(&native_type)
+        || !matches!(
+            pointer_type(source_type)?,
+            PointerType::Reference(_) | PointerType::OptionalReference
+        )
+    {
+        return Err("pending-native-expression-temporary-type-or-name".into());
+    }
+    let bindings = input
+        .emitted
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding.owner == call.owner
+                && binding.name == *temporary
+                && argument.span.lo <= binding.declaration_span.lo
+                && binding.declaration_span.hi <= argument.span.hi
+        })
+        .collect::<Vec<_>>();
+    let [binding] = bindings.as_slice() else {
+        return Err("pending-native-expression-temporary-not-unique".into());
+    };
+    let init_span = binding
+        .init_span
+        .ok_or("pending-native-expression-initializer-span-missing")?;
+    let init_text = binding
+        .init_text
+        .as_deref()
+        .ok_or("pending-native-expression-initializer-missing")?;
+    if input
+        .emitted_source
+        .get(init_span.lo as usize..init_span.hi as usize)
+        != Some(init_text)
+        || !same_expression(init_text, &pprust::expr_to_string(initializer))?
+        || binding
+            .type_text
+            .as_deref()
+            .map(parsed_type)
+            .transpose()?
+            .as_ref()
+            .is_none_or(|ty| pprust::ty_to_string(ty) != pprust::ty_to_string(&native_type))
+    {
+        return Err("pending-native-expression-binding-source-mismatch".into());
+    }
+    let mut source_expected = expected.clone();
+    source_expected.callee = source_function.clone();
+    let emitted_sources = emitted_candidates(input, &source_expected, source)?;
+    let emitted_sources = emitted_sources
+        .into_iter()
+        .filter(|source| init_span.lo <= source.span.lo && source.span.hi <= init_span.hi)
+        .collect::<Vec<_>>();
+    let [emitted_source] = emitted_sources.as_slice() else {
+        return Err("pending-native-expression-initializer-call-not-unique".into());
+    };
+    let call_text = input
+        .emitted_source
+        .get(emitted_source.span.lo as usize..emitted_source.span.hi as usize)
+        .ok_or("pending-native-expression-initializer-call-span-invalid")?;
+    if !same_expression(init_text, call_text)? {
+        return Err("pending-native-expression-initializer-is-not-source-call".into());
+    }
+    let source_target = target_owner(input, &source_expected)?;
+    for (position, (before, after)) in source
+        .arguments
+        .iter()
+        .zip(&emitted_source.arguments)
+        .enumerate()
+    {
+        if !same_expression(&before.text, &after.text)? {
+            let before = expression(&before.text)?;
+            let after = expression(&after.text)?;
+            let borrowed = source_target
+                .parameters
+                .get(position)
+                .map(|parameter| pointer_type(&parameter.type_text))
+                .transpose()?
+                .is_some_and(|ty| matches!(ty, PointerType::Reference(_)));
+            if (!borrowed || !same_view_operand(&after, &before))
+                && !pending_native_slice_argument(
+                    input,
+                    source_function,
+                    source,
+                    emitted_source,
+                    position,
+                    source_target,
+                )?
+            {
+                return Err(
+                    "pending-native-expression-source-argument-correspondence-unbuilt".into(),
+                );
+            }
+        }
+    }
+    validate_initializer_bindings(input, original, index, binding)?;
+    let ast::ExprKind::Cast(view, raw_type) = &unparen(tail).kind else {
+        return Err("pending-native-expression-raw-view-missing".into());
+    };
+    let target = target_owner(input, expected)?;
+    if pointer_type(&pprust::ty_to_string(raw_type))?
+        != pointer_type(&target.parameters[index].type_text)?
+    {
+        return Err("pending-native-expression-raw-target-mismatch".into());
+    }
+    let expected_view = pending_native_view(template, source_form, temporary, raw_type)?;
+    if !same_expression(&pprust::expr_to_string(view), &expected_view)? {
+        return Err("pending-native-expression-raw-view-template-mismatch".into());
+    }
+    let uses = input
+        .emitted
+        .uses
+        .iter()
+        .filter(|usage| {
+            usage.owner == call.owner
+                && argument.span.lo <= usage.span.lo
+                && usage.span.hi <= argument.span.hi
+                && input
+                    .emitted
+                    .bindings
+                    .get(usage.binding_id)
+                    .is_some_and(|binding| binding.name == *temporary)
+        })
+        .collect::<Vec<_>>();
+    let [usage] = uses.as_slice() else {
+        return Err("pending-native-expression-view-use-not-unique".into());
+    };
+    if usage.binding_id != binding.id
+        || usage.span.lo < binding.declaration_span.hi
+        || usage.context == super::bridge_custody_syntax::UseContext::AssignmentTarget
+    {
+        return Err("pending-native-expression-view-binding-mismatch".into());
+    }
+    // Inline pending views already carry their exact argument in the receipt.
+    // This safe native temporary is neither a raw nor a C9 temporary.
+    Ok(Vec::new())
 }
 
 fn pending(

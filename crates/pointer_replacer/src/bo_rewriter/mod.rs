@@ -78,6 +78,7 @@ pub(crate) mod decision;
 pub(crate) mod fat_facts;
 pub(crate) mod mechanical_receipt;
 pub(crate) mod plan;
+pub(crate) mod sibling_audit;
 pub(crate) mod sign_facts;
 pub(crate) mod use_census;
 pub(crate) mod verify;
@@ -103,6 +104,8 @@ pub(crate) mod bridge_custody_syntax;
 #[cfg(test)]
 mod bridge_custody_tests;
 #[cfg(test)]
+mod callee_input_tests;
+#[cfg(test)]
 mod declaration_pattern_tests;
 #[cfg(test)]
 mod declaration_tests;
@@ -111,15 +114,33 @@ pub(crate) mod delivery_custody;
 #[cfg(test)]
 mod emit_tests;
 #[cfg(test)]
+mod expression_sibling_tests;
+#[cfg(test)]
 mod goldens;
 #[cfg(test)]
 mod import_denylist;
 #[cfg(test)]
+mod native_return_receipt_tests;
+#[cfg(test)]
+mod native_return_replay_tests;
+#[cfg(test)]
 mod option_projection_tests;
+#[cfg(test)]
+mod option_receiver_tests;
+#[cfg(test)]
+mod outbound_expression_tests;
+#[cfg(test)]
+mod outbound_alias_permission_tests;
+#[cfg(test)]
+mod outbound_return_receipt_tests;
+#[cfg(test)]
+pub(crate) mod outbound_return_transport;
 #[cfg(test)]
 mod r216_boundary_tests;
 #[cfg(test)]
 mod r233_shape_emission_tests;
+#[cfg(test)]
+mod raw_receiver_tests;
 #[cfg(test)]
 mod retalias_semantics_tests;
 #[cfg(test)]
@@ -129,7 +150,17 @@ mod return_atom_lifetime_tests;
 #[cfg(test)]
 mod return_family_premise_tests;
 #[cfg(test)]
+mod return_family_tests;
+#[cfg(test)]
+mod return_receiver_shape_tests;
+#[cfg(test)]
+mod return_receiver_tests;
+#[cfg(test)]
+mod return_shape_tests;
+#[cfg(test)]
 mod return_terminal_tests;
+#[cfg(test)]
+mod return_wrapper_tests;
 #[cfg(test)]
 mod returned_child_terminal_view_tests;
 #[cfg(test)]
@@ -138,6 +169,10 @@ mod returned_child_tests;
 mod revert_input_tests;
 #[cfg(test)]
 mod seam_terminal_tests;
+#[cfg(test)]
+mod sibling_audit_tests;
+#[cfg(test)]
+mod sibling_audit_transport_tests;
 #[cfg(test)]
 mod sibling_overlap_tests;
 #[cfg(test)]
@@ -253,6 +288,7 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) bridge_custody_export: bridge_custody_export::Export,
     pub(crate) pending_sibling_receipts: Vec<plan::sibling_overlap::PendingSite>,
     pub(crate) sibling_coverage_gaps: Vec<decision::sibling_overlap::CoverageGapReceipt>,
+    pub(crate) sibling_audit_rows: Vec<sibling_audit::Row>,
     /// R219: independent emitted-tree custody checks retain the exact decided
     /// form, including distinctions absent from the historical coarse seed.
     pub(crate) custody_expectations: Vec<DeliveryExpectation>,
@@ -278,6 +314,9 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) slice_use_rows: Vec<mechanical_receipt::SliceUseAdapterReceiptRow>,
     pub(crate) option_rows: Vec<mechanical_receipt::OptionPresentationReceiptRow>,
     pub(crate) declaration_rows: Vec<mechanical_receipt::DeclarationShapeReceiptRow>,
+    pub(crate) outbound_return_required: Vec<mechanical_receipt::OutboundReturnRequirement>,
+    pub(crate) outbound_return_rows: Vec<mechanical_receipt::OutboundReturnBridgeReceiptRow>,
+    pub(crate) outbound_return_error: Option<String>,
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
@@ -1277,6 +1316,10 @@ fn round_files(
 > {
     let mut withheld = reverted.clone();
     withheld.extend(emission_plan.held_classes());
+    let withheld = emission_plan.effective_reverted_classes(&withheld, reverted_atoms);
+    emission_plan.validate_callee_parameter_input_receipts(&withheld, reverted_atoms)?;
+    emission_plan.validate_receiver_input_receipts(&withheld, reverted_atoms)?;
+    emission_plan.validate_outbound_return_receipts(&withheld, reverted_atoms)?;
     let reverts =
         ast_transform::revert_set_from_classes_and_atoms(&withheld, reverted_atoms, table)?;
     // **PER-FILE (A1, revived 2026-08-18).** The one-entry map that stood here
@@ -1345,6 +1388,8 @@ fn refresh_raw_boundary_receipt_events(
     reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     reverted_atoms: &std::collections::BTreeSet<String>,
 ) {
+    let effective_reverted = emission_plan.effective_reverted_classes(reverted, reverted_atoms);
+    let reverted = &effective_reverted;
     assert_eq!(
         emission_plan.unowned_a5_proof_sites, 0,
         "unowned A5 proof-site receipt identities"
@@ -1354,6 +1399,8 @@ fn refresh_raw_boundary_receipt_events(
         emission_plan.pending_sibling_receipts_with_atoms(reverted, reverted_atoms);
     artifacts.sibling_coverage_gaps =
         emission_plan.sibling_coverage_gaps_with_atoms(reverted, reverted_atoms);
+    artifacts.sibling_audit_rows =
+        emission_plan.sibling_audit_rows_with_atoms(reverted, reverted_atoms);
     #[cfg(test)]
     bridge_custody_export::refresh(
         &mut artifacts.bridge_custody_export,
@@ -1361,15 +1408,54 @@ fn refresh_raw_boundary_receipt_events(
         reverted,
         &artifacts.pending_sibling_receipts,
         &artifacts.sibling_coverage_gaps,
+        &artifacts.sibling_audit_rows,
     );
-    artifacts.unsafe_context_events = emission_plan.unsafe_context_events(reverted);
-    let (mechanical_events, a5_rows, slice_rows) = emission_plan.mechanical_receipts(reverted);
+    artifacts.unsafe_context_events =
+        emission_plan.unsafe_context_events_with_atoms(reverted, reverted_atoms);
+    let (mechanical_events, a5_rows, slice_rows) =
+        emission_plan.mechanical_receipts_with_atoms(reverted, reverted_atoms);
     artifacts.mechanical_events = mechanical_events;
     artifacts.a5_proof_site_fallback_rows = a5_rows;
     artifacts.slice_construction_rows = slice_rows;
     artifacts.slice_use_rows = emission_plan.slice_use_receipt_rows(reverted);
     artifacts.option_rows = emission_plan.option_receipt_rows(reverted);
-    artifacts.declaration_rows = emission_plan.declaration_receipt_rows(reverted);
+    artifacts.declaration_rows =
+        emission_plan.declaration_receipt_rows_with_atoms(reverted, reverted_atoms);
+    artifacts.outbound_return_required.clear();
+    artifacts.outbound_return_rows.clear();
+    artifacts.outbound_return_error = None;
+    match emission_plan.outbound_return_receipts(reverted, reverted_atoms) {
+        Ok((required, common, rows)) => {
+            artifacts.mechanical_events.extend(common);
+            artifacts.outbound_return_error = mechanical_receipt::reconcile_outbound_return_rows(
+                &required,
+                &rows,
+                &artifacts.mechanical_events,
+                &artifacts.bridge_events,
+            )
+            .err();
+            artifacts.outbound_return_required = required;
+            artifacts.outbound_return_rows = rows;
+        }
+        Err(reason) => artifacts.outbound_return_error = Some(reason),
+    }
+    #[cfg(test)]
+    {
+        artifacts.bridge_custody_export.outbound_return =
+            Some(outbound_return_transport::capture(artifacts));
+        artifacts.bridge_custody_export.outbound_return_bridge_keys = Some(
+            artifacts
+                .bridge_events
+                .iter()
+                .filter(|event| {
+                    event.stage == bridge_receipt::BridgeReceiptStage::Terminal
+                        && event.state == bridge_receipt::BridgeReceiptState::Applied
+                        && mechanical_receipt::is_return_receipt_kind(&event.site.bridge_kind)
+                })
+                .map(|event| event.site.receipt_key())
+                .collect(),
+        );
+    }
 }
 
 fn verify_and_revert(
@@ -2002,6 +2088,19 @@ fn verify_and_revert(
                 atom_reverify_count += 1;
                 let selected_atoms = selection.atoms.into_iter().collect::<Vec<_>>();
                 reverted_atoms.extend(selected_atoms.iter().cloned());
+                let effective_reverted =
+                    emission_plan.effective_reverted_classes(&reverted, &reverted_atoms);
+                for owner in effective_reverted.difference(&reverted) {
+                    facts
+                        .raw_boundary_artifacts
+                        .atom_outcomes
+                        .push_str(&format!(
+                            "return-origin-class-reverted\treturn-origin-atom-reverted:{}\t{}\n",
+                            owner.order_key(),
+                            selected_atoms.join(";"),
+                        ));
+                }
+                reverted = effective_reverted;
                 pending_atom_retry = Some((selection.reason.to_owned(), selected_atoms));
                 let (next_files, rollbacks, next_edited, next_maps) = match round_files(
                     tcx,
@@ -5436,6 +5535,20 @@ fn prepare_plan_files<'tcx>(
     }
     plan::link_a5_fallback_carriers(&mut planned, table, span_to_loc);
     plan::finalize_signature_classes(&mut planned, table, reverted);
+    let return_dependency_edges = planned
+        .class_finalization
+        .classes
+        .values()
+        .filter(|class| class.is_ready())
+        .flat_map(|class| {
+            class
+                .depends_on
+                .iter()
+                .map(move |dependency| (class.id, *dependency))
+        })
+        .collect::<Vec<_>>();
+    planned.terminal_call_plans.return_origin_dependencies =
+        decision::lifetime::ReturnOriginAtomDependencies::derive(table, &return_dependency_edges);
     let mut terminal_a5_raw_calls = Vec::new();
     for mut pending in pending_a5_raw_calls {
         if !planned
@@ -6112,6 +6225,23 @@ fn finish_decide<'tcx>(
         &advance_ok,
         &raw_boundary_argument_paths,
     );
+    let return_parameter_nodes = subjects
+        .iter()
+        .filter(|subject| {
+            subject.ptr_depth == 1 && matches!(subject.kind, decision::SubjectKind::Param { .. })
+        })
+        .map(|subject| (subject.fn_did, subject.hir_id))
+        .collect::<rustc_hash::FxHashSet<_>>();
+    let return_slice_uses = decision::emitability::collect_slice_uses_with_returns(
+        tcx,
+        &program.functions,
+        &names,
+        &mutable_of,
+        &advance_ok,
+        &raw_boundary_argument_paths,
+        &facts.return_sites,
+        &return_parameter_nodes,
+    );
     let prior_slice_uses = decision::emitability::collect_slice_uses_before_family(
         tcx,
         &program.functions,
@@ -6223,6 +6353,18 @@ fn finish_decide<'tcx>(
         &opt_deferred_uses,
     );
 
+    let return_opt_uses = decision::emitability::collect_opt_uses_with_returns(
+        tcx,
+        &program.functions,
+        &names,
+        &current_opt_accessors,
+        &opt_fat,
+        &raw_boundary_argument_paths,
+        &opt_deferred_uses,
+        &facts.return_sites,
+        &return_parameter_nodes,
+    );
+
     // Complete the frozen A5 site's legacy drops-elaborated reads before the
     // const-MIR fn-pointer collector becomes the terminal const-body reader
     // through `mir_for_ctfe`.  The proof object remains derived once and is
@@ -6302,40 +6444,56 @@ fn finish_decide<'tcx>(
         );
         retained_c9_plans = original_c9_plans.clone();
         facts.body_adapters = original_body_adapters.clone();
-        let slice_uses = additive::select_uses(
+        let current_slice_uses = additive::select_uses(
+            &return_slice_uses,
             &full_slice_uses,
+            &family_policy,
+            additive::FamilyStage::Return,
+        );
+        let slice_uses = additive::select_uses(
+            &current_slice_uses,
             &prior_slice_uses,
             &family_policy,
             additive::FamilyStage::SliceUse,
         );
-        let opt_uses = additive::select_uses(
+        let current_opt_uses = additive::select_uses(
+            &return_opt_uses,
             &full_opt_uses,
+            &family_policy,
+            additive::FamilyStage::Return,
+        );
+        let opt_uses = additive::select_uses(
+            &current_opt_uses,
             &prior_opt_uses,
             &family_policy,
             additive::FamilyStage::Option,
         );
-        let ctx_of = |gate, coconv, lifetime_eligibility, raw_boundary, exposure| decision::Ctx {
-            tcx,
-            family_policy: &family_policy,
-            declaration_pointees: &declaration_pointees,
-            declaration_patterns: &declaration_patterns,
-            input_interfaces: &input_interfaces,
-            model: &model,
-            slots: &slots,
-            facts: &facts,
-            fat: &fat,
-            sign: &sign,
-            slice_uses: &slice_uses,
-            opt_uses: &opt_uses,
-            box_facts: &box_facts,
-            constructions: &ctors,
-            subjects: &subjects,
-            gate,
-            coconv,
-            lifetime_eligibility,
-            raw_boundary,
-            exposure,
-        };
+        let ctx_of =
+            |gate, coconv, lifetime_eligibility, raw_boundary, exposure, return_receivers| {
+                decision::Ctx {
+                    tcx,
+                    return_receivers,
+                    family_policy: &family_policy,
+                    declaration_pointees: &declaration_pointees,
+                    declaration_patterns: &declaration_patterns,
+                    input_interfaces: &input_interfaces,
+                    model: &model,
+                    slots: &slots,
+                    facts: &facts,
+                    fat: &fat,
+                    sign: &sign,
+                    slice_uses: &slice_uses,
+                    opt_uses: &opt_uses,
+                    box_facts: &box_facts,
+                    constructions: &ctors,
+                    subjects: &subjects,
+                    gate,
+                    coconv,
+                    lifetime_eligibility,
+                    raw_boundary,
+                    exposure,
+                }
+            };
 
         let hypothetical = decision::decide(
             &ctx_of(
@@ -6344,6 +6502,7 @@ fn finish_decide<'tcx>(
                 None,
                 None,
                 Some(&preliminary_exposure),
+                None,
             ),
             &subjects,
         );
@@ -6351,8 +6510,16 @@ fn finish_decide<'tcx>(
         // report, so `build` consumes them rather than the census reading them
         // alongside.
         let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
+        let return_family_functions = program
+            .functions
+            .iter()
+            .copied()
+            .filter(|owner| family_policy.enabled(*owner, additive::FamilyStage::Return))
+            .collect::<rustc_hash::FxHashSet<_>>();
         let lifetime_eligibility = decision::lifetime::derive_return_eligibility(
             &program,
+            &return_family_functions,
+            &facts.return_sites,
             &slots,
             &model,
             analysis.origins.as_ref(),
@@ -6364,6 +6531,28 @@ fn finish_decide<'tcx>(
             fnptr_web_wall_s,
             &preliminary_exposure,
         );
+        // Candidate receiver interfaces use only the already-derived native
+        // permits. Actual settled interfaces are checked before emission.
+        let mut receiver_prototype = hypothetical.clone();
+        receiver_prototype.lifetime_plan = decision::lifetime::finalize(
+            &program,
+            analysis.origins.as_ref(),
+            &lifetime_eligibility,
+            &receiver_prototype,
+        )?;
+        receiver_prototype.return_interfaces = decision::return_interface::plan(
+            tcx,
+            &receiver_prototype,
+            &facts,
+            &lifetime_eligibility,
+            &return_family_functions,
+        );
+        let return_receivers = decision::return_receiver::plan(
+            tcx,
+            &receiver_prototype,
+            &ctors,
+            &lifetime_eligibility,
+        );
         let e2_hypothetical = decision::decide(
             &ctx_of(
                 decision::RefGate::LiftAdaptable,
@@ -6371,6 +6560,7 @@ fn finish_decide<'tcx>(
                 Some(&lifetime_eligibility),
                 None,
                 Some(&preliminary_exposure),
+                Some(&return_receivers),
             ),
             &subjects,
         );
@@ -6444,6 +6634,7 @@ fn finish_decide<'tcx>(
                 Some(&lifetime_eligibility),
                 Some(&raw_boundary),
                 Some(&candidate_exposure),
+                Some(&return_receivers),
             ),
             &subjects,
         );
@@ -6487,6 +6678,19 @@ fn finish_decide<'tcx>(
             &lifetime_eligibility,
             &table,
         )?;
+        table.return_interfaces = decision::return_interface::plan(
+            tcx,
+            &table,
+            &facts,
+            &lifetime_eligibility,
+            &return_family_functions,
+        );
+        for failure in decision::return_receiver::validate_current(&return_receivers, &table) {
+            table
+                .return_receivers
+                .failures
+                .insert(failure.node, failure);
+        }
         let finalization_wall_s = finalization_started.elapsed().as_secs_f64();
 
         // **S3.6-1 seam adapters.** Runs AFTER every gate that can still refuse a
@@ -6749,6 +6953,24 @@ fn finish_decide<'tcx>(
         append_surface_declaration_plans(tcx, &exposure, &mut table);
         append_inferred_local_declaration_plans(tcx, &mut table);
         table.c9_marks = retained_c9_plans.clone();
+        table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
+        table.seams.raw_receivers =
+            decision::raw_receiver::plan(&program, &table, &ctors, &retention);
+        table.seams.native_return_sites = facts.return_sites.clone();
+        table.seams.outbound_expressions = decision::outbound_expression::plan(
+            &program,
+            &table,
+            &raw_boundary_sites,
+            &retention,
+            &mut_facts,
+        );
+        table.seams.callee_parameter_inputs = decision::callee_parameter_input::plan(
+            tcx,
+            &table,
+            &facts,
+            &table.seams,
+            &raw_boundary,
+        );
         let mut table = table;
 
         // Structural self-check: the table matches the subjects it was handed. NOT
@@ -6845,6 +7067,7 @@ fn finish_decide<'tcx>(
             bridge_custody_export: Default::default(),
             pending_sibling_receipts: Vec::new(),
             sibling_coverage_gaps: Vec::new(),
+            sibling_audit_rows: Vec::new(),
             custody_expectations: Vec::new(),
             additive_family_receipts: family_receipts,
             exposure: exposure.receipts_tsv(),
@@ -6874,6 +7097,9 @@ fn finish_decide<'tcx>(
             slice_use_rows: Vec::new(),
             option_rows: Vec::new(),
             declaration_rows: Vec::new(),
+            outbound_return_required: Vec::new(),
+            outbound_return_rows: Vec::new(),
+            outbound_return_error: None,
             class_costs: bridge_receipt::class_cost_header(),
             class_collisions: bridge_receipt::class_collision_header(),
             unresolved_classes: bridge_receipt::unresolved_class_header(),
@@ -6942,7 +7168,11 @@ fn finish_decide<'tcx>(
             e2_artifacts,
         };
         table.sibling_overlap_inventory =
-            decision::sibling_overlap::collect_inventory(tcx, &context);
+            decision::sibling_overlap::collect_inventory_with_expressions(
+                tcx,
+                &context,
+                &table.seams.outbound_expressions,
+            );
         return Ok((table, context));
     }
 }
@@ -7244,6 +7474,10 @@ fn append_surface_declaration_plans(
     use bridge_receipt::SignatureClassId;
     use decision::{exposure::ExposureSurfacePlan, lifetime::FnSignatureSlot};
 
+    let (surface_arguments, failures) = decision::surface_argument::plan(tcx, exposure, table);
+    table.seams.surface_arguments = surface_arguments;
+    table.seams.surface_argument_failures = failures;
+
     for function in exposure.functions() {
         if !matches!(
             function.plan,
@@ -7283,37 +7517,6 @@ fn append_surface_declaration_plans(
                 arm: "surface",
             });
 
-        for (subject, decision) in &table.entries {
-            let decision_form = match decision {
-                decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => "ref",
-                decision::Decision::Slice { .. } => "slice",
-                decision::Decision::Opt { .. } => "optional",
-                decision::Decision::Box(_) | decision::Decision::Degraded(_) => continue,
-            };
-            let decision::SubjectKind::Param { hir_index } = subject.kind else {
-                continue;
-            };
-            if subject.fn_did != function.did {
-                continue;
-            }
-            table
-                .seams
-                .zero_bridges
-                .push(decision::seam::ZeroBridgeSite {
-                    owner_class: owner,
-                    caller: function.did,
-                    span: None,
-                    arm: "surface",
-                    position: format!("generated-wrapper-arg{hir_index}"),
-                    bridge_kind: "surface-unsafe-context-parameter",
-                    expected_form: decision_form,
-                    found_form: "raw",
-                    argument_kind: "generated-wrapper-argument",
-                    retention: bridge_receipt::BridgeRetentionTier::T1,
-                    waiver_id: None,
-                    unsafe_context: Some(presentation),
-                });
-        }
         if unsafe_fn {
             table
                 .seams
@@ -7345,15 +7548,30 @@ fn append_surface_declaration_plans(
                 .skip_binder()
                 .skip_binder();
             if let TyKind::RawPtr(pointee, mutability) = *signature.output().kind() {
-                let emitted_type = format!(
-                    "&{}{}",
-                    if mutability == Mutability::Mut {
-                        "mut "
-                    } else {
-                        ""
-                    },
-                    decision::declaration::pointee_source(tcx, pointee),
-                );
+                let return_interface = table.return_interfaces.functions.get(&function.did);
+                let emitted_type = return_interface
+                    .map(decision::return_interface::ReturnInterface::temporary_type)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "&{}{}",
+                            if mutability == Mutability::Mut {
+                                "mut "
+                            } else {
+                                ""
+                            },
+                            decision::declaration::pointee_source(tcx, pointee),
+                        )
+                    });
+                let return_form = return_interface.map(|interface| interface.form);
+                let return_form_key = match return_form {
+                    Some(
+                        form @ (decision::seam::Form::Opt { .. }
+                        | decision::seam::Form::Slice { .. }),
+                    ) => form.key(),
+                    Some(decision::seam::Form::Ref { .. } | decision::seam::Form::Raw) | None => {
+                        "ref"
+                    }
+                };
                 table
                     .seams
                     .explicit_declarations
@@ -7381,7 +7599,7 @@ fn append_surface_declaration_plans(
                         ),
                         bridge_kind: "return-ref-to-raw",
                         expected_form: "raw",
-                        found_form: "ref",
+                        found_form: return_form_key,
                         argument_kind: "return-seam",
                         retention: bridge_receipt::BridgeRetentionTier::T1,
                         waiver_id: None,
@@ -7423,40 +7641,67 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
     let mut declarations = Vec::new();
     let mut receives = Vec::new();
     for (subject, decision) in &table.entries {
-        let (mutable, callee) = match decision {
-            decision::Decision::InferredRef { mutable, callee } => (mutable, callee),
-            decision::Decision::Ref { .. }
-            | decision::Decision::Slice { .. }
-            | decision::Decision::Opt { .. }
-            | decision::Decision::Box(_)
-            | decision::Decision::Degraded(_) => continue,
-        };
-        let Some(name) = subject.param_name.as_deref() else {
-            continue;
-        };
-        let signature = tcx.fn_sig(callee.to_def_id()).skip_binder().skip_binder();
-        let TyKind::RawPtr(pointee, _) = *signature.output().kind() else {
-            continue;
-        };
-        let emitted_type = format!(
-            "&{}{}",
-            if *mutable { "mut " } else { "" },
-            decision::declaration::pointee_source(tcx, pointee)
-        );
-        let owner_class = SignatureClassId::of(*callee);
-        declarations.push(decision::seam::ExplicitDeclarationSite {
-            owner_class,
-            caller: subject.fn_did,
-            node: Some((subject.fn_did, subject.hir_id)),
-            span: Some(subject.binding_span),
-            category: "local",
-            replacement: Some(format!("{name}: {emitted_type}")),
-            emitted_type: emitted_type.clone(),
-            arm: "glue",
+        let node = (subject.fn_did, subject.hir_id);
+        let receiver = table.return_receivers.plans.get(&node).filter(|receiver| {
+            !table.return_receivers.failures.contains_key(&node)
+                && table.return_interfaces.functions.get(&receiver.callee)
+                    == Some(&receiver.candidate_interface)
+                && decision::seam::form_of(decision) == receiver.receiver_form
         });
+        let Some(name) = subject.param_name.as_deref() else { continue };
+        let (callee, emitted_type, expected_form) = if let Some(receiver) = receiver {
+            (
+                receiver.callee,
+                receiver.receiver_type(),
+                receiver.receiver_form.key(),
+            )
+        } else {
+            let (mutable, callee) = match decision {
+                decision::Decision::InferredRef { mutable, callee } => (mutable, callee),
+                decision::Decision::Ref { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_)
+                | decision::Decision::Degraded(_) => continue,
+            };
+            let signature = tcx.fn_sig(callee.to_def_id()).skip_binder().skip_binder();
+            let TyKind::RawPtr(pointee, _) = *signature.output().kind() else { continue };
+            (
+                *callee,
+                format!(
+                    "&{}{}",
+                    if *mutable { "mut " } else { "" },
+                    decision::declaration::pointee_source(tcx, pointee)
+                ),
+                "ref",
+            )
+        };
+        let owner_class = SignatureClassId::of(callee);
+        let binding_prefix = if receiver.is_some()
+            && table.option_mut_bindings.contains(&node)
+            && !subject.mut_binding
+        {
+            "mut "
+        } else {
+            ""
+        };
+        if receiver.is_none_or(|receiver| {
+            receiver.declaration == decision::return_receiver::ReceiverDeclaration::Inferred
+        }) {
+            declarations.push(decision::seam::ExplicitDeclarationSite {
+                owner_class,
+                caller: subject.fn_did,
+                node: Some((subject.fn_did, subject.hir_id)),
+                span: Some(subject.binding_span),
+                category: "local",
+                replacement: Some(format!("{binding_prefix}{name}: {emitted_type}")),
+                emitted_type: emitted_type.clone(),
+                arm: "glue",
+            });
+        }
         if let Some(digest) = table
             .lifetime_plan
-            .function(*callee)
+            .function(callee)
             .map(decision::lifetime::FunctionPlan::digest)
         {
             receives.push(decision::seam::ZeroBridgeSite {
@@ -7466,8 +7711,9 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
                 arm: "glue",
                 position: format!("caller-receive:type={emitted_type}:lifetime_plan={digest}"),
                 bridge_kind: "return-caller-receive-ref",
-                expected_form: "ref",
-                found_form: "raw",
+                expected_form,
+                found_form: receiver
+                    .map_or("raw", |receiver| receiver.candidate_interface.form.key()),
                 argument_kind: "return-call-result",
                 retention: bridge_receipt::BridgeRetentionTier::None,
                 waiver_id: None,

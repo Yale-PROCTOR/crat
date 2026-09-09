@@ -249,12 +249,38 @@ fn expand_signature_alias(ty: &mut Ty, depth: u8, resolved: Option<&str>) -> boo
 struct LifetimeSignatureVisitor<'a> {
     global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
     plans: &'a super::decision::lifetime::LifetimePlan,
+    return_interfaces: &'a super::decision::return_interface::ReturnInterfaces,
     reverted_fns: &'a FxHashSet<LocalDefId>,
     resolved_signatures: &'a FxHashMap<LocalDefId, ResolvedRawSignature>,
     unplaceable: Vec<(LocalDefId, super::decision::lifetime::FnSignatureSlot)>,
 }
 
 impl LifetimeSignatureVisitor<'_> {
+    fn rewrite_return_layer(
+        &self,
+        did: LocalDefId,
+        ty: &mut Ty,
+        depth: u8,
+        lifetime: &str,
+    ) -> bool {
+        if depth == 0
+            && let Some(interface) = self.return_interfaces.functions.get(&did)
+        {
+            let shape = match interface.form {
+                Form::Slice { mutable } => Some((DeclForm::Slice, mutable)),
+                Form::Opt { mutable, slice } => Some((DeclForm::Opt { slice }, mutable)),
+                Form::Raw | Form::Ref { .. } => None,
+            };
+            if let Some((form, mutable)) = shape {
+                let TyKind::Ptr(inner) = &ty.kind else { return false };
+                ty.kind =
+                    decl_ty_kind_with_lifetime(form, mutable, inner.ty.clone(), Some(lifetime));
+                return true;
+            }
+        }
+        rewrite_raw_layer(ty, depth, lifetime)
+    }
+
     fn apply_function(&mut self, did: LocalDefId, function: &mut rustc_ast::Fn) {
         if self.reverted_fns.contains(&did) {
             return;
@@ -305,7 +331,7 @@ impl LifetimeSignatureVisitor<'_> {
                                         .get(&did)
                                         .and_then(|signature| signature.output.as_deref()),
                                 ))
-                                && rewrite_raw_layer(ty, effective_depth, &lifetime)
+                                && self.rewrite_return_layer(did, ty, effective_depth, &lifetime)
                         }
                     }
                 }
@@ -401,6 +427,8 @@ pub(crate) enum GlueShape {
     Reborrow,
     /// `&mut X[0]` / `&X[0]`
     Index0,
+    /// `&mut X[OFFSET..]` / `&X[OFFSET..]`
+    Suffix { offset: u64 },
     /// `core::slice::from_raw_parts{_mut}(X, (LEN) as usize)`
     FromRawParts,
     /// `core::slice::from_mut(X)` / `core::slice::from_ref(X)`
@@ -539,6 +567,23 @@ pub(crate) fn glue_expr(
                 BorrowKind::Ref,
                 mutbl,
                 expr(ExprKind::Index(arg, zero, DUMMY_SP)),
+            )
+        }
+        GlueShape::Suffix { offset } => {
+            let start = expr(ExprKind::Lit(rustc_ast::token::Lit {
+                kind: rustc_ast::token::LitKind::Integer,
+                symbol: Symbol::intern(&offset.to_string()),
+                suffix: None,
+            }));
+            let range = expr(ExprKind::Range(
+                Some(start),
+                None,
+                rustc_ast::RangeLimits::HalfOpen,
+            ));
+            ExprKind::AddrOf(
+                BorrowKind::Ref,
+                mutbl,
+                expr(ExprKind::Index(arg, range, DUMMY_SP)),
             )
         }
         GlueShape::FromRawParts => {
@@ -1066,6 +1111,7 @@ struct ExplicitLocalDeclVisitor<'a> {
     local_map: &'a rustc_ast::node_id::NodeMap<HirId>,
     global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
     sites: &'a FxHashMap<(LocalDefId, HirId), String>,
+    mutable_option_bindings: &'a FxHashSet<(LocalDefId, HirId)>,
     current_fn: Option<LocalDefId>,
     guard: &'a mut Composition,
     placed: FxHashSet<(LocalDefId, HirId)>,
@@ -1105,6 +1151,11 @@ impl MutVisitor for ExplicitLocalDeclVisitor<'_> {
             return;
         }
         local.ty = Some(P(::utils::ast::parse_ty(ty.clone())));
+        if self.mutable_option_bindings.contains(&key)
+            && let rustc_ast::PatKind::Ident(binding, _, _) = &mut local.pat.kind
+        {
+            binding.1 = Mutability::Mut;
+        }
         self.placed.insert(key);
         rustc_ast::mut_visit::walk_local(self, local);
     }
@@ -1798,6 +1849,7 @@ impl<'a> SeamGraftVisitor<'a> {
             GlueCore::RawOption => None,
             GlueCore::First => None,
             GlueCore::Index0 => Some(GlueShape::Index0),
+            GlueCore::Suffix { offset } => Some(GlueShape::Suffix { offset }),
             GlueCore::FromRawParts => Some(GlueShape::FromRawParts),
             GlueCore::FromRefMut => Some(GlueShape::FromRefMut),
         };
@@ -2295,6 +2347,93 @@ impl MutVisitor for C9GraftVisitor<'_> {
     }
 }
 
+/// Restore an input-form receiver while preserving the already-adapted call.
+/// The producer excludes whole-call carriers at this exact initializer; the
+/// ordinary composition guard remains authoritative for all other collisions.
+#[derive(Clone, Copy)]
+enum ReceiverGraft<'a> {
+    Outbound(&'a super::decision::outbound_expression::OutboundExpressionPlan),
+    Retired(&'a super::decision::receiver_input::ReceiverInputPlan),
+    Raw(&'a super::decision::raw_receiver::RawReceiverPlan),
+    SharedOption(&'a super::decision::return_receiver::ReceiverPlan),
+}
+
+impl ReceiverGraft<'_> {
+    fn render(self, call: &str) -> String {
+        match self {
+            Self::Retired(input) => input.render(call),
+            Self::Raw(input) => input.render(call),
+            Self::Outbound(input) => input.render(call),
+            Self::SharedOption(input) => input.render_coercion(call),
+        }
+    }
+}
+
+struct ReceiverInputGraftVisitor<'a> {
+    inputs: &'a FxHashMap<(u32, u32), ReceiverGraft<'a>>,
+    guard: &'a mut Composition,
+    consumed: FxHashSet<(u32, u32)>,
+    failure: Option<String>,
+}
+
+impl MutVisitor for ReceiverInputGraftVisitor<'_> {
+    fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+        if expression.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        }
+        let key = (expression.span.lo().0, expression.span.hi().0);
+        let Some(input) = self.inputs.get(&key).copied() else {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        };
+        if self.consumed.contains(&key) {
+            self.failure = Some(format!(
+                "receiver-input-invariant:duplicate-ast:{}..{}",
+                key.0, key.1
+            ));
+            return;
+        }
+        if !matches!(expression.kind, rustc_ast::ExprKind::Call(..)) {
+            self.failure = Some(format!(
+                "receiver-input-invariant:non-call:{}..{}",
+                key.0, key.1
+            ));
+            return;
+        }
+        rustc_ast::mut_visit::walk_expr(self, expression);
+        if self.failure.is_some() {
+            return;
+        }
+        let source = rustc_ast_pretty::pprust::expr_to_string(expression);
+        let rendered = input.render(&source);
+        let parsed = match graft_expr(&rendered) {
+            Ok(parsed) => parsed,
+            Err(why) => {
+                self.failure = Some(format!(
+                    "receiver-input-invariant:parse:{}..{}:{why}",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        if !self
+            .guard
+            .claim(expression.id, expression.span, "receiver-input")
+        {
+            self.failure = Some(format!(
+                "receiver-input-invariant:composition:{}..{}",
+                key.0, key.1
+            ));
+            return;
+        }
+        self.consumed.insert(key);
+        // Keep the authoritative outer identity and source span. Parsed
+        // descendants have graft_expr's synthetic identities and spans.
+        expression.kind = parsed.kind;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2701,6 +2840,15 @@ pub(super) fn surface_wrapper_block(
     function: &rustc_ast::Fn,
     return_temp_type: Option<&str>,
 ) -> Result<P<rustc_ast::Block>, String> {
+    surface_wrapper_block_with_arguments(inner_name, function, return_temp_type, None)
+}
+
+fn surface_wrapper_block_with_arguments(
+    inner_name: &str,
+    function: &rustc_ast::Fn,
+    return_temp_type: Option<&str>,
+    planned_arguments: Option<&std::collections::BTreeMap<usize, String>>,
+) -> Result<P<rustc_ast::Block>, String> {
     if function.sig.decl.c_variadic() {
         return Err("inbound-wrapper-unplaceable: variadic function".to_owned());
     }
@@ -2710,7 +2858,20 @@ pub(super) fn surface_wrapper_block(
         .decl
         .inputs
         .iter()
-        .map(|parameter| surface_argument(parameter, enclosing_unsafe_fn))
+        .enumerate()
+        .map(|(index, parameter)| {
+            if let Some(arguments) = planned_arguments {
+                if let Some(expression) = arguments.get(&index) {
+                    return Ok(expression.clone());
+                }
+                let rustc_ast::PatKind::Ident(_, ident, None) = &parameter.pat.kind else {
+                    return Err("inbound-wrapper-unplaceable: non-identifier parameter".into());
+                };
+                // A reverted or unchanged input already has the original ABI.
+                return Ok(ident.name.to_string());
+            }
+            surface_argument(parameter, enclosing_unsafe_fn)
+        })
         .collect::<Result<Vec<_>, _>>()?
         .join(", ");
     let call = format!("{inner_name}({arguments})");
@@ -2909,6 +3070,7 @@ fn apply_surface_plans_to_items(
     exposure: &super::decision::exposure::ExposurePolicy,
     surface_names: &FxHashMap<Symbol, Symbol>,
     return_temp_types: &FxHashMap<LocalDefId, String>,
+    surface_arguments: &FxHashMap<LocalDefId, std::collections::BTreeMap<usize, String>>,
     reverted: &FxHashSet<LocalDefId>,
     guard: &mut Composition,
 ) -> Result<(), String> {
@@ -2931,6 +3093,7 @@ fn apply_surface_plans_to_items(
                 exposure,
                 surface_names,
                 return_temp_types,
+                surface_arguments,
                 reverted,
                 guard,
             )?;
@@ -2977,10 +3140,12 @@ fn apply_surface_plans_to_items(
             }
             .visit_block(body);
         }
-        outer_fn.body = Some(surface_wrapper_block(
+        let no_arguments = std::collections::BTreeMap::new();
+        outer_fn.body = Some(surface_wrapper_block_with_arguments(
             &inner_name,
             inner_fn,
             return_temp_types.get(&did).map(String::as_str),
+            Some(surface_arguments.get(&did).unwrap_or(&no_arguments)),
         )?);
         inner_fn.ident = Ident::new(Symbol::intern(&inner_name), inner_fn.ident.span);
         item.attrs
@@ -3022,6 +3187,30 @@ fn apply_surface_plans(
         .filter(|site| site.category == "return-temp")
         .map(|site| (site.owner_class.local_def_id(), site.emitted_type.clone()))
         .collect::<FxHashMap<_, _>>();
+    let mut surface_arguments =
+        FxHashMap::<LocalDefId, std::collections::BTreeMap<usize, String>>::default();
+    for argument in &table.seams.surface_arguments {
+        if !reverts.keeps_subject(argument.node.0, argument.node.1)
+            || !reverts.keeps_edit(argument.owner_class, &argument.atom_ids)
+        {
+            continue;
+        }
+        let unsafe_fn = argument
+            .bridge
+            .unsafe_context
+            .is_some_and(|context| context.unsafe_fn);
+        let expression = argument
+            .spec
+            .render_in_context(&argument.parameter_name, unsafe_fn)
+            .ok_or("surface-argument-render-unavailable")?;
+        let prior = surface_arguments
+            .entry(argument.owner_class.local_def_id())
+            .or_default()
+            .insert(argument.parameter_index, expression);
+        if prior.is_some() {
+            return Err("surface-argument-identity-duplicate".into());
+        }
+    }
     apply_surface_plans_to_items(
         &mut krate.items,
         &originals,
@@ -3029,6 +3218,7 @@ fn apply_surface_plans(
         exposure,
         &surface_names,
         &return_temp_types,
+        &surface_arguments,
         &reverts.fns,
         guard,
     )?;
@@ -3096,11 +3286,63 @@ fn transform_with<'tcx>(
     String,
 > {
     // The finalizer's complete collections replace the earlier adapter plans.
+    // An origin-parameter atom also owns its generated return interface.
+    // Apply the same class closure as receipts and verification accounting.
+    let normalized_reverts;
+    let reverts = if reverts.atom_names.is_empty() && reverts.fns.is_empty() {
+        reverts
+    } else {
+        let atoms = reverts.atom_names.iter().cloned().collect();
+        let classes = reverts
+            .fns
+            .iter()
+            .copied()
+            .map(super::bridge_receipt::SignatureClassId::of)
+            .collect();
+        let effective = if let Some(plans) = terminal_call_plans {
+            plans.effective_reverted_classes(&classes, &atoms)
+        } else {
+            let edges = table
+                .seams
+                .interface_dependencies
+                .iter()
+                .chain(&table.seams.generated_item_dependencies)
+                .copied()
+                .collect::<Vec<_>>();
+            super::decision::lifetime::ReturnOriginAtomDependencies::derive(table, &edges)
+                .effective_reverted_classes(&classes, &atoms)
+        };
+        normalized_reverts = RevertSet {
+            fns: effective
+                .into_iter()
+                .map(|owner| owner.local_def_id())
+                .collect(),
+            ..reverts.clone()
+        };
+        &normalized_reverts
+    };
     // In particular, a sealed empty collection must not resurrect an adapter
     // from the decision table. The shared filters still own all revert rules.
     let terminal_table = terminal_call_plans.map(|plans| {
         let mut sealed = table.clone();
         sealed.seams.a5_raw_calls.clone_from(&plans.a5_raw_calls);
+        sealed
+            .seams
+            .surface_arguments
+            .clone_from(&plans.surface_arguments);
+        sealed
+            .seams
+            .callee_parameter_inputs
+            .clone_from(&plans.callee_parameter_inputs);
+        sealed
+            .seams
+            .receiver_inputs
+            .clone_from(&plans.receiver_inputs);
+        sealed.seams.raw_receivers.clone_from(&plans.raw_receivers);
+        sealed
+            .seams
+            .outbound_expressions
+            .clone_from(&plans.outbound_expressions);
         sealed
             .seams
             .pair_raw_calls
@@ -3150,6 +3392,7 @@ fn transform_with<'tcx>(
     let mut lifetime_visitor = LifetimeSignatureVisitor {
         global_map: &map.global_map,
         plans: &table.lifetime_plan,
+        return_interfaces: &table.return_interfaces,
         reverted_fns: &reverts.fns,
         resolved_signatures: &resolved_signatures,
         unplaceable: Vec::new(),
@@ -3227,6 +3470,18 @@ fn transform_with<'tcx>(
         if !table
             .declaration_patterns
             .contains_key(&(subject.fn_did, subject.hir_id))
+            && !table
+                .return_receivers
+                .plans
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|receiver| {
+                    !table.return_receivers.failures.contains_key(&receiver.node)
+                        && table.seams.explicit_declarations.iter().any(|site| {
+                            site.category == "local"
+                                && site.node == Some(receiver.node)
+                                && site.emitted_type == receiver.receiver_type()
+                        })
+                })
         {
             insert_counting(
                 &mut decisions,
@@ -3275,12 +3530,13 @@ fn transform_with<'tcx>(
     let decls = v.stats;
 
     let mut explicit_local_types = FxHashMap::default();
-    for site in table
-        .seams
-        .explicit_declarations
-        .iter()
-        .filter(|site| site.category == "local" && reverts.keeps(site.owner_class))
-    {
+    for site in table.seams.explicit_declarations.iter().filter(|site| {
+        site.category == "local"
+            && reverts.keeps(site.owner_class)
+            && site
+                .node
+                .is_some_and(|node| reverts.keeps_subject(node.0, node.1))
+    }) {
         let Some(node) = site.node else {
             return Err("declaration-explicit-type-local-missing-node".to_owned());
         };
@@ -3300,6 +3556,7 @@ fn transform_with<'tcx>(
             local_map: &map.local_map,
             global_map: &map.global_map,
             sites: &explicit_local_types,
+            mutable_option_bindings: &table.option_mut_bindings,
             current_fn: None,
             guard: &mut guard,
             placed: FxHashSet::default(),
@@ -3320,6 +3577,12 @@ fn transform_with<'tcx>(
     // site check, so their revert semantics live entirely in how these maps are
     // built — and production builds them in exactly ONE place.
     let filtered = filtered_inputs(table, reverts);
+    if !filtered.callee_parameter_input_errors.is_empty() {
+        return Err(format!(
+            "callee-parameter-input-invariant:{}",
+            filtered.callee_parameter_input_errors.join(";")
+        ));
+    }
     let box_fabricated = filtered.box_fabricated;
     let uses = filtered.uses;
     let statement_deletes = filtered.statement_deletes;
@@ -3460,6 +3723,126 @@ fn transform_with<'tcx>(
         .collect::<Vec<_>>();
     if !unmatched.is_empty() {
         return Err(format!("unmatched retained C-9 call spans: {unmatched:?}"));
+    }
+
+    let classes = reverts
+        .fns
+        .iter()
+        .copied()
+        .map(super::bridge_receipt::SignatureClassId::of)
+        .collect();
+    let atoms = reverts.atom_names.iter().cloned().collect();
+    for unavailable in table.seams.receiver_inputs.unavailable.values() {
+        if unavailable.selection.active(&classes, &atoms) {
+            return Err(format!(
+                "receiver-input-invariant:unavailable:{}:{}:{:?}",
+                unavailable.selection.node.0.local_def_index.as_u32(),
+                unavailable.selection.node.1.local_id.as_u32(),
+                unavailable.reason
+            ));
+        }
+    }
+    let mut receiver_inputs = FxHashMap::default();
+    for input in table
+        .seams
+        .outbound_expressions
+        .plans
+        .values()
+        .filter(|input| input.active(&classes))
+    {
+        let key = (input.argument_span.lo().0, input.argument_span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Outbound(input))
+            .is_some()
+        {
+            return Err(format!(
+                "outbound-expression-invariant:duplicate-plan:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    for input in table
+        .seams
+        .receiver_inputs
+        .plans
+        .values()
+        .filter(|input| input.active(&classes, &atoms))
+    {
+        let span = input.receiver.initializer_span;
+        let key = (span.lo().0, span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Retired(input))
+            .is_some()
+        {
+            return Err(format!(
+                "receiver-input-invariant:duplicate-plan:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    for input in table
+        .seams
+        .raw_receivers
+        .plans
+        .values()
+        .filter(|input| input.active(&classes))
+    {
+        let span = input.initializer_span;
+        let key = (span.lo().0, span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Raw(input))
+            .is_some()
+        {
+            return Err(format!(
+                "receiver-input-invariant:duplicate-raw-plan:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    for receiver in table.return_receivers.plans.values().filter(|receiver| {
+        receiver.coercion == super::decision::return_receiver::ReceiverCoercion::SharedOption
+            && reverts.keeps(super::bridge_receipt::SignatureClassId::of(receiver.callee))
+            && reverts.keeps_subject(receiver.node.0, receiver.node.1)
+            && super::decision::return_receiver::active_initializer(
+                table,
+                receiver.node,
+                receiver.initializer_hir,
+                receiver.initializer_span,
+            )
+            .is_some()
+    }) {
+        let span = receiver.initializer_span;
+        let key = (span.lo().0, span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::SharedOption(receiver))
+            .is_some()
+        {
+            return Err(format!(
+                "receiver-input-invariant:duplicate-coercion:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    let mut receiver_grafts = ReceiverInputGraftVisitor {
+        inputs: &receiver_inputs,
+        guard: &mut guard,
+        consumed: FxHashSet::default(),
+        failure: None,
+    };
+    receiver_grafts.visit_crate(&mut krate);
+    if let Some(why) = receiver_grafts.failure.take() {
+        return Err(why);
+    }
+    let unmatched_receiver_inputs = receiver_inputs
+        .keys()
+        .filter(|key| !receiver_grafts.consumed.contains(key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unmatched_receiver_inputs.is_empty() {
+        return Err(format!(
+            "receiver-input-invariant:unmatched:{}:{unmatched_receiver_inputs:?}",
+            unmatched_receiver_inputs.len()
+        ));
     }
 
     // Surface policy runs after every inner-body transform. The transformed
@@ -4091,7 +4474,7 @@ fn compare_renders(
 ///
 /// Production carries one vocabulary: direct `LocalDefId` ownership. The
 /// historical text-oracle display names remain test-only.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RevertSet {
     pub fns: FxHashSet<LocalDefId>,
     #[cfg(test)]
@@ -4165,6 +4548,9 @@ pub(crate) struct FilteredInputs {
     pub seam_key_collisions: usize,
     pub statement_deletes: FxHashSet<(u32, u32)>,
     pub box_fabricated: usize,
+    /// Selected unavailable alternatives must already have held their caller.
+    /// A remaining failure is reported by transform_with, never silently lost.
+    pub callee_parameter_input_errors: Vec<String>,
 }
 
 /// Build both filtered maps from one decision table and one revert set.
@@ -4183,7 +4569,22 @@ pub(crate) fn filtered_inputs(
         seam_key_collisions: 0,
         statement_deletes: FxHashSet::default(),
         box_fabricated: 0,
+        callee_parameter_input_errors: Vec::new(),
     };
+    out.box_fabricated += table
+        .seams
+        .surface_arguments
+        .iter()
+        .filter(|argument| {
+            reverts.keeps_subject(argument.node.0, argument.node.1)
+                && reverts.keeps_edit(argument.owner_class, &argument.atom_ids)
+                && argument
+                    .spec
+                    .len
+                    .as_ref()
+                    .is_some_and(SeamLen::is_fabricated)
+        })
+        .count();
     let active_slice_constructions = table
         .slice_constructions
         .iter()
@@ -4325,7 +4726,69 @@ pub(crate) fn filtered_inputs(
         );
         out.box_fabricated += usize::from(plan.length.is_fallback());
     }
+    let reverted_classes = reverts
+        .fns
+        .iter()
+        .copied()
+        .map(super::bridge_receipt::SignatureClassId::of)
+        .collect::<std::collections::BTreeSet<_>>();
+    let reverted_atoms = reverts
+        .atom_names
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut selected_target_inputs = FxHashSet::default();
+    for (&key, input) in &table.seams.callee_parameter_inputs {
+        let Some(selected) = input.select(&reverted_classes, &reverted_atoms) else { continue };
+        selected_target_inputs.insert(key);
+        let alternative = match selected {
+            Ok(alternative) => alternative,
+            Err(reason) => {
+                out.callee_parameter_input_errors.push(format!(
+                    "class={}:arg={}..{}:{reason}",
+                    key.0.order_key(),
+                    key.1,
+                    key.2
+                ));
+                continue;
+            }
+        };
+        match &alternative.rendering {
+            super::decision::seam::SeamInputRendering::ZeroSyntax { .. } => {}
+            super::decision::seam::SeamInputRendering::Adapter { .. } => {
+                let span_key = (key.1, key.2);
+                let Some(target) = SeamTarget::of_input(
+                    &alternative.rendering,
+                    alternative.arg_span,
+                    out.uses.contains_key(&span_key),
+                ) else {
+                    out.callee_parameter_input_errors.push(format!(
+                        "class={}:arg={}..{}:adapter-unavailable",
+                        key.0.order_key(),
+                        key.1,
+                        key.2
+                    ));
+                    continue;
+                };
+                insert_counting(
+                    &mut out.seams,
+                    span_key,
+                    target,
+                    &mut out.seam_key_collisions,
+                );
+            }
+        }
+    }
     for edit in &table.seams.edits {
+        if let super::bridge_receipt::BridgeCalleeId::Local(callee) = edit.bridge.callee
+            && selected_target_inputs.contains(&(
+                super::bridge_receipt::SignatureClassId::of(callee),
+                edit.span.lo().0,
+                edit.span.hi().0,
+            ))
+        {
+            continue;
+        }
         if edit.zero_syntax {
             continue;
         }
@@ -4358,6 +4821,10 @@ pub(crate) fn filtered_inputs(
         insert_counting(&mut out.seams, key, target, &mut out.seam_key_collisions);
     }
     for edit in &table.seams.revert_found_form_edits {
+        if selected_target_inputs.contains(&(edit.owner_class, edit.span.lo().0, edit.span.hi().0))
+        {
+            continue;
+        }
         if !reverts.keeps(edit.owner_class)
             || reverts.keeps_subject(edit.source_node.0, edit.source_node.1)
         {

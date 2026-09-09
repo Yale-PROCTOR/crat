@@ -468,12 +468,12 @@ fn r231_raw_role_fixture_with_atom(
             // Consumer-level custody fault: real frozen site facts stay fixed;
             // make only the source-shape correspondence unavailable.
             for coverage in &mut table.sibling_overlap_inventory.coverage {
-                if coverage.potential.source.label == "caller::src" && coverage.potential.site.callee.symbol == "update" {
+                if coverage.potential.source.label() == "caller::src" && coverage.potential.site.callee.symbol == "update" {
                     coverage.evidence = super::decision::sibling_overlap::SourceBridgeEvidence::UnknownShape("injected-source-custody-gap");
                 }
             }
             table.sibling_overlap_inventory.potentials.retain(|potential|
-                !(potential.source.label == "caller::src" && potential.site.callee.symbol == "update"));
+                !(potential.source.label() == "caller::src" && potential.site.callee.symbol == "update"));
         }
         let (source, source_decision) = table.entries.iter()
             .find(|(subject, _)| subject.label == "caller::src").expect("exact PAIR source");
@@ -774,7 +774,7 @@ fn r233_pending_stamp_tracks_the_actual_source_and_callee_interfaces() {
         receipt.site.is_ok(),
         "exact compiler site mapping: {receipt:#?}"
     );
-    assert_eq!(receipt.receipt.potential.source.label, "caller::src");
+    assert_eq!(receipt.receipt.potential.source.label(), "caller::src");
     assert_eq!(receipt.receipt.tier, "T2-pending");
     let reverted = r231_raw_role_case(true);
     assert!(
@@ -795,7 +795,7 @@ fn r233_unknown_source_custody_survives_planning_as_a_terminal_gap() {
         1,
         "planning must preserve the exact unresolved delivered site"
     );
-    assert_eq!(live.gaps[0].potential.source.label, "caller::src");
+    assert_eq!(live.gaps[0].potential.source.label(), "caller::src");
     assert_eq!(
         live.gaps[0].reason,
         "sibling-source-bridge-custody-unresolved"

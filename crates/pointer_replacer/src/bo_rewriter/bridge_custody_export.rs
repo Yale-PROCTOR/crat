@@ -57,6 +57,7 @@ pub(crate) struct Descriptor {
 pub(crate) enum PendingSubjectKind {
     Parameter { hir_index: usize },
     Local,
+    NativeReturnExpression,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,9 +78,11 @@ pub(crate) struct PendingSubjectRecord {
     pub(crate) subject_identity: Option<String>,
     pub(crate) subject_owner: Option<String>,
     pub(crate) subject_kind: PendingSubjectKind,
-    pub(crate) mir_local: u32,
+    pub(crate) mir_local: Option<u32>,
     pub(crate) hir_owner: u32,
-    pub(crate) hir_binding: u32,
+    pub(crate) hir_binding: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hir_expression: Option<u32>,
     pub(crate) argument_index: usize,
     pub(crate) source_shape: String,
     pub(crate) source_form: String,
@@ -93,6 +96,12 @@ pub(crate) struct PendingSubjectRecord {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Export {
+    #[serde(default)]
+    pub(crate) outbound_return: Option<super::outbound_return_transport::Capture>,
+    #[serde(default)]
+    pub(crate) outbound_return_bridge_keys: Option<BTreeSet<String>>,
+    #[serde(default)]
+    pub(crate) sibling_audit: Option<SiblingAuditCapture>,
     pub(crate) files: BTreeMap<String, OriginalFile>,
     pub(crate) functions: Vec<FunctionMapping>,
     /// All typed candidates; final Applied keys select the active subset.
@@ -106,6 +115,12 @@ pub(crate) struct Export {
     pub(crate) pending_records: Vec<String>,
     pub(crate) pending_subject_records: Vec<PendingSubjectRecord>,
     pub(crate) coverage_gap_records: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SiblingAuditCapture {
+    pub(crate) expected_coverage_ids: BTreeSet<String>,
+    pub(crate) rows: Vec<super::sibling_audit::Row>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +485,23 @@ pub(crate) fn capture(
     original_files: &BTreeMap<super::plan::FileKey, String>,
 ) -> Export {
     let mut export = Export::default();
+    export.sibling_audit = Some(SiblingAuditCapture {
+        expected_coverage_ids: table
+            .sibling_overlap_inventory
+            .coverage
+            .iter()
+            .map(|record| super::decision::raw_boundary::site_atom_id(&record.potential.site))
+            .chain(
+                table
+                    .seams
+                    .outbound_expressions
+                    .plans
+                    .keys()
+                    .map(super::decision::raw_boundary::site_atom_id),
+            )
+            .collect(),
+        rows: Vec::new(),
+    });
     for (file, source) in original_files {
         let label = file_label(file);
         let files = tcx.sess.source_map().files();
@@ -537,28 +569,88 @@ pub(crate) fn capture(
             let [coverage] = coverage.as_slice() else {
                 return Err("pending-source-coverage-not-unique".into());
             };
-            use super::decision::sibling_overlap::SourceBridgeEvidence;
-            let shape = match &coverage.evidence {
-                SourceBridgeEvidence::WholeSubject => PendingSourceShape::WholeSubject,
-                SourceBridgeEvidence::ProjectedReferent { .. } => {
-                    PendingSourceShape::ProjectedReferent
+            use super::decision::sibling_overlap::{SiblingSource, SourceBridgeEvidence};
+            let pending_source = match (&potential.source, &coverage.evidence) {
+                (SiblingSource::Declared(source), evidence) => {
+                    let shape = match evidence {
+                        SourceBridgeEvidence::WholeSubject => PendingSourceShape::WholeSubject,
+                        SourceBridgeEvidence::ProjectedReferent { .. } => {
+                            PendingSourceShape::ProjectedReferent
+                        }
+                        SourceBridgeEvidence::TypedView { .. }
+                        | SourceBridgeEvidence::NativeReturnExpression { .. }
+                        | SourceBridgeEvidence::RawFieldValue
+                        | SourceBridgeEvidence::BindingStorage
+                        | SourceBridgeEvidence::UnknownShape(_) => {
+                            return Err("pending-source-coverage-not-supported".into());
+                        }
+                    };
+                    let (binding_file, binding_span) = source_location(tcx, source.binding_span)?;
+                    if binding_file != file {
+                        return Err("pending-source-binding-in-different-file".into());
+                    }
+                    PendingSource {
+                        binding: Some(
+                            source
+                                .param_name
+                                .clone()
+                                .ok_or("pending-source-binding-name-absent")?,
+                        ),
+                        binding_span: Some(binding_span),
+                        shape,
+                    }
                 }
-                SourceBridgeEvidence::TypedView { .. }
-                | SourceBridgeEvidence::RawFieldValue
-                | SourceBridgeEvidence::BindingStorage
-                | SourceBridgeEvidence::UnknownShape(_) => {
-                    return Err("pending-source-coverage-not-supported".into());
+                (
+                    SiblingSource::NativeReturnExpression {
+                        argument_hir,
+                        source_callee,
+                        source_interface,
+                        temporary,
+                        ..
+                    },
+                    SourceBridgeEvidence::NativeReturnExpression { use_hir_id },
+                ) => {
+                    let input = table
+                        .seams
+                        .outbound_expressions
+                        .plans
+                        .get(&potential.site)
+                        .ok_or("pending-native-expression-input-missing")?;
+                    if input.argument_hir != *argument_hir
+                        || use_hir_id != argument_hir
+                        || input.caller != potential.caller
+                        || input.source_callee != *source_callee
+                        || input.source_interface != *source_interface
+                        || input.temporary != *temporary
+                        || input.argument_span != potential.argument_span
+                        || input.call_span != potential.call_span
+                    {
+                        return Err("pending-native-expression-input-drift".into());
+                    }
+                    let (source_file, source_call_span) =
+                        source_location(tcx, input.argument_span)?;
+                    if source_file != file {
+                        return Err("pending-native-expression-in-different-file".into());
+                    }
+                    PendingSource {
+                        binding: None,
+                        binding_span: None,
+                        shape: PendingSourceShape::NativeReturnExpression {
+                            argument_span: span,
+                            source_call_span,
+                            source_owner: source_callee.local_def_index.as_u32(),
+                            source_function: tcx.def_path_str(source_callee.to_def_id()),
+                            source_form: source_interface.form.key().into(),
+                            source_type: source_interface.temporary_type(),
+                            temporary: temporary.clone(),
+                            template: input.template.key().into(),
+                        },
+                    }
+                }
+                (SiblingSource::NativeReturnExpression { .. }, _) => {
+                    return Err("pending-native-expression-coverage-mismatch".into());
                 }
             };
-            let (binding_file, binding_span) = source_location(tcx, potential.source.binding_span)?;
-            if binding_file != file {
-                return Err("pending-source-binding-in-different-file".into());
-            }
-            let binding = potential
-                .source
-                .param_name
-                .clone()
-                .ok_or("pending-source-binding-name-absent")?;
             Ok(Descriptor {
                 receipt_key: id.clone(),
                 source_file: file,
@@ -572,11 +664,7 @@ pub(crate) fn capture(
                         argument_index: potential.site.argument_index,
                     },
                     c9_stamp: None,
-                    pending_source: Some(PendingSource {
-                        binding,
-                        binding_span,
-                        shape,
-                    }),
+                    pending_source: Some(pending_source),
                     tier: String::new(),
                     waiver_id: None,
                 },
@@ -599,7 +687,18 @@ pub(crate) fn capture(
         &BTreeSet::new(),
         &plan.pending_sibling_receipts(&BTreeSet::new()),
         &plan.sibling_coverage_gaps(&BTreeSet::new()),
+        &plan.sibling_audit_rows_with_atoms(&BTreeSet::new(), &BTreeSet::new()),
     );
+    let mut artifacts = super::RawBoundaryArtifacts::default();
+    super::refresh_raw_boundary_receipt_events(
+        &mut artifacts,
+        plan,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    export.outbound_return = artifacts.bridge_custody_export.outbound_return;
+    export.outbound_return_bridge_keys =
+        artifacts.bridge_custody_export.outbound_return_bridge_keys;
     export
 }
 
@@ -609,7 +708,11 @@ pub(crate) fn refresh(
     reverted: &BTreeSet<super::bridge_receipt::SignatureClassId>,
     pending: &[super::plan::sibling_overlap::PendingSite],
     gaps: &[super::decision::sibling_overlap::CoverageGapReceipt],
+    audit_rows: &[super::sibling_audit::Row],
 ) {
+    if let Some(audit) = &mut export.sibling_audit {
+        audit.rows = audit_rows.to_vec();
+    }
     export.terminal_issues.clear();
     export.pending.clear();
     export.pending_records.clear();
@@ -632,18 +735,21 @@ pub(crate) fn refresh(
         let owners = export
             .functions
             .iter()
-            .filter(|function| function.owner_class == Some(source.fn_did.local_def_index.as_u32()))
+            .filter(|function| {
+                function.owner_class == Some(source.caller().local_def_index.as_u32())
+            })
             .map(|function| function.original_owner.clone())
             .collect::<Vec<_>>();
         let owner = match owners.as_slice() {
             [owner] => Some(owner.clone()),
             _ => None,
         };
-        let subject_kind = match source.kind {
-            super::decision::SubjectKind::Param { hir_index } => {
+        let subject_kind = match source.declared().map(|source| source.kind) {
+            Some(super::decision::SubjectKind::Param { hir_index }) => {
                 PendingSubjectKind::Parameter { hir_index }
             }
-            super::decision::SubjectKind::Local => PendingSubjectKind::Local,
+            Some(super::decision::SubjectKind::Local) => PendingSubjectKind::Local,
+            None => PendingSubjectKind::NativeReturnExpression,
         };
         use super::decision::sibling_overlap::LocalPostCallEvidence;
         let post_call = match &site.receipt.potential.local_post_call {
@@ -670,13 +776,19 @@ pub(crate) fn refresh(
         export.pending_subject_records.push(PendingSubjectRecord {
             site_id: site.receipt.site_id(),
             receipt_key: site.site.as_ref().ok().map(|key| key.receipt_key()),
-            subject_label: source.label.clone(),
+            subject_label: source.label(),
             subject_identity: owner.as_ref().map(|owner| source.identity_key(owner)),
             subject_owner: owner,
             subject_kind,
-            mir_local: source.local.as_u32(),
-            hir_owner: source.hir_id.owner.def_id.local_def_index.as_u32(),
-            hir_binding: source.hir_id.local_id.as_u32(),
+            mir_local: source.mir_local().map(|local| local.as_u32()),
+            hir_owner: source.hir_id().owner.def_id.local_def_index.as_u32(),
+            hir_binding: source
+                .declared()
+                .map(|source| source.hir_id.local_id.as_u32()),
+            hir_expression: source
+                .declared()
+                .is_none()
+                .then(|| source.hir_id().local_id.as_u32()),
             argument_index: site.receipt.potential.site.argument_index,
             source_shape: site.receipt.potential.source_shape.into(),
             source_form: site.receipt.source_form.key().into(),
@@ -737,6 +849,135 @@ pub(crate) fn compare_capture(
     compare_applied(export, &applied_receipts(events), sources, outcome)
 }
 
+fn sibling_audit_issues(audit: Option<&SiblingAuditCapture>) -> Vec<String> {
+    let Some(audit) = audit else {
+        return vec!["sibling-audit:missing-capture".into()];
+    };
+    let mut issues = Vec::new();
+    let mut observed = BTreeSet::new();
+    for row in &audit.rows {
+        issues.extend(super::sibling_audit::source_integrity_issues(row));
+        let id = &row.coverage_id;
+        if !observed.insert(id.clone()) {
+            issues.push(format!("sibling-audit:duplicate-coverage-id:{id}"));
+        }
+        if !audit.expected_coverage_ids.contains(id) {
+            issues.push(format!("sibling-audit:extra-coverage-id:{id}"));
+        }
+        if !row.data {
+            issues.push(format!("sibling-audit:incomplete-row:{id}"));
+        }
+        for issue in &row.issues {
+            issues.push(format!("sibling-audit:row-issue:{id}:{issue}"));
+        }
+        // An explicit Undeterminable or unknown access/post-call result is
+        // captured evidence. Only missing identities or incomplete rows fail
+        // this transport check; no predicate verdict is reconstructed here.
+    }
+    for id in audit.expected_coverage_ids.difference(&observed) {
+        issues.push(format!("sibling-audit:missing-coverage-id:{id}"));
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
+/// Native expression source metadata must agree with the separately owned
+/// selected J27 obligation. A saved successful audit row is not that proof.
+fn native_sibling_source_issues(export: &Export) -> Vec<String> {
+    let (Some(audit), Some(outbound)) = (&export.sibling_audit, &export.outbound_return) else {
+        // Their mandatory presence is checked by the surrounding comparator.
+        return Vec::new();
+    };
+    let requirements = outbound
+        .required
+        .iter()
+        .filter(|required| required.bridge.kind == "outbound-native-return-argument")
+        .collect::<Vec<_>>();
+    let same_site = |row: &super::sibling_audit::Row,
+                     required: &super::outbound_return_transport::Requirement| {
+        required.key.hir_owner == Some(row.source.hir_owner)
+            && required.key.hir_item_local_id == Some(row.source.hir_local)
+            && required
+                .key
+                .argument_index
+                .and_then(|index| usize::try_from(index).ok())
+                == Some(row.argument_index)
+    };
+    let native = |row: &super::sibling_audit::Row| {
+        matches!(
+            row.source.kind,
+            super::sibling_audit::SubjectKind::NativeReturnExpression
+        )
+    };
+    let mut issues = Vec::new();
+    for row in audit.rows.iter().filter(|row| native(row)) {
+        let selected = requirements
+            .iter()
+            .copied()
+            .filter(|required| same_site(row, required))
+            .collect::<Vec<_>>();
+        if !row.terminal.source_delivered {
+            if !selected.is_empty() {
+                issues.push(format!(
+                    "sibling-audit:native-source-retired-but-selected:{}",
+                    row.coverage_id
+                ));
+            }
+            continue;
+        }
+        let [required] = selected.as_slice() else {
+            issues.push(format!(
+                "sibling-audit:native-source-obligation-count:{}:{}",
+                row.coverage_id,
+                selected.len()
+            ));
+            continue;
+        };
+        let (Some(source), Some(proof)) = (&row.source.native_return, &required.native_lifetime)
+        else {
+            issues.push(format!(
+                "sibling-audit:native-source-independent-proof-missing:{}",
+                row.coverage_id
+            ));
+            continue;
+        };
+        if source.source_owner != proof.owner
+            || source.source_owner != required.key.owner
+            || source.source_form != required.terminal_interface
+            || source.lifetime != proof.lifetime
+            || source.lifetime_plan_digest != proof.plan_digest
+            || row.terminal.source_form != required.terminal_interface
+            || source.temporary
+                != format!(
+                    "__crat_outbound_return_{}_{}",
+                    row.source.hir_owner, row.source.hir_local
+                )
+        {
+            issues.push(format!(
+                "sibling-audit:native-source-independent-proof-mismatch:{}",
+                row.coverage_id
+            ));
+        }
+    }
+    // A selected expression obligation cannot disappear by relabeling its
+    // audit row as an ordinary declared source.
+    for required in requirements {
+        let count = audit
+            .rows
+            .iter()
+            .filter(|row| native(row) && same_site(row, required))
+            .count();
+        if count != 1 {
+            issues.push(format!(
+                "sibling-audit:native-obligation-audit-count:{}:{count}",
+                required.key.key
+            ));
+        }
+    }
+    issues
+}
+
 fn compare_applied(
     export: &Export,
     applied: &[AppliedReceipt],
@@ -748,6 +989,38 @@ fn compare_applied(
         ..CheckpointReport::default()
     };
     report.issues.extend(export.terminal_issues.iter().cloned());
+    report
+        .issues
+        .extend(sibling_audit_issues(export.sibling_audit.as_ref()));
+    report.issues.extend(native_sibling_source_issues(export));
+    match export.outbound_return.as_ref() {
+        None => report
+            .issues
+            .push("outbound-return-transport:missing-capture".into()),
+        Some(capture) => {
+            if let Err(reason) = super::outbound_return_transport::validate(capture) {
+                report.issues.push(reason);
+            }
+        }
+    }
+    match (&export.outbound_return, &export.outbound_return_bridge_keys) {
+        (Some(capture), Some(keys)) => {
+            let actual = capture
+                .bridges
+                .iter()
+                .filter(|bridge| bridge.stage == "terminal" && bridge.state == "applied")
+                .map(|bridge| bridge.key.key.clone())
+                .collect::<BTreeSet<_>>();
+            if &actual != keys {
+                report
+                    .issues
+                    .push("outbound-return-transport:outer-bridge-inventory-mismatch".into());
+            }
+        }
+        _ => report
+            .issues
+            .push("outbound-return-transport:missing-outer-bridge-inventory".into()),
+    }
     let mut active = BTreeMap::<String, Vec<BridgeExpectation>>::new();
     for event in applied {
         let key = event.receipt_key.clone();
@@ -1118,6 +1391,17 @@ mod tests {
         let key = event.site.receipt_key();
         let inventory = inventory_source("main.rs", INPUT).unwrap();
         let export = Export {
+            outbound_return_bridge_keys: Some(BTreeSet::new()),
+            outbound_return: Some(super::super::outbound_return_transport::capture(
+                &super::super::RawBoundaryArtifacts::default(),
+            )),
+            // This constructed bridge-only fixture supplies an explicitly
+            // empty sibling-coverage universe. Default/absent capture remains
+            // invalid; actual captures derive their universe from the table.
+            sibling_audit: Some(SiblingAuditCapture {
+                expected_coverage_ids: BTreeSet::new(),
+                rows: Vec::new(),
+            }),
             files: BTreeMap::from([(
                 "main.rs".into(),
                 OriginalFile {

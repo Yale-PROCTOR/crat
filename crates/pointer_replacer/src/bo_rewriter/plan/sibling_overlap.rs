@@ -10,7 +10,7 @@ use super::super::{
         DecisionTable, SubjectKind,
         seam::Form,
         sibling_overlap::{
-            self, CoverageGapReceipt, PendingSiblingReceipt, SiblingPotential,
+            self, CoverageGapReceipt, PendingSiblingReceipt, SiblingPotential, SiblingSource,
             SourceBridgeCoverage, SourceBridgeEvidence, TerminalSiteState,
         },
     },
@@ -77,14 +77,25 @@ pub(crate) fn plans(
 ) -> Vec<SiblingReceiptPlan> {
     table.sibling_overlap_inventory.coverage.iter().map(|coverage| {
         let potential = &coverage.potential;
-        let source_key = (potential.source.fn_did, potential.source.hir_id);
-        let source = Endpoint {
-            class: Some(SignatureClassId::of(potential.caller)),
-            atoms: table.seams.raw_boundary_atom_groups.get(&source_key).into_iter().flatten().map(|atom| atom.id.clone()).collect(),
-            input: table.input_interfaces.subject_forms.get(&source_key).copied().unwrap_or(Form::Raw),
-            placed: table.entries.iter().find(|(subject, _)| (subject.fn_did, subject.hir_id) == source_key)
-                .and_then(|(_, choice)| super::super::terminal_application(choice, true))
-                .map(super::super::decision::seam::form_of),
+        let source = match &potential.source {
+            SiblingSource::Declared(subject) => {
+                let source_key = (subject.fn_did, subject.hir_id);
+                Endpoint {
+                    class: Some(SignatureClassId::of(potential.caller)),
+                    atoms: table.seams.raw_boundary_atom_groups.get(&source_key).into_iter().flatten().map(|atom| atom.id.clone()).collect(),
+                    input: table.input_interfaces.subject_forms.get(&source_key).copied().unwrap_or(Form::Raw),
+                    placed: table.entries.iter().find(|(subject, _)| (subject.fn_did, subject.hir_id) == source_key)
+                        .and_then(|(_, choice)| super::super::terminal_application(choice, true))
+                        .map(super::super::decision::seam::form_of),
+                }
+            }
+            SiblingSource::NativeReturnExpression { source_callee, source_interface, .. } => Endpoint {
+                class: Some(SignatureClassId::of(*source_callee)),
+                // Return-origin atom closure has already normalized classes.
+                atoms: Vec::new(),
+                input: Form::Raw,
+                placed: Some(source_interface.form),
+            },
         };
         let target = potential.callee.as_local().map(|callee| Endpoint {
             class: Some(SignatureClassId::of(callee)),
@@ -100,7 +111,7 @@ pub(crate) fn plans(
                 .map(super::super::decision::seam::form_of),
         }).unwrap_or(Endpoint { class: None, input: Form::Raw, placed: None, atoms: Vec::new() });
         let site = locate(potential.argument_span).map(|(file, lo, hi)| BridgeSiteKey {
-            owner_class: SignatureClassId::of(potential.caller), caller: potential.caller,
+            owner_class: potential.source.owner_class(), caller: potential.caller,
             callee: potential.callee.as_local().map(BridgeCalleeId::Local)
                 .unwrap_or_else(|| BridgeCalleeId::Foreign(potential.site.callee.path.clone())),
             arm: "sibling-overlap".into(), position: format!("arg{}", potential.site.argument_index),
@@ -112,6 +123,30 @@ pub(crate) fn plans(
 }
 
 impl super::Plan {
+    pub(crate) fn sibling_audit_rows_with_atoms(
+        &self,
+        reverted: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> Vec<super::super::sibling_audit::Row> {
+        let reverted = self.effective_reverted_classes(reverted, atoms);
+        let inputs = self
+            .sibling_receipt_plans
+            .iter()
+            .map(|row| super::super::sibling_audit::Input {
+                site: row.site.clone(),
+                potential: row.potential.clone(),
+                source_evidence: row.evidence.clone(),
+                terminal: TerminalSiteState {
+                    source_form: row.source.form(self, &reverted, atoms),
+                    target_form: row.target.form(self, &reverted, atoms),
+                    source_delivered: row.source.placed.is_some()
+                        && row.source.live(self, &reverted, atoms),
+                },
+            })
+            .collect::<Vec<_>>();
+        super::super::sibling_audit::audit(&inputs)
+    }
+
     pub(crate) fn pending_sibling_receipts(
         &self,
         reverted: &BTreeSet<SignatureClassId>,
@@ -124,6 +159,8 @@ impl super::Plan {
         reverted: &BTreeSet<SignatureClassId>,
         atoms: &BTreeSet<String>,
     ) -> Vec<PendingSite> {
+        let effective_reverted = self.effective_reverted_classes(reverted, atoms);
+        let reverted = &effective_reverted;
         self.sibling_receipt_plans
             .iter()
             .filter(|row| {
@@ -132,6 +169,7 @@ impl super::Plan {
                     SourceBridgeEvidence::WholeSubject
                         | SourceBridgeEvidence::ProjectedReferent { .. }
                         | SourceBridgeEvidence::TypedView { .. }
+                        | SourceBridgeEvidence::NativeReturnExpression { .. }
                 )
             })
             .flat_map(|row| {
@@ -166,6 +204,8 @@ impl super::Plan {
         reverted: &BTreeSet<SignatureClassId>,
         atoms: &BTreeSet<String>,
     ) -> Vec<CoverageGapReceipt> {
+        let effective_reverted = self.effective_reverted_classes(reverted, atoms);
+        let reverted = &effective_reverted;
         self.sibling_receipt_plans
             .iter()
             .flat_map(|row| {

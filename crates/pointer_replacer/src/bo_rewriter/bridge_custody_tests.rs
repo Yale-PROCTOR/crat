@@ -349,6 +349,309 @@ mod matcher {
         })
     }
 
+    fn pending_native_return_expression_consumer_case(fault: &str) -> BridgeCustodyReport {
+        // Consumer-only pinned syntax: this exercises no decision pipeline,
+        // native lifetime proof, alias verdict, solver, or corpus worker.
+        let input = "unsafe fn identity(p: *const i32) -> *const i32 { p } unsafe fn target(r: *const i32, peer: *const i32) {} unsafe fn caller(p: *const i32, peer: *const i32) { target(identity(p), peer); }";
+        let output = "unsafe fn identity<'a>(p: &'a i32) -> &'a i32 { p } unsafe fn target(r: *const i32, peer: *const i32) {} unsafe fn caller(p: &i32, peer: *const i32) { target({ let __crat_outbound_return_3_17: &i32 = (identity(p)); (core::ptr::from_ref(__crat_outbound_return_3_17)) as *const i32 }, peer); }";
+        let original = syntax::inventory_source("native-expression-original.rs", input).unwrap();
+        let emitted = syntax::inventory_source("native-expression-emitted.rs", output).unwrap();
+        let original_calls = original
+            .calls
+            .iter()
+            .filter(|call| call.owner == "caller" && call.callee_path.as_deref() == Some("target"))
+            .collect::<Vec<_>>();
+        let [original_call] = original_calls.as_slice() else { panic!("one original outer call") };
+        let argument = &original_call.arguments[0];
+        assert!(
+            argument.binding.is_none(),
+            "the original source is a native call expression, not a declaration root"
+        );
+        let source_calls = original
+            .calls
+            .iter()
+            .filter(|call| {
+                call.owner == "caller"
+                    && call.span == argument.span
+                    && call.callee_path.as_deref() == Some("identity")
+            })
+            .collect::<Vec<_>>();
+        let [source_call] = source_calls.as_slice() else {
+            panic!("the exact original source call occupies argument zero")
+        };
+        let emitted_calls = emitted
+            .calls
+            .iter()
+            .filter(|call| call.owner == "caller" && call.callee_path.as_deref() == Some("target"))
+            .collect::<Vec<_>>();
+        let [emitted_call] = emitted_calls.as_slice() else { panic!("one emitted outer call") };
+        let emitted_argument = &emitted_call.arguments[0];
+        let temporaries = emitted
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.owner == "caller"
+                    && binding.name == "__crat_outbound_return_3_17"
+                    && emitted_argument.span.lo <= binding.declaration_span.lo
+                    && binding.declaration_span.hi <= emitted_argument.span.hi
+            })
+            .collect::<Vec<_>>();
+        let [temporary] = temporaries.as_slice() else {
+            panic!("one actual temporary inside the selected emitted argument")
+        };
+        assert_eq!(temporary.type_text.as_deref(), Some("&i32"));
+        assert_eq!(temporary.init_text.as_deref(), Some("(identity(p))"));
+        let views = emitted
+            .calls
+            .iter()
+            .filter(|call| {
+                call.owner == "caller"
+                    && call.callee_path.as_deref() == Some("core::ptr::from_ref")
+                    && emitted_argument.span.lo <= call.span.lo
+                    && call.span.hi <= emitted_argument.span.hi
+            })
+            .collect::<Vec<_>>();
+        let [view] = views.as_slice() else {
+            panic!("one exact raw view of the returned temporary")
+        };
+        assert_eq!(
+            view.arguments[0].binding.as_ref().map(|binding| binding.id),
+            Some(temporary.id)
+        );
+        let mut expected = BridgeExpectation {
+            identity: "consumer-only:native-return-expression:arg0".into(),
+            kind: BridgeKind::SiblingOverlapPending,
+            caller: "caller".into(),
+            callee: "target".into(),
+            anchor: SiteAnchor::Argument {
+                span: argument.span,
+                argument_index: 0,
+            },
+            c9_stamp: None,
+            pending_source: Some(PendingSource {
+                binding: None,
+                binding_span: None,
+                shape: PendingSourceShape::NativeReturnExpression {
+                    argument_span: argument.span,
+                    source_call_span: source_call.span,
+                    // Opaque consumer fixture identity; this parser control
+                    // makes no claim about a compiler-assigned definition ID.
+                    source_owner: 1,
+                    source_function: "identity".into(),
+                    source_form: "ref-shared".into(),
+                    source_type: "&i32".into(),
+                    temporary: temporary.name.clone(),
+                    template: "ref-shared-to-raw-const".into(),
+                },
+            }),
+            tier: "T2-pending".into(),
+            waiver_id: Some("c-aliasing-semantics-at-unsafe-bridges/v2-pending".into()),
+        };
+        let altered = match fault {
+            "wrong-temporary" => output.replace("__crat_outbound_return_3_17", "__crat_outbound_return_3_18"),
+            "wrong-source-callee" => output.replace("(identity(p))", "(another(p))"),
+            "missing-view" => output.replace("(core::ptr::from_ref(__crat_outbound_return_3_17)) as *const i32", "core::ptr::null::<i32>()"),
+            "receipt-without-carrier" => output.replace("{ let __crat_outbound_return_3_17: &i32 = (identity(p)); (core::ptr::from_ref(__crat_outbound_return_3_17)) as *const i32 }", "identity(p) as *const i32"),
+            "wrong-native-type" => output.replace("__crat_outbound_return_3_17: &i32", "__crat_outbound_return_3_17: *const i32"),
+            "changed-sibling" => output.replace("}, peer);", "}, p as *const i32);"),
+            "source-rename" => output.replace("identity", "__crat_safe_identity"),
+            _ => output.to_owned(),
+        };
+        if fault == "wrong-source-descriptor"
+            && let Some(PendingSource {
+                shape:
+                    PendingSourceShape::NativeReturnExpression {
+                        source_function, ..
+                    },
+                ..
+            }) = &mut expected.pending_source
+        {
+            *source_function = "target".into();
+        }
+        let context = if fault == "source-rename" {
+            BridgeCustodyContext {
+                owner_renames: vec![OwnerRename {
+                    original_owner: "identity".into(),
+                    emitted_owner: "__crat_safe_identity".into(),
+                    evidence: "consumer-only:explicit-native-source-rename".into(),
+                }],
+                callee_renames: vec![CalleeRename {
+                    original_caller: "caller".into(),
+                    original_callee_text: "identity".into(),
+                    emitted_callee_text: "__crat_safe_identity".into(),
+                    evidence: "consumer-only:explicit-native-call-rename".into(),
+                }],
+                ..Default::default()
+            }
+        } else {
+            BridgeCustodyContext::default()
+        };
+        let emitted = syntax::inventory_source("native-expression-control.rs", &altered).unwrap();
+        let report = compare(BridgeCustodyInput {
+            original: &original,
+            emitted: &emitted,
+            original_source: input,
+            emitted_source: &altered,
+            expectations: &[expected],
+            context: &context,
+        });
+        println!("R236 native-expression parser consumer control {fault}: {report:#?}");
+        report
+    }
+
+    #[test]
+    fn r236_pending_native_return_expression_parser_consumer_control() {
+        let report = pending_native_return_expression_consumer_case("none");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::WaivedPending,
+            "the selected native-result temporary/raw view must have custody without an invented declaration source: {report:#?}"
+        );
+        assert!(report.data && report.tree_only.is_empty(), "{report:#?}");
+    }
+
+    #[test]
+    fn r236_pending_native_return_expression_parser_consumer_faults() {
+        for fault in [
+            "wrong-temporary",
+            "wrong-source-callee",
+            "wrong-source-descriptor",
+            "missing-view",
+            "receipt-without-carrier",
+            "wrong-native-type",
+            "changed-sibling",
+        ] {
+            let report = pending_native_return_expression_consumer_case(fault);
+            assert!(
+                !report.data && report.rows[0].status != ReceiptStatus::WaivedPending,
+                "consumer-only native carrier fault {fault} must be rejected: {report:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r236_pending_native_return_expression_parser_consumer_source_rename() {
+        let report = pending_native_return_expression_consumer_case("source-rename");
+        assert!(
+            report.data && report.rows[0].status == ReceiptStatus::WaivedPending,
+            "consumer-only explicit source-function/call rename receipts preserve custody: {report:#?}"
+        );
+    }
+
+    fn native_slice_source_consumer_case(fault: &str) -> BridgeCustodyReport {
+        // Consumer-only version of the banked target(p) ->
+        // target(from_raw_parts_mut(p, FALLBACK_SLICE_EXTENT)) shape.
+        // The length waiver and native proof come from production receipts;
+        // this parser control creates neither of those facts.
+        let input = "unsafe fn raw_pair(q: *const i32, dst: *mut i32) -> i32 { dst.write(8); q.read() } unsafe fn target(p: *mut i32) -> *mut i32 { *p.offset(1) += 1; p } unsafe fn caller(p: *mut i32) -> i32 { raw_pair(target(p), p) }";
+        let output = "unsafe fn raw_pair(q: *const i32, dst: *mut i32) -> i32 { dst.write(8); q.read() } unsafe fn target<'a>(p: &'a mut [i32]) -> &'a mut [i32] { p[1] += 1; p } unsafe fn caller(p: *mut i32) -> i32 { raw_pair({ let __crat_outbound_return_5_7: &mut [i32] = (target(core::slice::from_raw_parts_mut(p, crate::FALLBACK_SLICE_EXTENT))); (__crat_outbound_return_5_7.as_ptr()) as *const i32 }, p) } const FALLBACK_SLICE_EXTENT: usize = 1024;";
+        let output = match fault {
+            "wrong-operand" => {
+                output.replace("from_raw_parts_mut(p,", "from_raw_parts_mut(p.add(1),")
+            }
+            "wrong-constructor" => output.replace(
+                "core::slice::from_raw_parts_mut",
+                "custom::from_raw_parts_mut",
+            ),
+            "wrong-mutability" => output.replace("from_raw_parts_mut", "from_raw_parts"),
+            "wrong-arity" => output.replace(
+                "p, crate::FALLBACK_SLICE_EXTENT",
+                "p, crate::FALLBACK_SLICE_EXTENT, 0",
+            ),
+            "wrong-extent" => output.replace("p, crate::FALLBACK_SLICE_EXTENT", "p, 0"),
+            "wrong-element-type" => output.replace("p: &'a mut [i32]", "p: &'a mut [u32]"),
+            _ => output.to_owned(),
+        };
+        let original = syntax::inventory_source("native-slice-source-original.rs", input).unwrap();
+        let emitted = syntax::inventory_source("native-slice-source-emitted.rs", &output).unwrap();
+        let outer = original
+            .calls
+            .iter()
+            .filter(|call| {
+                call.owner == "caller" && call.callee_path.as_deref() == Some("raw_pair")
+            })
+            .collect::<Vec<_>>();
+        let [outer] = outer.as_slice() else { panic!("one original raw sink") };
+        let argument = &outer.arguments[0];
+        assert_eq!(argument.text, "target(p)");
+        assert!(argument.binding.is_none());
+        let source = original
+            .calls
+            .iter()
+            .filter(|call| {
+                call.owner == "caller"
+                    && call.span == argument.span
+                    && call.callee_path.as_deref() == Some("target")
+            })
+            .collect::<Vec<_>>();
+        let [source] = source.as_slice() else { panic!("one original native source call") };
+        assert_eq!(source.arguments[0].text, "p");
+        let expected = BridgeExpectation {
+            identity: "consumer-only:native-slice-source-adapter:arg0".into(),
+            kind: BridgeKind::SiblingOverlapPending,
+            caller: "caller".into(),
+            callee: "raw_pair".into(),
+            anchor: SiteAnchor::Argument {
+                span: argument.span,
+                argument_index: 0,
+            },
+            c9_stamp: None,
+            pending_source: Some(PendingSource {
+                binding: None,
+                binding_span: None,
+                shape: PendingSourceShape::NativeReturnExpression {
+                    argument_span: argument.span,
+                    source_call_span: source.span,
+                    source_owner: 4,
+                    source_function: "target".into(),
+                    source_form: "slice-mut".into(),
+                    source_type: "&mut [i32]".into(),
+                    temporary: "__crat_outbound_return_5_7".into(),
+                    template: "slice-to-raw-const".into(),
+                },
+            }),
+            tier: "T2-pending".into(),
+            waiver_id: Some("c-aliasing-semantics-at-unsafe-bridges/v2-pending".into()),
+        };
+        let report = compare(BridgeCustodyInput {
+            original: &original,
+            emitted: &emitted,
+            original_source: input,
+            emitted_source: &output,
+            expectations: &[expected],
+            context: &BridgeCustodyContext::default(),
+        });
+        println!("R236 native source-call slice adapter consumer control {fault}: {report:#?}");
+        report
+    }
+
+    #[test]
+    fn r236_pending_native_slice_source_adapter_parser_consumer_control() {
+        let report = native_slice_source_consumer_case("none");
+        assert!(
+            report.data && report.rows[0].status == ReceiptStatus::WaivedPending,
+            "the banked inner source-call slice adapter preserves operand custody: {report:#?}"
+        );
+    }
+
+    #[test]
+    fn r236_pending_native_slice_source_adapter_parser_consumer_faults() {
+        for fault in [
+            "wrong-operand",
+            "wrong-constructor",
+            "wrong-mutability",
+            "wrong-arity",
+            "wrong-extent",
+            "wrong-element-type",
+        ] {
+            let report = native_slice_source_consumer_case(fault);
+            assert!(
+                !report.data && report.rows[0].status != ReceiptStatus::WaivedPending,
+                "consumer-only native source adapter fault {fault} must be rejected: {report:#?}"
+            );
+        }
+    }
+
     #[test]
     fn bridge_custody_match_links_the_site_stamped_raw_view_and_its_call_use() {
         let report = check(&raw_output(), &[expectation(BridgeKind::PairT2RawView)]);
@@ -774,8 +1077,8 @@ let mut value = 1; let holder = Holder { data: &mut value, scalar: 2 }; caller(&
             argument_index: 1,
         };
         pending.pending_source = (fault != "missing-metadata").then(|| PendingSource {
-            binding: "holder".into(),
-            binding_span: binding.binding_span,
+            binding: Some("holder".into()),
+            binding_span: Some(binding.binding_span),
             shape: PendingSourceShape::ProjectedReferent,
         });
         compare(BridgeCustodyInput {

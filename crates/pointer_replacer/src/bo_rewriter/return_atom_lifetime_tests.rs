@@ -10,7 +10,9 @@ use rustc_session::parse::ParseSess;
 use rustc_span::edition::Edition;
 
 use super::{
-    bridge_receipt::{BridgeReceiptStage, BridgeReceiptState, BridgeRetentionTier, SignatureClassId},
+    bridge_receipt::{
+        BridgeReceiptStage, BridgeReceiptState, BridgeRetentionTier, SignatureClassId,
+    },
     decision::{Decision, lifetime::FnSignatureSlot},
     delivery_custody::{TypeShape, inventory_source},
 };
@@ -29,29 +31,48 @@ const INPUT: &str = "#![allow(dead_code, unused_unsafe)]\n\
 fn choose_return(source: &str) -> (bool, String) {
     rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
         let session = ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
-        let krate = super::slice_use_inventory_tests::parse_crate(&session, "return-atom.rs", source)
-            .expect("actual emitted signature parses");
-        let functions = krate.items.iter().filter_map(|item| {
-            let ast::ItemKind::Fn(function) = &item.kind else { return None };
-            (function.ident.name.as_str() == "choose").then_some(function)
-        }).collect::<Vec<_>>();
+        let krate =
+            super::slice_use_inventory_tests::parse_crate(&session, "return-atom.rs", source)
+                .expect("actual emitted signature parses");
+        let functions = krate
+            .items
+            .iter()
+            .filter_map(|item| {
+                let ast::ItemKind::Fn(function) = &item.kind else { return None };
+                (function.ident.name.as_str() == "choose").then_some(function)
+            })
+            .collect::<Vec<_>>();
         let [function] = functions.as_slice() else { panic!("one actual choose definition") };
-        let ast::FnRetTy::Ty(output) = &function.sig.decl.output else { panic!("explicit choose return") };
+        let ast::FnRetTy::Ty(output) = &function.sig.decl.output else {
+            panic!("explicit choose return")
+        };
         let mut ty = &**output;
-        while let ast::TyKind::Paren(inner) = &ty.kind { ty = inner; }
-        (matches!(ty.kind, ast::TyKind::Ref(..)), pprust::ty_to_string(output))
+        while let ast::TyKind::Paren(inner) = &ty.kind {
+            ty = inner;
+        }
+        (
+            matches!(ty.kind, ast::TyKind::Ref(..)),
+            pprust::ty_to_string(output),
+        )
     })
 }
 
 fn require_parameter(source: &str, owner: &str, binding: &str, raw: bool) {
-    let declarations = inventory_source("return-atom-parameters.rs", source).expect("actual declaration inventory");
-    let matching = declarations.iter().filter(|row| row.owner == owner && row.binding == binding
-        && row.parameter_index == Some(1)).collect::<Vec<_>>();
+    let declarations = inventory_source("return-atom-parameters.rs", source)
+        .expect("actual declaration inventory");
+    let matching = declarations
+        .iter()
+        .filter(|row| {
+            row.owner == owner && row.binding == binding && row.parameter_index == Some(1)
+        })
+        .collect::<Vec<_>>();
     let [declaration] = matching.as_slice() else { panic!("one {owner}::{binding} parameter") };
-    assert!(matches!(&declaration.type_shape,
+    assert!(
+        matches!(&declaration.type_shape,
         TypeShape::RawPointer { mutable: false, .. } if raw)
-        || matches!(&declaration.type_shape, TypeShape::Reference { mutable: false, .. } if !raw),
-        "actual {owner}::{binding} declaration: {declaration:?}");
+            || matches!(&declaration.type_shape, TypeShape::Reference { mutable: false, .. } if !raw),
+        "actual {owner}::{binding} declaration: {declaration:?}"
+    );
 }
 
 #[test]
@@ -142,7 +163,60 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
                 files.into_values().next().unwrap()
             };
             let baseline = render(&BTreeSet::new());
-            let atom_output = render(&atoms);
+            // Exercise the production round boundary, including normalization
+            // before its revert-all check. The legacy AST-only None-plan path
+            // has a smaller dependency inventory and is not this control.
+            let (atom_files, atom_rollbacks, _, _) = super::round_files(tcx, &capture,
+                &emission.plan, &emission.texts, &held, &atoms,
+                emission.plan.root_file.as_ref(), &table).expect("production atom round render");
+            assert!(atom_rollbacks.is_empty(), "atom recovery has no unowned/residual rollback");
+            assert_eq!(atom_files.len(), 1);
+            let atom_output = atom_files.into_values().next().unwrap();
+
+            let original_files = std::collections::BTreeMap::from([(file.clone(), INPUT.to_owned())]);
+            let mut artifacts = super::RawBoundaryArtifacts {
+                bridge_custody_export: super::bridge_custody_export::capture(
+                    tcx, &capture, &table, &emission.plan, &original_files),
+                ..Default::default()
+            };
+            super::refresh_raw_boundary_receipt_events(&mut artifacts, &emission.plan,
+                &held, &BTreeSet::new());
+            let baseline_unsafe = artifacts.unsafe_context_events.iter().filter(|event|
+                event.site == return_key && event.stage == BridgeReceiptStage::Terminal).collect::<Vec<_>>();
+            let [unsafe_return] = baseline_unsafe.as_slice() else { panic!("real return unsafe-context receipt") };
+            assert_eq!(unsafe_return.state, BridgeReceiptState::Applied);
+            assert!(artifacts.bridge_events.iter().any(|event| event.site == return_key
+                && event.stage == BridgeReceiptStage::Terminal && event.state == BridgeReceiptState::Applied));
+            // Pass the original held set, so refresh itself must apply the
+            // atom-to-return-owner closure for every receipt family it owns.
+            super::refresh_raw_boundary_receipt_events(&mut artifacts, &emission.plan, &held, &atoms);
+            let refreshed_return = artifacts.bridge_events.iter().filter(|event|
+                event.site == return_key && event.stage == BridgeReceiptStage::Terminal).collect::<Vec<_>>();
+            let [refreshed_return] = refreshed_return.as_slice() else { panic!("same exact refreshed return receipt") };
+            assert_eq!(refreshed_return.state, BridgeReceiptState::Dropped);
+            assert_eq!(refreshed_return.drop_reason.as_deref(), Some("return-origin-atom-reverted"));
+            let refreshed_unsafe = artifacts.unsafe_context_events.iter().filter(|event|
+                event.site == return_key && event.stage == BridgeReceiptStage::Terminal).collect::<Vec<_>>();
+            let [refreshed_unsafe] = refreshed_unsafe.as_slice() else { panic!("same exact refreshed unsafe-context receipt") };
+            assert_eq!(refreshed_unsafe.state, BridgeReceiptState::Dropped);
+            let independent_refreshed = artifacts.bridge_events.iter().filter(|event|
+                event.site.owner_class == other && event.stage == BridgeReceiptStage::Terminal).collect::<Vec<_>>();
+            assert!(!independent_refreshed.is_empty());
+            assert!(independent_refreshed.iter().all(|event| event.state == BridgeReceiptState::Applied));
+
+            let effective = emission.plan.effective_reverted_classes(&held, &atoms);
+            let paths = emission.plan.class_finalization.classes.keys().map(|owner|
+                (*owner, tcx.def_path_str(owner.local_def_id().to_def_id()))).collect();
+            artifacts.final_reverts = super::render_raw_boundary_final_reverts(&effective, &atoms, &paths);
+            let rows = artifacts.final_reverts.lines().skip(1)
+                .map(|line| line.split('\t').collect::<Vec<_>>()).collect::<Vec<_>>();
+            let choose_name = tcx.def_path_str(subject.fn_did.to_def_id());
+            let independent_name = tcx.def_path_str(independent.fn_did.to_def_id());
+            assert_eq!(rows.iter().filter(|row| row.as_slice() == ["function", choose_name.as_str(),
+                format!("local-def-index:{}", owner.order_key()).as_str()]).count(), 1);
+            assert_eq!(rows.iter().filter(|row| row.as_slice() == ["atom", atom.as_str(), "-"]).count(), 1);
+            assert!(!rows.iter().any(|row| row.first() == Some(&"function") && row.get(1) == Some(&independent_name.as_str())));
+            println!("J17/J18 refreshed common/unsafe receipts and final reverts:\n{}", artifacts.final_reverts);
             let events = emission.plan.bridge_events_with_atoms(&held, &atoms);
             let terminal_state = |key: &super::bridge_receipt::BridgeSiteKey| {
                 let matching = events.iter().filter(|event| &event.site == key
@@ -161,14 +235,29 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
     let baseline_checks = super::verify::type_checks_str(&baseline);
     let atom_checks = super::verify::type_checks_str(&atom_output);
     println!("J17/J18 outside-callback typechecks: baseline={baseline_checks}, atom={atom_checks}");
-    assert!(baseline_checks && atom_checks, "actual emitted trees must type/borrow-check");
+    assert!(
+        baseline_checks && atom_checks,
+        "actual emitted trees must type/borrow-check"
+    );
     require_parameter(&baseline, "choose", "p", false);
     require_parameter(&atom_output, "choose", "p", true);
     require_parameter(&atom_output, "independent", "q", false);
-    assert!(choose_return(&baseline).0, "baseline actually delivered a reference return");
-    assert_eq!(strlen_state, BridgeReceiptState::Dropped, "the selected source atom must actually drop its T1 receipt");
-    assert!(independent_applied, "the independent real class remains Applied");
+    assert!(
+        choose_return(&baseline).0,
+        "baseline actually delivered a reference return"
+    );
+    assert_eq!(
+        strlen_state,
+        BridgeReceiptState::Dropped,
+        "the selected source atom must actually drop its T1 receipt"
+    );
+    assert!(
+        independent_applied,
+        "the independent real class remains Applied"
+    );
     let (borrowed_return, return_text) = choose_return(&atom_output);
-    assert!(!borrowed_return && return_state == BridgeReceiptState::Dropped,
-        "a raw sole origin cannot retain a generated reference return or Applied return receipt: return={return_text}, state={return_state:?}\n{atom_output}");
+    assert!(
+        !borrowed_return && return_state == BridgeReceiptState::Dropped,
+        "a raw sole origin cannot retain a generated reference return or Applied return receipt: return={return_text}, state={return_state:?}\n{atom_output}"
+    );
 }

@@ -156,11 +156,11 @@ fn confirm(case: &Case) -> Value {
             report["coverage"] = json!(table.sibling_overlap_inventory.coverage.iter().map(|coverage| {
                 let potential = &coverage.potential;
                 let source_form = super::terminal_subject_form(&table, &emission.plan.class_finalization,
-                    (potential.source.fn_did, potential.source.hir_id));
+                    (potential.source.caller(), potential.source.hir_id()));
                 let target_form = potential.callee.as_local().map_or(Form::Raw, |callee|
                     super::terminal_parameter_form(&table, &emission.plan.class_finalization,
                         callee, potential.site.argument_index));
-                json!({ "site": super::decision::raw_boundary::site_atom_id(&potential.site), "source": potential.source.label,
+                json!({ "site": super::decision::raw_boundary::site_atom_id(&potential.site), "source": potential.source.label(),
                     "callee": tcx.def_path_str(potential.callee), "argument_index": potential.site.argument_index,
                     "input_argument": tcx.sess.source_map().span_to_snippet(potential.argument_span).ok(),
                     "source_evidence": format!("{:?}", coverage.evidence),
@@ -172,7 +172,7 @@ fn confirm(case: &Case) -> Value {
             let pending = emission.plan.pending_sibling_receipts(&held);
             report["pending_count"] = json!(pending.len());
             report["pending"] = json!(pending.iter().map(|row| json!({
-                "site": format!("{:?}", row.site), "source": row.receipt.potential.source.label,
+                "site": format!("{:?}", row.site), "source": row.receipt.potential.source.label(),
                 "callee": tcx.def_path_str(row.receipt.potential.callee),
                 "argument_index": row.receipt.potential.site.argument_index,
                 "input_argument": tcx.sess.source_map().span_to_snippet(row.receipt.potential.argument_span).ok(),

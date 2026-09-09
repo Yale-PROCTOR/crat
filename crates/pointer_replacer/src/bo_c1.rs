@@ -494,8 +494,7 @@ fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Pat
         }
         let manifest = std::fs::read_to_string(directory.join("SHA256SUMS"))
             .map_err(|error| format!("bridge-custody:retained-manifest:{error}"))?;
-        let read = |suffix: &str| -> Result<Vec<u8>, String> {
-            let name = format!("{}.raw-boundary-{suffix}", frame.program);
+        let read_name = |name: String| -> Result<Vec<u8>, String> {
             let entries = manifest
                 .lines()
                 .filter_map(|line| line.split_once("  "))
@@ -511,6 +510,7 @@ fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Pat
             }
             Ok(bytes)
         };
+        let read = |suffix: &str| read_name(format!("{}.raw-boundary-{suffix}", frame.program));
         let expected_stamp = serde_json::to_value(&frame).map_err(|error| error.to_string())?;
         let mut sidecars = BTreeMap::new();
         for suffix in [
@@ -519,6 +519,8 @@ fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Pat
             "bridge-expectations",
             "pending-sibling-overlap",
             "sibling-coverage-gaps",
+            "sibling-predicate-audit",
+            "outbound-return-custody",
             "delivery-custody",
             "delivery-expectations",
             "delivery-declarations",
@@ -543,6 +545,65 @@ fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Pat
         let packet = &sidecars["bridge-replay"];
         let retained: RetainedReplay = serde_json::from_value(packet["replay"].clone())
             .map_err(|error| format!("bridge-custody:retained-replay-json:{error}"))?;
+        let audit: Option<crate::bo_rewriter::bridge_custody_export::SiblingAuditCapture> =
+            serde_json::from_value(
+                sidecars["sibling-predicate-audit"]
+                    .get("audit")
+                    .cloned()
+                    .ok_or("sibling-audit:retained-sidecar-missing-capture")?,
+            )
+            .map_err(|error| format!("sibling-audit:retained-sidecar-json:{error}"))?;
+        if audit.is_none() {
+            return Err("sibling-audit:retained-sidecar-missing-capture".into());
+        }
+        if audit != retained.export.sibling_audit {
+            return Err("sibling-audit:retained-sidecar-mismatch".into());
+        }
+        let outbound: Option<crate::bo_rewriter::outbound_return_transport::Capture> =
+            serde_json::from_value(
+                sidecars["outbound-return-custody"]
+                    .get("capture")
+                    .cloned()
+                    .ok_or("outbound-return-transport:sidecar-no-capture")?,
+            )
+            .map_err(|error| format!("outbound-return-transport:sidecar-json:{error}"))?;
+        let normalization_roots: Vec<String> = serde_json::from_value(
+            sidecars["outbound-return-custody"]
+                .get("normalization_roots")
+                .cloned()
+                .ok_or("outbound-return-transport:sidecar-no-roots")?,
+        )
+        .map_err(|error| format!("outbound-return-transport:sidecar-roots:{error}"))?;
+        let tsv = read_name(format!(
+            "{}.{}",
+            frame.program,
+            raw_schema::OUTBOUND_RETURN_BRIDGE_ROWS
+        ))?;
+        let tsv = std::str::from_utf8(&tsv)
+            .map_err(|error| format!("outbound-return-transport:sidecar-utf8:{error}"))?;
+        let mut outbound_frame = BTreeMap::from([("corpus".to_owned(), "rs-crown".to_owned())]);
+        for key in [
+            "program",
+            "analysis_frame",
+            "code_frame",
+            "cache_manifest_sha256",
+            "launch_env_sha256",
+        ] {
+            outbound_frame.insert(
+                key.to_owned(),
+                expected_stamp[key]
+                    .as_str()
+                    .ok_or("outbound-return-transport:frame-type")?
+                    .to_owned(),
+            );
+        }
+        crate::bo_rewriter::outbound_return_transport::validate_sidecars(
+            retained.export.outbound_return.as_ref(),
+            outbound.as_ref(),
+            Some(tsv),
+            &outbound_frame,
+            &normalization_roots,
+        )?;
         if row.get(raw_schema::OUTCOME_KIND)
             != Some(if retained.emitted_outcome {
                 "emitted"
@@ -672,6 +733,39 @@ fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Pat
             return Err("bridge-custody:retained-ledger-key-map".into());
         }
         let receipts = read_table("bridge-receipts.tsv")?;
+        let receiver_keys = receipts
+            .iter()
+            .filter(|record| {
+                record.get("stage").map(String::as_str) == Some("terminal")
+                    && record.get("state").map(String::as_str) == Some("applied")
+                    && record.get("bridge_kind").is_some_and(|kind| {
+                        crate::bo_rewriter::mechanical_receipt::is_return_receipt_kind(kind)
+                    })
+            })
+            .map(|record| {
+                record
+                    .get("site_key")
+                    .cloned()
+                    .ok_or("outbound-return-transport:retained-bridge-missing-key")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_receivers = retained
+            .export
+            .outbound_return_bridge_keys
+            .as_ref()
+            .ok_or("outbound-return-transport:missing-outer-bridge-inventory")?
+            .iter()
+            .map(|key| {
+                normalization_roots
+                    .iter()
+                    .fold(key.clone(), |key, root| key.replace(root, "<program>"))
+            })
+            .collect::<BTreeSet<_>>();
+        if receiver_keys.iter().collect::<BTreeSet<_>>().len() != receiver_keys.len()
+            || receiver_keys.into_iter().collect::<BTreeSet<_>>() != expected_receivers
+        {
+            return Err("outbound-return-transport:retained-native-bridge-mismatch".into());
+        }
         let active = receipts
             .iter()
             .filter(|record| {
@@ -721,6 +815,12 @@ fn r231_checkpoint_sidecars_validation_failure_cannot_leave_success() {
             }),
         ),
         (
+            "sibling-predicate-audit".into(),
+            serde_json::json!({
+                "stamp": {"data": "provisional"}, "audit": {"expected_coverage_ids": [], "rows": []}
+            }),
+        ),
+        (
             "pending".into(),
             serde_json::json!({
                 "stamp": {"data": "provisional"}, "classification": "WAIVED"
@@ -754,6 +854,12 @@ fn r231_checkpoint_sidecars_late_write_error_revokes_earlier_success() {
             "bridge-custody".into(),
             serde_json::json!({
                 "stamp": {"data": "provisional"}, "comparison": {"data": true, "issues": []}
+            }),
+        ),
+        (
+            "sibling-predicate-audit".into(),
+            serde_json::json!({
+                "stamp": {"data": "provisional"}, "audit": {"expected_coverage_ids": [], "rows": []}
             }),
         ),
         (
@@ -791,12 +897,20 @@ fn r231_checkpoint_sidecars_late_write_error_revokes_earlier_success() {
 
 #[test]
 fn r231_checkpoint_sidecars_success_preserves_final_status() {
-    let mut payloads = vec![(
-        "bridge-custody".into(),
-        serde_json::json!({
-            "stamp": {"data": "provisional"}, "comparison": {"data": true, "issues": []}
-        }),
-    )];
+    let mut payloads = vec![
+        (
+            "bridge-custody".into(),
+            serde_json::json!({
+                "stamp": {"data": "provisional"}, "comparison": {"data": true, "issues": []}
+            }),
+        ),
+        (
+            "sibling-predicate-audit".into(),
+            serde_json::json!({
+                "stamp": {"data": "provisional"}, "audit": {"expected_coverage_ids": [], "rows": []}
+            }),
+        ),
+    ];
     let expected = payloads.clone();
     let mut issues = Vec::new();
     raw_boundary_publish_custody_sidecars(&mut payloads, &mut issues, |_, _| Ok(()));
@@ -11335,6 +11449,15 @@ mod run {
             &artifact.mechanical_events,
         )
         .expect("declaration-shape receipt reconciliation");
+        let outbound_return_issue = artifact.outbound_return_error.clone().or_else(|| {
+            crate::bo_rewriter::mechanical_receipt::reconcile_outbound_return_rows(
+                &artifact.outbound_return_required,
+                &artifact.outbound_return_rows,
+                &artifact.mechanical_events,
+                &artifact.bridge_events,
+            )
+            .err()
+        });
         let mechanical_receipts =
             crate::bo_rewriter::mechanical_receipt::render_mechanical_obligations(
                 &artifact.mechanical_events,
@@ -11356,6 +11479,10 @@ mod run {
         let declaration_receipts =
             crate::bo_rewriter::mechanical_receipt::render_declaration_shape_rows(
                 &artifact.declaration_rows,
+            );
+        let outbound_return_receipts =
+            crate::bo_rewriter::mechanical_receipt::render_outbound_return_rows(
+                &artifact.outbound_return_rows,
             );
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
@@ -11428,6 +11555,14 @@ mod run {
             stamp(&declaration_receipts),
         )
         .expect("write declaration-shape receipts");
+        std::fs::write(
+            directory.join(format!(
+                "{name}.{}",
+                raw_schema::OUTBOUND_RETURN_BRIDGE_ROWS
+            )),
+            stamp(&outbound_return_receipts),
+        )
+        .expect("write outbound-return receipts");
         let mut diagnostics = String::from(RAW_BOUNDARY_DIAGNOSTIC_HEADER);
         for diagnostic in &capture.reverts {
             diagnostics.push_str(&format!(
@@ -11579,6 +11714,40 @@ mod run {
             bridge_sources.as_ref(),
             capture.outcome_kind,
         );
+        // Expected IDs remain independently captured from the decision table;
+        // sidecar rows come from the artifact's Plan-produced row transport.
+        let sibling_audit_payload =
+            artifact
+                .bridge_custody_export
+                .sibling_audit
+                .as_ref()
+                .map(
+                    |audit| crate::bo_rewriter::bridge_custody_export::SiblingAuditCapture {
+                        expected_coverage_ids: audit.expected_coverage_ids.clone(),
+                        rows: artifact.sibling_audit_rows.clone(),
+                    },
+                );
+        if sibling_audit_payload != artifact.bridge_custody_export.sibling_audit {
+            bridge_custody.data = false;
+            bridge_custody
+                .issues
+                .push("sibling-audit:artifact-row-transport-mismatch".into());
+        }
+        let outbound_return_payload =
+            crate::bo_rewriter::outbound_return_transport::capture(artifact);
+        if artifact.bridge_custody_export.outbound_return.as_ref() != Some(&outbound_return_payload)
+        {
+            bridge_custody.data = false;
+            bridge_custody
+                .issues
+                .push("outbound-return-transport:artifact-packet-mismatch".into());
+        }
+        if let Some(reason) = outbound_return_issue {
+            bridge_custody.data = false;
+            bridge_custody
+                .issues
+                .push(format!("outbound-return-transport:{reason}"));
+        }
         let custody_data = if custody.issues.is_empty() && bridge_custody.data {
             data
         } else {
@@ -11684,6 +11853,15 @@ mod run {
                 serde_json::json!({"stamp": &custody_stamp,
                     "count": artifact.bridge_custody_export.coverage_gap_records.len(),
                     "typed_records": &artifact.bridge_custody_export.coverage_gap_records}),
+            ),
+            (
+                "sibling-predicate-audit",
+                serde_json::json!({"stamp": &custody_stamp, "audit": &sibling_audit_payload}),
+            ),
+            (
+                "outbound-return-custody",
+                serde_json::json!({"stamp": &custody_stamp, "capture": &outbound_return_payload,
+                    "normalization_roots": &roots}),
             ),
             (
                 "pending-sibling-overlap-tsv",

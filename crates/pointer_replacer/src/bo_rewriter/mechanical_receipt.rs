@@ -4,9 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_hir::def_id::{DefId, LocalDefId};
 
-use super::bridge_receipt::{
-    BridgeReceiptStage, BridgeReceiptState, BridgeSiteKey, RAW_BOUNDARY_T2_WAIVER_ID,
-    SignatureClassId,
+use super::{
+    bridge_receipt::{
+        BridgeCalleeId, BridgeExtentKind, BridgeReceiptEvent, BridgeReceiptStage,
+        BridgeReceiptState, BridgeRetentionTier, BridgeSiteKey, RAW_BOUNDARY_T2_WAIVER_ID,
+        SignatureClassId, reconcile_bridge_events,
+    },
+    decision::raw_boundary::RetentionVerdict,
 };
 use crate::raw_boundary_census_schema as raw_schema;
 
@@ -139,9 +143,11 @@ pub(crate) enum CanonicalCallee {
 }
 
 impl CanonicalCallee {
-    fn receipt_key(&self) -> String {
+    pub(crate) fn receipt_key(&self) -> String {
         match self {
-            Self::Local(did) => format!("def-id:{did:?}"),
+            // DefId's Debug adds a context-dependent path while TyCtxt is
+            // installed. Receipt identity must survive that callback ending.
+            Self::Local(did) => format!("def-id:{}:{}", did.krate.as_u32(), did.index.as_u32()),
             Self::Foreign(symbol) => format!("foreign:{symbol}"),
             Self::Generated { owner, key } => {
                 format!("generated:{}:{key}", owner.local_def_index.as_u32())
@@ -1611,7 +1617,8 @@ pub(crate) fn reconcile_slice_use_rows(
                         "prior-family-rendering:SliceConstruction"
                         | "prior-family-rendering:SliceUse"
                         | "prior-family-rendering:Option"
-                        | "prior-family-rendering:Declaration")
+                        | "prior-family-rendering:Declaration"
+                        | "prior-family-rendering:Return")
                     && matches!(row.candidate_form.as_str(),
                         "slice-shared" | "slice-mut" | "opt-slice-shared" | "opt-slice-mut")
             });
@@ -1982,9 +1989,17 @@ pub(crate) fn render_declaration_shape_rows(rows: &[DeclarationShapeReceiptRow])
     output
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NativeReturnEvidence {
+    pub(crate) owner: u32,
+    pub(crate) lifetime: String,
+    pub(crate) plan_digest: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OutboundReturnBridgeReceiptRow {
     pub(crate) terminal: SpecializedReceiptTerminal,
+    pub(crate) associated_bridge: BridgeSiteKey,
     pub(crate) boundary_kind: String,
     pub(crate) endpoint: CanonicalCallee,
     pub(crate) position: String,
@@ -1993,10 +2008,512 @@ pub(crate) struct OutboundReturnBridgeReceiptRow {
     pub(crate) adapter: String,
     pub(crate) negative_write: NegativeWriteEvidence,
     pub(crate) retention: MechanicalRetention,
-    pub(crate) lifetime_origin: Option<MechanicalSubjectKey>,
+    pub(crate) retention_evidence: Option<RetentionVerdict>,
+    pub(crate) native_lifetime: Option<NativeReturnEvidence>,
+    pub(crate) lifetime_origin: Vec<MechanicalSubjectKey>,
     pub(crate) pair_role: String,
     pub(crate) effect_carrier: Option<CanonicalSiteKey>,
     pub(crate) terminal_interface: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutboundReturnRequirement {
+    pub(crate) key: MechanicalObligationKey,
+    pub(crate) associated_bridge: BridgeSiteKey,
+    pub(crate) adapter: String,
+    pub(crate) retention_evidence: Option<RetentionVerdict>,
+    pub(crate) native_lifetime: Option<NativeReturnEvidence>,
+    pub(crate) lifetime_origin: Vec<MechanicalSubjectKey>,
+    pub(crate) terminal_interface: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutboundReturnReceiptPlan {
+    pub(crate) obligation: MechanicalObligationPlan,
+    pub(crate) associated_bridge: BridgeSiteKey,
+    pub(crate) boundary_kind: String,
+    pub(crate) endpoint: CanonicalCallee,
+    pub(crate) position: String,
+    pub(crate) source_form: String,
+    pub(crate) target_form: String,
+    pub(crate) adapter: String,
+    pub(crate) negative_write: NegativeWriteEvidence,
+    pub(crate) retention: MechanicalRetention,
+    pub(crate) retention_evidence: Option<RetentionVerdict>,
+    pub(crate) native_lifetime: Option<NativeReturnEvidence>,
+    pub(crate) lifetime_origin: Vec<MechanicalSubjectKey>,
+    pub(crate) pair_role: String,
+    pub(crate) effect_carrier: Option<CanonicalSiteKey>,
+    pub(crate) terminal_interface: String,
+}
+
+impl OutboundReturnReceiptPlan {
+    pub(crate) fn materialize(
+        &self,
+        class_live: bool,
+        runtime_reverted: bool,
+    ) -> (
+        [MechanicalObligationEvent; 2],
+        [OutboundReturnBridgeReceiptRow; 2],
+    ) {
+        let events = self.obligation.events(class_live, runtime_reverted);
+        let row = |event: &MechanicalObligationEvent| OutboundReturnBridgeReceiptRow {
+            terminal: SpecializedReceiptTerminal {
+                obligation_key: event.key.clone(),
+                stage: event.stage,
+                state: event.state,
+                reason: event.terminal_reason.clone(),
+            },
+            associated_bridge: self.associated_bridge.clone(),
+            boundary_kind: self.boundary_kind.clone(),
+            endpoint: self.endpoint.clone(),
+            position: self.position.clone(),
+            source_form: self.source_form.clone(),
+            target_form: self.target_form.clone(),
+            adapter: self.adapter.clone(),
+            negative_write: self.negative_write.clone(),
+            retention: self.retention.clone(),
+            retention_evidence: self.retention_evidence.clone(),
+            native_lifetime: self.native_lifetime.clone(),
+            lifetime_origin: self.lifetime_origin.clone(),
+            pair_role: self.pair_role.clone(),
+            effect_carrier: self.effect_carrier.clone(),
+            terminal_interface: self.terminal_interface.clone(),
+        };
+        let rows = [row(&events[0]), row(&events[1])];
+        (events, rows)
+    }
+}
+
+/// J27 selected receiver views and native return expressions. Required
+/// metadata comes independently from the owned selection, so losing both
+/// outputs or corrupting both specialized stages together cannot pass.
+pub(crate) fn reconcile_outbound_return_rows(
+    required: &[OutboundReturnRequirement],
+    rows: &[OutboundReturnBridgeReceiptRow],
+    common: &[MechanicalObligationEvent],
+    bridges: &[BridgeReceiptEvent],
+) -> Result<usize, String> {
+    // Validate before collecting maps: duplicate stages must not be overwritten.
+    reconcile_mechanical_obligations(common)?;
+    let mut required_keys = BTreeMap::new();
+    for requirement in required {
+        let key = &requirement.key;
+        let expression =
+            requirement.associated_bridge.bridge_kind == "outbound-native-return-argument";
+        if key.family
+            != if expression {
+                MechanicalFamily::FlowsIntoRawParam
+            } else {
+                MechanicalFamily::ReturnNotAdapted
+            }
+            || required_keys
+                .insert(key.receipt_key(), requirement)
+                .is_some()
+        {
+            return Err("outbound-return duplicate or unsupported required key".to_owned());
+        }
+    }
+    // The selected common bridge inventory survives loss of both J27 output
+    // families, including the declared requirement vector itself.
+    for bridge in bridges.iter().filter(|bridge| {
+        bridge.stage == BridgeReceiptStage::Terminal
+            && bridge.state == BridgeReceiptState::Applied
+            && is_return_receipt_kind(&bridge.site.bridge_kind)
+    }) {
+        if required
+            .iter()
+            .filter(|requirement| requirement.associated_bridge == bridge.site)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "outbound-return selected bridge lacks unique required obligation:{}",
+                bridge.site.receipt_key()
+            ));
+        }
+    }
+    let mut common_rows = BTreeMap::new();
+    for event in common
+        .iter()
+        .filter(|event| is_outbound_return_family(event.key.family))
+    {
+        let obligation = event.key.receipt_key();
+        if required_keys.get(&obligation).map(|required| &required.key) != Some(&event.key) {
+            return Err(format!("unowned outbound-return common row {obligation}"));
+        }
+        common_rows.insert(format!("{obligation}:{}", event.stage.key()), event);
+    }
+    let associated_events = bridges
+        .iter()
+        .filter(|bridge| rows.iter().any(|row| row.associated_bridge == bridge.site))
+        .cloned()
+        .collect::<Vec<_>>();
+    reconcile_bridge_events(&associated_events)?;
+    let mut specialized = BTreeMap::new();
+    let mut bridge_owners = BTreeMap::new();
+    for row in rows {
+        let obligation = row.terminal.obligation_key.receipt_key();
+        let key = format!("{obligation}:{}", row.terminal.stage.key());
+        if specialized.insert(key.clone(), row).is_some() {
+            return Err(format!("duplicate outbound-return specialized row {key}"));
+        }
+        let requirement = required_keys
+            .get(&obligation)
+            .ok_or_else(|| format!("unowned outbound-return specialized row {key}"))?;
+        if row.terminal.obligation_key != requirement.key
+            || row.associated_bridge != requirement.associated_bridge
+            || row.adapter != requirement.adapter
+            || row.retention_evidence != requirement.retention_evidence
+            || row.native_lifetime != requirement.native_lifetime
+            || row.lifetime_origin != requirement.lifetime_origin
+            || row.terminal_interface != requirement.terminal_interface
+        {
+            return Err(format!(
+                "outbound-return independent requirement metadata drift at {key}"
+            ));
+        }
+        let event = common_rows
+            .get(&key)
+            .ok_or_else(|| format!("unowned outbound-return specialized row {key}"))?;
+        let associated = &row.associated_bridge;
+        let bridge_stage = match row.terminal.stage {
+            MechanicalStage::Plan => BridgeReceiptStage::Plan,
+            MechanicalStage::Terminal => BridgeReceiptStage::Terminal,
+        };
+        let matching = associated_events
+            .iter()
+            .filter(|bridge| bridge.site == *associated && bridge.stage == bridge_stage)
+            .collect::<Vec<_>>();
+        let [bridge] = matching.as_slice() else {
+            return Err(format!(
+                "outbound-return associated bridge count at {key}: {}",
+                matching.len()
+            ));
+        };
+        if let Some(prior) = bridge_owners.insert(associated.receipt_key(), obligation.clone())
+            && prior != obligation
+        {
+            return Err(format!(
+                "outbound-return bridge has multiple obligations at {key}"
+            ));
+        }
+        let BridgeCalleeId::Local(callee) = associated.callee else {
+            return Err(format!(
+                "outbound-return receiver endpoint is not local at {key}"
+            ));
+        };
+        let expected_state = match row.terminal.state {
+            MechanicalState::Planned => BridgeReceiptState::Planned,
+            MechanicalState::Applied => BridgeReceiptState::Applied,
+            MechanicalState::Dropped
+            | MechanicalState::HeldNonmechanical
+            | MechanicalState::Reclassified => {
+                return Err(format!(
+                    "outbound-return receiver state is unsupported at {key}"
+                ));
+            }
+        };
+        if row.terminal.obligation_key != event.key
+            || row.terminal.state != event.state
+            || row.terminal.reason != event.terminal_reason
+            || row.target_form != event.expected_form
+            || row.source_form != event.found_form
+            || row.negative_write != event.evidence.negative_write
+            || row.retention != event.evidence.retention
+            || event.mechanism
+                != if row.boundary_kind == "outbound-native-return-argument" {
+                    MechanicalMechanism::RawParameterView
+                } else {
+                    MechanicalMechanism::ReturnAdapter
+                }
+            || event.evidence.extent != MechanicalExtent::None
+            || event.evidence.terminal_contract
+                != (TerminalContract::Required {
+                    interface: row.terminal_interface.clone(),
+                })
+            || row.source_form.is_empty()
+            || row.adapter.is_empty()
+            || row.adapter == "-"
+            || row.boundary_kind != associated.bridge_kind
+            || row.position != associated.position
+            || row.endpoint != CanonicalCallee::Local(callee.to_def_id())
+            || event.key.site.callee.as_ref() != Some(&row.endpoint)
+            || event.key.owner_class != associated.owner_class
+            || (row.boundary_kind != "outbound-native-return-argument"
+                && associated.owner_class != SignatureClassId::of(callee))
+            || event.key.site.owner != associated.caller
+            || !matches!(event.key.site.location, CanonicalLocation::Hir { owner, .. }
+                if owner == associated.caller)
+            || row.pair_role != "not-applicable"
+            || row.effect_carrier.is_some()
+            || bridge.state != expected_state
+            || bridge.drop_reason.is_some()
+            || bridge.expected_form != row.target_form
+            || bridge.found_form != row.source_form
+            || bridge.argument_kind != event.argument_kind
+            || bridge.extent != BridgeExtentKind::None
+        {
+            return Err(format!(
+                "outbound-return specialized/common/bridge drift at {key}"
+            ));
+        }
+        let null_return = match row.boundary_kind.as_str() {
+            "outbound-native-return-argument" => {
+                let Some(proof) = row.native_lifetime.as_ref() else {
+                    return Err(format!(
+                        "outbound-return argument lifetime evidence missing at {key}"
+                    ));
+                };
+                let Some(index) = event.key.site.argument_index else {
+                    return Err(format!(
+                        "outbound-return argument position missing at {key}"
+                    ));
+                };
+                let CanonicalLocation::Hir {
+                    owner,
+                    item_local_id,
+                } = event.key.site.location
+                else {
+                    return Err(format!(
+                        "outbound-return argument expression missing at {key}"
+                    ));
+                };
+                let retention_valid = match (&row.retention, &row.retention_evidence) {
+                    (MechanicalRetention::T1, Some(RetentionVerdict::NoRetain { certificate })) => {
+                        bridge.retention == BridgeRetentionTier::T1
+                            && bridge.waiver_id.is_none()
+                            && usize::try_from(index).ok() == Some(certificate.argument_index)
+                    }
+                    (
+                        MechanicalRetention::T2 { waiver_id },
+                        Some(RetentionVerdict::Unknown { .. }),
+                    ) => {
+                        bridge.retention == BridgeRetentionTier::T2
+                            && waiver_id == RAW_BOUNDARY_T2_WAIVER_ID
+                            && bridge.waiver_id.as_deref() == Some(RAW_BOUNDARY_T2_WAIVER_ID)
+                    }
+                    _ => false,
+                };
+                if proof.owner != associated.owner_class.order_key()
+                    || proof.lifetime.is_empty()
+                    || proof.plan_digest.is_empty()
+                    || row.terminal_interface != row.source_form
+                    || row.source_form == "raw"
+                    || row.target_form != "raw"
+                    || !retention_valid
+                    || event.key.site.slot_depth != 0
+                    || !matches!(&event.key.subject,
+                        MechanicalSubjectKey::Generated { owner: subject_owner, key: expression, slot_depth: 0 }
+                            if *subject_owner == owner && expression == &format!("outbound-expression:{item_local_id}"))
+                {
+                    return Err(format!(
+                        "outbound-return native argument evidence drift at {key}"
+                    ));
+                }
+                false
+            }
+            "return-caller-receive-raw" => {
+                if row.terminal_interface != row.source_form
+                    || row.source_form == "raw"
+                    || row.target_form != "raw"
+                    || row.native_lifetime.is_some()
+                    || bridge.retention != BridgeRetentionTier::T2
+                    || bridge.waiver_id.as_deref() != Some(RAW_BOUNDARY_T2_WAIVER_ID)
+                    || row.retention
+                        != (MechanicalRetention::T2 {
+                            waiver_id: RAW_BOUNDARY_T2_WAIVER_ID.into(),
+                        })
+                    || !matches!(
+                        row.retention_evidence,
+                        Some(RetentionVerdict::Unknown { .. })
+                    )
+                    || !matches!(event.key.subject, MechanicalSubjectKey::Local { owner, .. }
+                        if owner == associated.caller)
+                {
+                    return Err(format!("outbound-return receiver evidence drift at {key}"));
+                }
+                false
+            }
+            "return-raw-to-ref" | "return-null-to-option" => {
+                let Some(proof) = row.native_lifetime.as_ref() else {
+                    return Err(format!(
+                        "outbound-return native lifetime evidence missing at {key}"
+                    ));
+                };
+                let null = row.boundary_kind == "return-null-to-option";
+                if proof.owner != callee.local_def_index.as_u32()
+                    || proof.lifetime.is_empty()
+                    || proof.plan_digest.is_empty()
+                    || associated.caller != callee
+                    || row.retention_evidence.is_some()
+                    || bridge.waiver_id.is_some()
+                    || row.terminal_interface != row.target_form
+                    || row.target_form.is_empty()
+                    || row.target_form == "raw"
+                {
+                    return Err(format!(
+                        "outbound-return native lifetime evidence drift at {key}"
+                    ));
+                }
+                if null {
+                    let CanonicalLocation::Hir {
+                        owner,
+                        item_local_id,
+                    } = event.key.site.location
+                    else {
+                        return Err(format!(
+                            "outbound-return null expression identity missing at {key}"
+                        ));
+                    };
+                    if row.source_form != "raw"
+                        || row.retention != MechanicalRetention::None
+                        || bridge.retention != BridgeRetentionTier::None
+                        || !row.lifetime_origin.is_empty()
+                        || !matches!(
+                            row.target_form.as_str(),
+                            "opt-ref-mut" | "opt-ref-shared" | "opt-slice-mut" | "opt-slice-shared"
+                        )
+                        || !matches!(&event.key.subject,
+                            MechanicalSubjectKey::Generated { owner: subject_owner, key: expression, slot_depth: 0 }
+                                if *subject_owner == owner && expression == &format!("return-expression:{item_local_id}"))
+                    {
+                        return Err(format!(
+                            "outbound-return native null evidence drift at {key}"
+                        ));
+                    }
+                } else if row.retention != MechanicalRetention::T1
+                    || bridge.retention != BridgeRetentionTier::T1
+                    || !matches!(event.key.subject,
+                        MechanicalSubjectKey::Local { owner, mir_local, slot_depth: 0 }
+                            if owner == callee && mir_local > 0)
+                {
+                    return Err(format!(
+                        "outbound-return native borrowed evidence drift at {key}"
+                    ));
+                }
+                null
+            }
+            _ => {
+                return Err(format!(
+                    "outbound-return unsupported boundary kind at {key}"
+                ));
+            }
+        };
+        let origin_owner = if row.boundary_kind == "outbound-native-return-argument" {
+            associated.owner_class.local_def_id()
+        } else {
+            callee
+        };
+        let mut origins = BTreeSet::new();
+        if (!null_return && row.lifetime_origin.is_empty())
+            || row.lifetime_origin.iter().any(|origin| {
+                !matches!(origin, MechanicalSubjectKey::Local { owner, mir_local, slot_depth }
+                    if *owner == origin_owner && *mir_local > 0 && *slot_depth == 0)
+                    || !origins.insert(origin.receipt_key())
+            })
+        {
+            return Err(format!(
+                "outbound-return missing, duplicate or mismatched source origins at {key}"
+            ));
+        }
+    }
+    for obligation in required_keys.keys() {
+        for stage in [MechanicalStage::Plan, MechanicalStage::Terminal] {
+            let key = format!("{obligation}:{}", stage.key());
+            if !common_rows.contains_key(&key) || !specialized.contains_key(&key) {
+                return Err(format!(
+                    "required outbound-return obligation lacks both receipt outputs at {key}"
+                ));
+            }
+        }
+        let planned = specialized[&format!("{obligation}:plan")];
+        let mut terminal = (*specialized[&format!("{obligation}:terminal")]).clone();
+        terminal.terminal = planned.terminal.clone();
+        if &terminal != planned {
+            return Err(format!(
+                "outbound-return source-origin or other metadata changed between stages at {obligation}"
+            ));
+        }
+    }
+    Ok(required_keys.len())
+}
+
+pub(crate) fn is_return_receipt_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "return-caller-receive-raw"
+            | "return-raw-to-ref"
+            | "return-null-to-option"
+            | "outbound-native-return-argument"
+    )
+}
+
+pub(crate) fn is_outbound_return_family(family: MechanicalFamily) -> bool {
+    matches!(
+        family,
+        MechanicalFamily::ReturnNotAdapted | MechanicalFamily::FlowsIntoRawParam
+    )
+}
+
+pub(crate) fn render_outbound_return_rows(rows: &[OutboundReturnBridgeReceiptRow]) -> String {
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            let origins = row
+                .lifetime_origin
+                .iter()
+                .map(MechanicalSubjectKey::receipt_key)
+                .collect::<Vec<_>>()
+                .join(";");
+            [
+                row.terminal.obligation_key.receipt_key(),
+                row.boundary_kind.clone(),
+                row.endpoint.receipt_key(),
+                row.position.clone(),
+                row.source_form.clone(),
+                row.target_form.clone(),
+                row.adapter.clone(),
+                row.negative_write.key(),
+                match (&row.retention_evidence, &row.native_lifetime) {
+                    (Some(retention), Some(native)) => {
+                        format!("retention={retention:?};native_lifetime={native:?}")
+                    }
+                    (Some(retention), None) => format!("{retention:?}"),
+                    (None, Some(native)) => format!("{native:?}"),
+                    (None, None) => "-".to_owned(),
+                },
+                row.retention.tier().to_owned(),
+                row.retention.waiver().to_owned(),
+                if origins.is_empty() {
+                    "-".to_owned()
+                } else {
+                    origins
+                },
+                row.pair_role.clone(),
+                row.effect_carrier
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), CanonicalSiteKey::receipt_key),
+                row.terminal_interface.clone(),
+                row.terminal.stage.key().to_owned(),
+                row.terminal.state.key().to_owned(),
+                row.terminal
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), MechanicalTerminalReason::key),
+            ]
+            .join("\t")
+        })
+        .collect::<Vec<_>>();
+    rendered.sort();
+    let mut output =
+        specialized_receipt_headers()[raw_schema::OUTBOUND_RETURN_BRIDGE_ROWS].join("\t");
+    output.push('\n');
+    for row in rendered {
+        output.push_str(&row);
+        output.push('\n');
+    }
+    output
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

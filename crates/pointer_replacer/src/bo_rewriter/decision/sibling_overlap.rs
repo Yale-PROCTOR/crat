@@ -25,8 +25,10 @@ use rustc_span::Span;
 use super::{
     Subject, SubjectKind,
     a5_site_proof::{A5PeerProof, A5SiteProofVerdict},
+    outbound_expression::OutboundExpressionPlans,
     raw_boundary::{RawBoundarySiteKey, RetentionVerdict, raw_target_type, site_atom_id},
     raw_boundary_contracts::{PointeeAccess, RetentionContract, classify_contract},
+    return_interface::ReturnInterface,
     seam::Form,
 };
 use crate::analyses::{
@@ -55,6 +57,9 @@ pub(crate) enum SiblingAccess {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SiblingEvidence {
     pub argument_index: usize,
+    /// Exact existing HIR argument classification; absence is missing capture,
+    /// never an inferred shape from a binding name or the A5 verdict.
+    pub argument_shape: Option<&'static str>,
     pub proof: A5PeerProof,
     pub access: SiblingAccess,
 }
@@ -76,11 +81,84 @@ pub(crate) enum LocalPostCallEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SiblingSource {
+    Declared(Subject),
+    NativeReturnExpression {
+        argument_hir: HirId,
+        source_callee: LocalDefId,
+        source_interface: ReturnInterface,
+        /// The original outer call's actual MIR operand, including an
+        /// original coercion temporary. This is not a declaration identity.
+        mir_argument_local: Option<Local>,
+        temporary: String,
+    },
+}
+
+impl SiblingSource {
+    pub(crate) fn declared(&self) -> Option<&Subject> {
+        match self {
+            Self::Declared(subject) => Some(subject),
+            Self::NativeReturnExpression { .. } => None,
+        }
+    }
+
+    pub(crate) fn hir_id(&self) -> HirId {
+        match self {
+            Self::Declared(subject) => subject.hir_id,
+            Self::NativeReturnExpression { argument_hir, .. } => *argument_hir,
+        }
+    }
+
+    pub(crate) fn caller(&self) -> LocalDefId {
+        match self {
+            Self::Declared(subject) => subject.fn_did,
+            Self::NativeReturnExpression { argument_hir, .. } => argument_hir.owner.def_id,
+        }
+    }
+
+    pub(crate) fn mir_local(&self) -> Option<Local> {
+        match self {
+            Self::Declared(subject) => Some(subject.local),
+            Self::NativeReturnExpression {
+                mir_argument_local, ..
+            } => *mir_argument_local,
+        }
+    }
+
+    pub(crate) fn owner_class(&self) -> crate::bo_rewriter::bridge_receipt::SignatureClassId {
+        let owner = match self {
+            Self::Declared(subject) => subject.fn_did,
+            Self::NativeReturnExpression { source_callee, .. } => *source_callee,
+        };
+        crate::bo_rewriter::bridge_receipt::SignatureClassId::of(owner)
+    }
+
+    pub(crate) fn identity_key(&self, caller_path: &str) -> String {
+        match self {
+            Self::Declared(subject) => subject.identity_key(caller_path),
+            Self::NativeReturnExpression { argument_hir, .. } => format!(
+                "{caller_path}::<outbound-expression:{}>",
+                argument_hir.local_id.as_u32()
+            ),
+        }
+    }
+
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Declared(subject) => subject.label.clone(),
+            Self::NativeReturnExpression { argument_hir, .. } => {
+                format!("outbound-expression:{}", argument_hir.local_id.as_u32())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SiblingPotential {
     pub site: RawBoundarySiteKey,
     pub caller: LocalDefId,
     pub callee: DefId,
-    pub source: Subject,
+    pub source: SiblingSource,
     pub argument_span: Span,
     pub call_span: Span,
     pub source_shape: &'static str,
@@ -93,6 +171,7 @@ pub(crate) enum SourceBridgeEvidence {
     WholeSubject,
     ProjectedReferent { use_hir_id: HirId },
     TypedView { use_hir_id: HirId, method: DefId },
+    NativeReturnExpression { use_hir_id: HirId },
     RawFieldValue,
     BindingStorage,
     UnknownShape(&'static str),
@@ -175,38 +254,73 @@ pub(crate) fn collect_inventory(
     tcx: TyCtxt<'_>,
     ctx: &super::super::DecideCtx,
 ) -> SiblingInventory {
+    collect_inventory_with_expressions(tcx, ctx, &OutboundExpressionPlans::default())
+}
+
+pub(crate) fn collect_inventory_with_expressions(
+    tcx: TyCtxt<'_>,
+    ctx: &super::super::DecideCtx,
+    outbound_expressions: &OutboundExpressionPlans,
+) -> SiblingInventory {
     let mut potentials = Vec::new();
     let mut coverage = Vec::new();
     let mut exit_liveness = FxHashMap::default();
     let mut expressions = FxHashMap::default();
     for site in &ctx.raw_boundary_sites.sites {
-        let Some((caller, binding)) = site.node else { continue };
-        let Some(source) = ctx
-            .subjects
-            .iter()
-            .find(|subject| subject.fn_did == caller && subject.hir_id == binding)
-        else {
-            continue;
-        };
-        let model_kind = ctx
-            .slots
-            .fn_local_slots
-            .get(&caller)
-            .and_then(|slots| slots.slot_for_local_depth(source.local, 0))
-            .and_then(|slot| ctx.model.get(&super::super::SlotRef::Local(caller, slot)));
-        if model_kind != Some(&super::super::SlotKind::Ref) {
-            continue;
-        }
-        let expressions = expressions
-            .entry(caller)
-            .or_insert_with(|| expression_index(tcx, caller));
-        let source_evidence = source_bridge_evidence(
-            tcx,
-            source,
-            site.source_span,
-            site.direct_storage_span.is_some(),
-            expressions,
-        );
+        let (caller, mut source, source_evidence) =
+            if let Some(expression) = outbound_expressions.plans.get(&site.key) {
+                let exact = expression.key == site.key
+                    && expression.argument_span == site.source_span
+                    && expression.call_span == site.call_span
+                    && expression.caller == expression.argument_hir.owner.def_id
+                    && tcx.def_path_str(expression.caller.to_def_id()) == site.key.caller;
+                (
+                    expression.caller,
+                    SiblingSource::NativeReturnExpression {
+                        argument_hir: expression.argument_hir,
+                        source_callee: expression.source_callee,
+                        source_interface: expression.source_interface.clone(),
+                        mir_argument_local: None,
+                        temporary: expression.temporary.clone(),
+                    },
+                    if exact {
+                        SourceBridgeEvidence::NativeReturnExpression {
+                            use_hir_id: expression.argument_hir,
+                        }
+                    } else {
+                        SourceBridgeEvidence::UnknownShape("native-expression-plan-site-mismatch")
+                    },
+                )
+            } else {
+                let Some((caller, binding)) = site.node else { continue };
+                let Some(source) = ctx
+                    .subjects
+                    .iter()
+                    .find(|subject| subject.fn_did == caller && subject.hir_id == binding)
+                else {
+                    continue;
+                };
+                let model_kind = ctx
+                    .slots
+                    .fn_local_slots
+                    .get(&caller)
+                    .and_then(|slots| slots.slot_for_local_depth(source.local, 0))
+                    .and_then(|slot| ctx.model.get(&super::super::SlotRef::Local(caller, slot)));
+                if model_kind != Some(&super::super::SlotKind::Ref) {
+                    continue;
+                }
+                let expressions = expressions
+                    .entry(caller)
+                    .or_insert_with(|| expression_index(tcx, caller));
+                let evidence = source_bridge_evidence(
+                    tcx,
+                    source,
+                    site.source_span,
+                    site.direct_storage_span.is_some(),
+                    expressions,
+                );
+                (caller, SiblingSource::Declared(source.clone()), evidence)
+            };
         let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
         let block = BasicBlock::from_u32(site.key.block);
         let Some(data) = body.basic_blocks.get(block) else { continue };
@@ -227,6 +341,15 @@ pub(crate) fn collect_inventory(
             block,
             statement_index: data.statements.len(),
         };
+        if let SiblingSource::NativeReturnExpression {
+            mir_argument_local, ..
+        } = &mut source
+        {
+            *mir_argument_local = args
+                .get(site.key.argument_index)
+                .and_then(|argument| argument.node.place())
+                .and_then(|place| place.as_local());
+        }
         let mut siblings = Vec::new();
         for (argument_index, argument) in args.iter().enumerate() {
             if argument_index == site.key.argument_index {
@@ -249,6 +372,32 @@ pub(crate) fn collect_inventory(
                         && sibling.key.argument_index == argument_index
                 })
                 .collect::<Vec<_>>();
+            let argument_shape = match sibling_sites.as_slice() {
+                [sibling] => Some(sibling.source_shape),
+                [] => {
+                    let shapes = callee
+                        .as_local()
+                        .and_then(|callee| ctx.facts.call_args.get(&callee))
+                        .into_iter()
+                        .flatten()
+                        .filter(|call| {
+                            call.caller == caller
+                                && call.span.source_callsite() == site.call_span.source_callsite()
+                        })
+                        .flat_map(|call| {
+                            call.args
+                                .iter()
+                                .filter(|argument| argument.index == argument_index)
+                        })
+                        .map(|argument| argument.shape.key())
+                        .collect::<Vec<_>>();
+                    match shapes.as_slice() {
+                        [shape] => Some(*shape),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
             let proof = if let ([sibling], Some(local_callee)) =
                 (sibling_sites.as_slice(), callee.as_local())
             {
@@ -321,27 +470,63 @@ pub(crate) fn collect_inventory(
             };
             siblings.push(SiblingEvidence {
                 argument_index,
+                argument_shape,
                 proof,
                 access,
             });
         }
-        if siblings.is_empty() {
+        if siblings.is_empty() && matches!(source, SiblingSource::Declared(_)) {
             continue;
         }
-        let local_post_call = match source.kind {
-            SubjectKind::Param { .. } => LocalPostCallEvidence::ParameterProtected,
-            SubjectKind::Local => {
+        let local_post_call = match &source {
+            SiblingSource::Declared(source) if matches!(source.kind, SubjectKind::Param { .. }) => {
+                LocalPostCallEvidence::ParameterProtected
+            }
+            SiblingSource::Declared(source) => {
                 let live = exit_liveness
                     .entry(caller)
                     .or_insert_with(|| call_exit_liveness(tcx, &body));
-                local_evidence(tcx, ctx, source, &body, location, live.get(&location))
+                local_evidence(
+                    tcx,
+                    ctx,
+                    source.fn_did,
+                    source.local,
+                    source.ptr_depth,
+                    &body,
+                    location,
+                    live.get(&location),
+                )
             }
+            SiblingSource::NativeReturnExpression {
+                mir_argument_local: Some(local),
+                ..
+            } => {
+                let live = exit_liveness
+                    .entry(caller)
+                    .or_insert_with(|| call_exit_liveness(tcx, &body));
+                let depth = raw_target_type(tcx, body.local_decls[*local].ty)
+                    .map_or(0, |target| if target.depth2.is_some() { 2 } else { 1 });
+                local_evidence(
+                    tcx,
+                    ctx,
+                    caller,
+                    *local,
+                    depth,
+                    &body,
+                    location,
+                    live.get(&location),
+                )
+            }
+            SiblingSource::NativeReturnExpression {
+                mir_argument_local: None,
+                ..
+            } => LocalPostCallEvidence::Unknown("native-expression-mir-argument-local-unavailable"),
         };
         let potential = SiblingPotential {
             site: site.key.clone(),
             caller,
             callee,
-            source: source.clone(),
+            source,
             argument_span: site.source_span,
             call_span: site.call_span,
             source_shape: site.source_shape,
@@ -351,7 +536,10 @@ pub(crate) fn collect_inventory(
         match source_evidence {
             SourceBridgeEvidence::WholeSubject
             | SourceBridgeEvidence::ProjectedReferent { .. }
-            | SourceBridgeEvidence::TypedView { .. } => potentials.push(potential.clone()),
+            | SourceBridgeEvidence::TypedView { .. }
+            | SourceBridgeEvidence::NativeReturnExpression { .. } => {
+                potentials.push(potential.clone())
+            }
             SourceBridgeEvidence::RawFieldValue
             | SourceBridgeEvidence::BindingStorage
             | SourceBridgeEvidence::UnknownShape(_) => {}
@@ -549,7 +737,7 @@ fn pending_site_eligible(potential: &SiblingPotential, state: TerminalSiteState)
         && potential.siblings.iter().any(risky_sibling)
 }
 
-fn risky_sibling(sibling: &SiblingEvidence) -> bool {
+pub(crate) fn risky_sibling(sibling: &SiblingEvidence) -> bool {
     if sibling.proof.verdict == A5SiteProofVerdict::Clear {
         return false;
     }
@@ -606,15 +794,20 @@ fn call_exit_liveness<'tcx>(
     live
 }
 
+/// The same frozen caller-origin, alias and exit-liveness proof applies to a
+/// declared local and to an actual MIR argument temporary. A native producer's
+/// remote parameter is never substituted for this caller-side starting local.
 fn local_evidence<'tcx>(
     tcx: TyCtxt<'tcx>,
     ctx: &super::super::DecideCtx,
-    source: &Subject,
+    caller: LocalDefId,
+    source_local: Local,
+    ptr_depth: u8,
     body: &Body<'tcx>,
     call: Location,
     live: Option<&DenseBitSet<Local>>,
 ) -> LocalPostCallEvidence {
-    if source.ptr_depth != 1 {
+    if ptr_depth != 1 {
         return LocalPostCallEvidence::Unknown("local-proof-depth-not-one");
     }
     let Some(flow) = ctx
@@ -622,12 +815,12 @@ fn local_evidence<'tcx>(
         .origins
         .as_ref()
         .and_then(|origins| origins.try_native_flows())
-        .and_then(|flows| flows.get(&source.fn_did))
+        .and_then(|flows| flows.get(&caller))
         .map(|flow| &flow.body)
     else {
         return LocalPostCallEvidence::Unknown("local-proof-origins-unavailable");
     };
-    let Some((parameters, complete)) = flow.depth0_argument_origins(body, source.local) else {
+    let Some((parameters, complete)) = flow.depth0_argument_origins(body, source_local) else {
         return LocalPostCallEvidence::Unknown("local-proof-origin-slot-unavailable");
     };
     if !parameters.is_empty() {
@@ -643,8 +836,8 @@ fn local_evidence<'tcx>(
     // retain the same reference capability after this source local dies.
     // The component is a may set; over-inclusion keeps uncertain locals pending.
     let flows = flow.depth0_value_flows();
-    let mut closure = FxHashSet::from_iter([SlotOwner::Local(source.local)]);
-    let mut frontier = vec![SlotOwner::Local(source.local)];
+    let mut closure = FxHashSet::from_iter([SlotOwner::Local(source_local)]);
+    let mut frontier = vec![SlotOwner::Local(source_local)];
     while let Some(owner) = frontier.pop() {
         for &(from, to) in &flows {
             let related = if from == owner {

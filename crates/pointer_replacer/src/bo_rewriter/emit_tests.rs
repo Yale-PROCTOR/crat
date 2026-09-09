@@ -12405,7 +12405,7 @@ fn slu_w1_shared_to_mut_view_requires_negative_write_evidence() {
         "{}",
         artifacts.dispositions
     );
-    // Item-5/I14 migration under R217-2/R220: the latest Declaration attempt
+    // Item-6/J13 stage migration under R217-2/R220: the latest Return attempt
     // stops at the callee's ordinary gate before a raw-view proof is consumed.
     // RetiredReceipts keeps that latest attempt for this canonical site; the
     // independent frozen writing evidence above remains load-bearing.
@@ -12413,14 +12413,18 @@ fn slu_w1_shared_to_mut_view_requires_negative_write_evidence() {
         artifacts
             .additive_family_receipts
             .iter()
-            .any(|row| row.family == "Declaration"
+            .any(|row| row.family == "Return"
                 && row.owner_path == "raw_read"
                 && row.cause == "unwitnessed-family-refusal:blocked-subject:arg-cast-form-unbuilt")
     );
+    println!(
+        "J13 latest retired adapters: {:?}",
+        retired.iter().map(|row| &row.adapter).collect::<Vec<_>>()
+    );
     let rejected = retired
         .iter()
-        .find(|plan| plan.adapter == "prior-family-rendering:Declaration")
-        .expect("latest Declaration-stage slice-use refusal");
+        .find(|plan| plan.adapter == "prior-family-rendering:Return")
+        .expect("latest Return-stage slice-use refusal");
     slu_r220_assert_retired_use_cause(
         rejected,
         super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
@@ -12552,22 +12556,26 @@ fn slu_w1_positive_retention_stays_held() {
         "{}",
         artifacts.dispositions
     );
-    // Item-5/I14 migration under R217-2/R220: alias admission exposes the
+    // Item-6/J13 stage migration under R217-2/R220: alias admission exposes the
     // callee's static-store gate. The latest canonical retirement therefore
     // reports the upstream callee refusal; frozen retention is checked above.
     assert!(
         artifacts
             .additive_family_receipts
             .iter()
-            .any(|row| row.family == "Declaration"
+            .any(|row| row.family == "Return"
                 && row.owner_path == "raw_keep"
                 && row.cause
                     == "unwitnessed-family-refusal:blocked-subject:escapes-via-static-store")
     );
+    println!(
+        "J13 latest retired adapters: {:?}",
+        retired.iter().map(|row| &row.adapter).collect::<Vec<_>>()
+    );
     let rejected = retired
         .iter()
-        .find(|plan| plan.adapter == "prior-family-rendering:Declaration")
-        .expect("latest Declaration-stage retaining-call refusal");
+        .find(|plan| plan.adapter == "prior-family-rendering:Return")
+        .expect("latest Return-stage retaining-call refusal");
     slu_r220_assert_retired_use_cause(
         rejected,
         super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(

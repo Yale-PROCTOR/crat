@@ -375,6 +375,49 @@ pub(crate) fn plan_values(
             }
         }
         for (hir, span, initializer) in values {
+            if initializer
+                && let Some(receiver) =
+                    super::return_receiver::active_initializer(table, node, hir, span)
+                && receiver.receiver_form == target
+            {
+                // Consume the callee's Option value directly. Calling a raw
+                // pointer constructor here would wrap/reborrow it a second time.
+                let interface = format!(
+                    "callee={}:type={}:lifetime-plan={}",
+                    receiver.callee.local_def_index.as_u32(),
+                    receiver.candidate_interface.temporary_type(),
+                    receiver.candidate_interface.lifetime_plan_digest
+                );
+                let mut row = receipt(
+                    tcx,
+                    subject,
+                    hir,
+                    MechanicalFamily::OptLocalConstruction,
+                    "borrowed-return-receive",
+                    receiver.candidate_interface.form,
+                    target,
+                    match receiver.coercion {
+                        super::return_receiver::ReceiverCoercion::Identity => {
+                            "owned-borrowed-call-result"
+                        }
+                        super::return_receiver::ReceiverCoercion::SharedOption => {
+                            "shared-option-return-map"
+                        }
+                    }
+                    .to_owned(),
+                    None,
+                    MechanicalEvidence {
+                        terminal_contract: TerminalContract::Optional {
+                            interface: interface.clone(),
+                        },
+                        ..MechanicalEvidence::default()
+                    },
+                );
+                row.nullability_fact = interface;
+                receipts.push(row);
+                initializers.push(node);
+                continue;
+            }
             let expression = tcx.hir_node(hir).expect_expr();
             let shape = emitability::classify_arg(tcx, expression);
             let null = emitability::is_zero_literal(expression);
@@ -619,6 +662,46 @@ pub(crate) fn plan_values(
     (receipts, initializers, composed_uses)
 }
 
+fn return_handoff_is_covered(
+    table: &DecisionTable,
+    subject: &Subject,
+    source: seam::Form,
+    uses: &emitability::OptUses,
+    site: &emitability::OptUseSite,
+) -> bool {
+    if !matches!(source, seam::Form::Opt { .. } | seam::Form::Slice { .. })
+        || table
+            .return_interfaces
+            .failures
+            .contains_key(&subject.fn_did)
+    {
+        return false;
+    }
+    let Some(interface) = table.return_interfaces.functions.get(&subject.fn_did) else {
+        return false;
+    };
+    if interface.form != source {
+        return false;
+    }
+    let Some(lifetime) = table.lifetime_plan.function(subject.fn_did) else { return false };
+    if lifetime.digest() != interface.lifetime_plan_digest
+        || lifetime.lifetime_for(super::lifetime::FnSignatureSlot::RETURN)
+            != Some(interface.lifetime.as_str())
+    {
+        return false;
+    }
+    uses.return_handoffs
+        .iter()
+        .filter(|handoff| {
+            handoff.owner == subject.fn_did
+                && handoff.root == Some(subject.hir_id)
+                && handoff.source_shape == "bare-local"
+                && handoff.span == site.span
+        })
+        .count()
+        == 1
+}
+
 pub(crate) fn plan_operations(
     program: &crate::utils::rustc::RustProgram<'_>,
     table: &mut DecisionTable,
@@ -651,6 +734,28 @@ pub(crate) fn plan_operations(
         };
         let node = (subject.fn_did, subject.hir_id);
         let Some(uses) = uses.get(&node) else { continue };
+        for site in uses
+            .sites
+            .iter()
+            .filter(|site| site.operation == "handoff-return")
+        {
+            if !return_handoff_is_covered(table, subject, source, uses, site) {
+                out.push(receipt(
+                    tcx,
+                    subject,
+                    site.hir_id,
+                    MechanicalFamily::OptUseUnsupported,
+                    site.operation,
+                    source,
+                    source,
+                    site.operation.to_owned(),
+                    Some(MechanicalTerminalReason::EvidenceMissing(
+                        "handoff-return:later-return-or-sink-wave".to_owned(),
+                    )),
+                    MechanicalEvidence::default(),
+                ));
+            }
+        }
         for site in uses
             .sites
             .iter()

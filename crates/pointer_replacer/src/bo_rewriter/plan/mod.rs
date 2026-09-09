@@ -32,6 +32,11 @@
 //! type. [`Justification`] is shaped against all ten goldens' expected text so
 //! the breadth in S2–S3 fills arms rather than reshaping the type.
 
+pub(crate) mod callee_parameter_input;
+pub(crate) mod native_return;
+pub(crate) mod outbound_expression;
+pub(crate) mod outbound_return;
+pub(crate) mod receiver_input;
 pub(crate) mod sibling_overlap;
 
 use std::{
@@ -488,9 +493,19 @@ fn nested_ast_composition(
         let option_value_over_inner = outer.key.bridge_kind == "option-value-composed"
             && inner.key.bridge_kind != "option-value-composed"
             && contains(outer, inner);
+        let raw_receiver_over_argument = matches!(
+            outer.key.bridge_kind.as_str(),
+            "return-caller-receive-raw"
+                | "return-shared-option"
+                | "outbound-native-return-argument"
+        ) && outer.key.owner_class == inner.key.owner_class
+            && outer.key.caller == inner.key.caller
+            && matches!(inner.key.arm.as_str(), "c" | "glue")
+            && strictly_contains(outer, inner);
         ((bridge_over_subject || pair_over_c || a5_over_inner) && strictly_contains(outer, inner))
             || slice_construction_over_inner
             || option_value_over_inner
+            || raw_receiver_over_argument
     };
     if composable(left, right) {
         Some((left.key.owner_class, right.key.owner_class))
@@ -1120,6 +1135,12 @@ pub(crate) fn finalize_signature_classes(
             | Decision::Degraded(_) => None,
         },
     ));
+    dependency_edges.extend(table.return_receivers.plans.values().map(|receiver| {
+        (
+            SignatureClassId::of(receiver.node.0),
+            SignatureClassId::of(receiver.callee),
+        )
+    }));
     for (dependent, dependency) in dependency_edges {
         if dependent == dependency || !by_class.contains_key(&dependency) {
             continue;
@@ -1341,6 +1362,15 @@ pub(crate) fn strict_recovery_subset(
 /// which is why the flat shape could not survive contact with the corpus.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
+    pub native_return_plans: native_return::NativeReturnPlans,
+    pub outbound_expression_plans: outbound_expression::OutboundExpressionReceiptPlans,
+    pub outbound_expression_sites:
+        rustc_hash::FxHashMap<super::decision::raw_boundary::RawBoundarySiteKey, ClassSite>,
+    pub raw_receiver_sites:
+        rustc_hash::FxHashMap<super::decision::return_receiver::Node, ClassSite>,
+    pub outbound_return_plans: outbound_return::OutboundReturnPlans,
+    pub receiver_input_receipts: receiver_input::ReceiverReceiptMap,
+    pub callee_parameter_input_receipts: callee_parameter_input::InputReceiptMap,
     pub sibling_receipt_plans: Vec<sibling_overlap::SiblingReceiptPlan>,
     pub by_file: BTreeMap<FileKey, Vec<Edit>>,
     /// Decisions that produced no placed edit, with attribution.
@@ -1437,6 +1467,152 @@ fn terminal_seam_site(
 }
 
 impl Plan {
+    pub(crate) fn outbound_return_receipts(
+        &self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> Result<
+        (
+            Vec<super::mechanical_receipt::OutboundReturnRequirement>,
+            Vec<super::mechanical_receipt::MechanicalObligationEvent>,
+            Vec<super::mechanical_receipt::OutboundReturnBridgeReceiptRow>,
+        ),
+        String,
+    > {
+        let mut withheld = classes.clone();
+        withheld.extend(self.held_classes());
+        let effective = self.effective_reverted_classes(&withheld, atoms);
+        let (mut required, mut common, mut rows) = self
+            .outbound_return_plans
+            .materialize(
+                &self.terminal_call_plans.receiver_inputs,
+                &self.terminal_call_plans.raw_receivers,
+                &effective,
+                atoms,
+            )
+            .map_err(|failures| format!("outbound-return-custody:{failures:?}"))?;
+        let (native_required, native_common, native_rows) = self
+            .native_return_plans
+            .materialize(&self.terminal_call_plans, &effective, atoms)
+            .map_err(|failures| format!("outbound-return-native-custody:{failures:?}"))?;
+        required.extend(native_required);
+        common.extend(native_common);
+        rows.extend(native_rows);
+        let (expression_required, expression_common, expression_rows) = self
+            .outbound_expression_plans
+            .materialize(&self.terminal_call_plans.outbound_expressions, &effective)
+            .map_err(|failures| format!("outbound-expression-custody:{failures:?}"))?;
+        required.extend(expression_required);
+        common.extend(expression_common);
+        rows.extend(expression_rows);
+        Ok((required, common, rows))
+    }
+
+    pub(crate) fn validate_outbound_return_receipts(
+        &self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let (required, common, rows) = self.outbound_return_receipts(classes, atoms)?;
+        super::mechanical_receipt::reconcile_outbound_return_rows(
+            &required,
+            &rows,
+            &common,
+            &self.bridge_events_with_atoms(classes, atoms),
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn validate_receiver_input_receipts(
+        &self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let selected = self.receiver_input_receipts.selected(
+            &self.terminal_call_plans.receiver_inputs,
+            classes,
+            atoms,
+        );
+        if selected.failures.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "return-receiver-input-custody:{}",
+            selected
+                .failures
+                .iter()
+                .map(|failure| format!(
+                    "{:?}:callee={}:caller={}:hir={}:{}",
+                    failure.kind,
+                    failure.callee.order_key(),
+                    failure.caller.order_key(),
+                    failure.node.1.local_id.as_u32(),
+                    failure.reason
+                ))
+                .collect::<Vec<_>>()
+                .join(";")
+        ))
+    }
+
+    fn receiver_declaration_reverted(
+        &self,
+        receipt: &super::mechanical_receipt::DeclarationShapeReceiptPlan,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> bool {
+        use super::mechanical_receipt::{MechanicalMechanism, MechanicalSubjectKey};
+        let event = &receipt.obligation.planned;
+        if event.mechanism != MechanicalMechanism::DeclarationExplicitType {
+            return false;
+        }
+        self.terminal_call_plans.receiver_inputs.plans.values().any(|input| {
+            input.active(classes, atoms) && receipt.owner_class == input.selection.callee
+                && matches!(event.key.subject, MechanicalSubjectKey::Local { owner, mir_local, .. }
+                    if owner == input.selection.node.0 && mir_local == input.destination.as_u32())
+        })
+    }
+
+    pub(crate) fn validate_callee_parameter_input_receipts(
+        &self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let selected = self.callee_parameter_input_receipts.selected(
+            &self.terminal_call_plans.callee_parameter_inputs,
+            classes,
+            atoms,
+        );
+        if selected.failures.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "callee-parameter-input-custody:{}",
+            selected
+                .failures
+                .iter()
+                .map(|failure| format!(
+                    "{:?}:class={}:caller={}:arg={}..{}:{}",
+                    failure.kind,
+                    failure.target.order_key(),
+                    failure.caller.order_key(),
+                    failure.key.1,
+                    failure.key.2,
+                    failure.reason
+                ))
+                .collect::<Vec<_>>()
+                .join(";")
+        ))
+    }
+
+    pub(crate) fn effective_reverted_classes(
+        &self,
+        reverted: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> BTreeSet<SignatureClassId> {
+        self.terminal_call_plans
+            .effective_reverted_classes(reverted, atoms)
+    }
+
     pub(crate) fn replace_terminal_seam(
         &mut self,
         old: &super::decision::seam::SeamEdit,
@@ -1705,8 +1881,25 @@ impl Plan {
         reverted_atoms: &BTreeSet<String>,
     ) -> Vec<super::bridge_receipt::BridgeReceiptEvent> {
         use super::bridge_receipt::{BridgeReceiptEvent, BridgeReceiptStage, BridgeReceiptState};
-        let return_origin_reverted = self.effective_reverted_classes(&BTreeSet::new(), reverted_atoms);
-        let reverted = self.effective_reverted_classes(reverted, reverted_atoms);
+        let return_origin_reverted = self
+            .terminal_call_plans
+            .return_origin_dependencies
+            .effective_reverted_classes(&BTreeSet::new(), reverted_atoms);
+        let mut withheld = reverted.clone();
+        withheld.extend(self.held_classes());
+        let (reverted, input_holds) = self
+            .terminal_call_plans
+            .input_reversion_closure(&withheld, reverted_atoms);
+        let inputs = self.callee_parameter_input_receipts.selected(
+            &self.terminal_call_plans.callee_parameter_inputs,
+            &reverted,
+            reverted_atoms,
+        );
+        let receivers = self.receiver_input_receipts.selected(
+            &self.terminal_call_plans.receiver_inputs,
+            &reverted,
+            reverted_atoms,
+        );
         let atom_dropped = self
             .by_file
             .iter()
@@ -1725,10 +1918,12 @@ impl Plan {
         for class in self.class_finalization.classes.values() {
             let terminal_drop = if return_origin_reverted.contains(&class.id) {
                 Some("return-origin-atom-reverted".to_owned())
-            } else if reverted.contains(&class.id) {
-                Some("class-reverted-after-verify".to_owned())
             } else if !class.is_ready() {
                 Some(class.hold_reasons().join(";"))
+            } else if let Some(reasons) = input_holds.get(&class.id) {
+                Some(reasons.iter().cloned().collect::<Vec<_>>().join(";"))
+            } else if reverted.contains(&class.id) {
+                Some("class-reverted-after-verify".to_owned())
             } else {
                 None
             };
@@ -1737,14 +1932,28 @@ impl Plan {
                 // Receipts sharing a physical carrier share its atom fate.
                 // A5/C9 carriers have no atom dependencies and stay Applied
                 // with their source input rendering while their class survives.
-                let terminal_drop = terminal_drop.clone().or_else(|| {
-                    (site
-                        .atom_ids
-                        .iter()
-                        .any(|atom| reverted_atoms.contains(atom))
-                        || atom_dropped.contains(&site.edit_key))
-                    .then(|| "atom-reverted-after-verify".to_owned())
-                });
+                let terminal_drop = terminal_drop
+                    .clone()
+                    .or_else(|| {
+                        inputs
+                            .withdrawn
+                            .contains(&site.key)
+                            .then(|| "callee-parameter-input-selected".to_owned())
+                    })
+                    .or_else(|| {
+                        receivers
+                            .withdrawn
+                            .contains(&site.key)
+                            .then(|| "return-receiver-input-selected".to_owned())
+                    })
+                    .or_else(|| {
+                        (site
+                            .atom_ids
+                            .iter()
+                            .any(|atom| reverted_atoms.contains(atom))
+                            || atom_dropped.contains(&site.edit_key))
+                        .then(|| "atom-reverted-after-verify".to_owned())
+                    });
                 events.push(BridgeReceiptEvent {
                     site: site.key.clone(),
                     expected_form: site.expected_form.clone(),
@@ -1775,6 +1984,8 @@ impl Plan {
                 });
             }
         }
+        events.extend(inputs.bridge_events);
+        events.extend(receivers.bridge_events);
         events
     }
 
@@ -1782,6 +1993,30 @@ impl Plan {
         &self,
         reverted: &std::collections::BTreeSet<SignatureClassId>,
     ) -> Vec<super::mechanical_receipt::UnsafeContextReceiptEvent> {
+        self.unsafe_context_events_with_atoms(reverted, &BTreeSet::new())
+    }
+
+    pub(crate) fn unsafe_context_events_with_atoms(
+        &self,
+        reverted: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> Vec<super::mechanical_receipt::UnsafeContextReceiptEvent> {
+        let mut withheld = reverted.clone();
+        withheld.extend(self.held_classes());
+        let (effective_reverted, input_holds) = self
+            .terminal_call_plans
+            .input_reversion_closure(&withheld, atoms);
+        let reverted = &effective_reverted;
+        let inputs = self.callee_parameter_input_receipts.selected(
+            &self.terminal_call_plans.callee_parameter_inputs,
+            reverted,
+            atoms,
+        );
+        let receivers = self.receiver_input_receipts.selected(
+            &self.terminal_call_plans.receiver_inputs,
+            reverted,
+            atoms,
+        );
         use super::{
             bridge_receipt::{BridgeReceiptStage, BridgeReceiptState},
             mechanical_receipt::UnsafeContextReceiptEvent,
@@ -1789,24 +2024,46 @@ impl Plan {
 
         let mut events = Vec::new();
         for class in self.class_finalization.classes.values() {
-            let terminal_drop = if reverted.contains(&class.id) {
-                Some("class-reverted-after-verify".to_owned())
-            } else if !class.is_ready() {
+            let terminal_drop = if !class.is_ready() {
                 Some(class.hold_reasons().join(";"))
+            } else if let Some(reasons) = input_holds.get(&class.id) {
+                Some(reasons.iter().cloned().collect::<Vec<_>>().join(";"))
+            } else if reverted.contains(&class.id) {
+                Some("class-reverted-after-verify".to_owned())
             } else {
                 None
             };
-            let disposition = if reverted.contains(&class.id) {
-                "reverted"
-            } else if class.is_ready() {
-                "ready"
-            } else {
+            let disposition = if !class.is_ready() {
                 "held"
+            } else if reverted.contains(&class.id) {
+                "reverted"
+            } else {
+                "ready"
             };
             for site in &class.sites {
                 let Some(presentation) = site.unsafe_context else {
                     continue;
                 };
+                let terminal_drop = terminal_drop
+                    .clone()
+                    .or_else(|| {
+                        inputs
+                            .withdrawn
+                            .contains(&site.key)
+                            .then(|| "callee-parameter-input-selected".to_owned())
+                    })
+                    .or_else(|| {
+                        receivers
+                            .withdrawn
+                            .contains(&site.key)
+                            .then(|| "return-receiver-input-selected".to_owned())
+                    })
+                    .or_else(|| {
+                        site.atom_ids
+                            .iter()
+                            .any(|atom| atoms.contains(atom))
+                            .then(|| "atom-reverted-after-verify".into())
+                    });
                 events.push(UnsafeContextReceiptEvent {
                     site: site.key.clone(),
                     enclosing: site.key.caller,
@@ -1831,6 +2088,8 @@ impl Plan {
                 });
             }
         }
+        events.extend(inputs.unsafe_context_events);
+        events.extend(receivers.unsafe_context_events);
         events
     }
 
@@ -1842,9 +2101,33 @@ impl Plan {
         Vec<super::mechanical_receipt::A5ProofSiteFallbackReceiptRow>,
         Vec<super::mechanical_receipt::SliceConstructionReceiptRow>,
     ) {
+        self.mechanical_receipts_with_atoms(reverted, &BTreeSet::new())
+    }
+
+    pub(crate) fn mechanical_receipts_with_atoms(
+        &self,
+        reverted: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> (
+        Vec<super::mechanical_receipt::MechanicalObligationEvent>,
+        Vec<super::mechanical_receipt::A5ProofSiteFallbackReceiptRow>,
+        Vec<super::mechanical_receipt::SliceConstructionReceiptRow>,
+    ) {
+        let effective_reverted = self.effective_reverted_classes(reverted, atoms);
+        let reverted = &effective_reverted;
         let mut events = Vec::new();
         let mut a5_rows = Vec::new();
         let mut slice_rows = Vec::new();
+        for argument in &self.terminal_call_plans.surface_arguments {
+            let live = self
+                .class_finalization
+                .classes
+                .get(&argument.owner_class)
+                .is_some_and(SignatureClassPlan::is_ready);
+            let removed = reverted.contains(&argument.owner_class)
+                || argument.atom_ids.iter().any(|atom| atoms.contains(atom));
+            events.extend(argument.obligation.events(live, removed));
+        }
         for receipt in &self.a5_receipt_plans {
             let class_live = self
                 .class_finalization
@@ -1888,7 +2171,11 @@ impl Plan {
                 .is_some_and(SignatureClassPlan::is_ready);
             events.extend(
                 receipt
-                    .materialize(live, reverted.contains(&receipt.owner_class))
+                    .materialize(
+                        live,
+                        reverted.contains(&receipt.owner_class)
+                            || self.receiver_declaration_reverted(receipt, reverted, atoms),
+                    )
                     .0,
             );
         }
@@ -1899,6 +2186,15 @@ impl Plan {
         &self,
         reverted: &BTreeSet<SignatureClassId>,
     ) -> Vec<super::mechanical_receipt::DeclarationShapeReceiptRow> {
+        self.declaration_receipt_rows_with_atoms(reverted, &BTreeSet::new())
+    }
+
+    pub(crate) fn declaration_receipt_rows_with_atoms(
+        &self,
+        reverted: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> Vec<super::mechanical_receipt::DeclarationShapeReceiptRow> {
+        let reverted = self.effective_reverted_classes(reverted, atoms);
         self.declaration_receipt_plans
             .iter()
             .flat_map(|receipt| {
@@ -1908,7 +2204,11 @@ impl Plan {
                     .get(&receipt.owner_class)
                     .is_some_and(SignatureClassPlan::is_ready);
                 receipt
-                    .materialize(live, reverted.contains(&receipt.owner_class))
+                    .materialize(
+                        live,
+                        reverted.contains(&receipt.owner_class)
+                            || self.receiver_declaration_reverted(receipt, &reverted, atoms),
+                    )
                     .1
             })
             .collect()
@@ -2313,6 +2613,24 @@ pub(crate) fn plan(
     let mut by_file: BTreeMap<FileKey, Vec<Edit>> = BTreeMap::new();
     let mut unplaceable = Vec::new();
     let mut preclass_sites = Vec::new();
+    let mut raw_receiver_sites = rustc_hash::FxHashMap::default();
+    let mut outbound_expression_sites = rustc_hash::FxHashMap::default();
+    let callee_parameter_input_receipts = callee_parameter_input::InputReceiptMap::capture(
+        &table.seams.callee_parameter_inputs,
+        &table.seams,
+        &span_to_loc,
+    );
+    for failure in callee_parameter_input_receipts.failures() {
+        for owner in [failure.caller, failure.target] {
+            preclass_sites.push(ClassSite::dropped(
+                owner,
+                failure.caller,
+                Arm::C,
+                "callee-parameter-input-unavailable",
+                failure.reason.clone(),
+            ));
+        }
+    }
     let mut a5_receipt_plans = Vec::new();
     let mut slice_construction_receipt_plans = table.retired_slice_constructions.clone();
     let slice_use_receipt_plans = table.slice_use_receipts.clone();
@@ -2438,6 +2756,213 @@ pub(crate) fn plan(
         });
     }
 
+    for argument in &table.seams.surface_arguments {
+        let bridge = &argument.bridge;
+        preclass_sites.push(ClassSite {
+            atom_ids: argument.atom_ids.clone(),
+            key: bridge.materialize(argument.owner_class, "<generated>".into(), 0, 0),
+            edit_key: "-".into(),
+            state: ClassSiteState::ZeroSyntaxReady,
+            expected_form: bridge.expected_form.clone(),
+            found_form: bridge.found_form.clone(),
+            argument_kind: bridge.argument_kind.clone(),
+            extent: bridge.extent.clone(),
+            retention: bridge.retention,
+            waiver_id: bridge.waiver_id.clone(),
+            unsafe_context: bridge.unsafe_context,
+        });
+    }
+    for failure in table.return_receivers.failures.values() {
+        if table
+            .seams
+            .raw_receivers
+            .plans
+            .get(&failure.node)
+            .is_some_and(|input| input.callee == failure.callee)
+        {
+            // This actual raw destination has its own required result view;
+            // no prospective borrowed-receiver presentation is needed.
+            continue;
+        }
+        let owner = SignatureClassId::of(failure.callee);
+        let mut site = ClassSite::zero(
+            owner,
+            SignatureClassId::of(failure.node.0),
+            Arm::C,
+            "return-receiver-interface-unavailable",
+        );
+        site.key.position = format!(
+            "receiver:{}:{}",
+            failure.node.0.local_def_index.as_u32(),
+            failure.node.1.local_id.as_u32()
+        );
+        site.state =
+            ClassSiteState::Dropped(format!("return-receiver-interface:{:?}", failure.kind));
+        preclass_sites.push(site);
+    }
+    for receiver in table.return_receivers.plans.values().filter(|receiver| {
+        receiver.coercion == super::decision::return_receiver::ReceiverCoercion::SharedOption
+            && super::decision::return_receiver::active_initializer(
+                table,
+                receiver.node,
+                receiver.initializer_hir,
+                receiver.initializer_span,
+            )
+            .is_some()
+    }) {
+        let owner = SignatureClassId::of(receiver.callee);
+        let bridge = BridgeSitePlan {
+            caller: receiver.node.0,
+            callee: BridgeCalleeId::Local(receiver.callee),
+            arm: "glue".into(),
+            position: format!(
+                "receiver-coercion:{}:{}:lifetime_plan={}",
+                receiver.node.0.local_def_index.as_u32(),
+                receiver.node.1.local_id.as_u32(),
+                receiver.candidate_interface.lifetime_plan_digest
+            ),
+            bridge_kind: "return-shared-option".into(),
+            expected_form: receiver.receiver_form.key().into(),
+            found_form: receiver.candidate_interface.form.key().into(),
+            argument_kind: "return-call-result".into(),
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+            unsafe_context: None,
+        };
+        match span_to_loc(receiver.initializer_span) {
+            Ok((file, lo, hi)) => preclass_sites.push(ClassSite {
+                atom_ids: Vec::new(),
+                key: bridge.materialize(owner, file_key_label(&file), lo as u32, hi as u32),
+                edit_key: "-".into(),
+                state: ClassSiteState::EditReady,
+                expected_form: bridge.expected_form,
+                found_form: bridge.found_form,
+                argument_kind: bridge.argument_kind,
+                extent: bridge.extent,
+                retention: bridge.retention,
+                waiver_id: bridge.waiver_id,
+                unsafe_context: bridge.unsafe_context,
+            }),
+            Err(reason) => preclass_sites.push(ClassSite::dropped(
+                owner,
+                SignatureClassId::of(receiver.node.0),
+                Arm::Glue,
+                "receiver-coercion-unlocated",
+                reason,
+            )),
+        }
+    }
+    for input in table.seams.outbound_expressions.plans.values() {
+        let owner = input.owner_class();
+        let bridge = input.bridge();
+        match span_to_loc(input.argument_span) {
+            Ok((file, lo, hi)) => {
+                let site = ClassSite {
+                    atom_ids: Vec::new(),
+                    key: bridge.materialize(owner, file_key_label(&file), lo as u32, hi as u32),
+                    edit_key: "-".into(),
+                    state: ClassSiteState::EditReady,
+                    expected_form: bridge.expected_form,
+                    found_form: bridge.found_form,
+                    argument_kind: bridge.argument_kind,
+                    extent: bridge.extent,
+                    retention: bridge.retention,
+                    waiver_id: bridge.waiver_id,
+                    unsafe_context: bridge.unsafe_context,
+                };
+                outbound_expression_sites.insert(input.key.clone(), site.clone());
+                preclass_sites.push(site);
+            }
+            Err(reason) => preclass_sites.push(ClassSite::dropped(
+                owner,
+                SignatureClassId::of(input.caller),
+                Arm::C,
+                "outbound-expression-site-unlocated",
+                reason,
+            )),
+        }
+    }
+    for unavailable in table.seams.outbound_expressions.unavailable.values() {
+        let owner = SignatureClassId::of(unavailable.source_callee);
+        let mut site = ClassSite::dropped(
+            owner,
+            SignatureClassId::of(unavailable.caller),
+            Arm::C,
+            "outbound-expression-unavailable",
+            format!("outbound-expression:{:?}", unavailable.reason),
+        );
+        site.key.caller = unavailable.caller;
+        site.key.callee = unavailable.sink_callee.clone();
+        site.key.position = format!(
+            "arg{}:expression={}",
+            unavailable.key.argument_index,
+            unavailable.argument_hir.local_id.as_u32()
+        );
+        if let Ok((file, lo, hi)) = span_to_loc(unavailable.argument_span) {
+            site.key.file = file_key_label(&file);
+            site.key.lo = lo as u32;
+            site.key.hi = hi as u32;
+        }
+        preclass_sites.push(site);
+    }
+    for input in table.seams.raw_receivers.plans.values() {
+        let owner = SignatureClassId::of(input.callee);
+        let bridge = input.bridge();
+        match span_to_loc(input.initializer_span) {
+            Ok((file, lo, hi)) => {
+                let site = ClassSite {
+                    atom_ids: Vec::new(),
+                    key: bridge.materialize(owner, file_key_label(&file), lo as u32, hi as u32),
+                    edit_key: "-".into(),
+                    state: ClassSiteState::EditReady,
+                    expected_form: bridge.expected_form,
+                    found_form: bridge.found_form,
+                    argument_kind: bridge.argument_kind,
+                    extent: bridge.extent,
+                    retention: bridge.retention,
+                    waiver_id: bridge.waiver_id,
+                    unsafe_context: bridge.unsafe_context,
+                };
+                raw_receiver_sites.insert(input.node, site.clone());
+                preclass_sites.push(site);
+            }
+            Err(reason) => preclass_sites.push(ClassSite::dropped(
+                owner,
+                SignatureClassId::of(input.node.0),
+                Arm::C,
+                "raw-receiver-site-unlocated",
+                reason,
+            )),
+        }
+    }
+    for unavailable in table.seams.raw_receivers.unavailable.values() {
+        let owner = SignatureClassId::of(unavailable.callee);
+        let mut site = ClassSite::dropped(
+            owner,
+            SignatureClassId::of(unavailable.node.0),
+            Arm::C,
+            "raw-receiver-result-unavailable",
+            format!("raw-receiver-result:{:?}", unavailable.reason),
+        );
+        site.key.position = format!(
+            "raw-receiver:{}:{}",
+            unavailable.node.0.local_def_index.as_u32(),
+            unavailable.node.1.local_id.as_u32()
+        );
+        preclass_sites.push(site);
+    }
+    for failure in &table.seams.surface_argument_failures {
+        let mut site = ClassSite::zero(
+            failure.owner_class,
+            failure.owner_class,
+            Arm::Surface,
+            "surface-argument-unavailable",
+        );
+        site.key.position = format!("generated-wrapper-arg{}", failure.parameter_index);
+        site.state = ClassSiteState::Dropped(failure.reason.into());
+        preclass_sites.push(site);
+    }
     for site in &table.seams.zero_bridges {
         let bridge = BridgeSitePlan {
             caller: site.caller,
@@ -2626,6 +3151,24 @@ pub(crate) fn plan(
     }
 
     for node in &table.option_mut_bindings {
+        if table
+            .return_receivers
+            .plans
+            .get(node)
+            .is_some_and(|receiver| {
+                !table.return_receivers.failures.contains_key(node)
+                    && table.seams.explicit_declarations.iter().any(|site| {
+                        site.category == "local"
+                            && site.node == Some(*node)
+                            && site.owner_class == SignatureClassId::of(receiver.callee)
+                            && site.emitted_type == receiver.receiver_type()
+                    })
+            })
+        {
+            // The callee-owned explicit declaration places type and binding
+            // together; a caller-owned edit here would claim the same span.
+            continue;
+        }
         let Some((subject, decision)) = table
             .entries
             .iter()
@@ -3013,7 +3556,21 @@ pub(crate) fn plan(
         let typed_pattern = table
             .declaration_patterns
             .contains_key(&(subject.fn_did, subject.hir_id));
-        let (ty_file, declaration_edit) = if inferred_box || typed_pattern {
+        let typed_receiver = table
+            .return_receivers
+            .plans
+            .get(&(subject.fn_did, subject.hir_id))
+            .is_some_and(|receiver| {
+                !table.return_receivers.failures.contains_key(&receiver.node)
+                    && super::decision::seam::form_of(decision) == receiver.receiver_form
+                    && table.seams.explicit_declarations.iter().any(|site| {
+                        site.category == "local"
+                            && site.node == Some(receiver.node)
+                            && site.owner_class == SignatureClassId::of(receiver.callee)
+                            && site.emitted_type == receiver.receiver_type()
+                    })
+            });
+        let (ty_file, declaration_edit) = if inferred_box || typed_pattern || typed_receiver {
             match span_to_loc(subject.binding_span) {
                 Ok((file, _, _)) => (file, None),
                 Err(reason) => {
@@ -3846,7 +4403,57 @@ pub(crate) fn plan(
     attribution_intervals.sort();
     attribution_intervals.dedup();
 
+    let receiver_input_receipts = receiver_input::ReceiverReceiptMap::capture(
+        &table.seams.receiver_inputs,
+        table,
+        &preclass_sites,
+        &by_file,
+        &span_to_loc,
+    );
+    let outbound_return_plans = outbound_return::capture(
+        table,
+        &table.seams.receiver_inputs,
+        &receiver_input_receipts,
+        &table.seams.raw_receivers,
+        &raw_receiver_sites,
+        &|owner| {
+            table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.fn_did == owner)
+                .map(|(subject, _)| owner_of(subject))
+        },
+    );
+
+    let native_return_plans = native_return::capture(table, &span_to_loc, &|owner| {
+        table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.fn_did == owner)
+            .map(|(subject, _)| owner_of(subject))
+    });
+
+    let outbound_expression_plans = outbound_expression::capture(
+        table,
+        &table.seams.outbound_expressions,
+        &outbound_expression_sites,
+        &|owner| {
+            table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.fn_did == owner)
+                .map(|(subject, _)| owner_of(subject))
+        },
+    );
+
     Plan {
+        native_return_plans,
+        outbound_expression_plans,
+        outbound_expression_sites,
+        raw_receiver_sites,
+        outbound_return_plans,
+        receiver_input_receipts,
+        callee_parameter_input_receipts,
         sibling_receipt_plans: sibling_overlap::plans(table, &span_to_loc),
         by_file,
         unplaceable,
@@ -3927,6 +4534,8 @@ mod tests {
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
+            return_interfaces: Default::default(),
+            return_receivers: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
             retired_slice_constructions: Vec::new(),
@@ -3993,6 +4602,8 @@ mod tests {
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
+            return_interfaces: Default::default(),
+            return_receivers: Default::default(),
             depth2_npo_storages: Vec::new(),
             slice_constructions: Vec::new(),
             retired_slice_constructions: Vec::new(),
