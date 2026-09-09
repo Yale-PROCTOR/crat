@@ -42,6 +42,7 @@ pub enum DeclarationHold {
     StaleSpan,
     Overlap,
     MissingCopyDerive,
+    LifetimeBound,
 }
 
 pub fn render_declaration(
@@ -62,11 +63,34 @@ pub fn render_declaration(
         .iter()
         .map(|(field, span)| (span, interface.field_types[field].clone()))
         .collect();
+    if interface.lifetimes.is_empty() && !interface.lifetime_bounds.is_empty() {
+        return Err(DeclarationHold::LifetimeBound);
+    }
     if !interface.lifetimes.is_empty() {
+        for (longer, shorter) in &interface.lifetime_bounds {
+            if !interface.lifetimes.contains(longer) || !interface.lifetimes.contains(shorter) {
+                return Err(DeclarationHold::LifetimeBound);
+            }
+        }
         let mut parameters: Vec<_> = interface
             .lifetimes
             .iter()
-            .map(|lt| format!("'{lt}"))
+            .map(|lt| {
+                let bounds: std::collections::BTreeSet<_> = interface
+                    .lifetime_bounds
+                    .iter()
+                    .filter(|(longer, _)| longer == lt)
+                    .map(|(_, shorter)| format!("'{shorter}"))
+                    .collect();
+                if bounds.is_empty() {
+                    format!("'{lt}")
+                } else {
+                    format!(
+                        "'{lt}: {}",
+                        bounds.into_iter().collect::<Vec<_>>().join(" + ")
+                    )
+                }
+            })
             .collect();
         parameters.extend(declaration.generics.parameters.iter().cloned());
         edits.push((

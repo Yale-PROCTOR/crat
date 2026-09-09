@@ -7,8 +7,16 @@ use super::{EvidenceKey, OwnerId};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DropShape {
     Leaf,
+    /// Legacy edges are mandatory; absence cannot certify a smaller value.
     Fields(Vec<OwnerId>),
+    OwnedFields(Vec<DropEdge>),
     Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropEdge {
+    pub payload: OwnerId,
+    pub optional: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +55,7 @@ pub struct DepthWitness {
     pub key: EvidenceKey,
     pub payload: OwnerId,
     pub graph_revision: [u8; 32],
+    pub graph: BTreeMap<OwnerId, DropShape>,
     pub maximum_depth: usize,
     pub admitted_depth: usize,
 }
@@ -107,6 +116,9 @@ fn recursive(payload: OwnerId, graph: &BTreeMap<OwnerId, DropShape>) -> Result<b
             Some(DropShape::Fields(children)) => {
                 stack.extend(children.iter().rev().map(|child| (*child, false)));
             }
+            Some(DropShape::OwnedFields(children)) => {
+                stack.extend(children.iter().rev().map(|child| (child.payload, false)));
+            }
             None | Some(DropShape::Unknown) => return Err(CloseHold::UnknownShape(node)),
         }
     }
@@ -145,6 +157,7 @@ pub fn implicit_close(
             || depth.kind != kind
             || depth.payload != payload
             || depth.graph_revision != graph_revision
+            || &depth.graph != graph
         {
             return Err(CloseHold::DepthWitnessMismatch);
         }

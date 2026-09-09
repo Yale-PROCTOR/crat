@@ -9,6 +9,8 @@ use super::{
 
 #[derive(Clone, Debug)]
 pub struct Observation {
+    /// Bounds whose longer lifetime was introduced by this interface.
+    pub introduced_bounds: Vec<(String, String)>,
     pub source_hash: [u8; 32],
     pub field_types: BTreeMap<FieldClassId, String>,
     pub lifetimes: Vec<String>,
@@ -47,6 +49,11 @@ pub fn check_fields(
     }
     let mut lifetimes = interface.lifetimes.clone();
     lifetimes.extend_from_slice(existing_lifetimes);
+    if observed.introduced_bounds.iter().collect::<BTreeSet<_>>()
+        != interface.lifetime_bounds.iter().collect::<BTreeSet<_>>()
+    {
+        return Err(CustodyError::Lifetimes);
+    }
     if observed.lifetimes != lifetimes {
         return Err(CustodyError::Lifetimes);
     }

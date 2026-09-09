@@ -38,6 +38,7 @@ pub enum Error {
     CopyRequired,
     StaleFinalization,
     CopySiteMissing(SiteId),
+    LifetimeRelation(FieldClassId),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -128,6 +129,7 @@ pub struct StructInterface {
     pub terminal_fields: BTreeSet<FieldClassId>,
     pub field_types: BTreeMap<FieldClassId, String>,
     pub lifetimes: Vec<String>,
+    pub lifetime_bounds: Vec<(String, String)>,
     pub remove_copy_clone: bool,
 }
 
@@ -151,6 +153,7 @@ pub fn struct_interface(
         terminal_fields: BTreeSet::new(),
         field_types: BTreeMap::new(),
         lifetimes: vec![],
+        lifetime_bounds: vec![],
         remove_copy_clone: false,
     };
     let mut used = reserved_lifetimes.clone();
@@ -243,4 +246,94 @@ pub fn struct_interface(
         }
     }
     Ok(result)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LifetimeRelations {
+    pub equal: Vec<(FieldClassId, FieldClassId)>,
+    pub outlives: Vec<(FieldClassId, FieldClassId)>,
+}
+
+pub fn struct_interface_with_relations(
+    owner: OwnerId,
+    fields: &[Field],
+    reserved: &BTreeSet<String>,
+    copy: &CopyContract,
+    transactions: &[Transaction],
+    terminal: &Finalization,
+    relations: &LifetimeRelations,
+) -> Result<StructInterface, Error> {
+    let mut interface = struct_interface(owner, fields, reserved, copy, transactions, terminal)?;
+    let mut groups: BTreeMap<_, _> = fields
+        .iter()
+        .filter(|f| matches!(f.candidate, FieldForm::Borrow { .. }))
+        .map(|f| (f.id, f.id))
+        .collect();
+    for (a, b) in relations.equal.iter().chain(&relations.outlives) {
+        if !groups.contains_key(a) {
+            return Err(Error::LifetimeRelation(*a));
+        }
+        if !groups.contains_key(b) {
+            return Err(Error::LifetimeRelation(*b));
+        }
+    }
+    for (a, b) in &relations.equal {
+        let left = groups[a];
+        let right = groups[b];
+        let representative = left.min(right);
+        for group in groups.values_mut() {
+            if *group == left || *group == right {
+                *group = representative;
+            }
+        }
+    }
+    let representatives: BTreeSet<_> = groups.values().copied().collect();
+    let mut names = BTreeMap::new();
+    let mut used = reserved.clone();
+    for group in representatives {
+        let base = format!("__crat_f{}", group.field);
+        let mut name = base.clone();
+        let mut suffix = 0;
+        while !used.insert(name.clone()) {
+            suffix += 1;
+            name = format!("{base}_{suffix}");
+        }
+        names.insert(group, name);
+    }
+    let mut active_groups = BTreeSet::new();
+    for field in fields {
+        if !interface.terminal_fields.contains(&field.id) {
+            continue;
+        }
+        if let FieldForm::Borrow {
+            pointee,
+            mutable,
+            optional,
+        } = &field.candidate
+        {
+            let group = groups[&field.id];
+            active_groups.insert(group);
+            let name = &names[&group];
+            let ty = format!("&'{name} {}{pointee}", if *mutable { "mut " } else { "" });
+            interface.field_types.insert(
+                field.id,
+                if *optional {
+                    format!("Option<{ty}>")
+                } else {
+                    ty
+                },
+            );
+        }
+    }
+    interface.lifetimes = active_groups.iter().map(|g| names[g].clone()).collect();
+    let mut bounds = BTreeSet::new();
+    for (a, b) in &relations.outlives {
+        let a = groups[a];
+        let b = groups[b];
+        if a != b && active_groups.contains(&a) && active_groups.contains(&b) {
+            bounds.insert((names[&a].clone(), names[&b].clone()));
+        }
+    }
+    interface.lifetime_bounds = bounds.into_iter().collect();
+    Ok(interface)
 }

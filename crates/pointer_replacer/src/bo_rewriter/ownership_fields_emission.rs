@@ -368,3 +368,106 @@ pub fn explicit_free(
         receipt: "c-free-site-drop",
     })
 }
+
+#[derive(Clone, Debug)]
+pub struct AggregateField {
+    pub field: super::FieldClassId,
+    pub name: String,
+    pub ty: OwnerType,
+    pub generation: EvidenceKey,
+}
+#[derive(Clone, Debug)]
+pub struct AggregateLeakContract {
+    pub coverage: LeakCoverage,
+    pub owner: super::OwnerId,
+    pub type_name: String,
+    pub all_owning_fields: std::collections::BTreeSet<super::FieldClassId>,
+    pub fields: Vec<AggregateField>,
+    pub field_inventory: Option<EvidenceKey>,
+    pub no_user_drop: Option<EvidenceKey>,
+    pub helper_lowering: Option<EvidenceKey>,
+}
+#[derive(Clone, Debug)]
+pub struct LeakAggregate {
+    name: String,
+    fields: std::collections::BTreeMap<super::FieldClassId, AggregateField>,
+}
+pub fn leak_aggregate(
+    contract: &AggregateLeakContract,
+    name: &str,
+    initializer: &str,
+) -> Result<(LeakAggregate, Emitted), EmitHold> {
+    contract.coverage.validate()?;
+    let key = contract.coverage.local;
+    if contract.field_inventory != Some(key) {
+        return Err(EmitHold::MissingEvidence("aggregate-fields"));
+    }
+    if contract.no_user_drop != Some(key) {
+        return Err(EmitHold::MissingEvidence("aggregate-drop-effects"));
+    }
+    if contract.helper_lowering != Some(key) {
+        return Err(EmitHold::MissingEvidence("aggregate-lowering"));
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    let mut names = std::collections::BTreeSet::new();
+    let mut generations = std::collections::BTreeSet::new();
+    for field in &contract.fields {
+        if field.field.owner != contract.owner
+            || !field.ty.optional
+            || field.generation.model != key.model
+            || field.generation.configuration != key.configuration
+            || field.generation.site.owner != key.site.owner
+            || !names.insert(field.name.clone())
+            || !generations.insert(field.generation.generation)
+            || fields.insert(field.field, field.clone()).is_some()
+        {
+            return Err(EmitHold::MissingEvidence("aggregate-fields"));
+        }
+    }
+    if fields
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        != contract.all_owning_fields
+    {
+        return Err(EmitHold::MissingEvidence("aggregate-fields"));
+    }
+    let emitted = Emitted {
+        code: format!(
+            "let mut {name}: std::mem::ManuallyDrop<{}> = std::mem::ManuallyDrop::new({initializer});",
+            contract.type_name
+        ),
+        key,
+        receipt: "waiver-leak(recursive-drop)",
+    };
+    Ok((
+        LeakAggregate {
+            name: name.into(),
+            fields,
+        },
+        emitted,
+    ))
+}
+impl LeakAggregate {
+    pub fn free_field(
+        &mut self,
+        field: super::FieldClassId,
+        permit: &OwnCallPermit,
+        sink: EvidenceKey,
+        allocator_layout: Option<EvidenceKey>,
+    ) -> Result<Emitted, EmitHold> {
+        let current = self.fields.get(&field).ok_or(EmitHold::SinkIdentity)?;
+        if !same_generation(current.generation, sink) {
+            return Err(EmitHold::SinkIdentity);
+        }
+        let emitted = explicit_free(
+            permit,
+            sink,
+            &format!("{}.{}", self.name, current.name),
+            true,
+            allocator_layout,
+        )?;
+        self.fields.remove(&field);
+        Ok(emitted)
+    }
+}

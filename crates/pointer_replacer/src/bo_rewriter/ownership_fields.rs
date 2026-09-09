@@ -50,3 +50,24 @@ pub mod declaration;
 
 #[path = "ownership_fields_custody.rs"]
 pub mod custody;
+
+#[path = "ownership_fields_uses.rs"]
+pub mod field_uses;
+
+#[path = "ownership_fields_boundary.rs"]
+pub mod boundary;
+
+#[path = "ownership_fields_free.rs"]
+pub mod free_sites;
+
+#[path = "ownership_fields_depth.rs"]
+pub mod drop_depth;
+
+#[path = "ownership_fields_copy.rs"]
+pub mod struct_copy;
+
+#[path = "ownership_fields_apply.rs"]
+pub mod application;
+
+#[path = "ownership_fields_recovery.rs"]
+pub mod recovery;

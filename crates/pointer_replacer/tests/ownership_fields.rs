@@ -184,6 +184,7 @@ fn deep_recursive_payload_leaks_at_each_unwitnessed_implicit_close() {
 #[test]
 fn shallow_recursive_payload_drops_only_with_exact_depth_witness() {
     let depth = DepthWitness {
+        graph: recursive_graph(),
         kind: CloseKind::ScopeExit,
         key: key(0),
         payload: OwnerId(1),
@@ -613,6 +614,7 @@ fn emitted_struct_copy_adaptation_and_explicit_free_drop_exactly_once() {
 fn permitted_shallow_close_and_explicit_free_are_not_suppressed() {
     let k = key(0);
     let depth = DepthWitness {
+        graph: recursive_graph(),
         kind: CloseKind::ScopeExit,
         key: k,
         payload: OwnerId(1),
@@ -693,6 +695,7 @@ fn structural_renderer_composes_copy_removal_owning_field_and_borrow_lifetime() 
             (field(0), "Option<Box<i32>>".into()),
             (field(1), "&'__crat_f1 i32".into()),
         ]),
+        lifetime_bounds: vec![],
         lifetimes: vec!["__crat_f1".into()],
         remove_copy_clone: true,
     };
@@ -748,6 +751,7 @@ fn unrelated_ready_site_cannot_pay_an_owning_field_copy_obligation() {
 fn scope_depth_witness_cannot_authorize_unwind_drop() {
     let k = key(0);
     let witness = DepthWitness {
+        graph: recursive_graph(),
         kind: CloseKind::ScopeExit,
         key: k,
         payload: OwnerId(1),
@@ -865,11 +869,13 @@ fn custody_rejects_equal_count_identity_swaps_and_planned_but_raw_fields() {
     let interface = StructInterface {
         terminal_fields: BTreeSet::from([field(0)]),
         field_types: BTreeMap::from([(field(0), "Option<Box<i32>>".into())]),
+        lifetime_bounds: vec![],
         lifetimes: vec![],
         remove_copy_clone: true,
     };
     let terminal = finalize(&[transaction(0)]).unwrap();
     let mut observation = Observation {
+        introduced_bounds: vec![],
         source_hash: [7; 32],
         field_types: interface.field_types.clone(),
         lifetimes: vec![],
@@ -1079,6 +1085,7 @@ fn duplicated_class_and_stale_finalization_are_rejected() {
 fn bounded_recursive_ordinary_scope_close_executes_destructors() {
     let k = key(0);
     let depth = DepthWitness {
+        graph: recursive_graph(),
         kind: CloseKind::ScopeExit,
         key: k,
         payload: OwnerId(1),
@@ -1122,12 +1129,14 @@ fn custody_checks_source_hash_type_lifetimes_and_copy_traits_together() {
     let interface = StructInterface {
         terminal_fields: BTreeSet::from([field(0)]),
         field_types: BTreeMap::from([(field(0), "Option<Box<i32>>".into())]),
+        lifetime_bounds: vec![],
         lifetimes: vec![],
         remove_copy_clone: true,
     };
     let terminal = finalize(&[transaction(0)]).unwrap();
     let ledger = BTreeSet::from([field(0)]);
     let mut observed = Observation {
+        introduced_bounds: vec![],
         source_hash: [7; 32],
         field_types: interface.field_types.clone(),
         lifetimes: vec![],
@@ -1177,6 +1186,7 @@ fn custody_cannot_pair_old_raw_interface_with_new_live_transaction() {
     )
     .unwrap();
     let observed = Observation {
+        introduced_bounds: vec![],
         source_hash: [7; 32],
         field_types: interface.field_types.clone(),
         lifetimes: vec![],
@@ -1222,6 +1232,7 @@ fn qualified_builtin_clone_is_removed_with_copy() {
     let interface = StructInterface {
         terminal_fields: BTreeSet::from([field(0)]),
         field_types: BTreeMap::from([(field(0), "Option<Box<i32>>".into())]),
+        lifetime_bounds: vec![],
         lifetimes: vec![],
         remove_copy_clone: true,
     };
@@ -1253,6 +1264,7 @@ fn custody_preserves_existing_and_introduced_lifetimes() {
     )
     .unwrap();
     let observed = Observation {
+        introduced_bounds: vec![],
         source_hash: [7; 32],
         field_types: interface.field_types.clone(),
         lifetimes: vec!["__crat_f0".into(), "a".into()],
@@ -1269,4 +1281,99 @@ fn custody_preserves_existing_and_introduced_lifetimes() {
         )
         .is_ok()
     );
+}
+
+#[path = "ownership_fields_cases/field.rs"]
+mod field_cases;
+
+#[path = "ownership_fields_cases/boundary.rs"]
+mod boundary_cases;
+
+#[path = "ownership_fields_cases/free.rs"]
+mod free_cases;
+
+#[path = "ownership_fields_cases/depth.rs"]
+mod depth_cases;
+
+#[path = "ownership_fields_cases/copy.rs"]
+mod copy_cases;
+
+#[path = "ownership_fields_cases/application.rs"]
+mod application_cases;
+
+#[path = "ownership_fields_cases/aggregate.rs"]
+mod aggregate_cases;
+
+#[path = "ownership_fields_cases/recovery.rs"]
+mod recovery_cases;
+
+#[test]
+fn synthetic_ownership_chain_composes_declaration_copy_signature_call_and_free() {
+    use ownership_fields::{boundary::*, field_uses::*, free_sites::*, struct_copy::*};
+    let definition = "#[derive(Copy,Clone,Debug)] struct Holder { child: *mut i32, key: i32 }";
+    let at = definition.find(" {").unwrap();
+    let declaration = Declaration {
+        owner: OwnerId(1),
+        fields: BTreeMap::from([(field(0), captured(definition, "*mut i32"))]),
+        generics: GenericSite {
+            span: CapturedSpan {
+                lo: at,
+                hi: at,
+                text: String::new(),
+            },
+            parameters: vec![],
+        },
+        derives: vec![DeriveSite {
+            span: captured(definition, "#[derive(Copy,Clone,Debug)]"),
+            traits: vec![
+                DeriveTrait::BuiltinCopy,
+                DeriveTrait::BuiltinClone,
+                DeriveTrait::Other("Debug".into()),
+            ],
+        }],
+    };
+    let interface = field_cases::interface();
+    let definition = render_declaration(definition, &declaration, &interface).unwrap();
+    let copy = plan_struct_copy(&copy_cases::copy_site(), &interface).unwrap();
+    let signature = boundary_cases::signature();
+    let sig = plan_signature(&signature).unwrap();
+    let returned = plan_return(&ReturnEdge {
+        source: signature.parameters[0].slot.clone(),
+        result: signature.result.clone(),
+        expression: "buf".into(),
+        take_optional_storage: false,
+        exclusive_storage: true,
+        transport: Some((signature.parameters[0].slot.key, signature.result.key)),
+    })
+    .unwrap();
+    let mut call = boundary_cases::contract();
+    call.arguments[0].expression = "copied.child".into();
+    let call = plan_call(&call).unwrap();
+    let sink = key(7);
+    let owner = key(6);
+    let free = plan_frees(
+        &BTreeSet::from([sink]),
+        &[FreeSite {
+            sink,
+            owner,
+            expression: "out".into(),
+            optional_storage: true,
+            casts: vec![CastKind::PointerToVoid],
+            exact_owner_relation: Some((owner, sink)),
+            allocation_base: Some(sink),
+            allocator_layout: Some(sink),
+            grant: grant(sink),
+            call: call_facts(sink),
+        }],
+    )
+    .unwrap();
+    let code = format!(
+        "{definition} fn pass({})->{}{{{returned}}}fn main(){{let mut original=Holder{{child:Some(Box::new(7)),key:3}};{}let mut out=pass({});assert_eq!(out.as_deref(),Some(&7));{}assert!(out.is_none());assert!(original.child.is_none());}}",
+        sig.parameters.join(","),
+        sig.result,
+        copy.code,
+        call.arguments.join(","),
+        free[&sink].code
+    );
+    assert!(compile_source(&code, true).status.success());
 }
