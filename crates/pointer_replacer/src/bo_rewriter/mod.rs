@@ -114,6 +114,8 @@ mod declaration_tests;
 #[cfg(test)]
 pub(crate) mod delivery_custody;
 #[cfg(test)]
+mod diagnostic_message_tests;
+#[cfg(test)]
 mod emit_tests;
 #[cfg(test)]
 mod escape_seam_tests;

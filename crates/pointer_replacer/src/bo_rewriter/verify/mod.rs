@@ -403,6 +403,13 @@ pub(crate) fn type_checks_str(source: &str) -> bool {
     diagnose_input(::utils::compilation::str_to_input(source)).errors == 0
 }
 
+/// The full diagnosis of a source string, for witnesses that must read the
+/// captured diagnostics themselves rather than only their count.
+#[cfg(test)]
+pub(crate) fn diagnose_str(source: &str) -> Diagnosis {
+    diagnose_input(::utils::compilation::str_to_input(source))
+}
+
 static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
 
 /// A rewritten copy of a crate, on disk, deleted when dropped.
@@ -713,13 +720,17 @@ pub(crate) struct Diagnosis {
     /// is counted and not located. Measured 2 vs 1 on the fixture below, which
     /// is what makes the count-independence witness able to fail.
     pub diags: Vec<Diag>,
-    /// Counted diagnostics that carried no `Str` content. Loud rather than
+    /// Counted diagnostics whose message came out empty. Loud rather than
     /// silent: the text degraded, the count did not.
     ///
-    /// **Currently unexercised**: both probed error kinds (E0308 mismatch, E0425
-    /// unresolved name) carry `Str` messages, so no fixture yet drives this
-    /// above zero. Recorded as a fixture gap rather than given a witness that
-    /// could not fail.
+    /// **Exercised since L31/L32** (2026-09-09). It was recorded here as an
+    /// unexercised fixture gap, on the reading that the probed error kinds
+    /// carry `Str` messages. The J'' ledger disproved that on real programs —
+    /// two live rows with no error code, one carrying a child note as its
+    /// whole message and one carrying nothing — and the cause was reading
+    /// `DiagMessage::Str` alone instead of asking rustc's `Translator`. The
+    /// witnesses in `diagnostic_message_tests` drive this above zero when the
+    /// resolution is dropped.
     pub unrenderable: usize,
 }
 
@@ -768,17 +779,34 @@ impl rustc_errors::emitter::Emitter for Capture {
         // COUNT FIRST, from Level alone. Nothing below can reduce it.
         *self.errors.lock().unwrap() += 1;
 
+        // L31/L32. `DiagMessage` has THREE variants and only one of them is
+        // `Str`: a `Translated` message is already resolved, and a
+        // `FluentIdentifier` still needs the translator to resolve it. Every
+        // lint and every Fluent-authored error uses one of the other two, so
+        // reading `Str` alone dropped the primary message and left whatever
+        // `Str` children happened to exist standing in its place. The J''
+        // ledger caught it: two live rows with no error code, one carrying a
+        // child note as its whole message and one carrying nothing.
+        //
+        // This is not cosmetic. `baseline_key` keys on
+        // `(file, code, message)`, so an empty message collapses distinct
+        // diagnostics of one code in one file into a single key, and the
+        // baseline differential is a MULTISET over those keys — a
+        // rewrite-introduced diagnostic could hide behind a baseline one it
+        // does not match. rustc's own `Translator` is what resolves all three
+        // variants, and it is already held here for the forwarding emitter.
+        let args = rustc_errors::translation::to_fluent_args(diag.args.iter());
         let mut message = String::new();
         for (msg, _) in &diag.messages {
-            if let rustc_errors::DiagMessage::Str(text) = msg {
-                message.push_str(text);
+            if let Ok(text) = self.translator.translate_message(msg, &args) {
+                message.push_str(&text);
             }
         }
         for child in &diag.children {
             for (msg, _) in &child.messages {
-                if let rustc_errors::DiagMessage::Str(text) = msg {
+                if let Ok(text) = self.translator.translate_message(msg, &args) {
                     message.push(' ');
-                    message.push_str(text);
+                    message.push_str(&text);
                 }
             }
         }
@@ -795,9 +823,11 @@ impl rustc_errors::emitter::Emitter for Capture {
                 let message = child
                     .messages
                     .iter()
-                    .filter_map(|(message, _)| match message {
-                        rustc_errors::DiagMessage::Str(text) => Some(text.as_ref()),
-                        _ => None,
+                    .filter_map(|(message, _)| {
+                        self.translator
+                            .translate_message(message, &args)
+                            .ok()
+                            .map(std::borrow::Cow::into_owned)
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
