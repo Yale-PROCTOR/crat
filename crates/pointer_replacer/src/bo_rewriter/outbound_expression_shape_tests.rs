@@ -12,14 +12,21 @@ use super::decision::seam::Form;
 /// The one skeleton every arm shares. `target` is the native source whose
 /// settled form changes; `raw_read` is the raw sink that still needs a pointer.
 fn fixture(argument: &str) -> String {
+    fixture_with_sink("q.read()", argument)
+}
+
+/// The same skeleton with the sink's body chosen by the caller, which is how
+/// the retention tier at this seam is varied.
+fn fixture_with_sink(sink_body: &str, argument: &str) -> String {
     format!(
         r#"
-    #![allow(dead_code, unused_unsafe)]
-    unsafe fn raw_read(q: *const i32) -> i32 {{ q.read() }}
+    #![allow(dead_code, unused_unsafe, unused_variables)]
+    unsafe fn raw_read(q: *const i32) -> i32 {{ {sink_body} }}
     unsafe fn target(p: *mut i32) -> *mut i32 {{
         *p.offset(1) += 1;
         p
     }}
+    static mut SINK: *const i32 = core::ptr::null();
     pub unsafe fn entry() -> i32 {{
         let mut values = [3, 5, 7];
         raw_read({argument})
@@ -34,6 +41,7 @@ struct ShapeOutcome {
     unavailable: Vec<String>,
     source_form: Form,
     withdrawals: Vec<String>,
+    tiers: Vec<String>,
 }
 
 /// Runs one arm through the ordinary pipeline and reports what the outbound
@@ -84,6 +92,13 @@ fn shape_outcome(input: &str, label: &str) -> ShapeOutcome {
         .expect("one emitted round");
         assert!(rollbacks.is_empty(), "{label}: the arm owns its rendering");
         ShapeOutcome {
+            tiers: table
+                .seams
+                .outbound_expressions
+                .plans
+                .values()
+                .map(|plan| format!("{:?}/{:?}", plan.tier, plan.retention))
+                .collect(),
             withdrawals: format!("{:#?}", ctx.raw_boundary_artifacts.additive_family_receipts)
                 .lines()
                 .map(str::trim)
@@ -221,4 +236,20 @@ fn outbound_shape_offset_over_a_call_result_holds_with_its_own_reason() {
         &input,
         "offset over call result",
     );
+}
+
+#[test]
+fn tmp_probe_tiers() {
+    for (label, body) in [
+        ("offset-deref", "*q.offset(1)"),
+        ("cast-deref", "*(q as *const i64) as i32"),
+        ("read-and-store", "SINK = q; q.read()"),
+    ] {
+        let input = fixture_with_sink(body, "target(values.as_mut_ptr())");
+        let outcome = shape_outcome(&input, label);
+        println!(
+            "TMPTIER[{label}] form={:?} plans={} unavailable={:?} tiers={:?}",
+            outcome.source_form, outcome.plans, outcome.unavailable, outcome.tiers
+        );
+    }
 }

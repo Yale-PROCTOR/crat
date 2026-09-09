@@ -114,6 +114,8 @@ pub(crate) mod delivery_custody;
 #[cfg(test)]
 mod emit_tests;
 #[cfg(test)]
+mod escape_seam_tests;
+#[cfg(test)]
 mod expression_sibling_tests;
 #[cfg(test)]
 mod goldens;
