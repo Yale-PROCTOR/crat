@@ -119,6 +119,12 @@ pub(crate) enum OutboundExpressionFailure {
     ChildPermission(ReturnedChildPermissionFailure),
     Template(RawBoundaryBlockReason),
     DuplicateSite,
+    /// The argument CONTAINS a form-changed native call instead of being one —
+    /// a cast, a projection or arithmetic wrapped around it. The carrier for
+    /// that shape is not built, and the site must be counted as held rather
+    /// than passed over: passing over it leaves the boundary unadapted with
+    /// nothing in the ledger to show for it.
+    NestedNativeCarrierUnbuilt,
 }
 
 impl OutboundExpressionFailure {
@@ -242,6 +248,32 @@ fn return_may_carry_pointer<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u32) -
     }
 }
 
+/// The one form-changed native call strictly inside `argument`, when the
+/// argument is not itself that call. Several such calls, or none, answer
+/// `None`: the first is ambiguous and the second has nothing to adapt.
+fn nested_native_source(
+    originals: &NativeCalls<'_, '_>,
+    table: &DecisionTable,
+    argument: Span,
+) -> Option<NativeCall> {
+    let mut found = None;
+    for (span, calls) in &originals.calls {
+        if *span == argument || !argument.contains(*span) {
+            continue;
+        }
+        for call in calls {
+            if table.return_interfaces.functions[&call.callee].form == Form::Raw {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(*call);
+        }
+    }
+    found
+}
+
 fn call_carrier_owns(table: &DecisionTable, spans: &[Span]) -> bool {
     table
         .seams
@@ -289,7 +321,31 @@ pub(crate) fn plan(
         };
         originals.visit_expr(tcx.hir_body_owned_by(caller).value);
         for site in sites {
-            let Some(calls) = originals.calls.get(&site.source_span) else { continue };
+            let Some(calls) = originals.calls.get(&site.source_span) else {
+                if let Some(nested) = nested_native_source(&originals, table, site.source_span) {
+                    out.unavailable.insert(
+                        site.key.clone(),
+                        OutboundExpressionUnavailable {
+                            key: site.key.clone(),
+                            caller,
+                            argument_hir: nested.hir,
+                            argument_span: site.source_span,
+                            call_span: site.call_span,
+                            source_callee: nested.callee,
+                            source_interface: table.return_interfaces.functions[&nested.callee]
+                                .clone(),
+                            sink_callee: site.callee_local.map_or_else(
+                                || BridgeCalleeId::Foreign(site.key.callee.path.clone()),
+                                BridgeCalleeId::Local,
+                            ),
+                            target: site.target.clone(),
+                            reason: OutboundExpressionFailure::NestedNativeCarrierUnbuilt,
+                            retention: None,
+                        },
+                    );
+                }
+                continue;
+            };
             let source = calls[0];
             let interface = &table.return_interfaces.functions[&source.callee];
             if interface.form == Form::Raw {
