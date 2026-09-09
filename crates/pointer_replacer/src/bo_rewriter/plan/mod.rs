@@ -493,6 +493,30 @@ fn nested_ast_composition(
         let option_value_over_inner = outer.key.bridge_kind == "option-value-composed"
             && inner.key.bridge_kind != "option-value-composed"
             && contains(outer, inner);
+        // L07 (§39 addendum 272, R272-3). The five outer/inner kind pairs the
+        // J'' frame measures as STRICT CONTAINMENTS, entering under exactly
+        // the dependency discipline `bridge_over_subject` already uses: the
+        // outer `depends_on` the inner, so reverting the inner reverts the
+        // outer, and no new custody contract is introduced.
+        //
+        // Each closed collision unholds TWO classes, because a declined
+        // containment makes both carry `cross-class-interval-collision`.
+        //
+        // The pairs are named exactly, never by a family predicate: an
+        // unlisted outer/inner combination still collides, which is what
+        // keeps this an allowlist rather than a loosened arm.
+        let l07_containment = outer.key.caller == inner.key.caller
+            && matches!(
+                (
+                    outer.key.bridge_kind.as_str(),
+                    inner.key.bridge_kind.as_str()
+                ),
+                ("pair-t2-raw-view", "typed-raw-temporary")
+                    | ("pair-copy-snapshot", "typed-raw-temporary")
+                    | ("pair-t2-raw-view", "raw-cast-const")
+                    | ("c-raw-reborrow-shared", "raw-cast-const")
+                    | ("pair-t2-raw-view", "subject-use")
+            );
         let raw_receiver_over_argument = matches!(
             outer.key.bridge_kind.as_str(),
             "return-caller-receive-raw"
@@ -502,7 +526,8 @@ fn nested_ast_composition(
             && outer.key.caller == inner.key.caller
             && matches!(inner.key.arm.as_str(), "c" | "glue")
             && strictly_contains(outer, inner);
-        ((bridge_over_subject || pair_over_c || a5_over_inner) && strictly_contains(outer, inner))
+        ((bridge_over_subject || pair_over_c || a5_over_inner || l07_containment)
+            && strictly_contains(outer, inner))
             || slice_construction_over_inner
             || option_value_over_inner
             || raw_receiver_over_argument
@@ -5133,6 +5158,185 @@ mod wave3_class_tests {
             let dependent_at = flattened.iter().position(|id| *id == ids[2]).unwrap();
             let dependency_at = flattened.iter().position(|id| *id == ids[0]).unwrap();
             assert!(dependent_at < dependency_at, "dependency order was lexical");
+        });
+    }
+
+    /// L07 (§39 addendum 272, R272-3) — the five kind pairs, each through the
+    /// three states the ruling requires.
+    ///
+    /// **State 1, both applied.** The containment is a composition, not a
+    /// collision: both classes stay ready and the outer records the inner as a
+    /// dependency.
+    ///
+    /// **State 2, inner reverted.** `dependent_closure` carries the revert
+    /// UPWARD along that dependency, so the outer goes with it. This is the
+    /// property that makes cross-class composition safe against revert
+    /// atomicity: the inner can never be withdrawn while the outer that wraps
+    /// it stays applied.
+    ///
+    /// **State 3, outer reverted with the inner applied.** The closure is
+    /// directional, so the inner survives — and it re-renders correctly
+    /// because `round_files` emits through
+    /// `ast_transform::ast_emitted_files_from`, an AST re-render from the
+    /// ready-class set, not a text splice. There is no half-composed text
+    /// region to leave behind: the inner rewrite applies to its own AST node
+    /// and the outer simply does not wrap it. (`apply::apply`'s
+    /// overlapping-edit rollback belongs to the span layer, which is not the
+    /// emission path here.)
+    #[test]
+    fn l07_five_kind_pairs_compose_and_revert_inner_first() {
+        use crate::bo_rewriter::decision::Arm;
+        const PAIRS: [(Arm, &str, Arm, &str); 5] = [
+            (Arm::Pair, "pair-t2-raw-view", Arm::C, "typed-raw-temporary"),
+            (
+                Arm::Pair,
+                "pair-copy-snapshot",
+                Arm::C,
+                "typed-raw-temporary",
+            ),
+            (Arm::Pair, "pair-t2-raw-view", Arm::C, "raw-cast-const"),
+            (Arm::C, "c-raw-reborrow-shared", Arm::C, "raw-cast-const"),
+            (Arm::Pair, "pair-t2-raw-view", Arm::Surface, "subject-use"),
+        ];
+        for (outer_arm, outer_kind, inner_arm, inner_kind) in PAIRS {
+            with_classes(2, |ids| {
+                let outer = ClassInput::new(ids[0], arms(&[outer_arm])).with_site(ClassSite::edit(
+                    ids[0], ids[1], outer_arm, "j.rs", 1000, 1080, outer_kind,
+                ));
+                let inner = ClassInput::new(ids[1], arms(&[inner_arm])).with_site(ClassSite::edit(
+                    ids[1], ids[1], inner_arm, "j.rs", 1020, 1040, inner_kind,
+                ));
+                let finalized = finalize_class_inputs(vec![outer, inner]);
+
+                // State 1.
+                assert!(
+                    finalized.classes[&ids[0]].is_ready(),
+                    "{outer_kind} over {inner_kind}: outer held {:?}",
+                    finalized.classes[&ids[0]].hold_reasons()
+                );
+                assert!(
+                    finalized.classes[&ids[1]].is_ready(),
+                    "{outer_kind} over {inner_kind}: inner held {:?}",
+                    finalized.classes[&ids[1]].hold_reasons()
+                );
+                assert!(
+                    finalized.classes[&ids[0]].depends_on.contains(&ids[1]),
+                    "{outer_kind} over {inner_kind}: composed without its dependency"
+                );
+                assert!(
+                    finalized.collisions.is_empty(),
+                    "{outer_kind} over {inner_kind}: still a collision"
+                );
+
+                // State 2.
+                let inner_reverted =
+                    dependent_closure(&finalized.classes, &BTreeSet::from([ids[1]]));
+                assert!(
+                    inner_reverted.contains(&ids[0]),
+                    "{outer_kind} over {inner_kind}: the outer survived its inner's revert"
+                );
+
+                // State 3.
+                let outer_reverted =
+                    dependent_closure(&finalized.classes, &BTreeSet::from([ids[0]]));
+                assert!(
+                    !outer_reverted.contains(&ids[1]),
+                    "{outer_kind} over {inner_kind}: reverting the outer took the inner with it"
+                );
+            });
+        }
+    }
+
+    /// The allowlist stays an allowlist. An outer/inner kind combination that
+    /// is not one of the five still collides, and both classes still hold —
+    /// which is exactly the cost L07 is paying down for the five it names.
+    #[test]
+    fn l07_unlisted_kind_pair_still_collides() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(2, |ids| {
+            let outer = ClassInput::new(ids[0], arms(&[Arm::Pair])).with_site(ClassSite::edit(
+                ids[0],
+                ids[1],
+                Arm::Pair,
+                "j.rs",
+                1000,
+                1080,
+                "pair-t2-raw-view",
+            ));
+            let inner = ClassInput::new(ids[1], arms(&[Arm::C])).with_site(ClassSite::edit(
+                ids[1],
+                ids[1],
+                Arm::C,
+                "j.rs",
+                1020,
+                1040,
+                "slice-to-raw-const",
+            ));
+            let finalized = finalize_class_inputs(vec![outer, inner]);
+            assert_eq!(finalized.collisions.len(), 1);
+            assert!(!finalized.classes[&ids[0]].is_ready());
+            assert!(!finalized.classes[&ids[1]].is_ready());
+        });
+    }
+
+    /// A true crossing of a LISTED pair is still a collision. Composition is
+    /// about strict containment; two intervals that merely overlap have no
+    /// inner-first order to render in.
+    #[test]
+    fn l07_listed_kinds_that_cross_are_still_held() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(2, |ids| {
+            let outer = ClassInput::new(ids[0], arms(&[Arm::Pair])).with_site(ClassSite::edit(
+                ids[0],
+                ids[1],
+                Arm::Pair,
+                "j.rs",
+                1000,
+                1050,
+                "pair-t2-raw-view",
+            ));
+            let inner = ClassInput::new(ids[1], arms(&[Arm::C])).with_site(ClassSite::edit(
+                ids[1],
+                ids[1],
+                Arm::C,
+                "j.rs",
+                1040,
+                1090,
+                "typed-raw-temporary",
+            ));
+            let finalized = finalize_class_inputs(vec![outer, inner]);
+            assert_eq!(finalized.collisions.len(), 1, "a crossing composed");
+            assert!(!finalized.classes[&ids[0]].is_ready());
+            assert!(!finalized.classes[&ids[1]].is_ready());
+        });
+    }
+
+    /// The two edits must live in ONE function body. A same-file containment
+    /// across two different callers is a byte coincidence, not a nesting.
+    #[test]
+    fn l07_containment_across_two_callers_is_not_a_composition() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(3, |ids| {
+            let outer = ClassInput::new(ids[0], arms(&[Arm::Pair])).with_site(ClassSite::edit(
+                ids[0],
+                ids[1],
+                Arm::Pair,
+                "j.rs",
+                1000,
+                1080,
+                "pair-t2-raw-view",
+            ));
+            let inner = ClassInput::new(ids[2], arms(&[Arm::C])).with_site(ClassSite::edit(
+                ids[2],
+                ids[2],
+                Arm::C,
+                "j.rs",
+                1020,
+                1040,
+                "typed-raw-temporary",
+            ));
+            let finalized = finalize_class_inputs(vec![outer, inner]);
+            assert_eq!(finalized.collisions.len(), 1, "two callers composed");
         });
     }
 
