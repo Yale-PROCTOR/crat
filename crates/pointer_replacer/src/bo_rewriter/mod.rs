@@ -106,6 +106,8 @@ mod bridge_custody_tests;
 #[cfg(test)]
 mod callee_input_tests;
 #[cfg(test)]
+mod cast_of_local_bridge_tests;
+#[cfg(test)]
 mod declaration_pattern_tests;
 #[cfg(test)]
 mod declaration_tests;

@@ -1806,6 +1806,14 @@ pub(crate) enum BridgeTemplate {
     VoidFromRef,
     VoidFromRefCastMut,
     VoidFromMutAsConst,
+    /// K19' (R272-2). A settled slice subject reaching a `c_void` position
+    /// through a cast. The raw view is taken from the SLICE, so the pointer
+    /// carries `len * size_of::<T>()` bytes -- the extent a `&c_void` could
+    /// never have carried, which is what makes this bridge the sound reading
+    /// of the edge R271-1 opened.
+    VoidFromSlice,
+    VoidFromSliceMut,
+    VoidFromSliceCastMut,
     RawCastMut,
     RawCastConst,
     TypedRawTemporary,
@@ -1834,7 +1842,8 @@ impl BridgeTemplate {
         match self {
             Self::Depth2NpoConst | Self::Depth2NpoMut => "depth2-npo-bridge",
             Self::VoidFromMut | Self::VoidFromRef | Self::VoidFromMutAsConst => "void-generic-raw",
-            Self::VoidFromRefCastMut => "shared-ref-to-mut-raw",
+            Self::VoidFromSlice | Self::VoidFromSliceMut => "void-generic-raw-slice",
+            Self::VoidFromRefCastMut | Self::VoidFromSliceCastMut => "shared-ref-to-mut-raw",
             Self::RawCastMut => "raw-cast-mut",
             Self::RawCastConst => "raw-cast-const",
             Self::TypedRawTemporary => "typed-raw-temporary",
@@ -1903,7 +1912,10 @@ impl BridgeTemplate {
             Self::VoidFromMut
             | Self::VoidFromRef
             | Self::VoidFromRefCastMut
-            | Self::VoidFromMutAsConst => {
+            | Self::VoidFromMutAsConst
+            | Self::VoidFromSlice
+            | Self::VoidFromSliceMut
+            | Self::VoidFromSliceCastMut => {
                 let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
                 let source = match self {
                     Self::VoidFromMut => format!("core::ptr::from_mut({argument})"),
@@ -1914,6 +1926,9 @@ impl BridgeTemplate {
                     Self::VoidFromMutAsConst => {
                         format!("core::ptr::from_ref(&*{argument})")
                     }
+                    Self::VoidFromSlice => format!("{argument}.as_ptr()"),
+                    Self::VoidFromSliceMut => format!("{argument}.as_mut_ptr()"),
+                    Self::VoidFromSliceCastMut => format!("{argument}.as_ptr().cast_mut()"),
                     _ => unreachable!(),
                 };
                 Ok(BridgeRender::Edit(format!("{source}.cast::<{pointee}>()")))
@@ -2388,10 +2403,31 @@ pub(crate) fn template_for(
             Decision::Ref { mutable: false } | Decision::InferredRef { mutable: false, .. } => {
                 Err(RawBoundaryBlockReason::SharedToMut)
             }
-            Decision::Slice { .. }
-            | Decision::Opt { .. }
-            | Decision::Box(_)
-            | Decision::Degraded(_) => Err(RawBoundaryBlockReason::TemplateUnavailable),
+            // K19' (R272-2). The four slice cells the void branch was missing.
+            // A slice's raw view carries the whole allocation the subject
+            // stands for, so the cast to `c_void` is a change of spelling
+            // rather than a loss of extent -- the opposite of what
+            // `&c_void` did. `Opt` stays unavailable: it is outside R272-2's
+            // approved arm and fails closed.
+            Decision::Slice { mutable: true, .. } if target.mutability == RawMutability::Mut => {
+                Ok(BridgeTemplate::VoidFromSliceMut)
+            }
+            // R259-2's writable-const carrier itself, not a void-specific
+            // twin of it: a mutable subject reaches a `*const` position
+            // through a WRITABLE derivation, and this is the exact template
+            // `returned_child_template` would select anyway. Naming it here
+            // keeps one carrier for one meaning.
+            Decision::Slice { mutable: true, .. } => Ok(BridgeTemplate::SliceMutToWritableRawConst),
+            Decision::Slice { mutable: false, .. } if target.mutability == RawMutability::Const => {
+                Ok(BridgeTemplate::VoidFromSlice)
+            }
+            Decision::Slice { mutable: false, .. } if has_negative_write_evidence => {
+                Ok(BridgeTemplate::VoidFromSliceCastMut)
+            }
+            Decision::Slice { mutable: false, .. } => Err(RawBoundaryBlockReason::SharedToMut),
+            Decision::Opt { .. } | Decision::Box(_) | Decision::Degraded(_) => {
+                Err(RawBoundaryBlockReason::TemplateUnavailable)
+            }
         };
     }
     match decision {

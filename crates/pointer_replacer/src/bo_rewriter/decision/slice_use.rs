@@ -110,6 +110,7 @@ fn shared_to_mut(template: raw_boundary::BridgeTemplate) -> bool {
     use raw_boundary::BridgeTemplate;
     match template {
         BridgeTemplate::VoidFromRefCastMut
+        | BridgeTemplate::VoidFromSliceCastMut
         | BridgeTemplate::RefSharedToRawMut
         | BridgeTemplate::SliceToRawMut
         | BridgeTemplate::OptRefToRawMut
@@ -119,6 +120,8 @@ fn shared_to_mut(template: raw_boundary::BridgeTemplate) -> bool {
         | BridgeTemplate::VoidFromMut
         | BridgeTemplate::VoidFromRef
         | BridgeTemplate::VoidFromMutAsConst
+        | BridgeTemplate::VoidFromSlice
+        | BridgeTemplate::VoidFromSliceMut
         | BridgeTemplate::RawCastMut
         | BridgeTemplate::RawCastConst
         | BridgeTemplate::TypedRawTemporary
