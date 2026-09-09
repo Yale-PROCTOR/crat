@@ -1813,7 +1813,6 @@ pub(crate) enum BridgeTemplate {
     /// of the edge R271-1 opened.
     VoidFromSlice,
     VoidFromSliceMut,
-    VoidFromSliceCastMut,
     RawCastMut,
     RawCastConst,
     TypedRawTemporary,
@@ -1843,7 +1842,7 @@ impl BridgeTemplate {
             Self::Depth2NpoConst | Self::Depth2NpoMut => "depth2-npo-bridge",
             Self::VoidFromMut | Self::VoidFromRef | Self::VoidFromMutAsConst => "void-generic-raw",
             Self::VoidFromSlice | Self::VoidFromSliceMut => "void-generic-raw-slice",
-            Self::VoidFromRefCastMut | Self::VoidFromSliceCastMut => "shared-ref-to-mut-raw",
+            Self::VoidFromRefCastMut => "shared-ref-to-mut-raw",
             Self::RawCastMut => "raw-cast-mut",
             Self::RawCastConst => "raw-cast-const",
             Self::TypedRawTemporary => "typed-raw-temporary",
@@ -1914,8 +1913,7 @@ impl BridgeTemplate {
             | Self::VoidFromRefCastMut
             | Self::VoidFromMutAsConst
             | Self::VoidFromSlice
-            | Self::VoidFromSliceMut
-            | Self::VoidFromSliceCastMut => {
+            | Self::VoidFromSliceMut => {
                 let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
                 let source = match self {
                     Self::VoidFromMut => format!("core::ptr::from_mut({argument})"),
@@ -1928,7 +1926,6 @@ impl BridgeTemplate {
                     }
                     Self::VoidFromSlice => format!("{argument}.as_ptr()"),
                     Self::VoidFromSliceMut => format!("{argument}.as_mut_ptr()"),
-                    Self::VoidFromSliceCastMut => format!("{argument}.as_ptr().cast_mut()"),
                     _ => unreachable!(),
                 };
                 Ok(BridgeRender::Edit(format!("{source}.cast::<{pointee}>()")))
@@ -2421,9 +2418,15 @@ pub(crate) fn template_for(
             Decision::Slice { mutable: false, .. } if target.mutability == RawMutability::Const => {
                 Ok(BridgeTemplate::VoidFromSlice)
             }
-            Decision::Slice { mutable: false, .. } if has_negative_write_evidence => {
-                Ok(BridgeTemplate::VoidFromSliceCastMut)
-            }
+            // A shared subject at a `*mut` position is NOT one of R272-2's
+            // four cells and is not opened here, even with negative-write
+            // evidence. That evidence is about the CALLEE's own writes; it
+            // says nothing about a descendant the callee hands back and the
+            // caller then writes through — the addendum-259 shape, whose
+            // guard only runs at `*const` targets. The typed twins
+            // (`RefSharedToRawMut`, `SliceToRawMut`, `VoidFromRefCastMut`)
+            // carry that same open obligation already; widening it to a new
+            // cell is the seat's call, not this arm's.
             Decision::Slice { mutable: false, .. } => Err(RawBoundaryBlockReason::SharedToMut),
             Decision::Opt { .. } | Decision::Box(_) | Decision::Degraded(_) => {
                 Err(RawBoundaryBlockReason::TemplateUnavailable)

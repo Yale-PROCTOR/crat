@@ -174,9 +174,14 @@ fn k19_mutable_slice_subject_at_a_const_position_uses_the_writable_const_carrier
     );
 }
 
-/// The mismatched-carrier fault, as a standing control. A SHARED subject at a
-/// `*mut` position has no negative-write evidence here, so no carrier may be
-/// invented for it: `SharedToMut` still holds the site.
+/// The mismatched-carrier fault, as a standing control, and the boundary of
+/// the approved arm. A SHARED subject at a `*mut` position is not one of
+/// R272-2's four cells: `SharedToMut` holds the site, and it holds it
+/// **unconditionally**, not merely for want of negative-write evidence.
+/// Negative-write evidence describes what the CALLEE does through the
+/// pointee; a pointer the callee returns and the caller then writes through
+/// is a different question, and the guard that asks it (addendum 259) runs
+/// only at `*const` targets. Opening this cell is the seat's call.
 #[test]
 fn k19_shared_slice_subject_at_a_mut_position_is_still_held() {
     let input = fixture(
