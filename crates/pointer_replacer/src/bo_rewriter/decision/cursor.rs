@@ -10,3 +10,9 @@ pub(crate) mod carrier;
 
 #[path = "cursor/transaction.rs"]
 pub(crate) mod transaction;
+
+#[path = "cursor/retention.rs"]
+pub(crate) mod retention;
+
+#[path = "cursor/adapters.rs"]
+pub(crate) mod adapters;

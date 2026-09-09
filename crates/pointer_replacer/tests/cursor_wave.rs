@@ -25,3 +25,9 @@ mod lowering_witnesses;
 
 #[path = "cursor_wave/transaction.rs"]
 mod transaction_witnesses;
+
+#[path = "cursor_wave/retention.rs"]
+mod retention_witnesses;
+
+#[path = "cursor_wave/adapters.rs"]
+mod adapter_witnesses;
