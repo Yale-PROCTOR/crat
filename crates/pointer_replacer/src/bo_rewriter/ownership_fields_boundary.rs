@@ -1,5 +1,5 @@
 //! Local owning signatures and exact caller/formal contracts, over typed facts.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     EvidenceKey, OwnerId, SiteId,
@@ -80,6 +80,7 @@ pub enum BoundaryHold {
     Call,
     DuplicateOwner,
     BorrowAcrossConsume,
+    BorrowAlias,
 }
 
 fn validate_slot(
@@ -209,7 +210,7 @@ pub fn plan_call(call: &CallContract) -> Result<CallPlan, BoundaryHold> {
         let mut actuals = Vec::new();
         let mut arguments = Vec::new();
         let mut consumed = Vec::new();
-        let mut borrowed = BTreeSet::new();
+        let mut borrowed = BTreeMap::new();
         let mut moved = BTreeSet::new();
         for param in parameters {
             let edges: Vec<_> = call
@@ -298,7 +299,27 @@ pub fn plan_call(call: &CallContract) -> Result<CallPlan, BoundaryHold> {
                     if edge.borrow_proof != Some(edge.actual) {
                         return Err(BoundaryHold::BorrowOrigin);
                     }
-                    borrowed.insert(edge.actual.generation);
+                    let source_grant = edge.actual_grant.as_ref().ok_or(BoundaryHold::Grant)?;
+                    let source_kind = if matches!(edge.source_type, BoundaryType::Owner(_)) {
+                        Kind::Owning
+                    } else {
+                        Kind::Ref
+                    };
+                    if source_grant.key != edge.actual
+                        || source_grant.kind != source_kind
+                        || source_grant.status != GrantStatus::Selected
+                        || source_grant.transport != Some(edge.actual)
+                    {
+                        return Err(BoundaryHold::Grant);
+                    }
+                    // This consumer has whole-payload regions. Finer disjointness
+                    // needs the native pair proof, never unequal expression text.
+                    if borrowed
+                        .insert(edge.actual.generation, *mutable)
+                        .is_some_and(|previous| previous || *mutable)
+                    {
+                        return Err(BoundaryHold::BorrowAlias);
+                    }
                     if *optional {
                         format!(
                             "({}).{}()",
@@ -329,7 +350,7 @@ pub fn plan_call(call: &CallContract) -> Result<CallPlan, BoundaryHold> {
         } else {
             actual_template = Some(actuals);
         }
-        if moved.iter().any(|g| borrowed.contains(g)) {
+        if moved.iter().any(|g| borrowed.contains_key(g)) {
             return Err(BoundaryHold::BorrowAcrossConsume);
         }
         let plan = CallPlan {

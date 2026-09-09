@@ -326,12 +326,25 @@ pub fn struct_interface_with_relations(
         }
     }
     interface.lifetimes = active_groups.iter().map(|g| names[g].clone()).collect();
-    let mut bounds = BTreeSet::new();
+    let mut edges: BTreeMap<FieldClassId, BTreeSet<FieldClassId>> = BTreeMap::new();
     for (a, b) in &relations.outlives {
-        let a = groups[a];
-        let b = groups[b];
-        if a != b && active_groups.contains(&a) && active_groups.contains(&b) {
-            bounds.insert((names[&a].clone(), names[&b].clone()));
+        edges.entry(groups[a]).or_default().insert(groups[b]);
+    }
+    let mut bounds = BTreeSet::new();
+    // Close the full relation before removing non-emitted intermediates.
+    for source in &active_groups {
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![*source];
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if current != *source && active_groups.contains(&current) {
+                bounds.insert((names[source].clone(), names[&current].clone()));
+            }
+            if let Some(next) = edges.get(&current) {
+                pending.extend(next.iter().copied());
+            }
         }
     }
     interface.lifetime_bounds = bounds.into_iter().collect();

@@ -223,3 +223,38 @@ fn custody_rejects_a_dropped_generated_lifetime_bound() {
         Err(CustodyError::Lifetimes)
     );
 }
+
+#[test]
+fn held_middle_field_does_not_erase_transitive_outlives_obligation() {
+    let fields: Vec<_> = (0..3)
+        .map(|n| Field {
+            id: field(n),
+            name: format!("p{n}"),
+            input_type: "*const i32".into(),
+            candidate: FieldForm::Borrow {
+                pointee: "i32".into(),
+                mutable: false,
+                optional: false,
+            },
+        })
+        .collect();
+    let mut tx = vec![transaction(0), transaction(1), transaction(2)];
+    tx[1].sites.clear();
+    let interface = struct_interface_with_relations(
+        OwnerId(1),
+        &fields,
+        &BTreeSet::new(),
+        &CopyContract::Absent,
+        &tx,
+        &finalize(&tx).unwrap(),
+        &LifetimeRelations {
+            equal: vec![],
+            outlives: vec![(field(0), field(1)), (field(1), field(2))],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        interface.lifetime_bounds,
+        vec![("__crat_f0".into(), "__crat_f2".into())]
+    );
+}

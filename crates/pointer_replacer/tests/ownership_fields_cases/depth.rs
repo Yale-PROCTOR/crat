@@ -109,3 +109,42 @@ fn value_graph() -> BTreeMap<OwnerId, DropShape> {
         }]),
     )])
 }
+
+#[test]
+fn proven_none_has_zero_drop_depth_but_possible_nullability_is_insufficient() {
+    let witness = empty_owner_depth(
+        key(0),
+        CloseKind::ScopeExit,
+        OwnerId(1),
+        &value_graph(),
+        [3; 32],
+        Some(key(0)),
+        &budget(),
+    )
+    .unwrap();
+    assert_eq!(witness.maximum_depth, 0);
+    assert!(matches!(
+        implicit_close(
+            key(0),
+            CloseKind::ScopeExit,
+            OwnerId(1),
+            &value_graph(),
+            [3; 32],
+            Some(&witness),
+            &proofs(key(0))
+        ),
+        Ok(ClosePlan::Drop { .. })
+    ));
+    assert!(
+        empty_owner_depth(
+            key(0),
+            CloseKind::ScopeExit,
+            OwnerId(1),
+            &value_graph(),
+            [3; 32],
+            None,
+            &budget()
+        )
+        .is_err()
+    );
+}

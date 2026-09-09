@@ -208,3 +208,67 @@ fn indirect_scalar_targets_must_share_actual_identity_and_frame() {
     };
     assert_eq!(plan_call(&c), Err(BoundaryHold::TargetSet));
 }
+
+#[test]
+fn duplicate_consuming_arguments_cannot_create_two_responsibilities() {
+    let mut c = contract();
+    let mut second = c.targets[0].parameters[0].clone();
+    second.index = 1;
+    second.name = "other".into();
+    second.slot.key = callee_key(3);
+    second.slot.grant = Some(grant(callee_key(3)));
+    c.targets[0].parameters.push(second);
+    let mut edge = c.arguments[0].clone();
+    edge.index = 1;
+    edge.formal = callee_key(3);
+    edge.transport = Some((edge.actual, edge.formal));
+    c.arguments.push(edge);
+    assert_eq!(plan_call(&c), Err(BoundaryHold::DuplicateOwner));
+}
+#[test]
+fn uniform_indirect_targets_share_one_actual_inventory() {
+    let mut c = contract();
+    let mut other = c.targets[0].clone();
+    other.owner = OwnerId(3);
+    for slot in [&mut other.parameters[0].slot, &mut other.result] {
+        slot.key.site.owner = OwnerId(3);
+        slot.grant = Some(grant(slot.key));
+    }
+    let mut edge = c.arguments[0].clone();
+    edge.formal = other.parameters[0].slot.key;
+    edge.transport = Some((edge.actual, edge.formal));
+    c.arguments.push(edge);
+    c.targets.push(other);
+    c.required_targets.insert(OwnerId(3));
+    assert!(plan_call(&c).is_ok());
+}
+#[test]
+fn mutable_borrow_aliases_need_a_pair_witness_before_emission() {
+    let mut c = contract();
+    let ty = BoundaryType::Borrow {
+        pointee: "i32".into(),
+        mutable: true,
+        optional: true,
+        lifetime: "a".into(),
+    };
+    c.targets[0].parameters[0].slot.ty = ty.clone();
+    c.targets[0].parameters[0].slot.grant.as_mut().unwrap().kind = Kind::Ref;
+    c.targets[0].parameters[0].slot.borrow_origin = Some(callee_key(0));
+    c.arguments[0].mode = PassingMode::BorrowMutable;
+    c.arguments[0].borrow_proof = Some(key(0));
+    let mut second = c.targets[0].parameters[0].clone();
+    second.index = 1;
+    second.name = "other".into();
+    second.slot.key = callee_key(3);
+    let mut g = grant(callee_key(3));
+    g.kind = Kind::Ref;
+    second.slot.grant = Some(g);
+    second.slot.borrow_origin = Some(callee_key(3));
+    c.targets[0].parameters.push(second);
+    let mut edge = c.arguments[0].clone();
+    edge.index = 1;
+    edge.formal = callee_key(3);
+    edge.transport = Some((edge.actual, edge.formal));
+    c.arguments.push(edge);
+    assert!(plan_call(&c).is_err());
+}

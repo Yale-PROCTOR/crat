@@ -1309,7 +1309,7 @@ mod recovery_cases;
 
 #[test]
 fn synthetic_ownership_chain_composes_declaration_copy_signature_call_and_free() {
-    use ownership_fields::{boundary::*, field_uses::*, free_sites::*, struct_copy::*};
+    use ownership_fields::{boundary::*, free_sites::*, struct_copy::*};
     let definition = "#[derive(Copy,Clone,Debug)] struct Holder { child: *mut i32, key: i32 }";
     let at = definition.find(" {").unwrap();
     let declaration = Declaration {
@@ -1377,3 +1377,6 @@ fn synthetic_ownership_chain_composes_declaration_copy_signature_call_and_free()
     );
     assert!(compile_source(&code, true).status.success());
 }
+
+#[path = "ownership_fields_cases/raw_audit.rs"]
+mod raw_audit_cases;

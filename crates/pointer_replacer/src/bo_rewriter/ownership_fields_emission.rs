@@ -389,6 +389,9 @@ pub struct AggregateLeakContract {
 }
 #[derive(Clone, Debug)]
 pub struct LeakAggregate {
+    key: EvidenceKey,
+    owner: super::OwnerId,
+    type_name: String,
     name: String,
     fields: std::collections::BTreeMap<super::FieldClassId, AggregateField>,
 }
@@ -442,6 +445,9 @@ pub fn leak_aggregate(
     };
     Ok((
         LeakAggregate {
+            key,
+            owner: contract.owner,
+            type_name: contract.type_name.clone(),
             name: name.into(),
             fields,
         },
@@ -468,6 +474,44 @@ impl LeakAggregate {
             allocator_layout,
         )?;
         self.fields.remove(&field);
+        Ok(emitted)
+    }
+}
+
+impl LeakAggregate {
+    pub fn overwrite(
+        &mut self,
+        old: &ClosePlan,
+        new: &AggregateLeakContract,
+        initializer: &str,
+    ) -> Result<Emitted, EmitHold> {
+        let ClosePlan::LeakRecursive {
+            key,
+            kind: CloseKind::Overwrite,
+        } = old
+        else {
+            return Err(EmitHold::WrongClose);
+        };
+        if !same_generation(*key, self.key)
+            || new.coverage.local.model != key.model
+            || new.coverage.local.configuration != key.configuration
+            || new.coverage.local.site.owner != key.site.owner
+            || new.coverage.local.generation == key.generation
+            || new.owner != self.owner
+            || new.type_name != self.type_name
+        {
+            return Err(EmitHold::WrongClose);
+        }
+        let (replacement, _) = leak_aggregate(new, &self.name, initializer)?;
+        let emitted = Emitted {
+            code: format!(
+                "{} = std::mem::ManuallyDrop::new({initializer});",
+                self.name
+            ),
+            key: *key,
+            receipt: old.receipt(),
+        };
+        *self = replacement;
         Ok(emitted)
     }
 }

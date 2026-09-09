@@ -71,3 +71,6 @@ pub mod application;
 
 #[path = "ownership_fields_recovery.rs"]
 pub mod recovery;
+
+#[path = "ownership_fields_raw_audit.rs"]
+pub mod raw_audit;

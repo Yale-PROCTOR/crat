@@ -116,3 +116,39 @@ pub fn depth_witness(
         admitted_depth: budget.admitted_depth,
     })
 }
+
+/// A current-value None fact, not merely possible nullability, supplies depth
+/// zero. The owning-call occurrence and other close obligations still remain.
+pub fn empty_owner_depth(
+    key: EvidenceKey,
+    kind: CloseKind,
+    payload: OwnerId,
+    graph: &BTreeMap<OwnerId, DropShape>,
+    revision: [u8; 32],
+    known_none: Option<EvidenceKey>,
+    budget: &StackBudget,
+) -> Result<DepthWitness, DepthHold> {
+    if known_none != Some(key) {
+        return Err(DepthHold::Incomplete);
+    }
+    if budget.key != key
+        || budget.kind != kind
+        || budget.payload != payload
+        || budget.graph_revision != revision
+        || budget.lowering_evidence != Some(key)
+    {
+        return Err(DepthHold::Budget);
+    }
+    if !graph.contains_key(&payload) {
+        return Err(DepthHold::UnknownType(payload));
+    }
+    Ok(DepthWitness {
+        key,
+        kind,
+        payload,
+        graph_revision: revision,
+        graph: graph.clone(),
+        maximum_depth: 0,
+        admitted_depth: budget.admitted_depth,
+    })
+}
