@@ -19,7 +19,7 @@ use rustc_middle::{
 use super::{
     raw_boundary::{raw_target_type, symbol_key},
     raw_boundary_contracts::{
-        ArgumentContract, PointeeAccess, RetentionContract, classify_contract,
+        ArgumentContract, OwnershipContract, PointeeAccess, RetentionContract, classify_contract,
     },
     return_alias::{self, ReturnUseObservation},
 };
@@ -217,6 +217,84 @@ pub(crate) fn derive(
                     parent_argument_index: index,
                 },
                 contract,
+                &argument.node,
+                destination,
+                target,
+            ))
+        })
+        .collect()
+}
+
+/// **K18'/OAP-CHILD-ACCESS.** The same descendant walk, for a callee with no
+/// pinned contract row.
+///
+/// Without a row we cannot know whether the callee's return derives from this
+/// argument, so we assume it MAY -- that is the conservative direction -- and
+/// let the walk report what the caller then does with the result. The point is
+/// the difference between "no evidence" and "evidence of no write": passing
+/// `None` for a child's access makes every shared subject hold, while a walk
+/// that finds the child unused or only read keeps it admitted.
+///
+/// Only argument positions whose own type is a pointer are considered, and only
+/// when `may_yield` says the callee can hand a pointer back at all. The
+/// synthesized contract is neutral: unknown retention, no pointee access of its
+/// own, and `returns_alias_of` set to this argument precisely because that is
+/// the assumption being made.
+pub(crate) fn derive_type_backed<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: LocalDefId,
+    call: Location,
+    may_yield: &dyn Fn(DefId) -> bool,
+) -> Vec<ReturnedChildEvidence> {
+    let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+    let Some(data) = body.basic_blocks.get(call.block) else { return Vec::new() };
+    if call.statement_index != data.statements.len() {
+        return Vec::new();
+    }
+    let (func, arguments, destination, target) = match &data.terminator().kind {
+        TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            target,
+            ..
+        } => (func, &args[..], Some(*destination), *target),
+        TerminatorKind::TailCall { func, args, .. } => (func, &args[..], None, None),
+        _ => return Vec::new(),
+    };
+    let Some(callee) = resolved(func) else { return Vec::new() };
+    if !may_yield(callee) {
+        return Vec::new();
+    }
+    let functions = tcx.hir_body_owners().collect::<Vec<_>>();
+    arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            if contract_at(tcx, &body, &functions, callee, index, &argument.node).is_some() {
+                // The pinned row is the authority wherever it exists.
+                return None;
+            }
+            if !pointer(argument.node.ty(&*body, tcx)) {
+                return None;
+            }
+            Some(walk(
+                tcx,
+                &body,
+                &functions,
+                ReturnedChildKey {
+                    caller,
+                    call,
+                    callee,
+                    parent_argument_index: index,
+                },
+                ArgumentContract {
+                    retention: RetentionContract::Unknown,
+                    access: PointeeAccess::None,
+                    ownership: OwnershipContract::BorrowView,
+                    returns_alias_of: Some(index),
+                    provenance: "type-derived-return-carrier",
+                },
                 &argument.node,
                 destination,
                 target,

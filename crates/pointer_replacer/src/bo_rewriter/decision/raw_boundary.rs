@@ -822,6 +822,10 @@ pub(crate) struct RetentionSummaries {
     facts: FxHashMap<(LocalDefId, usize), RetentionBodyFacts>,
     attested: bool,
     returned_children: FxHashMap<LocalDefId, Vec<ReturnedChildRecord>>,
+    /// K18'/OAP-CHILD-ACCESS: the same descendant evidence for callees with no
+    /// pinned contract row, kept apart so the row stays the authority wherever
+    /// it exists.
+    type_backed_children: FxHashMap<LocalDefId, Vec<ReturnedChildRecord>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1472,12 +1476,14 @@ impl RetentionSummaries {
         let attested = attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
         let mut facts = FxHashMap::default();
         let mut returned_children = FxHashMap::default();
+        let mut type_backed_children = FxHashMap::default();
         for &function in &program.functions {
             let body = program
                 .tcx
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
             let mut children = Vec::new();
+            let mut type_backed = Vec::new();
             for (block, data) in body.basic_blocks.iter_enumerated() {
                 if !matches!(
                     data.terminator().kind,
@@ -1502,6 +1508,18 @@ impl RetentionSummaries {
                         raw_field_parent,
                     });
                 }
+                for evidence in super::returned_child::derive_type_backed(
+                    program.tcx,
+                    function,
+                    call,
+                    &|callee| callee_may_yield_pointer(program.tcx, callee),
+                ) {
+                    type_backed.push(ReturnedChildRecord {
+                        callee: symbol_key(program.tcx, evidence.key.callee, &program.functions),
+                        evidence,
+                        raw_field_parent: false,
+                    });
+                }
             }
             for argument_index in 0..body.arg_count {
                 let local = Local::from_usize(argument_index + 1);
@@ -1521,6 +1539,7 @@ impl RetentionSummaries {
                 );
             }
             returned_children.insert(function, children);
+            type_backed_children.insert(function, type_backed);
         }
         let rows = if origins.is_none() {
             evaluate_retention(&facts, false)
@@ -1547,6 +1566,7 @@ impl RetentionSummaries {
             facts,
             attested,
             returned_children,
+            type_backed_children,
         }
     }
 
@@ -1589,6 +1609,34 @@ impl RetentionSummaries {
                 child: Err("returned-child-evidence-ambiguous"),
                 raw_field_parent: false,
             },
+        }
+    }
+
+    /// K18'/OAP-CHILD-ACCESS. What the caller actually does with a pointer this
+    /// callee may hand back, for callees with no pinned contract row. `None`
+    /// means the walk produced no unique evidence, and the caller must keep
+    /// treating the child's access as unknown.
+    pub(crate) fn type_backed_child_access(
+        &self,
+        caller: LocalDefId,
+        site: &RawBoundarySiteKey,
+    ) -> Option<&super::returned_child::ChildAccess> {
+        let matches = self
+            .type_backed_children
+            .get(&caller)
+            .into_iter()
+            .flatten()
+            .filter(|record| {
+                record.evidence.key.caller == caller
+                    && record.evidence.key.call.block.as_u32() == site.block
+                    && record.evidence.key.call.statement_index == site.statement_index as usize
+                    && record.evidence.key.parent_argument_index == site.argument_index
+                    && record.callee == site.callee
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [record] => Some(&record.evidence.access),
+            _ => None,
         }
     }
 
@@ -2436,6 +2484,9 @@ pub(crate) struct RawBoundaryDispositionIndex {
     /// storage? Carried from the site facts so the terminal emission can ask
     /// the same question the disposition asked.
     callee_may_yield_pointer: BTreeMap<RawBoundarySiteKey, bool>,
+    /// K18'/OAP-CHILD-ACCESS, carried per site so the terminal emission asks
+    /// the same question the disposition asked.
+    type_backed_child_access: BTreeMap<RawBoundarySiteKey, super::returned_child::ChildAccess>,
 }
 
 impl RawBoundaryDispositionIndex {
@@ -2446,6 +2497,15 @@ impl RawBoundaryDispositionIndex {
             .get(key)
             .copied()
             .unwrap_or(true)
+    }
+
+    /// K18'/OAP-CHILD-ACCESS, so the terminal emission asks the same question
+    /// the disposition asked.
+    pub(crate) fn type_backed_child_access_for(
+        &self,
+        key: &RawBoundarySiteKey,
+    ) -> Option<&super::returned_child::ChildAccess> {
+        self.type_backed_child_access.get(key)
     }
 
     pub(crate) fn returned_child_evidence(
@@ -2474,6 +2534,12 @@ impl RawBoundaryDispositionIndex {
         for site in &site_facts.sites {
             out.callee_may_yield_pointer
                 .insert(site.key.clone(), site.callee_may_yield_pointer);
+            if let Some(node) = site.node
+                && let Some(access) = retention.type_backed_child_access(node.0, &site.key)
+            {
+                out.type_backed_child_access
+                    .insert(site.key.clone(), access.clone());
+            }
             let mut mutable_binding_required = false;
             let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
                 (|| {
@@ -2740,12 +2806,22 @@ impl RawBoundaryDispositionIndex {
                         // parent reference is still live, so the seam decides
                         // on the source's own mutability.
                         let view = reference_view.as_ref().unwrap_or(decision);
+                        // K18'/OAP-CHILD-ACCESS: what the caller actually does
+                        // with a pointer this callee may hand back. Absent this,
+                        // every shared subject holds on "no evidence"; with it,
+                        // an unused or read-only child stays admitted.
+                        let child_access = retention.type_backed_child_access(node.0, &site.key);
                         if is_mutable_safe_source(view) {
                             // (1) A writable derivation satisfies the const
                             // parameter type and keeps write permission, so the
                             // mutable case costs no hold at all. The shared
                             // presentation of a mutable subject is retired here.
-                            match returned_child_template(view, &site.target, None, template) {
+                            match returned_child_template(
+                                view,
+                                &site.target,
+                                child_access,
+                                template,
+                            ) {
                                 Ok(selected) => {
                                     template = selected.template;
                                     mutable_binding_required = selected.mutable_binding_required;
@@ -2766,6 +2842,7 @@ impl RawBoundaryDispositionIndex {
                         } else if is_shared_safe_source(view)
                             && site.callee_may_yield_pointer
                             && contract.is_err()
+                            && returned_child_permission(view, child_access).is_err()
                         {
                             // (2) A shared subject has no mutable view to
                             // upgrade to. Negative-write evidence does not

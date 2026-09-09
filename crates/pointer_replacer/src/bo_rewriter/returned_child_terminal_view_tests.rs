@@ -78,6 +78,7 @@ fn check(form: RootForm, shared_address: bool) {
                 mutable_binding_required: false, target: target.clone(), original_expression: original.clone(), operand_expression: operand.clone(),
                 ownership: None, negative_write: true, box_slice: false, enclosing_unsafe_fn: true,
                 callee_may_yield_pointer: true,
+                child_access: None,
             }),
             zero_syntax: false, span: site.span, call_span: site.call_span, replacement: replacement.clone(),
             owner_class: owner, bridge: bridge.clone(), owner_fn: subject.label.clone(), lifetime_plan_digest: None,

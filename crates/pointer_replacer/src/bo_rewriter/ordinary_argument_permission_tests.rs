@@ -262,3 +262,52 @@ fn ordinary_argument_shared_subject_at_a_scalar_sink_still_emits() {
         outcome.emitted
     );
 }
+
+/// K18' / OAP-CHILD-ACCESS. The same shared subject as the hold witness, but the
+/// caller only READS the returned child.
+///
+/// Before this, the seam had no evidence about a contract-less callee's child
+/// and every shared subject held on "no evidence". The descendant walk that the
+/// pinned-contract path already used now runs for contract-less callees too, so
+/// "no evidence" becomes "evidence of no write" wherever the caller's own body
+/// says so — which is the difference between holding a subset of the shared
+/// population and holding all of it.
+const SHARED_READ_ONLY_CHILD_INPUT: &str = r#"
+    #![allow(dead_code, unused_unsafe)]
+    unsafe fn dup(q: *const i32) -> *mut i32 { let _ = q.read(); q.cast_mut() }
+    pub unsafe fn entry(p: *const i32) -> i32 {
+        let first = *p.offset(1);
+        let child = dup(p);
+        let seen = *child;
+        first + seen
+    }
+"#;
+
+#[test]
+fn ordinary_argument_shared_subject_with_a_read_only_child_still_emits() {
+    let outcome = argument_outcome(
+        SHARED_READ_ONLY_CHILD_INPUT,
+        "entry::p",
+        "shared subject, read-only child",
+    );
+    println!(
+        "ORDINARY-ARGUMENT[shared, read-only child] form={:?} reason={} withdrawals={:#?}\n{}",
+        outcome.subject_form, outcome.subject_reason, outcome.withdrawals, outcome.emitted
+    );
+    assert_eq!(
+        outcome.subject_form,
+        Form::Slice { mutable: false },
+        "a child that is only read leaves the shared subject admitted: {}",
+        outcome.subject_reason
+    );
+    assert!(
+        outcome.withdrawals.is_empty(),
+        "no permission hold is recorded: {:#?}",
+        outcome.withdrawals
+    );
+    assert!(
+        super::verify::type_checks_str(&outcome.emitted),
+        "emitted output type/borrow-checks:\n{}",
+        outcome.emitted
+    );
+}

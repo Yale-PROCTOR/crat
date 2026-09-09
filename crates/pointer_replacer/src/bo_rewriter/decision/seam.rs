@@ -346,6 +346,9 @@ pub(crate) struct RawOutboundEndpoint {
     /// The terminal emission needs this to decide a shared source's fate when
     /// no contract row supplies returned-child evidence.
     pub(crate) callee_may_yield_pointer: bool,
+    /// K18'/OAP-CHILD-ACCESS: what the caller does with a pointer a
+    /// contract-less callee may hand back. `None` keeps the child unknown.
+    pub(crate) child_access: Option<super::returned_child::ChildAccess>,
 }
 
 /// Recheck only frozen returned-child evidence against the terminal view.
@@ -4685,6 +4688,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 box_slice: site.box_slice,
                 enclosing_unsafe_fn: enclosing_function_is_unsafe(tcx, owner_did),
                 callee_may_yield_pointer: raw_boundary.callee_may_yield_pointer(key),
+                child_access: raw_boundary.type_backed_child_access_for(key).cloned(),
             }),
             zero_syntax,
             span: site.span,

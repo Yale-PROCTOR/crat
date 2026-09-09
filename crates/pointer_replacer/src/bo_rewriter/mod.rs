@@ -5037,6 +5037,9 @@ fn seal_terminal_outbound_calls(
                     // returned-child evidence, and the block above never ran,
                     // so a `*const` position received `as_ptr()` however the
                     // callee used what it got.
+                    // K18'/OAP-CHILD-ACCESS at the terminal half, asking the
+                    // same question the disposition asked.
+                    let child_access = endpoint.child_access.as_ref();
                     if decision::raw_boundary::is_mutable_safe_source(effective_source) {
                         // (1) A writable derivation satisfies the const
                         // parameter type and keeps write permission, so this
@@ -5045,7 +5048,7 @@ fn seal_terminal_outbound_calls(
                         match decision::raw_boundary::returned_child_template(
                             effective_source,
                             &endpoint.target,
-                            None,
+                            child_access,
                             template,
                         ) {
                             Ok(selected)
@@ -5081,6 +5084,11 @@ fn seal_terminal_outbound_calls(
                     } else if decision::raw_boundary::is_shared_safe_source(effective_source)
                         && endpoint.callee_may_yield_pointer
                         && endpoint.ownership.is_none()
+                        && decision::raw_boundary::returned_child_permission(
+                            effective_source,
+                            child_access,
+                        )
+                        .is_err()
                     {
                         // (2) A shared source has no mutable view to upgrade
                         // to, and in this branch no descendant evidence exists
