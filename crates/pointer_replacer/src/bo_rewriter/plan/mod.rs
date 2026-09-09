@@ -2890,7 +2890,10 @@ pub(crate) fn plan(
             SignatureClassId::of(unavailable.caller),
             Arm::C,
             "outbound-expression-unavailable",
-            format!("outbound-expression:{:?}", unavailable.reason),
+            unavailable.reason.alias_permission_reason().map_or_else(
+                || format!("outbound-expression:{:?}", unavailable.reason),
+                str::to_owned,
+            ),
         );
         site.key.caller = unavailable.caller;
         site.key.callee = unavailable.sink_callee.clone();

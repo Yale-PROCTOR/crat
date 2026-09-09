@@ -11,7 +11,7 @@ use rustc_hir::{
 };
 use rustc_middle::{
     mir::Local,
-    ty::{TyCtxt, TyKind},
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::Span;
 
@@ -21,6 +21,7 @@ use super::{
     raw_boundary::{
         self, BridgeTemplate, NegativeWriteEvidence, RawBoundaryBlockReason, RawBoundarySiteFacts,
         RawBoundarySiteKey, RawTargetType, RetentionSummaries, RetentionVerdict,
+        ReturnedChildPermissionFailure,
     },
     return_interface::ReturnInterface,
     seam::{self, Form, GlueSpec},
@@ -115,8 +116,20 @@ pub(crate) enum OutboundExpressionFailure {
     RetentionSummaryUnavailable,
     PositiveRetention,
     RetentionCertificateInvalid,
+    ChildPermission(ReturnedChildPermissionFailure),
     Template(RawBoundaryBlockReason),
     DuplicateSite,
+}
+
+impl OutboundExpressionFailure {
+    /// The outbound alias-permission gate is the one hold whose reason the
+    /// class-site ledger names in full: it reports an emitted write reaching
+    /// memory through a shared view of a safe subject. Every other failure
+    /// keeps the debug-rendered identity its consumers already read.
+    pub(crate) fn alias_permission_reason(&self) -> Option<&'static str> {
+        matches!(self, Self::ChildPermission(_))
+            .then_some("outbound-alias-permission:write-through-shared-view")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +189,44 @@ impl<'tcx> Visitor<'tcx> for NativeCalls<'_, 'tcx> {
                 });
         }
         walk_expr(self, expression);
+    }
+}
+
+/// How deep the sink's return type is walked before the answer is conceded.
+const RETURN_CARRIER_WALK_DEPTH: u32 = 6;
+
+/// A conservative compile-time walk of the sink's return type. A sink that
+/// cannot return a pointer has no returned child at all, so the returned-child
+/// permission and its writable carrier have no premise at that site and the
+/// ordinary outgoing view stands; whether the callee writes through the
+/// argument itself remains the existing negative-write evidence's question.
+///
+/// Only the scalar kinds that provably carry no pointer answer `false`.
+/// Aggregates are walked field-wise through every variant, and everything
+/// opaque, generic or past the depth budget is treated as pointer-carrying:
+/// the walk fails closed.
+fn return_may_carry_pointer<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u32) -> bool {
+    if depth == 0 {
+        return true;
+    }
+    match ty.kind() {
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_)
+        | TyKind::Never => false,
+        TyKind::Tuple(fields) => fields
+            .iter()
+            .any(|field| return_may_carry_pointer(tcx, field, depth - 1)),
+        TyKind::Array(inner, _) | TyKind::Slice(inner) => {
+            return_may_carry_pointer(tcx, *inner, depth - 1)
+        }
+        // A box owns its pointer, so it is a carrier without a field walk.
+        TyKind::Adt(definition, arguments) if !definition.is_box() => definition
+            .all_fields()
+            .any(|field| return_may_carry_pointer(tcx, field.ty(tcx, arguments), depth - 1)),
+        _ => true,
     }
 }
 
@@ -301,8 +352,30 @@ pub(crate) fn plan(
                     .ok_or_else(|| (OutboundExpressionFailure::Template(RawBoundaryBlockReason::TemplateUnavailable), Some(evidence.clone())))?;
                 // R-B precedes the retention tier; T2 cannot supply missing
                 // permission for a shared source at a writing raw position.
-                let template = raw_boundary::template_for(&source_form, &site.target, None, negative_write.is_some())
+                // The returned child's permission and its carrier are queried
+                // exactly as the established receiver path does: an outgoing
+                // view of a mutable subject keeps a writable carrier, and a
+                // shared subject holds rather than lending a read-only view to
+                // a position whose child may write through it.
+                let sink_may_return_child = return_may_carry_pointer(
+                    tcx,
+                    tcx.fn_sig(callee).skip_binder().skip_binder().output(),
+                    RETURN_CARRIER_WALK_DEPTH,
+                );
+                if sink_may_return_child
+                    && let Err(reason) = raw_boundary::returned_child_permission(&source_form, None)
+                {
+                    return Err((OutboundExpressionFailure::ChildPermission(reason), Some(evidence.clone())));
+                }
+                let base = raw_boundary::template_for(&source_form, &site.target, None, negative_write.is_some())
                     .map_err(|reason| (OutboundExpressionFailure::Template(reason), Some(evidence.clone())))?;
+                let (template, child_binding_required) = if sink_may_return_child {
+                    let selected = raw_boundary::returned_child_template(&source_form, &site.target, None, base)
+                        .map_err(|reason| (OutboundExpressionFailure::Template(reason), Some(evidence.clone())))?;
+                    (selected.template, selected.mutable_binding_required)
+                } else {
+                    (base, false)
+                };
                 let (tier, waiver_id) = match &evidence {
                     RetentionVerdict::NoRetain { certificate } => {
                         retention.verify_certificate(callee, site.key.argument_index, certificate)
@@ -316,7 +389,10 @@ pub(crate) fn plan(
                 let temporary = format!("__crat_outbound_return_{}_{}", caller.local_def_index.as_u32(), source.hir.local_id.as_u32());
                 let view = spec.render(&temporary).ok_or_else(|| (
                     OutboundExpressionFailure::Template(RawBoundaryBlockReason::TemplateUnavailable), Some(evidence.clone())))?;
-                let mutable_temporary = matches!(interface.form, Form::Opt { mutable: true, .. });
+                let mutable_temporary = match interface.form {
+                    Form::Opt { mutable, .. } => mutable,
+                    Form::Raw | Form::Ref { .. } | Form::Slice { .. } => child_binding_required,
+                };
                 Ok(OutboundExpressionPlan {
                     key: site.key.clone(), caller, argument_hir: source.hir,
                     argument_span: site.source_span, call_span: site.call_span,

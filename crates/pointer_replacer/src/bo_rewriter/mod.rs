@@ -128,9 +128,9 @@ mod option_projection_tests;
 #[cfg(test)]
 mod option_receiver_tests;
 #[cfg(test)]
-mod outbound_expression_tests;
-#[cfg(test)]
 mod outbound_alias_permission_tests;
+#[cfg(test)]
+mod outbound_expression_tests;
 #[cfg(test)]
 mod outbound_return_receipt_tests;
 #[cfg(test)]
