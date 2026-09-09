@@ -762,10 +762,16 @@ fn matcher_resolves_the_existing_merged_import_in_mod_rs() {
         let syn::Item::Use(import) = item else { return false };
         let syn::UseTree::Path(root) = &import.tree else { return false };
         let syn::UseTree::Group(group) = &*root.tree else { return false };
-        root.ident == "crate" && group.items.iter().any(|item|
-            matches!(item, syn::UseTree::Path(path) if path.ident == "analyses"))
+        root.ident == "crate"
+            && group
+                .items
+                .iter()
+                .any(|item| matches!(item, syn::UseTree::Path(path) if path.ident == "analyses"))
     });
-    assert!(merged, "the driver must retain an actual brace-merged analyses import for H1");
+    assert!(
+        merged,
+        "the driver must retain an actual brace-merged analyses import for H1"
+    );
 }
 
 // ---------------------------------------------------------------------------
