@@ -593,10 +593,9 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
                                 continue;
                             };
                             if site.old_input != super::realloc::OldInput::KnownNull {
-                                let zero_retirement = super::realloc::classify(site).is_ok_and(|cases| cases.iter().any(|case| {
-                                super::realloc::retirement_availability(site, case)
-                                    == super::realloc::ReallocRetirementAvailability::MayRetireOnZero
-                            }));
+                                // Held zero-size sites still have a possible original
+                                // storage retirement; a raw hold is not a no-free proof.
+                                let zero_retirement = super::realloc::zero_size_possible(site);
                                 let (condition, coverage) = match super::realloc::classify(site) {
                                     Ok(cases) => {
                                         assert!(cases.iter().any(|case| case.outcome == super::realloc::ReallocOutcome::Success && case.old == super::realloc::OldResponsibility::RetireIfPresent));

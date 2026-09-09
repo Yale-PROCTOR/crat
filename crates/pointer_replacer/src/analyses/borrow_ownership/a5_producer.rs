@@ -962,6 +962,9 @@ pub(crate) fn produce_a5_plan(
                             transfers.push(CallTransfer::direct(key));
                         }
                         for &dependency in &dependencies {
+                            #[cfg(test)]
+                            let dependency =
+                                super::wrapper_fault_tests::dependency(key, dependency);
                             transfers.push(CallTransfer::forwarded(key, dependency)?);
                         }
                     }

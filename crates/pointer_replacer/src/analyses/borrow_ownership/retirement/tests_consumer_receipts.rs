@@ -11,7 +11,6 @@ use rustc_middle::{
 };
 use rustc_span::def_id::LocalDefId;
 
-use super::UnresolvedReason;
 use crate::{
     analyses::{
         borrow_ownership::{
@@ -180,22 +179,26 @@ fn check_decline(label: &str, source: &str, name: &str, storage_only: bool) {
         let function = function(&program, name);
         let slots = CrateSlots::build(&program);
         let captured = capture(&program, &slots);
-        assert!(
-            captured.model.is_none(),
-            "bank the actual current decline for {label}"
-        );
-        assert!(
-            !captured.stats.source_retirement_decline.is_empty(),
-            "decline needs typed source evidence"
-        );
+        let model = captured
+            .model
+            .as_ref()
+            .expect("R245 keeps the consumer model with local repairs");
+        assert!(captured.stats.source_retirement_decline.is_empty());
         let final_review = captured
             .export
             .source_retirement
             .as_ref()
             .expect("final review");
-        assert_eq!(
-            captured.stats.source_retirement_decline,
-            final_review.unresolved
+        assert!(final_review.unresolved.is_empty());
+        let rows = captured
+            .export
+            .retirement_rounds
+            .iter()
+            .flat_map(|round| &round.demotions)
+            .collect::<Vec<_>>();
+        assert!(
+            !rows.is_empty(),
+            "accepted consumer needs its exact inner repair receipt"
         );
         if storage_only {
             assert!(
@@ -207,10 +210,15 @@ fn check_decline(label: &str, source: &str, name: &str, storage_only: bool) {
                 "ForeignC set_* is not a retirement primitive"
             );
         }
-        for row in &captured.stats.source_retirement_decline {
-            let UnresolvedReason::MissingInnerLoan { slot, depth } = &row.reason else {
-                panic!("{label}: a different typed cause needs separate attribution: {row:?}");
+        for row in rows {
+            let super::local_outcome::Reason::InnerLoanMissing { depth } = &row.reason else {
+                panic!("{label}: unrelated local outcome requires attribution: {row:?}");
             };
+            let slot = &row.holder;
+            assert!(row.chain.contains(slot));
+            for target in &row.chain {
+                assert_eq!(model[target], SlotKind::Raw);
+            }
             assert_eq!(*depth, 1, "actual depth-one coverage residual");
             let SlotRef::Local(owner, id) = *slot else {
                 panic!("unexpected nonlocal inner slot: {row:?}")
@@ -223,21 +231,21 @@ fn check_decline(label: &str, source: &str, name: &str, storage_only: bool) {
                 slots.fn_local_slots[&owner].slot_for_local_depth(local, *depth),
                 Some(id)
             );
-            let key = row.source.as_ref().expect("original source event identity");
+            let key = &row.source;
             let event = captured
                 .source
                 .retirements
                 .get(key)
                 .expect("no fabricated retirement row");
-            assert_eq!(row.function, Some(function));
+            assert_eq!(row.function, function);
             assert_eq!(
                 row.location,
-                Some(Location {
+                Location {
                     block: rustc_middle::mir::BasicBlock::from_u32(key.block),
                     statement_index: key.statement
-                })
+                }
             );
-            assert_eq!(row.phase, Some(key.phase));
+            assert_eq!(row.phase, key.phase);
             assert!(
                 row.route.is_empty(),
                 "these exact fixtures have no local call routing"

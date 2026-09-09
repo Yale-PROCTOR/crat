@@ -359,26 +359,17 @@ pub unsafe fn deep(pp: *mut *mut u8) -> u8 {
 "#;
     let replay = replay(CODE, "deep", &[("localpp", 1)]);
     let review = replay.export.source_retirement.as_ref().unwrap();
-    let (target, key) = &replay.selected[&("localpp".to_owned(), 1)];
-    let repaired = review.conflicts.iter().any(|row| {
-        row.function == replay.function
-            && row.source.role == SourceRole::Free
-            && row.target == *target
-            && &row.target_key == key
-            && row.loan.is_some()
-    });
-    let declined = review.unresolved.iter().any(|row| {
-        row.function == Some(replay.function)
-            && row
-                .source
-                .as_ref()
-                .is_some_and(|source| source.role == SourceRole::Free)
-            && row
-                .location
-                .is_some_and(|location| replay.free_points.contains(&location))
-    });
+    let (target, _key) = &replay.selected[&("localpp".to_owned(), 1)];
     assert!(
-        repaired || declined,
-        "a relevant live inner Ref local requires exact-depth repair or a typed source-retirement decline"
+        review.demotions.iter().any(|row| {
+            row.function == replay.function
+                && row.source.role == SourceRole::Free
+                && replay.free_points.contains(&row.location)
+                && row.holder == *target
+                && row.reason == super::local_outcome::Reason::InnerLoanMissing { depth: 1 }
+                && row.chain.contains(target)
+        }),
+        "a relevant unrepresented inner loan requires its exact Raw repair"
     );
+    assert!(review.raw_targets().contains(target));
 }

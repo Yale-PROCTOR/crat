@@ -602,14 +602,21 @@ impl Resolver<'_, '_> {
                 Ok(value)
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let coverage=review.coverage.iter().map(|row|Ok(json!({"source":source_key(&row.source),"function":self.function(row.function)?,"location":location(row.location),"phase":tag(row.phase),"route":self.steps(&row.route)?,"disposition":tag(row.disposition)}))).collect::<Result<Vec<_>,String>>()?;
+        let coverage=review.coverage.iter().map(|row|Ok(json!({"source":source_key(&row.source),"function":self.function(row.function)?,"location":location(row.location),"phase":tag(row.phase),"route":self.steps(&row.route)?,"disposition":tag(row.disposition),"receipt":(row.disposition==rt::CoverageDisposition::IrrelevantNoSafeHolder).then_some("retirement:irrelevant-no-safe-holder")}))).collect::<Result<Vec<_>,String>>()?;
+        let demotions=review.demotions.iter().map(|row|Ok(json!({"source":source_key(&row.source),"function":self.function(row.function)?,"location":location(row.location),"phase":tag(row.phase),"route":self.steps(&row.route)?,"holder":self.slot(row.holder)?,"receipt":row.reason.label(),"chain":row.chain.iter().map(|slot|self.slot(*slot)).collect::<Result<Vec<_>,_>>()?}))).collect::<Result<Vec<_>,String>>()?;
         let terminal = review
             .terminal
             .iter()
-            .map(|(key, state)| json!({"source":source_key(key),"disposition":tag(state)}))
+            .map(|(key, state)| {
+                json!({
+                    "source":source_key(key),"disposition":tag(state),
+                    "receipt":(*state == rt::EventDisposition::CheckedWithoutConflict)
+                        .then_some("retirement:checked-without-conflict")
+                })
+            })
             .collect::<Vec<_>>();
         Ok((
-            json!({"conflicts":conflicts,"unresolved":unresolved,"coverage":coverage,"ordinary_error_points":review.ordinary_error_points,"terminal":terminal}),
+            json!({"conflicts":conflicts,"demotions":demotions,"unresolved":unresolved,"coverage":coverage,"ordinary_error_points":review.ordinary_error_points,"terminal":terminal}),
             json!(diagnostics),
         ))
     }
@@ -625,6 +632,9 @@ fn record_key(family: ExportFamily, fields: &BTreeMap<String, Value>) -> Result<
         F::OwnershipValues => vec!["scope"],
         F::SourceSelectors | F::SinkSelectors => vec!["role", "call"],
         F::ReallocVersions => vec!["function", "event", "outcome", "edge", "location", "local"],
+        F::ReallocCases if fields.get("kind").and_then(Value::as_str) == Some("coverage-hold") => {
+            vec!["event", "kind"]
+        }
         F::ReallocCases => vec!["event", "outcome"],
         F::RetirementRounds => vec!["round"],
         F::RetirementFinal | F::DemandEvidence | F::ProofEvidence => vec![],
@@ -773,6 +783,9 @@ pub(crate) fn collect(
     }
     for row in &export.realloc_version_sites {
         out.add(F::ReallocVersions,json!({"function":resolver.function(row.fn_did)?,"event":realloc_key(&row.event),"outcome":tag(row.outcome),"edge":row.edge,"location":mir_location(row.location),"local":row.local.as_u32(),"use_present":row.use_var.is_some()}),json!({"use_var":row.use_var.map(|v|v.as_u32()),"def_var":row.def_var.as_u32()}))?;
+    }
+    for row in &export.realloc_coverage_holds {
+        out.add(F::ReallocCases,json!({"event":realloc_key(&row.site),"kind":"coverage-hold","receipt":"realloc-ssa-coverage:hold-raw","reason":row.reason.label(),"slots":row.slots.iter().map(|slot|resolver.slot(*slot)).collect::<Result<Vec<_>,_>>()?}),Value::Null)?;
     }
     for row in &export.realloc_cases {
         resolver.named_function(&row.event.function)?;

@@ -431,6 +431,7 @@ fn emit_fn_body_into<'tcx>(
     let realloc_plans =
         realloc_ssa::plan_body(crate_ctxt, body, &mut definitions, &inventory.reallocations)
             .map_err(|error| anyhow::anyhow!("realloc ownership coverage: {error:?}"))?;
+    realloc_ssa::constrain_coverage_holds(crate_ctxt, body, slots, kind_solver, &realloc_plans);
     let ssa_state = SSAState::new(body, &compute_dominance_frontier(body), definitions);
     let copy_lend_guards = copy_lends
         .map(|pairs| coherence::copy_lend_guards_for_body(kind_solver, slots, fn_did, body, pairs))
@@ -642,3 +643,6 @@ impl<'tcx> CrateCtxt<'tcx> {
         self.fn_ctxt.fns()
     }
 }
+
+#[cfg(test)]
+pub(crate) mod wrapper_fault_tests;

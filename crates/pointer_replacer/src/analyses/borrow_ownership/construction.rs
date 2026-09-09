@@ -718,6 +718,8 @@ fn construct_bo_into_with_esc(
     enable_esc_minimal: bool,
 ) -> anyhow::Result<BoConstruction> {
     let source_events = super::source_events::for_construction(program);
+    #[cfg(test)]
+    let source_events = super::wrapper_fault_tests::inventory(source_events);
     super::export::record(|export| export.source_events = Some(source_events.clone()));
     super::comparison::record_sites(program, slots);
     let crate_ctxt = CrateCtxt::new(program);
@@ -1122,9 +1124,11 @@ fn verify_constructed_to_fixpoint(
     Option<FxHashMap<SlotRef, SlotKind>>,
     super::borrow_verify::RoundStats,
 ) {
+    #[cfg(test)]
+    super::wrapper_fault_tests::verification(slots, solver);
     let copy_lends =
         (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
-    verify_to_fixpoint_counting_with_flows_impl(
+    let result = verify_to_fixpoint_counting_with_flows_impl(
         program,
         slots,
         origins.native_flows(),
@@ -1135,7 +1139,10 @@ fn verify_constructed_to_fixpoint(
         Some(&construction.esc_minimal.loans),
         parameter_overlaps,
         LoopBackend::HardCheckRoundOptimize,
-    )
+    );
+    #[cfg(test)]
+    super::wrapper_fault_tests::verification_result(solver);
+    result
 }
 
 pub(crate) fn verify_bo_construction_counting(

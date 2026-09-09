@@ -1007,6 +1007,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         super::export::begin_round();
         let active_escaped_copy_lends = escaped_copy_lends
             .map(|escaped| super::esc_minimal::active_loans_for_model(escaped, &model));
+        let _retirement_model = super::retirement::model_scope(&model);
         let selected_copy_lends = selected_copy_lends_for_round(
             program,
             slots,
@@ -1065,6 +1066,24 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         if !reviewed.retirement.unresolved.is_empty() {
             stats.source_retirement_decline = reviewed.retirement.unresolved;
             return (None, stats);
+        }
+        let raw_targets = reviewed.retirement.raw_targets();
+        if !raw_targets.is_empty() {
+            for target in &raw_targets {
+                solver.assume(*target, SlotKind::Raw);
+            }
+            #[cfg(test)]
+            raw_commit_trace::record(stats.rounds, false, &raw_targets);
+            stats.commits_conflict += raw_targets.len();
+            stats.commits_per_round.push(raw_targets.len());
+            let Some((next, dropped)) =
+                solve_round_model(solver, selectors, backend, hard.as_ref())
+            else {
+                return (None, stats);
+            };
+            model = next;
+            record_dropped(&mut stats, selectors, &dropped);
+            continue;
         }
         let mut conflicts = reviewed.conflicts;
         append_retirement_targets(&mut conflicts, &reviewed.retirement);
@@ -1415,6 +1434,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
         super::export::begin_round();
         let active_escaped_copy_lends = escaped_copy_lends
             .map(|escaped| super::esc_minimal::active_loans_for_model(escaped, &model));
+        let _retirement_model = super::retirement::model_scope(&model);
         let selected_copy_lends = selected_copy_lends_for_round(
             program,
             slots,
@@ -1442,6 +1462,66 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             stats.source_retirement_decline = reviewed.retirement.unresolved;
             emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
             return (None, stats);
+        }
+        let raw_targets = reviewed.retirement.raw_targets();
+        if !raw_targets.is_empty() {
+            // A typed coverage repair is independent of L2's guarded loan clauses.
+            // Keep its validation-round accounting honest without inventing a loan.
+            #[cfg(test)]
+            if coverage_planner_fault::active() {
+                planner = Planner::new(usize::MAX);
+            }
+            match planner.plan_round(L2SolverOutcome::Sat, &[], &model) {
+                L2RoundPlan::Accept { validation_round } => {
+                    assert_eq!(
+                        stats.rounds, validation_round,
+                        "L2 coverage/planner validation counters diverged"
+                    );
+                }
+                L2RoundPlan::Decline {
+                    validation_round,
+                    reason,
+                } => {
+                    record_l2_decline(&mut stats, validation_round, reason, diagnostics_enabled);
+                    emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
+                    return (None, stats);
+                }
+                L2RoundPlan::Continue { .. } => {
+                    panic!("empty L2 observations produced commit actions")
+                }
+            }
+            for target in &raw_targets {
+                solver.assume(*target, SlotKind::Raw);
+            }
+            #[cfg(test)]
+            raw_commit_trace::record(stats.rounds, true, &raw_targets);
+            stats.commits_conflict += raw_targets.len();
+            stats.commits_per_round.push(raw_targets.len());
+            match solve_l2_round_model(solver, selectors, backend, hard.as_ref()) {
+                L2SolveResult::Sat { kinds, dropped } => {
+                    model = kinds;
+                    record_dropped(&mut stats, selectors, &dropped);
+                    continue;
+                }
+                L2SolveResult::Unsat => {
+                    record_l2_decline(
+                        &mut stats,
+                        planner.validation_rounds(),
+                        L2DeclineReason::Solver(L2SolverDecline::Unsat),
+                        diagnostics_enabled,
+                    );
+                    return (None, stats);
+                }
+                L2SolveResult::Unknown => {
+                    record_l2_decline(
+                        &mut stats,
+                        planner.validation_rounds(),
+                        L2DeclineReason::Solver(L2SolverDecline::Unknown),
+                        diagnostics_enabled,
+                    );
+                    return (None, stats);
+                }
+            }
         }
         let conflicts = reviewed.conflicts;
         let mut observations = Vec::new();
@@ -1719,6 +1799,7 @@ fn model_accepts_with_flows_impl(
          region. Capture must be armed only around the accepted run; move the \
          arm, do not suspend here."
     );
+    let _retirement_model = super::retirement::model_scope(model);
     let reviewed = revalidate_replaying_reviewed(
         program,
         slots,
@@ -1733,7 +1814,10 @@ fn model_accepts_with_flows_impl(
         None,
         None,
     );
-    if !reviewed.retirement.unresolved.is_empty() || !reviewed.retirement.conflicts.is_empty() {
+    if !reviewed.retirement.unresolved.is_empty()
+        || !reviewed.retirement.conflicts.is_empty()
+        || !reviewed.retirement.demotions.is_empty()
+    {
         return false;
     }
     let conflicts = reviewed.conflicts;
@@ -2048,5 +2132,63 @@ mod nb5l_a_prime_menu_tests {
         let m = model(&[(source, SlotKind::Ref), (destination, SlotKind::Raw)]);
         assert_eq!(a_prime_menu(&conflict, &m), vec![source]);
         assert_eq!(representative(&conflict, &m), Some(source));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod coverage_planner_fault {
+    thread_local! { static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    pub(super) fn active() -> bool {
+        ACTIVE.with(|active| active.get())
+    }
+    pub(crate) fn with_overflow<T>(f: impl FnOnce() -> T) -> T {
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ACTIVE.with(|active| active.set(self.0));
+            }
+        }
+        let _reset = Reset(ACTIVE.with(|active| active.replace(true)));
+        f()
+    }
+}
+
+/// R258 test-only observation of the actual retirement Raw-delivery branch.
+#[cfg(test)]
+pub(crate) mod raw_commit_trace {
+    use std::cell::RefCell;
+
+    use super::SlotRef;
+    #[derive(Clone, Debug)]
+    pub(crate) struct Commit {
+        pub(crate) round: usize,
+        pub(crate) l2: bool,
+        pub(crate) targets: Vec<SlotRef>,
+    }
+    thread_local! {static CAPTURE:RefCell<Option<Vec<Commit>>>=const{RefCell::new(None)};}
+    pub(super) fn record(round: usize, l2: bool, targets: &[SlotRef]) {
+        CAPTURE.with(|capture| {
+            if let Some(rows) = capture.borrow_mut().as_mut() {
+                rows.push(Commit {
+                    round,
+                    l2,
+                    targets: targets.to_vec(),
+                });
+            }
+        });
+    }
+    pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Commit>) {
+        struct Restore(Option<Vec<Commit>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CAPTURE.with(|capture| {
+                    capture.replace(self.0.take());
+                });
+            }
+        }
+        let _restore = Restore(CAPTURE.with(|capture| capture.replace(Some(Vec::new()))));
+        let value = f();
+        let rows = CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+        (value, rows)
     }
 }

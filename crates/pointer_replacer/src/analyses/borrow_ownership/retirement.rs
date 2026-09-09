@@ -26,6 +26,9 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+pub(crate) mod local_outcome;
+#[cfg(test)]
+mod local_outcome_tests;
 mod objects;
 mod routes;
 
@@ -101,6 +104,7 @@ pub(crate) enum CoverageDisposition {
     Null,
     InactiveStorage,
     UnaddressedStorage,
+    IrrelevantNoSafeHolder,
     /// All currently represented obligations were examined. A conflict or
     /// unresolved row still prevents acceptance; this is not a soundness proof.
     Checked,
@@ -119,6 +123,7 @@ pub(crate) struct ContextCoverage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetirementReview {
     pub(crate) conflicts: Vec<RetirementConflict>,
+    pub(crate) demotions: Vec<local_outcome::Demotion>,
     pub(crate) unresolved: Vec<RetirementUnresolved>,
     pub(crate) coverage: Vec<ContextCoverage>,
     /// Actual ordinary error points, kept separate from the loan inventory.
@@ -242,12 +247,27 @@ struct Context {
     locals: FxHashMap<(LocalDefId, ProvenanceOwner), SlotRef>,
     fields: FxHashMap<StructFieldSlot, SlotRef>,
     refs: FxHashSet<SlotRef>,
+    safe_holders: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
+    copy_graph: FxHashMap<SlotRef, Vec<SlotRef>>,
+    exact_kinds: bool,
     unrepresented_inner: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
     entry_consistent: bool,
     latest: FxHashMap<LocalDefId, RetirementReview>,
 }
 
-thread_local! { static CURRENT: RefCell<Option<Context>> = const { RefCell::new(None) }; }
+thread_local! {
+    static CURRENT: RefCell<Option<Context>> = const { RefCell::new(None) };
+    static MODEL: RefCell<Option<FxHashMap<SlotRef, super::SlotKind>>> = const { RefCell::new(None) };
+}
+pub(crate) struct ModelScope(Option<FxHashMap<SlotRef, super::SlotKind>>);
+impl Drop for ModelScope {
+    fn drop(&mut self) {
+        MODEL.with(|model| model.replace(self.0.take()));
+    }
+}
+pub(crate) fn model_scope(model: &FxHashMap<SlotRef, super::SlotKind>) -> ModelScope {
+    ModelScope(MODEL.with(|current| current.replace(Some(model.clone()))))
+}
 
 pub(crate) struct RetirementScope {
     previous: Option<Context>,
@@ -281,6 +301,7 @@ pub(crate) fn begin(
     let entries = protected_entry::current().expect("validated parameter-entry scope");
     let objects = ObjectFacts::analyze(program, slots, &source);
     let routed = routes::expand(program, &source, &objects);
+    let exact = MODEL.with(|current| current.borrow().clone());
     let mut context = Context {
         source,
         entries,
@@ -291,6 +312,9 @@ pub(crate) fn begin(
         locals: FxHashMap::default(),
         fields: FxHashMap::default(),
         refs: FxHashSet::default(),
+        safe_holders: Vec::new(),
+        copy_graph: local_outcome::copy_graph(program, slots),
+        exact_kinds: exact.is_some(),
         unrepresented_inner: Vec::new(),
         entry_consistent: true,
         latest: FxHashMap::default(),
@@ -315,6 +339,13 @@ pub(crate) fn begin(
                 context
                     .locals
                     .insert((function, ProvenanceOwner::Local(local)), reference);
+            }
+            // R251: only Ref carriers hold loans; Owning is handled by the ledger.
+            let safe = is_ref(reference);
+            if safe {
+                context
+                    .safe_holders
+                    .push((reference, Some((function, local)), slot.depth));
             }
             if is_ref(reference) {
                 context.refs.insert(reference);
@@ -354,6 +385,11 @@ pub(crate) fn begin(
                 },
                 reference,
             );
+        }
+        // R251: only Ref carriers hold loans; Owning is handled by the ledger.
+        let safe = is_ref(reference);
+        if safe {
+            context.safe_holders.push((reference, None, slot.depth));
         }
         if is_ref(reference) {
             context.refs.insert(reference);
@@ -448,6 +484,15 @@ impl Context {
                     _ => None,
                 }
             };
+            let heap_only = matches!(
+                event.source.key.role,
+                SourceRole::Free | SourceRole::ReallocOld
+            );
+            let holders = self.overlapping_holders(function, event, heap_only);
+            let skip = skip.or_else(|| {
+                (self.exact_kinds && !heap_only && holders.is_empty())
+                    .then_some(CoverageDisposition::IrrelevantNoSafeHolder)
+            });
             review.coverage.push(ContextCoverage {
                 source: event.source.key.clone(),
                 function,
@@ -462,10 +507,7 @@ impl Context {
             // No new Ref materialization in this frame means no retirement
             // obligation here; caller protectors are checked in their routed
             // contexts. Unknown lifecycle identity alone is not a Ref conflict.
-            if !self.refs.iter().any(|slot| {
-                matches!(slot, SlotRef::Field(_))
-                    || matches!(slot, SlotRef::Local(owner, _) if *owner == function)
-            }) {
+            if holders.is_empty() {
                 continue;
             }
             let heap_only = matches!(
@@ -475,7 +517,7 @@ impl Context {
             // Native loan owners carry only the outer provenance. A deeper
             // non-entry Ref can keep an inner target live through Raw copies,
             // even after its source local's last use. Until that demand has an
-            // exact loan/depth witness, possible retirement overlap declines.
+            // exact loan/depth witness, possible retirement overlap demotes that holder.
             // Field instance flow is unrepresented here and remains Unknown.
             for &(slot, owner, depth) in &self.unrepresented_inner {
                 let target = if let Some((owner_function, local)) = owner {
@@ -492,10 +534,12 @@ impl Context {
                     ObjectSet::default()
                 };
                 if overlap(&target, &event.objects, function, heap_only).is_some() {
-                    review.unresolved.push(residual(
+                    self.demote(
+                        &mut review,
                         event,
-                        UnresolvedReason::MissingInnerLoan { slot, depth },
-                    ));
+                        slot,
+                        local_outcome::Reason::InnerLoanMissing { depth },
+                    );
                 }
             }
             let active_entries: Vec<_> = self
@@ -550,8 +594,12 @@ impl Context {
                 }
             }
             let point = facts.location_map.point_from_location(event.location);
-            let Some(live) = facts.loan_liveness.row(point) else { continue };
-            for loan in live.iter() {
+            for loan in facts
+                .loan_liveness
+                .row(point)
+                .into_iter()
+                .flat_map(|live| live.iter())
+            {
                 let data = &facts.borrow_set.loans[loan];
                 let borrowed = PlaceKey::from_place(data.borrowed);
                 // Resolve the value at reservation, never through a later rebinding.
@@ -761,6 +809,7 @@ impl RetirementScope {
             }
             review.ordinary_error_points += latest.ordinary_error_points;
             review.conflicts.append(&mut latest.conflicts);
+            review.demotions.append(&mut latest.demotions);
             review.unresolved.append(&mut latest.unresolved);
             review.coverage.append(&mut latest.coverage);
         }
@@ -807,7 +856,9 @@ impl RetirementScope {
                     .any(|row| row.source.as_ref().is_none_or(|key| key == source))
                 {
                     EventDisposition::Unresolved
-                } else if review.conflicts.iter().any(|row| &row.source == source) {
+                } else if review.conflicts.iter().any(|row| &row.source == source)
+                    || review.demotions.iter().any(|row| &row.source == source)
+                {
                     EventDisposition::Conflict
                 } else if review.coverage.iter().any(|row| {
                     &row.source == source && row.disposition == CoverageDisposition::Checked

@@ -270,7 +270,7 @@ pub(crate) struct ReallocCase {
     pub(crate) contents: ContentsRelation,
 }
 
-fn zero_size_possible(site: &ReallocSite) -> bool {
+pub(crate) fn zero_size_possible(site: &ReallocSite) -> bool {
     site.size == ReallocSize::Zero
         || (site.size == ReallocSize::ByteCount
             && !matches!(

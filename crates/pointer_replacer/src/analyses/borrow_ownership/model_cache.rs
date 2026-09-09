@@ -39,7 +39,7 @@ use crate::utils::rustc::RustProgram;
 
 /// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
 /// changes after this commit do not advance this identity.
-pub(crate) const ANALYSIS_FRAME: &str = "era5a-p1s-realloc243-field-result-v1";
+pub(crate) const ANALYSIS_FRAME: &str = "era5a-r258-local-coverage-v1";
 
 const CACHE_SCHEMA: &str = "bo-model-cache-v2";
 const A14_MARKER: &str = "positive-opacity-v1";
@@ -67,6 +67,18 @@ pub(crate) fn solver_identity(
     if let Ok(digest) = std::env::var("CRAT_ERA5_LAUNCH_DIGEST") {
         fields.insert("era5_launch_digest", digest);
     }
+    fields.insert(
+        "local_coverage_outcomes",
+        "r245-ref-inner-demote-realloc-site-hold-v1".to_owned(),
+    );
+    fields.insert(
+        "retirement_receipts",
+        "r253-three-dispositions-v1".to_owned(),
+    );
+    fields.insert(
+        "coverage_integrity",
+        "r253-inventory-complete-l2-result-propagation-v1".to_owned(),
+    );
     fields.insert("protected_entry", "p1-prime-s-v1".to_owned());
     fields.insert(
         "realloc_outcomes",
@@ -687,8 +699,11 @@ mod tests {
             Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         );
         for required in [
-            "analysis_frame=era5a-p1s-realloc243-field-result-v1",
+            "analysis_frame=era5a-r258-local-coverage-v1",
             "era5_schema=era5a-model-cache-v1",
+            "local_coverage_outcomes=r245-ref-inner-demote-realloc-site-hold-v1",
+            "retirement_receipts=r253-three-dispositions-v1",
+            "coverage_integrity=r253-inventory-complete-l2-result-propagation-v1",
             "protected_entry=p1-prime-s-v1",
             "realloc_outcomes=r243-field-test-fallback-both-v1",
             "field_inner_facts=explicit-availability-v1",

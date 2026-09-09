@@ -44,6 +44,7 @@ pub(crate) struct ReallocSsaPlan {
     /// Normalized SSA owner; `site` retains the original source-call operand.
     pub(crate) old: Option<Local>,
     pub(crate) operations: Vec<ReallocEdgeOperation>,
+    pub(crate) coverage_hold: Option<coverage_hold::Reason>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +52,9 @@ pub(crate) enum ReallocSsaUnsupported {
     Lifecycle(ReallocUnsupported),
     MultipleSites,
     StaleSite,
+    UnsupportedControlFlow(BasicBlock),
+    UnsupportedTransport(Location),
+    UnsupportedOwnershipCarrier(Local),
     AmbiguousOldOwner(Local),
     ProjectedOldOwner(Local),
     CrossBlockOldProxy(Local),
@@ -149,7 +153,7 @@ fn old_owner(
 
 /// Accept only the supplied body's single supported site. An error leaves the
 /// definition sets untouched, so a typed decline cannot partially install SSA.
-pub(crate) fn plan_body<'tcx>(
+fn plan_body_exact<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
     body: &Body<'tcx>,
     definitions: &mut Definitions,
@@ -201,6 +205,7 @@ pub(crate) fn plan_body<'tcx>(
                 site: site.clone(),
                 old: continuation.old,
                 operations: Vec::new(),
+                coverage_hold: None,
             })
         })
         .collect::<Result<Vec<_>, ReallocSsaError>>()?;
@@ -320,7 +325,7 @@ pub(crate) fn plan_body<'tcx>(
                 target: Some(target),
                 ..
             } => *target,
-            _ => return Err(error(ReallocSsaUnsupported::StaleSite)),
+            _ => return Err(error(ReallocSsaUnsupported::UnsupportedControlFlow(block))),
         };
         previous = block;
         block = next;
@@ -373,11 +378,11 @@ pub(crate) fn plan_body<'tcx>(
         };
         let (source, by_move) = pointer_transfer(value)
             .ok_or_else(|| error(ReallocSsaUnsupported::InvalidTransport(location)))?;
-        if destination.as_local() != Some(transport.destination)
-            || source != transport.source
-            || aliases.contains_key(&transport.destination)
-        {
+        if destination.as_local() != Some(transport.destination) || source != transport.source {
             return Err(error(ReallocSsaUnsupported::InvalidTransport(location)));
+        }
+        if aliases.contains_key(&transport.destination) {
+            return Err(error(ReallocSsaUnsupported::UnsupportedTransport(location)));
         }
         let source = *aliases
             .get(&source)
@@ -400,9 +405,12 @@ pub(crate) fn plan_body<'tcx>(
         .struct_ctxt
         .with_max_precision(super::BO_PRECISION);
     for &local in &affected {
-        if definitions.call_arg_temps.contains(&local)
-            || !definitions.locals_with_defs.contains(local)
-            || definitions.def_sites[local].is_empty()
+        if definitions.call_arg_temps.contains(&local) {
+            return Err(error(ReallocSsaUnsupported::UnsupportedOwnershipCarrier(
+                local,
+            )));
+        }
+        if !definitions.locals_with_defs.contains(local) || definitions.def_sites[local].is_empty()
         {
             return Err(error(ReallocSsaUnsupported::MissingOwnershipDefinition(
                 local,
@@ -458,6 +466,240 @@ pub(crate) fn plan_body<'tcx>(
         site: site.clone(),
         old,
         operations,
+        coverage_hold: None,
     });
     Ok(continuation_plans)
+}
+
+/// R245/R246 recovery validates source identity before converting a coverage limit.
+pub(crate) fn plan_body<'tcx>(
+    crate_ctxt: &CrateCtxt<'tcx>,
+    body: &Body<'tcx>,
+    definitions: &mut Definitions,
+    sites: &[ReallocSite],
+) -> Result<Vec<ReallocSsaPlan>, ReallocSsaError> {
+    let function = crate_ctxt.tcx.def_path_str(body.source.def_id());
+    let relevant = sites
+        .iter()
+        .filter(|site| site.key.function == function)
+        .collect::<Vec<_>>();
+    // A realloc-free body needs no fresh inventory materialization. An empty
+    // supplied inventory for an actual realloc body must reach completeness.
+    if relevant.is_empty()
+        && !body.basic_blocks.iter().any(|data| {
+            data.terminator().as_call(crate_ctxt.tcx).is_some_and(
+                |call| matches!(call.func, CallKind::LibC(name) if name.as_str() == "realloc"),
+            )
+        })
+    {
+        return plan_body_exact(crate_ctxt, body, definitions, sites);
+    }
+    let program = crate::utils::rustc::RustProgram {
+        tcx: crate_ctxt.tcx,
+        functions: crate_ctxt.fns().iter().map(|f| f.expect_local()).collect(),
+        structs: Vec::new(),
+    };
+    let actual = realloc::collect_sites(&program);
+    for site in &relevant {
+        if actual.iter().find(|row| row.key == site.key) != Some(*site)
+            || relevant.iter().filter(|row| row.key == site.key).count() != 1
+        {
+            return Err(ReallocSsaError {
+                site: site.key.clone(),
+                reason: ReallocSsaUnsupported::StaleSite,
+            });
+        }
+    }
+    let actual_count = actual
+        .iter()
+        .filter(|site| site.key.function == function)
+        .count();
+    if actual_count != relevant.len() {
+        return Err(ReallocSsaError {
+            site: actual
+                .iter()
+                .find(|site| site.key.function == function)
+                .or_else(|| relevant.first().copied())
+                .expect("inventory count mismatch has a source or supplied site")
+                .key
+                .clone(),
+            reason: ReallocSsaUnsupported::StaleSite,
+        });
+    }
+    if let Some(site) = relevant
+        .iter()
+        .find(|site| site.size == realloc::ReallocSize::Unknown)
+    {
+        return Err(ReallocSsaError {
+            site: site.key.clone(),
+            reason: ReallocSsaUnsupported::Lifecycle(ReallocUnsupported::UnknownSize),
+        });
+    }
+    #[cfg(test)]
+    let planned = super::wrapper_fault_tests::recovery_error(relevant.first().copied())
+        .map(Err)
+        .unwrap_or_else(|| plan_body_exact(crate_ctxt, body, definitions, sites));
+    #[cfg(not(test))]
+    let planned = plan_body_exact(crate_ctxt, body, definitions, sites);
+    match planned {
+        Ok(plans) => Ok(plans),
+        Err(error) => {
+            let Some(reason) = coverage_hold::Reason::from_error(&error.reason) else {
+                return Err(error);
+            };
+            // No definition set is mutated before the exact planner succeeds.
+            // Hold every affected call in this function, keeping its original
+            // source site/size/outcome evidence and source timing untouched.
+            Ok(relevant
+                .into_iter()
+                .map(|site| ReallocSsaPlan {
+                    site: site.clone(),
+                    old: None,
+                    operations: Vec::new(),
+                    coverage_hold: Some(reason),
+                })
+                .collect())
+        }
+    }
+}
+
+pub(crate) mod coverage_hold {
+    use super::*;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Reason {
+        MultipleSites,
+        AmbiguousOldOwner,
+        ProjectedOldOwner,
+        CrossBlockOldProxy,
+        OldOwnerOverwritten,
+        OwnershipMeasure,
+        ExtraPredecessor,
+        OutcomeReentry,
+        LiveOutcomeJoin,
+        ControlFlow,
+        Transport,
+        OwnershipCarrier,
+        ZeroSize,
+        ResultTest,
+    }
+    impl Reason {
+        pub(crate) fn label(self) -> &'static str {
+            match self {
+                Self::MultipleSites => "multiple-sites",
+                Self::AmbiguousOldOwner => "ambiguous-old-owner",
+                Self::ProjectedOldOwner => "projected-old-owner",
+                Self::CrossBlockOldProxy => "cross-block-old-proxy",
+                Self::OldOwnerOverwritten => "old-owner-overwritten",
+                Self::OwnershipMeasure => "ownership-measure",
+                Self::ExtraPredecessor => "extra-predecessor",
+                Self::OutcomeReentry => "outcome-reentry",
+                Self::LiveOutcomeJoin => "live-outcome-join",
+                Self::ControlFlow => "control-flow",
+                Self::Transport => "transport-representation",
+                Self::OwnershipCarrier => "ownership-carrier",
+                Self::ZeroSize => "zero-size-lifecycle",
+                Self::ResultTest => "result-test",
+            }
+        }
+
+        pub(crate) fn from_error(error: &ReallocSsaUnsupported) -> Option<Self> {
+            Some(match error {
+                ReallocSsaUnsupported::MultipleSites => Self::MultipleSites,
+                ReallocSsaUnsupported::AmbiguousOldOwner(_) => Self::AmbiguousOldOwner,
+                ReallocSsaUnsupported::ProjectedOldOwner(_) => Self::ProjectedOldOwner,
+                ReallocSsaUnsupported::CrossBlockOldProxy(_) => Self::CrossBlockOldProxy,
+                ReallocSsaUnsupported::OldOwnerOverwritten(_) => Self::OldOwnerOverwritten,
+                ReallocSsaUnsupported::OwnershipMeasure { .. } => Self::OwnershipMeasure,
+                ReallocSsaUnsupported::ExtraPredecessor(_) => Self::ExtraPredecessor,
+                ReallocSsaUnsupported::OutcomeReentry(_) => Self::OutcomeReentry,
+                ReallocSsaUnsupported::LiveOutcomeJoin { .. } => Self::LiveOutcomeJoin,
+                ReallocSsaUnsupported::UnsupportedControlFlow(_) => Self::ControlFlow,
+                ReallocSsaUnsupported::UnsupportedTransport(_) => Self::Transport,
+                ReallocSsaUnsupported::UnsupportedOwnershipCarrier(_) => Self::OwnershipCarrier,
+                ReallocSsaUnsupported::Lifecycle(ReallocUnsupported::ZeroSize) => Self::ZeroSize,
+                ReallocSsaUnsupported::Lifecycle(
+                    ReallocUnsupported::DiscardedResult | ReallocUnsupported::UnresolvedResultTest,
+                ) => Self::ResultTest,
+                _ => return None,
+            })
+        }
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct Receipt {
+        pub(crate) site: ReallocSiteKey,
+        pub(crate) reason: Reason,
+        pub(crate) slots: Vec<super::super::solver::SlotRef>,
+    }
+}
+
+/// Apply only site-local ownership holds before linking SSA values to kinds.
+pub(crate) fn constrain_coverage_holds<'tcx>(
+    crate_ctxt: &CrateCtxt<'tcx>,
+    body: &Body<'tcx>,
+    slots: &super::crate_slots::CrateSlots,
+    solver: &super::solver::KindSolver,
+    plans: &[ReallocSsaPlan],
+) {
+    use super::{
+        resolve::{ResolvedSlot, resolve_place},
+        solver::SlotRef,
+    };
+    if !plans.iter().any(|plan| plan.coverage_hold.is_some()) {
+        return;
+    }
+    let function = body.source.def_id().expect_local();
+    let program = crate::utils::rustc::RustProgram {
+        tcx: crate_ctxt.tcx,
+        functions: crate_ctxt.fns().iter().map(|f| f.expect_local()).collect(),
+        structs: Vec::new(),
+    };
+    let graph = super::retirement::local_outcome::copy_graph(&program, slots);
+    for plan in plans {
+        let Some(reason) = plan.coverage_hold else { continue };
+        assert!(plan.operations.is_empty());
+        let block = BasicBlock::from_u32(plan.site.key.block);
+        let call = body.basic_blocks[block]
+            .terminator()
+            .as_call(crate_ctxt.tcx)
+            .expect("validated held call");
+        let mut pending = Vec::new();
+        for place in std::iter::once(call.destination)
+            .chain(call.args.first().and_then(|argument| argument.node.place()))
+        {
+            for depth in 0..super::crate_slots::MAX_SLOT_DEPTH {
+                if let Some(resolved) = resolve_place(slots, function, body, place, depth, None) {
+                    pending.push(match resolved {
+                        ResolvedSlot::Local(id) => SlotRef::Local(function, id),
+                        ResolvedSlot::Field(id) => SlotRef::Field(id),
+                    });
+                }
+            }
+        }
+        let mut seen = rustc_hash::FxHashSet::default();
+        while let Some(slot) = pending.pop() {
+            if seen.insert(slot) {
+                pending.extend(graph.get(&slot).into_iter().flatten().copied());
+            }
+        }
+        let targets = seen
+            .into_iter()
+            .map(|slot| (super::l2::SlotKey::of(slot), slot))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
+        assert!(
+            !targets.is_empty(),
+            "held realloc has no represented operand/result: missing required slot mapping"
+        );
+        for &target in &targets {
+            solver.assume(target, super::SlotKind::Raw);
+        }
+        super::export::record(|capture| {
+            capture.realloc_coverage_holds.push(coverage_hold::Receipt {
+                site: plan.site.key.clone(),
+                reason,
+                slots: targets,
+            })
+        });
+    }
 }

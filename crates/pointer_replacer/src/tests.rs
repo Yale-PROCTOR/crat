@@ -12697,7 +12697,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     #[test]
     fn escw1_escape_shape_demotes_x_raw() {
         use crate::analyses::borrow_ownership::{
-            retirement::UnresolvedReason, source_events::SourceRole,
+            retirement::local_outcome::Reason, source_events::SourceRole,
         };
         const CODE: &str = r#"
 unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
@@ -12753,14 +12753,16 @@ unsafe fn caller() -> i32 {
                 });
             assert_eq!(selected_sites, 1, "ESC-W1 selects one exact N4 site");
             assert!(!extensions.is_empty(), "escaped loan was not extended");
-            assert!(
-                model.is_none(),
-                "the receipted era-5 fixture declines before any accepted save::x verdict"
+            let model = model.expect("R245 ESC coverage recovery keeps the model");
+            let save = function_by_name(&program, "save");
+            let x = local_slot(&slots, save, local_by_var_name(tcx, save, "x"), 0);
+            assert_eq!(
+                model[&x],
+                SlotKind::Raw,
+                "selected escape repairs its source issuer"
             );
             {
-                // R213/R217 D: this exact fixture now stops at caller inner
-                // coverage before ② can commit. This is not post-demotion
-                // convergence, nor an accepted Ref verdict for save::x.
+                // R245/R253: preserve exact source/depth receipts through local repair.
                 let caller = function_by_name(&program, "caller");
                 let slot_storage = local_by_var_name(tcx, caller, "slot");
                 let cell_storage = local_by_var_name(tcx, caller, "cell");
@@ -12787,27 +12789,34 @@ unsafe fn caller() -> i32 {
                     .as_ref()
                     .expect("typed retirement decline");
                 assert_eq!(stats.source_retirement_decline, review.unresolved);
-                assert_eq!(review.unresolved.len(), 4);
+                assert!(review.unresolved.is_empty());
+                let rows = export
+                    .retirement_rounds
+                    .iter()
+                    .flat_map(|round| &round.demotions)
+                    .filter(|row| row.holder == inner)
+                    .collect::<Vec<_>>();
+                assert!(!rows.is_empty());
+                assert_eq!(model[&inner], SlotKind::Raw);
                 let mut actual = std::collections::BTreeSet::new();
-                for row in &review.unresolved {
-                    assert_eq!(
-                        row.reason,
-                        UnresolvedReason::MissingInnerLoan {
-                            slot: inner,
-                            depth: 1
-                        }
-                    );
-                    let event = row.source.as_ref().expect("source storage event");
+                for row in &rows {
+                    assert_eq!(row.reason, Reason::InnerLoanMissing { depth: 1 });
+                    assert_eq!(row.holder, inner);
+                    assert!(row.chain.contains(&inner));
+                    for target in &row.chain {
+                        assert_eq!(model[target], SlotKind::Raw);
+                    }
+                    let event = &row.source;
                     assert!(source.retirements.contains_key(event));
                     assert_eq!(event.function, "caller");
-                    assert_eq!(row.function, Some(caller));
-                    assert_eq!(row.phase, Some(event.phase));
+                    assert_eq!(row.function, caller);
+                    assert_eq!(row.phase, event.phase);
                     assert_eq!(
                         row.location,
-                        Some(Location {
+                        Location {
                             block: rustc_middle::mir::BasicBlock::from_u32(event.block),
                             statement_index: event.statement
-                        })
+                        }
                     );
                     assert!(row.route.is_empty());
                     actual.insert((event.role, event.storage_local));
@@ -12822,17 +12831,11 @@ unsafe fn caller() -> i32 {
                     })
                     .collect::<std::collections::BTreeSet<_>>();
                 assert_eq!(actual, expected);
-                assert_eq!(
-                    (
-                        stats.rounds,
-                        stats.commits_conflict,
-                        stats.copy_lend_replay_selections
-                    ),
-                    (1, 0, 1)
-                );
+                assert!(stats.rounds > 1 && stats.commits_conflict > 0);
+                assert_eq!(stats.copy_lend_replay_selections, 0);
                 assert!(
-                    export.residual_conflicts.is_none(),
-                    "decline has no acceptance certificate"
+                    export.residual_conflicts.is_some(),
+                    "accepted model has its certificate"
                 );
             }
         });
@@ -12954,8 +12957,7 @@ unsafe fn caller() -> i32 {
     #[test]
     fn a5_baseline_reference_does_not_consume_esc_selection() {
         use crate::analyses::borrow_ownership::{
-            construction::A5PreledgerDeclineReason, retirement::UnresolvedReason,
-            source_events::SourceRole,
+            retirement::local_outcome::Reason, source_events::SourceRole,
         };
         const CODE: &str = r#"
 unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
@@ -12982,99 +12984,86 @@ unsafe fn caller() -> i32 {
                     )
                 })
             });
-            match result {
-                Ok(_) => panic!(
-                    "the receipted era-5 reference fixture declines before an accepted model"
-                ),
-                Err(decline) => {
-                    // The reference path still consumes no ② selection. Its
-                    // only admitted decline is this fixture's receipted caller
-                    // inner/storage coverage, before any accepted x verdict.
-                    assert_eq!(
-                        decline.reason(),
-                        A5PreledgerDeclineReason::BaselineVerification
-                    );
-                    assert!(
-                        decline
-                            .detail()
-                            .is_some_and(|detail| detail.contains("selected_copy_lends=0"))
-                    );
-                    assert!(!export.retirement_rounds.is_empty());
-                    assert!(
-                        export
-                            .loans
-                            .iter()
-                            .all(|loan| loan.class != LoanClass::CopyLend)
-                    );
-                    let caller = function_by_name(&program, "caller");
-                    let slot_storage = local_by_var_name(tcx, caller, "slot");
-                    let cell_storage = local_by_var_name(tcx, caller, "cell");
-                    let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
-                    let out_addresses: Vec<_> = body
-                        .basic_blocks
-                        .iter()
-                        .flat_map(|block| &block.statements)
-                        .filter_map(|statement| {
-                            let StatementKind::Assign(box (
-                                destination,
-                                Rvalue::RawPtr(_, borrowed),
-                            )) = &statement.kind
-                            else {
-                                return None;
-                            };
-                            (borrowed.as_local() == Some(slot_storage))
-                                .then(|| destination.as_local())
-                                .flatten()
-                        })
-                        .collect();
-                    assert_eq!(out_addresses.len(), 1);
-                    let inner = local_slot(&slots, caller, out_addresses[0], 1);
-                    let source = export
-                        .source_events
-                        .as_ref()
-                        .expect("actual reference source inventory");
-                    let review = export
-                        .source_retirement
-                        .as_ref()
-                        .expect("typed reference decline");
-                    assert_eq!(review.unresolved.len(), 4);
-                    let mut actual = std::collections::BTreeSet::new();
-                    for row in &review.unresolved {
-                        assert_eq!(
-                            row.reason,
-                            UnresolvedReason::MissingInnerLoan {
-                                slot: inner,
-                                depth: 1
-                            }
-                        );
-                        let event = row.source.as_ref().expect("source storage event");
-                        assert!(source.retirements.contains_key(event));
-                        assert_eq!(event.function, "caller");
-                        assert_eq!(row.function, Some(caller));
-                        assert_eq!(row.phase, Some(event.phase));
-                        assert_eq!(
-                            row.location,
-                            Some(Location {
-                                block: rustc_middle::mir::BasicBlock::from_u32(event.block),
-                                statement_index: event.statement
-                            })
-                        );
-                        assert!(row.route.is_empty());
-                        actual.insert((event.role, event.storage_local));
-                    }
-                    let expected = [cell_storage, slot_storage]
-                        .into_iter()
-                        .flat_map(|local| {
-                            [
-                                (SourceRole::UnwindStorage, Some(local.as_u32())),
-                                (SourceRole::StorageDead, Some(local.as_u32())),
-                            ]
-                        })
-                        .collect::<std::collections::BTreeSet<_>>();
-                    assert_eq!(actual, expected);
-                    assert!(export.residual_conflicts.is_none());
+            let verified = result.expect("R245 keeps the reference model");
+            let model = &verified.model;
+            assert!(!export.retirement_rounds.is_empty());
+            assert!(
+                export
+                    .loans
+                    .iter()
+                    .all(|loan| loan.class != LoanClass::CopyLend)
+            );
+            let caller = function_by_name(&program, "caller");
+            let slot_storage = local_by_var_name(tcx, caller, "slot");
+            let cell_storage = local_by_var_name(tcx, caller, "cell");
+            let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+            let out_addresses: Vec<_> = body
+                .basic_blocks
+                .iter()
+                .flat_map(|block| &block.statements)
+                .filter_map(|statement| {
+                    let StatementKind::Assign(box (destination, Rvalue::RawPtr(_, borrowed))) =
+                        &statement.kind
+                    else {
+                        return None;
+                    };
+                    (borrowed.as_local() == Some(slot_storage))
+                        .then(|| destination.as_local())
+                        .flatten()
+                })
+                .collect();
+            assert_eq!(out_addresses.len(), 1);
+            let inner = local_slot(&slots, caller, out_addresses[0], 1);
+            let source = export
+                .source_events
+                .as_ref()
+                .expect("actual reference source inventory");
+            let review = export
+                .source_retirement
+                .as_ref()
+                .expect("typed reference decline");
+            assert!(review.unresolved.is_empty());
+            let rows = export
+                .retirement_rounds
+                .iter()
+                .flat_map(|round| &round.demotions)
+                .filter(|row| row.holder == inner)
+                .collect::<Vec<_>>();
+            assert!(!rows.is_empty());
+            assert_eq!(model[&inner], SlotKind::Raw);
+            let mut actual = std::collections::BTreeSet::new();
+            for row in &rows {
+                assert_eq!(row.reason, Reason::InnerLoanMissing { depth: 1 });
+                assert_eq!(row.holder, inner);
+                for target in &row.chain {
+                    assert_eq!(model[target], SlotKind::Raw);
                 }
-            };
+                let event = &row.source;
+                assert!(source.retirements.contains_key(event));
+                assert_eq!(event.function, "caller");
+                assert_eq!(row.function, caller);
+                assert_eq!(row.phase, event.phase);
+                assert_eq!(
+                    row.location,
+                    Location {
+                        block: rustc_middle::mir::BasicBlock::from_u32(event.block),
+                        statement_index: event.statement
+                    }
+                );
+                assert!(row.route.is_empty());
+                actual.insert((event.role, event.storage_local));
+            }
+            let expected = [cell_storage, slot_storage]
+                .into_iter()
+                .flat_map(|local| {
+                    [
+                        (SourceRole::UnwindStorage, Some(local.as_u32())),
+                        (SourceRole::StorageDead, Some(local.as_u32())),
+                    ]
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(actual, expected);
+            assert!(export.residual_conflicts.is_some());
         });
     }
 
@@ -14793,7 +14782,7 @@ pub unsafe fn stash(owner: *mut Holder) {
     fn outparam_escape_aliasing_outer_ptr_never_owning() {
         use crate::analyses::borrow_ownership::{
             borrow_engine::borrow_conflicts_with_flows, borrow_verify::verify_to_fixpoint_counting,
-            origin_flow::analyze_program_origin_flow, retirement::UnresolvedReason,
+            origin_flow::analyze_program_origin_flow, retirement::local_outcome::Reason,
             source_events::SourceRole,
         };
         run_compiler(
@@ -14858,14 +14847,11 @@ pub unsafe fn caller() -> *mut core::ffi::c_void {
 
                 let p = local_slot(&slots, caller, local_by_var_name(tcx, caller, "p"), 0);
                 let q = local_slot(&slots, caller, local_by_var_name(tcx, caller, "q"), 0);
-                assert!(
-                    model.is_none(),
-                    "the current fixture must decline without an ownership verdict for stack aliases {p:?}/{q:?}"
-                );
+                let model = model.expect("R245 stack-holder coverage repair retains model");
+                assert_ne!(model[&p], SlotKind::Owning);
+                assert_ne!(model[&q], SlotKind::Owning);
                 {
-                    // R213/R217 D: no accepted p/q kinds are produced. Reopening
-                    // acceptance needs its own receipt and must still prohibit
-                    // owning these stack pointers; decline is not that proof.
+                    // Preserve stack non-ownership and exact deeper repair receipts.
                     let storage = local_by_var_name(tcx, caller, "local");
                     let universe = &slots.fn_local_slots[&caller];
                     let expected: FxHashSet<_> = (0..universe.len())
@@ -14884,42 +14870,51 @@ pub unsafe fn caller() -> *mut core::ffi::c_void {
                         .as_ref()
                         .expect("typed stack-storage decline");
                     assert_eq!(stats.source_retirement_decline, review.unresolved);
-                    assert!(!review.unresolved.is_empty());
+                    assert!(review.unresolved.is_empty());
+                    let rows = export
+                        .retirement_rounds
+                        .iter()
+                        .flat_map(|round| &round.demotions)
+                        .collect::<Vec<_>>();
+                    assert!(!rows.is_empty());
                     let mut actual = FxHashSet::default();
-                    for row in &review.unresolved {
-                        let UnresolvedReason::MissingInnerLoan { slot, depth: 1 } = row.reason
-                        else {
-                            panic!("unreceipted outparam decline: {row:?}");
-                        };
+                    for row in &rows {
+                        assert_eq!(row.reason, Reason::InnerLoanMissing { depth: 1 });
+                        let slot = row.holder;
                         assert!(expected.contains(&slot));
-                        actual.insert(slot);
-                        let event = row
-                            .source
-                            .as_ref()
-                            .expect("actual local storage retirement");
+                        for target in &row.chain {
+                            assert_eq!(model[target], SlotKind::Raw);
+                            if expected.contains(target) {
+                                actual.insert(*target);
+                            }
+                        }
+                        let event = &row.source;
                         assert_eq!(event.function, "caller");
                         assert_eq!(event.storage_local, Some(storage.as_u32()));
                         assert!(matches!(
                             event.role,
                             SourceRole::UnwindStorage | SourceRole::StorageDead
                         ));
-                        assert_eq!(row.function, Some(caller));
-                        assert_eq!(row.phase, Some(event.phase));
+                        assert_eq!(row.function, caller);
+                        assert_eq!(row.phase, event.phase);
                         assert_eq!(
                             row.location,
-                            Some(Location {
+                            Location {
                                 block: rustc_middle::mir::BasicBlock::from_u32(event.block),
                                 statement_index: event.statement
-                            })
+                            }
                         );
                         assert!(row.route.is_empty());
                     }
                     assert_eq!(actual, expected);
                     assert!(
-                        review.conflicts.iter().any(|row| row.loan.is_some()),
+                        export
+                            .retirement_rounds
+                            .iter()
+                            .any(|round| round.conflicts.iter().any(|row| row.loan.is_some())),
                         "ordinary alias witnesses remain visible"
                     );
-                    assert!(export.residual_conflicts.is_none());
+                    assert!(export.residual_conflicts.is_some());
                 }
             },
         );

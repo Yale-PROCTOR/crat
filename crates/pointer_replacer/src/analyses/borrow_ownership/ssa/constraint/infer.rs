@@ -269,6 +269,10 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             realloc_ssa::ReallocEdgeOperation,
         };
         for plan in self.realloc_plans.clone() {
+            if plan.coverage_hold.is_some() {
+                assert!(plan.operations.is_empty(), "held realloc edge operations");
+                continue;
+            }
             let ReallocResult::DirectBranch(branch) = &plan.site.result else { continue };
             let outcome = if bb == branch.success {
                 ReallocOutcome::Success

@@ -14,7 +14,7 @@ use crate::{
         a5_overlap::WholeProgramAttestation,
         borrow_verify::with_mode_a_commit_trace,
         construction::{
-            A5PreledgerDeclineReason, CopyLendMode, TestValidationBackend, construct_bo_into,
+            CopyLendMode, TestValidationBackend, construct_bo_into,
             solve_bo_a5_reference_reporting, verify_bo_construction_counting_for_test,
         },
         crate_slots::CrateSlots,
@@ -165,15 +165,11 @@ fn receipt(code: &str, case: Case, backend: TestValidationBackend) {
                         Some(WholeProgramAttestation::FrozenBenchmarkGraph))
                 }))
             });
-            let decline = match result {
-                Err(decline) => decline,
-                Ok(_) => panic!("A5 reference fixture requires an explicit decline receipt at this frame"),
-            };
-            assert_eq!(decline.reason(), A5PreledgerDeclineReason::BaselineVerification);
-            println!("receipt.case=A5Reference status=declined construction={decline:?}");
+            let verified = result.expect("R245 local recovery retains the A5 reference model");
+            println!("receipt.case=A5Reference status=accepted");
             assert!(export.loans.iter().all(|loan| loan.class != LoanClass::CopyLend),
                 "the reference path must still exclude fixture-selected escaped CopyLends");
-            (None, None, export, commits)
+            (Some(verified.model), None, export, commits)
         } else {
             let (((model, stats), commits), export) = with_bo_export(|| {
                 let solve = || {
@@ -213,13 +209,36 @@ fn receipt(code: &str, case: Case, backend: TestValidationBackend) {
         }
         match case {
             Case::EscSelected | Case::A5Reference => {
-                assert!(model.is_none(), "do not label an early decline as completed ESC repair");
-                check_inner_decline(case, &program, &slots, source, review);
-                if let Some(stats) = &stats {
-                    assert_eq!(stats.source_retirement_decline, review.unresolved);
-                    println!("receipt.case={case:?} selected_in_last_attempt={} commits={} rounds={} accepted_model=false",
-                        stats.copy_lend_replay_selections, stats.commits_conflict, stats.rounds);
+                let model = model.as_ref().expect("R245 coverage decline is removed");
+                assert!(review.unresolved.is_empty());
+                let rows = export.retirement_rounds.iter().flat_map(|round| &round.demotions).collect::<Vec<_>>();
+                assert!(!rows.is_empty(), "acceptance must retain the actual local repair receipts");
+                for row in rows {
+                    let super::local_outcome::Reason::InnerLoanMissing { depth } = row.reason else {
+                        panic!("unrelated recovery is not an expectation migration: {row:?}");
+                    };
+                    let (identity, actual_depth) = slot_identity(&program, &slots, row.holder);
+                    assert_eq!((depth, actual_depth), (1, 1));
+                    assert_eq!(program.tcx.item_name(row.function.to_def_id()).as_str(), "caller");
+                    assert!(source.retirements.contains_key(&row.source));
+                    assert!(matches!(row.source.role, SourceRole::StorageDead | SourceRole::ReturnStorage | SourceRole::UnwindStorage));
+                    assert!(row.chain.contains(&row.holder));
+                    for target in &row.chain { assert_eq!(model[target], SlotKind::Raw); }
+                    println!("receipt.case={case:?} status=accepted receipt={} holder={identity} source={:?} chain={:?}", row.reason.label(), row.source, row.chain);
                 }
+                if case == Case::EscSelected {
+                    let save = *program.functions.iter().find(|function| tcx.item_name(function.to_def_id()).as_str()=="save").unwrap();
+                    let body=tcx.mir_drops_elaborated_and_const_checked(save).borrow();
+                    let x=body.var_debug_info.iter().find_map(|info| {
+                        if info.name.as_str()!="x" { return None; }
+                        let VarDebugInfoContents::Place(place)=info.value else { return None; };
+                        place.as_local()
+                    }).unwrap();
+                    let target=SlotRef::Local(save,slots.fn_local_slots[&save].slot_for_local_depth(x,0).unwrap());
+                    assert_eq!(model[&target],SlotKind::Raw);
+                    assert!(commits.iter().any(|commit| commit.target==target && commit.conflict.esc_issuer_first));
+                }
+                if let Some(stats) = &stats { assert!(stats.source_retirement_decline.is_empty()); }
             }
             Case::Outparam => {
                 if model.is_none() {

@@ -50,6 +50,21 @@ where
             })
             .cloned()
             .expect("realloc requires a validated source outcome plan");
+        if plan.coverage_hold.is_some() {
+            assert!(
+                plan.operations.is_empty(),
+                "held realloc must not install outcome operations"
+            );
+            // The raw site carries no inferred allocation responsibility. Keep
+            // source behavior, but do not invent conditional ownership claims.
+            if let Some(destination) = destination {
+                <Analysis as InferMode>::borrow(self, destination);
+            }
+            for (argument, _) in args.iter().flatten() {
+                <Analysis as InferMode>::borrow(self, argument.clone());
+            }
+            return;
+        }
         if let Some(continuation) = plan.site.result.continuation() {
             let cases = realloc::classify(&plan.site).expect("validated R219 cases");
             let old_argument = args.first().cloned().flatten();

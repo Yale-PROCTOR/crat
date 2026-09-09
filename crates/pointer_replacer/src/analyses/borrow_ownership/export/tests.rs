@@ -1447,9 +1447,26 @@ pub unsafe fn f(p: *mut u8) -> u8 {
         let origins = compute_origins(&program);
         let facts = MutFacts::from_program(&program);
         let solver = KindSolver::new(&slots);
-        let result = construct_bo_into(&program, &slots, &origins, &facts, &solver, CopyLendMode::Baseline);
-        assert!(result.is_err(), "live outcome correlation must not disappear through ordinary phi equality and T2 retraction");
-        assert!(result.err().unwrap().to_string().contains("LiveOutcomeJoin"));
+        let ((model,_),capture)=with_bo_export(|| {
+            let construction=construct_bo_into(&program,&slots,&origins,&facts,&solver,CopyLendMode::Baseline).expect("live join holds locally");
+            verify_bo_construction_counting(&program,&slots,&origins,&solver,&construction,&facts)
+        });
+        let model=model.expect("held live join retains model");
+        let holds=&capture.realloc_coverage_holds;
+        assert!(!holds.is_empty());
+        assert!(holds.iter().all(|row| row.reason==crate::analyses::borrow_ownership::realloc_ssa::coverage_hold::Reason::LiveOutcomeJoin));
+        for row in holds { for target in &row.slots { assert_eq!(model[target],crate::analyses::borrow_ownership::SlotKind::Raw); } }
+        assert!(capture.source_events.as_ref().unwrap().retirements.keys().any(|key|
+            key.role==crate::analyses::borrow_ownership::source_events::SourceRole::ReallocOld));
+        assert!(capture.realloc_version_sites.is_empty(), "held correlation creates no outcome ownership versions");
+        let ctxt=crate::analyses::borrow_ownership::CrateCtxt::new(&program);
+        let function=function_named(&program,"f");
+        let body=tcx.mir_drops_elaborated_and_const_checked(function).borrow();
+        let mut defs=crate::analyses::borrow_ownership::ssa::consume::initial_definitions(&body,&ctxt);
+        let sites=crate::analyses::borrow_ownership::realloc::collect_sites(&program);
+        let plans=crate::analyses::borrow_ownership::realloc_ssa::plan_body(&ctxt,&body,&mut defs,&sites).unwrap();
+        assert_eq!(plans.len(),1);
+        assert!(plans[0].operations.is_empty() && plans[0].old.is_none());
     }).unwrap_or_else(|error| error.raise());
 }
 

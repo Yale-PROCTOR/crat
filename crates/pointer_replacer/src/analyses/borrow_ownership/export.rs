@@ -532,6 +532,7 @@ pub(crate) struct BoExport {
     pub demand_evidence: Option<super::demand_evidence::DemandEvidence>,
     pub realloc_version_sites: Vec<ReallocVersionSite>,
     pub realloc_cases: Vec<ReallocCaseReceipt>,
+    pub realloc_coverage_holds: Vec<super::realloc_ssa::coverage_hold::Receipt>,
     /// E-R2 consume sites, in emission order.
     pub version_sites: Vec<VersionSite>,
     /// E-R2 per-`Var` ownership, evaluated from the accepted model.
