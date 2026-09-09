@@ -198,56 +198,6 @@ impl<'tcx> Visitor<'tcx> for NativeCalls<'_, 'tcx> {
     }
 }
 
-/// How deep the sink's return type is walked before the answer is conceded.
-const RETURN_CARRIER_WALK_DEPTH: u32 = 6;
-
-/// A conservative compile-time walk of the sink's return type. A sink that
-/// cannot return a pointer has no returned child at all, so the returned-child
-/// permission and its writable carrier have no premise at that site and the
-/// ordinary outgoing view stands; whether the callee writes through the
-/// argument itself remains the existing negative-write evidence's question.
-///
-/// Only the scalar kinds that provably carry no pointer answer `false`.
-/// Aggregates are walked field-wise through every variant, and everything
-/// opaque, generic or past the depth budget is treated as pointer-carrying:
-/// the walk fails closed.
-/// The target pointer's width in bits, which is what an integer return has to
-/// reach before it can carry a whole address.
-fn pointer_bits(tcx: TyCtxt<'_>) -> u64 {
-    tcx.data_layout.pointer_size.bits()
-}
-
-fn return_may_carry_pointer<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u32) -> bool {
-    if depth == 0 {
-        return true;
-    }
-    match ty.kind() {
-        // An integer at least as wide as the target pointer can hand the caller
-        // a whole address, and a pointer reconstructed from it inherits the
-        // permission the outgoing view created, so it IS a returned-child
-        // carrier (addendum 256(2)). `isize`/`usize` have no fixed width here
-        // and are pointer-width by definition. Narrower integers cannot hold an
-        // address; reconstruction from partial values stays outside the
-        // fragment.
-        TyKind::Int(int) => int.bit_width().is_none_or(|bits| bits >= pointer_bits(tcx)),
-        TyKind::Uint(uint) => uint
-            .bit_width()
-            .is_none_or(|bits| bits >= pointer_bits(tcx)),
-        TyKind::Bool | TyKind::Char | TyKind::Float(_) | TyKind::Never => false,
-        TyKind::Tuple(fields) => fields
-            .iter()
-            .any(|field| return_may_carry_pointer(tcx, field, depth - 1)),
-        TyKind::Array(inner, _) | TyKind::Slice(inner) => {
-            return_may_carry_pointer(tcx, *inner, depth - 1)
-        }
-        // A box owns its pointer, so it is a carrier without a field walk.
-        TyKind::Adt(definition, arguments) if !definition.is_box() => definition
-            .all_fields()
-            .any(|field| return_may_carry_pointer(tcx, field.ty(tcx, arguments), depth - 1)),
-        _ => true,
-    }
-}
-
 /// The one form-changed native call strictly inside `argument`, when the
 /// argument is not itself that call. Several such calls, or none, answer
 /// `None`: the first is ambiguous and the second has nothing to adapt.
@@ -425,10 +375,10 @@ pub(crate) fn plan(
                 // view of a mutable subject keeps a writable carrier, and a
                 // shared subject holds rather than lending a read-only view to
                 // a position whose child may write through it.
-                let sink_may_return_child = return_may_carry_pointer(
+                let sink_may_return_child = raw_boundary::may_carry_pointer(
                     tcx,
                     tcx.fn_sig(callee).skip_binder().skip_binder().output(),
-                    RETURN_CARRIER_WALK_DEPTH,
+                    raw_boundary::CARRIER_WALK_DEPTH,
                 );
                 if sink_may_return_child
                     && let Err(reason) = raw_boundary::returned_child_permission(&source_form, None)

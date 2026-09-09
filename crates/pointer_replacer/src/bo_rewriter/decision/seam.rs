@@ -342,6 +342,10 @@ pub(crate) struct RawOutboundEndpoint {
     pub(crate) negative_write: bool,
     pub(crate) box_slice: bool,
     pub(crate) enclosing_unsafe_fn: bool,
+    /// Can the callee hand a pointer back, by return or by output storage?
+    /// The terminal emission needs this to decide a shared source's fate when
+    /// no contract row supplies returned-child evidence.
+    pub(crate) callee_may_yield_pointer: bool,
 }
 
 /// Recheck only frozen returned-child evidence against the terminal view.
@@ -4680,6 +4684,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 negative_write: raw_boundary.negative_write_evidence(key).is_some(),
                 box_slice: site.box_slice,
                 enclosing_unsafe_fn: enclosing_function_is_unsafe(tcx, owner_did),
+                callee_may_yield_pointer: raw_boundary.callee_may_yield_pointer(key),
             }),
             zero_syntax,
             span: site.span,

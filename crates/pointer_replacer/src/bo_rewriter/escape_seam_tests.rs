@@ -98,9 +98,18 @@ const FIELD_STORE_INPUT: &str = r#"
 "#;
 
 /// J23 — a foreign argument is an ordinary pointer seam: the subject keeps its
-/// settled slice form and the boundary takes a raw view of it. The view's
-/// mutability follows the foreign parameter, which is what keeps a `*const`
-/// position from receiving a mutable derivation it was never promised.
+/// settled slice form and the boundary takes a raw view of it.
+///
+/// Expectation migrated under addendum 259(1) with this receipt. The original
+/// assertion read `consume(p.as_ptr())`, on the reasoning that the view's
+/// mutability should follow the foreign parameter. That reasoning was the
+/// defect: a `*const` position says what the callee's type promises, not what
+/// permission the derivation may carry, and a pointer derived from a shared
+/// view of non-`UnsafeCell` bytes may never be written through -- by the callee,
+/// or by anything it hands back. A mutable subject therefore takes the writable
+/// carrier here, which satisfies the const parameter type and costs no hold.
+/// The mutability contrast below keeps its own meaning: `*mut` still selects
+/// the plain mutable view rather than the const-cast one.
 #[test]
 fn escape_seam_foreign_argument_takes_a_raw_view_of_the_settled_subject() {
     let outcome = escape_outcome(FOREIGN_ARG_INPUT, "entry::p", "foreign argument");
@@ -114,8 +123,10 @@ fn escape_seam_foreign_argument_takes_a_raw_view_of_the_settled_subject() {
         "the escape does not degrade the subject"
     );
     assert!(
-        outcome.emitted.contains("consume(p.as_ptr())"),
-        "the const foreign position takes the shared view:\n{}",
+        outcome
+            .emitted
+            .contains("consume(p.as_mut_ptr().cast::<i32>().cast_const())"),
+        "a mutable subject keeps write permission even at a const position:\n{}",
         outcome.emitted
     );
     assert!(

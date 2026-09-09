@@ -23,6 +23,85 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+/// How deep a signature type is walked before the answer is conceded.
+pub(crate) const CARRIER_WALK_DEPTH: u32 = 6;
+
+/// The target pointer's width in bits, which is what an integer has to reach
+/// before it can carry a whole address.
+fn pointer_bits(tcx: TyCtxt<'_>) -> u64 {
+    tcx.data_layout.pointer_size.bits()
+}
+
+/// A conservative compile-time walk: can a value of this type carry a pointer?
+///
+/// Only the scalar kinds that provably carry none answer `false`. Integers at
+/// least as wide as the target pointer DO carry one, because a pointer
+/// reconstructed from an address inherits the permission the outgoing view
+/// created (addendum 256(2)); narrower integers cannot hold an address, and
+/// reconstruction from partial values is outside the fragment. Aggregates are
+/// walked field-wise through every variant, and everything opaque, generic or
+/// past the depth budget is pointer-carrying: the walk fails closed.
+pub(crate) fn may_carry_pointer<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u32) -> bool {
+    if depth == 0 {
+        return true;
+    }
+    match ty.kind() {
+        TyKind::Int(int) => int.bit_width().is_none_or(|bits| bits >= pointer_bits(tcx)),
+        TyKind::Uint(uint) => uint
+            .bit_width()
+            .is_none_or(|bits| bits >= pointer_bits(tcx)),
+        TyKind::Bool | TyKind::Char | TyKind::Float(_) | TyKind::Never => false,
+        TyKind::Tuple(fields) => fields
+            .iter()
+            .any(|field| may_carry_pointer(tcx, field, depth - 1)),
+        TyKind::Array(inner, _) | TyKind::Slice(inner) => may_carry_pointer(tcx, *inner, depth - 1),
+        // A box owns its pointer, so it is a carrier without a field walk.
+        TyKind::Adt(definition, arguments) if !definition.is_box() => definition
+            .all_fields()
+            .any(|field| may_carry_pointer(tcx, field.ty(tcx, arguments), depth - 1)),
+        _ => true,
+    }
+}
+
+/// Can this callee hand a pointer back to its caller — through its return type,
+/// or by writing one into storage the caller owns?
+///
+/// The second half is what makes this "return **or output**" (addendum 259(2)):
+/// a `*mut`/`&mut` parameter whose pointee can itself carry a pointer is output
+/// storage, and a callee can stash the argument there just as it can return it.
+/// A void-like FFI pointee is treated as carrying, because `*mut c_void` walks
+/// to a field-free ADT that would otherwise read as provably pointer-free.
+pub(crate) fn callee_may_yield_pointer(tcx: TyCtxt<'_>, callee: DefId) -> bool {
+    let signature = tcx.fn_sig(callee).skip_binder().skip_binder();
+    if may_carry_pointer(tcx, signature.output(), CARRIER_WALK_DEPTH) {
+        return true;
+    }
+    signature.inputs().iter().any(|input| {
+        let pointee = match input.kind() {
+            TyKind::RawPtr(pointee, mutability) => {
+                (*mutability == rustc_middle::mir::Mutability::Mut).then_some(*pointee)
+            }
+            TyKind::Ref(_, pointee, mutability) => {
+                (*mutability == rustc_middle::mir::Mutability::Mut).then_some(*pointee)
+            }
+            _ => None,
+        };
+        pointee.is_some_and(|pointee| {
+            void_like(tcx, pointee) || may_carry_pointer(tcx, pointee, CARRIER_WALK_DEPTH - 1)
+        })
+    })
+}
+
+/// `c_void` and its kin walk to a field-free ADT, which the carrier walk would
+/// otherwise call provably pointer-free. Output storage of unknown shape is
+/// exactly the case that must fail closed.
+fn void_like(tcx: TyCtxt<'_>, ty: Ty<'_>) -> bool {
+    let TyKind::Adt(definition, _) = ty.kind() else {
+        return false;
+    };
+    tcx.def_path_str(definition.did()).ends_with("c_void")
+}
+
 /// A lifetime-free, artifact-stable call-site identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct RawBoundarySiteKey {
@@ -307,6 +386,9 @@ pub(crate) struct RawBoundarySiteFact {
     pub direct_storage_span: Option<Span>,
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<RawMutability>,
+    /// Can this callee hand a pointer back — by return or by output storage?
+    /// Fails closed: an unresolved callee answers `true`.
+    pub callee_may_yield_pointer: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,6 +458,7 @@ fn mir_candidates(
                 block: block.as_u32(),
                 statement_index: data.statements.len() as u32,
                 callee: key,
+                did: callee,
             })
         })
         .collect()
@@ -428,6 +511,8 @@ impl RawBoundarySiteFacts {
                     direct_storage_span: fact.direct_storage.map(|(_, span)| span),
                     adapter_operand_span: fact.adapter_operand_span,
                     adapter_operand_mutability: fact.adapter_operand_mutability,
+                    callee_may_yield_pointer: unique_candidate_did(&fact.callee, &candidates)
+                        .is_none_or(|did| callee_may_yield_pointer(tcx, did)),
                 }),
                 Err(reason) => out.failures.push(RawBoundarySiteFailure {
                     caller: tcx.def_path_str(fact.caller.to_def_id()),
@@ -497,6 +582,11 @@ impl RawBoundarySiteFacts {
                             direct_storage_span: argument.direct_storage.map(|(_, span)| span),
                             adapter_operand_span: argument.adapter_operand_span,
                             adapter_operand_mutability: argument.adapter_operand_mutability,
+                            callee_may_yield_pointer: unique_candidate_did(
+                                &callee_key,
+                                &candidates,
+                            )
+                            .is_none_or(|did| callee_may_yield_pointer(tcx, did)),
                         }),
                         Err(reason) => out.failures.push(RawBoundarySiteFailure {
                             caller: tcx.def_path_str(call.caller.to_def_id()),
@@ -582,6 +672,9 @@ pub(crate) struct MirCallCandidate {
     pub block: u32,
     pub statement_index: u32,
     pub callee: ForeignSymbolKey,
+    /// The resolved callee, kept so the carrier walk can read its signature.
+    /// Selection still keys on `callee`; this never participates in matching.
+    pub did: DefId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1979,6 +2072,30 @@ pub(crate) fn returned_child_template(
     })
 }
 
+/// A settled safe source whose own view is mutable, so a writable derivation
+/// of it is available.
+pub(crate) fn is_mutable_safe_source(decision: &super::Decision) -> bool {
+    matches!(
+        decision,
+        super::Decision::Ref { mutable: true }
+            | super::Decision::InferredRef { mutable: true, .. }
+            | super::Decision::Slice { mutable: true, .. }
+            | super::Decision::Opt { mutable: true, .. }
+    )
+}
+
+/// A settled safe source whose only view is shared. `Box` is excluded: it is an
+/// owning form with its own arm, not a borrowed view.
+pub(crate) fn is_shared_safe_source(decision: &super::Decision) -> bool {
+    matches!(
+        decision,
+        super::Decision::Ref { mutable: false }
+            | super::Decision::InferredRef { mutable: false, .. }
+            | super::Decision::Slice { mutable: false, .. }
+            | super::Decision::Opt { mutable: false, .. }
+    )
+}
+
 /// An address expression borrows its selected place, independently of the
 /// reference, slice or Option form of the binding containing that place.
 pub(crate) fn outbound_reference_view(
@@ -2315,9 +2432,22 @@ pub(crate) struct RawBoundaryDispositionIndex {
     address_classes: FxHashMap<(LocalDefId, HirId), super::emitability::AddressUseClass>,
     certificate_replay_wall_s: f64,
     returned_children: BTreeMap<RawBoundarySiteKey, ReturnedChildSiteEvidence>,
+    /// Per site: can the callee hand a pointer back, by return or by output
+    /// storage? Carried from the site facts so the terminal emission can ask
+    /// the same question the disposition asked.
+    callee_may_yield_pointer: BTreeMap<RawBoundarySiteKey, bool>,
 }
 
 impl RawBoundaryDispositionIndex {
+    /// Fails closed: a site with no recorded answer is treated as able to
+    /// yield a pointer.
+    pub(crate) fn callee_may_yield_pointer(&self, key: &RawBoundarySiteKey) -> bool {
+        self.callee_may_yield_pointer
+            .get(key)
+            .copied()
+            .unwrap_or(true)
+    }
+
     pub(crate) fn returned_child_evidence(
         &self,
         key: &RawBoundarySiteKey,
@@ -2342,6 +2472,8 @@ impl RawBoundaryDispositionIndex {
         let mut open_nodes = FxHashMap::<(LocalDefId, HirId), Vec<bool>>::default();
         let mut handled_nodes = FxHashMap::<(LocalDefId, HirId), Vec<bool>>::default();
         for site in &site_facts.sites {
+            out.callee_may_yield_pointer
+                .insert(site.key.clone(), site.callee_may_yield_pointer);
             let mut mutable_binding_required = false;
             let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
                 (|| {
@@ -2595,6 +2727,65 @@ impl RawBoundaryDispositionIndex {
                         })?;
                         template = selected.template;
                         mutable_binding_required = selected.mutable_binding_required;
+                    } else if returned_child.is_none()
+                        && site.target.mutability == RawMutability::Const
+                    {
+                        // Addendum 259. Without a contract row there is no
+                        // returned-child evidence, and absence of evidence was
+                        // being read as evidence of absence: the block above
+                        // never ran and a `*const` position received `as_ptr()`
+                        // however the callee used what it got. A pointer
+                        // derived from a shared-reference view of non-UnsafeCell
+                        // bytes may never be written through, whether or not the
+                        // parent reference is still live, so the seam decides
+                        // on the source's own mutability.
+                        let view = reference_view.as_ref().unwrap_or(decision);
+                        if is_mutable_safe_source(view) {
+                            // (1) A writable derivation satisfies the const
+                            // parameter type and keeps write permission, so the
+                            // mutable case costs no hold at all. The shared
+                            // presentation of a mutable subject is retired here.
+                            match returned_child_template(view, &site.target, None, template) {
+                                Ok(selected) => {
+                                    template = selected.template;
+                                    mutable_binding_required = selected.mutable_binding_required;
+                                }
+                                // The writable carrier does not exist for this
+                                // base -- a raw expression derived from a safe
+                                // root, or depth-2 storage. Hold only where the
+                                // callee could actually hand a pointer back.
+                                Err(reason) if site.callee_may_yield_pointer => {
+                                    return Err((
+                                        reason,
+                                        "ordinary-argument-permission:writable-carrier-unavailable"
+                                            .to_owned(),
+                                    ));
+                                }
+                                Err(_) => {}
+                            }
+                        } else if is_shared_safe_source(view)
+                            && site.callee_may_yield_pointer
+                            && contract.is_err()
+                        {
+                            // (2) A shared subject has no mutable view to
+                            // upgrade to. Negative-write evidence does not
+                            // discharge this: it says the callee does not write
+                            // through the pointee, and says nothing about what
+                            // the CALLER may do with a descendant.
+                            //
+                            // A pinned contract row IS descendant evidence:
+                            // `returns_alias_of` names the argument a callee
+                            // hands back, so a row that does not name this one
+                            // proves no child descends from it. `strlen` is the
+                            // case that makes this matter -- it returns
+                            // `usize`, which the carrier walk correctly calls
+                            // pointer-width, and without this guard every
+                            // modeled read-only libc position would hold.
+                            return Err((
+                                RawBoundaryBlockReason::ReturnedChildPermission,
+                                "ordinary-argument-permission:write-through-shared-view".to_owned(),
+                            ));
+                        }
                     }
                     match retention_verdict {
                         RetentionVerdict::NoRetain { certificate } => {
@@ -3142,6 +3333,18 @@ impl RawBoundaryDispositionIndex {
 }
 
 /// Select the one MIR call which represents an already-resolved HIR call site.
+/// The resolved callee of the one matching candidate, when there is exactly
+/// one. Ambiguity and absence answer `None`, and the carrier question then
+/// fails closed at the caller.
+fn unique_candidate_did(
+    expected: &ForeignSymbolKey,
+    candidates: &[MirCallCandidate],
+) -> Option<DefId> {
+    let mut matching = candidates.iter().filter(|site| site.callee == *expected);
+    let site = matching.next()?;
+    matching.next().is_none().then_some(site.did)
+}
+
 /// Zero and multiple matches stay typed rather than choosing by traversal
 /// order.
 pub(crate) fn select_unique_site(
@@ -3164,6 +3367,8 @@ pub(crate) fn select_unique_site(
 
 #[cfg(test)]
 mod tests {
+    use rustc_hir::def_id::CRATE_DEF_ID;
+
     use super::*;
 
     fn constructed_child_access() -> (
@@ -3831,6 +4036,7 @@ mod tests {
                 block: 7,
                 statement_index: 3,
                 callee: expected.clone(),
+                did: CRATE_DEF_ID.to_def_id(),
             }],
         );
         assert_eq!(site, Ok((7, 3)));
@@ -3847,6 +4053,7 @@ mod tests {
             block: 1,
             statement_index: 0,
             callee: expected.clone(),
+            did: CRATE_DEF_ID.to_def_id(),
         };
         assert_eq!(
             select_unique_site(&expected, &[one.clone(), one]),
@@ -3865,6 +4072,7 @@ mod tests {
                     block: 2,
                     statement_index: 1,
                     callee: local,
+                    did: CRATE_DEF_ID.to_def_id(),
                 }],
             ),
             Err(SiteMatchFailure::CalleeMismatch)

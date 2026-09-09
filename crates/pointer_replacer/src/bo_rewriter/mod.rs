@@ -130,6 +130,8 @@ mod option_projection_tests;
 #[cfg(test)]
 mod option_receiver_tests;
 #[cfg(test)]
+mod ordinary_argument_permission_tests;
+#[cfg(test)]
 mod outbound_alias_permission_tests;
 #[cfg(test)]
 mod outbound_expression_shape_tests;
@@ -5021,6 +5023,78 @@ fn seal_terminal_outbound_calls(
                             );
                             continue;
                         }
+                    }
+                } else if endpoint.target.mutability == decision::raw_boundary::RawMutability::Const
+                {
+                    // Addendum 259, the terminal half of the same rule the
+                    // disposition applies. Without a contract row there is no
+                    // returned-child evidence, and the block above never ran,
+                    // so a `*const` position received `as_ptr()` however the
+                    // callee used what it got.
+                    if decision::raw_boundary::is_mutable_safe_source(effective_source) {
+                        // (1) A writable derivation satisfies the const
+                        // parameter type and keeps write permission, so this
+                        // costs no hold. The shared presentation of a mutable
+                        // subject is retired at this seam.
+                        match decision::raw_boundary::returned_child_template(
+                            effective_source,
+                            &endpoint.target,
+                            None,
+                            template,
+                        ) {
+                            Ok(selected)
+                                if !selected.mutable_binding_required
+                                    || table.option_mut_bindings.contains(&node) =>
+                            {
+                                selected.template
+                            }
+                            Ok(_) => {
+                                planned.hold_terminal_class(
+                                    old.owner_class,
+                                    decision::Arm::C,
+                                    "outbound-terminal-mutable-binding",
+                                    "ordinary-argument-permission:mutable-binding-unplanned".into(),
+                                );
+                                continue;
+                            }
+                            // The writable carrier does not exist for this
+                            // base. Hold only where the callee could actually
+                            // hand a pointer back.
+                            Err(_) if endpoint.callee_may_yield_pointer => {
+                                planned.hold_terminal_class(
+                                    old.owner_class,
+                                    decision::Arm::C,
+                                    "outbound-returned-child-view",
+                                    "ordinary-argument-permission:writable-carrier-unavailable"
+                                        .into(),
+                                );
+                                continue;
+                            }
+                            Err(_) => template,
+                        }
+                    } else if decision::raw_boundary::is_shared_safe_source(effective_source)
+                        && endpoint.callee_may_yield_pointer
+                        && endpoint.ownership.is_none()
+                    {
+                        // (2) A shared source has no mutable view to upgrade
+                        // to, and in this branch no descendant evidence exists
+                        // at all -- that is what an absent returned child
+                        // means. Negative-write evidence does not discharge
+                        // it: that speaks to the callee's own access, not to
+                        // what the caller may do with a descendant. A pinned
+                        // contract row does discharge it -- `ownership` is
+                        // `Some` exactly when the row classified, and a row
+                        // whose `returns_alias_of` is not this argument proves
+                        // no child descends from it.
+                        planned.hold_terminal_class(
+                            old.owner_class,
+                            decision::Arm::C,
+                            "outbound-returned-child-permission",
+                            "ordinary-argument-permission:write-through-shared-view".into(),
+                        );
+                        continue;
+                    } else {
+                        template
                     }
                 } else {
                     template
