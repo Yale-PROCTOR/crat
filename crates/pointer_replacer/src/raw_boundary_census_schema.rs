@@ -179,6 +179,9 @@ pub(crate) const IO_DOMAIN_DUPLICATE_COUNT: &str = "raw_boundary_io_domain_dupli
 /// out of depth budget without deciding. Nonzero at Phase N reopens the depth
 /// decision -- a fail-closed variant of the walk -- not the rule itself.
 pub(crate) const IO_DOMAIN_BUDGET_EXHAUSTED: &str = "raw_boundary_io_domain_budget_exhausted";
+/// R271-1. Slots held because their pointee is `c_void`, which carries no
+/// extent and therefore no sound reference form.
+pub(crate) const VOID_POINTEE_HELD: &str = "raw_boundary_void_pointee_held";
 pub(crate) const UNSAFE_CONTEXT_SITE_COUNT: &str = "raw_boundary_unsafe_context_site_count";
 pub(crate) const UNSAFE_CONTEXT_INSERTED_COUNT: &str = "raw_boundary_unsafe_context_inserted_count";
 pub(crate) const UNSAFE_CONTEXT_OMITTED_COUNT: &str = "raw_boundary_unsafe_context_omitted_count";
@@ -371,6 +374,7 @@ pub(crate) const ALL: &[&str] = &[
     IO_DOMAIN_UNEXPECTED_COUNT,
     IO_DOMAIN_DUPLICATE_COUNT,
     IO_DOMAIN_BUDGET_EXHAUSTED,
+    VOID_POINTEE_HELD,
     UNSAFE_CONTEXT_SITE_COUNT,
     UNSAFE_CONTEXT_INSERTED_COUNT,
     UNSAFE_CONTEXT_OMITTED_COUNT,

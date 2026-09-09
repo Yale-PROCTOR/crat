@@ -186,6 +186,8 @@ mod sibling_overlap_tests;
 #[cfg(test)]
 mod slice_use_inventory_tests;
 #[cfg(test)]
+mod void_pointee_tests;
+#[cfg(test)]
 mod zero_syntax_custody_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -333,6 +335,8 @@ pub(crate) struct RawBoundaryArtifacts {
     /// of depth budget without deciding. A nonzero count reopens the depth
     /// choice, not the rule.
     pub(crate) io_domain_budget_exhausted: usize,
+    /// R271-1: slots held because their pointee is `c_void`.
+    pub(crate) void_pointee_held: usize,
     pub(crate) sites_from_non_subject_arguments: usize,
     pub(crate) converted_callee_without_site_receipt: usize,
     pub(crate) degraded_output_receipt: String,
@@ -6282,6 +6286,7 @@ fn finish_decide<'tcx>(
     let declaration_pointees = decision::declaration::collect(tcx, &subjects);
     let (io_domain_subjects, io_domain_budget_exhausted) =
         decision::io_domain::collect(tcx, &subjects);
+    let void_pointee_subjects = decision::void_pointee::collect(tcx, &subjects);
     let declaration_patterns = decision::declaration_pattern::collect(tcx, &subjects);
     let input_interfaces = decision::interface::collect(tcx, &subjects, &program.functions);
     let mut facts = decision::emitability::collect(tcx, &program.functions);
@@ -6569,6 +6574,7 @@ fn finish_decide<'tcx>(
                     return_receivers,
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,
+                    void_pointee: &void_pointee_subjects,
                     declaration_pointees: &declaration_pointees,
                     declaration_patterns: &declaration_patterns,
                     input_interfaces: &input_interfaces,
@@ -7159,6 +7165,7 @@ fn finish_decide<'tcx>(
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
             io_domain_budget_exhausted,
+            void_pointee_held: void_pointee_subjects.len(),
             #[cfg(test)]
             bridge_custody_export: Default::default(),
             pending_sibling_receipts: Vec::new(),

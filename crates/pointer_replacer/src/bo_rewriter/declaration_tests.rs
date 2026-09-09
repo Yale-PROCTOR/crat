@@ -454,35 +454,43 @@ fn decl_w1_receipt_tracks_the_annotation_and_its_terminal_owner() {
     .unwrap();
 }
 
+/// Expectation migrated under R271-1 with this receipt. The test's subject is
+/// the distinction between the REAL `core::ffi::c_void` and a user type that
+/// merely shares its name, and that distinction is now load-bearing twice over:
+/// the real one is held `held:void-pointee`, because a one-byte pointee carries
+/// no extent for its callee to access through, while a user `c_void` is an
+/// ordinary struct and still converts and renders. The rule matches through the
+/// lang item, which is exactly what keeps the two apart — so the alias-rendering
+/// half of this test moves to the user type, and the real type gains the hold
+/// assertion.
 #[test]
 fn decl_void_alias_uses_the_real_core_type_without_renaming_a_user_type() {
-    for (input, owner, expected) in [
-        (
-            "type Ptr = *const core::ffi::c_void; pub fn null(p: Ptr) -> bool { p.is_null() }",
-            "null",
-            "core::ffi::c_void",
-        ),
-        (
-            "#[allow(non_camel_case_types)] pub struct c_void { pub value: i32 } type Ptr = *const c_void; pub unsafe fn read(p: Ptr) -> i32 { (*p).value }",
-            "read",
-            "crate::c_void",
-        ),
-    ] {
-        decision_with_model(input, owner, "p", super::SlotKind::Ref);
-        let output = emitted(input, &[]);
-        let row = declaration(&output, owner, "p");
-        assert!(row.type_is_fully_explicit);
-        assert!(
-            row.rendered_type
-                .as_deref()
-                .is_some_and(|ty| ty.contains(expected)),
-            "{output}"
-        );
-        assert!(
-            !row.rendered_type.as_deref().unwrap().contains("libc::"),
-            "{output}"
-        );
-    }
+    let real = "type Ptr = *const core::ffi::c_void; pub fn null(p: Ptr) -> bool { p.is_null() }";
+    let reasons = super::emit_tests::decisions_of(real)
+        .into_iter()
+        .map(|(name, _, reason)| (name, reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        reasons.get("p").map(String::as_str),
+        Some("held:void-pointee"),
+        "the real core type has no sound reference form: {reasons:#?}"
+    );
+
+    let user = "#[allow(non_camel_case_types)] pub struct c_void { pub value: i32 } type Ptr = *const c_void; pub unsafe fn read(p: Ptr) -> i32 { (*p).value }";
+    decision_with_model(user, "read", "p", super::SlotKind::Ref);
+    let output = emitted(user, &[]);
+    let row = declaration(&output, "read", "p");
+    assert!(row.type_is_fully_explicit);
+    assert!(
+        row.rendered_type
+            .as_deref()
+            .is_some_and(|ty| ty.contains("crate::c_void")),
+        "a user type that only shares the name still converts: {output}"
+    );
+    assert!(
+        !row.rendered_type.as_deref().unwrap().contains("libc::"),
+        "{output}"
+    );
 }
 
 #[test]

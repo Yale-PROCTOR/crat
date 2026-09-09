@@ -57,6 +57,7 @@ pub(crate) mod sibling_overlap;
 pub(crate) mod slice_use;
 pub(crate) mod surface_argument;
 pub(crate) mod universe;
+pub(crate) mod void_pointee;
 
 use emitability::EmitabilityFacts;
 
@@ -533,6 +534,10 @@ pub(crate) enum DegradeReason {
     /// boundary is permanent and by type, not only by argument position or by
     /// the sealed identity list.
     IoDomainType,
+    /// R271-1. The slot's pointee is `c_void`, a one-byte type carrying no
+    /// extent, so no reference form of it can carry the provenance its callee
+    /// accesses through. Held at any depth.
+    VoidPointee,
     /// Structural: the subject has no depth-0 slot, or none in the model.
     NoSlot,
     /// The resolved parameter type is a pointer but the **declaration** is not
@@ -764,6 +769,7 @@ impl DegradeReason {
             DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
             DegradeReason::PtrComparison => "ptr-comparison",
             DegradeReason::IoDomainType => "held:io-domain:type",
+            DegradeReason::VoidPointee => "held:void-pointee",
             DegradeReason::NoSlot => "no-slot",
             DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
             DegradeReason::ReturnNotAdapted => "return-not-adapted",
@@ -1001,6 +1007,7 @@ impl DecisionTable {
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
     pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
     pub(crate) input_interfaces: &'a interface::InputInterfaces,
@@ -1456,6 +1463,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
         io_domain,
+        void_pointee,
         declaration_pointees,
         declaration_patterns,
         input_interfaces: _,
@@ -1542,6 +1550,19 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             };
         }
         None => return degrade(subject, decl_site, DegradeReason::NoSlot),
+    }
+
+    // **R271-1 — void pointees, after the owning arm and before every borrowing
+    // one.** `c_void` carries no extent, so no REFERENCE form of it can carry
+    // the provenance its callee accesses through: `&c_void` is a one-byte claim
+    // over memory the callee reads at whatever width it casts to.
+    //
+    // The owning arm above is deliberately not covered. A void allocation
+    // becomes `Box<[u8]>` with the malloc byte count as its length, which is a
+    // real extent and therefore sound — the seat kept that arm as is, and this
+    // hold sits below it so it cannot pre-empt it.
+    if void_pointee.contains(&(subject.fn_did, subject.hir_id)) {
+        return degrade(subject, decl_site, DegradeReason::VoidPointee);
     }
 
     // A1 emitability: BO says a reference is SOUND; these say whether one can
