@@ -124,6 +124,8 @@ pub enum CopyContract {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructInterface {
+    /// Field application set that produced this exact type vector.
+    pub terminal_fields: BTreeSet<FieldClassId>,
     pub field_types: BTreeMap<FieldClassId, String>,
     pub lifetimes: Vec<String>,
     pub remove_copy_clone: bool,
@@ -146,6 +148,7 @@ pub fn struct_interface(
         return Err(Error::StaleFinalization);
     }
     let mut result = StructInterface {
+        terminal_fields: BTreeSet::new(),
         field_types: BTreeMap::new(),
         lifetimes: vec![],
         remove_copy_clone: false,
@@ -179,6 +182,7 @@ pub fn struct_interface(
             None
         };
         let ty = if actual.live.contains(&id) {
+            result.terminal_fields.insert(field.id);
             match &field.candidate {
                 FieldForm::Borrow {
                     pointee,

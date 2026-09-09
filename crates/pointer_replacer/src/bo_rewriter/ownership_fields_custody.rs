@@ -23,9 +23,11 @@ pub enum CustodyError {
     Lifetimes,
     CopyClone,
     DeliveredIdentity,
+    TerminalInterface,
 }
 
 pub fn check_fields(
+    existing_lifetimes: &[String],
     expected_source_hash: [u8; 32],
     interface: &StructInterface,
     terminal: &Finalization,
@@ -43,7 +45,9 @@ pub fn check_fields(
             return Err(CustodyError::FieldType(*field));
         }
     }
-    if observed.lifetimes != interface.lifetimes {
+    let mut lifetimes = interface.lifetimes.clone();
+    lifetimes.extend_from_slice(existing_lifetimes);
+    if observed.lifetimes != lifetimes {
         return Err(CustodyError::Lifetimes);
     }
     if interface.remove_copy_clone && observed.has_copy_clone {
@@ -55,6 +59,9 @@ pub fn check_fields(
         .copied()
         .filter(|field| terminal.live.contains(&ClassId::Field(*field)))
         .collect();
+    if delivered != interface.terminal_fields {
+        return Err(CustodyError::TerminalInterface);
+    }
     if &delivered != ledger_delivered {
         return Err(CustodyError::DeliveredIdentity);
     }

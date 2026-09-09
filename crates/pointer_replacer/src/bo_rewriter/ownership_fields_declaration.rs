@@ -19,8 +19,16 @@ pub struct GenericSite {
 #[derive(Clone, Debug)]
 pub struct DeriveSite {
     pub span: CapturedSpan,
-    pub traits: Vec<String>,
+    pub traits: Vec<DeriveTrait>,
 }
+/// Resolved builtin identity, not suffix matching of arbitrary macro paths.
+#[derive(Clone, Debug)]
+pub enum DeriveTrait {
+    BuiltinCopy,
+    BuiltinClone,
+    Other(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct Declaration {
     pub owner: OwnerId,
@@ -72,8 +80,10 @@ pub fn render_declaration(
             let retained: Vec<_> = derive
                 .traits
                 .iter()
-                .filter(|name| !matches!(name.as_str(), "Copy" | "Clone"))
-                .cloned()
+                .filter_map(|derive| match derive {
+                    DeriveTrait::BuiltinCopy | DeriveTrait::BuiltinClone => None,
+                    DeriveTrait::Other(path) => Some(path.clone()),
+                })
                 .collect();
             if retained.len() != derive.traits.len() {
                 found = true;

@@ -680,10 +680,15 @@ fn structural_renderer_composes_copy_removal_owning_field_and_borrow_lifetime() 
         },
         derives: vec![DeriveSite {
             span: captured(source, "#[derive(Copy, Clone, Debug)]"),
-            traits: vec!["Copy".into(), "Clone".into(), "Debug".into()],
+            traits: vec![
+                DeriveTrait::BuiltinCopy,
+                DeriveTrait::BuiltinClone,
+                DeriveTrait::Other("Debug".into()),
+            ],
         }],
     };
     let interface = StructInterface {
+        terminal_fields: BTreeSet::from([field(0)]),
         field_types: BTreeMap::from([
             (field(0), "Option<Box<i32>>".into()),
             (field(1), "&'__crat_f1 i32".into()),
@@ -858,6 +863,7 @@ use ownership_fields::custody::*;
 #[test]
 fn custody_rejects_equal_count_identity_swaps_and_planned_but_raw_fields() {
     let interface = StructInterface {
+        terminal_fields: BTreeSet::from([field(0)]),
         field_types: BTreeMap::from([(field(0), "Option<Box<i32>>".into())]),
         lifetimes: vec![],
         remove_copy_clone: true,
@@ -871,6 +877,7 @@ fn custody_rejects_equal_count_identity_swaps_and_planned_but_raw_fields() {
     };
     assert_eq!(
         check_fields(
+            &[],
             [7; 32],
             &interface,
             &terminal,
@@ -882,6 +889,7 @@ fn custody_rejects_equal_count_identity_swaps_and_planned_but_raw_fields() {
     observation.field_types.insert(field(0), "*mut i32".into());
     assert_eq!(
         check_fields(
+            &[],
             [7; 32],
             &interface,
             &terminal,
@@ -1112,6 +1120,7 @@ fn bounded_recursive_ordinary_scope_close_executes_destructors() {
 #[test]
 fn custody_checks_source_hash_type_lifetimes_and_copy_traits_together() {
     let interface = StructInterface {
+        terminal_fields: BTreeSet::from([field(0)]),
         field_types: BTreeMap::from([(field(0), "Option<Box<i32>>".into())]),
         lifetimes: vec![],
         remove_copy_clone: true,
@@ -1125,22 +1134,139 @@ fn custody_checks_source_hash_type_lifetimes_and_copy_traits_together() {
         has_copy_clone: false,
     };
     assert_eq!(
-        check_fields([7; 32], &interface, &terminal, &ledger, &observed),
+        check_fields(&[], [7; 32], &interface, &terminal, &ledger, &observed),
         Ok(())
     );
     assert_eq!(
-        check_fields([8; 32], &interface, &terminal, &ledger, &observed),
+        check_fields(&[], [8; 32], &interface, &terminal, &ledger, &observed),
         Err(CustodyError::SourceHash)
     );
     observed.has_copy_clone = true;
     assert_eq!(
-        check_fields([7; 32], &interface, &terminal, &ledger, &observed),
+        check_fields(&[], [7; 32], &interface, &terminal, &ledger, &observed),
         Err(CustodyError::CopyClone)
     );
     observed.has_copy_clone = false;
     observed.lifetimes.push("orphan".into());
     assert_eq!(
-        check_fields([7; 32], &interface, &terminal, &ledger, &observed),
+        check_fields(&[], [7; 32], &interface, &terminal, &ledger, &observed),
         Err(CustodyError::Lifetimes)
+    );
+}
+
+#[test]
+fn custody_cannot_pair_old_raw_interface_with_new_live_transaction() {
+    let fields = vec![Field {
+        id: field(0),
+        name: "p".into(),
+        input_type: "*mut i32".into(),
+        candidate: FieldForm::Owning {
+            pointee: "i32".into(),
+            optional: true,
+        },
+    }];
+    let mut held = transaction(0);
+    held.sites.clear();
+    let interface = struct_interface(
+        OwnerId(1),
+        &fields,
+        &BTreeSet::new(),
+        &CopyContract::Absent,
+        &[held.clone()],
+        &finalize(&[held]).unwrap(),
+    )
+    .unwrap();
+    let observed = Observation {
+        source_hash: [7; 32],
+        field_types: interface.field_types.clone(),
+        lifetimes: vec![],
+        has_copy_clone: false,
+    };
+    assert!(
+        check_fields(
+            &[],
+            [7; 32],
+            &interface,
+            &finalize(&[transaction(0)]).unwrap(),
+            &BTreeSet::from([field(0)]),
+            &observed
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn qualified_builtin_clone_is_removed_with_copy() {
+    let source = "#[derive(Copy, std::clone::Clone, Debug)] struct Holder { p: *mut i32 }";
+    let at = source.find(" {").unwrap();
+    let declaration = Declaration {
+        owner: OwnerId(1),
+        fields: BTreeMap::from([(field(0), captured(source, "*mut i32"))]),
+        generics: GenericSite {
+            span: CapturedSpan {
+                lo: at,
+                hi: at,
+                text: String::new(),
+            },
+            parameters: vec![],
+        },
+        derives: vec![DeriveSite {
+            span: captured(source, "#[derive(Copy, std::clone::Clone, Debug)]"),
+            traits: vec![
+                DeriveTrait::BuiltinCopy,
+                DeriveTrait::BuiltinClone,
+                DeriveTrait::Other("Debug".into()),
+            ],
+        }],
+    };
+    let interface = StructInterface {
+        terminal_fields: BTreeSet::from([field(0)]),
+        field_types: BTreeMap::from([(field(0), "Option<Box<i32>>".into())]),
+        lifetimes: vec![],
+        remove_copy_clone: true,
+    };
+    let output = render_declaration(source, &declaration, &interface).unwrap();
+    assert!(output.starts_with("#[derive(Debug)]"), "{output}");
+}
+
+#[test]
+fn custody_preserves_existing_and_introduced_lifetimes() {
+    let fields = vec![Field {
+        id: field(0),
+        name: "p".into(),
+        input_type: "*const &'a i32".into(),
+        candidate: FieldForm::Borrow {
+            pointee: "&'a i32".into(),
+            mutable: false,
+            optional: false,
+        },
+    }];
+    let tx = vec![transaction(0)];
+    let terminal = finalize(&tx).unwrap();
+    let interface = struct_interface(
+        OwnerId(1),
+        &fields,
+        &BTreeSet::from(["a".into()]),
+        &CopyContract::Absent,
+        &tx,
+        &terminal,
+    )
+    .unwrap();
+    let observed = Observation {
+        source_hash: [7; 32],
+        field_types: interface.field_types.clone(),
+        lifetimes: vec!["__crat_f0".into(), "a".into()],
+        has_copy_clone: false,
+    };
+    assert!(
+        check_fields(
+            &["a".into()],
+            [7; 32],
+            &interface,
+            &terminal,
+            &BTreeSet::from([field(0)]),
+            &observed
+        )
+        .is_ok()
     );
 }
