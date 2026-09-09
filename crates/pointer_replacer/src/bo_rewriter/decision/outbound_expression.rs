@@ -205,17 +205,29 @@ const RETURN_CARRIER_WALK_DEPTH: u32 = 6;
 /// Aggregates are walked field-wise through every variant, and everything
 /// opaque, generic or past the depth budget is treated as pointer-carrying:
 /// the walk fails closed.
+/// The target pointer's width in bits, which is what an integer return has to
+/// reach before it can carry a whole address.
+fn pointer_bits(tcx: TyCtxt<'_>) -> u64 {
+    tcx.data_layout.pointer_size.bits()
+}
+
 fn return_may_carry_pointer<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u32) -> bool {
     if depth == 0 {
         return true;
     }
     match ty.kind() {
-        TyKind::Bool
-        | TyKind::Char
-        | TyKind::Int(_)
-        | TyKind::Uint(_)
-        | TyKind::Float(_)
-        | TyKind::Never => false,
+        // An integer at least as wide as the target pointer can hand the caller
+        // a whole address, and a pointer reconstructed from it inherits the
+        // permission the outgoing view created, so it IS a returned-child
+        // carrier (addendum 256(2)). `isize`/`usize` have no fixed width here
+        // and are pointer-width by definition. Narrower integers cannot hold an
+        // address; reconstruction from partial values stays outside the
+        // fragment.
+        TyKind::Int(int) => int.bit_width().is_none_or(|bits| bits >= pointer_bits(tcx)),
+        TyKind::Uint(uint) => uint
+            .bit_width()
+            .is_none_or(|bits| bits >= pointer_bits(tcx)),
+        TyKind::Bool | TyKind::Char | TyKind::Float(_) | TyKind::Never => false,
         TyKind::Tuple(fields) => fields
             .iter()
             .any(|field| return_may_carry_pointer(tcx, field, depth - 1)),

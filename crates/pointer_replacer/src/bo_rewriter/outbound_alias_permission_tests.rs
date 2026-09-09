@@ -464,6 +464,27 @@ const STRUCT_SINK_INPUT: &str = r#"
     }
 "#;
 
+/// A sink that returns a pointer-width integer CAN return a child: the caller
+/// reconstructs a pointer from the address and writes through it, and under
+/// exposed-provenance semantics that reconstructed pointer inherits the
+/// permission the outgoing view created. A shared `as_ptr()` view would make
+/// the write UB on a UB-free input, so this shape is a carrier
+/// (§39 addendum 256(2)).
+const POINTER_WIDTH_INT_SINK_INPUT: &str = r#"
+    #![allow(dead_code, unused_unsafe)]
+    unsafe fn target(p: *mut i32) -> *mut i32 {
+        *p.offset(1) += 1;
+        p
+    }
+    unsafe fn raw_addr(q: *const i32) -> usize {
+        q.read() as usize
+    }
+    pub unsafe fn caller() -> usize {
+        let mut values = [3_i32; 2048];
+        raw_addr(target(values.as_mut_ptr()))
+    }
+"#;
+
 /// The premises the two return-shape controls share, plus the carrier that the
 /// outbound expression planner actually selected for the one native site.
 fn outbound_carrier(input: &'static str, sink: &str) -> (String, Option<BridgeTemplate>, String) {
@@ -558,6 +579,39 @@ fn outbound_alias_permission_scalar_returning_sink_keeps_the_ordinary_view() {
     assert!(
         emitted.contains(".as_ptr()") && !emitted.contains(".as_mut_ptr().cast::<i32>()"),
         "no writable carrier is manufactured where no child can exist:\n{emitted}"
+    );
+}
+
+/// §39 addendum 256(2) — the adversarial-review HIGH residual. A sink whose
+/// return type is an integer at least as wide as the target pointer can hand
+/// the caller a reconstructable address, so it is a returned-child carrier and
+/// its outgoing view must be the writable one. Narrower integers stay
+/// non-carriers; `raw_scalar -> i32` above is that contrast, and it also holds
+/// the pinned-parser custody correspondence the addendum-254 gate protects.
+#[test]
+fn outbound_alias_permission_pointer_width_integer_return_takes_the_writable_carrier() {
+    assert!(
+        super::verify::type_checks_str(POINTER_WIDTH_INT_SINK_INPUT),
+        "unchanged pointer-width-integer-sink input type/borrow-checks"
+    );
+    let (emitted, carrier, unavailable) =
+        outbound_carrier(POINTER_WIDTH_INT_SINK_INPUT, "raw_addr -> usize");
+    println!(
+        "OUTBOUND-RETURN-SHAPE[raw_addr -> usize] EMITTED:\n{emitted}\nunavailable={unavailable}"
+    );
+    assert!(
+        super::verify::type_checks_str(&emitted),
+        "complete pointer-width-integer-sink output type/borrow-checks:\n{emitted}"
+    );
+    assert_eq!(
+        carrier,
+        Some(BridgeTemplate::SliceMutToWritableRawConst),
+        "an integer return at least as wide as the target pointer can carry a \
+         reconstructable address, so it reaches the writable carrier: {unavailable}"
+    );
+    assert!(
+        emitted.contains(".as_mut_ptr().cast::<i32>().cast_const()"),
+        "the writable carrier must actually render:\n{emitted}"
     );
 }
 
