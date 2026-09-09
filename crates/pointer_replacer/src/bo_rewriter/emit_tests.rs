@@ -3607,14 +3607,36 @@ fn a_subject_whose_uses_nest_produces_no_overlapping_edits() {
          an attributed reason: {:?}",
         emission.rollbacks
     );
-    // Not merely "no rollback" — the subject must degrade UNDER ITS OWN REASON.
-    // An implementation that silently dropped one of the two edits would satisfy
-    // the assertion above while emitting the stale `(*table)` text, which is the
-    // failure this gate exists to prevent.
+    // MIGRATED under R217-2(a) by K21. The name and the rollback assertion above
+    // still hold and are still the point: nesting must never reach `apply`. What
+    // changed is the disposition. The comment above this test argued the
+    // flat-splice model "cannot express this rewrite at all" — true of that
+    // model, and K21 replaces it: the inner edit is spliced into the outer
+    // replacement, so both are expressed by one edit and the subject delivers.
+    //
+    // The failure the old assertion guarded against — silently dropping one edit
+    // and emitting stale `(*table)` text — is guarded here by checking the
+    // composed text and the type-check, which is strictly stronger than
+    // asserting a degradation reason.
     assert_eq!(
         reason_of(&decisions_of(src), "table", true),
-        "nested-use-edits",
-        "the nesting must be attributed, not absorbed into another reason"
+        "<emitted>",
+        "the nesting composes rather than degrading"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("the composed nesting must emit")
+    };
+    assert!(
+        source.contains("table = &table[(table[0].value) as usize..]"),
+        "the inner read is rewritten inside the outer slice expression:\n{source}"
+    );
+    assert!(
+        !source.contains("(*table)"),
+        "no stale pointer text survives the composition:\n{source}"
+    );
+    assert!(
+        super::verify::type_checks_str(&source),
+        "the composed output type/borrow-checks:\n{source}"
     );
 }
 
@@ -3659,17 +3681,23 @@ fn nesting_across_two_subjects_refuses_the_inner_and_keeps_the_outer() {
         "cross-subject nesting reached `apply`: {:?}",
         emit(&fixture).rollbacks
     );
+    // MIGRATED under R217-2(a) by K21. The outer subject still survives, and
+    // the rollback assertion above is unchanged. The reason the outer survives
+    // is what moved: the comment above says its embedded snippet "is valid
+    // exactly because the inner stayed raw", which was true of the flat-splice
+    // model. K21 rewrites that embedded snippet to the inner subject's own safe
+    // spelling, so the outer is valid for a better reason and the inner
+    // delivers too.
     let got = decisions_of(src);
     assert_eq!(
         reason_of(&got, "block_ids", true),
-        "nested-use-edits",
-        "the INNER subject is the one the nesting refuses: {got:?}"
+        "<emitted>",
+        "the INNER subject composes into its container rather than degrading: {got:?}"
     );
     assert_eq!(
         reason_of(&got, "new_id", true),
         "<emitted>",
-        "the OUTER subject must survive — its embedded snippet is valid exactly \
-         because the inner stayed raw: {got:?}"
+        "the OUTER subject still survives: {got:?}"
     );
 }
 

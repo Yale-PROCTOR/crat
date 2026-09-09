@@ -1308,21 +1308,34 @@ pub(crate) fn refuse_nested_use_edits(tcx: TyCtxt<'_>, table: &mut DecisionTable
         // it contains.
         edits.sort_by_key(|(_, s)| (s.lo(), std::cmp::Reverse(s.hi())));
 
-        let mut refuse: Option<(usize, Span)> = None;
+        let mut nested: Option<((usize, Span), (usize, Span))> = None;
         let mut open: Vec<(usize, Span)> = Vec::new();
         for (entry, span) in edits {
             while open.last().is_some_and(|(_, o)| o.hi() <= span.lo()) {
                 open.pop();
             }
-            // Same entry or not, the INNER one is refused; see above.
-            if open.last().is_some_and(|(_, outer)| outer.contains(span)) {
-                refuse = Some((entry, span));
+            if let Some(outer) = open.last().copied()
+                && outer.1.contains(span)
+            {
+                nested = Some((outer, (entry, span)));
                 break;
             }
             open.push((entry, span));
         }
 
-        let Some((entry, span)) = refuse else { return };
+        let Some((outer, inner)) = nested else { return };
+        // **K21 — compose before refusing.** The container's replacement text
+        // carries the inner span's ORIGINAL text verbatim, because the outer
+        // rewrite only re-spells the parts that belong to ITS subject. So the
+        // composition is textual and checkable: splice the inner replacement
+        // into the outer one and drop the inner edit, whose work now lives
+        // inside its container. Where the inner text is not uniquely locatable
+        // the old refusal stands, which is what keeps a rewrite from landing on
+        // a use that was never the inner subject's.
+        if compose_nested_use_edit(tcx, table, outer, inner) {
+            continue;
+        }
+        let (entry, span) = inner;
         let (subject, decision) = &mut table.entries[entry];
         *decision = degrade(
             subject,
@@ -1330,6 +1343,62 @@ pub(crate) fn refuse_nested_use_edits(tcx: TyCtxt<'_>, table: &mut DecisionTable
             DegradeReason::NestedUseEdits,
         );
     }
+}
+
+/// Splice one nested use edit into its container. Returns whether it composed.
+///
+/// Both edits keep their own subject: the outer subject's replacement simply
+/// grows to contain the inner subject's rewritten spelling, and the inner edit
+/// is removed so nothing tries to apply it a second time.
+fn compose_nested_use_edit(
+    tcx: TyCtxt<'_>,
+    table: &mut DecisionTable,
+    (outer_entry, outer_span): (usize, Span),
+    (inner_entry, inner_span): (usize, Span),
+) -> bool {
+    let Ok(inner_source) = tcx.sess.source_map().span_to_snippet(inner_span) else {
+        return false;
+    };
+    let uses_of = |decision: &Decision| -> Option<Vec<emitability::UseEdit>> {
+        match decision {
+            Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => Some(uses.clone()),
+            _ => None,
+        }
+    };
+    let Some(inner_uses) = uses_of(&table.entries[inner_entry].1) else { return false };
+    let Some(inner_edit) = inner_uses.iter().find(|u| u.span == inner_span).cloned() else {
+        return false;
+    };
+    let Some(outer_uses) = uses_of(&table.entries[outer_entry].1) else { return false };
+    let Some(outer_position) = outer_uses.iter().position(|u| u.span == outer_span) else {
+        return false;
+    };
+    // Exactly one occurrence, or the splice could land on a use that was never
+    // this inner subject's.
+    if outer_uses[outer_position]
+        .replacement
+        .matches(inner_source.as_str())
+        .count()
+        != 1
+    {
+        return false;
+    }
+    let composed = outer_uses[outer_position]
+        .replacement
+        .replace(inner_source.as_str(), &inner_edit.replacement);
+    match &mut table.entries[outer_entry].1 {
+        Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => {
+            uses[outer_position].replacement = composed;
+        }
+        _ => return false,
+    }
+    match &mut table.entries[inner_entry].1 {
+        Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => {
+            uses.retain(|u| u.span != inner_span);
+        }
+        _ => return false,
+    }
+    true
 }
 
 fn degrade(subject: &Subject, site: String, reason: DegradeReason) -> Decision {
