@@ -38,6 +38,7 @@ pub(crate) mod declaration_pattern;
 pub(crate) mod emitability;
 pub(crate) mod exposure;
 pub(crate) mod interface;
+pub(crate) mod io_domain;
 pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
@@ -526,6 +527,12 @@ pub(crate) enum DegradeReason {
     /// and inverts. Refusing here is the only place that catches it before a
     /// behavioral gate exists.
     PtrComparison,
+    /// R261-3. The subject's own type reaches the io-domain -- a stream handle,
+    /// or an aggregate holding one. A `FILE*` promoted to `&mut FILE` claims
+    /// exclusive access to a handle libc holds its own pointer to, so the
+    /// boundary is permanent and by type, not only by argument position or by
+    /// the sealed identity list.
+    IoDomainType,
     /// Structural: the subject has no depth-0 slot, or none in the model.
     NoSlot,
     /// The resolved parameter type is a pointer but the **declaration** is not
@@ -756,6 +763,7 @@ impl DegradeReason {
             DegradeReason::RawPointerOperation { .. } => "raw-pointer-operation",
             DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
             DegradeReason::PtrComparison => "ptr-comparison",
+            DegradeReason::IoDomainType => "held:io-domain:type",
             DegradeReason::NoSlot => "no-slot",
             DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
             DegradeReason::ReturnNotAdapted => "return-not-adapted",
@@ -992,6 +1000,7 @@ impl DecisionTable {
 /// next phase a finished value, so a context that could not be mutated is the
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
+    pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
     pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
     pub(crate) input_interfaces: &'a interface::InputInterfaces,
@@ -1446,6 +1455,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
 fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
+        io_domain,
         declaration_pointees,
         declaration_patterns,
         input_interfaces: _,
@@ -1468,6 +1478,13 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         exposure,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
+    // R261-3, before every other rung: a subject whose own type reaches the
+    // io-domain is held permanently. Placed first so no promotion path can
+    // reach a stream handle -- the argument-position interception only ever
+    // covered the call, never the binding.
+    if io_domain.contains(&(subject.fn_did, subject.hir_id)) {
+        return degrade(subject, decl_site, DegradeReason::IoDomainType);
+    }
     let option_enabled = family_policy.enabled(subject.fn_did, FamilyStage::Option);
     let depth2_npo = matches!(subject.kind, SubjectKind::Local)
         .then(|| facts.depth2_npo_target((subject.fn_did, subject.hir_id)))

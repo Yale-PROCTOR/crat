@@ -285,6 +285,13 @@ fn escape_seam_stream_position_is_not_re_presented() {
     assert!(
         outcome
             .emitted
+            .contains("pub unsafe fn entry(stream: *mut FILE)"),
+        "the stream-typed binding is held by type, not promoted:\n{}",
+        outcome.emitted
+    );
+    assert!(
+        outcome
+            .emitted
             .contains("fgets(p.as_mut_ptr(), 64, stream)"),
         "the buffer takes its raw view and the stream is passed through \
          unadapted:\n{}",

@@ -122,6 +122,8 @@ mod goldens;
 #[cfg(test)]
 mod import_denylist;
 #[cfg(test)]
+mod io_domain_tests;
+#[cfg(test)]
 mod native_return_receipt_tests;
 #[cfg(test)]
 mod native_return_replay_tests;
@@ -6266,6 +6268,7 @@ fn finish_decide<'tcx>(
 
     perturb(&mut subjects);
     let declaration_pointees = decision::declaration::collect(tcx, &subjects);
+    let io_domain_subjects = decision::io_domain::collect(tcx, &subjects);
     let declaration_patterns = decision::declaration_pattern::collect(tcx, &subjects);
     let input_interfaces = decision::interface::collect(tcx, &subjects, &program.functions);
     let mut facts = decision::emitability::collect(tcx, &program.functions);
@@ -6552,6 +6555,7 @@ fn finish_decide<'tcx>(
                     tcx,
                     return_receivers,
                     family_policy: &family_policy,
+                    io_domain: &io_domain_subjects,
                     declaration_pointees: &declaration_pointees,
                     declaration_patterns: &declaration_patterns,
                     input_interfaces: &input_interfaces,

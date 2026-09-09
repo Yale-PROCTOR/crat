@@ -2858,7 +2858,7 @@ fn artifact_rows_of(src: &str) -> Vec<crate::coverage_recon::schema::Row> {
     .expect("fixture compiles")
 }
 
-fn decisions_of(src: &str) -> Vec<(String, bool, String)> {
+pub(super) fn decisions_of(src: &str) -> Vec<(String, bool, String)> {
     artifact_rows_of(src)
         .iter()
         .map(|r| {
