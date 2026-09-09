@@ -91,6 +91,57 @@ fn io_domain_type_rule_leaves_stream_free_shapes_alone() {
     );
 }
 
+/// R261-3 rider (addendum 264) — a chain deeper than the budget is COUNTED, not
+/// silently answered. The walk fails open, so the subject is left unheld; what
+/// must not happen is that the undecided case looks identical to a decided
+/// negative in the receipt.
+#[test]
+fn io_domain_budget_exhaustion_is_counted_not_hidden() {
+    let deep = r#"
+    #![allow(dead_code, unused_unsafe)]
+    pub struct FILE {
+        pub flags: i32,
+    }
+    pub struct C {
+        pub handle: *mut FILE,
+    }
+    pub struct B {
+        pub c: *mut C,
+    }
+    pub struct A {
+        pub b: *mut B,
+    }
+    pub unsafe fn deep(a: *mut A) -> i32 {
+        (*(*(*(*a).b).c).handle).flags
+    }
+"#;
+    let got = reasons(deep);
+    assert_ne!(
+        got.get("a").map(String::as_str),
+        Some("held:io-domain:type"),
+        "the walk fails open past its budget: {got:#?}"
+    );
+    let outcome = ::utils::compilation::run_compiler_on_str(deep, |tcx| {
+        let owner = tcx
+            .hir_body_owners()
+            .find(|did| tcx.item_name(did.to_def_id()).as_str() == "deep")
+            .expect("the deep fixture's function");
+        let parameter = tcx.fn_sig(owner).skip_binder().skip_binder().inputs()[0];
+        super::decision::io_domain::walk_io_domain_ty(
+            tcx,
+            parameter,
+            super::decision::io_domain::IO_DOMAIN_WALK_DEPTH,
+        )
+    })
+    .expect("deep fixture compiles");
+    assert!(!outcome.io_domain, "the walk fails open past its budget");
+    let exhausted = usize::from(outcome.budget_exhausted);
+    assert!(
+        exhausted >= 1,
+        "the undecided subject is counted, so Phase N can reopen the depth"
+    );
+}
+
 /// The type names the rule is anchored on, pinned so a rename cannot silently
 /// empty the set.
 #[test]

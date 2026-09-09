@@ -175,6 +175,10 @@ pub(crate) const IO_DOMAIN_OBSERVED_COUNT: &str = "raw_boundary_io_domain_observ
 pub(crate) const IO_DOMAIN_MISSING_COUNT: &str = "raw_boundary_io_domain_missing_count";
 pub(crate) const IO_DOMAIN_UNEXPECTED_COUNT: &str = "raw_boundary_io_domain_unexpected_count";
 pub(crate) const IO_DOMAIN_DUPLICATE_COUNT: &str = "raw_boundary_io_domain_duplicate_count";
+/// R261-3 rider (addendum 264). Subjects whose type-derived io-domain walk ran
+/// out of depth budget without deciding. Nonzero at Phase N reopens the depth
+/// decision -- a fail-closed variant of the walk -- not the rule itself.
+pub(crate) const IO_DOMAIN_BUDGET_EXHAUSTED: &str = "raw_boundary_io_domain_budget_exhausted";
 pub(crate) const UNSAFE_CONTEXT_SITE_COUNT: &str = "raw_boundary_unsafe_context_site_count";
 pub(crate) const UNSAFE_CONTEXT_INSERTED_COUNT: &str = "raw_boundary_unsafe_context_inserted_count";
 pub(crate) const UNSAFE_CONTEXT_OMITTED_COUNT: &str = "raw_boundary_unsafe_context_omitted_count";
@@ -366,6 +370,7 @@ pub(crate) const ALL: &[&str] = &[
     IO_DOMAIN_MISSING_COUNT,
     IO_DOMAIN_UNEXPECTED_COUNT,
     IO_DOMAIN_DUPLICATE_COUNT,
+    IO_DOMAIN_BUDGET_EXHAUSTED,
     UNSAFE_CONTEXT_SITE_COUNT,
     UNSAFE_CONTEXT_INSERTED_COUNT,
     UNSAFE_CONTEXT_OMITTED_COUNT,

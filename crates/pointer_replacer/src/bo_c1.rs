@@ -12373,6 +12373,10 @@ mod run {
             artifact.sites.lines().skip(1).count(),
         );
         row.set(raw_schema::SUBJECT_ROWS, subjects.len());
+        row.set(
+            raw_schema::IO_DOMAIN_BUDGET_EXHAUSTED,
+            artifact.io_domain_budget_exhausted,
+        );
         row.set(raw_schema::T1_CANDIDATE_SITES, t1_sites);
         row.set(raw_schema::T2_CANDIDATE_SITES, t2_sites);
         row.set(raw_schema::T2_WAIVER_SITES, t2_sites);
