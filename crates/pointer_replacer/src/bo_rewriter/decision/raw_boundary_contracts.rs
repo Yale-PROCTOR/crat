@@ -36,6 +36,64 @@ impl PointeeAccess {
     }
 }
 
+/// How many elements a foreign position's contract consumes, and where that
+/// number comes from (§39 addendum 272, R272-1(b)).
+///
+/// **This is the axis the `&c_void` finding generalises to.** An emitted `&T`
+/// carries provenance over exactly `size_of::<T>()` bytes, so a THIN reference
+/// delivered to any position that consumes more than one element is the same
+/// Stacked-Borrows extent violation `held:void-pointee` repairs — the pointee
+/// merely happens to be typed instead of opaque. `strlen(str)` on a
+/// `&libc::c_char` is the worked example: a one-byte retag read to the NUL.
+///
+/// The seat's taxonomy is one-element / NUL-terminated / byte-count /
+/// element-count / unmodeled-foreign. Two more are recorded because the table
+/// has them and forcing them into the five would misstate the contract:
+/// `UnboundedWrite` (a destination whose size is set by the SOURCE, never
+/// stated at the call — `strcpy`, `strcat`, `sprintf`, the scanf `%s` tail)
+/// and `Lifecycle` (a position that consumes an allocation rather than
+/// accessing elements). `unmodeled-foreign` is not a value here: it is the
+/// absence of a row, which `classify_contract` already reports as
+/// `PositionUnmodeled`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArgumentExtent {
+    /// Exactly one `T`. The only extent a thin `&T` can carry.
+    OneElement,
+    /// Elements up to a NUL the callee finds. Unbounded from the caller's side.
+    NulTerminated,
+    /// A byte count stated at the call site.
+    ByteCount,
+    /// A count and an element size stated at the call site.
+    ElementCount,
+    /// A destination whose extent is set by the source, not by the call.
+    UnboundedWrite,
+    /// The allocation itself is consumed; no element access.
+    Lifecycle,
+    /// No extent decided yet. A row may not ship in this state; the table
+    /// completeness control below is what enforces that.
+    Unclassified,
+}
+
+impl ArgumentExtent {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::OneElement => "one-element",
+            Self::NulTerminated => "nul-terminated",
+            Self::ByteCount => "byte-count",
+            Self::ElementCount => "element-count",
+            Self::UnboundedWrite => "unbounded-write",
+            Self::Lifecycle => "lifecycle",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// Can a THIN `&T` carry this position's extent? Only a single element
+    /// can. Everything else needs a slice, a stated count, or a hold.
+    pub(crate) fn fits_one_element(self) -> bool {
+        matches!(self, Self::OneElement | Self::Lifecycle)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnershipContract {
     BorrowView,
@@ -49,6 +107,8 @@ pub(crate) struct ArgumentContract {
     pub retention: RetentionContract,
     pub access: PointeeAccess,
     pub ownership: OwnershipContract,
+    /// R272-1(b). How many elements this position consumes.
+    pub extent: ArgumentExtent,
     /// Function-level relation: a non-null returned view derives from this
     /// zero-based argument. Consumers must compare it with their own argument
     /// index; its presence does not make every argument the returned parent.
@@ -85,6 +145,16 @@ struct ContractRow {
     access: PointeeAccess,
     ownership: OwnershipContract,
     returns_alias_of: Option<usize>,
+    extent: ArgumentExtent,
+}
+
+impl ContractRow {
+    /// Every row states its extent explicitly. The base constructors leave it
+    /// `Unclassified` on purpose, so a row added without one is caught by the
+    /// completeness control rather than inheriting a plausible default.
+    const fn with(self, extent: ArgumentExtent) -> Self {
+        Self { extent, ..self }
+    }
 }
 
 const fn row(symbol: &'static str, position: usize, access: PointeeAccess) -> ContractRow {
@@ -94,6 +164,7 @@ const fn row(symbol: &'static str, position: usize, access: PointeeAccess) -> Co
         access,
         ownership: OwnershipContract::BorrowView,
         returns_alias_of: None,
+        extent: ArgumentExtent::Unclassified,
     }
 }
 
@@ -119,54 +190,55 @@ const fn return_alias_row(
 /// Per-argument no-retention contracts. Fixed positions and variadic positions
 /// are explicit so a destination never inherits a source's access mode.
 const TABLE: &[ContractRow] = &[
-    row("fdopen", 1, PointeeAccess::Read),
-    return_alias_row("fgets", 0, PointeeAccess::Write),
-    row("fopen", 0, PointeeAccess::Read),
-    row("fopen", 1, PointeeAccess::Read),
-    row("fprintf", 1, PointeeAccess::Read),
-    row("fputs", 0, PointeeAccess::Read),
-    row("fscanf", 1, PointeeAccess::Read),
-    row("getenv", 0, PointeeAccess::Read),
-    row("glob", 0, PointeeAccess::Read),
-    row("glob", 3, PointeeAccess::Write),
-    row("lstat", 0, PointeeAccess::Read),
-    row("lstat", 1, PointeeAccess::Write),
-    row("open", 0, PointeeAccess::Read),
-    row("perror", 0, PointeeAccess::Read),
-    row("printf", 0, PointeeAccess::Read),
-    row("scanf", 0, PointeeAccess::Read),
-    row("snprintf", 0, PointeeAccess::Write),
-    row("snprintf", 2, PointeeAccess::Read),
-    row("sprintf", 0, PointeeAccess::Write),
-    row("sprintf", 1, PointeeAccess::Read),
-    row("sscanf", 0, PointeeAccess::Read),
-    row("sscanf", 1, PointeeAccess::Read),
-    row("stat", 0, PointeeAccess::Read),
-    row("stat", 1, PointeeAccess::Write),
-    return_alias_row("strcat", 0, PointeeAccess::Write),
-    return_alias_row("strcat", 1, PointeeAccess::Read),
-    return_alias_row("strchr", 0, PointeeAccess::Read),
-    row("strcmp", 0, PointeeAccess::Read),
-    row("strcmp", 1, PointeeAccess::Read),
-    return_alias_row("strcpy", 0, PointeeAccess::Write),
-    return_alias_row("strcpy", 1, PointeeAccess::Read),
-    row("strlen", 0, PointeeAccess::Read),
-    row("strncasecmp", 0, PointeeAccess::Read),
-    row("strncasecmp", 1, PointeeAccess::Read),
-    return_alias_row("strncat", 0, PointeeAccess::Write),
-    return_alias_row("strncat", 1, PointeeAccess::Read),
-    return_alias_row("strncpy", 0, PointeeAccess::Write),
-    return_alias_row("strncpy", 1, PointeeAccess::Read),
-    return_alias_row("strstr", 0, PointeeAccess::Read),
-    return_alias_row("strstr", 1, PointeeAccess::Read),
-    row("utime", 0, PointeeAccess::Read),
-    row("utime", 1, PointeeAccess::Read),
+    row("fdopen", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    return_alias_row("fgets", 0, PointeeAccess::Write).with(ArgumentExtent::ByteCount),
+    row("fopen", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("fopen", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("fprintf", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("fputs", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("fscanf", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("getenv", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("glob", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("glob", 3, PointeeAccess::Write).with(ArgumentExtent::OneElement),
+    row("lstat", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("lstat", 1, PointeeAccess::Write).with(ArgumentExtent::OneElement),
+    row("open", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("perror", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("printf", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("scanf", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("snprintf", 0, PointeeAccess::Write).with(ArgumentExtent::ByteCount),
+    row("snprintf", 2, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("sprintf", 0, PointeeAccess::Write).with(ArgumentExtent::UnboundedWrite),
+    row("sprintf", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("sscanf", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("sscanf", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("stat", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("stat", 1, PointeeAccess::Write).with(ArgumentExtent::OneElement),
+    return_alias_row("strcat", 0, PointeeAccess::Write).with(ArgumentExtent::UnboundedWrite),
+    return_alias_row("strcat", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    return_alias_row("strchr", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("strcmp", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("strcmp", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    return_alias_row("strcpy", 0, PointeeAccess::Write).with(ArgumentExtent::UnboundedWrite),
+    return_alias_row("strcpy", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("strlen", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("strncasecmp", 0, PointeeAccess::Read).with(ArgumentExtent::ByteCount),
+    row("strncasecmp", 1, PointeeAccess::Read).with(ArgumentExtent::ByteCount),
+    return_alias_row("strncat", 0, PointeeAccess::Write).with(ArgumentExtent::UnboundedWrite),
+    return_alias_row("strncat", 1, PointeeAccess::Read).with(ArgumentExtent::ByteCount),
+    return_alias_row("strncpy", 0, PointeeAccess::Write).with(ArgumentExtent::ByteCount),
+    return_alias_row("strncpy", 1, PointeeAccess::Read).with(ArgumentExtent::ByteCount),
+    return_alias_row("strstr", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    return_alias_row("strstr", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("utime", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("utime", 1, PointeeAccess::Read).with(ArgumentExtent::OneElement),
     ContractRow {
         symbol: "fclose",
         position: Position::Exact(0),
         access: PointeeAccess::Lifecycle,
         ownership: OwnershipContract::Consume,
         returns_alias_of: None,
+        extent: ArgumentExtent::Lifecycle,
     },
     ContractRow {
         symbol: "free",
@@ -174,6 +246,7 @@ const TABLE: &[ContractRow] = &[
         access: PointeeAccess::Lifecycle,
         ownership: OwnershipContract::Consume,
         returns_alias_of: None,
+        extent: ArgumentExtent::Lifecycle,
     },
     ContractRow {
         symbol: "realloc",
@@ -181,6 +254,7 @@ const TABLE: &[ContractRow] = &[
         access: PointeeAccess::Lifecycle,
         ownership: OwnershipContract::AtomicSourceSink,
         returns_alias_of: None,
+        extent: ArgumentExtent::Lifecycle,
     },
 ];
 
@@ -220,20 +294,26 @@ fn family_contract(
     argument_index: usize,
     target: &RawTargetType,
 ) -> Result<Option<ArgumentContract>, ContractFailure> {
-    let (access, provenance) =
+    // A pointer in a printf tail is a `%s` argument: read to the NUL. In a
+    // scanf tail it is a destination whose size the call never states. A
+    // stdio stream position is one `FILE`.
+    let (access, extent, provenance) =
         if printf_tail_first(symbol).is_some_and(|first| argument_index >= first) {
             (
                 PointeeAccess::Read,
+                ArgumentExtent::NulTerminated,
                 "pinned-libc-family-printf-tail-0.2.184",
             )
         } else if scanf_tail_first(symbol).is_some_and(|first| argument_index >= first) {
             (
                 PointeeAccess::Write,
+                ArgumentExtent::UnboundedWrite,
                 "pinned-libc-family-scanf-tail-0.2.184",
             )
         } else if is_stdio_stream_position(symbol, argument_index) {
             (
                 PointeeAccess::Stream,
+                ArgumentExtent::OneElement,
                 "pinned-libc-family-stdio-stream-0.2.184",
             )
         } else {
@@ -246,6 +326,7 @@ fn family_contract(
         retention: RetentionContract::NoRetain,
         access,
         ownership: OwnershipContract::BorrowView,
+        extent,
         returns_alias_of: function_return_alias(symbol),
         provenance,
     }))
@@ -283,6 +364,7 @@ pub(crate) fn classify_contract(
         retention: RetentionContract::NoRetain,
         access: row.access,
         ownership: row.ownership,
+        extent: row.extent,
         returns_alias_of: row.returns_alias_of,
         provenance: "pinned-libc-0.2.184",
     })
@@ -291,6 +373,99 @@ pub(crate) fn classify_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R272-1(b) completeness. A row without a deliberate extent may not
+    /// ship: the constructors leave `Unclassified` so that adding a symbol
+    /// without deciding what its position consumes fails here rather than
+    /// inheriting a plausible default.
+    #[test]
+    fn r272_every_contract_row_states_its_extent() {
+        let unclassified = TABLE
+            .iter()
+            .filter(|row| row.extent == ArgumentExtent::Unclassified)
+            .map(|row| (row.symbol, row.position))
+            .collect::<Vec<_>>();
+        assert!(
+            unclassified.is_empty(),
+            "contract rows without an extent: {unclassified:?}"
+        );
+    }
+
+    /// The finding this column exists for, as a property rather than a list:
+    /// only a one-element position can be reached by a THIN reference. Every
+    /// other row is a position where a delivered `&T` carries less provenance
+    /// than the callee consumes.
+    #[test]
+    fn r272_only_one_element_positions_fit_a_thin_reference() {
+        for row in TABLE {
+            assert_eq!(
+                row.extent.fits_one_element(),
+                matches!(
+                    row.extent,
+                    ArgumentExtent::OneElement | ArgumentExtent::Lifecycle
+                ),
+                "{} position {:?}",
+                row.symbol,
+                row.position
+            );
+        }
+        assert!(
+            TABLE
+                .iter()
+                .any(|row| row.extent == ArgumentExtent::NulTerminated),
+            "the NUL-terminated family is the population R272-1 widened to"
+        );
+    }
+
+    /// The two worked examples the seat named, pinned by symbol so a table
+    /// edit that reclassified them would have to say so.
+    #[test]
+    fn r272_named_examples_keep_their_measured_extent() {
+        let extent = |symbol: &str, position: usize| {
+            TABLE
+                .iter()
+                .find(|row| row.symbol == symbol && row.position.matches(position))
+                .unwrap_or_else(|| panic!("{symbol} position {position}"))
+                .extent
+        };
+        // `buffer_new_with_copy(mut str: &libc::c_char)` then `strlen(str)`:
+        // a one-byte retag read to the NUL.
+        assert_eq!(extent("strlen", 0), ArgumentExtent::NulTerminated);
+        // bzip2 `copyFileName::from` at `strncpy(to, from, 1024)`.
+        assert_eq!(extent("strncpy", 1), ArgumentExtent::ByteCount);
+        assert_eq!(extent("strncpy", 0), ArgumentExtent::ByteCount);
+        // rgba `rgba_to_string::buf` at `snprintf(buf, len, ...)`.
+        assert_eq!(extent("snprintf", 0), ArgumentExtent::ByteCount);
+        // A destination sized by its source, never by the call.
+        assert_eq!(extent("strcpy", 0), ArgumentExtent::UnboundedWrite);
+        // The genuinely single-element positions.
+        assert_eq!(extent("stat", 1), ArgumentExtent::OneElement);
+        assert_eq!(extent("fclose", 0), ArgumentExtent::Lifecycle);
+    }
+
+    /// The family path carries an extent too, so a `%s` in a printf tail is
+    /// not silently one element.
+    #[test]
+    fn r272_family_positions_state_their_extent() {
+        let target = RawTargetType {
+            rendered: "*const i8".to_owned(),
+            pointee: "i8".to_owned(),
+            mutability: RawMutability::Const,
+            depth2: None,
+        };
+        let contract =
+            classify_contract(&callee("printf", true), 1, &target).expect("printf tail is modeled");
+        assert_eq!(contract.extent, ArgumentExtent::NulTerminated);
+        let stream = RawTargetType {
+            rendered: "*mut FILE".to_owned(),
+            pointee: "FILE".to_owned(),
+            mutability: RawMutability::Mut,
+            depth2: None,
+        };
+        let contract =
+            classify_contract(&callee("fprintf", true), 0, &stream).expect("stdio stream position");
+        assert_eq!(contract.extent, ArgumentExtent::OneElement);
+    }
 
     fn callee(name: &str, foreign: bool) -> ForeignSymbolKey {
         ForeignSymbolKey {
@@ -320,6 +495,7 @@ mod tests {
                 retention: RetentionContract::NoRetain,
                 access: PointeeAccess::Read,
                 ownership: OwnershipContract::BorrowView,
+                extent: ArgumentExtent::NulTerminated,
                 returns_alias_of: None,
                 provenance: "pinned-libc-0.2.184",
             })

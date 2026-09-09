@@ -19,7 +19,8 @@ use rustc_middle::{
 use super::{
     raw_boundary::{raw_target_type, symbol_key},
     raw_boundary_contracts::{
-        ArgumentContract, OwnershipContract, PointeeAccess, RetentionContract, classify_contract,
+        ArgumentContract, ArgumentExtent, OwnershipContract, PointeeAccess, RetentionContract,
+        classify_contract,
     },
     return_alias::{self, ReturnUseObservation},
 };
@@ -292,6 +293,11 @@ pub(crate) fn derive_type_backed<'tcx>(
                     retention: RetentionContract::Unknown,
                     access: PointeeAccess::None,
                     ownership: OwnershipContract::BorrowView,
+                    // K18' synthesizes a contract for a callee that HAS no
+                    // pinned row, so nothing is known about how many elements
+                    // the position consumes. `Unclassified` says exactly that;
+                    // it is not `OneElement`, which would be a claim.
+                    extent: ArgumentExtent::Unclassified,
                     returns_alias_of: Some(index),
                     provenance: "type-derived-return-carrier",
                 },
