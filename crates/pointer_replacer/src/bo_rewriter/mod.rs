@@ -1051,7 +1051,7 @@ fn rewrite_core_injected_with_config(
         #[cfg(test)]
         if census_once || raw_boundary_full {
             decide_ctx.raw_boundary_artifacts.bridge_custody_export =
-                artifact::bridge_custody_export(
+                bridge_custody_export::capture(
                     tcx,
                     &capture,
                     &table,

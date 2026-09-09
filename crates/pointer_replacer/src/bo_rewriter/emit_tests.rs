@@ -3939,23 +3939,12 @@ fn a_may_be_negative_offset_refuses_the_slice_form_with_its_own_reason() {
          SIGN, not on the presence of arithmetic"
     );
 
-    // **PRECEDENCE — the gate must stay LAST in the arm.**
-    //
-    // The two halves above pin that the gate fires and that it is conditional;
-    // neither pins WHERE. Moving it above the `SliceUseUnsupported` check would
-    // leave both green while silently displacing an earlier, more specific
-    // reason — the "can only convert a would-be emission" property that makes
-    // its movement a pre-registered count rather than an unbounded one.
-    //
-    // This subject is may-be-negative AND separately unsupported (`p` is also
-    // returned bare). The earlier reason must win.
+    // R256/R210 per-entry migration: item 6 admits the bare return shape.
+    // The sign refusal precedes return-handoff admission and cursor typing.
     assert_eq!(
         reason_for("    let _v = *p.offset(k);\n    p"),
-        "slice-use-unsupported",
-        "the sign gate must fire LAST: a subject that is ALSO unsupported for \
-         its use shape must keep the earlier, more specific attribution. If \
-         this reads `slice-neg-or-unknown-offset`, the gate has been hoisted \
-         above a reason it must never displace."
+        "slice-neg-or-unknown-offset",
+        "an otherwise adapted bare return must retain the sign refusal"
     );
 }
 
@@ -4031,12 +4020,12 @@ fn a_may_be_negative_offset_refuses_the_fat_optional_form_too() {
         "a THIN optional forms no index and must keep emitting"
     );
 
-    // PRECEDENCE — last in its own arm, same rule as the slice twin.
+    // R256/R210 per-entry migration: the optional bare return is an item-6
+    // handoff; its presence must not displace the existing sign refusal.
     assert_eq!(
         reason_for(&[NULL_TEST, "    let _v = *p.offset(k);\n    p"].concat()),
-        "opt-use-unsupported",
-        "the fat-optional sign gate must fire LAST in its arm: a subject that \
-         is ALSO unsupported for its use shape keeps the earlier attribution"
+        "slice-neg-or-unknown-offset",
+        "the fat-optional return keeps the same sign authority"
     );
 }
 
@@ -6331,9 +6320,8 @@ fn e2_body_scope_adapts_only_the_enumerated_function_identity() {
     );
 }
 
-/// E2-SCHEMA-W1 — expectation migration under addendum 182 §5 and addendum
-/// 200. The former blocked rows are now placed raw-to-safe adapters plus one
-/// proof-site primary and one exact-waiver T2 raw-view role.
+/// E2-SCHEMA-W1 — R256/R231 per-entry migration. Candidate forms and peer
+/// evidence survive one primary adapter and one unrenderable fallback hold.
 #[test]
 fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
     let src = format!(
@@ -6370,8 +6358,15 @@ fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
         .filter(|line| line.starts_with("placed\t"))
         .map(|line| line.split('\t').collect::<Vec<_>>())
         .collect::<Vec<_>>();
-    assert_eq!(placed.len(), 2, "{}", attempt.receipt);
-    for row in placed {
+    assert_eq!(placed.len(), 1, "{}", attempt.receipt);
+    assert_eq!(placed[0][column("param_index")], "0");
+    let blocked = attempt.receipt.lines().skip(1).filter(|line| line.starts_with("blocked\t"))
+        .map(|line| line.split('\t').collect::<Vec<_>>()).collect::<Vec<_>>();
+    assert_eq!(blocked.len(), 1, "{}", attempt.receipt);
+    assert_eq!(blocked[0][column("param_index")], "1");
+    assert_eq!(blocked[0][column("family_or_reason")], "a5-raw-view-template-unavailable");
+    assert_eq!(blocked[0][column("peer_pairs")], "0/1[same_root=1,left_blind=0,right_blind=0]");
+    for row in placed.iter().chain(&blocked) {
         assert_eq!(row[expected], "ref-mut", "{row:?}");
         assert_eq!(row[found], "raw", "{row:?}");
         assert_eq!(row[candidate], "c-raw-reborrow-mut", "{row:?}");
@@ -6379,17 +6374,19 @@ fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
         assert_eq!(row[blind], "0", "{row:?}");
         assert_eq!(row[context], "call-argument", "{row:?}");
     }
-    assert_eq!(
-        attempt
-            .receipt
-            .lines()
-            .filter(|line| line.starts_with("blocked\t"))
-            .count(),
-        0,
-        "{}",
-        attempt.receipt
-    );
-    assert_d14_primary_and_t2_receipt(&attempt, "undeterminable", 1);
+    let proofs = attempt.receipt.lines().skip(1).filter(|line| line.starts_with("overlap-proof\t"))
+        .map(|line| line.split('\t').collect::<Vec<_>>()).collect::<Vec<_>>();
+    assert_eq!(proofs.len(), 2);
+    for (index, family) in [("0", "a5-site-proof-pair-primary"), ("1", "a5-site-proof-reclassified")] {
+        let rows = proofs.iter().filter(|row| row[column("param_index")] == index).collect::<Vec<_>>();
+        let [row] = rows.as_slice() else { panic!("one original proof position") };
+        assert_eq!(row[column("family_or_reason")], family);
+        assert_eq!(row[column("overlap_verdict")], "undeterminable");
+        assert_eq!(row[column("overlap_reason")], "seam-a5-attestation-absent");
+        assert_ne!(row[column("a5_peer_proofs")], "-");
+    }
+    assert_r256_unattested_fallback_is_held(&attempt);
+
 
     let no_edit = e2_attempt(&src, &|table| {
         force_body_forms(
@@ -8203,37 +8200,50 @@ fn br_w7_raw_const_mut_casts_use_the_exact_direction() {
             }
         }
     });
-    let source = e2_root_text(&attempt);
-    assert!(
-        source.contains("wants_const(mutable.cast_const())"),
-        "{source}"
-    );
-    assert!(source.contains("wants_mut(shared.cast_mut())"), "{source}");
-    assert!(!source.contains("mutable.cast_mut()"), "{source}");
-    assert!(!source.contains("shared.cast_const()"), "{source}");
-    assert!(
-        e2_type_checks(&attempt),
-        "BR-W7 emitted tree must type-check"
-    );
-    let events = attempt
-        .emission
-        .plan
-        .bridge_events(&std::collections::BTreeSet::new());
-    for kind in ["raw-cast-const", "raw-cast-mut"] {
-        let pair = events
-            .iter()
-            .filter(|event| event.site.bridge_kind == kind)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            pair.len(),
-            2,
-            "exact plan/terminal pair for {kind}: {events:#?}"
-        );
-        assert!(pair.iter().all(|event| {
-            event.retention == super::bridge_receipt::BridgeRetentionTier::T1
-                && event.waiver_id.is_none()
-        }));
+    // R256/R231: the raw sources stay in their exact original input form.
+    // The preterminal planner still records both direction-named templates.
+    let boundary = attempt.receipt.split("\n-- addresses --").next().unwrap();
+    let header = boundary.lines().next().unwrap().split('\t').collect::<Vec<_>>();
+    let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
+    let rows = boundary.lines().skip(1).map(|line| line.split('\t').collect::<Vec<_>>()).collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "{boundary}");
+    for (callee, template) in [("wants_const", "raw-cast-const"), ("wants_mut", "raw-cast-mut")] {
+        let rows = rows.iter().filter(|row| row[column("callee")] == callee).collect::<Vec<_>>();
+        let [row] = rows.as_slice() else { panic!("one exact raw cast direction: {boundary}") };
+        assert_eq!(row[column("template")], template);
+        assert_eq!(row[column("tier")], "T1");
+        assert_eq!(row[column("evidence")], "raw-pointer-mutability-cast");
+        assert_eq!(row[column("waiver_id")], "-");
     }
+    let classes = &attempt.emission.plan.class_finalization.classes;
+    assert_eq!(classes.len(), 1);
+    let class = classes.values().next().unwrap();
+    assert!(class.is_ready());
+    assert_eq!(class.sites.len(), 2);
+    assert!(class.sites.iter().all(|site| site.key.bridge_kind == "outbound-input-form"
+        && site.state == super::plan::ClassSiteState::ZeroSyntaxReady
+        && site.expected_form == "raw" && site.found_form == "raw"));
+    let events = attempt.emission.plan.bridge_events(&std::collections::BTreeSet::new());
+    assert_eq!(events.len(), 4, "exact two Plan/Terminal pairs: {events:#?}");
+    for callee in ["wants_const", "wants_mut"] {
+        let rows = events.iter().filter(|event| event.site.callee == super::bridge_receipt::BridgeCalleeId::Foreign(callee.into())).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().filter(|event| event.stage == super::bridge_receipt::BridgeReceiptStage::Plan).count(), 1);
+        assert_eq!(rows.iter().filter(|event| event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
+            && event.state == super::bridge_receipt::BridgeReceiptState::Applied).count(), 1);
+        assert!(rows.iter().all(|event| event.site.bridge_kind == "outbound-input-form"
+            && event.expected_form == "raw" && event.found_form == "raw"
+            && event.retention == super::bridge_receipt::BridgeRetentionTier::None && event.waiver_id.is_none()));
+    }
+    assert!(attempt.emission.files.is_empty(), "a proven all-input-form plan has no source edit");
+    let materialized = verify::materialize(&attempt.fixture.root(), &attempt.emission.files).unwrap();
+    let restored = std::fs::read_to_string(materialized.root()).unwrap();
+    assert_eq!(restored, source, "the original casts survive byte-for-byte after materialization");
+    assert!(restored.contains("wants_const(mutable as *const i32)"));
+    assert!(restored.contains("wants_mut(shared as *mut i32)"));
+    assert!(!restored.contains("wants_const(mutable as *mut i32)"));
+    assert!(!restored.contains("wants_mut(shared as *const i32)"));
+    assert!(verify::type_checks_str(&restored), "BR-W7 materialized original type-checks");
 }
 
 /// BR-W8 RED: a nullable safe source may satisfy a required safe contract by
@@ -10945,24 +10955,58 @@ fn e_adapt_w3_n2_clear_template_none_is_untouched() {
     assert!(!e2_root_text(&attempt).contains("core::slice::"));
 }
 
-/// E-ADAPT-W3-N3 — expectation migration under addendum 182 §5 and addendum
-/// 200. An unattested proof is Undeterminable, which now selects one safe
-/// primary and one exact-waiver T2 raw-view role rather than the old block.
+/// R256/R231: these two unattested consumer fixtures have no native proof-site
+/// key. Their per-position refusal must hold the owning class, never discharge T2.
+fn assert_r256_unattested_fallback_is_held(attempt: &E2Attempt) {
+    let sites = attempt.emission.plan.class_finalization.classes.values()
+        .flat_map(|class| class.sites.iter())
+        .filter(|site| site.key.bridge_kind == "a5-site-proof-reclassified").collect::<Vec<_>>();
+    let [site] = sites.as_slice() else { panic!("one exact reclassified fallback: {sites:#?}") };
+    assert_eq!(site.key.position, "arg1");
+    assert_eq!(site.state, super::plan::ClassSiteState::Dropped(
+        "a5-fallback-unrenderable:proof-site-key-unavailable".into()));
+    assert_eq!(site.retention, super::bridge_receipt::BridgeRetentionTier::None);
+    assert!(site.waiver_id.is_none());
+    assert!(!attempt.emission.plan.class_finalization.classes[&site.key.owner_class].is_ready());
+    assert!(attempt.emission.plan.held_classes().contains(&site.key.owner_class));
+    assert!(!attempt.emission.plan.bridge_events(&BTreeSet::new()).iter().any(|event|
+        event.site.owner_class == site.key.owner_class && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
+            && event.state == super::bridge_receipt::BridgeReceiptState::Applied));
+}
+
+/// E-ADAPT-W3-N3 — R256/R231 per-entry migration. An unattested proof remains
+/// Undeterminable; missing native site identity cannot discharge a T2 view.
 #[test]
 fn e_adapt_w3_n3_unattested_site_fails_closed_with_typed_reason() {
     let attempt = e3_attempt(E3_CLEAR_RAW, false, true);
-    assert_eq!(
-        attempt
-            .receipt
-            .lines()
-            .filter(|line| line.starts_with("placed\t"))
-            .count(),
-        2,
-        "{}",
-        attempt.receipt
-    );
-    assert_d14_primary_and_t2_receipt(&attempt, "undeterminable", 1);
-    assert!(e2_root_text(&attempt).contains("core::slice::from_raw_parts_mut"));
+    let column = |name: &str| receipt_column(&attempt.receipt, name);
+    let rows = attempt.receipt.lines().skip(1).map(|line| line.split('\t').collect::<Vec<_>>()).collect::<Vec<_>>();
+    let placed = rows.iter().filter(|row| row[0] == "placed").collect::<Vec<_>>();
+    let blocked = rows.iter().filter(|row| row[0] == "blocked").collect::<Vec<_>>();
+    assert_eq!(placed.len(), 1);
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(placed[0][column("param_index")], "0");
+    assert_eq!(blocked[0][column("param_index")], "1");
+    assert_eq!(blocked[0][column("family_or_reason")], "a5-raw-view-template-unavailable");
+    assert_eq!(blocked[0][column("peer_pairs")], "0/1[same_root=0,left_blind=1,right_blind=1]");
+    for row in placed.iter().chain(&blocked) {
+        assert_eq!(row[column("expected_form")], "slice-mut");
+        assert_eq!(row[column("found_form")], "raw");
+        assert_eq!(row[column("candidate_template")], "c-raw-slice-mut");
+        assert_eq!(row[column("blind")], "1");
+        assert_eq!(row[column("overlap_verdict")], "undeterminable");
+        assert_eq!(row[column("overlap_reason")], "seam-a5-attestation-absent");
+        assert_eq!(row[column("resolved_call_location")], "-");
+        assert_ne!(row[column("a5_peer_proofs")], "-");
+    }
+    let proofs = rows.iter().filter(|row| row[0] == "overlap-proof").collect::<Vec<_>>();
+    assert_eq!(proofs.len(), 2);
+    assert_eq!(proofs.iter().filter(|row| row[column("family_or_reason")] == "a5-site-proof-pair-primary").count(), 1);
+    assert_eq!(proofs.iter().filter(|row| row[column("family_or_reason")] == "a5-site-proof-reclassified").count(), 1);
+    assert_r256_unattested_fallback_is_held(&attempt);
+    let source = attempt.ast_source.as_ref().expect("full original AST remains available under the held class");
+    assert!(source.contains("fn target(a: *mut i32, b: *mut i32)"), "{source}");
+    assert!(verify::type_checks_str(source), "held unattested fixture remains type-correct");
 }
 
 /// E-ADAPT-W3-N6 — evidence-backed extents remain preferred after the overlap
@@ -11009,9 +11053,9 @@ fn e_adapt_w3_n7_clear_site_receipts_named_fallback_extent() {
     );
 }
 
-/// E-ADAPT-W3-N8 — expectation migration under addendum 182 §5 and addendum
-/// 200. Two calls retain independent verdicts: the clear site stays clear and
-/// the overlapping neighbor now receives its own primary/T2 proof-site pair.
+/// E-ADAPT-W3-N8 — R256/R231 per-entry migration. The clear call retains its
+/// proof, while the overlapping injected call lacks a settled raw role and
+/// holds its owner; a planned whole-call edit is not an Applied raw view.
 #[test]
 fn e_adapt_w3_n8_site_key_does_not_license_an_overlapping_neighbor() {
     let attempt = e3_attempt_with(E3_SCOPED_PAIR, true, &force_wave3_target_slices);
@@ -11035,14 +11079,34 @@ fn e_adapt_w3_n8_site_key_does_not_license_an_overlapping_neighbor() {
             .count(),
         2
     );
-    assert_d14_primary_and_t2_receipt(&attempt, "overlapping", 0);
-    let source = e2_root_text(&attempt);
-    assert!(source.contains("clear_caller"), "{source}");
-    assert!(source.contains("overlap_caller"), "{source}");
-    assert!(
-        source.contains("core::slice::from_raw_parts_mut"),
-        "{source}"
-    );
+    let sites = attempt.emission.plan.class_finalization.classes.values()
+        .flat_map(|class| class.sites.iter())
+        .filter(|site| site.key.bridge_kind == "a5-site-proof-t2-fallback").collect::<Vec<_>>();
+    assert_eq!(sites.len(), 2, "one logical position and its whole-call carrier: {sites:#?}");
+    let positions = sites.iter().filter(|site| site.key.position == "arg1").collect::<Vec<_>>();
+    let carriers = sites.iter().filter(|site| site.key.position.starts_with("args=")).collect::<Vec<_>>();
+    let ([position], [carrier]) = (positions.as_slice(), carriers.as_slice()) else {
+        panic!("exact position/carrier partition: {sites:#?}");
+    };
+    assert_eq!(position.state, super::plan::ClassSiteState::Dropped(
+        "a5-fallback-unrenderable:raw=false;carriers=0;edits=0".into()));
+    assert_eq!(carrier.state, super::plan::ClassSiteState::EditReady);
+    assert_eq!(position.key.owner_class, carrier.key.owner_class);
+    assert!(sites.iter().all(|site| site.retention == super::bridge_receipt::BridgeRetentionTier::T2
+        && site.waiver_id.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)));
+    let owner = position.key.owner_class;
+    assert!(!attempt.emission.plan.class_finalization.classes[&owner].is_ready());
+    assert!(attempt.emission.plan.held_classes().contains(&owner));
+    let terminal = attempt.emission.plan.bridge_events(&BTreeSet::new()).into_iter()
+        .filter(|event| event.site.owner_class == owner && event.site.bridge_kind == "a5-site-proof-t2-fallback"
+            && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal).collect::<Vec<_>>();
+    assert_eq!(terminal.len(), 2);
+    assert!(terminal.iter().all(|event| event.state == super::bridge_receipt::BridgeReceiptState::Dropped));
+    let source = attempt.ast_source.as_ref().expect("held scoped fixture still has its complete AST");
+    assert!(source.contains("clear_caller") && source.contains("overlap_caller"));
+    assert!(source.contains("fn target(a: *mut i32, b: *mut i32)"), "{source}");
+    assert!(!source.contains("__crat_a5_raw_value"), "no Applied carrier may survive its held owner");
+    assert!(verify::type_checks_str(source), "the held scoped fixture type-checks");
 }
 
 /// **A BLOCKED seam row names the CALLEE in `owner_fn`, and the caller in its
@@ -11695,8 +11759,12 @@ fn c_n2_seed_without_settled_signature_subject_has_no_pointless_wrapper() {
     let fixture = Fixture::new(&[(
         "lib.rs",
         "#![allow(dead_code, unused_unsafe)]\n\
-         pub unsafe extern \"C\" fn api(p: *const i32) -> *const i32 { p.offset(1) }\n",
+         pub unsafe extern \"C\" fn api(p: *const i32) -> *const i32 { p.offset(-1) }\n",
     )]);
+    let original = std::fs::read_to_string(fixture.root()).unwrap();
+    let decisions = decisions_of(&original);
+    assert_eq!(reason_of(&decisions, "p", true), "slice-neg-or-unknown-offset",
+        "R256/R210 migrated negative fixture must actually have no admitted slice signature");
     let run_config = super::EmissionRunConfig {
         configured_exposure: configured_exposure_input("api"),
     };

@@ -755,15 +755,17 @@ fn matcher_resolves_the_existing_merged_import_in_mod_rs() {
         "the matcher did not resolve the driver's brace-merged analyses import; \
          resolved paths were {paths:?}"
     );
-    // The property that made H1 a HIGH: no single LINE carries the fragment.
-    assert!(
-        !text
-            .lines()
-            .filter(|l| !is_comment(l))
-            .any(|l| l.contains("crate::analyses")),
-        "the driver's import is now on one line, so this file no longer \
-         witnesses the evasion H1 was about — pick another real input"
-    );
+    // Inspect the actual merged import. Unrelated fully-qualified type uses
+    // elsewhere in the driver do not change whether this import tests H1.
+    let syntax = syn::parse_file(&text).expect("driver syntax parses");
+    let merged = syntax.items.iter().any(|item| {
+        let syn::Item::Use(import) = item else { return false };
+        let syn::UseTree::Path(root) = &import.tree else { return false };
+        let syn::UseTree::Group(group) = &*root.tree else { return false };
+        root.ident == "crate" && group.items.iter().any(|item|
+            matches!(item, syn::UseTree::Path(path) if path.ident == "analyses"))
+    });
+    assert!(merged, "the driver must retain an actual brace-merged analyses import for H1");
 }
 
 // ---------------------------------------------------------------------------
