@@ -616,13 +616,17 @@ pub(crate) fn capture(
                         .plans
                         .get(&potential.site)
                         .ok_or("pending-native-expression-input-missing")?;
+                    // A nested carrier edits a span strictly inside the
+                    // argument, so the argument identity it must match is its
+                    // enclosing span, not its edit span.
+                    let enclosing = input.enclosing_argument_span.unwrap_or(input.argument_span);
                     if input.argument_hir != *argument_hir
                         || use_hir_id != argument_hir
                         || input.caller != potential.caller
                         || input.source_callee != *source_callee
                         || input.source_interface != *source_interface
                         || input.temporary != *temporary
-                        || input.argument_span != potential.argument_span
+                        || enclosing != potential.argument_span
                         || input.call_span != potential.call_span
                     {
                         return Err("pending-native-expression-input-drift".into());
@@ -632,18 +636,37 @@ pub(crate) fn capture(
                     if source_file != file {
                         return Err("pending-native-expression-in-different-file".into());
                     }
+                    let source_owner = source_callee.local_def_index.as_u32();
+                    let source_function = tcx.def_path_str(source_callee.to_def_id());
+                    let source_form = source_interface.form.key().into();
+                    let source_type = source_interface.temporary_type();
+                    let temporary = temporary.clone();
+                    let template = input.template.key().into();
                     PendingSource {
                         binding: None,
                         binding_span: None,
-                        shape: PendingSourceShape::NativeReturnExpression {
-                            argument_span: span,
-                            source_call_span,
-                            source_owner: source_callee.local_def_index.as_u32(),
-                            source_function: tcx.def_path_str(source_callee.to_def_id()),
-                            source_form: source_interface.form.key().into(),
-                            source_type: source_interface.temporary_type(),
-                            temporary: temporary.clone(),
-                            template: input.template.key().into(),
+                        shape: if input.enclosing_argument_span.is_some() {
+                            PendingSourceShape::NativeReturnExpressionNested {
+                                argument_span: span,
+                                source_call_span,
+                                source_owner,
+                                source_function,
+                                source_form,
+                                source_type,
+                                temporary,
+                                template,
+                            }
+                        } else {
+                            PendingSourceShape::NativeReturnExpression {
+                                argument_span: span,
+                                source_call_span,
+                                source_owner,
+                                source_function,
+                                source_form,
+                                source_type,
+                                temporary,
+                                template,
+                            }
                         },
                     }
                 }

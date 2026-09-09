@@ -1299,3 +1299,78 @@ let mut value = 1; let holder = Holder { data: &mut value, scalar: 2 }; caller(&
         assert!(!pending_with_local_native_index(true).data);
     }
 }
+
+/// Q-J20-CARRIER custody witnesses (seat addendum 259(5)). The nested carrier
+/// got its own `PendingSourceShape` variant rather than a loosened rule on the
+/// existing one, so what has to be shown is that neither arm accepts what the
+/// other describes.
+mod native_expression_interval {
+    use super::super::{
+        bridge_custody_match::native_expression_interval_ok, delivery_custody::ByteSpan,
+    };
+
+    fn span(lo: u32, hi: u32) -> ByteSpan {
+        ByteSpan { lo, hi }
+    }
+
+    /// The existing arm still rejects drift: an edit strictly inside the
+    /// argument is exactly what the bare carrier may not claim, and this is
+    /// the rule that would have had to be loosened to admit the nested shape
+    /// without its own variant.
+    #[test]
+    fn bare_carrier_rejects_a_strictly_nested_edit() {
+        assert!(!native_expression_interval_ok(
+            &span(100, 140),
+            &span(100, 120),
+            false
+        ));
+        assert!(native_expression_interval_ok(
+            &span(100, 140),
+            &span(100, 140),
+            false
+        ));
+    }
+
+    /// A nested carrier claiming the whole argument is a mismatched receipt:
+    /// it describes an edit the emitter did not make.
+    #[test]
+    fn nested_carrier_rejects_an_edit_equal_to_the_argument() {
+        assert!(!native_expression_interval_ok(
+            &span(100, 140),
+            &span(100, 140),
+            true
+        ));
+    }
+
+    /// A nested carrier whose edit escapes the argument is caught on either
+    /// side, which is the deliberate fault this rule exists to kill.
+    #[test]
+    fn nested_carrier_rejects_an_edit_outside_the_argument() {
+        assert!(!native_expression_interval_ok(
+            &span(100, 140),
+            &span(90, 120),
+            true
+        ));
+        assert!(!native_expression_interval_ok(
+            &span(100, 140),
+            &span(120, 150),
+            true
+        ));
+        assert!(!native_expression_interval_ok(
+            &span(100, 140),
+            &span(200, 210),
+            true
+        ));
+    }
+
+    /// What it does accept: strict containment at either end and in the middle.
+    #[test]
+    fn nested_carrier_accepts_strict_containment() {
+        for (lo, hi) in [(100, 120), (120, 140), (110, 130)] {
+            assert!(
+                native_expression_interval_ok(&span(100, 140), &span(lo, hi), true),
+                "{lo}..{hi} sits inside 100..140"
+            );
+        }
+    }
+}

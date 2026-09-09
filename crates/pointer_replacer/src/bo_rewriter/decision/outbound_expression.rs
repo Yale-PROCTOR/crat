@@ -41,6 +41,10 @@ pub(crate) struct OutboundExpressionPlan {
     pub(crate) caller: LocalDefId,
     pub(crate) argument_hir: HirId,
     pub(crate) argument_span: Span,
+    /// For a NESTED carrier, the whole argument that contains the edit;
+    /// `None` when the argument IS the changed call. The two are never equal:
+    /// strict containment is what the custody arm for this shape requires.
+    pub(crate) enclosing_argument_span: Option<Span>,
     pub(crate) call_span: Span,
     pub(crate) source_callee: LocalDefId,
     pub(crate) source_interface: ReturnInterface,
@@ -201,11 +205,31 @@ impl<'tcx> Visitor<'tcx> for NativeCalls<'_, 'tcx> {
 /// The one form-changed native call strictly inside `argument`, when the
 /// argument is not itself that call. Several such calls, or none, answer
 /// `None`: the first is ambiguous and the second has nothing to adapt.
-fn nested_native_source(
+/// Any form-changed native call strictly inside `argument`, used only to
+/// report that a containing site had something to adapt when
+/// [`nested_native_source`] refused to choose between several.
+fn any_nested_native_source(
     originals: &NativeCalls<'_, '_>,
     table: &DecisionTable,
     argument: Span,
 ) -> Option<NativeCall> {
+    originals.calls.iter().find_map(|(span, calls)| {
+        (*span != argument && argument.contains(*span))
+            .then(|| {
+                calls
+                    .iter()
+                    .find(|call| table.return_interfaces.functions[&call.callee].form != Form::Raw)
+                    .copied()
+            })
+            .flatten()
+    })
+}
+
+fn nested_native_source(
+    originals: &NativeCalls<'_, '_>,
+    table: &DecisionTable,
+    argument: Span,
+) -> Option<(NativeCall, Span)> {
     let mut found = None;
     for (span, calls) in &originals.calls {
         if *span == argument || !argument.contains(*span) {
@@ -218,7 +242,7 @@ fn nested_native_source(
             if found.is_some() {
                 return None;
             }
-            found = Some(*call);
+            found = Some((*call, *span));
         }
     }
     found
@@ -271,30 +295,55 @@ pub(crate) fn plan(
         };
         originals.visit_expr(tcx.hir_body_owned_by(caller).value);
         for site in sites {
-            let Some(calls) = originals.calls.get(&site.source_span) else {
-                if let Some(nested) = nested_native_source(&originals, table, site.source_span) {
-                    out.unavailable.insert(
-                        site.key.clone(),
-                        OutboundExpressionUnavailable {
-                            key: site.key.clone(),
-                            caller,
-                            argument_hir: nested.hir,
-                            argument_span: site.source_span,
-                            call_span: site.call_span,
-                            source_callee: nested.callee,
-                            source_interface: table.return_interfaces.functions[&nested.callee]
-                                .clone(),
-                            sink_callee: site.callee_local.map_or_else(
-                                || BridgeCalleeId::Foreign(site.key.callee.path.clone()),
-                                BridgeCalleeId::Local,
-                            ),
-                            target: site.target.clone(),
-                            reason: OutboundExpressionFailure::NestedNativeCarrierUnbuilt,
-                            retention: None,
-                        },
-                    );
-                }
-                continue;
+            // The argument either IS a form-changed native call, or CONTAINS
+            // exactly one. In the nested case the edit lands on the inner call
+            // and restores its own original raw type, so the outer cast,
+            // projection or arithmetic applies to exactly what it applied to
+            // before and the whole argument still type-checks unchanged.
+            let owned;
+            let (calls, edit_span, enclosing_argument_span) = match originals
+                .calls
+                .get(&site.source_span)
+            {
+                Some(calls) => (calls.as_slice(), site.source_span, None),
+                None => match nested_native_source(&originals, table, site.source_span) {
+                    Some((call, span)) => {
+                        owned = vec![call];
+                        (owned.as_slice(), span, Some(site.source_span))
+                    }
+                    // Nothing to adapt, or several candidates and no
+                    // principled way to pick one. The second case is a
+                    // required site and must be counted as held rather
+                    // than passed over.
+                    None => {
+                        if let Some(nested) =
+                            any_nested_native_source(&originals, table, site.source_span)
+                        {
+                            out.unavailable.insert(
+                                site.key.clone(),
+                                OutboundExpressionUnavailable {
+                                    key: site.key.clone(),
+                                    caller,
+                                    argument_hir: nested.hir,
+                                    argument_span: site.source_span,
+                                    call_span: site.call_span,
+                                    source_callee: nested.callee,
+                                    source_interface: table.return_interfaces.functions
+                                        [&nested.callee]
+                                        .clone(),
+                                    sink_callee: site.callee_local.map_or_else(
+                                        || BridgeCalleeId::Foreign(site.key.callee.path.clone()),
+                                        BridgeCalleeId::Local,
+                                    ),
+                                    target: site.target.clone(),
+                                    reason: OutboundExpressionFailure::NestedNativeCarrierUnbuilt,
+                                    retention: None,
+                                },
+                            );
+                        }
+                        continue;
+                    }
+                },
             };
             let source = calls[0];
             let interface = &table.return_interfaces.functions[&source.callee];
@@ -318,7 +367,7 @@ pub(crate) fn plan(
                 key: site.key.clone(),
                 caller,
                 argument_hir: source.hir,
-                argument_span: site.source_span,
+                argument_span: edit_span,
                 call_span: site.call_span,
                 source_callee: source.callee,
                 source_interface: interface.clone(),
@@ -339,7 +388,7 @@ pub(crate) fn plan(
                 {
                     return Err(fail(OutboundExpressionFailure::NativeLifetimeDrift));
                 }
-                let original_expression = tcx.sess.source_map().span_to_snippet(site.source_span)
+                let original_expression = tcx.sess.source_map().span_to_snippet(edit_span)
                     .map_err(|_| fail(OutboundExpressionFailure::OriginalExpressionUnavailable))?;
                 let expression = tcx.hir_node(source.hir).expect_expr();
                 let source_type = raw_boundary::raw_target_type(tcx, tcx.typeck(caller).expr_ty(expression));
@@ -352,7 +401,7 @@ pub(crate) fn plan(
                 if site.target.pointee != interface.pointee && !site.target.is_void_pointee() {
                     return Err(fail(OutboundExpressionFailure::TargetPointeeMismatch));
                 }
-                if call_carrier_owns(table, &[site.source_span, site.call_span]) {
+                if call_carrier_owns(table, &[site.source_span, edit_span, site.call_span]) {
                     return Err(fail(OutboundExpressionFailure::CallCarrierCompositionUnbuilt));
                 }
                 let Some(callee) = site.callee_local else {
@@ -385,10 +434,18 @@ pub(crate) fn plan(
                 {
                     return Err((OutboundExpressionFailure::ChildPermission(reason), Some(evidence.clone())));
                 }
-                let base = raw_boundary::template_for(&source_form, &site.target, None, negative_write.is_some())
+                // A nested carrier restores the inner call's OWN raw type, so
+                // the outer expression is untouched; only the bare case
+                // converts to the sink's parameter type.
+                let carrier_target = if enclosing_argument_span.is_some() {
+                    source_type.as_ref().ok_or_else(|| fail(OutboundExpressionFailure::SourcePointeeMismatch))?
+                } else {
+                    &site.target
+                };
+                let base = raw_boundary::template_for(&source_form, carrier_target, None, negative_write.is_some())
                     .map_err(|reason| (OutboundExpressionFailure::Template(reason), Some(evidence.clone())))?;
                 let (template, child_binding_required) = if sink_may_return_child {
-                    let selected = raw_boundary::returned_child_template(&source_form, &site.target, None, base)
+                    let selected = raw_boundary::returned_child_template(&source_form, carrier_target, None, base)
                         .map_err(|reason| (OutboundExpressionFailure::Template(reason), Some(evidence.clone())))?;
                     (selected.template, selected.mutable_binding_required)
                 } else {
@@ -403,7 +460,7 @@ pub(crate) fn plan(
                     RetentionVerdict::Unknown { .. } => (BridgeRetentionTier::T2, Some(RAW_BOUNDARY_T2_WAIVER_ID)),
                     RetentionVerdict::Retains { .. } => return Err((OutboundExpressionFailure::PositiveRetention, Some(evidence))),
                 };
-                let spec = GlueSpec::raw_boundary_target(template, &site.target, false, true);
+                let spec = GlueSpec::raw_boundary_target(template, carrier_target, false, true);
                 let temporary = format!("__crat_outbound_return_{}_{}", caller.local_def_index.as_u32(), source.hir.local_id.as_u32());
                 let view = spec.render(&temporary).ok_or_else(|| (
                     OutboundExpressionFailure::Template(RawBoundaryBlockReason::TemplateUnavailable), Some(evidence.clone())))?;
@@ -413,9 +470,12 @@ pub(crate) fn plan(
                 };
                 Ok(OutboundExpressionPlan {
                     key: site.key.clone(), caller, argument_hir: source.hir,
-                    argument_span: site.source_span, call_span: site.call_span,
+                    argument_span: edit_span, enclosing_argument_span, call_span: site.call_span,
                     source_callee: source.callee, source_interface: interface.clone(), sink_callee: sink_callee.clone(),
-                    target: site.target.clone(), retention: evidence, tier, waiver_id, negative_write,
+                    // For a nested carrier this is the inner call's OWN raw
+                    // type: the block must reproduce exactly what the outer
+                    // expression consumed before, not the sink's parameter.
+                    target: carrier_target.clone(), retention: evidence, tier, waiver_id, negative_write,
                     template, spec, original_expression, temporary, mutable_temporary, view,
                 })
             };

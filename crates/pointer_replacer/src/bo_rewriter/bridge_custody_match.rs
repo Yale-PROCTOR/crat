@@ -58,6 +58,20 @@ pub(crate) enum PendingSourceShape {
         temporary: String,
         template: String,
     },
+    /// The same carrier placed at a call the argument CONTAINS rather than IS.
+    /// Its own arm, so the shape above keeps its exact rule: there the edit
+    /// interval and the argument are the same span, here the edit is strictly
+    /// inside the argument and the enclosing text must survive verbatim.
+    NativeReturnExpressionNested {
+        argument_span: ByteSpan,
+        source_call_span: ByteSpan,
+        source_owner: u32,
+        source_function: String,
+        source_form: String,
+        source_type: String,
+        temporary: String,
+        template: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1315,6 +1329,7 @@ fn pending_original_source(
     if matches!(
         &metadata.shape,
         PendingSourceShape::NativeReturnExpression { .. }
+            | PendingSourceShape::NativeReturnExpressionNested { .. }
     ) {
         return Err("pending-native-expression-carrier-unbuilt".into());
     }
@@ -1344,7 +1359,8 @@ fn pending_original_source(
     let shape_matches = match &metadata.shape {
         PendingSourceShape::WholeSubject => path(expression).as_deref() == Some(name),
         PendingSourceShape::ProjectedReferent => projected_referent_uses(expression, name),
-        PendingSourceShape::NativeReturnExpression { .. } => {
+        PendingSourceShape::NativeReturnExpression { .. }
+        | PendingSourceShape::NativeReturnExpressionNested { .. } => {
             return Err("pending-native-expression-carrier-unbuilt".into());
         }
     };
@@ -1378,6 +1394,7 @@ fn pending_selected_argument(
         matches!(
             &source.shape,
             PendingSourceShape::NativeReturnExpression { .. }
+                | PendingSourceShape::NativeReturnExpressionNested { .. }
         )
     }) {
         return pending_native_expression(input, expected, original, call, index);
@@ -1569,6 +1586,28 @@ fn pending_native_slice_argument(
     ))
 }
 
+/// The one rule that separates the two native-expression carriers.
+///
+/// The bare carrier edits the argument itself, so its edit interval must BE the
+/// argument. The nested carrier edits a call the argument contains, so its
+/// interval must sit **strictly** inside: equality would mean it had claimed
+/// the whole argument, and anything outside means the receipt does not describe
+/// the edit that was made. Neither arm may accept what the other describes --
+/// that is what keeps custody catching carrier drift after the shape was added.
+pub(crate) fn native_expression_interval_ok(
+    argument_span: &ByteSpan,
+    source_call_span: &ByteSpan,
+    nested: bool,
+) -> bool {
+    if nested {
+        argument_span.lo <= source_call_span.lo
+            && source_call_span.hi <= argument_span.hi
+            && source_call_span != argument_span
+    } else {
+        source_call_span == argument_span
+    }
+}
+
 fn pending_native_expression(
     input: &BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -1580,7 +1619,7 @@ fn pending_native_expression(
         .pending_source
         .as_ref()
         .ok_or("pending-native-expression-source-missing")?;
-    let PendingSourceShape::NativeReturnExpression {
+    let (
         argument_span,
         source_call_span,
         source_function,
@@ -1588,15 +1627,57 @@ fn pending_native_expression(
         source_type,
         temporary,
         template,
-        ..
-    } = &metadata.shape
-    else {
-        return Err("pending-native-expression-source-kind".into());
+        nested,
+    ) = match &metadata.shape {
+        PendingSourceShape::NativeReturnExpression {
+            argument_span,
+            source_call_span,
+            source_function,
+            source_form,
+            source_type,
+            temporary,
+            template,
+            ..
+        } => (
+            argument_span,
+            source_call_span,
+            source_function,
+            source_form,
+            source_type,
+            temporary,
+            template,
+            false,
+        ),
+        PendingSourceShape::NativeReturnExpressionNested {
+            argument_span,
+            source_call_span,
+            source_function,
+            source_form,
+            source_type,
+            temporary,
+            template,
+            ..
+        } => (
+            argument_span,
+            source_call_span,
+            source_function,
+            source_form,
+            source_type,
+            temporary,
+            template,
+            true,
+        ),
+        _ => return Err("pending-native-expression-source-kind".into()),
     };
+    // The two shapes differ in exactly one rule and share every other. The
+    // bare carrier requires the edit interval to BE the argument; the nested
+    // one requires it to sit strictly inside, which is what keeps the
+    // enclosing cast, projection or arithmetic in the caller's hands.
+    let interval_ok = native_expression_interval_ok(argument_span, source_call_span, nested);
     if metadata.binding.is_some()
         || metadata.binding_span.is_some()
         || *argument_span != original.arguments[index].span
-        || source_call_span != argument_span
+        || !interval_ok
         || !temporary.starts_with("__crat_outbound_return_")
     {
         return Err("pending-native-expression-source-identity-mismatch".into());

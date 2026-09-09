@@ -68,7 +68,7 @@ fn shape_outcome(input: &str, label: &str) -> ShapeOutcome {
         let (_, decision) = table
             .entries
             .iter()
-            .find(|(subject, _)| subject.label == "target::p")
+            .find(|(subject, _)| subject.label.ends_with("::p"))
             .expect("actual native source parameter");
         let source_form = super::decision::seam::form_of(decision);
         let emission = super::emit_files(
@@ -143,113 +143,79 @@ fn outbound_shape_bare_call_result_is_bridged() {
     );
 }
 
-/// The contract every CONTAINING shape must satisfy today: the site is
-/// dispositioned, not passed over.
+/// The contract every CONTAINING shape satisfies: the changed call is bridged
+/// where it stands, and the cast, projection or arithmetic wrapped around it is
+/// left exactly as written.
 ///
-/// A cast, a projection or arithmetic wrapped around the changed call is a
-/// required expression-level site (design §10.3), but its carrier is not built:
-/// the planner keys its native-call lookup on the argument span, and a
-/// containing argument is not itself a call. What must never happen is the
-/// third outcome — no plan, no hold, and an unadapted boundary left in an
-/// emitted tree that no longer compiles. The family withdraws instead, naming
-/// the shape in its receipt, and the emitted tree is the untouched original.
-///
-/// The premise that this shape really does have something to adapt is carried
-/// by two facts, not asserted twice: `outbound_shape_bare_call_result_is_bridged`
-/// runs the identical skeleton with a bare call argument and settles a mutable
-/// slice, and the withdrawal receipt below exists at all — a family was formed
-/// for this site and then dropped, naming the shape.
-///
-/// When the nested carrier is built (recorded as a sized deferral, since it
-/// needs a custody-contract extension), these two witnesses become the
-/// bridged-and-safe assertions their names promise; the fail-closed contract
-/// they pin now is what makes that change measurable.
-fn assert_containing_shape_holds_and_leaves_the_input_intact(
-    outcome: &ShapeOutcome,
-    input: &str,
-    label: &str,
-) {
+/// The block restores the inner call's OWN raw type rather than converting to
+/// the sink's parameter type, which is what lets the outer expression apply to
+/// exactly what it applied to before. A required site therefore never has the
+/// third outcome -- no plan, no hold, and an unadapted boundary in a tree that
+/// no longer compiles.
+fn assert_containing_shape_is_bridged(outcome: &ShapeOutcome, original: &str, label: &str) {
     assert_eq!(
         outcome.source_form,
-        Form::Raw,
-        "{label}: the unsatisfiable site must withdraw its family, not promote"
+        Form::Slice { mutable: true },
+        "{label}: the native source keeps its settled form"
     );
-    assert_eq!(outcome.plans, 0, "{label}: no plan is manufactured");
-    let nested = outcome
-        .withdrawals
-        .iter()
-        .filter(|row| row.contains("NestedNativeCarrierUnbuilt"))
-        .count();
-    assert_eq!(
-        nested, 1,
-        "{label}: exactly one typed withdrawal names the unbuilt nested \
-         carrier: {:#?}",
+    assert_eq!(outcome.plans, 1, "{label}: one nested outbound plan");
+    assert!(
+        outcome.unavailable.is_empty(),
+        "{label}: nothing is held: {:?}",
+        outcome.unavailable
+    );
+    assert!(
+        outcome.withdrawals.is_empty(),
+        "{label}: no family withdraws: {:#?}",
         outcome.withdrawals
     );
     assert!(
-        super::verify::type_checks_str(&outcome.emitted),
-        "{label}: a held site must leave a compiling tree:\n{}",
+        outcome.emitted.contains(original),
+        "{label}: the enclosing expression survives verbatim:\n{}",
         outcome.emitted
     );
-    assert_eq!(
-        outcome.emitted.replace(char::is_whitespace, ""),
-        input.replace(char::is_whitespace, ""),
-        "{label}: the withdrawn family leaves the original program"
+    assert!(
+        super::verify::type_checks_str(&outcome.emitted),
+        "{label}: emitted output type/borrow-checks:\n{}",
+        outcome.emitted
     );
 }
 
 /// A cast WRAPPING the changed call.
 #[test]
-fn outbound_shape_cast_over_a_call_result_holds_with_its_own_reason() {
+fn outbound_shape_cast_over_a_call_result_is_bridged() {
     let input = fixture("target(values.as_mut_ptr()) as *const i32");
     let outcome = shape_outcome(&input, "cast over call result");
     println!(
-        "OUTBOUND-SHAPE[cast over call result] form={:?} plans={} unavailable={:?} withdrawals={:#?}\n{}",
-        outcome.source_form,
-        outcome.plans,
-        outcome.unavailable,
-        outcome.withdrawals,
-        outcome.emitted
+        "OUTBOUND-SHAPE[cast over call result] form={:?} plans={} unavailable={:?}\n{}",
+        outcome.source_form, outcome.plans, outcome.unavailable, outcome.emitted
     );
-    assert_containing_shape_holds_and_leaves_the_input_intact(
-        &outcome,
-        &input,
-        "cast over call result",
+    assert_containing_shape_is_bridged(&outcome, "} as *const i32)", "cast over call result");
+    assert!(
+        outcome.emitted.contains(".as_mut_ptr()) as *mut i32"),
+        "the block reproduces the inner call's own raw type:\n{}",
+        outcome.emitted
     );
 }
 
 /// Pointer arithmetic APPLIED TO the changed call, the other containing shape.
 #[test]
-fn outbound_shape_offset_over_a_call_result_holds_with_its_own_reason() {
+fn outbound_shape_offset_over_a_call_result_is_bridged() {
     let input = fixture("target(values.as_mut_ptr()).offset(1)");
     let outcome = shape_outcome(&input, "offset over call result");
     println!(
-        "OUTBOUND-SHAPE[offset over call result] form={:?} plans={} unavailable={:?} withdrawals={:#?}\n{}",
-        outcome.source_form,
-        outcome.plans,
-        outcome.unavailable,
-        outcome.withdrawals,
-        outcome.emitted
+        "OUTBOUND-SHAPE[offset over call result] form={:?} plans={} unavailable={:?}\n{}",
+        outcome.source_form, outcome.plans, outcome.unavailable, outcome.emitted
     );
-    assert_containing_shape_holds_and_leaves_the_input_intact(
-        &outcome,
-        &input,
-        "offset over call result",
-    );
+    assert_containing_shape_is_bridged(&outcome, "}.offset(1))", "offset over call result");
 }
 
-#[test]
-fn tmp_probe_tiers() {
-    for (label, body) in [
-        ("offset-deref", "*q.offset(1)"),
-        ("cast-deref", "*(q as *const i64) as i32"),
-        ("read-and-store", "SINK = q; q.read()"),
-    ] {
-        let input = fixture_with_sink(body, "target(values.as_mut_ptr())");
-        let outcome = shape_outcome(&input, label);
-        println!(
-            "TMPTIER[{label}] form={:?} plans={} unavailable={:?} tiers={:?}",
-            outcome.source_form, outcome.plans, outcome.unavailable, outcome.tiers
-        );
-    }
-}
+// Two changed calls inside one argument are held rather than resolved by
+// traversal order (`nested_native_source` refuses to choose). That branch is
+// deliberately UNWITNESSED here, and the two authoring attempts are recorded
+// rather than a third contrived one: one root called twice makes neither call
+// promote, so the fixture witnesses nothing; two roots with two callees
+// promoted only one of the two calls, so the finder correctly saw a single
+// candidate and planned it. The branch is fail-closed -- it holds -- so the
+// cost of leaving it unwitnessed is bounded, and it is recorded in the lane's
+// working ledger as an open witness rather than a satisfied one.
