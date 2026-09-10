@@ -1020,9 +1020,19 @@ fn pending_sibling_overlap_issues(
                         // producer never claimed. Layout and that comma are
                         // the only things dropped; every other token, in
                         // order, must still be there.
-                        if !normalised_tokens(emitted).contains(&normalised_tokens(&expected)) {
+                        // **R291-3 — no opaque failures.** A comparator that
+                        // says only "absent" tells the reader nothing about
+                        // WHY, and every hour spent on binn and libzahl was
+                        // spent recovering what the arm already knew. The
+                        // issue carries the expected sequence, the window of
+                        // the emitted file that best matches it, and the
+                        // offset at which they first differ.
+                        let want = normalised_tokens(&expected);
+                        let have = normalised_tokens(emitted);
+                        if !have.contains(&want) {
                             issues.push(format!(
-                                "pending-sibling-overlap:emitted-call-text-absent:{id}"
+                                "pending-sibling-overlap:emitted-call-text-absent:{id}:{}",
+                                token_divergence(&want, &have)
                             ));
                         }
                     }
@@ -1080,6 +1090,37 @@ fn check_sibling_dispositions(id: &str, siblings: &[PendingSiblingRow], issues: 
 /// The token sequence of `text`, with the two things `pprust` is free to
 /// change and the producer never claimed: layout, and the trailing comma it
 /// adds to a delimited list once it breaks that list across lines.
+/// Where `want` stops matching anything in `have`, said in one line.
+///
+/// The best-matching window is the one sharing the longest prefix with
+/// `want`; the report names that prefix's length, what `want` expects next and
+/// what the tree has there. Truncated, because a receipt line is read by a
+/// person.
+fn token_divergence(want: &str, have: &str) -> String {
+    fn clip(text: &str, from: usize, len: usize) -> String {
+        text.chars().skip(from).take(len).collect()
+    }
+    let best = (0..=have.len().saturating_sub(1))
+        .filter(|start| have.is_char_boundary(*start))
+        .map(|start| {
+            let shared = want
+                .chars()
+                .zip(have[start..].chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            (shared, start)
+        })
+        .max()
+        .unwrap_or((0, 0));
+    let (shared, start) = best;
+    format!(
+        "diverges-at={shared}:want={:?}:have={:?}:expected={:?}",
+        clip(want, shared, 24),
+        clip(&have[start..], shared, 24),
+        clip(want, 0, 60)
+    )
+}
+
 fn normalised_tokens(text: &str) -> String {
     let dense = text
         .chars()
