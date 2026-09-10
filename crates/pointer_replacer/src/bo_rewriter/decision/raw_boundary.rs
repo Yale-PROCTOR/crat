@@ -2832,9 +2832,7 @@ impl RawBoundaryDispositionIndex {
                         })?;
                         template = selected.template;
                         mutable_binding_required = selected.mutable_binding_required;
-                    } else if returned_child.is_none()
-                        && site.target.mutability == RawMutability::Const
-                    {
+                    } else if returned_child.is_none() {
                         // Addendum 259. Without a contract row there is no
                         // returned-child evidence, and absence of evidence was
                         // being read as evidence of absence: the block above
@@ -2850,7 +2848,9 @@ impl RawBoundaryDispositionIndex {
                         // every shared subject holds on "no evidence"; with it,
                         // an unused or read-only child stays admitted.
                         let child_access = retention.type_backed_child_access(node.0, &site.key);
-                        if is_mutable_safe_source(view) {
+                        if site.target.mutability == RawMutability::Const
+                            && is_mutable_safe_source(view)
+                        {
                             // (1) A writable derivation satisfies the const
                             // parameter type and keeps write permission, so the
                             // mutable case costs no hold at all. The shared
@@ -2883,6 +2883,19 @@ impl RawBoundaryDispositionIndex {
                             && contract.is_err()
                             && returned_child_permission(view, child_access).is_err()
                         {
+                            // **R283-3 widened this arm to `*mut` positions.**
+                            // It used to run only at `*const` targets, so a
+                            // shared subject reaching a contract-less callee's
+                            // `*mut` parameter was bridged
+                            // `from_ref(x).cast_mut()` with no descendant check
+                            // at all — the R277-1 gap, 173 sites at J''. The
+                            // negative-write evidence that admitted those is
+                            // Foster immutability, which describes what the
+                            // CALLEE writes through the pointee; it is not a
+                            // statement about a child the callee hands back.
+                            // The K18' type-backed walk is the same evidence
+                            // here as at `*const`, so it is asked the same
+                            // question.
                             // (2) A shared subject has no mutable view to
                             // upgrade to. Negative-write evidence does not
                             // discharge this: it says the callee does not write

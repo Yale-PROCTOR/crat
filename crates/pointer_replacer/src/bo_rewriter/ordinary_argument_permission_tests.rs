@@ -311,3 +311,91 @@ fn ordinary_argument_shared_subject_with_a_read_only_child_still_emits() {
         outcome.emitted
     );
 }
+
+// ---------------------------------------------------------------------------
+// R283-3 — the descendant walk at `*mut` positions of contract-less callees.
+//
+// Until R283-3 the K18' type-backed walk was asked only at `*const` targets,
+// so a shared subject reaching a contract-less callee's `*mut` parameter was
+// bridged `core::ptr::from_ref(x).cast_mut()` with no descendant check at all.
+// 173 J'' sites sat in that arm, admitted by Foster immutability — which
+// describes what the CALLEE writes through the pointee and says nothing about
+// a child it hands back.
+//
+// **Measured before building: the gap is not reachable.** Ten shapes were
+// constructed to write through a returned child while keeping the subject
+// shared — the write in the caller, in a grand-caller, through a second local
+// callee, through an unmodeled foreign callee, through a cast child, through
+// an out-parameter, through an intervening copy, and with the subject declared
+// `*const` and cast to `*mut` at the call. In every one the subject either
+// settles `&mut` (Foster's whole-program mutability follows the descendant) or
+// is refused outright. So the widened walk is defence in depth against a shape
+// this corpus does not contain, not a repair of a realized defect; its
+// population is pre-registered as **0 over the 173** and measured at the next
+// corpus custody run.
+//
+// The two witnesses below are the reachable halves of the rule.
+
+/// A ReadOnly child KEEPS the bridge at a `*mut` position. This is the case
+/// R283-3 says must survive, and it is what makes the widened walk a
+/// permission question rather than a blanket refusal of `*mut` positions.
+#[test]
+fn oap_r283_readonly_child_keeps_the_bridge_at_a_mut_position() {
+    const INPUT: &str = r#"
+    #![allow(dead_code, unused_unsafe, unused_mut)]
+    unsafe fn next(chunk: *mut u8) -> *mut u8 { chunk.offset(1) }
+    pub unsafe fn find(p: *const u8) -> u8 {
+        let head = *p;
+        let child = next(p as *mut u8);
+        head ^ *child
+    }
+"#;
+    let got = super::emit_tests::decisions_of(INPUT)
+        .into_iter()
+        .map(|(name, _, reason)| (name, reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        got.get("p").map(String::as_str),
+        Some("<emitted>"),
+        "a child the caller only reads leaves the bridge admitted: {got:#?}"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(INPUT) else {
+        panic!("the read-only child fixture must emit")
+    };
+    assert!(
+        source.contains("core::ptr::from_ref(p).cast_mut()"),
+        "the shared subject reaches the `*mut` position through its own view:\n{source}"
+    );
+    assert!(
+        super::verify::type_checks_str(&source),
+        "emitted output type/borrow-checks:\n{source}"
+    );
+}
+
+/// The twin that writes through the child is refused. Recorded as observed:
+/// it is held at `flows-into-raw-param`, an EARLIER gate than the widened
+/// walk, which is exactly why the walk's own population is zero here. The
+/// property under test is the refusal, not which gate delivers it.
+#[test]
+fn oap_r283_written_child_is_refused_at_a_mut_position() {
+    const INPUT: &str = r#"
+    #![allow(dead_code, unused_unsafe, unused_mut)]
+    unsafe fn next(chunk: *mut u8) -> *mut u8 { chunk.offset(1) }
+    pub unsafe fn find(p: *const u8) -> u8 {
+        let head = *p;
+        let child = next(p as *mut u8);
+        *child = 9;
+        head
+    }
+"#;
+    let got = super::emit_tests::decisions_of(INPUT)
+        .into_iter()
+        .map(|(name, _, reason)| (name, reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_ne!(
+        got.get("p").map(String::as_str),
+        Some("<emitted>"),
+        "a child the caller writes through may not be reached from a shared \
+         view: {got:#?}"
+    );
+}
