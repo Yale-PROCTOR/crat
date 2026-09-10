@@ -56,6 +56,7 @@ pub(crate) mod seam;
 pub(crate) mod sibling_overlap;
 pub(crate) mod slice_use;
 pub(crate) mod surface_argument;
+pub(crate) mod thin_extent;
 pub(crate) mod universe;
 pub(crate) mod void_pointee;
 
@@ -534,6 +535,11 @@ pub(crate) enum DegradeReason {
     /// boundary is permanent and by type, not only by argument position or by
     /// the sealed identity list.
     IoDomainType,
+    /// R272-1 / R280-1. A thin reference carries provenance for one element,
+    /// and this subject reaches a foreign position whose contract consumes more
+    /// than one — read to a NUL, to a stated count, or to a source-determined
+    /// length. The extent column of the pinned contract table decides.
+    ThinExtent,
     /// R271-1. The slot's pointee is `c_void`, a one-byte type carrying no
     /// extent, so no reference form of it can carry the provenance its callee
     /// accesses through. Held at any depth.
@@ -770,6 +776,7 @@ impl DegradeReason {
             DegradeReason::PtrComparison => "ptr-comparison",
             DegradeReason::IoDomainType => "held:io-domain:type",
             DegradeReason::VoidPointee => "held:void-pointee",
+            DegradeReason::ThinExtent => "held:thin-extent",
             DegradeReason::NoSlot => "no-slot",
             DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
             DegradeReason::ReturnNotAdapted => "return-not-adapted",
@@ -1008,6 +1015,7 @@ impl DecisionTable {
 pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
     pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
     pub(crate) input_interfaces: &'a interface::InputInterfaces,
@@ -1533,6 +1541,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         tcx,
         io_domain,
         void_pointee,
+        thin_extent,
         declaration_pointees,
         declaration_patterns,
         input_interfaces: _,
@@ -1883,6 +1892,21 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 slice: false,
                 uses: uses.rewrites,
             };
+        }
+        // **R272-1 / R280-1, route (A).** A thin reference is a one-element
+        // claim, and this subject is handed to a foreign position whose
+        // contract consumes more than one element — to the NUL, to a stated
+        // count, or to whatever the source turns out to be. Miri confirms the
+        // `strlen` shape is UB under Stacked Borrows.
+        //
+        // Placed HERE, at the thin-`Ref` return, rather than beside
+        // `held:void-pointee` higher up: every form that carries its own
+        // extent — slice, Option of slice, `Box` — has already returned, and
+        // those are sound and stay untouched. Like the void hold, it therefore
+        // also sits below the owning arm, which is the placement R271-1's two
+        // Box controls established.
+        if thin_extent.contains(&(subject.fn_did, subject.hir_id)) {
+            return degrade(subject, decl_site, DegradeReason::ThinExtent);
         }
         return Decision::Ref {
             mutable: subject.mutable,

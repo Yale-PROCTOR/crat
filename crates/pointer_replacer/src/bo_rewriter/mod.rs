@@ -192,6 +192,8 @@ mod sibling_overlap_tests;
 #[cfg(test)]
 mod slice_use_inventory_tests;
 #[cfg(test)]
+mod thin_extent_tests;
+#[cfg(test)]
 mod void_pointee_tests;
 #[cfg(test)]
 mod zero_syntax_custody_tests;
@@ -6297,6 +6299,7 @@ fn finish_decide<'tcx>(
     let input_interfaces = decision::interface::collect(tcx, &subjects, &program.functions);
     let mut facts = decision::emitability::collect(tcx, &program.functions);
     let original_body_adapters = facts.body_adapters.clone();
+    let thin_extent_subjects = decision::thin_extent::collect(&facts);
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
     // here in the decision phase and nowhere later — E1's rule that no phase
     // after this one asks an analysis a question.
@@ -6581,6 +6584,7 @@ fn finish_decide<'tcx>(
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,
                     void_pointee: &void_pointee_subjects,
+                    thin_extent: &thin_extent_subjects,
                     declaration_pointees: &declaration_pointees,
                     declaration_patterns: &declaration_patterns,
                     input_interfaces: &input_interfaces,
