@@ -35,15 +35,34 @@ enum ChildCase {
 }
 
 fn input(case: ChildCase) -> String {
+    // **R285-3 / R217-2 — the parent read is offset, and that is the whole
+    // migration.** `strchr` reads to the NUL, so route (A)'s
+    // `held:thin-extent` holds a THIN source at this position, correctly. The
+    // retained-alias question these cases ask is about the returned CHILD's
+    // tier, not about the parent's width, and every returned-parent row in the
+    // pinned table is many-element — so the fixture gives the parent an
+    // evidence-backed extent and settles a shared SLICE instead of a thin
+    // reference. `shared()` already admitted `Slice { mutable: false }`; the
+    // child relation, the T1/T2 split and the write twin's model-Raw
+    // protection are untouched.
+    //
+    // The extent witness is a SEPARATE read, deliberately: the parent's own
+    // direct load stays exactly one, which is what the consumed-load assertion
+    // below counts, and would have gone to zero had the offset replaced it.
     let body = match case {
-        ChildCase::Discarded => "strchr(p, 65); let parent_read = *p; parent_read",
+        ChildCase::Discarded => {
+            "strchr(p, 65); let extent_witness = *p.offset(1);\n\
+            let parent_read = *p; parent_read"
+        }
         ChildCase::CopiedRead => {
             "let child = strchr(p, 65); let copied = child;\n\
+            let extent_witness = *p.offset(1);\n\
             let parent_read = *p;\n\
             if copied.is_null() { parent_read } else { parent_read ^ *copied }"
         }
         ChildCase::CopiedWrite => {
             "let child = strchr(p, 65); let copied = child;\n\
+            let extent_witness = *p.offset(1);\n\
             let parent_read = *p;\n\
             if copied.is_null() { parent_read } else { *copied = 66; parent_read }"
         }

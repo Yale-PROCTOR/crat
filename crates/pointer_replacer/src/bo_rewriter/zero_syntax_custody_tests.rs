@@ -1,5 +1,30 @@
-//! Logical receipt custody for real returned-parent zero-syntax seams.
+//! Logical receipt custody for real zero-syntax seams.
 //! Independent control sites are constructed receipt inputs, not model facts.
+//!
+//! **R285-3 / R217-2 — why the source moved from `strchr` to `utime`.**
+//!
+//! These fixtures reached their zero-syntax carrier through a RETURNED-PARENT
+//! source: `strchr(p, 65)` with `p: &i8`. Route (A)'s `held:thin-extent` now
+//! holds exactly that shape, and correctly — `strchr` reads to the NUL while
+//! `&i8` grants one byte — so `target::p` degrades before any seam is planned.
+//!
+//! The shape is not recoverable by editing the fixture. Every returned-parent
+//! row in the pinned contract table carries a many-element extent
+//! (`NulTerminated`, `ByteCount`, `UnboundedWrite`); there is no
+//! returned-parent position that fits one element, and a fat source cannot
+//! produce a zero-syntax carrier because a slice needs `.as_ptr()`. Returned
+//! parent and zero syntax are now mutually exclusive.
+//!
+//! So the route changed and the property did not. The source is a one-element
+//! position (`utime` argument 1, `Read`/`OneElement`), whose `&Times` still
+//! coerces with no syntax, and every custody assertion below — the
+//! `ZeroSyntaxReady` state, the logical atom dependency without a text edit,
+//! the atom-fate split against an independent same-class site, and the
+//! explicit-to-zero replacement — is unchanged and still driven by a real
+//! model fact. What is lost is coverage of the returned-parent ROUTE to a
+//! zero-syntax carrier, which route (A) removed on purpose;
+//! `thin_extent_holds_the_returned_parent_zero_syntax_source` below keeps that
+//! removal witnessed rather than silent.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,20 +36,19 @@ use super::{
 
 fn fixture(readonly: bool) -> (Plan, SeamEdit, FileKey, usize, usize) {
     let body = if readonly {
-        "let child = strchr(p, 65); let copied = child;\n\
-         let parent_read = *p;\n\
-         if copied.is_null() { parent_read } else { parent_read ^ *copied }"
+        "let code = utime(b\"f\\0\" as *const u8 as *const i8, p);\n\
+         if code == 0 { (*p).actime } else { (*p).modtime }"
     } else {
-        "strchr(p, 65); let parent_read = *p; parent_read"
+        "utime(b\"f\\0\" as *const u8 as *const i8, p); (*p).actime"
     };
-    // Exact accepted discarded/readonly inputs from retalias_semantics_tests.
     let source = format!(
         "#![allow(dead_code, unused_variables, unused_unsafe)]\n\
-         extern \"C\" {{ fn strchr(s: *const i8, c: i32) -> *mut i8; }}\n\
-         unsafe fn target(p: *const i8) -> i8 {{ {body} }}\n\
-         pub unsafe fn entry() -> i8 {{\n\
-             let mut storage: [i8; 2] = [65, 0];\n\
-             target(storage.as_mut_ptr() as *const i8)\n\
+         #[repr(C)] pub struct Times {{ pub actime: i64, pub modtime: i64 }}\n\
+         extern \"C\" {{ fn utime(path: *const i8, times: *const Times) -> i32; }}\n\
+         unsafe fn target(p: *const Times) -> i64 {{ {body} }}\n\
+         pub unsafe fn entry() -> i64 {{\n\
+             let storage = Times {{ actime: 65, modtime: 0 }};\n\
+             target(&storage)\n\
          }}\n"
     );
     let (plan, seam, file, lo, hi, baseline, reverted_source) = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
@@ -50,9 +74,9 @@ fn fixture(readonly: bool) -> (Plan, SeamEdit, FileKey, usize, usize) {
         assert!(emission.plan.class_finalization.classes[&owner].is_ready());
         let seams = emission.plan.terminal_call_plans.seam_edits.iter().filter(|seam| {
             seam.source_node == Some((subject.fn_did, subject.hir_id))
-                && seam.raw_outbound.as_ref().is_some_and(|endpoint| endpoint.returned_child.is_some())
+                && seam.zero_syntax
         }).collect::<Vec<_>>();
-        let [seam] = seams.as_slice() else { panic!("one real returned-parent seam required: {seams:?}") };
+        let [seam] = seams.as_slice() else { panic!("one real zero-syntax seam required: {seams:?}") };
         let seam = (**seam).clone();
         assert!(seam.zero_syntax, "fixture must exercise the actual zero-syntax carrier");
         assert!(!seam.atom_ids.is_empty(), "actual source atom dependency required");
@@ -157,12 +181,12 @@ fn check_real_zero(readonly: bool) {
 }
 
 #[test]
-fn zero_syntax_custody_discarded_return_parent_drops_with_source_atom() {
+fn zero_syntax_custody_discarded_one_element_source_drops_with_source_atom() {
     check_real_zero(false);
 }
 
 #[test]
-fn zero_syntax_custody_readonly_return_parent_drops_with_source_atom() {
+fn zero_syntax_custody_readonly_one_element_source_drops_with_source_atom() {
     check_real_zero(true);
 }
 
@@ -218,4 +242,38 @@ fn zero_syntax_custody_explicit_to_zero_replacement_preserves_atom_dependency() 
     assert_eq!(site.atom_ids, new.atom_ids);
     let independent = add_independent_site(&mut plan, new.owner_class);
     require_atom_fate(&plan, &key, &independent, &new.atom_ids[0]);
+}
+
+/// **R285-3's receipt, as a live witness.** The shape these fixtures used to
+/// take is held, not quietly absent: the returned-parent source degrades with
+/// `ThinExtent` before a seam exists, which is why the route above changed.
+#[test]
+fn thin_extent_holds_the_returned_parent_zero_syntax_source() {
+    let source = "#![allow(dead_code, unused_variables, unused_unsafe)]\n\
+         extern \"C\" { fn strchr(s: *const i8, c: i32) -> *mut i8; }\n\
+         unsafe fn target(p: *const i8) -> i8 { strchr(p, 65); let parent_read = *p; parent_read }\n\
+         pub unsafe fn entry() -> i8 {\n\
+             let mut storage: [i8; 2] = [65, 0];\n\
+             target(storage.as_mut_ptr() as *const i8)\n\
+         }\n";
+    ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(tcx, Some((
+            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+        ))).expect("actual fixture decisions");
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.label == "target::p")
+            .expect("the fixture's source subject");
+        assert!(
+            matches!(
+                decision,
+                Decision::Degraded(degraded)
+                    if degraded.reason == super::decision::DegradeReason::ThinExtent
+            ),
+            "the returned-parent NUL-terminated source must be held, not delivered thin: {decision:?}"
+        );
+    })
+    .expect("held-source fixture compiles");
 }

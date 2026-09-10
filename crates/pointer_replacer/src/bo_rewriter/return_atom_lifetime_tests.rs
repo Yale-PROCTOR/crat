@@ -17,15 +17,30 @@ use super::{
     delivery_custody::{TypeShape, inventory_source},
 };
 
-// Both callees receive caller-owned live storage. strlen sees an initialized
-// NUL-terminated two-byte buffer, and the chosen byte is read before scope exit.
+// Both callees receive caller-owned live storage, and the chosen field is read
+// before scope exit.
+//
+// **R285-3 / R217-2 — why the source callee moved from `strlen` to `utime`.**
+//
+// This fixture needs `choose::p` to settle a THIN shared reference, because
+// the property under test is a return-origin atom over a generated borrow: a
+// slice source would change the return shape and with it the question. Route
+// (A)'s `held:thin-extent` holds a thin source at a NUL-terminated position,
+// and `strlen` is one — correctly, since it reads to the NUL while `&i8`
+// grants one byte. So the position moved, not the shape: `utime` argument 1 is
+// `Read`/`OneElement`, which a thin `&Times` fits exactly. The parameter is
+// still a shared thin reference returned from the same function, the source
+// seam is still T1 with one atom, and every assertion below is unchanged.
 const INPUT: &str = "#![allow(dead_code, unused_unsafe)]\n\
-    extern \"C\" { fn strlen(p: *const i8) -> usize; }\n\
-    unsafe fn choose(p: *const i8) -> *const i8 { let _ = strlen(p); p }\n\
-    unsafe fn independent(q: *const i8) -> i8 { *q }\n\
-    pub unsafe fn entry() -> i8 {\n\
-        let storage: [i8; 2] = [7, 0]; let separate: i8 = 3;\n\
-        *choose(storage.as_ptr()) + independent(&separate)\n\
+    #[repr(C)] pub struct Times { pub actime: i64, pub modtime: i64 }\n\
+    extern \"C\" { fn utime(path: *const i8, times: *const Times) -> i32; }\n\
+    unsafe fn choose(p: *const Times) -> *const Times {\n\
+        let _ = utime(b\"f\\0\" as *const u8 as *const i8, p); p\n\
+    }\n\
+    unsafe fn independent(q: *const i64) -> i64 { *q }\n\
+    pub unsafe fn entry() -> i64 {\n\
+        let storage = Times { actime: 7, modtime: 0 }; let separate: i64 = 3;\n\
+        (*choose(&storage)).actime + independent(&separate)\n\
     }\n";
 
 fn choose_return(source: &str) -> (bool, String) {
@@ -77,7 +92,7 @@ fn require_parameter(source: &str, owner: &str, binding: &str, raw: bool) {
 
 #[test]
 fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
-    let (baseline, atom_output, strlen_state, return_state, independent_applied) =
+    let (baseline, atom_output, source_state, return_state, independent_applied) =
         ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
             let capture = super::ast_transform::capture_ast(tcx).expect("one original AST capture");
             let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
@@ -129,14 +144,14 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
                     "AUTHORING PREMISE: both real classes Ready: {:?}", emission.plan.class_finalization);
                 assert!(!held.contains(&class));
             }
-            let strlen = emission.plan.terminal_call_plans.seam_edits.iter().filter(|edit|
+            let source_seam = emission.plan.terminal_call_plans.seam_edits.iter().filter(|edit|
                 edit.source_node == Some(node) && edit.raw_outbound.is_some()
-                    && edit.bridge.callee == super::bridge_receipt::BridgeCalleeId::Foreign("strlen".into()))
+                    && edit.bridge.callee == super::bridge_receipt::BridgeCalleeId::Foreign("utime".into()))
                 .collect::<Vec<_>>();
-            let [strlen] = strlen.as_slice() else { panic!("AUTHORING PREMISE: one real strlen source seam") };
-            assert_eq!(strlen.bridge.retention, BridgeRetentionTier::T1);
-            assert!(strlen.bridge.waiver_id.is_none());
-            let [atom] = strlen.atom_ids.as_slice() else { panic!("AUTHORING PREMISE: one exact T1 source atom") };
+            let [source_seam] = source_seam.as_slice() else { panic!("AUTHORING PREMISE: one real utime source seam") };
+            assert_eq!(source_seam.bridge.retention, BridgeRetentionTier::T1);
+            assert!(source_seam.bridge.waiver_id.is_none());
+            let [atom] = source_seam.atom_ids.as_slice() else { panic!("AUTHORING PREMISE: one exact T1 source atom") };
             let atoms = BTreeSet::from([atom.clone()]);
             let source_atoms = table.seams.raw_boundary_atom_groups.get(&node).expect("real source atom group");
             assert!(source_atoms.iter().any(|candidate| candidate.id == *atom));
@@ -147,10 +162,10 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
             let [returned] = returns.as_slice() else { panic!("one exact return terminal receipt") };
             assert_eq!(returned.state, BridgeReceiptState::Applied);
             let return_key = returned.site.clone();
-            let source_file = tcx.sess.source_map().lookup_source_file(strlen.span.lo());
-            let file = super::file_key(&source_file.name).expect("real strlen file");
-            let strlen_key = strlen.bridge.materialize(owner, super::bridge_custody_export::file_label(&file),
-                strlen.span.lo().0 - source_file.start_pos.0, strlen.span.hi().0 - source_file.start_pos.0);
+            let source_file = tcx.sess.source_map().lookup_source_file(source_seam.span.lo());
+            let file = super::file_key(&source_file.name).expect("real utime source file");
+            let source_key = source_seam.bridge.materialize(owner, super::bridge_custody_export::file_label(&file),
+                source_seam.span.lo().0 - source_file.start_pos.0, source_seam.span.hi().0 - source_file.start_pos.0);
             let render = |atoms: &BTreeSet<String>| {
                 let reverts = super::ast_transform::revert_set_from_classes_and_atoms(&held, atoms, &table)
                     .expect("production atom revert closure");
@@ -229,7 +244,7 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
             let independent_applied = !independent_events.is_empty()
                 && independent_events.iter().all(|event| event.state == BridgeReceiptState::Applied);
             println!("J17/J18 selected atom={atom}; terminal events={events:#?}\nBASELINE:\n{baseline}\nATOM REVERT:\n{atom_output}");
-            (baseline, atom_output, terminal_state(&strlen_key), terminal_state(&return_key), independent_applied)
+            (baseline, atom_output, terminal_state(&source_key), terminal_state(&return_key), independent_applied)
         }).expect("UB-free caller-owned-storage fixture compiles");
 
     let baseline_checks = super::verify::type_checks_str(&baseline);
@@ -247,7 +262,7 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
         "baseline actually delivered a reference return"
     );
     assert_eq!(
-        strlen_state,
+        source_state,
         BridgeReceiptState::Dropped,
         "the selected source atom must actually drop its T1 receipt"
     );

@@ -261,7 +261,11 @@ fn pair_raw_parameter_outbound_case(operand: &str) {
 
 fn assert_pair_raw_parameter_outbound(
     input: &str,
-    required_import: Option<&'static str>,
+    // The fixed raw-pointer import the PAIR parameter must reach, and the
+    // ARGUMENT INDEX it reaches it at. The index used to be assumed 0, which
+    // was true only while the import was `strlen`; R285-3 moved the read to a
+    // one-element position, and `utime`'s is argument 1.
+    required_import: Option<(&'static str, usize)>,
     raw_mutable: bool,
 ) -> String {
     assert!(
@@ -288,7 +292,7 @@ fn assert_pair_raw_parameter_outbound(
         assert!(table.seams.pair_raw_calls.iter().any(|call| {
             call.callee == subject.fn_did && call.views.iter().any(|view| view.argument_index == 1)
         }), "the same-object call must carry the selected second raw parameter");
-        if let Some(symbol) = required_import {
+        if let Some((symbol, import_argument)) = required_import {
             let hypothetical = ctx.hypothetical.entries.iter()
                 .find(|(candidate, _)| candidate.fn_did == subject.fn_did
                     && candidate.hir_id == subject.hir_id).map(|(_, decision)| decision)
@@ -298,10 +302,10 @@ fn assert_pair_raw_parameter_outbound(
             let site = ctx.raw_boundary_sites.sites.iter().find(|site| {
                 site.node == Some((subject.fn_did, subject.hir_id))
                     && site.key.callee.foreign && site.key.callee.symbol == symbol
-                    && site.key.argument_index == 0
+                    && site.key.argument_index == import_argument
             }).expect("the PAIR raw parameter must reach the fixed raw-pointer import argument");
-            if symbol == "strlen" {
-                assert_eq!(site.target.rendered, "*const i8");
+            if symbol == "utime" {
+                assert_eq!(site.target.rendered, "*const crate::Times");
                 let contract = super::decision::raw_boundary_contracts::classify_contract(
                     &site.key.callee, site.key.argument_index, &site.target)
                     .expect("the fixed pointer argument has its sealed import contract");
@@ -376,18 +380,31 @@ fn seam_terminal_pair_raw_parameter_bare_operand_drives_its_outbound_adapter() {
 
 #[test]
 fn seam_terminal_pair_raw_parameter_fixed_read_import_uses_its_placed_form() {
-    // The write touches bytes[0]; bytes[1] remains NUL for the read-only strlen.
+    // The write and the read touch the same one live element.
+    //
+    // **R285-3 / R217-2 — why the read moved from `strlen` to `utime`.** The
+    // fixture's second parameter must reach PAIR raw placement as a THIN
+    // reference, and route (A)'s `held:thin-extent` holds a thin source at a
+    // NUL-terminated position, which `strlen` is. The same-object PAIR shape
+    // is what this test is about, not the callee's extent, so the read moved
+    // to a position that fits one element — `utime` argument 1, `Read`/
+    // `OneElement` — and the placement, the import and the outbound form are
+    // asserted unchanged.
     let input = "#![allow(dead_code, unused_unsafe)]\n\
-        extern \"C\" { fn strlen(s: *const i8) -> usize; }\n\
-        pub unsafe fn update(a: *mut i8, b: *const i8) {\n\
-            *a += 1; let _ = strlen(b);\n\
+        #[derive(Copy, Clone)]\n\
+        #[repr(C)] pub struct Times { pub actime: i64, pub modtime: i64 }\n\
+        extern \"C\" { fn utime(path: *const i8, times: *const Times) -> i32; }\n\
+        pub unsafe fn update(a: *mut Times, b: *const Times) {\n\
+            (*a).actime += 1;\n\
+            let _ = utime(b\"f\\0\" as *const u8 as *const i8, b);\n\
         }\n\
         pub unsafe fn caller() {\n\
-            let mut bytes = [0i8; 3]; update(&mut bytes[0], &bytes[0]);\n\
+            let mut items = [Times { actime: 0, modtime: 0 }; 3];\n\
+            update(&mut items[0], &items[0]);\n\
         }\n";
-    let output = assert_pair_raw_parameter_outbound(input, Some("strlen"), false);
+    let output = assert_pair_raw_parameter_outbound(input, Some(("utime", 1)), false);
     assert!(
-        output.contains("let _ = strlen("),
+        output.contains("let _ = utime("),
         "the required pointer call survives: {output}"
     );
 }
@@ -405,7 +422,7 @@ fn seam_terminal_pair_raw_parameter_void_read_import_uses_its_placed_form() {
         pub unsafe fn caller() {\n\
             let mut bytes = [0i8; 3]; update(&mut bytes[0], &bytes[0]);\n\
         }\n";
-    let output = assert_pair_raw_parameter_outbound(input, Some("memcmp"), false);
+    let output = assert_pair_raw_parameter_outbound(input, Some(("memcmp", 0)), false);
     assert!(
         output.contains("let _ = memcmp("),
         "the two pointer arguments survive: {output}"
