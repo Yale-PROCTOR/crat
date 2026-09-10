@@ -182,7 +182,7 @@ fn check(family: Family) {
         let held = emission.plan.held_classes();
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(&held, &BTreeSet::new(), &table)
             .expect("actual initial receiver reverts");
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
             tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
             Some(&emission.plan.terminal_call_plans)).expect("actual receiver AST emission");
         assert_eq!(files.len(), 1);
@@ -389,7 +389,7 @@ fn check_caller_class_reversion(family: Family) {
             assert!(!held.contains(&caller) && !held.contains(&callee));
             let baseline_reverts = super::ast_transform::revert_set_from_classes_and_atoms(&held, &BTreeSet::new(), &table)
                 .expect("actual baseline reverts");
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx, &capture, &baseline_reverts, emission.plan.root_file.as_ref(), &table,
                 Some(&emission.plan.terminal_call_plans)).expect("baseline borrowed receiver AST");
             assert_eq!(files.len(), 1);
@@ -466,7 +466,7 @@ fn check_caller_class_reversion(family: Family) {
             assert_eq!(specialized.terminal.state, common.state);
             assert_eq!(specialized.terminal_class_result, common.state);
             assert!(common.terminal_reason.is_some());
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
                 Some(&emission.plan.terminal_call_plans)).expect("caller-reverted receiver AST");
             assert_eq!(files.len(), 1);
@@ -641,7 +641,7 @@ fn return_receiver_consumer_selected_unavailable_holds_only_its_interface_closur
         let (unselected, unselected_reasons) = consumer.terminal_call_plans.input_reversion_closure(&held, &atoms);
         assert_eq!(unselected, held, "an unselected future twin cannot hold the live interface");
         assert!(unselected_reasons.is_empty());
-        let (baseline_files, _, _, _) = super::round_files(tcx, &capture, &consumer, &emission.texts,
+        let (baseline_files, _, _, _, _) = super::round_files(tcx, &capture, &consumer, &emission.texts,
             &held, &atoms, consumer.root_file.as_ref(), &table)
             .expect("unselected unavailable twin leaves baseline emission available");
         assert_eq!(baseline_files.len(), 1);
@@ -665,7 +665,7 @@ fn return_receiver_consumer_selected_unavailable_holds_only_its_interface_closur
         assert!(reasons.get(&callee).is_some_and(|rows| rows.iter().any(|reason|
             reason == &format!("return-receiver-input-unavailable:caller={}:hir={}:PositiveRetention",
                 node.0.local_def_index.as_u32(), node.1.local_id.as_u32()))));
-        let (restored_files, _, _, _) = super::round_files(tcx, &capture, &consumer, &emission.texts,
+        let (restored_files, _, _, _, _) = super::round_files(tcx, &capture, &consumer, &emission.texts,
             &selected, &atoms, consumer.root_file.as_ref(), &table)
             .expect("selected unavailable closure returns the original raw interfaces");
         assert_eq!(restored_files.len(), 1);

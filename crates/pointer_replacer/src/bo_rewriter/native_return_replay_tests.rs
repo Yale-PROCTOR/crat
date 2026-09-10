@@ -75,7 +75,7 @@ fn actual_capture() -> (RawBoundaryArtifacts, Capture) {
             &held,
             &BTreeSet::new(),
         );
-        let (files, rollbacks, _, _) = super::round_files(
+        let (files, rollbacks, _, _, _) = super::round_files(
             tcx,
             &ast,
             &emission.plan,

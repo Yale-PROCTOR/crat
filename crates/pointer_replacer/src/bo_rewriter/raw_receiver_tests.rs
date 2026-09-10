@@ -157,11 +157,11 @@ fn raw_receiver_keeps_the_borrowed_callee_and_views_its_result_once() {
         assert_eq!(retired_bridge.state, BridgeReceiptState::Dropped);
         super::outbound_return_transport::validate(&super::outbound_return_transport::capture(&retired_artifacts))
             .expect("retired raw result has no applied J27 view, while its dropped common receipt remains history");
-        let (retired_files, retired_rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+        let (retired_files, retired_rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
             &emission.texts, &retired_classes, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table).unwrap();
         assert!(retired_rollbacks.is_empty());
         let retired = retired_files.into_values().next().unwrap();
-        let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+        let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
             &emission.texts, &held, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table)
             .expect("actual raw-receiver emission round");
         assert!(rollbacks.is_empty());
@@ -257,7 +257,7 @@ fn raw_receiver_returned_address_keeps_the_positive_retention_hold() {
         )
         .unwrap();
         let held = emission.plan.held_classes();
-        let (files, _, _, _) = super::round_files(
+        let (files, _, _, _, _) = super::round_files(
             tcx,
             &capture,
             &emission.plan,

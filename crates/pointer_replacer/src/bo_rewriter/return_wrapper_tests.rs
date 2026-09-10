@@ -121,7 +121,7 @@ fn emit_source(source: &str, family: Family, hold_owner: bool) -> Output {
         let render = |reverted: &BTreeSet<SignatureClassId>| {
             let reverts = super::ast_transform::revert_set_from_classes_and_atoms(reverted, &BTreeSet::new(), &table)
                 .expect("actual owner revert set");
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
                 emission.plan.root_file.as_ref(), &table, Some(&emission.plan.terminal_call_plans))
                 .expect("actual wrapper AST rendering");
             assert_eq!(files.len(), 1);
@@ -471,7 +471,7 @@ fn check_nonreturn_parameter_atom(check_missing_receipt: bool) {
             let [unsafe_before] = unsafe_before.as_slice() else { panic!("one actual parameter unsafe-context receipt") };
             assert_eq!(unsafe_before.state, BridgeReceiptState::Applied);
             let render = |atoms: &BTreeSet<String>| {
-                let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+                let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
                     &emission.texts, &held, atoms, emission.plan.root_file.as_ref(), &table)
                     .expect("actual parameter-atom round");
                 assert!(rollbacks.is_empty());

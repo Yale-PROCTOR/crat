@@ -3993,6 +3993,10 @@ pub(crate) fn ast_emitted_files_from(
         super::ast_bridge::SubstStats,
         // **I-31**: the emitted document's line map, from the splicer.
         std::collections::BTreeMap<super::plan::FileKey, super::apply::LineMap>,
+        // **R299-2**: the emitted text of every sibling-overlap call, keyed by
+        // its ORIGINAL span, rendered by this layer rather than reconstructed
+        // from the plan. See [`rendered_calls`].
+        std::collections::BTreeMap<(u32, u32), String>,
     ),
     String,
 > {
@@ -4028,7 +4032,66 @@ pub(crate) fn ast_emitted_files_from(
             text.push('\n');
         }
     }
-    Ok((files, stats, maps))
+    let pending_call_renders = rendered_calls(
+        &krate,
+        &table
+            .sibling_overlap_inventory
+            .coverage
+            .iter()
+            .map(|coverage| {
+                let span = coverage.potential.call_span;
+                (span.lo().0, span.hi().0)
+            })
+            .collect(),
+    );
+    Ok((files, stats, maps, pending_call_renders))
+}
+
+/// **R299-2 — the emitted text of a call, from the producer's own renderer.**
+///
+/// A pending sibling-overlap row owes the emitted call (R287-1(b)), and the
+/// plan cannot state it: the argument bridges that reach the tree are grafted
+/// by THIS layer from the decision table, not carried as `by_file` edits, so a
+/// reconstruction spliced out of the plan's edit set states a call the tree
+/// does not contain. Measured at head on heman's
+/// `kmQuaternionRotationAxisAngle` site: the row carried `edits: []` while the
+/// tree read `core::ptr::from_ref(axis)`.
+///
+/// The two hand-rolled compositions R295-2 tried — splice-nested and
+/// supersession — each guessed a different occurrence rule and contradicted
+/// each other on `a5_raw_210_1`. This guesses nothing: it pretty-prints the
+/// call node the transform passes actually produced, after every pass has run,
+/// which is by construction the text the splicer goes on to emit.
+///
+/// Keyed by the ORIGINAL call span, which the graft passes preserve on the
+/// node they rewrite in place (the A5/PAIR grafts replace `kind` and keep the
+/// span, so the render is the whole hoisting block).
+fn rendered_calls(
+    krate: &rustc_ast::Crate,
+    wanted: &FxHashSet<(u32, u32)>,
+) -> std::collections::BTreeMap<(u32, u32), String> {
+    struct V<'a> {
+        wanted: &'a FxHashSet<(u32, u32)>,
+        out: std::collections::BTreeMap<(u32, u32), String>,
+    }
+    impl rustc_ast::visit::Visitor<'_> for V<'_> {
+        fn visit_expr(&mut self, expression: &rustc_ast::Expr) {
+            if !expression.span.is_dummy() {
+                let key = (expression.span.lo().0, expression.span.hi().0);
+                if self.wanted.contains(&key) {
+                    self.out
+                        .insert(key, rustc_ast_pretty::pprust::expr_to_string(expression));
+                }
+            }
+            rustc_ast::visit::walk_expr(self, expression);
+        }
+    }
+    let mut visitor = V {
+        wanted,
+        out: std::collections::BTreeMap::new(),
+    };
+    rustc_ast::visit::Visitor::visit_crate(&mut visitor, krate);
+    visitor.out
 }
 
 pub(crate) fn ast_emitted_source_from(

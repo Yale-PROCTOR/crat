@@ -187,7 +187,7 @@ fn confirm(case: &Case) -> Value {
                 &BTreeSet::new(),
                 &table,
             )?;
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx,
                 &capture,
                 &reverts,

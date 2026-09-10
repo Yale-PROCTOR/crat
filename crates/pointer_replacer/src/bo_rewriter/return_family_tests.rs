@@ -118,7 +118,7 @@ fn check(family: Family) {
         let held = emission.plan.held_classes();
         assert!(!held.contains(&owner));
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(&held, &BTreeSet::new(), &table).unwrap();
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
             emission.plan.root_file.as_ref(), &table, Some(&emission.plan.terminal_call_plans)).expect("actual family AST emission");
         assert_eq!(files.len(), 1);
         let emitted = files.into_values().next().unwrap();

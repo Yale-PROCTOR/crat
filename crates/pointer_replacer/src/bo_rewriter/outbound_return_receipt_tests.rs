@@ -89,7 +89,7 @@ fn outbound_return_receipt_selected_slice_receiver_has_required_and_specialized_
             assert!(matches!(input.retention, RetentionVerdict::Unknown { .. }),
                 "native return admission is not a caller alias-schedule certificate");
             let render = |classes: &BTreeSet<SignatureClassId>| {
-                let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+                let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
                     &emission.texts, classes, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table)
                     .expect("actual J27 receiver round");
                 assert!(rollbacks.is_empty());

@@ -156,7 +156,7 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
                     .expect("production atom revert closure");
                 assert!(reverts.keeps_subject(independent.fn_did, independent.hir_id));
                 if !atoms.is_empty() { assert!(!reverts.keeps_subject(subject.fn_did, subject.hir_id)); }
-                let (files, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
+                let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
                     emission.plan.root_file.as_ref(), &table, Some(&emission.plan.terminal_call_plans))
                     .expect("actual atom-filtered AST render");
                 assert_eq!(files.len(), 1);
@@ -166,7 +166,7 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
             // Exercise the production round boundary, including normalization
             // before its revert-all check. The legacy AST-only None-plan path
             // has a smaller dependency inventory and is not this control.
-            let (atom_files, atom_rollbacks, _, _) = super::round_files(tcx, &capture,
+            let (atom_files, atom_rollbacks, _, _, _) = super::round_files(tcx, &capture,
                 &emission.plan, &emission.texts, &held, &atoms,
                 emission.plan.root_file.as_ref(), &table).expect("production atom round render");
             assert!(atom_rollbacks.is_empty(), "atom recovery has no unowned/residual rollback");

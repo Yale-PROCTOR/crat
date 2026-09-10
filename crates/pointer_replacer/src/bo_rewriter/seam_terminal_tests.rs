@@ -332,7 +332,7 @@ fn assert_pair_raw_parameter_outbound(
         let held = emission.plan.held_classes();
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
             &held, &std::collections::BTreeSet::new(), &table).expect("PAIR actual reverts");
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture,
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture,
             &reverts, emission.plan.root_file.as_ref(), &table,
             Some(&emission.plan.terminal_call_plans)).expect("PAIR placed AST");
         files.into_values().next().expect("PAIR output source")
@@ -528,7 +528,7 @@ fn r231_raw_role_fixture_with_atom(
             &withheld, &atoms, &table).expect("actual caller/class/atom reversion");
         assert_eq!(reverts.keeps(caller_class), !revert_caller);
         assert!(reverts.keeps(update_class), "the target class must remain live for this RFF witness");
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
             emission.plan.root_file.as_ref(), &table, Some(&emission.plan.terminal_call_plans))
             .expect("PAIR source-reversion emission");
         use super::bridge_custody_match::{BridgeExpectation, BridgeKind, SiteAnchor, BridgeCustodyContext};

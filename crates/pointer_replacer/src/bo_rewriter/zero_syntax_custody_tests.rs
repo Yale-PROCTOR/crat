@@ -63,7 +63,7 @@ fn fixture(readonly: bool) -> (Plan, SeamEdit, FileKey, usize, usize) {
         let held = emission.plan.held_classes();
         let render = |atoms: BTreeSet<String>| {
             let reverts = super::ast_transform::revert_set_from_classes_and_atoms(&held, &atoms, &table).unwrap();
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
                 emission.plan.root_file.as_ref(), &table, Some(&emission.plan.terminal_call_plans)).unwrap();
             assert_eq!(files.len(), 1);
             files.into_values().next().unwrap()

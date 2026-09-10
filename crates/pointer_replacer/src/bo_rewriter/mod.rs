@@ -1335,6 +1335,11 @@ fn round_files(
         // splicer produced this round. `attribute` cannot key a diagnostic to a
         // function without it once the emitter reflows.
         std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+        // **R299-2**: the emitted text of each sibling-overlap call, keyed by
+        // its original span. The pending custody row states this rather than a
+        // reconstruction, because the bridges that reach the tree are grafted
+        // by the AST layer and never appear as `by_file` edits.
+        std::collections::BTreeMap<(u32, u32), String>,
     ),
     String,
 > {
@@ -1352,7 +1357,7 @@ fn round_files(
     // verify loop's own end-to-end witnesses, which ARE multi-file, and which
     // it silently collapsed. The corpus emission is unchanged by this: a
     // single-file crate yields a single-entry map either way.
-    let (files, stats, maps) = ast_transform::ast_emitted_files_from(
+    let (files, stats, maps, pending_call_renders) = ast_transform::ast_emitted_files_from(
         tcx,
         capture,
         &reverts,
@@ -1403,14 +1408,43 @@ fn round_files(
             ));
         }
     }
-    Ok((files, Vec::new(), stats.files_with_edits, maps))
+    Ok((
+        files,
+        Vec::new(),
+        stats.files_with_edits,
+        maps,
+        pending_call_renders,
+    ))
 }
 
+/// The receipt refresh at an exit that has no rendered emission to state.
+///
+/// Every exit but the emitted one is here: a degraded or unresolved round
+/// produced no converged tree, so there is no call text for the pending rows
+/// to carry and the comparator keeps its plan-spliced reading.
 fn refresh_raw_boundary_receipt_events(
     artifacts: &mut RawBoundaryArtifacts,
     emission_plan: &plan::Plan,
     reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     reverted_atoms: &std::collections::BTreeSet<String>,
+) {
+    refresh_raw_boundary_receipt_events_with_renders(
+        artifacts,
+        emission_plan,
+        reverted,
+        reverted_atoms,
+        &std::collections::BTreeMap::new(),
+    );
+}
+
+fn refresh_raw_boundary_receipt_events_with_renders(
+    artifacts: &mut RawBoundaryArtifacts,
+    emission_plan: &plan::Plan,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
+    // **R299-2** — the AST layer's own render of each sibling-overlap call at
+    // THIS revert state, keyed by original span.
+    call_renders: &std::collections::BTreeMap<(u32, u32), String>,
 ) {
     let effective_reverted = emission_plan.effective_reverted_classes(reverted, reverted_atoms);
     let reverted = &effective_reverted;
@@ -1433,6 +1467,7 @@ fn refresh_raw_boundary_receipt_events(
         &artifacts.pending_sibling_receipts,
         &artifacts.sibling_coverage_gaps,
         &artifacts.sibling_audit_rows,
+        call_renders,
     );
     artifacts.unsafe_context_events =
         emission_plan.unsafe_context_events_with_atoms(reverted, reverted_atoms);
@@ -1691,7 +1726,10 @@ fn verify_and_revert(
     // pre-loop rollback gate judged — that gate validates the PLAN (byte-offset
     // collisions), which is layer-independent, so it keeps its meaning.
     let ast_started = std::time::Instant::now();
-    let (mut files, mut files_edited, mut line_maps) = match round_files(
+    // **R299-2** — the AST layer's render of every sibling-overlap call, kept
+    // in step with `files` so whichever exit emits states the text of the round
+    // it emitted.
+    let (mut files, mut files_edited, mut line_maps, mut call_renders) = match round_files(
         tcx,
         capture,
         &emission_plan,
@@ -1701,7 +1739,7 @@ fn verify_and_revert(
         root_key.as_ref(),
         table,
     ) {
-        Ok((round0, rollbacks, edited, maps)) => {
+        Ok((round0, rollbacks, edited, maps, renders)) => {
             if !rollbacks.is_empty() {
                 // The pre-loop structural gate already rejected a non-empty
                 // rollback set for this plan, so this is a DISAGREEMENT between
@@ -1712,7 +1750,7 @@ fn verify_and_revert(
                     rollbacks.len()
                 ));
             }
-            (round0, edited, maps)
+            (round0, edited, maps, renders)
         }
         Err(why) => {
             facts.files_touched = files_edited;
@@ -2090,11 +2128,12 @@ fn verify_and_revert(
                 &reverted_atoms,
                 &class_paths,
             );
-            refresh_raw_boundary_receipt_events(
+            refresh_raw_boundary_receipt_events_with_renders(
                 &mut facts.raw_boundary_artifacts,
                 &emission_plan,
                 &reverted,
                 &reverted_atoms,
+                &call_renders,
             );
             return facts.emitted(source, files);
         }
@@ -2146,23 +2185,24 @@ fn verify_and_revert(
                 }
                 reverted = effective_reverted;
                 pending_atom_retry = Some((selection.reason.to_owned(), selected_atoms));
-                let (next_files, rollbacks, next_edited, next_maps) = match round_files(
-                    tcx,
-                    capture,
-                    &emission_plan,
-                    &emission_texts,
-                    &reverted,
-                    &reverted_atoms,
-                    root_key.as_ref(),
-                    table,
-                ) {
-                    Ok(quad) => quad,
-                    Err(why) => {
-                        escalation =
-                            Some(format!("escalation-required: atom re-emit failed: {why}"));
-                        break;
-                    }
-                };
+                let (next_files, rollbacks, next_edited, next_maps, next_renders) =
+                    match round_files(
+                        tcx,
+                        capture,
+                        &emission_plan,
+                        &emission_texts,
+                        &reverted,
+                        &reverted_atoms,
+                        root_key.as_ref(),
+                        table,
+                    ) {
+                        Ok(quad) => quad,
+                        Err(why) => {
+                            escalation =
+                                Some(format!("escalation-required: atom re-emit failed: {why}"));
+                            break;
+                        }
+                    };
                 if !rollbacks.is_empty() {
                     escalation = Some(format!(
                         "escalation-required: atom re-render rolled back {} edit(s)",
@@ -2173,6 +2213,7 @@ fn verify_and_revert(
                 files = next_files;
                 files_edited = next_edited;
                 line_maps = next_maps;
+                call_renders = next_renders;
                 // The atom retry is its own bounded phase; its result must be
                 // allowed to fall through to ordinary function attribution
                 // rather than tripping the general no-progress detector.
@@ -2300,7 +2341,7 @@ fn verify_and_revert(
         // BATCH revert: the union of this round's attributions, not one
         // at a time — one compile per round rather than one per function.
         reverted.extend(newly);
-        let (next_files, rollbacks, next_edited, next_maps) = match round_files(
+        let (next_files, rollbacks, next_edited, next_maps, next_renders) = match round_files(
             tcx,
             capture,
             &emission_plan,
@@ -2326,6 +2367,7 @@ fn verify_and_revert(
         files = next_files;
         files_edited = next_edited;
         line_maps = next_maps;
+        call_renders = next_renders;
     }
 
     // ---- (C) BISECT: the escalation path ----
@@ -2386,7 +2428,7 @@ fn verify_and_revert(
     }
 
     let (final_reverted, probes) = recover_class_groups(&candidates, &recovery_base, |trial| {
-        let Ok((trial_files, rollbacks, _, _)) = round_files(
+        let Ok((trial_files, rollbacks, _, _, _)) = round_files(
             tcx,
             capture,
             &emission_plan,
@@ -2448,7 +2490,7 @@ fn verify_and_revert(
     // `round_files`' own doc names — a program returned that is not the
     // program the probes verified — and it also left M-3 with an escalation
     // path that has no implementation once `render` is deleted.
-    let (final_files, rollbacks, final_edited, _final_maps) = match round_files(
+    let (final_files, rollbacks, final_edited, _final_maps, final_call_renders) = match round_files(
         tcx,
         capture,
         &emission_plan,
@@ -2542,11 +2584,12 @@ fn verify_and_revert(
             facts.escalated = Some(escalation);
             facts.raw_boundary_artifacts.final_reverts =
                 render_raw_boundary_final_reverts(&final_reverted, &reverted_atoms, &class_paths);
-            refresh_raw_boundary_receipt_events(
+            refresh_raw_boundary_receipt_events_with_renders(
                 &mut facts.raw_boundary_artifacts,
                 &emission_plan,
                 &final_reverted,
                 &reverted_atoms,
+                &final_call_renders,
             );
             facts.emitted(source, final_files)
         }

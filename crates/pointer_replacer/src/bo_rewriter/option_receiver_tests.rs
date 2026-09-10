@@ -101,7 +101,7 @@ fn option_receiver_shared_weakening_and_caller_retirement_keep_native_return_cus
         assert!(emission.plan.class_finalization.classes[&caller].is_ready());
         let held = emission.plan.held_classes();
         let render = |classes: &BTreeSet<SignatureClassId>| {
-            let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+            let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
                 &emission.texts, classes, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table)
                 .expect("actual shared-Option receiver round");
             assert!(rollbacks.is_empty());

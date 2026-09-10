@@ -136,7 +136,7 @@ fn check(shape: ReceiverShape) {
             "an already borrowed callee result requires no raw-slice constructor");
         let held = emission.plan.held_classes();
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(&held, &BTreeSet::new(), &table).unwrap();
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
             emission.plan.root_file.as_ref(), &table, Some(&emission.plan.terminal_call_plans)).unwrap();
         assert_eq!(files.len(), 1);
         files.into_values().next().unwrap()
@@ -298,7 +298,7 @@ fn check_caller_reversion(shape: ReceiverShape) {
             let held = emission.plan.held_classes();
             assert!(!held.contains(&caller) && !held.contains(&callee));
             let atoms = BTreeSet::new();
-            let (files, _, _, _) = super::round_files(tcx, &capture, &emission.plan, &emission.texts,
+            let (files, _, _, _, _) = super::round_files(tcx, &capture, &emission.plan, &emission.texts,
                 &held, &atoms, emission.plan.root_file.as_ref(), &table).unwrap();
             assert_eq!(files.len(), 1);
             let baseline = files.into_values().next().unwrap();
@@ -344,7 +344,7 @@ fn check_caller_reversion(shape: ReceiverShape) {
             println!("RETURN-RECEIVER-SHAPE REVERSION {shape:?}: source_return={interface:#?}; q_form={:?}; input={:#?}; unavailable={:#?}; actual_retention={native_retention:#?}; selected={selected:?}; effective={effective:?}; closure_causes={reasons:#?}",
                 receiver.receiver_form, inputs.plans.get(&node), inputs.unavailable.get(&node));
             let reverted = super::round_files(tcx, &capture, &emission.plan, &emission.texts,
-                &selected, &atoms, emission.plan.root_file.as_ref(), &table).map(|(files, _, _, _)| {
+                &selected, &atoms, emission.plan.root_file.as_ref(), &table).map(|(files, _, _, _, _)| {
                     assert_eq!(files.len(), 1);
                     files.into_values().next().unwrap()
                 });

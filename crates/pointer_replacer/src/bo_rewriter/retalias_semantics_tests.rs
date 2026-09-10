@@ -428,7 +428,7 @@ fn check(case: ChildCase) {
         let held = emission.plan.held_classes();
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
             &held, &BTreeSet::new(), &table).expect("actual held-class reverts");
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
             tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
             Some(&emission.plan.terminal_call_plans)).expect("RB-RETALIAS AST emission");
         assert_eq!(files.len(), 1, "the unchanged fixture emits one complete source file");

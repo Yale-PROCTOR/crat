@@ -28,7 +28,7 @@ fn revert_probe(input: &str, inject_unowned_use: bool) -> RevertProbe {
         assert!(!ready.is_empty(), "revert-all control needs a ready class");
         let root = emission.plan.root_file.as_ref().expect("fixture root key");
         let original = BTreeMap::from([(root.clone(), input.to_owned())]);
-        let (candidate, rollbacks, edited, _) = super::round_files(
+        let (candidate, rollbacks, edited, _, _) = super::round_files(
             tcx,
             &capture,
             &emission.plan,
@@ -111,7 +111,7 @@ fn revert_probe(input: &str, inject_unowned_use: bool) -> RevertProbe {
             Some(root),
             &table,
         )
-        .map(|(files, rollbacks, edited, _)| {
+        .map(|(files, rollbacks, edited, _, _)| {
             assert!(
                 rollbacks.is_empty(),
                 "revert-all produced a structural rollback"

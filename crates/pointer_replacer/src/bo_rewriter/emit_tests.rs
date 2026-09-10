@@ -38,7 +38,7 @@ pub(super) fn ast_emitted_source_of(input: &str) -> Result<String, String> {
                 &std::collections::BTreeSet::new(),
                 &table,
             )?;
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx,
                 &capture,
                 &reverts,
@@ -6965,7 +6965,7 @@ fn e3_attempt_with_mutability(
             &table,
         )
         .expect("wave-3 terminal revert set");
-        let (ast_files, _, _) = super::ast_transform::ast_emitted_files_from(
+        let (ast_files, _, _, _) = super::ast_transform::ast_emitted_files_from(
             tcx,
             &capture,
             &reverts,
@@ -6996,7 +6996,7 @@ fn e3_attempt_with_mutability(
                 &table,
             )
             .expect("runtime-reverted fixture set");
-            let (runtime_files, _, _) = super::ast_transform::ast_emitted_files_from(
+            let (runtime_files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx,
                 &capture,
                 &runtime_reverts,
@@ -10254,7 +10254,7 @@ fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
                     &ctx.model,
                 )
                 .ok_or_else(|| "E2-N5 model key did not render".to_owned())?;
-                let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+                let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                     tcx,
                     &capture,
                     &super::ast_transform::RevertSet::default(),
@@ -10313,7 +10313,7 @@ fn e2_n5_two_roots_share_plan_receipts_and_unowned_source_bytes() {
                     ),
                 )),
             )?;
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx,
                 &capture,
                 &super::ast_transform::RevertSet::default(),
@@ -12012,7 +12012,7 @@ fn d3_w1_generated_inner_use_depends_on_ready_defining_class() {
                 &std::collections::BTreeSet::new(),
                 &table,
             )?;
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx,
                 &capture,
                 &reverts,
@@ -12478,7 +12478,7 @@ fn slu_w1_assert_use_receipt_count(
             let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
                 &emission.plan.held_classes(), &BTreeSet::new(), &table,
             )?;
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
                 Some(&emission.plan.terminal_call_plans),
             )?;
@@ -12736,7 +12736,7 @@ fn slu_w1_positive_retention_stays_held() {
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
             &emission.plan.held_classes(), &BTreeSet::new(), &table,
         )?;
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
             tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
             Some(&emission.plan.terminal_call_plans),
         )?;
@@ -14150,7 +14150,7 @@ fn opt_w1_exact_span_composition_keeps_the_completed_option_value() {
             &table,
         )
         .unwrap();
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
             tcx,
             &capture,
             &reverts,

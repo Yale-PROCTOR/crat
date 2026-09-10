@@ -145,7 +145,7 @@ fn native_return_receipts_inventory_both_null_and_parameter_branches() {
             println!("NATIVE-RETURN-J27 exact site={site:#?}; original_hir={expression:?}; common={common:#?}; origins={expected_origins:?}");
             expected.push((*expression, (***terminal).clone(), expected_origins));
         }
-        let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan, &emission.texts,
+        let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan, &emission.texts,
             &held, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table).unwrap();
         assert!(rollbacks.is_empty());
         assert_eq!(files.len(), 1);

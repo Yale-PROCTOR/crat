@@ -244,7 +244,7 @@ fn outbound_expression_native_slice_return_to_raw_argument_has_one_owned_view() 
             &missing.mechanical_events, &missing.bridge_events).is_err(),
             "deliberate-fault: erasing every expression output leaves the independent Applied bridge and is caught");
 
-        let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+        let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
             &emission.texts, &held, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table)
             .expect("actual outbound-expression rendering");
         assert!(rollbacks.is_empty(), "new outgoing site cannot retire its native producer");
@@ -254,7 +254,7 @@ fn outbound_expression_native_slice_return_to_raw_argument_has_one_owned_view() 
             .collect::<std::collections::BTreeMap<_, _>>();
         let emitted = files.into_values().next().unwrap();
         let render_reverted = |classes: &BTreeSet<SignatureClassId>| {
-            let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+            let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
                 &emission.texts, classes, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table).unwrap();
             assert!(rollbacks.is_empty());
             assert_eq!(files.len(), 1);

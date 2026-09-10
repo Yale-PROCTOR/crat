@@ -247,7 +247,7 @@ fn outbound_alias_permission_local_const_alias_result_preserves_writable_view() 
             println!("OUTBOUND-ALIAS-PERMISSION admitted plan={plan:#?}; existing required carrier={required:#?}; applied={applied:#?}");
             Observation::Applied { selected: plan.template, required: required.template, temporary: plan.temporary.clone() }
         };
-        let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+        let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
             &emission.texts, &held, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table)
             .expect("full alias-permission emitted round");
         assert!(rollbacks.is_empty(), "the observed guard or carrier must own the complete rendering");
@@ -404,7 +404,7 @@ fn outbound_alias_permission_shared_source_written_child_holds_the_native_view()
             "a refused shared source keeps no native form: {decision:#?}");
         let hold = format!("{}; source={:?}; owner-hold={hold_reason:?}", fallback.cause,
             match decision { Decision::Degraded(record) => Some(format!("{:?}", record.reason)), _ => None });
-        let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+        let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
             &emission.texts, &held, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table)
             .expect("full shared-source emitted round");
         assert!(rollbacks.is_empty(), "the observed hold must own the complete rendering");
@@ -535,7 +535,7 @@ fn outbound_carrier(input: &'static str, sink: &str) -> (String, Option<BridgeTe
             [] => None,
             _ => panic!("at most one native outbound site: {plans:#?}"),
         };
-        let (files, rollbacks, _, _) = super::round_files(
+        let (files, rollbacks, _, _, _) = super::round_files(
             tcx,
             &capture,
             &emission.plan,

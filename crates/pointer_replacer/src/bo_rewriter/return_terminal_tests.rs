@@ -161,7 +161,7 @@ fn emit(input: &str, functions: &[Function], exposed: &str, hold_exposed: bool) 
         let render = |held: &BTreeSet<SignatureClassId>| {
             let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
                 held, &BTreeSet::new(), &table).expect("existing class revert harness");
-            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
                 tcx, &capture, &reverts, emission.plan.root_file.as_ref(), &table,
                 Some(&emission.plan.terminal_call_plans)).expect("AST uses the real terminal call plans");
             assert_eq!(files.len(), 1, "complete single-file fixture emission");

@@ -144,6 +144,22 @@ pub(crate) struct PendingCallRow {
     pub(crate) lo: usize,
     pub(crate) hi: usize,
     pub(crate) edits: Vec<(usize, usize, String)>,
+    /// **R299-2 — the PRODUCER'S OWN RENDER of this call.**
+    ///
+    /// The plan cannot state these calls from `by_file`: the argument bridges
+    /// that reach the tree are grafted by the AST layer straight from the
+    /// decision table and never become plan edits, so a row spliced out of the
+    /// edit set states a call the tree does not contain — measured on heman's
+    /// `kmQuaternionRotationAxisAngle` site, whose row carried `edits: []`
+    /// while the tree read `core::ptr::from_ref(axis)`.
+    ///
+    /// So the emitting layer renders the call node it actually produced and
+    /// the row carries that text verbatim. `None` is the pre-convergence
+    /// state — an exit that never reached an emission has nothing to render —
+    /// and the comparator then falls back to the spliced reading rather than
+    /// inventing a verdict.
+    #[serde(default)]
+    pub(crate) rendered: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -747,6 +763,7 @@ pub(crate) fn capture(
         &plan.pending_sibling_receipts(&BTreeSet::new()),
         &plan.sibling_coverage_gaps(&BTreeSet::new()),
         &plan.sibling_audit_rows_with_atoms(&BTreeSet::new(), &BTreeSet::new()),
+        &BTreeMap::new(),
     );
     let mut artifacts = super::RawBoundaryArtifacts::default();
     super::refresh_raw_boundary_receipt_events(
@@ -768,6 +785,8 @@ pub(crate) fn refresh(
     pending: &[super::plan::sibling_overlap::PendingSite],
     gaps: &[super::decision::sibling_overlap::CoverageGapReceipt],
     audit_rows: &[super::sibling_audit::Row],
+    // R299-2: the emitting layer's render of each call, by original span.
+    call_renders: &BTreeMap<(u32, u32), String>,
 ) {
     if let Some(audit) = &mut export.sibling_audit {
         audit.rows = audit_rows.to_vec();
@@ -809,6 +828,12 @@ pub(crate) fn refresh(
                         lo: call.lo,
                         hi: call.hi,
                         edits: call.edits.clone(),
+                        rendered: call_renders
+                            .get(&(
+                                site.receipt.potential.call_span.lo().0,
+                                site.receipt.potential.call_span.hi().0,
+                            ))
+                            .cloned(),
                     })
                 },
             ),
@@ -1003,7 +1028,15 @@ fn pending_sibling_overlap_issues(
                 "pending-sibling-overlap:original-file-missing:{id}:{}",
                 row.source_file
             )),
-            Some(original) => match render_pending_call(original.source.as_str(), call) {
+            // **R299-2.** The producer's render, when it has one, IS the
+            // claim; splicing the plan's edits is only the pre-convergence
+            // fallback. Preferring the render is what makes the row statable
+            // for every call whose bridges the AST layer grafts.
+            Some(original) => match call
+                .rendered
+                .clone()
+                .or_else(|| render_pending_call(original.source.as_str(), call))
+            {
                 None => issues.push(format!(
                     "pending-sibling-overlap:emitted-call-unrenderable:{id}"
                 )),
@@ -2126,7 +2159,7 @@ mod tests {
                     &table,
                 )
                 .expect("fixture reverts");
-                let (files, _, _) = crate::bo_rewriter::ast_transform::ast_emitted_files_from(
+                let (files, _, _, _) = crate::bo_rewriter::ast_transform::ast_emitted_files_from(
                     tcx,
                     &ast_capture,
                     &reverts,
@@ -2203,6 +2236,110 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // R299-2 — a pending row's call text comes from the PRODUCER'S OWN
+    // RENDERER, never from a hand-rolled composition.
+    //
+    // The plan cannot state these calls. The argument bridges that reach the
+    // tree are grafted by the AST layer straight from the decision table and
+    // never become `by_file` edits, so a row spliced out of the edit set
+    // states a call the tree does not contain. Measured at head, before this
+    // rule, on heman's `kmQuaternionRotationAxisAngle` site — the row carried
+    //
+    //     EmittedCall { lo: 103980, hi: 104035, edits: [] }
+    //
+    // while the tree read `kmQuaternionRotationAxisAngle(&mut quat,
+    // core::ptr::from_ref(axis), radians)`. Across binn, libzahl, heman and
+    // brotli that is 111 distinct sites and 224 reported issues, every one of
+    // them `emitted-call-text-absent`.
+    //
+    // The two hand-rolled compositions R295-2 tried each guessed a different
+    // occurrence rule and contradicted each other on `a5_raw_210_1`. Nothing
+    // is guessed here: `ast_transform::rendered_calls` pretty-prints the call
+    // node the transform passes actually produced, and the row carries that
+    // text.
+
+    /// heman's shape, reduced to the two facts custody depends on: the plan
+    /// states no edit inside the call, and the tree carries a bridge there.
+    const RENDERED_SOURCE: &str = "fn caller(w: &mut i32, r: &i32) { callee(w, r); }";
+    const RENDERED_EMITTED: &str =
+        "fn caller(w: &mut i32, r: &i32) { callee(w, core::ptr::from_ref(r)); }";
+
+    fn rendered_row(rendered: Option<&str>) -> (Export, BTreeMap<String, String>) {
+        let lo = RENDERED_SOURCE.find("callee(").expect("fixture call");
+        let hi = RENDERED_SOURCE.find(");").expect("fixture call end") + 1;
+        let mut export = Export::default();
+        export.files.insert(
+            "lib.rs".to_owned(),
+            OriginalFile {
+                source: RENDERED_SOURCE.to_owned(),
+                sha256: String::new(),
+                global_start: 0,
+            },
+        );
+        export.pending_sites = vec![PendingSiteRow {
+            site_id: "raw-boundary-site:caller:0:0:callee:1".to_owned(),
+            waiver: super::super::decision::sibling_overlap::PENDING_REASON.to_owned(),
+            source_file: "lib.rs".to_owned(),
+            call: Ok(PendingCallRow {
+                lo,
+                hi,
+                // heman's row exactly: the plan has nothing to say inside this
+                // call, because the bridge is not one of its edits.
+                edits: Vec::new(),
+                rendered: rendered.map(str::to_owned),
+            }),
+            siblings: vec![PendingSiblingRow {
+                argument_index: 0,
+                disposition: "raw-unchanged".to_owned(),
+                detail: "-".to_owned(),
+            }],
+        }];
+        (
+            export,
+            BTreeMap::from([("lib.rs".to_owned(), RENDERED_EMITTED.to_owned())]),
+        )
+    }
+
+    /// **The R299-2 witness.** With the producer's render the row states the
+    /// call the tree actually carries, and custody is complete.
+    #[test]
+    fn r299_a_rendered_pending_row_states_the_bridge_the_tree_carries() {
+        let (export, sources) = rendered_row(Some("callee(w, core::ptr::from_ref(r))"));
+        let issues = pending_sibling_overlap_issues(&export, Some(&sources));
+        assert!(issues.is_empty(), "the tree must read the row: {issues:#?}");
+    }
+
+    /// **The R299-2 fault.** A reconstruction that bypasses the renderer —
+    /// here the plan-spliced reading, which is the call's original bytes
+    /// because the plan holds no edit inside it — is caught, and the issue
+    /// says where it diverges rather than only that it is absent.
+    #[test]
+    fn r299_a_reconstruction_that_bypasses_the_renderer_is_caught() {
+        let (export, sources) = rendered_row(None);
+        let issues = pending_sibling_overlap_issues(&export, Some(&sources));
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert!(
+            issues[0].contains("emitted-call-text-absent") && issues[0].contains("diverges-at="),
+            "the spliced reading must be caught, with its divergence: {issues:#?}"
+        );
+    }
+
+    /// A render that is not what the tree carries is caught too: the row is
+    /// checked against the tree, never trusted because it came from a
+    /// renderer.
+    #[test]
+    fn r299_a_render_that_disagrees_with_the_tree_is_caught() {
+        let (export, sources) = rendered_row(Some("callee(w, core::ptr::from_mut(r))"));
+        let issues = pending_sibling_overlap_issues(&export, Some(&sources));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("emitted-call-text-absent")),
+            "{issues:#?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // R287-1 — the pending sibling-overlap custody contract.
     //
     // A site under the R232-4 pending waiver is a DELIVERED site. These pin
@@ -2240,7 +2377,12 @@ mod tests {
             site_id: "raw-boundary-site:caller:0:0:copy:0".to_owned(),
             waiver: super::super::decision::sibling_overlap::PENDING_REASON.to_owned(),
             source_file: "lib.rs".to_owned(),
-            call: Ok(PendingCallRow { lo, hi, edits }),
+            call: Ok(PendingCallRow {
+                lo,
+                hi,
+                edits,
+                rendered: None,
+            }),
             siblings,
         }
     }

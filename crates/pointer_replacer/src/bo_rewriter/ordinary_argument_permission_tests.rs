@@ -57,7 +57,7 @@ fn argument_outcome(input: &str, subject: &str, label: &str) -> ArgumentOutcome 
         )
         .expect("actual emission plan");
         let held = emission.plan.held_classes();
-        let (files, rollbacks, _, _) = super::round_files(
+        let (files, rollbacks, _, _, _) = super::round_files(
             tcx,
             &capture,
             &emission.plan,

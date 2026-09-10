@@ -133,7 +133,7 @@ fn check(target_input: bool, source_input: bool) {
         if source_input { selected_classes.insert(caller); }
         let atoms = if target_input { BTreeSet::from([p_atom.clone()]) } else { BTreeSet::new() };
         let effective = emission.plan.effective_reverted_classes(&selected_classes, &atoms);
-        let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan,
+        let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan,
             &emission.texts, &selected_classes, &atoms, emission.plan.root_file.as_ref(), &table)
             .expect("actual selected ordinary-call emission");
         assert!(rollbacks.is_empty(), "the fixture must not hide a structural rollback");

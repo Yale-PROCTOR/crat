@@ -113,7 +113,7 @@ fn return_shape_mixed_null_and_parameter_keeps_a_required_parameter() {
         assert!(!held.contains(&owner));
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(&held, &BTreeSet::new(), &table)
             .expect("actual mixed-return final class selection");
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
             emission.plan.root_file.as_ref(), &table, Some(&emission.plan.terminal_call_plans))
             .expect("actual mixed-return AST emission");
         assert_eq!(files.len(), 1);
@@ -319,7 +319,7 @@ fn return_shape_constant_parameter_offset_returns_the_remaining_slice() {
         assert_ne!(returned.extent, super::bridge_receipt::BridgeExtentKind::Fallback,
             "reslicing an existing Slice uses its remaining extent");
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(&held, &BTreeSet::new(), &table).unwrap();
-        let (files, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
+        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
             emission.plan.root_file.as_ref(), &table, Some(&emission.plan.terminal_call_plans)).unwrap();
         assert_eq!(files.len(), 1);
         (files.into_values().next().unwrap(), hir_index)

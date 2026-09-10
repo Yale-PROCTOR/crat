@@ -183,7 +183,7 @@ fn expression_sibling_actual_writer_keeps_native_source_and_exact_pending_custod
         let original_files = tcx.sess.source_map().files().iter().filter_map(|file|
             Some((super::file_key(&file.name)?, file.src.as_ref()?.to_string()))).collect::<BTreeMap<_, _>>();
         let export = custody::capture(tcx, &capture, &table, &emission.plan, &original_files);
-        let (files, rollbacks, _, _) = super::round_files(tcx, &capture, &emission.plan, &emission.texts,
+        let (files, rollbacks, _, _, _) = super::round_files(tcx, &capture, &emission.plan, &emission.texts,
             &held, &BTreeSet::new(), emission.plan.root_file.as_ref(), &table).expect("actual writer-sibling output");
         assert!(rollbacks.is_empty(), "pending stamping does not change emission or hold a class");
         let sources = files.into_iter().map(|(file, text)| (custody::file_label(&file), text)).collect::<BTreeMap<_, _>>();
