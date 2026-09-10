@@ -1035,12 +1035,12 @@ fn pending_sibling_overlap_issues(
             Some(original) => match call
                 .rendered
                 .clone()
-                .or_else(|| render_pending_call(original.source.as_str(), call))
+                .map_or_else(|| render_pending_call(original.source.as_str(), call), Ok)
             {
-                None => issues.push(format!(
-                    "pending-sibling-overlap:emitted-call-unrenderable:{id}"
+                Err(why) => issues.push(format!(
+                    "pending-sibling-overlap:emitted-call-unrenderable:{id}:{why}"
                 )),
-                Some(expected) => match sources.and_then(|map| map.get(&row.source_file)) {
+                Ok(expected) => match sources.and_then(|map| map.get(&row.source_file)) {
                     // No emitted source is a transport state, not a verdict:
                     // the row is complete and there is nothing to compare it
                     // against yet.
@@ -1170,25 +1170,40 @@ fn normalised_tokens(text: &str) -> String {
     out
 }
 
-fn render_pending_call(original_source: &str, call: &PendingCallRow) -> Option<String> {
+fn render_pending_call(original_source: &str, call: &PendingCallRow) -> Result<String, String> {
     render_span(original_source, call.lo, call.hi, &call.edits)
 }
 
+/// **R295-3 — the failure says which composition it could not state.**
+///
+/// This returned a bare `None`, and every reading of
+/// `emitted-call-unrenderable` then had to reconstruct which of four
+/// conditions fired. They are named instead: a crossing or reversed interval,
+/// an interval outside the file, an inner edit whose original text is empty,
+/// and K21's guard — an inner original occurring other than exactly once in
+/// the outer replacement, which is the composition that is not statable.
 fn render_span(
     source: &str,
     lo: usize,
     hi: usize,
     edits: &[(usize, usize, String)],
-) -> Option<String> {
+) -> Result<String, String> {
+    fn slice(source: &str, lo: usize, hi: usize) -> Result<&str, String> {
+        source
+            .get(lo..hi)
+            .ok_or_else(|| format!("interval-outside-source:{lo}..{hi}"))
+    }
     let mut out = String::new();
     let mut cursor = lo;
     let mut index = 0;
     while index < edits.len() {
         let (edit_lo, edit_hi, replacement) = &edits[index];
         if *edit_lo < cursor || *edit_hi > hi || edit_lo > edit_hi {
-            return None;
+            return Err(format!(
+                "crossing-or-out-of-range-edit:{edit_lo}..{edit_hi}:in={lo}..{hi}:cursor={cursor}"
+            ));
         }
-        out.push_str(source.get(cursor..*edit_lo)?);
+        out.push_str(slice(source, cursor, *edit_lo)?);
         let children = edits[index + 1..]
             .iter()
             .take_while(|(child_lo, child_hi, _)| child_lo >= edit_lo && child_hi <= edit_hi)
@@ -1199,10 +1214,17 @@ fn render_span(
         } else {
             let mut composed = replacement.clone();
             for child in &children {
-                let original = source.get(child.0..child.1)?;
+                let original = slice(source, child.0, child.1)?;
                 let rendered = render_span(source, child.0, child.1, std::slice::from_ref(child))?;
-                if original.is_empty() || composed.matches(original).count() != 1 {
-                    return None;
+                if original.is_empty() {
+                    return Err(format!("empty-inner-original:{}..{}", child.0, child.1));
+                }
+                let occurrences = composed.matches(original).count();
+                if occurrences != 1 {
+                    return Err(format!(
+                        "inner-original-occurs-{occurrences}-times:{}..{}",
+                        child.0, child.1
+                    ));
                 }
                 composed = composed.replace(original, &rendered);
             }
@@ -1211,8 +1233,8 @@ fn render_span(
         cursor = *edit_hi;
         index += 1 + children.len();
     }
-    out.push_str(source.get(cursor..hi)?);
-    Some(out)
+    out.push_str(slice(source, cursor, hi)?);
+    Ok(out)
 }
 
 fn sibling_audit_issues(audit: Option<&SiblingAuditCapture>) -> Vec<String> {
@@ -1231,7 +1253,16 @@ fn sibling_audit_issues(audit: Option<&SiblingAuditCapture>) -> Vec<String> {
             issues.push(format!("sibling-audit:extra-coverage-id:{id}"));
         }
         if !row.data {
-            issues.push(format!("sibling-audit:incomplete-row:{id}"));
+            // **R295-3.** The bare id said only that the row was incomplete.
+            // The row's own issues say what it is missing, and a row that is
+            // incomplete while recording nothing is a producer defect of its
+            // own, so it says that rather than reading like the old line.
+            let why = if row.issues.is_empty() {
+                "no-issue-recorded".to_owned()
+            } else {
+                row.issues.join(",")
+            };
+            issues.push(format!("sibling-audit:incomplete-row:{id}:{why}"));
         }
         for issue in &row.issues {
             issues.push(format!("sibling-audit:row-issue:{id}:{issue}"));
@@ -1669,14 +1700,95 @@ fn compare_applied(
             }
         }
         if !comparison.data {
-            report
-                .issues
-                .push(format!("bridge-custody:comparison-failed:{file}"));
+            report.issues.push(format!(
+                "bridge-custody:comparison-failed:{file}:{}",
+                comparison_failure_reason(&comparison)
+            ));
         }
         report.files.insert(file, comparison);
     }
     report.data = report.issues.is_empty() && report.files.values().all(|file| file.data);
     report
+}
+
+/// **R295-3 — why this file's comparison failed, in the issue line.**
+///
+/// `comparison-failed:{file}` named a file and nothing else, so every reading
+/// of it began by opening the per-file report and re-deriving what the arm
+/// already knew — the same cost R291-3 removed from the pending arm. The three
+/// things that can clear `data` are named here: rows that did not match (with
+/// their status, identity and reason), witnesses the tree carries that no
+/// receipt claims, and the matcher's own issues.
+///
+/// Truncated, because a receipt line is read by a person: the counts are
+/// complete, the named rows are the first three in row order.
+fn comparison_failure_reason(comparison: &bridge_custody_match::BridgeCustodyReport) -> String {
+    use bridge_custody_match::ReceiptStatus;
+    fn status_key(status: ReceiptStatus) -> &'static str {
+        match status {
+            ReceiptStatus::MatchedRaw => "matched-raw",
+            ReceiptStatus::MatchedC9 => "matched-c9",
+            ReceiptStatus::WaivedPending => "waived-pending",
+            ReceiptStatus::InvalidRenderedRole => "invalid-rendered-role",
+            ReceiptStatus::Missing => "missing",
+            ReceiptStatus::Unresolved => "unresolved",
+        }
+    }
+    fn clip(text: &str, len: usize) -> String {
+        if text.chars().count() <= len {
+            return text.to_owned();
+        }
+        text.chars().take(len).collect::<String>() + "…"
+    }
+    let unmatched = comparison
+        .rows
+        .iter()
+        .filter(|row| {
+            !matches!(
+                row.status,
+                ReceiptStatus::MatchedRaw | ReceiptStatus::MatchedC9 | ReceiptStatus::WaivedPending
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut parts = Vec::new();
+    if !unmatched.is_empty() {
+        let mut by_status = BTreeMap::<&str, usize>::new();
+        for row in &unmatched {
+            *by_status.entry(status_key(row.status)).or_default() += 1;
+        }
+        parts.push(format!(
+            "rows={}({})",
+            unmatched.len(),
+            by_status
+                .into_iter()
+                .map(|(status, count)| format!("{status}={count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        for row in unmatched.iter().take(3) {
+            parts.push(format!(
+                "{}:{}:{}",
+                status_key(row.status),
+                clip(&row.identity, 96),
+                clip(&row.reason, 64)
+            ));
+        }
+    }
+    if !comparison.tree_only.is_empty() {
+        parts.push(format!("tree-only={}", comparison.tree_only.len()));
+    }
+    if !comparison.issues.is_empty() {
+        parts.push(format!(
+            "match-issues={}",
+            clip(&comparison.issues.join(","), 160)
+        ));
+    }
+    if parts.is_empty() {
+        // `data` false with nothing to name is itself a defect, and saying so
+        // is better than an empty suffix that reads like the old line.
+        parts.push("cleared-without-a-named-row".to_owned());
+    }
+    parts.join(";")
 }
 
 fn insert_owner(
@@ -2335,6 +2447,128 @@ mod tests {
             issues
                 .iter()
                 .any(|issue| issue.contains("emitted-call-text-absent")),
+            "{issues:#?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // R295-3 — no comparator arm fails opaquely.
+    //
+    // R291-3 removed the cost of an unexplained "absent" from the pending
+    // arm's text comparison; the same cost sat in three more lines, each of
+    // which named an identity and stopped. These pin the reasons.
+
+    /// An unstatable composition names WHICH condition fired — here K21's
+    /// guard, an inner original occurring twice in the outer replacement,
+    /// which is exactly the shape a hand-rolled splice produces.
+    #[test]
+    fn r295_an_unstatable_composition_names_its_condition() {
+        const SOURCE: &str = "fn caller(x: *mut i32) { f(x, x); }";
+        let lo = SOURCE.find("f(x").expect("fixture call");
+        let hi = SOURCE.find(");").expect("fixture call end") + 1;
+        let inner = lo + "f(".len();
+        let mut export = Export::default();
+        export.files.insert(
+            "lib.rs".to_owned(),
+            OriginalFile {
+                source: SOURCE.to_owned(),
+                sha256: String::new(),
+                global_start: 0,
+            },
+        );
+        export.pending_sites = vec![PendingSiteRow {
+            site_id: "raw-boundary-site:caller:0:0:f:0".to_owned(),
+            waiver: super::super::decision::sibling_overlap::PENDING_REASON.to_owned(),
+            source_file: "lib.rs".to_owned(),
+            call: Ok(PendingCallRow {
+                lo,
+                hi,
+                edits: vec![
+                    (lo, hi, "f(x, x)".to_owned()),
+                    (inner, inner + 1, "y".to_owned()),
+                ],
+                rendered: None,
+            }),
+            siblings: Vec::new(),
+        }];
+        let sources = BTreeMap::from([("lib.rs".to_owned(), SOURCE.to_owned())]);
+        let issues = pending_sibling_overlap_issues(&export, Some(&sources));
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert!(
+            issues[0].contains("emitted-call-unrenderable")
+                && issues[0].contains("inner-original-occurs-2-times"),
+            "the unstatable composition must name itself: {issues:#?}"
+        );
+    }
+
+    /// A minimal audit row: only `coverage_id`, `data` and `issues` are read
+    /// by the transport check these two tests exercise.
+    fn sibling_audit_row(id: &str) -> super::super::sibling_audit::Row {
+        use super::super::sibling_audit as audit;
+        audit::Row {
+            coverage_id: id.to_owned(),
+            receipt_key: None,
+            file: None,
+            argument_span: None,
+            call_global_span: (0, 0),
+            caller: "caller".to_owned(),
+            callee: "callee".to_owned(),
+            block: 0,
+            statement_index: 0,
+            argument_index: 0,
+            source: audit::Source {
+                identity: id.to_owned(),
+                label: id.to_owned(),
+                kind: audit::SubjectKind::Local,
+                mir_local: None,
+                hir_owner: 0,
+                hir_local: 0,
+                argument_shape: "bare-local".to_owned(),
+                evidence: audit::SourceEvidence::WholeSubject,
+                native_return: None,
+            },
+            siblings: Vec::new(),
+            post_call: audit::PostCall::ParameterProtected,
+            terminal: audit::Terminal {
+                source_form: "ref-shared".to_owned(),
+                target_form: "raw".to_owned(),
+                source_delivered: true,
+            },
+            outcome: audit::Outcome::IncompleteCapture,
+            data: true,
+            issues: Vec::new(),
+        }
+    }
+
+    /// An incomplete audit row carries what it is missing, and a row that
+    /// records nothing says so rather than reading like the old bare line.
+    #[test]
+    fn r295_an_incomplete_audit_row_names_what_it_is_missing() {
+        let with_issue = super::super::sibling_audit::Row {
+            data: false,
+            issues: vec!["sibling-audit:source-custody-unstated".to_owned()],
+            ..sibling_audit_row("covered")
+        };
+        let silent = super::super::sibling_audit::Row {
+            data: false,
+            issues: Vec::new(),
+            ..sibling_audit_row("silent")
+        };
+        let issues = sibling_audit_issues(Some(&SiblingAuditCapture {
+            expected_coverage_ids: ["covered".to_owned(), "silent".to_owned()]
+                .into_iter()
+                .collect(),
+            rows: vec![with_issue, silent],
+        }));
+        assert!(
+            issues.iter().any(|issue| issue
+                == "sibling-audit:incomplete-row:covered:sibling-audit:source-custody-unstated"),
+            "{issues:#?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue == "sibling-audit:incomplete-row:silent:no-issue-recorded"),
             "{issues:#?}"
         );
     }

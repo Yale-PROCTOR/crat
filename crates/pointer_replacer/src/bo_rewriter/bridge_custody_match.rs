@@ -1946,8 +1946,19 @@ fn pending(
             matching.push((*call, witnesses));
         }
     }
+    // **R295-3 — the two failures this arm can have are not the same failure.**
+    //
+    // One message covered both an EMPTY match set — no corresponding call in
+    // the tree, a real custody failure — and a set of two or more, which is
+    // the uniqueness requirement R287-1 ruled custody never needed. A reader
+    // of `pending-call-correspondence-not-unique` could not tell which had
+    // happened, and the two want opposite dispositions.
     let [(call, witnesses)] = matching.as_slice() else {
-        return Err("pending-call-correspondence-not-unique".into());
+        return Err(if matching.is_empty() {
+            "pending-call-correspondence-absent".into()
+        } else {
+            format!("pending-call-correspondence-not-unique:{}", matching.len())
+        });
     };
     Ok((call.span, witnesses.clone(), ReceiptStatus::WaivedPending))
 }
