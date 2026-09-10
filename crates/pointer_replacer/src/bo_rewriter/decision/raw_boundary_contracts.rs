@@ -294,20 +294,42 @@ fn family_contract(
     argument_index: usize,
     target: &RawTargetType,
 ) -> Result<Option<ArgumentContract>, ContractFailure> {
-    // A pointer in a printf tail is a `%s` argument: read to the NUL. In a
-    // scanf tail it is a destination whose size the call never states. A
-    // stdio stream position is one `FILE`.
+    // A pointer in a printf tail is a `%s` argument — read to the NUL — only
+    // when its pointee is a character. The same position also carries `%p`,
+    // whose argument is an ADDRESS the callee formats and never dereferences,
+    // and that is one element, not a string. The format string is not visible
+    // to this table, so the pointee type is what separates them; a character
+    // pointee at a variadic position is a string in every C2Rust shape this
+    // corpus contains.
+    //
+    // The scanf tail is the same split in the other direction: `%s` writes a
+    // string of unstated length, `%d` and its kin write one element.
+    let character_pointee = matches!(
+        target
+            .pointee
+            .trim_start_matches("core::ffi::")
+            .trim_start_matches("libc::"),
+        "i8" | "u8" | "c_char" | "c_uchar" | "c_schar"
+    );
     let (access, extent, provenance) =
         if printf_tail_first(symbol).is_some_and(|first| argument_index >= first) {
             (
                 PointeeAccess::Read,
-                ArgumentExtent::NulTerminated,
+                if character_pointee {
+                    ArgumentExtent::NulTerminated
+                } else {
+                    ArgumentExtent::OneElement
+                },
                 "pinned-libc-family-printf-tail-0.2.184",
             )
         } else if scanf_tail_first(symbol).is_some_and(|first| argument_index >= first) {
             (
                 PointeeAccess::Write,
-                ArgumentExtent::UnboundedWrite,
+                if character_pointee {
+                    ArgumentExtent::UnboundedWrite
+                } else {
+                    ArgumentExtent::OneElement
+                },
                 "pinned-libc-family-scanf-tail-0.2.184",
             )
         } else if is_stdio_stream_position(symbol, argument_index) {
@@ -444,7 +466,8 @@ mod tests {
     }
 
     /// The family path carries an extent too, so a `%s` in a printf tail is
-    /// not silently one element.
+    /// not silently one element — and a `%p` in the same position is not
+    /// silently a string.
     #[test]
     fn r272_family_positions_state_their_extent() {
         let target = RawTargetType {
@@ -465,6 +488,19 @@ mod tests {
         let contract =
             classify_contract(&callee("fprintf", true), 0, &stream).expect("stdio stream position");
         assert_eq!(contract.extent, ArgumentExtent::OneElement);
+
+        // `%p`: a non-character pointee at the same variadic position is an
+        // address the callee formats, not a string it walks.
+        let address = RawTargetType {
+            rendered: "*const i32".to_owned(),
+            pointee: "i32".to_owned(),
+            mutability: RawMutability::Const,
+            depth2: None,
+        };
+        let contract = classify_contract(&callee("printf", true), 1, &address)
+            .expect("printf tail is modeled for any pointee");
+        assert_eq!(contract.extent, ArgumentExtent::OneElement);
+        assert_eq!(contract.access, PointeeAccess::Read);
     }
 
     fn callee(name: &str, foreign: bool) -> ForeignSymbolKey {

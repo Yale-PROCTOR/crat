@@ -11707,14 +11707,24 @@ fn raw_boundary_exact_slice_use_region_has_one_owner() {
     );
 }
 
-/// Addendum-169 R-B production witness for the two RB-X3 family shapes. The
-/// variadic subject crosses a libc position whose contract marks the argument
-/// read-only, so it may use the explicit address view. The FILE stream contract
-/// is not read-only and therefore must remain raw even when the Rust body only
-/// reads through the pointer.
+/// Addendum-169 R-B production witness for the two RB-X3 family shapes, as
+/// **migrated under R217-2(a) for route (A)** (seat addendum 280).
 ///
-/// A mutation that treats the stream shape itself as negative-write evidence
-/// incorrectly promotes `stream` and emits a second `cast_mut` bridge.
+/// The original assertion was that the variadic subject reaches
+/// `print_arg(p: &i8)` through the explicit address view, because its libc
+/// position marks the argument read-only. Route (A) reads the SAME family row
+/// one column further along: a `%s` position in a printf tail consumes
+/// elements to the NUL, so a thin `&i8` there carries one element of
+/// provenance against an unbounded read. The subject is now held
+/// `held:thin-extent` and keeps its raw form.
+///
+/// **The property under test survives and is strengthened.** What this witness
+/// exists for is that both family contracts reach the shared emission path
+/// rather than being special-cased — and the printf half now proves it twice
+/// over, since both the read-only access and the extent come from the one
+/// family row. The stream half is unchanged, and so is the mutation this test
+/// kills: treating the stream shape as negative-write evidence would promote
+/// `stream` and emit a `cast_mut` bridge, and there must be none at all now.
 #[test]
 fn rb_x3_family_contracts_reach_the_shared_emission_path() {
     let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
@@ -11733,20 +11743,31 @@ fn rb_x3_family_contracts_reach_the_shared_emission_path() {
     let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
         panic!("both exact family contracts must emit");
     };
-    assert!(source.contains("print_arg(p: &i8)"), "{source}");
+    let reasons = decisions_of(src)
+        .into_iter()
+        .map(|(name, _, reason)| (name, reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        reasons.get("p").map(String::as_str),
+        Some("held:thin-extent"),
+        "a `%s` tail reads to the NUL, so a thin reference cannot carry it: \
+         {reasons:#?}"
+    );
+    assert!(source.contains("print_arg(p: *mut i8)"), "{source}");
     assert!(
         source.contains("print_stream(stream: *mut File)"),
         "{source}"
     );
     assert_eq!(
         source.matches("core::ptr::from_ref(").count(),
-        1,
-        "only the libc-read-only subject may use an explicit bridge: {source}"
+        0,
+        "neither family shape licenses an explicit bridge now: {source}"
     );
     assert_eq!(
         source.matches(".cast_mut()").count(),
-        1,
-        "a stream contract must not license a shared-to-mut raw bridge: {source}"
+        0,
+        "a stream contract must not license a shared-to-mut raw bridge, and \
+         the held printf subject no longer emits one either: {source}"
     );
 }
 
