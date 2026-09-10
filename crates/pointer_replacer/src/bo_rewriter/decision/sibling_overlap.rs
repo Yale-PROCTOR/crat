@@ -60,6 +60,11 @@ pub(crate) struct SiblingEvidence {
     /// Exact existing HIR argument classification; absence is missing capture,
     /// never an inferred shape from a binding name or the A5 verdict.
     pub argument_shape: Option<&'static str>,
+    /// **R287-1(c).** Where this sibling's argument actually is, so the pending
+    /// ledger row can state a disposition for it rather than leave a gap. The
+    /// same absence rule as `argument_shape`: `None` is missing capture, and a
+    /// disposition is never guessed from it.
+    pub argument_span: Option<Span>,
     pub proof: A5PeerProof,
     pub access: SiblingAccess,
 }
@@ -468,9 +473,14 @@ pub(crate) fn collect_inventory_with_expressions(
             } else {
                 SiblingAccess::Unknown("sibling-library-native-reference-access-unresolved")
             };
+            let argument_span = match sibling_sites.as_slice() {
+                [sibling] => Some(sibling.source_span),
+                _ => None,
+            };
             siblings.push(SiblingEvidence {
                 argument_index,
                 argument_shape,
+                argument_span,
                 proof,
                 access,
             });

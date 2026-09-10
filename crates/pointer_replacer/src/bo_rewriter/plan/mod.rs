@@ -68,7 +68,7 @@ pub(crate) enum FileKey {
     Virtual(String),
 }
 
-fn file_key_label(key: &FileKey) -> String {
+pub(crate) fn file_key_label(key: &FileKey) -> String {
     match key {
         FileKey::Real(path) => path.display().to_string(),
         FileKey::Virtual(name) => name.clone(),

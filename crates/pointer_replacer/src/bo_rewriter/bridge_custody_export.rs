@@ -113,8 +113,44 @@ pub(crate) struct Export {
     pub(crate) descriptor_issues: BTreeMap<String, String>,
     pub(crate) pending_candidates: BTreeMap<String, Result<Descriptor, String>>,
     pub(crate) pending_records: Vec<String>,
+    /// **R287-1 — the pending sibling-overlap ledger.**
+    ///
+    /// A site under the R232-4 pending waiver is a DELIVERED site, so its row
+    /// owes the emitted call and a disposition for every sibling. These are
+    /// the rows the one new strict arm checks; nothing else reads them.
+    #[serde(default)]
+    pub(crate) pending_sites: Vec<PendingSiteRow>,
     pub(crate) pending_subject_records: Vec<PendingSubjectRecord>,
     pub(crate) coverage_gap_records: Vec<String>,
+}
+
+/// One pending sibling-overlap site, stated completely (R287-1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingSiteRow {
+    pub(crate) site_id: String,
+    /// (a) the waiver receipt.
+    pub(crate) waiver: String,
+    pub(crate) source_file: String,
+    /// (b) the call's original interval and the edits planned inside it;
+    /// `Err` is a producer defect and is reported as one, never accepted.
+    pub(crate) call: Result<PendingCallRow, String>,
+    /// (c) one entry per pointer sibling. An empty list where the site has
+    /// siblings is the `sibling-audit:incomplete-row` defect, not a pass.
+    pub(crate) siblings: Vec<PendingSiblingRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingCallRow {
+    pub(crate) lo: usize,
+    pub(crate) hi: usize,
+    pub(crate) edits: Vec<(usize, usize, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingSiblingRow {
+    pub(crate) argument_index: usize,
+    pub(crate) disposition: String,
+    pub(crate) detail: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -739,6 +775,7 @@ pub(crate) fn refresh(
     export.terminal_issues.clear();
     export.pending.clear();
     export.pending_records.clear();
+    export.pending_sites.clear();
     export.pending_subject_records.clear();
     export.coverage_gap_records.clear();
     for function in &mut export.functions {
@@ -754,6 +791,48 @@ pub(crate) fn refresh(
     }
     for site in pending {
         export.pending_records.push(format!("{site:#?}"));
+        export.pending_sites.push(PendingSiteRow {
+            site_id: site.receipt.site_id(),
+            waiver: site.receipt.reason.to_owned(),
+            source_file: match &site.emitted_call {
+                Ok(call) => super::plan::file_key_label(&call.file),
+                Err(_) => site
+                    .site
+                    .as_ref()
+                    .map(|key| key.file.clone())
+                    .unwrap_or_default(),
+            },
+            call: site.emitted_call.as_ref().map_or_else(
+                |error| Err(error.clone()),
+                |call| {
+                    Ok(PendingCallRow {
+                        lo: call.lo,
+                        hi: call.hi,
+                        edits: call.edits.clone(),
+                    })
+                },
+            ),
+            siblings: site
+                .siblings
+                .iter()
+                .map(|disposition| PendingSiblingRow {
+                    argument_index: disposition.argument_index(),
+                    disposition: disposition.key().to_owned(),
+                    detail: match disposition {
+                        super::plan::sibling_overlap::SiblingDisposition::Bridged {
+                            custody_identity,
+                            ..
+                        } => custody_identity.clone(),
+                        super::plan::sibling_overlap::SiblingDisposition::Held {
+                            reason, ..
+                        } => reason.clone(),
+                        super::plan::sibling_overlap::SiblingDisposition::RawUnchanged {
+                            ..
+                        } => "-".to_owned(),
+                    },
+                })
+                .collect(),
+        });
         let source = &site.receipt.potential.source;
         let owners = export
             .functions
@@ -870,6 +949,180 @@ pub(crate) fn compare_capture(
     outcome: CensusOutcomeKind,
 ) -> CheckpointReport {
     compare_applied(export, &applied_receipts(events), sources, outcome)
+}
+
+/// **R287-1 — the one new strict arm: "pending sibling-overlap site".**
+///
+/// A site under the R232-4 pending waiver is a DELIVERED site. Its ledger row
+/// must carry the waiver receipt, the emitted call, and an explicit
+/// disposition for every sibling argument; this arm checks exactly those
+/// three and nothing else. Existing arms are untouched.
+///
+/// It replaces a *uniqueness* requirement with an *equality* one. The old
+/// pending matcher searched the emitted tree for the unique structurally
+/// corresponding call and answered `pending-call-correspondence-not-unique`
+/// whenever an owner held two — a property custody never needed. Here the
+/// producer states what the tree should read and the arm checks that some
+/// call in that file reads it, so two identical calls satisfy custody rather
+/// than defeating it.
+///
+/// Nothing here is permitted to pass on absence: a missing call, an
+/// unrenderable one, or a sibling without a disposition is a producer-side
+/// ledger-completeness defect and is reported as such.
+fn pending_sibling_overlap_issues(
+    export: &Export,
+    sources: Option<&BTreeMap<String, String>>,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    for row in &export.pending_sites {
+        let id = &row.site_id;
+        if row.waiver != super::decision::sibling_overlap::PENDING_REASON {
+            issues.push(format!(
+                "pending-sibling-overlap:waiver-receipt-mismatch:{id}:{}",
+                row.waiver
+            ));
+        }
+        let call = match &row.call {
+            Ok(call) => call,
+            // A row that explicitly declines the call-text claim is complete:
+            // the native-return-expression shape's text belongs to its own
+            // arm. Every OTHER absence is the producer defect R287-1 names.
+            Err(reason) if reason.starts_with("pending-sibling-call-not-claimed:") => {
+                check_sibling_dispositions(id, &row.siblings, &mut issues);
+                continue;
+            }
+            Err(reason) => {
+                issues.push(format!(
+                    "pending-sibling-overlap:emitted-call-missing:{id}:{reason}"
+                ));
+                continue;
+            }
+        };
+        match export.files.get(&row.source_file) {
+            None => issues.push(format!(
+                "pending-sibling-overlap:original-file-missing:{id}:{}",
+                row.source_file
+            )),
+            Some(original) => match render_pending_call(original.source.as_str(), call) {
+                None => issues.push(format!(
+                    "pending-sibling-overlap:emitted-call-unrenderable:{id}"
+                )),
+                Some(expected) => match sources.and_then(|map| map.get(&row.source_file)) {
+                    // No emitted source is a transport state, not a verdict:
+                    // the row is complete and there is nothing to compare it
+                    // against yet.
+                    None => {}
+                    Some(emitted) => {
+                        // Compared as TOKENS, not bytes. The emitted tree is
+                        // reprinted by `pprust`, which reflows a long call
+                        // across lines, so a byte comparison would fail on
+                        // formatting the producer never claimed. Whitespace is
+                        // the only thing dropped; every token, in order, must
+                        // still be there.
+                        if !without_whitespace(emitted).contains(&without_whitespace(&expected)) {
+                            issues.push(format!(
+                                "pending-sibling-overlap:emitted-call-text-absent:{id}"
+                            ));
+                        }
+                    }
+                },
+            },
+        }
+        check_sibling_dispositions(id, &row.siblings, &mut issues);
+    }
+    issues
+}
+
+fn check_sibling_dispositions(id: &str, siblings: &[PendingSiblingRow], issues: &mut Vec<String>) {
+    {
+        let mut seen = BTreeSet::new();
+        for sibling in siblings {
+            if !seen.insert(sibling.argument_index) {
+                issues.push(format!(
+                    "pending-sibling-overlap:duplicate-sibling-disposition:{id}:arg{}",
+                    sibling.argument_index
+                ));
+            }
+            match sibling.disposition.as_str() {
+                "bridged" if sibling.detail.is_empty() || sibling.detail == "-" => {
+                    issues.push(format!(
+                        "pending-sibling-overlap:bridged-sibling-without-custody-identity:{id}:arg{}",
+                        sibling.argument_index
+                    ));
+                }
+                "held" if sibling.detail.is_empty() || sibling.detail == "-" => {
+                    issues.push(format!(
+                        "pending-sibling-overlap:held-sibling-without-reason:{id}:arg{}",
+                        sibling.argument_index
+                    ));
+                }
+                "bridged" | "held" | "raw-unchanged" => {}
+                other => issues.push(format!(
+                    "pending-sibling-overlap:unknown-sibling-disposition:{id}:arg{}:{other}",
+                    sibling.argument_index
+                )),
+            }
+        }
+    }
+}
+
+/// The emitted text of a pending call, from the original bytes and the edits
+/// the plan recorded inside it.
+///
+/// Edits arrive sorted outermost-first. A **nested** pair is not a defect —
+/// L07's composed containments put an inner edit inside an outer one, and the
+/// AST layer renders the descendant first and moves the rewritten subtree into
+/// the outer. This mirrors that, with K21's guard: the inner's original text
+/// must occur exactly once in the outer's replacement, or the composition is
+/// not statable and the row says so. A true **crossing** — which L07 measured
+/// at zero — is rejected rather than rendered around.
+fn without_whitespace(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn render_pending_call(original_source: &str, call: &PendingCallRow) -> Option<String> {
+    render_span(original_source, call.lo, call.hi, &call.edits)
+}
+
+fn render_span(
+    source: &str,
+    lo: usize,
+    hi: usize,
+    edits: &[(usize, usize, String)],
+) -> Option<String> {
+    let mut out = String::new();
+    let mut cursor = lo;
+    let mut index = 0;
+    while index < edits.len() {
+        let (edit_lo, edit_hi, replacement) = &edits[index];
+        if *edit_lo < cursor || *edit_hi > hi || edit_lo > edit_hi {
+            return None;
+        }
+        out.push_str(source.get(cursor..*edit_lo)?);
+        let children = edits[index + 1..]
+            .iter()
+            .take_while(|(child_lo, child_hi, _)| child_lo >= edit_lo && child_hi <= edit_hi)
+            .cloned()
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            out.push_str(replacement);
+        } else {
+            let mut composed = replacement.clone();
+            for child in &children {
+                let original = source.get(child.0..child.1)?;
+                let rendered = render_span(source, child.0, child.1, std::slice::from_ref(child))?;
+                if original.is_empty() || composed.matches(original).count() != 1 {
+                    return None;
+                }
+                composed = composed.replace(original, &rendered);
+            }
+            out.push_str(&composed);
+        }
+        cursor = *edit_hi;
+        index += 1 + children.len();
+    }
+    out.push_str(source.get(cursor..hi)?);
+    Some(out)
 }
 
 fn sibling_audit_issues(audit: Option<&SiblingAuditCapture>) -> Vec<String> {
@@ -1016,6 +1269,9 @@ fn compare_applied(
         .issues
         .extend(sibling_audit_issues(export.sibling_audit.as_ref()));
     report.issues.extend(native_sibling_source_issues(export));
+    report
+        .issues
+        .extend(pending_sibling_overlap_issues(export, sources));
     match export.outbound_return.as_ref() {
         None => report
             .issues
