@@ -2048,8 +2048,25 @@ fn verify_and_revert(
                 );
             }
             let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
+            // **R291-5 — the ledger partitions on the same set the TREE does.**
+            //
+            // `reverted` is the set of classes taken back DIRECTLY. The emitted
+            // tree is rendered through `effective_reverted_classes`, which adds
+            // the input-reversion closure: reverting a callee retires every
+            // caller whose converted form depended on it. Partitioning on the
+            // direct set alone left the ledger claiming deliveries the tree had
+            // already retired — urlparser's `url_get_query::url#1`, whose
+            // parameter stayed `*mut libc::c_char` because `url_get_search` was
+            // reverted, while the ledger still called it placed.
+            let effective_reverted = emission_plan.effective_reverted_classes(
+                &reverted
+                    .union(&emission_plan.held_classes())
+                    .copied()
+                    .collect(),
+                &reverted_atoms,
+            );
             let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects.iter().partition(|subject| {
-                !reverted.contains(&subject.owner_class)
+                !effective_reverted.contains(&subject.owner_class)
                     && subject
                         .atoms
                         .iter()
@@ -2068,8 +2085,11 @@ fn verify_and_revert(
             facts.emitted_count = kept.len();
             facts.reverted_count = taken.len();
             facts.files_touched = files_edited;
-            facts.raw_boundary_artifacts.final_reverts =
-                render_raw_boundary_final_reverts(&reverted, &reverted_atoms, &class_paths);
+            facts.raw_boundary_artifacts.final_reverts = render_raw_boundary_final_reverts(
+                &effective_reverted,
+                &reverted_atoms,
+                &class_paths,
+            );
             refresh_raw_boundary_receipt_events(
                 &mut facts.raw_boundary_artifacts,
                 &emission_plan,
