@@ -126,7 +126,7 @@ pub unsafe fn f(p: *const u8) -> u8 {
         let ((review, source), captured) = export::with_bo_export(|| {
             // No borrow_verify wrapper: it would replace this deliberately
             // faulted catalog with a newly constructed retirement scope.
-            let scope = begin(&program, &slots, |slot| slot == target);
+            let scope = begin(&program, &slots, &flows, |slot| slot == target);
             let source = CURRENT.with(|current| {
                 let mut current = current.borrow_mut();
                 let context = current.as_mut().expect("manual retirement context");

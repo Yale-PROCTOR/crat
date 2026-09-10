@@ -233,8 +233,12 @@ fn call_effect<'tcx>(
     body: &Body<'tcx>,
     location: Location,
     normal: bool,
+    certificates: &crate::analyses::borrow_ownership::retirement::return_origin::CertificateMap,
     state: &mut State,
 ) {
+    use crate::analyses::borrow_ownership::retirement::return_origin::{
+        self, ClosedOrigin, Rejection,
+    };
     let terminator = body.basic_blocks[location.block].terminator();
     let Some(call) = terminator.as_call(program.tcx) else {
         if matches!(
@@ -255,11 +259,56 @@ fn call_effect<'tcx>(
     let null = core_pointer
         && matches!(call.func, CallKind::RustLib(did)
         if matches!(program.tcx.item_name(did).as_str(), "null" | "null_mut"));
-    if !allocator && !free && !core_pointer {
+    let local_candidate = !allocator && !free && !core_pointer;
+    let mut certificate = if !normal {
+        Err(Rejection::NoNormalReturn)
+    } else if call.destination.as_local().is_none() {
+        Err(Rejection::UnsupportedProjection)
+    } else if local_candidate {
+        return_origin::for_call(program, certificates, &call)
+    } else {
+        Err(Rejection::ForeignCall)
+    };
+    let mut argument_index = None;
+    let mut input_snapshot = None;
+    if let Ok(proof) = certificate
+        && let ClosedOrigin::Input(parameter) = proof.origin
+    {
+        let snapshot = return_origin::input_argument_index(parameter).and_then(|index| {
+            let actual = call
+                .args
+                .get(index)
+                .ok_or(Rejection::MissingActualArgument)?;
+            let supported = match &actual.node {
+                Operand::Copy(place) | Operand::Move(place) => {
+                    place.projection.iter().all(|projection| {
+                        matches!(projection, rustc_middle::mir::ProjectionElem::Deref)
+                    })
+                }
+                Operand::Constant(_) => {
+                    source_events::operand_is_null(&actual.node, &[], program.tcx)
+                }
+            };
+            if !supported {
+                return Err(Rejection::UnsupportedActual);
+            }
+            Ok((index, operand_value(&actual.node, 0, state, program.tcx)))
+        });
+        match snapshot {
+            Ok((index, objects)) => {
+                argument_index = Some(index);
+                input_snapshot = Some(objects);
+            }
+            Err(reason) => certificate = Err(reason),
+        }
+    }
+    // Return identity is not an effect summary. Retain this exact old clobber,
+    // after taking any admitted actual-value snapshot and before destination write.
+    if local_candidate {
         clobber(state);
     }
     if normal {
-        let value = if allocator {
+        let mut value = if allocator {
             ObjectSet::root(ObjectRoot::Fresh {
                 frame: function,
                 site: location,
@@ -267,9 +316,37 @@ fn call_effect<'tcx>(
         } else if null {
             ObjectSet::null()
         } else {
-            ObjectSet::default()
+            match certificate {
+                Ok(proof) => match proof.origin {
+                    ClosedOrigin::Fresh => ObjectSet::root(ObjectRoot::Fresh {
+                        frame: function,
+                        site: location,
+                    }),
+                    ClosedOrigin::Input(_) => input_snapshot.unwrap_or_default(),
+                },
+                Err(_) => ObjectSet::default(),
+            }
         };
+        if certificate.is_ok_and(|proof| proof.nullable) {
+            // Null contributes no object. The explicit alternative lives in the
+            // certificate/receipt; this union never clears an actual's Unknown.
+            value.union(&ObjectSet::null());
+        }
         write(call.destination, vec![value], state);
+    }
+    #[cfg(test)]
+    if local_candidate {
+        return_origin::record_transfer(|| return_origin::TransferReceipt {
+            caller: function,
+            callee: return_origin::direct_callee(program, &call).ok(),
+            location,
+            normal,
+            certificate,
+            argument_index,
+            // Observe the actual post-write state. A projected write can discard
+            // a factory value, so that value is never substituted for delivery.
+            destination_objects: pointer(state, &PlaceKey::from_place(call.destination), 0),
+        });
     }
 }
 
@@ -290,7 +367,12 @@ impl ObjectFacts {
         program: &RustProgram<'_>,
         slots: &CrateSlots,
         events: &SourceEvents,
+        origin_flows: &crate::analyses::borrow_ownership::origin_flow::OriginFlowResults,
     ) -> Self {
+        let certificates = crate::analyses::borrow_ownership::retirement::return_origin::derive(
+            program,
+            origin_flows,
+        );
         let mut facts = Self::default();
         for &function in &program.functions {
             let body = program
@@ -347,7 +429,15 @@ impl ObjectFacts {
                     let mut outgoing = state.clone();
                     let normal = matches!(data.terminator().kind,
                         TerminatorKind::Call { target: Some(target), .. } if target == successor);
-                    call_effect(program, function, &body, location, normal, &mut outgoing);
+                    call_effect(
+                        program,
+                        function,
+                        &body,
+                        location,
+                        normal,
+                        &certificates,
+                        &mut outgoing,
+                    );
                     for site in &reallocations {
                         let ReallocResult::DirectBranch(branch) = &site.result else { continue };
                         if branch.test != location

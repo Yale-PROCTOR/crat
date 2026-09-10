@@ -108,7 +108,11 @@ fn finish_coverage(fault: Fault) -> Finished {
         // real compiler slots; no invented Loan, LocalDefId or field identity.
         let _entries =
             protected_entry::for_model(&program, &slots, |slot| carried_slot == Some(slot));
-        let scope = begin(&program, &slots, |slot| slot == expected_slot);
+        let origin_flows =
+            crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(&program);
+        let scope = begin(&program, &slots, &origin_flows, |slot| {
+            slot == expected_slot
+        });
         let (expected, sources, free) = CURRENT.with(|current| {
             let mut current = current.borrow_mut();
             let context = current.as_mut().expect("actual retirement scope");

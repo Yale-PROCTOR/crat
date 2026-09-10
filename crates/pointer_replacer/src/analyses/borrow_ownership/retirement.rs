@@ -30,7 +30,10 @@ pub(crate) mod local_outcome;
 #[cfg(test)]
 mod local_outcome_tests;
 mod objects;
+mod return_origin;
 mod routes;
+#[cfg(test)]
+mod tests_return_origin;
 
 use objects::{ObjectFacts, ObjectRoot, ObjectSet};
 use routes::{FrameEvent, RoutedEvents};
@@ -291,6 +294,7 @@ impl Drop for RetirementScope {
 pub(crate) fn begin(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
+    origin_flows: &crate::analyses::borrow_ownership::origin_flow::OriginFlowResults,
     is_ref: impl Fn(SlotRef) -> bool,
 ) -> RetirementScope {
     let source = source_events::for_construction(program);
@@ -299,7 +303,7 @@ pub(crate) fn begin(
         .is_none()
         .then(|| protected_entry::for_model(program, slots, &is_ref));
     let entries = protected_entry::current().expect("validated parameter-entry scope");
-    let objects = ObjectFacts::analyze(program, slots, &source);
+    let objects = ObjectFacts::analyze(program, slots, &source, origin_flows);
     let routed = routes::expand(program, &source, &objects);
     let exact = MODEL.with(|current| current.borrow().clone());
     let mut context = Context {
