@@ -200,6 +200,8 @@ pub(crate) struct CoverageGapReceipt {
     pub source_form: Form,
     pub target_form: Form,
     pub reason: &'static str,
+    /// R291-1: the unsealed source shape, carried rather than discarded.
+    pub shape: &'static str,
 }
 
 pub(crate) fn select_coverage_gaps(
@@ -216,11 +218,20 @@ pub(crate) fn select_coverage_gaps(
             if !pending_site_eligible(&record.potential, state) {
                 return None;
             }
+            let SourceBridgeEvidence::UnknownShape(shape) = record.evidence else {
+                // Guarded by the filter above; restated so a new evidence
+                // variant cannot silently acquire the empty shape.
+                return None;
+            };
             Some(CoverageGapReceipt {
                 potential: record.potential.clone(),
                 source_form: state.source_form,
                 target_form: state.target_form,
                 reason: "sibling-source-bridge-custody-unresolved",
+                // **R291-1** — the gap carries the shape it could not seal.
+                // The receipt discarded it, so 276 corpus sites arrived under
+                // one name with no partition to design a row contract on.
+                shape,
             })
         })
         .collect()
@@ -699,7 +710,79 @@ fn source_bridge_evidence(
             method,
         };
     }
-    SourceBridgeEvidence::UnknownShape("source-expression-not-a-sealed-reference-view")
+    SourceBridgeEvidence::UnknownShape(unsealed_shape(tcx, typeck, expression, source))
+}
+
+/// **R291-1 — what the source expression IS, when it is none of the sealed
+/// shapes.**
+///
+/// The fallback said only `source-expression-not-a-sealed-reference-view`, and
+/// every one of the corpus's 276 gap sites reported it — one bucket, no
+/// partition, and no way to tell a shape worth sealing from one that never
+/// could be. It names the shape instead, which is what the source-bridge row
+/// contract has to state.
+///
+/// This changes no verdict: the site is a gap either way. It changes only what
+/// the receipt says about it.
+fn unsealed_shape(
+    tcx: TyCtxt<'_>,
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    expression: &Expr<'_>,
+    source: &Subject,
+) -> &'static str {
+    fn rooted_elsewhere(expression: &Expr<'_>) -> bool {
+        matches!(expression.kind, ExprKind::Path(QPath::Resolved(_, path))
+            if matches!(path.res, Res::Local(_)))
+    }
+    match expression.kind {
+        ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+            Res::Local(_) => "unsealed:local-other-than-the-subject",
+            Res::Def(rustc_hir::def::DefKind::Static { .. }, _) => "unsealed:static",
+            Res::Def(rustc_hir::def::DefKind::Const, _)
+            | Res::Def(rustc_hir::def::DefKind::AssocConst, _) => "unsealed:const",
+            Res::Def(rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn, _) => {
+                "unsealed:function-item"
+            }
+            _ => "unsealed:path-other",
+        },
+        ExprKind::Path(_) => "unsealed:path-unresolved",
+        ExprKind::Field(..) => "unsealed:field-not-raw",
+        ExprKind::Index(..) => "unsealed:index",
+        ExprKind::Unary(rustc_hir::UnOp::Deref, _) => "unsealed:deref",
+        ExprKind::Unary(..) => "unsealed:unary",
+        ExprKind::Binary(..) => "unsealed:binary",
+        ExprKind::AddrOf(..) => {
+            if rooted_elsewhere(expression) {
+                "unsealed:addr-of-other-root"
+            } else {
+                "unsealed:addr-of-non-place"
+            }
+        }
+        ExprKind::MethodCall(_, receiver, _, _) => {
+            let Some(method) = typeck.type_dependent_def_id(expression.hir_id) else {
+                return "unsealed:method-unresolved";
+            };
+            let receiver_is_subject = matches!(receiver.kind, ExprKind::Path(QPath::Resolved(_, path))
+                if path.res == Res::Local(source.hir_id));
+            match (method.is_local(), receiver_is_subject) {
+                (true, _) => "unsealed:method-local",
+                (false, true) if tcx.crate_name(method.krate).as_str() == "core" => {
+                    // On the subject, from core, but outside the sealed method
+                    // list — the one bucket a widened seal would come from.
+                    "unsealed:core-method-outside-the-seal"
+                }
+                (false, true) => "unsealed:foreign-method-on-the-subject",
+                (false, false) => "unsealed:method-on-another-receiver",
+            }
+        }
+        ExprKind::Call(..) => "unsealed:call",
+        ExprKind::Lit(..) => "unsealed:literal",
+        ExprKind::Cast(..) => "unsealed:cast-not-pointer-to-pointer",
+        ExprKind::If(..) | ExprKind::Match(..) => "unsealed:branch",
+        ExprKind::Block(..) => "unsealed:block",
+        ExprKind::Struct(..) | ExprKind::Array(..) | ExprKind::Tup(..) => "unsealed:aggregate",
+        _ => "unsealed:other",
+    }
 }
 
 pub(crate) fn select_pending(

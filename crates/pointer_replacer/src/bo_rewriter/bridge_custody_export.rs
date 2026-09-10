@@ -958,9 +958,10 @@ pub(crate) fn refresh(
     for gap in gaps {
         export.coverage_gap_records.push(format!("{gap:#?}"));
         export.terminal_issues.push(format!(
-            "bridge-custody:sibling-coverage-gap:{}:{}",
+            "bridge-custody:sibling-coverage-gap:{}:{}:{}",
             super::decision::raw_boundary::site_atom_id(&gap.potential.site),
-            gap.reason
+            gap.reason,
+            gap.shape
         ));
     }
 }

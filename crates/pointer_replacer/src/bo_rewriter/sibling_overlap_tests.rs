@@ -608,6 +608,10 @@ fn sibling_r233_coverage_unknown_rooted_wrapper_is_explicit_and_terminal_filtere
     );
     assert_eq!(gaps[0].potential.site, record.potential.site);
     assert_eq!(gaps[0].reason, "sibling-source-bridge-custody-unresolved");
+    // **R291-1** — the gap carries the shape it could not seal. The receipt
+    // used to discard it, so every corpus site arrived under one name with no
+    // partition to design the source-bridge row contract on.
+    assert_eq!(gaps[0].shape, "constructed-unresolved-wrapper-control");
     for terminal in [
         TerminalSiteState {
             source_delivered: false,
