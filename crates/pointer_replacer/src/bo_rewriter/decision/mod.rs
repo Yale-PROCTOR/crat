@@ -1846,6 +1846,31 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         {
             return degrade(subject, decl_site, residual_reason(subject.ctor.as_ref()));
         }
+        // **R272-1 / R280-1, route (A).** A thin reference is a one-element
+        // claim, and this subject is handed to a foreign position whose
+        // contract consumes more than one element — to the NUL, to a stated
+        // count, or to whatever the source turns out to be. Miri confirms the
+        // `strlen` shape is UB under Stacked Borrows.
+        //
+        // **Placed before the class gate, and that placement is measured.**
+        // At the thin-`Ref` return it reached the right subjects — the corpus
+        // witness removed exactly the census's 11 buffer and 2 rgba thin
+        // references — but every one of them reported `call-site-not-adapted`
+        // instead, and `held:thin-extent` never appeared in a receipt. The
+        // hold changes the HYPOTHETICAL, so co-conversion drops the subject
+        // from its node set, and the class gate's not-a-node arm below fires
+        // first. A typed refusal must not be reported as an untyped one.
+        //
+        // It is still inside the `Form::Plain` arm and guarded on
+        // `depth2_npo.is_none()`, so it can only ever convert a would-be thin
+        // `Decision::Ref`: slices, Options of slices, depth-2 NPO Options and
+        // `Box` all keep their own extent and are untouched. That preserves
+        // the property the freed-slot and null-init gates were placed for —
+        // a gate that only converts a would-be emission is what makes a
+        // pre-registered count a count.
+        if depth2_npo.is_none() && thin_extent.contains(&(subject.fn_did, subject.hir_id)) {
+            return degrade(subject, decl_site, DegradeReason::ThinExtent);
+        }
         // **S3.6-1 step 3 — THE CLASS GATE, and it consults `admits`.**
         //
         // That is what UNIFORM means: the class verdict governs every node, not
@@ -1892,21 +1917,6 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 slice: false,
                 uses: uses.rewrites,
             };
-        }
-        // **R272-1 / R280-1, route (A).** A thin reference is a one-element
-        // claim, and this subject is handed to a foreign position whose
-        // contract consumes more than one element — to the NUL, to a stated
-        // count, or to whatever the source turns out to be. Miri confirms the
-        // `strlen` shape is UB under Stacked Borrows.
-        //
-        // Placed HERE, at the thin-`Ref` return, rather than beside
-        // `held:void-pointee` higher up: every form that carries its own
-        // extent — slice, Option of slice, `Box` — has already returned, and
-        // those are sound and stay untouched. Like the void hold, it therefore
-        // also sits below the owning arm, which is the placement R271-1's two
-        // Box controls established.
-        if thin_extent.contains(&(subject.fn_did, subject.hir_id)) {
-            return degrade(subject, decl_site, DegradeReason::ThinExtent);
         }
         return Decision::Ref {
             mutable: subject.mutable,
