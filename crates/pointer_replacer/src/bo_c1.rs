@@ -24989,6 +24989,57 @@ fn r219_custody_failure_row_cannot_supply_aggregate_data() {
     assert!(!raw_boundary_rows_have_data(&[row]));
 }
 
+/// **R295-1 — the delivery law, at the comparator that enforces it.**
+///
+/// `delivered` is `placed` AND the retained tree's declaration carrying the
+/// decided safe form AND the owner being outside
+/// `effective_reverted_classes` — the direct set PLUS the input-reversion
+/// closure. This is the fault a direct-set-only partition produces, and it is
+/// the shape urlparser and json.h were actually in: the ledger claimed a
+/// delivery while the tree still read the raw form, because the closure had
+/// retired the owner and only the direct set was consulted.
+#[test]
+fn r295_direct_set_only_partition_is_caught_as_ledger_only() {
+    let report = r219_custody_observe(
+        &[r219_custody_expectation("f", "p")],
+        &["f::p#1"],
+        "fn f(p: *const i32) {}",
+        &[],
+    );
+    assert!(
+        report.delivered_by_tree.is_empty(),
+        "the tree carries the raw form: {report:?}"
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("ledger-only") && issue.contains("f::p#1")),
+        "a delivery the tree does not carry must be reported: {report:?}"
+    );
+}
+
+/// The witness: once the owner is retired, the ledger must not claim it, and
+/// the comparator agrees silently. A callee revert reaches the caller through
+/// the closure, so this is what a retired DEPENDENT looks like at this seam.
+#[test]
+fn r295_a_retired_owner_is_not_claimed_by_the_ledger() {
+    let report = r219_custody_observe(
+        &[r219_custody_expectation("f", "p")],
+        &[],
+        "fn f(p: *const i32) {}",
+        &["f"],
+    );
+    assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    assert!(
+        !report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("identity-mismatch")),
+        "a retired owner claimed by neither side is not a mismatch: {report:?}"
+    );
+}
+
 #[test]
 fn r219_custody_review_a_different_file_cannot_supply_the_declaration() {
     let mut expectation = r219_custody_expectation("f", "p");
