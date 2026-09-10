@@ -255,5 +255,220 @@ pub(crate) fn publish(directory: &Path, entry: &CompleteEntry) -> Result<PathBuf
         .map_err(|e| e.to_string())?;
     Ok(destination)
 }
+
+/// A validated canonical entry kept on disk. Cloning the prepared cache shares
+/// this handle; it never duplicates the portable history's JSON tree.
+pub(crate) struct StreamedEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) metadata: stream::Metadata,
+    pub(crate) hashes: Option<StreamHashes>,
+    remove_on_drop: bool,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct StreamHashes {
+    pub(crate) entry: String,
+    pub(crate) payload: String,
+    pub(crate) exports: String,
+}
+impl Drop for StreamedEntry {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct HashWriter(sha2::Sha256);
+impl HashWriter {
+    fn new() -> Self {
+        use sha2::Digest;
+        Self(sha2::Sha256::new())
+    }
+
+    fn finish(self) -> String {
+        use sha2::Digest;
+        format!("{:x}", self.0.finalize())
+    }
+}
+impl std::io::Write for HashWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut input = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+    let mut output = HashWriter::new();
+    std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
+    Ok(output.finish())
+}
+
+pub(crate) fn validate_file(path: &Path) -> Result<stream::Metadata, String> {
+    let input = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+    stream::validate_reader(input)
+}
+
+pub(crate) fn equal_files(left: &Path, right: &Path) -> Result<bool, String> {
+    use std::io::Read;
+    let mut left = std::fs::File::open(left).map_err(|e| e.to_string())?;
+    let mut right = std::fs::File::open(right).map_err(|e| e.to_string())?;
+    if left.metadata().map_err(|e| e.to_string())?.len()
+        != right.metadata().map_err(|e| e.to_string())?.len()
+    {
+        return Ok(false);
+    }
+    let mut a = [0u8; 64 * 1024];
+    let mut b = [0u8; 64 * 1024];
+    loop {
+        let count = left.read(&mut a).map_err(|e| e.to_string())?;
+        if count == 0 {
+            return Ok(true);
+        }
+        right
+            .read_exact(&mut b[..count])
+            .map_err(|e| e.to_string())?;
+        if a[..count] != b[..count] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Exports must come from the canonical Value-order spool, not the typed
+/// PortableExport-order proof file. The full validator is run on staged bytes.
+pub(crate) fn stage_streamed(
+    directory: &Path,
+    metadata: &stream::Metadata,
+    exports: &Path,
+) -> Result<StreamedEntry, String> {
+    use std::{
+        io::{Read, Seek, SeekFrom, Write},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static NEXT_STREAM: AtomicU64 = AtomicU64::new(0);
+    metadata.validate_meta()?;
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let path = directory.join(format!(
+        ".{}.{}-{}.streamed",
+        metadata.key,
+        std::process::id(),
+        NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
+    ));
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    let mut staged = StreamedEntry {
+        path,
+        metadata: metadata.clone(),
+        hashes: None,
+        remove_on_drop: true,
+    };
+    staged.metadata.functions.sort();
+    staged.metadata.universe.sort();
+    let meta = &staged.metadata;
+    let mut writer = std::io::BufWriter::new(file);
+    macro_rules! field {
+        ($prefix:literal, $value:expr) => {{
+            writer.write_all($prefix).map_err(|e| e.to_string())?;
+            serde_json::to_writer(&mut writer, $value).map_err(|e| e.to_string())?;
+        }};
+    }
+    field!(b"{\"schema\":", &meta.schema);
+    field!(b",\"key\":", &meta.key);
+    field!(b",\"inputs\":", &meta.inputs);
+    field!(b",\"functions\":", &meta.functions);
+    field!(b",\"universe\":", &meta.universe);
+    field!(b",\"model\":", &meta.model);
+    field!(b",\"baseline\":", &meta.baseline);
+    field!(b",\"receipt\":", &meta.receipt);
+    writer
+        .write_all(b",\"exports\":")
+        .map_err(|e| e.to_string())?;
+    let export_start = writer.stream_position().map_err(|e| e.to_string())?;
+    let mut export_input =
+        std::io::BufReader::new(std::fs::File::open(exports).map_err(|e| e.to_string())?);
+    let export_length = std::io::copy(&mut export_input, &mut writer).map_err(|e| e.to_string())?;
+    field!(b",\"origin\":", &meta.origin);
+    writer.write_all(b"}").map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    writer.get_ref().sync_all().map_err(|e| e.to_string())?;
+    drop(writer);
+    let validated = validate_file(&staged.path)?;
+    if validated.inputs != meta.inputs || validated.key != meta.key {
+        return Err("staged stream semantic identity changed".into());
+    }
+    let mut payload = HashWriter::new();
+    serde_json::to_writer(&mut payload, &(&meta.model, &meta.baseline, &meta.receipt))
+        .map_err(|e| e.to_string())?;
+    let mut export_hash = HashWriter::new();
+    export_hash.write_all(b"[").map_err(|e| e.to_string())?;
+    let mut input = std::fs::File::open(&staged.path).map_err(|e| e.to_string())?;
+    input
+        .seek(SeekFrom::Start(export_start))
+        .map_err(|e| e.to_string())?;
+    std::io::copy(&mut input.take(export_length), &mut export_hash).map_err(|e| e.to_string())?;
+    export_hash.write_all(b",").map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut export_hash, &meta.origin).map_err(|e| e.to_string())?;
+    export_hash.write_all(b"]").map_err(|e| e.to_string())?;
+    staged.hashes = Some(StreamHashes {
+        entry: file_sha256(&staged.path)?,
+        payload: payload.finish(),
+        exports: export_hash.finish(),
+    });
+    Ok(staged)
+}
+
+pub(crate) fn existing_streamed(path: PathBuf, metadata: stream::Metadata) -> StreamedEntry {
+    StreamedEntry {
+        path,
+        metadata,
+        hashes: None,
+        remove_on_drop: false,
+    }
+}
+
+pub(crate) fn publish_streamed(directory: &Path, entry: &StreamedEntry) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let checked = validate_file(&entry.path)?;
+    if checked.key != entry.metadata.key || checked.inputs != entry.metadata.inputs {
+        return Err("staged stream metadata changed before publication".into());
+    }
+    if let Some(hashes) = &entry.hashes {
+        if file_sha256(&entry.path)? != hashes.entry {
+            return Err("staged stream bytes changed before publication".into());
+        }
+    }
+    let destination = directory.join(format!("{}.json", entry.metadata.key));
+    if destination.exists() {
+        return if equal_files(&entry.path, &destination)? {
+            Ok(destination)
+        } else {
+            Err("completed semantic address already has a different body".into())
+        };
+    }
+    match std::fs::hard_link(&entry.path, &destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !equal_files(&entry.path, &destination)? {
+                return Err("concurrent semantic-address collision".into());
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    std::fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(destination)
+}
+
+pub(crate) mod stream;
+
 #[cfg(test)]
 mod tests;

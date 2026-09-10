@@ -944,5 +944,9 @@ pub(crate) fn collect(
     Ok(out)
 }
 
+pub(crate) mod stream;
+#[cfg(test)]
+mod stream_tests;
+
 #[cfg(test)]
 mod tests;

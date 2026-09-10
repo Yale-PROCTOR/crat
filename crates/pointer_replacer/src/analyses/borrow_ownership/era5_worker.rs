@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     a5_overlap::{A5Mode, WholeProgramAttestation},
-    cache_contract::{self, CompleteEntry, SemanticInputs},
+    cache_contract::{self, SemanticInputs},
     construction::solve_bo_a5_config_reporting,
     crate_slots::CrateSlots,
     era5_instruments::{REQUIRED_PROGRAMS, ResourceSeal, validate_resources},
@@ -334,27 +334,29 @@ fn derive(job: &Job, manifest: &BTreeMap<String, String>) -> Result<Completed, F
                     };
                     let path =
                         model_cache::store(tcx, &program, &slots, &cached, mode, attestation)
-                            .ok_or_else(|| invalid("complete-entry publication failed".into()))?;
-                    let bytes = fs::read(&path).map_err(|error| invalid(error.to_string()))?;
-                    let entry: CompleteEntry = cache_contract::decode(&bytes).map_err(&invalid)?;
+                            .ok_or_else(|| {
+                                invalid(format!(
+                                    "complete-entry publication failed: {:?}",
+                                    model_cache::prepare_error()
+                                ))
+                            })?;
+                    // Stream the strict readback and exact canonical hashes. The
+                    // accepted portable history never becomes a worker Value tree.
+                    let entry = cache_contract::validate_file(&path).map_err(&invalid)?;
                     let delta = execution_guard::model_entries()
                         .checked_sub(before)
                         .ok_or_else(|| invalid("model counter decreased".into()))?;
                     if delta != 1 || entry.inputs != inputs || entry.key != key {
                         return Err(invalid("entry/key/model-entry custody mismatch".into()));
                     }
-                    let payload =
-                        serde_json::to_vec(&(&entry.model, &entry.baseline, &entry.receipt))
-                            .map_err(|error| invalid(error.to_string()))?;
-                    let exports = serde_json::to_vec(&(&entry.exports, &entry.origin))
-                        .map_err(|error| invalid(error.to_string()))?;
+                    let hashes = entry.canonical_file_hashes(&path).map_err(&invalid)?;
                     Ok(Completed {
                         key: key.clone(),
                         inputs: inputs.clone(),
                         cache_entry: path,
-                        entry_sha256: sha(&bytes),
-                        payload_sha256: sha(&payload),
-                        export_sha256: sha(&exports),
+                        entry_sha256: hashes.entry,
+                        payload_sha256: hashes.payload,
+                        export_sha256: hashes.exports,
                         model_entries: delta,
                     })
                 });

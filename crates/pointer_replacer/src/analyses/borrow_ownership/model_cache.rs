@@ -407,7 +407,7 @@ pub(crate) struct CachedModel {
 
 #[derive(Clone)]
 struct Prepared {
-    entry: super::cache_contract::CompleteEntry,
+    entry: std::sync::Arc<super::cache_contract::StreamedEntry>,
     cached: CachedModel,
 }
 thread_local! {
@@ -461,8 +461,18 @@ pub(crate) fn prepare(
 ) {
     let result = (|| -> Result<Prepared, String> {
         let inputs = semantic_inputs(program, mode, attestation)?;
+        #[cfg(test)]
+        if std::env::var("CRAT_ERA5_BYTE_PROOF").as_deref() == Ok("1")
+            && !matches!(inputs.program.as_str(), "bst" | "avl")
+        {
+            return Err("byte proof is restricted to the admitted bst/avl programs".into());
+        }
         let key = super::cache_contract::semantic_key(&inputs)?;
-        let portable = super::portable_export::collect(program, slots, captured)?;
+        let directory = dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("era5a-model-cache-v1");
+        let portable =
+            super::portable_export::stream::collect_to_path(program, slots, captured, &directory)?;
         let origin = super::origin_evidence::collect(program, slots, origins, Some(captured));
         let mut functions: Vec<_> = program
             .functions
@@ -470,7 +480,7 @@ pub(crate) fn prepare(
             .map(|did| program.tcx.def_path_str(did.to_def_id()))
             .collect();
         functions.sort();
-        let entry = super::cache_contract::CompleteEntry {
+        let metadata = super::cache_contract::stream::Metadata {
             schema: super::cache_contract::SCHEMA.into(),
             key,
             inputs,
@@ -484,13 +494,87 @@ pub(crate) fn prepare(
             baseline: model_map(program.tcx, slots, &verified.baseline_model)
                 .ok_or("invalid baseline model keys")?,
             receipt: verified.receipt.clone(),
-            exports: serde_json::from_str(&portable.canonical_json()?)
-                .map_err(|e| e.to_string())?,
             origin: serde_json::from_str(&origin.canonical_json()).map_err(|e| e.to_string())?,
         };
-        entry.validate()?;
+        let entry = super::cache_contract::stage_streamed(&directory, &metadata, &portable.path)?;
+        #[cfg(test)]
+        if std::env::var("CRAT_ERA5_BYTE_PROOF").as_deref() == Ok("1") {
+            use std::io::Write;
+            let proof_root = dir()
+                .ok_or("byte proof requires an explicit quarantine cache directory")?
+                .join("byte-proof");
+            std::fs::create_dir_all(&proof_root).map_err(|error| error.to_string())?;
+            let reference_path =
+                proof_root.join(format!("{}.reference.json", metadata.inputs.program));
+            let receipt_path = proof_root.join(format!("{}.proof.json", metadata.inputs.program));
+            let mut reference_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&reference_path)
+                .map_err(|error| error.to_string())?;
+            let mut proof_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&receipt_path)
+                .map_err(|error| error.to_string())?;
+            // The frozen materializer sees the same capture and actual metadata.
+            // No diagnostic labels, history, identities, or bytes are normalized.
+            let reference_exports = super::portable_export::collect(program, slots, captured)?;
+            let reference = super::cache_contract::CompleteEntry {
+                schema: metadata.schema.clone(),
+                key: metadata.key.clone(),
+                inputs: metadata.inputs.clone(),
+                functions: metadata.functions.clone(),
+                universe: metadata.universe.clone(),
+                model: metadata.model.clone(),
+                baseline: metadata.baseline.clone(),
+                receipt: metadata.receipt.clone(),
+                exports: serde_json::from_str(&reference_exports.canonical_json()?)
+                    .map_err(|error| error.to_string())?,
+                origin: metadata.origin.clone(),
+            };
+            let bytes = reference.canonical_json()?;
+            reference_file
+                .write_all(&bytes)
+                .map_err(|error| error.to_string())?;
+            reference_file
+                .sync_all()
+                .map_err(|error| error.to_string())?;
+            drop(reference_file);
+            let identical = super::cache_contract::equal_files(&reference_path, &entry.path)?;
+            let reference_sha256 = super::cache_contract::file_sha256(&reference_path)?;
+            let streamed_sha256 = super::cache_contract::file_sha256(&entry.path)?;
+            let proof = serde_json::json!({
+                "schema": "era5a-same-capture-byte-proof-v1",
+                "program": metadata.inputs.program,
+                "key": metadata.key,
+                "inputs": metadata.inputs,
+                "same_capture": true,
+                "same_actual_metadata": true,
+                "additional_model_entries": 0,
+                "normalization": "none",
+                "reference_path": reference_path,
+                "reference_sha256": reference_sha256,
+                "streamed_sha256": streamed_sha256,
+                "reference_bytes": bytes.len(),
+                "streamed_bytes": std::fs::metadata(&entry.path).map_err(|error| error.to_string())?.len(),
+                "expected_published_entry": directory.join(format!("{}.json", metadata.key)),
+                "full_cache_bytes_identical": identical,
+                "data": identical,
+            });
+            serde_json::to_writer(&mut proof_file, &proof).map_err(|error| error.to_string())?;
+            proof_file
+                .write_all(b"\n")
+                .map_err(|error| error.to_string())?;
+            proof_file.sync_all().map_err(|error| error.to_string())?;
+            if !identical {
+                return Err(
+                    "same-capture complete cache bytes differ from the frozen materializer".into(),
+                );
+            }
+        }
         Ok(Prepared {
-            entry,
+            entry: std::sync::Arc::new(entry),
             cached: CachedModel {
                 model: verified.model.clone(),
                 baseline_model: verified.baseline_model.clone(),
@@ -510,13 +594,18 @@ pub(crate) fn prepare(
     }
 }
 
+/// Explicit materializing compatibility view; model derivation and publication
+/// use the shared streamed entry instead.
 pub(crate) fn prepared_entry(fingerprint: &str) -> Option<super::cache_contract::CompleteEntry> {
-    PREPARED.with(|p| {
-        p.borrow()
+    let entry = PREPARED.with(|prepared| {
+        prepared
+            .borrow()
             .as_ref()
-            .filter(|p| p.entry.key == fingerprint)
-            .map(|p| p.entry.clone())
-    })
+            .filter(|prepared| prepared.entry.metadata.key == fingerprint)
+            .map(|prepared| std::sync::Arc::clone(&prepared.entry))
+    })?;
+    let bytes = std::fs::read(&entry.path).ok()?;
+    super::cache_contract::decode(&bytes).ok()
 }
 
 fn kind_label(kind: SlotKind) -> &'static str {
@@ -587,14 +676,14 @@ pub(crate) fn store(
             .borrow()
             .as_ref()
             .filter(|p| {
-                p.entry.key == fp
+                p.entry.metadata.key == fp
                     && p.cached.model == cached.model
                     && p.cached.baseline_model == cached.baseline_model
                     && p.cached.a5_receipt == cached.a5_receipt
             })
-            .map(|p| p.entry.clone())
+            .map(|p| std::sync::Arc::clone(&p.entry))
     })?;
-    match super::cache_contract::publish(&directory, &entry) {
+    match super::cache_contract::publish_streamed(&directory, &entry) {
         Ok(path) => Some(path),
         Err(error) => {
             PREPARE_ERROR.with(|e| *e.borrow_mut() = Some(error));
@@ -635,8 +724,8 @@ pub(crate) fn load(
     }
     let expected = semantic_inputs(program, a5_mode, attestation).ok()?;
     let fp = super::cache_contract::semantic_key(&expected).ok()?;
-    let body = std::fs::read(entry_path(&dir()?, &fp)).ok()?;
-    let entry = super::cache_contract::decode(&body).ok()?;
+    let path = entry_path(&dir()?, &fp);
+    let entry = super::cache_contract::validate_file(&path).ok()?;
     if entry.key != fp || entry.inputs != expected {
         return None;
     }
@@ -676,7 +765,7 @@ pub(crate) fn load(
     };
     PREPARED.with(|p| {
         *p.borrow_mut() = Some(Prepared {
-            entry,
+            entry: std::sync::Arc::new(super::cache_contract::existing_streamed(path, entry)),
             cached: cached.clone(),
         })
     });
@@ -1109,7 +1198,7 @@ pub(crate) fn memo_get(fp: &str) -> Option<CachedModel> {
                 k == fp
                     && PREPARED.with(|prepared| {
                         prepared.borrow().as_ref().is_some_and(|p| {
-                            p.entry.key == fp
+                            p.entry.metadata.key == fp
                                 && p.cached.model == cached.model
                                 && p.cached.baseline_model == cached.baseline_model
                                 && p.cached.a5_receipt == cached.a5_receipt

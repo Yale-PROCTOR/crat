@@ -291,6 +291,135 @@ fn e5_i_cache_publish_is_atomic_idempotent_and_never_overwrites() {
     let decoded: CompleteEntry = serde_json::from_slice(&original).unwrap();
     decoded.validate().unwrap();
     assert_eq!(decoded, entry);
+
+    // R281 W01/W06/W09/W10: exercise the new bounded transport against this
+    // independently constructed frozen CompleteEntry and its exact encodings.
+    let exports_path = directory.0.join("exports.json");
+    std::fs::write(&exports_path, serde_json::to_vec(&entry.exports).unwrap()).unwrap();
+    let metadata = stream::Metadata::from(entry.clone());
+    let staged = stage_streamed(&directory.0, &metadata, &exports_path).unwrap();
+    assert_eq!(
+        std::fs::read(&staged.path).unwrap(),
+        entry.canonical_json().unwrap()
+    );
+    let hashes = staged.hashes.as_ref().unwrap();
+    use sha2::Digest;
+    let payload = serde_json::to_vec(&(&entry.model, &entry.baseline, &entry.receipt)).unwrap();
+    let exports = serde_json::to_vec(&(&entry.exports, &entry.origin)).unwrap();
+    assert_eq!(
+        hashes.payload,
+        format!("{:x}", sha2::Sha256::digest(&payload))
+    );
+    assert_eq!(
+        hashes.exports,
+        format!("{:x}", sha2::Sha256::digest(&exports))
+    );
+    let readback = validate_file(&staged.path).unwrap();
+    let read_hashes = readback.canonical_file_hashes(&staged.path).unwrap();
+    assert_eq!(read_hashes.entry, hashes.entry);
+    assert_eq!(read_hashes.payload, hashes.payload);
+    assert_eq!(read_hashes.exports, hashes.exports);
+    assert_eq!(publish_streamed(&directory.0, &staged).unwrap(), path);
+    let stream_root = directory.0.join("stream-publication");
+    let stream_path = publish_streamed(&stream_root, &staged).unwrap();
+    assert!(equal_files(&path, &stream_path).unwrap());
+    assert_eq!(
+        publish_streamed(&stream_root, &staged).unwrap(),
+        stream_path
+    );
+    let mut collision_metadata = metadata.clone();
+    collision_metadata
+        .receipt
+        .push_str("different-receipt=true\n");
+    let different = stage_streamed(&directory.0, &collision_metadata, &exports_path).unwrap();
+    assert!(publish_streamed(&stream_root, &different).is_err());
+    // W09: a start barrier exercises concurrent contenders, but does not
+    // claim to force both through the internal pre-link check simultaneously.
+    let identical = stage_streamed(&directory.0, &metadata, &exports_path).unwrap();
+    let same_root = directory.0.join("concurrent-same");
+    let start = std::sync::Barrier::new(2);
+    let (left, right) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| {
+            start.wait();
+            publish_streamed(&same_root, &staged)
+        });
+        let right = scope.spawn(|| {
+            start.wait();
+            publish_streamed(&same_root, &identical)
+        });
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    let same_path = left.expect("first same-body contender");
+    assert_eq!(right.expect("second same-body contender"), same_path);
+    assert!(equal_files(&same_path, &staged.path).unwrap());
+    assert_eq!(std::fs::read_dir(&same_root).unwrap().count(), 1);
+
+    let different_root = directory.0.join("concurrent-different");
+    let start = std::sync::Barrier::new(2);
+    let (left, right) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| {
+            start.wait();
+            publish_streamed(&different_root, &staged)
+        });
+        let right = scope.spawn(|| {
+            start.wait();
+            publish_streamed(&different_root, &different)
+        });
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    let (winner, expected, loser) = match (left, right) {
+        (Ok(path), Err(_)) => (path, &staged, &different),
+        (Err(_), Ok(path)) => (path, &different, &staged),
+        other => panic!("different-body contenders need exactly one winner: {other:?}"),
+    };
+    assert!(equal_files(&winner, &expected.path).unwrap());
+    assert!(publish_streamed(&different_root, loser).is_err());
+    assert!(
+        equal_files(&winner, &expected.path).unwrap(),
+        "loser cannot overwrite winner"
+    );
+    assert_eq!(std::fs::read_dir(&different_root).unwrap().count(), 1);
+
+    // Staged corruption is rejected before a new destination is linked.
+    let broken = stage_streamed(&directory.0, &metadata, &exports_path).unwrap();
+    std::fs::write(&broken.path, b"{").unwrap();
+    let refused_root = directory.0.join("refused-publication");
+    assert!(publish_streamed(&refused_root, &broken).is_err());
+    assert!(!refused_root.join(format!("{}.json", entry.key)).exists());
+
+    // Separate semantic readback from redundant hash protection. A corrupted
+    // but self-consistently hashed stage must still fail full family validation.
+    let mut malformed = entry.clone();
+    malformed.exports["families"]["loans"]["source_rows"] = serde_json::json!(1);
+    let invalid_exports = directory.0.join("invalid-exports.json");
+    std::fs::write(
+        &invalid_exports,
+        serde_json::to_vec(&malformed.exports).unwrap(),
+    )
+    .unwrap();
+    let stage_error = stage_streamed(&directory.0, &metadata, &invalid_exports)
+        .err()
+        .expect("W06 staging must validate complete families");
+    assert!(
+        stage_error.contains("incomplete portable family"),
+        "{stage_error}"
+    );
+    let mut rehashed = stage_streamed(&directory.0, &metadata, &exports_path).unwrap();
+    std::fs::write(&rehashed.path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+    rehashed.hashes.as_mut().unwrap().entry = file_sha256(&rehashed.path).unwrap();
+    let readback_root = directory.0.join("semantic-readback-refused");
+    let publish_error = publish_streamed(&readback_root, &rehashed)
+        .err()
+        .expect("W06 publication must validate despite a matching body hash");
+    assert!(
+        publish_error.contains("incomplete portable family"),
+        "{publish_error}"
+    );
+    assert!(!readback_root.join(format!("{}.json", entry.key)).exists());
+    let owned_path = staged.path.clone();
+    drop(staged);
+    assert!(!owned_path.exists());
+    assert_eq!(std::fs::read(&stream_path).unwrap(), original);
 }
 
 #[test]
