@@ -1015,11 +1015,12 @@ fn pending_sibling_overlap_issues(
                     Some(emitted) => {
                         // Compared as TOKENS, not bytes. The emitted tree is
                         // reprinted by `pprust`, which reflows a long call
-                        // across lines, so a byte comparison would fail on
-                        // formatting the producer never claimed. Whitespace is
-                        // the only thing dropped; every token, in order, must
-                        // still be there.
-                        if !without_whitespace(emitted).contains(&without_whitespace(&expected)) {
+                        // across lines and adds a trailing comma when it does,
+                        // so a byte comparison would fail on formatting the
+                        // producer never claimed. Layout and that comma are
+                        // the only things dropped; every other token, in
+                        // order, must still be there.
+                        if !normalised_tokens(emitted).contains(&normalised_tokens(&expected)) {
                             issues.push(format!(
                                 "pending-sibling-overlap:emitted-call-text-absent:{id}"
                             ));
@@ -1076,8 +1077,23 @@ fn check_sibling_dispositions(id: &str, siblings: &[PendingSiblingRow], issues: 
 /// must occur exactly once in the outer's replacement, or the composition is
 /// not statable and the row says so. A true **crossing** — which L07 measured
 /// at zero — is rejected rather than rendered around.
-fn without_whitespace(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
+/// The token sequence of `text`, with the two things `pprust` is free to
+/// change and the producer never claimed: layout, and the trailing comma it
+/// adds to a delimited list once it breaks that list across lines.
+fn normalised_tokens(text: &str) -> String {
+    let dense = text
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    let mut out = String::with_capacity(dense.len());
+    let mut chars = dense.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ',' && matches!(chars.peek(), Some(')' | ']' | '}' | '>')) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn render_pending_call(original_source: &str, call: &PendingCallRow) -> Option<String> {
@@ -2142,6 +2158,199 @@ mod tests {
         assert!(
             !fault.data,
             "live receipt without the consumed raw view must be caught: {fault:#?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // R287-1 — the pending sibling-overlap custody contract.
+    //
+    // A site under the R232-4 pending waiver is a DELIVERED site. These pin
+    // the three things its row owes and the two absences that must never pass.
+
+    const PENDING_SOURCE: &str = "fn caller(p: *mut i32, q: *const i32) { copy(p, q, 4); }";
+
+    fn pending_export(
+        rows: Vec<PendingSiteRow>,
+        emitted: &str,
+    ) -> (Export, BTreeMap<String, String>) {
+        let mut export = Export::default();
+        export.files.insert(
+            "lib.rs".to_owned(),
+            OriginalFile {
+                source: PENDING_SOURCE.to_owned(),
+                sha256: String::new(),
+                global_start: 0,
+            },
+        );
+        export.pending_sites = rows;
+        (
+            export,
+            BTreeMap::from([("lib.rs".to_owned(), emitted.to_owned())]),
+        )
+    }
+
+    fn pending_row(
+        siblings: Vec<PendingSiblingRow>,
+        edits: Vec<(usize, usize, String)>,
+    ) -> PendingSiteRow {
+        let lo = PENDING_SOURCE.find("copy(").expect("fixture call");
+        let hi = PENDING_SOURCE.find(");").expect("fixture call end") + 1;
+        PendingSiteRow {
+            site_id: "raw-boundary-site:caller:0:0:copy:0".to_owned(),
+            waiver: super::super::decision::sibling_overlap::PENDING_REASON.to_owned(),
+            source_file: "lib.rs".to_owned(),
+            call: Ok(PendingCallRow { lo, hi, edits }),
+            siblings,
+        }
+    }
+
+    /// A pending site whose sibling is BRIDGED: the ledger names the edit's
+    /// custody identity, and the emitted call reads what the row says.
+    #[test]
+    fn r287_pending_site_with_a_bridged_sibling_is_complete() {
+        let q = PENDING_SOURCE.rfind('q').expect("sibling argument");
+        let row = pending_row(
+            vec![PendingSiblingRow {
+                argument_index: 1,
+                disposition: "bridged".to_owned(),
+                detail: "c:arg1".to_owned(),
+            }],
+            vec![(q, q + 1, "q.as_ptr()".to_owned())],
+        );
+        let (export, sources) = pending_export(
+            vec![row],
+            "fn caller(p: *mut i32, q: &[i32]) { copy(p, q.as_ptr(), 4); }",
+        );
+        assert_eq!(
+            pending_sibling_overlap_issues(&export, Some(&sources)),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The tulipindicators shape: a sibling the hold refused. The row states
+    /// the typed reason, and the emitted call still reads the ORIGINAL text at
+    /// that argument, because a held sibling is not rewritten.
+    #[test]
+    fn r287_pending_site_with_a_held_sibling_is_complete() {
+        let row = pending_row(
+            vec![PendingSiblingRow {
+                argument_index: 1,
+                disposition: "held".to_owned(),
+                detail: "held:thin-extent".to_owned(),
+            }],
+            Vec::new(),
+        );
+        let (export, sources) = pending_export(vec![row], PENDING_SOURCE);
+        assert_eq!(
+            pending_sibling_overlap_issues(&export, Some(&sources)),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A sibling nothing touched. `raw-unchanged` is a disposition, not an
+    /// absence, and it needs no detail.
+    #[test]
+    fn r287_pending_site_with_a_raw_unchanged_sibling_is_complete() {
+        let row = pending_row(
+            vec![PendingSiblingRow {
+                argument_index: 1,
+                disposition: "raw-unchanged".to_owned(),
+                detail: "-".to_owned(),
+            }],
+            Vec::new(),
+        );
+        let (export, sources) = pending_export(vec![row], PENDING_SOURCE);
+        assert_eq!(
+            pending_sibling_overlap_issues(&export, Some(&sources)),
+            Vec::<String>::new()
+        );
+    }
+
+    /// **Fault 1** — a pending row without its emitted call. This is the
+    /// `emitted_call: null` state the corpus was in; it must be reported as a
+    /// producer defect, never accepted.
+    #[test]
+    fn r287_pending_row_without_its_emitted_call_is_caught() {
+        let mut row = pending_row(Vec::new(), Vec::new());
+        row.call = Err("pending-call-correspondence-not-unique".to_owned());
+        let (export, sources) = pending_export(vec![row], PENDING_SOURCE);
+        let issues = pending_sibling_overlap_issues(&export, Some(&sources));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("emitted-call-missing")),
+            "{issues:?}"
+        );
+    }
+
+    /// **Fault 2** — a sibling without a disposition. An empty detail on a
+    /// `bridged` or `held` row is exactly the `sibling-audit:incomplete-row`
+    /// shape, and it must fail rather than count as covered.
+    #[test]
+    fn r287_sibling_without_a_disposition_is_caught() {
+        for disposition in ["bridged", "held"] {
+            let row = pending_row(
+                vec![PendingSiblingRow {
+                    argument_index: 1,
+                    disposition: disposition.to_owned(),
+                    detail: String::new(),
+                }],
+                Vec::new(),
+            );
+            let (export, sources) = pending_export(vec![row], PENDING_SOURCE);
+            let issues = pending_sibling_overlap_issues(&export, Some(&sources));
+            assert!(
+                issues.iter().any(|issue| issue.contains("without")),
+                "{disposition}: {issues:?}"
+            );
+        }
+        let row = pending_row(
+            vec![PendingSiblingRow {
+                argument_index: 1,
+                disposition: "unstated".to_owned(),
+                detail: "-".to_owned(),
+            }],
+            Vec::new(),
+        );
+        let (export, sources) = pending_export(vec![row], PENDING_SOURCE);
+        assert!(
+            pending_sibling_overlap_issues(&export, Some(&sources))
+                .iter()
+                .any(|issue| issue.contains("unknown-sibling-disposition"))
+        );
+    }
+
+    /// The emitted call is compared as TOKENS. Reflowing it across lines the
+    /// way `pprust` does must not fail custody; changing a token must.
+    #[test]
+    fn r287_emitted_call_is_compared_by_tokens_not_bytes() {
+        let q = PENDING_SOURCE.rfind('q').expect("sibling argument");
+        let row = pending_row(
+            vec![PendingSiblingRow {
+                argument_index: 1,
+                disposition: "bridged".to_owned(),
+                detail: "c:arg1".to_owned(),
+            }],
+            vec![(q, q + 1, "q.as_ptr()".to_owned())],
+        );
+        let (export, reflowed) = pending_export(
+            vec![row.clone()],
+            "fn caller(p: *mut i32, q: &[i32]) {\n    copy(\n        p,\n        q.as_ptr(),\n        4,\n    );\n}",
+        );
+        assert_eq!(
+            pending_sibling_overlap_issues(&export, Some(&reflowed)),
+            Vec::<String>::new(),
+            "a reflowed call is the same call"
+        );
+        let (export, changed) = pending_export(
+            vec![row],
+            "fn caller(p: *mut i32, q: &[i32]) { copy(p, q.as_mut_ptr(), 4); }",
+        );
+        assert!(
+            pending_sibling_overlap_issues(&export, Some(&changed))
+                .iter()
+                .any(|issue| issue.contains("emitted-call-text-absent")),
+            "a changed carrier is a different call"
         );
     }
 }
