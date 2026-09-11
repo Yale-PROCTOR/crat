@@ -32,14 +32,9 @@ pub(crate) enum RouteReason {
     UnreachableRouteEvent,
     UnknownObject,
     DropEffects,
-    MissingArgument {
-        parameter: u32,
-        depth: u8,
-    },
+    MissingArgument { parameter: u32, depth: u8 },
     ForeignInputFrame(LocalDefId),
     Recursive(LocalDefId),
-    /// Row (b): bounded field identity has no cross-frame rebasing rule.
-    FieldAcrossFrame,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -218,7 +213,6 @@ fn substitute(
             // field identity cross a frame unrebased.
             ObjectRoot::Field { .. } => {
                 output.unknown = true;
-                uncertainty.get_or_insert(RouteReason::FieldAcrossFrame);
             }
         }
     }
