@@ -12,14 +12,19 @@
 //!
 //! Diagnostic only, `#[ignore]`; nothing gates on it.
 
-use crate::analyses::borrow_ownership::{
-    SlotKind,
-    a5_overlap::{A5Mode, WholeProgramAttestation},
-    construction::solve_bo_a5_config_reporting,
-    crate_slots::CrateSlots,
-    export::with_bo_export,
-    mutability_facts::MutFacts,
-    origins::compute_origins,
+use rustc_mir_dataflow::Analysis;
+
+use crate::analyses::{
+    borrow_ownership::{
+        SlotKind,
+        a5_overlap::{A5Mode, WholeProgramAttestation},
+        construction::solve_bo_a5_config_reporting,
+        crate_slots::CrateSlots,
+        export::with_bo_export,
+        mutability_facts::MutFacts,
+        origins::compute_origins,
+    },
+    liveness::MaybeLiveLocals,
 };
 
 #[test]
@@ -109,6 +114,51 @@ fn r316_1_analysis_reason_for_raw_subjects() {
                 if let Some((block, index)) = last.get(local) {
                     println!(
                         "R318-3 label={label} kind=last-use owner={owner} local=_{local} name={name} at={block}:{index}"
+                    );
+                }
+            }
+        }
+
+        // **R320-2 — liveness by DATAFLOW at the event, not by last-use.**
+        //
+        // The carry rests on the subject being dead at the conflicting event,
+        // and a normal-path last-use table is weaker than the claim: it says
+        // nothing about an unwind edge directly. `MaybeLiveLocals` is queried
+        // at each event's own location, after the primary effect, and the
+        // answer is printed per named local.
+        for &fn_did in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+            let owner = tcx.def_path_str(fn_did.to_def_id());
+            let named = body
+                .var_debug_info
+                .iter()
+                .filter_map(|info| match &info.value {
+                    rustc_middle::mir::VarDebugInfoContents::Place(place) => {
+                        place.as_local().map(|l| (l, info.name.to_string()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut cursor = MaybeLiveLocals
+                .iterate_to_fixpoint(tcx, &body, None)
+                .into_results_cursor(&body);
+            for (block, data) in body.basic_blocks.iter_enumerated() {
+                for statement_index in 0..=data.statements.len() {
+                    let location = rustc_middle::mir::Location {
+                        block,
+                        statement_index,
+                    };
+                    cursor.seek_after_primary_effect(location);
+                    let live = cursor.get();
+                    let names = named
+                        .iter()
+                        .filter(|(local, _)| live.contains(*local))
+                        .map(|(local, name)| format!("_{}={name}", local.as_u32()))
+                        .collect::<Vec<_>>();
+                    println!(
+                        "R320-2 label={label} kind=live-at owner={owner} at={}:{statement_index} live=[{}]",
+                        block.as_u32(),
+                        names.join(",")
                     );
                 }
             }
