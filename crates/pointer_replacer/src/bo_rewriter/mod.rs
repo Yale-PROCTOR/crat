@@ -1446,7 +1446,24 @@ fn refresh_raw_boundary_receipt_events_with_renders(
     // THIS revert state, keyed by original span.
     call_renders: &std::collections::BTreeMap<(u32, u32), String>,
 ) {
-    let effective_reverted = emission_plan.effective_reverted_classes(reverted, reverted_atoms);
+    // **R306-1(i) — the ledger is derived against the population the TREE was
+    // emitted against.**
+    //
+    // `round_files` withholds `reverted ∪ held_classes()` and then takes the
+    // input-reversion closure; this derived its receipts from `reverted`
+    // alone. A class reverted only through the closure OF A HELD CLASS was
+    // therefore absent from every receipt while the tree kept it raw — heman's
+    // `kmPlaneIntersectLine` appears in `final_reverts`, its parameters stay
+    // `*const kmVec3` in the tree, and the ledger still carried a T2-pending
+    // sibling-overlap waiver over them, which custody read as
+    // `pending-protected-source-not-a-reference`.
+    //
+    // Correcting the ledger to the tree moves no decision: the partition into
+    // emitted and reverted subjects is computed by the caller from its own
+    // effective set, and this only decides which receipts that state produces.
+    let mut withheld = reverted.clone();
+    withheld.extend(emission_plan.held_classes());
+    let effective_reverted = emission_plan.effective_reverted_classes(&withheld, reverted_atoms);
     let reverted = &effective_reverted;
     assert_eq!(
         emission_plan.unowned_a5_proof_sites, 0,

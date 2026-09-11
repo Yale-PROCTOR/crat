@@ -1425,3 +1425,47 @@ mod r304_local_type_correspondence {
         }
     }
 }
+
+#[cfg(test)]
+mod r306_void_carrier {
+    use super::super::bridge_custody_match::whole_subject_uses_for_test;
+
+    fn uses(expression: &str, binding: &str) -> bool {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || whole_subject_uses_for_test(expression, binding),
+        )
+    }
+
+    /// **Witness.** The K19′ void carrier is the whole subject wearing a
+    /// raw-pointer cast, and the bare path still is too.
+    #[test]
+    fn r306_the_void_carrier_is_the_whole_subject() {
+        for text in [
+            "p",
+            "p as *const libc::c_void",
+            "p as *mut libc::c_void",
+            "(p) as *const core::ffi::c_void",
+            "p as *const u8 as *const libc::c_void",
+        ] {
+            assert!(uses(text, "p"), "{text}");
+        }
+    }
+
+    /// **Fault.** Only raw-pointer casts are peeled, and only the binding's own
+    /// path survives them.
+    #[test]
+    fn r306_a_non_pointer_cast_or_another_binding_is_not_the_whole_subject() {
+        for (text, binding) in [
+            ("q as *const libc::c_void", "p"),
+            ("p as usize", "p"),
+            ("p as usize as *const libc::c_void", "p"),
+            ("(*p).field as *const libc::c_void", "p"),
+            ("p.offset(1) as *const libc::c_void", "p"),
+        ] {
+            assert!(!uses(text, binding), "{text} / {binding}");
+        }
+    }
+}

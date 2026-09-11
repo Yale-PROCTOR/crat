@@ -270,8 +270,34 @@ fn view_operand(mut expression: &ast::Expr) -> &ast::Expr {
     expression
 }
 
+/// **R306-1(ii) — the K19′ carrier replaced the original's raw cast, so the
+/// comparison peels that cast on BOTH sides.**
+///
+/// `raw_initializer_matches` already peels a raw-pointer cast off the emitted
+/// initializer; the original kept its own, so `ann` was compared against
+/// `ann as *const libc::c_void` and ten correct void carriers over four
+/// programs read as `pending-source-view-correspondence-unbuilt`.
+///
+/// Strict, and for the same reason as the arm above: **only** raw-pointer
+/// casts are peeled. A cast to any other type is a different value and still
+/// refuses.
+fn peel_raw_pointer_casts(mut expression: &ast::Expr) -> &ast::Expr {
+    loop {
+        expression = unparen(expression);
+        let ast::ExprKind::Cast(inner, ty) = &expression.kind else {
+            break;
+        };
+        if !matches!(ty.kind, ast::TyKind::Ptr(_)) {
+            break;
+        }
+        expression = inner;
+    }
+    expression
+}
+
 fn same_view_operand(expression: &ast::Expr, original: &ast::Expr) -> bool {
-    expression_key(view_operand(expression)) == expression_key(view_operand(original))
+    expression_key(view_operand(peel_raw_pointer_casts(expression)))
+        == expression_key(view_operand(peel_raw_pointer_casts(original)))
 }
 
 fn raw_initializer_matches(initializer: &ast::Expr, original: &ast::Expr) -> bool {
@@ -623,6 +649,20 @@ fn binding_at<'a>(
 
 /// Test seam for R304's correspondence witnesses; the predicate itself stays
 /// private to this module.
+/// Test seam for R306's void-carrier witness.
+#[cfg(test)]
+pub(crate) fn whole_subject_uses_for_test(expression: &str, binding: &str) -> bool {
+    let Ok(parsed) = expression_for_test(expression) else {
+        return false;
+    };
+    whole_subject_uses(&parsed, binding)
+}
+
+#[cfg(test)]
+fn expression_for_test(text: &str) -> MatchResult<ast::ptr::P<ast::Expr>> {
+    expression(text)
+}
+
 #[cfg(test)]
 pub(crate) fn local_types_correspond_for_test(
     original: Option<&str>,
@@ -1448,6 +1488,26 @@ fn pending_carrier_witnesses(
     Ok(witnesses)
 }
 
+/// **R306-1(ii) — the K19′ void carrier is the whole subject, cast.**
+///
+/// `p as *const libc::c_void` reaches a void position as a cast OF the subject,
+/// not as a different source, and the ledger's `WholeSubject` claim is right
+/// about it. The comparator compared the whole expression to the binding's path
+/// and so refused ten correct emissions over four programs.
+///
+/// Strict: only **raw-pointer** casts are peeled — a cast to any other type is
+/// a different value — and what remains must be the binding's own path.
+fn whole_subject_uses(expression: &ast::Expr, binding: &str) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, ty) = &view.kind {
+        if !matches!(ty.kind, ast::TyKind::Ptr(_)) {
+            return false;
+        }
+        view = unparen(inner);
+    }
+    path(view).as_deref() == Some(binding)
+}
+
 fn projected_referent_uses(expression: &ast::Expr, binding: &str) -> bool {
     // **R304-2's seal has a SECOND SPELLING, and the comparator knows it as
     // strictly as the decision layer does.** `((*binding).field).as_ptr()` is
@@ -1544,7 +1604,7 @@ fn pending_original_source(
     let used = PendingScalarRead::binding(input.original, &original.owner, span, name)
         .is_some_and(|used| used.id == binding.id && used == **binding);
     let shape_matches = match &metadata.shape {
-        PendingSourceShape::WholeSubject => path(expression).as_deref() == Some(name),
+        PendingSourceShape::WholeSubject => whole_subject_uses(expression, name),
         PendingSourceShape::ProjectedReferent => projected_referent_uses(expression, name),
         PendingSourceShape::NativeReturnExpression { .. }
         | PendingSourceShape::NativeReturnExpressionNested { .. } => {
@@ -2107,7 +2167,21 @@ fn pending(
                 .emitted_source
                 .get(call.span.lo as usize..call.span.hi as usize)
                 .ok_or("pending-call-span-outside-emitted-source")?;
-            if super::bridge_custody_export::normalised_tokens(text) != want {
+            // **R306-1(ii) — the A5/PAIR composite is stated as ONE unit.**
+            //
+            // The producer renders the whole hoisting construct the AST layer
+            // emitted at this original span — `{ let __crat_a5_raw_N: T = …;
+            // callee(…, __crat_a5_raw_N) }` — bound to its stamp. The
+            // candidate here is the CALL, which lives inside that block, so an
+            // equality against the call's own span can never hold for these
+            // sites. The strict arm: the tree must carry the stated composite,
+            // and this candidate must be the call within it.
+            let have = super::bridge_custody_export::normalised_tokens(text);
+            if have != want
+                && !(want.contains(&have)
+                    && super::bridge_custody_export::normalised_tokens(input.emitted_source)
+                        .contains(&want))
+            {
                 continue;
             }
             let mut witnesses = Vec::new();
@@ -2122,7 +2196,17 @@ fn pending(
         // producer stated both satisfy an equality claim; that is exactly the
         // property R287-1 chose over uniqueness.
         let Some((call, witnesses)) = stated.into_iter().next() else {
-            return Err("pending-call-render-absent".into());
+            // R295-3: say WHICH absence. A render the file carries somewhere
+            // but no candidate does is a candidate-selection question; a
+            // render the file does not carry at all means the AST layer never
+            // emitted that call, and R306-1(i) deletes such a row rather than
+            // keeping a claim the tree cannot answer.
+            let in_file = super::bridge_custody_export::normalised_tokens(input.emitted_source)
+                .contains(&want);
+            return Err(format!(
+                "pending-call-render-absent:candidates={}:in-file={in_file}",
+                candidates.len()
+            ));
         };
         return Ok((call.span, witnesses, ReceiptStatus::WaivedPending));
     }
