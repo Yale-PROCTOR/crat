@@ -1101,3 +1101,120 @@ fn e5_r258_realloc_guarded_and_nested_source_reachability() {
         });
     }
 }
+
+/// **R316-1 — the analysis's OWN reason for a subject's Raw.**
+///
+/// Reads the fixture source from `CRAT_R316_SOURCE` and prints, for every slot
+/// the model settles Raw, the retirement review's own account of it: the
+/// conflict's `OverlapReason` with its route, or the unresolved row's
+/// `UnresolvedReason`. Nothing is inferred from any assertion text.
+///
+/// Diagnostic only, `#[ignore]`; nothing gates on it.
+#[test]
+#[ignore]
+fn r316_1_analysis_reason_for_raw_subjects() {
+    let Ok(code) = std::env::var("CRAT_R316_SOURCE") else {
+        println!("R316-1: no CRAT_R316_SOURCE");
+        return;
+    };
+    let label = std::env::var("CRAT_R316_LABEL").unwrap_or_default();
+    with_program(&code, |program| {
+        let slots = CrateSlots::build(program);
+        let origins = compute_origins(program);
+        let facts = MutFacts::from_program(program);
+        let (result, capture) = super::export::with_bo_export(|| {
+            solve_bo_a5_config_reporting(
+                program,
+                &slots,
+                &origins,
+                &facts,
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )
+        });
+        let raw = match &result {
+            Ok(model) => model
+                .model
+                .iter()
+                .filter(|(_, kind)| **kind == SlotKind::Raw)
+                .count(),
+            Err(_) => usize::MAX,
+        };
+        println!("R316-1 label={label} raw_slots={raw}");
+        let Some(review) = capture.source_retirement.as_ref() else {
+            println!("R316-1 label={label} bucket=no-review");
+            return;
+        };
+        for conflict in &review.conflicts {
+            let route = conflict
+                .route
+                .iter()
+                .map(|step| format!("{step:?}"))
+                .collect::<Vec<_>>()
+                .join(">");
+            println!(
+                "R316-1 label={label} kind=conflict target={} overlap={:?} route={route}",
+                conflict.target_key, conflict.overlap
+            );
+        }
+        for row in &review.unresolved {
+            println!("R316-1 label={label} kind=unresolved reason={:?}", row);
+        }
+        for demotion in &review.demotions {
+            println!("R316-1 label={label} kind=demotion {demotion:?}");
+        }
+        let mut dispositions = std::collections::BTreeMap::<String, usize>::new();
+        for row in &review.coverage {
+            *dispositions
+                .entry(format!("{:?}", row.disposition))
+                .or_default() += 1;
+        }
+        println!(
+            "R316-1 label={label} coverage={dispositions:?} terminal={:?} ordinary_error_points={}",
+            review.terminal.values().fold(
+                std::collections::BTreeMap::<String, usize>::new(),
+                |mut acc, d| {
+                    *acc.entry(format!("{d:?}")).or_default() += 1;
+                    acc
+                }
+            ),
+            review.ordinary_error_points
+        );
+        // The conflict targets are MIR locals; bind them to the fixture's own
+        // names so a subject the test names can be matched without reading the
+        // assertion text.
+        for &fn_did in &program.functions {
+            let body = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(fn_did)
+                .borrow();
+            let owner = program.tcx.def_path_str(fn_did.to_def_id());
+            for info in &body.var_debug_info {
+                if let rustc_middle::mir::VarDebugInfoContents::Place(place) = &info.value
+                    && let Some(local) = place.as_local()
+                {
+                    println!(
+                        "R316-1 label={label} kind=name owner={owner} local=_{} name={}",
+                        local.as_u32(),
+                        info.name
+                    );
+                }
+            }
+        }
+        println!(
+            "R316-1 label={label} rounds={}",
+            capture.retirement_rounds.len()
+        );
+        for (index, round) in capture.retirement_rounds.iter().enumerate() {
+            for conflict in &round.conflicts {
+                println!(
+                    "R316-1 label={label} kind=round-conflict round={index} target={} overlap={:?}",
+                    conflict.target_key, conflict.overlap
+                );
+            }
+            for row in &round.unresolved {
+                println!("R316-1 label={label} kind=round-unresolved round={index} reason={row:?}");
+            }
+        }
+    });
+}
