@@ -621,6 +621,16 @@ fn binding_at<'a>(
     Ok(binding)
 }
 
+/// Test seam for R304's correspondence witnesses; the predicate itself stays
+/// private to this module.
+#[cfg(test)]
+pub(crate) fn local_types_correspond_for_test(
+    original: Option<&str>,
+    emitted: Option<&str>,
+) -> MatchResult<bool> {
+    local_types_correspond(original, emitted)
+}
+
 fn local_types_correspond(original: Option<&str>, emitted: Option<&str>) -> MatchResult<bool> {
     if original == emitted {
         return Ok(true);
@@ -639,12 +649,58 @@ fn local_types_correspond(original: Option<&str>, emitted: Option<&str>) -> Matc
     if pprust::ty_to_string(original) == pprust::ty_to_string(emitted) {
         return Ok(true);
     }
-    let (ast::TyKind::Ptr(raw), ast::TyKind::Ref(_, reference)) = (&original.kind, &emitted.kind)
-    else {
+    let ast::TyKind::Ptr(raw) = &original.kind else {
         return Ok(false);
     };
-    Ok((!reference.mutbl.is_mut() || raw.mutbl.is_mut())
-        && pprust::ty_to_string(&raw.ty) == pprust::ty_to_string(&reference.ty))
+    // **The emitted side has more than one safe form, and this predicate knew
+    // one of them.** The protected-form check two arms down already accepts
+    // `Option<&…>`; this one accepted only `&T`, so a correctly emitted
+    // nullable or fat form read as a binding mismatch — measured on
+    // tulipindicators' `line`, `*mut c_char` against
+    // `Option<&mut [c_char]>`, the single refusal that failed that program.
+    //
+    // The identity requirement is unchanged: same pointee text, and the
+    // reference may not be mutable where the raw pointer was const. Only the
+    // two shapes the emitter actually produces are peeled — an `Option`
+    // wrapper, which is how null is represented, and a slice pointee, which
+    // carries an extent over the same element type.
+    let emitted = match option_inner(emitted) {
+        Some(inner) => inner,
+        None => emitted,
+    };
+    let ast::TyKind::Ref(_, reference) = &emitted.kind else {
+        return Ok(false);
+    };
+    if reference.mutbl.is_mut() && !raw.mutbl.is_mut() {
+        return Ok(false);
+    }
+    let mut pointee = &*reference.ty;
+    while let ast::TyKind::Paren(inner) = &pointee.kind {
+        pointee = inner;
+    }
+    if let ast::TyKind::Slice(element) = &pointee.kind {
+        pointee = element;
+    }
+    Ok(pprust::ty_to_string(&raw.ty) == pprust::ty_to_string(pointee))
+}
+
+/// `Option<T>` → `T`, for the one wrapper the emitter uses to represent null.
+fn option_inner(ty: &ast::Ty) -> Option<&ast::Ty> {
+    let ast::TyKind::Path(None, path) = &ty.kind else {
+        return None;
+    };
+    let segment = path.segments.last()?;
+    if segment.ident.name.as_str() != "Option" {
+        return None;
+    }
+    let ast::GenericArgs::AngleBracketed(arguments) = &**segment.args.as_ref()? else {
+        return None;
+    };
+    let [ast::AngleBracketedArg::Arg(ast::GenericArg::Type(inner))] = arguments.args.as_slice()
+    else {
+        return None;
+    };
+    Some(inner)
 }
 
 fn span_bindings_correspond(
@@ -759,7 +815,8 @@ fn same_source_binding_inner(
         emitted.init_span,
     ) {
         (Some(left), Some(right), Some(left_span), Some(right_span)) => {
-            same_expression(left, right).unwrap_or(false)
+            (same_expression(left, right).unwrap_or(false)
+                || null_initializer_corresponds(left, right, emitted.type_text.as_deref()))
                 && span_bindings_correspond(
                     input,
                     &original.owner,
@@ -774,6 +831,96 @@ fn same_source_binding_inner(
     };
     visiting.remove(&pair);
     result
+}
+
+/// `None` is how an optional reference spells the null a raw local was
+/// initialized with.
+///
+/// The comparator already knows this two arms away — `PointerType::
+/// OptionalReference` and `optional_raw_view_matches` are built on it — and
+/// this predicate did not, so a correctly emitted nullable local read as an
+/// initializer mismatch. The emitted type must actually be an `Option`, and
+/// the original initializer must actually be a null pointer literal; nothing
+/// else corresponds.
+fn null_initializer_corresponds(original: &str, emitted: &str, emitted_type: Option<&str>) -> bool {
+    if emitted.trim() != "None" {
+        return false;
+    }
+    if !emitted_type
+        .and_then(|text| parsed_type(text).ok())
+        .is_some_and(|ty| option_inner(&ty).is_some())
+    {
+        return false;
+    }
+    let Ok(parsed) = expression(original) else {
+        return false;
+    };
+    let mut view = unparen(&parsed);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    matches!(&view.kind, ast::ExprKind::Lit(literal)
+        if literal.kind == ast::token::LitKind::Integer && literal.symbol.as_str() == "0")
+}
+
+/// **R295-3, applied to a predicate rather than an arm.** `same_source_binding`
+/// answers a bare `bool`, and one refusal in tulipindicators reported two
+/// identically named bindings as a mismatch with nothing to read. This names
+/// the FIRST condition that refuses; it re-derives nothing the predicate does
+/// not itself check, and is only ever called on the failing path.
+fn source_binding_divergence(
+    input: &BridgeCustodyInput<'_>,
+    original: &Binding,
+    emitted: &Binding,
+) -> String {
+    if original.name != emitted.name {
+        return format!("name:{}!={}", original.name, emitted.name);
+    }
+    if mapped_owner(&original.owner, input.context).ok() != Some(emitted.owner.as_str()) {
+        return format!("owner:{}!={}", original.owner, emitted.owner);
+    }
+    let count = |inventory: &Inventory, owner: &str, name: &str| {
+        inventory
+            .bindings
+            .iter()
+            .filter(|binding| binding.owner == owner && binding.name == name)
+            .count()
+    };
+    let originals = count(input.original, &original.owner, &original.name);
+    let emitteds = count(input.emitted, &emitted.owner, &emitted.name);
+    if originals != 1 {
+        return format!("original-name-not-unique:{originals}");
+    }
+    if emitteds != 1 {
+        return format!("emitted-name-not-unique:{emitteds}");
+    }
+    if !local_types_correspond(original.type_text.as_deref(), emitted.type_text.as_deref())
+        .unwrap_or(false)
+    {
+        return format!(
+            "type:{}!={}",
+            original.type_text.as_deref().unwrap_or("-"),
+            emitted.type_text.as_deref().unwrap_or("-")
+        );
+    }
+    match (
+        original.init_text.as_deref(),
+        emitted.init_text.as_deref(),
+        original.init_span,
+        emitted.init_span,
+    ) {
+        (Some(left), Some(right), Some(_), Some(_)) => {
+            if !same_expression(left, right).unwrap_or(false)
+                && !null_initializer_corresponds(left, right, emitted.type_text.as_deref())
+            {
+                format!("initializer:{left}!={right}")
+            } else {
+                "initializer-dependencies".to_owned()
+            }
+        }
+        (None, None, None, None) => "declared-type".to_owned(),
+        _ => "initializer-presence".to_owned(),
+    }
 }
 
 fn same_source_binding(
@@ -1302,6 +1449,35 @@ fn pending_carrier_witnesses(
 }
 
 fn projected_referent_uses(expression: &ast::Expr, binding: &str) -> bool {
+    // **R304-2's seal has a SECOND SPELLING, and the comparator knows it as
+    // strictly as the decision layer does.** `((*binding).field).as_ptr()` is
+    // the same depth-1 projection of the protected referent, viewed as a
+    // pointer by an array or slice method instead of borrowed with `&`. The
+    // arm is exact: the receiver must be a place, the walk must reach the
+    // binding, and the depth must be one — a loaded raw field value still
+    // cannot pass, because its walk sees no dereference of the binding.
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    if let ast::ExprKind::MethodCall(method) = &view.kind
+        && method.args.is_empty()
+        && matches!(method.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr")
+    {
+        let mut place = unparen(&method.receiver);
+        let mut dereferences = 0;
+        loop {
+            match &place.kind {
+                ast::ExprKind::Field(base, _) => place = unparen(base),
+                ast::ExprKind::Unary(ast::UnOp::Deref, base) => {
+                    dereferences += 1;
+                    place = unparen(base);
+                }
+                _ => break,
+            }
+        }
+        return dereferences == 1 && path(place).as_deref() == Some(binding);
+    }
     let ast::ExprKind::AddrOf(ast::BorrowKind::Ref, _, place) = &unparen(expression).kind else {
         return false;
     };
@@ -1375,8 +1551,17 @@ fn pending_original_source(
             return Err("pending-native-expression-carrier-unbuilt".into());
         }
     };
-    if !used || !shape_matches {
-        return Err("pending-source-evidence-does-not-match-the-actual-operand-binding".into());
+    // R295-3's rule: two independent conditions, two names.
+    if !used {
+        return Err(format!(
+            "pending-source-operand-binding-not-the-declared-one:{name}"
+        ));
+    }
+    if !shape_matches {
+        return Err(format!(
+            "pending-source-operand-shape-mismatch:{name}:{:?}",
+            metadata.shape
+        ));
     }
     Ok((**binding).clone())
 }
@@ -1458,8 +1643,8 @@ fn pending_selected_argument(
     // tell which had fired.
     if !same_source_binding(input, &original_binding, &emitted_binding) {
         return Err(format!(
-            "pending-protected-source-binding-mismatch:{name}:emitted={}",
-            emitted_binding.name
+            "pending-protected-source-binding-mismatch:{name}:{}",
+            source_binding_divergence(input, &original_binding, &emitted_binding)
         ));
     }
     if !protected_form {

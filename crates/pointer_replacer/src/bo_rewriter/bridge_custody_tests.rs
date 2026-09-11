@@ -1374,3 +1374,54 @@ mod native_expression_interval {
         }
     }
 }
+
+#[cfg(test)]
+mod r304_local_type_correspondence {
+    use super::super::bridge_custody_match::local_types_correspond_for_test;
+
+    /// The predicate parses types, so it needs session globals like every
+    /// other parser-backed check in this file.
+    fn correspond(raw: &str, safe: &str) -> bool {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || local_types_correspond_for_test(Some(raw), Some(safe)).unwrap(),
+        )
+    }
+
+    /// **Witness.** Every safe form the emitter produces for a raw local
+    /// corresponds, and the pointee identity is what carries it.
+    #[test]
+    fn r304_the_emitted_safe_forms_correspond_to_their_raw_local() {
+        for (raw, safe) in [
+            ("*mut i32", "&mut i32"),
+            ("*const i32", "&i32"),
+            ("*mut i32", "Option<&mut i32>"),
+            ("*const i32", "Option<&i32>"),
+            ("*mut i32", "&mut [i32]"),
+            (
+                "*mut std::os::raw::c_char",
+                "Option<&mut [std::os::raw::c_char]>",
+            ),
+        ] {
+            assert!(correspond(raw, safe), "{raw} -> {safe}");
+        }
+    }
+
+    /// **Fault.** The identity requirement is unchanged: a different pointee
+    /// never corresponds, and a shared raw pointer never yields a mutable
+    /// reference.
+    #[test]
+    fn r304_a_different_pointee_or_a_widened_mutability_still_refuses() {
+        for (raw, safe) in [
+            ("*mut i32", "&mut u8"),
+            ("*const i32", "&mut i32"),
+            ("*const i32", "Option<&mut i32>"),
+            ("*mut i32", "Option<&mut [u8]>"),
+            ("*mut i32", "Option<i32>"),
+        ] {
+            assert!(!correspond(raw, safe), "{raw} -> {safe}");
+        }
+    }
+}
