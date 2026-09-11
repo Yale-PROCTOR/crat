@@ -647,7 +647,7 @@ pub unsafe fn release_owned(p: *mut u8) { free(p); }
     }
 }
 
-fn with_program(code: &str, check: impl FnOnce(&RustProgram<'_>) + Send + Sync) {
+pub(super) fn with_program(code: &str, check: impl FnOnce(&RustProgram<'_>) + Send + Sync) {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let mut functions = Vec::new();
         let mut structs = Vec::new();
@@ -669,7 +669,7 @@ fn with_program(code: &str, check: impl FnOnce(&RustProgram<'_>) + Send + Sync) 
     .unwrap_or_else(|error| error.raise());
 }
 
-fn named_function(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+pub(super) fn named_function(program: &RustProgram<'_>, name: &str) -> LocalDefId {
     let found: Vec<_> = program
         .functions
         .iter()
