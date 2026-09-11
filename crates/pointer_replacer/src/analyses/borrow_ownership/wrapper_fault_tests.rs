@@ -1201,15 +1201,71 @@ fn r316_1_analysis_reason_for_raw_subjects() {
                 }
             }
         }
+        for &fn_did in &program.functions {
+            let body = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(fn_did)
+                .borrow();
+            let owner = program.tcx.def_path_str(fn_did.to_def_id());
+            let mut last = std::collections::BTreeMap::<u32, (u32, usize)>::new();
+            let named = body
+                .var_debug_info
+                .iter()
+                .filter_map(|info| match &info.value {
+                    rustc_middle::mir::VarDebugInfoContents::Place(place) => place
+                        .as_local()
+                        .map(|l| (l.as_u32(), info.name.to_string())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for (block, data) in body.basic_blocks.iter_enumerated() {
+                for (index, statement) in data.statements.iter().enumerate() {
+                    let text = format!("{statement:?}");
+                    if text.starts_with("StorageDead") || text.starts_with("StorageLive") {
+                        continue;
+                    }
+                    for (local, _) in &named {
+                        if text.contains(&format!("_{local}")) {
+                            last.insert(*local, (block.as_u32(), index));
+                        }
+                    }
+                }
+                let terminator = format!("{:?}", data.terminator().kind);
+                for (local, _) in &named {
+                    if terminator.contains(&format!("_{local}")) {
+                        last.insert(*local, (block.as_u32(), data.statements.len()));
+                    }
+                }
+            }
+            for (local, name) in &named {
+                if let Some((block, index)) = last.get(local) {
+                    println!(
+                        "R318-3 label={label} kind=last-use owner={owner} local=_{local} name={name} at={block}:{index}"
+                    );
+                }
+            }
+        }
+
         println!(
             "R316-1 label={label} rounds={}",
             capture.retirement_rounds.len()
         );
         for (index, round) in capture.retirement_rounds.iter().enumerate() {
             for conflict in &round.conflicts {
+                // **R318-3 — the EVENT, not just the label.** The conflicting
+                // source event's role, phase and location decide whether a
+                // family is carried or migrated; the overlap label never does.
                 println!(
-                    "R316-1 label={label} kind=round-conflict round={index} target={} overlap={:?}",
-                    conflict.target_key, conflict.overlap
+                    "R318-3 label={label} kind=round-conflict round={index} target={} overlap={:?} role={:?} phase={:?} event_at={}:{} storage_local={:?} condition={:?} conflict_at={:?}",
+                    conflict.target_key,
+                    conflict.overlap,
+                    conflict.source.role,
+                    conflict.source.phase,
+                    conflict.source.block,
+                    conflict.source.statement,
+                    conflict.source.storage_local,
+                    conflict.source.condition,
+                    conflict.location,
                 );
             }
             for row in &round.unresolved {
