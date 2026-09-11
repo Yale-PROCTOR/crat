@@ -286,6 +286,15 @@ pub(crate) struct E2Artifacts {
     pub(crate) seams: String,
     pub(crate) pb_web: String,
     pub(crate) timings: E2Timings,
+    /// **A7/A8 — the lifetime plan must decide nothing.**
+    ///
+    /// Two `decide` runs over the same subjects differing in exactly one
+    /// argument: `lifetime_eligibility` present versus absent. Everything else
+    /// — gate, co-conversion, raw boundary, exposure, return receivers — is
+    /// held fixed, so a difference between the digests is attributable to the
+    /// lifetime pass and to nothing else. Quoted side by side in the receipt.
+    pub(crate) plan_inert_digest_with: String,
+    pub(crate) plan_inert_digest_without: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -6756,6 +6765,27 @@ fn finish_decide<'tcx>(
             ),
             &subjects,
         );
+        // **A7/A8 control — the same decision, one argument removed.**
+        //
+        // `hypothetical` above is NOT this control: it also drops
+        // `return_receivers`, so a difference against it would be attributable
+        // to two changes at once. This run differs from `e2_hypothetical` in
+        // exactly `lifetime_eligibility`, which is what the rider is about —
+        // a lifetime plan annotates signatures and must decide nothing.
+        let e2_plan_inert_control = decision::decide(
+            &ctx_of(
+                decision::RefGate::LiftAdaptable,
+                None,
+                None,
+                None,
+                Some(&preliminary_exposure),
+                Some(&return_receivers),
+            ),
+            &subjects,
+        );
+        let plan_inert_digest_with = digest_of(&decision_vector_render(tcx, &e2_hypothetical));
+        let plan_inert_digest_without =
+            digest_of(&decision_vector_render(tcx, &e2_plan_inert_control));
         let converting_signature_functions = e2_hypothetical
             .entries
             .iter()
@@ -7242,6 +7272,8 @@ fn finish_decide<'tcx>(
         let receipt_started = std::time::Instant::now();
         let mut e2_artifacts =
             e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility)?;
+        e2_artifacts.plan_inert_digest_with = plan_inert_digest_with.clone();
+        e2_artifacts.plan_inert_digest_without = plan_inert_digest_without.clone();
         e2_artifacts.timings = E2Timings {
             cache_load_wall_s: format!("{:.6}", analysis.cache_load_wall_s),
             origin_derivation_wall_s: format!("{:.6}", analysis.origin_derivation_wall_s),
@@ -8784,6 +8816,40 @@ fn e2_terminal_disposition<'a>(
     }
 }
 
+/// **A6/A7 — the decision vector, rendered for byte comparison.**
+///
+/// One line per subject, `identity\tdecision-form`, sorted by identity so the
+/// rendering does not depend on subject iteration order. This is the object the
+/// rider is about: if the lifetime pass decides nothing, two runs that differ
+/// only in whether it was supplied render the same bytes.
+pub(crate) fn decision_vector_render(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
+    let mut lines = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| {
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            let form = match decision {
+                decision::Decision::Ref { .. } => "ref".to_owned(),
+                decision::Decision::InferredRef { .. } => "inferred-ref".to_owned(),
+                decision::Decision::Slice { .. } => "slice".to_owned(),
+                decision::Decision::Opt { .. } => "optional".to_owned(),
+                decision::Decision::Box(_) => "box".to_owned(),
+                decision::Decision::Degraded(record) => {
+                    format!("degraded:{}", record.reason.key())
+                }
+            };
+            format!("{}\t{form}\n", subject.identity_key(&owner))
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    lines.concat()
+}
+
+fn digest_of(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
 fn e2_artifacts_from_table(
     tcx: TyCtxt<'_>,
     table: &decision::DecisionTable,
@@ -8931,6 +8997,9 @@ fn e2_artifacts_from_table(
             if failure_rows.is_empty() { "" } else { "\n" },
         ),
         seams: seam_tsv_from_table(tcx, table),
+        // Filled by the caller, which holds the two control runs.
+        plan_inert_digest_with: String::new(),
+        plan_inert_digest_without: String::new(),
         pb_web: format!(
             "unit\tfunction\treason\n{}{}",
             pb_rows.join("\n"),

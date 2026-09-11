@@ -10965,6 +10965,27 @@ mod run {
             capture.e2_artifacts.failures.lines().skip(1).count(),
         );
         row.set("e2_function_rows", functions.lines().skip(1).count());
+        // **A7/A8 — the two decision-vector digests, side by side.** Equal means
+        // the lifetime pass decided nothing on this program; unequal names it as
+        // decision-moving, which the rider forbids.
+        row.set(
+            "e2_plan_inert_digest_with",
+            &capture.e2_artifacts.plan_inert_digest_with,
+        );
+        row.set(
+            "e2_plan_inert_digest_without",
+            &capture.e2_artifacts.plan_inert_digest_without,
+        );
+        row.set(
+            "e2_plan_inert",
+            if capture.e2_artifacts.plan_inert_digest_with
+                == capture.e2_artifacts.plan_inert_digest_without
+            {
+                "true"
+            } else {
+                "false"
+            },
+        );
         row.set("pb_roots", produced_roots.len());
         row.set("pb_members", produced_members.len());
         row.set("pb_expected_roots", expected_roots.len());
