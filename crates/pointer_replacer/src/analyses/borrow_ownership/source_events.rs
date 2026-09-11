@@ -1,7 +1,7 @@
 //! Source lifecycle inventory. These identities never describe generated drops.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
 };
@@ -93,6 +93,12 @@ pub(crate) enum Coverage {
     UnresolvedWholeObject,
     UnresolvedStorage,
     UnresolvedDropEffects,
+    /// A callee whose body this analysis never scans, so its retirement effects
+    /// are unknown. Today that is every `CallKind::Impl` target, because
+    /// `program.functions` holds only free-standing items; the emission site
+    /// tests membership, so the class empties itself once impl bodies are
+    /// scanned (queue row IMPL-METHOD-SCAN-COVERAGE).
+    UnresolvedCalleeEffects,
     UnresolvedReallocLifecycle,
 }
 
@@ -447,11 +453,48 @@ pub(crate) fn library_drop_effect<'tcx>(
     payload.needs_drop(tcx, body.typing_env(tcx))
 }
 
+thread_local! {
+    /// Set while a one-function leaf probe runs. A nested `CallKind::Impl` site
+    /// must not re-enter the probe: an impl call inside a candidate body makes
+    /// that body NON-leaf whatever the inner callee turns out to be, and the row
+    /// (0) event the nested collection emits is exactly what the outer probe
+    /// observes. The flag therefore terminates cycles without weakening the
+    /// verdict, and no leaf classification is ever cached across programs.
+    static LEAF_PROBE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// R309-1: an unscanned impl callee is LEAF when its own body retires nothing
+/// that propagates and calls nothing. Storage roles are the callee's own stack
+/// and are excluded under §28; the admitted roles are exactly the propagation
+/// filter used to build `reachable` below.
+fn is_leaf_callee(program: &RustProgram<'_>, callee: rustc_span::def_id::LocalDefId) -> bool {
+    if LEAF_PROBE.with(Cell::get) {
+        return false;
+    }
+    LEAF_PROBE.with(|probe| probe.set(true));
+    let observed = collect(&RustProgram {
+        tcx: program.tcx,
+        functions: vec![callee],
+        structs: program.structs.clone(),
+    });
+    LEAF_PROBE.with(|probe| probe.set(false));
+    observed.calls.is_empty()
+        && !observed.retirements.keys().any(|key| {
+            matches!(
+                key.role,
+                SourceRole::Free | SourceRole::ReallocOld | SourceRole::Drop
+            )
+        })
+}
+
 pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
     let tcx = program.tcx;
     let mut events = SourceEvents::default();
     events.call_targets = call_targets::analyze(program);
     events.reallocations = super::realloc::collect_sites(program);
+    // Per-collection, never a thread-local cache: LocalDefId indices are only
+    // meaningful inside one program.
+    let mut leaf_callees = rustc_hash::FxHashMap::default();
     for &function in &program.functions {
         let function_path = tcx.def_path_str(function.to_def_id());
         let body = tcx
@@ -664,6 +707,37 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
                                     key: event_key,
                                     object: SourceObject::UnknownOperand,
                                     coverage: Coverage::UnresolvedDropEffects,
+                                    generation: SourceGeneration::Missing,
+                                    region: SourceRegion::Missing,
+                                },
+                            );
+                        }
+                        // R308-1: an inherent-method callee outside the scanned
+                        // function set has unknown retirement effects. Recording a
+                        // route would demand coverage nothing can ever supply and
+                        // decline the program (R245-1); the unknown-retirement
+                        // event states the same uncertainty in the vocabulary the
+                        // conflict machinery already propagates to every caller.
+                        CallKind::Impl(callee) if !program.functions.contains(&callee) => {
+                            // R309-1 row (0'): a leaf callee retires nothing and
+                            // calls nothing, so it gets neither event nor route.
+                            let leaf = *leaf_callees
+                                .entry(callee)
+                                .or_insert_with(|| is_leaf_callee(program, callee));
+                            if leaf {
+                                continue;
+                            }
+                            let mut event_key =
+                                key(index, SourcePhase::Call, SourceRole::Drop, None);
+                            if func.constant().is_none() {
+                                event_key.condition = SourceCondition::IndirectTarget;
+                            }
+                            insert(
+                                &mut events,
+                                SourceRetirement {
+                                    key: event_key,
+                                    object: SourceObject::UnknownOperand,
+                                    coverage: Coverage::UnresolvedCalleeEffects,
                                     generation: SourceGeneration::Missing,
                                     region: SourceRegion::Missing,
                                 },

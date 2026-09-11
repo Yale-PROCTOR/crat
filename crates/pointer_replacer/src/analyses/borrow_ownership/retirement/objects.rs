@@ -9,6 +9,7 @@ use rustc_middle::mir::{
 };
 use rustc_span::def_id::LocalDefId;
 
+use super::call_reach::EscapeFacts;
 use crate::{
     analyses::{
         borrow_ownership::{
@@ -146,6 +147,25 @@ fn clobber(state: &mut State) {
     }
 }
 
+/// R304-7 row (a): the clobber a non-allocator local call actually needs.
+///
+/// Every depth >= 1 cell describes memory behind a pointer, which a callee may
+/// write, and is clobbered exactly as before. A depth-0 cell holds the pointer
+/// value in the caller's own MIR local; a callee cannot name it unless the
+/// local's address escaped, so a non-escaping local's depth-0 cell survives.
+/// Statics are not cells of this state at all, so nothing about them is
+/// preserved here.
+fn clobber_callee_reachable(state: &mut State, escapes: &EscapeFacts) {
+    for (local, row) in state.iter_mut().enumerate() {
+        let reachable = escapes.escapes(Local::from_usize(local));
+        for (depth, objects) in row.iter_mut().enumerate() {
+            if depth > 0 || reachable {
+                objects.unknown = true;
+            }
+        }
+    }
+}
+
 fn write(place: Place<'_>, values: Vec<ObjectSet>, state: &mut State) {
     let Some(local) = place.as_local() else {
         clobber(state);
@@ -234,6 +254,7 @@ fn call_effect<'tcx>(
     location: Location,
     normal: bool,
     certificates: &crate::analyses::borrow_ownership::retirement::return_origin::CertificateMap,
+    escapes: &EscapeFacts,
     state: &mut State,
 ) {
     use crate::analyses::borrow_ownership::retirement::return_origin::{
@@ -302,10 +323,12 @@ fn call_effect<'tcx>(
             Err(reason) => certificate = Err(reason),
         }
     }
-    // Return identity is not an effect summary. Retain this exact old clobber,
-    // after taking any admitted actual-value snapshot and before destination write.
+    // Return identity is not an effect summary. The clobber keeps its exact
+    // position -- after any admitted actual-value snapshot, before the
+    // destination write -- and row (a) narrows only its SCOPE, to the cells a
+    // callee can reach. Every other clobber site in this file is unchanged.
     if local_candidate {
-        clobber(state);
+        clobber_callee_reachable(state, escapes);
     }
     if normal {
         let mut value = if allocator {
@@ -401,6 +424,7 @@ impl ObjectFacts {
                         .collect()
                 })
                 .collect();
+            let escapes = EscapeFacts::of_body(&body);
             let function_path = program.tcx.def_path_str(function.to_def_id());
             let reallocations: Vec<_> = events
                 .reallocations
@@ -436,6 +460,7 @@ impl ObjectFacts {
                         location,
                         normal,
                         &certificates,
+                        &escapes,
                         &mut outgoing,
                     );
                     for site in &reallocations {

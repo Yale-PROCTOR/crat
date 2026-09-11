@@ -902,15 +902,30 @@ fn check_destination(code: &str, expected: ExpectedObject) {
             actual, expected,
             "normal-return transfer at exact caller/callee/site"
         );
+        // premise-moved:row-a (R318-1). This control asserted that the local-call
+        // clobber reached `_1`'s own depth-0 cell -- true only while the clobber
+        // was whole-state, which was G0-B's era-5a' disposition. Row (a) narrows
+        // it to the cells a callee can reach, so the control now asserts the
+        // NARROWED verdict: `_1`'s own cell is clobbered exactly when its address
+        // escapes. It still discriminates in both directions -- a clobber that
+        // reached everything would fail here for a non-escaping `_1`, and one
+        // that reached nothing would fail for an escaping one.
         let incoming = facts.pointer_at(
             caller,
             at,
             &PlaceKey::from_place(Place::from(Local::from_u32(1))),
             0,
         );
-        assert!(
-            incoming.unknown,
-            "local-call clobber remains independently active"
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(caller)
+            .borrow();
+        let reachable =
+            crate::analyses::borrow_ownership::retirement::call_reach::EscapeFacts::of_body(&body)
+                .escapes(Local::from_u32(1));
+        assert_eq!(
+            incoming.unknown, reachable,
+            "local-call clobber reaches _1's own cell exactly when its address escapes (R318-1)"
         );
     });
 }

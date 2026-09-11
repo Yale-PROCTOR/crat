@@ -26,6 +26,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+pub(crate) mod call_reach;
 pub(crate) mod local_outcome;
 #[cfg(test)]
 mod local_outcome_tests;
@@ -1093,6 +1094,12 @@ mod tests_recursion;
 
 #[cfg(test)]
 mod tests_routes_edges;
+
+#[cfg(test)]
+mod tests_routes_inherent;
+
+#[cfg(test)]
+mod tests_call_reach;
 
 #[cfg(test)]
 mod tests_loans;

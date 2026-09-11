@@ -117,7 +117,14 @@ fn valid_event<'tcx>(
                         _ => return false,
                     };
                     targets.known.iter().any(|target| super::source_events::library_drop_effect(
-                        program.tcx, body, *target, args.first().map(|argument| &argument.node)))
+                        program.tcx, body, *target, args.first().map(|argument| &argument.node))
+                        // R308-1: the unknown-retirement event emitted for an
+                        // inherent-method callee outside the scanned set. The
+                        // membership test retires this disjunct by itself once
+                        // impl bodies are scanned.
+                        || matches!(
+                            super::source_events::call_targets::kind_for_target(program.tcx, *target),
+                            CallKind::Impl(callee) if !program.functions.contains(&callee)))
                 })),
         SourceRole::ReturnStorage => key.phase == SourcePhase::Return
             && key.storage_local.is_some() && matches!(terminator.kind, TerminatorKind::Return),
