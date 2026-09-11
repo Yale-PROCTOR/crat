@@ -270,6 +270,70 @@ fn view_operand(mut expression: &ast::Expr) -> &ast::Expr {
     expression
 }
 
+/// **R328-4 — the emitted initializer is the original with the emission's own
+/// call adapters applied.**
+///
+/// lodepng's `filter` has `let bpp = lodepng_get_bpp(color);`. `lodepng_get_bpp`
+/// converted its parameter, so the emitted call site reads
+/// `lodepng_get_bpp(&*color)` — a correct adapted call to the same function with
+/// the same argument. `same_expression` compared the two texts and said no, and
+/// because `linebytes`'s initializer uses `bpp` and `inindex`'s uses
+/// `linebytes`, one unmatched binding took ten custody rows with it. That is
+/// comparator lag, not a divergence: the frame produced a shape the predicate
+/// had never been shown.
+///
+/// **Strict, and additive.** Only a reborrow — `&*e` or `&mut *e`, the form
+/// `view_operand` already peels — is accepted, and only at an argument
+/// position of a call whose callee path and arity match exactly. Any other
+/// difference still refuses. It is tried *after* the plain comparison, so it
+/// can turn a refusal into a match and never the reverse.
+fn initializer_matches_modulo_adapters(original: &ast::Expr, emitted: &ast::Expr) -> bool {
+    let original = unparen(original);
+    let emitted = unparen(emitted);
+    let reborrowed = matches!(
+        &emitted.kind,
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, _, inner)
+            if matches!(&unparen(inner).kind, ast::ExprKind::Unary(ast::UnOp::Deref, _))
+    );
+    if reborrowed && initializer_matches_modulo_adapters(original, view_operand(emitted)) {
+        return true;
+    }
+    match (&original.kind, &emitted.kind) {
+        (ast::ExprKind::Call(left, left_args), ast::ExprKind::Call(right, right_args)) => {
+            expression_key(left) == expression_key(right)
+                && left_args.len() == right_args.len()
+                && left_args
+                    .iter()
+                    .zip(right_args.iter())
+                    .all(|(l, r)| initializer_matches_modulo_adapters(l, r))
+        }
+        (ast::ExprKind::MethodCall(left), ast::ExprKind::MethodCall(right)) => {
+            left.seg.ident.name == right.seg.ident.name
+                && initializer_matches_modulo_adapters(&left.receiver, &right.receiver)
+                && left.args.len() == right.args.len()
+                && left
+                    .args
+                    .iter()
+                    .zip(right.args.iter())
+                    .all(|(l, r)| initializer_matches_modulo_adapters(l, r))
+        }
+        _ => expression_key(original) == expression_key(emitted),
+    }
+}
+
+/// Parse both sides and apply [`initializer_matches_modulo_adapters`].
+fn initializer_adapter_correspondence(original: &str, emitted: &str) -> bool {
+    let (Ok(original), Ok(emitted)) = (expression(original), expression(emitted)) else {
+        return false;
+    };
+    initializer_matches_modulo_adapters(&original, &emitted)
+}
+
+/// Test seam for the arm above.
+pub(crate) fn initializer_adapter_correspondence_for_test(original: &str, emitted: &str) -> bool {
+    initializer_adapter_correspondence(original, emitted)
+}
+
 /// **R306-1(ii) — the K19′ carrier replaced the original's raw cast, so the
 /// comparison peels that cast on BOTH sides.**
 ///
@@ -880,7 +944,8 @@ fn same_source_binding_inner(
     ) {
         (Some(left), Some(right), Some(left_span), Some(right_span)) => {
             (same_expression(left, right).unwrap_or(false)
-                || null_initializer_corresponds(left, right, emitted.type_text.as_deref()))
+                || null_initializer_corresponds(left, right, emitted.type_text.as_deref())
+                || initializer_adapter_correspondence(left, right))
                 && span_bindings_correspond(
                     input,
                     &original.owner,
