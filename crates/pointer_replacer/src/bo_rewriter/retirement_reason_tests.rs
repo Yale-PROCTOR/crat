@@ -119,6 +119,73 @@ fn r316_1_analysis_reason_for_raw_subjects() {
             }
         }
 
+        // **R324-1 — for a local callee, read its body.**
+        //
+        // The seat's rule: a call-argument escape is a copy reaching a place
+        // that *survives the frame*. Returning the pointer does not — it lands
+        // in the caller's own local, which dies with the same frame — so the
+        // return place is excluded here. `retaining = !intrinsic` stays the
+        // fail-closed default, but only for a callee with no scannable body.
+        let callee_stores_a_parameter = |did: rustc_hir::def_id::LocalDefId| -> bool {
+            if !tcx.is_mir_available(did.to_def_id()) {
+                return true; // no body to read: fail closed
+            }
+            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            // The parameters, plus every temporary that carries one. `H = q`
+            // lowers to `_3 = copy _1; (*_2) = move _3`, so a scan without this
+            // closure reports "stores nothing" for a callee that stores into a
+            // static — which is exactly what the `local_retainer` control
+            // caught. Same defect class as the caller-side scan's cast temp.
+            let mut carriers = (1..=body.arg_count)
+                .map(|index| index as u32)
+                .collect::<std::collections::BTreeSet<_>>();
+            loop {
+                let before = carriers.len();
+                for data in body.basic_blocks.iter() {
+                    for statement in &data.statements {
+                        let rustc_middle::mir::StatementKind::Assign(assign) = &statement.kind
+                        else {
+                            continue;
+                        };
+                        let Some(dest) = assign.0.as_local() else { continue };
+                        let text = format!("{:?}", assign.1);
+                        if carriers.iter().any(|n| {
+                            text.trim() == format!("copy _{n}")
+                                || text.trim() == format!("move _{n}")
+                                || text.starts_with(&format!("copy _{n} as "))
+                                || text.starts_with(&format!("move _{n} as "))
+                        }) {
+                            carriers.insert(dest.as_u32());
+                        }
+                    }
+                }
+                if carriers.len() == before {
+                    break;
+                }
+            }
+            for data in body.basic_blocks.iter() {
+                for statement in &data.statements {
+                    let rustc_middle::mir::StatementKind::Assign(assign) = &statement.kind else {
+                        continue;
+                    };
+                    // Survives the frame = a projection through something else.
+                    // The return place `_0` is deliberately NOT counted.
+                    if assign.0.as_local().is_some() {
+                        continue;
+                    }
+                    let text = format!("{:?}", assign.1);
+                    if carriers.iter().any(|n| {
+                        text.contains(&format!("copy _{n}"))
+                            || text.contains(&format!("move _{n}"))
+                            || text.contains(&format!("&_{n}"))
+                    }) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+
         // **R320-2 — liveness by DATAFLOW at the event, not by last-use.**
         //
         // The carry rests on the subject being dead at the conflicting event,
@@ -366,12 +433,19 @@ fn r316_1_analysis_reason_for_raw_subjects() {
                                 let intrinsic = (callee.starts_with("std::ptr::")
                                     || callee.starts_with("core::ptr::"))
                                     && callee.contains("<impl *");
+                                // R324-1: a local callee whose body stores no
+                                // parameter outside the frame retains nothing.
+                                let local_callee_is_transparent = !intrinsic
+                                    && func
+                                        .const_fn_def()
+                                        .and_then(|(did, _)| did.as_local())
+                                        .is_some_and(|did| !callee_stores_a_parameter(did));
                                 println!(
                                     "R321-1 label={label} kind=escape-call owner={owner} at=bb{} callee={callee} retaining={} local=_{n} name={name} arg={text}",
                                     block.as_u32(),
-                                    !intrinsic
+                                    !intrinsic && !local_callee_is_transparent
                                 );
-                                if !intrinsic {
+                                if !intrinsic && !local_callee_is_transparent {
                                     // A terminator sits after every statement
                                     // in its own block.
                                     escapes.entry(owner.clone()).or_default().push((
