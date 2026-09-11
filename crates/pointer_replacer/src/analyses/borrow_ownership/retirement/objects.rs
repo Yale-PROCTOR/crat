@@ -9,7 +9,7 @@ use rustc_middle::mir::{
 };
 use rustc_span::def_id::LocalDefId;
 
-use super::call_reach::EscapeFacts;
+use super::{call_reach::EscapeFacts, field_objects};
 use crate::{
     analyses::{
         borrow_ownership::{
@@ -39,6 +39,12 @@ pub(crate) enum ObjectRoot {
         function: LocalDefId,
         local: Local,
     },
+    /// Row (b): the object pointed to by field `field` of a single known base.
+    /// `FieldBase` has no field variant, so the path is bounded to one step.
+    Field {
+        base: super::field_objects::FieldBase,
+        field: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,7 +70,7 @@ impl ObjectSet {
         }
     }
 
-    fn root(root: ObjectRoot) -> Self {
+    pub(super) fn root(root: ObjectRoot) -> Self {
         Self {
             roots: FxHashSet::from_iter([root]),
             unknown: false,
@@ -104,6 +110,14 @@ fn snapshot(state: &State) -> Snapshot {
 }
 
 fn pointer(state: &State, place: &PlaceKey, extra_depth: u8) -> ObjectSet {
+    if let Some((base_depth, field)) = field_objects::field_step(&place.proj, extra_depth) {
+        let base = state
+            .get(place.local.as_usize())
+            .and_then(|row| row.get(base_depth))
+            .cloned()
+            .unwrap_or_default();
+        return field_objects::mint(&base, field);
+    }
     if !place
         .proj
         .iter()
@@ -159,7 +173,11 @@ fn clobber_callee_reachable(state: &mut State, escapes: &EscapeFacts) {
     for (local, row) in state.iter_mut().enumerate() {
         let reachable = escapes.escapes(Local::from_usize(local));
         for (depth, objects) in row.iter_mut().enumerate() {
-            if depth > 0 || reachable {
+            // Row (b): a callee may write the field cell a `Field` root was
+            // loaded from, so field identity does not survive a call even in a
+            // cell the callee cannot name. Wave 1 has no callee/base
+            // reachability relation and therefore kills every field root.
+            if depth > 0 || reachable || field_objects::names_field(objects) {
                 objects.unknown = true;
             }
         }
@@ -543,6 +561,19 @@ impl ObjectFacts {
         place: &PlaceKey,
         extra_depth: u8,
     ) -> ObjectSet {
+        let Some(state) = self.snapshots.get(&(function, location)) else {
+            return ObjectSet::default();
+        };
+        if let Some((base_depth, field)) = field_objects::field_step(&place.proj, extra_depth) {
+            let Ok(base_depth) = u8::try_from(base_depth) else {
+                return ObjectSet::default();
+            };
+            let base = state
+                .get(&(place.local, base_depth))
+                .cloned()
+                .unwrap_or_default();
+            return field_objects::mint(&base, field);
+        }
         if !place
             .proj
             .iter()
@@ -553,9 +584,8 @@ impl ObjectFacts {
         let Ok(depth) = u8::try_from(place.proj.len() + usize::from(extra_depth)) else {
             return ObjectSet::default();
         };
-        self.snapshots
-            .get(&(function, location))
-            .and_then(|state| state.get(&(place.local, depth)))
+        state
+            .get(&(place.local, depth))
             .cloned()
             .unwrap_or_default()
     }

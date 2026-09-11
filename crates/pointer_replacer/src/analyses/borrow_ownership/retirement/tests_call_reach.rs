@@ -22,14 +22,14 @@ use crate::{
 };
 
 /// The object state of one fixture crate, built exactly as production builds it.
-fn object_facts(program: &RustProgram<'_>) -> ObjectFacts {
+pub(super) fn object_facts(program: &RustProgram<'_>) -> ObjectFacts {
     let slots = CrateSlots::build(program);
     let events = source_events::collect(program);
     let flows = analyze_program_origin_flow(program);
     ObjectFacts::analyze(program, &slots, &events, &flows)
 }
 
-fn named_local(body: &Body<'_>, name: &str) -> Local {
+pub(super) fn named_local(body: &Body<'_>, name: &str) -> Local {
     let found: Vec<_> = body
         .var_debug_info
         .iter()

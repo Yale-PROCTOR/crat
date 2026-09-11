@@ -32,9 +32,14 @@ pub(crate) enum RouteReason {
     UnreachableRouteEvent,
     UnknownObject,
     DropEffects,
-    MissingArgument { parameter: u32, depth: u8 },
+    MissingArgument {
+        parameter: u32,
+        depth: u8,
+    },
     ForeignInputFrame(LocalDefId),
     Recursive(LocalDefId),
+    /// Row (b): bounded field identity has no cross-frame rebasing rule.
+    FieldAcrossFrame,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -207,6 +212,13 @@ fn substitute(
             }
             ObjectRoot::Stack { .. } => {
                 output.roots.insert(*root);
+            }
+            // Row (b): a field root's base names objects of THIS frame, and
+            // wave 1 has no rebasing rule for it. Fail closed rather than let
+            // field identity cross a frame unrebased.
+            ObjectRoot::Field { .. } => {
+                output.unknown = true;
+                uncertainty.get_or_insert(RouteReason::FieldAcrossFrame);
             }
         }
     }
