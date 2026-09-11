@@ -649,6 +649,30 @@ fn binding_at<'a>(
 
 /// Test seam for R304's correspondence witnesses; the predicate itself stays
 /// private to this module.
+/// Test seams for R310-4(iii)'s branch-specific killers: these go through the
+/// real dispatch and the real initializer comparison, not the helpers.
+#[cfg(test)]
+pub(crate) fn pending_whole_subject_for_test(expression: &str, binding: &str) -> bool {
+    let Ok(parsed) = expression_for_test(expression) else {
+        return false;
+    };
+    whole_subject_uses(&parsed, binding)
+}
+
+#[cfg(test)]
+pub(crate) fn raw_initializer_matches_for_test(emitted: &str, original: &str) -> bool {
+    let (Ok(emitted), Ok(original)) = (expression_for_test(emitted), expression_for_test(original))
+    else {
+        return false;
+    };
+    raw_initializer_matches(&emitted, &original)
+}
+
+#[cfg(test)]
+pub(crate) fn normalised_tokens_of_call_for_test(text: &str) -> String {
+    super::bridge_custody_export::normalised_tokens(text)
+}
+
 /// Test seam for R306's void-carrier witness.
 #[cfg(test)]
 pub(crate) fn whole_subject_uses_for_test(expression: &str, binding: &str) -> bool {

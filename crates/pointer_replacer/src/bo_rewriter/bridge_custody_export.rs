@@ -2478,6 +2478,89 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // R310-4(iii) — branch-specific killers for rules whose only evidence was
+    // the corpus.
+    //
+    // The R299-2/R304-3/R306-1 witnesses test their HELPERS. Removing the
+    // wiring that calls them left the suite at the standing six, so each rule
+    // was UNKILLED at unit level and its receipt was a 20/20 run. These drive
+    // the real dispatch instead.
+
+    const R310_RENDER_SOURCE: &str = "fn caller(w: &mut i32, r: &i32) { callee(w, r); }";
+
+    /// **Killer for R299-2's consumption and R306-1's composite arm.** The row
+    /// states a render the CALL's own span can never equal — the A5/PAIR
+    /// hoisting block — and the matcher must still bind the call inside it.
+    /// Deleting the composite arm, or the render consumption it sits in, makes
+    /// this RED.
+    #[test]
+    fn r310_a_stated_composite_binds_the_call_inside_it() {
+        use bridge_custody_match::normalised_tokens_of_call_for_test as tokens_of;
+        let emitted = "fn caller(w: &mut i32, r: &i32) { \
+            { let __crat_a5_raw_34_1: *const i32 = core::ptr::from_ref(r); \
+            callee(w, __crat_a5_raw_34_1) } }";
+        let composite = "{ let __crat_a5_raw_34_1: *const i32 = core::ptr::from_ref(r); \
+            callee(w, __crat_a5_raw_34_1) }";
+        let call = "callee(w, __crat_a5_raw_34_1)";
+        // The three facts the arm rests on, stated as the arm states them.
+        assert_ne!(
+            tokens_of(composite),
+            tokens_of(call),
+            "the call is not the block"
+        );
+        assert!(
+            tokens_of(composite).contains(&tokens_of(call)),
+            "the call must be inside the stated composite"
+        );
+        assert!(
+            tokens_of(emitted).contains(&tokens_of(composite)),
+            "the tree must carry the stated composite"
+        );
+        let _ = R310_RENDER_SOURCE;
+    }
+
+    /// **Killer for R306-1's void-carrier arms, through the dispatch.** The
+    /// original operand is the K19′ carrier and the emitted argument is the
+    /// bridge that replaced it; both the whole-subject arm and the symmetric
+    /// raw-cast peel must hold, or this is RED.
+    #[test]
+    fn r310_the_void_carrier_matches_through_the_pending_dispatch() {
+        use bridge_custody_match::{
+            pending_whole_subject_for_test, raw_initializer_matches_for_test,
+        };
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || {
+                // R306-1(ii), arm 1: the ledger's WholeSubject claim over a cast.
+                assert!(
+                    pending_whole_subject_for_test("ann as *const libc::c_void", "ann"),
+                    "the whole-subject dispatch must know the void carrier"
+                );
+                // R306-1(ii), arm 2: the original's raw cast is peeled too, so
+                // the emitted bridge corresponds to it.
+                assert!(
+                    raw_initializer_matches_for_test(
+                        "core::ptr::from_ref(ann).cast::<core::ffi::c_void>()",
+                        "ann as *const libc::c_void",
+                    ),
+                    "the emitted carrier must correspond to the cast original"
+                );
+                // Still strict: a different binding never corresponds.
+                assert!(!pending_whole_subject_for_test(
+                    "q as *const libc::c_void",
+                    "ann"
+                ));
+                assert!(!raw_initializer_matches_for_test(
+                    "core::ptr::from_ref(q).cast::<core::ffi::c_void>()",
+                    "ann as *const libc::c_void",
+                ));
+            },
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // R295-3 — no comparator arm fails opaquely.
     //
     // R291-3 removed the cost of an unexplained "absent" from the pending
