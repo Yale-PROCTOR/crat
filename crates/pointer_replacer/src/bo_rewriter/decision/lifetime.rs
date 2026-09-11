@@ -822,6 +822,30 @@ pub(crate) struct ReturnOriginAtomDependencies {
 }
 
 impl ReturnOriginAtomDependencies {
+    /// **The emission-loop test seam.**
+    ///
+    /// DEFERRED-KILLER(R291-5) and DEFERRED-KILLER(R306-1c) are both statements
+    /// about the withheld set a constructed plan yields, and neither could be
+    /// written because these edges could not be stated directly — the only way
+    /// to populate them was to run the real deriver over a real program. That
+    /// absence, not the difficulty of the rules, is why both were deferred.
+    #[cfg(test)]
+    pub(crate) fn from_edges_for_test(
+        owners_by_atom: BTreeMap<
+            String,
+            BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
+        >,
+        dependents_by_class: BTreeMap<
+            crate::bo_rewriter::bridge_receipt::SignatureClassId,
+            BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
+        >,
+    ) -> Self {
+        Self {
+            owners_by_atom,
+            dependents_by_class,
+        }
+    }
+
     /// `dependency_edges` use the finalized planner's `(dependent, dependency)`
     /// ordering. Every origin in a multi-parameter return reuse is retained.
     pub(crate) fn derive(

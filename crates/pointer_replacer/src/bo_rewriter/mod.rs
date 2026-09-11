@@ -158,6 +158,7 @@ mod raw_receiver_tests;
 #[cfg(test)]
 mod retalias_semantics_tests;
 #[cfg(test)]
+mod emission_loop_seam_tests;
 mod retirement_reason_tests;
 mod return_alias_tests;
 #[cfg(test)]
@@ -1353,9 +1354,7 @@ fn round_files(
     ),
     String,
 > {
-    let mut withheld = reverted.clone();
-    withheld.extend(emission_plan.held_classes());
-    let withheld = emission_plan.effective_reverted_classes(&withheld, reverted_atoms);
+    let withheld = effective_withheld_classes(emission_plan, reverted, reverted_atoms);
     emission_plan.validate_callee_parameter_input_receipts(&withheld, reverted_atoms)?;
     emission_plan.validate_receiver_input_receipts(&withheld, reverted_atoms)?;
     emission_plan.validate_outbound_return_receipts(&withheld, reverted_atoms)?;
@@ -1432,6 +1431,29 @@ fn round_files(
 /// Every exit but the emitted one is here: a degraded or unresolved round
 /// produced no converged tree, so there is no call text for the pending rows
 /// to carry and the comparator keeps its plan-spliced reading.
+/// **The emission-loop withholding law, stated once.**
+///
+/// The tree is emitted against `reverted ∪ held_classes()`, closed under
+/// input-reversion — not against the directly-reverted set. Three places need
+/// that set and each used to spell it out: the round emitter, the receipt
+/// refresh, and the delivery partition. Three copies of one law is how
+/// R306-1 happened: the receipts were derived against `reverted` while the tree
+/// was emitted against `reverted ∪ held`, and nothing in the types objected.
+///
+/// It is `pub(crate)` because it is also the seam the emission-loop killers
+/// need: DEFERRED-KILLER(R291-5) (the delivery partition takes the effective
+/// set) and DEFERRED-KILLER(R306-1c) (the receipts are derived against the same
+/// set) are both statements about this function's result.
+pub(crate) fn effective_withheld_classes(
+    emission_plan: &plan::Plan,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
+    let mut withheld = reverted.clone();
+    withheld.extend(emission_plan.held_classes());
+    emission_plan.effective_reverted_classes(&withheld, reverted_atoms)
+}
+
 fn refresh_raw_boundary_receipt_events(
     artifacts: &mut RawBoundaryArtifacts,
     emission_plan: &plan::Plan,
@@ -1471,9 +1493,7 @@ fn refresh_raw_boundary_receipt_events_with_renders(
     // Correcting the ledger to the tree moves no decision: the partition into
     // emitted and reverted subjects is computed by the caller from its own
     // effective set, and this only decides which receipts that state produces.
-    let mut withheld = reverted.clone();
-    withheld.extend(emission_plan.held_classes());
-    let effective_reverted = emission_plan.effective_reverted_classes(&withheld, reverted_atoms);
+    let effective_reverted = effective_withheld_classes(emission_plan, reverted, reverted_atoms);
     let reverted = &effective_reverted;
     assert_eq!(
         emission_plan.unowned_a5_proof_sites, 0,
@@ -2123,13 +2143,8 @@ fn verify_and_revert(
             // already retired — urlparser's `url_get_query::url#1`, whose
             // parameter stayed `*mut libc::c_char` because `url_get_search` was
             // reverted, while the ledger still called it placed.
-            let effective_reverted = emission_plan.effective_reverted_classes(
-                &reverted
-                    .union(&emission_plan.held_classes())
-                    .copied()
-                    .collect(),
-                &reverted_atoms,
-            );
+            let effective_reverted =
+                effective_withheld_classes(&emission_plan, &reverted, &reverted_atoms);
             let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects.iter().partition(|subject| {
                 !effective_reverted.contains(&subject.owner_class)
                     && subject
