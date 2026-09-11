@@ -158,6 +158,7 @@ mod raw_receiver_tests;
 #[cfg(test)]
 mod retalias_semantics_tests;
 #[cfg(test)]
+mod retirement_reason_tests;
 mod return_alias_tests;
 #[cfg(test)]
 mod return_atom_lifetime_tests;
