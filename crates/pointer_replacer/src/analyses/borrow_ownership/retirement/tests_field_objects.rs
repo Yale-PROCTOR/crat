@@ -566,10 +566,8 @@ fn b_w08_a_field_root_fails_closed_across_a_route_step() {
         );
         assert_eq!(
             crossed[0].uncertainty,
-            Some(super::RouteReason::UnknownObject),
-            "the fail-closed step carries the existing unknown-object reason. A field-specific \
-             reason would be better evidence, but adding a `RouteReason` variant forces a one-line \
-             arm in `portable_export`, which row (b)'s approved surface does not include."
+            Some(super::RouteReason::FieldAcrossFrame),
+            "the fail-closed step is typed, not an indistinguishable unknown object (R323-2)"
         );
     });
 }

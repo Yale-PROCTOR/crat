@@ -526,7 +526,8 @@ impl Resolver<'_, '_> {
             | R::MissingRouteEvent
             | R::UnreachableRouteEvent
             | R::UnknownObject
-            | R::DropEffects => json!({"kind":tag(reason)}),
+            | R::DropEffects
+            | R::FieldAcrossFrame => json!({"kind":tag(reason)}),
         })
     }
 
