@@ -174,11 +174,30 @@ pub(crate) struct SiblingPotential {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SourceBridgeEvidence {
     WholeSubject,
-    ProjectedReferent { use_hir_id: HirId },
-    TypedView { use_hir_id: HirId, method: DefId },
-    NativeReturnExpression { use_hir_id: HirId },
+    ProjectedReferent {
+        use_hir_id: HirId,
+    },
+    TypedView {
+        use_hir_id: HirId,
+        method: DefId,
+    },
+    NativeReturnExpression {
+        use_hir_id: HirId,
+    },
     RawFieldValue,
     BindingStorage,
+    /// **R304-2 — a depth-1 projection of the subject's referent, viewed as a
+    /// pointer by an array or slice method.**
+    ///
+    /// `((*pOut).mat).as_mut_ptr()`: the projection is exactly the one
+    /// [`Self::ProjectedReferent`] already licenses, and the only reason it
+    /// fell through was that the view is spelled as a `MethodCall` rather than
+    /// an `AddrOf`. Custody joins it through the sibling row of the other
+    /// receiver, which R287-1(c) already requires.
+    ProjectedArrayView {
+        use_hir_id: HirId,
+        method: rustc_hir::def_id::DefId,
+    },
     UnknownShape(&'static str),
 }
 
@@ -202,6 +221,31 @@ pub(crate) struct CoverageGapReceipt {
     pub reason: &'static str,
     /// R291-1: the unsealed source shape, carried rather than discarded.
     pub shape: &'static str,
+    /// **R304-2 — a STATED hold is complete custody, not an unresolved gap.**
+    ///
+    /// A shape the seat has ruled on is held under its own name and recorded
+    /// as a receipt; only a shape nothing has ruled on is still an issue. The
+    /// row is recorded either way, so the ledger carries both populations.
+    pub held: bool,
+}
+
+/// R304-2: a pointer loaded THROUGH the subject is a value, not a view of it,
+/// so there is no source bridge to state and the site is held under its own
+/// name rather than reported as an unresolved shape.
+pub(crate) const HELD_SOURCE_IS_LOAD: &str = "held:bridge-source-is-load";
+
+/// The seat's disposition for an unsealed shape, or `None` where it has none
+/// and the site stays an unresolved gap. Fail-closed by construction: a new
+/// shape is unresolved until it is ruled on.
+pub(crate) fn held_disposition(shape: &str) -> Option<&'static str> {
+    // Both shapes are the same fact: the pointer handed to the callee was
+    // LOADED through the subject. One spells the load `*p.offset(i)`, the
+    // other projects a raw pointer field and adjusts it, `((*t).arr).offset(i)`.
+    matches!(
+        shape,
+        "unsealed:deref" | "unsealed:method-on-a-loaded-pointer"
+    )
+    .then_some(HELD_SOURCE_IS_LOAD)
 }
 
 pub(crate) fn select_coverage_gaps(
@@ -223,15 +267,17 @@ pub(crate) fn select_coverage_gaps(
                 // variant cannot silently acquire the empty shape.
                 return None;
             };
+            let held = held_disposition(shape);
             Some(CoverageGapReceipt {
                 potential: record.potential.clone(),
                 source_form: state.source_form,
                 target_form: state.target_form,
-                reason: "sibling-source-bridge-custody-unresolved",
+                reason: held.unwrap_or("sibling-source-bridge-custody-unresolved"),
                 // **R291-1** — the gap carries the shape it could not seal.
                 // The receipt discarded it, so 276 corpus sites arrived under
                 // one name with no partition to design a row contract on.
                 shape,
+                held: held.is_some(),
             })
         })
         .collect()
@@ -558,6 +604,7 @@ pub(crate) fn collect_inventory_with_expressions(
             SourceBridgeEvidence::WholeSubject
             | SourceBridgeEvidence::ProjectedReferent { .. }
             | SourceBridgeEvidence::TypedView { .. }
+            | SourceBridgeEvidence::ProjectedArrayView { .. }
             | SourceBridgeEvidence::NativeReturnExpression { .. } => {
                 potentials.push(potential.clone())
             }
@@ -710,6 +757,46 @@ fn source_bridge_evidence(
             method,
         };
     }
+    // **R304-2 — the projected array view.** `((*subject).field).as_ptr()` is
+    // the depth-1 projection `ProjectedReferent` licenses, wearing an array or
+    // slice method instead of an `AddrOf`. The projection walk is the same one
+    // the `AddrOf` arm runs, and the same depth rule applies: exactly one
+    // dereference of the subject, no more.
+    if let ExprKind::MethodCall(_, receiver, _, _) = expression.kind
+        && let Some(method) = typeck.type_dependent_def_id(expression.hir_id)
+        && !method.is_local()
+        && tcx.crate_name(method.krate).as_str() == "core"
+        && tcx.def_kind(method) == rustc_hir::def::DefKind::AssocFn
+        && matches!(tcx.item_name(method).as_str(), "as_ptr" | "as_mut_ptr")
+        && matches!(
+            typeck.expr_ty(receiver).peel_refs().kind(),
+            TyKind::Array(..) | TyKind::Slice(..)
+        )
+    {
+        let mut place = receiver;
+        let mut dereferences = 0;
+        loop {
+            match place.kind {
+                ExprKind::Field(base, _) | ExprKind::DropTemps(base) => place = base,
+                ExprKind::Index(base, _, _)
+                    if typeck.type_dependent_def_id(place.hir_id).is_none() =>
+                {
+                    place = base
+                }
+                ExprKind::Unary(rustc_hir::UnOp::Deref, base) => {
+                    dereferences += 1;
+                    place = base;
+                }
+                _ => break,
+            }
+        }
+        if dereferences == 1 && root(place, source.hir_id) {
+            return SourceBridgeEvidence::ProjectedArrayView {
+                use_hir_id: expression.hir_id,
+                method,
+            };
+        }
+    }
     SourceBridgeEvidence::UnknownShape(unsealed_shape(tcx, typeck, expression, source))
 }
 
@@ -759,6 +846,31 @@ fn unsealed_shape(
             }
         }
         ExprKind::MethodCall(_, receiver, _, _) => {
+            // **R304-2, refined on libtree.** `((*t).arr).offset(i)` — the
+            // receiver is a raw pointer PROJECTED OUT OF the subject's
+            // referent, so the value it adjusts was loaded through the
+            // subject, exactly as `*argv.offset(i)` is. It is the load family
+            // wearing a method, not the array view the seal was ruled for.
+            let mut place = receiver;
+            loop {
+                match place.kind {
+                    ExprKind::Field(base, _) | ExprKind::DropTemps(base) => place = base,
+                    ExprKind::Index(base, _, _)
+                        if typeck.type_dependent_def_id(place.hir_id).is_none() =>
+                    {
+                        place = base
+                    }
+                    ExprKind::Unary(rustc_hir::UnOp::Deref, base) => place = base,
+                    _ => break,
+                }
+            }
+            if !matches!(receiver.kind, ExprKind::Path(..))
+                && matches!(place.kind, ExprKind::Path(QPath::Resolved(_, path))
+                    if path.res == Res::Local(source.hir_id))
+                && matches!(typeck.expr_ty(receiver).kind(), TyKind::RawPtr(..))
+            {
+                return "unsealed:method-on-a-loaded-pointer";
+            }
             let Some(method) = typeck.type_dependent_def_id(expression.hir_id) else {
                 return "unsealed:method-unresolved";
             };

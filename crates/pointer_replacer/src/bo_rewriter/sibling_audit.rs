@@ -103,6 +103,14 @@ pub(crate) enum SourceEvidence {
         method_crate: u32,
         method_definition: u32,
     },
+    /// R304-2: a depth-1 projection of the referent, viewed as a pointer by an
+    /// array or slice method.
+    ProjectedArrayView {
+        hir_owner: u32,
+        hir_local: u32,
+        method_crate: u32,
+        method_definition: u32,
+    },
     NativeReturnExpression {
         hir_owner: u32,
         hir_local: u32,
@@ -167,6 +175,9 @@ pub(crate) enum Outcome {
     NoRiskySibling,
     PendingWaiver,
     CoverageGap,
+    /// R304-2: the source is a pointer LOADED through the subject — a value,
+    /// not a view of it — so the site is held under its own name.
+    HeldSourceIsLoad,
     IncompleteCapture,
 }
 
@@ -218,6 +229,14 @@ fn source_evidence(evidence: &SourceBridgeEvidence) -> SourceEvidence {
             method_crate: method.krate.as_u32(),
             method_definition: method.index.as_u32(),
         },
+        SourceBridgeEvidence::ProjectedArrayView { use_hir_id, method } => {
+            SourceEvidence::ProjectedArrayView {
+                hir_owner: use_hir_id.owner.def_id.local_def_index.as_u32(),
+                hir_local: use_hir_id.local_id.as_u32(),
+                method_crate: method.krate.as_u32(),
+                method_definition: method.index.as_u32(),
+            }
+        }
         SourceBridgeEvidence::NativeReturnExpression { use_hir_id } => {
             SourceEvidence::NativeReturnExpression {
                 hir_owner: use_hir_id.owner.def_id.local_def_index.as_u32(),
@@ -239,6 +258,8 @@ fn outcome(input: &Input) -> Outcome {
         SourceBridgeEvidence::WholeSubject
             | SourceBridgeEvidence::ProjectedReferent { .. }
             | SourceBridgeEvidence::TypedView { .. }
+            // **R304-2** — sealed, so the source IS represented here.
+            | SourceBridgeEvidence::ProjectedArrayView { .. }
             | SourceBridgeEvidence::NativeReturnExpression { .. }
     );
     if represented_source
@@ -251,8 +272,14 @@ fn outcome(input: &Input) -> Outcome {
         potential: potential.clone(),
         evidence: input.source_evidence.clone(),
     };
-    if !sibling_overlap::select_coverage_gaps(&[coverage], |_| input.terminal).is_empty() {
-        return Outcome::CoverageGap;
+    // **R304-2 — a stated hold is an outcome, not a gap.** A pointer loaded
+    // through the subject is a value rather than a view of it, so there is no
+    // source bridge to state and the site is held under its own name. Only a
+    // shape nothing has ruled on is still an unresolved gap.
+    match sibling_overlap::select_coverage_gaps(&[coverage], |_| input.terminal).as_slice() {
+        [] => {}
+        [receipt] if receipt.held => return Outcome::HeldSourceIsLoad,
+        _ => return Outcome::CoverageGap,
     }
     if !input.terminal.source_delivered {
         return Outcome::SourceNotDelivered;
@@ -269,6 +296,7 @@ fn outcome(input: &Input) -> Outcome {
         SourceBridgeEvidence::WholeSubject
         | SourceBridgeEvidence::ProjectedReferent { .. }
         | SourceBridgeEvidence::TypedView { .. }
+        | SourceBridgeEvidence::ProjectedArrayView { .. }
         | SourceBridgeEvidence::NativeReturnExpression { .. }
         | SourceBridgeEvidence::UnknownShape(_) => {}
     }

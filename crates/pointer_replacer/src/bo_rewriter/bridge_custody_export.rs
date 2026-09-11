@@ -626,7 +626,11 @@ pub(crate) fn capture(
                 (SiblingSource::Declared(source), evidence) => {
                     let shape = match evidence {
                         SourceBridgeEvidence::WholeSubject => PendingSourceShape::WholeSubject,
-                        SourceBridgeEvidence::ProjectedReferent { .. } => {
+                        // **R304-2** — the array view is the same depth-1
+                        // projection of the referent, differing only in how it
+                        // is spelled, so it is the same pending source shape.
+                        SourceBridgeEvidence::ProjectedReferent { .. }
+                        | SourceBridgeEvidence::ProjectedArrayView { .. } => {
                             PendingSourceShape::ProjectedReferent
                         }
                         SourceBridgeEvidence::TypedView { .. }
@@ -956,7 +960,13 @@ pub(crate) fn refresh(
         }
     }
     for gap in gaps {
+        // **R304-2 — the row is recorded either way; only an UNRULED shape is
+        // an issue.** A shape the seat has ruled on is held under its own name
+        // and that is complete custody, not an unresolved gap.
         export.coverage_gap_records.push(format!("{gap:#?}"));
+        if gap.held {
+            continue;
+        }
         export.terminal_issues.push(format!(
             "bridge-custody:sibling-coverage-gap:{}:{}:{}",
             super::decision::raw_boundary::site_atom_id(&gap.potential.site),
@@ -1155,7 +1165,7 @@ fn token_divergence(want: &str, have: &str) -> String {
     )
 }
 
-fn normalised_tokens(text: &str) -> String {
+pub(crate) fn normalised_tokens(text: &str) -> String {
     let dense = text
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -1671,6 +1681,21 @@ fn compare_applied(
             source_global_start: original_file.global_start,
             owner_renames: owner_renames.clone(),
             callee_renames: Vec::new(),
+            // **R304-3** — this file's stated pending-call renders, keyed by
+            // the original interval the row already carries. A row that
+            // declines the call-text claim, or one from a round that reached
+            // no emission, simply contributes nothing and the matcher keeps
+            // its structural search for that call.
+            pending_call_renders: export
+                .pending_sites
+                .iter()
+                .filter(|row| row.source_file == file)
+                .filter_map(|row| {
+                    let call = row.call.as_ref().ok()?;
+                    let rendered = call.rendered.clone()?;
+                    Some(((call.lo as u32, call.hi as u32), rendered))
+                })
+                .collect(),
         };
         let requested = active.get(&file).map_or(&[][..], Vec::as_slice);
         let expectations = requested

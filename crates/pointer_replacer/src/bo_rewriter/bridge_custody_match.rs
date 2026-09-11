@@ -122,6 +122,17 @@ pub(crate) struct BridgeCustodyContext {
     pub(crate) source_global_start: u32,
     pub(crate) owner_renames: Vec<OwnerRename>,
     pub(crate) callee_renames: Vec<CalleeRename>,
+    /// **R304-3 — the producer's stated render of each pending call**, keyed by
+    /// the ORIGINAL call's file-relative interval.
+    ///
+    /// R287-1 replaced this arm's *uniqueness* requirement with an *equality*
+    /// one, and R299-2 gave that equality a real text. Where a render is
+    /// stated, the structural search below is retired for that call: the
+    /// matcher asks whether the tree reads what the producer says it emitted,
+    /// which is stricter than re-deriving correspondence from a hand-listed
+    /// set of argument equivalences — the set that did not know the K19′ void
+    /// carrier and reported 85 absences over correct emissions.
+    pub(crate) pending_call_renders: std::collections::BTreeMap<(u32, u32), String>,
 }
 
 pub(crate) struct BridgeCustodyInput<'a> {
@@ -1441,8 +1452,21 @@ fn pending_selected_argument(
         }
         PointerType::Raw(_) | PointerType::Other => false,
     };
-    if !same_source_binding(input, &original_binding, &emitted_binding) || !protected_form {
-        return Err("pending-protected-source-declaration-correspondence-unresolved".into());
+    // **R295-3's rule, applied here too.** One name covered two independent
+    // conditions — the emitted binding is not the original's, and the emitted
+    // binding's declared form is not a protected one — and a reader could not
+    // tell which had fired.
+    if !same_source_binding(input, &original_binding, &emitted_binding) {
+        return Err(format!(
+            "pending-protected-source-binding-mismatch:{name}:emitted={}",
+            emitted_binding.name
+        ));
+    }
+    if !protected_form {
+        return Err(format!(
+            "pending-protected-source-not-a-reference:{name}:{}",
+            emitted_binding.type_text.as_deref().unwrap_or("-")
+        ));
     }
     Ok(witnesses)
 }
@@ -1884,8 +1908,40 @@ fn pending(
     {
         return Err("pending-tier-or-waiver-mismatch".into());
     }
-    let mut matching = Vec::new();
     let target = target_owner(input, expected)?;
+    // **R304-3 — the stated render is the claim.**
+    if let Some(rendered) = input
+        .context
+        .pending_call_renders
+        .get(&(original.span.lo, original.span.hi))
+    {
+        let want = super::bridge_custody_export::normalised_tokens(rendered);
+        let mut stated = Vec::new();
+        for call in candidates {
+            let text = input
+                .emitted_source
+                .get(call.span.lo as usize..call.span.hi as usize)
+                .ok_or("pending-call-span-outside-emitted-source")?;
+            if super::bridge_custody_export::normalised_tokens(text) != want {
+                continue;
+            }
+            let mut witnesses = Vec::new();
+            for &index in indices {
+                witnesses.extend(pending_selected_argument(
+                    input, expected, original, call, index,
+                )?);
+            }
+            stated.push((*call, witnesses));
+        }
+        // **Duplicates settle by text equality.** Two calls reading what the
+        // producer stated both satisfy an equality claim; that is exactly the
+        // property R287-1 chose over uniqueness.
+        let Some((call, witnesses)) = stated.into_iter().next() else {
+            return Err("pending-call-render-absent".into());
+        };
+        return Ok((call.span, witnesses, ReceiptStatus::WaivedPending));
+    }
+    let mut matching = Vec::new();
     for call in candidates {
         let mut same = true;
         let mut witnesses = Vec::new();

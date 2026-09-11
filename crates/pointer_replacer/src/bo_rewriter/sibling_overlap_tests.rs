@@ -767,3 +767,134 @@ fn sibling_r233_unknown_shape_with_actual_sealed_read_only_sibling_has_no_scope_
         "read-only sibling access is outside the pending-write waiver, without a soundness claim"
     );
 }
+
+// -------------------------------------------------------------------------
+// R304-2 — the seat's two dispositions for the unsealed source shapes.
+
+/// **Witness: the deref shape is HELD, not an unresolved gap.** A pointer
+/// loaded through the subject is a value, not a view of it, so there is no
+/// source bridge to state and the site is held under its own name.
+#[test]
+fn r304_a_loaded_source_is_held_under_its_own_name() {
+    let inventory = inventory(PARAMETER_CASE, "caller::src");
+    let mut record = covered(&inventory, "caller::src", "update", 1).clone();
+    record.evidence = SourceBridgeEvidence::UnknownShape("unsealed:deref");
+    let receipts =
+        sibling_overlap::select_coverage_gaps(std::slice::from_ref(&record), raw_terminal);
+    let [receipt] = receipts.as_slice() else {
+        panic!("the held site still owes a receipt: {receipts:?}")
+    };
+    assert!(receipt.held, "a ruled shape is held: {receipt:?}");
+    assert_eq!(receipt.reason, sibling_overlap::HELD_SOURCE_IS_LOAD);
+    assert_eq!(receipt.shape, "unsealed:deref");
+}
+
+/// **Fault: an UNRULED shape stays an unresolved gap.** The disposition table
+/// is fail-closed — a shape nothing has ruled on must not acquire a hold by
+/// being new.
+#[test]
+fn r304_an_unruled_source_shape_is_still_an_unresolved_gap() {
+    let inventory = inventory(PARAMETER_CASE, "caller::src");
+    for shape in [
+        "unsealed:call",
+        "unsealed:binary",
+        "unsealed:method-on-another-receiver",
+        "constructed-unresolved-wrapper-control",
+    ] {
+        let mut record = covered(&inventory, "caller::src", "update", 1).clone();
+        record.evidence = SourceBridgeEvidence::UnknownShape(shape);
+        let receipts =
+            sibling_overlap::select_coverage_gaps(std::slice::from_ref(&record), raw_terminal);
+        let [receipt] = receipts.as_slice() else { panic!("one receipt for {shape}") };
+        assert!(!receipt.held, "{shape} must stay unresolved: {receipt:?}");
+        assert_eq!(receipt.reason, "sibling-source-bridge-custody-unresolved");
+    }
+}
+
+/// heman's shape, reduced: a depth-1 projection of the referent viewed as a
+/// pointer by an array method. The projection is the one `ProjectedReferent`
+/// licenses; the array view is the only reason it used to fall through.
+const PROJECTED_ARRAY_CASE: &str = "#![allow(dead_code, unused_unsafe, non_snake_case)]\n\
+    #[derive(Copy, Clone)]\n\
+    #[repr(C)] pub struct Mat { pub mat: [f32; 4] }\n\
+    extern \"C\" {\n\
+        fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: usize)\n\
+            -> *mut core::ffi::c_void;\n\
+    }\n\
+    pub unsafe fn assign(pOut: *mut Mat, pIn: *const Mat) {\n\
+        memcpy(((*pOut).mat).as_mut_ptr() as *mut core::ffi::c_void,\n\
+            ((*pIn).mat).as_ptr() as *const core::ffi::c_void, 16);\n\
+    }\n\
+    pub unsafe fn entry() -> f32 {\n\
+        let mut out = Mat { mat: [0.; 4] }; let src = Mat { mat: [1., 2., 3., 4.] };\n\
+        assign(&mut out, &src); out.mat[0]\n\
+    }\n";
+
+/// **Witness: the projected array view is SEALED.** It is the same depth-1
+/// projection, so the source is represented and the site is no longer an
+/// unsealed shape at all.
+#[test]
+fn r304_a_projected_array_view_is_sealed_as_a_referent_projection() {
+    let inventory = inventory(PROJECTED_ARRAY_CASE, "assign::pIn");
+    let record = covered(&inventory, "assign::pIn", "memcpy", 1);
+    assert!(
+        matches!(
+            record.evidence,
+            SourceBridgeEvidence::ProjectedArrayView { .. }
+        ),
+        "the array view must seal as a projection: {:?}",
+        record.evidence
+    );
+    assert!(
+        sibling_overlap::select_coverage_gaps(std::slice::from_ref(record), raw_terminal)
+            .is_empty(),
+        "a sealed source owes no gap receipt"
+    );
+    // R287-1(c)'s cross-reference: the OTHER receiver is a sibling of this
+    // site, so custody joins the two ends through the sibling rows.
+    assert!(
+        record
+            .potential
+            .siblings
+            .iter()
+            .any(|sibling| sibling.argument_index == 0),
+        "the other receiver must be a stated sibling: {:?}",
+        record.potential.siblings
+    );
+}
+
+/// **Fault: the seal is depth-1 only.** A projection through two dereferences
+/// is not the shape `ProjectedReferent` licenses, and must not acquire the
+/// seal by wearing the same array method.
+#[test]
+fn r304_a_deeper_projection_does_not_acquire_the_array_view_seal() {
+    let input = "#![allow(dead_code, unused_unsafe, non_snake_case)]\n\
+        #[derive(Copy, Clone)]\n\
+        #[repr(C)] pub struct Inner { pub mat: [f32; 4] }\n\
+        #[derive(Copy, Clone)]\n\
+        #[repr(C)] pub struct Outer { pub inner: *const Inner }\n\
+        extern \"C\" {\n\
+            fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: usize)\n\
+                -> *mut core::ffi::c_void;\n\
+        }\n\
+        pub unsafe fn assign(pOut: *mut Inner, pIn: *const Outer) {\n\
+            memcpy(((*pOut).mat).as_mut_ptr() as *mut core::ffi::c_void,\n\
+                ((*(*pIn).inner).mat).as_ptr() as *const core::ffi::c_void, 16);\n\
+        }\n\
+        pub unsafe fn entry() -> f32 {\n\
+            let mut out = Inner { mat: [0.; 4] };\n\
+            let src = Inner { mat: [1., 2., 3., 4.] };\n\
+            let holder = Outer { inner: &src };\n\
+            assign(&mut out, &holder); out.mat[0]\n\
+        }\n";
+    let inventory = inventory(input, "assign::pIn");
+    let record = covered(&inventory, "assign::pIn", "memcpy", 1);
+    assert!(
+        !matches!(
+            record.evidence,
+            SourceBridgeEvidence::ProjectedArrayView { .. }
+        ),
+        "two dereferences are not the licensed depth: {:?}",
+        record.evidence
+    );
+}
