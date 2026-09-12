@@ -1380,3 +1380,6 @@ fn synthetic_ownership_chain_composes_declaration_copy_signature_call_and_free()
 
 #[path = "ownership_fields_cases/raw_audit.rs"]
 mod raw_audit_cases;
+
+#[path = "ownership_fields_cases/bst_fold.rs"]
+mod bst_fold_cases;

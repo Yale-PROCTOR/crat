@@ -450,16 +450,21 @@ pub fn plan_return(edge: &ReturnEdge) -> Result<String, BoundaryHold> {
     if edge.source.ty != edge.result.ty {
         return Err(BoundaryHold::Type);
     }
-    let BoundaryType::Owner(ty) = &edge.result.ty else {
-        return Err(BoundaryHold::Type);
-    };
-    let value = if edge.take_optional_storage {
-        if !ty.optional || !edge.exclusive_storage {
+    let value = match &edge.result.ty {
+        BoundaryType::Owner(ty) if edge.take_optional_storage => {
+            if !ty.optional || !edge.exclusive_storage {
+                return Err(BoundaryHold::Type);
+            }
+            format!("({}).take()", edge.expression)
+        }
+        // validate_slot above checks both origin permits and Ref grants. A
+        // lending return keeps that exact borrowed type/region; it transfers
+        // no owning capability and may never take an optional owner cell.
+        BoundaryType::Borrow { .. } if edge.take_optional_storage => {
             return Err(BoundaryHold::Type);
         }
-        format!("({}).take()", edge.expression)
-    } else {
-        edge.expression.clone()
+        BoundaryType::Owner(_) | BoundaryType::Borrow { .. } => edge.expression.clone(),
+        BoundaryType::Scalar(_) => return Err(BoundaryHold::Type),
     };
     Ok(format!("return {value};"))
 }
