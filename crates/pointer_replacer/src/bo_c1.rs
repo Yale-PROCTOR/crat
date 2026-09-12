@@ -21522,6 +21522,7 @@ struct RawBoundaryControlReconciliation {
     t2_cross_tab: String,
     libc_site_movement: String,
     io_domain_migrations: String,
+    libc_hold_receipt: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21583,6 +21584,86 @@ fn raw_boundary_io_domain_migration(
         })
 }
 
+/// R342-2. A libc contract edge that no longer produces a T1 `contract:`
+/// disposition is explained by exactly one pinned hold, or it is a divergence.
+///
+/// The subject's own `reason` column is authoritative when it carries one; a
+/// blocked subject records its cause in the `exclusion` column instead, and the
+/// two must be read as one field or a hold reads as "unrecorded".
+fn raw_boundary_libc_hold_class(
+    family: &str,
+    reason: &str,
+    exclusion: &str,
+) -> Option<&'static str> {
+    let cause = if reason.is_empty() || reason == "-" {
+        exclusion
+            .split(';')
+            .find_map(|part| {
+                part.trim()
+                    .strip_prefix("terminal-not-applied:blocked-subject:")
+            })
+            .unwrap_or("")
+    } else {
+        reason
+    };
+    match cause {
+        "held:thin-extent" => Some("thin-extent"),
+        "held:io-domain:type" => Some("io-domain-type"),
+        "kind-raw" if family == "raw" => Some("analysis-frame-decline"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn control_keys_unused(
+    control: &std::collections::BTreeMap<(String, String, String, usize, usize), String>,
+    used: &std::collections::BTreeSet<(String, String, String, usize, usize)>,
+) -> Vec<(String, String, String, usize, usize)> {
+    control
+        .keys()
+        .filter(|key| !used.contains(*key))
+        .cloned()
+        .collect()
+}
+
+/// R342-2. Resolve one unmatched libc contract edge against the identity-exact
+/// re-pin: the control must list it, and production must actually carry the
+/// hold the control claims. Fail-closed in both directions.
+#[allow(clippy::type_complexity)]
+fn raw_boundary_libc_hold_resolve(
+    hold_index: &std::collections::BTreeMap<(String, String), (String, String, String)>,
+    control: &std::collections::BTreeMap<(String, String, String, usize, usize), String>,
+    used: &mut std::collections::BTreeSet<(String, String, String, usize, usize)>,
+    receipt: &mut String,
+    key: &(String, String, String, usize, usize),
+) -> Result<(), String> {
+    let Some(expected) = control.get(key) else {
+        return Err("libc-hold-unlisted".to_owned());
+    };
+    let Some((family, reason, exclusion)) = hold_index.get(&(key.0.clone(), key.1.clone())) else {
+        return Err("libc-hold-subject-absent".to_owned());
+    };
+    let Some(observed) = raw_boundary_libc_hold_class(family, reason, exclusion) else {
+        return Err("libc-hold-unrecognised".to_owned());
+    };
+    if observed != expected {
+        return Err(format!("libc-hold-class-mismatch:{expected}!={observed}"));
+    }
+    if !used.insert(key.clone()) {
+        return Err("libc-hold-control-row-reused".to_owned());
+    }
+    let cause = if reason.is_empty() || reason == "-" {
+        exclusion.as_str()
+    } else {
+        reason.as_str()
+    };
+    receipt.push_str(&format!(
+        "{}\t{}\t{}\t{}\t{}\t{observed}\t{family}\t{cause}\n",
+        key.0, key.1, key.2, key.3, key.4
+    ));
+    Ok(())
+}
+
 fn control_edge_parts(edge: &str) -> Option<(&str, usize, usize)> {
     let (callee, rest) = edge.split_once('#')?;
     let (argument, site) = rest.split_once('@')?;
@@ -21622,6 +21703,8 @@ fn reconcile_raw_boundary_controls(
     box_control: &str,
     subject_artifacts: &[(String, String)],
     disposition_artifacts: &[(String, String)],
+    hold_artifacts: &[(String, String)],
+    hold_control: &str,
 ) -> Result<RawBoundaryControlReconciliation, String> {
     let primary = ParsedTsv::parse(primary)?;
     let box_control = ParsedTsv::parse(box_control)?;
@@ -21659,6 +21742,51 @@ fn reconcile_raw_boundary_controls(
             dispositions.push(record);
         }
     }
+    // R342-2. The hold index carries the subject's own family/reason/exclusion,
+    // which the subject-index does not; the control is the identity-exact
+    // re-pin of the libc contract population after the thin-extent hold.
+    let mut hold_index =
+        std::collections::BTreeMap::<(String, String), (String, String, String)>::new();
+    for (program, text) in hold_artifacts {
+        let parsed = ParsedTsv::parse(text)?;
+        for row in &parsed.rows {
+            let identity = parsed.field(row, "subject_key")?.to_owned();
+            hold_index.insert(
+                (program.clone(), identity),
+                (
+                    parsed.field(row, "family")?.to_owned(),
+                    parsed.field(row, "reason")?.to_owned(),
+                    parsed.field(row, "exclusion")?.to_owned(),
+                ),
+            );
+        }
+    }
+    let parsed_hold_control = ParsedTsv::parse(hold_control)?;
+    let mut hold_control_rows =
+        std::collections::BTreeMap::<(String, String, String, usize, usize), String>::new();
+    for row in &parsed_hold_control.rows {
+        let key = (
+            parsed_hold_control.field(row, "program")?.to_owned(),
+            parsed_hold_control.field(row, "identity")?.to_owned(),
+            parsed_hold_control.field(row, "callee")?.to_owned(),
+            parsed_hold_control
+                .field(row, "argument")?
+                .parse::<usize>()
+                .map_err(|error| format!("hold-control argument: {error}"))?,
+            parsed_hold_control
+                .field(row, "line")?
+                .parse::<usize>()
+                .map_err(|error| format!("hold-control line: {error}"))?,
+        );
+        let class = parsed_hold_control.field(row, "class")?.to_owned();
+        if hold_control_rows.insert(key.clone(), class).is_some() {
+            return Err(format!("duplicate libc hold control row {key:?}"));
+        }
+    }
+    let mut used_hold_control =
+        std::collections::BTreeSet::<(String, String, String, usize, usize)>::new();
+    let mut libc_hold_receipt =
+        String::from("program\tidentity\tcallee\targument\tline\tclass\tfamily\tcause\n");
     let mut divergences = String::from("control\tprogram\tidentity\treason\tdetail\n");
     let mut arm_b = String::from(
         "unit\tprogram\tidentity\tboundary_direction\tmodel_kind\tblocker\tmissing_fact\tarm_a_applicable\n",
@@ -21689,6 +21817,7 @@ fn reconcile_raw_boundary_controls(
         t2_cross_tab: String::new(),
         libc_site_movement: String::new(),
         io_domain_migrations: String::new(),
+        libc_hold_receipt: String::new(),
     };
     for row in &primary.rows {
         let program = primary.field(row, "program")?;
@@ -21740,10 +21869,32 @@ fn reconcile_raw_boundary_controls(
                                 })
                         });
                         let Some((matched_index, record)) = candidate else {
-                            divergences.push_str(&format!(
-                                "libc-edge\t{program}\t{identity}\tio-domain-migration-unmatched\t{edge}\n"
-                            ));
-                            continue;
+                            // R342-2. The type-level io-domain hold now fires
+                            // before the shared-to-mut path this migration
+                            // table was written for. A pinned hold explains the
+                            // edge; anything else is still a divergence.
+                            let key = (
+                                program.to_owned(),
+                                identity.to_owned(),
+                                callee.to_owned(),
+                                argument,
+                                line,
+                            );
+                            match raw_boundary_libc_hold_resolve(
+                                &hold_index,
+                                &hold_control_rows,
+                                &mut used_hold_control,
+                                &mut libc_hold_receipt,
+                                &key,
+                            ) {
+                                Ok(()) => continue,
+                                Err(detail) => {
+                                    divergences.push_str(&format!(
+                                        "libc-edge\t{program}\t{identity}\t{detail}\t{edge}\n"
+                                    ));
+                                    continue;
+                                }
+                            }
                         };
                         used_libc_dispositions.insert(matched_index);
                         io_domain_migrations.push_str(&format!(
@@ -21782,10 +21933,31 @@ fn reconcile_raw_boundary_controls(
                                 })
                         });
                     let Some((matched_index, record)) = candidate else {
-                        divergences.push_str(&format!(
-                            "libc-edge\t{program}\t{identity}\tcontract-site-unmatched\t{edge}\n"
-                        ));
-                        continue;
+                        // R342-2. The thin-extent hold (and, at L01", the
+                        // analysis's kind narrowing) removed these deliveries
+                        // deliberately; the control says which, by identity.
+                        let key = (
+                            program.to_owned(),
+                            identity.to_owned(),
+                            callee.to_owned(),
+                            argument,
+                            line,
+                        );
+                        match raw_boundary_libc_hold_resolve(
+                            &hold_index,
+                            &hold_control_rows,
+                            &mut used_hold_control,
+                            &mut libc_hold_receipt,
+                            &key,
+                        ) {
+                            Ok(()) => continue,
+                            Err(detail) => {
+                                divergences.push_str(&format!(
+                                    "libc-edge\t{program}\t{identity}\t{detail}\t{edge}\n"
+                                ));
+                                continue;
+                            }
+                        }
                     };
                     used_libc_dispositions.insert(matched_index);
                     let production_line = record
@@ -21934,10 +22106,17 @@ fn reconcile_raw_boundary_controls(
     for ((label, disposition), count) in corpus_t2_cross {
         t2_cross_tab.push_str(&format!("ALL\t{label}\t{disposition}\t{count}\n"));
     }
+    for key in control_keys_unused(&hold_control_rows, &used_hold_control) {
+        divergences.push_str(&format!(
+            "libc-edge\t{}\t{}\tlibc-hold-control-unused\t{}#{}@{}\n",
+            key.0, key.1, key.2, key.3, key.4
+        ));
+    }
     counts.divergences = divergences;
     counts.arm_b_ledger = arm_b;
     counts.free_arm_b_ledger = free_arm_b;
     counts.t2_cross_tab = t2_cross_tab;
+    counts.libc_hold_receipt = libc_hold_receipt;
     counts.libc_site_movement = libc_site_movement;
     counts.io_domain_migrations = io_domain_migrations;
     Ok(counts)
@@ -23024,6 +23203,48 @@ fn raw_boundary_wave2_corpus_census() {
         "promote exclusion contains an unknown subject"
     );
 
+    // R342-3. The waiver is identity-exact: every identity that accounts for a
+    // per-program decline must be listed with the class production actually
+    // shows, or the program's regression stands.
+    let hold_subjects = raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-subjects.tsv")
+        .expect("read current subject ledger");
+    let mut hold_causes = BTreeMap::<(String, String), (String, String, String)>::new();
+    for (program, text) in &hold_subjects {
+        for row in named_tsv_rows(text) {
+            hold_causes.insert(
+                (
+                    program.clone(),
+                    row.get("subject_key").cloned().unwrap_or_default(),
+                ),
+                (
+                    row.get("family").cloned().unwrap_or_default(),
+                    row.get("reason").cloned().unwrap_or_default(),
+                    row.get("exclusion").cloned().unwrap_or_default(),
+                ),
+            );
+        }
+    }
+    let waiver_path = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_REGRESSION_WAIVER")
+            .expect("raw-boundary census requires the R342-3 regression waiver"),
+    );
+    let waiver_bytes = fs::read(&waiver_path).unwrap_or_else(|error| {
+        panic!("read regression waiver {}: {error}", waiver_path.display())
+    });
+    let waiver_sha256 = format!("{:x}", Sha256::digest(&waiver_bytes));
+    let waiver_text = String::from_utf8(waiver_bytes).expect("regression waiver must be UTF-8");
+    let mut waiver_rows = BTreeMap::<(String, String), String>::new();
+    for row in named_tsv_rows(&waiver_text) {
+        waiver_rows.insert(
+            (
+                row.get("program").cloned().unwrap_or_default(),
+                row.get("subject_key").cloned().unwrap_or_default(),
+            ),
+            row.get("class").cloned().unwrap_or_default(),
+        );
+    }
+    let mut lost_by_program = BTreeMap::<String, Vec<String>>::new();
+
     let mut tally = RawBoundaryFrameTally::default();
     let mut current_population = 0usize;
     let mut excluded_current_members = 0usize;
@@ -23065,6 +23286,12 @@ fn raw_boundary_wave2_corpus_census() {
         let regressed_identity = membership.baseline
             && baseline_delivery == "realized-as-predicted"
             && current_delivery != "realized-as-predicted";
+        if regressed_identity {
+            lost_by_program
+                .entry(key.0.clone())
+                .or_default()
+                .push(key.1.clone());
+        }
         subject_delivery.push_str(&format!(
             "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
@@ -23095,6 +23322,7 @@ fn raw_boundary_wave2_corpus_census() {
     let mut regression_rows = String::from(
         "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tbaseline_realized\tcurrent_realized\tdelta\twaiver\n",
     );
+    let mut waiver_audit = String::from("corpus\tcode_frame\tprogram\tsubject_key\tverdict\n");
     let mut regressed_programs = BTreeSet::new();
     for program in CORPUS {
         let baseline_counts = RawBoundaryFrameTally::counts(&tally.baseline, program.name);
@@ -23120,15 +23348,61 @@ fn raw_boundary_wave2_corpus_census() {
         );
         let regression = current_counts.realized < baseline_counts.realized;
         if regression {
-            regressed_programs.insert(program.name.to_owned());
+            // R342-3. A decline is waived only when EVERY identity that
+            // accounts for it is listed with the class production shows, and
+            // only the two classes the seat ruled: the analysis frame's kind
+            // narrowing, and the thin-extent hold R342-2 let stand. One
+            // unlisted or differently-classed identity and the decline stands.
+            let mut waived = true;
+            for identity in lost_by_program.get(program.name).into_iter().flatten() {
+                let key = (program.name.to_owned(), identity.clone());
+                let listed = waiver_rows.get(&key).map(String::as_str);
+                let observed = hold_causes
+                    .get(&key)
+                    .and_then(|(family, reason, exclusion)| {
+                        raw_boundary_libc_hold_class(family, reason, exclusion)
+                    });
+                let verdict = match (listed, observed) {
+                    (Some(listed), Some(observed))
+                        if listed == observed
+                            && matches!(listed, "analysis-frame-decline" | "thin-extent") =>
+                    {
+                        listed.to_owned()
+                    }
+                    (Some(listed), Some(observed)) => {
+                        waived = false;
+                        format!("unwaived:listed={listed}:observed={observed}")
+                    }
+                    (Some(listed), None) => {
+                        waived = false;
+                        format!("unwaived:listed={listed}:observed=none")
+                    }
+                    (None, _) => {
+                        waived = false;
+                        "unwaived:unlisted".to_owned()
+                    }
+                };
+                waiver_audit.push_str(&format!(
+                    "rs-crown\t{}\t{}\t{identity}\t{verdict}\n",
+                    code_frame, program.name
+                ));
+            }
+            if !waived {
+                regressed_programs.insert(program.name.to_owned());
+            }
             regression_rows.push_str(&format!(
-                "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\tnone\n",
+                "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\n",
                 crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
                 code_frame,
                 program.name,
                 baseline_counts.realized,
                 current_counts.realized,
                 current_counts.realized as isize - baseline_counts.realized as isize,
+                if waived {
+                    "analysis-frame-decline"
+                } else {
+                    "none"
+                },
             ));
         }
         per_program_delivery.push_str(&format!(
@@ -23161,6 +23435,11 @@ fn raw_boundary_wave2_corpus_census() {
     .expect("write per-program delivery table");
     fs::write(artifact_dir.join("regression-rows.tsv"), &regression_rows)
         .expect("write regression rows");
+    fs::write(
+        artifact_dir.join("regression-waiver-audit.tsv"),
+        &waiver_audit,
+    )
+    .expect("write regression waiver audit");
 
     let degraded_programs = rows
         .iter()
@@ -23339,9 +23618,32 @@ fn raw_boundary_wave2_corpus_census() {
     let dispositions = raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-dispositions.tsv")
         .expect("read current dispositions");
     let box_control = raw_boundary_control_box_rows(&box_control_dir).expect("Box controls");
-    let controls =
-        reconcile_raw_boundary_controls(&primary, &box_control, &subjects, &dispositions)
-            .expect("reconcile raw-boundary controls");
+    let hold_control_path = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_LIBC_HOLD_CONTROL")
+            .expect("raw-boundary census requires the R342-2 libc hold control"),
+    );
+    let hold_control_bytes = fs::read(&hold_control_path).unwrap_or_else(|error| {
+        panic!(
+            "read libc hold control {}: {error}",
+            hold_control_path.display()
+        )
+    });
+    let hold_control_sha256 = format!("{:x}", Sha256::digest(&hold_control_bytes));
+    let hold_control = String::from_utf8(hold_control_bytes).expect("hold control must be UTF-8");
+    let controls = reconcile_raw_boundary_controls(
+        &primary,
+        &box_control,
+        &subjects,
+        &dispositions,
+        &hold_subjects,
+        &hold_control,
+    )
+    .expect("reconcile raw-boundary controls");
+    fs::write(
+        artifact_dir.join("libc-contract-hold-receipt.tsv"),
+        &controls.libc_hold_receipt,
+    )
+    .expect("write libc contract hold receipt");
     fs::write(
         artifact_dir.join("control-divergences.tsv"),
         &controls.divergences,
@@ -23389,7 +23691,19 @@ fn raw_boundary_wave2_corpus_census() {
         controls.divergences
     );
     assert_eq!(controls.arm_b_ledger.lines().count(), 63);
-    assert_eq!(controls.io_domain_migrations.lines().count(), 5);
+    // R342-2. The four addendum-176/177 migration rows are superseded: the
+    // type-level io-domain hold now fires before the shared-to-mut path that
+    // table described, so they arrive as `io-domain-type` hold-receipt rows and
+    // the migration table is empty. Header only.
+    assert_eq!(controls.io_domain_migrations.lines().count(), 1);
+    // The re-pin is identity-exact in both directions: every control row is
+    // consumed exactly once (an unused row is already a divergence above), and
+    // the receipt carries one line per control row plus its header.
+    assert_eq!(
+        controls.libc_hold_receipt.lines().count(),
+        77,
+        "libc contract hold receipt population drift"
+    );
     assert_eq!(
         controls.free_arm_b_rows, 5,
         "free-parameter Arm-B receipt population drift"
@@ -23756,7 +24070,7 @@ fn raw_boundary_wave2_corpus_census() {
     fs::write(
         artifact_dir.join("census-receipt.txt"),
         format!(
-            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_current={}/{}/{}/{}/{}\nsubject_frame_corrected={}/{}/{}/{}\npromote_rate_current={}/{}\npromote_rate_corrected={}/{}\nmembership_gained={}\nmembership_lost={}\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\n",
+            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_current={}/{}/{}/{}/{}\nsubject_frame_corrected={}/{}/{}/{}\npromote_rate_current={}/{}\npromote_rate_corrected={}/{}\nmembership_gained={}\nmembership_lost={}\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\nlibc_hold_control_sha256={}\nlibc_hold_rows={}\nregression_waiver_sha256={}\nregression_waiver_audit_rows={}\n",
             delivery.key(),
             20 - degraded_programs.len(),
             degraded_programs.len(),
@@ -23791,6 +24105,10 @@ fn raw_boundary_wave2_corpus_census() {
             diagnostic_recon.new,
             baseline_digest,
             exclusion_sha256,
+            hold_control_sha256,
+            controls.libc_hold_receipt.lines().count() - 1,
+            waiver_sha256,
+            waiver_audit.lines().count() - 1,
         ),
     )
     .expect("write census receipt");
@@ -24141,6 +24459,54 @@ fn r340_2_the_parent_counts_the_current_frame_population_and_reports_membership(
 }
 
 #[test]
+fn r342_2_a_libc_contract_hold_names_itself_from_either_column() {
+    // the reason column when it carries one
+    assert_eq!(
+        raw_boundary_libc_hold_class("ref", "held:thin-extent", "-"),
+        Some("thin-extent")
+    );
+    assert_eq!(
+        raw_boundary_libc_hold_class("ref", "held:io-domain:type", "-"),
+        Some("io-domain-type")
+    );
+    // an analysis-frame decline is the kind narrowing, and only when the
+    // family actually moved to raw
+    assert_eq!(
+        raw_boundary_libc_hold_class("raw", "kind-raw", "-"),
+        Some("analysis-frame-decline")
+    );
+    assert_eq!(raw_boundary_libc_hold_class("ref", "kind-raw", "-"), None);
+    // a blocked subject records its cause in the exclusion column, and the
+    // reason column reads "-": the same hold must still name itself
+    assert_eq!(
+        raw_boundary_libc_hold_class(
+            "ref",
+            "-",
+            "terminal-not-applied:blocked-subject:held:thin-extent"
+        ),
+        Some("thin-extent")
+    );
+    assert_eq!(
+        raw_boundary_libc_hold_class(
+            "ref",
+            "-",
+            "something-else; terminal-not-applied:blocked-subject:held:io-domain:type"
+        ),
+        Some("io-domain-type")
+    );
+    // anything else is not a pinned hold and stays a divergence
+    assert_eq!(
+        raw_boundary_libc_hold_class(
+            "ref",
+            "-",
+            "terminal-not-applied:blocked-subject:slice-use-unsupported"
+        ),
+        None
+    );
+    assert_eq!(raw_boundary_libc_hold_class("ref", "-", "-"), None);
+}
+
+#[test]
 fn raw_boundary_lr1_receipt_exclusion_reclassifies_without_changing_the_worker() {
     assert_eq!(
         raw_boundary_apply_receipt_exclusion("degraded", "-", true),
@@ -24373,6 +24739,114 @@ fn raw_boundary_primary_control_fixture_keeps_all_exact_populations() {
 }
 
 #[test]
+fn r342_2_a_listed_hold_resolves_the_edge_and_an_unlisted_or_mismatched_one_diverges() {
+    let primary = concat!(
+        "read\tprogram\trecord_key\tcategory\ttyped_subkind\tconsumer_edges\n",
+        "A\tp\tp::f::libc#1\tLIBC-CONTRACT-OPENABLE\tknown-libc-no-independent-hard-conflict\tstrlen#0@p/lib.rs:4\n",
+    );
+    let box_control = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\n";
+    let subjects = concat!(
+        "subject_identity\towner\tmir_local\tsubject_kind\thypothetical\tsettled\tdirect_site_count\tdirect_tiers\traw_open\tclass_id\tclass_admits\tclass_block\tnode_block\tptr_depth\n",
+        "p::f::libc#1\tp::f\t1\tparam\tref\tdegraded\t1\tblocked\t1\t0\t1\t-\t-\t1\n",
+    );
+    // no T1 `contract:` row: the thin-extent hold took the site
+    let dispositions = "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n";
+    let ledger = concat!(
+        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\tsole_blocker\n",
+        "p::f::libc#1\tp::f\t1\t1\t1\tref\tref\tdegraded\theld:thin-extent\t-\t-\t0\t-\t-\n",
+    );
+    let listed = concat!(
+        "program\tidentity\tcallee\targument\tline\tclass\n",
+        "p\tp::f::libc#1\tstrlen\t0\t4\tthin-extent\n",
+    );
+    let result = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+        &[("p".to_owned(), ledger.to_owned())],
+        listed,
+    )
+    .expect("listed hold reconciles");
+    assert_eq!(result.libc_edges, 1);
+    assert_eq!(
+        result.divergences.lines().count(),
+        1,
+        "a listed hold is not a divergence: {}",
+        result.divergences
+    );
+    assert_eq!(
+        result.libc_hold_receipt.lines().count(),
+        2,
+        "the hold is receipted: {}",
+        result.libc_hold_receipt
+    );
+    assert!(
+        result
+            .libc_hold_receipt
+            .contains("\tthin-extent\tref\theld:thin-extent\n")
+    );
+
+    // an unlisted edge still diverges
+    let unlisted = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+        &[("p".to_owned(), ledger.to_owned())],
+        "program\tidentity\tcallee\targument\tline\tclass\n",
+    )
+    .expect("unlisted hold reconciles");
+    assert!(
+        unlisted.divergences.contains("libc-hold-unlisted"),
+        "{}",
+        unlisted.divergences
+    );
+
+    // a listed edge whose production hold is a DIFFERENT class diverges: the
+    // re-pin is identity-exact, not a blanket amnesty
+    let mismatched = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+        &[("p".to_owned(), ledger.to_owned())],
+        concat!(
+            "program\tidentity\tcallee\targument\tline\tclass\n",
+            "p\tp::f::libc#1\tstrlen\t0\t4\tio-domain-type\n",
+        ),
+    )
+    .expect("mismatched hold reconciles");
+    assert!(
+        mismatched
+            .divergences
+            .contains("libc-hold-class-mismatch:io-domain-type!=thin-extent"),
+        "{}",
+        mismatched.divergences
+    );
+
+    // a control row nothing consumed diverges too
+    let unused = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+        &[("p".to_owned(), ledger.to_owned())],
+        concat!(
+            "program\tidentity\tcallee\targument\tline\tclass\n",
+            "p\tp::f::libc#1\tstrlen\t0\t4\tthin-extent\n",
+            "p\tp::f::ghost#9\tstrcmp\t1\t7\tthin-extent\n",
+        ),
+    )
+    .expect("unused hold reconciles");
+    assert!(
+        unused.divergences.contains("libc-hold-control-unused"),
+        "{}",
+        unused.divergences
+    );
+}
+
+#[test]
 fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
     let primary = concat!(
         "read\tprogram\trecord_key\tcategory\ttyped_subkind\tconsumer_edges\n",
@@ -24408,6 +24882,8 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
         box_control,
         &[("p".to_owned(), subjects.to_owned())],
         &[("p".to_owned(), dispositions.to_owned())],
+        &[],
+        "program\tidentity\tcallee\targument\tline\tclass\n",
     )
     .expect("fixture reconciles");
     assert_eq!(result.libc_subjects, 1);
@@ -24471,6 +24947,8 @@ fn r176_w1_genann_stdio_control_migrates_to_io_domain_holds() {
         box_control,
         &[("genann".to_owned(), subjects.to_owned())],
         &[("genann".to_owned(), dispositions.to_owned())],
+        &[],
+        "program\tidentity\tcallee\targument\tline\tclass\n",
     )
     .expect("genann migration fixture reconciles");
 
@@ -24520,6 +24998,8 @@ fn raw_boundary_market_labels_cross_tab_and_free_params_receipt_without_relabeli
         box_control,
         &[("p".to_owned(), subjects.to_owned())],
         &[("p".to_owned(), dispositions.to_owned())],
+        &[],
+        "program\tidentity\tcallee\targument\tline\tclass\n",
     )
     .expect("fixture reconciles");
     assert_eq!(
