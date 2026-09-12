@@ -116,6 +116,8 @@ pub(crate) mod delivery_custody;
 #[cfg(test)]
 mod diagnostic_message_tests;
 #[cfg(test)]
+mod emission_loop_seam_tests;
+#[cfg(test)]
 mod emit_tests;
 #[cfg(test)]
 mod escape_seam_tests;
@@ -157,8 +159,6 @@ mod r233_shape_emission_tests;
 mod raw_receiver_tests;
 #[cfg(test)]
 mod retalias_semantics_tests;
-#[cfg(test)]
-mod emission_loop_seam_tests;
 mod retirement_reason_tests;
 mod return_alias_tests;
 #[cfg(test)]
@@ -10466,14 +10466,20 @@ mod raw_boundary_atom_tests {
     /// vanishes and the census counts a delivery that does not exist.
     #[test]
     fn c5_an_unplaceable_lifetime_is_recorded_and_never_reported_as_planned() {
-        use super::{E2TerminalDisposition, decision::lifetime::LifetimeFailure as F, e2_terminal_disposition};
+        use super::{
+            E2TerminalDisposition, decision::lifetime::LifetimeFailure as F,
+            e2_terminal_disposition,
+        };
         let decided = super::decision::Decision::Ref { mutable: false };
         for planned in [true, false] {
             let disposition =
                 e2_terminal_disposition(planned, true, Some(F::AstUnplaceable), &decided)
                     .expect("a placement failure is not an invariant violation");
             assert!(
-                matches!(disposition, E2TerminalDisposition::Failure(F::AstUnplaceable)),
+                matches!(
+                    disposition,
+                    E2TerminalDisposition::Failure(F::AstUnplaceable)
+                ),
                 "planned={planned}: {disposition:?}"
             );
         }
@@ -10485,14 +10491,20 @@ mod raw_boundary_atom_tests {
     /// and it must survive `planned`.
     #[test]
     fn c6_an_incompatible_seam_is_recorded_and_never_reported_as_planned() {
-        use super::{E2TerminalDisposition, decision::lifetime::LifetimeFailure as F, e2_terminal_disposition};
+        use super::{
+            E2TerminalDisposition, decision::lifetime::LifetimeFailure as F,
+            e2_terminal_disposition,
+        };
         let decided = super::decision::Decision::Ref { mutable: true };
         for planned in [true, false] {
             let disposition =
                 e2_terminal_disposition(planned, true, Some(F::SeamIncompatible), &decided)
                     .expect("a seam failure is not an invariant violation");
             assert!(
-                matches!(disposition, E2TerminalDisposition::Failure(F::SeamIncompatible)),
+                matches!(
+                    disposition,
+                    E2TerminalDisposition::Failure(F::SeamIncompatible)
+                ),
                 "planned={planned}: {disposition:?}"
             );
         }
@@ -10504,7 +10516,10 @@ mod raw_boundary_atom_tests {
     /// insensitive to the arm it is testing.
     #[test]
     fn c5_c6_a_tranche_hold_still_outranks_a_placement_failure() {
-        use super::{E2TerminalDisposition, decision::lifetime::LifetimeFailure as F, e2_terminal_disposition};
+        use super::{
+            E2TerminalDisposition, decision::lifetime::LifetimeFailure as F,
+            e2_terminal_disposition,
+        };
         let decided = super::decision::Decision::Ref { mutable: false };
         let disposition = e2_terminal_disposition(true, true, Some(F::FieldHeld), &decided)
             .expect("a tranche hold is not an invariant violation");

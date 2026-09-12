@@ -11215,7 +11215,12 @@ mod run {
         );
         assert!(tally.partition_holds(), "{tally:?}");
         assert_eq!(
-            (tally.realized, tally.degraded, tally.reverted_function, tally.reverted_program),
+            (
+                tally.realized,
+                tally.degraded,
+                tally.reverted_function,
+                tally.reverted_program
+            ),
             (1, 1, 1, 1),
             "{tally:?}"
         );

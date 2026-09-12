@@ -31,7 +31,12 @@ use super::{
 ///
 /// A partition on the direct set alone keeps the last three, which is exactly
 /// the ledger claiming deliveries the tree had already retired.
-fn fixture() -> (Plan, BTreeSet<SignatureClassId>, BTreeSet<String>, [SignatureClassId; 4]) {
+fn fixture() -> (
+    Plan,
+    BTreeSet<SignatureClassId>,
+    BTreeSet<String>,
+    [SignatureClassId; 4],
+) {
     let ids = class_ids();
     let [direct, held, atom_owner, dependent] = ids;
     let mut plan = Plan::default();

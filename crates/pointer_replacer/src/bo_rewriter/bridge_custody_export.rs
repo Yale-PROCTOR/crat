@@ -2581,14 +2581,14 @@ mod tests {
     fn r328_4_an_adapted_initializer_still_binds_to_its_original() {
         use super::super::bridge_custody_match::initializer_adapter_correspondence_for_test as c;
         rustc_span::create_default_session_globals_then(|| {
-        assert!(c("lodepng_get_bpp(color)", "lodepng_get_bpp(&*color)"));
-        assert!(c("f(a, b)", "f(&*a, b)"));
-        assert!(c("f(a, b)", "f(&*a, &mut *b)"));
-        assert!(c("x.len(p)", "x.len(&*p)"));
-        assert!(c("f(g(p))", "f(g(&*p))"));
-        // Identical text still corresponds — the arm is additive, not a
-        // replacement for the plain comparison.
-        assert!(c("lodepng_get_bpp(color)", "lodepng_get_bpp(color)"));
+            assert!(c("lodepng_get_bpp(color)", "lodepng_get_bpp(&*color)"));
+            assert!(c("f(a, b)", "f(&*a, b)"));
+            assert!(c("f(a, b)", "f(&*a, &mut *b)"));
+            assert!(c("x.len(p)", "x.len(&*p)"));
+            assert!(c("f(g(p))", "f(g(&*p))"));
+            // Identical text still corresponds — the arm is additive, not a
+            // replacement for the plain comparison.
+            assert!(c("lodepng_get_bpp(color)", "lodepng_get_bpp(color)"));
         });
     }
 
@@ -2598,21 +2598,21 @@ mod tests {
     fn r328_4_anything_but_a_reborrow_adapter_still_refuses() {
         use super::super::bridge_custody_match::initializer_adapter_correspondence_for_test as c;
         rustc_span::create_default_session_globals_then(|| {
-        // A different callee.
-        assert!(!c("lodepng_get_bpp(color)", "lodepng_get_bpc(&*color)"));
-        // A different argument behind the adapter.
-        assert!(!c("lodepng_get_bpp(color)", "lodepng_get_bpp(&*other)"));
-        // A different arity.
-        assert!(!c("f(a)", "f(&*a, b)"));
-        // A plain borrow is NOT a reborrow: `&a` does not peel to `a`.
-        assert!(!c("f(a)", "f(&a)"));
-        // A cast is not an adapter this arm accepts.
-        assert!(!c("f(a)", "f(a as *const u8)"));
-        // A different method.
-        assert!(!c("x.len(p)", "x.cap(&*p)"));
-        // The adapter may not appear on the ORIGINAL side to excuse a bare
-        // emitted argument — the peel is one-directional.
-        assert!(!c("f(&*a)", "f(a)"));
+            // A different callee.
+            assert!(!c("lodepng_get_bpp(color)", "lodepng_get_bpc(&*color)"));
+            // A different argument behind the adapter.
+            assert!(!c("lodepng_get_bpp(color)", "lodepng_get_bpp(&*other)"));
+            // A different arity.
+            assert!(!c("f(a)", "f(&*a, b)"));
+            // A plain borrow is NOT a reborrow: `&a` does not peel to `a`.
+            assert!(!c("f(a)", "f(&a)"));
+            // A cast is not an adapter this arm accepts.
+            assert!(!c("f(a)", "f(a as *const u8)"));
+            // A different method.
+            assert!(!c("x.len(p)", "x.cap(&*p)"));
+            // The adapter may not appear on the ORIGINAL side to excuse a bare
+            // emitted argument — the peel is one-directional.
+            assert!(!c("f(&*a)", "f(a)"));
         });
     }
 
