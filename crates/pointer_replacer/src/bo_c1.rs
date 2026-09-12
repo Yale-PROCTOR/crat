@@ -132,6 +132,11 @@ impl RawBoundarySubjectDelivery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RawBoundaryDelivery {
     Clean,
+    /// R346-2. The gate comparator closes, but only because every identity that
+    /// accounts for a decline is waived by identity under the written
+    /// analysis-frame waiver. Distinct from `Clean` so a reader never mistakes a
+    /// waived frame for an unwaived one.
+    CleanWithWrittenAnalysisFrameWaiver,
     Degraded,
     Regressed,
 }
@@ -140,9 +145,17 @@ impl RawBoundaryDelivery {
     fn key(self) -> &'static str {
         match self {
             Self::Clean => "clean",
+            Self::CleanWithWrittenAnalysisFrameWaiver => "clean-with-written-analysis-frame-waiver",
             Self::Degraded => "degraded",
             Self::Regressed => "regressed",
         }
+    }
+
+    fn is_clean(self) -> bool {
+        matches!(
+            self,
+            Self::Clean | Self::CleanWithWrittenAnalysisFrameWaiver
+        )
     }
 }
 
@@ -1046,10 +1059,23 @@ fn raw_boundary_delivery_verdict(
     any_degraded_program: bool,
     any_unwaived_regression: bool,
 ) -> RawBoundaryDelivery {
+    raw_boundary_delivery_verdict_waived(any_degraded_program, any_unwaived_regression, false)
+}
+
+/// R346-2. The gate comparator's verdict. `any_waived_regression` records that
+/// a decline was closed by the written analysis-frame waiver rather than never
+/// having happened; the two must not read the same on the row.
+fn raw_boundary_delivery_verdict_waived(
+    any_degraded_program: bool,
+    any_unwaived_regression: bool,
+    any_waived_regression: bool,
+) -> RawBoundaryDelivery {
     if any_degraded_program {
         RawBoundaryDelivery::Degraded
     } else if any_unwaived_regression {
         RawBoundaryDelivery::Regressed
+    } else if any_waived_regression {
+        RawBoundaryDelivery::CleanWithWrittenAnalysisFrameWaiver
     } else {
         RawBoundaryDelivery::Clean
     }
@@ -21584,6 +21610,47 @@ fn raw_boundary_io_domain_migration(
         })
 }
 
+/// R346-1(ii). Why an A5 pair site the 2026-08-30 audit recorded no longer
+/// exists: read from the callee parameter's own ledger row, never assumed.
+fn raw_boundary_pair_site_retirement(
+    family: &str,
+    delivery: &str,
+    reason: &str,
+    exclusion: &str,
+) -> (&'static str, String) {
+    if family == "raw" {
+        return ("narrowed-to-raw", "kind-raw".to_owned());
+    }
+    if delivery == "realized-as-predicted" {
+        return ("delivered-safe", "-".to_owned());
+    }
+    let cause = if reason.is_empty() || reason == "-" {
+        exclusion
+            .split(';')
+            .find_map(|part| {
+                part.trim()
+                    .strip_prefix("terminal-not-applied:blocked-subject:")
+            })
+            .map_or_else(
+                || {
+                    if exclusion.is_empty() || exclusion == "-" {
+                        "-".to_owned()
+                    } else {
+                        format!(
+                            "exclusion:{}",
+                            &exclusion.split(';').next().unwrap_or("")
+                                [..exclusion.split(';').next().unwrap_or("").len().min(30)]
+                        )
+                    }
+                },
+                str::to_owned,
+            )
+    } else {
+        reason.to_owned()
+    };
+    ("held", cause)
+}
+
 /// R342-2. A libc contract edge that no longer produces a T1 `contract:`
 /// disposition is explained by exactly one pinned hold, or it is a divergence.
 ///
@@ -23224,6 +23291,34 @@ fn raw_boundary_wave2_corpus_census() {
             );
         }
     }
+    // R346-2. The GATE comparator is the previous same-lineage frame; the era-4
+    // landed comparison stays reported beside it and gates nothing.
+    let gate_dir = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_GATE_BASELINE_DIR")
+            .expect("raw-boundary census requires the R346-2 gate baseline"),
+    );
+    let gate_artifacts =
+        raw_boundary_program_artifacts(&gate_dir, "raw-boundary-subject-outcomes.tsv")
+            .expect("read gate baseline outcomes");
+    let mut gate_realized = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut gate_digest = Sha256::new();
+    for (program, text) in &gate_artifacts {
+        gate_digest.update(program.as_bytes());
+        gate_digest.update(text.as_bytes());
+        for row in named_tsv_rows(text) {
+            if row.get("delivery").map(String::as_str) == Some("realized-as-predicted")
+                && row
+                    .get("family")
+                    .is_some_and(|family| raw_boundary_safe_family(family))
+            {
+                gate_realized
+                    .entry(program.clone())
+                    .or_default()
+                    .insert(row.get("subject_key").cloned().unwrap_or_default());
+            }
+        }
+    }
+    let gate_digest = format!("{:x}", gate_digest.finalize());
     let waiver_path = PathBuf::from(
         std::env::var_os("CRAT_RAW_BOUNDARY_REGRESSION_WAIVER")
             .expect("raw-boundary census requires the R342-3 regression waiver"),
@@ -23244,6 +23339,7 @@ fn raw_boundary_wave2_corpus_census() {
         );
     }
     let mut lost_by_program = BTreeMap::<String, Vec<String>>::new();
+    let mut current_realized = BTreeMap::<String, BTreeSet<String>>::new();
 
     let mut tally = RawBoundaryFrameTally::default();
     let mut current_population = 0usize;
@@ -23292,6 +23388,12 @@ fn raw_boundary_wave2_corpus_census() {
                 .or_default()
                 .push(key.1.clone());
         }
+        if membership.current && current_delivery == "realized-as-predicted" {
+            current_realized
+                .entry(key.0.clone())
+                .or_default()
+                .insert(key.1.clone());
+        }
         subject_delivery.push_str(&format!(
             "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
@@ -23320,10 +23422,14 @@ fn raw_boundary_wave2_corpus_census() {
         "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tbaseline_realized\tbaseline_degraded\tbaseline_reverted\tcurrent_realized\tcurrent_degraded\tcurrent_reverted_function\tcurrent_reverted_program\tcurrent_typed_excluded\tcorrected_realized\tcorrected_degraded\tcorrected_reverted_function\tcorrected_reverted_program\tbaseline_to_current_delta\tregression\tmembership_gained\tmembership_lost\n",
     );
     let mut regression_rows = String::from(
-        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tbaseline_realized\tcurrent_realized\tdelta\twaiver\n",
+        "comparator\tcorpus\tanalysis_frame\tcode_frame\tdata\tprogram\tbaseline_realized\tcurrent_realized\tdelta\twaiver\n",
     );
-    let mut waiver_audit = String::from("corpus\tcode_frame\tprogram\tsubject_key\tverdict\n");
+    let mut waiver_audit =
+        String::from("comparator\tcorpus\tcode_frame\tprogram\tsubject_key\tverdict\n");
+    // R346-2: era-4 is REPORTED, the gate comparator decides.
+    let mut era4_regressed_programs = BTreeSet::new();
     let mut regressed_programs = BTreeSet::new();
+    let mut gate_waived_programs = BTreeSet::new();
     for program in CORPUS {
         let baseline_counts = RawBoundaryFrameTally::counts(&tally.baseline, program.name);
         let current_counts = RawBoundaryFrameTally::counts(&tally.current, program.name);
@@ -23383,15 +23489,15 @@ fn raw_boundary_wave2_corpus_census() {
                     }
                 };
                 waiver_audit.push_str(&format!(
-                    "rs-crown\t{}\t{}\t{identity}\t{verdict}\n",
+                    "era4-j-double-prime\trs-crown\t{}\t{}\t{identity}\t{verdict}\n",
                     code_frame, program.name
                 ));
             }
             if !waived {
-                regressed_programs.insert(program.name.to_owned());
+                era4_regressed_programs.insert(program.name.to_owned());
             }
             regression_rows.push_str(&format!(
-                "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\n",
+                "era4-j-double-prime\trs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\n",
                 crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
                 code_frame,
                 program.name,
@@ -23428,6 +23534,72 @@ fn raw_boundary_wave2_corpus_census() {
             membership_lost,
         ));
     }
+    // R346-2. The gate comparator: the previous same-lineage frame. Its decline
+    // set is differenced by identity and waived by identity; era-4's rows above
+    // are reported and gate nothing.
+    for program in CORPUS {
+        let gate = gate_realized.get(program.name).cloned().unwrap_or_default();
+        let now = current_realized
+            .get(program.name)
+            .cloned()
+            .unwrap_or_default();
+        if now.len() >= gate.len() {
+            continue;
+        }
+        let mut waived = true;
+        for identity in gate.difference(&now) {
+            let key = (program.name.to_owned(), identity.clone());
+            let listed = waiver_rows.get(&key).map(String::as_str);
+            let observed = hold_causes
+                .get(&key)
+                .and_then(|(family, reason, exclusion)| {
+                    raw_boundary_libc_hold_class(family, reason, exclusion)
+                });
+            let verdict = match (listed, observed) {
+                (Some(listed), Some(observed))
+                    if listed == observed
+                        && matches!(listed, "analysis-frame-decline" | "thin-extent") =>
+                {
+                    listed.to_owned()
+                }
+                (Some(listed), Some(observed)) => {
+                    waived = false;
+                    format!("unwaived:listed={listed}:observed={observed}")
+                }
+                (Some(listed), None) => {
+                    waived = false;
+                    format!("unwaived:listed={listed}:observed=none")
+                }
+                (None, _) => {
+                    waived = false;
+                    "unwaived:unlisted".to_owned()
+                }
+            };
+            waiver_audit.push_str(&format!(
+                "gate-27bb3b3a\trs-crown\t{}\t{}\t{identity}\t{verdict}\n",
+                code_frame, program.name
+            ));
+        }
+        if waived {
+            gate_waived_programs.insert(program.name.to_owned());
+        } else {
+            regressed_programs.insert(program.name.to_owned());
+        }
+        regression_rows.push_str(&format!(
+            "gate-27bb3b3a\trs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\n",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+            code_frame,
+            program.name,
+            gate.len(),
+            now.len(),
+            now.len() as isize - gate.len() as isize,
+            if waived {
+                "analysis-frame-decline"
+            } else {
+                "none"
+            },
+        ));
+    }
     fs::write(
         artifact_dir.join("subject-frame-per-program.tsv"),
         &per_program_delivery,
@@ -23446,17 +23618,19 @@ fn raw_boundary_wave2_corpus_census() {
         .filter(|row| row.get(raw_schema::OUTCOME_KIND) == Some("degraded"))
         .filter_map(|row| row.get("program").map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let delivery = raw_boundary_delivery_verdict(
+    let delivery = raw_boundary_delivery_verdict_waived(
         !degraded_programs.is_empty(),
         !regressed_programs.is_empty(),
+        !gate_waived_programs.is_empty(),
     );
     for row in &mut rows {
         let program = row.get("program").unwrap_or("missing").to_owned();
         row.set(
             raw_schema::DELIVERY,
-            raw_boundary_delivery_verdict(
+            raw_boundary_delivery_verdict_waived(
                 degraded_programs.contains(&program),
                 regressed_programs.contains(&program),
+                gate_waived_programs.contains(&program),
             )
             .key(),
         );
@@ -23762,6 +23936,44 @@ fn raw_boundary_wave2_corpus_census() {
             }
         }
     }
+    // R346-1(ii). A site the audit recorded may be RETIRED — the callee's
+    // parameter is delivered safe, narrowed to raw, or held — and the retirement
+    // control says which, by identity. A site that is merely absent from the
+    // control, or whose production class differs from the listed one, is still a
+    // divergence; so is a control row nothing consumed.
+    let retirement_path = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_PAIR_SITE_RETIREMENT")
+            .expect("raw-boundary census requires the R346-1 pair-site retirement control"),
+    );
+    let retirement_bytes = fs::read(&retirement_path).unwrap_or_else(|error| {
+        panic!(
+            "read pair-site retirement control {}: {error}",
+            retirement_path.display()
+        )
+    });
+    let retirement_sha256 = format!("{:x}", Sha256::digest(&retirement_bytes));
+    let retirement_text =
+        String::from_utf8(retirement_bytes).expect("retirement control must be UTF-8");
+    let mut retirement_rows = BTreeMap::<(String, String), (String, String, String)>::new();
+    for row in named_tsv_rows(&retirement_text) {
+        retirement_rows.insert(
+            (
+                row.get("program").cloned().unwrap_or_default(),
+                row.get("adapter_key").cloned().unwrap_or_default(),
+            ),
+            (
+                row.get("parameter_subject_key")
+                    .cloned()
+                    .unwrap_or_default(),
+                row.get("class").cloned().unwrap_or_default(),
+                row.get("cause").cloned().unwrap_or_default(),
+            ),
+        );
+    }
+    let mut used_retirement = BTreeSet::<(String, String)>::new();
+    let mut retirement_receipt = String::from(
+        "program\tadapter_key\tparameter_subject_key\tclass\tcause\tfamily\tdelivery\n",
+    );
     let mut pair_divergences = String::from("program\tadapter_key\texpected\tobserved\n");
     for (program, key, expected) in &expected_pair_sites {
         let observed = observed_pair_sites
@@ -23770,10 +23982,63 @@ fn raw_boundary_wave2_corpus_census() {
                 candidate_program == program && candidate_key == key
             })
             .map_or("missing", |(_, _, verdict)| verdict.as_str());
-        if observed != expected {
-            pair_divergences.push_str(&format!("{program}\t{key}\t{expected}\t{observed}\n"));
+        if observed == expected {
+            continue;
         }
+        if observed != "missing" {
+            pair_divergences.push_str(&format!(
+                "{program}\t{key}\tpair-site-verdict-moved:{expected}\t{observed}\n"
+            ));
+            continue;
+        }
+        let Some((subject_key, listed_class, listed_cause)) =
+            retirement_rows.get(&(program.clone(), key.clone()))
+        else {
+            pair_divergences.push_str(&format!(
+                "{program}\t{key}\t{expected}\tpair-site-retirement-unlisted\n"
+            ));
+            continue;
+        };
+        let Some((family, reason, exclusion)) =
+            hold_causes.get(&(program.clone(), subject_key.clone()))
+        else {
+            pair_divergences.push_str(&format!(
+                "{program}\t{key}\t{expected}\tpair-site-subject-absent:{subject_key}\n"
+            ));
+            continue;
+        };
+        let delivery = current
+            .get(&(program.clone(), subject_key.clone()))
+            .and_then(|row| row.get("delivery").cloned())
+            .unwrap_or_default();
+        let (class, cause) =
+            raw_boundary_pair_site_retirement(family, &delivery, reason, exclusion);
+        if class != listed_class || (&cause != listed_cause && listed_class == "held") {
+            pair_divergences.push_str(&format!(
+                "{program}\t{key}\t{listed_class}/{listed_cause}\tpair-site-class-mismatch:{class}/{cause}\n"
+            ));
+            continue;
+        }
+        used_retirement.insert((program.clone(), key.clone()));
+        retirement_receipt.push_str(&format!(
+            "{program}\t{key}\t{subject_key}\t{class}\t{cause}\t{family}\t{delivery}\n"
+        ));
     }
+    for (program, key) in retirement_rows
+        .keys()
+        .filter(|key| !used_retirement.contains(*key))
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        pair_divergences.push_str(&format!(
+            "{program}\t{key}\t-\tpair-site-retirement-unused\n"
+        ));
+    }
+    fs::write(
+        artifact_dir.join("pair-site-retirement-receipt.tsv"),
+        &retirement_receipt,
+    )
+    .expect("write pair-site retirement receipt");
     fs::write(
         artifact_dir.join("pair-site-control-divergences.tsv"),
         &pair_divergences,
@@ -24070,7 +24335,7 @@ fn raw_boundary_wave2_corpus_census() {
     fs::write(
         artifact_dir.join("census-receipt.txt"),
         format!(
-            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_current={}/{}/{}/{}/{}\nsubject_frame_corrected={}/{}/{}/{}\npromote_rate_current={}/{}\npromote_rate_corrected={}/{}\nmembership_gained={}\nmembership_lost={}\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\nlibc_hold_control_sha256={}\nlibc_hold_rows={}\nregression_waiver_sha256={}\nregression_waiver_audit_rows={}\n",
+            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_current={}/{}/{}/{}/{}\nsubject_frame_corrected={}/{}/{}/{}\npromote_rate_current={}/{}\npromote_rate_corrected={}/{}\nmembership_gained={}\nmembership_lost={}\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\nlibc_hold_control_sha256={}\nlibc_hold_rows={}\nregression_waiver_sha256={}\nregression_waiver_audit_rows={}\ngate_baseline_sha256={}\ngate_regressed_programs={}\ngate_waived_programs={}\nera4_reported_regressed_programs={}\npair_site_retirement_sha256={}\npair_site_retired={}\n",
             delivery.key(),
             20 - degraded_programs.len(),
             degraded_programs.len(),
@@ -24109,6 +24374,12 @@ fn raw_boundary_wave2_corpus_census() {
             controls.libc_hold_receipt.lines().count() - 1,
             waiver_sha256,
             waiver_audit.lines().count() - 1,
+            gate_digest,
+            regressed_programs.len(),
+            gate_waived_programs.len(),
+            era4_regressed_programs.len(),
+            retirement_sha256,
+            retirement_receipt.lines().count() - 1,
         ),
     )
     .expect("write census receipt");
@@ -24456,6 +24727,44 @@ fn r340_2_the_parent_counts_the_current_frame_population_and_reports_membership(
         .count();
     assert_eq!(parent_over_the_baseline, 1);
     assert_ne!(parent_over_the_baseline, worker_realized);
+}
+
+#[test]
+fn r346_1_a_retired_pair_site_names_why_from_the_parameter_row() {
+    // the callee's parameter is delivered safe: no construction adapter, so no
+    // A5 pair site -- the commonest retirement
+    assert_eq!(
+        raw_boundary_pair_site_retirement("ref", "realized-as-predicted", "-", "-"),
+        ("delivered-safe", "-".to_owned())
+    );
+    assert_eq!(
+        raw_boundary_pair_site_retirement("slice", "realized-as-predicted", "-", "-"),
+        ("delivered-safe", "-".to_owned())
+    );
+    // the analysis narrowed the parameter: raw wins over every other reading
+    assert_eq!(
+        raw_boundary_pair_site_retirement("raw", "degraded", "kind-raw", "-"),
+        ("narrowed-to-raw", "kind-raw".to_owned())
+    );
+    assert_eq!(
+        raw_boundary_pair_site_retirement("raw", "realized-as-predicted", "-", "-"),
+        ("narrowed-to-raw", "kind-raw".to_owned())
+    );
+    // held, with the cause read from `reason`
+    assert_eq!(
+        raw_boundary_pair_site_retirement("ref", "degraded", "pair-raw-view", "-"),
+        ("held", "pair-raw-view".to_owned())
+    );
+    // held, with the cause read from the exclusion column when `reason` is "-"
+    assert_eq!(
+        raw_boundary_pair_site_retirement(
+            "slice",
+            "degraded",
+            "-",
+            "terminal-not-applied:blocked-subject:slice-use-unsupported"
+        ),
+        ("held", "slice-use-unsupported".to_owned())
+    );
 }
 
 #[test]
