@@ -366,7 +366,10 @@ pub unsafe fn deep(pp: *mut *mut u8) -> u8 {
                 && row.source.role == SourceRole::Free
                 && replay.free_points.contains(&row.location)
                 && row.holder == *target
-                && row.reason == super::local_outcome::Reason::InnerLoanMissing { depth: 1 }
+                // R343-1: `q` is the freed pointer and `free(q)` takes it as an
+                // argument, so the holder's value leaves the frame: the verdict is
+                // the same demotion, now labelled with why the facts are missing.
+                && row.reason.inner_loan_depth() == Some(1)
                 && row.chain.contains(target)
         }),
         "a relevant unrepresented inner loan requires its exact Raw repair"

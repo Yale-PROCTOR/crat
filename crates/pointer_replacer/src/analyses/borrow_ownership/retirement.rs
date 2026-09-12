@@ -257,6 +257,8 @@ struct Context {
     copy_graph: FxHashMap<SlotRef, Vec<SlotRef>>,
     exact_kinds: bool,
     unrepresented_inner: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
+    /// R343-1: the BO-owned loans for those of them that have one.
+    inner_loans: inner_loan::InnerLoans,
     entry_consistent: bool,
     latest: FxHashMap<LocalDefId, RetirementReview>,
 }
@@ -323,6 +325,7 @@ pub(crate) fn begin(
         copy_graph: local_outcome::copy_graph(program, slots),
         exact_kinds: exact.is_some(),
         unrepresented_inner: Vec::new(),
+        inner_loans: inner_loan::analyze(program, slots, &is_ref),
         entry_consistent: true,
         latest: FxHashMap::default(),
     };
@@ -521,11 +524,19 @@ impl Context {
                 event.source.key.role,
                 SourceRole::Free | SourceRole::ReallocOld
             );
-            // Native loan owners carry only the outer provenance. A deeper
-            // non-entry Ref can keep an inner target live through Raw copies,
-            // even after its source local's last use. Until that demand has an
-            // exact loan/depth witness, possible retirement overlap demotes that holder.
-            // Field instance flow is unrepresented here and remains Unknown.
+            // Native loan owners carry only the outer provenance: `Context::owner`
+            // resolves through maps populated at depth 0 alone and
+            // `ProvenanceOwner` carries no depth, so a live native loan can never
+            // name an inner holder. R343-1 supplies the missing loan as a BO-owned
+            // obligation and this is where it is consumed, in the three-way
+            // disposition of the sizing's 2.2:
+            //   * dead    -- the loan is provably not demanded here: nothing;
+            //   * live    -- a conflict naming THIS holder, not a demotion of its
+            //                whole copy closure;
+            //   * missing -- no obligation, or the value escaped the frame: the
+            //                demotion this site has always done, unchanged.
+            // Field instance flow is still unrepresented and still has no
+            // obligation, so a field-owned holder takes the third arm.
             for &(slot, owner, depth) in &self.unrepresented_inner {
                 let target = if let Some((owner_function, local)) = owner {
                     if owner_function != function {
@@ -540,13 +551,41 @@ impl Context {
                 } else {
                     ObjectSet::default()
                 };
-                if overlap(&target, &event.objects, function, heap_only).is_some() {
-                    self.demote(
+                let Some(reason) = overlap(&target, &event.objects, function, heap_only) else {
+                    continue;
+                };
+                let disposition = match owner {
+                    Some((_, local)) => {
+                        self.inner_loans
+                            .disposition(function, local, depth, event.location)
+                    }
+                    None => {
+                        inner_loan::Disposition::Unrepresented(inner_loan::Missing::NoObligation)
+                    }
+                };
+                match disposition {
+                    inner_loan::Disposition::Dead => {}
+                    // No `LoanIdentity` is attached: a BO-owned obligation has no
+                    // legacy loan index, and fabricating one is exactly what the
+                    // entry obligation's `MissingLegacyLoan` warns against. The
+                    // conflict's own target key carries `@d1` or deeper, which is
+                    // what identifies it as an inner holder.
+                    inner_loan::Disposition::Live => {
+                        self.conflict(&mut review, event, slot, None, None, reason)
+                    }
+                    inner_loan::Disposition::Unrepresented(missing) => self.demote(
                         &mut review,
                         event,
                         slot,
-                        local_outcome::Reason::InnerLoanMissing { depth },
-                    );
+                        match missing {
+                            inner_loan::Missing::NoObligation => {
+                                local_outcome::Reason::InnerLoanMissing { depth }
+                            }
+                            inner_loan::Missing::Escaped => {
+                                local_outcome::Reason::InnerLoanEscaped { depth }
+                            }
+                        },
+                    ),
                 }
             }
             let active_entries: Vec<_> = self
@@ -950,13 +989,17 @@ mod tests {
                 let body = tcx
                     .mir_drops_elaborated_and_const_checked(function)
                     .borrow();
+                // R343-1: body locals are selectable too, because an inner-loan
+                // holder IS a body local -- parameters are `protected_entry`'s and
+                // never carry an obligation. The guard still catches a typo'd
+                // index, which is what it was for.
                 assert!(
-                    parameter > 0 && parameter as usize <= body.arg_count,
-                    "selection must name an actual source parameter"
+                    parameter > 0 && (parameter as usize) < body.local_decls.len(),
+                    "selection must name an actual source local"
                 );
                 let slot = slots.fn_local_slots[&function]
                     .slot_for_local_depth(Local::from_u32(parameter), depth)
-                    .expect("registered parameter depth");
+                    .expect("registered local depth");
                 assert_eq!(
                     model.insert(SlotRef::Local(function, slot), SlotKind::Ref),
                     Some(SlotKind::Raw),

@@ -196,10 +196,45 @@ fn check_decline(label: &str, source: &str, name: &str, storage_only: bool) {
             .iter()
             .flat_map(|round| &round.demotions)
             .collect::<Vec<_>>();
-        assert!(
-            !rows.is_empty(),
-            "accepted consumer needs its exact inner repair receipt"
-        );
+        // R343-1: a consumer may now have NO local repair at all, because the
+        // disposition can prove the inner holder's loan dead at the event -- BOX_N5
+        // is exactly that: `*p` is never read or written, so nothing protects the
+        // freed object and the inner cell keeps its Ref. The invariant that must
+        // hold either way, and the one this witness is really for, is that no slot
+        // goes Raw with nothing explaining it.
+        let mut explained: rustc_hash::FxHashSet<SlotRef> = rustc_hash::FxHashSet::default();
+        for round in &captured.export.retirement_rounds {
+            for row in &round.demotions {
+                explained.extend(row.chain.iter().copied());
+                explained.insert(row.holder);
+            }
+            explained.extend(round.conflicts.iter().map(|row| row.target));
+        }
+        for (&slot, &kind) in model.iter() {
+            let SlotRef::Local(owner, id) = slot else {
+                continue;
+            };
+            if owner != function || kind != SlotKind::Raw {
+                continue;
+            }
+            let actual = slots.fn_local_slots[&owner].slot(id);
+            if actual.depth == 0 {
+                continue;
+            }
+            assert!(
+                explained.contains(&slot),
+                "{label}: an inner slot went Raw with no demotion or conflict naming it: {:?}",
+                slot_key::local_key(
+                    program.tcx,
+                    owner,
+                    match actual.owner {
+                        SlotOwner::Local(local) => local.as_usize(),
+                        SlotOwner::Field(_) => panic!("local universe holds a field slot"),
+                    },
+                    actual.depth
+                )
+            );
+        }
         if storage_only {
             assert!(
                 captured
@@ -211,9 +246,12 @@ fn check_decline(label: &str, source: &str, name: &str, storage_only: bool) {
             );
         }
         for row in rows {
-            let super::local_outcome::Reason::InnerLoanMissing { depth } = &row.reason else {
+            // R343-1/R345-2: either inner-loan reason is the same verdict; any
+            // other reason is still refused.
+            let Some(depth) = row.reason.inner_loan_depth() else {
                 panic!("{label}: unrelated local outcome requires attribution: {row:?}");
             };
+            let depth = &depth;
             let slot = &row.holder;
             assert!(row.chain.contains(slot));
             for target in &row.chain {

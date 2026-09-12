@@ -231,7 +231,7 @@ fn disposition_at_free(code: &str, function: &str, holder: &str) -> inner_loan::
             .mir_drops_elaborated_and_const_checked(wanted)
             .borrow();
         let local = named_local(&body, holder);
-        answer = Some(loans.disposition(&body, wanted, local, 1, free_call(&body)));
+        answer = Some(loans.disposition(wanted, local, 1, free_call(&body)));
     });
     answer.expect("the fixture compiled")
 }
@@ -273,13 +273,7 @@ fn c_w05_a_holder_with_no_obligation_is_unrepresented() {
         // Depth 7 is not a slot of anything: the lookup must fail closed rather
         // than answer for a holder it has no obligation for.
         assert_eq!(
-            loans.disposition(
-                &body,
-                wanted,
-                named_local(&body, "inner"),
-                7,
-                free_call(&body)
-            ),
+            loans.disposition(wanted, named_local(&body, "inner"), 7, free_call(&body)),
             inner_loan::Disposition::Unrepresented(inner_loan::Missing::NoObligation)
         );
     });
@@ -369,4 +363,68 @@ fn c_w09_a_holder_that_never_leaves_the_frame_is_decided_by_its_liveness() {
         "a constant-true escape rule would satisfy the positive half and silently \
          disable the whole recovery"
     );
+}
+
+/// End to end: the inner cell of a freed allocation is never read or written, so
+/// nothing protects the retired object and the holder keeps its Ref. Before the
+/// disposition this slot was demoted by the blanket rule, with its whole copy
+/// closure dragged Raw behind it.
+const END_TO_END: &str = r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+pub unsafe fn f() {
+    let p: *mut *mut i32 = malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i32;
+    free(p as *mut core::ffi::c_void);
+}
+"#;
+
+#[test]
+fn c_w01_end_to_end_a_dead_inner_holder_is_accepted() {
+    let mut index = None;
+    with_program(END_TO_END, |program| {
+        let wanted = named_function(program, "f");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(wanted)
+            .borrow();
+        index = Some(named_local(&body, "p").as_u32());
+    });
+    let local = index.expect("the fixture compiled");
+    assert!(
+        super::tests::accepts(END_TO_END, &[("f", local, 1)]),
+        "the inner cell of the freed allocation is never touched, so no protector \
+         exists and the holder keeps its Ref"
+    );
+}
+
+#[test]
+fn c_w04_a_dead_holder_drags_no_closure_member_raw() {
+    // The collateral half of the same change. `demote` walks the copy closure and
+    // takes every safe holder in it Raw; a holder the disposition never demotes
+    // drags nobody. With closure-WIDE liveness the members of a dead holder's
+    // closure are dead too, so this is the whole of the collateral recovery: no
+    // demotion row and no conflict row exists for this frame at all.
+    with_program(END_TO_END, |program| {
+        let slots = CrateSlots::build(program);
+        let wanted = named_function(program, "f");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(wanted)
+            .borrow();
+        let loans = inner_loan::analyze(program, &slots, |_| true);
+        let local = named_local(&body, "p");
+        assert_eq!(
+            loans.disposition(wanted, local, 1, free_call(&body)),
+            inner_loan::Disposition::Dead
+        );
+        let members = loans
+            .members(wanted, local, 1)
+            .expect("the inner holder has an obligation");
+        assert!(
+            members.len() >= 1,
+            "the closure is what the old chain would have demoted"
+        );
+    });
 }

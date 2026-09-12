@@ -12800,7 +12800,7 @@ unsafe fn caller() -> i32 {
                 assert_eq!(model[&inner], SlotKind::Raw);
                 let mut actual = std::collections::BTreeSet::new();
                 for row in &rows {
-                    assert_eq!(row.reason, Reason::InnerLoanMissing { depth: 1 });
+                    assert_eq!(row.reason.inner_loan_depth(), Some(1));
                     assert_eq!(row.holder, inner);
                     assert!(row.chain.contains(&inner));
                     for target in &row.chain {
@@ -13033,7 +13033,7 @@ unsafe fn caller() -> i32 {
             assert_eq!(model[&inner], SlotKind::Raw);
             let mut actual = std::collections::BTreeSet::new();
             for row in &rows {
-                assert_eq!(row.reason, Reason::InnerLoanMissing { depth: 1 });
+                assert_eq!(row.reason.inner_loan_depth(), Some(1));
                 assert_eq!(row.holder, inner);
                 for target in &row.chain {
                     assert_eq!(model[target], SlotKind::Raw);
@@ -14879,7 +14879,7 @@ pub unsafe fn caller() -> *mut core::ffi::c_void {
                     assert!(!rows.is_empty());
                     let mut actual = FxHashSet::default();
                     for row in &rows {
-                        assert_eq!(row.reason, Reason::InnerLoanMissing { depth: 1 });
+                        assert_eq!(row.reason.inner_loan_depth(), Some(1));
                         let slot = row.holder;
                         assert!(expected.contains(&slot));
                         for target in &row.chain {

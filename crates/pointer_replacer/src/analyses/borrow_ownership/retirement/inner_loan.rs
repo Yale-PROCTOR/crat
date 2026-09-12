@@ -20,9 +20,12 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::IndexVec;
-use rustc_middle::mir::{
-    BasicBlock, Body, Local, Location, Operand, ProjectionElem, RETURN_PLACE, Rvalue,
-    StatementKind, TerminatorKind,
+use rustc_middle::{
+    mir::{
+        BasicBlock, Body, Local, Location, Operand, ProjectionElem, RETURN_PLACE, Rvalue,
+        StatementKind, TerminatorKind,
+    },
+    ty::TyCtxt,
 };
 use rustc_span::def_id::LocalDefId;
 
@@ -82,7 +85,7 @@ pub(crate) struct ValueEscapes {
 }
 
 impl ValueEscapes {
-    pub(crate) fn of_body(body: &Body<'_>) -> Self {
+    pub(crate) fn of_body<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Self {
         let mut escaping = FxHashSet::default();
         for data in body.basic_blocks.iter() {
             for statement in &data.statements {
@@ -101,7 +104,7 @@ impl ValueEscapes {
                 // Form 3: the value reaches the return place.
                 let returned = destination.local == RETURN_PLACE;
                 if through_pointer || returned {
-                    escaping_reads(value, &mut escaping);
+                    escaping_reads(tcx, body, value, &mut escaping);
                 }
             }
             let terminator = data.terminator();
@@ -139,12 +142,22 @@ impl ValueEscapes {
 /// difference between an escape and an ordinary read, and it was measured: with
 /// the loose rule, `_0 = copy (*_8)` marked `_8` -- the inner cell's own value --
 /// as escaped, so every holder read through before a free was demoted.
-fn escaping_reads(value: &Rvalue<'_>, into: &mut FxHashSet<Local>) {
-    let mut operand = |operand: &Operand<'_>| {
-        if let Some(place) = operand.place() {
-            if place.projection.is_empty() {
-                into.insert(place.local);
-            }
+fn escaping_reads<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    value: &Rvalue<'tcx>,
+    into: &mut FxHashSet<Local>,
+) {
+    let mut operand = |operand: &Operand<'tcx>| {
+        let Some(place) = operand.place() else { return };
+        // An unprojected read leaves this local's own value. A PROJECTED read
+        // leaves what is behind it, which is this local's value at some deeper
+        // slot exactly when the thing read is itself a pointer: `_0 = copy (*_qq)`
+        // with `*qq: *mut i32` returns the inner cell's value, while the same
+        // shape with `*_8: u8` returns a byte and lets no pointer out. The
+        // relation is depth-agnostic, so marking the local is the safe direction.
+        if place.projection.is_empty() || place.ty(&body.local_decls, tcx).ty.is_any_ptr() {
+            into.insert(place.local);
         }
     };
     match value {
@@ -222,6 +235,17 @@ pub(crate) struct ClosureLiveness {
     members: FxHashSet<Local>,
     /// Some member is used at or after this block's entry, on some path.
     live_in: IndexVec<BasicBlock, bool>,
+    /// Per block, everything a query needs, so the retirement loop can ask
+    /// without carrying a `Body` it does not have in that scope.
+    blocks: IndexVec<BasicBlock, BlockFacts>,
+}
+
+#[derive(Clone, Debug)]
+struct BlockFacts {
+    /// One entry per statement: does it use a closure member?
+    statements: Vec<bool>,
+    terminator: bool,
+    successor_live: bool,
 }
 
 impl ClosureLiveness {
@@ -243,7 +267,27 @@ impl ClosureLiveness {
                 }
             }
         }
-        Self { members, live_in }
+        let blocks = body
+            .basic_blocks
+            .iter_enumerated()
+            .map(|(block, data)| BlockFacts {
+                statements: data
+                    .statements
+                    .iter()
+                    .map(|statement| statement_uses(statement, &members))
+                    .collect(),
+                terminator: terminator_uses(data.terminator(), &members),
+                successor_live: data
+                    .terminator()
+                    .successors()
+                    .any(|successor| live_in[successor]),
+            })
+            .collect::<IndexVec<BasicBlock, _>>();
+        Self {
+            members,
+            live_in,
+            blocks,
+        }
     }
 
     /// Every local this holder's value can be in.
@@ -257,20 +301,17 @@ impl ClosureLiveness {
     /// successors, because the terminator's own operands are the event itself and
     /// not a later use. R321-1's lesson is taken here: the union over successors
     /// answers "somewhere later", and a caller that needs one edge asks for it.
-    pub(crate) fn live_after(&self, body: &Body<'_>, location: Location) -> bool {
-        let data = &body.basic_blocks[location.block];
-        let rest = data
+    pub(crate) fn live_after(&self, location: Location) -> bool {
+        let facts = &self.blocks[location.block];
+        let rest = facts
             .statements
             .iter()
             .skip(location.statement_index + 1)
-            .any(|statement| statement_uses(statement, &self.members));
-        let terminator = location.statement_index < data.statements.len()
-            && terminator_uses(data.terminator(), &self.members);
-        rest || terminator
-            || data
-                .terminator()
-                .successors()
-                .any(|successor| self.live_in[successor])
+            .any(|&uses| uses);
+        // At a terminator -- which is what a `free` call is -- the terminator's
+        // own operands are the EVENT, not a later use.
+        let terminator = location.statement_index < facts.statements.len() && facts.terminator;
+        rest || terminator || facts.successor_live
     }
 
     /// Is it demanded on THIS edge only? An event on a cleanup path is discharged
@@ -451,7 +492,7 @@ pub(crate) fn analyze(
         let escaped = {
             let direct = escapes
                 .entry(loan.key.function)
-                .or_insert_with(|| ValueEscapes::of_body(&body));
+                .or_insert_with(|| ValueEscapes::of_body(program.tcx, &body));
             members.iter().any(|&local| direct.escapes(local))
         };
         let liveness = ClosureLiveness::of_body(&body, members);
@@ -530,7 +571,6 @@ impl InnerLoans {
     /// about the program. Absence of an obligation is asked first of all.
     pub(crate) fn disposition(
         &self,
-        body: &Body<'_>,
         function: LocalDefId,
         local: Local,
         depth: u8,
@@ -542,7 +582,7 @@ impl InnerLoans {
         if row.escaped {
             return Disposition::Unrepresented(Missing::Escaped);
         }
-        if row.liveness.live_after(body, location) {
+        if row.liveness.live_after(location) {
             Disposition::Live
         } else {
             Disposition::Dead

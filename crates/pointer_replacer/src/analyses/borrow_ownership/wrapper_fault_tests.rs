@@ -764,9 +764,17 @@ fn owning_outer_raw_delivery(l2: bool) {
     use rustc_middle::mir::VarDebugInfoContents;
 
     use super::{borrow_verify, construction};
+    // R343-1: the inner cell's value is passed to a foreign call before the free,
+    // so it leaves the frame and the holder is `Unrepresented(Escaped)` -- which is
+    // what keeps the demotion this witness is about. Without it the inner cell is
+    // never touched at all, the disposition proves its loan dead, and there is no
+    // Raw commit to trace. A call argument is the escape form that keeps this
+    // fixture's precondition -- no ordinary represented-loan edge explains the
+    // demotion -- because a CallArg loan is structurally inert. The subject here
+    // is commit-target identity, not the disposition.
     const CODE: &str = r#"
-unsafe extern "C"{fn malloc(n:usize)->*mut core::ffi::c_void;fn free(p:*mut core::ffi::c_void);}
-pub unsafe fn f(){let p=malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i32;free(p as *mut core::ffi::c_void);}
+unsafe extern "C"{fn malloc(n:usize)->*mut core::ffi::c_void;fn free(p:*mut core::ffi::c_void);fn opaque(q:*mut i32);}
+pub unsafe fn f(){let p=malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i32;let v=*p;opaque(v);free(p as *mut core::ffi::c_void);}
 "#;
     with_program(CODE, |program| {
         let slots = CrateSlots::build(program);
@@ -873,8 +881,9 @@ pub unsafe fn f(){let p=malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i3
                 .retirement_rounds
                 .iter()
                 .flat_map(|round| &round.demotions)
-                .any(|row| row.holder == inner
-                    && row.reason.label() == "p1s-inner-loan-missing:demote"),
+                // R343-1/R345-2: either inner-loan label is the same verdict, and
+                // any other reason still fails this assertion.
+                .any(|row| row.holder == inner && row.reason.inner_loan_depth().is_some()),
             "typed inner-loan receipt is required"
         );
         assert!(
@@ -911,10 +920,8 @@ pub unsafe fn f(){let p=malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i3
             assert!(!actual.contains(&outer));
             assert!(actual.iter().all(|slot| initial[slot] == SlotKind::Ref));
             for row in &review.demotions {
-                assert_eq!(
-                    row.reason,
-                    super::retirement::local_outcome::Reason::InnerLoanMissing { depth: 1 }
-                );
+                // R343-1/R345-2: either inner-loan label is the same verdict.
+                assert_eq!(row.reason.inner_loan_depth(), Some(1));
                 assert_eq!(row.source.role, super::source_events::SourceRole::Free);
                 assert!(c.source_events.retirements.contains_key(&row.source));
             }

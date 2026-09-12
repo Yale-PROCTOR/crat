@@ -11,14 +11,37 @@ use crate::analyses::borrow_ownership::{
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reason {
-    InnerLoanMissing { depth: u8 },
+    InnerLoanMissing {
+        depth: u8,
+    },
+    /// R343-1/R345-2: the holder's value leaves the frame, so its copy closure is
+    /// incomplete and its liveness is not a statement about the program. The
+    /// VERDICT is the same demotion as `InnerLoanMissing`; the label is separate
+    /// so the escaped population is counted rather than inferred (sizing 2.6).
+    InnerLoanEscaped {
+        depth: u8,
+    },
     OwnerMissing,
 }
 impl Reason {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::InnerLoanMissing { .. } => "p1s-inner-loan-missing:demote",
+            Self::InnerLoanEscaped { .. } => "p1s-inner-loan-escaped:demote",
             Self::OwnerMissing => "p1s-owner-missing:demote",
+        }
+    }
+
+    /// The depth, when this is an inner-loan demotion of either kind.
+    ///
+    /// `InnerLoanMissing` and `InnerLoanEscaped` are ONE verdict -- the demotion
+    /// this site has always done -- and differ only in why the facts were
+    /// missing. A receipt reader that cares about the verdict asks this; one that
+    /// cares about the population asks the label.
+    pub(crate) fn inner_loan_depth(self) -> Option<u8> {
+        match self {
+            Self::InnerLoanMissing { depth } | Self::InnerLoanEscaped { depth } => Some(depth),
+            Self::OwnerMissing => None,
         }
     }
 }

@@ -110,7 +110,12 @@ fn e5_r245_full_draw_foreign_address_carriers_keep_model() {
 }
 #[test]
 fn e5_r245_inner_holder_and_copy_chain_demote_raw_without_decline() {
-    const CODE: &str = "pub unsafe fn f()->i32{let mut p:*mut i32;{let mut old=7;p=&mut old;}let q=p;let pp=&mut p as *mut *mut i32;let qq=pp;*q+**qq}";
+    // R343-1: the inner value is RETURNED, so it leaves the frame and the holder
+    // is `Unrepresented(Escaped)` -- which keeps the copy-chain demotion this
+    // witness is about. Without the return the holder is merely live, the
+    // disposition raises a targeted conflict instead, and there is no chain to
+    // export. The subject here is chain-receipt fidelity, not the disposition.
+    const CODE: &str = "pub unsafe fn f()->*mut i32{let mut p:*mut i32;{let mut old=7;p=&mut old;}let q=p;let pp=&mut p as *mut *mut i32;let qq=pp;let _s=*q+**qq;*qq}";
     for backend in [
         TestValidationBackend::HardCheckRoundOptimize,
         TestValidationBackend::LegacyOptimize,
@@ -209,7 +214,10 @@ fn e5_r245_inner_holder_and_copy_chain_demote_raw_without_decline() {
                     "portable demotions must retain every copy-chain member"
                 );
                 let json = portable.canonical_json().unwrap();
-                assert!(json.contains("p1s-inner-loan-missing:demote"));
+                assert!(
+                    json.contains("p1s-inner-loan-escaped:demote"),
+                    "the escaped label is the same verdict with its reason named"
+                );
                 assert!(
                     capture
                         .source_retirement
@@ -323,7 +331,12 @@ fn e5_r253_l2_coverage_propagates_planner_decline_before_commit() {
     use crate::analyses::borrow_ownership::{
         borrow_verify::coverage_planner_fault, l2::DeclineReason,
     };
-    const CODE: &str = "pub unsafe fn f()->i32{let mut p:*mut i32;{let mut old=7;p=&mut old;}let q=p;let pp=&mut p as *mut *mut i32;let qq=pp;*q+**qq}";
+    // R343-1: the inner value is RETURNED, so it leaves the frame and the holder
+    // is `Unrepresented(Escaped)` -- which keeps the copy-chain demotion this
+    // witness is about. Without the return the holder is merely live, the
+    // disposition raises a targeted conflict instead, and there is no chain to
+    // export. The subject here is chain-receipt fidelity, not the disposition.
+    const CODE: &str = "pub unsafe fn f()->*mut i32{let mut p:*mut i32;{let mut old=7;p=&mut old;}let q=p;let pp=&mut p as *mut *mut i32;let qq=pp;let _s=*q+**qq;*qq}";
     with_program(CODE, |program| {
         let slots = CrateSlots::build(program);
         let origins = compute_origins(program);

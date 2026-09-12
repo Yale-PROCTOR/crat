@@ -214,7 +214,11 @@ fn receipt(code: &str, case: Case, backend: TestValidationBackend) {
                 let rows = export.retirement_rounds.iter().flat_map(|round| &round.demotions).collect::<Vec<_>>();
                 assert!(!rows.is_empty(), "acceptance must retain the actual local repair receipts");
                 for row in rows {
-                    let super::local_outcome::Reason::InnerLoanMissing { depth } = row.reason else {
+                    // R343-1/R345-2: `InnerLoanEscaped` is the SAME verdict as
+                    // `InnerLoanMissing` -- the demotion this site has always done
+                    // -- with the reason the facts were missing named. The guard
+                    // still refuses any OTHER reason, which is what it is for.
+                    let Some(depth) = row.reason.inner_loan_depth() else {
                         panic!("unrelated recovery is not an expectation migration: {row:?}");
                     };
                     let (identity, actual_depth) = slot_identity(&program, &slots, row.holder);
