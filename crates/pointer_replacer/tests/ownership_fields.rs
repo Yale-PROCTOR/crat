@@ -1386,3 +1386,6 @@ mod bst_fold_cases;
 
 #[path = "ownership_fields_cases/export_adapter.rs"]
 mod export_adapter_cases;
+
+#[path = "ownership_fields_cases/held_report.rs"]
+mod held_report_cases;

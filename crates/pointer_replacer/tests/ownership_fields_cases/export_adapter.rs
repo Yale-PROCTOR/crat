@@ -13,7 +13,7 @@ fn absent(owner: EvidenceOwner, field: &'static str) -> Missing {
         reason: MissingReason::Field(field),
     }
 }
-fn fixture() -> (AcceptedInputs, Vec<Row>) {
+pub(super) fn fixture() -> (AcceptedInputs, Vec<Row>) {
     let artifact = Digest([9; 32]);
     let frame = Frame {
         program: ProgramId("synthetic-fold".into()),

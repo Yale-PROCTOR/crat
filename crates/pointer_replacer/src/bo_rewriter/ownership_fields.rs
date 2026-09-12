@@ -80,3 +80,6 @@ pub mod export;
 
 #[path = "ownership_fields_adapter.rs"]
 pub mod adapter;
+
+#[path = "ownership_fields_held_report.rs"]
+pub mod held_report;
