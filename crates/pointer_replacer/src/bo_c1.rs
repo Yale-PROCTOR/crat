@@ -1067,6 +1067,147 @@ fn raw_boundary_apply_receipt_exclusion<'a>(
     }
 }
 
+/// Per-program delivery counters over one frame's safe-family population.
+///
+/// Module-scoped by R340-2 so the counting law the corpus census applies is the
+/// same one a unit test can drive.
+#[derive(Clone, Copy, Debug, Default)]
+struct RawBoundaryDeliveryCounts {
+    realized: usize,
+    degraded: usize,
+    reverted_function: usize,
+    reverted_program: usize,
+    typed_excluded: usize,
+}
+
+impl RawBoundaryDeliveryCounts {
+    fn add_current(&mut self, disposition: &str, revert_scope: &str) {
+        match (disposition, revert_scope) {
+            ("realized-as-predicted", "-") => self.realized += 1,
+            ("degraded", "-") => self.degraded += 1,
+            ("reverted", "function") => self.reverted_function += 1,
+            ("reverted", "program") => self.reverted_program += 1,
+            ("typed-excluded", "-") => self.typed_excluded += 1,
+            pair => panic!("unsealed raw-boundary delivery pair: {pair:?}"),
+        }
+    }
+
+    fn add_baseline(&mut self, disposition: &str) {
+        match disposition {
+            "realized-as-predicted" => self.realized += 1,
+            "degraded" => self.degraded += 1,
+            "reverted" => self.reverted_function += 1,
+            "typed-excluded" => self.typed_excluded += 1,
+            other => panic!("unsealed baseline delivery: {other}"),
+        }
+    }
+
+    fn delivered_total(self) -> usize {
+        self.realized
+            + self.degraded
+            + self.reverted_function
+            + self.reverted_program
+            + self.typed_excluded
+    }
+}
+
+fn raw_boundary_safe_family(family: &str) -> bool {
+    matches!(family, "ref" | "slice" | "optional" | "box")
+}
+
+/// Which of the two frames hold a subject in their safe-family population.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RawBoundaryFrameMembership {
+    baseline: bool,
+    current: bool,
+}
+
+impl RawBoundaryFrameMembership {
+    fn gained(self) -> bool {
+        self.current && !self.baseline
+    }
+
+    fn lost(self) -> bool {
+        self.baseline && !self.current
+    }
+
+    fn counted(self) -> bool {
+        self.baseline || self.current
+    }
+}
+
+/// R340-2. The parent counts the **current** frame's safe-family population —
+/// the same ledger the worker writes — so a subject that becomes safe-family
+/// only at this frame is visible to the worker/parent cross-check instead of
+/// reading as drift. The era-4 baseline counts only its own population: it
+/// feeds the regression and delta columns and the two reported membership
+/// counts, and never asserts over the current frame.
+#[derive(Clone, Debug, Default)]
+struct RawBoundaryFrameTally {
+    baseline: std::collections::BTreeMap<String, RawBoundaryDeliveryCounts>,
+    current: std::collections::BTreeMap<String, RawBoundaryDeliveryCounts>,
+    corrected: std::collections::BTreeMap<String, RawBoundaryDeliveryCounts>,
+    membership_gained: std::collections::BTreeMap<String, usize>,
+    membership_lost: std::collections::BTreeMap<String, usize>,
+}
+
+impl RawBoundaryFrameTally {
+    fn observe(
+        &mut self,
+        program: &str,
+        baseline_family: &str,
+        baseline_delivery: &str,
+        current_family: &str,
+        current_delivery: &str,
+        revert_scope: &str,
+        corrected_member: bool,
+    ) -> RawBoundaryFrameMembership {
+        let membership = RawBoundaryFrameMembership {
+            baseline: raw_boundary_safe_family(baseline_family),
+            current: raw_boundary_safe_family(current_family),
+        };
+        if membership.baseline {
+            self.baseline
+                .entry(program.to_owned())
+                .or_default()
+                .add_baseline(baseline_delivery);
+        }
+        if membership.current {
+            self.current
+                .entry(program.to_owned())
+                .or_default()
+                .add_current(current_delivery, revert_scope);
+            if corrected_member {
+                self.corrected
+                    .entry(program.to_owned())
+                    .or_default()
+                    .add_current(current_delivery, revert_scope);
+            }
+        }
+        if membership.gained() {
+            *self
+                .membership_gained
+                .entry(program.to_owned())
+                .or_default() += 1;
+        }
+        if membership.lost() {
+            *self.membership_lost.entry(program.to_owned()).or_default() += 1;
+        }
+        membership
+    }
+
+    fn counts(
+        map: &std::collections::BTreeMap<String, RawBoundaryDeliveryCounts>,
+        program: &str,
+    ) -> RawBoundaryDeliveryCounts {
+        map.get(program).copied().unwrap_or_default()
+    }
+
+    fn membership(map: &std::collections::BTreeMap<String, usize>, program: &str) -> usize {
+        map.get(program).copied().unwrap_or(0)
+    }
+}
+
 fn raw_boundary_lossless_encode(value: &str) -> String {
     value
         .as_bytes()
@@ -22802,46 +22943,6 @@ fn raw_boundary_wave2_corpus_census() {
     }
     assert_eq!(corpus_unresolved, 0, "corpus unresolved attribution drift");
 
-    #[derive(Clone, Copy, Debug, Default)]
-    struct DeliveryCounts {
-        realized: usize,
-        degraded: usize,
-        reverted_function: usize,
-        reverted_program: usize,
-        typed_excluded: usize,
-    }
-
-    impl DeliveryCounts {
-        fn add_current(&mut self, disposition: &str, revert_scope: &str) {
-            match (disposition, revert_scope) {
-                ("realized-as-predicted", "-") => self.realized += 1,
-                ("degraded", "-") => self.degraded += 1,
-                ("reverted", "function") => self.reverted_function += 1,
-                ("reverted", "program") => self.reverted_program += 1,
-                ("typed-excluded", "-") => self.typed_excluded += 1,
-                pair => panic!("unsealed raw-boundary delivery pair: {pair:?}"),
-            }
-        }
-
-        fn add_baseline(&mut self, disposition: &str) {
-            match disposition {
-                "realized-as-predicted" => self.realized += 1,
-                "degraded" => self.degraded += 1,
-                "reverted" => self.reverted_function += 1,
-                "typed-excluded" => self.typed_excluded += 1,
-                other => panic!("unsealed baseline delivery: {other}"),
-            }
-        }
-
-        fn delivered_total(self) -> usize {
-            self.realized
-                + self.degraded
-                + self.reverted_function
-                + self.reverted_program
-                + self.typed_excluded
-        }
-    }
-
     let baseline_dir = PathBuf::from(
         std::env::var_os("CRAT_RAW_BOUNDARY_DELIVERY_BASELINE_DIR")
             .expect("raw-boundary census requires the accepted subject-ledger baseline"),
@@ -22923,23 +23024,18 @@ fn raw_boundary_wave2_corpus_census() {
         "promote exclusion contains an unknown subject"
     );
 
-    let is_four_family = |row: &BTreeMap<String, String>| {
-        row.get("family")
-            .is_some_and(|family| matches!(family.as_str(), "ref" | "slice" | "optional" | "box"))
-    };
-    let mut baseline_by_program = BTreeMap::<String, DeliveryCounts>::new();
-    let mut current_by_program = BTreeMap::<String, DeliveryCounts>::new();
-    let mut corrected_by_program = BTreeMap::<String, DeliveryCounts>::new();
+    let mut tally = RawBoundaryFrameTally::default();
+    let mut current_population = 0usize;
+    let mut excluded_current_members = 0usize;
     let mut subject_delivery = String::from(
-        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tsubject_key\tfamily\tbaseline_delivery\tworker_delivery\tcurrent_delivery\trevert_scope\tcorrected_denominator_member\tregressed_identity\n",
+        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tsubject_key\tfamily\tcurrent_family\tbaseline_member\tcurrent_member\tbaseline_delivery\tworker_delivery\tcurrent_delivery\trevert_scope\tcorrected_denominator_member\tregressed_identity\n",
     );
     for (key, baseline_row) in &baseline {
-        if !is_four_family(baseline_row) {
-            continue;
-        }
         let current_row = current
             .get(key)
             .unwrap_or_else(|| panic!("current subject missing {key:?}"));
+        let baseline_family = baseline_row.get("family").map_or("-", String::as_str);
+        let current_family = current_row.get("family").map_or("-", String::as_str);
         let baseline_delivery = baseline_row.get("disposition").map_or("-", String::as_str);
         let worker_delivery = current_row.get("delivery").map_or("-", String::as_str);
         let corrected_member = !exclusion_keys.contains(key);
@@ -22948,29 +23044,37 @@ fn raw_boundary_wave2_corpus_census() {
             current_row.get("revert_scope").map_or("-", String::as_str),
             !corrected_member,
         );
-        baseline_by_program
-            .entry(key.0.clone())
-            .or_default()
-            .add_baseline(baseline_delivery);
-        current_by_program
-            .entry(key.0.clone())
-            .or_default()
-            .add_current(current_delivery, revert_scope);
-        if corrected_member {
-            corrected_by_program
-                .entry(key.0.clone())
-                .or_default()
-                .add_current(current_delivery, revert_scope);
+        let membership = tally.observe(
+            &key.0,
+            baseline_family,
+            baseline_delivery,
+            current_family,
+            current_delivery,
+            revert_scope,
+            corrected_member,
+        );
+        if !membership.counted() {
+            continue;
         }
-        let regressed_identity = baseline_delivery == "realized-as-predicted"
+        if membership.current {
+            current_population += 1;
+            if !corrected_member {
+                excluded_current_members += 1;
+            }
+        }
+        let regressed_identity = membership.baseline
+            && baseline_delivery == "realized-as-predicted"
             && current_delivery != "realized-as-predicted";
         subject_delivery.push_str(&format!(
-            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
             code_frame,
             key.0,
             key.1,
-            baseline_row.get("family").map_or("-", String::as_str),
+            baseline_family,
+            current_family,
+            u8::from(membership.baseline),
+            u8::from(membership.current),
             baseline_delivery,
             worker_delivery,
             current_delivery,
@@ -22986,25 +23090,23 @@ fn raw_boundary_wave2_corpus_census() {
     .expect("write subject delivery ledger");
 
     let mut per_program_delivery = String::from(
-        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tbaseline_realized\tbaseline_degraded\tbaseline_reverted\tcurrent_realized\tcurrent_degraded\tcurrent_reverted_function\tcurrent_reverted_program\tcurrent_typed_excluded\tcorrected_realized\tcorrected_degraded\tcorrected_reverted_function\tcorrected_reverted_program\tbaseline_to_current_delta\tregression\n",
+        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tbaseline_realized\tbaseline_degraded\tbaseline_reverted\tcurrent_realized\tcurrent_degraded\tcurrent_reverted_function\tcurrent_reverted_program\tcurrent_typed_excluded\tcorrected_realized\tcorrected_degraded\tcorrected_reverted_function\tcorrected_reverted_program\tbaseline_to_current_delta\tregression\tmembership_gained\tmembership_lost\n",
     );
     let mut regression_rows = String::from(
         "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tbaseline_realized\tcurrent_realized\tdelta\twaiver\n",
     );
     let mut regressed_programs = BTreeSet::new();
     for program in CORPUS {
-        let baseline_counts = baseline_by_program
-            .get(program.name)
-            .copied()
-            .unwrap_or_default();
-        let current_counts = current_by_program
-            .get(program.name)
-            .copied()
-            .unwrap_or_default();
-        let corrected_counts = corrected_by_program
-            .get(program.name)
-            .copied()
-            .unwrap_or_default();
+        let baseline_counts = RawBoundaryFrameTally::counts(&tally.baseline, program.name);
+        let current_counts = RawBoundaryFrameTally::counts(&tally.current, program.name);
+        let corrected_counts = RawBoundaryFrameTally::counts(&tally.corrected, program.name);
+        let membership_gained =
+            RawBoundaryFrameTally::membership(&tally.membership_gained, program.name);
+        let membership_lost =
+            RawBoundaryFrameTally::membership(&tally.membership_lost, program.name);
+        // R340-2: worker and parent are compared over ONE population — the
+        // current frame's safe families. A subject that became safe-family only
+        // at this frame is counted by both, not read as drift.
         assert_eq!(
             current_counts.realized,
             rows.iter()
@@ -23030,7 +23132,7 @@ fn raw_boundary_wave2_corpus_census() {
             ));
         }
         per_program_delivery.push_str(&format!(
-            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
             code_frame,
             program.name,
@@ -23048,6 +23150,8 @@ fn raw_boundary_wave2_corpus_census() {
             corrected_counts.reverted_program,
             current_counts.realized as isize - baseline_counts.realized as isize,
             u8::from(regression),
+            membership_gained,
+            membership_lost,
         ));
     }
     fs::write(
@@ -23385,11 +23489,11 @@ fn raw_boundary_wave2_corpus_census() {
         );
         values.into_iter().next().unwrap()
     };
-    let sum_counts = |counts: &BTreeMap<String, DeliveryCounts>| {
+    let sum_counts = |counts: &BTreeMap<String, RawBoundaryDeliveryCounts>| {
         counts
             .values()
             .copied()
-            .fold(DeliveryCounts::default(), |mut total, row| {
+            .fold(RawBoundaryDeliveryCounts::default(), |mut total, row| {
                 total.realized += row.realized;
                 total.degraded += row.degraded;
                 total.reverted_function += row.reverted_function;
@@ -23398,14 +23502,25 @@ fn raw_boundary_wave2_corpus_census() {
                 total
             })
     };
-    let baseline_counts = sum_counts(&baseline_by_program);
-    let current_counts = sum_counts(&current_by_program);
-    let corrected_counts = sum_counts(&corrected_by_program);
+    let baseline_counts = sum_counts(&tally.baseline);
+    let current_counts = sum_counts(&tally.current);
+    let corrected_counts = sum_counts(&tally.corrected);
+    let corrected_population = current_population - excluded_current_members;
+    let membership_gained_total = tally.membership_gained.values().sum::<usize>();
+    let membership_lost_total = tally.membership_lost.values().sum::<usize>();
+    // The era-4 baseline asserts over its OWN population only (R340-2).
     assert_eq!(baseline_counts.delivered_total(), 4_744);
-    assert_eq!(current_counts.delivered_total(), 4_744);
-    assert_eq!(corrected_counts.delivered_total(), 4_706);
-    assert_eq!(current_counts.typed_excluded, 38);
+    // The current frame's population is whatever this frame's ledger says it
+    // is; the parent's four arms must partition exactly that.
+    assert_eq!(current_counts.delivered_total(), current_population);
+    assert_eq!(corrected_counts.delivered_total(), corrected_population);
+    assert_eq!(current_counts.typed_excluded, excluded_current_members);
     assert_eq!(corrected_counts.typed_excluded, 0);
+    assert_eq!(
+        baseline_counts.delivered_total() + membership_gained_total - membership_lost_total,
+        current_population,
+        "membership accounting does not close"
+    );
     let mut aggregate = report::Row::default();
     aggregate.set(raw_schema::CORPUS, "rs-crown");
     aggregate.set(
@@ -23587,17 +23702,18 @@ fn raw_boundary_wave2_corpus_census() {
     aggregate.set(raw_schema::STATUS, "ok");
     let delivery_summary = format!(
         "corpus\tanalysis_frame\tcode_frame\tdata\tdelivery\tdenominator\trealized\tdegraded\treverted_function\treverted_program\ttyped_excluded\tpromote_rate_pct\tt1_boundary_realized\tt2_boundary_realized\tprograms_emitted\tprograms_degraded\tregressed_programs\tbaseline_artifact_sha256\texclusion_artifact_sha256\n\
-         rs-crown\t{}\t{}\ttrue\t{}\t4744\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n\
-         rs-crown\t{}\t{}\ttrue\t{}\t4706\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+         rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n\
+         rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
         code_frame,
         delivery.key(),
+        current_population,
         current_counts.realized,
         current_counts.degraded,
         current_counts.reverted_function,
         current_counts.reverted_program,
         current_counts.typed_excluded,
-        current_counts.realized as f64 * 100.0 / 4_744.0,
+        current_counts.realized as f64 * 100.0 / current_population as f64,
         total(raw_schema::T1_REALIZED_SUBJECTS),
         total(raw_schema::T2_REALIZED_SUBJECTS),
         20 - degraded_programs.len(),
@@ -23608,12 +23724,13 @@ fn raw_boundary_wave2_corpus_census() {
         crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
         code_frame,
         delivery.key(),
+        corrected_population,
         corrected_counts.realized,
         corrected_counts.degraded,
         corrected_counts.reverted_function,
         corrected_counts.reverted_program,
         corrected_counts.typed_excluded,
-        corrected_counts.realized as f64 * 100.0 / 4_706.0,
+        corrected_counts.realized as f64 * 100.0 / corrected_population as f64,
         total(raw_schema::T1_REALIZED_SUBJECTS),
         total(raw_schema::T2_REALIZED_SUBJECTS),
         20 - degraded_programs.len(),
@@ -23639,7 +23756,7 @@ fn raw_boundary_wave2_corpus_census() {
     fs::write(
         artifact_dir.join("census-receipt.txt"),
         format!(
-            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_4744={}/{}/{}/{}/{}\nsubject_frame_4706={}/{}/{}/{}\npromote_rate_4744={}/4744\npromote_rate_4706={}/4706\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\n",
+            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_current={}/{}/{}/{}/{}\nsubject_frame_corrected={}/{}/{}/{}\npromote_rate_current={}/{}\npromote_rate_corrected={}/{}\nmembership_gained={}\nmembership_lost={}\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\n",
             delivery.key(),
             20 - degraded_programs.len(),
             degraded_programs.len(),
@@ -23654,7 +23771,11 @@ fn raw_boundary_wave2_corpus_census() {
             corrected_counts.reverted_function,
             corrected_counts.reverted_program,
             current_counts.realized,
+            current_population,
             corrected_counts.realized,
+            corrected_population,
+            membership_gained_total,
+            membership_lost_total,
             total(raw_schema::T1_REALIZED_SUBJECTS),
             total(raw_schema::T2_REALIZED_SUBJECTS),
             controls.libc_subjects,
@@ -23942,6 +24063,81 @@ fn raw_boundary_delivery_verdict_is_sealed_and_degraded_precedes_regressed() {
         raw_boundary_delivery_verdict(true, true),
         RawBoundaryDelivery::Degraded
     );
+}
+
+#[test]
+fn r340_2_the_parent_counts_the_current_frame_population_and_reports_membership() {
+    // (baseline_family, baseline_disposition, current_family, worker_delivery)
+    let rows = [
+        // era-4 `raw`, L01" `ref`: safe-family only at the CURRENT frame. This
+        // is the shape that made the parent's baseline-keyed count read four
+        // low against heman's worker row.
+        ("raw", "degraded", "ref", "realized-as-predicted"),
+        // safe at both frames
+        (
+            "ref",
+            "realized-as-predicted",
+            "ref",
+            "realized-as-predicted",
+        ),
+        // safe-family only at era 4
+        ("ref", "degraded", "raw", "degraded"),
+        // in neither population
+        ("unmodeled", "typed-excluded", "unmodeled", "typed-excluded"),
+    ];
+    let mut tally = RawBoundaryFrameTally::default();
+    let mut counted = 0usize;
+    for (baseline_family, baseline_delivery, current_family, worker_delivery) in rows {
+        let membership = tally.observe(
+            "heman",
+            baseline_family,
+            baseline_delivery,
+            current_family,
+            worker_delivery,
+            "-",
+            true,
+        );
+        counted += usize::from(membership.counted());
+    }
+    assert_eq!(
+        counted, 3,
+        "the subject in neither population is not counted"
+    );
+
+    // The worker counts realized over the CURRENT frame's safe families.
+    let worker_realized = rows
+        .iter()
+        .filter(|row| raw_boundary_safe_family(row.2) && row.3 == "realized-as-predicted")
+        .count();
+    assert_eq!(worker_realized, 2);
+    // The cross-check passes: parent and worker are the same population.
+    assert_eq!(
+        RawBoundaryFrameTally::counts(&tally.current, "heman").realized,
+        worker_realized
+    );
+    assert_eq!(
+        RawBoundaryFrameTally::membership(&tally.membership_gained, "heman"),
+        1
+    );
+    assert_eq!(
+        RawBoundaryFrameTally::membership(&tally.membership_lost, "heman"),
+        1
+    );
+    // The baseline still counts its own population, for the delta columns.
+    assert_eq!(
+        RawBoundaryFrameTally::counts(&tally.baseline, "heman").realized,
+        1
+    );
+
+    // MUTATION — the law before R340-2: gate the CURRENT delivery on the
+    // BASELINE family. That is the parent-over-the-baseline count, and it
+    // disagrees with the worker, which is the drift panic reproduced.
+    let parent_over_the_baseline = rows
+        .iter()
+        .filter(|row| raw_boundary_safe_family(row.0) && row.3 == "realized-as-predicted")
+        .count();
+    assert_eq!(parent_over_the_baseline, 1);
+    assert_ne!(parent_over_the_baseline, worker_realized);
 }
 
 #[test]
