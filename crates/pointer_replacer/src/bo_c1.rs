@@ -1446,8 +1446,19 @@ impl StandingCensusLaunchRecipe {
         cache_dir: &std::path::Path,
         artifact_dir: &std::path::Path,
         code_frame: &str,
+        program: &str,
     ) -> Vec<(&'static str, String)> {
         let mut env = self.common_child_env(cache_dir);
+        // **The era-5 cache key carries the program name, and the driver never
+        // supplied it.**
+        //
+        // `semantic_inputs` falls back to `crate_name(LOCAL_CRATE)` when
+        // `CRAT_ERA5_PROGRAM` is unset — which is `lib` for every corpus input,
+        // not `bst`/`heman`/…. Every key therefore missed and the cache gate
+        // refused with `ManifestMiss` on the first program, so this driver could
+        // not consume an era-5 cache at all. The producer set the pin per
+        // program; the consumer must too.
+        env.push(("CRAT_ERA5_PROGRAM", program.to_owned()));
         let cache_manifest = std::env::var("CRAT_RAW_BOUNDARY_CACHE_MANIFEST")
             .expect("raw-boundary parent requires accepted cache manifest");
         let exposure_input = std::env::var("CRAT_RAW_BOUNDARY_EXPOSURE_INPUT")
@@ -22199,7 +22210,7 @@ fn raw_boundary_wave2_preflight() {
             "raw-boundary-census",
             Duration::from_secs(recipe.timeout_secs),
             recipe.memory_mib,
-            &recipe.raw_boundary_child_env(&cache_dir, &artifact_dir, &code_frame),
+            &recipe.raw_boundary_child_env(&cache_dir, &artifact_dir, &code_frame, name),
         );
         let row = outcome
             .row
@@ -22650,7 +22661,12 @@ fn raw_boundary_wave2_corpus_census() {
                 "raw-boundary-census",
                 Duration::from_secs(recipe.timeout_secs),
                 recipe.memory_mib,
-                &recipe.raw_boundary_child_env(&cache_dir, &artifact_dir, &code_frame),
+                &recipe.raw_boundary_child_env(
+                    &cache_dir,
+                    &artifact_dir,
+                    &code_frame,
+                    program.name,
+                ),
             );
             let row = raw_boundary_worker_row(program.name, &outcome);
             if raw_boundary_typed_failure(&row)
