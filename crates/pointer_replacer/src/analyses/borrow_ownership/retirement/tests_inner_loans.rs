@@ -1,7 +1,8 @@
 //! R343-1 P1S-INNER-LOAN-REPRESENTATION witnesses.
 
 use super::{
-    inner_loan,
+    inner_loan::{self, ValueEscapes},
+    tests_call_reach::named_local,
     tests_return_origin::{named_function, with_program},
 };
 use crate::analyses::borrow_ownership::{
@@ -127,6 +128,75 @@ fn c_w00_a_raw_holder_gets_no_obligation() {
         assert!(
             inner_loan::obligations(program, &slots, |_| false).is_empty(),
             "only Ref carriers hold loans (R251); a Raw holder has nothing to protect"
+        );
+    });
+}
+
+/// Each escape form once, and one local that stays home so the relation
+/// discriminates in both directions.
+const ESCAPES: &str = r#"
+unsafe fn opaque(slot: *mut u8) -> *mut u8 { slot }
+pub unsafe fn caller(out: *mut *mut u8, base: *mut u8) -> *mut u8 {
+    let argument: *mut u8 = base;
+    let _echo = opaque(argument);
+    let stored: *mut u8 = base;
+    *out = stored;
+    let mut addressed: *mut u8 = base;
+    let _taken: *mut *mut u8 = &raw mut addressed;
+    let kept: *mut u8 = base;
+    let copied: *mut u8 = kept;
+    let _reread: *mut u8 = copied;
+    let returned: *mut u8 = base;
+    returned
+}
+"#;
+
+#[test]
+fn c_w09_every_escape_form_is_an_escape_and_a_kept_value_is_not() {
+    with_program(ESCAPES, |program| {
+        let caller = named_function(program, "caller");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(caller)
+            .borrow();
+        let escapes = ValueEscapes::of_body(&body);
+        for name in ["argument", "stored", "addressed", "returned"] {
+            assert!(
+                escapes.escapes(named_local(&body, name)),
+                "{name} leaves the frame and must count as an escape"
+            );
+        }
+        // `kept` flows only into other locals and never leaves: assignments are
+        // exactly the shape the copy graph DOES follow, so its closure is complete
+        // and the relation must not claim it escaped.
+        for name in ["kept", "copied", "_reread"] {
+            assert!(
+                !escapes.escapes(named_local(&body, name)),
+                "{name} never leaves the frame; its closure is complete"
+            );
+        }
+    });
+}
+
+#[test]
+fn c_w09_a_frame_with_no_escape_at_all_escapes_nothing() {
+    const HOME: &str = r#"
+pub unsafe fn caller(base: *mut u8) {
+    let kept: *mut u8 = base;
+    let _copied: *mut u8 = kept;
+}
+"#;
+    with_program(HOME, |program| {
+        let caller = named_function(program, "caller");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(caller)
+            .borrow();
+        let escapes = ValueEscapes::of_body(&body);
+        assert!(!escapes.escapes(named_local(&body, "kept")));
+        assert!(
+            !escapes.escapes(named_local(&body, "_copied")),
+            "an empty escape set is reachable, so the relation is not constant-true"
         );
     });
 }
