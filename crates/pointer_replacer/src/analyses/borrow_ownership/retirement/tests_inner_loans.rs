@@ -132,95 +132,38 @@ fn c_w00_a_raw_holder_gets_no_obligation() {
     });
 }
 
-/// Each escape form once, and one local that stays home so the relation
-/// discriminates in both directions.
+/// Each escape form once, on a real inner holder, so the rule is witnessed where
+/// it acts rather than on the relation in isolation.
 const ESCAPES: &str = r#"
-unsafe fn opaque(slot: *mut u8) -> *mut u8 { slot }
-pub unsafe fn caller(out: *mut *mut u8, base: *mut u8) -> *mut u8 {
-    let argument: *mut u8 = base;
-    let _echo = opaque(argument);
-    let stored: *mut u8 = base;
-    *out = stored;
-    let mut addressed: *mut u8 = base;
-    let _taken: *mut *mut u8 = &raw mut addressed;
-    let kept: *mut u8 = base;
-    let copied: *mut u8 = kept;
-    let _reread: *mut u8 = copied;
-    let returned: *mut u8 = base;
-    returned
-}
-"#;
-
-#[test]
-fn c_w09_every_escape_form_is_an_escape_and_a_kept_value_is_not() {
-    with_program(ESCAPES, |program| {
-        let caller = named_function(program, "caller");
-        let body = program
-            .tcx
-            .mir_drops_elaborated_and_const_checked(caller)
-            .borrow();
-        let escapes = ValueEscapes::of_body(&body);
-        for name in ["argument", "stored", "addressed", "returned"] {
-            assert!(
-                escapes.escapes(named_local(&body, name)),
-                "{name} leaves the frame and must count as an escape"
-            );
-        }
-        // `kept` flows only into other locals and never leaves: assignments are
-        // exactly the shape the copy graph DOES follow, so its closure is complete
-        // and the relation must not claim it escaped.
-        for name in ["kept", "copied", "_reread"] {
-            assert!(
-                !escapes.escapes(named_local(&body, name)),
-                "{name} never leaves the frame; its closure is complete"
-            );
-        }
-    });
-}
-
-#[test]
-fn c_w09_a_frame_with_no_escape_at_all_escapes_nothing() {
-    const HOME: &str = r#"
-pub unsafe fn caller(base: *mut u8) {
-    let kept: *mut u8 = base;
-    let _copied: *mut u8 = kept;
-}
-"#;
-    with_program(HOME, |program| {
-        let caller = named_function(program, "caller");
-        let body = program
-            .tcx
-            .mir_drops_elaborated_and_const_checked(caller)
-            .borrow();
-        let escapes = ValueEscapes::of_body(&body);
-        assert!(!escapes.escapes(named_local(&body, "kept")));
-        assert!(
-            !escapes.escapes(named_local(&body, "_copied")),
-            "an empty escape set is reachable, so the relation is not constant-true"
-        );
-    });
-}
-
-/// The same frame three ways: a holder whose last use precedes the free, one used
-/// after it, and one kept alive only through a raw copy.
-const LIVENESS: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
 unsafe fn opaque(slot: *mut u8) -> *mut u8 { slot }
-pub unsafe fn dead(base: *mut u8, other: *mut u8) {
-    let holder: *mut u8 = base;
-    let _early = opaque(holder);
+pub unsafe fn passed(other: *mut u8) {
+    let mut base: *mut u8 = opaque(core::ptr::null_mut());
+    let inner: *mut *mut u8 = &raw mut base;
+    let loaded: *mut u8 = *inner;
+    let _echo = opaque(loaded);
     free(other as *mut core::ffi::c_void);
 }
-pub unsafe fn live(base: *mut u8, other: *mut u8) -> *mut u8 {
-    let holder: *mut u8 = base;
+pub unsafe fn stored(out: *mut *mut u8, other: *mut u8) {
+    let mut base: *mut u8 = opaque(core::ptr::null_mut());
+    let inner: *mut *mut u8 = &raw mut base;
+    let loaded: *mut u8 = *inner;
+    *out = loaded;
     free(other as *mut core::ffi::c_void);
-    opaque(holder)
 }
-pub unsafe fn through_raw_copy(base: *mut u8, other: *mut u8) -> *mut u8 {
-    let holder: *mut u8 = base;
-    let carried: *mut u8 = holder;
+pub unsafe fn returned(other: *mut u8) -> *mut u8 {
+    let mut base: *mut u8 = opaque(core::ptr::null_mut());
+    let inner: *mut *mut u8 = &raw mut base;
+    let loaded: *mut u8 = *inner;
     free(other as *mut core::ffi::c_void);
-    opaque(carried)
+    loaded
+}
+pub unsafe fn home(other: *mut u8) -> u8 {
+    let mut base: *mut u8 = opaque(core::ptr::null_mut());
+    let inner: *mut *mut u8 = &raw mut base;
+    let byte: u8 = **inner;
+    free(other as *mut core::ffi::c_void);
+    byte
 }
 "#;
 
@@ -243,54 +186,187 @@ fn free_call(body: &rustc_middle::mir::Body<'_>) -> rustc_middle::mir::Location 
     rows[0]
 }
 
-fn liveness_after_free(code: &str, function: &str, holder: &str) -> bool {
+/// The three dispositions in one fixture: a dead inner holder, a live one, and an
+/// escaped one whose liveness must never be consulted.
+const DISPOSITIONS: &str = r#"
+unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
+unsafe fn opaque(slot: *mut u8) -> *mut u8 { slot }
+pub unsafe fn dead(other: *mut u8) -> u8 {
+    let mut base: *mut u8 = opaque(core::ptr::null_mut());
+    let inner: *mut *mut u8 = &raw mut base;
+    let byte: u8 = **inner;
+    free(other as *mut core::ffi::c_void);
+    byte
+}
+pub unsafe fn live(other: *mut u8) -> u8 {
+    let mut base: *mut u8 = opaque(core::ptr::null_mut());
+    let inner: *mut *mut u8 = &raw mut base;
+    free(other as *mut core::ffi::c_void);
+    **inner
+}
+pub unsafe fn through_raw_copy(other: *mut u8) -> u8 {
+    let mut base: *mut u8 = opaque(core::ptr::null_mut());
+    let inner: *mut *mut u8 = &raw mut base;
+    let carried: *mut u8 = *inner;
+    free(other as *mut core::ffi::c_void);
+    *carried
+}
+pub unsafe fn escaped(other: *mut u8) -> *mut u8 {
+    let mut base: *mut u8 = opaque(core::ptr::null_mut());
+    let inner: *mut *mut u8 = &raw mut base;
+    let loaded: *mut u8 = *inner;
+    free(other as *mut core::ffi::c_void);
+    opaque(loaded)
+}
+"#;
+
+fn disposition_at_free(code: &str, function: &str, holder: &str) -> inner_loan::Disposition {
     let mut answer = None;
     with_program(code, |program| {
+        let slots = CrateSlots::build(program);
+        let loans = inner_loan::analyze(program, &slots, |_| true);
         let wanted = named_function(program, function);
         let body = program
             .tcx
             .mir_drops_elaborated_and_const_checked(wanted)
             .borrow();
         let local = named_local(&body, holder);
-        let liveness = inner_loan::ClosureLiveness::of_body(&body, local);
-        answer = Some(liveness.live_after(&body, free_call(&body)));
+        answer = Some(loans.disposition(&body, wanted, local, 1, free_call(&body)));
     });
     answer.expect("the fixture compiled")
 }
 
 #[test]
-fn c_w01_a_holder_whose_last_use_precedes_the_free_is_not_live_after_it() {
-    assert!(!liveness_after_free(LIVENESS, "dead", "holder"));
+fn c_w01_a_dead_inner_holder_is_dispositioned_dead() {
+    assert_eq!(
+        disposition_at_free(DISPOSITIONS, "dead", "inner"),
+        inner_loan::Disposition::Dead
+    );
 }
 
 #[test]
-fn c_w02_a_holder_used_after_the_free_is_live_after_it() {
-    assert!(liveness_after_free(LIVENESS, "live", "holder"));
+fn c_w02_a_live_inner_holder_is_dispositioned_live() {
+    assert_eq!(
+        disposition_at_free(DISPOSITIONS, "live", "inner"),
+        inner_loan::Disposition::Live
+    );
+}
+
+#[test]
+fn c_w09_an_escaped_holder_is_unrepresented_and_its_liveness_is_never_consulted() {
+    assert_eq!(
+        disposition_at_free(DISPOSITIONS, "escaped", "inner"),
+        inner_loan::Disposition::Unrepresented(inner_loan::Missing::Escaped)
+    );
+}
+
+#[test]
+fn c_w05_a_holder_with_no_obligation_is_unrepresented() {
+    with_program(DISPOSITIONS, |program| {
+        let slots = CrateSlots::build(program);
+        let loans = inner_loan::analyze(program, &slots, |_| true);
+        let wanted = named_function(program, "dead");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(wanted)
+            .borrow();
+        // Depth 7 is not a slot of anything: the lookup must fail closed rather
+        // than answer for a holder it has no obligation for.
+        assert_eq!(
+            loans.disposition(
+                &body,
+                wanted,
+                named_local(&body, "inner"),
+                7,
+                free_call(&body)
+            ),
+            inner_loan::Disposition::Unrepresented(inner_loan::Missing::NoObligation)
+        );
+    });
 }
 
 #[test]
 fn c_w03_a_holder_kept_alive_only_through_a_raw_copy_is_live() {
-    assert!(
-        liveness_after_free(LIVENESS, "through_raw_copy", "holder"),
+    assert_eq!(
+        disposition_at_free(DISPOSITIONS, "through_raw_copy", "inner"),
+        inner_loan::Disposition::Live,
         "a closure member's use is the holder's use; this is the case the \
          retirement comment names"
     );
 }
 
 #[test]
-fn c_w03_the_closure_is_what_carries_it() {
-    with_program(LIVENESS, |program| {
+fn c_w03_the_raw_copy_is_what_carries_it() {
+    with_program(DISPOSITIONS, |program| {
+        let slots = CrateSlots::build(program);
+        let loans = inner_loan::analyze(program, &slots, |_| true);
         let wanted = named_function(program, "through_raw_copy");
         let body = program
             .tcx
             .mir_drops_elaborated_and_const_checked(wanted)
             .borrow();
-        let holder = named_local(&body, "holder");
+        let inner = named_local(&body, "inner");
         let carried = named_local(&body, "carried");
-        let liveness = inner_loan::ClosureLiveness::of_body(&body, holder);
+        let members = loans
+            .members(wanted, inner, 1)
+            .expect("the inner holder has an obligation");
         assert!(
-            liveness.members().contains(&carried),
+            members.contains(&carried),
             "the raw copy is a closure member, or C-W03 would pass for the wrong reason"
         );
     });
+}
+
+#[test]
+fn c_w08_the_disposition_can_be_asked_of_one_edge() {
+    with_program(DISPOSITIONS, |program| {
+        let slots = CrateSlots::build(program);
+        let loans = inner_loan::analyze(program, &slots, |_| true);
+        let wanted = named_function(program, "live");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(wanted)
+            .borrow();
+        let inner = named_local(&body, "inner");
+        let free = free_call(&body);
+        let successors: Vec<_> = body.basic_blocks[free.block]
+            .terminator()
+            .successors()
+            .collect();
+        assert!(
+            successors
+                .iter()
+                .any(|&block| loans.disposition_on(wanted, inner, 1, block)
+                    == inner_loan::Disposition::Live),
+            "the successor carrying the later use answers Live on its own"
+        );
+        // An event on a cleanup edge is discharged by THAT edge: the per-edge
+        // answer exists and is not the successor union.
+        assert_eq!(
+            loans.disposition_on(wanted, inner, 1, rustc_middle::mir::START_BLOCK),
+            loans.disposition_on(wanted, inner, 1, successors[0]),
+            "every block answers for itself"
+        );
+    });
+}
+
+#[test]
+fn c_w09_every_escape_form_leaves_the_holder_unrepresented() {
+    for function in ["passed", "stored", "returned"] {
+        assert_eq!(
+            disposition_at_free(ESCAPES, function, "inner"),
+            inner_loan::Disposition::Unrepresented(inner_loan::Missing::Escaped),
+            "{function}: the value leaves the frame, so its copy closure is incomplete"
+        );
+    }
+}
+
+#[test]
+fn c_w09_a_holder_that_never_leaves_the_frame_is_decided_by_its_liveness() {
+    assert_eq!(
+        disposition_at_free(ESCAPES, "home", "inner"),
+        inner_loan::Disposition::Dead,
+        "a constant-true escape rule would satisfy the positive half and silently \
+         disable the whole recovery"
+    );
 }

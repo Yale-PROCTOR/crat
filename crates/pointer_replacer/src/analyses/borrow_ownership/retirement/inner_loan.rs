@@ -18,7 +18,7 @@
 //! field object identity is row (b)'s material, it is out of this build by
 //! R342-4, and a holder without an obligation keeps today's demotion.
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::IndexVec;
 use rustc_middle::mir::{
     BasicBlock, Body, Local, Location, Operand, ProjectionElem, RETURN_PLACE, Rvalue,
@@ -26,10 +26,7 @@ use rustc_middle::mir::{
 };
 use rustc_span::def_id::LocalDefId;
 
-use super::{
-    super::{crate_slots::CrateSlots, slots::SlotOwner, solver::SlotRef},
-    call_reach::EscapeFacts,
-};
+use super::super::{crate_slots::CrateSlots, slots::SlotOwner, solver::SlotRef};
 use crate::utils::rustc::RustProgram;
 
 /// One inner holder, named by its frame, its slot and its depth.
@@ -53,7 +50,14 @@ pub(crate) struct InnerLoan {
     pub(crate) reservations: Vec<Location>,
 }
 
-/// R343-1(i), sizing 2.6: the locals whose VALUE leaves this frame.
+/// R343-1(i), sizing 2.6: the locals whose value leaves this frame DIRECTLY.
+///
+/// MIR copies a value into a temporary before it leaves -- `opaque(argument)` is
+/// `_5 = copy _3; opaque(move _5)` -- so a holder escapes when any member of its
+/// copy closure escapes directly. The closure is the production copy graph's
+/// component, which is depth-aware; propagating escape along a depth-AGNOSTIC
+/// local relation here instead would have been wrong in both directions, and was
+/// measured wrong on `_b = copy (*_a)` before this was split.
 ///
 /// The liveness of an inner holder is computed over its copy closure, and the
 /// copy graph is built from five ASSIGNMENT forms. Every way a value can leave
@@ -64,6 +68,14 @@ pub(crate) struct InnerLoan {
 /// that escapes is therefore `facts missing`, and `facts missing` keeps today's
 /// demotion. Flow-insensitive and in the safe direction, exactly as
 /// `EscapeFacts::of_body` is.
+/// Sizing 2.6 named `EscapeFacts::escapes` -- the local's own storage address
+/// escaping -- as a fifth form. It is NOT one, and the witness found it: an inner
+/// holder is built by taking an address (`inner = &raw mut base`), so `base` is
+/// address-taken in every such frame and is a member of the holder's closure. The
+/// rule would then mark every stack-constructed inner holder escaped and disable
+/// the whole recovery. That relation answers a different question -- can a callee
+/// WRITE this cell -- and the object state already answers it, in
+/// `clobber_callee_reachable`. Four value-escape forms, then.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ValueEscapes {
     escaping: FxHashSet<Local>,
@@ -72,14 +84,6 @@ pub(crate) struct ValueEscapes {
 impl ValueEscapes {
     pub(crate) fn of_body(body: &Body<'_>) -> Self {
         let mut escaping = FxHashSet::default();
-        // Form 5, already computed: the local's own storage address escaped, so a
-        // callee can reach the cell itself.
-        let address = EscapeFacts::of_body(body);
-        for local in body.local_decls.indices() {
-            if address.escapes(local) {
-                escaping.insert(local);
-            }
-        }
         for data in body.basic_blocks.iter() {
             for statement in &data.statements {
                 let StatementKind::Assign(box (destination, value)) = &statement.kind else {
@@ -97,7 +101,7 @@ impl ValueEscapes {
                 // Form 3: the value reaches the return place.
                 let returned = destination.local == RETURN_PLACE;
                 if through_pointer || returned {
-                    read_locals(value, &mut escaping);
+                    escaping_reads(value, &mut escaping);
                 }
             }
             let terminator = data.terminator();
@@ -119,23 +123,6 @@ impl ValueEscapes {
                 _ => {}
             }
         }
-        // MIR copies a value into a temporary before it leaves the frame:
-        // `opaque(argument)` is `_5 = copy _3; opaque(move _5)`. A relation that
-        // only named `_5` would say `argument` stays home, which is the opposite
-        // of the truth, so the escape is propagated BACK along the copy edges the
-        // frame actually has. These are the same five assignment forms the copy
-        // graph follows, which is why this closure is exactly as wide as the
-        // closure the liveness will be computed over -- no wider, no narrower.
-        let edges = copy_edges(body);
-        let mut moved = true;
-        while moved {
-            moved = false;
-            for &(source, destination) in &edges {
-                if escaping.contains(&destination) && escaping.insert(source) {
-                    moved = true;
-                }
-            }
-        }
         Self { escaping }
     }
 
@@ -145,34 +132,48 @@ impl ValueEscapes {
     }
 }
 
-/// `(source, destination)` for every plain copy between two locals: the same five
-/// assignment forms `local_outcome::copy_graph` follows, restricted to this body.
-fn copy_edges(body: &Body<'_>) -> Vec<(Local, Local)> {
-    let mut rows = Vec::new();
-    for data in body.basic_blocks.iter() {
-        for statement in &data.statements {
-            let StatementKind::Assign(box (destination, value)) = &statement.kind else {
-                continue;
-            };
-            let Some(destination) = destination.as_local() else {
-                continue;
-            };
-            let source = match value {
-                Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => operand.place(),
-                Rvalue::CopyForDeref(place)
-                | Rvalue::Ref(_, _, place)
-                | Rvalue::RawPtr(_, place) => Some(*place),
-                _ => None,
-            };
-            if let Some(place) = source {
-                rows.push((place.local, destination));
+/// The locals whose OWN VALUE this rvalue produces.
+///
+/// `_b = copy _a` produces `_a`'s value; `_b = copy (*_a)` produces the pointee,
+/// a different value at a different depth. The distinction is the whole
+/// difference between an escape and an ordinary read, and it was measured: with
+/// the loose rule, `_0 = copy (*_8)` marked `_8` -- the inner cell's own value --
+/// as escaped, so every holder read through before a free was demoted.
+fn escaping_reads(value: &Rvalue<'_>, into: &mut FxHashSet<Local>) {
+    let mut operand = |operand: &Operand<'_>| {
+        if let Some(place) = operand.place() {
+            if place.projection.is_empty() {
+                into.insert(place.local);
             }
         }
+    };
+    match value {
+        Rvalue::Use(row) | Rvalue::Repeat(row, _) | Rvalue::Cast(_, row, _) => operand(row),
+        Rvalue::BinaryOp(_, rows) => {
+            operand(&rows.0);
+            operand(&rows.1);
+        }
+        Rvalue::UnaryOp(_, row) => operand(row),
+        Rvalue::Aggregate(_, rows) => {
+            for row in rows {
+                operand(row);
+            }
+        }
+        // `&raw mut (*p)` is a reborrow: the same value as `p`. `&raw mut x` is
+        // the ADDRESS of `x`, which is a different value and one the object state
+        // owns, not this rule.
+        Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+            if place.projection.len() == 1 && matches!(place.projection[0], ProjectionElem::Deref) {
+                into.insert(place.local);
+            }
+        }
+        _ => {}
     }
-    rows
 }
 
-fn read_locals(value: &Rvalue<'_>, into: &mut FxHashSet<Local>) {
+/// Every local this rvalue mentions at all. Liveness wants the loose rule: a read
+/// THROUGH a member is still a use of that member.
+fn mentioned_locals(value: &Rvalue<'_>, into: &mut FxHashSet<Local>) {
     let mut operand = |operand: &Operand<'_>| {
         if let Some(place) = operand.place() {
             into.insert(place.local);
@@ -224,8 +225,7 @@ pub(crate) struct ClosureLiveness {
 }
 
 impl ClosureLiveness {
-    pub(crate) fn of_body(body: &Body<'_>, local: Local) -> Self {
-        let members = closure_of(body, local);
+    pub(crate) fn of_body(body: &Body<'_>, members: FxHashSet<Local>) -> Self {
         let mut live_in: IndexVec<BasicBlock, bool> =
             IndexVec::from_elem_n(false, body.basic_blocks.len());
         let mut moved = true;
@@ -280,23 +280,6 @@ impl ClosureLiveness {
     }
 }
 
-/// Every local the holder's value can reach through the frame's copy edges.
-fn closure_of(body: &Body<'_>, local: Local) -> FxHashSet<Local> {
-    let edges = copy_edges(body);
-    let mut members = FxHashSet::default();
-    members.insert(local);
-    let mut moved = true;
-    while moved {
-        moved = false;
-        for &(source, destination) in &edges {
-            if members.contains(&source) && members.insert(destination) {
-                moved = true;
-            }
-        }
-    }
-    members
-}
-
 fn block_uses(data: &rustc_middle::mir::BasicBlockData<'_>, members: &FxHashSet<Local>) -> bool {
     data.statements
         .iter()
@@ -312,7 +295,7 @@ fn statement_uses(
         return false;
     };
     let mut read = FxHashSet::default();
-    read_locals(value, &mut read);
+    mentioned_locals(value, &mut read);
     // A write THROUGH a member is a use of the member; a write INTO it is not.
     read.iter().any(|local| members.contains(local))
         || (destination.as_local().is_none() && members.contains(&destination.local))
@@ -408,4 +391,183 @@ fn definitions(body: &rustc_middle::mir::Body<'_>, local: Local) -> Vec<Location
         }
     }
     rows
+}
+
+/// What the retirement loop should do with one inner holder at one event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// The loan is provably dead here: no conflict and no demotion. The recovery.
+    Dead,
+    /// Live and demanded: the caller tests object overlap and, if it overlaps,
+    /// raises a conflict naming THIS holder rather than demoting its closure.
+    Live,
+    /// Facts missing. Sizing 2.2 row 3: today's demotion, unchanged.
+    Unrepresented(Missing),
+}
+
+/// Why a holder has no usable fact. Both keep the current verdict; they are kept
+/// apart so the escaped population is counted rather than inferred (sizing 2.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Missing {
+    /// No obligation: a field-owned holder, a parameter, or a Raw carrier.
+    NoObligation,
+    /// The value leaves the frame, so its copy closure is incomplete.
+    Escaped,
+}
+
+/// Every inner-holder obligation of a program, with the facts to decide it.
+#[derive(Debug, Default)]
+pub(crate) struct InnerLoans {
+    rows: FxHashMap<(LocalDefId, Local, u8), Row>,
+}
+
+#[derive(Debug)]
+struct Row {
+    loan: InnerLoan,
+    escaped: bool,
+    liveness: ClosureLiveness,
+}
+
+/// Build the obligations and their facts once per model.
+///
+/// The closure is `local_outcome::copy_graph`'s component -- the same relation
+/// the demotion chain already walks, so a holder's closure here is exactly the
+/// set that would have been demoted with it -- mapped to the owner locals the
+/// MIR-level liveness and escape questions are asked about.
+pub(crate) fn analyze(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    is_ref: impl Fn(SlotRef) -> bool,
+) -> InnerLoans {
+    let graph = super::local_outcome::copy_graph(program, slots);
+    let mut rows = FxHashMap::default();
+    let mut escapes: FxHashMap<LocalDefId, ValueEscapes> = FxHashMap::default();
+    for loan in obligations(program, slots, is_ref) {
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(loan.key.function)
+            .borrow();
+        let members = member_locals(slots, &graph, loan.key.holder, loan.key.local);
+        let escaped = {
+            let direct = escapes
+                .entry(loan.key.function)
+                .or_insert_with(|| ValueEscapes::of_body(&body));
+            members.iter().any(|&local| direct.escapes(local))
+        };
+        let liveness = ClosureLiveness::of_body(&body, members);
+        rows.insert(
+            (loan.key.function, loan.key.local, loan.key.depth),
+            Row {
+                loan,
+                escaped,
+                liveness,
+            },
+        );
+    }
+    InnerLoans { rows }
+}
+
+/// The owner locals of the holder's copy-graph component, in its own frame.
+fn member_locals(
+    slots: &CrateSlots,
+    graph: &FxHashMap<SlotRef, Vec<SlotRef>>,
+    holder: SlotRef,
+    local: Local,
+) -> FxHashSet<Local> {
+    let mut seen = FxHashSet::default();
+    let mut pending = vec![holder];
+    while let Some(slot) = pending.pop() {
+        if seen.insert(slot) {
+            pending.extend(graph.get(&slot).into_iter().flatten().copied());
+        }
+    }
+    let mut locals = FxHashSet::default();
+    locals.insert(local);
+    for slot in seen {
+        let SlotRef::Local(function, id) = slot else {
+            continue;
+        };
+        let Some(universe) = slots.fn_local_slots.get(&function) else {
+            continue;
+        };
+        if let SlotOwner::Local(member) = universe.slot(id).owner {
+            locals.insert(member);
+        }
+    }
+    locals
+}
+
+impl InnerLoans {
+    /// The locals this holder's value can be in: its copy-graph component.
+    pub(crate) fn members(
+        &self,
+        function: LocalDefId,
+        local: Local,
+        depth: u8,
+    ) -> Option<&FxHashSet<Local>> {
+        self.rows
+            .get(&(function, local, depth))
+            .map(|row| row.liveness.members())
+    }
+
+    /// The obligation for one holder, if it has one.
+    pub(crate) fn reservations(
+        &self,
+        function: LocalDefId,
+        local: Local,
+        depth: u8,
+    ) -> &[Location] {
+        self.rows
+            .get(&(function, local, depth))
+            .map_or(&[], |row| row.loan.reservations.as_slice())
+    }
+
+    /// R343-1: the three-way disposition of sizing 2.2, in one place.
+    ///
+    /// The order is the whole soundness argument. Escape is asked BEFORE
+    /// liveness, because an escaped value's closure is incomplete and its
+    /// liveness answer would be a statement about the edges we built rather than
+    /// about the program. Absence of an obligation is asked first of all.
+    pub(crate) fn disposition(
+        &self,
+        body: &Body<'_>,
+        function: LocalDefId,
+        local: Local,
+        depth: u8,
+        location: Location,
+    ) -> Disposition {
+        let Some(row) = self.rows.get(&(function, local, depth)) else {
+            return Disposition::Unrepresented(Missing::NoObligation);
+        };
+        if row.escaped {
+            return Disposition::Unrepresented(Missing::Escaped);
+        }
+        if row.liveness.live_after(body, location) {
+            Disposition::Live
+        } else {
+            Disposition::Dead
+        }
+    }
+
+    /// The same question on one edge: an event on a cleanup path is discharged by
+    /// the cleanup successor's liveness, never by the normal path's.
+    pub(crate) fn disposition_on(
+        &self,
+        function: LocalDefId,
+        local: Local,
+        depth: u8,
+        block: BasicBlock,
+    ) -> Disposition {
+        let Some(row) = self.rows.get(&(function, local, depth)) else {
+            return Disposition::Unrepresented(Missing::NoObligation);
+        };
+        if row.escaped {
+            return Disposition::Unrepresented(Missing::Escaped);
+        }
+        if row.liveness.live_on(block) {
+            Disposition::Live
+        } else {
+            Disposition::Dead
+        }
+    }
 }
