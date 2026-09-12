@@ -74,3 +74,9 @@ pub mod recovery;
 
 #[path = "ownership_fields_raw_audit.rs"]
 pub mod raw_audit;
+
+#[path = "ownership_fields_export.rs"]
+pub mod export;
+
+#[path = "ownership_fields_adapter.rs"]
+pub mod adapter;

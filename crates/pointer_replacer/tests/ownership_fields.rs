@@ -1383,3 +1383,6 @@ mod raw_audit_cases;
 
 #[path = "ownership_fields_cases/bst_fold.rs"]
 mod bst_fold_cases;
+
+#[path = "ownership_fields_cases/export_adapter.rs"]
+mod export_adapter_cases;
