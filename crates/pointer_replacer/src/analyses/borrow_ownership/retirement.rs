@@ -28,6 +28,7 @@ use crate::{
 
 pub(crate) mod call_reach;
 pub(crate) mod field_objects;
+pub(crate) mod inner_loan;
 pub(crate) mod local_outcome;
 #[cfg(test)]
 mod local_outcome_tests;
@@ -1104,6 +1105,9 @@ mod tests_call_reach;
 
 #[cfg(test)]
 mod tests_field_objects;
+
+#[cfg(test)]
+mod tests_inner_loans;
 
 #[cfg(test)]
 mod tests_loans;
