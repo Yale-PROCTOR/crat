@@ -463,6 +463,65 @@ fn raw_boundary_publish_custody_sidecars(
 
 /// Reaggregation is parser-only replay of sealed worker bytes. It never enters
 /// the compiler worker or resolves source paths in the current checkout.
+/// **The subject tally, with the one law R336-7 fixes stated in the types.**
+///
+/// Four arms **partition** the safe-family population — a subject whose family
+/// is `ref`, `slice`, `optional` or `box` lands in exactly one of them, and
+/// `data` reconciles that population and no other.
+///
+/// `typed_excluded` is **not one of those arms.** A typed exclusion is carried
+/// by `family = unmodeled`, so counting it inside the family gate made it dead:
+/// it reported 0 on every program while the ledger held 839 such rows over the
+/// 19 accepted models. It ranges over **every** ledger row instead, which is
+/// why the five numbers do not sum to the safe-family total and were never
+/// meant to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RawBoundarySubjectTally {
+    realized: usize,
+    degraded: usize,
+    reverted_function: usize,
+    reverted_program: usize,
+    /// Over every family, not only the safe ones.
+    typed_excluded: usize,
+    /// The denominator the four arms partition.
+    safe_family_rows: usize,
+}
+
+impl RawBoundarySubjectTally {
+    fn observe(&mut self, family: &str, delivery: RawBoundarySubjectDelivery) {
+        if matches!(family, "ref" | "slice" | "optional" | "box") {
+            self.safe_family_rows += 1;
+            match delivery {
+                RawBoundarySubjectDelivery::Realized => self.realized += 1,
+                RawBoundarySubjectDelivery::Degraded => self.degraded += 1,
+                RawBoundarySubjectDelivery::Reverted(RawBoundaryRevertScope::Function) => {
+                    self.reverted_function += 1
+                }
+                RawBoundarySubjectDelivery::Reverted(RawBoundaryRevertScope::Program) => {
+                    self.reverted_program += 1
+                }
+                // Counted below, over every family.
+                RawBoundarySubjectDelivery::TypedExcluded => {}
+            }
+        }
+        if delivery == RawBoundarySubjectDelivery::TypedExcluded {
+            self.typed_excluded += 1;
+        }
+    }
+
+    /// The four arms partition the safe-family rows.
+    ///
+    /// Deliberately **not** asserted in the census: a safe-family typed
+    /// exclusion would leave the partition one short, and that is a shape to
+    /// report, not a reason to abort a twenty-program run. N06 checks it by
+    /// differencing the reported numbers, which is why they are all on the row.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn partition_holds(self) -> bool {
+        self.realized + self.degraded + self.reverted_function + self.reverted_program
+            == self.safe_family_rows
+    }
+}
+
 fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Path) -> report::Row {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -11107,6 +11166,74 @@ mod run {
         .map_err(|error| format!("configured exposure input for {program}: {error:?}"))
     }
 
+    /// **R336-7 — `typed_excluded_subjects` counts every ledger row, and the
+    /// four arms still partition the safe-family population.**
+    ///
+    /// The fixture carries one `unmodeled` typed-excluded subject, which is the
+    /// shape that made the counter dead: it sits outside the family gate, so a
+    /// counter placed inside that gate can never see it. Before this fix the
+    /// ledger held 839 such rows over the 19 accepted models and the counter
+    /// reported 0 on every program.
+    #[test]
+    fn r336_7_typed_excluded_counts_every_family_and_the_partition_is_unchanged() {
+        use super::{
+            RawBoundaryRevertScope as Scope, RawBoundarySubjectDelivery as D,
+            RawBoundarySubjectTally as Tally,
+        };
+        let mut tally = Tally::default();
+        // The safe-family population: one row per arm.
+        tally.observe("ref", D::Realized);
+        tally.observe("slice", D::Degraded);
+        tally.observe("optional", D::Reverted(Scope::Function));
+        tally.observe("box", D::Reverted(Scope::Program));
+        // The row the gate used to hide: typed-excluded, family `unmodeled`.
+        tally.observe("unmodeled", D::TypedExcluded);
+        // …and a `raw` row, which is in no family arm and is not excluded.
+        tally.observe("raw", D::Degraded);
+
+        // The counter sees the unmodeled row. This is the assertion that fails
+        // against the pre-fix instrument.
+        assert_eq!(tally.typed_excluded, 1, "{tally:?}");
+
+        // The partition is unchanged: four arms over the safe-family rows.
+        assert_eq!(tally.safe_family_rows, 4, "{tally:?}");
+        assert_eq!(
+            tally.realized + tally.degraded + tally.reverted_function + tally.reverted_program,
+            tally.safe_family_rows,
+            "{tally:?}"
+        );
+        assert!(tally.partition_holds(), "{tally:?}");
+        assert_eq!(
+            (tally.realized, tally.degraded, tally.reverted_function, tally.reverted_program),
+            (1, 1, 1, 1),
+            "{tally:?}"
+        );
+
+        // And typed-excluded is NOT an arm of that partition: adding it would
+        // overshoot the denominator, which is why it is documented separately.
+        assert_ne!(
+            tally.realized
+                + tally.degraded
+                + tally.reverted_function
+                + tally.reverted_program
+                + tally.typed_excluded,
+            tally.safe_family_rows,
+            "typed_excluded must not be summed into the safe-family partition"
+        );
+
+        // A typed exclusion inside a safe family is still counted once, and
+        // still contributes no arm.
+        let mut safe_excluded = Tally::default();
+        safe_excluded.observe("ref", D::TypedExcluded);
+        assert_eq!(safe_excluded.typed_excluded, 1, "{safe_excluded:?}");
+        assert_eq!(safe_excluded.safe_family_rows, 1, "{safe_excluded:?}");
+        assert!(
+            !safe_excluded.partition_holds(),
+            "a safe-family typed exclusion leaves the partition short by one, \
+             which is the honest reading and not a miscount: {safe_excluded:?}"
+        );
+    }
+
     #[test]
     fn raw_boundary_exposure_input_parses_explicit_empty_without_internal_inference() {
         let input = parse_raw_boundary_exposure_input(
@@ -11643,11 +11770,7 @@ mod run {
         let mut subject_outcomes = String::from(
             "subject_key\towner_fn\tfamily\tplaced\texclusion\tdelivery\trevert_scope\n",
         );
-        let mut realized_subjects = 0usize;
-        let mut degraded_subjects = 0usize;
-        let mut reverted_function_subjects = 0usize;
-        let mut reverted_program_subjects = 0usize;
-        let mut typed_excluded_subjects = 0usize;
+        let mut tally = super::RawBoundarySubjectTally::default();
         let mut delivered_by_ledger = BTreeSet::new();
         for subject in named_tsv_rows(&capture.subject_receipt) {
             let subject_key = subject.get("subject_key").map_or("-", String::as_str);
@@ -11665,21 +11788,10 @@ mod run {
             if delivery == super::RawBoundarySubjectDelivery::Realized {
                 delivered_by_ledger.insert(subject_key.to_owned());
             }
-            if matches!(family, "ref" | "slice" | "optional" | "box") {
-                match delivery {
-                    super::RawBoundarySubjectDelivery::Realized => realized_subjects += 1,
-                    super::RawBoundarySubjectDelivery::Degraded => degraded_subjects += 1,
-                    super::RawBoundarySubjectDelivery::Reverted(
-                        super::RawBoundaryRevertScope::Function,
-                    ) => reverted_function_subjects += 1,
-                    super::RawBoundarySubjectDelivery::Reverted(
-                        super::RawBoundaryRevertScope::Program,
-                    ) => reverted_program_subjects += 1,
-                    super::RawBoundarySubjectDelivery::TypedExcluded => {
-                        typed_excluded_subjects += 1
-                    }
-                }
-            }
+            // The safe-family partition and the wider typed-exclusion count;
+            // both laws live in `RawBoundarySubjectTally`, which is what the
+            // unit test exercises.
+            tally.observe(family, delivery);
             subject_outcomes.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 subject_key,
@@ -11696,17 +11808,17 @@ mod run {
             stamp(&subject_outcomes),
         )
         .expect("write raw-boundary subject outcomes");
-        row.set(raw_schema::REALIZED_SUBJECTS, realized_subjects);
-        row.set(raw_schema::DEGRADED_SUBJECTS, degraded_subjects);
+        row.set(raw_schema::REALIZED_SUBJECTS, tally.realized);
+        row.set(raw_schema::DEGRADED_SUBJECTS, tally.degraded);
         row.set(
             raw_schema::REVERTED_FUNCTION_SUBJECTS,
-            reverted_function_subjects,
+            tally.reverted_function,
         );
         row.set(
             raw_schema::REVERTED_PROGRAM_SUBJECTS,
-            reverted_program_subjects,
+            tally.reverted_program,
         );
-        row.set(raw_schema::TYPED_EXCLUDED_SUBJECTS, typed_excluded_subjects);
+        row.set(raw_schema::TYPED_EXCLUDED_SUBJECTS, tally.typed_excluded);
 
         let custody_sources = capture.emitted_files.as_ref().map(|files| {
             files
