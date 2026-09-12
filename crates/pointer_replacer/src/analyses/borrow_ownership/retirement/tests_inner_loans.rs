@@ -200,3 +200,97 @@ pub unsafe fn caller(base: *mut u8) {
         );
     });
 }
+
+/// The same frame three ways: a holder whose last use precedes the free, one used
+/// after it, and one kept alive only through a raw copy.
+const LIVENESS: &str = r#"
+unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
+unsafe fn opaque(slot: *mut u8) -> *mut u8 { slot }
+pub unsafe fn dead(base: *mut u8, other: *mut u8) {
+    let holder: *mut u8 = base;
+    let _early = opaque(holder);
+    free(other as *mut core::ffi::c_void);
+}
+pub unsafe fn live(base: *mut u8, other: *mut u8) -> *mut u8 {
+    let holder: *mut u8 = base;
+    free(other as *mut core::ffi::c_void);
+    opaque(holder)
+}
+pub unsafe fn through_raw_copy(base: *mut u8, other: *mut u8) -> *mut u8 {
+    let holder: *mut u8 = base;
+    let carried: *mut u8 = holder;
+    free(other as *mut core::ffi::c_void);
+    opaque(carried)
+}
+"#;
+
+/// The location of the `free` call terminator in one function.
+fn free_call(body: &rustc_middle::mir::Body<'_>) -> rustc_middle::mir::Location {
+    let rows: Vec<_> = body
+        .basic_blocks
+        .iter_enumerated()
+        .filter(|(_, data)| {
+            matches!(&data.terminator().kind,
+                rustc_middle::mir::TerminatorKind::Call { func, .. }
+                    if format!("{func:?}").contains("free"))
+        })
+        .map(|(block, data)| rustc_middle::mir::Location {
+            block,
+            statement_index: data.statements.len(),
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "one exact free call");
+    rows[0]
+}
+
+fn liveness_after_free(code: &str, function: &str, holder: &str) -> bool {
+    let mut answer = None;
+    with_program(code, |program| {
+        let wanted = named_function(program, function);
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(wanted)
+            .borrow();
+        let local = named_local(&body, holder);
+        let liveness = inner_loan::ClosureLiveness::of_body(&body, local);
+        answer = Some(liveness.live_after(&body, free_call(&body)));
+    });
+    answer.expect("the fixture compiled")
+}
+
+#[test]
+fn c_w01_a_holder_whose_last_use_precedes_the_free_is_not_live_after_it() {
+    assert!(!liveness_after_free(LIVENESS, "dead", "holder"));
+}
+
+#[test]
+fn c_w02_a_holder_used_after_the_free_is_live_after_it() {
+    assert!(liveness_after_free(LIVENESS, "live", "holder"));
+}
+
+#[test]
+fn c_w03_a_holder_kept_alive_only_through_a_raw_copy_is_live() {
+    assert!(
+        liveness_after_free(LIVENESS, "through_raw_copy", "holder"),
+        "a closure member's use is the holder's use; this is the case the \
+         retirement comment names"
+    );
+}
+
+#[test]
+fn c_w03_the_closure_is_what_carries_it() {
+    with_program(LIVENESS, |program| {
+        let wanted = named_function(program, "through_raw_copy");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(wanted)
+            .borrow();
+        let holder = named_local(&body, "holder");
+        let carried = named_local(&body, "carried");
+        let liveness = inner_loan::ClosureLiveness::of_body(&body, holder);
+        assert!(
+            liveness.members().contains(&carried),
+            "the raw copy is a closure member, or C-W03 would pass for the wrong reason"
+        );
+    });
+}

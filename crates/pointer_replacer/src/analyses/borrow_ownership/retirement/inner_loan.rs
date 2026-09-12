@@ -19,9 +19,10 @@
 //! R342-4, and a holder without an obligation keeps today's demotion.
 
 use rustc_hash::FxHashSet;
+use rustc_index::IndexVec;
 use rustc_middle::mir::{
-    Body, Local, Location, Operand, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind,
-    TerminatorKind,
+    BasicBlock, Body, Local, Location, Operand, ProjectionElem, RETURN_PLACE, Rvalue,
+    StatementKind, TerminatorKind,
 };
 use rustc_span::def_id::LocalDefId;
 
@@ -198,6 +199,149 @@ fn read_locals(value: &Rvalue<'_>, into: &mut FxHashSet<Local>) {
         }
         _ => {}
     }
+}
+
+/// R343-1: is this holder's loan still demanded after a point?
+///
+/// The fact `protected_entry` does not need and this module does. An entry
+/// obligation is live at every event in its frame by construction; an inner
+/// holder is not, and that difference is the entire recovery.
+///
+/// Liveness is taken over the holder's COPY CLOSURE, not over its own local. The
+/// comment this build exists to answer says why: "a deeper non-entry Ref can keep
+/// an inner target live through Raw copies, even after its source local's last
+/// use". A closure member's use is the holder's use.
+///
+/// It is a MAY-live: a reassignment of a member does not kill the closure. That
+/// is the safe direction -- over-approximating liveness over-approximates "still
+/// demanded", which keeps today's demotion -- and it is stated rather than
+/// hidden, because it costs recall wherever a holder is rebound before the event.
+#[derive(Clone, Debug)]
+pub(crate) struct ClosureLiveness {
+    members: FxHashSet<Local>,
+    /// Some member is used at or after this block's entry, on some path.
+    live_in: IndexVec<BasicBlock, bool>,
+}
+
+impl ClosureLiveness {
+    pub(crate) fn of_body(body: &Body<'_>, local: Local) -> Self {
+        let members = closure_of(body, local);
+        let mut live_in: IndexVec<BasicBlock, bool> =
+            IndexVec::from_elem_n(false, body.basic_blocks.len());
+        let mut moved = true;
+        while moved {
+            moved = false;
+            for (block, data) in body.basic_blocks.iter_enumerated() {
+                let here = block_uses(data, &members)
+                    || data
+                        .terminator()
+                        .successors()
+                        .any(|successor| live_in[successor]);
+                if here && !live_in[block] {
+                    live_in[block] = true;
+                    moved = true;
+                }
+            }
+        }
+        Self { members, live_in }
+    }
+
+    /// Every local this holder's value can be in.
+    pub(crate) fn members(&self) -> &FxHashSet<Local> {
+        &self.members
+    }
+
+    /// Is the loan still demanded strictly AFTER this location?
+    ///
+    /// At a terminator -- which is what a `free` call is -- "after" is the
+    /// successors, because the terminator's own operands are the event itself and
+    /// not a later use. R321-1's lesson is taken here: the union over successors
+    /// answers "somewhere later", and a caller that needs one edge asks for it.
+    pub(crate) fn live_after(&self, body: &Body<'_>, location: Location) -> bool {
+        let data = &body.basic_blocks[location.block];
+        let rest = data
+            .statements
+            .iter()
+            .skip(location.statement_index + 1)
+            .any(|statement| statement_uses(statement, &self.members));
+        let terminator = location.statement_index < data.statements.len()
+            && terminator_uses(data.terminator(), &self.members);
+        rest || terminator
+            || data
+                .terminator()
+                .successors()
+                .any(|successor| self.live_in[successor])
+    }
+
+    /// Is it demanded on THIS edge only? An event on a cleanup path is discharged
+    /// by the cleanup successor's liveness, never by the normal path's.
+    pub(crate) fn live_on(&self, block: BasicBlock) -> bool {
+        self.live_in[block]
+    }
+}
+
+/// Every local the holder's value can reach through the frame's copy edges.
+fn closure_of(body: &Body<'_>, local: Local) -> FxHashSet<Local> {
+    let edges = copy_edges(body);
+    let mut members = FxHashSet::default();
+    members.insert(local);
+    let mut moved = true;
+    while moved {
+        moved = false;
+        for &(source, destination) in &edges {
+            if members.contains(&source) && members.insert(destination) {
+                moved = true;
+            }
+        }
+    }
+    members
+}
+
+fn block_uses(data: &rustc_middle::mir::BasicBlockData<'_>, members: &FxHashSet<Local>) -> bool {
+    data.statements
+        .iter()
+        .any(|statement| statement_uses(statement, members))
+        || terminator_uses(data.terminator(), members)
+}
+
+fn statement_uses(
+    statement: &rustc_middle::mir::Statement<'_>,
+    members: &FxHashSet<Local>,
+) -> bool {
+    let StatementKind::Assign(box (destination, value)) = &statement.kind else {
+        return false;
+    };
+    let mut read = FxHashSet::default();
+    read_locals(value, &mut read);
+    // A write THROUGH a member is a use of the member; a write INTO it is not.
+    read.iter().any(|local| members.contains(local))
+        || (destination.as_local().is_none() && members.contains(&destination.local))
+}
+
+fn terminator_uses(
+    terminator: &rustc_middle::mir::Terminator<'_>,
+    members: &FxHashSet<Local>,
+) -> bool {
+    let mut operands: Vec<&Operand<'_>> = Vec::new();
+    let mut places: Vec<Local> = Vec::new();
+    match &terminator.kind {
+        TerminatorKind::Call { func, args, .. } | TerminatorKind::TailCall { func, args, .. } => {
+            operands.push(func);
+            operands.extend(args.iter().map(|argument| &argument.node));
+        }
+        TerminatorKind::SwitchInt { discr, .. } => operands.push(discr),
+        TerminatorKind::Assert { cond, .. } => operands.push(cond),
+        TerminatorKind::Drop { place, .. } => places.push(place.local),
+        TerminatorKind::Yield { value, .. } => operands.push(value),
+        _ => {}
+    }
+    places.extend(
+        operands
+            .into_iter()
+            .filter_map(|operand| operand.place())
+            .map(|place| place.local),
+    );
+    places.into_iter().any(|local| members.contains(&local))
 }
 
 /// The obligations of one program: one per non-parameter Ref local at depth >= 1.
