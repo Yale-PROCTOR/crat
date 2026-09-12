@@ -23328,10 +23328,15 @@ fn raw_boundary_wave2_corpus_census() {
     });
     let waiver_sha256 = format!("{:x}", Sha256::digest(&waiver_bytes));
     let waiver_text = String::from_utf8(waiver_bytes).expect("regression waiver must be UTF-8");
-    let mut waiver_rows = BTreeMap::<(String, String), String>::new();
+    // The waiver is keyed by COMPARATOR as well as identity: one env var feeds
+    // two comparators, and a list written for one of them must not silently
+    // answer for the other. Phase O's first attempt read the era-4 list for the
+    // gate and reported 129 `unwaived:unlisted` for that reason alone.
+    let mut waiver_rows = BTreeMap::<(String, String, String), String>::new();
     for row in named_tsv_rows(&waiver_text) {
         waiver_rows.insert(
             (
+                row.get("comparator").cloned().unwrap_or_default(),
                 row.get("program").cloned().unwrap_or_default(),
                 row.get("subject_key").cloned().unwrap_or_default(),
             ),
@@ -23461,13 +23466,17 @@ fn raw_boundary_wave2_corpus_census() {
             // unlisted or differently-classed identity and the decline stands.
             let mut waived = true;
             for identity in lost_by_program.get(program.name).into_iter().flatten() {
-                let key = (program.name.to_owned(), identity.clone());
+                let key = (
+                    "era4-j-double-prime".to_owned(),
+                    program.name.to_owned(),
+                    identity.clone(),
+                );
                 let listed = waiver_rows.get(&key).map(String::as_str);
-                let observed = hold_causes
-                    .get(&key)
-                    .and_then(|(family, reason, exclusion)| {
+                let observed = hold_causes.get(&(key.1.clone(), key.2.clone())).and_then(
+                    |(family, reason, exclusion)| {
                         raw_boundary_libc_hold_class(family, reason, exclusion)
-                    });
+                    },
+                );
                 let verdict = match (listed, observed) {
                     (Some(listed), Some(observed))
                         if listed == observed
@@ -23548,13 +23557,17 @@ fn raw_boundary_wave2_corpus_census() {
         }
         let mut waived = true;
         for identity in gate.difference(&now) {
-            let key = (program.name.to_owned(), identity.clone());
+            let key = (
+                "gate-27bb3b3a".to_owned(),
+                program.name.to_owned(),
+                identity.clone(),
+            );
             let listed = waiver_rows.get(&key).map(String::as_str);
-            let observed = hold_causes
-                .get(&key)
-                .and_then(|(family, reason, exclusion)| {
+            let observed = hold_causes.get(&(key.1.clone(), key.2.clone())).and_then(
+                |(family, reason, exclusion)| {
                     raw_boundary_libc_hold_class(family, reason, exclusion)
-                });
+                },
+            );
             let verdict = match (listed, observed) {
                 (Some(listed), Some(observed))
                     if listed == observed
