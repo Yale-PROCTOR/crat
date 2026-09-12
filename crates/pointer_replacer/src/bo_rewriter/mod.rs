@@ -10138,8 +10138,30 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
 /// trigger a second analysis or solve.
 fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
     let sm = tcx.sess.source_map();
+    // R346-1. The adapter receipt carries the callee parameter's SUBJECT KEY,
+    // so a consumer joins on an identity rather than re-deriving one from
+    // `owner_fn` + `param_index`. A parameter's MIR local is its zero-based
+    // index plus one; anything that does not resolve stays "-" rather than
+    // guessing.
+    let parameter_subject_keys = table
+        .entries
+        .iter()
+        .map(|(subject, _)| {
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            (
+                (owner.clone(), subject.local.as_u32()),
+                subject.identity_key(&owner),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let subject_key_for = |owner: &str, param_index: usize| -> String {
+        parameter_subject_keys
+            .get(&(owner.to_owned(), param_index as u32 + 1))
+            .cloned()
+            .unwrap_or_else(|| "-".to_owned())
+    };
     let mut out = String::from(
-        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\toverlap_verdict\toverlap_reason\tresolved_call_location\ta5_peer_proofs\toverlap_a5_world\toverlap_a5_abi_guard\tlifetime_plan_digest\n",
+        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\toverlap_verdict\toverlap_reason\tresolved_call_location\ta5_peer_proofs\toverlap_a5_world\toverlap_a5_abi_guard\tlifetime_plan_digest\tparameter_subject_key\n",
     );
     for edit in &table.seams.edits {
         let family = match edit.family {
@@ -10195,6 +10217,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             &mut out,
             edit.overlap.as_ref(),
             edit.lifetime_plan_digest.as_deref().unwrap_or("-"),
+            &subject_key_for(&edit.owner_fn, edit.param_index),
         );
     }
     // **`owner_fn` is the REVERT KEY on every row kind** (2026-08-12). It was
@@ -10239,7 +10262,12 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             blocked.root_identity,
             u8::from(blocked.blind),
         ));
-        push_overlap_columns(&mut out, blocked.overlap.as_ref(), "-");
+        push_overlap_columns(
+            &mut out,
+            blocked.overlap.as_ref(),
+            "-",
+            &subject_key_for(&callee, blocked.index),
+        );
     }
     for edit in &table.seams.body_edits {
         let family = match edit.family {
@@ -10268,7 +10296,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             edit.root_identity,
             u8::from(edit.blind),
         ));
-        push_overlap_columns(&mut out, None, "-");
+        push_overlap_columns(&mut out, None, "-", "-");
     }
     for blocked in &table.seams.body_blocked {
         let site = sm.span_to_diagnostic_string(blocked.span);
@@ -10290,7 +10318,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             blocked.root_identity,
             u8::from(blocked.blind),
         ));
-        push_overlap_columns(&mut out, None, "-");
+        push_overlap_columns(&mut out, None, "-", "-");
     }
     // Item 4a: companion-length coverage, one row per LENGTH-GATED POSITION.
     for (callee, index, evidence) in &table.seams.length_evidence {
@@ -10298,7 +10326,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             "lengated\t{callee}\t{}\t#{index}\t-\t-\t-\t{index}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-",
             evidence.key()
         ));
-        push_overlap_columns(&mut out, None, "-");
+        push_overlap_columns(&mut out, None, "-", "-");
     }
     // Rule 1 (2026-08-11): a pair that fired with no census row is REPORTED.
     // The census is a prioritization overlay and has already been shown
@@ -10307,7 +10335,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
         out.push_str(&format!(
             "uncensused\t-\t{found:?} -> {expected:?}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-"
         ));
-        push_overlap_columns(&mut out, None, "-");
+        push_overlap_columns(&mut out, None, "-", "-");
     }
     for proof in &table.seams.overlap_proofs {
         let caller = tcx.def_path_str(proof.caller.to_def_id());
@@ -10326,7 +10354,12 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             proof.index,
             fallback_template,
         ));
-        push_overlap_columns(&mut out, Some(proof), "-");
+        push_overlap_columns(
+            &mut out,
+            Some(proof),
+            "-",
+            &subject_key_for(&callee, proof.index),
+        );
     }
     out
 }
@@ -10335,10 +10368,11 @@ fn push_overlap_columns(
     output: &mut String,
     proof: Option<&decision::seam::A5PositionProof>,
     lifetime_plan_digest: &str,
+    parameter_subject_key: &str,
 ) {
     if let Some(proof) = proof {
         output.push_str(&format!(
-            "\t{}\t{}\t{}\t{}\t{}\t{}\t{lifetime_plan_digest}\n",
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{lifetime_plan_digest}\t{parameter_subject_key}\n",
             proof.verdict.key(),
             proof.reason,
             proof.locations,
@@ -10347,7 +10381,9 @@ fn push_overlap_columns(
             proof.guard,
         ));
     } else {
-        output.push_str(&format!("\t-\t-\t-\t-\t-\t-\t{lifetime_plan_digest}\n"));
+        output.push_str(&format!(
+            "\t-\t-\t-\t-\t-\t-\t{lifetime_plan_digest}\t{parameter_subject_key}\n"
+        ));
     }
 }
 
