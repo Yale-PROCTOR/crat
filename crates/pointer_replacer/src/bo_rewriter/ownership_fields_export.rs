@@ -57,6 +57,7 @@ pub struct SourceInstance {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvidenceOwner {
+    AcceptedModel,
     Era5b,
     FrameQualification,
     NativeIdentity,
@@ -85,6 +86,8 @@ pub enum MissingReason {
     Companion(FactFamily),
     DuplicateClose(SiteId),
     CloseReason(SiteId),
+    ModelNotOwning(Kind),
+    ModelInventory,
 }
 
 /// Bodies are addressed by both artifact digest and row, never by a display
