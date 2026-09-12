@@ -1392,3 +1392,6 @@ mod held_report_cases;
 
 #[path = "ownership_fields_cases/model_adapter.rs"]
 mod model_adapter_cases;
+
+#[path = "ownership_fields_cases/lend.rs"]
+mod lend_cases;

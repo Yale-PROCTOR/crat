@@ -86,3 +86,6 @@ pub mod held_report;
 
 #[path = "ownership_fields_model_adapter.rs"]
 pub mod model_adapter;
+
+#[path = "ownership_fields_lend.rs"]
+pub mod lend;
