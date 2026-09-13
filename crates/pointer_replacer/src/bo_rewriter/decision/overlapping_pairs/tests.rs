@@ -101,3 +101,117 @@ fn w5p_diagnostic_carries_native_forms_and_mutability() {
     })
     .expect("diagnostic fixture");
 }
+
+fn discovery(input: &str, admitted: usize) {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native discovery table");
+        let found = super::consumer::discover(
+            tcx,
+            &ctx.facts,
+            &ctx.hypothetical,
+            table.exposure.as_ref(),
+            &ctx.a5_site_proofs,
+            &ctx.lifetime_eligibility,
+            &ctx.mut_facts,
+        );
+        assert_eq!(found.calls.len(), admitted, "{found:#?}");
+    })
+    .expect("discovery fixture");
+}
+
+#[test]
+fn w5p_consumer_native_inventory() {
+    discovery(
+        r#"
+        pub unsafe fn read_pair(a: *mut i32, b: *const i32) -> bool { *a == *b }
+        pub unsafe fn caller(p: *mut i32) -> bool { let v = read_pair(&mut *p, &*p); *p = 7; v }
+    "#,
+        1,
+    );
+}
+
+#[test]
+fn w5p_consumer_one_uncovered_call_holds_subject() {
+    discovery(
+        r#"
+        pub unsafe fn read_pair(a: *mut i32, b: *const i32) -> bool { *a == *b }
+        pub unsafe fn caller(p: *mut i32) -> bool { let v = read_pair(&mut *p, &*p); *p = 7; v }
+        pub unsafe fn unadaptable(p: *mut i32) -> bool { read_pair(p.offset(0), p) }
+    "#,
+        0,
+    );
+}
+
+#[test]
+fn w5p_consumer_mutable_peer_holds_component() {
+    discovery(
+        r#"
+        pub unsafe fn read_pair(a: *mut i32, b: *const i32, writer: *mut i32) -> bool {
+            let first = *a; *writer = 7; first == *b
+        }
+        pub unsafe fn caller(p: *mut i32) -> bool { read_pair(&mut *p, &*p, p) }
+    "#,
+        0,
+    );
+}
+
+#[test]
+fn w5p_consumer_distinct_roots_need_backing_source_evidence() {
+    discovery(
+        r#"
+        pub unsafe fn read_pair(a: *mut i32, b: *const i32) -> bool { *a == *b }
+        pub unsafe fn caller(p: *mut i32, q: *mut i32) -> bool { let v = read_pair(&mut *p, &*q); *p = 7; v }
+    "#,
+        0,
+    );
+}
+
+#[test]
+fn w5p_consumer_transitive_writer_is_held() {
+    discovery(
+        r#"
+        static mut VALUE: i32 = 0;
+        unsafe fn write_global() { VALUE = 7; }
+        pub unsafe fn read_pair(a: *mut i32, b: *const i32) -> bool { write_global(); *a == *b }
+        pub unsafe fn caller(p: *mut i32) -> bool { let v = read_pair(&mut *p, &*p); *p = 7; v }
+    "#,
+        0,
+    );
+}
+
+#[test]
+fn w5p_consumer_method_caller_is_not_lost_from_inventory() {
+    discovery(
+        r#"
+        pub unsafe fn read_pair(a: *mut i32, b: *const i32) -> bool { *a == *b }
+        pub unsafe fn caller(p: *mut i32) -> bool { let v = read_pair(&mut *p, &*p); *p = 7; v }
+        pub struct Other;
+        impl Other { pub unsafe fn hidden(p: *mut i32) -> bool { read_pair(p, p) } }
+    "#,
+        0,
+    );
+}
+
+#[test]
+fn w5p_consumer_unknown_and_exceptional_calls_are_held() {
+    for code in [
+        r#"
+        unsafe extern "C" { fn external(); }
+        pub unsafe fn read_pair(a: *mut i32, b: *const i32) -> bool { external(); *a == *b }
+        pub unsafe fn caller(p: *mut i32) -> bool { let v = read_pair(&mut *p, &*p); *p = 7; v }
+    "#,
+        r#"
+        pub unsafe fn read_pair(a: *mut i32, b: *const i32) -> i32 { *a / *b }
+        pub unsafe fn caller(p: *mut i32) -> i32 { let v = read_pair(&mut *p, &*p); *p = 7; v }
+    "#,
+    ] {
+        discovery(code, 0);
+    }
+}

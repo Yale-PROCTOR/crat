@@ -490,6 +490,7 @@ pub(crate) struct PeerConflict {
 /// remains in `SeamPlan::overlap_proofs` so it cannot vanish from the control.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct A5PositionProof {
+    pub shared_permission: Option<super::overlapping_pairs::consumer::Permission>,
     pub proof_site_key: Option<A5ProofSiteKey>,
     pub caller: LocalDefId,
     pub callee: LocalDefId,
@@ -602,6 +603,7 @@ impl A5PositionProof {
         }
         Self {
             proof_site_key,
+            shared_permission: None,
             caller,
             callee,
             index,
@@ -1065,6 +1067,7 @@ pub(crate) struct RawBoundaryGlue {
 /// One adapter, described rather than rendered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GlueSpec {
+    pub shared_address: Option<super::overlapping_pairs::consumer::SharedAddress>,
     pub core: GlueCore,
     /// The EXPECTED side's mutability — selects `&`/`&mut` and
     /// `from_ref`/`from_mut`.
@@ -1107,6 +1110,7 @@ impl GlueSpec {
 
     pub(crate) fn core(core: GlueCore, mutable: bool) -> Self {
         Self {
+            shared_address: None,
             core,
             mutable,
             unwrap: None,
@@ -1168,6 +1172,7 @@ impl GlueSpec {
 
     pub(crate) fn literal_none(mutable: bool) -> Self {
         Self {
+            shared_address: None,
             core: GlueCore::Bare,
             mutable,
             unwrap: None,
@@ -1187,6 +1192,7 @@ impl GlueSpec {
         force_explicit: bool,
     ) -> Self {
         Self {
+            shared_address: None,
             core: GlueCore::Bare,
             mutable: target_mutability == super::raw_boundary::RawMutability::Mut,
             unwrap: None,
@@ -1261,6 +1267,9 @@ impl GlueSpec {
     }
 
     pub(crate) fn template_key(&self) -> &'static str {
+        if self.shared_address.is_some() {
+            return "shared-pair-address";
+        }
         if let Some(raw) = self.raw_boundary.as_ref() {
             return raw.template.key();
         }
@@ -1416,6 +1425,9 @@ impl GlueSpec {
         text: &str,
         enclosing_unsafe_fn: bool,
     ) -> Option<String> {
+        if let Some(address) = &self.shared_address {
+            return address.render(text);
+        }
         let unsafe_expr = |inner: String| {
             super::super::mechanical_receipt::present_unsafe_text(inner, enclosing_unsafe_fn)
         };
@@ -2933,6 +2945,7 @@ use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape
 /// reason is a yield number nobody can attribute.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
+    pub shared_required: Vec<super::overlapping_pairs::consumer::Permission>,
     pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
     pub(crate) outbound_expressions: super::outbound_expression::OutboundExpressionPlans,
     pub(crate) raw_receivers: super::raw_receiver::RawReceiverPlans,
@@ -3136,6 +3149,23 @@ impl Candidate {
             waiver_id: self.waiver_id,
         }
     }
+}
+
+fn shared_candidate(
+    address: &super::overlapping_pairs::consumer::SharedAddress,
+    text: &str,
+) -> Result<Option<Candidate>, SeamBlock> {
+    let mut spec = GlueSpec::core(GlueCore::Bare, false);
+    spec.shared_address = Some(address.clone());
+    let replacement = spec.render(text).ok_or(SeamBlock::UnnameableOperand)?;
+    Ok(Some(Candidate {
+        spec,
+        replacement,
+        family: SeamFamily::Safe,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3801,6 +3831,22 @@ pub(crate) fn synthesize_with_raw_boundary(
 ) -> SeamPlan {
     let sm = tcx.sess.source_map();
     let mut plan = SeamPlan::default();
+    let shared_pairs = super::overlapping_pairs::consumer::discover(
+        tcx,
+        facts,
+        table,
+        table.exposure.as_ref(),
+        a5_site_proofs,
+        lifetime_eligibility,
+        mut_facts,
+    );
+    plan.shared_required = shared_pairs
+        .calls
+        .values()
+        .map(|call| call.permission.clone())
+        .collect();
+    plan.shared_required
+        .sort_by_key(|permission| permission.receipt());
     plan.pair_sites = coconv.pair_sites().to_vec();
     let mut a5_raw_calls = BTreeMap::<(u32, u32, u32, u32), A5RawViewCall>::new();
 
@@ -4049,37 +4095,53 @@ pub(crate) fn synthesize_with_raw_boundary(
                 } else {
                     (None, None)
                 };
-                candidates.push(build_candidate(
-                    pos.expected,
-                    pos.found,
-                    text,
-                    &pos.source_type,
-                    pos.literal_null,
-                    len_text.as_deref(),
-                    len_evidence,
-                    enclosing_unsafe_fn,
-                    retention,
-                    *callee,
-                    pos.index,
-                    return_tied,
-                ));
+                candidates.push(
+                    if let Some(address) = shared_pairs
+                        .at(*callee, site)
+                        .and_then(|call| call.addresses.get(&pos.index))
+                    {
+                        shared_candidate(address, text)
+                    } else {
+                        build_candidate(
+                            pos.expected,
+                            pos.found,
+                            text,
+                            &pos.source_type,
+                            pos.literal_null,
+                            len_text.as_deref(),
+                            len_evidence,
+                            enclosing_unsafe_fn,
+                            retention,
+                            *callee,
+                            pos.index,
+                            return_tied,
+                        )
+                    },
+                );
                 let input = if pos.root.is_some() {
                     let input_found = a5_argument_expression_form(pos.source_shape, Form::Raw)
                         .unwrap_or(Form::Raw);
-                    build_candidate(
-                        pos.expected,
-                        input_found,
-                        text,
-                        &pos.source_type,
-                        pos.literal_null,
-                        len_text.as_deref(),
-                        len_evidence,
-                        enclosing_unsafe_fn,
-                        retention,
-                        *callee,
-                        pos.index,
-                        return_tied,
-                    )
+                    (if let Some(address) = shared_pairs
+                        .at(*callee, site)
+                        .and_then(|call| call.addresses.get(&pos.index))
+                    {
+                        shared_candidate(address, text)
+                    } else {
+                        build_candidate(
+                            pos.expected,
+                            input_found,
+                            text,
+                            &pos.source_type,
+                            pos.literal_null,
+                            len_text.as_deref(),
+                            len_evidence,
+                            enclosing_unsafe_fn,
+                            retention,
+                            *callee,
+                            pos.index,
+                            return_tied,
+                        )
+                    })
                     .map(|candidate| {
                         Some(candidate.map_or(
                             SeamInputRendering::ZeroSyntax { found: input_found },
@@ -4125,7 +4187,10 @@ pub(crate) fn synthesize_with_raw_boundary(
                     } else {
                         positions[j].expected
                     };
-                    if !is_mut(&left_form) && !is_mut(&right_form) {
+                    if !is_mut(&left_form)
+                        && !is_mut(&right_form)
+                        && shared_pairs.at(*callee, site).is_none()
+                    {
                         continue;
                     }
                     let same_root = !matches!(
@@ -4139,7 +4204,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                     // retain the established same-root/blind trigger exactly.
                     let boundary_observation = positions[i].raw_boundary_observation
                         && positions[j].raw_boundary_observation;
-                    if same_root || positions[i].blind || positions[j].blind || boundary_observation
+                    if same_root
+                        || positions[i].blind
+                        || positions[j].blind
+                        || boundary_observation
+                        || shared_pairs.at(*callee, site).is_some()
                     {
                         let (left_blind, right_blind) = if positions[i].index <= positions[j].index
                         {
@@ -4192,7 +4261,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                     ]
                 })
                 .collect::<Vec<_>>();
-            let a5_roles = super::co_conversion::resolve_pair_roles(&role_entries);
+            let mut a5_roles = super::co_conversion::resolve_pair_roles(&role_entries);
+            if shared_pairs.at(*callee, site).is_some() {
+                a5_roles.insert(0, super::co_conversion::PairRole::Primary);
+                a5_roles.insert(1, super::co_conversion::PairRole::Primary);
+            }
 
             // ---- pass 3: emit ----
             for (idx, pos) in positions.iter().enumerate() {
@@ -4229,6 +4302,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                         a5_site_proofs,
                     )
                 });
+                if let Some(call) = shared_pairs.at(*callee, site) {
+                    if let Some(proof) = &mut overlap {
+                        proof.shared_permission = Some(call.permission.clone());
+                    }
+                }
                 let pair_owned = coconv.pair_sites().iter().any(|pair| {
                     pair.caller == site.caller
                         && pair.callee == *callee

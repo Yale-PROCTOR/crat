@@ -84,6 +84,9 @@ mod ownership_fields_cp2_tests;
 #[cfg(test)]
 mod ownership_fields_native_tests;
 pub(crate) mod plan;
+mod shared_pair_ast;
+#[cfg(test)]
+mod shared_pair_tests;
 pub(crate) mod sibling_audit;
 pub(crate) mod sign_facts;
 pub(crate) mod use_census;
@@ -321,6 +324,8 @@ pub(crate) struct E2Timings {
 pub(crate) struct RawBoundaryArtifacts {
     /// R369 FIELD-CP observer, captured from the same frozen decision pass.
     pub(crate) ownership_native: String,
+    pub(crate) shared_permissions: Vec<decision::overlapping_pairs::consumer::Permission>,
+    pub(crate) shared_pair_receipts: String,
     #[cfg(test)]
     pub(crate) bridge_custody_export: bridge_custody_export::Export,
     pub(crate) pending_sibling_receipts: Vec<plan::sibling_overlap::PendingSite>,
@@ -1503,6 +1508,8 @@ fn refresh_raw_boundary_receipt_events_with_renders(
     // effective set, and this only decides which receipts that state produces.
     let effective_reverted = effective_withheld_classes(emission_plan, reverted, reverted_atoms);
     let reverted = &effective_reverted;
+    artifacts.shared_pair_receipts =
+        shared_pair_ast::terminal(&artifacts.shared_permissions, reverted, call_renders);
     assert_eq!(
         emission_plan.unowned_a5_proof_sites, 0,
         "unowned A5 proof-site receipt identities"
@@ -7357,6 +7364,8 @@ fn finish_decide<'tcx>(
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
+            shared_permissions: table.seams.shared_required.clone(),
+            shared_pair_receipts: String::new(),
             io_domain_budget_exhausted,
             void_pointee_held: void_pointee_subjects.len(),
             #[cfg(test)]

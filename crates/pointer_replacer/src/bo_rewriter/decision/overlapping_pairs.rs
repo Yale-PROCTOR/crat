@@ -5,6 +5,7 @@
     reason = "Native evidence checkpoint; admission awaits the shared-pair receipt carrier."
 )]
 
+pub(crate) mod consumer;
 mod observer;
 pub(crate) mod reader;
 pub(crate) use observer::publish;

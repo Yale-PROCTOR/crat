@@ -26,7 +26,12 @@ fn with_request(input: &str, check: impl FnOnce(TyCtxt<'_>, Request) + Send) {
             .iter()
             .find(|did| tcx.item_name(did.to_def_id()).as_str() == "reader")
             .unwrap();
-        for local in tcx.optimized_mir(reader).args_iter().take(2) {
+        for local in tcx
+            .mir_drops_elaborated_and_const_checked(reader)
+            .borrow()
+            .args_iter()
+            .take(2)
+        {
             assert!(!facts.is_defaulted(reader, local));
             assert!(
                 !facts.is_mutable(reader, local),
@@ -38,7 +43,7 @@ fn with_request(input: &str, check: impl FnOnce(TyCtxt<'_>, Request) + Send) {
             .iter()
             .find(|did| tcx.item_name(did.to_def_id()).as_str() == "entry")
             .unwrap();
-        let body = tcx.optimized_mir(caller);
+        let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
         let mut calls = body
             .basic_blocks
             .iter_enumerated()

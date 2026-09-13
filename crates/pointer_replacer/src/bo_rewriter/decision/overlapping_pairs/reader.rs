@@ -53,6 +53,12 @@ pub(crate) struct Certificate {
     functions: Vec<LocalDefId>,
 }
 
+impl Certificate {
+    pub(crate) fn matches(&self, request: &Request) -> bool {
+        &self.request == request
+    }
+}
+
 pub(crate) fn prove(tcx: TyCtxt<'_>, request: &Request) -> Result<Certificate, Hold> {
     if request.world != ATTESTED_WORLD || request.guard != ATTESTED_GUARD {
         return Err(Hold::UnattestedWorld);
@@ -68,7 +74,9 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, request: &Request) -> Result<Certificate, H
     {
         return Err(Hold::InvalidSite);
     }
-    let caller = tcx.optimized_mir(left.caller);
+    let caller = tcx
+        .mir_drops_elaborated_and_const_checked(left.caller)
+        .borrow();
     if left.location.block as usize >= caller.basic_blocks.len() {
         return Err(Hold::InvalidSite);
     }
@@ -126,7 +134,9 @@ fn check_function(
     if !active.insert(function) {
         return Err(Hold::RecursiveCall);
     }
-    let body = tcx.optimized_mir(function);
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(function)
+        .borrow();
     // Restrict result representation; this is not a retention certificate.
     // Aggregate and pointer returns need a separate lifetime producer. The
     // expression whitelist below also excludes encoded pointer provenance.

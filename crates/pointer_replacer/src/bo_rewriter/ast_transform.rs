@@ -1823,6 +1823,9 @@ impl<'a> SeamGraftVisitor<'a> {
     fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
         use super::decision::seam::{GlueCore, NullArm};
         let spec = &target.spec;
+        if let Some(address) = &spec.shared_address {
+            return super::shared_pair_ast::build(e, address);
+        }
         if let Some(raw) = spec.raw_boundary.as_ref() {
             let argument = if target.arg_span == e.span {
                 e.clone()
@@ -4002,6 +4005,7 @@ pub(crate) fn ast_emitted_files_from(
 > {
     let (decls, _, seams, _, _, _, _, krate, edited) =
         transform_with(tcx, capture, table, reverts, terminal_call_plans)?;
+    super::shared_pair_ast::validate(&krate, table, reverts, &capture.map.global_map)?;
     let expected_aliases = table
         .entries
         .iter()
@@ -4032,18 +4036,24 @@ pub(crate) fn ast_emitted_files_from(
             text.push('\n');
         }
     }
-    let pending_call_renders = rendered_calls(
-        &krate,
-        &table
-            .sibling_overlap_inventory
-            .coverage
-            .iter()
-            .map(|coverage| {
-                let span = coverage.potential.call_span;
-                (span.lo().0, span.hi().0)
-            })
-            .collect(),
-    );
+    let pending_call_renders =
+        rendered_calls(
+            &krate,
+            &table
+                .sibling_overlap_inventory
+                .coverage
+                .iter()
+                .map(|coverage| {
+                    let span = coverage.potential.call_span;
+                    (span.lo().0, span.hi().0)
+                })
+                .chain(
+                    table.seams.shared_required.iter().map(|permission| {
+                        (permission.call_span.lo().0, permission.call_span.hi().0)
+                    }),
+                )
+                .collect(),
+        );
     Ok((files, stats, maps, pending_call_renders))
 }
 

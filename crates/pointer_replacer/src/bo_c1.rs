@@ -11859,6 +11859,13 @@ mod run {
             )
             .unwrap_or_else(|error| panic!("write raw-boundary {suffix}: {error}"));
         }
+        if !artifact.shared_pair_receipts.is_empty() {
+            std::fs::write(
+                directory.join(format!("{name}.shared-pair-permissions.tsv")),
+                stamp(&artifact.shared_pair_receipts),
+            )
+            .expect("write shared-pair terminal receipts");
+        }
         std::fs::write(
             directory.join(format!(
                 "{name}.{}",
