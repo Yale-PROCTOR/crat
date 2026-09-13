@@ -42,6 +42,7 @@ pub(crate) mod io_domain;
 pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
+pub(crate) mod local_callee_extent;
 pub(crate) mod option;
 pub(crate) mod outbound_expression;
 pub(crate) mod raw_boundary;
@@ -540,6 +541,17 @@ pub(crate) enum DegradeReason {
     /// than one — read to a NUL, to a stated count, or to a source-determined
     /// length. The extent column of the pinned contract table decides.
     ThinExtent,
+    /// R364-2 / R365-1. A thin reference carries provenance for one element,
+    /// and this subject is handed to a LOCAL callee parameter whose body
+    /// accesses past one — a `c_void` pointee cast away to a real width, or
+    /// pointer arithmetic. Sibling of [`ThinExtent`](Self::ThinExtent), which
+    /// decides the same question at FOREIGN positions from the contract table.
+    ///
+    /// Named for the ACCESS, not for a read: six of the twenty corpus sites are
+    /// eight-byte writes through a one-byte `&mut uint8_t`.
+    LocalCalleeAccessExtent {
+        access: Box<local_callee_extent::LocalCalleeAccess>,
+    },
     /// R271-1. The slot's pointee is `c_void`, a one-byte type carrying no
     /// extent, so no reference form of it can carry the provenance its callee
     /// accesses through. Held at any depth.
@@ -777,6 +789,7 @@ impl DegradeReason {
             DegradeReason::IoDomainType => "held:io-domain:type",
             DegradeReason::VoidPointee => "held:void-pointee",
             DegradeReason::ThinExtent => "held:thin-extent",
+            DegradeReason::LocalCalleeAccessExtent { .. } => "held:local-callee-access-extent",
             DegradeReason::NoSlot => "no-slot",
             DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
             DegradeReason::ReturnNotAdapted => "return-not-adapted",
@@ -812,6 +825,7 @@ impl DegradeReason {
             DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
             DegradeReason::BoxFailure { failure } => failure.detail(),
             DegradeReason::SignatureClassHeld { reason } => reason.clone(),
+            DegradeReason::LocalCalleeAccessExtent { access } => access.detail(),
             _ => "-".to_owned(),
         }
     }
@@ -1016,6 +1030,8 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    pub(crate) local_callee_extent:
+        &'a FxHashMap<(LocalDefId, rustc_hir::HirId), local_callee_extent::LocalCalleeAccess>,
     pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
     pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
     pub(crate) input_interfaces: &'a interface::InputInterfaces,
@@ -1542,6 +1558,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         io_domain,
         void_pointee,
         thin_extent,
+        local_callee_extent,
         declaration_pointees,
         declaration_patterns,
         input_interfaces: _,
@@ -1870,6 +1887,31 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // pre-registered count a count.
         if depth2_npo.is_none() && thin_extent.contains(&(subject.fn_did, subject.hir_id)) {
             return degrade(subject, decl_site, DegradeReason::ThinExtent);
+        }
+        // **R364-2 / R365-1 — the same rule at a LOCAL callee.** The sibling
+        // above reads a pinned FOREIGN contract; this one reads the callee's
+        // own body, because a local callee has no contract row and its
+        // parameter's access is visible instead.
+        //
+        // **Placed beside its sibling, and the alternative was measured.** A
+        // hold that only ever converts a would-be emission is the better shape
+        // in general, so this one was first written at the last point before
+        // `Decision::Ref`. That is WRONG here, for the reason the note above
+        // records: the hold changes the HYPOTHETICAL, so co-conversion drops
+        // the subject from its node set either way, and placed last the refusal
+        // arrives as the UNTYPED `call-site-not-adapted` instead. Measured on
+        // the suite — the same expectations move under both placements, and
+        // only this one reports them typed.
+        if depth2_npo.is_none()
+            && let Some(access) = local_callee_extent.get(&(subject.fn_did, subject.hir_id))
+        {
+            return degrade(
+                subject,
+                decl_site,
+                DegradeReason::LocalCalleeAccessExtent {
+                    access: Box::new(access.clone()),
+                },
+            );
         }
         // **S3.6-1 step 3 — THE CLASS GATE, and it consults `admits`.**
         //

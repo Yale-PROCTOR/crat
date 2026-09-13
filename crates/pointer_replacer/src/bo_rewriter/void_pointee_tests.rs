@@ -116,10 +116,24 @@ fn void_pointee_write_parameter_is_not_delivered_as_a_reference() {
     );
 }
 
-/// The delivery this repair BUYS: the caller end stops being blocked by the
-/// cast pair and delivers through the ordinary bridge.
+/// The caller end of the edge the census found 519 of.
+///
+/// **Expectation migrated under R217-2(a) for R364-2 (seat addendum 364).**
+/// R271-1 reasoned that with the callee's parameter no longer converting, the
+/// caller "takes the ordinary raw-boundary bridge, whose pointer carries the
+/// caller subject's own full extent". That is exactly right and it is exactly
+/// the hole: here the caller's subject is ITSELF thin, so its own full extent
+/// is one byte, while `read64` casts to `*const u64` and reads eight. The
+/// caller end is therefore held too, by `held:local-callee-access-extent` —
+/// the sibling of `held:thin-extent` that reads a LOCAL callee's body where
+/// the other reads a pinned foreign contract.
+///
+/// The measured note this test used to carry — that the caller left the cast
+/// pair but did not deliver, because the raw-boundary bridge opens `bare-local`
+/// and `addr-of` and this one is a `cast-of-local` — is now moot for this
+/// fixture and is preserved in the R271-3 delta record.
 #[test]
-fn void_pointee_caller_end_delivers_through_the_ordinary_bridge() {
+fn void_pointee_caller_end_is_held_for_its_own_extent() {
     let got = reasons(CALLER_END_INPUT);
     assert_eq!(
         got.get("p").map(String::as_str),
@@ -128,16 +142,14 @@ fn void_pointee_caller_end_delivers_through_the_ordinary_bridge() {
     );
     assert_eq!(
         got.get("data").map(String::as_str),
-        Some("flows-into-raw-param"),
-        "with the callee no longer converting, the caller leaves the cast pair: {got:#?}"
+        Some("held:local-callee-access-extent"),
+        "a thin caller subject read eight bytes deep is held at its own end too: {got:#?}"
     );
-    // Measured, not assumed. The caller end leaves the cast pair as R271-1
-    // expects, but it does NOT deliver: the raw-boundary bridge opens
-    // `bare-local` and `addr-of` arguments, and this one is a `cast-of-local`.
-    // Making it deliver needs the "raw view of a converting local, then the
-    // original cast" arm, which is a bridge arm rather than the approved
-    // cast-DELETION arm. Reported to the seat with the R271-3 delta.
     let source = emitted(CALLER_END_INPUT);
+    assert!(
+        source.contains("hash(data: *const u8)"),
+        "the held caller subject keeps the raw form that carries the buffer:\n{source}"
+    );
     assert!(
         super::verify::type_checks_str(&source),
         "emitted output type/borrow-checks:\n{source}"

@@ -54,10 +54,23 @@ const READ_SINK: &str = "unsafe fn raw_read(q: *const core::ffi::c_void) -> i32 
 const WRITE_SINK: &str = "unsafe fn raw_write(q: *mut core::ffi::c_void) \
                           { let r = q as *mut i32; r.write(1); }";
 
-/// The thin control, and the reason this file exists at all: it passes TODAY.
-/// A `cast-of-local` argument is already opened and already rendered; the
-/// carrier replaces the whole argument and folds the original cast into
-/// `.cast::<c_void>()`.
+/// The thin control. **Expectation migrated under R217-2(a) for R364-2, and
+/// the fixture is kept exactly, because the fixture IS the finding.**
+///
+/// This test asserted that `data: *const u8` delivers and renders
+/// `core::ptr::from_ref(data).cast::<core::ffi::c_void>()`, under the comment
+/// "the thin carrier keeps the subject's own extent". Both halves were true and
+/// together they are seat addendum 364's defect in miniature: the subject's own
+/// extent is ONE BYTE, the carrier hands it to `take`, and `take` casts to
+/// `*const u64` and reads EIGHT. The emitted program was UB under Stacked
+/// Borrows at the second byte — the same thing R271-1 held the callee's own
+/// parameter for, arriving from the caller's end instead.
+///
+/// The carrier mechanism itself is not in question and is not what changed:
+/// `k19_shared_slice_subject_bridges_through_as_ptr` below still renders a
+/// carrier
+/// from a subject that carries a real extent. What this control now pins is
+/// that the THIN subject no longer reaches it.
 #[test]
 fn k19_thin_subject_already_bridges_through_the_void_carrier() {
     const INPUT: &str = r#"
@@ -78,13 +91,17 @@ fn k19_thin_subject_already_bridges_through_the_void_carrier() {
     );
     assert_eq!(
         got.get("data").map(String::as_str),
-        Some("<emitted>"),
-        "the caller end delivers: {got:#?}"
+        Some("held:local-callee-access-extent"),
+        "a one-byte subject handed to an eight-byte reader is held: {got:#?}"
     );
     let source = emitted(INPUT);
     assert!(
-        source.contains("core::ptr::from_ref(data).cast::<core::ffi::c_void>()"),
-        "the thin carrier keeps the subject's own extent:\n{source}"
+        !source.contains("core::ptr::from_ref(data)"),
+        "no thin carrier is rendered for a subject the callee reads past:\n{source}"
+    );
+    assert!(
+        source.contains("hash(data: *const u8)"),
+        "the held subject keeps its raw form, which carries the real buffer:\n{source}"
     );
     assert!(
         super::verify::type_checks_str(&source),

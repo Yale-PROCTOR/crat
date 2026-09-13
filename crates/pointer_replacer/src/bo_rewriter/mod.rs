@@ -6438,6 +6438,10 @@ fn finish_decide<'tcx>(
         &advance_ok,
         &raw_boundary_argument_paths,
     );
+    // After `full_slice_uses`, deliberately: a callee parameter that can become
+    // `&[T]` carries its own checked extent and is out of this class (R365-2).
+    let local_callee_extent_subjects =
+        decision::local_callee_extent::collect(tcx, &subjects, &facts, &full_slice_uses);
     let return_parameter_nodes = subjects
         .iter()
         .filter(|subject| {
@@ -6690,6 +6694,7 @@ fn finish_decide<'tcx>(
                     io_domain: &io_domain_subjects,
                     void_pointee: &void_pointee_subjects,
                     thin_extent: &thin_extent_subjects,
+                    local_callee_extent: &local_callee_extent_subjects,
                     declaration_pointees: &declaration_pointees,
                     declaration_patterns: &declaration_patterns,
                     input_interfaces: &input_interfaces,

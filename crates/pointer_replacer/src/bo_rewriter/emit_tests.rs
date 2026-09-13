@@ -11841,6 +11841,101 @@ fn rb_x3_family_contracts_reach_the_shared_emission_path() {
     );
 }
 
+/// R364-2 / R365-1 RED (i): **a one-byte reborrow into a four-byte reader is
+/// held.** The brotli shape, minimised — `Hash14(data: &uint8_t)` bridging into
+/// `BrotliUnalignedRead32(p: *const c_void)` whose body is
+/// `*(p as *const uint32_t)`. The reader's own parameter is held
+/// `held:void-pointee` by R271-1; what this witness is for is the CALLER, whose
+/// thin one-element claim the reader walks off.
+#[test]
+fn r364_2_a_one_byte_reborrow_into_a_four_byte_reader_is_held() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+               pub unsafe fn read32(p: *const core::ffi::c_void) -> u32 {\n\
+                   *(p as *const u32)\n\
+               }\n\
+               pub unsafe fn hash(data: *const u8) -> u32 {\n\
+                   read32(data as *const core::ffi::c_void)\n\
+               }\n";
+    let got = decisions_of(src);
+    let reason = reason_of(&got, "data", true);
+    assert!(
+        reason.starts_with("held:local-callee-access-extent"),
+        "a four-byte read through a one-byte claim must be held: {got:?}"
+    );
+}
+
+/// R364-2 / R365-1 RED (ii): **a one-byte `&mut` into an eight-byte writer is
+/// held, and the hold says `write`.** `BrotliWriteBits` minimised: the callee
+/// offsets its raw parameter and then writes eight bytes through the result.
+/// Six of the twenty corpus sites are this shape, which is why the class is
+/// named for the access rather than for a read.
+#[test]
+fn r364_2_a_one_byte_mut_into_an_eight_byte_writer_is_held_as_a_write() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+               pub unsafe fn write_bits(pos: *mut u64, array: *mut u8) {\n\
+                   let p = array.offset((*pos >> 3) as isize);\n\
+                   *(p as *mut u64) = 7;\n\
+               }\n\
+               pub unsafe fn store(storage: *mut u8, at: *mut u64) {\n\
+                   write_bits(at, storage)\n\
+               }\n";
+    let got = decisions_of(src);
+    let reason = reason_of(&got, "storage", true);
+    assert!(
+        reason.starts_with("held:local-callee-access-extent"),
+        "an eight-byte write past a one-byte claim must be held: {got:?}"
+    );
+    // The reason KEY is the census vocabulary; the four things R365-1 requires
+    // the hold to name travel in the receipt's `detail` column beside it, which
+    // is read from the decision record itself.
+    let detail = ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let table = super::decide_table(tcx).expect("writer fixture table");
+        table
+            .entries
+            .iter()
+            .find_map(|(subject, decision)| match decision {
+                super::decision::Decision::Degraded(record)
+                    if subject.param_name.as_deref() == Some("storage") =>
+                {
+                    Some(record.reason.detail())
+                }
+                _ => None,
+            })
+            .expect("the held subject carries a record")
+    })
+    .expect("writer fixture compiles");
+    assert!(
+        detail.contains(":write:"),
+        "the hold must name the ACCESS, and this one is a write: {detail}"
+    );
+    assert!(
+        detail.contains("write_bits") && detail.contains("array"),
+        "the hold must name the callee and the parameter: {detail}"
+    );
+    assert!(
+        detail.contains("pointer-arithmetic"),
+        "the hold must name why the access leaves one element: {detail}"
+    );
+}
+
+/// R364-2 / R365-1 RED (iii): **a one-element reader is NOT held.** The
+/// discriminator. A callee that dereferences its parameter once accesses
+/// exactly what a thin reference carries, so the rule must leave it alone —
+/// without this, "hold every subject reaching a local callee" would pass the
+/// two witnesses above and cost the whole population.
+#[test]
+fn r364_2_a_one_element_reader_is_not_held() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+               pub unsafe fn read_one(p: *const u8) -> u8 { *p }\n\
+               pub unsafe fn feed(data: *const u8) -> u8 { read_one(data) }\n";
+    let got = decisions_of(src);
+    let reason = reason_of(&got, "data", true);
+    assert!(
+        !reason.starts_with("held:local-callee-access-extent"),
+        "one dereference is exactly one element, and must not be held: {got:?}"
+    );
+}
+
 fn configured_exposure_input(name: &str) -> super::decision::exposure::ConfiguredExposureInput {
     let digest = match name {
         "api" => "14c2529eb4498c5d1ffd6915d05bf58a91bdda796af59f41d480d11c099d0479",
