@@ -11118,6 +11118,22 @@ fn e_adapt_w3_n3_unattested_site_fails_closed_with_typed_reason() {
             .count(),
         1
     );
+    // R374-4: the proof rows carry the two forms the position was judged at,
+    // and they are the SAME two the placed and blocked rows above report for
+    // this site. They read "-" until now, so a consumer had to re-derive in
+    // process what the row already knew.
+    for row in &proofs {
+        assert_eq!(
+            row[column("expected_form")],
+            "slice-mut",
+            "the proof names the form the position wanted: {row:?}"
+        );
+        assert_eq!(
+            row[column("found_form")],
+            "raw",
+            "the proof names the form the position had: {row:?}"
+        );
+    }
     assert_r256_unattested_fallback_is_held(&attempt);
     let source = attempt
         .ast_source

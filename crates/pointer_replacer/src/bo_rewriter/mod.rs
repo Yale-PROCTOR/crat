@@ -10362,12 +10362,19 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             decision::seam::A5ProofSiteFallback::T2RawView { template, .. } => template.as_str(),
             _ => proof.candidate_template.as_str(),
         };
+        // The proof carries the two forms the site was judged at, and the row
+        // reported them as "-". A consumer asking "which form did this position
+        // want, and which did it have" had to read them in-process, from a
+        // structure the receipt already had in hand — so the receipt was not a
+        // substitute for the run, which is the only thing it is for.
         out.push_str(&format!(
-            "overlap-proof\t{callee}\t{}\t{site}\t-\t-\t{caller}\t{}\t{}\t-\t-\t{adapter_key}\t-\tcall-argument\tparam:{}\t-\t-\t{}\t-\t-\t-",
+            "overlap-proof\t{callee}\t{}\t{site}\t-\t-\t{caller}\t{}\t{}\t-\t-\t{adapter_key}\t-\tcall-argument\tparam:{}\t{}\t{}\t{}\t-\t-\t-",
             proof.fallback.key(),
             proof.index,
             fallback_template,
             proof.index,
+            proof.expected_form.key(),
+            proof.found_form.key(),
             fallback_template,
         ));
         push_overlap_columns(
