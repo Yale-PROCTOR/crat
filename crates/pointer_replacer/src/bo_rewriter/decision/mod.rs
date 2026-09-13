@@ -33,6 +33,7 @@ pub(crate) mod box_facts;
 pub(crate) mod callee_parameter_input;
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
+pub(crate) mod cursor_native;
 pub(crate) mod declaration;
 pub(crate) mod declaration_pattern;
 pub(crate) mod emitability;
@@ -1102,6 +1103,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         })
         .collect::<Vec<_>>();
     option::inherit_wrapped_payloads(ctx, &mut entries);
+    cursor_native::observe(ctx, &entries);
     let option_mut_bindings = entries
         .iter()
         .filter_map(|(subject, decision)| {
