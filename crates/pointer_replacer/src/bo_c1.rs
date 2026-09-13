@@ -21681,6 +21681,42 @@ fn raw_boundary_libc_hold_class(
     }
 }
 
+/// The decision reason a subject held for a local callee's access carries.
+pub(crate) const RAW_BOUNDARY_LOCAL_CALLEE_ACCESS_EXTENT: &str = "held:local-callee-access-extent";
+
+/// The exact exclusion a peer loses its site to when the composite site's
+/// raw-view template can no longer be rendered.
+const RAW_BOUNDARY_DROPPED_RAW_VIEW: &str = "dropped-site:a5-raw-view-template-unavailable";
+
+/// R370-1. The KNOCK-ON class beside [`raw_boundary_libc_hold_class`]: a subject
+/// that loses its site because a PEER parameter of the same owner is held for
+/// its extent.
+///
+/// `lodepng_assign_icc` is the shape. Its `profile#3` is held
+/// `held:local-callee-access-extent`; both parameters feed one
+/// `lodepng_memcpy(dst, src, size)` site; with the peer held the site's A5
+/// raw-view template is no longer renderable, and `info#1` — whose own T2
+/// receipt is unchanged — loses the site rather than the evidence.
+///
+/// **Both halves are required, and that is the whole point of the clause.** The
+/// exclusion alone says a site was dropped and says nothing about why; the held
+/// peer alone says a sibling was held and says nothing about this subject. Only
+/// the conjunction is the knock-on, so a waiver naming it cannot be spent on
+/// either half — which is what keeps this a class the production run OBSERVES
+/// rather than a string the waiver file asserts.
+fn raw_boundary_knock_on_hold_class(
+    program: &str,
+    owner_fn: &str,
+    exclusion: &str,
+    directly_held_owners: &std::collections::BTreeSet<(String, String)>,
+) -> Option<&'static str> {
+    let dropped = exclusion
+        .split(';')
+        .any(|part| part.trim().contains(RAW_BOUNDARY_DROPPED_RAW_VIEW));
+    let peer_held = directly_held_owners.contains(&(program.to_owned(), owner_fn.to_owned()));
+    (dropped && peer_held).then_some("knock-on:held:local-callee-access-extent")
+}
+
 #[allow(clippy::type_complexity)]
 fn control_keys_unused(
     control: &std::collections::BTreeMap<(String, String, String, usize, usize), String>,
@@ -23275,9 +23311,18 @@ fn raw_boundary_wave2_corpus_census() {
     // shows, or the program's regression stands.
     let hold_subjects = raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-subjects.tsv")
         .expect("read current subject ledger");
-    let mut hold_causes = BTreeMap::<(String, String), (String, String, String)>::new();
+    let mut hold_causes = BTreeMap::<(String, String), (String, String, String, String)>::new();
+    // R370-1. Owners carrying a parameter that is DIRECTLY held for its extent.
+    // The knock-on class is only observable against this set, so it is built
+    // from the same ledger in the same pass and never from the waiver's text.
+    let mut directly_held_owners = std::collections::BTreeSet::<(String, String)>::new();
     for (program, text) in &hold_subjects {
         for row in named_tsv_rows(text) {
+            let owner = row.get("owner_fn").cloned().unwrap_or_default();
+            let reason = row.get("reason").cloned().unwrap_or_default();
+            if reason.starts_with(RAW_BOUNDARY_LOCAL_CALLEE_ACCESS_EXTENT) {
+                directly_held_owners.insert((program.clone(), owner.clone()));
+            }
             hold_causes.insert(
                 (
                     program.clone(),
@@ -23285,8 +23330,9 @@ fn raw_boundary_wave2_corpus_census() {
                 ),
                 (
                     row.get("family").cloned().unwrap_or_default(),
-                    row.get("reason").cloned().unwrap_or_default(),
+                    reason,
                     row.get("exclusion").cloned().unwrap_or_default(),
+                    owner,
                 ),
             );
         }
@@ -23461,9 +23507,10 @@ fn raw_boundary_wave2_corpus_census() {
         if regression {
             // R342-3. A decline is waived only when EVERY identity that
             // accounts for it is listed with the class production shows, and
-            // only the two classes the seat ruled: the analysis frame's kind
-            // narrowing, and the thin-extent hold R342-2 let stand. One
-            // unlisted or differently-classed identity and the decline stands.
+            // only the classes the seat ruled: the analysis frame's kind
+            // narrowing, the thin-extent hold R342-2 let stand, and R370-1's
+            // knock-on. One unlisted or differently-classed identity and the
+            // decline stands.
             let mut waived = true;
             for identity in lost_by_program.get(program.name).into_iter().flatten() {
                 let key = (
@@ -23473,14 +23520,26 @@ fn raw_boundary_wave2_corpus_census() {
                 );
                 let listed = waiver_rows.get(&key).map(String::as_str);
                 let observed = hold_causes.get(&(key.1.clone(), key.2.clone())).and_then(
-                    |(family, reason, exclusion)| {
-                        raw_boundary_libc_hold_class(family, reason, exclusion)
+                    |(family, reason, exclusion, owner_fn)| {
+                        raw_boundary_libc_hold_class(family, reason, exclusion).or_else(|| {
+                            raw_boundary_knock_on_hold_class(
+                                &key.1,
+                                owner_fn,
+                                exclusion,
+                                &directly_held_owners,
+                            )
+                        })
                     },
                 );
                 let verdict = match (listed, observed) {
                     (Some(listed), Some(observed))
                         if listed == observed
-                            && matches!(listed, "analysis-frame-decline" | "thin-extent") =>
+                            && matches!(
+                                listed,
+                                "analysis-frame-decline"
+                                    | "thin-extent"
+                                    | "knock-on:held:local-callee-access-extent"
+                            ) =>
                     {
                         listed.to_owned()
                     }
@@ -23564,14 +23623,26 @@ fn raw_boundary_wave2_corpus_census() {
             );
             let listed = waiver_rows.get(&key).map(String::as_str);
             let observed = hold_causes.get(&(key.1.clone(), key.2.clone())).and_then(
-                |(family, reason, exclusion)| {
-                    raw_boundary_libc_hold_class(family, reason, exclusion)
+                |(family, reason, exclusion, owner_fn)| {
+                    raw_boundary_libc_hold_class(family, reason, exclusion).or_else(|| {
+                        raw_boundary_knock_on_hold_class(
+                            &key.1,
+                            owner_fn,
+                            exclusion,
+                            &directly_held_owners,
+                        )
+                    })
                 },
             );
             let verdict = match (listed, observed) {
                 (Some(listed), Some(observed))
                     if listed == observed
-                        && matches!(listed, "analysis-frame-decline" | "thin-extent") =>
+                        && matches!(
+                            listed,
+                            "analysis-frame-decline"
+                                | "thin-extent"
+                                | "knock-on:held:local-callee-access-extent"
+                        ) =>
                 {
                     listed.to_owned()
                 }
@@ -24012,7 +24083,7 @@ fn raw_boundary_wave2_corpus_census() {
             ));
             continue;
         };
-        let Some((family, reason, exclusion)) =
+        let Some((family, reason, exclusion, _owner_fn)) =
             hold_causes.get(&(program.clone(), subject_key.clone()))
         else {
             pair_divergences.push_str(&format!(
@@ -24826,6 +24897,59 @@ fn r342_2_a_libc_contract_hold_names_itself_from_either_column() {
         None
     );
     assert_eq!(raw_boundary_libc_hold_class("ref", "-", "-"), None);
+}
+
+/// R370-1 RED: the knock-on class is the CONJUNCTION, and neither half spends
+/// the waiver on its own.
+///
+/// The waived shape is `lodepng_assign_icc`: its peer `profile#3` is directly
+/// held for a local callee's access, both parameters feed one `lodepng_memcpy`
+/// site, and `info#1` loses that site to
+/// `dropped-site:a5-raw-view-template-unavailable`. A dropped site with no held
+/// peer is some other site loss; a held peer with no dropped site is a sibling
+/// that was held while this subject fell for a reason of its own. Only the
+/// conjunction is observable as the knock-on, which is what stops the waiver
+/// from being a string the file asserts rather than a class production shows.
+#[test]
+fn r370_1_the_knock_on_class_needs_the_dropped_site_and_the_held_peer() {
+    let owner = "src::lodepng::lodepng_assign_icc";
+    let dropped = "terminal-not-applied:dropped-site:a5-raw-view-template-unavailable:\
+                   a5-raw-view-template-unavailable;dropped-site:other";
+    let held: std::collections::BTreeSet<(String, String)> =
+        [("lodepng".to_owned(), owner.to_owned())]
+            .into_iter()
+            .collect();
+    let none = std::collections::BTreeSet::new();
+
+    // both halves: the lodepng shape waives
+    assert_eq!(
+        raw_boundary_knock_on_hold_class("lodepng", owner, dropped, &held),
+        Some("knock-on:held:local-callee-access-extent")
+    );
+    // the dropped site WITHOUT a held peer does not
+    assert_eq!(
+        raw_boundary_knock_on_hold_class("lodepng", owner, dropped, &none),
+        None
+    );
+    // a held peer WITHOUT the dropped site does not
+    assert_eq!(
+        raw_boundary_knock_on_hold_class(
+            "lodepng",
+            owner,
+            "terminal-not-applied:blocked-subject:copy-source-coupled",
+            &held
+        ),
+        None
+    );
+    // the held peer must be the SAME owner, and in the same program
+    assert_eq!(
+        raw_boundary_knock_on_hold_class("lodepng", "src::lodepng::other_fn", dropped, &held),
+        None
+    );
+    assert_eq!(
+        raw_boundary_knock_on_hold_class("binn", owner, dropped, &held),
+        None
+    );
 }
 
 #[test]
