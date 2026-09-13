@@ -11822,6 +11822,10 @@ mod run {
                 &artifact.outbound_return_rows,
             );
         let artifact_rows = [
+            (
+                "ownership-fields-native",
+                artifact.ownership_native.as_str(),
+            ),
             ("exposure", artifact.exposure.as_str()),
             ("d4-edges", artifact.d4_edges.as_str()),
             ("pairs", artifact.pairs.as_str()),

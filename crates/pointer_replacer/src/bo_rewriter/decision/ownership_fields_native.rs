@@ -51,6 +51,9 @@ struct Bundle {
 pub(crate) struct Candidates {
     bundles: FxHashMap<Node, Bundle>,
     pub(crate) holds: FxHashMap<Node, NativeHold>,
+    /// Observation only: the primary diagnosis before the native stage.
+    /// Kept apart from native holds and final decisions, including on success.
+    primary: FxHashMap<Node, (String, String)>,
 }
 
 pub(crate) struct Inputs<'a, 'tcx> {
@@ -68,6 +71,99 @@ impl Candidates {
         self.bundles.is_empty()
     }
 
+    /// Append-only observation of the already-computed candidate family.
+    /// This must run even when there are no successful native bundles.
+    pub(crate) fn audit(
+        &self,
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        slots: &CrateSlots,
+        model: &FxHashMap<SlotRef, SlotKind>,
+        table: &DecisionTable,
+    ) -> String {
+        let clean = |text: &str| text.replace(['\t', '\r', '\n'], " ");
+        let mut rows = Vec::new();
+        for (subject, decision) in &table.entries {
+            if !outer_owning(slots, model, subject) {
+                continue;
+            }
+            let node = (subject.fn_did, subject.hir_id);
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            let key = subject.identity_key(&owner);
+            let primary = self
+                .primary
+                .get(&node)
+                .cloned()
+                .unwrap_or_else(|| primary_diagnosis(decision));
+            let final_form = match decision {
+                Decision::Box(_) => "box",
+                Decision::Degraded(_) => "degraded",
+                Decision::Ref { .. } => "ref",
+                Decision::InferredRef { .. } => "inferred-ref",
+                Decision::Slice { .. } => "slice",
+                Decision::Opt { .. } => "optional",
+            };
+            let (considered, status, kind, detail) = if let Some(bundle) = self.bundles.get(&node) {
+                let selected = match decision {
+                    Decision::Box(plan) => plan == &bundle.plan,
+                    Decision::Degraded(_)
+                    | Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Slice { .. }
+                    | Decision::Opt { .. } => false,
+                };
+                if selected {
+                    (true, "selected", "-", "-".to_owned())
+                } else {
+                    (
+                        true,
+                        "not-selected",
+                        "CandidateNotSelected",
+                        "final decision does not carry the exact native candidate plan".to_owned(),
+                    )
+                }
+            } else if let Some(hold) = self.holds.get(&node) {
+                (true, "held", native_hold_kind(hold), format!("{hold:?}"))
+            } else {
+                let kind = match subject.kind {
+                    SubjectKind::Param { .. } => "ParameterNotAttempted",
+                    SubjectKind::Local if subject.ptr_depth != 1 => "DepthNotAttempted",
+                    SubjectKind::Local => "OutsideNativeCandidateScope",
+                };
+                (
+                    false,
+                    "unattempted",
+                    kind,
+                    "no native candidate or native rejection was produced for this subject"
+                        .to_owned(),
+                )
+            };
+            let row = format!(
+                "{}\t{}\t{}\t{}\t{}\towning\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                clean(&key),
+                clean(&owner),
+                subject.local.as_u32(),
+                matches!(subject.kind, SubjectKind::Param { .. }),
+                subject.ptr_depth,
+                final_form,
+                considered,
+                status,
+                kind,
+                clean(&detail),
+                clean(&primary.0),
+                clean(&primary.1),
+            );
+            rows.push((key, row));
+        }
+        // Sorting is presentation only. Duplicate identities remain visible to
+        // the census join instead of being overwritten by a map insertion.
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut output = "subject_key\towner_fn\tmir_local\tis_param\tptr_depth\tmodel_kind\tfinal_decision\tconsidered\tnative_status\tnative_hold_kind\tnative_hold_detail\tprimary_reason\tprimary_detail\n".to_owned();
+        for (_, row) in rows {
+            output.push_str(&row);
+        }
+        output
+    }
+
     pub(crate) fn derive(
         inputs: &Inputs<'_, '_>,
         table: &DecisionTable,
@@ -76,6 +172,12 @@ impl Candidates {
         let effects = NativeEffects::derive(inputs.program);
         let mut result = Self::default();
         for (subject, decision) in &table.entries {
+            if outer_owning(inputs.slots, inputs.model, subject) {
+                result.primary.insert(
+                    (subject.fn_did, subject.hir_id),
+                    primary_diagnosis(decision),
+                );
+            }
             if subject.kind != SubjectKind::Local {
                 continue;
             }
@@ -171,6 +273,84 @@ impl Candidates {
             }
         }
         invalid
+    }
+}
+
+fn outer_owning(
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    subject: &super::Subject,
+) -> bool {
+    slots
+        .fn_local_slots
+        .get(&subject.fn_did)
+        .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+        .is_some_and(|slot| {
+            model.get(&SlotRef::Local(subject.fn_did, slot)) == Some(&SlotKind::Owning)
+        })
+}
+
+fn primary_diagnosis(decision: &Decision) -> (String, String) {
+    match decision {
+        Decision::Degraded(record) => (record.reason.key().to_owned(), record.reason.detail()),
+        Decision::Box(_)
+        | Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::Opt { .. } => ("-".to_owned(), "-".to_owned()),
+    }
+}
+
+fn native_hold_kind(hold: &NativeHold) -> &'static str {
+    use super::ownership_fields_effects::EffectsHold;
+    match hold {
+        NativeHold::Source(source) => match source {
+            SourceHold::Missing(_) => "Source::Missing",
+            SourceHold::Identity => "Source::Identity",
+            SourceHold::ConstructorIdentity => "Source::ConstructorIdentity",
+            SourceHold::ConstructorShape => "Source::ConstructorShape",
+            SourceHold::UnsupportedOwnerUse => "Source::UnsupportedOwnerUse",
+            SourceHold::FreeIdentity => "Source::FreeIdentity",
+            SourceHold::NormalExitCoverage => "Source::NormalExitCoverage",
+            SourceHold::UnsupportedControlFlow => "Source::UnsupportedControlFlow",
+            SourceHold::Duplicate(_) => "Source::Duplicate",
+            SourceHold::Unexpected(_) => "Source::Unexpected",
+            SourceHold::Absent(_) => "Source::Absent",
+        },
+        NativeHold::Call(Hold::NativeEffects(effects)) => match effects {
+            EffectsHold::MissingFunction(_) => "Call::NativeEffects::MissingFunction",
+            EffectsHold::Parameter { .. } => "Call::NativeEffects::Parameter",
+            EffectsHold::Retirement(_) => "Call::NativeEffects::Retirement",
+            EffectsHold::Opaque(_) => "Call::NativeEffects::Opaque",
+            EffectsHold::Cycle(_) => "Call::NativeEffects::Cycle",
+        },
+        NativeHold::Call(Hold::Lend(lend)) => match lend {
+            LendHold::Missing(_) => "Call::Lend::Missing",
+            LendHold::Inventory => "Call::Lend::Inventory",
+            LendHold::Grant => "Call::Lend::Grant",
+            LendHold::Identity => "Call::Lend::Identity",
+            LendHold::OwningCallee => "Call::Lend::OwningCallee",
+            LendHold::ConsumingCallee => "Call::Lend::ConsumingCallee",
+            LendHold::Formal => "Call::Lend::Formal",
+            LendHold::MoveInsteadOfLend => "Call::Lend::MoveInsteadOfLend",
+            LendHold::Retention => "Call::Lend::Retention",
+            LendHold::Span => "Call::Lend::Span",
+            LendHold::LiveReference => "Call::Lend::LiveReference",
+            LendHold::Protector => "Call::Lend::Protector",
+            LendHold::PeerAlias => "Call::Lend::PeerAlias",
+            LendHold::TargetDisagreement => "Call::Lend::TargetDisagreement",
+        },
+        NativeHold::Call(Hold::Missing(_)) => "Call::Missing",
+        NativeHold::Call(Hold::Identity) => "Call::Identity",
+        NativeHold::Call(Hold::Construction) => "Call::Construction",
+        NativeHold::Call(Hold::Projection) => "Call::Projection",
+        NativeHold::Call(Hold::RecursiveSuppression) => "Call::RecursiveSuppression",
+        NativeHold::Call(Hold::Free(_)) => "Call::Free",
+        NativeHold::Call(Hold::Close(_)) => "Call::Close",
+        NativeHold::Missing(_) => "Missing",
+        NativeHold::Identity => "Identity",
+        NativeHold::Peer(_) => "Peer",
+        NativeHold::FinalInterface => "FinalInterface",
     }
 }
 
@@ -396,4 +576,136 @@ fn derive_bundle(
         },
         formals,
     })
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::bo_rewriter as bo;
+
+    fn rows(text: &str) -> Vec<Vec<&str>> {
+        text.lines()
+            .skip(1)
+            .map(|line| line.split('\t').collect())
+            .collect()
+    }
+
+    #[test]
+    fn native_audit_covers_admitted_owners_and_unattempted_parameters() {
+        let source =
+            bo::ownership_fields_native_tests::native_fixture_source("edt", "edt(pl1,pl2);");
+        ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+            let (table, ctx) = bo::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    bo::A5Mode::PreciseReplay,
+                    Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            // Audit-only retained snapshots of actual native plans. These do
+            // not authorize a plan or change the compiler/solver result.
+            let mut candidates = Candidates::default();
+            for (subject, decision) in &table.entries {
+                if let Decision::Box(plan) = decision {
+                    candidates.bundles.insert(
+                        (subject.fn_did, subject.hir_id),
+                        Bundle {
+                            plan: plan.clone(),
+                            formals: vec![],
+                        },
+                    );
+                }
+            }
+            assert_eq!(
+                candidates.bundles.len(),
+                2,
+                "both owners admitted by real native pipeline"
+            );
+            let audit = candidates.audit(tcx, &ctx.slots, &ctx.model, &table);
+            let data = rows(&audit);
+            assert_eq!(
+                data.len(),
+                4,
+                "both actual caller owners and both Owning formals"
+            );
+            let keys: BTreeSet<_> = data.iter().map(|row| row[0]).collect();
+            assert_eq!(keys.len(), 4);
+            assert!(data.iter().all(|row| row.len() == 13 && row[5] == "owning"));
+            assert_eq!(
+                data.iter()
+                    .filter(|row| row[7] == "true" && row[8] == "selected" && row[6] == "box")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                data.iter()
+                    .filter(|row| row[3] == "true"
+                        && row[7] == "false"
+                        && row[8] == "unattempted"
+                        && row[9] == "ParameterNotAttempted")
+                    .count(),
+                2
+            );
+            // A candidate's name is not enough: one changed plan is no longer
+            // the exact selected native candidate, with model/table unchanged.
+            let bundle = candidates.bundles.values_mut().next().unwrap();
+            bundle
+                .plan
+                .receipts
+                .push("audit-test-stale-plan".to_owned());
+            let changed = candidates.audit(tcx, &ctx.slots, &ctx.model, &table);
+            assert_eq!(
+                rows(&changed)
+                    .iter()
+                    .filter(|row| row[8] == "not-selected")
+                    .count(),
+                1
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn native_audit_keeps_typed_cfg_hold_beside_primary_reason() {
+        let source = bo::ownership_fields_native_tests::native_fixture_source(
+            "edt",
+            "if *pl1 > 0.0 { edt(pl1,pl2); }",
+        );
+        ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+            let (table, ctx) = bo::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    bo::A5Mode::PreciseReplay,
+                    Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let program = bo::collect_program(tcx);
+            let candidates = Candidates::derive(
+                &Inputs {
+                    program: &program,
+                    slots: &ctx.slots,
+                    model: &ctx.model,
+                    constructions: &ctx.constructions,
+                    sites: &ctx.raw_boundary_sites,
+                    retention: &ctx.retention,
+                    a5: &ctx.a5_site_proofs,
+                },
+                &table,
+                &ClassFinalization::default(),
+            );
+            assert_eq!(candidates.holds.len(), 2, "actual source CFG refusals");
+            let audit = candidates.audit(tcx, &ctx.slots, &ctx.model, &table);
+            let data = rows(&audit);
+            assert_eq!(data.len(), 4);
+            let held: Vec<_> = data.iter().filter(|row| row[8] == "held").collect();
+            assert_eq!(held.len(), 2);
+            assert!(held.iter().all(|row| row[7] == "true"
+                && row[9] == "Source::UnsupportedControlFlow"
+                && row[10].contains("UnsupportedControlFlow")
+                && row[11] == "box-param-caller-unknown"));
+        })
+        .unwrap();
+    }
 }

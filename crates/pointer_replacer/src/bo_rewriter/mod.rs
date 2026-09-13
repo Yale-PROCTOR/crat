@@ -317,6 +317,8 @@ pub(crate) struct E2Timings {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RawBoundaryArtifacts {
+    /// R369 FIELD-CP observer, captured from the same frozen decision pass.
+    pub(crate) ownership_native: String,
     #[cfg(test)]
     pub(crate) bridge_custody_export: bridge_custody_export::Export,
     pub(crate) pending_sibling_receipts: Vec<plan::sibling_overlap::PendingSite>,
@@ -7352,6 +7354,7 @@ fn finish_decide<'tcx>(
         };
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
+            ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             io_domain_budget_exhausted,
             void_pointee_held: void_pointee_subjects.len(),
             #[cfg(test)]
