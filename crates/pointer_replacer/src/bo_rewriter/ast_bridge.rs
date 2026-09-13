@@ -276,7 +276,8 @@ pub(crate) fn census(tcx: TyCtxt<'_>) -> Result<(Vec<BridgeRow>, IdemStats), Str
                 | super::decision::Decision::InferredRef { .. }
                 | super::decision::Decision::Slice { .. }
                 | super::decision::Decision::Opt { .. }
-                | super::decision::Decision::Box(_) => true,
+                | super::decision::Decision::Box(_)
+                | super::decision::Decision::Cursor { .. } => true,
                 super::decision::Decision::Degraded(_) => false,
             },
             hir_resolved: hir_image.contains(&subject.hir_id),

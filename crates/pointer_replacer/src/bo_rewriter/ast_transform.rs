@@ -43,6 +43,8 @@ use super::decision::seam::{Form, SeamLen};
 /// enum names *what to build*, not *why*.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DeclForm {
+    /// A full borrowed base and an administrative index, `(&[T], usize)`.
+    Cursor,
     /// `&T` / `&mut T` — arm 1.
     Ref,
     /// `&[T]` / `&mut [T]`.
@@ -137,16 +139,34 @@ fn decl_ty_kind_with_lifetime(
         DeclForm::Ref | DeclForm::Opt { slice: false } | DeclForm::Box { slice: false, .. } => {
             pointee
         }
-        DeclForm::Slice | DeclForm::Opt { slice: true } | DeclForm::Box { slice: true, .. } => {
-            P(Ty {
-                id: DUMMY_NODE_ID,
-                kind: TyKind::Slice(pointee),
-                span: DUMMY_SP,
-                tokens: None,
-            })
-        }
+        DeclForm::Slice
+        | DeclForm::Cursor
+        | DeclForm::Opt { slice: true }
+        | DeclForm::Box { slice: true, .. } => P(Ty {
+            id: DUMMY_NODE_ID,
+            kind: TyKind::Slice(pointee),
+            span: DUMMY_SP,
+            tokens: None,
+        }),
     };
     match form {
+        DeclForm::Cursor => TyKind::Tup(ThinVec::from_iter([
+            P(Ty {
+                id: DUMMY_NODE_ID,
+                kind: TyKind::Ref(
+                    lifetime.map(ast_lifetime),
+                    MutTy {
+                        ty: referent,
+                        mutbl,
+                    },
+                ),
+                span: DUMMY_SP,
+                tokens: None,
+            }),
+            P(::utils::ast::parse_ty(
+                "::core::primitive::usize".to_owned(),
+            )),
+        ])),
         DeclForm::Ref | DeclForm::Slice | DeclForm::Opt { .. } => {
             let reference = TyKind::Ref(
                 lifetime.map(ast_lifetime),
@@ -163,7 +183,7 @@ fn decl_ty_kind_with_lifetime(
                     span: DUMMY_SP,
                     tokens: None,
                 })),
-                DeclForm::Box { .. } => unreachable!(),
+                DeclForm::Box { .. } | DeclForm::Cursor => unreachable!(),
             }
         }
         DeclForm::Box { optional, .. } => {
@@ -269,7 +289,7 @@ impl LifetimeSignatureVisitor<'_> {
             let shape = match interface.form {
                 Form::Slice { mutable } => Some((DeclForm::Slice, mutable)),
                 Form::Opt { mutable, slice } => Some((DeclForm::Opt { slice }, mutable)),
-                Form::Raw | Form::Ref { .. } => None,
+                Form::Raw | Form::Ref { .. } | Form::Cursor { .. } => None,
             };
             if let Some((form, mutable)) = shape {
                 let TyKind::Ptr(inner) = &ty.kind else { return false };
@@ -1019,6 +1039,7 @@ impl RefDeclVisitor<'_> {
             }
         };
         let claimant = match form {
+            DeclForm::Cursor => "decl:cursor",
             DeclForm::Ref => "decl:ref",
             DeclForm::Slice => "decl:slice",
             DeclForm::Opt { .. } => "decl:opt",
@@ -1042,7 +1063,7 @@ impl RefDeclVisitor<'_> {
                 self.stats.rewritten += 1;
                 self.stats.rendered.push(render);
             }
-            DeclForm::Slice => {
+            DeclForm::Slice | DeclForm::Cursor => {
                 self.stats.slice_rewritten += 1;
                 self.stats.rendered_arm2.push(render);
             }
@@ -1063,7 +1084,10 @@ impl RefDeclVisitor<'_> {
         }
         let Some(node) = self.stats.placed_ids.last() else { return };
         if self.mutable_option_bindings.contains(node)
-            && matches!(self.decisions.get(node), Some((DeclForm::Opt { .. }, _, _)))
+            && matches!(
+                self.decisions.get(node),
+                Some((DeclForm::Opt { .. } | DeclForm::Cursor, _, _))
+            )
             && let rustc_ast::PatKind::Ident(mode, _, _) = &mut pat.kind
         {
             mode.1 = Mutability::Mut;
@@ -3425,6 +3449,9 @@ fn transform_with<'tcx>(
         // EXHAUSTIVE — the denylist rejects the bypass shape, and the arm's
         // population is defined by which disposition was reached.
         let (form, mutable, use_edits) = match decision {
+            super::decision::Decision::Cursor { mutable, plan } => {
+                (DeclForm::Cursor, *mutable, Some(&plan.uses))
+            }
             super::decision::Decision::Ref { mutable } => (DeclForm::Ref, *mutable, None),
             // Its direct callee's rewritten return type supplies the inferred
             // local type. No declaration splice exists or is synthesized.
@@ -4681,6 +4708,7 @@ pub(crate) fn filtered_inputs(
         .collect::<FxHashSet<_>>();
     for (subject, decision) in &table.entries {
         let use_edits = match decision {
+            super::decision::Decision::Cursor { plan, .. } => Some(&plan.uses),
             super::decision::Decision::Ref { .. }
             | super::decision::Decision::InferredRef { .. } => None,
             super::decision::Decision::Slice { uses, .. } => Some(uses),
@@ -4765,6 +4793,7 @@ pub(crate) fn filtered_inputs(
         };
         match decision {
             super::decision::Decision::Opt { .. } => {}
+            super::decision::Decision::Cursor { .. } => continue,
             super::decision::Decision::Ref { .. }
             | super::decision::Decision::InferredRef { .. }
             | super::decision::Decision::Slice { .. }
@@ -7238,7 +7267,7 @@ mod arm2_witnesses {
                         stats.rewritten += 1;
                         stats.rendered.push(render);
                     }
-                    DeclForm::Slice => {
+                    DeclForm::Slice | DeclForm::Cursor => {
                         stats.slice_rewritten += 1;
                         stats.rendered_arm2.push(render);
                     }

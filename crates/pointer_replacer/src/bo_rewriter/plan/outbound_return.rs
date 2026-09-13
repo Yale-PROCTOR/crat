@@ -54,6 +54,7 @@ pub(crate) type Materialized = (
 
 fn in_scope(input: &ReceiverInputPlan) -> bool {
     match input.receiver.candidate_interface.form {
+        Form::Cursor { .. } => false,
         Form::Raw => false,
         Form::Ref { .. } | Form::Slice { .. } | Form::Opt { .. } => true,
     }
@@ -182,7 +183,8 @@ pub(crate) fn capture(
                 | Decision::InferredRef { .. }
                 | Decision::Slice { .. }
                 | Decision::Opt { .. }
-                | Decision::Box(_) => false,
+                | Decision::Box(_)
+                | Decision::Cursor { .. } => false,
             });
             if !raw
                 || input.node != node

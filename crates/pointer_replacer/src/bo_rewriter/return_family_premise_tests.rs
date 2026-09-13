@@ -17,7 +17,8 @@ fn decision_record(decision: Option<&Decision>) -> serde_json::Value {
         | Decision::InferredRef { .. }
         | Decision::Slice { .. }
         | Decision::Opt { .. }
-        | Decision::Box(_) => None,
+        | Decision::Box(_)
+        | Decision::Cursor { .. } => None,
     };
     serde_json::json!({"observed": true, "decision": format!("{decision:?}"),
         "form": super::decision::seam::form_of(decision).key(), "hold": hold})

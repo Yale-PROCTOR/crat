@@ -58,6 +58,7 @@ fn revert_probe(input: &str, inject_unowned_use: bool) -> RevertProbe {
                     | Decision::Slice { .. }
                     | Decision::Opt { .. }
                     | Decision::Box(_)
+                    | Decision::Cursor { .. }
                     | Decision::Degraded(_) => None,
                 })
                 .expect("deliberate-fault control needs its ordinary Ref subject");

@@ -391,6 +391,7 @@ fn unlicensed_argument_adjacency(
         .iter()
         .find(|(subject, _)| subject.fn_did == node.0 && subject.hir_id == source)?;
     match source_decision {
+        Decision::Cursor { .. } => return None,
         Decision::Degraded(_) => return None,
         Decision::Ref { .. }
         | Decision::InferredRef { .. }
@@ -655,6 +656,7 @@ pub(crate) fn collect_composable_edits(
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Box(_)
+            | Decision::Cursor { .. }
             | Decision::Degraded(_) => None,
         };
         edits.extend(
@@ -760,6 +762,7 @@ pub(crate) fn plan_slice_constructions(
             | Decision::InferredRef { .. }
             | Decision::Opt { slice: false, .. }
             | Decision::Box(_)
+            | Decision::Cursor { .. }
             | Decision::Degraded(_) => continue,
         };
         let node = (subject.fn_did, subject.hir_id);

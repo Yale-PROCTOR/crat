@@ -469,7 +469,7 @@ pub(crate) fn derive_return_eligibility(
                 return_family_functions.contains(&subject.0)
             }
             Some(Decision::InferredRef { .. }) => false,
-            Some(Decision::Box(_)) => false,
+            Some(Decision::Box(_) | Decision::Cursor { .. }) => false,
             Some(Decision::Degraded(_)) => false,
             None => false,
         };
@@ -692,6 +692,7 @@ pub(crate) fn derive_return_eligibility(
                 | Decision::InferredRef { .. }
                 | Decision::Opt { .. }
                 | Decision::Box(_)
+                | Decision::Cursor { .. }
                 | Decision::Degraded(_) => false,
             });
         if !is_return_residual && !is_annotated_slice {

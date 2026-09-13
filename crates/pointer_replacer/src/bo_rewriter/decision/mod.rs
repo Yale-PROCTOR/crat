@@ -853,6 +853,11 @@ pub(crate) struct Degradation {
 /// What M1 decided for one subject.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
+    /// A retained borrowed base and an independent checked element index.
+    Cursor {
+        mutable: bool,
+        plan: cursor_native::CursorPlan,
+    },
     /// Emit a reference form: `&T` or `&mut T`.
     Ref { mutable: bool },
     /// An unannotated local whose borrowed type is supplied by a direct local
@@ -904,6 +909,7 @@ pub(crate) enum Decision {
 /// The finished, immutable table handed to [`super::plan`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
+    pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
     pub(crate) declaration_pointees: declaration::DeclarationPointees,
     pub(crate) declaration_patterns: declaration_pattern::PatternDeclarations,
@@ -999,6 +1005,7 @@ impl DecisionTable {
         self.entries.iter().filter_map(|(_, d)| match d {
             Decision::Degraded(record) => Some(record),
             Decision::Ref { .. }
+            | Decision::Cursor { .. }
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
@@ -1103,11 +1110,15 @@ pub(crate) fn decide_with_raw_fallbacks(
         })
         .collect::<Vec<_>>();
     option::inherit_wrapped_payloads(ctx, &mut entries);
-    cursor_native::observe(ctx, &entries);
+    let cursor_receipts = cursor_native::promote(ctx, &mut entries);
+    cursor_native::observe(ctx, &entries, &cursor_receipts);
     let option_mut_bindings = entries
         .iter()
         .filter_map(|(subject, decision)| {
             let needed = match decision {
+                Decision::Cursor { mutable, plan } => {
+                    *mutable && !plan.bridges.is_empty() && !subject.mut_binding
+                }
                 Decision::Opt { mutable, .. } => {
                     ctx.family_policy
                         .enabled(subject.fn_did, FamilyStage::Option)
@@ -1134,6 +1145,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         })
         .collect();
     DecisionTable {
+        cursor_receipts,
         sibling_overlap_inventory: Default::default(),
         input_interfaces: ctx.input_interfaces.clone(),
         declaration_patterns: ctx
@@ -1253,7 +1265,9 @@ pub(crate) fn plan_depth2_npo_storages(
                         (format!("{source_text}.as_deref_mut()"), false)
                     }
                     Some(Decision::Opt { .. }) => (format!("{source_text}.as_deref()"), false),
-                    Some(Decision::Slice { .. } | Decision::Box(_)) => continue,
+                    Some(Decision::Slice { .. } | Decision::Cursor { .. } | Decision::Box(_)) => {
+                        continue;
+                    }
                     Some(Decision::Degraded(_)) | None => (
                         super::mechanical_receipt::present_unsafe_text(
                             format!("(({init_text}) as {raw_inner}).{method}()"),
@@ -1517,6 +1531,11 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // compile error here, because a form this veto does not name is a form that
     // escapes it.
     match decision {
+        Decision::Cursor { .. } => degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            DegradeReason::SliceCursorUse,
+        ),
         Decision::Ref { mutable } => {
             if receiver_failed {
                 degrade(
@@ -1764,6 +1783,9 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             return degrade(subject, decl_site, DegradeReason::ReturnNotAdapted);
         }
         form = match receiver.receiver_form {
+            seam::Form::Cursor { .. } => {
+                return degrade(subject, decl_site, DegradeReason::ReturnNotAdapted);
+            }
             seam::Form::Slice { .. } => Form::Slice,
             seam::Form::Opt { slice, .. } => Form::Opt { slice },
             seam::Form::Raw | seam::Form::Ref { .. } => form,
@@ -2228,6 +2250,7 @@ mod self_consistency_tests {
 
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
+            cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),

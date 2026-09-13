@@ -51,6 +51,7 @@ use crate::bo_rewriter::bridge_receipt::{
 /// caller ask for something the callee's own converted type already forbids.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Form {
+    Cursor { mutable: bool },
     Raw,
     Ref { mutable: bool },
     Slice { mutable: bool },
@@ -60,6 +61,8 @@ pub(crate) enum Form {
 impl Form {
     pub(crate) fn key(self) -> &'static str {
         match self {
+            Form::Cursor { mutable: true } => "cursor-mut",
+            Form::Cursor { mutable: false } => "cursor-shared",
             Form::Raw => "raw",
             Form::Ref { mutable: true } => "ref-mut",
             Form::Ref { mutable: false } => "ref-shared",
@@ -90,6 +93,7 @@ impl Form {
 /// is a yield number nobody can attribute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SeamBlock {
+    CursorBoundaryUnbuilt,
     /// A slice form is expected and the argument is raw: a length is needed and
     /// **none may be invented**. Ruling item 4.
     LengthUnknown,
@@ -129,6 +133,7 @@ pub(crate) enum SeamBlock {
 impl SeamBlock {
     pub(crate) fn key(self) -> &'static str {
         match self {
+            SeamBlock::CursorBoundaryUnbuilt => "cursor-boundary-unbuilt",
             SeamBlock::LengthUnknown => "seam-len-unknown",
             SeamBlock::SharedToMut => "seam-shared-to-mut",
             SeamBlock::UnnameableOperand => "seam-unnameable-operand",
@@ -1101,6 +1106,14 @@ pub(crate) struct GlueSpec {
 
 impl GlueSpec {
     pub(crate) fn requires_unsafe(&self) -> bool {
+        if let Some(raw) = &self.raw_boundary {
+            return matches!(
+                raw.template,
+                super::raw_boundary::BridgeTemplate::CursorSharedToRawConst
+                    | super::raw_boundary::BridgeTemplate::CursorMutToRawMut
+                    | super::raw_boundary::BridgeTemplate::CursorMutToRawConst
+            );
+        }
         self.raw_boundary.is_none()
             && matches!(
                 self.core,
@@ -1229,7 +1242,10 @@ impl GlueSpec {
                 (target.is_void_pointee()
                     || matches!(
                         template,
-                        super::raw_boundary::BridgeTemplate::OptRefMutToRawMut
+                        super::raw_boundary::BridgeTemplate::CursorSharedToRawConst
+                            | super::raw_boundary::BridgeTemplate::CursorMutToRawMut
+                            | super::raw_boundary::BridgeTemplate::CursorMutToRawConst
+                            | super::raw_boundary::BridgeTemplate::OptRefMutToRawMut
                             | super::raw_boundary::BridgeTemplate::RefMutToWritableRawConst
                             | super::raw_boundary::BridgeTemplate::SliceMutToWritableRawConst
                             | super::raw_boundary::BridgeTemplate::OptRefMutToWritableRawConst
@@ -1449,6 +1465,9 @@ impl GlueSpec {
             };
             return match rendered.ok()? {
                 super::raw_boundary::BridgeRender::ZeroSyntax => Some(text.to_owned()),
+                super::raw_boundary::BridgeRender::Edit(replacement) if self.requires_unsafe() => {
+                    Some(unsafe_expr(replacement))
+                }
                 super::raw_boundary::BridgeRender::Edit(replacement) => Some(replacement),
                 super::raw_boundary::BridgeRender::Lifecycle => Some(text.to_owned()),
             };
@@ -1566,6 +1585,7 @@ fn glue_with_nonempty(
     let shared_to_mut = |want: bool, have: bool| want && !have;
 
     Ok(match (expected, found) {
+        (Cursor { .. }, _) | (_, Cursor { .. }) => return Err(SeamBlock::CursorBoundaryUnbuilt),
         // ---- identities and coercions: no edit ----
         (Ref { mutable: w }, Ref { mutable: h }) => {
             if shared_to_mut(w, h) {
@@ -3082,6 +3102,7 @@ impl SeamPlan {
 /// The form a decision emits.
 pub(crate) fn form_of(decision: &Decision) -> Form {
     match decision {
+        Decision::Cursor { mutable, .. } => Form::Cursor { mutable: *mutable },
         Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => {
             Form::Ref { mutable: *mutable }
         }
@@ -3223,6 +3244,7 @@ fn build_candidate(
 
 pub(crate) fn decision_for_safe_form(form: Form) -> Option<super::Decision> {
     match form {
+        Form::Cursor { .. } => None,
         Form::Raw => None,
         Form::Ref { mutable } => Some(super::Decision::Ref { mutable }),
         Form::Slice { mutable } => Some(super::Decision::Slice {
@@ -4687,6 +4709,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             .and_then(|node| decision_of.get(&node).copied())
             .into_iter()
             .flat_map(|decision| match decision {
+                Decision::Cursor { plan, .. } => plan.uses.as_slice(),
                 Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => uses.as_slice(),
                 Decision::Ref { .. }
                 | Decision::InferredRef { .. }
@@ -5038,6 +5061,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 mutable: output_mutability == rustc_middle::ty::Mutability::Mut,
             });
         let expected_mutable = match expected {
+            Form::Cursor { mutable } => mutable,
             Form::Ref { mutable } | Form::Slice { mutable } | Form::Opt { mutable, .. } => mutable,
             Form::Raw => false,
         };

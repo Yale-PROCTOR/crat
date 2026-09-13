@@ -297,6 +297,12 @@ pub(crate) fn plan_returned_value(
         ));
     };
     let mutable_temporary = match site.source_interface.form {
+        super::seam::Form::Cursor { .. } => {
+            return Err((
+                ReceiverInputFailure::Template(RawBoundaryBlockReason::TemplateUnavailable),
+                Some(evidence),
+            ));
+        }
         super::seam::Form::Opt { mutable, .. } => mutable,
         super::seam::Form::Raw
         | super::seam::Form::Ref { .. }

@@ -212,6 +212,7 @@ pub(crate) enum EdgeForm {
     Raw,
     Ref,
     Slice,
+    Cursor,
     Optional,
     Box,
 }
@@ -221,6 +222,7 @@ impl EdgeForm {
         match decision {
             Decision::Ref { .. } | Decision::InferredRef { .. } => Self::Ref,
             Decision::Slice { .. } => Self::Slice,
+            Decision::Cursor { .. } => Self::Cursor,
             Decision::Opt { .. } => Self::Optional,
             Decision::Box(_) => Self::Box,
             Decision::Degraded(_) => Self::Raw,
@@ -232,6 +234,7 @@ impl EdgeForm {
             Self::Raw => "raw",
             Self::Ref => "ref",
             Self::Slice => "slice",
+            Self::Cursor => "cursor",
             Self::Optional => "optional",
             Self::Box => "box",
         }
@@ -784,6 +787,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_)
+            | Decision::Cursor { .. }
             | Decision::Degraded(_) => continue,
         };
         let key = (subject.fn_did, subject.hir_id);
@@ -801,6 +805,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Box(_)
+            | Decision::Cursor { .. }
             | Decision::Degraded(_) => None,
         })
         .collect();
@@ -1465,6 +1470,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             let source_form = settled(edge.source, edge.source_form);
             let target_form = settled(edge.target, edge.target_form);
             let route = match (source_form, target_form) {
+                (EdgeForm::Cursor, _) | (_, EdgeForm::Cursor) => EdgeRoute::Glue,
                 (left, right) if left == right => EdgeRoute::ZeroSyntax,
                 (EdgeForm::Raw, _) => EdgeRoute::ArmC,
                 (_, EdgeForm::Raw) => EdgeRoute::ArmA,

@@ -168,6 +168,15 @@ pub(crate) fn emitted_type(
         }
         Decision::Slice { mutable, .. } => (*mutable, true, false),
         Decision::Opt { mutable, slice, .. } => (*mutable, *slice, true),
+        Decision::Cursor { mutable, .. } => {
+            let lifetime = lifetime.map_or_else(String::new, |name| {
+                format!("'{} ", name.trim_start_matches('\''))
+            });
+            return Some(format!(
+                "(&{lifetime}{}[{pointee}], ::core::primitive::usize)",
+                if *mutable { "mut " } else { "" },
+            ));
+        }
         Decision::Box(_) | Decision::Degraded(_) => return None,
     };
     let pointee = if slice {

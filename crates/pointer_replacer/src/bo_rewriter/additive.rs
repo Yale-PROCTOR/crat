@@ -109,6 +109,7 @@ impl SoundnessWithdrawal {
             decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_)
+            | decision::Decision::Cursor { .. }
             | decision::Decision::Degraded(_) => false,
         };
         if !required || !old.null_init {
@@ -131,7 +132,8 @@ fn safe(decision: &decision::Decision) -> bool {
         | decision::Decision::InferredRef { .. }
         | decision::Decision::Slice { .. }
         | decision::Decision::Opt { .. }
-        | decision::Decision::Box(_) => true,
+        | decision::Decision::Box(_)
+        | decision::Decision::Cursor { .. } => true,
         decision::Decision::Degraded(_) => false,
     }
 }
@@ -179,6 +181,7 @@ fn losses<'a>(
                     decision::Decision::Slice { .. }
                     | decision::Decision::Opt { .. }
                     | decision::Decision::Box(_)
+                    | decision::Decision::Cursor { .. }
                     | decision::Decision::Degraded(_) => false,
                 };
             let witnessed = required_null

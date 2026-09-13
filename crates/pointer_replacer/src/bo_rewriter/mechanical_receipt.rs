@@ -63,10 +63,11 @@ pub(crate) enum MechanicalFamily {
     MissingCArm,
     Diagnostic,
     JsonRecovery,
+    Cursor,
 }
 
 impl MechanicalFamily {
-    pub(crate) const ALL: [Self; 30] = [
+    pub(crate) const ALL: [Self; 31] = [
         Self::UnsafeContext,
         Self::A5ProofSiteFallback,
         Self::SliceLocalConstruction,
@@ -97,6 +98,7 @@ impl MechanicalFamily {
         Self::MissingCArm,
         Self::Diagnostic,
         Self::JsonRecovery,
+        Self::Cursor,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -131,6 +133,7 @@ impl MechanicalFamily {
             Self::MissingCArm => "missing-c-arm",
             Self::Diagnostic => "diagnostic",
             Self::JsonRecovery => "json-recovery",
+            Self::Cursor => "cursor",
         }
     }
 }
@@ -383,6 +386,7 @@ pub(crate) enum MechanicalMechanism {
     DiagnosticCapture,
     JsonRecovery,
     SharedRefToMutRaw,
+    Cursor,
 }
 
 impl MechanicalMechanism {
@@ -422,6 +426,7 @@ impl MechanicalMechanism {
             MechanicalFamily::MissingCArm => Self::MissingCArm,
             MechanicalFamily::Diagnostic => Self::DiagnosticCapture,
             MechanicalFamily::JsonRecovery => Self::JsonRecovery,
+            MechanicalFamily::Cursor => Self::Cursor,
         }
     }
 
@@ -447,6 +452,7 @@ impl MechanicalMechanism {
             Self::MissingCArm => "missing-c-arm",
             Self::DiagnosticCapture => "diagnostic-capture",
             Self::JsonRecovery => "json-recovery",
+            Self::Cursor => "cursor",
             Self::SharedRefToMutRaw => "shared-ref-to-mut-raw",
         }
     }

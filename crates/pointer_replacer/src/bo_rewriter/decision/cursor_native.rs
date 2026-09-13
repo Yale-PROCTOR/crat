@@ -12,6 +12,97 @@ use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solve
 
 #[path = "cursor/admission.rs"]
 mod admission;
+#[path = "cursor/emission.rs"]
+mod emission;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorPlan {
+    pub(crate) uses: Vec<super::emitability::UseEdit>,
+    pub(crate) use_hirs: Vec<rustc_hir::HirId>,
+    pub(crate) base: Local,
+    pub(crate) component: Vec<Local>,
+    pub(crate) extent: u64,
+    pub(crate) bridges: Vec<CursorBridge>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorBridge {
+    pub(crate) call_hir: rustc_hir::HirId,
+    pub(crate) callee: LocalDefId,
+    pub(crate) argument_span: rustc_span::Span,
+    pub(crate) argument_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorHold {
+    SourceUnavailable,
+    UseUnbuilt,
+    IndexRangeMissing,
+    WindowMissing,
+    BaseMissing,
+    LayoutUnbuilt,
+    ScheduleMissing,
+    RawBoundaryUnbuilt,
+    DeclarationUnbuilt,
+    OptionalUnbuilt,
+    RefMissing,
+    ComponentAliasUnbuilt,
+    BorrowedElementUnbuilt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorReceipt {
+    pub(crate) owner: LocalDefId,
+    pub(crate) hir_id: rustc_hir::HirId,
+    pub(crate) local: Local,
+    pub(crate) disposition: Result<(), CursorHold>,
+}
+
+pub(crate) fn promote(
+    ctx: &Ctx<'_, '_>,
+    entries: &mut [(Subject, Decision)],
+) -> Vec<CursorReceipt> {
+    if ctx.family_policy.stage != super::super::additive::FamilyStage::Return {
+        return vec![];
+    }
+    let proposals = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (subject, decision))| {
+            let candidate = match decision {
+                Decision::Degraded(record) => is_cursor_reason(&record.reason),
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::Cursor { .. } => false,
+            };
+            (candidate
+                && ctx
+                    .family_policy
+                    .enabled(subject.fn_did, super::super::additive::FamilyStage::Return))
+            .then(|| (index, emission::plan(ctx, subject, entries)))
+        })
+        .collect::<Vec<_>>();
+    let mut receipts = Vec::new();
+    for (index, proposed) in proposals {
+        let (subject, decision) = &mut entries[index];
+        receipts.push(CursorReceipt {
+            owner: subject.fn_did,
+            hir_id: subject.hir_id,
+            local: subject.local,
+            disposition: proposed.as_ref().map(|_| ()).map_err(|e| *e),
+        });
+        if let Ok(plan) = proposed {
+            *decision = Decision::Cursor {
+                mutable: subject.mutable,
+                plan,
+            };
+        }
+    }
+    receipts
+}
 
 pub(crate) fn inspect_subject(
     tcx: TyCtxt<'_>,
@@ -63,7 +154,11 @@ fn model_kinds(
         .collect()
 }
 
-pub(crate) fn observe(ctx: &Ctx<'_, '_>, entries: &[(Subject, Decision)]) {
+pub(crate) fn observe(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+    receipts: &[CursorReceipt],
+) {
     let Some(directory) = std::env::var_os("CRAT_CURSOR_ADMISSION_OUTPUT") else { return };
     if ctx.raw_boundary.is_none()
         || ctx.family_policy.stage != super::super::additive::FamilyStage::Return
@@ -87,6 +182,25 @@ pub(crate) fn observe(ctx: &Ctx<'_, '_>, entries: &[(Subject, Decision)]) {
     );
     let root = Path::new(&directory).join(&program);
     std::fs::create_dir_all(&root).expect("cursor audit directory");
+    let frame =
+        std::env::var("CRAT_RAW_BOUNDARY_CODE_FRAME").expect("cursor audit needs source frame");
+    let custody =
+        serde_json::json!({"program": program, "pid": std::process::id(), "frame": frame});
+    let guard = root.join("custody.json");
+    match OpenOptions::new().write(true).create_new(true).open(&guard) {
+        Ok(mut file) => writeln!(file, "{custody}").expect("write native archive custody"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let prior: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&guard).expect("read native archive custody"),
+            )
+            .expect("parse native archive custody");
+            assert_eq!(
+                prior, custody,
+                "cursor archive belongs to another worker/frame"
+            );
+        }
+        Err(error) => panic!("cursor archive custody: {error}"),
+    }
     for (subject, decision) in entries {
         let path = root.join(format!(
             "{}-{}.json",
@@ -103,6 +217,7 @@ pub(crate) fn observe(ctx: &Ctx<'_, '_>, entries: &[(Subject, Decision)]) {
         let cursor_reason = match decision {
             Decision::Degraded(d) => is_cursor_reason(&d.reason),
             Decision::Ref { .. }
+            | Decision::Cursor { .. }
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
@@ -128,7 +243,9 @@ pub(crate) fn observe(ctx: &Ctx<'_, '_>, entries: &[(Subject, Decision)]) {
                 "root": f.root.map(|l| l.index()), "site": f.site.map(|s| [s.block, s.statement]),
             })).collect::<Vec<_>>()),
             "component": row.as_ref().map(|r| r.component.iter().map(|l| l.index()).collect::<Vec<_>>()),
-            "emission": is_candidate.then_some("Held(CursorFormUnbuilt)"), "changes_decision": false,
+            "native_outcome": receipts.iter().find(|r| r.owner == subject.fn_did && r.hir_id == subject.hir_id).map(|r| format!("{:?}", r.disposition)),
+            "emission": match decision { Decision::Cursor { .. } => "planned-cursor", Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) | Decision::Degraded(_) => "unchanged" },
+            "stage": "candidate-pre-finalization", "source_frame": frame,
         });
         let mut file = OpenOptions::new()
             .write(true)

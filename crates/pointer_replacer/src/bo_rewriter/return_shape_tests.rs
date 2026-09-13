@@ -96,7 +96,7 @@ fn return_shape_mixed_null_and_parameter_keeps_a_required_parameter() {
         let required_parameter = match decision {
             Decision::Ref { mutable: true } => true,
             Decision::Ref { mutable: false } | Decision::InferredRef { .. }
-            | Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_)
+            | Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) | Decision::Cursor { .. }
             | Decision::Degraded(_) => false,
         };
         assert!(required_parameter, "return nullability must not make the always-dereferenced parameter optional: {decision:#?}");

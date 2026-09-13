@@ -400,6 +400,9 @@ pub(crate) struct DeliveryExpectation {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub(crate) enum DeliveryForm {
+    Cursor {
+        mutable: bool,
+    },
     Borrowed {
         mutable: bool,
         optional: bool,
@@ -419,6 +422,9 @@ fn delivery_form(decision: &decision::Decision) -> Option<DeliveryForm> {
                 optional: false,
                 slice: false,
             })
+        }
+        decision::Decision::Cursor { mutable, .. } => {
+            Some(DeliveryForm::Cursor { mutable: *mutable })
         }
         decision::Decision::Slice { mutable, .. } => Some(DeliveryForm::Borrowed {
             mutable: *mutable,
@@ -1153,6 +1159,7 @@ fn rewrite_core_injected_with_config(
             match decision {
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => {}
@@ -4965,6 +4972,7 @@ fn terminal_application(
     match decision {
         decision::Decision::Ref { .. }
         | decision::Decision::InferredRef { .. }
+        | decision::Decision::Cursor { .. }
         | decision::Decision::Slice { .. }
         | decision::Decision::Opt { .. }
         | decision::Decision::Box(_) => Some(decision),
@@ -6286,6 +6294,7 @@ fn restored_reference_copy_sites(
         let is_reference = match decided {
             decision::Decision::Ref { .. } => true,
             decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_)
@@ -6312,6 +6321,7 @@ fn restored_reference_copy_sites(
                 decision::Decision::Degraded(_) => true,
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => false,
@@ -6350,6 +6360,7 @@ fn finish_decide<'tcx>(
         match decision {
             decision::Decision::Ref { .. }
             | decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_) => true,
@@ -7009,7 +7020,8 @@ fn finish_decide<'tcx>(
                         let is_ref = match decision {
                             decision::Decision::Ref { .. }
                             | decision::Decision::InferredRef { .. } => true,
-                            decision::Decision::Slice { .. }
+                            decision::Decision::Cursor { .. }
+                            | decision::Decision::Slice { .. }
                             | decision::Decision::Opt { .. }
                             | decision::Decision::Box(_)
                             | decision::Decision::Degraded(_) => false,
@@ -7115,6 +7127,7 @@ fn finish_decide<'tcx>(
                 }
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => false,
@@ -7528,6 +7541,12 @@ fn learn_a5_fallback_roles(
             // Already-raw targets need a materialized call view but no new
             // parameter presentation. Owning admission is never changed here.
             Decision::Degraded(_) => continue,
+            Decision::Cursor { .. } => {
+                proof.fallback = A5ProofSiteFallback::Held {
+                    reason: "a5-fallback-unrenderable:cursor-parameter".into(),
+                };
+                continue;
+            }
             Decision::Box(_) => {
                 proof.fallback = A5ProofSiteFallback::Held {
                     reason: "a5-fallback-unrenderable:owning-parameter".into(),
@@ -7603,6 +7622,7 @@ fn a5_role_target_hypothesis(
         match choice {
             decision::Decision::Ref { .. }
             | decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. } => {
                 *choice = decision::Decision::Degraded(decision::Degradation {
@@ -7872,7 +7892,8 @@ fn append_surface_declaration_plans(
                 let return_form_key = match return_form {
                     Some(
                         form @ (decision::seam::Form::Opt { .. }
-                        | decision::seam::Form::Slice { .. }),
+                        | decision::seam::Form::Slice { .. }
+                        | decision::seam::Form::Cursor { .. }),
                     ) => form.key(),
                     Some(decision::seam::Form::Ref { .. } | decision::seam::Form::Raw) | None => {
                         "ref"
@@ -7965,6 +7986,7 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
             let (mutable, callee) = match decision {
                 decision::Decision::InferredRef { mutable, callee } => (mutable, callee),
                 decision::Decision::Ref { .. }
+                | decision::Decision::Cursor { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_)
@@ -8053,6 +8075,7 @@ fn derive_arm_requirements(
                     && match decision {
                         decision::Decision::Ref { .. }
                         | decision::Decision::InferredRef { .. }
+                        | decision::Decision::Cursor { .. }
                         | decision::Decision::Slice { .. }
                         | decision::Decision::Opt { .. }
                         | decision::Decision::Box(_) => true,
@@ -8079,6 +8102,10 @@ fn derive_arm_requirements(
                 candidate.fn_did == subject.fn_did
                     && candidate.hir_id == subject.hir_id
                     && match decision {
+                        decision::Decision::Cursor { plan, .. } => plan
+                            .uses
+                            .iter()
+                            .any(|edit| edit.bridge_kind.starts_with("raw-op-")),
                         decision::Decision::Slice { uses, .. }
                         | decision::Decision::Opt { uses, .. } => uses
                             .iter()
@@ -8176,6 +8203,7 @@ fn arm_outcomes_tsv(
         let decision_degraded = decision.is_some_and(|decision| match decision {
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
+            | Decision::Cursor { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_) => false,
@@ -8263,6 +8291,7 @@ fn atomic_arm_outcomes_tsv(
         let decision_degraded = match decision {
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
+            | Decision::Cursor { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_) => false,
@@ -8340,6 +8369,7 @@ fn raw_boundary_subjects_tsv(
     let decision_key = |decision: &decision::Decision| match decision {
         decision::Decision::Ref { .. } => "ref",
         decision::Decision::InferredRef { .. } => "inferred-ref",
+        decision::Decision::Cursor { .. } => "cursor",
         decision::Decision::Slice { .. } => "slice",
         decision::Decision::Opt { .. } => "optional",
         decision::Decision::Box(_) => "box",
@@ -8550,6 +8580,7 @@ fn box_mir_drop_policies(
                 decision::Decision::Box(plan) => plan,
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Degraded(_) => return None,
@@ -8661,6 +8692,7 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
                 ),
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. } => {
                     return Err(format!(
@@ -8737,12 +8769,14 @@ fn e1_subject_family(
                 decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => {
                     Some("ref")
                 }
+                decision::Decision::Cursor { .. } => Some("cursor"),
                 decision::Decision::Slice { .. } => Some("slice"),
                 decision::Decision::Opt { .. } => Some("optional"),
                 decision::Decision::Box(_) => Some("box"),
                 decision::Decision::Degraded(_) => match hypothetical {
                     Some(decision::Decision::Ref { .. })
                     | Some(decision::Decision::InferredRef { .. }) => Some("ref"),
+                    Some(decision::Decision::Cursor { .. }) => Some("cursor"),
                     Some(decision::Decision::Slice { .. }) => Some("slice"),
                     Some(decision::Decision::Opt { .. }) => Some("optional"),
                     Some(decision::Decision::Box(_)) => Some("box"),
@@ -8762,6 +8796,7 @@ fn e1_subject_family(
                 },
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => unreachable!("emitting form mapped above"),
@@ -8860,6 +8895,7 @@ fn e2_terminal_disposition<'a>(
         decision::Decision::Degraded(_)
         | decision::Decision::Ref { .. }
         | decision::Decision::InferredRef { .. }
+        | decision::Decision::Cursor { .. }
         | decision::Decision::Slice { .. }
         | decision::Decision::Opt { .. }
         | decision::Decision::Box(_) => None,
@@ -8880,6 +8916,7 @@ fn e2_terminal_disposition<'a>(
             },
             decision::Decision::Ref { .. }
             | decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_) => {}
@@ -8911,6 +8948,7 @@ pub(crate) fn decision_vector_render(tcx: TyCtxt<'_>, table: &decision::Decision
             let form = match decision {
                 decision::Decision::Ref { .. } => "ref".to_owned(),
                 decision::Decision::InferredRef { .. } => "inferred-ref".to_owned(),
+                decision::Decision::Cursor { .. } => "cursor".to_owned(),
                 decision::Decision::Slice { .. } => "slice".to_owned(),
                 decision::Decision::Opt { .. } => "optional".to_owned(),
                 decision::Decision::Box(_) => "box".to_owned(),
@@ -8978,6 +9016,7 @@ fn e2_artifacts_from_table(
         let ordinary_key = match ordinary_decision {
             Some(decision::Decision::Ref { .. }) => "ref",
             Some(decision::Decision::InferredRef { .. }) => "inferred-ref",
+            Some(decision::Decision::Cursor { .. }) => "cursor",
             Some(decision::Decision::Slice { .. }) => "slice",
             Some(decision::Decision::Opt { .. }) => "optional",
             Some(decision::Decision::Box(_)) => "box",
@@ -8987,6 +9026,7 @@ fn e2_artifacts_from_table(
         let final_key = match final_decision {
             decision::Decision::Ref { .. } => "ref",
             decision::Decision::InferredRef { .. } => "inferred-ref",
+            decision::Decision::Cursor { .. } => "cursor",
             decision::Decision::Slice { .. } => "slice",
             decision::Decision::Opt { .. } => "optional",
             decision::Decision::Box(_) => "box",
@@ -9193,6 +9233,12 @@ fn e1_subject_seed_tsv(
                 "inferred-ref",
                 "-",
                 tcx.def_path_str(callee.to_def_id()),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::Cursor { .. } => (
+                "cursor",
+                "-",
+                "-".to_owned(),
                 decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
             ),
             decision::Decision::Slice { .. } => (
@@ -9980,6 +10026,7 @@ fn freed_slots_tsv_from(
                 match d {
                     decision::Decision::Ref { .. } => "emitted-ref".to_owned(),
                     decision::Decision::InferredRef { .. } => "inferred-ref".to_owned(),
+                    decision::Decision::Cursor { .. } => "emitted-cursor".to_owned(),
                     decision::Decision::Slice { .. } => "emitted-slice".to_owned(),
                     decision::Decision::Opt { slice, .. } => {
                         if *slice {

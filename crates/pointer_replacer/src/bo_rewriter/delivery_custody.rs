@@ -34,6 +34,9 @@ pub(crate) enum TypeShape {
     Slice {
         element: Box<TypeShape>,
     },
+    Tuple {
+        elements: Vec<TypeShape>,
+    },
     Option {
         path: String,
         payload: Box<TypeShape>,
@@ -113,6 +116,12 @@ fn observed_type(ty: &ast::Ty) -> TypeShape {
         },
         ast::TyKind::Slice(element) => TypeShape::Slice {
             element: Box::new(observed_type(element)),
+        },
+        ast::TyKind::Tup(elements) => TypeShape::Tuple {
+            elements: elements
+                .iter()
+                .map(|element| observed_type(element))
+                .collect(),
         },
         ast::TyKind::Paren(inner) => observed_type(inner),
         ast::TyKind::Infer => TypeShape::Inferred,
@@ -856,6 +865,30 @@ fn custody_option_slice_box_and_mutability_are_distinct_observations() {
         rows[5].type_shape,
         TypeShape::RawPointer { mutable: true, .. }
     ));
+}
+
+#[test]
+fn custody_cursor_tuple_retains_base_index_and_mutability() {
+    let rows = inventory_source(
+        "cursor-shapes.rs",
+        "fn f(a: (&[i32], ::core::primitive::usize), b: (&mut [i32], ::core::primitive::usize), c: (&[i32], _)) {}",
+    )
+    .expect("valid tuple declaration syntax");
+    assert_eq!(rows.len(), 3);
+    for (row, mutable) in rows[..2].iter().zip([false, true]) {
+        let Some(TypeShape::Tuple { elements }) = row.effective_type_shape() else {
+            panic!("explicit cursor tuple must retain its structural custody");
+        };
+        assert_eq!(elements.len(), 2);
+        assert!(
+            matches!(&elements[0], TypeShape::Reference { mutable: observed, pointee }
+            if *observed == mutable && matches!(pointee.as_ref(), TypeShape::Slice { element }
+                if matches!(element.as_ref(), TypeShape::Named { path } if path == "i32")))
+        );
+        assert!(matches!(&elements[1], TypeShape::Named { path }
+            if path == "::core::primitive::usize"));
+    }
+    assert_eq!(rows[2].effective_type_shape(), None);
 }
 
 #[test]

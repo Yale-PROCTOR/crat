@@ -944,7 +944,8 @@ fn option_receipt_requires_changed_form(
         })
         .is_some_and(|(_, decision)| match decision {
             Decision::Opt { .. } => true,
-            Decision::Ref { .. }
+            Decision::Cursor { .. }
+            | Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
@@ -1029,7 +1030,8 @@ pub(crate) fn finalize_signature_classes(
             .copied()
             .unwrap_or_default();
         let (emits, degraded_reason) = match decision {
-            Decision::Ref { .. }
+            Decision::Cursor { .. }
+            | Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
@@ -1153,7 +1155,8 @@ pub(crate) fn finalize_signature_classes(
                 SignatureClassId::of(subject.fn_did),
                 SignatureClassId::of(*callee),
             )),
-            Decision::Ref { .. }
+            Decision::Cursor { .. }
+            | Decision::Ref { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_)
@@ -1385,6 +1388,12 @@ pub(crate) fn strict_recovery_subset(
 ///
 /// 10 of the 20 frozen-corpus programs carry subjects across 2–110 source files,
 /// which is why the flat shape could not survive contact with the corpus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorReceiptPlan {
+    obligation: super::mechanical_receipt::MechanicalObligationPlan,
+    atom_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
     pub native_return_plans: native_return::NativeReturnPlans,
@@ -1434,6 +1443,7 @@ pub(crate) struct Plan {
     /// Proof-site-owned wave-3b A5 obligations. The common and specialized
     /// ledgers are materialized from this one carrier after class finalization.
     pub a5_receipt_plans: Vec<super::mechanical_receipt::A5ProofSiteReceiptPlan>,
+    pub(crate) cursor_receipt_plans: Vec<CursorReceiptPlan>,
     /// Item-2 local-slice construction obligations, sharing one identity with
     /// the common mechanical ledger.
     pub slice_construction_receipt_plans:
@@ -2153,6 +2163,19 @@ impl Plan {
                 || argument.atom_ids.iter().any(|atom| atoms.contains(atom));
             events.extend(argument.obligation.events(live, removed));
         }
+        for receipt in &self.cursor_receipt_plans {
+            let owner = receipt.obligation.planned.key.owner_class;
+            let live = self
+                .class_finalization
+                .classes
+                .get(&owner)
+                .is_some_and(SignatureClassPlan::is_ready);
+            events.extend(receipt.obligation.events(
+                live,
+                reverted.contains(&owner)
+                    || receipt.atom_ids.iter().any(|atom| atoms.contains(atom)),
+            ));
+        }
         for receipt in &self.a5_receipt_plans {
             let class_live = self
                 .class_finalization
@@ -2308,6 +2331,198 @@ impl Plan {
     }
 }
 
+fn cursor_bridge(
+    subject: &super::decision::Subject,
+    cursor: &super::decision::cursor_native::CursorPlan,
+    edit: Option<&super::decision::emitability::UseEdit>,
+) -> BridgeSitePlan {
+    let kind = edit.map_or("cursor-declaration", |edit| edit.bridge_kind);
+    let boundary = edit.and_then(|edit| {
+        cursor
+            .bridges
+            .iter()
+            .find(|bridge| bridge.argument_span == edit.span)
+    });
+    let hir = edit.map_or(subject.hir_id, |edit| {
+        let index = cursor
+            .uses
+            .iter()
+            .position(|candidate| candidate == edit)
+            .expect("validated cursor use identity");
+        cursor.use_hirs[index]
+    });
+    let form = if subject.mutable {
+        "cursor-mut"
+    } else {
+        "cursor-shared"
+    };
+    let (expected, found, argument) = match kind {
+        "cursor-constructor" | "cursor-declaration" => (form, "raw", "local"),
+        "cursor-element" => ("element", form, "indexed-element"),
+        "raw-op-cursor-t1" => ("raw", form, "bare-local"),
+        _ => unreachable!("validated cursor operation"),
+    };
+    let mut bridge = BridgeSitePlan::local(
+        subject.fn_did,
+        boundary.map_or(subject.fn_did, |site| site.callee),
+        if boundary.is_some() {
+            Arm::Addr.key()
+        } else {
+            Arm::Surface.key()
+        },
+        boundary.map_or_else(
+            || format!("hir{}", hir.local_id.as_u32()),
+            |site| {
+                format!(
+                    "call-hir{}:arg{}",
+                    site.call_hir.local_id.as_u32(),
+                    site.argument_index
+                )
+            },
+        ),
+        kind,
+    )
+    .with_forms(expected, found, argument)
+    .with_extent(BridgeExtentKind::Evidence(format!(
+        "array-local={}:elements={}",
+        cursor.base.as_u32(),
+        cursor.extent
+    )));
+    if boundary.is_some() {
+        bridge.retention = BridgeRetentionTier::T1;
+    }
+    bridge
+}
+
+fn cursor_obligations(
+    subject: &super::decision::Subject,
+    cursor: &super::decision::cursor_native::CursorPlan,
+    owner_path: &str,
+    required_arms: &str,
+    atom_ids: &[String],
+) -> Result<Vec<CursorReceiptPlan>, &'static str> {
+    use super::mechanical_receipt::*;
+    let valid = cursor.uses.len() == cursor.use_hirs.len()
+        && cursor
+            .use_hirs
+            .iter()
+            .all(|hir| hir.owner.def_id == subject.fn_did)
+        && cursor
+            .use_hirs
+            .iter()
+            .collect::<rustc_hash::FxHashSet<_>>()
+            .len()
+            == cursor.use_hirs.len()
+        && cursor.bridges.iter().all(|bridge| {
+            bridge.call_hir.owner.def_id == subject.fn_did
+                && u32::try_from(bridge.argument_index).is_ok()
+                && cursor
+                    .uses
+                    .iter()
+                    .filter(|edit| {
+                        edit.span == bridge.argument_span && edit.bridge_kind == "raw-op-cursor-t1"
+                    })
+                    .count()
+                    == 1
+        })
+        && cursor.uses.iter().all(|edit| {
+            let count = cursor
+                .bridges
+                .iter()
+                .filter(|bridge| bridge.argument_span == edit.span)
+                .count();
+            match edit.bridge_kind {
+                "raw-op-cursor-t1" => count == 1,
+                "cursor-constructor" | "cursor-element" => count == 0,
+                _ => false,
+            }
+        });
+    if !valid {
+        return Err("cursor-receipt-metadata-unavailable");
+    }
+    let owner = SignatureClassId::of(subject.fn_did);
+    Ok(std::iter::once(None)
+        .chain(cursor.uses.iter().map(Some))
+        .map(|edit| {
+            let bridge = cursor_bridge(subject, cursor, edit);
+            let boundary = edit.and_then(|edit| {
+                cursor
+                    .bridges
+                    .iter()
+                    .find(|bridge| bridge.argument_span == edit.span)
+            });
+            let hir = boundary.map_or_else(
+                || {
+                    edit.map_or(subject.hir_id, |edit| {
+                        cursor.use_hirs[cursor
+                            .uses
+                            .iter()
+                            .position(|candidate| candidate == edit)
+                            .unwrap()]
+                    })
+                },
+                |site| site.call_hir,
+            );
+            let planned = MechanicalObligationEvent {
+                key: MechanicalObligationKey {
+                    owner_class: owner,
+                    subject: MechanicalSubjectKey::Local {
+                        owner: subject.fn_did,
+                        mir_local: subject.local.as_u32(),
+                        slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                    },
+                    site: CanonicalSiteKey {
+                        owner: subject.fn_did,
+                        location: CanonicalLocation::Hir {
+                            owner: subject.fn_did,
+                            item_local_id: hir.local_id.as_u32(),
+                        },
+                        callee: boundary
+                            .map(|site| CanonicalCallee::Local(site.callee.to_def_id())),
+                        argument_index: boundary.map(|site| site.argument_index as u32),
+                        slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                    },
+                    family: MechanicalFamily::Cursor,
+                },
+                owner_path: owner_path.to_owned(),
+                prior_reason: bridge.bridge_kind.clone(),
+                expected_form: bridge.expected_form,
+                found_form: bridge.found_form,
+                argument_kind: bridge.argument_kind,
+                source_shape: "slice-plus-index".to_owned(),
+                required_arms: required_arms.to_owned(),
+                mechanism: MechanicalMechanism::Cursor,
+                composition_parent: None,
+                dependency_classes: BTreeSet::new(),
+                evidence: MechanicalEvidence {
+                    extent: MechanicalExtent::Evidence(format!(
+                        "array-local={}:elements={}",
+                        cursor.base.as_u32(),
+                        cursor.extent
+                    )),
+                    retention: if boundary.is_some() {
+                        MechanicalRetention::T1
+                    } else {
+                        MechanicalRetention::None
+                    },
+                    ..MechanicalEvidence::default()
+                },
+                stage: MechanicalStage::Plan,
+                state: MechanicalState::Planned,
+                terminal_reason: None,
+            };
+            CursorReceiptPlan {
+                obligation: MechanicalObligationPlan {
+                    planned,
+                    intended_terminal_state: MechanicalState::Applied,
+                    intended_terminal_reason: None,
+                },
+                atom_ids: atom_ids.to_vec(),
+            }
+        })
+        .collect())
+}
+
 fn declaration_lifetime<'a>(
     table: &'a DecisionTable,
     subject: &super::decision::Subject,
@@ -2377,7 +2592,8 @@ fn declaration_receipts(
                         record.reason.key().to_owned(),
                     )),
                 ),
-                Decision::Ref { .. }
+                Decision::Cursor { .. }
+                | Decision::Ref { .. }
                 | Decision::InferredRef { .. }
                 | Decision::Slice { .. }
                 | Decision::Opt { .. }
@@ -2657,6 +2873,7 @@ pub(crate) fn plan(
         }
     }
     let mut a5_receipt_plans = Vec::new();
+    let mut cursor_receipt_plans = Vec::new();
     let mut slice_construction_receipt_plans = table.retired_slice_constructions.clone();
     let slice_use_receipt_plans = table.slice_use_receipts.clone();
     let option_receipt_plans = table.option_receipts.clone();
@@ -3204,22 +3421,31 @@ pub(crate) fn plan(
         else {
             continue;
         };
-        match decision {
-            Decision::Opt { .. } => {}
+        let (binding_prefix, binding_kind, binding_detail) = match decision {
+            Decision::Opt { .. } => (
+                "option-binding",
+                "option-mut-binding",
+                "Option binding mutability",
+            ),
+            Decision::Cursor { .. } => (
+                "cursor-binding",
+                "cursor-mut-binding",
+                "Cursor binding mutability",
+            ),
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
             | Decision::Degraded(_) => continue,
-        }
+        };
         let owner = SignatureClassId::of(subject.fn_did);
         let Some(name) = &subject.param_name else { continue };
         let bridge = BridgeSitePlan::local(
             subject.fn_did,
             subject.fn_did,
             Arm::Surface.key(),
-            format!("option-binding:hir{}", subject.hir_id.local_id.as_u32()),
-            "option-mut-binding",
+            format!("{binding_prefix}:hir{}", subject.hir_id.local_id.as_u32()),
+            binding_kind,
         );
         match span_to_loc(subject.binding_span) {
             Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
@@ -3236,13 +3462,13 @@ pub(crate) fn plan(
                 atom_ids: Vec::new(),
                 subject_id: subject.identity_key(&owner_of(subject)),
                 required_arms: owner_arms.get(&owner).copied().unwrap_or_default().render(),
-                edit_kind: "option-mut-binding",
+                edit_kind: binding_kind,
             }),
             Err(reason) => unplaceable.push(Unplaceable {
                 owner_class: owner,
                 bridge,
                 reason,
-                detail: "Option binding mutability".to_owned(),
+                detail: binding_detail.to_owned(),
                 subject: subject.identity_key(&owner_of(subject)),
             }),
         }
@@ -3509,7 +3735,17 @@ pub(crate) fn plan(
         // `Unplaceable` record — measured with a variant probe before the
         // repair: the build named only `artifact::rows` and `degradations()`.
         // A `match` makes the next disposition a compile error at this site.
+        let cursor_plan = match decision {
+            Decision::Cursor { plan, .. } => Some(plan),
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => None,
+        };
         let (mutable, use_edits_in, optional, fat, box_plan) = match decision {
+            Decision::Cursor { mutable, plan } => (mutable, Some(&plan.uses), false, true, None),
             Decision::Ref { mutable } => (mutable, None, false, false, None),
             // The direct callee supplies this local's type. There is no local
             // declaration span to edit; the signature owner is planned by E2.
@@ -3576,6 +3812,27 @@ pub(crate) fn plan(
             .copied()
             .unwrap_or_default()
             .render();
+        if let Some(cursor) = cursor_plan {
+            match cursor_obligations(
+                subject,
+                cursor,
+                &owner_of(subject),
+                &subject_arms,
+                &subject_atom_ids,
+            ) {
+                Ok(receipts) => cursor_receipt_plans.extend(receipts),
+                Err(reason) => {
+                    unplaceable.push(Unplaceable {
+                        owner_class: SignatureClassId::of(subject.fn_did),
+                        bridge: surface_bridge(),
+                        reason,
+                        detail: attribution(),
+                        subject: identity(),
+                    });
+                    continue;
+                }
+            }
+        }
         // A bridge-admitted unannotated Box binding gets its complete type from
         // the rewritten initializer. It still needs a file anchor for its value
         // edits, but deliberately has no declaration splice. Every other form
@@ -3729,7 +3986,10 @@ pub(crate) fn plan(
                 .and_then(|plan| plan.pointee_override)
                 .map(super::decision::box_facts::BoxPointeeOverride::source_name)
                 .unwrap_or(source_pointee);
-            let base = if box_plan.is_some() {
+            let base = if cursor_plan.is_some() {
+                let mutability = if *mutable { "mut " } else { "" };
+                format!("(&{mutability}[{pointee}], ::core::primitive::usize)")
+            } else if box_plan.is_some() {
                 if fat {
                     format!("Box<[{pointee}]>")
                 } else {
@@ -3857,25 +4117,35 @@ pub(crate) fn plan(
                     hi,
                     replacement: use_edit.replacement.clone(),
                     justification: Justification::KindDecision {
-                        kind: if optional { "Opt(use)" } else { "Slice(use)" },
+                        kind: if cursor_plan.is_some() {
+                            "Cursor(use)"
+                        } else if optional {
+                            "Opt(use)"
+                        } else {
+                            "Slice(use)"
+                        },
                     },
                     owner_class: Some(SignatureClassId::of(subject.fn_did)),
                     owner_path: owner_of(subject),
-                    bridge: Some(BridgeSitePlan::local(
-                        subject.fn_did,
-                        subject.fn_did,
-                        if raw_op {
-                            Arm::Addr.key()
-                        } else {
-                            Arm::Surface.key()
-                        },
-                        if raw_op {
-                            format!("{}@{}..{}", subject_id, lo, hi)
-                        } else {
-                            subject_id.clone()
-                        },
-                        use_edit.bridge_kind,
-                    )),
+                    bridge: Some(if let Some(cursor) = cursor_plan {
+                        cursor_bridge(subject, cursor, Some(use_edit))
+                    } else {
+                        BridgeSitePlan::local(
+                            subject.fn_did,
+                            subject.fn_did,
+                            if raw_op {
+                                Arm::Addr.key()
+                            } else {
+                                Arm::Surface.key()
+                            },
+                            if raw_op {
+                                format!("{}@{}..{}", subject_id, lo, hi)
+                            } else {
+                                subject_id.clone()
+                            },
+                            use_edit.bridge_kind,
+                        )
+                    }),
                     atom_ids: subject_atom_ids.clone(),
                     subject_id: subject_id.clone(),
                     required_arms: subject_arms.clone(),
@@ -3897,7 +4167,13 @@ pub(crate) fn plan(
             });
             continue;
         }
-        let kind = if box_plan.is_some() {
+        let kind = if cursor_plan.is_some() {
+            if *mutable {
+                "Cursor(mut)"
+            } else {
+                "Cursor(shared)"
+            }
+        } else if box_plan.is_some() {
             match (optional, fat) {
                 (false, false) => "Box",
                 (false, true) => "BoxSlice",
@@ -3928,17 +4204,25 @@ pub(crate) fn plan(
                 justification: Justification::KindDecision { kind },
                 owner_class: Some(SignatureClassId::of(subject.fn_did)),
                 owner_path: owner_of(subject),
-                bridge: Some(BridgeSitePlan::local(
-                    subject.fn_did,
-                    subject.fn_did,
-                    Arm::Surface.key(),
-                    subject_id.clone(),
-                    "subject-declaration",
-                )),
+                bridge: Some(if let Some(cursor) = cursor_plan {
+                    cursor_bridge(subject, cursor, None)
+                } else {
+                    BridgeSitePlan::local(
+                        subject.fn_did,
+                        subject.fn_did,
+                        Arm::Surface.key(),
+                        subject_id.clone(),
+                        "subject-declaration",
+                    )
+                }),
                 atom_ids: subject_atom_ids,
                 subject_id,
                 required_arms: subject_arms,
-                edit_kind: "subject-declaration",
+                edit_kind: if cursor_plan.is_some() {
+                    "cursor-declaration"
+                } else {
+                    "subject-declaration"
+                },
             });
         }
     }
@@ -4493,6 +4777,7 @@ pub(crate) fn plan(
         class_finalization: ClassFinalization::default(),
         attribution_intervals,
         a5_receipt_plans,
+        cursor_receipt_plans,
         slice_construction_receipt_plans,
         slice_use_receipt_plans,
         option_receipt_plans,
@@ -4534,6 +4819,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cursor_receipts_require_exact_t1_site_and_survive_revert_accounting() {
+        use crate::bo_rewriter::{
+            decision::{
+                cursor_native::{CursorBridge, CursorPlan},
+                emitability::UseEdit,
+            },
+            mechanical_receipt::*,
+        };
+        let mut subject = alias_subject();
+        subject.kind = crate::bo_rewriter::decision::SubjectKind::Local;
+        let hir = |index| rustc_hir::HirId {
+            owner: subject.hir_id.owner,
+            local_id: rustc_hir::ItemLocalId::from_u32(index),
+        };
+        let cursor = CursorPlan {
+            uses: vec![UseEdit {
+                span: rustc_span::DUMMY_SP,
+                replacement: "p.0.as_ptr().add(p.1)".into(),
+                bridge_kind: "raw-op-cursor-t1",
+            }],
+            use_hirs: vec![hir(1)],
+            base: Local::from_u32(2),
+            component: vec![subject.local],
+            extent: 8,
+            bridges: vec![CursorBridge {
+                call_hir: hir(2),
+                callee: subject.fn_did,
+                argument_span: rustc_span::DUMMY_SP,
+                argument_index: 0,
+            }],
+        };
+        let receipts = cursor_obligations(&subject, &cursor, "f", "addr", &[]).unwrap();
+        assert_eq!(receipts.len(), 2);
+        let declaration = &receipts[0].obligation.planned;
+        assert_eq!(declaration.key.family, MechanicalFamily::Cursor);
+        assert_eq!(declaration.expected_form, "cursor-shared");
+        assert_eq!(declaration.evidence.retention, MechanicalRetention::None);
+        let call = &receipts[1].obligation.planned;
+        assert_eq!(
+            call.key.site.location,
+            CanonicalLocation::Hir {
+                owner: subject.fn_did,
+                item_local_id: 2
+            }
+        );
+        assert_eq!(call.key.site.argument_index, Some(0));
+        assert_eq!(call.evidence.retention, MechanicalRetention::T1);
+        assert_eq!(
+            call.evidence.extent,
+            MechanicalExtent::Evidence("array-local=2:elements=8".into())
+        );
+        let bridge = cursor_bridge(&subject, &cursor, Some(&cursor.uses[0]));
+        assert_eq!(bridge.retention, BridgeRetentionTier::T1);
+        assert_eq!(bridge.found_form, "cursor-shared");
+        for reverted in [false, true] {
+            let events = receipts
+                .iter()
+                .flat_map(|receipt| receipt.obligation.events(true, reverted))
+                .collect::<Vec<_>>();
+            assert!(reconcile_mechanical_obligations(&events).is_ok());
+            assert!(
+                events
+                    .iter()
+                    .filter(|event| event.stage == MechanicalStage::Terminal)
+                    .all(|event| event.state
+                        == if reverted {
+                            MechanicalState::Dropped
+                        } else {
+                            MechanicalState::Applied
+                        })
+            );
+        }
+        let mut missing = cursor.clone();
+        missing.bridges.clear();
+        assert!(cursor_obligations(&subject, &missing, "f", "addr", &[]).is_err());
+        let mut duplicate = cursor.clone();
+        duplicate.bridges.push(cursor.bridges[0].clone());
+        assert!(cursor_obligations(&subject, &duplicate, "f", "addr", &[]).is_err());
+        let mut missing_hir = cursor;
+        missing_hir.use_hirs.clear();
+        assert!(cursor_obligations(&subject, &missing_hir, "f", "addr", &[]).is_err());
+    }
+
     /// **The arm-3 witness.** A `Ref` decision on a declaration with no pointee
     /// span is recorded as `Unplaceable`, not skipped.
     ///
@@ -4553,6 +4922,7 @@ mod tests {
     #[test]
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
+            cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),
@@ -4621,6 +4991,7 @@ mod tests {
     #[test]
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
+            cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),

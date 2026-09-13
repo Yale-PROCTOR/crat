@@ -154,6 +154,7 @@ pub(crate) fn plan(
                 continue;
             }
             // Keep the established scalar InferredRef path unchanged.
+            Form::Cursor { .. } => continue,
             Form::Raw | Form::Ref { .. } => continue,
         };
         let shared_slice_weakening = matches!(

@@ -192,6 +192,7 @@ fn return_dependencies<'tcx>(
                         | Decision::Slice { .. }
                         | Decision::Opt { .. }
                         | Decision::Box(_)
+                        | Decision::Cursor { .. }
                         | Decision::Degraded(_) => {}
                     }
                 }
@@ -306,6 +307,9 @@ fn current_alternative(
     found: Form,
     input_form: Form,
 ) -> Result<SeamAlternative, &'static str> {
+    if matches!(found, Form::Cursor { .. }) {
+        return Err("callee-parameter-input-cursor-source-unbuilt");
+    }
     if input_form != Form::Raw {
         return Err("callee-parameter-input-native-target-unbuilt");
     }
@@ -322,7 +326,9 @@ fn current_alternative(
             subject.fn_did == caller
                 && subject.hir_id == root
                 && match decision {
-                    Decision::Box(_) | Decision::InferredRef { .. } => true,
+                    Decision::Box(_) | Decision::Cursor { .. } | Decision::InferredRef { .. } => {
+                        true
+                    }
                     Decision::Ref { .. }
                     | Decision::Slice { .. }
                     | Decision::Opt { .. }
@@ -485,7 +491,7 @@ pub(crate) fn plan(
                     | Decision::InferredRef { .. }
                     | Decision::Slice { .. }
                     | Decision::Opt { .. } => seam::form_of(choice),
-                    Decision::Box(_) | Decision::Degraded(_) => continue,
+                    Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_) => continue,
                 };
                 let input_form = *table
                     .input_interfaces

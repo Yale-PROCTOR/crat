@@ -109,7 +109,8 @@ pub(crate) fn plan(
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
-            | Decision::Box(_) => false,
+            | Decision::Box(_)
+            | Decision::Cursor { .. } => false,
         };
         if !raw || subject.kind != SubjectKind::Local {
             continue;
@@ -125,6 +126,7 @@ pub(crate) fn plan(
         };
         let Some(interface) = table.return_interfaces.functions.get(&callee) else { continue };
         match interface.form {
+            Form::Cursor { .. } => continue,
             Form::Raw => continue,
             Form::Ref { .. } | Form::Slice { .. } | Form::Opt { .. } => {}
         }

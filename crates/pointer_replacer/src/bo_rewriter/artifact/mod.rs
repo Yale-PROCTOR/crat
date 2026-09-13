@@ -85,6 +85,14 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                     },
                     None,
                 ),
+                Decision::Cursor { mutable, .. } => (
+                    if *mutable {
+                        Outcome::CursorMut
+                    } else {
+                        Outcome::CursorShared
+                    },
+                    None,
+                ),
                 Decision::Box(plan) => (
                     match (plan.optional, plan.shape) {
                         (false, super::decision::box_facts::BoxShape::Sized) => Outcome::Box,
@@ -218,6 +226,7 @@ mod tests {
             slice_constructions: Vec::new(),
             retired_slice_constructions: Vec::new(),
             slice_use_receipts: Vec::new(),
+            cursor_receipts: Vec::new(),
             option_receipts: Vec::new(),
             option_value_initializers: Vec::new(),
             option_mut_bindings: rustc_hash::FxHashSet::default(),

@@ -22,6 +22,7 @@ pub(crate) struct ReturnInterface {
 impl ReturnInterface {
     pub(crate) fn temporary_type(&self) -> String {
         let (mutable, slice, optional) = match self.form {
+            Form::Cursor { .. } => unreachable!("cursor return interfaces are not admitted"),
             Form::Raw => unreachable!("return lifetime plans contain borrowed interfaces"),
             Form::Ref { mutable } => (mutable, false, false),
             Form::Slice { mutable } => (mutable, true, false),
@@ -69,6 +70,17 @@ pub(crate) fn plan(
             .iter()
             .filter(|site| site.owner == function)
             .collect::<Vec<_>>();
+        if sites.iter().filter_map(|site| site.root).any(|root| {
+            matches!(
+                decisions.get(&(function, root)),
+                Some(Decision::Cursor { .. })
+            )
+        }) {
+            result
+                .failures
+                .insert(function, "return-interface-cursor-unbuilt");
+            continue;
+        }
         let has_null = sites.iter().any(|site| site.source_shape == "null-lit");
         let new_family = enabled_families.contains(&function)
             && (has_null
@@ -79,6 +91,7 @@ pub(crate) fn plan(
                             Decision::Ref { .. }
                             | Decision::InferredRef { .. }
                             | Decision::Box(_)
+                            | Decision::Cursor { .. }
                             | Decision::Degraded(_),
                         )
                         | None => false,
@@ -101,7 +114,7 @@ pub(crate) fn plan(
                         | Decision::InferredRef { .. }
                         | Decision::Slice { .. }
                         | Decision::Opt { .. } => Some(form_of(decision)),
-                        Decision::Box(_) | Decision::Degraded(_) => None,
+                        Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_) => None,
                     }?;
                     let supported = match site.expression_shape {
                         super::emitability::ReturnExprShape::Other => site.source_shape == "bare-local",
@@ -128,6 +141,7 @@ pub(crate) fn plan(
                         mutable,
                         slice: true,
                     } => Form::Slice { mutable },
+                    Form::Cursor { .. } => unreachable!("cursor return sources are rejected above"),
                     Form::Ref { .. } | Form::Slice { .. } | Form::Raw => *form,
                 })
                 .collect::<Vec<_>>();
@@ -151,7 +165,7 @@ pub(crate) fn plan(
                         mutable,
                         slice: true,
                     },
-                    Form::Raw | Form::Opt { .. } => {
+                    Form::Cursor { .. } | Form::Raw | Form::Opt { .. } => {
                         result
                             .failures
                             .insert(function, "return-interface-unbuilt-raw-source");

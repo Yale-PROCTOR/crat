@@ -343,7 +343,7 @@ pub(crate) fn pair_raw_view_expression(
             }
             _ => raw_passthrough(),
         },
-        Some(Decision::Box(_)) => None,
+        Some(Decision::Box(_) | Decision::Cursor { .. }) => None,
     }
 }
 
@@ -1821,6 +1821,9 @@ pub(crate) enum BridgeTemplate {
     RefMutToWritableRawConst,
     RefSharedToRawConst,
     RefSharedToRawMut,
+    CursorSharedToRawConst,
+    CursorMutToRawMut,
+    CursorMutToRawConst,
     SliceMutToRawMut,
     SliceToRawConst,
     SliceMutToWritableRawConst,
@@ -1851,6 +1854,9 @@ impl BridgeTemplate {
             Self::RefMutToWritableRawConst => "returned-child-ref-mut-to-raw-const",
             Self::RefSharedToRawConst => "ref-shared-to-raw-const",
             Self::RefSharedToRawMut => "shared-ref-to-mut-raw",
+            Self::CursorSharedToRawConst => "cursor-shared-to-raw-const",
+            Self::CursorMutToRawMut => "cursor-mut-to-raw-mut",
+            Self::CursorMutToRawConst => "cursor-mut-to-raw-const",
             Self::SliceMutToRawMut => "slice-mut-to-raw-mut",
             Self::SliceToRawConst => "slice-to-raw-const",
             Self::SliceMutToWritableRawConst => "returned-child-slice-mut-to-raw-const",
@@ -1978,6 +1984,35 @@ impl BridgeTemplate {
             ))),
             Self::RefMutToRawMut | Self::RefMutToRawConst | Self::RefSharedToRawConst => {
                 Ok(BridgeRender::ZeroSyntax)
+            }
+            Self::CursorSharedToRawConst | Self::CursorMutToRawMut | Self::CursorMutToRawConst => {
+                let mutable = self != Self::CursorSharedToRawConst;
+                let expected = if self == Self::CursorMutToRawMut {
+                    RawMutability::Mut
+                } else {
+                    RawMutability::Const
+                };
+                if target_mutability != expected {
+                    return Err(RawBoundaryBlockReason::TemplateUnavailable);
+                }
+                // SAFETY: native cursor admission proves the retained base and
+                // current index; the boundary requires verified no-retention.
+                // Borrowing the operand once neither moves the base nor repeats
+                // an operand expression. The block's binding shadows only after
+                // its initializer, even if the source has the generated name.
+                let borrow = if mutable { "&mut " } else { "&" };
+                let method = if mutable { "as_mut_ptr" } else { "as_ptr" };
+                let cast = cast_pointee
+                    .map(|pointee| format!(".cast::<{pointee}>()"))
+                    .unwrap_or_default();
+                let as_const = if self == Self::CursorMutToRawConst {
+                    ".cast_const()"
+                } else {
+                    ""
+                };
+                Ok(BridgeRender::Edit(format!(
+                    "{{ let __crat_cursor = {borrow}({argument}); __crat_cursor.0.{method}().add(__crat_cursor.1){cast}{as_const} }}"
+                )))
             }
             Self::SliceMutToRawMut => Ok(BridgeRender::Edit(format!("{argument}.as_mut_ptr()"))),
             Self::SliceToRawConst => Ok(BridgeRender::Edit(format!("{argument}.as_ptr()"))),
@@ -2118,7 +2153,10 @@ pub(crate) fn returned_child_template(
         | super::Decision::InferredRef { mutable: false, .. }
         | super::Decision::Slice { mutable: false, .. }
         | super::Decision::Opt { mutable: false, .. }
-        | super::Decision::Box(_) => return Err(RawBoundaryBlockReason::ReturnedChildPermission),
+        | super::Decision::Box(_)
+        | super::Decision::Cursor { .. } => {
+            return Err(RawBoundaryBlockReason::ReturnedChildPermission);
+        }
     };
     if base == BridgeTemplate::TypedRawTemporary {
         // A raw expression derived from a safe root needs its own operation
@@ -2171,7 +2209,9 @@ pub(crate) fn outbound_reference_view(
             "addr-of-mut" | "addr-of-mut-cast" => Some(super::Decision::Ref { mutable: true }),
             _ => None,
         },
-        super::Decision::Box(_) | super::Decision::Degraded(_) => None,
+        super::Decision::Box(_) | super::Decision::Cursor { .. } | super::Decision::Degraded(_) => {
+            None
+        }
     }
 }
 
@@ -2186,6 +2226,7 @@ pub(crate) fn returned_child_permission(
         | super::Decision::InferredRef { mutable, .. }
         | super::Decision::Slice { mutable, .. }
         | super::Decision::Opt { mutable, .. } => !*mutable,
+        super::Decision::Cursor { .. } => return Err(ReturnedChildPermissionFailure::Unknown),
         super::Decision::Box(_) | super::Decision::Degraded(_) => false,
     };
     if !shared {
@@ -2321,6 +2362,7 @@ fn box_site_owner(
         | super::Decision::InferredRef { .. }
         | super::Decision::Slice { .. }
         | super::Decision::Opt { .. }
+        | super::Decision::Cursor { .. }
         | super::Decision::Degraded(_) => return None,
     };
     let site_span = site.source_span.source_callsite();
@@ -2374,6 +2416,7 @@ pub(crate) fn template_for(
             Decision::Opt { slice: true, .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
+            | Decision::Cursor { .. }
             | Decision::Degraded(_) => Err(RawBoundaryBlockReason::TemplateUnavailable),
         };
     }
@@ -2428,9 +2471,10 @@ pub(crate) fn template_for(
             // carry that same open obligation already; widening it to a new
             // cell is the seat's call, not this arm's.
             Decision::Slice { mutable: false, .. } => Err(RawBoundaryBlockReason::SharedToMut),
-            Decision::Opt { .. } | Decision::Box(_) | Decision::Degraded(_) => {
-                Err(RawBoundaryBlockReason::TemplateUnavailable)
-            }
+            Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => Err(RawBoundaryBlockReason::TemplateUnavailable),
         };
     }
     match decision {
@@ -2482,8 +2526,38 @@ pub(crate) fn template_for(
                 Err(RawBoundaryBlockReason::TemplateUnavailable)
             }
         }
+        Decision::Cursor { mutable, .. } => {
+            if ownership == Some(OwnershipContract::Consume) {
+                return Err(RawBoundaryBlockReason::OwnershipTransfer);
+            }
+            match (*mutable, target.mutability) {
+                (false, RawMutability::Const) => Ok(BridgeTemplate::CursorSharedToRawConst),
+                (true, RawMutability::Mut) => Ok(BridgeTemplate::CursorMutToRawMut),
+                (true, RawMutability::Const) => Ok(BridgeTemplate::CursorMutToRawConst),
+                (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
+            }
+        }
         Decision::Degraded(_) => Err(RawBoundaryBlockReason::SubjectNotSafe),
     }
+}
+
+fn cursor_retention_permit(
+    decision: &super::Decision,
+    verdict: &RetentionVerdict,
+) -> Result<(), RawBoundaryBlockReason> {
+    let cursor = match decision {
+        super::Decision::Cursor { .. } => true,
+        super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::Slice { .. }
+        | super::Decision::Opt { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Degraded(_) => false,
+    };
+    if cursor && matches!(verdict, RetentionVerdict::Unknown { .. }) {
+        return Err(RawBoundaryBlockReason::TemplateUnavailable);
+    }
+    Ok(())
 }
 
 fn template_for_source_form(
@@ -2606,7 +2680,8 @@ impl RawBoundaryDispositionIndex {
                         | super::Decision::InferredRef { .. }
                         | super::Decision::Slice { .. }
                         | super::Decision::Opt { .. }
-                        | super::Decision::Box(_) => false,
+                        | super::Decision::Box(_)
+                        | super::Decision::Cursor { .. } => false,
                     };
                     if source_stays_raw
                         && let Some(source_mutability) = site.adapter_operand_mutability
@@ -2916,6 +2991,9 @@ impl RawBoundaryDispositionIndex {
                             ));
                         }
                     }
+                    cursor_retention_permit(decision, &retention_verdict).map_err(|reason| {
+                        (reason, "cursor-retention-unknown-unlicensed".to_owned())
+                    })?;
                     match retention_verdict {
                         RetentionVerdict::NoRetain { certificate } => {
                             let certificate_started = std::time::Instant::now();
@@ -2963,6 +3041,7 @@ impl RawBoundaryDispositionIndex {
                     | super::Decision::InferredRef { .. }
                     | super::Decision::Slice { .. }
                     | super::Decision::Opt { .. }
+                    | super::Decision::Cursor { .. }
                     | super::Decision::Degraded(_) => false,
                 });
             let target_stays_raw = site.callee_local.is_none_or(|callee| {
@@ -2980,7 +3059,8 @@ impl RawBoundaryDispositionIndex {
                                 | super::Decision::InferredRef { .. }
                                 | super::Decision::Slice { .. }
                                 | super::Decision::Opt { .. }
-                                | super::Decision::Box(_) => false,
+                                | super::Decision::Box(_)
+                                | super::Decision::Cursor { .. } => false,
                             })
                     })
                     .unwrap_or(true)
@@ -4599,3 +4679,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cursor_raw_tests.rs"]
+mod cursor_raw_tests;

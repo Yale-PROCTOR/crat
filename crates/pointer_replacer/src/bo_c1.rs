@@ -247,6 +247,20 @@ fn raw_boundary_custody_observed_form(
         _ => (false, shape),
     };
     match payload {
+        TypeShape::Tuple { elements } => {
+            if !optional
+                && let [
+                    TypeShape::Reference { mutable, pointee },
+                    TypeShape::Named { path },
+                ] = elements.as_slice()
+                && matches!(pointee.as_ref(), TypeShape::Slice { .. })
+                && path.trim_start_matches("::") == "core::primitive::usize"
+            {
+                Ok(Some(DeliveryForm::Cursor { mutable: *mutable }))
+            } else {
+                Err("unresolved-cursor-type")
+            }
+        }
         TypeShape::Reference { mutable, pointee } => Ok(Some(DeliveryForm::Borrowed {
             mutable: *mutable,
             optional,
@@ -15800,6 +15814,8 @@ struct OutcomeCounts {
     /// it counts rather than by changing the program.
     slice_mut: usize,
     slice_shared: usize,
+    cursor_mut: usize,
+    cursor_shared: usize,
     /// **S3.2′-3** — optional forms, counted apart from their plain twins for
     /// the same reason the slice buckets are: `decided_ref` is pinned across the
     /// milestone's records and an optional reference is not one.
@@ -15830,6 +15846,8 @@ impl OutcomeCounts {
         self.ref_shared += other.ref_shared;
         self.slice_mut += other.slice_mut;
         self.slice_shared += other.slice_shared;
+        self.cursor_mut += other.cursor_mut;
+        self.cursor_shared += other.cursor_shared;
         // **S3.2′-5 hardening.** S3.2′-3 added these four buckets to
         // `count_outcomes` — where the compiler forced it — and to neither
         // `merge` nor `count_line`, where it did not. The corpus TOTAL line
@@ -15914,6 +15932,8 @@ fn count_outcomes(rows: &[crate::coverage_recon::schema::Row]) -> OutcomeCounts 
             // pinned number means by it.
             Some(Outcome::SliceMut) => c.slice_mut += 1,
             Some(Outcome::SliceShared) => c.slice_shared += 1,
+            Some(Outcome::CursorMut) => c.cursor_mut += 1,
+            Some(Outcome::CursorShared) => c.cursor_shared += 1,
             // S3.2′-3: optional dispositions likewise. `decided_ref` is pinned
             // across the milestone's records; an optional reference is not one.
             Some(Outcome::OptRefMut) => c.opt_ref_mut += 1,
@@ -15950,6 +15970,7 @@ fn count_line(scope: &str, c: &OutcomeCounts) -> String {
     format!(
         "M1COUNT {scope} rows={} decided_ref={} ref_mut={} ref_shared={} \
          decided_slice={} slice_mut={} slice_shared={} \
+         decided_cursor={} cursor_mut={} cursor_shared={} \
          decided_opt={} opt_ref_mut={} opt_ref_shared={} opt_slice_mut={} \
          opt_slice_shared={} \
          box_sized={} box_slice={} opt_box_sized={} opt_box_slice={} \
@@ -15961,6 +15982,9 @@ fn count_line(scope: &str, c: &OutcomeCounts) -> String {
         c.slice_mut + c.slice_shared,
         c.slice_mut,
         c.slice_shared,
+        c.cursor_mut + c.cursor_shared,
+        c.cursor_mut,
+        c.cursor_shared,
         c.decided_opt(),
         c.opt_ref_mut,
         c.opt_ref_shared,
@@ -16004,6 +16028,8 @@ fn every_bucket_is_merged_and_reported() {
         ref_shared: 5,
         slice_mut: 7,
         slice_shared: 11,
+        cursor_mut: 59,
+        cursor_shared: 61,
         opt_ref_mut: 13,
         opt_ref_shared: 17,
         opt_slice_mut: 19,
@@ -16028,6 +16054,8 @@ fn every_bucket_is_merged_and_reported() {
         ref_shared: 10,
         slice_mut: 14,
         slice_shared: 22,
+        cursor_mut: 118,
+        cursor_shared: 122,
         opt_ref_mut: 26,
         opt_ref_shared: 34,
         opt_slice_mut: 38,
@@ -16060,6 +16088,9 @@ fn every_bucket_is_merged_and_reported() {
         ("decided_slice", 18),
         ("slice_mut", 7),
         ("slice_shared", 11),
+        ("decided_cursor", 120),
+        ("cursor_mut", 59),
+        ("cursor_shared", 61),
         ("decided_opt", 72),
         ("opt_ref_mut", 13),
         ("opt_ref_shared", 17),
@@ -25948,6 +25979,58 @@ fn r219_custody_observe(
         &std::collections::BTreeMap::from([("fixture.rs".to_owned(), source.to_owned())]),
         &reverted.iter().map(|owner| (*owner).to_owned()).collect(),
     )
+}
+
+#[test]
+fn cursor_custody_requires_exact_base_index_tuple() {
+    use crate::bo_rewriter::DeliveryForm;
+    for mutable in [false, true] {
+        let qualifier = if mutable { "mut " } else { "" };
+        let mut expectation = r219_custody_expectation("f", "p");
+        expectation.parameter_index = None;
+        expectation.expected_form = DeliveryForm::Cursor { mutable };
+        let source =
+            format!("fn f() {{ let p: (&{qualifier}[i32], ::core::primitive::usize) = todo!(); }}");
+        let report = r219_custody_observe(&[expectation], &["f::p#1"], &source, &[]);
+        assert!(report.issues.is_empty(), "{report:?}");
+        assert!(report.delivered_by_tree.contains("f::p#1"), "{report:?}");
+    }
+    for actual_type in [
+        "&[i32]",
+        "(&[i32], ::core::primitive::isize)",
+        "(&[i32], usize)",
+        "(&[i32], user::usize)",
+        "(&i32, ::core::primitive::usize)",
+        "(&[i32], ::core::primitive::usize, bool)",
+        "Option<(&[i32], ::core::primitive::usize)>",
+        "(&mut [i32], ::core::primitive::usize)",
+    ] {
+        let mut expectation = r219_custody_expectation("f", "p");
+        expectation.parameter_index = None;
+        expectation.expected_form = DeliveryForm::Cursor { mutable: false };
+        let source = format!("fn f() {{ let p: {actual_type} = todo!(); }}");
+        let report = r219_custody_observe(&[expectation], &["f::p#1"], &source, &[]);
+        assert!(
+            report.delivered_by_tree.is_empty(),
+            "{actual_type}: {report:?}"
+        );
+        assert!(!report.issues.is_empty(), "{actual_type}: {report:?}");
+    }
+    let mut expectation = r219_custody_expectation("f", "p");
+    expectation.parameter_index = None;
+    expectation.expected_form = DeliveryForm::Borrowed {
+        mutable: false,
+        optional: false,
+        slice: true,
+    };
+    let report = r219_custody_observe(
+        &[expectation],
+        &["f::p#1"],
+        "fn f() { let p: (&[i32], ::core::primitive::usize) = todo!(); }",
+        &[],
+    );
+    assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    assert!(!report.issues.is_empty(), "{report:?}");
 }
 
 #[test]
