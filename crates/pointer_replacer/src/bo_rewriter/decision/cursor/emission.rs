@@ -39,6 +39,21 @@ fn local(expr: &hir::Expr<'_>) -> Option<hir::HirId> {
     }
 }
 
+fn binding_name(tcx: TyCtxt<'_>, subject: &Subject) -> Result<String, CursorHold> {
+    let hir::Node::Pat(pattern) = tcx.hir_node(subject.hir_id) else {
+        return Err(CursorHold::DeclarationUnbuilt);
+    };
+    let hir::PatKind::Binding(_, id, ident, None) = pattern.kind else {
+        return Err(CursorHold::DeclarationUnbuilt);
+    };
+    if id != subject.hir_id {
+        return Err(CursorHold::DeclarationUnbuilt);
+    }
+    // Preserve the compiler-resolved binding token, including raw identifiers.
+    // Symbol spelling alone drops `r#` and can turn a use into a keyword.
+    text(tcx, ident.span)
+}
+
 fn method(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &hir::Expr<'_>, expected: &[&str]) -> bool {
     let Some(did) = tcx.typeck(owner).type_dependent_def_id(expr.hir_id) else { return false };
     !did.is_local()
@@ -279,7 +294,14 @@ impl Uses<'_, '_> {
         }
         if let hir::ExprKind::MethodCall(_, receiver, _, _) = expr.kind {
             let (index, range) = self.position(receiver)?;
-            return step(self.tcx, self.subject.fn_did, expr, index, range);
+            let (index, range) = step(self.tcx, self.subject.fn_did, expr, index, range)?;
+            // Every position in the chain needs a representation, including
+            // positions that are never dereferenced. One-past is permitted;
+            // leaving the carried window and returning is not a usize cursor.
+            if range.lo < 0 || range.hi > i128::from(self.origin.count) {
+                return Err(CursorHold::WindowMissing);
+            }
+            return Ok((index, range));
         }
         Err(CursorHold::UseUnbuilt)
     }
@@ -306,7 +328,14 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             return;
         }
         if let hir::ExprKind::Unary(hir::UnOp::Deref, pointer) = expr.kind {
-            if let Ok((index, range)) = self.position(pointer) {
+            let position = self.position(pointer);
+            if let Err(hold) = position
+                && contains_local(pointer, self.subject.hir_id)
+            {
+                self.hold.get_or_insert(hold);
+                return;
+            }
+            if let Ok((index, range)) = position {
                 if range.lo < 0 || range.hi >= i128::from(self.origin.count) {
                     self.hold = Some(CursorHold::WindowMissing);
                     return;
@@ -421,10 +450,7 @@ pub(super) fn plan(
         subject,
         origin: &base,
         init,
-        name: subject
-            .param_name
-            .clone()
-            .ok_or(CursorHold::DeclarationUnbuilt)?,
+        name: binding_name(ctx.tcx, subject)?,
         uses: vec![],
         use_hirs: vec![],
         hold: None,

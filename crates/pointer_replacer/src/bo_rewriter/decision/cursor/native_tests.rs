@@ -256,6 +256,43 @@ fn cursor_mutable_t1_binding_supports_whole_tuple_reborrow() {
 }
 
 #[test]
+fn cursor_checks_intermediate_positions_not_just_final_dereference() {
+    let source = emitted(
+        "pub unsafe fn witness(a:&[i32;4])->i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(-3).offset(3) }",
+    );
+    assert!(
+        !source.contains("::core::primitive::usize"),
+        "an intermediate position leaves the proved window: {source}"
+    );
+    let source = emitted(
+        "pub unsafe fn witness(a:&[i32;4])->i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(2).offset(-1) }",
+    );
+    assert!(
+        source.contains("::core::primitive::usize"),
+        "one-past then back is within the proved window: {source}"
+    );
+    compile(
+        &source,
+        Some("fn main(){assert_eq!(unsafe{witness(&[10,20,30,40])},40);}"),
+    );
+}
+
+#[test]
+fn cursor_preserves_raw_identifier_bindings() {
+    let source = emitted(
+        "pub unsafe fn witness(a:&[i32;4])->i32 { let r#type:*const i32=a.as_ptr().add(2); *r#type.offset(-1) }",
+    );
+    assert!(
+        source.contains("::core::primitive::usize"),
+        "raw identifier cursor did not survive: {source}"
+    );
+    compile(
+        &source,
+        Some("fn main(){assert_eq!(unsafe{witness(&[10,20,30,40])},20);}"),
+    );
+}
+
+#[test]
 fn requested_return_keeps_typed_cursor_hold() {
     let input =
         "pub unsafe fn witness(p: *const i32, delta: isize) -> *const i32 { p.offset(delta) }";
