@@ -7469,6 +7469,7 @@ fn finish_decide<'tcx>(
                 &context,
                 &table.seams.outbound_expressions,
             );
+        decision::overlapping_pairs::publish(tcx, &table, &context)?;
         return Ok((table, context));
     }
 }

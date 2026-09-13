@@ -72,6 +72,14 @@ fn w5p_diagnostic_carries_native_forms_and_mutability() {
         )
         .expect("native writer-pair table");
         assert!(!table.seams.overlap_proofs.is_empty());
+        let (positions, formals) = super::observer::snapshot(tcx, &table, &ctx);
+        assert_eq!(
+            positions.lines().count(),
+            table.seams.overlap_proofs.len() + 1
+        );
+        assert!(formals.contains("reader\t0\timmutable\tfalse"), "{formals}");
+        assert!(formals.contains("reader\t1\timmutable\tfalse"), "{formals}");
+        assert!(formals.contains("entry\t0\tmutable\tfalse"), "{formals}");
         let rows = super::diagnose(&table, &ctx.mut_facts);
         assert_eq!(rows.len(), table.seams.overlap_proofs.len());
         for (row, proof) in rows.iter().zip(&table.seams.overlap_proofs) {

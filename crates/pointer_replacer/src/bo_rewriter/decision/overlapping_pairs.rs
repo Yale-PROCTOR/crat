@@ -5,7 +5,9 @@
     reason = "Native evidence checkpoint; admission awaits the shared-pair receipt carrier."
 )]
 
+mod observer;
 pub(crate) mod reader;
+pub(crate) use observer::publish;
 
 use super::{DecisionTable, SubjectKind, a5_site_proof::A5ProofSiteKey, seam::Form};
 use crate::analyses::borrow_ownership::mutability_facts::MutFacts;
