@@ -8727,6 +8727,76 @@ fn br_w11_ptr_eq_uses_slice_data_and_typed_option_null_views() {
     );
 }
 
+/// R362-1 RED: a seam that names NO parameter must carry no parameter subject
+/// key. Return seams and address observations set `param_index` to
+/// `usize::MAX`; the receipt's `parameter_subject_key` column is derived from
+/// that index, so the sentinel has to survive the derivation. It did not: the
+/// index was narrowed with `as u32` and incremented, which panics under the
+/// default profile's overflow checks and silently wraps to local 0 — the
+/// return place — without them. This fixture reaches the sentinel through the
+/// address-observation arm.
+#[test]
+fn r362_1_a_seam_that_names_no_parameter_carries_no_subject_key() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub unsafe fn eq(p: *const i32, q: *const i32) -> bool { core::ptr::eq(p, q) }\n";
+    let attempt = raw_boundary_attempt_with(source, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("eq::p") {
+                *decision = super::decision::Decision::Slice {
+                    mutable: false,
+                    uses: Vec::new(),
+                };
+            } else if subject.label.ends_with("eq::q") {
+                *decision = super::decision::Decision::Opt {
+                    mutable: false,
+                    slice: false,
+                    uses: Vec::new(),
+                };
+            }
+        }
+    });
+    // `raw_boundary_attempt_with` returns a COMPOSITE receipt; the seam table
+    // is the section after the `-- seams --` marker.
+    let seams = attempt
+        .receipt
+        .split_once("-- seams --\n")
+        .expect("receipt carries a seam section")
+        .1;
+    let header = seams
+        .lines()
+        .next()
+        .expect("seam section carries a header")
+        .split('\t')
+        .collect::<Vec<_>>();
+    let index_column = header
+        .iter()
+        .position(|name| *name == "param_index")
+        .expect("receipt carries param_index");
+    let key_column = header
+        .iter()
+        .position(|name| *name == "parameter_subject_key")
+        .expect("receipt carries parameter_subject_key");
+    let sentinel = usize::MAX.to_string();
+    let sentinel_rows = seams
+        .lines()
+        .skip(1)
+        .map(|row| row.split('\t').collect::<Vec<_>>())
+        .filter(|row| row.len() > key_column && row[index_column] == sentinel)
+        .collect::<Vec<_>>();
+    assert!(
+        !sentinel_rows.is_empty(),
+        "the fixture must reach the no-parameter sentinel: {}",
+        attempt.receipt
+    );
+    for row in &sentinel_rows {
+        assert_eq!(
+            row[key_column], "-",
+            "a seam naming no parameter must not borrow a parameter's identity: {}",
+            attempt.receipt
+        );
+    }
+}
+
 /// BR-W12 RED: one class exercises every inference-sensitive declaration
 /// family. The static/table and raw wrapper keep explicit raw types, while the
 /// generated return temporary and caller local receive the carried safe type.

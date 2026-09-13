@@ -10155,8 +10155,19 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     let subject_key_for = |owner: &str, param_index: usize| -> String {
+        // Return seams and address observations carry `usize::MAX` because they
+        // name no parameter at all. That is not an index to convert: `as u32`
+        // would truncate it and the `+ 1` would then wrap to local 0 — the
+        // return place — and hand back a NEIGHBOURING subject's identity.
+        // Convert fallibly and let the sentinel fall through to "-".
+        let Some(local) = param_index
+            .checked_add(1)
+            .and_then(|local| u32::try_from(local).ok())
+        else {
+            return "-".to_owned();
+        };
         parameter_subject_keys
-            .get(&(owner.to_owned(), param_index as u32 + 1))
+            .get(&(owner.to_owned(), local))
             .cloned()
             .unwrap_or_else(|| "-".to_owned())
     };
