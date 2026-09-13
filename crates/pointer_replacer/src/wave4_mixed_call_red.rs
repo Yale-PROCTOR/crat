@@ -49,7 +49,9 @@ const PRELUDE: &str = r#"
 // SAFETY: these fixture functions are compiled and analyzed only. The witness
 // does not call them. Each operation states the source pattern under review.
 unsafe fn safe_target(q: *mut i32) -> i32 { *q }
-unsafe fn raw_target(q: *mut i32) -> i32 { q.read() }
+unsafe fn raw_target(q: *mut i32) -> i32 {
+    (q > core::ptr::null_mut()) as i32
+}
 "#;
 
 const MINIMAL: &str = r#"
