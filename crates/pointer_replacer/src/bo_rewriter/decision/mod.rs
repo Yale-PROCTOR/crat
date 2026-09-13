@@ -71,6 +71,7 @@ pub(crate) mod surface_argument;
 pub(crate) mod thin_extent;
 pub(crate) mod universe;
 pub(crate) mod void_pointee;
+mod wave5r;
 
 use emitability::EmitabilityFacts;
 
@@ -2072,7 +2073,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         return Decision::Opt {
             mutable: subject.mutable,
             slice,
-            uses: uses.rewrites,
+            uses: wave5r::optional_uses(tcx, subject, slice, uses.rewrites),
         };
     }
 

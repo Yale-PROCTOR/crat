@@ -1886,6 +1886,7 @@ impl<'a> SeamGraftVisitor<'a> {
             && !spec.optional
             && spec.unwrap.is_none()
             && !matches!(spec.core, GlueCore::First)
+            && !super::wave5r_cast::is_bare_cast_peel(spec, e, target.arg_span)
         {
             self.stats.unsupported += 1;
             return None;

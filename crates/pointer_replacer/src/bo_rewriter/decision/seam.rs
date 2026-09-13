@@ -5582,6 +5582,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             }),
         }
     }
+    super::wave5r::complete_casts(tcx, table, &mut plan);
     complete_interface_inventory(
         facts,
         table,

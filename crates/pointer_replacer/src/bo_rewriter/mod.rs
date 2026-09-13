@@ -91,6 +91,9 @@ pub(crate) mod sibling_audit;
 pub(crate) mod sign_facts;
 pub(crate) mod use_census;
 pub(crate) mod verify;
+mod wave5r_cast;
+#[cfg(test)]
+mod wave5r_tests;
 
 #[cfg(test)]
 mod additive_tests;
