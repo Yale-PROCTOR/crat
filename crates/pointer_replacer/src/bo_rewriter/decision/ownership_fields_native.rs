@@ -100,6 +100,7 @@ impl Candidates {
                 Decision::Ref { .. } => "ref",
                 Decision::InferredRef { .. } => "inferred-ref",
                 Decision::Slice { .. } => "slice",
+                Decision::Cursor { .. } => "cursor",
                 Decision::Opt { .. } => "optional",
             };
             let (considered, status, kind, detail) = if let Some(bundle) = self.bundles.get(&node) {
@@ -109,6 +110,7 @@ impl Candidates {
                     | Decision::Ref { .. }
                     | Decision::InferredRef { .. }
                     | Decision::Slice { .. }
+                    | Decision::Cursor { .. }
                     | Decision::Opt { .. } => false,
                 };
                 if selected {
@@ -186,6 +188,7 @@ impl Candidates {
                 Decision::Ref { .. }
                 | Decision::InferredRef { .. }
                 | Decision::Slice { .. }
+                | Decision::Cursor { .. }
                 | Decision::Opt { .. }
                 | Decision::Box(_) => continue,
             };
@@ -247,6 +250,7 @@ impl Candidates {
                     Decision::Ref { .. }
                     | Decision::InferredRef { .. }
                     | Decision::Slice { .. }
+                    | Decision::Cursor { .. }
                     | Decision::Opt { .. }
                     | Decision::Degraded(_) => false,
                 };
@@ -298,6 +302,7 @@ fn primary_diagnosis(decision: &Decision) -> (String, String) {
         | Decision::Ref { .. }
         | Decision::InferredRef { .. }
         | Decision::Slice { .. }
+        | Decision::Cursor { .. }
         | Decision::Opt { .. } => ("-".to_owned(), "-".to_owned()),
     }
 }
@@ -365,6 +370,7 @@ fn stable_raw_formal(table: &DecisionTable, callee: LocalDefId, argument: usize)
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
+            | Decision::Cursor { .. }
             | Decision::Opt { .. }
             | Decision::Box(_) => false,
         };

@@ -123,6 +123,7 @@ pub(crate) fn resolve(
         Decision::Ref { .. }
         | Decision::InferredRef { .. }
         | Decision::Slice { .. }
+        | Decision::Cursor { .. }
         | Decision::Opt { .. }
         | Decision::Degraded(_) => false,
     };
