@@ -28,6 +28,7 @@ pub(crate) struct NativeFormal {
     argument: usize,
     model_kind: Kind,
     emitted: FormalForm,
+    terminal: super::seam::Form,
 }
 
 impl NativeFormal {
@@ -41,6 +42,10 @@ impl NativeFormal {
 
     pub(crate) fn emitted(&self) -> FormalForm {
         self.emitted
+    }
+
+    pub(crate) fn terminal(&self) -> super::seam::Form {
+        self.terminal
     }
 
     pub(crate) fn matches(&self, callee: LocalDefId, argument: usize) -> bool {
@@ -121,12 +126,13 @@ pub(crate) fn resolve(
         | Decision::Opt { .. }
         | Decision::Degraded(_) => false,
     };
+    let terminal = crate::bo_rewriter::terminal_parameter_form(table, classes, callee, argument);
     let emitted = if live && is_box {
         FormalForm::Box
     } else {
         // For every other representation, the common terminal interface
         // resolver supplies the placed form or the actual restored input.
-        match crate::bo_rewriter::terminal_parameter_form(table, classes, callee, argument) {
+        match terminal {
             super::seam::Form::Raw => FormalForm::MutableRaw,
             super::seam::Form::Ref { mutable: true }
             | super::seam::Form::Slice { mutable: true } => FormalForm::MutableReference,
@@ -138,6 +144,7 @@ pub(crate) fn resolve(
         argument,
         model_kind,
         emitted,
+        terminal,
     })
 }
 

@@ -46,6 +46,7 @@ pub(crate) mod local_callee_extent;
 pub(crate) mod option;
 pub(crate) mod outbound_expression;
 pub(crate) mod ownership_fields_cache_binding;
+pub(crate) mod ownership_fields_constructor;
 pub(crate) mod ownership_fields_effects;
 pub(crate) mod ownership_fields_formal;
 pub(crate) mod ownership_fields_hook;

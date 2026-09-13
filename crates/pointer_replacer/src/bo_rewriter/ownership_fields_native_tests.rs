@@ -2,7 +2,7 @@
 //! native grants/holds; none inject Owning model bits. R365's source bundle
 //! supplies the proof obligations for the two positive caller-live reductions.
 
-use super::decision::{Decision, DegradeReason, box_facts::BoxPlanFailure};
+use super::decision::Decision;
 
 pub(super) fn native_fixture_source(callee: &str, body: &str) -> String {
     format!(
@@ -27,66 +27,18 @@ pub(super) fn native_fixture_source(callee: &str, body: &str) -> String {
     )
 }
 
-fn check_native_hold(callee: &str, body: &str) {
-    let source = native_fixture_source(callee, body);
-    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
-        let (table, ctx) = super::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                super::A5Mode::PreciseReplay,
-                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .expect("actual native fixture analysis");
-        let mut observed = 0;
-        for (subject, decision) in &table.entries {
-            if !matches!(subject.param_name.as_deref(), Some("pl1" | "pl2")) {
-                continue;
-            }
-            let slot = ctx.slots.fn_local_slots[&subject.fn_did]
-                .slot_for_local_depth(subject.local, 0)
-                .unwrap();
-            let kind = ctx.model.get(&super::SlotRef::Local(subject.fn_did, slot));
-            println!(
-                "OWNFIELDS-NATIVE {callee} {} {kind:?} {decision:?}",
-                subject.label
-            );
-            assert_eq!(
-                kind,
-                Some(&super::SlotKind::Owning),
-                "real model premise, never injected"
-            );
-            match decision {
-                Decision::Degraded(d) => match &d.reason {
-                    DegradeReason::BoxFailure {
-                        failure: BoxPlanFailure::NativeEvidenceHeld { detail, .. },
-                    } => {
-                        assert!(detail.contains("native-subject-bundle"));
-                    }
-                    other => panic!("expected exact missing native bundle, got {other:?}"),
-                },
-                other => panic!("a native positive needs actual bundle producers, got {other:?}"),
-            }
-            observed += 1;
-        }
-        assert_eq!(observed, 2, "both caller owners must be accounted for");
-    })
-    .expect("native source fixture compiles");
-}
-
 #[test]
-fn owning_native_two_buffer_edt_reports_missing_bundle_without_fabricating_a_box() {
-    // Unsupported control flow cannot acquire a bundle from the positive
-    // straight-line fragment, despite the same actual Owning model kinds.
-    check_native_hold(
+fn r376_native_conditional_lend_bundle_is_admitted() {
+    require_native_r365_bundle(
         "edt_with_payload",
         "if *pl1 > 0.0 { edt_with_payload(pl1,pl2); }",
+        1,
     );
 }
 
 #[test]
-fn owning_native_transform_reports_missing_bundle_for_repeated_caller_live_calls() {
-    check_native_hold("edt", "while *pl1 > 0.0 { edt(pl1,pl2); *pl1=0.0; }");
+fn r376_native_loop_repeated_caller_lend_bundle_is_admitted() {
+    require_native_r365_bundle("edt", "while *pl1 > 0.0 { edt(pl1,pl2); *pl1=0.0; }", 1);
 }
 
 fn require_native_r365_bundle(callee_name: &str, calls: &str, expected_calls: usize) {

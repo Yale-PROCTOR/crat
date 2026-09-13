@@ -266,7 +266,8 @@ impl Candidates {
                     argument,
                 )
                 .map_or(true, |current| current != *proof)
-                    || !stable_raw_formal(table, callee, argument)
+                    || (proof.terminal() == super::seam::Form::Raw
+                        && !stable_raw_formal(table, callee, argument))
                 {
                     invalid.insert(node.0);
                 }
@@ -398,7 +399,8 @@ fn derive_bundle(
         subject.local.as_u32(),
         subject.hir_id
     )];
-    receipts.push(format!("native-box-index-zero-nonempty count={} length-unchanged=closed-root-uses source-aliases={:?}",source.count(),source.mir_aliases()));
+    receipts.push(format!("native-box-slice-uses count={} element={} length-unchanged=closed-root-uses source-aliases={:?} indexing=delivered-slice-walker",source.count(),source.element(),source.mir_aliases()));
+    receipts.push(format!("native-generated-unwind-permit operations=allocation-helpers-and-slice-bounds-checks all-roots=fresh-local-closed-uses-and-verified-T1 payload={}/nonrecursive; actual-waiver-sites=emitted-MIR-ledger",source.element()));
     let mut formals = Vec::new();
     let mut checked_calls = BTreeSet::<SourceCallKey>::new();
     for obligation in source.calls() {
@@ -438,11 +440,17 @@ fn derive_bundle(
             argument,
         )
         .map_err(NativeHold::Call)?;
-        if emitted.emitted() != FormalForm::MutableRaw
-            || !stable_raw_formal(table, callee, argument)
-        {
-            return Err(NativeHold::FinalInterface);
-        }
+        let lend_expression = match (emitted.emitted(), emitted.terminal()) {
+            (FormalForm::MutableRaw, super::seam::Form::Raw)
+                if stable_raw_formal(table, callee, argument) =>
+            {
+                format!("<[_]>::as_mut_ptr(&mut *({name}))")
+            }
+            (FormalForm::MutableReference, super::seam::Form::Slice { mutable: true }) => {
+                format!("&mut *({name})")
+            }
+            _ => return Err(NativeHold::FinalInterface),
+        };
         formal::require_nonconsuming(effects, &emitted).map_err(NativeHold::Call)?;
         let Some(RetentionVerdict::NoRetain { certificate }) =
             inputs.retention.get(callee, argument)
@@ -454,16 +462,32 @@ fn derive_bundle(
             .verify_certificate(callee, argument, certificate)
             .map_err(|_| NativeHold::Call(Hold::Lend(LendHold::Retention)))?;
         let sig = tcx.fn_sig(callee.to_def_id()).skip_binder().skip_binder();
-        // No hidden scalar effects, callee operand evaluation, indirect target,
-        // aggregate argument or pointer-return path is admitted by this slice.
+        // The source permit accounts for every nonpointer operand separately.
+        // Only literal/local/cast scalar reads commute with the peer borrows.
+        let pointer_indices: BTreeSet<_> = sig
+            .inputs()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ty)| ty.is_raw_ptr().then_some(index))
+            .collect();
+        let scalar_indices: BTreeSet<_> = (0..sig.inputs().len())
+            .filter(|index| !pointer_indices.contains(index))
+            .collect();
         if !sig.output().is_unit()
-            || sig
-                .inputs()
-                .iter()
-                .any(|ty| !matches!(ty.kind(), rustc_middle::ty::TyKind::RawPtr(..)))
+            || &scalar_indices != obligation.scalar_arguments()
+            || scalar_indices.iter().any(|index| {
+                !matches!(
+                    sig.inputs()[*index].kind(),
+                    rustc_middle::ty::TyKind::Int(_)
+                        | rustc_middle::ty::TyKind::Uint(_)
+                        | rustc_middle::ty::TyKind::Float(_)
+                        | rustc_middle::ty::TyKind::Bool
+                )
+            })
         {
             return Err(NativeHold::Missing("native-complete-pointer-call-shape"));
         }
+        receipts.push(format!("native-box-call-scalar-evaluation {key:?} arguments={scalar_indices:?} effect-free=literal-local-cast"));
         let peers: Vec<_> = inputs
             .sites
             .sites
@@ -476,7 +500,7 @@ fn derive_bundle(
             })
             .collect();
         let indices: BTreeSet<_> = peers.iter().map(|p| p.key.argument_index).collect();
-        if indices != (0..sig.inputs().len()).collect()
+        if indices != pointer_indices
             || peers.len() != indices.len()
             || peers
                 .iter()
@@ -519,20 +543,20 @@ fn derive_bundle(
             span: obligation.argument_span(),
             // Select the inherent slice operation directly; a source trait
             // method on Box must not capture the generated view operation.
-            replacement: format!("<[_]>::as_mut_ptr(&mut *({name}))"),
+            replacement: lend_expression,
             receipt: "native-box-lend-t1",
         });
-        receipts.push(format!("native-box-lend {:?} arg={argument} formal_model={:?} emitted=raw T1=verified nonconsuming=verified interval=argument-list-through-return protector=call source-reference-inventory=complete",key,emitted.model_kind()));
+        receipts.push(format!("native-box-lend {:?} arg={argument} formal_model={:?} emitted={} T1=verified nonconsuming=verified interval=argument-list-through-return protector=call source-reference-inventory=complete",key,emitted.model_kind(),emitted.terminal().key()));
         checked_calls.insert(key);
         formals.push(emitted);
     }
-    // SourcePlan proves one fresh f32 root, no source aliases/escaping storage,
+    // SourcePlan proves a fresh numeric root per allocation occurrence, no source aliases/escaping storage,
     // no reference-taking or rebinding, and all normal paths through its exact
     // C free. Each owner-using call above is separately proved nonretaining and
     // nonconsuming. That completes the all-roots account for extra unwinding
     // closes of this scalar root; it is not inferred from an empty loan set.
     for at in source.unwind_obligations() {
-        receipts.push(format!("native-unwind-close-permit source-call={at:?} all-roots=fresh-local-closed-uses-and-verified-T1 payload=f32/nonrecursive; actual-waiver-sites=emitted-MIR-ledger"));
+        receipts.push(format!("native-unwind-close-permit source-call={at:?} all-roots=fresh-local-closed-uses-and-verified-T1 payload={}/nonrecursive; actual-waiver-sites=emitted-MIR-ledger",source.element()));
     }
     let required: BTreeSet<_> = source.frees().iter().map(|site| site.key()).collect();
     let frees = plan_frees(&required, source.frees()).map_err(NativeHold::Source)?;
@@ -667,10 +691,10 @@ mod audit_tests {
     }
 
     #[test]
-    fn native_audit_keeps_typed_cfg_hold_beside_primary_reason() {
+    fn native_audit_keeps_typed_source_hold_beside_primary_reason() {
         let source = bo::ownership_fields_native_tests::native_fixture_source(
             "edt",
-            "if *pl1 > 0.0 { edt(pl1,pl2); }",
+            "let a=pl1.offset(1); let b=pl2.offset(1); *a=*b; edt(pl1,pl2);",
         );
         ::utils::compilation::run_compiler_on_str(&source, |tcx| {
             let (table, ctx) = bo::decide_table_with_ctx_config(
@@ -695,17 +719,149 @@ mod audit_tests {
                 &table,
                 &ClassFinalization::default(),
             );
-            assert_eq!(candidates.holds.len(), 2, "actual source CFG refusals");
+            assert_eq!(candidates.holds.len(), 2, "actual unsupported cursor uses");
             let audit = candidates.audit(tcx, &ctx.slots, &ctx.model, &table);
             let data = rows(&audit);
             assert_eq!(data.len(), 4);
             let held: Vec<_> = data.iter().filter(|row| row[8] == "held").collect();
             assert_eq!(held.len(), 2);
             assert!(held.iter().all(|row| row[7] == "true"
-                && row[9] == "Source::UnsupportedControlFlow"
-                && row[10].contains("UnsupportedControlFlow")
+                && row[9] == "Source::UnsupportedOwnerUse"
+                && row[10].contains("UnsupportedOwnerUse")
                 && row[11] == "box-param-caller-unknown"));
         })
         .unwrap();
+    }
+
+    #[test]
+    fn r376_synthetic_terminal_slice_renders_lend_and_recovery_invalidates_owner() {
+        use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+
+        let input =
+            bo::ownership_fields_native_tests::native_fixture_source("edt", "edt(pl1,pl2);");
+        let carrier = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+            let (mut table, ctx) = bo::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    bo::A5Mode::PreciseReplay,
+                    Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let original_model = ctx.model.clone();
+            let program = bo::collect_program(tcx);
+            let callee = *program
+                .functions
+                .iter()
+                .find(|id| tcx.def_path_str(id.to_def_id()) == "edt")
+                .unwrap();
+            let mut classes =
+                bo::prepare_plan_files(tcx, &table, &FxHashSet::default(), &ctx.retained_c9_plans)
+                    .unwrap()
+                    .plan
+                    .class_finalization;
+            // Mechanical terminal-class snapshot only: source identities,
+            // ownership model, native effects, T1 and A5 remain real. These
+            // inserted Slice decisions are not native slice grants.
+            let mut changed = 0;
+            for (subject, decision) in &mut table.entries {
+                if subject.fn_did == callee && matches!(subject.kind, SubjectKind::Param { .. }) {
+                    *decision = Decision::Slice {
+                        mutable: true,
+                        uses: Vec::new(),
+                    };
+                    changed += 1;
+                }
+            }
+            assert_eq!(changed, 2);
+            let id = SignatureClassId::of(callee);
+            classes.classes.insert(
+                id,
+                bo::plan::SignatureClassPlan {
+                    id,
+                    required_arms: Default::default(),
+                    site_keys: Vec::new(),
+                    edit_keys: Vec::new(),
+                    depends_on: Vec::new(),
+                    disposition: bo::plan::SignatureClassDisposition::Ready,
+                    sites: Vec::new(),
+                },
+            );
+            let inputs = Inputs {
+                program: &program,
+                slots: &ctx.slots,
+                model: &ctx.model,
+                constructions: &ctx.constructions,
+                sites: &ctx.raw_boundary_sites,
+                retention: &ctx.retention,
+                a5: &ctx.a5_site_proofs,
+            };
+            let effects = NativeEffects::derive(&program);
+            let mut candidates = Candidates::default();
+            let mut arguments = std::collections::BTreeMap::new();
+            let mut owners = FxHashSet::default();
+            for (subject, _) in &table.entries {
+                let Some(name @ ("pl1" | "pl2")) = subject.param_name.as_deref() else {
+                    continue;
+                };
+                assert!(outer_owning(&ctx.slots, &ctx.model, subject));
+                let source = source::derive(&program, subject, &ctx.constructions).unwrap();
+                let bundle =
+                    derive_bundle(&inputs, &table, &classes, &effects, subject, &source).unwrap();
+                assert_eq!(bundle.formals.len(), 1);
+                assert_eq!(bundle.formals[0].emitted(), FormalForm::MutableReference);
+                assert_eq!(
+                    bundle.formals[0].terminal(),
+                    super::super::seam::Form::Slice { mutable: true }
+                );
+                let edits: Vec<_> = bundle
+                    .plan
+                    .expr_edits
+                    .iter()
+                    .filter(|edit| edit.receipt == "native-box-lend-t1")
+                    .collect();
+                assert_eq!(edits.len(), 1);
+                assert_eq!(edits[0].replacement, format!("&mut *({name})"));
+                arguments.insert(name.to_owned(), edits[0].replacement.clone());
+                owners.insert(subject.fn_did);
+                candidates
+                    .bundles
+                    .insert((subject.fn_did, subject.hir_id), bundle);
+            }
+            assert_eq!(candidates.bundles.len(), 2);
+            for (subject, decision) in &mut table.entries {
+                if let Some(bundle) = candidates.bundles.get(&(subject.fn_did, subject.hir_id)) {
+                    *decision = Decision::Box(bundle.plan.clone());
+                }
+            }
+            assert!(
+                candidates
+                    .invalid_owners(&inputs, &table, &classes)
+                    .is_empty()
+            );
+            classes.classes.get_mut(&id).unwrap().disposition =
+                bo::plan::SignatureClassDisposition::Held(vec!["synthetic-slice-recovery".into()]);
+            assert_eq!(candidates.invalid_owners(&inputs, &table, &classes), owners);
+            for bundle in candidates.bundles.values() {
+                let proof = &bundle.formals[0];
+                let (callee, argument) = proof.identity();
+                let recovered = formal::resolve(
+                    tcx, &ctx.slots, &ctx.model, &table, &classes, callee, argument,
+                )
+                .unwrap();
+                assert_eq!(recovered.terminal(), super::super::seam::Form::Raw);
+                assert_ne!(&recovered, proof);
+            }
+            assert_eq!(ctx.model, original_model);
+            format!(
+                "fn edt(input: &mut [f32], output: &mut [f32]) {{ output[0] = input[0]; }}\n\
+                 fn main() {{ let mut pl1: Box<[f32]> = vec![1.0; 2].into_boxed_slice();\n\
+                 let mut pl2: Box<[f32]> = vec![0.0; 2].into_boxed_slice();\n\
+                 edt({}, {}); drop(pl1); drop(pl2); }}",
+                arguments["pl1"], arguments["pl2"],
+            )
+        })
+        .unwrap();
+        assert!(bo::verify::type_checks_str(&carrier));
     }
 }

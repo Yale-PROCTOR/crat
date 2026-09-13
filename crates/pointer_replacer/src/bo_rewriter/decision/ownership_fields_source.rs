@@ -1,19 +1,24 @@
-//! R365 native constructor/free source proofs for straight-line scalar buffers.
+//! R376 native constructor/free source proofs for scalar boxed-slice roots.
 //! Source occurrence identity is not allocation-generation identity. Ordinary
 //! call and generated-unwind obligations remain explicit for the bundle owner.
 use std::collections::{BTreeMap, BTreeSet};
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     Expr, ExprKind, HirId, Node, QPath,
     def::Res,
     intravisit::{self, Visitor},
 };
 use rustc_middle::{
-    mir::{BasicBlock, CastKind, Local, Operand, Rvalue, StatementKind, TerminatorKind},
+    mir::{
+        BasicBlock, CastKind, Local, Location, Operand, Place, Rvalue, StatementKind,
+        TerminatorKind,
+        visit::{PlaceContext, Visitor as MirVisitor},
+    },
     ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::{
-    Span, Symbol,
+    Span,
     def_id::{DefId, LocalDefId},
 };
 
@@ -48,6 +53,7 @@ pub(crate) struct CallObligation {
     argument: usize,
     argument_span: Span,
     call_span: Span,
+    scalar_arguments: BTreeSet<usize>,
 }
 impl CallObligation {
     pub(crate) fn key(&self) -> SourceCallKey {
@@ -68,6 +74,10 @@ impl CallObligation {
 
     pub(crate) fn call_span(&self) -> Span {
         self.call_span
+    }
+
+    pub(crate) fn scalar_arguments(&self) -> &BTreeSet<usize> {
+        &self.scalar_arguments
     }
 }
 #[derive(Clone, Debug)]
@@ -106,7 +116,8 @@ impl SourceFreeSite {
 pub(crate) struct SourcePlan {
     owner: LocalDefId,
     binding: HirId,
-    count: usize,
+    count: String,
+    element: String,
     constructor: BoxExprEdit,
     scalar_edits: Vec<BoxExprEdit>,
     frees: Vec<SourceFreeSite>,
@@ -126,8 +137,12 @@ impl SourcePlan {
         self.binding
     }
 
-    pub(crate) fn count(&self) -> usize {
-        self.count
+    pub(crate) fn count(&self) -> &str {
+        &self.count
+    }
+
+    pub(crate) fn element(&self) -> &str {
+        &self.element
     }
 
     pub(crate) fn constructor(&self) -> &BoxExprEdit {
@@ -226,9 +241,6 @@ fn c_function(tcx: TyCtxt<'_>, callee: DefId, expected: &str) -> bool {
         return false;
     }
     match expected {
-        "calloc" => {
-            sig.inputs() == [tcx.types.usize, tcx.types.usize] && void_pointer(tcx, sig.output())
-        }
         "free" => {
             sig.inputs().len() == 1 && void_pointer(tcx, sig.inputs()[0]) && sig.output().is_unit()
         }
@@ -259,6 +271,63 @@ fn plain_local(operand: &Operand<'_>) -> Option<Local> {
         Operand::Constant(_) => None,
     }
 }
+// The original call's scalar arguments introduce no reference, effect or
+// trap between the generated peer borrows. Count operands are a different
+// phase: they remain evaluated once at their original allocation site.
+fn scalar_arguments(
+    expression: &Expr<'_>,
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+) -> Result<BTreeSet<usize>, SourceHold> {
+    fn pure(expression: &Expr<'_>, typeck: &rustc_middle::ty::TypeckResults<'_>) -> bool {
+        if !matches!(
+            typeck.expr_ty(expression).kind(),
+            TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool
+        ) {
+            return false;
+        }
+        match expression.kind {
+            ExprKind::Lit(_) => true,
+            ExprKind::Path(QPath::Resolved(_, path)) => matches!(path.res, Res::Local(_)),
+            ExprKind::Cast(inner, _) => pure(inner, typeck),
+            _ => false,
+        }
+    }
+    let ExprKind::Call(_, arguments) = expression.kind else { return Err(SourceHold::Identity) };
+    let mut scalars = BTreeSet::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if typeck.expr_ty(argument).is_raw_ptr() {
+            continue;
+        }
+        if !pure(argument, typeck) {
+            return Err(SourceHold::UnsupportedOwnerUse);
+        }
+        scalars.insert(index);
+    }
+    Ok(scalars)
+}
+/// Actual MIR reads (including pointer bases of payload stores), excluding
+/// StorageLive/Dead and writes of the fresh initializer into its destination.
+struct RootReads<'a> {
+    aliases: &'a BTreeSet<u32>,
+    found: bool,
+}
+impl<'tcx> MirVisitor<'tcx> for RootReads<'_> {
+    fn visit_operand(&mut self, operand: &Operand<'tcx>, location: Location) {
+        if let Operand::Copy(place) | Operand::Move(place) = operand
+            && self.aliases.contains(&place.local.as_u32())
+        {
+            self.found = true;
+        }
+        self.super_operand(operand, location);
+    }
+
+    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        if !place.projection.is_empty() && self.aliases.contains(&place.local.as_u32()) {
+            self.found = true;
+        }
+        self.super_place(place, context, location);
+    }
+}
 struct MirCall<'tcx> {
     key: SourceCallKey,
     expression: &'tcx Expr<'tcx>,
@@ -282,10 +351,11 @@ pub(crate) fn derive<'tcx>(
     let body = tcx
         .mir_drops_elaborated_and_const_checked(subject.fn_did)
         .borrow();
-    if !matches!(body.local_decls[subject.local].ty.kind(), TyKind::RawPtr(pointee, rustc_hir::Mutability::Mut) if *pointee == tcx.types.f32)
-    {
+    let TyKind::RawPtr(element, rustc_hir::Mutability::Mut) =
+        body.local_decls[subject.local].ty.kind()
+    else {
         return Err(SourceHold::ConstructorShape);
-    }
+    };
     let key = (subject.fn_did, subject.hir_id);
     let init_hir = *constructions
         .init_hirs
@@ -296,49 +366,10 @@ pub(crate) fn derive<'tcx>(
         return Err(SourceHold::Identity);
     }
     let typeck = tcx.typeck(subject.fn_did);
-    let allocation = peel(init, typeck)?;
-    let ExprKind::Call(callee_expression, arguments) = allocation.kind else {
-        return Err(SourceHold::ConstructorShape);
-    };
-    let allocator = definition(callee_expression).ok_or(SourceHold::ConstructorIdentity)?;
-    if !c_function(tcx, allocator, "calloc") {
-        return Err(SourceHold::ConstructorIdentity);
-    }
-    let [count_expression, size_expression] = arguments else {
-        return Err(SourceHold::ConstructorShape);
-    };
-    let ExprKind::Lit(literal) = count_expression.kind else {
-        return Err(SourceHold::ConstructorShape);
-    };
-    let rustc_ast::LitKind::Int(value, _) = literal.node else {
-        return Err(SourceHold::ConstructorShape);
-    };
-    let count = usize::try_from(value.get())
-        .ok()
-        .filter(|n| *n > 0)
-        .ok_or(SourceHold::ConstructorShape)?;
-    // The exact bounded f32 layout, not the old snippet `contains(size_of)`.
-    let pointer_bits = tcx.data_layout.pointer_size.bits();
-    let maximum_bytes = 1u128
-        .checked_shl((pointer_bits - 1) as u32)
-        .and_then(|limit| limit.checked_sub(1))
-        .ok_or(SourceHold::ConstructorShape)?;
-    if (count as u128)
-        .checked_mul(4)
-        .is_none_or(|bytes| bytes > maximum_bytes)
-    {
-        return Err(SourceHold::ConstructorShape);
-    }
-    let ExprKind::Call(size_callee, size_arguments) = size_expression.kind else {
-        return Err(SourceHold::ConstructorShape);
-    };
-    let size_definition = definition(size_callee).ok_or(SourceHold::ConstructorShape)?;
-    if !size_arguments.is_empty()
-        || !tcx.is_diagnostic_item(Symbol::intern("mem_size_of"), size_definition)
-        || !matches!(typeck.expr_ty(size_callee).kind(), TyKind::FnDef(did, args) if *did == size_definition && args.type_at(0) == tcx.types.f32)
-    {
-        return Err(SourceHold::ConstructorShape);
-    }
+    let constructor =
+        super::ownership_fields_constructor::derive(tcx, subject.fn_did, init, *element)?;
+    let allocation = constructor.allocation;
+    let allocator = constructor.allocator;
     let Node::Pat(pattern) = tcx.hir_node(subject.hir_id) else { return Err(SourceHold::Identity) };
     let rustc_hir::PatKind::Binding(_, binding, ident, None) = pattern.kind else {
         return Err(SourceHold::Identity);
@@ -367,23 +398,13 @@ pub(crate) fn derive<'tcx>(
     }) {
         return Err(SourceHold::UnsupportedOwnerUse);
     }
+    // The delivered-slice walker owns index syntax. Only its complete direct
+    // dereference edits are consumed here; raw aliases/cursors and self-advance
+    // still need their own view/ownership transactions.
     let mut covered = BTreeSet::new();
-    let mut scalar_edits = Vec::new();
     let mut root_calls = Vec::new();
+    let mut boundary_arguments = FxHashSet::default();
     for &expression in &expressions.0 {
-        if let ExprKind::Unary(rustc_hir::UnOp::Deref, operand) = expression.kind
-            && root_path(operand, binding)
-        {
-            if typeck.expr_ty(expression) != tcx.types.f32 {
-                return Err(SourceHold::UnsupportedOwnerUse);
-            }
-            covered.insert(operand.hir_id.local_id.as_u32());
-            scalar_edits.push(BoxExprEdit {
-                span: expression.span,
-                replacement: format!("{root_spelling}[0]"),
-                receipt: "native-box-scalar-access",
-            });
-        }
         if let ExprKind::Call(callee, arguments) = expression.kind {
             for (index, argument) in arguments.iter().enumerate() {
                 let Ok(operand) = peel(argument, typeck) else { continue };
@@ -391,14 +412,88 @@ pub(crate) fn derive<'tcx>(
                     continue;
                 }
                 let did = definition(callee).ok_or(SourceHold::UnsupportedOwnerUse)?;
-                // Returned pointers need their own explicit owner/view protocol.
                 if !typeck.expr_ty(expression).is_unit() {
                     return Err(SourceHold::UnsupportedOwnerUse);
                 }
                 covered.insert(operand.hir_id.local_id.as_u32());
+                boundary_arguments.insert((
+                    subject.fn_did,
+                    binding,
+                    argument.span.lo().0,
+                    argument.span.hi().0,
+                ));
                 root_calls.push((expression, did, index, argument.span));
             }
         }
+    }
+    let names = FxHashMap::from_iter([(key, root_spelling.clone())]);
+    let slice_uses = super::emitability::collect_slice_uses(
+        tcx,
+        &[subject.fn_did],
+        &names,
+        &FxHashSet::from_iter([key]),
+        &FxHashSet::default(),
+        &boundary_arguments,
+    );
+    let uses = slice_uses
+        .get(&key)
+        .ok_or(SourceHold::UnsupportedOwnerUse)?;
+    if uses.unsupported.is_some()
+        || !uses.return_handoffs.is_empty()
+        || uses
+            .raw_uses
+            .iter()
+            .any(|u| !covered.contains(&u.hir_id.local_id.as_u32()) || u.boundary_span.is_none())
+    {
+        return Err(SourceHold::UnsupportedOwnerUse);
+    }
+    let mut scalar_edits = Vec::new();
+    for edit in &uses.rewrites {
+        let access = expressions
+            .0
+            .iter()
+            .find(|e| e.span == edit.span)
+            .ok_or(SourceHold::UnsupportedOwnerUse)?;
+        let ExprKind::Unary(rustc_hir::UnOp::Deref, operand) = access.kind else {
+            return Err(SourceHold::UnsupportedOwnerUse);
+        };
+        let root = if root_path(operand, binding) {
+            operand
+        } else {
+            let ExprKind::MethodCall(_, receiver, arguments, _) = operand.kind else {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            };
+            let did = typeck
+                .type_dependent_def_id(operand.hir_id)
+                .ok_or(SourceHold::UnsupportedOwnerUse)?;
+            if !root_path(receiver, binding)
+                || arguments.len() != 1
+                || !typeck.expr_ty(receiver).is_raw_ptr()
+                || tcx.crate_name(did.krate).as_str() != "core"
+                || tcx.item_name(did).as_str() != "offset"
+            {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            }
+            receiver
+        };
+        if typeck.expr_ty(access) != *element {
+            return Err(SourceHold::UnsupportedOwnerUse);
+        }
+        covered.insert(root.hir_id.local_id.as_u32());
+        scalar_edits.push(BoxExprEdit {
+            span: edit.span,
+            replacement: edit.replacement.clone(),
+            receipt: "native-box-slice-access",
+        });
+    }
+    // Nested index edits need a composed expression transaction; they cannot
+    // silently consume overlapping source bytes in this fragment.
+    scalar_edits.sort_by_key(|e| (e.span.lo(), e.span.hi()));
+    if scalar_edits
+        .windows(2)
+        .any(|w| w[0].span.hi() > w[1].span.lo())
+    {
+        return Err(SourceHold::UnsupportedOwnerUse);
     }
     let all_uses: BTreeSet<_> = expressions
         .0
@@ -433,7 +528,11 @@ pub(crate) fn derive<'tcx>(
             .iter()
             .copied()
             .filter(|e| {
-                matches!(e.kind, ExprKind::Call(callee, _) if definition(callee) == Some(did))
+                (match e.kind {
+                    ExprKind::Call(callee, _) => definition(callee),
+                    ExprKind::MethodCall(..) => typeck.type_dependent_def_id(e.hir_id),
+                    _ => None,
+                }) == Some(did)
                     && e.span.source_callsite() == span
             })
             .collect();
@@ -545,6 +644,7 @@ pub(crate) fn derive<'tcx>(
                 argument,
                 argument_span,
                 call_span: expression.span,
+                scalar_arguments: scalar_arguments(expression, typeck)?,
             });
         }
     }
@@ -562,63 +662,93 @@ pub(crate) fn derive<'tcx>(
     {
         return Err(SourceHold::UnsupportedOwnerUse);
     }
-    // All normal control flow is linear in this first native fragment. Reject
-    // every branch/cycle instead of inferring a sink on the unvisited arm.
-    let mut block = BasicBlock::from_u32(0);
+    // A source occurrence may execute repeatedly in a loop. Track each
+    // reachable normal state, never fabricate a dynamic allocation generation.
+    // An iteration can allocate again only after its previous exact C free.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum State {
+        Before,
+        Live,
+        Freed,
+    }
+    let mut pending = vec![(BasicBlock::from_u32(0), State::Before)];
     let mut visited = BTreeSet::new();
-    let mut allocated = false;
-    let mut freed = false;
-    let mut unwind_obligations = Vec::new();
-    loop {
-        if !visited.insert(block.as_u32()) {
-            return Err(SourceHold::UnsupportedControlFlow);
+    let mut unwind_obligations = BTreeSet::new();
+    while let Some((block, mut state)) = pending.pop() {
+        if !visited.insert((block.as_u32(), state)) {
+            continue;
         }
         let data = &body.basic_blocks[block];
+        let mut reads = RootReads {
+            aliases: &aliases,
+            found: false,
+        };
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            reads.visit_statement(
+                statement,
+                Location {
+                    block,
+                    statement_index,
+                },
+            );
+        }
+        reads.visit_terminator(
+            data.terminator(),
+            Location {
+                block,
+                statement_index: data.statements.len(),
+            },
+        );
+        if reads.found && state != State::Live {
+            return Err(SourceHold::NormalExitCoverage);
+        }
         if let Some(call) = mir_calls.get(&block) {
             if call.key == allocation_call.key {
-                if allocated {
+                if state == State::Live {
                     return Err(SourceHold::NormalExitCoverage);
                 }
-                allocated = true;
+                state = State::Live;
             } else if call.key == free.key {
-                if !allocated || freed {
+                if state != State::Live {
                     return Err(SourceHold::NormalExitCoverage);
                 }
-                freed = true;
-            } else if allocated && !freed {
-                unwind_obligations.push(call.key);
+                state = State::Freed;
+            } else if state == State::Live {
+                unwind_obligations.insert(call.key);
             }
         }
-        match data.terminator().kind {
+        let successors = match &data.terminator().kind {
             TerminatorKind::Goto { target }
             | TerminatorKind::Call {
                 target: Some(target),
                 ..
-            } => block = target,
-            TerminatorKind::Return if allocated && freed => break,
+            }
+            | TerminatorKind::Assert { target, .. } => vec![*target],
+            TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().to_vec(),
+            TerminatorKind::FalseEdge { real_target, .. }
+            | TerminatorKind::FalseUnwind { real_target, .. } => vec![*real_target],
+            TerminatorKind::Return if state != State::Live => Vec::new(),
             TerminatorKind::Return => return Err(SourceHold::NormalExitCoverage),
             _ => return Err(SourceHold::UnsupportedControlFlow),
-        }
+        };
+        pending.extend(successors.into_iter().map(|next| (next, state)));
     }
     if mir_calls
         .values()
-        .any(|call| !visited.contains(&call.key.block))
+        .any(|call| !visited.iter().any(|(block, _)| *block == call.key.block))
     {
         return Err(SourceHold::UnsupportedControlFlow);
     }
     Ok(SourcePlan {
         owner: subject.fn_did,
         binding,
-        count,
-        constructor: BoxExprEdit {
-            span: init.span,
-            replacement: format!("::std::vec![0.0f32; {count}].into_boxed_slice()"),
-            receipt: "native-calloc-zero-f32",
-        },
+        count: constructor.count,
+        element: constructor.element.to_string(),
+        constructor: constructor.edit,
         scalar_edits,
         frees,
         calls,
-        unwind_obligations,
+        unwind_obligations: unwind_obligations.into_iter().collect(),
         mir_aliases: aliases,
     })
 }
@@ -628,7 +758,7 @@ mod tests {
     use super::*;
     use crate::bo_rewriter as bo;
 
-    fn inspect(source: &str, name: &str) -> Result<(usize, usize, usize, usize), SourceHold> {
+    fn inspect(source: &str, name: &str) -> Result<(String, usize, usize, usize), SourceHold> {
         let name = name.to_owned();
         ::utils::compilation::run_compiler_on_str(source, move |tcx| {
             let (table, ctx) = bo::decide_table_with_ctx_config(
@@ -649,7 +779,11 @@ mod tests {
             let plan = derive(&program, &subjects[0].0, &ctx.constructions)?;
             assert_eq!(plan.binding(), subjects[0].0.hir_id);
             assert_eq!(plan.owner(), subjects[0].0.fn_did);
-            assert_eq!(plan.constructor().receipt, "native-calloc-zero-f32");
+            assert!(
+                plan.constructor()
+                    .receipt
+                    .starts_with("native-calloc-zero-")
+            );
             assert!(plan.constructor().replacement.contains("into_boxed_slice"));
             for free in plan.frees() {
                 assert_eq!(free.binding(), plan.binding());
@@ -663,7 +797,7 @@ mod tests {
                 );
             }
             Ok((
-                plan.count(),
+                plan.count().to_owned(),
                 plan.frees().len(),
                 plan.calls().len(),
                 plan.unwind_obligations().len(),
@@ -680,7 +814,7 @@ mod tests {
         );
         for name in ["pl1", "pl2"] {
             let (count, frees, calls, unwinds) = inspect(&source, name).unwrap();
-            assert_eq!((count, frees, calls), (2, 1, 1));
+            assert_eq!((count, frees, calls), ("2".into(), 1, 1));
             assert!(
                 unwinds >= 1,
                 "the ordinary call's generated unwind remains owed"
@@ -695,7 +829,7 @@ mod tests {
         );
         for name in ["pl1", "pl2"] {
             let (count, frees, calls, unwinds) = inspect(&source, name).unwrap();
-            assert_eq!((count, frees, calls), (2, 1, 2));
+            assert_eq!((count, frees, calls), ("2".into(), 1, 2));
             assert!(unwinds >= 2);
         }
     }
@@ -772,5 +906,78 @@ mod tests {
             inspect(&source, "pl1"),
             Err(SourceHold::ConstructorShape)
         ));
+    }
+    #[test]
+    fn source_cp2_loop_local_allocation_has_one_close_per_iteration() {
+        let source = r#"
+            extern "C" {
+                fn calloc(n:usize,s:usize)->*mut core::ffi::c_void;
+                fn free(p:*mut core::ffi::c_void);
+            }
+            unsafe fn edt(p:*mut f32) { *p=2.0; }
+            pub unsafe fn transform_to_coordfield(mut width:i32) {
+                while width>0 {
+                    let mut pl1=calloc(2,core::mem::size_of::<f32>()) as *mut f32;
+                    let mut y=0;
+                    while y<2 { *pl1.offset(y as isize)=1.0; y+=1; }
+                    edt(pl1);
+                    free(pl1 as *mut core::ffi::c_void);
+                    width-=1;
+                }
+            }
+        "#;
+        assert!(
+            inspect(source, "pl1").is_ok(),
+            "R376 loop-local root, direct offsets and C-free backedge"
+        );
+    }
+    #[test]
+    fn source_cp2_branch_and_loop_preserve_the_single_sink() {
+        for operation in [
+            "if *pl1>0.0 { edt(pl1,pl2); }",
+            "while *pl1>0.0 { edt(pl1,pl2); *pl1=0.0; }",
+            "*pl1.offset(1 as isize)=*pl2.offset(0 as isize); edt(pl1,pl2);",
+        ] {
+            let source = bo::ownership_fields_native_tests::native_fixture_source("edt", operation);
+            for name in ["pl1", "pl2"] {
+                assert!(inspect(&source, name).is_ok(), "R376 {name}: {operation}");
+            }
+        }
+    }
+    #[test]
+    fn source_cp2_constructor_shapes_share_native_source_evidence() {
+        let base = bo::ownership_fields_native_tests::native_fixture_source("edt", "edt(pl1,pl2);");
+        for count in ["size", "(height+1)*(width+1)"] {
+            let source=base.replace("count:usize,size:usize", "count:core::ffi::c_ulong,size:core::ffi::c_ulong")
+                .replace("let mut pl1=", "let (width,height)=(2,3); let size=width*height; let mut pl1=")
+                .replace("calloc(2,core::mem::size_of::<f32>())", &format!("calloc(({count}) as core::ffi::c_ulong,core::mem::size_of::<f32>() as core::ffi::c_ulong)"));
+            assert!(
+                inspect(&source, "pl1").is_ok(),
+                "R376 same count value {count}"
+            );
+        }
+        let source = base
+            .replace("f32", "u16")
+            .replace("1.0", "1u16")
+            .replace("3.0", "3u16");
+        assert!(inspect(&source, "pl1").is_ok(), "R376 uint16_t cast target");
+    }
+    #[test]
+    fn source_cp2_live_exit_and_repeat_free_hold() {
+        for operation in [
+            "if *pl1>0.0 { return 0.0; } edt(pl1,pl2);",
+            "while *pl1>0.0 { free(pl1 as *mut core::ffi::c_void); } edt(pl1,pl2);",
+        ] {
+            let source = bo::ownership_fields_native_tests::native_fixture_source("edt", operation);
+            assert!(
+                matches!(
+                    inspect(&source, "pl1"),
+                    Err(SourceHold::NormalExitCoverage
+                        | SourceHold::FreeIdentity
+                        | SourceHold::UnsupportedOwnerUse)
+                ),
+                "R376 unclosed/repeated free: {operation}"
+            );
+        }
     }
 }

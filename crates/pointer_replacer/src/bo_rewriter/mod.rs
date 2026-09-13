@@ -80,6 +80,8 @@ pub(crate) mod mechanical_receipt;
 // R351 ownership/fields consumers arrive from the preserved lane commits.
 pub(crate) mod ownership_fields;
 #[cfg(test)]
+mod ownership_fields_cp2_tests;
+#[cfg(test)]
 mod ownership_fields_native_tests;
 pub(crate) mod plan;
 pub(crate) mod sibling_audit;
