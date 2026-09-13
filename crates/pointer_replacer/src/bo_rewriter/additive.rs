@@ -16,6 +16,7 @@ pub(crate) enum FamilyStage {
     Option,
     Declaration,
     Return,
+    Ownership,
 }
 
 impl FamilyStage {
@@ -27,6 +28,7 @@ impl FamilyStage {
             Self::Option => Some(Self::SliceUse),
             Self::Declaration => Some(Self::Option),
             Self::Return => Some(Self::Declaration),
+            Self::Ownership => Some(Self::Return),
         }
     }
 
@@ -37,7 +39,8 @@ impl FamilyStage {
             Self::SliceUse => Some(Self::Option),
             Self::Option => Some(Self::Declaration),
             Self::Declaration => Some(Self::Return),
-            Self::Return => None,
+            Self::Return => Some(Self::Ownership),
+            Self::Ownership => None,
         }
     }
 }

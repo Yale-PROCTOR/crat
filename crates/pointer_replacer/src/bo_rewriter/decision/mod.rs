@@ -47,9 +47,12 @@ pub(crate) mod option;
 pub(crate) mod outbound_expression;
 pub(crate) mod ownership_fields_cache_binding;
 pub(crate) mod ownership_fields_effects;
+pub(crate) mod ownership_fields_formal;
 pub(crate) mod ownership_fields_hook;
+pub(crate) mod ownership_fields_native;
 #[cfg(test)]
 mod ownership_fields_roles_tests;
+pub(crate) mod ownership_fields_source;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
 pub(crate) mod raw_receiver;

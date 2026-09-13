@@ -6636,6 +6636,7 @@ fn finish_decide<'tcx>(
     // reaches a gate.
     let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
     let mut predecessor: Option<additive::StageSnapshot> = None;
+    let mut native_ownership_candidates = decision::ownership_fields_native::Candidates::default();
     let mut retired = additive::RetiredReceipts::default();
     let mut family_receipts = Vec::new();
     let original_c9_plans = retained_c9_plans.clone();
@@ -6692,7 +6693,8 @@ fn finish_decide<'tcx>(
         // Candidate inventory is independent of hypothetical Box rendering.
         // Native producer installation remains an explicit pre-census gate.
         let ownership_fields =
-            decision::ownership_fields_hook::Inputs::discover(&model, &slots, &subjects);
+            decision::ownership_fields_hook::Inputs::discover(&model, &slots, &subjects)
+                .with_native_candidates(native_ownership_candidates.clone());
         let ctx_of =
             |gate, coconv, lifetime_eligibility, raw_boundary, exposure, return_receivers| {
                 decision::Ctx {
@@ -7234,6 +7236,38 @@ fn finish_decide<'tcx>(
             &rustc_hash::FxHashSet::default(),
             &retained_c9_plans,
         )?;
+        let native_inputs = decision::ownership_fields_native::Inputs {
+            program: &program,
+            slots: &slots,
+            model: &model,
+            constructions: &ctors,
+            sites: &raw_boundary_sites,
+            retention: &retention,
+            a5: &a5_site_proofs,
+        };
+        if family_policy.stage == additive::FamilyStage::Return {
+            native_ownership_candidates = decision::ownership_fields_native::Candidates::derive(
+                &native_inputs,
+                &table,
+                &prepared.plan.class_finalization,
+            );
+        } else if family_policy.stage == additive::FamilyStage::Ownership {
+            let invalid = native_ownership_candidates.invalid_owners(
+                &native_inputs,
+                &table,
+                &prepared.plan.class_finalization,
+            );
+            let mut withdrawn = false;
+            for owner in invalid {
+                withdrawn |= family_policy.withdrawn.insert((
+                    additive::FamilyStage::Ownership,
+                    bridge_receipt::SignatureClassId::of(owner),
+                ));
+            }
+            if withdrawn {
+                continue;
+            }
+        }
         let candidate = additive::StageSnapshot {
             table: table.clone(),
             plan: prepared.plan.clone(),
@@ -7288,7 +7322,9 @@ fn finish_decide<'tcx>(
                 return Err(error);
             }
         }
-        if let Some(next) = family_policy.stage.next() {
+        if let Some(next) = family_policy.stage.next()
+            && (next != additive::FamilyStage::Ownership || !native_ownership_candidates.is_empty())
+        {
             predecessor = Some(candidate);
             family_policy.stage = next;
             continue;

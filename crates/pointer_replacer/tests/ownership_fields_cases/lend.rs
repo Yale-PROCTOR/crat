@@ -1,4 +1,4 @@
-//! R350 reductions of two heman calls, with synthetic native/bridge proofs.
+//! R350/R365 reductions of two heman calls, with synthetic native/bridge proofs.
 //! No actual corpus/model/cache run or native identity join is performed.
 use ownership_fields::{
     emission::{ReferenceInterval, Span},
@@ -319,13 +319,96 @@ fn lending_needs_nonconsuming_and_t1_evidence_separately() {
     }
     let mut site = base.clone();
     site.formal.as_mut().unwrap().kind = Kind::Owning;
+    site.formal.as_mut().unwrap().form = FormalForm::Box;
     assert_eq!(plan_call(&inv, &[site]), Err(LendHold::OwningCallee));
     let mut site = base.clone();
-    site.formal.as_mut().unwrap().kind = Kind::Ref;
+    site.formal.as_mut().unwrap().payload = Payload::Sized("u8".into());
     assert_eq!(plan_call(&inv, &[site]), Err(LendHold::Formal));
     let mut site = base;
     site.retention.as_mut().unwrap().edge.argument += 1;
     assert_eq!(plan_call(&inv, &[site]), Err(LendHold::Identity));
+}
+
+#[test]
+fn owning_model_formal_emitted_raw_is_lent_and_records_its_kind() {
+    let mut site = lend(
+        0,
+        "owner",
+        FormalForm::MutableRaw,
+        Payload::Sized("f32".into()),
+    );
+    site.formal.as_mut().unwrap().kind = Kind::Owning;
+    let plan = plan_call(&inventory(&[site.clone()]), &[site.clone()])
+        .expect("R365: the formal is emitted raw and the synthetic lend proofs are present");
+    assert_eq!(plan.arguments[&0], "core::ptr::from_mut(&mut *(owner))");
+    assert_eq!(plan.receipts[0].formal_model_kind, Kind::Owning);
+    assert_eq!(plan.receipts[0].form, FormalForm::MutableRaw);
+    assert_eq!(plan.receipts[0].owner_after, site.edge.actual);
+    assert_eq!(
+        plan.receipts[0].continuation,
+        *site.continuation.as_ref().unwrap()
+    );
+}
+
+#[test]
+fn admitted_box_formal_requires_the_owning_call_rule() {
+    let mut site = lend(
+        0,
+        "owner",
+        FormalForm::MutableRaw,
+        Payload::Sized("f32".into()),
+    );
+    site.formal.as_mut().unwrap().kind = Kind::Owning;
+    site.formal.as_mut().unwrap().form = FormalForm::Box;
+    assert_eq!(
+        plan_call(&inventory(&[site.clone()]), &[site]),
+        Err(LendHold::OwningCallee)
+    );
+}
+
+#[test]
+fn owning_model_raw_formal_does_not_supply_missing_nonconsuming_evidence() {
+    let mut site = lend(
+        0,
+        "owner",
+        FormalForm::MutableRaw,
+        Payload::Sized("f32".into()),
+    );
+    site.formal.as_mut().unwrap().kind = Kind::Owning;
+    let why = Missing {
+        owner: EvidenceOwner::Emission,
+        reason: MissingReason::Field("transitive_nonconsuming"),
+    };
+    site.non_consuming = Err(why.clone());
+    assert_eq!(
+        plan_call(&inventory(&[site.clone()]), &[site]),
+        Err(LendHold::Missing(why))
+    );
+}
+
+#[test]
+fn raw_emitted_indirect_targets_may_have_different_recorded_model_kinds() {
+    let first = lend(
+        0,
+        "owner",
+        FormalForm::MutableRaw,
+        Payload::Sized("f32".into()),
+    );
+    let mut edge = first.edge;
+    edge.target = OwnerId(3);
+    edge.formal.site.owner = edge.target;
+    let mut second = at_edge(first.clone(), edge);
+    second.formal.as_mut().unwrap().kind = Kind::Owning;
+    let sites = [first, second];
+    let plan = plan_call(&inventory(&sites), &sites).unwrap();
+    assert_eq!(plan.arguments.len(), 1);
+    assert_eq!(
+        plan.receipts
+            .iter()
+            .map(|r| r.formal_model_kind)
+            .collect::<Vec<_>>(),
+        [Kind::Raw, Kind::Owning]
+    );
 }
 
 #[test]

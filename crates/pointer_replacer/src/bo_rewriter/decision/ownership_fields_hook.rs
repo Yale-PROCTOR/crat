@@ -78,6 +78,8 @@ pub(crate) struct Bundle {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Inputs {
     rows: FxHashMap<Node, Evidence<Bundle>>,
+    terminal_formals: BTreeMap<(u32, usize), super::ownership_fields_formal::NativeFormal>,
+    native_candidates: super::ownership_fields_native::Candidates,
 }
 impl Inputs {
     /// Called before hypothetical decisions. This records scope only; no
@@ -101,7 +103,19 @@ impl Inputs {
                 );
             }
         }
-        Self { rows }
+        Self {
+            rows,
+            terminal_formals: BTreeMap::new(),
+            native_candidates: Default::default(),
+        }
+    }
+
+    pub(crate) fn with_native_candidates(
+        mut self,
+        candidates: super::ownership_fields_native::Candidates,
+    ) -> Self {
+        self.native_candidates = candidates;
+        self
     }
 
     /// The native producer must derive authenticated facts independently of
@@ -279,14 +293,15 @@ fn validate(bundle: &Bundle) -> Result<BoxPlan, Hold> {
     Ok(plan)
 }
 
-/// R350's lend rule accepts only actual non-owning formal model kinds.
-/// T1 and no-consumption proofs cannot change an Owning formal into a lend.
+/// R365 checks an owning-aware terminal formal while recording its model kind.
+/// Effects neither manufacture the terminal interface nor override model bits.
 pub(crate) fn native_lend_formal(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     slots: &crate::analyses::borrow_ownership::crate_slots::CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
     callee: LocalDefId,
     argument: usize,
+    emitted: &super::ownership_fields_formal::NativeFormal,
 ) -> Result<owned::emission::Kind, Hold> {
     if argument
         >= tcx
@@ -305,12 +320,17 @@ pub(crate) fn native_lend_formal(
         .and_then(|slots| slots.slot_for_local_depth(local, 0))
         .map(|slot| SlotRef::Local(callee, slot))
         .ok_or_else(|| Hold::Missing(missing("native-formal-slot")))?;
-    match model.get(&formal) {
-        Some(SlotKind::Ref) => Ok(owned::emission::Kind::Ref),
-        Some(SlotKind::Raw) => Ok(owned::emission::Kind::Raw),
-        Some(SlotKind::Owning) => Err(Hold::Lend(lend::LendHold::OwningCallee)),
-        None => Err(Hold::Missing(missing("native-formal-kind"))),
+    let kind = match model.get(&formal) {
+        Some(SlotKind::Ref) => owned::emission::Kind::Ref,
+        Some(SlotKind::Raw) => owned::emission::Kind::Raw,
+        Some(SlotKind::Owning) => owned::emission::Kind::Owning,
+        None => return Err(Hold::Missing(missing("native-formal-kind"))),
+    };
+    if !emitted.matches(callee, argument) || emitted.model_kind() != kind {
+        return Err(Hold::Identity);
     }
+    emitted.require_lend()?;
+    Ok(kind)
 }
 
 pub(crate) fn plan(
@@ -324,6 +344,19 @@ pub(crate) fn plan(
         Ok(plan) => return Ok(plan),
         Err(failure) => failure,
     };
+    if ctx.family_policy.enabled(
+        subject.fn_did,
+        super::super::additive::FamilyStage::Ownership,
+    ) && let Some(plan) = ctx
+        .ownership_fields
+        .native_candidates
+        .plan((subject.fn_did, subject.hir_id))
+    {
+        // The final ownership stage rebuilds boundary/class machinery from
+        // these proof-backed candidates and rechecks its terminal formals.
+        // Hypothetical rendering is not a delivered-interface receipt.
+        return Ok(plan.clone());
+    }
     if !matches!(
         prior_failure,
         BoxPlanFailure::BoundaryHeld
@@ -369,16 +402,18 @@ pub(crate) fn plan(
                     .find(|owner| owner.local_def_index.as_u32() == site.edge.target.0)
                     .ok_or_else(|| Hold::Missing(missing("native-lend-callee")))?;
                 let argument = site.edge.argument as usize;
-                let kind = native_lend_formal(ctx.tcx, ctx.slots, ctx.model, callee, argument)?;
-                if need(&site.formal)?.kind != kind {
+                let emitted = ctx
+                    .ownership_fields
+                    .terminal_formals
+                    .get(&(callee.local_def_index.as_u32(), argument))
+                    .ok_or_else(|| Hold::Missing(missing("terminal-formal-frame")))?;
+                let kind =
+                    native_lend_formal(ctx.tcx, ctx.slots, ctx.model, callee, argument, emitted)?;
+                if need(&site.formal)?.kind != kind || need(&site.formal)?.form != emitted.emitted()
+                {
                     return Err(Hold::Identity);
                 }
-                let proof = effects
-                    .certify(callee, argument)
-                    .map_err(Hold::NativeEffects)?;
-                if !proof.matches(&effects, callee, argument) {
-                    return Err(Hold::Identity);
-                }
+                super::ownership_fields_formal::require_nonconsuming(&effects, emitted)?;
             }
         }
         Ok(plan)

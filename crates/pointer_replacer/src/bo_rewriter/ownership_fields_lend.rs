@@ -1,5 +1,6 @@
-//! R350: lend an owning subject to a non-owning call parameter. No native
-//! registration or proof derivation. The integration adapter must supply the
+//! R350/R365: lend an owning subject to a formal emitted as raw or borrowed.
+//! The formal's model kind is retained for custody, not used as its emitted
+//! ownership role. No native proof derivation. The adapter must supply the
 //! existing raw-boundary T1 proof, exact model/formal join and complete access
 //! inventory, including scalar/retained-raw arguments of the same call.
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,10 +28,13 @@ pub enum Payload {
 pub enum FormalForm {
     MutableReference,
     MutableRaw,
+    /// The emitted signature admits an owner; its call needs the move rule.
+    Box,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Formal {
     pub edge: EdgeKey,
+    /// The unchanged analysis kind, independent of the admitted emitted form.
     pub kind: Kind,
     pub form: FormalForm,
     pub payload: Payload,
@@ -95,6 +99,8 @@ pub struct CallInventory {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LendReceipt {
     pub edge: EdgeKey,
+    /// R365 preserves this even when an Owning model formal is emitted raw.
+    pub formal_model_kind: Kind,
     pub form: FormalForm,
     pub view: Span,
     pub protector: Span,
@@ -114,6 +120,9 @@ pub enum LendHold {
     Grant,
     Identity,
     OwningCallee,
+    /// A native producer found a consuming/free effect. Missing evidence is
+    /// still Missing; this consumer never invents a no-free proof.
+    ConsumingCallee,
     Formal,
     MoveInsteadOfLend,
     Retention,
@@ -189,15 +198,10 @@ pub fn plan_call(inventory: &CallInventory, sites: &[LendSite]) -> Result<LendPl
         if formal.edge != e {
             return Err(LendHold::Identity);
         }
-        if formal.kind == Kind::Owning {
+        if formal.form == FormalForm::Box {
             return Err(LendHold::OwningCallee);
         }
-        if formal.payload != site.payload
-            || !matches!(
-                (formal.kind, formal.form),
-                (Kind::Raw, FormalForm::MutableRaw) | (Kind::Ref, FormalForm::MutableReference)
-            )
-        {
+        if formal.payload != site.payload {
             return Err(LendHold::Formal);
         }
         for fact in [
@@ -270,10 +274,12 @@ pub fn plan_call(inventory: &CallInventory, sites: &[LendSite]) -> Result<LendPl
             (Payload::Sized(_), FormalForm::MutableRaw) => {
                 format!("core::ptr::from_mut(&mut *({}))", site.place)
             }
+            (_, FormalForm::Box) => return Err(LendHold::OwningCallee),
         };
         result.arguments.insert(e.argument, code);
         result.receipts.push(LendReceipt {
             edge: e,
+            formal_model_kind: formal.kind,
             form: formal.form,
             view: site.view,
             protector: site.protector,
