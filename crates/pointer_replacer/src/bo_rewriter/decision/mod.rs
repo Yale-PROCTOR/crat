@@ -45,8 +45,11 @@ pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod local_callee_extent;
 pub(crate) mod option;
 pub(crate) mod outbound_expression;
+pub(crate) mod ownership_fields_cache_binding;
 pub(crate) mod ownership_fields_effects;
 pub(crate) mod ownership_fields_hook;
+#[cfg(test)]
+mod ownership_fields_roles_tests;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
 pub(crate) mod raw_receiver;

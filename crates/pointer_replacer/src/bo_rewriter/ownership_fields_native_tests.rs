@@ -4,8 +4,8 @@
 
 use super::decision::{Decision, DegradeReason, box_facts::BoxPlanFailure};
 
-fn check_native_hold(callee: &str, body: &str) {
-    let source = format!(
+pub(super) fn native_fixture_source(callee: &str, body: &str) -> String {
+    format!(
         r#"
         #![allow(dead_code,unused_unsafe,unused_mut)]
         extern "C" {{
@@ -24,7 +24,11 @@ fn check_native_hold(callee: &str, body: &str) {
             result
         }}
         "#,
-    );
+    )
+}
+
+fn check_native_hold(callee: &str, body: &str) {
+    let source = native_fixture_source(callee, body);
     ::utils::compilation::run_compiler_on_str(&source, |tcx| {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,

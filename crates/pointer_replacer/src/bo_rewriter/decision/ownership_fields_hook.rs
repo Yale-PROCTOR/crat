@@ -279,6 +279,40 @@ fn validate(bundle: &Bundle) -> Result<BoxPlan, Hold> {
     Ok(plan)
 }
 
+/// R350's lend rule accepts only actual non-owning formal model kinds.
+/// T1 and no-consumption proofs cannot change an Owning formal into a lend.
+pub(crate) fn native_lend_formal(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    slots: &crate::analyses::borrow_ownership::crate_slots::CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    callee: LocalDefId,
+    argument: usize,
+) -> Result<owned::emission::Kind, Hold> {
+    if argument
+        >= tcx
+            .fn_sig(callee.to_def_id())
+            .skip_binder()
+            .skip_binder()
+            .inputs()
+            .len()
+    {
+        return Err(Hold::Identity);
+    }
+    let local = rustc_middle::mir::Local::from_usize(argument + 1);
+    let formal = slots
+        .fn_local_slots
+        .get(&callee)
+        .and_then(|slots| slots.slot_for_local_depth(local, 0))
+        .map(|slot| SlotRef::Local(callee, slot))
+        .ok_or_else(|| Hold::Missing(missing("native-formal-slot")))?;
+    match model.get(&formal) {
+        Some(SlotKind::Ref) => Ok(owned::emission::Kind::Ref),
+        Some(SlotKind::Raw) => Ok(owned::emission::Kind::Raw),
+        Some(SlotKind::Owning) => Err(Hold::Lend(lend::LendHold::OwningCallee)),
+        None => Err(Hold::Missing(missing("native-formal-kind"))),
+    }
+}
+
 pub(crate) fn plan(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
@@ -335,28 +369,7 @@ pub(crate) fn plan(
                     .find(|owner| owner.local_def_index.as_u32() == site.edge.target.0)
                     .ok_or_else(|| Hold::Missing(missing("native-lend-callee")))?;
                 let argument = site.edge.argument as usize;
-                if argument
-                    >= ctx
-                        .tcx
-                        .fn_sig(callee.to_def_id())
-                        .skip_binder()
-                        .skip_binder()
-                        .inputs()
-                        .len()
-                {
-                    return Err(Hold::Identity);
-                }
-                let local = rustc_middle::mir::Local::from_usize(argument + 1);
-                let formal = ctx.slots.fn_local_slots[&callee]
-                    .slot_for_local_depth(local, 0)
-                    .map(|slot| SlotRef::Local(callee, slot))
-                    .ok_or_else(|| Hold::Missing(missing("native-formal-slot")))?;
-                let kind = match ctx.model.get(&formal) {
-                    Some(SlotKind::Ref) => owned::emission::Kind::Ref,
-                    Some(SlotKind::Raw) => owned::emission::Kind::Raw,
-                    Some(SlotKind::Owning) => return Err(Hold::Lend(lend::LendHold::OwningCallee)),
-                    None => return Err(Hold::Missing(missing("native-formal-kind"))),
-                };
+                let kind = native_lend_formal(ctx.tcx, ctx.slots, ctx.model, callee, argument)?;
                 if need(&site.formal)?.kind != kind {
                     return Err(Hold::Identity);
                 }
