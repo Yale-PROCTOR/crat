@@ -600,6 +600,12 @@ fn g06_class_is_attributed_at_decision_time() {
                     | DegradeReason::BoxFailure {
                         failure: super::decision::box_facts::BoxPlanFailure::BoundaryHeld,
                     }
+                    | DegradeReason::BoxFailure {
+                        failure: super::decision::box_facts::BoxPlanFailure::NativeEvidenceHeld {
+                            prior_key: "box-param-caller-unknown",
+                            ..
+                        },
+                    }
             )
         })
         .unwrap_or_else(|| {

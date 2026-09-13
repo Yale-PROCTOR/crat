@@ -77,6 +77,10 @@ pub(crate) mod c9;
 pub(crate) mod decision;
 pub(crate) mod fat_facts;
 pub(crate) mod mechanical_receipt;
+// R351 ownership/fields consumers arrive from the preserved lane commits.
+pub(crate) mod ownership_fields;
+#[cfg(test)]
+mod ownership_fields_native_tests;
 pub(crate) mod plan;
 pub(crate) mod sibling_audit;
 pub(crate) mod sign_facts;
@@ -6685,6 +6689,10 @@ fn finish_decide<'tcx>(
             &family_policy,
             additive::FamilyStage::Option,
         );
+        // Candidate inventory is independent of hypothetical Box rendering.
+        // Native producer installation remains an explicit pre-census gate.
+        let ownership_fields =
+            decision::ownership_fields_hook::Inputs::discover(&model, &slots, &subjects);
         let ctx_of =
             |gate, coconv, lifetime_eligibility, raw_boundary, exposure, return_receivers| {
                 decision::Ctx {
@@ -6706,6 +6714,7 @@ fn finish_decide<'tcx>(
                     slice_uses: &slice_uses,
                     opt_uses: &opt_uses,
                     box_facts: &box_facts,
+                    ownership_fields: &ownership_fields,
                     constructions: &ctors,
                     subjects: &subjects,
                     gate,

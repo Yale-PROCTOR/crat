@@ -1,9 +1,9 @@
 //! Ownership/field emission components prepared under R244.
 //!
-//! Not registered in the production pipeline yet. Integration must provide
-//! compiler-session identities and accepted evidence, never source-name joins.
-//! The independent test target imports this module without changing shared
-//! main-lane files. No module here reads a model cache or runs an analysis.
+//! Registered by the native decision intake. Positive admission still needs
+//! complete compiler-session identities and accepted evidence, never name joins.
+//! The independent test target also imports this module. No module here reads
+//! a model cache or runs an analysis; native producers live in decision/.
 
 #[path = "ownership_fields_transaction.rs"]
 pub mod transaction;

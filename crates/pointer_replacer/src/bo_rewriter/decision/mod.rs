@@ -45,6 +45,8 @@ pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod local_callee_extent;
 pub(crate) mod option;
 pub(crate) mod outbound_expression;
+pub(crate) mod ownership_fields_effects;
+pub(crate) mod ownership_fields_hook;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
 pub(crate) mod raw_receiver;
@@ -1046,6 +1048,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) slice_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
     pub(crate) opt_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
     pub(crate) box_facts: &'a box_facts::BoxOwnershipFacts,
+    pub(crate) ownership_fields: &'a ownership_fields_hook::Inputs,
     pub(crate) constructions: &'a construction::ConstructionFacts,
     pub(crate) subjects: &'a [Subject],
     /// **S3.6-1** — see [`RefGate`]. A mode rather than a fact, which is why it
@@ -1572,6 +1575,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         slice_uses,
         opt_uses,
         box_facts,
+        ownership_fields: _,
         constructions,
         subjects,
         gate,
@@ -1632,14 +1636,16 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                     DegradeReason::UnsupportedDeclShape { shape: "alias" },
                 );
             }
-            return match box_facts.plan_for_subject(
+            let owning_slot = SlotRef::Local(subject.fn_did, slot_id);
+            let prior = box_facts.plan_for_subject(
                 tcx,
                 subject,
-                SlotRef::Local(subject.fn_did, slot_id),
+                owning_slot,
                 constructions,
                 slots,
                 subjects,
-            ) {
+            );
+            return match ownership_fields_hook::plan(ctx, subject, owning_slot, prior) {
                 Ok(plan) => Decision::Box(plan),
                 Err(failure) => degrade(subject, decl_site, DegradeReason::BoxFailure { failure }),
             };

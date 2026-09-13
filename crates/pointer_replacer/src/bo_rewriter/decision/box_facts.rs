@@ -1551,7 +1551,9 @@ pub(crate) enum BoxPlanFailure {
     ParameterHeld,
     ConstructionUnmappable,
     ConstructionBridge(ConstructionBridgeFailure),
-    FlexibleTailHeld { evidence: String },
+    FlexibleTailHeld {
+        evidence: String,
+    },
     EndpointInactive,
     EndpointUnjoined,
     MoveAmbiguous,
@@ -1562,6 +1564,10 @@ pub(crate) enum BoxPlanFailure {
     FreeDuplicate,
     StoreFormUnknown,
     AstUnplaceable,
+    NativeEvidenceHeld {
+        prior_key: &'static str,
+        detail: String,
+    },
 }
 
 impl BoxPlanFailure {
@@ -1582,6 +1588,7 @@ impl BoxPlanFailure {
             BoxPlanFailure::FreeDuplicate => "box-free-duplicate",
             BoxPlanFailure::StoreFormUnknown => "box-store-form-unknown",
             BoxPlanFailure::AstUnplaceable => "box-ast-unplaceable",
+            BoxPlanFailure::NativeEvidenceHeld { prior_key, .. } => prior_key,
         }
     }
 
@@ -1591,6 +1598,7 @@ impl BoxPlanFailure {
                 format!("construction-bridge-{}", reason.key())
             }
             Self::FlexibleTailHeld { evidence } => evidence.clone(),
+            Self::NativeEvidenceHeld { detail, .. } => detail.clone(),
             _ => "-".to_owned(),
         }
     }
