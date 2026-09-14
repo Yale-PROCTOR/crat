@@ -140,6 +140,11 @@ const DIRECT_COUNTED_CONTROL_INPUT: &str = r#"
 #[test]
 fn thin_extent_transplant_of_the_bzip2_shape() {
     let got = reasons(TRANSPLANT_INPUT);
+    assert_eq!(
+        got.get("to").map(String::as_str),
+        Some("<emitted>"),
+        "the failed `from` candidate must not withdraw `to`'s older slice: {got:#?}"
+    );
     // **Reported as observed, and it does NOT reach the hold.** Measured:
     // `from` degrades `call-site-not-adapted` and its sibling `to` degrades
     // `slice-use-unsupported`.
