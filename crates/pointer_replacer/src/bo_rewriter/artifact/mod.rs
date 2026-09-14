@@ -210,6 +210,7 @@ mod tests {
 
     fn table(entries: Vec<(Subject, Decision)>) -> DecisionTable {
         DecisionTable {
+            counted_void: Default::default(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),

@@ -36,6 +36,8 @@ pub(crate) mod construction;
 pub(crate) mod construction_values;
 #[cfg(test)]
 mod counted_extent_tests;
+pub(crate) mod counted_void;
+mod counted_void_loop;
 pub(crate) mod cursor_native;
 pub(crate) mod declaration;
 pub(crate) mod declaration_pattern;
@@ -939,6 +941,7 @@ pub(crate) enum Decision {
 /// The finished, immutable table handed to [`super::plan`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
+    pub(crate) counted_void: counted_void::Contracts,
     pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
     pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
@@ -1077,6 +1080,7 @@ impl DecisionTable {
 /// next phase a finished value, so a context that could not be mutated is the
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
+    pub(crate) counted_void: &'a counted_void::Contracts,
     pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
@@ -1179,6 +1183,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         })
         .collect();
     DecisionTable {
+        counted_void: ctx.counted_void.clone(),
         nested_receipts: Vec::new(),
         cursor_receipts,
         sibling_overlap_inventory: Default::default(),
@@ -1642,6 +1647,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
         io_domain,
+        counted_void: _,
         void_pointee,
         thin_extent,
         local_callee_extent,
@@ -1745,7 +1751,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // becomes `Box<[u8]>` with the malloc byte count as its length, which is a
     // real extent and therefore sound — the seat kept that arm as is, and this
     // hold sits below it so it cannot pre-empt it.
-    if void_pointee.contains(&(subject.fn_did, subject.hir_id)) {
+    let counted = counted_void::active(ctx, subject);
+    if counted.is_none() && void_pointee.contains(&(subject.fn_did, subject.hir_id)) {
         return degrade(subject, decl_site, DegradeReason::VoidPointee);
     }
 
@@ -1820,6 +1827,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             }
         }
         None if nullable_value => Form::Opt { slice: false },
+        None if counted.is_some() => Form::Slice,
         None => Form::Plain,
     };
     if let Some(receiver) = return_receivers
@@ -2178,7 +2186,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // authority, no parallel notion. `may_be_negative` folds a lookup miss to
     // the conservative side, so an unanalyzed local is refused rather than
     // emitted on absent evidence.
-    if sign.may_be_negative(subject.fn_did, subject.local) {
+    if counted.is_none() && sign.may_be_negative(subject.fn_did, subject.local) {
         return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
     }
     if let Some(site) = uses.return_handoffs.first()
@@ -2305,6 +2313,7 @@ mod self_consistency_tests {
 
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
+            counted_void: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

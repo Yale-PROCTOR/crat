@@ -132,6 +132,8 @@ mod callee_input_tests;
 #[cfg(test)]
 mod cast_of_local_bridge_tests;
 #[cfg(test)]
+mod counted_void_tests;
+#[cfg(test)]
 mod declaration_pattern_tests;
 #[cfg(test)]
 mod declaration_tests;
@@ -6693,7 +6695,8 @@ fn finish_decide<'tcx>(
     }
 
     perturb(&mut subjects);
-    let declaration_pointees = decision::declaration::collect(tcx, &subjects);
+    let mut declaration_pointees = decision::declaration::collect(tcx, &subjects);
+    let counted_void = decision::counted_void::collect(tcx, &subjects, &mut declaration_pointees);
     let (io_domain_subjects, io_domain_budget_exhausted) =
         decision::io_domain::collect(tcx, &subjects);
     let void_pointee_subjects = decision::void_pointee::collect(tcx, &subjects);
@@ -6965,12 +6968,13 @@ fn finish_decide<'tcx>(
             &family_policy,
             additive::FamilyStage::Return,
         );
-        let slice_uses = additive::select_uses(
+        let mut slice_uses = additive::select_uses(
             &current_slice_uses,
             &prior_slice_uses,
             &family_policy,
             additive::FamilyStage::SliceUse,
         );
+        decision::counted_void::install(&counted_void, &mut slice_uses);
         let current_opt_uses = additive::select_uses(
             &return_opt_uses,
             &full_opt_uses,
@@ -6992,6 +6996,7 @@ fn finish_decide<'tcx>(
             |gate, coconv, lifetime_eligibility, raw_boundary, exposure, return_receivers| {
                 decision::Ctx {
                     tcx,
+                    counted_void: &counted_void,
                     return_receivers,
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,

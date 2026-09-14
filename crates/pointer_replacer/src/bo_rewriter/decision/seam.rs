@@ -1091,6 +1091,7 @@ pub(crate) struct RawBoundaryGlue {
 /// One adapter, described rather than rendered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GlueSpec {
+    pub(crate) counted_byte: Option<super::counted_void::ByteElement>,
     pub shared_address: Option<super::overlapping_pairs::consumer::SharedAddress>,
     pub core: GlueCore,
     /// The EXPECTED side's mutability — selects `&`/`&mut` and
@@ -1142,6 +1143,7 @@ impl GlueSpec {
 
     pub(crate) fn core(core: GlueCore, mutable: bool) -> Self {
         Self {
+            counted_byte: None,
             shared_address: None,
             core,
             mutable,
@@ -1204,6 +1206,7 @@ impl GlueSpec {
 
     pub(crate) fn literal_none(mutable: bool) -> Self {
         Self {
+            counted_byte: None,
             shared_address: None,
             core: GlueCore::Bare,
             mutable,
@@ -1224,6 +1227,7 @@ impl GlueSpec {
         force_explicit: bool,
     ) -> Self {
         Self {
+            counted_byte: None,
             shared_address: None,
             core: GlueCore::Bare,
             mutable: target_mutability == super::raw_boundary::RawMutability::Mut,
@@ -1460,6 +1464,9 @@ impl GlueSpec {
         text: &str,
         enclosing_unsafe_fn: bool,
     ) -> Option<String> {
+        if let Some(element) = self.counted_byte {
+            return super::counted_void::render_bridge(self, element, text);
+        }
         if let Some(address) = &self.shared_address {
             return address.render(text);
         }
@@ -3234,7 +3241,11 @@ fn build_candidate(
     callee: LocalDefId,
     argument_index: usize,
     return_tied: bool,
+    counted: Option<&super::counted_void::Contract>,
 ) -> Result<Option<Candidate>, SeamBlock> {
+    if counted.is_some() && found != Form::Raw {
+        return Err(SeamBlock::UnnameableOperand);
+    }
     let answer = if literal_null {
         glue_null(expected)?
     } else {
@@ -3248,6 +3259,13 @@ fn build_candidate(
     } else {
         spec
     };
+    let mut spec = spec;
+    if let Some(contract) = counted {
+        if len_text.is_none() {
+            return Err(SeamBlock::LengthUnknown);
+        }
+        spec.counted_byte = Some(contract.element);
+    }
     let replacement = spec
         .render_in_context(text, enclosing_unsafe_fn)
         .ok_or(SeamBlock::LengthUnknown)?;
@@ -4130,11 +4148,17 @@ pub(crate) fn synthesize_with_raw_boundary(
                     input_candidates.push(Err(SeamBlock::UnnameableOperand));
                     continue;
                 };
+                let counted = super::counted_void::parameter(table, *callee, pos.index);
                 let wants_len = matches!(
                     pos.expected,
                     Form::Slice { .. } | Form::Opt { slice: true, .. }
                 ) && !pos.literal_null;
-                let (len_text, len_evidence) = if wants_len {
+                let (len_text, len_evidence) = if let Some(contract) = counted {
+                    (
+                        super::counted_void::count_argument(tcx, table, site, contract),
+                        Some(LenEvidence::Elsewhere),
+                    )
+                } else if wants_len {
                     let arm = length_evidence(tcx, *callee, pos.index);
                     let companion = match arm {
                         LenEvidence::Following => Some(pos.index + 1),
@@ -4170,6 +4194,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             *callee,
                             pos.index,
                             return_tied,
+                            counted,
                         )
                     },
                 );
@@ -4195,6 +4220,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             *callee,
                             pos.index,
                             return_tied,
+                            counted,
                         )
                     })
                     .map(|candidate| {
@@ -5047,7 +5073,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             .unwrap_or_default();
         plan.edits.push(SeamEdit {
             raw_outbound: None,
-            zero_syntax: false,
+            zero_syntax: super::counted_void::owns_address(table, site),
             span: site.span,
             call_span: site.span,
             replacement,

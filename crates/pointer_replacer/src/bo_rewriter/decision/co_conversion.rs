@@ -1979,6 +1979,7 @@ mod a5_cast_role_tests {
                 }],
             );
             let table = DecisionTable {
+                counted_void: Default::default(),
                 entries: subjects
                     .iter()
                     .cloned()

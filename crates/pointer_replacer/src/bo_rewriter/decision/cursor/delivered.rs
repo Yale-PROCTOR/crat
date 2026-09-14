@@ -339,6 +339,7 @@ pub(super) fn plan(
         match choice {
             Decision::Slice { mutable, .. } => {
                 let table = crate::bo_rewriter::decision::DecisionTable {
+                    counted_void: Default::default(),
                     entries: entries.to_vec(),
                     input_interfaces: ctx.input_interfaces.clone(),
                     return_receivers: ctx.return_receivers.cloned().unwrap_or_default(),

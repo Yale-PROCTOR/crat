@@ -5240,6 +5240,7 @@ mod tests {
     #[test]
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
+            counted_void: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
@@ -5310,6 +5311,7 @@ mod tests {
     #[test]
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
+            counted_void: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

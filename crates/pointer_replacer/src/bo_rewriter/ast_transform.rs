@@ -1091,8 +1091,10 @@ impl RefDeclVisitor<'_> {
         // it would be refused on behalf of work that never happened. Ownership
         // now follows the transform rather than the attempt.
         let pointee = match &ty.kind {
-            TyKind::Ptr(mut_ty) => mut_ty.ty.clone(),
-            TyKind::Path(..) => {
+            TyKind::Ptr(mut_ty) if !self.declaration_pointees.contains_key(&(fn_did, hir_id)) => {
+                mut_ty.ty.clone()
+            }
+            TyKind::Ptr(..) | TyKind::Path(..) => {
                 let Some(carrier) = self.declaration_pointees.get(&(fn_did, hir_id)) else {
                     self.stats.not_a_pointer_decl += 1;
                     return;
@@ -1920,6 +1922,14 @@ impl<'a> SeamGraftVisitor<'a> {
     fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
         use super::decision::seam::{GlueCore, NullArm};
         let spec = &target.spec;
+        if let Some(element) = spec.counted_byte {
+            let argument = if target.arg_span == e.span {
+                e
+            } else {
+                find_by_span(e, target.arg_span)?
+            };
+            return super::decision::counted_void::bridge_ast(spec, element, argument);
+        }
         if let Some(address) = &spec.shared_address {
             return super::shared_pair_ast::build(e, address);
         }
