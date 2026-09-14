@@ -21867,6 +21867,9 @@ fn raw_boundary_libc_hold_class(
     reason: &str,
     exclusion: &str,
 ) -> Option<&'static str> {
+    if family == "slice" && reason == "slice-use-unsupported" && matches!(exclusion, "" | "-") {
+        return Some("slice-use-unsupported");
+    }
     let cause = if reason.is_empty() || reason == "-" {
         exclusion
             .split(';')
@@ -25403,6 +25406,38 @@ fn r342_2_a_libc_contract_hold_names_itself_from_either_column() {
         Some("analysis-frame-decline")
     );
     assert_eq!(raw_boundary_libc_hold_class("ref", "kind-raw", "-"), None);
+    // A contract-selected Slice whose terminal carrier is withdrawn keeps its
+    // direct typed decision reason. The family and empty exclusion are both
+    // load-bearing: this is not a blanket acceptance of any mention of the
+    // generic Slice-use reason.
+    assert_eq!(
+        raw_boundary_libc_hold_class("slice", "slice-use-unsupported", "-"),
+        Some("slice-use-unsupported")
+    );
+    assert_eq!(
+        raw_boundary_libc_hold_class("ref", "slice-use-unsupported", "-"),
+        None
+    );
+    assert_eq!(
+        raw_boundary_libc_hold_class("raw", "slice-use-unsupported", "-"),
+        None
+    );
+    assert_eq!(
+        raw_boundary_libc_hold_class(
+            "slice",
+            "-",
+            "terminal-not-applied:blocked-subject:slice-use-unsupported"
+        ),
+        None
+    );
+    assert_eq!(
+        raw_boundary_libc_hold_class(
+            "slice",
+            "slice-use-unsupported",
+            "terminal-not-applied:other"
+        ),
+        None
+    );
     // a blocked subject records its cause in the exclusion column, and the
     // reason column reads "-": the same hold must still name itself
     assert_eq!(

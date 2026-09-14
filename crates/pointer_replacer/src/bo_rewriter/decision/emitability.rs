@@ -946,6 +946,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 continue;
                             };
                             let shape = classify_arg(self.tcx, arg);
+                            let root_through_deref = place_root(arg).1;
                             let adapter_operand_span = match shape {
                                 ArgShape::AddrOfCast { inner, .. }
                                 | ArgShape::CastOfLocal { inner, .. } => inner,
@@ -989,6 +990,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 argument_index: index,
                                 argument_span: arg.span,
                                 root: shape.place_root(),
+                                root_through_deref,
                                 shape: shape.key(),
                                 source_type: format!("{source_ty:?}"),
                                 target,

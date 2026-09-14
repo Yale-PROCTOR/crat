@@ -106,6 +106,37 @@ const UNMODELED_CONTROL_INPUT: &str = r#"
     }
 "#;
 
+/// A counted access through a pointer-valued field consumes the field's
+/// allocation, not multiple elements of the aggregate that owns the field.
+/// Rooting the foreign argument through `(*state).bytes` at `state` would
+/// therefore turn an otherwise valid `&mut State` into a false thin-extent
+/// hold.
+const PROJECTED_FIELD_CONTROL_INPUT: &str = r#"
+    #![allow(dead_code, unused_unsafe)]
+    #[repr(C)]
+    pub struct State { pub bytes: *mut u8 }
+    extern "C" {
+        fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+    }
+    static SOURCE: [u8; 4] = [1, 2, 3, 4];
+    pub unsafe fn fill_state(state: *mut State) {
+        memcpy((*state).bytes, SOURCE.as_ptr(), SOURCE.len());
+    }
+"#;
+
+/// The direct pointer remains the extent owner and must retain the hold. This
+/// distinguishes the projected-field repair from disabling counted contracts.
+const DIRECT_COUNTED_CONTROL_INPUT: &str = r#"
+    #![allow(dead_code, unused_unsafe)]
+    extern "C" {
+        fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+    }
+    static SOURCE: [u8; 4] = [1, 2, 3, 4];
+    pub unsafe fn fill(dest: *mut u8) {
+        memcpy(dest, SOURCE.as_ptr(), SOURCE.len());
+    }
+"#;
+
 #[test]
 fn thin_extent_transplant_of_the_bzip2_shape() {
     let got = reasons(TRANSPLANT_INPUT);
@@ -177,6 +208,26 @@ fn unmodeled_foreign_position_is_untouched() {
         got.get("w").map(String::as_str),
         Some("held:thin-extent"),
         "no contract row means no extent claim: {got:#?}"
+    );
+}
+
+#[test]
+fn projected_field_extent_does_not_hold_the_aggregate_owner() {
+    let got = reasons(PROJECTED_FIELD_CONTROL_INPUT);
+    assert_eq!(
+        got.get("state").map(String::as_str),
+        Some("<emitted>"),
+        "the foreign extent belongs to `(*state).bytes`, not `state`: {got:#?}"
+    );
+}
+
+#[test]
+fn direct_counted_pointer_keeps_the_thin_extent_hold() {
+    let got = reasons(DIRECT_COUNTED_CONTROL_INPUT);
+    assert_eq!(
+        got.get("dest").map(String::as_str),
+        Some("held:thin-extent"),
+        "a direct memcpy destination consumes more than one `dest` element: {got:#?}"
     );
 }
 

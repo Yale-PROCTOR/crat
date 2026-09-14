@@ -13,6 +13,12 @@ use super::{
 };
 use crate::{analyses::borrow_ownership::SlotKind, bo_rewriter::fat_facts::FatFacts};
 
+/// Receipt fields are single-line TSV cells. Keep the compiler spelling in the
+/// semantic plan and normalize only the copy written to a receipt.
+fn receipt_expression(value: &str) -> String {
+    value.replace(['\t', '\r', '\n'], " ")
+}
+
 impl Promotion {
     pub(crate) fn receipt_sites(&self) -> String {
         self.sites
@@ -41,7 +47,7 @@ impl Promotion {
                     count.argument_index,
                     count.elements.as_ref().map_or_else(
                         |gap| format!("missing:{gap:?}"),
-                        |elements| elements.clone(),
+                        |elements| receipt_expression(elements),
                     ),
                 )),
                 Requirement::OneElement
@@ -59,7 +65,7 @@ impl Promotion {
 
     pub(crate) fn receipt_length(&self) -> String {
         match &self.length {
-            LengthPlan::Evidence { elements, .. } => elements.clone(),
+            LengthPlan::Evidence { elements, .. } => receipt_expression(elements),
             LengthPlan::Fallback(_) => "crate::FALLBACK_SLICE_EXTENT".to_owned(),
         }
     }
@@ -199,8 +205,9 @@ pub(crate) fn collect(
         .collect::<FxHashMap<_, _>>();
     let mut by_subject = FxHashMap::<_, Candidate>::default();
     for fact in &facts.foreign_call_args {
-        let root = fact.direct_storage.map(|(root, _)| root).or(fact.root);
-        let Some(root) = root else { continue };
+        let Some(root) = fact.direct_subject_root() else {
+            continue;
+        };
         let node = (fact.caller, root);
         let Some(subject) = subjects.get(&node).copied() else { continue };
         let Ok(contract) = classify_contract(&fact.callee, fact.argument_index, &fact.target)

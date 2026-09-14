@@ -283,6 +283,73 @@ fn ce_w07_strncpy_source_count_is_an_upper_bound_and_never_exact_evidence() {
 }
 
 #[test]
+fn multiline_count_expression_is_single_line_only_in_the_receipt() {
+    let source = r#"
+        #![allow(dead_code, unused_unsafe)]
+        extern "C" { fn strncpy(dest: *mut i8, src: *const i8, n: usize) -> *mut i8; }
+        pub unsafe fn copy_file_name(src: *const i8) {
+            let mut dest = [0i8; 1034];
+            strncpy(dest.as_mut_ptr(), src, (1034usize - 10usize) as
+                usize);
+        }
+    "#;
+    let plans = promotions(source);
+    assert_eq!(
+        plans.len(),
+        1,
+        "only the readable source promotes: {plans:#?}"
+    );
+    assert_eq!(
+        plans[0].length,
+        super::decision::contract_extent::LengthPlan::Fallback(
+            super::decision::contract_extent::FallbackReason::UpperBound
+        )
+    );
+    let count_expression = plans[0]
+        .sites
+        .iter()
+        .find_map(|site| match &site.requirement {
+            super::decision::contract_extent::Requirement::UpperBound(Some(count)) => {
+                count.elements.as_ref().ok()
+            }
+            _ => None,
+        })
+        .expect("upper-bound count operand");
+    assert!(
+        count_expression.contains('\n'),
+        "the compiler fact retains the original expression: {count_expression:?}"
+    );
+
+    let super::RewriteOutcome::Emitted {
+        source: output,
+        raw_boundary_artifacts,
+        ..
+    } = super::rewrite_m1(source)
+    else {
+        panic!("multiline-count fixture must emit")
+    };
+    assert!(output.contains("strncpy("), "{output}");
+    assert_eq!(output.matches("1034usize - 10usize").count(), 1, "{output}");
+
+    let rendered =
+        super::mechanical_receipt::render_slice_use_rows(&raw_boundary_artifacts.slice_use_rows);
+    let lines = rendered.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        raw_boundary_artifacts.slice_use_rows.len() + 1,
+        "one physical TSV line per logical receipt row:\n{rendered}"
+    );
+    let width = lines[0].split('\t').count();
+    assert_eq!(width, 23, "specialized Slice-use schema width");
+    assert!(
+        lines[1..]
+            .iter()
+            .all(|line| line.split('\t').count() == width),
+        "every data row keeps the header width:\n{rendered}"
+    );
+}
+
+#[test]
 fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() {
     let source = r#"
         #![allow(dead_code, unused_unsafe, static_mut_refs)]

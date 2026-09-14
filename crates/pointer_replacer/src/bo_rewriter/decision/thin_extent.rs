@@ -60,11 +60,7 @@ pub(crate) fn collect(facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)
         if !position_consumes_many_elements(&fact.callee, fact.argument_index, &fact.target) {
             continue;
         }
-        let root = fact
-            .direct_storage
-            .map(|(storage, _)| storage)
-            .or(fact.root);
-        if let Some(root) = root {
+        if let Some(root) = fact.direct_subject_root() {
             out.insert((fact.caller, root));
         }
     }

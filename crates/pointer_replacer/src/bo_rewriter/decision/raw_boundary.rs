@@ -358,6 +358,10 @@ pub(crate) struct ForeignCallArgFact {
     pub argument_index: usize,
     pub argument_span: Span,
     pub root: Option<HirId>,
+    /// The argument's place root was reached through `*owner`. In that shape
+    /// the foreign extent belongs to a projected field/value, not to the
+    /// aggregate pointer named by `root`.
+    pub root_through_deref: bool,
     pub shape: &'static str,
     pub source_type: String,
     pub target: RawTargetType,
@@ -365,6 +369,17 @@ pub(crate) struct ForeignCallArgFact {
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<RawMutability>,
     pub contract_count: Option<ContractCountOperandFact>,
+}
+
+impl ForeignCallArgFact {
+    /// The pointer subject whose own extent the foreign position consumes.
+    /// A root reached through `*aggregate` names only the owner of a projected
+    /// child place, so attributing the child's extent to it is invalid.
+    pub(crate) fn direct_subject_root(&self) -> Option<HirId> {
+        self.direct_storage
+            .map(|(storage, _)| storage)
+            .or_else(|| (!self.root_through_deref).then_some(self.root).flatten())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
