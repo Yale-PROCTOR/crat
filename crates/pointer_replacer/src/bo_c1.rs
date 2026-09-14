@@ -11463,6 +11463,39 @@ mod run {
     /// families, so a delivered Cursor was emitted and then counted nowhere —
     /// absent from the denominator, absent from its arm, and invisible to the
     /// promote rate. The number would have moved without anything reporting it.
+    /// R390-1 RED: **the census child honours an inherited `DIR`, and is
+    /// otherwise unchanged.**
+    ///
+    /// The child's `DIR` was `workspace_root()` unconditionally, and that is
+    /// compile-time `CARGO_MANIFEST_DIR/../..` — so a binary built in an
+    /// isolated worktree named THAT worktree however the parent was launched.
+    /// The child then looked for `deps_crate/target/debug/deps` under a root
+    /// that had never been built and aborted `deps_crate not found`, twenty
+    /// workers at a time. Wave-4's candidate #1a spent two authorised census
+    /// slots on it.
+    ///
+    /// Both halves are asserted because only the pair is the fix: honouring the
+    /// inherited value is what makes a parent able to point at a built root,
+    /// and the unchanged fallback is what keeps every existing caller — this
+    /// lane's own censuses included, which set no bare `DIR` — on exactly the
+    /// value they had before.
+    #[test]
+    fn r390_1_the_census_child_prefers_an_inherited_dir() {
+        use std::ffi::OsString;
+
+        let inherited = OsString::from("/home/p51lee/dev/crat");
+        assert_eq!(
+            super::orchestrate::child_dir(Some(inherited.clone())),
+            inherited,
+            "a parent that knows where a built deps_crate lives must be able to say so"
+        );
+        assert_eq!(
+            super::orchestrate::child_dir(None),
+            super::orchestrate::workspace_root().into_os_string(),
+            "and with nothing inherited the value is exactly what it was before"
+        );
+    }
+
     #[test]
     fn r379_1_a_delivered_cursor_joins_the_safe_family_population() {
         use super::{RawBoundarySubjectDelivery as D, RawBoundarySubjectTally as Tally};
@@ -27375,6 +27408,7 @@ fn selector_leak_representatives_use_available_coverage_up_to_two() {
 #[cfg(test)]
 mod orchestrate {
     use std::{
+        ffi::OsString,
         fs,
         path::{Path, PathBuf},
         process::{Command, Stdio},
@@ -27431,6 +27465,24 @@ mod orchestrate {
 
     pub fn workspace_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// The `DIR` a census child is launched with (R390-1 hygiene row).
+    ///
+    /// [`workspace_root`] is compile-time `CARGO_MANIFEST_DIR/../..`, so a
+    /// binary built in an isolated worktree names THAT worktree wherever the
+    /// parent runs. The child then resolves `deps_crate/target/debug/deps`
+    /// under a root that may never have been built and
+    /// `utils::compilation::find_deps` panics `deps_crate not found` — which
+    /// cost wave-4's candidate #1a two slot bookings, because the parent's own
+    /// `DIR` was overwritten before the child could read it.
+    ///
+    /// An inherited `DIR` therefore wins: a parent that knows where a built
+    /// `deps_crate` lives can say so. **Unset, the value is exactly what it was
+    /// before**, so no existing caller changes behaviour — which is why this is
+    /// hygiene rather than a repair of anything currently measured.
+    pub fn child_dir(inherited: Option<OsString>) -> OsString {
+        inherited.unwrap_or_else(|| workspace_root().into_os_string())
     }
 
     pub fn out_dir() -> PathBuf {
@@ -27617,7 +27669,7 @@ mod orchestrate {
             .env("CRAT_BOC1_INPUT", input)
             .env("CRAT_BOC1_MODE", mode)
             .env("CRAT_BOC1_NAME", program)
-            .env("DIR", workspace_root())
+            .env("DIR", child_dir(std::env::var_os("DIR")))
             .stdin(Stdio::null())
             .stdout(Stdio::from(out_file))
             .stderr(Stdio::from(err_file));
