@@ -1966,6 +1966,7 @@ impl<'a> SeamGraftVisitor<'a> {
             } else {
                 find_by_span(e, target.arg_span)?.clone()
             };
+            let argument = super::slice_forms_ast::argument(argument, spec.forward_slice.as_ref())?;
             return raw_boundary_expr(
                 rustc_ast::Expr {
                     id: DUMMY_NODE_ID,
@@ -1994,6 +1995,7 @@ impl<'a> SeamGraftVisitor<'a> {
         // "building" it would be a no-op that reads as a placement.
         if shape.is_none()
             && !spec.optional
+            && spec.forward_slice.is_none()
             && spec.unwrap.is_none()
             && !matches!(spec.core, GlueCore::First)
             && !super::wave5r_cast::is_bare_cast_peel(spec, e, target.arg_span)
@@ -2031,6 +2033,11 @@ impl<'a> SeamGraftVisitor<'a> {
             self.stats.arg_peeled += 1;
             P(inner.clone())
         };
+
+        let arg = P(super::slice_forms_ast::argument(
+            (*arg).clone(),
+            spec.forward_slice.as_ref(),
+        )?);
 
         // ---- the length: the ONE genuinely new expression ----
         //
@@ -4145,6 +4152,7 @@ fn transform_with<'tcx>(
         &mut guard,
     )?;
     super::wave6r_option_reborrow::apply(tcx, table, reverts, &mut krate, &mut guard)?;
+    super::slice_forms_ast::apply(tcx, table, reverts, &mut krate, &mut guard)?;
     apply_surface_plans(capture, table, reverts, &mut krate, &mut guard)?;
     super::wave5r_helper_path::qualify(tcx, capture, table, reverts, &mut krate);
 

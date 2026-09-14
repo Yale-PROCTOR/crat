@@ -743,3 +743,214 @@ fn wave6s_computed_view_composes_into_option_value() {
         "{source}"
     );
 }
+
+#[test]
+fn wave6s_strff_forward_parameter_pass_on() {
+    let source = emit(STRFF);
+    println!("EMITTED {source}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("ptr: &[i8]"),
+        "forward parameter must deliver: {source}"
+    );
+    assert!(
+        source.contains("let mut __crat_wave6s_pos_"),
+        "forward parameter needs its index: {source}"
+    );
+}
+
+fn emit(input: &str) -> String {
+    emit_reverting(input, None)
+}
+
+fn emit_reverting(input: &str, revert: Option<&str>) -> String {
+    let output = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("capture original AST");
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native corpus-mode decisions");
+        println!("SLICE RECEIPTS {:#?}", table.slice_use_receipts);
+        for (subject, decision) in &table.entries {
+            println!("DECISION {} {decision:?}", subject.label);
+        }
+        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+            .expect("native emission plan");
+        let mut held = emission.plan.held_classes();
+        if let Some(name) = revert {
+            let owner = tcx
+                .hir_body_owners()
+                .find(|owner| tcx.def_path_str(owner.to_def_id()) == name)
+                .expect("the reverted fixture function exists");
+            held.insert(super::bridge_receipt::SignatureClassId::of(owner));
+        }
+        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+            &held,
+            &Default::default(),
+            &table,
+        )
+        .expect("planned held classes");
+        super::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_call_plans),
+        )
+        .expect("native AST emission")
+        .0
+        .into_values()
+        .next()
+        .expect("one source file")
+    })
+    .expect("input type-checks");
+    println!(
+        "WAVE6S_RUNTIME {}",
+        serde_json::json!({"input": input, "output": output})
+    );
+    output
+}
+
+#[test]
+fn wave6s_brotli_forward_word_and_byte_walk() {
+    let source = emit(BROTLI);
+    println!("EMITTED {source}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("s2: &[u8]"),
+        "forward byte parameter must deliver: {source}"
+    );
+    assert!(
+        source.contains("let mut __crat_wave6s_pos_"),
+        "forward byte parameter needs its index: {source}"
+    );
+}
+
+const STRFF: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe extern "C" {
+    fn strlen(p: *const i8) -> usize;
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn strcpy(out: *mut i8, input: *const i8) -> *mut i8;
+ }
+ unsafe extern "C" fn strdup(input: *const i8) -> *mut i8 {
+    let n = strlen(input) + 1;
+    let dup = malloc(n) as *mut i8;
+    if !dup.is_null() { strcpy(dup, input); }
+    return dup;
+ }
+ pub unsafe fn strff(mut ptr: *mut i8, n: i32) -> *mut i8 {
+  let mut y = 0; let mut i = 0;
+  while i < n { let fresh11 = *ptr; ptr = ptr.offset(1); y = fresh11 as i32; i += 1; }
+  strdup(ptr)
+ }
+ "#;
+
+const BROTLI: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe fn BrotliUnalignedRead64(p: *const core::ffi::c_void) -> u64 {
+   *(p as *const u64)
+ }
+pub unsafe fn FindMatchLengthWithLimit(mut s1:
+                    *const u8, mut s2: *const u8, mut limit: u64)
+                -> u64 {
+                let mut matched = 0 as i32 as u64;
+                let mut limit2 =
+                    (limit >>
+                                3 as
+                                    i32).wrapping_add(1 as i32 as
+                            u64);
+                loop {
+                    limit2 = limit2.wrapping_sub(1);
+                    if !((limit2 != 0) as i32 as i64 != 0) {
+                        break;
+                    }
+                    if (BrotliUnalignedRead64(s2 as *const core::ffi::c_void) ==
+                                            BrotliUnalignedRead64(s1.offset(matched as isize) as
+                                                    *const core::ffi::c_void)) as i32 as i64 != 0 {
+                        s2 = s2.offset(8 as i32 as isize);
+                        matched =
+                            (matched as
+                                                u64).wrapping_add(8 as i32 as
+                                            u64) as u64 as u64;
+                    } else {
+                        let mut x =
+                            BrotliUnalignedRead64(s2 as *const core::ffi::c_void) ^
+                                BrotliUnalignedRead64(s1.offset(matched as isize) as
+                                        *const core::ffi::c_void);
+                        let mut matching_bits =
+                            (x as u64).trailing_zeros() as i32 as u64;
+                        matched =
+                            (matched as
+                                                u64).wrapping_add(matching_bits >>
+                                            3 as i32) as u64 as u64;
+                        return matched;
+                    }
+                }
+                limit =
+                    (limit &
+                                7 as i32 as
+                                    u64).wrapping_add(1 as i32 as
+                            u64);
+                loop {
+                    limit = limit.wrapping_sub(1);
+                    if !(limit != 0) { break; }
+                    if (*s1.offset(matched as isize) as i32 ==
+                                            *s2 as i32) as i32 as i64 != 0 {
+                        s2 = s2.offset(1);
+                        matched = matched.wrapping_add(1);
+                    } else { return matched }
+                }
+                return matched;
+            }
+
+"#;
+
+#[test]
+fn wave6s_strff_revert_withdraws_index_and_tail_view() {
+    let source = emit_reverting(STRFF, Some("strff"));
+    assert!(super::verify::type_checks_str(&source));
+    assert!(source.contains("ptr: *mut i8"), "{source}");
+    assert!(!source.contains("__crat_wave6s_pos_"), "{source}");
+}
+
+#[test]
+fn wave6s_strff_mixed_return_preserves_shared_permission_hold() {
+    let input = STRFF.replace(
+        "return dup;",
+        "if n == 5 { return input as *mut i8; } return dup;",
+    );
+    let source = emit(&input);
+    assert!(super::verify::type_checks_str(&source));
+    assert!(source.contains("ptr: *mut i8"), "{source}");
+    assert!(!source.contains("__crat_wave6s_pos_"), "{source}");
+}
+
+#[test]
+fn wave6s_backward_parameter_keeps_its_separate_hold() {
+    let source = emit(&STRFF.replace("ptr.offset(1)", "ptr.offset(-1)"));
+    assert!(super::verify::type_checks_str(&source));
+    assert!(!source.contains("__crat_wave6s_pos_"), "{source}");
+}
+
+#[test]
+fn wave6s_strff_incoming_preserves_tail_extent() {
+    let input =
+        format!("{STRFF}\npub unsafe fn drive(p: *mut i8, n: i32) -> *mut i8 {{ strff(p, n) }}");
+    let source = emit(&input);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("ptr: &[i8]"), "{source}");
+    assert!(
+        source.contains("p: *mut i8"),
+        "thin incoming source stays raw: {source}"
+    );
+    assert!(
+        source.contains("FALLBACK_SLICE_EXTENT"),
+        "prefix count does not prove the NUL tail: {source}"
+    );
+}

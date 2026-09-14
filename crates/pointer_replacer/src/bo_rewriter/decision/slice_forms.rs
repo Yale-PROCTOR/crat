@@ -792,3 +792,293 @@ fn lower_forward_parameters(
     }
     Ok(())
 }
+
+use rustc_ast::mut_visit::{self, MutVisitor};
+use rustc_hash::FxHashSet;
+use rustc_hir::{
+    Expr, ExprKind, HirId, QPath,
+    def::Res,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
+use rustc_middle::ty::TyCtxt;
+use rustc_span::Span;
+
+use super::{Decision, DecisionTable, SubjectKind, emitability::UseEdit};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardParameter {
+    pub(crate) node: (LocalDefId, HirId),
+    pub(crate) body_span: Span,
+    pub(crate) index_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardView {
+    pub(crate) index_name: String,
+    pub(crate) mutable: bool,
+}
+
+impl ForwardView {
+    pub(crate) fn render(&self, argument: &str) -> String {
+        let borrow = if self.mutable { "&mut " } else { "&" };
+        format!("({borrow}({argument})[{}..])", self.index_name)
+    }
+}
+
+fn local(expression: &Expr<'_>) -> Option<HirId> {
+    match expression.kind {
+        ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+            Res::Local(binding) => Some(binding),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+struct Advance {
+    assignment: Span,
+    rhs: Span,
+    delta: String,
+}
+
+struct Inventory<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    node: (LocalDefId, HirId),
+    name: String,
+    index_name: String,
+    advances: Vec<Advance>,
+    uses: Vec<Span>,
+    collision: bool,
+}
+
+impl<'tcx> Visitor<'tcx> for Inventory<'tcx> {
+    fn visit_pat(&mut self, pattern: &'tcx rustc_hir::Pat<'tcx>) {
+        if let rustc_hir::PatKind::Binding(_, binding, ident, _) = pattern.kind {
+            self.collision |= ident.name.as_str() == self.index_name
+                || (ident.name.as_str() == self.name && binding != self.node.1);
+        }
+        intravisit::walk_pat(self, pattern);
+    }
+
+    fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
+        if local(expression) == Some(self.node.1) {
+            self.uses.push(expression.span);
+        }
+        if let ExprKind::Assign(lhs, rhs, _) = expression.kind
+            && local(lhs) == Some(self.node.1)
+            && let ExprKind::MethodCall(segment, receiver, [delta], _) = rhs.kind
+            && local(receiver) == Some(self.node.1)
+            && matches!(segment.ident.name.as_str(), "offset" | "add")
+            && self
+                .tcx
+                .typeck(self.node.0)
+                .type_dependent_def_id(rhs.hir_id)
+                .is_some_and(|callee| self.tcx.crate_name(callee.krate).as_str() == "core")
+            && let Ok(delta) = self.tcx.sess.source_map().span_to_snippet(delta.span)
+        {
+            self.advances.push(Advance {
+                assignment: expression.span,
+                rhs: rhs.span,
+                delta,
+            });
+        }
+        intravisit::walk_expr(self, expression);
+    }
+}
+
+fn contains(outer: Span, inner: Span) -> bool {
+    outer.lo() <= inner.lo() && inner.hi() <= outer.hi()
+}
+
+fn shifted_use(edit: &UseEdit, name: &str, view: &ForwardView) -> Option<UseEdit> {
+    struct Shift<'a> {
+        name: &'a str,
+        replacement: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Shift<'_> {
+        fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+            if matches!(&expression.kind, rustc_ast::ExprKind::Path(None, path)
+                if path.segments.len() == 1 && path.segments[0].ident.name.as_str() == self.name)
+            {
+                expression.kind = self.replacement.kind.clone();
+                self.hits += 1;
+                return;
+            }
+            mut_visit::walk_expr(self, expression);
+        }
+    }
+    let (mut parsed, replacement) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (
+            ::utils::ast::parse_expr(edit.replacement.clone()),
+            ::utils::ast::parse_expr(view.render(name)),
+        )
+    }))
+    .ok()?;
+    let mut shift = Shift {
+        name,
+        replacement,
+        hits: 0,
+    };
+    shift.visit_expr(&mut parsed);
+    (shift.hits > 0).then(|| UseEdit {
+        span: edit.span,
+        replacement: rustc_ast_pretty::pprust::expr_to_string(&parsed),
+        bridge_kind: edit.bridge_kind,
+    })
+}
+
+/// Select only complete existing Slice presentations. An uncovered occurrence
+/// keeps the established reslice form; it never obtains new admission here.
+pub(crate) fn lower(
+    tcx: TyCtxt<'_>,
+    table: &mut DecisionTable,
+    advance_ok: &FxHashSet<(LocalDefId, HirId)>,
+    native: &super::raw_boundary::RawBoundarySiteFacts,
+) -> Result<(), String> {
+    for entry in 0..table.entries.len() {
+        let (subject, decision) = &table.entries[entry];
+        let node = (subject.fn_did, subject.hir_id);
+        let Decision::Slice {
+            mutable: false,
+            uses,
+        } = decision
+        else {
+            continue;
+        };
+        let mutable = &false;
+        // Keep existing reslice presentations stable. This first rule owns
+        // forward call-bearing subjects with newly proved result independence.
+        if !native.sites.iter().any(|site| {
+            site.node == Some(node) && native.forward_return_independent.contains_key(&site.key)
+        }) {
+            continue;
+        }
+        if !matches!(subject.kind, SubjectKind::Param { .. }) || !advance_ok.contains(&node) {
+            continue;
+        }
+        let Some(name) = subject.param_name.as_deref() else { continue };
+        let index_name = format!(
+            "__crat_wave6s_pos_{}_{}",
+            node.0.local_def_index.as_u32(),
+            node.1.local_id.as_u32()
+        );
+        let body = tcx.hir_body_owned_by(node.0);
+        let ExprKind::Block(block, _) = body.value.kind else { continue };
+        let mut inventory = Inventory {
+            tcx,
+            node,
+            name: name.to_owned(),
+            index_name: index_name.clone(),
+            advances: Vec::new(),
+            uses: Vec::new(),
+            collision: false,
+        };
+        inventory.visit_body(body);
+        if inventory.collision || inventory.advances.is_empty() {
+            continue;
+        }
+        // The existing source edit licenses each advancement. Reject nested
+        // edits and nested uses in its delta rather than embedding stale text.
+        if inventory.advances.iter().any(|advance| {
+            uses.iter().filter(|edit| edit.span == advance.rhs).count() != 1
+                || uses
+                    .iter()
+                    .any(|edit| edit.span != advance.rhs && contains(advance.assignment, edit.span))
+                || inventory
+                    .uses
+                    .iter()
+                    .filter(|&&span| contains(advance.assignment, span))
+                    .count()
+                    != 2
+        }) {
+            continue;
+        }
+        let seam_indices = table
+            .seams
+            .edits
+            .iter()
+            .enumerate()
+            .filter(|(_, edit)| {
+                edit.source_node == Some(node)
+                    && inventory.uses.contains(&edit.arg_span)
+                    && edit.spec.shared_address.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if inventory.uses.iter().any(|&span| {
+            !inventory
+                .advances
+                .iter()
+                .any(|advance| contains(advance.assignment, span))
+                && !uses.iter().any(|edit| contains(edit.span, span))
+                && !seam_indices
+                    .iter()
+                    .any(|&index| table.seams.edits[index].arg_span == span)
+        }) {
+            continue;
+        }
+        let view = ForwardView {
+            index_name: index_name.clone(),
+            mutable: *mutable,
+        };
+        let mut replacements = Vec::new();
+        let mut complete = true;
+        for edit in uses {
+            if let Some(advance) = inventory.advances.iter().find(|a| a.rhs == edit.span) {
+                replacements.push(UseEdit {
+                    span: advance.assignment,
+                    replacement: format!(
+                        "{index_name} = {index_name}.checked_add(({}) as usize).expect(\"forward slice index overflow\")",
+                        advance.delta
+                    ),
+                    bridge_kind: "subject-use",
+                });
+            } else if let Some(edit) = shifted_use(edit, name, &view) {
+                replacements.push(edit);
+            } else {
+                complete = false;
+            }
+        }
+        if !complete {
+            continue;
+        }
+        let mut seams = Vec::new();
+        for index in seam_indices {
+            let mut edit = table.seams.edits[index].clone();
+            edit.spec.forward_slice = Some(view.clone());
+            let argument = tcx
+                .sess
+                .source_map()
+                .span_to_snippet(edit.arg_span)
+                .map_err(|_| "forward-slice:seam-source-unavailable")?;
+            edit.replacement = edit
+                .spec
+                .render_in_context(
+                    &argument,
+                    tcx.fn_sig(node.0)
+                        .skip_binder()
+                        .skip_binder()
+                        .safety
+                        .is_unsafe(),
+                )
+                .ok_or("forward-slice:seam-render-unavailable")?;
+            // A suffix is syntax even if the original safe argument required
+            // no wrapper. Keep the same boundary owner and permission receipt.
+            edit.zero_syntax = false;
+            seams.push((index, edit));
+        }
+        let Decision::Slice { uses, .. } = &mut table.entries[entry].1 else { unreachable!() };
+        *uses = replacements;
+        for (index, edit) in seams {
+            table.seams.edits[index] = edit;
+        }
+        table.forward_slice_parameters.push(ForwardParameter {
+            node,
+            body_span: block.span,
+            index_name,
+        });
+    }
+    Ok(())
+}

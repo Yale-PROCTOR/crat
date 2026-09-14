@@ -103,12 +103,15 @@ pub(crate) mod shared_read_pairs;
 pub(crate) mod sibling_overlap;
 pub(crate) mod slice_carrier;
 pub(crate) mod slice_construction_values;
+pub(crate) mod slice_forms;
 pub(crate) mod slice_input;
 #[cfg(test)]
 mod slice_input_root_tests;
 #[cfg(test)]
 mod slice_input_tests;
 pub(crate) mod slice_local_construction;
+pub(crate) mod slice_return_evidence;
+pub(crate) mod slice_scalar_return;
 pub(crate) mod slice_use;
 pub(crate) mod surface_argument;
 pub(crate) mod thin_counted;
@@ -994,6 +997,7 @@ pub(crate) struct DecisionTable {
     pub(crate) allocator_contracts: allocator_contract::Plans,
     pub(crate) void_region: void_region::Contracts,
     pub(crate) void_region_receivers: void_region::Receivers,
+    pub(crate) forward_slice_parameters: Vec<slice_forms::ForwardParameter>,
     pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
     pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
@@ -1289,6 +1293,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         allocator_contracts: ctx.allocator_contracts.clone(),
         void_region: ctx.void_region.clone(),
         void_region_receivers: ctx.void_region_receivers.clone(),
+        forward_slice_parameters: Vec::new(),
         nested_receipts: Vec::new(),
         cursor_receipts,
         sibling_overlap_inventory: Default::default(),
@@ -2653,6 +2658,7 @@ mod self_consistency_tests {
             allocator_contracts: Default::default(),
             void_region: Default::default(),
             void_region_receivers: Default::default(),
+            forward_slice_parameters: Vec::new(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

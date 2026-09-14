@@ -478,6 +478,8 @@ pub(crate) struct RawBoundarySiteFailure {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RawBoundarySiteFacts {
+    pub forward_return_independent:
+        FxHashMap<RawBoundarySiteKey, super::slice_return_evidence::ReturnIndependence>,
     pub sites: Vec<RawBoundarySiteFact>,
     pub failures: Vec<RawBoundarySiteFailure>,
 }
@@ -743,6 +745,7 @@ impl RawBoundarySiteFacts {
                 }
             }
         }
+        out.forward_return_independent = super::slice_return_evidence::collect(program, &out);
         out.sites.sort_by(|left, right| left.key.cmp(&right.key));
         out.failures.sort_by(|left, right| {
             (&left.caller, &left.callee, left.argument_index).cmp(&(
@@ -3874,6 +3877,8 @@ fn template_for_source_form(
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RawBoundaryDispositionIndex {
+    return_independent:
+        BTreeMap<RawBoundarySiteKey, super::slice_return_evidence::ReturnIndependence>,
     by_site: BTreeMap<RawBoundarySiteKey, RawBoundaryDisposition>,
     negative_write: BTreeMap<RawBoundarySiteKey, NegativeWriteEvidence>,
     render_sites: BTreeMap<RawBoundarySiteKey, RawBoundaryRenderSite>,
@@ -3896,6 +3901,13 @@ pub(crate) struct RawBoundaryDispositionIndex {
 }
 
 impl RawBoundaryDispositionIndex {
+    pub(crate) fn return_independent(
+        &self,
+        key: &RawBoundarySiteKey,
+    ) -> Option<&super::slice_return_evidence::ReturnIndependence> {
+        self.return_independent.get(key)
+    }
+
     /// Fails closed: a site with no recorded answer is treated as able to
     /// yield a pointer.
     pub(crate) fn callee_may_yield_pointer(&self, key: &RawBoundarySiteKey) -> bool {
@@ -4194,6 +4206,15 @@ impl RawBoundaryDispositionIndex {
                         &site.source_type,
                         &site.target,
                     );
+                    let independent_return = (matches!(decision, super::Decision::Slice { .. })
+                        && matches!(retention_verdict, RetentionVerdict::NoRetain { .. }))
+                    .then(|| site_facts.forward_return_independent.get(&site.key))
+                    .flatten();
+                    if let Some(proof) = independent_return {
+                        evidence.push_str(&format!(";{proof}"));
+                        out.return_independent
+                            .insert(site.key.clone(), proof.clone());
+                    }
                     if let Some(returned) = &returned_child
                         && !returned.raw_field_parent
                     {
@@ -4260,6 +4281,7 @@ impl RawBoundaryDispositionIndex {
                         } else if is_shared_safe_source(view)
                             && site.callee_may_yield_pointer
                             && contract.is_err()
+                            && independent_return.is_none()
                             && returned_child_permission(view, child_access).is_err()
                             && !super::returned_child_descent::no_child_can_descend(
                                 &retention_verdict,

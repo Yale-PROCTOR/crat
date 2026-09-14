@@ -108,6 +108,9 @@ pub(crate) mod sign_facts;
 #[cfg(test)]
 mod slice_construction_values_tests;
 mod slice_cursor_prelude;
+mod slice_forms_ast;
+#[cfg(test)]
+mod slice_forms_tests;
 pub(crate) mod use_census;
 pub(crate) mod verify;
 #[cfg(test)]
@@ -5373,6 +5376,8 @@ fn seal_terminal_outbound_calls(
                     } else if decision::raw_boundary::is_shared_safe_source(effective_source)
                         && endpoint.callee_may_yield_pointer
                         && endpoint.ownership.is_none()
+                        && !(matches!(effective_source, decision::Decision::Slice { .. })
+                            && endpoint.return_independent.is_some())
                         && decision::raw_boundary::returned_child_permission(
                             effective_source,
                             child_access,
@@ -5402,12 +5407,13 @@ fn seal_terminal_outbound_calls(
                 } else {
                     template
                 };
-                let spec = GlueSpec::raw_boundary_target(
+                let mut spec = GlueSpec::raw_boundary_target(
                     template,
                     &endpoint.target,
                     endpoint.box_slice,
                     false,
                 );
+                spec.forward_slice = old.spec.forward_slice.clone();
                 let Some(replacement) = spec
                     .render_in_context(&endpoint.operand_expression, endpoint.enclosing_unsafe_fn)
                 else {
@@ -5424,19 +5430,20 @@ fn seal_terminal_outbound_calls(
                 sealed.bridge.bridge_kind = template.key().to_owned();
                 // Existing borrowed-to-raw coercions still count as sites,
                 // while needing no syntax edit at the original argument.
-                sealed.zero_syntax = matches!(
-                    template.render(
-                        &endpoint.operand_expression,
-                        endpoint.target.mutability,
-                        endpoint.box_slice,
-                        sealed
-                            .spec
-                            .raw_boundary
-                            .as_ref()
-                            .and_then(|raw| raw.cast_pointee.as_deref())
-                    ),
-                    Ok(decision::raw_boundary::BridgeRender::ZeroSyntax)
-                );
+                sealed.zero_syntax = sealed.spec.forward_slice.is_none()
+                    && matches!(
+                        template.render(
+                            &endpoint.operand_expression,
+                            endpoint.target.mutability,
+                            endpoint.box_slice,
+                            sealed
+                                .spec
+                                .raw_boundary
+                                .as_ref()
+                                .and_then(|raw| raw.cast_pointee.as_deref())
+                        ),
+                        Ok(decision::raw_boundary::BridgeRender::ZeroSyntax)
+                    );
             } else {
                 // No safe declaration was applied for this source. The input
                 // argument already obeys the original raw ABI, including its
@@ -7831,6 +7838,7 @@ fn finish_decide<'tcx>(
             &raw_boundary,
         );
         let mut table = table;
+        decision::slice_forms::lower(tcx, &mut table, &advance_ok, &raw_boundary_sites)?;
 
         // Structural self-check: the table matches the subjects it was handed. NOT
         // the coverage gate — every comparison in it is against the collector's own

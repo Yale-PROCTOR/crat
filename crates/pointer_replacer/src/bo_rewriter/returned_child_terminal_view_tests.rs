@@ -74,6 +74,7 @@ fn check(form: RootForm, shared_address: bool) {
         };
         let seam = SeamEdit {
             raw_outbound: Some(RawOutboundEndpoint {
+                return_independent: None,
                 returned_child: Some(ReturnedChildSiteEvidence { child: Err("constructed-unknown-child-access"), raw_field_parent: false }),
                 mutable_binding_required: false, target: target.clone(), original_expression: original.clone(), operand_expression: operand.clone(),
                 ownership: None, negative_write: true, box_slice: false, enclosing_unsafe_fn: true,

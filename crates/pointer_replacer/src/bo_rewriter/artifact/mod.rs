@@ -217,6 +217,7 @@ mod tests {
             allocator_contracts: Default::default(),
             void_region: Default::default(),
             void_region_receivers: Default::default(),
+            forward_slice_parameters: Vec::new(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),

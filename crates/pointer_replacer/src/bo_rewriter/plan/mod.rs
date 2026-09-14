@@ -38,6 +38,7 @@ pub(crate) mod outbound_expression;
 pub(crate) mod outbound_return;
 pub(crate) mod receiver_input;
 pub(crate) mod sibling_overlap;
+mod slice_forms;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -4652,6 +4653,18 @@ pub(crate) fn plan(
                 Err(reason) => use_failure = Some(reason),
             }
         }
+        slice_forms::append(
+            table,
+            subject,
+            &ty_file,
+            &span_to_loc,
+            &owner_of(subject),
+            &subject_id,
+            &subject_atom_ids,
+            &subject_arms,
+            &mut use_edits,
+            &mut use_failure,
+        );
         if let Some(reason) = use_failure {
             unplaceable.push(Unplaceable {
                 owner_class: SignatureClassId::of(subject.fn_did),
@@ -5556,6 +5569,7 @@ mod tests {
             allocator_contracts: Default::default(),
             void_region: Default::default(),
             void_region_receivers: Default::default(),
+            forward_slice_parameters: Vec::new(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
@@ -5713,6 +5727,7 @@ mod tests {
             allocator_contracts: Default::default(),
             void_region: Default::default(),
             void_region_receivers: Default::default(),
+            forward_slice_parameters: Vec::new(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

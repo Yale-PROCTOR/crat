@@ -169,7 +169,11 @@ fn parameter_access(
     // for the seat; it is not moved here.)
     if slice_uses
         .get(&(param.fn_did, param.hir_id))
-        .is_some_and(|uses| uses.unsupported.is_none() && !uses.rewrites.is_empty())
+        .is_some_and(|uses| {
+            uses.unsupported.is_none()
+                && !uses.rewrites.is_empty()
+                && !super::slice_return_evidence::needs_full_base(tcx, param, uses)
+        })
     {
         return None;
     }

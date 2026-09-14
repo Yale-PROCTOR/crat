@@ -367,6 +367,7 @@ pub(crate) struct RevertFoundFormEdit {
 /// finalization. Text is carried from the exact original AST spans.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RawOutboundEndpoint {
+    pub(crate) return_independent: Option<super::slice_return_evidence::ReturnIndependence>,
     pub(crate) returned_child: Option<super::raw_boundary::ReturnedChildSiteEvidence>,
     pub(crate) mutable_binding_required: bool,
     pub(crate) target: super::raw_boundary::RawTargetType,
@@ -1104,6 +1105,7 @@ pub(crate) struct GlueSpec {
     pub(crate) counted_byte: Option<super::counted_void::CountedByte>,
     /// wave-6b: the argument is a void buffer bridged as one typed region.
     pub(crate) void_region: Option<super::void_region::Bridge>,
+    pub(crate) forward_slice: Option<super::slice_forms::ForwardView>,
     pub shared_address: Option<super::overlapping_pairs::consumer::SharedAddress>,
     pub core: GlueCore,
     /// The EXPECTED side's mutability — selects `&`/`&mut` and
@@ -1157,6 +1159,7 @@ impl GlueSpec {
         Self {
             counted_byte: None,
             void_region: None,
+            forward_slice: None,
             shared_address: None,
             core,
             mutable,
@@ -1221,6 +1224,7 @@ impl GlueSpec {
         Self {
             counted_byte: None,
             void_region: None,
+            forward_slice: None,
             shared_address: None,
             core: GlueCore::Bare,
             mutable,
@@ -1243,6 +1247,7 @@ impl GlueSpec {
         Self {
             counted_byte: None,
             void_region: None,
+            forward_slice: None,
             shared_address: None,
             core: GlueCore::Bare,
             mutable: target_mutability == super::raw_boundary::RawMutability::Mut,
@@ -1485,6 +1490,8 @@ impl GlueSpec {
         if let Some(address) = &self.shared_address {
             return address.render(text);
         }
+        let shifted = self.forward_slice.as_ref().map(|view| view.render(text));
+        let text = shifted.as_deref().unwrap_or(text);
         let unsafe_expr = |inner: String| {
             super::super::mechanical_receipt::present_unsafe_text(inner, enclosing_unsafe_fn)
         };
@@ -4588,6 +4595,13 @@ pub(crate) fn synthesize_with_raw_boundary(
                     .root
                     .and_then(|root| decision_of.get(&(site.caller, root)).copied())
                     .and_then(|decision| owner_view_candidate(Some(decision), pos.expected, text));
+                let len_text = super::slice_return_evidence::companion_for_tail(
+                    table,
+                    raw_boundary,
+                    *callee,
+                    pos.index,
+                    len_text,
+                );
                 candidates.push(
                     if let Some(address) = shared_pairs
                         .at(*callee, site)
@@ -5330,6 +5344,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             .expect("located outbound argument has original source");
         plan.edits.push(SeamEdit {
             raw_outbound: Some(RawOutboundEndpoint {
+                return_independent: raw_boundary.return_independent(key).cloned(),
                 returned_child: raw_boundary.returned_child_evidence(key).cloned(),
                 mutable_binding_required: site.mutable_binding_required,
                 target: site.target.clone(),
