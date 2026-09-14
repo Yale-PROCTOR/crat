@@ -516,7 +516,7 @@ struct RawBoundarySubjectTally {
 
 impl RawBoundarySubjectTally {
     fn observe(&mut self, family: &str, delivery: RawBoundarySubjectDelivery) {
-        if matches!(family, "ref" | "slice" | "optional" | "box") {
+        if raw_boundary_safe_family(family) {
             self.safe_family_rows += 1;
             match delivery {
                 RawBoundarySubjectDelivery::Realized => self.realized += 1,
@@ -1151,8 +1151,31 @@ impl RawBoundaryDeliveryCounts {
     }
 }
 
+/// The families whose subjects are SAFE forms, and therefore the denominator
+/// every delivery arm partitions.
+///
+/// **`cursor` is one of them (R379-1).** The emitting side has produced the
+/// family since the cursor wave landed, and this list had four entries, so a
+/// delivered Cursor was emitted and then counted nowhere: outside the
+/// denominator, outside its arm, and invisible to the promote rate. The four
+/// counting surfaces in this file now read the family from here, from
+/// [`raw_boundary_emitting_family`], or from `DEGRADED_MASS_FAMILIES`, so a
+/// future form is added in one place and not four.
 fn raw_boundary_safe_family(family: &str) -> bool {
-    matches!(family, "ref" | "slice" | "optional" | "box")
+    matches!(family, "ref" | "slice" | "optional" | "box" | "cursor")
+}
+
+/// The decisions that EMIT, for the T1 / T2 boundary counts.
+///
+/// Wider than [`raw_boundary_safe_family`] by `inferred-ref`, which is a
+/// delivered reference without a declaration span rather than a family of its
+/// own. Extracted from the closure it was written in so the count has a seam a
+/// witness can reach.
+fn raw_boundary_emitting_family(decision: &str) -> bool {
+    matches!(
+        decision,
+        "ref" | "inferred-ref" | "slice" | "optional" | "box" | "cursor"
+    )
 }
 
 /// Which of the two frames hold a subject in their safe-family population.
@@ -6000,7 +6023,7 @@ mod run {
             ProductionPrecisionEvidence, RemovalFilter,
         },
         ownership_yield::{self, ModelKindRecord, OwnerClass, SlotRecord},
-        raw_schema,
+        raw_boundary_emitting_family, raw_schema,
         report::Row,
         selector_leak_diagnosis::{
             self, CommitEvent, CoreEvidence, DetailEvidence, OutParamTag, SelectorClass, TracePhase,
@@ -10346,7 +10369,8 @@ mod run {
         ]
     }
 
-    const DEGRADED_MASS_FAMILIES: [&str; 4] = ["ref", "slice", "optional", "box"];
+    pub(super) const DEGRADED_MASS_FAMILIES: [&str; 5] =
+        ["ref", "slice", "optional", "box", "cursor"];
 
     fn degraded_mass_lifetime_reason(reason: &str) -> bool {
         matches!(
@@ -11431,6 +11455,83 @@ mod run {
         );
     }
 
+    /// R379-1 RED (i): **a newly admitted Cursor enters the safe-family
+    /// population and counts.**
+    ///
+    /// The emitting side has produced the `cursor` family since the cursor wave
+    /// landed; the four COUNTING surfaces in this file still listed four
+    /// families, so a delivered Cursor was emitted and then counted nowhere —
+    /// absent from the denominator, absent from its arm, and invisible to the
+    /// promote rate. The number would have moved without anything reporting it.
+    #[test]
+    fn r379_1_a_delivered_cursor_joins_the_safe_family_population() {
+        use super::{RawBoundarySubjectDelivery as D, RawBoundarySubjectTally as Tally};
+        assert!(
+            super::raw_boundary_safe_family("cursor"),
+            "cursor is a safe form; the predicate is what puts it in the denominator"
+        );
+        let mut tally = Tally::default();
+        tally.observe("ref", D::Realized);
+        tally.observe("cursor", D::Realized);
+        tally.observe("cursor", D::Degraded);
+        assert_eq!(tally.safe_family_rows, 3, "{tally:?}");
+        assert_eq!(tally.realized, 2, "{tally:?}");
+        assert_eq!(tally.degraded, 1, "{tally:?}");
+        assert!(tally.partition_holds(), "{tally:?}");
+    }
+
+    /// R379-1 RED (ii): **a safe-family identity that becomes a Cursor does not
+    /// disappear from either frame.**
+    ///
+    /// The membership is read per COLUMN, so a subject whose baseline family is
+    /// `ref` and whose current family is `cursor` must stay in the baseline
+    /// population AND enter the current one. With `cursor` unlisted it left the
+    /// current frame silently, which reads as a delivery loss that never
+    /// happened — the most misleading shape this class can take.
+    #[test]
+    fn r379_1_a_ref_that_becomes_a_cursor_stays_in_both_frames() {
+        let mut tally = super::RawBoundaryFrameTally::default();
+        let membership = tally.observe(
+            "bst",
+            "ref",
+            "realized-as-predicted",
+            "cursor",
+            "realized-as-predicted",
+            "-",
+            true,
+        );
+        assert!(membership.baseline, "the baseline frame still holds it");
+        assert!(
+            membership.current,
+            "and the current frame gains it rather than losing the subject"
+        );
+        assert!(membership.counted(), "so it is counted, not dropped");
+    }
+
+    /// R379-1 RED (iii): **a realized Cursor T1 bridge is counted**, and a
+    /// degraded Cursor is inventoried.
+    ///
+    /// The T1 / T2 emitting-family filter and the degraded-mass inventory are
+    /// the two remaining counting surfaces. The filter decided whether a
+    /// subject's bridges enter the boundary counts at all, so an emitted Cursor
+    /// carrying a T1 certificate contributed zero to `t1_boundary_realized`.
+    #[test]
+    fn r379_1_a_cursor_is_an_emitting_family_and_an_inventoried_one() {
+        for decision in ["ref", "inferred-ref", "slice", "optional", "box", "cursor"] {
+            assert!(
+                super::raw_boundary_emitting_family(decision),
+                "{decision} emits, so its T1/T2 bridges are counted"
+            );
+        }
+        for degraded in ["kind-raw", "held:thin-extent", "call-site-not-adapted"] {
+            assert!(!super::raw_boundary_emitting_family(degraded), "{degraded}");
+        }
+        assert!(
+            super::run::DEGRADED_MASS_FAMILIES.contains(&"cursor"),
+            "a degraded Cursor is inventoried with the other safe families"
+        );
+    }
+
     #[test]
     fn raw_boundary_exposure_input_parses_explicit_empty_without_internal_inference() {
         let input = parse_raw_boundary_exposure_input(
@@ -12409,12 +12510,9 @@ mod run {
             }
         }
         let emits = |identity: &str| {
-            subject_decisions.get(identity).is_some_and(|decision| {
-                matches!(
-                    decision.as_str(),
-                    "ref" | "inferred-ref" | "slice" | "optional" | "box"
-                )
-            })
+            subject_decisions
+                .get(identity)
+                .is_some_and(|decision| raw_boundary_emitting_family(decision.as_str()))
         };
         let t1_realized = subjects
             .iter()
