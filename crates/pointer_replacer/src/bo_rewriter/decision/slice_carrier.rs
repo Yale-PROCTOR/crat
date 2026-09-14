@@ -656,4 +656,77 @@ mod tests {
         )
         .unwrap();
     }
+
+    #[test]
+    fn w5c_wc1_equal_mutable_slices_reborrow_at_both_calls() {
+        let input = r#"
+            #![allow(dead_code, unused_unsafe)]
+            pub unsafe extern "C" fn update(values: *mut i32) {
+                *values.offset(1) += 1;
+            }
+            pub unsafe extern "C" fn caller(values: *mut i32) {
+                *values.offset(0) += 2;
+                update(values);
+                update(values);
+                *values.offset(0) += 3;
+            }
+        "#;
+        let table = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+            crate::bo_rewriter::decide_table(tcx).unwrap()
+        })
+        .unwrap();
+        let completed = table
+            .slice_use_receipts
+            .iter()
+            .filter(|p| p.adapter == ADAPTER)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed.len(),
+            2,
+            "both mutable call carriers: {:#?}",
+            table.slice_use_receipts
+        );
+        assert!(completed.iter().all(|p| p.source_form == "slice-mut"
+            && p.target_form == "slice-mut"
+            && p.obligation.intended_terminal_state == MechanicalState::Applied));
+        assert_eq!(
+            table
+                .entries
+                .iter()
+                .filter(|(s, d)| s.param_name.as_deref() == Some("values")
+                    && matches!(d, Decision::Slice { mutable: true, .. }))
+                .count(),
+            2
+        );
+        let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(input).unwrap();
+        let compact = emitted.split_whitespace().collect::<String>();
+        assert_eq!(
+            compact.matches("values:&mut[i32]").count(),
+            2,
+            "both mutable signatures: {emitted}"
+        );
+        assert_eq!(
+            compact.matches("update(values)").count(),
+            2,
+            "implicit reborrows at both calls: {emitted}"
+        );
+        assert!(
+            crate::bo_rewriter::verify::type_checks_str(&emitted),
+            "{emitted}"
+        );
+        if let Some(dir) = std::env::var_os("CRAT_W5C_ARTIFACT_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::write(dir.join("mutable-input.rs"), input).unwrap();
+            std::fs::write(dir.join("mutable-emitted.rs"), emitted).unwrap();
+            let rows = completed
+                .iter()
+                .flat_map(|p| p.materialize(true, false).1)
+                .collect::<Vec<_>>();
+            std::fs::write(
+                dir.join("mutable-receipts.tsv"),
+                crate::bo_rewriter::mechanical_receipt::render_slice_use_rows(&rows),
+            )
+            .unwrap();
+        }
+    }
 }
