@@ -4018,6 +4018,7 @@ fn transform_with<'tcx>(
     // function becomes the safe inner; the pristine capture supplies the raw
     // outer declaration and attributes. One function-span claim makes the
     // two-item replacement one edit region.
+    super::shared_read_arguments::apply(table, reverts, &mut krate, &mut guard)?;
     super::wave5r_field_borrow::apply(tcx, table, reverts, &mut krate, &mut guard)?;
     super::decision::cursor_native::wrapper_ast::apply(
         table,
@@ -5386,6 +5387,7 @@ pub(crate) fn revert_set_from_classes_and_atoms(
     }
     out.atom_names.extend(atoms.iter().cloned());
     close_nested_reverts(table, &mut out);
+    super::shared_read_arguments::close_reverts(table, &mut out);
     Ok(out)
 }
 

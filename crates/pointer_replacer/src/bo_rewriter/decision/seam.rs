@@ -2987,6 +2987,7 @@ use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape
 /// reason is a yield number nobody can attribute.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
+    pub(crate) shared_read_calls: Vec<super::shared_read_pairs::SharedCall>,
     pub shared_required: Vec<super::overlapping_pairs::consumer::Permission>,
     pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
     pub(crate) outbound_expressions: super::outbound_expression::OutboundExpressionPlans,
@@ -4323,11 +4324,12 @@ pub(crate) fn synthesize_with_raw_boundary(
 
             // Native immutable facts discharge only the shared/read consumer
             // hold. Preserve the A5 verdict and all incident peer receipts.
-            let shared_read_positions = positions
+            let shared_read_call = super::shared_read_pairs::prepare(tcx, table, *callee, site);
+            let mut shared_read_positions = positions
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, pos)| {
-                    super::shared_read_pairs::admits(
+                    (shared_read_call.is_some() && super::shared_read_pairs::admits(
                         mut_facts,
                         *callee,
                         pos.index,
@@ -4348,10 +4350,16 @@ pub(crate) fn synthesize_with_raw_boundary(
                                     .expected;
                                 (index, form)
                             }),
-                    )
+                    ))
                     .then_some(pos.index)
                 })
                 .collect::<BTreeSet<_>>();
+            // The two safe views and every address operator are one grant.
+            if shared_read_positions.len() != 2 {
+                shared_read_positions.clear();
+            } else if let Some(call) = shared_read_call {
+                plan.shared_read_calls.push(call);
+            }
             for &index in &shared_read_positions {
                 a5_roles.insert(index, super::co_conversion::PairRole::Primary);
             }

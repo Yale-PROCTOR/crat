@@ -898,6 +898,9 @@ impl ReturnOriginAtomDependencies {
                 }
             }
         }
+        for (atom, owner) in super::shared_read_pairs::atom_owners(table) {
+            result.owners_by_atom.entry(atom).or_default().insert(owner);
+        }
         for &(dependent, dependency) in dependency_edges {
             result
                 .dependents_by_class

@@ -99,6 +99,7 @@ mod wave5d_accumulator_tests;
 #[cfg(test)]
 mod wave5d_tests;
 mod wave5r_cast;
+mod shared_read_arguments;
 mod wave5r_field_borrow;
 mod wave5r_helper_path;
 #[cfg(test)]
@@ -6020,6 +6021,7 @@ fn prepare_plan_files<'tcx>(
             edit_kind: "pair-copy-snapshot",
         });
     }
+    shared_read_arguments::plan(tcx, table, reverted, &mut planned, span_to_loc)?;
     plan::link_a5_fallback_carriers(&mut planned, table, span_to_loc);
     plan::finalize_signature_classes(&mut planned, table, reverted);
     validate_cursor_delivered_bases(tcx, table, &mut planned);
