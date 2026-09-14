@@ -10,6 +10,61 @@ pub unsafe fn inspect(info: *const Info) -> i32 {
 }
 "#;
 
+/// A cast repair cannot supply the multi-byte extent of fwrite's source.
+#[test]
+fn wave5r_e0606_counted_foreign_read_stays_raw_without_extent() {
+    let input = r#"
+        #![allow(dead_code, unused_unsafe)]
+        unsafe extern "C" {
+            fn fwrite(buffer: *const core::ffi::c_void, size: usize,
+                count: usize, file: *mut core::ffi::c_void) -> usize;
+        }
+        pub unsafe fn save(buffer: *const u8, buffersize: usize, file: *mut core::ffi::c_void) {
+            fwrite(buffer as *const core::ffi::c_void, 1, buffersize, file);
+        }
+    "#;
+    let attempted = ast_source_reverting(input, None);
+    assert!(
+        !super::verify::type_checks_str(&attempted),
+        "the unlicensed one-byte form must not be made compilable: {attempted}"
+    );
+    let outcome = super::rewrite_core_injected(
+        ::utils::compilation::str_to_input(input),
+        None,
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        true,
+        Some((
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    );
+    let (source, reverted_count) = match outcome {
+        super::RewriteOutcome::Emitted {
+            source,
+            reverted_count,
+            ..
+        }
+        | super::RewriteOutcome::Degraded {
+            source,
+            reverted_count,
+            ..
+        } => (source, reverted_count),
+    };
+    println!("R5-HELD {source}");
+    assert!(super::verify::type_checks_str(&source));
+    assert!(
+        source.contains("buffer: *const u8"),
+        "one-byte reference must not replace the counted buffer: {source}"
+    );
+    assert!(
+        reverted_count > 0,
+        "existing verifier conservatively retains the raw function"
+    );
+}
+
 #[test]
 fn wave5r_e0596_shared_field_borrow_into_readonly_callee() {
     let source = emitted(

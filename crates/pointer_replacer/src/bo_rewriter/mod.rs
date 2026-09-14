@@ -94,7 +94,6 @@ pub(crate) mod verify;
 mod wave5r_cast;
 mod wave5r_field_borrow;
 mod wave5r_helper_path;
-mod wave5r_pointer_cast;
 #[cfg(test)]
 mod wave5r_tests;
 
