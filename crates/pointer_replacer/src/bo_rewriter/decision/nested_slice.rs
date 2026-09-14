@@ -1,6 +1,9 @@
 //! R384: relocate already-admitted local slice formations into finite wrapper
 //! descriptors. This module inherits dispositions; it does not classify aliases.
 
+#[path = "nested_accumulator.rs"]
+mod accumulator;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     BinOpKind, Expr, ExprKind, HirId, PatKind, QPath, StmtKind, UnOp,
@@ -62,6 +65,8 @@ pub(crate) struct Plan {
     pub(crate) owner: LocalDefId,
     pub(crate) count: HirId,
     pub(crate) count_name: String,
+    pub(crate) accumulator: Option<HirId>,
+    pub(crate) conditional_updates: Vec<HirId>,
     pub(crate) rows: Vec<Row>,
     pub(crate) parameters: Vec<Parameter>,
 }
@@ -217,6 +222,8 @@ struct LoopCheck<'a, 'tcx> {
     valid: bool,
     offsets: FxHashMap<HirId, usize>,
     increments: usize,
+    accumulator: Option<HirId>,
+    conditional_updates: Vec<HirId>,
 }
 impl<'tcx> Visitor<'tcx> for LoopCheck<'_, 'tcx> {
     fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
@@ -244,6 +251,25 @@ impl<'tcx> Visitor<'tcx> for LoopCheck<'_, 'tcx> {
             }
             ExprKind::Assign(left, _, _) | ExprKind::AssignOp(_, left, _) if matches!(binding(left), Some(id) if id == self.index || id == self.count) => {
                 self.valid = false
+            }
+            ExprKind::If(condition, then, None) => {
+                let Some(accumulator) = self.accumulator else {
+                    self.valid = false;
+                    return;
+                };
+                if !accumulator::condition(self, condition)
+                    || !accumulator::update(self, then, accumulator)
+                {
+                    self.valid = false;
+                    return;
+                }
+                self.conditional_updates.push(e.hir_id);
+                // The strict scalar whitelist has excluded pointer/index/count
+                // writes and calls. Reuse the existing row-use collector only
+                // after validation; these are syntactic, not per-path accesses.
+                self.visit_expr(condition);
+                self.visit_expr(then);
+                return;
             }
             ExprKind::Loop(..)
             | ExprKind::Ret(..)
@@ -394,6 +420,8 @@ fn inspect<'tcx>(
     let tables = parameters.iter().map(|p| p.hir).collect::<FxHashSet<_>>();
     let mut rows = Vec::new();
     let mut index = None;
+    let mut accumulator = None;
+    let mut conditional_updates = Vec::new();
     let mut loop_seen = false;
     let mut returned = false;
     for stmt in block.stmts {
@@ -408,7 +436,7 @@ fn inspect<'tcx>(
                     && let Some((receiver, arg)) = offset(tcx, owner, operand)
                     && let Some(parameter) = binding(receiver).filter(|p| tables.contains(p))
                 {
-                    if index.is_some() {
+                    if index.is_some() || accumulator.is_some() {
                         return Err(Hold::IntervalChanged);
                     }
                     let projection = integer(arg).ok_or(Hold::CountRelationUnproved)?;
@@ -452,6 +480,15 @@ fn inspect<'tcx>(
                         raw_name: format!("__crat_nested_{}_raw", id.local_id.as_u32()),
                         view_name: format!("__crat_nested_{}_view", id.local_id.as_u32()),
                     });
+                } else if integer(init) == Some(0)
+                    && tcx.typeck(owner).node_type(id).to_string() == "f64"
+                    && index.is_none()
+                    && accumulator.is_none()
+                    && !rows.is_empty()
+                {
+                    // Pure scalar zero initialization remains in the original
+                    // body. No table load may occur after it in this rule.
+                    accumulator = Some(id);
                 } else if integer(init) == Some(0)
                     && tcx.typeck(owner).node_type(id).to_string() == "i32"
                     && index.is_none()
@@ -509,6 +546,8 @@ fn inspect<'tcx>(
                         valid: true,
                         offsets: FxHashMap::default(),
                         increments: 0,
+                        accumulator,
+                        conditional_updates: Vec::new(),
                     };
                     check.visit_expr(then);
                     if !check.valid
@@ -517,6 +556,7 @@ fn inspect<'tcx>(
                     {
                         return Err(Hold::RawBoundaryUnbuilt);
                     }
+                    conditional_updates = check.conditional_updates;
                     loop_seen = true;
                 }
                 ExprKind::Ret(Some(value))
@@ -560,6 +600,8 @@ fn inspect<'tcx>(
         owner,
         count,
         count_name,
+        accumulator,
+        conditional_updates,
         rows,
         parameters,
     })
@@ -669,7 +711,7 @@ pub(crate) fn observe(tcx: TyCtxt<'_>, table: &DecisionTable) {
     let rows = table.nested_receipts.iter().map(|receipt| {
         let owner = tcx.def_path_str(receipt.owner.to_def_id());
         match &receipt.result {
-            Ok(plan) => serde_json::json!({"owner":owner, "status":"planned", "inherited_pair":"not-required", "count_hir":plan.count.local_id.as_u32(), "count":plan.count_name,
+            Ok(plan) => serde_json::json!({"owner":owner, "status":"planned", "inherited_pair":"not-required", "count_hir":plan.count.local_id.as_u32(), "count":plan.count_name, "scalar_accumulator_hir":plan.accumulator.map(|h|h.local_id.as_u32()), "conditional_updates":plan.conditional_updates.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
                 "parameters":plan.parameters.iter().map(|p|serde_json::json!({"hir":p.hir.local_id.as_u32(),"argument":p.index,"name":p.name,"inner_depth":1,"outer_mutable":p.mutable,"inner_mutable":p.mutable})).collect::<Vec<_>>(),
                 "rows":plan.rows.iter().map(|r|serde_json::json!({"source_local_hir":r.local.local_id.as_u32(),"source_formation_hir":r.init.local_id.as_u32(),"table_hir":r.parameter.local_id.as_u32(),"projection":r.index,"destination":r.view_name,"inner_depth":1,"fabricated_before":r.was_fallback,"fabricated_after":false})).collect::<Vec<_>>() }),
             Err(hold) => serde_json::json!({"owner":owner,"status":"held","hold":format!("{hold:?}")}),
