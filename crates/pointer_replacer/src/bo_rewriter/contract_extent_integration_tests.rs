@@ -49,6 +49,45 @@ fn ce_w01_strlen_contract_promotes_the_arr_subject_and_receipts_fallback() {
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
 
+#[test]
+fn ce_w01_terminal_slice_use_receipt_owns_the_contract_promotion() {
+    let super::RewriteOutcome::Emitted {
+        raw_boundary_artifacts,
+        ..
+    } = super::rewrite_m1(CE_W01_STRLEN)
+    else {
+        panic!("CE-W01 receipt fixture must emit");
+    };
+    let rows = raw_boundary_artifacts
+        .slice_use_rows
+        .iter()
+        .filter(|row| row.contract_extent.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "one plan and one terminal row: {rows:#?}");
+    let terminal = rows
+        .iter()
+        .find(|row| row.terminal.stage == super::mechanical_receipt::MechanicalStage::Terminal)
+        .expect("terminal contract-extent row");
+    assert_eq!(
+        terminal.terminal.state,
+        super::mechanical_receipt::MechanicalState::Applied
+    );
+    assert_eq!(
+        terminal.retention,
+        super::mechanical_receipt::MechanicalRetention::T1
+    );
+    let promotion = terminal
+        .contract_extent
+        .as_ref()
+        .expect("promotion payload");
+    assert_eq!(
+        promotion.length,
+        super::decision::contract_extent::LengthPlan::Fallback(
+            super::decision::contract_extent::FallbackReason::NulTerminated
+        )
+    );
+}
+
 fn promotions(source: &str) -> Vec<super::decision::contract_extent::Promotion> {
     ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(source), |tcx| {
         let table = super::decide_table(tcx)?;

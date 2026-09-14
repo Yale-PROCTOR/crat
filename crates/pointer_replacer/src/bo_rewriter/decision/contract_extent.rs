@@ -147,6 +147,102 @@ pub(crate) struct Promotion {
     pub sites: Vec<ContractSite>,
 }
 
+impl Promotion {
+    pub(crate) fn receipt_sites(&self) -> String {
+        self.sites
+            .iter()
+            .map(|site| {
+                format!(
+                    "{}|{}|{}",
+                    site.site,
+                    site.contract,
+                    site.requirement.receipt_key()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    pub(crate) fn receipt_count_operands(&self) -> String {
+        self.sites
+            .iter()
+            .filter_map(|site| match &site.requirement {
+                Requirement::ExactAccess(Some(count))
+                | Requirement::UpperBound(Some(count))
+                | Requirement::ElementCount(Some(count)) => Some(format!(
+                    "site={}:arg={}:elements={}",
+                    count.site,
+                    count.argument_index,
+                    count.elements.as_ref().map_or_else(
+                        |gap| format!("missing:{gap:?}"),
+                        |elements| elements.clone(),
+                    ),
+                )),
+                Requirement::OneElement
+                | Requirement::Lifecycle
+                | Requirement::ExactAccess(None)
+                | Requirement::UpperBound(None)
+                | Requirement::NulTerminated
+                | Requirement::ElementCount(None)
+                | Requirement::UnboundedWrite
+                | Requirement::LocalAccess => None,
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    pub(crate) fn receipt_length(&self) -> String {
+        match &self.length {
+            LengthPlan::Evidence { elements, .. } => elements.clone(),
+            LengthPlan::Fallback(_) => "crate::FALLBACK_SLICE_EXTENT".to_owned(),
+        }
+    }
+
+    pub(crate) fn receipt_extent_kind(&self) -> &'static str {
+        match self.length {
+            LengthPlan::Evidence { .. } => "evidence",
+            LengthPlan::Fallback(_) => "fallback",
+        }
+    }
+
+    pub(crate) fn receipt_waiver(&self) -> &'static str {
+        match self.length {
+            LengthPlan::Evidence { .. } => "-",
+            LengthPlan::Fallback(_) => super::super::mechanical_receipt::SLICE_EXTENT_WAIVER_ID,
+        }
+    }
+
+    pub(crate) fn mechanical_extent(&self) -> super::super::mechanical_receipt::MechanicalExtent {
+        use super::super::mechanical_receipt::{
+            FALLBACK_EXTENT_RECEIPT, MechanicalExtent, SLICE_EXTENT_WAIVER_ID,
+        };
+        match &self.length {
+            LengthPlan::Evidence { source, .. } => {
+                MechanicalExtent::Evidence(format!("contract-extent:{source:?}"))
+            }
+            LengthPlan::Fallback(_) => MechanicalExtent::Fallback {
+                receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
+            },
+        }
+    }
+}
+
+impl Requirement {
+    fn receipt_key(&self) -> &'static str {
+        match self {
+            Self::OneElement => "one-element",
+            Self::Lifecycle => "lifecycle",
+            Self::ExactAccess(_) => "exact-access",
+            Self::UpperBound(_) => "upper-bound",
+            Self::NulTerminated => "nul-terminated",
+            Self::ElementCount(_) => "element-count",
+            Self::UnboundedWrite => "unbounded-write",
+            Self::LocalAccess => "local-access",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum KeepReason {
     ExistingForm,

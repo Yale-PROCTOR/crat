@@ -14,8 +14,8 @@ use super::{
 use crate::bo_rewriter::{
     bridge_receipt::SignatureClassId,
     mechanical_receipt::{
-        CanonicalCallee, CanonicalLocation, CanonicalSiteKey, MechanicalEvidence, MechanicalFamily,
-        MechanicalMechanism, MechanicalObligationEvent, MechanicalObligationKey,
+        CanonicalCallee, CanonicalLocation, CanonicalSiteKey, MechanicalEvidence, MechanicalExtent,
+        MechanicalFamily, MechanicalMechanism, MechanicalObligationEvent, MechanicalObligationKey,
         MechanicalObligationPlan, MechanicalRetention, MechanicalStage, MechanicalState,
         MechanicalSubjectKey, MechanicalTerminalReason, NegativeWriteEvidence, SliceUseReceiptPlan,
     },
@@ -779,6 +779,7 @@ pub(crate) fn receipt_plans(
                 raw_boundary::RawMutability::Mut => "mut",
             }
             .to_owned();
+            let contract_extent = table.contract_extent_promotions.get(&node).cloned();
             let event = MechanicalObligationEvent {
                 key: MechanicalObligationKey {
                     owner_class,
@@ -810,6 +811,11 @@ pub(crate) fn receipt_plans(
                 composition_parent: None,
                 dependency_classes,
                 evidence: MechanicalEvidence {
+                    extent: contract_extent
+                        .as_ref()
+                        .map_or(MechanicalExtent::None, |promotion| {
+                            promotion.mechanical_extent()
+                        }),
                     retention: retention.clone(),
                     negative_write,
                     ..MechanicalEvidence::default()
@@ -835,6 +841,7 @@ pub(crate) fn receipt_plans(
                 boundary_evidence,
                 retention,
                 owner_class,
+                contract_extent,
             });
         }
     }

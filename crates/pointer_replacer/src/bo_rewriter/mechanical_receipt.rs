@@ -1523,6 +1523,7 @@ pub(crate) struct SliceUseAdapterReceiptRow {
     pub(crate) boundary_evidence: String,
     pub(crate) retention: MechanicalRetention,
     pub(crate) terminal_class_state: MechanicalState,
+    pub(crate) contract_extent: Option<super::decision::contract_extent::Promotion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1540,6 +1541,7 @@ pub(crate) struct SliceUseReceiptPlan {
     pub(crate) boundary_evidence: String,
     pub(crate) retention: MechanicalRetention,
     pub(crate) owner_class: SignatureClassId,
+    pub(crate) contract_extent: Option<super::decision::contract_extent::Promotion>,
 }
 
 impl SliceUseReceiptPlan {
@@ -1576,6 +1578,7 @@ impl SliceUseReceiptPlan {
             boundary_evidence: self.boundary_evidence.clone(),
             retention: self.retention.clone(),
             terminal_class_state,
+            contract_extent: self.contract_extent.clone(),
         };
         let rows = [row(&events[0]), row(&events[1])];
         (events, rows)
@@ -1639,6 +1642,9 @@ pub(crate) fn reconcile_slice_use_rows(
             || row.retention != event.evidence.retention
             || row.terminal.state != event.state
             || row.terminal.reason != event.terminal_reason
+            || row.contract_extent.as_ref().is_some_and(|promotion| {
+                promotion.sites.is_empty() || promotion.mechanical_extent() != event.evidence.extent
+            })
         {
             return Err(format!(
                 "slice-use specialized/common drift at {key}: row{{use_site={:?} source_form={} candidate_form={} target_form={} adapter={} retention={:?} state={:?} reason={:?} extent={:?}}} event{{site={:?} found={} expected={} shape={} retention={:?} state={:?} reason={:?} extent={:?}}} retired={retired}",
@@ -1677,7 +1683,7 @@ pub(crate) fn render_slice_use_rows(rows: &[SliceUseAdapterReceiptRow]) -> Strin
         .iter()
         .map(|row| {
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 row.terminal.obligation_key.receipt_key(),
                 row.use_site.receipt_key(),
                 row.source_form,
@@ -1690,6 +1696,32 @@ pub(crate) fn render_slice_use_rows(rows: &[SliceUseAdapterReceiptRow]) -> Strin
                 row.retention.tier(),
                 row.retention.waiver(),
                 row.terminal_class_state.key(),
+                row.contract_extent
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), |promotion| promotion.subject.clone()),
+                row.contract_extent.as_ref().map_or_else(
+                    || "-".to_owned(),
+                    super::decision::contract_extent::Promotion::receipt_sites,
+                ),
+                row.contract_extent.as_ref().map_or_else(
+                    || "-".to_owned(),
+                    super::decision::contract_extent::Promotion::receipt_count_operands,
+                ),
+                row.contract_extent.as_ref().map_or_else(
+                    || "-".to_owned(),
+                    |promotion| promotion.construction.clone(),
+                ),
+                row.contract_extent.as_ref().map_or("-", |promotion| {
+                    promotion.receipt_extent_kind()
+                }),
+                row.contract_extent.as_ref().map_or_else(
+                    || "-".to_owned(),
+                    super::decision::contract_extent::Promotion::receipt_length,
+                ),
+                row.contract_extent
+                    .as_ref()
+                    .map_or("-", super::decision::contract_extent::Promotion::receipt_waiver),
+                if row.contract_extent.is_some() { "arr" } else { "-" },
                 row.terminal.stage.key(),
                 row.terminal.state.key(),
                 row.terminal
@@ -2801,6 +2833,14 @@ pub(crate) fn specialized_receipt_headers() -> BTreeMap<&'static str, &'static [
                 "retention_tier",
                 "waiver_id",
                 "terminal_class_state",
+                "contract_extent_subject",
+                "contract_extent_sites",
+                "contract_extent_count_operands",
+                "contract_extent_construction",
+                "contract_extent_kind",
+                "contract_extent_length",
+                "contract_extent_waiver",
+                "contract_extent_fatness",
                 "stage",
                 "state",
                 "drop_reason",
