@@ -35,6 +35,7 @@ pub(crate) mod co_conversion;
 pub(crate) mod construction;
 pub(crate) mod construction_values;
 pub(crate) mod contract_extent;
+pub(crate) mod contract_extent_adapter;
 #[cfg(test)]
 mod counted_extent_tests;
 pub(crate) mod counted_void;
@@ -1091,7 +1092,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) local_callee_extent:
         &'a FxHashMap<(LocalDefId, rustc_hir::HirId), local_callee_extent::LocalCalleeAccess>,
-    pub(crate) contract_extent: &'a contract_extent::CandidateIndex,
+    pub(crate) contract_extent: &'a contract_extent_adapter::CandidateIndex,
     pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
     pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
     pub(crate) input_interfaces: &'a interface::InputInterfaces,

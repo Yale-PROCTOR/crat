@@ -6755,7 +6755,7 @@ fn finish_decide<'tcx>(
     // `&[T]` carries its own checked extent and is out of this class (R365-2).
     let local_callee_extent_subjects =
         decision::local_callee_extent::collect(tcx, &subjects, &facts, &full_slice_uses);
-    let contract_extent_candidates = decision::contract_extent::collect(
+    let contract_extent_candidates = decision::contract_extent_adapter::collect(
         &subjects,
         &facts,
         &ctors,
