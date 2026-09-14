@@ -82,6 +82,15 @@ pub(crate) struct Inputs {
     native_candidates: super::ownership_fields_native::Candidates,
 }
 impl Inputs {
+    pub(crate) fn selected_slice_elements(
+        &self,
+        node: Node,
+        selected: &super::box_facts::BoxPlan,
+    ) -> Option<u64> {
+        self.native_candidates
+            .selected_slice_elements(node, selected)
+    }
+
     /// Called before hypothetical decisions. This records scope only; no
     /// syntax/custody/Box decision is manufactured to bootstrap raw-boundary.
     pub(crate) fn discover(

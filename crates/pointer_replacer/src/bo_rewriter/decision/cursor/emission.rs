@@ -39,7 +39,7 @@ fn local(expr: &hir::Expr<'_>) -> Option<hir::HirId> {
     }
 }
 
-fn binding_name(tcx: TyCtxt<'_>, subject: &Subject) -> Result<String, CursorHold> {
+pub(super) fn binding_name(tcx: TyCtxt<'_>, subject: &Subject) -> Result<String, CursorHold> {
     let hir::Node::Pat(pattern) = tcx.hir_node(subject.hir_id) else {
         return Err(CursorHold::DeclarationUnbuilt);
     };
@@ -54,7 +54,12 @@ fn binding_name(tcx: TyCtxt<'_>, subject: &Subject) -> Result<String, CursorHold
     text(tcx, ident.span)
 }
 
-fn method(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &hir::Expr<'_>, expected: &[&str]) -> bool {
+pub(super) fn method(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    expr: &hir::Expr<'_>,
+    expected: &[&str],
+) -> bool {
     let Some(did) = tcx.typeck(owner).type_dependent_def_id(expr.hir_id) else { return false };
     !did.is_local()
         && matches!(tcx.crate_name(did.krate).as_str(), "core" | "std")
@@ -234,7 +239,7 @@ fn origin(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &hir::Expr<'_>) -> Result<Or
 /// A compiler-resolved scalar raw reader. Its entire body is one primitive
 /// pointer read, so it cannot store/return a pointer or consume the allocation.
 /// This is an independent T1 proof, not a function-name allowlist.
-fn scalar_reader(tcx: TyCtxt<'_>, callee: &hir::Expr<'_>) -> Option<LocalDefId> {
+pub(super) fn scalar_reader(tcx: TyCtxt<'_>, callee: &hir::Expr<'_>) -> Option<LocalDefId> {
     let ty::FnDef(did, _) = *tcx
         .typeck(callee.hir_id.owner.def_id)
         .expr_ty(callee)
@@ -507,6 +512,8 @@ pub(super) fn plan(
         base: root_local,
         component: observed.component,
         extent: base.count,
+        delivered_base: None,
         bridges: visitor.bridges,
+        local_bridges: vec![],
     })
 }

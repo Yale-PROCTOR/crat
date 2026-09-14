@@ -1444,6 +1444,7 @@ pub(crate) struct Plan {
     /// ledgers are materialized from this one carrier after class finalization.
     pub a5_receipt_plans: Vec<super::mechanical_receipt::A5ProofSiteReceiptPlan>,
     pub(crate) cursor_receipt_plans: Vec<CursorReceiptPlan>,
+    pub(crate) cursor_base_atom_owners: BTreeMap<String, BTreeSet<SignatureClassId>>,
     /// Item-2 local-slice construction obligations, sharing one identity with
     /// the common mechanical ledger.
     pub slice_construction_receipt_plans:
@@ -1644,8 +1645,14 @@ impl Plan {
         reverted: &BTreeSet<SignatureClassId>,
         atoms: &BTreeSet<String>,
     ) -> BTreeSet<SignatureClassId> {
+        let mut with_bases = reverted.clone();
+        for atom in atoms {
+            if let Some(owners) = self.cursor_base_atom_owners.get(atom) {
+                with_bases.extend(owners.iter().copied());
+            }
+        }
         self.terminal_call_plans
-            .effective_reverted_classes(reverted, atoms)
+            .effective_reverted_classes(&with_bases, atoms)
     }
 
     pub(crate) fn replace_terminal_seam(
@@ -2331,6 +2338,41 @@ impl Plan {
     }
 }
 
+fn cursor_extent_evidence(cursor: &super::decision::cursor_native::CursorPlan) -> String {
+    use super::decision::cursor_native::DeliveredBaseProvider;
+    match &cursor.delivered_base {
+        Some(base) => {
+            let mut evidence = format!(
+                "runtime-binding-length:owner={}:hir={}:initializer={}",
+                base.binding.owner.def_id.local_def_index.as_u32(),
+                base.binding.local_id.as_u32(),
+                base.initializer.map_or_else(
+                    || "parameter".to_owned(),
+                    |hir| format!("hir{}", hir.local_id.as_u32())
+                )
+            );
+            match &base.provider {
+                DeliveredBaseProvider::OriginalSlice => {}
+                DeliveredBaseProvider::Slice { producer } => evidence.push_str(&format!(
+                    ";producer-slice-init-hir={}:length-source={}:provenance={}",
+                    producer.init_hir.local_id.as_u32(),
+                    producer.length.source.receipt_key(),
+                    producer.length.provenance_receipt()
+                )),
+                DeliveredBaseProvider::Box { elements, .. } => evidence.push_str(&format!(
+                    ";producer-box-slice:elements={elements}:fabricated=false"
+                )),
+            }
+            evidence
+        }
+        None => format!(
+            "array-local={}:elements={}",
+            cursor.base.as_u32(),
+            cursor.extent
+        ),
+    }
+}
+
 fn cursor_bridge(
     subject: &super::decision::Subject,
     cursor: &super::decision::cursor_native::CursorPlan,
@@ -2351,6 +2393,12 @@ fn cursor_bridge(
             .expect("validated cursor use identity");
         cursor.use_hirs[index]
     });
+    let local_boundary = edit.and_then(|_| {
+        cursor
+            .local_bridges
+            .iter()
+            .find(|site| site.initializer == hir)
+    });
     let form = if subject.mutable {
         "cursor-mut"
     } else {
@@ -2359,19 +2407,33 @@ fn cursor_bridge(
     let (expected, found, argument) = match kind {
         "cursor-constructor" | "cursor-declaration" => (form, "raw", "local"),
         "cursor-element" => ("element", form, "indexed-element"),
+        "cursor-advance" => (form, form, "checked-index-update"),
+        "cursor-length" => ("usize", form, "retained-base-length"),
         "raw-op-cursor-t1" => ("raw", form, "bare-local"),
+        "raw-op-cursor-local" => ("raw", form, "ephemeral-local"),
         _ => unreachable!("validated cursor operation"),
     };
     let mut bridge = BridgeSitePlan::local(
         subject.fn_did,
         boundary.map_or(subject.fn_did, |site| site.callee),
-        if boundary.is_some() {
+        if boundary.is_some() || local_boundary.is_some() {
             Arm::Addr.key()
         } else {
             Arm::Surface.key()
         },
         boundary.map_or_else(
-            || format!("hir{}", hir.local_id.as_u32()),
+            || {
+                local_boundary.map_or_else(
+                    || format!("hir{}", hir.local_id.as_u32()),
+                    |site| {
+                        format!(
+                            "local-hir{}:access-hir{}",
+                            site.destination.local_id.as_u32(),
+                            site.access.local_id.as_u32()
+                        )
+                    },
+                )
+            },
             |site| {
                 format!(
                     "call-hir{}:arg{}",
@@ -2383,12 +2445,8 @@ fn cursor_bridge(
         kind,
     )
     .with_forms(expected, found, argument)
-    .with_extent(BridgeExtentKind::Evidence(format!(
-        "array-local={}:elements={}",
-        cursor.base.as_u32(),
-        cursor.extent
-    )));
-    if boundary.is_some() {
+    .with_extent(BridgeExtentKind::Evidence(cursor_extent_evidence(cursor)));
+    if boundary.is_some() || local_boundary.is_some() {
         bridge.retention = BridgeRetentionTier::T1;
     }
     bridge
@@ -2402,7 +2460,13 @@ fn cursor_obligations(
     atom_ids: &[String],
 ) -> Result<Vec<CursorReceiptPlan>, &'static str> {
     use super::mechanical_receipt::*;
-    let valid = cursor.uses.len() == cursor.use_hirs.len()
+    let valid = cursor.delivered_base.as_ref().is_none_or(|base| {
+        base.binding == base.window_binding
+            && base.binding.owner.def_id == subject.fn_did
+            && base
+                .initializer
+                .is_none_or(|hir| hir.owner.def_id == subject.fn_did)
+    }) && cursor.uses.len() == cursor.use_hirs.len()
         && cursor
             .use_hirs
             .iter()
@@ -2425,15 +2489,60 @@ fn cursor_obligations(
                     .count()
                     == 1
         })
-        && cursor.uses.iter().all(|edit| {
+        && cursor.local_bridges.iter().all(|site| {
+            [site.destination, site.initializer, site.access]
+                .iter()
+                .all(|hir| hir.owner.def_id == subject.fn_did)
+                && site.destination != subject.hir_id
+                && site.destination != site.initializer
+                && site.destination != site.access
+                && site.initializer != site.access
+                && cursor
+                    .uses
+                    .iter()
+                    .zip(&cursor.use_hirs)
+                    .filter(|(edit, hir)| {
+                        **hir == site.initializer
+                            && edit.bridge_kind == "raw-op-cursor-local"
+                            && cursor
+                                .uses
+                                .iter()
+                                .filter(|other| other.span == edit.span)
+                                .count()
+                                == 1
+                    })
+                    .count()
+                    == 1
+                && cursor
+                    .local_bridges
+                    .iter()
+                    .filter(|other| other.destination == site.destination)
+                    .count()
+                    == 1
+                && cursor
+                    .local_bridges
+                    .iter()
+                    .filter(|other| other.access == site.access)
+                    .count()
+                    == 1
+        })
+        && cursor.uses.iter().zip(&cursor.use_hirs).all(|(edit, hir)| {
             let count = cursor
                 .bridges
                 .iter()
                 .filter(|bridge| bridge.argument_span == edit.span)
                 .count();
+            let local_count = cursor
+                .local_bridges
+                .iter()
+                .filter(|site| site.initializer == *hir)
+                .count();
             match edit.bridge_kind {
-                "raw-op-cursor-t1" => count == 1,
-                "cursor-constructor" | "cursor-element" => count == 0,
+                "raw-op-cursor-t1" => count == 1 && local_count == 0,
+                "raw-op-cursor-local" => count == 0 && local_count == 1,
+                "cursor-constructor" | "cursor-element" | "cursor-advance" | "cursor-length" => {
+                    count == 0 && local_count == 0
+                }
                 _ => false,
             }
         });
@@ -2495,12 +2604,8 @@ fn cursor_obligations(
                 composition_parent: None,
                 dependency_classes: BTreeSet::new(),
                 evidence: MechanicalEvidence {
-                    extent: MechanicalExtent::Evidence(format!(
-                        "array-local={}:elements={}",
-                        cursor.base.as_u32(),
-                        cursor.extent
-                    )),
-                    retention: if boundary.is_some() {
+                    extent: MechanicalExtent::Evidence(cursor_extent_evidence(cursor)),
+                    retention: if bridge.retention == BridgeRetentionTier::T1 {
                         MechanicalRetention::T1
                     } else {
                         MechanicalRetention::None
@@ -2874,6 +2979,7 @@ pub(crate) fn plan(
     }
     let mut a5_receipt_plans = Vec::new();
     let mut cursor_receipt_plans = Vec::new();
+    let mut cursor_base_atom_owners = BTreeMap::<String, BTreeSet<SignatureClassId>>::new();
     let mut slice_construction_receipt_plans = table.retired_slice_constructions.clone();
     let slice_use_receipt_plans = table.slice_use_receipts.clone();
     let option_receipt_plans = table.option_receipts.clone();
@@ -3724,7 +3830,7 @@ pub(crate) fn plan(
         if reverted(subject) {
             continue;
         }
-        let subject_atom_ids = table
+        let mut subject_atom_ids = table
             .seams
             .raw_boundary_atom_groups
             .get(&(subject.fn_did, subject.hir_id))
@@ -3744,6 +3850,23 @@ pub(crate) fn plan(
             | Decision::Box(_)
             | Decision::Degraded(_) => None,
         };
+        if let Some(base) = cursor_plan.and_then(|plan| plan.delivered_base.as_ref()) {
+            if let Some(atoms) = table
+                .seams
+                .raw_boundary_atom_groups
+                .get(&(subject.fn_did, base.binding))
+            {
+                for atom in atoms {
+                    cursor_base_atom_owners
+                        .entry(atom.id.clone())
+                        .or_default()
+                        .insert(SignatureClassId::of(subject.fn_did));
+                    subject_atom_ids.push(atom.id.clone());
+                }
+                subject_atom_ids.sort();
+                subject_atom_ids.dedup();
+            }
+        }
         let (mutable, use_edits_in, optional, fat, box_plan) = match decision {
             Decision::Cursor { mutable, plan } => (mutable, Some(&plan.uses), false, true, None),
             Decision::Ref { mutable } => (mutable, None, false, false, None),
@@ -4778,6 +4901,7 @@ pub(crate) fn plan(
         attribution_intervals,
         a5_receipt_plans,
         cursor_receipt_plans,
+        cursor_base_atom_owners,
         slice_construction_receipt_plans,
         slice_use_receipt_plans,
         option_receipt_plans,
@@ -4823,7 +4947,10 @@ mod tests {
     fn cursor_receipts_require_exact_t1_site_and_survive_revert_accounting() {
         use crate::bo_rewriter::{
             decision::{
-                cursor_native::{CursorBridge, CursorPlan},
+                cursor_native::{
+                    CursorBridge, CursorLocalBridge, CursorPlan, DeliveredBase,
+                    DeliveredBaseProvider,
+                },
                 emitability::UseEdit,
             },
             mechanical_receipt::*,
@@ -4844,6 +4971,8 @@ mod tests {
             base: Local::from_u32(2),
             component: vec![subject.local],
             extent: 8,
+            delivered_base: None,
+            local_bridges: vec![],
             bridges: vec![CursorBridge {
                 call_hir: hir(2),
                 callee: subject.fn_did,
@@ -4892,6 +5021,87 @@ mod tests {
                         })
             );
         }
+        let mut delivered = cursor.clone();
+        delivered.extent = 0;
+        delivered.delivered_base = Some(DeliveredBase {
+            provider: DeliveredBaseProvider::OriginalSlice,
+            binding: hir(4),
+            window_binding: hir(4),
+            initializer: Some(hir(5)),
+        });
+        delivered.bridges.clear();
+        for operation in ["cursor-advance", "cursor-length"] {
+            delivered.uses[0].bridge_kind = operation;
+            let receipts = cursor_obligations(&subject, &delivered, "f", "surface", &[]).unwrap();
+            assert!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt.obligation.planned.evidence.extent
+                        == MechanicalExtent::Evidence(
+                            "runtime-binding-length:owner=0:hir=4:initializer=hir5".to_owned()
+                        ))
+            );
+            assert!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt.obligation.planned.evidence.retention
+                        == MechanicalRetention::None)
+            );
+            assert_eq!(
+                cursor_bridge(&subject, &delivered, Some(&delivered.uses[0])).extent,
+                BridgeExtentKind::Evidence(
+                    "runtime-binding-length:owner=0:hir=4:initializer=hir5".to_owned()
+                )
+            );
+        }
+        let mut local_cursor = delivered.clone();
+        local_cursor.uses[0].bridge_kind = "raw-op-cursor-local";
+        local_cursor.local_bridges.push(CursorLocalBridge {
+            destination: hir(7),
+            initializer: hir(1),
+            access: hir(8),
+        });
+        let local_receipts = cursor_obligations(&subject, &local_cursor, "f", "addr", &[]).unwrap();
+        let local_event = &local_receipts[1].obligation.planned;
+        assert_eq!(
+            local_event.key.site.location,
+            CanonicalLocation::Hir {
+                owner: subject.fn_did,
+                item_local_id: 1,
+            }
+        );
+        assert_eq!(local_event.key.site.callee, None);
+        assert_eq!(local_event.key.site.argument_index, None);
+        assert_eq!(local_event.evidence.retention, MechanicalRetention::T1);
+        assert_eq!(local_event.expected_form, "raw");
+        assert_eq!(local_event.found_form, "cursor-shared");
+        assert_eq!(local_event.argument_kind, "ephemeral-local");
+        let local_bridge = cursor_bridge(&subject, &local_cursor, Some(&local_cursor.uses[0]));
+        assert_eq!(local_bridge.position, "local-hir7:access-hir8");
+        assert_eq!(local_bridge.retention, BridgeRetentionTier::T1);
+        assert_eq!(
+            local_bridge.extent,
+            BridgeExtentKind::Evidence(
+                "runtime-binding-length:owner=0:hir=4:initializer=hir5".to_owned()
+            )
+        );
+        let mut no_local = local_cursor.clone();
+        no_local.local_bridges.clear();
+        assert!(cursor_obligations(&subject, &no_local, "f", "addr", &[]).is_err());
+        let mut duplicate_local = local_cursor.clone();
+        duplicate_local
+            .local_bridges
+            .push(local_cursor.local_bridges[0].clone());
+        assert!(cursor_obligations(&subject, &duplicate_local, "f", "addr", &[]).is_err());
+        let mut wrong_initializer = local_cursor.clone();
+        wrong_initializer.local_bridges[0].initializer = hir(9);
+        assert!(cursor_obligations(&subject, &wrong_initializer, "f", "addr", &[]).is_err());
+        let mut duplicate_span = local_cursor;
+        duplicate_span.uses.push(duplicate_span.uses[0].clone());
+        duplicate_span.use_hirs.push(hir(10));
+        assert!(cursor_obligations(&subject, &duplicate_span, "f", "addr", &[]).is_err());
+        delivered.delivered_base.as_mut().unwrap().window_binding = hir(6);
+        assert!(cursor_obligations(&subject, &delivered, "f", "surface", &[]).is_err());
         let mut missing = cursor.clone();
         missing.bridges.clear();
         assert!(cursor_obligations(&subject, &missing, "f", "addr", &[]).is_err());
@@ -4901,6 +5111,38 @@ mod tests {
         let mut missing_hir = cursor;
         missing_hir.use_hirs.clear();
         assert!(cursor_obligations(&subject, &missing_hir, "f", "addr", &[]).is_err());
+    }
+
+    #[test]
+    fn cursor_base_atom_withdrawal_reverts_the_dependent_owner() {
+        let owner = SignatureClassId::of(rustc_hir::def_id::CRATE_DEF_ID);
+        let planned = Plan {
+            cursor_base_atom_owners: BTreeMap::from([(
+                "base-atom".to_owned(),
+                BTreeSet::from([owner]),
+            )]),
+            ..Plan::default()
+        };
+        assert!(
+            planned
+                .effective_reverted_classes(&BTreeSet::new(), &BTreeSet::new())
+                .is_empty()
+        );
+        assert!(
+            planned
+                .effective_reverted_classes(
+                    &BTreeSet::new(),
+                    &BTreeSet::from(["other-atom".to_owned()])
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            planned.effective_reverted_classes(
+                &BTreeSet::new(),
+                &BTreeSet::from(["base-atom".to_owned()])
+            ),
+            BTreeSet::from([owner])
+        );
     }
 
     /// **The arm-3 witness.** A `Ref` decision on a declaration with no pointee

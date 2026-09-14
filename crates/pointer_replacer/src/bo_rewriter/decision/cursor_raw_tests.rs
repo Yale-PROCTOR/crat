@@ -9,7 +9,9 @@ fn cursor(mutable: bool) -> Decision {
         plan: CursorPlan {
             use_hirs: vec![],
             extent: 4,
+            delivered_base: None,
             bridges: vec![],
+            local_bridges: vec![],
             uses: Vec::new(),
             base: Local::from_u32(1),
             component: Vec::new(),

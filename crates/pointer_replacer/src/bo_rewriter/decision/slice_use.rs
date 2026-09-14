@@ -108,6 +108,70 @@ fn same_form_copy(
     ))
 }
 
+/// The destination owns this complete local initializer; the source must not
+/// also materialize a raw alias at the same RHS.
+fn cursor_incoming_initializer(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    source: &super::Subject,
+    destination: &super::Subject,
+    rhs: &rustc_hir::Expr<'_>,
+) -> bool {
+    use rustc_hir::{ExprKind, Node, PatKind, QPath, def::Res};
+
+    use super::cursor_native::DeliveredBaseProvider;
+    let (mutable, plan) = match table
+        .entries
+        .iter()
+        .find(|(subject, _)| {
+            subject.fn_did == destination.fn_did && subject.hir_id == destination.hir_id
+        })
+        .map(|(_, decision)| decision)
+    {
+        Some(Decision::Cursor { mutable, plan }) => (mutable, plan),
+        Some(
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_),
+        )
+        | None => return false,
+    };
+    let Some(base) = &plan.delivered_base else { return false };
+    let DeliveredBaseProvider::Slice { producer } = &base.provider else { return false };
+    if base.binding != source.hir_id
+        || base.window_binding != source.hir_id
+        || producer.node != (source.fn_did, source.hir_id)
+        || (*mutable && !producer.mutable)
+        || producer.nullable
+        || producer.replacement.is_none()
+        || producer.hold_reason.is_some()
+        || !matches!(rhs.kind, ExprKind::Path(QPath::Resolved(_, path)) if path.res == Res::Local(source.hir_id))
+    {
+        return false;
+    }
+    let Node::LetStmt(local) = tcx.parent_hir_node(rhs.hir_id) else { return false };
+    if !matches!(local.pat.kind, PatKind::Binding(_, hir, _, None) if hir == destination.hir_id)
+        || !local.init.is_some_and(|init| init.hir_id == rhs.hir_id)
+    {
+        return false;
+    }
+    plan.uses.len() == plan.use_hirs.len()
+        && plan
+            .uses
+            .iter()
+            .zip(&plan.use_hirs)
+            .filter(|(edit, hir)| {
+                **hir == rhs.hir_id
+                    && edit.span == rhs.span
+                    && edit.bridge_kind == "cursor-constructor"
+            })
+            .count()
+            == 1
+}
+
 fn shared_to_mut(template: raw_boundary::BridgeTemplate) -> bool {
     use raw_boundary::BridgeTemplate;
     match template {
@@ -534,7 +598,13 @@ pub(crate) fn receipt_plans(
                                 )
                         })
                         .collect::<Vec<_>>();
-                    if target_form != source.key()
+                    if matches!(source, Form::Slice { mutable } if !destination.mutable || mutable)
+                        && cursor_incoming_initializer(tcx, table, subject, destination, rhs)
+                    {
+                        adapter = "owned-cursor-incoming-destination".to_owned();
+                        boundary_evidence = "destination-owned-cursor-initializer".to_owned();
+                        dependency_classes.insert(SignatureClassId::of(destination.fn_did));
+                    } else if target_form != source.key()
                         && let [carrier] = wrapping.as_slice()
                     {
                         // Item 4 owns Some(view) at the destination. Reuse its

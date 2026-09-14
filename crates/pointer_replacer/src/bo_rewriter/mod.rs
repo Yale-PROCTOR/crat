@@ -5479,6 +5479,175 @@ pub(crate) fn emit_files<'tcx>(
 
 /// Pure planning, class finalization and structural validation shared with
 /// additive-family preflight. The AST is emitted only through round_files.
+/// Seal each base against its original native type or its exact constructor
+/// plan. Cursor recovery also follows the selected base's atom dependencies.
+fn validate_cursor_delivered_bases(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    planned: &mut plan::Plan,
+) {
+    for (subject, choice) in &table.entries {
+        let cursor = match choice {
+            decision::Decision::Cursor { plan, .. } => plan,
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_)
+            | decision::Decision::Degraded(_) => continue,
+        };
+        let Some(base) = &cursor.delivered_base else { continue };
+        let node = (subject.fn_did, base.binding);
+        let valid_binding = base.binding == base.window_binding
+            && base.binding.owner.def_id == subject.fn_did
+            && matches!(tcx.hir_node(base.binding), rustc_hir::Node::Pat(pattern)
+                if matches!(pattern.kind, rustc_hir::PatKind::Binding(_, id, _, None) if id == base.binding));
+        let original_slice = valid_binding
+            && {
+                let ty = tcx.typeck(subject.fn_did).node_type(base.binding);
+                matches!(ty.kind(), TyKind::Ref(_, pointee, mutability)
+                if matches!(pointee.kind(), TyKind::Slice(_)) && (!subject.mutable || mutability.is_mut()))
+            };
+        // Reject a planned change even when its current type happens to be a
+        // slice: that change can be withdrawn independently during recovery.
+        let changed_base = table.entries.iter().any(|(other, decision)| {
+            (other.fn_did, other.hir_id) == node
+                && match decision {
+                    decision::Decision::Degraded(_) => false,
+                    decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::Cursor { .. } => true,
+                }
+        }) || table
+            .seams
+            .explicit_declarations
+            .iter()
+            .any(|site| site.node == Some(node))
+            || table
+                .slice_constructions
+                .iter()
+                .any(|constructor| constructor.node == node)
+            || table.return_receivers.plans.contains_key(&node)
+            || table.seams.receiver_inputs.plans.contains_key(&node)
+            || table
+                .seams
+                .callee_parameter_inputs
+                .values()
+                .any(|input| input.node == node);
+        let exact_cursor_source = cursor
+            .uses
+            .iter()
+            .zip(&cursor.use_hirs)
+            .filter(|(edit, _)| edit.bridge_kind == "cursor-constructor")
+            .all(|(edit, hir)| {
+                let rustc_hir::Node::Expr(init) = tcx.hir_node(*hir) else { return false };
+                if init.span != edit.span {
+                    return false;
+                }
+                let source = match init.kind {
+                    rustc_hir::ExprKind::MethodCall(_, receiver, [], _) => receiver,
+                    rustc_hir::ExprKind::Path(_) => init,
+                    _ => return false,
+                };
+                matches!(source.kind, rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path))
+                    if path.res == rustc_hir::def::Res::Local(base.binding))
+            })
+            && cursor
+                .uses
+                .iter()
+                .filter(|edit| edit.bridge_kind == "cursor-constructor")
+                .count()
+                == 1;
+        let valid_initializer = match base.initializer {
+            Some(hir) => {
+                hir.owner.def_id == subject.fn_did
+                    && matches!(tcx.parent_hir_node(base.binding), rustc_hir::Node::LetStmt(decl)
+                    if decl.pat.hir_id == base.binding && decl.init.is_some_and(|init| init.hir_id == hir))
+            }
+            None => tcx
+                .hir_body_owned_by(subject.fn_did)
+                .params
+                .iter()
+                .any(|param| param.pat.hir_id == base.binding),
+        };
+        use decision::cursor_native::DeliveredBaseProvider;
+        let overrides_base = table.return_receivers.plans.contains_key(&node)
+            || table.seams.receiver_inputs.plans.contains_key(&node)
+            || table
+                .seams
+                .callee_parameter_inputs
+                .values()
+                .any(|input| input.node == node);
+        let provider_delivered = match &base.provider {
+            DeliveredBaseProvider::OriginalSlice => original_slice && !changed_base,
+            DeliveredBaseProvider::Slice { producer } => {
+                let exact_constructor = producer.node == node
+                    && base.initializer == Some(producer.init_hir)
+                    && producer.replacement.is_some()
+                    && producer.hold_reason.is_none()
+                    && !producer.nullable
+                    && (!subject.mutable || producer.mutable)
+                    && table
+                        .slice_constructions
+                        .iter()
+                        .filter(|plan| plan.node == node)
+                        .count()
+                        == 1
+                    && table
+                        .slice_constructions
+                        .iter()
+                        .any(|plan| plan == producer);
+                exact_constructor
+                    && !overrides_base
+                    && terminal_subject_form(table, &planned.class_finalization, node)
+                        == decision::seam::Form::Slice {
+                            mutable: producer.mutable,
+                        }
+            }
+            DeliveredBaseProvider::Box {
+                producer,
+                elements: _,
+            } => {
+                let exact_box = !producer.optional
+                    && !producer.fabricated_extent
+                    && producer.shape == decision::box_facts::BoxShape::Slice
+                    && table.entries.iter().any(|(candidate, choice)| {
+                        (candidate.fn_did, candidate.hir_id) == node
+                            && match choice {
+                                decision::Decision::Box(actual) => actual == producer,
+                                decision::Decision::Ref { .. }
+                                | decision::Decision::InferredRef { .. }
+                                | decision::Decision::Slice { .. }
+                                | decision::Decision::Opt { .. }
+                                | decision::Decision::Cursor { .. }
+                                | decision::Decision::Degraded(_) => false,
+                            }
+                    });
+                exact_box
+                    && !overrides_base
+                    && base.initializer.is_some()
+                    && planned
+                        .class_finalization
+                        .classes
+                        .get(&bridge_receipt::SignatureClassId::of(subject.fn_did))
+                        .is_some_and(plan::SignatureClassPlan::is_ready)
+            }
+        };
+        if !valid_binding || !provider_delivered || !valid_initializer || !exact_cursor_source {
+            planned.hold_terminal_class(
+                bridge_receipt::SignatureClassId::of(subject.fn_did),
+                decision::Arm::Surface,
+                "cursor-delivered-base-unavailable",
+                format!("binding-hir={}:window-hir={}:original-slice={original_slice}:changed-base={changed_base}:initializer={valid_initializer}:provider-delivered={provider_delivered}",
+                    base.binding.local_id.as_u32(), base.window_binding.local_id.as_u32()),
+            );
+        }
+    }
+}
+
 fn prepare_plan_files<'tcx>(
     tcx: TyCtxt<'tcx>,
     table: &decision::DecisionTable,
@@ -5772,6 +5941,7 @@ fn prepare_plan_files<'tcx>(
     }
     plan::link_a5_fallback_carriers(&mut planned, table, span_to_loc);
     plan::finalize_signature_classes(&mut planned, table, reverted);
+    validate_cursor_delivered_bases(tcx, table, &mut planned);
     let return_dependency_edges = planned
         .class_finalization
         .classes
@@ -5958,6 +6128,7 @@ fn prepare_plan_files<'tcx>(
     }
     loop {
         let before = planned.held_classes();
+        validate_cursor_delivered_bases(tcx, table, &mut planned);
         validate_terminal_option_calls(tcx, table, &mut planned);
         seal_terminal_outbound_calls(tcx, table, &mut planned)?;
         if planned.held_classes() == before {
@@ -6052,6 +6223,7 @@ fn prepare_plan_files<'tcx>(
                 reasons.join(";"),
             );
         }
+        validate_cursor_delivered_bases(tcx, table, &mut planned);
         validate_terminal_option_calls(tcx, table, &mut planned);
         seal_terminal_outbound_calls(tcx, table, &mut planned)?;
     };

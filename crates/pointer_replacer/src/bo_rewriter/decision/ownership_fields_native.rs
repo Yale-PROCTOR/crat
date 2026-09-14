@@ -44,6 +44,7 @@ pub(crate) enum NativeHold {
 #[derive(Clone, Debug)]
 struct Bundle {
     plan: BoxPlan,
+    source_elements: Option<u64>,
     formals: Vec<NativeFormal>,
 }
 
@@ -67,6 +68,18 @@ pub(crate) struct Inputs<'a, 'tcx> {
 }
 
 impl Candidates {
+    /// The bound belongs to this exact selected native plan, not its display
+    /// receipt or another owner with a coincidentally equal allocation size.
+    pub(crate) fn selected_slice_elements(&self, node: Node, selected: &BoxPlan) -> Option<u64> {
+        let bundle = self.bundles.get(&node)?;
+        (bundle.plan == *selected
+            && selected.shape == BoxShape::Slice
+            && !selected.optional
+            && !selected.fabricated_extent)
+            .then_some(bundle.source_elements)
+            .flatten()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.bundles.is_empty()
     }
@@ -591,6 +604,7 @@ fn derive_bundle(
     }
     receipts.push(format!("native-box-continuations calls={checked_calls:?} free_keys={required:?} scope-exit=exact-C-free"));
     Ok(Bundle {
+        source_elements: source.count().parse::<u64>().ok(),
         plan: BoxPlan {
             shape: BoxShape::Slice,
             optional: false,
@@ -641,6 +655,7 @@ mod audit_tests {
                     candidates.bundles.insert(
                         (subject.fn_did, subject.hir_id),
                         Bundle {
+                            source_elements: None,
                             plan: plan.clone(),
                             formals: vec![],
                         },

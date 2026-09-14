@@ -1,6 +1,6 @@
 use super::*;
 
-fn emitted(input: &str) -> String {
+pub(super) fn emitted(input: &str) -> String {
     let source = utils::compilation::run_compiler_on_str(input, |tcx| {
         let capture = crate::bo_rewriter::ast_transform::capture_ast(tcx).unwrap();
         let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
@@ -21,6 +21,9 @@ fn emitted(input: &str) -> String {
         )
         .unwrap();
         let held = emission.plan.held_classes();
+        if !held.is_empty() {
+            println!("CURSOR-HELD {:#?}", emission.plan.class_finalization);
+        }
         let reverts = crate::bo_rewriter::ast_transform::revert_set_from_classes_and_atoms(
             &held,
             &std::collections::BTreeSet::new(),
@@ -43,7 +46,7 @@ fn emitted(input: &str) -> String {
     source
 }
 
-fn compile(source: &str, main: Option<&str>) {
+pub(super) fn compile(source: &str, main: Option<&str>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let directory = std::env::temp_dir().join(format!(

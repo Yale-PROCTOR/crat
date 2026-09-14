@@ -1,5 +1,5 @@
-//! R368 native admission observation hook. This hook does not change decisions,
-//! types, plans, or delivery. Cursor emission needs explicit shared form support.
+//! Native cursor decisions and compiler-bound admission receipts. The observer
+//! reports candidate-stage facts; terminal delivery remains custody-owned.
 
 use std::{collections::BTreeMap, fs::OpenOptions, io::Write, path::Path};
 
@@ -12,6 +12,8 @@ use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solve
 
 #[path = "cursor/admission.rs"]
 mod admission;
+#[path = "cursor/delivered.rs"]
+mod delivered;
 #[path = "cursor/emission.rs"]
 mod emission;
 
@@ -22,7 +24,36 @@ pub(crate) struct CursorPlan {
     pub(crate) base: Local,
     pub(crate) component: Vec<Local>,
     pub(crate) extent: u64,
+    pub(crate) delivered_base: Option<DeliveredBase>,
     pub(crate) bridges: Vec<CursorBridge>,
+    pub(crate) local_bridges: Vec<CursorLocalBridge>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeliveredBase {
+    pub(crate) binding: rustc_hir::HirId,
+    pub(crate) window_binding: rustc_hir::HirId,
+    pub(crate) initializer: Option<rustc_hir::HirId>,
+    pub(crate) provider: DeliveredBaseProvider,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveredBaseProvider {
+    OriginalSlice,
+    Slice {
+        producer: super::construction::SliceConstructionPlan,
+    },
+    Box {
+        producer: super::box_facts::BoxPlan,
+        elements: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorLocalBridge {
+    pub(crate) destination: rustc_hir::HirId,
+    pub(crate) initializer: rustc_hir::HirId,
+    pub(crate) access: rustc_hir::HirId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,27 +93,50 @@ pub(crate) fn promote(
     ctx: &Ctx<'_, '_>,
     entries: &mut [(Subject, Decision)],
 ) -> Vec<CursorReceipt> {
-    if ctx.family_policy.stage != super::super::additive::FamilyStage::Return {
+    if !matches!(
+        ctx.family_policy.stage,
+        super::super::additive::FamilyStage::Return
+            | super::super::additive::FamilyStage::Ownership
+    ) {
         return vec![];
     }
     let proposals = entries
         .iter()
         .enumerate()
         .filter_map(|(index, (subject, decision))| {
-            let candidate = match decision {
-                Decision::Degraded(record) => is_cursor_reason(&record.reason),
+            if !ctx
+                .family_policy
+                .enabled(subject.fn_did, super::super::additive::FamilyStage::Return)
+            {
+                return None;
+            }
+            let proposed = match decision {
+                Decision::Degraded(record) => {
+                    if is_cursor_reason(&record.reason) {
+                        Some(
+                            delivered::plan(ctx, subject, entries)
+                                .unwrap_or_else(|| emission::plan(ctx, subject, entries)),
+                        )
+                    } else if matches!(
+                        record.reason,
+                        DegradeReason::KindRaw | DegradeReason::RawPointerOperation { .. }
+                    ) {
+                        // An original typed slice is already a reference capability.
+                        // The closed administrative rewrite does not fabricate a Ref
+                        // model verdict or license a raw base construction.
+                        delivered::plan(ctx, subject, entries)
+                    } else {
+                        None
+                    }
+                }
                 Decision::Ref { .. }
                 | Decision::InferredRef { .. }
                 | Decision::Slice { .. }
                 | Decision::Opt { .. }
                 | Decision::Box(_)
-                | Decision::Cursor { .. } => false,
+                | Decision::Cursor { .. } => None,
             };
-            (candidate
-                && ctx
-                    .family_policy
-                    .enabled(subject.fn_did, super::super::additive::FamilyStage::Return))
-            .then(|| (index, emission::plan(ctx, subject, entries)))
+            proposed.map(|plan| (index, plan))
         })
         .collect::<Vec<_>>();
     let mut receipts = Vec::new();
@@ -161,13 +215,18 @@ pub(crate) fn observe(
 ) {
     let Some(directory) = std::env::var_os("CRAT_CURSOR_ADMISSION_OUTPUT") else { return };
     if ctx.raw_boundary.is_none()
-        || ctx.family_policy.stage != super::super::additive::FamilyStage::Return
+        || !matches!(
+            ctx.family_policy.stage,
+            super::super::additive::FamilyStage::Return
+                | super::super::additive::FamilyStage::Ownership
+        )
     {
         return;
     }
     // A cache-only corpus worker has one compiler session and one model. The
-    // archive is single-use per program; each identity is observed once. The
-    // admission proof does not depend on later placement/recovery decisions.
+    // archive belongs to one worker/frame. Repeated family passes replace a
+    // provisional row so the last candidate includes the settled owner stage.
+    // Terminal placement/recovery remains a separate custody observation.
     let program =
         std::env::var("CRAT_ERA5_PROGRAM").expect("cursor audit needs compiler worker program pin");
     assert_eq!(
@@ -207,9 +266,6 @@ pub(crate) fn observe(
             subject.fn_did.local_def_index.as_u32(),
             subject.hir_id.local_id.as_u32()
         ));
-        if path.exists() {
-            continue;
-        }
         // Collect all named identities, not a docs-derived admission allowlist.
         // The later market join selects 70/44 and the newly routed population.
         let sign = ctx.sign.render(subject.fn_did, subject.local);
@@ -245,11 +301,21 @@ pub(crate) fn observe(
             "component": row.as_ref().map(|r| r.component.iter().map(|l| l.index()).collect::<Vec<_>>()),
             "native_outcome": receipts.iter().find(|r| r.owner == subject.fn_did && r.hir_id == subject.hir_id).map(|r| format!("{:?}", r.disposition)),
             "emission": match decision { Decision::Cursor { .. } => "planned-cursor", Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) | Decision::Degraded(_) => "unchanged" },
+            "delivered_base": match decision {
+                Decision::Cursor { plan, .. } => plan.delivered_base.as_ref().map(|base| serde_json::json!({
+                    "binding_hir": base.binding.local_id.as_u32(), "window_hir": base.window_binding.local_id.as_u32(),
+                    "initializer_hir": base.initializer.map(|hir| hir.local_id.as_u32()),
+                    "provider": format!("{:?}", base.provider), "window": "binding.len()",
+                })),
+                Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Slice { .. }
+                | Decision::Opt { .. } | Decision::Box(_) | Decision::Degraded(_) => None,
+            },
             "stage": "candidate-pre-finalization", "source_frame": frame,
         });
         let mut file = OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .open(&path)
             .expect("fresh cursor identity receipt");
         writeln!(file, "{receipt}").expect("write cursor identity receipt");
@@ -268,3 +334,11 @@ fn is_cursor_reason(reason: &DegradeReason) -> bool {
 #[cfg(test)]
 #[path = "cursor/native_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cursor/delivered_tests.rs"]
+mod delivered_tests;
+
+#[cfg(test)]
+#[path = "cursor/custody_tests.rs"]
+mod custody_tests;
