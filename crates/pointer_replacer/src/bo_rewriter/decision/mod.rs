@@ -33,6 +33,8 @@ pub(crate) mod box_facts;
 pub(crate) mod callee_parameter_input;
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
+#[cfg(test)]
+mod counted_extent_tests;
 pub(crate) mod cursor_native;
 pub(crate) mod declaration;
 pub(crate) mod declaration_pattern;
