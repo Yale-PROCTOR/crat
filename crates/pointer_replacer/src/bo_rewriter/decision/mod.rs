@@ -1165,6 +1165,7 @@ pub(crate) fn decide_with_raw_fallbacks(
                 Decision::Ref { .. }
                 | Decision::InferredRef { .. }
                 | Decision::Cursor { .. }
+                | Decision::NestedSlice { .. }
                 | Decision::Opt { slice: false, .. }
                 | Decision::Box(_)
                 | Decision::Degraded(_) => return None,
