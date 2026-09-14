@@ -7298,6 +7298,7 @@ fn finish_decide<'tcx>(
             &mut_facts,
             &family_policy,
         );
+        decision::slice_carrier::complete(tcx, &mut table);
         let option_operations = decision::option::plan_operations(
             &program,
             &mut table,

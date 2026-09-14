@@ -67,6 +67,7 @@ pub(crate) mod return_receiver;
 pub(crate) mod returned_child;
 pub(crate) mod seam;
 pub(crate) mod sibling_overlap;
+pub(crate) mod slice_carrier;
 pub(crate) mod slice_use;
 pub(crate) mod surface_argument;
 pub(crate) mod thin_extent;
