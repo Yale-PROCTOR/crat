@@ -93,7 +93,19 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
     let form = super::seam::form_of(source);
     let mutable = match form {
         Form::Slice { mutable } => mutable,
-        Form::Raw | Form::Ref { .. } | Form::Opt { .. } | Form::Cursor { .. } => {
+        // `NestedSlice` is a composition arm, added where wave-5d's variant
+        // meets this rule for the first time (batch 4). It DECLINES, with every
+        // other non-plain-slice form: the same-slice carrier reasons about one
+        // extent, and a nested slice carries two. Declining can only forgo a
+        // carrier, never manufacture one, so it preserves this rule's measured
+        // behaviour — in the lane's own census the variant did not exist, so no
+        // subject could present it. Admitting it instead would extend the rule
+        // to a form the lane has not witnessed, which is the lane's call.
+        Form::Raw
+        | Form::Ref { .. }
+        | Form::Opt { .. }
+        | Form::Cursor { .. }
+        | Form::NestedSlice { .. } => {
             return Err(Hold::Source);
         }
     };
