@@ -82,6 +82,10 @@ pub(crate) mod slice_carrier;
 pub(crate) mod slice_construction_values;
 pub(crate) mod slice_use;
 pub(crate) mod surface_argument;
+pub(crate) mod thin_counted;
+pub(crate) mod thin_counted_entropy;
+#[cfg(test)]
+mod thin_counted_tests;
 pub(crate) mod thin_extent;
 pub(crate) mod universe;
 pub(crate) mod void_pointee;
@@ -583,6 +587,7 @@ pub(crate) enum DegradeReason {
     /// eight-byte writes through a one-byte `&mut uint8_t`.
     LocalCalleeAccessExtent {
         access: Box<local_callee_extent::LocalCalleeAccess>,
+        count: Option<thin_counted::Hold>,
     },
     /// R271-1. The slot's pointee is `c_void`, a one-byte type carrying no
     /// extent, so no reference form of it can carry the provenance its callee
@@ -867,7 +872,9 @@ impl DegradeReason {
             DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
             DegradeReason::BoxFailure { failure } => failure.detail(),
             DegradeReason::SignatureClassHeld { reason } => reason.clone(),
-            DegradeReason::LocalCalleeAccessExtent { access } => access.detail(),
+            DegradeReason::LocalCalleeAccessExtent { access, count } => {
+                thin_counted::hold_detail(access, *count)
+            }
             _ => "-".to_owned(),
         }
     }
@@ -1912,6 +1919,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             Form::Slice
         };
     }
+    let counted = thin_counted::enabled_proof(tcx, subject, facts, family_policy);
+    if counted.is_some() && matches!(form, Form::Plain | Form::Slice) {
+        form = Form::Slice;
+    }
     if let Some(receiver) = return_receivers
         .and_then(|receivers| receivers.plans.get(&(subject.fn_did, subject.hir_id)))
     {
@@ -1938,9 +1949,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
         let node = (subject.fn_did, subject.hir_id);
         let address_candidate = facts.is_value_observation_candidate(node);
-        let address_open = address_candidate
-            && (coconv.is_none()
-                || raw_boundary.is_some_and(|raw_boundary| raw_boundary.opens_address(node)));
+        let address_open = thin_counted::covers_comparison(counted.as_ref(), *span)
+            || address_candidate
+                && (coconv.is_none()
+                    || raw_boundary.is_some_and(|raw_boundary| raw_boundary.opens_address(node)));
         if !address_open {
             return degrade(
                 subject,
@@ -2096,6 +2108,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 decl_site,
                 DegradeReason::LocalCalleeAccessExtent {
                     access: Box::new(access.clone()),
+                    count: thin_counted::missing_evidence(tcx, subject, facts),
                 },
             );
         }
@@ -2245,6 +2258,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         .get(&(subject.fn_did, subject.hir_id))
         .cloned()
         .unwrap_or_default();
+    let uses = thin_counted::slice_uses(counted.as_ref(), uses);
     if let Some(span) = uses.unsupported {
         return degrade(
             subject,
