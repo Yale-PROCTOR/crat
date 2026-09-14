@@ -25,6 +25,7 @@ pub(super) fn apply(
             let reference = match decision {
                 decision::Decision::Ref { .. } => true,
                 decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_)

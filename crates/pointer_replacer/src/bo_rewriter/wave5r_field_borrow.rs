@@ -19,6 +19,7 @@ fn shared(decision: &Decision) -> bool {
     match decision {
         Decision::Ref { mutable } => !mutable,
         Decision::InferredRef { .. }
+        | Decision::Cursor { .. }
         | Decision::Slice { .. }
         | Decision::Opt { .. }
         | Decision::Box(_)

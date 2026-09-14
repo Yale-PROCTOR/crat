@@ -61,6 +61,7 @@ pub(super) fn complete_casts(
         let mutable = match decision {
             super::Decision::Ref { mutable } => mutable,
             super::Decision::InferredRef { .. }
+            | super::Decision::Cursor { .. }
             | super::Decision::Slice { .. }
             | super::Decision::Opt { .. }
             | super::Decision::Box(_)
