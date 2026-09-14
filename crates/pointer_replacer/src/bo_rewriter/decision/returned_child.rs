@@ -298,6 +298,8 @@ pub(crate) fn derive_type_backed<'tcx>(
                     // the position consumes. `Unclassified` says exactly that;
                     // it is not `OneElement`, which would be a claim.
                     extent: ArgumentExtent::Unclassified,
+                    count_argument_index: None,
+                    count_is_exact: false,
                     returns_alias_of: Some(index),
                     provenance: "type-derived-return-carrier",
                 },

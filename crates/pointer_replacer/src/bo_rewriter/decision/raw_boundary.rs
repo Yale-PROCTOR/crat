@@ -364,6 +364,17 @@ pub(crate) struct ForeignCallArgFact {
     pub direct_storage: Option<(HirId, Span)>,
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<RawMutability>,
+    pub contract_count: Option<ContractCountOperandFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContractCountOperandFact {
+    pub argument_index: usize,
+    pub span: Span,
+    pub expression: String,
+    /// The contract describes the whole range rather than an upper limit.
+    /// Units and typed construction validity remain separate decision gates.
+    pub exact: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

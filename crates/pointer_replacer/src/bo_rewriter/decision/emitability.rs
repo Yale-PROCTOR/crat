@@ -940,6 +940,26 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                     }
                                     _ => None,
                                 };
+                            let contract_count = super::raw_boundary_contracts::classify_contract(
+                                &symbol, index, &target,
+                            )
+                            .ok()
+                            .and_then(|contract| {
+                                let count_index = contract.count_argument_index?;
+                                let count = args.get(count_index)?;
+                                let expression = self
+                                    .tcx
+                                    .sess
+                                    .source_map()
+                                    .span_to_snippet(count.span)
+                                    .ok()?;
+                                Some(super::raw_boundary::ContractCountOperandFact {
+                                    argument_index: count_index,
+                                    span: count.span,
+                                    expression,
+                                    exact: contract.count_is_exact,
+                                })
+                            });
                             self.facts.foreign_call_args.push(ForeignCallArgFact {
                                 caller: self.fn_did,
                                 callee: symbol.clone(),
@@ -953,6 +973,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 direct_storage: direct_mutable_storage(arg),
                                 adapter_operand_span,
                                 adapter_operand_mutability,
+                                contract_count,
                             });
                         }
                     }

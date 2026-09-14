@@ -109,6 +109,11 @@ pub(crate) struct ArgumentContract {
     pub ownership: OwnershipContract,
     /// R272-1(b). How many elements this position consumes.
     pub extent: ArgumentExtent,
+    /// Exact call argument carrying this position's count, when the contract
+    /// states one. This is metadata only; the decision hook must still prove
+    /// units, construction identity, and whether the count is exact or upper.
+    pub count_argument_index: Option<usize>,
+    pub count_is_exact: bool,
     /// Function-level relation: a non-null returned view derives from this
     /// zero-based argument. Consumers must compare it with their own argument
     /// index; its presence does not make every argument the returned parent.
@@ -146,6 +151,8 @@ struct ContractRow {
     ownership: OwnershipContract,
     returns_alias_of: Option<usize>,
     extent: ArgumentExtent,
+    count_argument_index: Option<usize>,
+    count_is_exact: bool,
 }
 
 impl ContractRow {
@@ -154,6 +161,14 @@ impl ContractRow {
     /// completeness control rather than inheriting a plausible default.
     const fn with(self, extent: ArgumentExtent) -> Self {
         Self { extent, ..self }
+    }
+
+    const fn with_count(self, argument_index: usize, exact: bool) -> Self {
+        Self {
+            count_argument_index: Some(argument_index),
+            count_is_exact: exact,
+            ..self
+        }
     }
 }
 
@@ -165,6 +180,8 @@ const fn row(symbol: &'static str, position: usize, access: PointeeAccess) -> Co
         ownership: OwnershipContract::BorrowView,
         returns_alias_of: None,
         extent: ArgumentExtent::Unclassified,
+        count_argument_index: None,
+        count_is_exact: false,
     }
 }
 
@@ -191,7 +208,9 @@ const fn return_alias_row(
 /// are explicit so a destination never inherits a source's access mode.
 const TABLE: &[ContractRow] = &[
     row("fdopen", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
-    return_alias_row("fgets", 0, PointeeAccess::Write).with(ArgumentExtent::ByteCount),
+    return_alias_row("fgets", 0, PointeeAccess::Write)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(1, true),
     row("fopen", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("fopen", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("fprintf", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
@@ -206,7 +225,9 @@ const TABLE: &[ContractRow] = &[
     row("perror", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("printf", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("scanf", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
-    row("snprintf", 0, PointeeAccess::Write).with(ArgumentExtent::ByteCount),
+    row("snprintf", 0, PointeeAccess::Write)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(1, true),
     row("snprintf", 2, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("sprintf", 0, PointeeAccess::Write).with(ArgumentExtent::UnboundedWrite),
     row("sprintf", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
@@ -222,12 +243,28 @@ const TABLE: &[ContractRow] = &[
     return_alias_row("strcpy", 0, PointeeAccess::Write).with(ArgumentExtent::UnboundedWrite),
     return_alias_row("strcpy", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("strlen", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
-    row("strncasecmp", 0, PointeeAccess::Read).with(ArgumentExtent::ByteCount),
-    row("strncasecmp", 1, PointeeAccess::Read).with(ArgumentExtent::ByteCount),
+    row("strncasecmp", 0, PointeeAccess::Read)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, false),
+    row("strncasecmp", 1, PointeeAccess::Read)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, false),
     return_alias_row("strncat", 0, PointeeAccess::Write).with(ArgumentExtent::UnboundedWrite),
-    return_alias_row("strncat", 1, PointeeAccess::Read).with(ArgumentExtent::ByteCount),
-    return_alias_row("strncpy", 0, PointeeAccess::Write).with(ArgumentExtent::ByteCount),
-    return_alias_row("strncpy", 1, PointeeAccess::Read).with(ArgumentExtent::ByteCount),
+    return_alias_row("strncat", 1, PointeeAccess::Read)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, false),
+    return_alias_row("strncpy", 0, PointeeAccess::Write)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, true),
+    return_alias_row("strncpy", 1, PointeeAccess::Read)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, false),
+    return_alias_row("memcpy", 0, PointeeAccess::Write)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, true),
+    return_alias_row("memcpy", 1, PointeeAccess::Read)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, true),
     return_alias_row("strstr", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     return_alias_row("strstr", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("utime", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
@@ -239,6 +276,8 @@ const TABLE: &[ContractRow] = &[
         ownership: OwnershipContract::Consume,
         returns_alias_of: None,
         extent: ArgumentExtent::Lifecycle,
+        count_argument_index: None,
+        count_is_exact: false,
     },
     ContractRow {
         symbol: "free",
@@ -247,6 +286,8 @@ const TABLE: &[ContractRow] = &[
         ownership: OwnershipContract::Consume,
         returns_alias_of: None,
         extent: ArgumentExtent::Lifecycle,
+        count_argument_index: None,
+        count_is_exact: false,
     },
     ContractRow {
         symbol: "realloc",
@@ -255,6 +296,8 @@ const TABLE: &[ContractRow] = &[
         ownership: OwnershipContract::AtomicSourceSink,
         returns_alias_of: None,
         extent: ArgumentExtent::Lifecycle,
+        count_argument_index: None,
+        count_is_exact: false,
     },
 ];
 
@@ -349,6 +392,8 @@ fn family_contract(
         access,
         ownership: OwnershipContract::BorrowView,
         extent,
+        count_argument_index: None,
+        count_is_exact: false,
         returns_alias_of: function_return_alias(symbol),
         provenance,
     }))
@@ -387,6 +432,8 @@ pub(crate) fn classify_contract(
         access: row.access,
         ownership: row.ownership,
         extent: row.extent,
+        count_argument_index: row.count_argument_index,
+        count_is_exact: row.count_is_exact,
         returns_alias_of: row.returns_alias_of,
         provenance: "pinned-libc-0.2.184",
     })
@@ -503,6 +550,36 @@ mod tests {
         assert_eq!(contract.access, PointeeAccess::Read);
     }
 
+    #[test]
+    fn r351_contract_count_metadata_names_operand_and_exactness() {
+        let memcpy_dest =
+            classify_contract(&callee("memcpy", true), 0, &target(RawMutability::Mut))
+                .expect("memcpy destination contract");
+        let memcpy_source =
+            classify_contract(&callee("memcpy", true), 1, &target(RawMutability::Const))
+                .expect("memcpy source contract");
+        for contract in [memcpy_dest, memcpy_source] {
+            assert_eq!(contract.extent, ArgumentExtent::ByteCount);
+            assert_eq!(contract.count_argument_index, Some(2));
+            assert!(contract.count_is_exact);
+            assert_eq!(contract.returns_alias_of, Some(0));
+        }
+
+        let bounded = classify_contract(
+            &callee("strncasecmp", true),
+            1,
+            &target(RawMutability::Const),
+        )
+        .expect("bounded string comparison contract");
+        assert_eq!(bounded.count_argument_index, Some(2));
+        assert!(!bounded.count_is_exact);
+
+        let nul = classify_contract(&callee("strlen", true), 0, &target(RawMutability::Const))
+            .expect("NUL-terminated contract");
+        assert_eq!(nul.count_argument_index, None);
+        assert!(!nul.count_is_exact);
+    }
+
     fn callee(name: &str, foreign: bool) -> ForeignSymbolKey {
         ForeignSymbolKey {
             symbol: name.to_owned(),
@@ -532,6 +609,8 @@ mod tests {
                 access: PointeeAccess::Read,
                 ownership: OwnershipContract::BorrowView,
                 extent: ArgumentExtent::NulTerminated,
+                count_argument_index: None,
+                count_is_exact: false,
                 returns_alias_of: None,
                 provenance: "pinned-libc-0.2.184",
             })

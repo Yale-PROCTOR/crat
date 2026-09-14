@@ -6,7 +6,7 @@
 pub mod slot_domain;
 mod analyses {
     pub mod borrow_ownership {
-        pub use crate::slot_domain as domain;
+        pub use crate::slot_domain::SlotKind;
     }
 }
 mod contract_extent;

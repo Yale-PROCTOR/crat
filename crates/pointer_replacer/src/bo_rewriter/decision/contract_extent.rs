@@ -6,7 +6,7 @@
 //! No symbols are classified here, no analysis is run, and no Rust is emitted.
 //! `Keep` means resume the unchanged decision ladder, including ThinExtent.
 
-use crate::analyses::borrow_ownership::domain::SlotKind;
+use crate::analyses::borrow_ownership::SlotKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CurrentForm {
