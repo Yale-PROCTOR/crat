@@ -78,6 +78,8 @@ pub(crate) mod decision;
 pub(crate) mod fat_facts;
 pub(crate) mod mechanical_receipt;
 // R351 ownership/fields consumers arrive from the preserved lane commits.
+#[cfg(test)]
+mod construction_values_tests;
 pub(crate) mod ownership_fields;
 #[cfg(test)]
 mod ownership_fields_cp2_tests;

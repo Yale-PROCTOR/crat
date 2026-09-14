@@ -4018,7 +4018,8 @@ pub(crate) fn plan(
         let inferred_box = box_plan.is_some_and(|plan| plan.inferred_binding);
         let typed_pattern = table
             .declaration_patterns
-            .contains_key(&(subject.fn_did, subject.hir_id));
+            .contains_key(&(subject.fn_did, subject.hir_id))
+            || super::decision::construction_values::has_declaration(table, subject);
         let typed_receiver = table
             .return_receivers
             .plans

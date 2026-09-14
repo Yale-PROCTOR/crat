@@ -4321,6 +4321,41 @@ pub(crate) fn synthesize_with_raw_boundary(
                 a5_roles.insert(1, super::co_conversion::PairRole::Primary);
             }
 
+            // Native immutable facts discharge only the shared/read consumer
+            // hold. Preserve the A5 verdict and all incident peer receipts.
+            let shared_read_positions = positions
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, pos)| {
+                    super::shared_read_pairs::admits(
+                        mut_facts,
+                        *callee,
+                        pos.index,
+                        pos.expected,
+                        conflicts[idx]
+                            .iter()
+                            .filter(|peer| peer.proof.verdict != A5SiteProofVerdict::Clear)
+                            .map(|peer| {
+                                let index = if peer.left == pos.index {
+                                    peer.right
+                                } else {
+                                    peer.left
+                                };
+                                let form = positions
+                                    .iter()
+                                    .find(|position| position.index == index)
+                                    .expect("conflict peer comes from positions")
+                                    .expected;
+                                (index, form)
+                            }),
+                    )
+                    .then_some(pos.index)
+                })
+                .collect::<BTreeSet<_>>();
+            for &index in &shared_read_positions {
+                a5_roles.insert(index, super::co_conversion::PairRole::Primary);
+            }
+
             // ---- pass 3: emit ----
             for (idx, pos) in positions.iter().enumerate() {
                 let (candidate_template, null_arm, extent_arm) = match &candidates[idx] {
@@ -4395,6 +4430,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                             super::co_conversion::PairRole::Clear
                             | super::co_conversion::PairRole::Primary => {
                                 proof.fallback = A5ProofSiteFallback::Primary;
+                                if shared_read_positions.contains(&pos.index) {
+                                    proof.reason.push_str(";native-shared-read-peers");
+                                }
                             }
                             super::co_conversion::PairRole::RawView => {
                                 if let (Some(proof_site_key), Some(argument)) =
@@ -5618,6 +5656,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         }
     }
     super::wave5r::complete_casts(tcx, table, &mut plan);
+    super::construction_values::complete(tcx, table, &mut plan);
     complete_interface_inventory(
         facts,
         table,

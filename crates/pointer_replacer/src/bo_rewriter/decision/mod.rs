@@ -33,6 +33,7 @@ pub(crate) mod box_facts;
 pub(crate) mod callee_parameter_input;
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
+pub(crate) mod construction_values;
 #[cfg(test)]
 mod counted_extent_tests;
 pub(crate) mod cursor_native;
@@ -68,6 +69,7 @@ pub(crate) mod return_interface;
 pub(crate) mod return_receiver;
 pub(crate) mod returned_child;
 pub(crate) mod seam;
+pub(crate) mod shared_read_pairs;
 pub(crate) mod sibling_overlap;
 pub(crate) mod slice_carrier;
 pub(crate) mod slice_use;
@@ -1139,6 +1141,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         })
         .collect::<Vec<_>>();
     option::inherit_wrapped_payloads(ctx, &mut entries);
+    construction_values::settle(ctx, &mut entries);
     let cursor_receipts = cursor_native::promote(ctx, &mut entries);
     cursor_native::observe(ctx, &entries, &cursor_receipts);
     let option_mut_bindings = entries
@@ -1585,6 +1588,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
             DegradeReason::SliceCursorUse,
         ),
+        Decision::Ref { .. } if construction_values::permits(ctx, subject) => decision,
         Decision::Ref { mutable } => {
             if receiver_failed {
                 degrade(
@@ -1940,6 +1944,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // gate that is not blocking them, 121 of them in functions that are not
         // even pinned.
         if subject.ty_span.is_none()
+            && !construction_values::permits(ctx, subject)
             && !(family_policy.enabled(subject.fn_did, FamilyStage::Declaration)
                 && declaration_patterns.contains_key(&(subject.fn_did, subject.hir_id)))
             && !lifetime_eligibility.is_some_and(|eligibility| {

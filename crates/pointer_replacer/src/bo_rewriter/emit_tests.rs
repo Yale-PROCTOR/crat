@@ -4095,9 +4095,9 @@ fn a_may_be_negative_offset_refuses_the_fat_optional_form_too() {
 /// **THE DISSOLUTION'S RESIDUE WITNESS — one case per construction class**
 /// (user ruling RECLASSIFY-ONLY, 2026-08-12).
 ///
-/// Every unannotated local still degrades — the pin below is not weakened by
-/// one subject — but it degrades **naming the owed capability it is waiting
-/// on** rather than naming the rewriter's splice mechanism.
+/// R395 / wave-6k: a direct same-pointee copy from a delivered reference now
+/// has an explicit declaration and reborrow value. The other construction
+/// shapes retain the residual capability they still require.
 ///
 /// # Where this test came from, kept adjacent
 ///
@@ -4138,7 +4138,7 @@ fn a_may_be_negative_offset_refuses_the_fat_optional_form_too() {
 /// *Mutation-tested:* deleting the residue gate ahead of the co-conversion gate
 /// reports `call-site-not-adapted` for all four.
 #[test]
-fn every_unannotated_local_class_degrades_naming_its_owed_capability() {
+fn every_unannotated_local_class_emits_or_names_its_owed_capability() {
     fn reason_for_q(body: &str) -> String {
         let src = format!(
             "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
@@ -4149,11 +4149,7 @@ fn every_unannotated_local_class_degrades_naming_its_owed_capability() {
     }
 
     for (label, body, want) in [
-        (
-            "copy",
-            "    let q = p;\n    *q = 7;\n    *q",
-            "copy-source-coupled",
-        ),
+        ("copy", "    let q = p;\n    *q = 7;\n    *q", "<emitted>"),
         (
             "other",
             "    let q = if n > 0 { p } else { p };\n    *q = 7;\n    *q",
@@ -4173,11 +4169,8 @@ fn every_unannotated_local_class_degrades_naming_its_owed_capability() {
         assert_eq!(
             reason_for_q(body),
             want,
-            "{label}: every class of unannotated local must still degrade, and \
-             must name the owed capability it waits on. If this moved, either \
-             something is claiming this population without a ruling — the \
-             unwitnessable ledger movement F1 refused — or a residual fold has \
-             been silently rerouted."
+            "{label}: only the witnessed direct copy has a value plan; \
+             unsupported construction shapes must retain their typed capability."
         );
     }
 }
@@ -13040,7 +13033,7 @@ fn slu_w1_local_construction_and_raw_use_share_the_class() {
 }
 
 #[test]
-fn slu_w1_named_copy_keeps_an_input_form_raw_alias() {
+fn slu_w1_named_copy_uses_a_checked_reference_origin() {
     // The first draft passed the alias to an opaque pointer read and its
     // frozen model was Raw. This is the measured strlen-style copy/schedule.
     let input = "#![allow(dead_code, unused_unsafe)]\n\
@@ -13051,7 +13044,7 @@ fn slu_w1_named_copy_keeps_an_input_form_raw_alias() {
         }\n";
     let emitted = ast_emitted_source_of(input).expect("SLU named-copy emission");
     assert!(
-        emitted.contains("p: &[i32]") && emitted.contains("let base = p.as_ptr()"),
+        emitted.contains("p: &[i32]") && emitted.contains("let base: &i32 = &p[0]"),
         "{emitted}"
     );
     slu_w1_assert_use_receipt_count(input, 2);

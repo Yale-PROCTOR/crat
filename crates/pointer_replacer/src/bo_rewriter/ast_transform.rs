@@ -3638,6 +3638,7 @@ fn transform_with<'tcx>(
         if !table
             .declaration_patterns
             .contains_key(&(subject.fn_did, subject.hir_id))
+            && !super::decision::construction_values::has_declaration(table, subject)
             && !table
                 .return_receivers
                 .plans

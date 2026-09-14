@@ -619,6 +619,16 @@ pub(crate) fn receipt_plans(
                         adapter = "owned-cursor-incoming-destination".to_owned();
                         boundary_evidence = "destination-owned-cursor-initializer".to_owned();
                         dependency_classes.insert(SignatureClassId::of(destination.fn_did));
+                    } else if super::construction_values::owns_initializer(
+                        tcx,
+                        table,
+                        subject,
+                        destination,
+                        rhs,
+                    ) {
+                        adapter = "owned-copy-value-destination".to_owned();
+                        boundary_evidence = "destination-owned-checked-element-copy".to_owned();
+                        dependency_classes.insert(SignatureClassId::of(destination.fn_did));
                     } else if target_form != source.key()
                         && let [carrier] = wrapping.as_slice()
                     {
