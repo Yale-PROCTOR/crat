@@ -940,14 +940,20 @@ pub(crate) fn lower(
     for entry in 0..table.entries.len() {
         let (subject, decision) = &table.entries[entry];
         let node = (subject.fn_did, subject.hir_id);
-        let Decision::Slice {
-            mutable: false,
-            uses,
-        } = decision
-        else {
-            continue;
+        let uses = match decision {
+            Decision::Slice {
+                mutable: false,
+                uses,
+            } => uses,
+            Decision::Slice { mutable: true, .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => continue,
         };
-        let mutable = &false;
         // Keep existing reslice presentations stable. This first rule owns
         // forward call-bearing subjects with newly proved result independence.
         if !native.sites.iter().any(|site| {
@@ -1021,7 +1027,7 @@ pub(crate) fn lower(
         }
         let view = ForwardView {
             index_name: index_name.clone(),
-            mutable: *mutable,
+            mutable: false,
         };
         let mut replacements = Vec::new();
         let mut complete = true;
@@ -1069,8 +1075,16 @@ pub(crate) fn lower(
             edit.zero_syntax = false;
             seams.push((index, edit));
         }
-        let Decision::Slice { uses, .. } = &mut table.entries[entry].1 else { unreachable!() };
-        *uses = replacements;
+        match &mut table.entries[entry].1 {
+            Decision::Slice { uses, .. } => *uses = replacements,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => unreachable!("selected slice keeps its decision"),
+        }
         for (index, edit) in seams {
             table.seams.edits[index] = edit;
         }

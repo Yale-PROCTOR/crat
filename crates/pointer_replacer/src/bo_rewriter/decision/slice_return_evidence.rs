@@ -140,6 +140,10 @@ fn fresh_return(program: &RustProgram<'_>, callee: LocalDefId) -> bool {
                 let sig = tcx.fn_sig(definition).skip_binder().skip_binder();
                 symbol.foreign
                     && symbol.symbol == "malloc"
+                    && tcx
+                        .codegen_fn_attrs(definition)
+                        .link_name
+                        .is_none_or(|name| name.as_str() == "malloc")
                     && symbol.abi.starts_with('C')
                     && args.len() == 1
                     && sig.inputs().len() == 1
@@ -274,6 +278,19 @@ mod tests {
         assert!(!proves(
             r#"
             unsafe fn malloc(n: usize) -> *mut core::ffi::c_void { n as *mut core::ffi::c_void }
+            pub unsafe fn target(input: *const i8) -> *mut i8 { malloc(8) as *mut i8 }
+        "#
+        ));
+    }
+
+    #[test]
+    fn wave6s_linked_nonallocator_is_not_a_fresh_contract() {
+        assert!(!proves(
+            r#"
+            unsafe extern "C" {
+                #[link_name = "lookup_existing_storage"]
+                fn malloc(n: usize) -> *mut core::ffi::c_void;
+            }
             pub unsafe fn target(input: *const i8) -> *mut i8 { malloc(8) as *mut i8 }
         "#
         ));

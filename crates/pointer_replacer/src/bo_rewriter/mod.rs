@@ -5376,8 +5376,10 @@ fn seal_terminal_outbound_calls(
                     } else if decision::raw_boundary::is_shared_safe_source(effective_source)
                         && endpoint.callee_may_yield_pointer
                         && endpoint.ownership.is_none()
-                        && !(matches!(effective_source, decision::Decision::Slice { .. })
-                            && endpoint.return_independent.is_some())
+                        && !(matches!(
+                            decision::seam::form_of(effective_source),
+                            decision::seam::Form::Slice { .. }
+                        ) && endpoint.return_independent.is_some())
                         && decision::raw_boundary::returned_child_permission(
                             effective_source,
                             child_access,

@@ -4206,10 +4206,13 @@ impl RawBoundaryDispositionIndex {
                         &site.source_type,
                         &site.target,
                     );
-                    let independent_return = (matches!(decision, super::Decision::Slice { .. })
-                        && matches!(retention_verdict, RetentionVerdict::NoRetain { .. }))
-                    .then(|| site_facts.forward_return_independent.get(&site.key))
-                    .flatten();
+                    let independent_return =
+                        (matches!(
+                            super::seam::form_of(decision),
+                            super::seam::Form::Slice { .. }
+                        ) && matches!(retention_verdict, RetentionVerdict::NoRetain { .. }))
+                        .then(|| site_facts.forward_return_independent.get(&site.key))
+                        .flatten();
                     if let Some(proof) = independent_return {
                         evidence.push_str(&format!(";{proof}"));
                         out.return_independent

@@ -9,7 +9,7 @@ use rustc_span::Span;
 use super::{
     ast_transform::{Composition, RevertSet, graft_expr},
     bridge_receipt::SignatureClassId,
-    decision::{Decision, DecisionTable},
+    decision::DecisionTable,
 };
 
 /// Wrap the already selected argument subtree, preserving its exact source
@@ -70,7 +70,10 @@ pub(super) fn apply(
             || !reverts.keeps_subject(owner, binding)
             || !table.entries.iter().any(|(subject, decision)| {
                 (subject.fn_did, subject.hir_id) == parameter.node
-                    && matches!(decision, Decision::Slice { .. })
+                    && matches!(
+                        super::decision::seam::form_of(decision),
+                        super::decision::seam::Form::Slice { .. }
+                    )
             })
         {
             continue;
