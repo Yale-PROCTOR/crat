@@ -168,6 +168,23 @@ pub(crate) fn emitted_type(
         }
         Decision::Slice { mutable, .. } => (*mutable, true, false),
         Decision::Opt { mutable, slice, .. } => (*mutable, *slice, true),
+        Decision::NestedSlice {
+            mutable,
+            inner_mutable,
+            ..
+        } => {
+            let element = pointee
+                .strip_prefix("*const ")
+                .or_else(|| pointee.strip_prefix("*mut "))?;
+            let lifetime = lifetime.map_or_else(String::new, |name| {
+                format!("'{} ", name.trim_start_matches('\''))
+            });
+            return Some(format!(
+                "&{lifetime}{}[&{}[{element}]]",
+                if *mutable { "mut " } else { "" },
+                if *inner_mutable { "mut " } else { "" },
+            ));
+        }
         Decision::Cursor { mutable, .. } => {
             let lifetime = lifetime.map_or_else(String::new, |name| {
                 format!("'{} ", name.trim_start_matches('\''))

@@ -40,6 +40,17 @@ fn safe_destination_form(decision: &Decision) -> Option<&'static str> {
             (true, super::box_facts::BoxShape::Sized) => "opt-box",
             (true, super::box_facts::BoxShape::Slice) => "opt-box-slice",
         }),
+        Decision::NestedSlice {
+            mutable,
+            inner_mutable,
+            ..
+        } => Some(
+            Form::NestedSlice {
+                mutable: *mutable,
+                inner_mutable: *inner_mutable,
+            }
+            .key(),
+        ),
         Decision::Cursor { mutable, .. } => Some(Form::Cursor { mutable: *mutable }.key()),
         Decision::Degraded(_) => None,
     }
@@ -95,7 +106,7 @@ fn same_form_copy(
         Form::Opt { mutable: true, .. } if subject.mut_binding || binding_will_be_mutable => {
             format!("{name}.as_deref_mut()")
         }
-        Form::Cursor { .. } => return None,
+        Form::NestedSlice { .. } | Form::Cursor { .. } => return None,
         Form::Raw | Form::Ref { .. } | Form::Opt { mutable: true, .. } => return None,
     };
     Some((
@@ -130,7 +141,8 @@ fn cursor_incoming_initializer(
     {
         Some(Decision::Cursor { mutable, plan }) => (mutable, plan),
         Some(
-            Decision::Ref { .. }
+            Decision::NestedSlice { .. }
+            | Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
@@ -241,6 +253,7 @@ pub(crate) fn receipt_plans(
             | Decision::InferredRef { .. }
             | Decision::Opt { slice: false, .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. } => continue,
             Decision::Degraded(record) => match record.reason {
                 super::DegradeReason::SliceCursorUse => {
@@ -354,6 +367,7 @@ pub(crate) fn receipt_plans(
                                         | Decision::Slice { .. }
                                         | Decision::Opt { .. }
                                         | Decision::Box(_)
+                                        | Decision::NestedSlice { .. }
                                         | Decision::Cursor { .. } => true,
                                         Decision::Degraded(_) => false,
                                     },
@@ -542,7 +556,8 @@ pub(crate) fn receipt_plans(
                         "optional-slice-const-view"
                     }
                     Form::Slice { .. } => "slice-as-ptr",
-                    Form::Cursor { .. }
+                    Form::NestedSlice { .. }
+                    | Form::Cursor { .. }
                     | Form::Raw
                     | Form::Ref { .. }
                     | Form::Opt { slice: false, .. } => {
@@ -660,7 +675,7 @@ pub(crate) fn receipt_plans(
                         Form::Ref { mutable }
                         | Form::Slice { mutable }
                         | Form::Opt { mutable, .. } => mutable,
-                        Form::Cursor { .. } => false,
+                        Form::NestedSlice { .. } | Form::Cursor { .. } => false,
                         Form::Raw => false,
                     };
                     let read_only = !mut_facts.is_defaulted(subject.fn_did, subject.local)
@@ -693,7 +708,7 @@ pub(crate) fn receipt_plans(
                                 (read_only && target.mutability == raw_boundary::RawMutability::Mut).then(|| match source {
                                     Form::Slice { .. } => format!("{name}.as_ptr().cast_mut()"),
                                     Form::Opt { slice: true, .. } => format!("{name}.as_deref().map_or(core::ptr::null_mut::<{}>(), |slice| slice.as_ptr().cast_mut())", target.pointee),
-                                    Form::Cursor { .. } | Form::Raw | Form::Ref { .. } | Form::Opt { slice: false, .. } => unreachable!("slice source selected above"),
+                                    Form::NestedSlice { .. } | Form::Cursor { .. } | Form::Raw | Form::Ref { .. } | Form::Opt { slice: false, .. } => unreachable!("slice source selected above"),
                                 })
                             });
                         if let Some(replacement) = replacement {
@@ -825,6 +840,7 @@ pub(crate) fn receipt_plans(
             | Decision::InferredRef { .. }
             | Decision::Opt { slice: false, .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => unreachable!("body view source remains slice"),
         }

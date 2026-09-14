@@ -465,7 +465,7 @@ pub(crate) fn plan(
                 let view = spec.render(&temporary).ok_or_else(|| (
                     OutboundExpressionFailure::Template(RawBoundaryBlockReason::TemplateUnavailable), Some(evidence.clone())))?;
                 let mutable_temporary = match interface.form {
-                    Form::Cursor { .. } => return Err((OutboundExpressionFailure::Template(RawBoundaryBlockReason::TemplateUnavailable), Some(evidence))),
+                    Form::NestedSlice { .. } | Form::Cursor { .. } => return Err((OutboundExpressionFailure::Template(RawBoundaryBlockReason::TemplateUnavailable), Some(evidence))),
                     Form::Opt { mutable, .. } => mutable,
                     Form::Raw | Form::Ref { .. } | Form::Slice { .. } => child_binding_required,
                 };

@@ -297,7 +297,7 @@ pub(crate) fn plan_returned_value(
         ));
     };
     let mutable_temporary = match site.source_interface.form {
-        super::seam::Form::Cursor { .. } => {
+        super::seam::Form::NestedSlice { .. } | super::seam::Form::Cursor { .. } => {
             return Err((
                 ReceiverInputFailure::Template(RawBoundaryBlockReason::TemplateUnavailable),
                 Some(evidence),

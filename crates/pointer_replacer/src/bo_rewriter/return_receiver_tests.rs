@@ -144,7 +144,7 @@ fn check(family: Family) {
             (Family::Nullable, Decision::Opt { mutable: true, slice: false, uses })
             | (Family::Slice, Decision::Slice { mutable: true, uses }) => uses,
             (_, Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Slice { .. }
-                | Decision::Opt { .. } | Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_)) =>
+                | Decision::Opt { .. } | Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::Degraded(_)) =>
                 panic!("receiver must consume the full borrowed return family: {family:?}; {decision:#?}"),
         };
         assert!(!uses.is_empty(), "consumed receiver uses require their family-specific rewrites");

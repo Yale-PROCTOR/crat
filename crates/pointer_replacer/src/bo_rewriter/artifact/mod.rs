@@ -77,7 +77,7 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                     },
                     None,
                 ),
-                Decision::Slice { mutable, .. } => (
+                Decision::NestedSlice { mutable, .. } | Decision::Slice { mutable, .. } => (
                     if *mutable {
                         Outcome::SliceMut
                     } else {
@@ -226,6 +226,7 @@ mod tests {
             slice_constructions: Vec::new(),
             retired_slice_constructions: Vec::new(),
             slice_use_receipts: Vec::new(),
+            nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             option_receipts: Vec::new(),
             option_value_initializers: Vec::new(),

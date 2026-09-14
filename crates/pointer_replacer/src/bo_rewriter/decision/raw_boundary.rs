@@ -343,7 +343,7 @@ pub(crate) fn pair_raw_view_expression(
             }
             _ => raw_passthrough(),
         },
-        Some(Decision::Box(_) | Decision::Cursor { .. }) => None,
+        Some(Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. }) => None,
     }
 }
 
@@ -2154,6 +2154,7 @@ pub(crate) fn returned_child_template(
         | super::Decision::Slice { mutable: false, .. }
         | super::Decision::Opt { mutable: false, .. }
         | super::Decision::Box(_)
+        | super::Decision::NestedSlice { .. }
         | super::Decision::Cursor { .. } => {
             return Err(RawBoundaryBlockReason::ReturnedChildPermission);
         }
@@ -2209,9 +2210,10 @@ pub(crate) fn outbound_reference_view(
             "addr-of-mut" | "addr-of-mut-cast" => Some(super::Decision::Ref { mutable: true }),
             _ => None,
         },
-        super::Decision::Box(_) | super::Decision::Cursor { .. } | super::Decision::Degraded(_) => {
-            None
-        }
+        super::Decision::Box(_)
+        | super::Decision::NestedSlice { .. }
+        | super::Decision::Cursor { .. }
+        | super::Decision::Degraded(_) => None,
     }
 }
 
@@ -2226,7 +2228,9 @@ pub(crate) fn returned_child_permission(
         | super::Decision::InferredRef { mutable, .. }
         | super::Decision::Slice { mutable, .. }
         | super::Decision::Opt { mutable, .. } => !*mutable,
-        super::Decision::Cursor { .. } => return Err(ReturnedChildPermissionFailure::Unknown),
+        super::Decision::NestedSlice { .. } | super::Decision::Cursor { .. } => {
+            return Err(ReturnedChildPermissionFailure::Unknown);
+        }
         super::Decision::Box(_) | super::Decision::Degraded(_) => false,
     };
     if !shared {
@@ -2362,6 +2366,7 @@ fn box_site_owner(
         | super::Decision::InferredRef { .. }
         | super::Decision::Slice { .. }
         | super::Decision::Opt { .. }
+        | super::Decision::NestedSlice { .. }
         | super::Decision::Cursor { .. }
         | super::Decision::Degraded(_) => return None,
     };
@@ -2416,6 +2421,7 @@ pub(crate) fn template_for(
             Decision::Opt { slice: true, .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => Err(RawBoundaryBlockReason::TemplateUnavailable),
         };
@@ -2473,6 +2479,7 @@ pub(crate) fn template_for(
             Decision::Slice { mutable: false, .. } => Err(RawBoundaryBlockReason::SharedToMut),
             Decision::Opt { .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => Err(RawBoundaryBlockReason::TemplateUnavailable),
         };
@@ -2526,6 +2533,7 @@ pub(crate) fn template_for(
                 Err(RawBoundaryBlockReason::TemplateUnavailable)
             }
         }
+        Decision::NestedSlice { .. } => Err(RawBoundaryBlockReason::TemplateUnavailable),
         Decision::Cursor { mutable, .. } => {
             if ownership == Some(OwnershipContract::Consume) {
                 return Err(RawBoundaryBlockReason::OwnershipTransfer);
@@ -2546,6 +2554,7 @@ fn cursor_retention_permit(
     verdict: &RetentionVerdict,
 ) -> Result<(), RawBoundaryBlockReason> {
     let cursor = match decision {
+        super::Decision::NestedSlice { .. } => false,
         super::Decision::Cursor { .. } => true,
         super::Decision::Ref { .. }
         | super::Decision::InferredRef { .. }
@@ -2681,6 +2690,7 @@ impl RawBoundaryDispositionIndex {
                         | super::Decision::Slice { .. }
                         | super::Decision::Opt { .. }
                         | super::Decision::Box(_)
+                        | super::Decision::NestedSlice { .. }
                         | super::Decision::Cursor { .. } => false,
                     };
                     if source_stays_raw
@@ -3041,6 +3051,7 @@ impl RawBoundaryDispositionIndex {
                     | super::Decision::InferredRef { .. }
                     | super::Decision::Slice { .. }
                     | super::Decision::Opt { .. }
+                    | super::Decision::NestedSlice { .. }
                     | super::Decision::Cursor { .. }
                     | super::Decision::Degraded(_) => false,
                 });
@@ -3060,6 +3071,7 @@ impl RawBoundaryDispositionIndex {
                                 | super::Decision::Slice { .. }
                                 | super::Decision::Opt { .. }
                                 | super::Decision::Box(_)
+                                | super::Decision::NestedSlice { .. }
                                 | super::Decision::Cursor { .. } => false,
                             })
                     })

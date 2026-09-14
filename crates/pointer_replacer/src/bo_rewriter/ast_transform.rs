@@ -43,6 +43,9 @@ use super::decision::seam::{Form, SeamLen};
 /// enum names *what to build*, not *why*.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DeclForm {
+    NestedSlice {
+        inner_mutable: bool,
+    },
     /// A full borrowed base and an administrative index, `(&[T], usize)`.
     Cursor,
     /// `&T` / `&mut T` — arm 1.
@@ -50,7 +53,9 @@ pub(crate) enum DeclForm {
     /// `&[T]` / `&mut [T]`.
     Slice,
     /// `Option<&T>` and its three twins; `slice` selects the fat one.
-    Opt { slice: bool },
+    Opt {
+        slice: bool,
+    },
     /// `Box<T>` / `Box<[T]>`, optionally wrapped for nullable ownership.
     Box {
         slice: bool,
@@ -121,6 +126,23 @@ fn decl_ty_kind_with_lifetime(
     mut pointee: P<Ty>,
     lifetime: Option<&str>,
 ) -> TyKind {
+    if let DeclForm::NestedSlice { inner_mutable } = form {
+        let TyKind::Ptr(inner) = &pointee.kind else {
+            unreachable!("native nested plan requires a raw pointer element");
+        };
+        let inner = P(Ty {
+            id: DUMMY_NODE_ID,
+            kind: decl_ty_kind_with_lifetime(
+                DeclForm::Slice,
+                inner_mutable,
+                inner.ty.clone(),
+                None,
+            ),
+            span: DUMMY_SP,
+            tokens: None,
+        });
+        return decl_ty_kind_with_lifetime(DeclForm::Slice, mutable, inner, lifetime);
+    }
     if let DeclForm::Box {
         pointee_override: Some(override_kind),
         ..
@@ -139,7 +161,8 @@ fn decl_ty_kind_with_lifetime(
         DeclForm::Ref | DeclForm::Opt { slice: false } | DeclForm::Box { slice: false, .. } => {
             pointee
         }
-        DeclForm::Slice
+        DeclForm::NestedSlice { .. }
+        | DeclForm::Slice
         | DeclForm::Cursor
         | DeclForm::Opt { slice: true }
         | DeclForm::Box { slice: true, .. } => P(Ty {
@@ -167,7 +190,7 @@ fn decl_ty_kind_with_lifetime(
                 "::core::primitive::usize".to_owned(),
             )),
         ])),
-        DeclForm::Ref | DeclForm::Slice | DeclForm::Opt { .. } => {
+        DeclForm::Ref | DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Opt { .. } => {
             let reference = TyKind::Ref(
                 lifetime.map(ast_lifetime),
                 MutTy {
@@ -176,7 +199,7 @@ fn decl_ty_kind_with_lifetime(
                 },
             );
             match form {
-                DeclForm::Ref | DeclForm::Slice => reference,
+                DeclForm::Ref | DeclForm::NestedSlice { .. } | DeclForm::Slice => reference,
                 DeclForm::Opt { .. } => option_of(P(Ty {
                     id: DUMMY_NODE_ID,
                     kind: reference,
@@ -289,7 +312,9 @@ impl LifetimeSignatureVisitor<'_> {
             let shape = match interface.form {
                 Form::Slice { mutable } => Some((DeclForm::Slice, mutable)),
                 Form::Opt { mutable, slice } => Some((DeclForm::Opt { slice }, mutable)),
-                Form::Raw | Form::Ref { .. } | Form::Cursor { .. } => None,
+                Form::Raw | Form::Ref { .. } | Form::Cursor { .. } | Form::NestedSlice { .. } => {
+                    None
+                }
             };
             if let Some((form, mutable)) = shape {
                 let TyKind::Ptr(inner) = &ty.kind else { return false };
@@ -1041,7 +1066,7 @@ impl RefDeclVisitor<'_> {
         let claimant = match form {
             DeclForm::Cursor => "decl:cursor",
             DeclForm::Ref => "decl:ref",
-            DeclForm::Slice => "decl:slice",
+            DeclForm::NestedSlice { .. } | DeclForm::Slice => "decl:slice",
             DeclForm::Opt { .. } => "decl:opt",
             DeclForm::Box { .. } => "decl:box",
         };
@@ -1063,7 +1088,7 @@ impl RefDeclVisitor<'_> {
                 self.stats.rewritten += 1;
                 self.stats.rendered.push(render);
             }
-            DeclForm::Slice | DeclForm::Cursor => {
+            DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Cursor => {
                 self.stats.slice_rewritten += 1;
                 self.stats.rendered_arm2.push(render);
             }
@@ -3099,6 +3124,7 @@ fn apply_surface_plans_to_items(
     surface_names: &FxHashMap<Symbol, Symbol>,
     return_temp_types: &FxHashMap<LocalDefId, String>,
     surface_arguments: &FxHashMap<LocalDefId, std::collections::BTreeMap<usize, String>>,
+    nested: &FxHashMap<LocalDefId, &super::decision::nested_slice::Plan>,
     reverted: &FxHashSet<LocalDefId>,
     guard: &mut Composition,
 ) -> Result<(), String> {
@@ -3122,6 +3148,7 @@ fn apply_surface_plans_to_items(
                 surface_names,
                 return_temp_types,
                 surface_arguments,
+                nested,
                 reverted,
                 guard,
             )?;
@@ -3175,6 +3202,14 @@ fn apply_surface_plans_to_items(
             return_temp_types.get(&did).map(String::as_str),
             Some(surface_arguments.get(&did).unwrap_or(&no_arguments)),
         )?);
+        if let Some(nested) = nested.get(&did) {
+            let expression = ::utils::ast::parse_expr(format!("{{ {} }}", nested.prefix()));
+            let rustc_ast::ExprKind::Block(mut block, _) = expression.kind else { unreachable!() };
+            block
+                .stmts
+                .extend(outer_fn.body.as_ref().unwrap().stmts.iter().cloned());
+            outer_fn.body = Some(block);
+        }
         inner_fn.ident = Ident::new(Symbol::intern(&inner_name), inner_fn.ident.span);
         item.attrs
             .retain(|attr| !attr.has_name(sym::no_mangle) && !attr.has_name(sym::export_name));
@@ -3215,6 +3250,30 @@ fn apply_surface_plans(
         .filter(|site| site.category == "return-temp")
         .map(|site| (site.owner_class.local_def_id(), site.emitted_type.clone()))
         .collect::<FxHashMap<_, _>>();
+    let nested = table
+        .nested_receipts
+        .iter()
+        .filter_map(|receipt| {
+            let plan = receipt.result.as_ref().ok()?;
+            (!reverts.fns.contains(&plan.owner)
+                && plan
+                    .required_nodes()
+                    .all(|h| reverts.keeps_subject(plan.owner, h))
+                && plan.parameters.iter().all(|p| {
+                    table
+                        .seams
+                        .surface_arguments
+                        .iter()
+                        .filter(|a| {
+                            a.node == (plan.owner, p.hir)
+                                && reverts.keeps_edit(a.owner_class, &a.atom_ids)
+                        })
+                        .count()
+                        == 1
+                }))
+            .then_some((plan.owner, plan))
+        })
+        .collect::<FxHashMap<_, _>>();
     let mut surface_arguments =
         FxHashMap::<LocalDefId, std::collections::BTreeMap<usize, String>>::default();
     for argument in &table.seams.surface_arguments {
@@ -3227,10 +3286,17 @@ fn apply_surface_plans(
             .bridge
             .unsafe_context
             .is_some_and(|context| context.unsafe_fn);
-        let expression = argument
-            .spec
-            .render_in_context(&argument.parameter_name, unsafe_fn)
-            .ok_or("surface-argument-render-unavailable")?;
+        let expression = if matches!(argument.form, Form::NestedSlice { .. }) {
+            nested
+                .get(&argument.node.0)
+                .and_then(|plan| plan.argument(argument.parameter_index))
+                .ok_or("nested-surface-argument-withdrawn")?
+        } else {
+            argument
+                .spec
+                .render_in_context(&argument.parameter_name, unsafe_fn)
+                .ok_or("surface-argument-render-unavailable")?
+        };
         let prior = surface_arguments
             .entry(argument.owner_class.local_def_id())
             .or_default()
@@ -3247,6 +3313,7 @@ fn apply_surface_plans(
         &surface_names,
         &return_temp_types,
         &surface_arguments,
+        &nested,
         &reverts.fns,
         guard,
     )?;
@@ -3457,6 +3524,17 @@ fn transform_with<'tcx>(
             // Its direct callee's rewritten return type supplies the inferred
             // local type. No declaration splice exists or is synthesized.
             super::decision::Decision::InferredRef { .. } => continue,
+            super::decision::Decision::NestedSlice {
+                mutable,
+                inner_mutable,
+                uses,
+            } => (
+                DeclForm::NestedSlice {
+                    inner_mutable: *inner_mutable,
+                },
+                *mutable,
+                Some(uses),
+            ),
             super::decision::Decision::Slice { mutable, uses } => {
                 (DeclForm::Slice, *mutable, Some(uses))
             }
@@ -4714,7 +4792,8 @@ pub(crate) fn filtered_inputs(
             super::decision::Decision::Cursor { plan, .. } => Some(&plan.uses),
             super::decision::Decision::Ref { .. }
             | super::decision::Decision::InferredRef { .. } => None,
-            super::decision::Decision::Slice { uses, .. } => Some(uses),
+            super::decision::Decision::NestedSlice { uses, .. }
+            | super::decision::Decision::Slice { uses, .. } => Some(uses),
             super::decision::Decision::Opt { uses, .. } => Some(uses),
             super::decision::Decision::Box(_) => None,
             super::decision::Decision::Degraded(_) => continue,
@@ -4799,6 +4878,7 @@ pub(crate) fn filtered_inputs(
             super::decision::Decision::Cursor { .. } => continue,
             super::decision::Decision::Ref { .. }
             | super::decision::Decision::InferredRef { .. }
+            | super::decision::Decision::NestedSlice { .. }
             | super::decision::Decision::Slice { .. }
             | super::decision::Decision::Box(_)
             | super::decision::Decision::Degraded(_) => continue,
@@ -5129,6 +5209,33 @@ fn resolve_reverts(
 /// Production verify-loop adapter. Class ownership arrives as a typed
 /// `LocalDefId` wrapper, so this path performs no rendered-name scan or
 /// resolution. Atom IDs remain checked against the carried decision table.
+/// Close the new nested transaction in the shared revert input. The same
+/// owner closure is then consumed by both text planning and structural AST.
+pub(crate) fn close_nested_reverts(
+    table: &super::decision::DecisionTable,
+    reverts: &mut RevertSet,
+) {
+    for receipt in &table.nested_receipts {
+        let Ok(plan) = &receipt.result else { continue };
+        if !plan
+            .required_nodes()
+            .all(|h| reverts.keeps_subject(plan.owner, h))
+            || plan.parameters.iter().any(|p| {
+                let arguments = table
+                    .seams
+                    .surface_arguments
+                    .iter()
+                    .filter(|a| a.node == (plan.owner, p.hir))
+                    .collect::<Vec<_>>();
+                arguments.len() != 1
+                    || !reverts.keeps_edit(arguments[0].owner_class, &arguments[0].atom_ids)
+            })
+        {
+            reverts.fns.insert(plan.owner);
+        }
+    }
+}
+
 pub(crate) fn revert_set_from_classes_and_atoms(
     classes: &std::collections::BTreeSet<super::bridge_receipt::SignatureClassId>,
     atoms: &std::collections::BTreeSet<String>,
@@ -5168,6 +5275,7 @@ pub(crate) fn revert_set_from_classes_and_atoms(
         ));
     }
     out.atom_names.extend(atoms.iter().cloned());
+    close_nested_reverts(table, &mut out);
     Ok(out)
 }
 
@@ -7270,7 +7378,7 @@ mod arm2_witnesses {
                         stats.rewritten += 1;
                         stats.rendered.push(render);
                     }
-                    DeclForm::Slice | DeclForm::Cursor => {
+                    DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Cursor => {
                         stats.slice_rewritten += 1;
                         stats.rendered_arm2.push(render);
                     }

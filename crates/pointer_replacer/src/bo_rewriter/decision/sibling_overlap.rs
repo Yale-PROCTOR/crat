@@ -929,7 +929,7 @@ pub(crate) fn select_pending(
 
 fn pending_site_eligible(potential: &SiblingPotential, state: TerminalSiteState) -> bool {
     let borrowed_source = match state.source_form {
-        Form::Cursor { .. } => false,
+        Form::NestedSlice { .. } | Form::Cursor { .. } => false,
         Form::Raw => false,
         Form::Ref { .. } | Form::Slice { .. } | Form::Opt { .. } => true,
     };

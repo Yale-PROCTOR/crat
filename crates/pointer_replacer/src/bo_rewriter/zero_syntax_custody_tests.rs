@@ -66,7 +66,7 @@ fn fixture(readonly: bool) -> (Plan, SeamEdit, FileKey, usize, usize) {
         let shared = match decision {
             Decision::Ref { mutable } | Decision::InferredRef { mutable, .. }
             | Decision::Slice { mutable, .. } | Decision::Opt { mutable, .. } => !*mutable,
-            Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_) => false,
+            Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::Degraded(_) => false,
         };
         assert!(shared, "actual shared source required: {decision:?}");
         let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans).unwrap();

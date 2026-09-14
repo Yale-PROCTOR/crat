@@ -947,6 +947,7 @@ fn option_receipt_requires_changed_form(
             Decision::Cursor { .. }
             | Decision::Ref { .. }
             | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
             | Decision::Degraded(_) => false,
@@ -1033,6 +1034,7 @@ pub(crate) fn finalize_signature_classes(
             Decision::Cursor { .. }
             | Decision::Ref { .. }
             | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_) => (true, None),
@@ -1157,6 +1159,7 @@ pub(crate) fn finalize_signature_classes(
             )),
             Decision::Cursor { .. }
             | Decision::Ref { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_)
@@ -2700,6 +2703,7 @@ fn declaration_receipts(
                 Decision::Cursor { .. }
                 | Decision::Ref { .. }
                 | Decision::InferredRef { .. }
+                | Decision::NestedSlice { .. }
                 | Decision::Slice { .. }
                 | Decision::Opt { .. }
                 | Decision::Box(_) => match emitted {
@@ -3540,6 +3544,7 @@ pub(crate) fn plan(
             ),
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
             | Decision::Degraded(_) => continue,
@@ -3841,10 +3846,21 @@ pub(crate) fn plan(
         // `Unplaceable` record — measured with a variant probe before the
         // repair: the build named only `artifact::rows` and `degradations()`.
         // A `match` makes the next disposition a compile error at this site.
+        let nested_slice = match decision {
+            Decision::NestedSlice { .. } => true,
+            Decision::Cursor { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => false,
+        };
         let cursor_plan = match decision {
             Decision::Cursor { plan, .. } => Some(plan),
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_)
@@ -3874,7 +3890,9 @@ pub(crate) fn plan(
             // declaration span to edit; the signature owner is planned by E2.
             Decision::InferredRef { .. } => continue,
             // S3.2′-2: the first disposition that is not declaration-only.
-            Decision::Slice { mutable, uses } => (mutable, Some(uses), false, true, None),
+            Decision::NestedSlice { mutable, uses, .. } | Decision::Slice { mutable, uses } => {
+                (mutable, Some(uses), false, true, None)
+            }
             // S3.2′-3: an optional form, thin or fat. Its uses travel the same
             // channel — declaration and uses move together or not at all, which
             // `use_failure` below enforces for every form that has uses.
@@ -4109,7 +4127,10 @@ pub(crate) fn plan(
                 .and_then(|plan| plan.pointee_override)
                 .map(super::decision::box_facts::BoxPointeeOverride::source_name)
                 .unwrap_or(source_pointee);
-            let base = if cursor_plan.is_some() {
+            let base = if nested_slice {
+                super::decision::declaration::emitted_type(decision, pointee, None)
+                    .expect("nested admission has a raw pointer element")
+            } else if cursor_plan.is_some() {
                 let mutability = if *mutable { "mut " } else { "" };
                 format!("(&{mutability}[{pointee}], ::core::primitive::usize)")
             } else if box_plan.is_some() {
@@ -5164,6 +5185,7 @@ mod tests {
     #[test]
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
+            nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
@@ -5233,6 +5255,7 @@ mod tests {
     #[test]
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
+            nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),

@@ -84,7 +84,10 @@ pub(crate) fn plan(
                     mutable: *mutable,
                     slice: *slice,
                 },
-                Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_) => continue,
+                Decision::Box(_)
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. }
+                | Decision::Degraded(_) => continue,
             };
             let node = (subject.fn_did, subject.hir_id);
             let built = (|| -> Result<SurfaceArgumentPlan, &'static str> {
@@ -103,6 +106,7 @@ pub(crate) fn plan(
                     Form::Ref { mutable } | Form::Slice { mutable } | Form::Opt { mutable, .. } => {
                         mutable
                     }
+                    Form::NestedSlice { .. } => return Err("surface-argument-nested-unbuilt"),
                     Form::Cursor { .. } => return Err("surface-argument-cursor-unbuilt"),
                     Form::Raw => {
                         unreachable!("only admitted borrowed parameters reach the constructor")

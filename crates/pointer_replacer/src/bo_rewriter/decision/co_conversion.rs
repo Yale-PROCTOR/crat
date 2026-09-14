@@ -212,6 +212,7 @@ pub(crate) enum EdgeForm {
     Raw,
     Ref,
     Slice,
+    NestedSlice,
     Cursor,
     Optional,
     Box,
@@ -222,6 +223,7 @@ impl EdgeForm {
         match decision {
             Decision::Ref { .. } | Decision::InferredRef { .. } => Self::Ref,
             Decision::Slice { .. } => Self::Slice,
+            Decision::NestedSlice { .. } => Self::NestedSlice,
             Decision::Cursor { .. } => Self::Cursor,
             Decision::Opt { .. } => Self::Optional,
             Decision::Box(_) => Self::Box,
@@ -234,6 +236,7 @@ impl EdgeForm {
             Self::Raw => "raw",
             Self::Ref => "ref",
             Self::Slice => "slice",
+            Self::NestedSlice => "nested-slice",
             Self::Cursor => "cursor",
             Self::Optional => "optional",
             Self::Box => "box",
@@ -787,6 +790,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => continue,
         };
@@ -805,6 +809,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => None,
         })
@@ -1470,6 +1475,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             let source_form = settled(edge.source, edge.source_form);
             let target_form = settled(edge.target, edge.target_form);
             let route = match (source_form, target_form) {
+                (EdgeForm::NestedSlice, _) | (_, EdgeForm::NestedSlice) => EdgeRoute::Glue,
                 (EdgeForm::Cursor, _) | (_, EdgeForm::Cursor) => EdgeRoute::Glue,
                 (left, right) if left == right => EdgeRoute::ZeroSyntax,
                 (EdgeForm::Raw, _) => EdgeRoute::ArmC,

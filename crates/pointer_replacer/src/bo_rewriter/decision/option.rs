@@ -53,6 +53,7 @@ fn source_form(
             mutable: *mutable,
             slice: *slice,
         }),
+        Some(Decision::NestedSlice { .. }) => Err("nested-interface-unbuilt"),
         Some(Decision::Cursor { .. }) => Err("cursor-interface-unbuilt"),
         Some(Decision::Box(plan)) => Err(if plan.optional { "opt-box" } else { "box" }),
         Some(Decision::Degraded(_)) | None => Ok(seam::Form::Raw),
@@ -98,6 +99,7 @@ pub(crate) fn inherit_wrapped_payloads(
                     | Decision::Slice { .. }
                     | Decision::Opt { slice: true, .. }
                     | Decision::Box(_)
+                    | Decision::NestedSlice { .. }
                     | Decision::Cursor { .. }
                     | Decision::Degraded(_) => false,
                 }
@@ -128,7 +130,7 @@ pub(crate) fn inherit_wrapped_payloads(
             let mutable = match decision {
                 Decision::Opt { mutable, slice: false, .. } => *mutable,
                 Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Slice { .. }
-                | Decision::Opt { slice: true, .. } | Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_) => return None,
+                | Decision::Opt { slice: true, .. } | Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::Degraded(_) => return None,
             };
             let name = subject.param_name.clone()?;
             let node = (subject.fn_did, subject.hir_id);
@@ -152,7 +154,7 @@ pub(crate) fn inherit_wrapped_payloads(
                     Some(Decision::Slice { mutable: source_mutable, .. }
                         | Decision::Opt { mutable: source_mutable, slice: true, .. }) => !mutable || *source_mutable,
                     Some(Decision::Ref { .. } | Decision::InferredRef { .. }
-                        | Decision::Opt { slice: false, .. } | Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_))
+                        | Decision::Opt { slice: false, .. } | Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::Degraded(_))
                         | None => false,
                 }
             });
@@ -325,6 +327,7 @@ pub(crate) fn plan_values(
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => continue,
         };
@@ -587,7 +590,7 @@ pub(crate) fn plan_values(
                                 "{text}.{}()",
                                 if mutable { "as_deref_mut" } else { "as_deref" }
                             ),
-                            seam::Form::Cursor { .. } => {
+                            seam::Form::NestedSlice { .. } | seam::Form::Cursor { .. } => {
                                 unreachable!("Option adapter cannot target cursor")
                             }
                             seam::Form::Raw
@@ -659,6 +662,7 @@ pub(crate) fn plan_values(
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => unreachable!("Option value remains optional"),
         }
@@ -737,6 +741,7 @@ pub(crate) fn plan_operations(
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => continue,
         };
@@ -801,6 +806,7 @@ pub(crate) fn plan_operations(
                 let mut reason = None;
                 let mut adapter = "same-form-call".to_owned();
                 let operation = match target {
+                    seam::Form::NestedSlice { .. } => "call-nested-unbuilt",
                     seam::Form::Cursor { .. } => "call-cursor-unbuilt",
                     seam::Form::Raw => "call-raw",
                     seam::Form::Ref { .. } | seam::Form::Slice { .. } => "call-required",
@@ -1148,6 +1154,7 @@ pub(crate) fn plan_operations(
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => continue,
         };
@@ -1215,6 +1222,7 @@ pub(crate) fn plan_operations(
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Box(_)
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => unreachable!("Option body source remains optional"),
         }

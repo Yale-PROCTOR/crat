@@ -101,7 +101,7 @@ fn emit_source(source: &str, family: Family, hold_owner: bool) -> Output {
             Decision::Opt { mutable: true, slice: false, .. } => matches!(family, Family::Nullable),
             Decision::Slice { mutable: true, .. } => matches!(family, Family::Slice),
             Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Opt { .. }
-            | Decision::Slice { .. } | Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_) => false,
+            | Decision::Slice { .. } | Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::Degraded(_) => false,
         }, "AUTHORING PREMISE: actual return family survives exposure: {choice:?}");
         let node = (subject.fn_did, subject.hir_id);
         let permit = ctx.lifetime_eligibility.return_permit(node).expect("actual native return permit");

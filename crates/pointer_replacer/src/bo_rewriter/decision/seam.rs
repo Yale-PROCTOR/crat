@@ -55,6 +55,7 @@ pub(crate) enum Form {
     Raw,
     Ref { mutable: bool },
     Slice { mutable: bool },
+    NestedSlice { mutable: bool, inner_mutable: bool },
     Opt { mutable: bool, slice: bool },
 }
 
@@ -63,6 +64,22 @@ impl Form {
         match self {
             Form::Cursor { mutable: true } => "cursor-mut",
             Form::Cursor { mutable: false } => "cursor-shared",
+            Form::NestedSlice {
+                mutable: false,
+                inner_mutable: false,
+            } => "nested-slice-shared",
+            Form::NestedSlice {
+                mutable: false,
+                inner_mutable: true,
+            } => "nested-slice-shared-mut",
+            Form::NestedSlice {
+                mutable: true,
+                inner_mutable: false,
+            } => "nested-slice-mut-shared",
+            Form::NestedSlice {
+                mutable: true,
+                inner_mutable: true,
+            } => "nested-slice-mut-mut",
             Form::Raw => "raw",
             Form::Ref { mutable: true } => "ref-mut",
             Form::Ref { mutable: false } => "ref-shared",
@@ -94,6 +111,7 @@ impl Form {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SeamBlock {
     CursorBoundaryUnbuilt,
+    NestedBoundaryUnbuilt,
     /// A slice form is expected and the argument is raw: a length is needed and
     /// **none may be invented**. Ruling item 4.
     LengthUnknown,
@@ -133,6 +151,7 @@ pub(crate) enum SeamBlock {
 impl SeamBlock {
     pub(crate) fn key(self) -> &'static str {
         match self {
+            SeamBlock::NestedBoundaryUnbuilt => "nested-boundary-unbuilt",
             SeamBlock::CursorBoundaryUnbuilt => "cursor-boundary-unbuilt",
             SeamBlock::LengthUnknown => "seam-len-unknown",
             SeamBlock::SharedToMut => "seam-shared-to-mut",
@@ -1585,6 +1604,9 @@ fn glue_with_nonempty(
     let shared_to_mut = |want: bool, have: bool| want && !have;
 
     Ok(match (expected, found) {
+        (NestedSlice { .. }, _) | (_, NestedSlice { .. }) => {
+            return Err(SeamBlock::NestedBoundaryUnbuilt);
+        }
         (Cursor { .. }, _) | (_, Cursor { .. }) => return Err(SeamBlock::CursorBoundaryUnbuilt),
         // ---- identities and coercions: no edit ----
         (Ref { mutable: w }, Ref { mutable: h }) => {
@@ -3106,6 +3128,14 @@ pub(crate) fn form_of(decision: &Decision) -> Form {
         Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => {
             Form::Ref { mutable: *mutable }
         }
+        Decision::NestedSlice {
+            mutable,
+            inner_mutable,
+            ..
+        } => Form::NestedSlice {
+            mutable: *mutable,
+            inner_mutable: *inner_mutable,
+        },
         Decision::Slice { mutable, .. } => Form::Slice { mutable: *mutable },
         Decision::Opt { mutable, slice, .. } => Form::Opt {
             mutable: *mutable,
@@ -3244,7 +3274,7 @@ fn build_candidate(
 
 pub(crate) fn decision_for_safe_form(form: Form) -> Option<super::Decision> {
     match form {
-        Form::Cursor { .. } => None,
+        Form::NestedSlice { .. } | Form::Cursor { .. } => None,
         Form::Raw => None,
         Form::Ref { mutable } => Some(super::Decision::Ref { mutable }),
         Form::Slice { mutable } => Some(super::Decision::Slice {
@@ -4710,7 +4740,9 @@ pub(crate) fn synthesize_with_raw_boundary(
             .into_iter()
             .flat_map(|decision| match decision {
                 Decision::Cursor { plan, .. } => plan.uses.as_slice(),
-                Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => uses.as_slice(),
+                Decision::Slice { uses, .. }
+                | Decision::NestedSlice { uses, .. }
+                | Decision::Opt { uses, .. } => uses.as_slice(),
                 Decision::Ref { .. }
                 | Decision::InferredRef { .. }
                 | Decision::Box(_)
@@ -5061,6 +5093,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 mutable: output_mutability == rustc_middle::ty::Mutability::Mut,
             });
         let expected_mutable = match expected {
+            Form::NestedSlice { mutable, .. } => mutable,
             Form::Cursor { mutable } => mutable,
             Form::Ref { mutable } | Form::Slice { mutable } | Form::Opt { mutable, .. } => mutable,
             Form::Raw => false,

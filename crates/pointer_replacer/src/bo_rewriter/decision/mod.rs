@@ -44,6 +44,7 @@ pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod local_callee_extent;
+pub(crate) mod nested_slice;
 pub(crate) mod option;
 pub(crate) mod outbound_expression;
 pub(crate) mod overlapping_pairs;
@@ -878,6 +879,12 @@ pub(crate) enum Decision {
         mutable: bool,
         uses: Vec<emitability::UseEdit>,
     },
+    /// Two independently qualified borrowed slice levels.
+    NestedSlice {
+        mutable: bool,
+        inner_mutable: bool,
+        uses: Vec<emitability::UseEdit>,
+    },
     /// **S3.2′-3 — emit an optional form: `Option<&T>`, `Option<&mut T>`, or
     /// their slice twins.**
     ///
@@ -910,6 +917,7 @@ pub(crate) enum Decision {
 /// The finished, immutable table handed to [`super::plan`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
+    pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
     pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
     pub(crate) declaration_pointees: declaration::DeclarationPointees,
@@ -1006,6 +1014,7 @@ impl DecisionTable {
         self.entries.iter().filter_map(|(_, d)| match d {
             Decision::Degraded(record) => Some(record),
             Decision::Ref { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
@@ -1139,6 +1148,7 @@ pub(crate) fn decide_with_raw_fallbacks(
                 Decision::Ref { .. }
                 | Decision::InferredRef { .. }
                 | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
                 | Decision::Box(_)
                 | Decision::Degraded(_) => false,
             };
@@ -1146,6 +1156,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         })
         .collect();
     DecisionTable {
+        nested_receipts: Vec::new(),
         cursor_receipts,
         sibling_overlap_inventory: Default::default(),
         input_interfaces: ctx.input_interfaces.clone(),
@@ -1266,7 +1277,12 @@ pub(crate) fn plan_depth2_npo_storages(
                         (format!("{source_text}.as_deref_mut()"), false)
                     }
                     Some(Decision::Opt { .. }) => (format!("{source_text}.as_deref()"), false),
-                    Some(Decision::Slice { .. } | Decision::Cursor { .. } | Decision::Box(_)) => {
+                    Some(
+                        Decision::Slice { .. }
+                        | Decision::NestedSlice { .. }
+                        | Decision::Cursor { .. }
+                        | Decision::Box(_),
+                    ) => {
                         continue;
                     }
                     Some(Decision::Degraded(_)) | None => (
@@ -1350,7 +1366,9 @@ pub(crate) fn refuse_nested_use_edits(tcx: TyCtxt<'_>, table: &mut DecisionTable
         let mut edits: Vec<(usize, Span)> = Vec::new();
         for (i, (_, decision)) in table.entries.iter().enumerate() {
             let uses = match decision {
-                Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => uses.as_slice(),
+                Decision::Slice { uses, .. }
+                | Decision::NestedSlice { uses, .. }
+                | Decision::Opt { uses, .. } => uses.as_slice(),
                 Decision::Box(_) => &[],
                 _ => &[],
             };
@@ -1413,7 +1431,9 @@ fn compose_nested_use_edit(
     };
     let uses_of = |decision: &Decision| -> Option<Vec<emitability::UseEdit>> {
         match decision {
-            Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => Some(uses.clone()),
+            Decision::Slice { uses, .. }
+            | Decision::NestedSlice { uses, .. }
+            | Decision::Opt { uses, .. } => Some(uses.clone()),
             _ => None,
         }
     };
@@ -1439,13 +1459,17 @@ fn compose_nested_use_edit(
         .replacement
         .replace(inner_source.as_str(), &inner_edit.replacement);
     match &mut table.entries[outer_entry].1 {
-        Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => {
             uses[outer_position].replacement = composed;
         }
         _ => return false,
     }
     match &mut table.entries[inner_entry].1 {
-        Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => {
             uses.retain(|u| u.span != inner_span);
         }
         _ => return false,
@@ -1532,6 +1556,11 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // compile error here, because a form this veto does not name is a form that
     // escapes it.
     match decision {
+        Decision::NestedSlice { .. } => degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            DegradeReason::ReturnNotAdapted,
+        ),
         Decision::Cursor { .. } => degrade(
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
@@ -1784,7 +1813,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             return degrade(subject, decl_site, DegradeReason::ReturnNotAdapted);
         }
         form = match receiver.receiver_form {
-            seam::Form::Cursor { .. } => {
+            seam::Form::NestedSlice { .. } | seam::Form::Cursor { .. } => {
                 return degrade(subject, decl_site, DegradeReason::ReturnNotAdapted);
             }
             seam::Form::Slice { .. } => Form::Slice,
@@ -2251,6 +2280,7 @@ mod self_consistency_tests {
 
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
+            nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),

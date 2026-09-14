@@ -477,6 +477,7 @@ pub(super) fn plan(
                 | Decision::Slice { .. }
                 | Decision::Opt { .. }
                 | Decision::Box(_)
+                | Decision::NestedSlice { .. }
                 | Decision::Cursor { .. },
             )
             | None => false,

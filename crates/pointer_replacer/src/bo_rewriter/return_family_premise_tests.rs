@@ -18,6 +18,7 @@ fn decision_record(decision: Option<&Decision>) -> serde_json::Value {
         | Decision::Slice { .. }
         | Decision::Opt { .. }
         | Decision::Box(_)
+        | Decision::NestedSlice { .. }
         | Decision::Cursor { .. } => None,
     };
     serde_json::json!({"observed": true, "decision": format!("{decision:?}"),

@@ -277,6 +277,7 @@ pub(crate) fn census(tcx: TyCtxt<'_>) -> Result<(Vec<BridgeRow>, IdemStats), Str
                 | super::decision::Decision::Slice { .. }
                 | super::decision::Decision::Opt { .. }
                 | super::decision::Decision::Box(_)
+                | super::decision::Decision::NestedSlice { .. }
                 | super::decision::Decision::Cursor { .. } => true,
                 super::decision::Decision::Degraded(_) => false,
             },

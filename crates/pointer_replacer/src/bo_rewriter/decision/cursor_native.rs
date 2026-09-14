@@ -134,6 +134,7 @@ pub(crate) fn promote(
                 | Decision::Slice { .. }
                 | Decision::Opt { .. }
                 | Decision::Box(_)
+                | Decision::NestedSlice { .. }
                 | Decision::Cursor { .. } => None,
             };
             proposed.map(|plan| (index, plan))
@@ -273,6 +274,7 @@ pub(crate) fn observe(
         let cursor_reason = match decision {
             Decision::Degraded(d) => is_cursor_reason(&d.reason),
             Decision::Ref { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::InferredRef { .. }
             | Decision::Slice { .. }
@@ -300,14 +302,14 @@ pub(crate) fn observe(
             })).collect::<Vec<_>>()),
             "component": row.as_ref().map(|r| r.component.iter().map(|l| l.index()).collect::<Vec<_>>()),
             "native_outcome": receipts.iter().find(|r| r.owner == subject.fn_did && r.hir_id == subject.hir_id).map(|r| format!("{:?}", r.disposition)),
-            "emission": match decision { Decision::Cursor { .. } => "planned-cursor", Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) | Decision::Degraded(_) => "unchanged" },
+            "emission": match decision { Decision::Cursor { .. } => "planned-cursor", Decision::NestedSlice { .. } | Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) | Decision::Degraded(_) => "unchanged" },
             "delivered_base": match decision {
                 Decision::Cursor { plan, .. } => plan.delivered_base.as_ref().map(|base| serde_json::json!({
                     "binding_hir": base.binding.local_id.as_u32(), "window_hir": base.window_binding.local_id.as_u32(),
                     "initializer_hir": base.initializer.map(|hir| hir.local_id.as_u32()),
                     "provider": format!("{:?}", base.provider), "window": "binding.len()",
                 })),
-                Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Slice { .. }
+                Decision::NestedSlice { .. } | Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Slice { .. }
                 | Decision::Opt { .. } | Decision::Box(_) | Decision::Degraded(_) => None,
             },
             "stage": "candidate-pre-finalization", "source_frame": frame,

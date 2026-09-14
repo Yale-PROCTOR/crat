@@ -6664,6 +6664,7 @@ fn seal_injected_a5_raw_roles(table: &mut super::decision::DecisionTable) {
                 super::decision::Decision::Ref { .. }
                 | super::decision::Decision::InferredRef { .. }
                 | super::decision::Decision::Box(_)
+                | super::decision::Decision::NestedSlice { .. }
                 | super::decision::Decision::Cursor { .. }
                 | super::decision::Decision::Degraded(_) => {}
             }
@@ -10188,6 +10189,7 @@ fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
                 super::decision::Decision::Slice { .. } => "slice",
                 super::decision::Decision::Opt { .. } => "optional",
                 super::decision::Decision::Box(_) => "box",
+                super::decision::Decision::NestedSlice { .. } => "nested-slice",
                 super::decision::Decision::Cursor { .. } => "cursor",
                 super::decision::Decision::Degraded(_) => "degraded",
             };

@@ -433,7 +433,8 @@ fn delivery_form(decision: &decision::Decision) -> Option<DeliveryForm> {
         decision::Decision::Cursor { mutable, .. } => {
             Some(DeliveryForm::Cursor { mutable: *mutable })
         }
-        decision::Decision::Slice { mutable, .. } => Some(DeliveryForm::Borrowed {
+        decision::Decision::NestedSlice { mutable, .. }
+        | decision::Decision::Slice { mutable, .. } => Some(DeliveryForm::Borrowed {
             mutable: *mutable,
             optional: false,
             slice: true,
@@ -1167,6 +1168,7 @@ fn rewrite_core_injected_with_config(
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
                 | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => {}
@@ -4980,6 +4982,7 @@ fn terminal_application(
         decision::Decision::Ref { .. }
         | decision::Decision::InferredRef { .. }
         | decision::Decision::Cursor { .. }
+        | decision::Decision::NestedSlice { .. }
         | decision::Decision::Slice { .. }
         | decision::Decision::Opt { .. }
         | decision::Decision::Box(_) => Some(decision),
@@ -5491,7 +5494,8 @@ fn validate_cursor_delivered_bases(
     for (subject, choice) in &table.entries {
         let cursor = match choice {
             decision::Decision::Cursor { plan, .. } => plan,
-            decision::Decision::Ref { .. }
+            decision::Decision::NestedSlice { .. }
+            | decision::Decision::Ref { .. }
             | decision::Decision::InferredRef { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
@@ -5516,7 +5520,8 @@ fn validate_cursor_delivered_bases(
             (other.fn_did, other.hir_id) == node
                 && match decision {
                     decision::Decision::Degraded(_) => false,
-                    decision::Decision::Ref { .. }
+                    decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Ref { .. }
                     | decision::Decision::InferredRef { .. }
                     | decision::Decision::Slice { .. }
                     | decision::Decision::Opt { .. }
@@ -5620,7 +5625,8 @@ fn validate_cursor_delivered_bases(
                         (candidate.fn_did, candidate.hir_id) == node
                             && match choice {
                                 decision::Decision::Box(actual) => actual == producer,
-                                decision::Decision::Ref { .. }
+                                decision::Decision::NestedSlice { .. }
+                                | decision::Decision::Ref { .. }
                                 | decision::Decision::InferredRef { .. }
                                 | decision::Decision::Slice { .. }
                                 | decision::Decision::Opt { .. }
@@ -6474,6 +6480,7 @@ fn restored_reference_copy_sites(
             decision::Decision::Ref { .. } => true,
             decision::Decision::InferredRef { .. }
             | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_)
@@ -6501,6 +6508,7 @@ fn restored_reference_copy_sites(
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
                 | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => false,
@@ -6540,6 +6548,7 @@ fn finish_decide<'tcx>(
             decision::Decision::Ref { .. }
             | decision::Decision::InferredRef { .. }
             | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_) => true,
@@ -7200,6 +7209,7 @@ fn finish_decide<'tcx>(
                             decision::Decision::Ref { .. }
                             | decision::Decision::InferredRef { .. } => true,
                             decision::Decision::Cursor { .. }
+                            | decision::Decision::NestedSlice { .. }
                             | decision::Decision::Slice { .. }
                             | decision::Decision::Opt { .. }
                             | decision::Decision::Box(_)
@@ -7307,6 +7317,7 @@ fn finish_decide<'tcx>(
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
                 | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => false,
@@ -7439,6 +7450,23 @@ fn finish_decide<'tcx>(
             &rustc_hash::FxHashSet::default(),
             &retained_c9_plans,
         )?;
+        let prepared = if decision::nested_slice::promote(
+            tcx,
+            &mut table,
+            &slots,
+            &model,
+            &prepared.plan.class_finalization,
+            &family_policy,
+        ) {
+            prepare_plan_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &retained_c9_plans,
+            )?
+        } else {
+            prepared
+        };
         let native_inputs = decision::ownership_fields_native::Inputs {
             program: &program,
             slots: &slots,
@@ -7671,6 +7699,7 @@ fn finish_decide<'tcx>(
                 &table.seams.outbound_expressions,
             );
         decision::overlapping_pairs::publish(tcx, &table, &context)?;
+        decision::nested_slice::observe(tcx, &table);
         return Ok((table, context));
     }
 }
@@ -7715,6 +7744,7 @@ fn learn_a5_fallback_roles(
         match current {
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. } => {}
             // Already-raw targets need a materialized call view but no new
@@ -7802,6 +7832,7 @@ fn a5_role_target_hypothesis(
             decision::Decision::Ref { .. }
             | decision::Decision::InferredRef { .. }
             | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. } => {
                 *choice = decision::Decision::Degraded(decision::Degradation {
@@ -8072,7 +8103,8 @@ fn append_surface_declaration_plans(
                     Some(
                         form @ (decision::seam::Form::Opt { .. }
                         | decision::seam::Form::Slice { .. }
-                        | decision::seam::Form::Cursor { .. }),
+                        | decision::seam::Form::Cursor { .. }
+                        | decision::seam::Form::NestedSlice { .. }),
                     ) => form.key(),
                     Some(decision::seam::Form::Ref { .. } | decision::seam::Form::Raw) | None => {
                         "ref"
@@ -8166,6 +8198,7 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
                 decision::Decision::InferredRef { mutable, callee } => (mutable, callee),
                 decision::Decision::Ref { .. }
                 | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_)
@@ -8255,6 +8288,7 @@ fn derive_arm_requirements(
                         decision::Decision::Ref { .. }
                         | decision::Decision::InferredRef { .. }
                         | decision::Decision::Cursor { .. }
+                        | decision::Decision::NestedSlice { .. }
                         | decision::Decision::Slice { .. }
                         | decision::Decision::Opt { .. }
                         | decision::Decision::Box(_) => true,
@@ -8285,7 +8319,8 @@ fn derive_arm_requirements(
                             .uses
                             .iter()
                             .any(|edit| edit.bridge_kind.starts_with("raw-op-")),
-                        decision::Decision::Slice { uses, .. }
+                        decision::Decision::NestedSlice { uses, .. }
+                        | decision::Decision::Slice { uses, .. }
                         | decision::Decision::Opt { uses, .. } => uses
                             .iter()
                             .any(|edit| edit.bridge_kind.starts_with("raw-op-")),
@@ -8383,6 +8418,7 @@ fn arm_outcomes_tsv(
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Cursor { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_) => false,
@@ -8471,6 +8507,7 @@ fn atomic_arm_outcomes_tsv(
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Cursor { .. }
+            | Decision::NestedSlice { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_) => false,
@@ -8549,7 +8586,7 @@ fn raw_boundary_subjects_tsv(
         decision::Decision::Ref { .. } => "ref",
         decision::Decision::InferredRef { .. } => "inferred-ref",
         decision::Decision::Cursor { .. } => "cursor",
-        decision::Decision::Slice { .. } => "slice",
+        decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => "slice",
         decision::Decision::Opt { .. } => "optional",
         decision::Decision::Box(_) => "box",
         decision::Decision::Degraded(_) => "degraded",
@@ -8760,6 +8797,7 @@ fn box_mir_drop_policies(
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
                 | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Degraded(_) => return None,
@@ -8872,6 +8910,7 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
                 | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. } => {
                     return Err(format!(
@@ -8949,14 +8988,18 @@ fn e1_subject_family(
                     Some("ref")
                 }
                 decision::Decision::Cursor { .. } => Some("cursor"),
-                decision::Decision::Slice { .. } => Some("slice"),
+                decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => {
+                    Some("slice")
+                }
                 decision::Decision::Opt { .. } => Some("optional"),
                 decision::Decision::Box(_) => Some("box"),
                 decision::Decision::Degraded(_) => match hypothetical {
                     Some(decision::Decision::Ref { .. })
                     | Some(decision::Decision::InferredRef { .. }) => Some("ref"),
                     Some(decision::Decision::Cursor { .. }) => Some("cursor"),
-                    Some(decision::Decision::Slice { .. }) => Some("slice"),
+                    Some(
+                        decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. },
+                    ) => Some("slice"),
                     Some(decision::Decision::Opt { .. }) => Some("optional"),
                     Some(decision::Decision::Box(_)) => Some("box"),
                     Some(decision::Decision::Degraded(_)) | None => None,
@@ -8976,6 +9019,7 @@ fn e1_subject_family(
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
                 | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => unreachable!("emitting form mapped above"),
@@ -9075,6 +9119,7 @@ fn e2_terminal_disposition<'a>(
         | decision::Decision::Ref { .. }
         | decision::Decision::InferredRef { .. }
         | decision::Decision::Cursor { .. }
+        | decision::Decision::NestedSlice { .. }
         | decision::Decision::Slice { .. }
         | decision::Decision::Opt { .. }
         | decision::Decision::Box(_) => None,
@@ -9096,6 +9141,7 @@ fn e2_terminal_disposition<'a>(
             decision::Decision::Ref { .. }
             | decision::Decision::InferredRef { .. }
             | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_) => {}
@@ -9128,7 +9174,9 @@ pub(crate) fn decision_vector_render(tcx: TyCtxt<'_>, table: &decision::Decision
                 decision::Decision::Ref { .. } => "ref".to_owned(),
                 decision::Decision::InferredRef { .. } => "inferred-ref".to_owned(),
                 decision::Decision::Cursor { .. } => "cursor".to_owned(),
-                decision::Decision::Slice { .. } => "slice".to_owned(),
+                decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => {
+                    "slice".to_owned()
+                }
                 decision::Decision::Opt { .. } => "optional".to_owned(),
                 decision::Decision::Box(_) => "box".to_owned(),
                 decision::Decision::Degraded(record) => {
@@ -9196,7 +9244,9 @@ fn e2_artifacts_from_table(
             Some(decision::Decision::Ref { .. }) => "ref",
             Some(decision::Decision::InferredRef { .. }) => "inferred-ref",
             Some(decision::Decision::Cursor { .. }) => "cursor",
-            Some(decision::Decision::Slice { .. }) => "slice",
+            Some(decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. }) => {
+                "slice"
+            }
             Some(decision::Decision::Opt { .. }) => "optional",
             Some(decision::Decision::Box(_)) => "box",
             Some(decision::Decision::Degraded(record)) => record.reason.key(),
@@ -9206,7 +9256,7 @@ fn e2_artifacts_from_table(
             decision::Decision::Ref { .. } => "ref",
             decision::Decision::InferredRef { .. } => "inferred-ref",
             decision::Decision::Cursor { .. } => "cursor",
-            decision::Decision::Slice { .. } => "slice",
+            decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => "slice",
             decision::Decision::Opt { .. } => "optional",
             decision::Decision::Box(_) => "box",
             decision::Decision::Degraded(record) => record.reason.key(),
@@ -9420,7 +9470,7 @@ fn e1_subject_seed_tsv(
                 "-".to_owned(),
                 decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
             ),
-            decision::Decision::Slice { .. } => (
+            decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => (
                 "slice",
                 "-",
                 "-".to_owned(),
@@ -10206,7 +10256,9 @@ fn freed_slots_tsv_from(
                     decision::Decision::Ref { .. } => "emitted-ref".to_owned(),
                     decision::Decision::InferredRef { .. } => "inferred-ref".to_owned(),
                     decision::Decision::Cursor { .. } => "emitted-cursor".to_owned(),
-                    decision::Decision::Slice { .. } => "emitted-slice".to_owned(),
+                    decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => {
+                        "emitted-slice".to_owned()
+                    }
                     decision::Decision::Opt { slice, .. } => {
                         if *slice {
                             "emitted-opt-slice".to_owned()

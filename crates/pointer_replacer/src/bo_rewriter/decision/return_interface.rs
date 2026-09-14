@@ -22,6 +22,7 @@ pub(crate) struct ReturnInterface {
 impl ReturnInterface {
     pub(crate) fn temporary_type(&self) -> String {
         let (mutable, slice, optional) = match self.form {
+            Form::NestedSlice { .. } => unreachable!("nested return interfaces are not admitted"),
             Form::Cursor { .. } => unreachable!("cursor return interfaces are not admitted"),
             Form::Raw => unreachable!("return lifetime plans contain borrowed interfaces"),
             Form::Ref { mutable } => (mutable, false, false),
@@ -73,6 +74,17 @@ pub(crate) fn plan(
         if sites.iter().filter_map(|site| site.root).any(|root| {
             matches!(
                 decisions.get(&(function, root)),
+                Some(Decision::NestedSlice { .. })
+            )
+        }) {
+            result
+                .failures
+                .insert(function, "return-interface-nested-unbuilt");
+            continue;
+        }
+        if sites.iter().filter_map(|site| site.root).any(|root| {
+            matches!(
+                decisions.get(&(function, root)),
                 Some(Decision::Cursor { .. })
             )
         }) {
@@ -91,6 +103,7 @@ pub(crate) fn plan(
                             Decision::Ref { .. }
                             | Decision::InferredRef { .. }
                             | Decision::Box(_)
+                            | Decision::NestedSlice { .. }
                             | Decision::Cursor { .. }
                             | Decision::Degraded(_),
                         )
@@ -114,7 +127,7 @@ pub(crate) fn plan(
                         | Decision::InferredRef { .. }
                         | Decision::Slice { .. }
                         | Decision::Opt { .. } => Some(form_of(decision)),
-                        Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_) => None,
+                        Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::Degraded(_) => None,
                     }?;
                     let supported = match site.expression_shape {
                         super::emitability::ReturnExprShape::Other => site.source_shape == "bare-local",
@@ -141,6 +154,9 @@ pub(crate) fn plan(
                         mutable,
                         slice: true,
                     } => Form::Slice { mutable },
+                    Form::NestedSlice { .. } => {
+                        unreachable!("nested return sources are rejected above")
+                    }
                     Form::Cursor { .. } => unreachable!("cursor return sources are rejected above"),
                     Form::Ref { .. } | Form::Slice { .. } | Form::Raw => *form,
                 })
@@ -165,7 +181,10 @@ pub(crate) fn plan(
                         mutable,
                         slice: true,
                     },
-                    Form::Cursor { .. } | Form::Raw | Form::Opt { .. } => {
+                    Form::NestedSlice { .. }
+                    | Form::Cursor { .. }
+                    | Form::Raw
+                    | Form::Opt { .. } => {
                         result
                             .failures
                             .insert(function, "return-interface-unbuilt-raw-source");

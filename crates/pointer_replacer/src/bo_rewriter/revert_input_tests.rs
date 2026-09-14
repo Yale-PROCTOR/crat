@@ -58,6 +58,7 @@ fn revert_probe(input: &str, inject_unowned_use: bool) -> RevertProbe {
                     | Decision::Slice { .. }
                     | Decision::Opt { .. }
                     | Decision::Box(_)
+                    | Decision::NestedSlice { .. }
                     | Decision::Cursor { .. }
                     | Decision::Degraded(_) => None,
                 })

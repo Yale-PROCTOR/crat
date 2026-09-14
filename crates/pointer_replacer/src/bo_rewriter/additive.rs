@@ -109,6 +109,7 @@ impl SoundnessWithdrawal {
             decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_)
+            | decision::Decision::NestedSlice { .. }
             | decision::Decision::Cursor { .. }
             | decision::Decision::Degraded(_) => false,
         };
@@ -133,6 +134,7 @@ fn safe(decision: &decision::Decision) -> bool {
         | decision::Decision::Slice { .. }
         | decision::Decision::Opt { .. }
         | decision::Decision::Box(_)
+        | decision::Decision::NestedSlice { .. }
         | decision::Decision::Cursor { .. } => true,
         decision::Decision::Degraded(_) => false,
     }
@@ -181,6 +183,7 @@ fn losses<'a>(
                     decision::Decision::Slice { .. }
                     | decision::Decision::Opt { .. }
                     | decision::Decision::Box(_)
+                    | decision::Decision::NestedSlice { .. }
                     | decision::Decision::Cursor { .. }
                     | decision::Decision::Degraded(_) => false,
                 };

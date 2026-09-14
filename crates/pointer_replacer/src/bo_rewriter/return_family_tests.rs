@@ -103,7 +103,7 @@ fn check(family: Family) {
         let family_matches = match decision {
             Decision::Opt { mutable, slice, .. } => matches!(family, Family::Nullable) && *mutable && !*slice,
             Decision::Slice { mutable, .. } => matches!(family, Family::Slice) && *mutable,
-            Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Box(_) | Decision::Cursor { .. } | Decision::Degraded(_) => false,
+            Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::Degraded(_) => false,
         };
         assert!(family_matches, "returning preserves the real source family: {decision:?}");
         let function_plan = table.lifetime_plan.function(subject.fn_did).expect("parameter-tied return lifetime plan");

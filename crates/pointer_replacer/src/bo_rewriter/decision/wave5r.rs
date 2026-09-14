@@ -62,6 +62,7 @@ pub(super) fn complete_casts(
             super::Decision::Ref { mutable } => mutable,
             super::Decision::InferredRef { .. }
             | super::Decision::Cursor { .. }
+            | super::Decision::NestedSlice { .. }
             | super::Decision::Slice { .. }
             | super::Decision::Opt { .. }
             | super::Decision::Box(_)

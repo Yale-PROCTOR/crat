@@ -389,7 +389,8 @@ pub(super) fn plan(
                     true,
                 )
             }
-            Decision::Ref { .. }
+            Decision::NestedSlice { .. }
+            | Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Opt { .. }
             | Decision::Cursor { .. }
@@ -573,7 +574,8 @@ fn build<'tcx>(
         {
             Some(Decision::Degraded(_)) => true,
             Some(
-                Decision::Ref { .. }
+                Decision::NestedSlice { .. }
+                | Decision::Ref { .. }
                 | Decision::InferredRef { .. }
                 | Decision::Slice { .. }
                 | Decision::Opt { .. }
@@ -734,7 +736,8 @@ fn build<'tcx>(
         let raw = match target.map(|(_, decision)| decision) {
             Some(Decision::Degraded(_)) => true,
             Some(
-                Decision::Ref { .. }
+                Decision::NestedSlice { .. }
+                | Decision::Ref { .. }
                 | Decision::InferredRef { .. }
                 | Decision::Slice { .. }
                 | Decision::Opt { .. }
