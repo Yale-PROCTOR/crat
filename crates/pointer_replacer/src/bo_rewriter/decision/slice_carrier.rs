@@ -93,7 +93,9 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
     let form = super::seam::form_of(source);
     let mutable = match form {
         Form::Slice { mutable } => mutable,
-        Form::Raw | Form::Ref { .. } | Form::Opt { .. } => return Err(Hold::Source),
+        Form::Raw | Form::Ref { .. } | Form::Opt { .. } | Form::Cursor { .. } => {
+            return Err(Hold::Source);
+        }
     };
     let parameters = table
         .entries
