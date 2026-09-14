@@ -1919,7 +1919,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             Form::Slice
         };
     }
-    let counted = thin_counted::enabled_proof(tcx, subject, facts, family_policy);
+    let counted = thin_counted::enabled_proof(tcx, subject, facts, family_policy, exposure);
     if counted.is_some() && matches!(form, Form::Plain | Form::Slice) {
         form = Form::Slice;
     }
@@ -2108,7 +2108,13 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 decl_site,
                 DegradeReason::LocalCalleeAccessExtent {
                     access: Box::new(access.clone()),
-                    count: thin_counted::missing_evidence(tcx, subject, facts),
+                    count: thin_counted::missing_evidence(
+                        tcx,
+                        subject,
+                        facts,
+                        family_policy,
+                        exposure,
+                    ),
                 },
             );
         }

@@ -20,12 +20,14 @@ pub(crate) enum Hold {
     CallerSource,
     CallerCount,
     IncompleteCallers,
+    CalleeEmission,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Proof {
     pub count_parameter: usize,
     pub callers: usize,
     pub reader: Option<thin_counted_entropy::ReaderProof>,
+    pub members: Vec<LocalDefId>,
 }
 fn peel<'a>(mut e: &'a Expr<'a>) -> &'a Expr<'a> {
     while let ExprKind::DropTemps(x) = e.kind {
@@ -259,8 +261,9 @@ fn reader_sources(
     owner: LocalDefId,
     parameter: usize,
     facts: &EmitabilityFacts,
-) -> Result<usize, Hold> {
+) -> Result<(usize, Vec<LocalDefId>), Hold> {
     let calls = closed_calls(tcx, owner, facts)?;
+    let mut members = vec![owner];
     for call in calls {
         let arg = call
             .args
@@ -286,8 +289,11 @@ fn reader_sources(
         if forwarder.callee != owner || forwarder.callee_parameter != parameter {
             return Err(Hold::CallerSource);
         }
+        if !members.contains(&call.caller) {
+            members.push(call.caller);
+        }
     }
-    Ok(calls.len())
+    Ok((calls.len(), members))
 }
 
 pub(crate) fn prove(
@@ -305,20 +311,58 @@ pub(crate) fn prove(
         if reader.count_parameter != hir_index + 1 {
             return Err(Hold::CallerCount);
         }
-        let callers = reader_sources(tcx, subject.fn_did, hir_index, facts)?;
+        let (callers, members) = reader_sources(tcx, subject.fn_did, hir_index, facts)?;
         return Ok(Proof {
             count_parameter: reader.count_parameter,
             callers,
             reader: Some(reader),
+            members,
         });
     }
     let (forwarder, callers) = forwarder_source(tcx, subject.fn_did, hir_index, facts)?;
-    reader_sources(tcx, forwarder.callee, forwarder.callee_parameter, facts)?;
+    let (_, members) = reader_sources(tcx, forwarder.callee, forwarder.callee_parameter, facts)?;
     Ok(Proof {
         count_parameter: forwarder.count_parameter,
         callers,
         reader: None,
+        members,
     })
+}
+
+fn chain_gate(
+    proof: &Proof,
+    policy: &crate::bo_rewriter::additive::FamilyPolicy,
+    exposure: Option<&super::exposure::ExposurePolicy>,
+) -> Result<(), Hold> {
+    // Seed provenance exists in preliminary policies even before a converting
+    // signature receives a surface plan. A configured raw entry has no source
+    // array/count certificate and may not construct a fallback for this rule.
+    if exposure.is_some_and(|exposure| {
+        proof.members.iter().any(|owner| {
+            exposure
+                .functions()
+                .iter()
+                .find(|row| row.did == *owner)
+                .is_none_or(|row| {
+                    row.fnptr_web
+                        || row
+                            .seed
+                            .is_some_and(|seed| seed.configured_name || seed.address_taken)
+                })
+        })
+    }) {
+        return Err(Hold::IncompleteCallers);
+    }
+    // Both ends participate in the same SliceUse expansion. Retiring the
+    // reader cannot silently change this rule into a Slice-to-raw bridge.
+    if !proof
+        .members
+        .iter()
+        .all(|owner| policy.enabled(*owner, crate::bo_rewriter::additive::FamilyStage::SliceUse))
+    {
+        return Err(Hold::CalleeEmission);
+    }
+    Ok(())
 }
 
 pub(crate) fn enabled_proof(
@@ -326,14 +370,17 @@ pub(crate) fn enabled_proof(
     subject: &Subject,
     facts: &EmitabilityFacts,
     policy: &crate::bo_rewriter::additive::FamilyPolicy,
+    exposure: Option<&super::exposure::ExposurePolicy>,
 ) -> Option<Proof> {
-    policy
-        .enabled(
-            subject.fn_did,
-            crate::bo_rewriter::additive::FamilyStage::SliceUse,
-        )
-        .then(|| prove(tcx, subject, facts).ok())
-        .flatten()
+    if !policy.enabled(
+        subject.fn_did,
+        crate::bo_rewriter::additive::FamilyStage::SliceUse,
+    ) {
+        return None;
+    }
+    let proof = prove(tcx, subject, facts).ok()?;
+    chain_gate(&proof, policy, exposure).ok()?;
+    Some(proof)
 }
 pub(crate) fn covers_comparison(proof: Option<&Proof>, span: rustc_span::Span) -> bool {
     proof
@@ -361,6 +408,7 @@ impl Hold {
             Self::CallerSource => "caller-source",
             Self::CallerCount => "caller-count",
             Self::IncompleteCallers => "incomplete-callers",
+            Self::CalleeEmission => "callee-slice-withdrawn",
         }
     }
 }
@@ -368,10 +416,19 @@ pub(crate) fn missing_evidence(
     tcx: TyCtxt<'_>,
     subject: &Subject,
     facts: &EmitabilityFacts,
+    policy: &crate::bo_rewriter::additive::FamilyPolicy,
+    exposure: Option<&super::exposure::ExposurePolicy>,
 ) -> Option<Hold> {
-    prove(tcx, subject, facts)
-        .err()
-        .filter(|h| *h != Hold::OutsideScope)
+    match prove(tcx, subject, facts) {
+        Ok(proof) => chain_gate(&proof, policy, exposure).err().filter(|hold| {
+            *hold != Hold::CalleeEmission
+                || policy.enabled(
+                    subject.fn_did,
+                    crate::bo_rewriter::additive::FamilyStage::SliceUse,
+                )
+        }),
+        Err(hold) => (hold != Hold::OutsideScope).then_some(hold),
+    }
 }
 pub(crate) fn hold_detail(
     access: &super::local_callee_extent::LocalCalleeAccess,

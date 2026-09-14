@@ -234,3 +234,92 @@ fn w5c_thin_count_missing_half_is_receipted() {
         d.reason
     );
 }
+
+#[test]
+fn w5c_thin_count_configured_private_entry_stays_held() {
+    use sha2::{Digest, Sha256};
+    for name in ["BitsEntropy", "ShannonEntropy"] {
+        let input = fixture(18, "run");
+        let config = crate::bo_rewriter::EmissionRunConfig {
+            configured_exposure: super::exposure::ConfiguredExposureInput::checked(
+                "counted-private-entry",
+                [name.to_owned()],
+                format!("{:x}", Sha256::digest(name.as_bytes())),
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        let table = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+            crate::bo_rewriter::decide_table_with_emission_config(tcx, None, &config)
+                .unwrap()
+                .0
+        })
+        .unwrap();
+        for label in ["BitsEntropy::population", "ShannonEntropy::population"] {
+            let (_, decision) = table
+                .entries
+                .iter()
+                .find(|(s, _)| s.label == label)
+                .unwrap();
+            assert!(
+                !matches!(decision, super::Decision::Slice { .. }),
+                "configured {name}, {label}: {decision:?}"
+            );
+        }
+    }
+}
+#[test]
+fn w5c_thin_count_reader_family_withdrawal_holds_wrapper() {
+    use crate::bo_rewriter::{
+        additive::{FamilyPolicy, FamilyStage},
+        bridge_receipt::SignatureClassId,
+    };
+    ::utils::compilation::run_compiler_on_str(&fixture(18, "run"), |tcx| {
+        let table = crate::bo_rewriter::decide_table(tcx).unwrap();
+        let functions = tcx
+            .hir_body_owners()
+            .filter(|d| matches!(tcx.def_kind(*d), rustc_hir::def::DefKind::Fn))
+            .collect::<Vec<_>>();
+        let facts = super::emitability::collect(tcx, &functions);
+        let (wrapper, _) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.label == "BitsEntropy::population")
+            .unwrap();
+        let (reader, _) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.label == "ShannonEntropy::population")
+            .unwrap();
+        let mut policy = FamilyPolicy::at(FamilyStage::SliceUse);
+        policy
+            .withdrawn
+            .insert((FamilyStage::SliceUse, SignatureClassId::of(reader.fn_did)));
+        assert!(super::thin_counted::enabled_proof(tcx, wrapper, &facts, &policy, None).is_none());
+    })
+    .unwrap();
+}
+#[test]
+fn w5c_thin_count_other_reader_gate_holds_wrapper() {
+    let table = ::utils::compilation::run_compiler_on_str(&fixture(18, "run"), |tcx| {
+        crate::bo_rewriter::decide_table_perturbed(tcx, |subjects| {
+            let reader = subjects
+                .iter_mut()
+                .find(|s| s.label == "ShannonEntropy::population")
+                .unwrap();
+            reader.freed_at = Some(reader.attribution_span());
+        })
+        .unwrap()
+        .0
+    })
+    .unwrap();
+    let (_, decision) = table
+        .entries
+        .iter()
+        .find(|(s, _)| s.label == "BitsEntropy::population")
+        .unwrap();
+    assert!(
+        !matches!(decision, super::Decision::Slice { .. }),
+        "{decision:?}"
+    );
+}
