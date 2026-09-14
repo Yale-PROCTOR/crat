@@ -1,5 +1,8 @@
 //! Use images for the optional-slice revert class.
 
+#[path = "wave6r_literal.rs"]
+mod literal;
+
 use rustc_hir::{Expr, ExprKind, Node, QPath, UnOp, def::Res, intravisit};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
@@ -14,6 +17,8 @@ pub(super) fn complete_casts(
     table: &super::DecisionTable,
     plan: &mut super::seam::SeamPlan,
 ) {
+    literal::hold_shared_origins(tcx, plan);
+
     use rustc_middle::ty::TyKind;
 
     use super::seam::{BodyEdit, Form, GlueCore, GlueSpec, SeamFamily};

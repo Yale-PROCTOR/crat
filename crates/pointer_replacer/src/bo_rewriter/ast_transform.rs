@@ -4027,6 +4027,7 @@ fn transform_with<'tcx>(
         &mut krate,
         &mut guard,
     )?;
+    super::wave6r_option_reborrow::apply(tcx, table, reverts, &mut krate, &mut guard)?;
     apply_surface_plans(capture, table, reverts, &mut krate, &mut guard)?;
     super::wave5r_helper_path::qualify(tcx, capture, table, reverts, &mut krate);
 

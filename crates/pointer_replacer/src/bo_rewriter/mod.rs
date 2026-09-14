@@ -104,6 +104,7 @@ mod wave5r_field_borrow;
 mod wave5r_helper_path;
 #[cfg(test)]
 mod wave5r_tests;
+mod wave6r_option_reborrow;
 
 #[cfg(test)]
 mod additive_tests;

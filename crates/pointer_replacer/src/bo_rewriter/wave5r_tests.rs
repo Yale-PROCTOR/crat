@@ -389,3 +389,6 @@ fn wave5r_e0308_raw_destination_keeps_its_initializer() {
     );
     assert!(source.contains("&mut *p.offset(1) as *mut Item"));
 }
+
+#[path = "wave6r_option_tests.rs"]
+mod wave6r_option_tests;
