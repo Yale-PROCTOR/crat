@@ -806,6 +806,9 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
         .iter()
         .filter_map(|(subject, decision)| match decision {
             Decision::Slice { .. } | Decision::Opt { .. } => Some((subject.fn_did, subject.hir_id)),
+            Decision::Cursor { plan, .. } if plan.wrapper && plan.parameter => {
+                Some((subject.fn_did, subject.hir_id))
+            }
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Box(_)

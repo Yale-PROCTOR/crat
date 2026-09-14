@@ -812,6 +812,11 @@ fn build<'tcx>(
             })
             .ok_or(CursorHold::BaseMissing)?;
     Ok(CursorPlan {
+        parent_cursor: None,
+        wrapper: false,
+        parameter: false,
+        optional: false,
+        fallback: false,
         uses: uses.edits,
         use_hirs: uses.hirs,
         base: root_local,

@@ -46,8 +46,11 @@ pub(crate) enum DeclForm {
     NestedSlice {
         inner_mutable: bool,
     },
-    /// A full borrowed base and an administrative index, `(&[T], usize)`.
-    Cursor,
+    /// Legacy wrapper for bidirectional access, or the existing base/index tuple.
+    Cursor {
+        wrapper: bool,
+        optional: bool,
+    },
     /// `&T` / `&mut T` — arm 1.
     Ref,
     /// `&[T]` / `&mut [T]`.
@@ -126,6 +129,50 @@ fn decl_ty_kind_with_lifetime(
     mut pointee: P<Ty>,
     lifetime: Option<&str>,
 ) -> TyKind {
+    if let DeclForm::Cursor {
+        wrapper: true,
+        optional,
+    } = form
+    {
+        let name = if mutable {
+            "SliceCursorMut"
+        } else {
+            "SliceCursor"
+        };
+        let args = AngleBracketedArgs {
+            span: DUMMY_SP,
+            args: ThinVec::from_iter([
+                AngleBracketedArg::Arg(GenericArg::Lifetime(ast_lifetime(lifetime.unwrap_or("_")))),
+                AngleBracketedArg::Arg(GenericArg::Type(pointee)),
+            ]),
+        };
+        let kind = TyKind::Path(
+            None,
+            Path {
+                span: DUMMY_SP,
+                segments: ThinVec::from_iter([
+                    PathSegment::from_ident(Ident::new(Symbol::intern("crate"), DUMMY_SP)),
+                    PathSegment::from_ident(Ident::new(Symbol::intern("slice_cursor"), DUMMY_SP)),
+                    PathSegment {
+                        ident: Ident::new(Symbol::intern(name), DUMMY_SP),
+                        id: DUMMY_NODE_ID,
+                        args: Some(P(GenericArgs::AngleBracketed(args))),
+                    },
+                ]),
+                tokens: None,
+            },
+        );
+        return if optional {
+            option_of(P(Ty {
+                id: DUMMY_NODE_ID,
+                kind,
+                span: DUMMY_SP,
+                tokens: None,
+            }))
+        } else {
+            kind
+        };
+    }
     if let DeclForm::NestedSlice { inner_mutable } = form {
         let TyKind::Ptr(inner) = &pointee.kind else {
             unreachable!("native nested plan requires a raw pointer element");
@@ -163,7 +210,7 @@ fn decl_ty_kind_with_lifetime(
         }
         DeclForm::NestedSlice { .. }
         | DeclForm::Slice
-        | DeclForm::Cursor
+        | DeclForm::Cursor { .. }
         | DeclForm::Opt { slice: true }
         | DeclForm::Box { slice: true, .. } => P(Ty {
             id: DUMMY_NODE_ID,
@@ -173,7 +220,7 @@ fn decl_ty_kind_with_lifetime(
         }),
     };
     match form {
-        DeclForm::Cursor => TyKind::Tup(ThinVec::from_iter([
+        DeclForm::Cursor { .. } => TyKind::Tup(ThinVec::from_iter([
             P(Ty {
                 id: DUMMY_NODE_ID,
                 kind: TyKind::Ref(
@@ -206,7 +253,7 @@ fn decl_ty_kind_with_lifetime(
                     span: DUMMY_SP,
                     tokens: None,
                 })),
-                DeclForm::Box { .. } | DeclForm::Cursor => unreachable!(),
+                DeclForm::Box { .. } | DeclForm::Cursor { .. } => unreachable!(),
             }
         }
         DeclForm::Box { optional, .. } => {
@@ -1064,7 +1111,7 @@ impl RefDeclVisitor<'_> {
             }
         };
         let claimant = match form {
-            DeclForm::Cursor => "decl:cursor",
+            DeclForm::Cursor { .. } => "decl:cursor",
             DeclForm::Ref => "decl:ref",
             DeclForm::NestedSlice { .. } | DeclForm::Slice => "decl:slice",
             DeclForm::Opt { .. } => "decl:opt",
@@ -1088,7 +1135,7 @@ impl RefDeclVisitor<'_> {
                 self.stats.rewritten += 1;
                 self.stats.rendered.push(render);
             }
-            DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Cursor => {
+            DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Cursor { .. } => {
                 self.stats.slice_rewritten += 1;
                 self.stats.rendered_arm2.push(render);
             }
@@ -1111,7 +1158,7 @@ impl RefDeclVisitor<'_> {
         if self.mutable_option_bindings.contains(node)
             && matches!(
                 self.decisions.get(node),
-                Some((DeclForm::Opt { .. } | DeclForm::Cursor, _, _))
+                Some((DeclForm::Opt { .. } | DeclForm::Cursor { .. }, _, _))
             )
             && let rustc_ast::PatKind::Ident(mode, _, _) = &mut pat.kind
         {
@@ -3518,7 +3565,19 @@ fn transform_with<'tcx>(
         // population is defined by which disposition was reached.
         let (form, mutable, use_edits) = match decision {
             super::decision::Decision::Cursor { mutable, plan } => {
-                (DeclForm::Cursor, *mutable, Some(&plan.uses))
+                let form = if plan.wrapper && plan.parameter {
+                    if plan.optional {
+                        DeclForm::Opt { slice: true }
+                    } else {
+                        DeclForm::Slice
+                    }
+                } else {
+                    DeclForm::Cursor {
+                        wrapper: plan.wrapper,
+                        optional: plan.optional,
+                    }
+                };
+                (form, *mutable, Some(&plan.uses))
             }
             super::decision::Decision::Ref { mutable } => (DeclForm::Ref, *mutable, None),
             // Its direct callee's rewritten return type supplies the inferred
@@ -3959,6 +4018,13 @@ fn transform_with<'tcx>(
     // outer declaration and attributes. One function-span claim makes the
     // two-item replacement one edit region.
     super::wave5r_field_borrow::apply(tcx, table, reverts, &mut krate, &mut guard)?;
+    super::decision::cursor_native::wrapper_ast::apply(
+        table,
+        reverts,
+        &capture.map.global_map,
+        &mut krate,
+        &mut guard,
+    )?;
     apply_surface_plans(capture, table, reverts, &mut krate, &mut guard)?;
     super::wave5r_helper_path::qualify(tcx, capture, table, reverts, &mut krate);
 
@@ -4130,7 +4196,30 @@ pub(crate) fn ast_emitted_files_from(
     let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
     let (mut files, stats, maps) =
         super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&edited));
-    if seams.len_fabricated > 0 {
+    let surviving_wrappers = table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| match decision {
+            super::decision::Decision::Cursor { plan, .. }
+                if plan.wrapper && reverts.keeps_subject(subject.fn_did, subject.hir_id) =>
+            {
+                Some(plan)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !surviving_wrappers.is_empty() {
+        let key = root_key.cloned().or_else(|| files.keys().next().cloned());
+        if let Some(key) = key
+            && let Some(text) = files.get_mut(&key)
+            && !text.is_empty()
+        {
+            text.push('\n');
+            text.push_str(super::slice_cursor_prelude::SLICE_CURSOR_PRELUDE);
+            text.push('\n');
+        }
+    }
+    if seams.len_fabricated > 0 || surviving_wrappers.iter().any(|plan| plan.fallback) {
         // Root selection: the caller's key when it has one (the loop's round-0
         // file), else the map's first — deterministic because the map is
         // ordered by `FileKey`.
@@ -7378,7 +7467,7 @@ mod arm2_witnesses {
                         stats.rewritten += 1;
                         stats.rendered.push(render);
                     }
-                    DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Cursor => {
+                    DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Cursor { .. } => {
                         stats.slice_rewritten += 1;
                         stats.rendered_arm2.push(render);
                     }

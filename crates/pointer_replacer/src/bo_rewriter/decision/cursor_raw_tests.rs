@@ -7,6 +7,11 @@ fn cursor(mutable: bool) -> Decision {
     Decision::Cursor {
         mutable,
         plan: CursorPlan {
+            parent_cursor: None,
+            wrapper: false,
+            parameter: false,
+            optional: false,
+            fallback: false,
             use_hirs: vec![],
             extent: 4,
             delivered_base: None,

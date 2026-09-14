@@ -3792,6 +3792,53 @@ fn a_usize_counter_still_renders_a_bare_index() {
     );
 }
 
+fn assert_r394_cursor(source: &str, owner: &str, name: &str, parameter: bool, optional: bool) {
+    ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let table = super::decide_table(tcx).expect("R394 fixture decisions");
+        let (subject, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| {
+                tcx.def_path_str(subject.fn_did.to_def_id()) == owner
+                    && subject.param_name.as_deref() == Some(name)
+                    && matches!(subject.kind, super::decision::SubjectKind::Param { .. })
+                        == parameter
+            })
+            .expect("R394 exact cursor subject");
+        let super::decision::Decision::Cursor { plan, .. } = decision else {
+            panic!("R394 subject must select the wrapper: {decision:?}");
+        };
+        assert!(
+            plan.wrapper,
+            "R394 must select the legacy wrapper, not the tuple"
+        );
+        assert_eq!(plan.parameter, parameter);
+        assert_eq!(
+            plan.optional, optional,
+            "nullability remains orthogonal to cursor selection"
+        );
+        assert!(
+            plan.uses
+                .iter()
+                .any(|edit| edit.bridge_kind == "cursor-element"),
+            "the wrapper must own its signed element access: {plan:?}"
+        );
+        let receipts = table
+            .cursor_receipts
+            .iter()
+            .filter(|receipt| receipt.owner == subject.fn_did && receipt.hir_id == subject.hir_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receipts.len(),
+            1,
+            "one cursor decision receipt per exact subject"
+        );
+        assert_eq!(receipts[0].local, subject.local);
+        assert_eq!(receipts[0].disposition, Ok(()));
+    })
+    .expect("R394 fixture compiles");
+}
+
 /// **THE ACCEPT-SET IS THE SCOPE.** Both authorised positions emit; every known
 /// neighbour position is refused with its own attribution.
 ///
@@ -3870,28 +3917,14 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
             "rebind",
             "    let q: *mut i32 = p.offset(1 as isize);\n    q",
         ),
-        // **S3.2′-5 registers the SIGN as a refusal axis in this vocabulary.**
-        // Every other entry here is refused for the shape of a *use*; this one
-        // has an authorised use shape and is refused for the *argument's sign*.
-        // It is listed here so the accept-set is read as "which subjects emit",
-        // not merely "which use shapes are recognised" — and so a future slice
-        // that lifts the gate has to edit this list to do it.
-        (
-            "may-be-negative offset",
-            "    let _v = *p.offset(-1 as isize);\n    core::ptr::null_mut()",
-        ),
     ] {
         let got = reason_for(body);
-        // **Per-entry, not one shared disjunction.** S3.2′-5 adds a third
-        // admissible reason; widening a single `||` for the whole loop would
-        // let ANY negative control drift onto ANY of the three unnoticed, which
-        // is exactly the coverage this guard exists to deny.
+        // Each retained neighbour keeps its own refusal attribution.
         let allowed: &[&str] = match label {
             // Addendum 210 A / item-3 design: this cursor-derived use remains
             // refused. Each neighbour retains its own observed attribution.
             "borrow of deref" => &["slice-cursor-use"],
             "rebind" => &["slice-cursor-use"],
-            "may-be-negative offset" => &["slice-neg-or-unknown-offset"],
             _ => unreachable!("every negative neighbour has its own attribution"),
         };
         assert!(
@@ -3901,9 +3934,19 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
         );
         assert_ne!(got, "<emitted>", "{label} must not emit");
     }
+    // R394-2 moves the signed-access neighbour into the wrapper family.
+    assert_r394_cursor(
+        "pub unsafe fn f(mut p: *mut i32, n: usize) -> *mut i32 { let _v = *p.offset(-1 as isize); core::ptr::null_mut() }",
+        "f",
+        "p",
+        true,
+        false,
+    );
 }
 
 /// **S3.2′-5 — the sign gate on the deref-through-arithmetic positions.**
+/// R394-2 now routes supported signed accesses to the legacy wrapper; the
+/// original forward-only and unsupported-return controls stay pinned below.
 ///
 /// The `-2` arm authorised `*p.offset(e)` ⇒ `p[(e) as usize]` while consulting
 /// no sign information at all. When `e` is negative at runtime the cast wraps to
@@ -3930,11 +3973,8 @@ fn a_may_be_negative_offset_refuses_the_slice_form_with_its_own_reason() {
         reason_of(&got, "p", true)
     }
 
-    // NEGATIVE HALF — a may-be-negative offset must be refused, and refused
-    // with the reason that names the *sign*, not the op and not the use shape.
-    // `k` is an unconstrained `isize` parameter, so the offset-sign lattice
-    // settles `Top`, which `needs_cursor()` admits through the same door as
-    // `Neg`. The taint is per-LOCAL, so one tainted position taints `p`.
+    // R394-2: both Top and Neg now select the bounds-checked wrapper.
+    // The function keeps its historical name to preserve suite identity.
     for (label, body) in [
         (
             "unbounded offset",
@@ -3945,13 +3985,14 @@ fn a_may_be_negative_offset_refuses_the_slice_form_with_its_own_reason() {
             "    let _v = *p.offset(-1 as isize);\n    core::ptr::null_mut()",
         ),
     ] {
+        let source = format!(
+            "pub unsafe fn f(mut p: *mut i32, n: usize, k: isize) -> *mut i32 {{ {body} }}"
+        );
+        assert_r394_cursor(&source, "f", "p", true, false);
         assert_eq!(
             reason_for(body),
-            "slice-neg-or-unknown-offset",
-            "{label}: a may-be-negative offset must degrade with its own \
-             attributed reason — the op is fine and the use shape is fine, so \
-             neither `raw-pointer-operation` nor `slice-use-unsupported` names \
-             what actually blocked it"
+            "<emitted>",
+            "{label}: R394 wrapper delivery"
         );
     }
 
@@ -3977,6 +4018,8 @@ fn a_may_be_negative_offset_refuses_the_slice_form_with_its_own_reason() {
 }
 
 /// **S3.2′-5 hardening — the FAT-OPTIONAL twin carries the identical hazard.**
+/// R394-2 now delivers the nullable wrapper for the signed-access fixture;
+/// forward-only, thin-optional, and unsupported-return controls remain.
 ///
 /// `Form::Opt { slice: true }` reaches the same `*p.offset(e)` position through
 /// `accessor[index]` (`emitability.rs:522-559`) and the same `(e) as usize`
@@ -4005,20 +4048,12 @@ fn a_may_be_negative_offset_refuses_the_fat_optional_form_too() {
     }
     const NULL_TEST: &str = "    if p.is_null() { return core::ptr::null_mut(); }\n";
 
-    // NEGATIVE — the probe that exposed the gap, now a permanent fixture.
-    assert_eq!(
-        reason_for(
-            &[
-                NULL_TEST,
-                "    let _v = *p.offset(k);\n    core::ptr::null_mut()"
-            ]
-            .concat()
-        ),
-        "slice-neg-or-unknown-offset",
-        "a fat OPTIONAL with a may-be-negative offset must be refused for the \
-         same reason its plain twin is — the hazard is the index, and the \
-         `Option` wrapper does not change it"
+    // R394-2 delivers the optional wrapper; null still selects None.
+    // The historical test name remains stable in the suite identity.
+    let source = format!(
+        "pub unsafe fn f(mut p: *mut i32, n: usize, k: isize) -> *mut i32 {{ {NULL_TEST} let _v = *p.offset(k); core::ptr::null_mut() }}"
     );
+    assert_r394_cursor(&source, "f", "p", true, true);
 
     // POSITIVE — the fat-optional arm must still emit on a provable non-negative.
     assert_eq!(
@@ -12545,12 +12580,8 @@ fn slc_w1_non_slice_and_negative_offset_controls_remain_outside_item2() {
         }\n";
     let decisions = decisions_of(source);
     assert_eq!(reason_of(&decisions, "p", false), "raw-pointer-operation");
-    assert!(
-        decisions.iter().any(|(name, is_param, reason)| !is_param
-            && name == "p"
-            && reason == "slice-neg-or-unknown-offset"),
-        "cursor/negative-offset boundary moved: {decisions:?}"
-    );
+    // Item 2 still does not own this local: R394's wrapper does.
+    assert_r394_cursor(source, "negative", "p", false, false);
 }
 
 // Wave-3b item 3, F02–F03: syntax shapes come from the sealed F01 identity

@@ -521,7 +521,9 @@ pub(crate) enum DegradeReason {
     /// Atomic signature-class finalization held this otherwise-emittable
     /// subject because another required site/arm in the same class was not
     /// ready.
-    SignatureClassHeld { reason: String },
+    SignatureClassHeld {
+        reason: String,
+    },
     /// BO decided the slot is a raw pointer; leaving the source alone is the
     /// decision, not a failure.
     KindRaw,
@@ -532,9 +534,13 @@ pub(crate) enum DegradeReason {
     /// BO decided owning; Box forms and the drop policy arrive in S3.
     KindOwning,
     /// Box wave-1 filter failure, preserving the exact first-failure class.
-    BoxFailure { failure: box_facts::BoxPlanFailure },
+    BoxFailure {
+        failure: box_facts::BoxPlanFailure,
+    },
     /// The parameter is used in an operation that exists only on raw pointers.
-    RawPointerOperation { op: String },
+    RawPointerOperation {
+        op: String,
+    },
     /// The function is referenced in-crate — called, address-taken, or cast to
     /// a fn pointer — and use sites are not yet adapted. **Retired by S3.**
     CallSiteNotAdapted,
@@ -591,7 +597,9 @@ pub(crate) enum DegradeReason {
     /// contains the `*mut`, so `&mut lil_value_t` would be wrong — and
     /// conflating it with the collection fix would repeat this milestone's
     /// pattern of bundling.
-    UnsupportedDeclShape { shape: &'static str },
+    UnsupportedDeclShape {
+        shape: &'static str,
+    },
     /// **The dissolution's residue** — the subject has no declared type, every
     /// other gate has declined to speak, and the type would have to come from
     /// the **callee's return type**.
@@ -651,6 +659,8 @@ pub(crate) enum DegradeReason {
     SliceUseUnsupported,
     /// Pointer movement used as a raw value requires the separate cursor wave.
     SliceCursorUse,
+    CursorBaseModelRaw,
+    CursorBaseUnavailable,
     /// **S3.2′-5 — the offset may be negative, so no `&[T]` form may emit.**
     ///
     /// `*p.offset(e)` becomes `p[(e) as usize]`. Where `e` is negative at
@@ -759,7 +769,9 @@ pub(crate) enum DegradeReason {
     /// **Scope, stated:** only plain-`Ref` subjects can carry it, because only
     /// they are class nodes. A `&mut [T]` or `Option<&mut T>` reaching a raw
     /// context is the same hazard and is **not** gated here.
-    SilentCoercion { via: co_conversion::BlockReason },
+    SilentCoercion {
+        via: co_conversion::BlockReason,
+    },
     /// **S3.6-1 step 3 — the subject's CLASS cannot convert, though the subject
     /// contributes no blocking fact of its own.**
     ///
@@ -773,7 +785,9 @@ pub(crate) enum DegradeReason {
     /// subject a hazard it does not carry — the third application of the
     /// reason-honesty rule in this slice. The collateral itemization is read
     /// from the census's `class_block` column: one vocabulary, two columns.
-    ClassBlocked { via: co_conversion::BlockReason },
+    ClassBlocked {
+        via: co_conversion::BlockReason,
+    },
     /// A mutable optional subject with more than one use needs `as_mut()`, and
     /// `as_mut()` needs a `mut` binding this declaration does not have.
     ///
@@ -814,6 +828,8 @@ impl DegradeReason {
             DegradeReason::FreedSlot => "freed-slot",
             DegradeReason::SliceUseUnsupported => "slice-use-unsupported",
             DegradeReason::SliceCursorUse => "slice-cursor-use",
+            DegradeReason::CursorBaseModelRaw => "cursor-base-model-raw",
+            DegradeReason::CursorBaseUnavailable => "cursor-base-unavailable",
             DegradeReason::NestedUseEdits => "nested-use-edits",
             DegradeReason::SliceNegOrUnknownOffset => "slice-neg-or-unknown-offset",
             DegradeReason::SliceLocalConstruction => "slice-local-construction",
@@ -1130,7 +1146,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         .filter_map(|(subject, decision)| {
             let needed = match decision {
                 Decision::Cursor { mutable, plan } => {
-                    *mutable && !plan.bridges.is_empty() && !subject.mut_binding
+                    (plan.wrapper || (*mutable && !plan.bridges.is_empty())) && !subject.mut_binding
                 }
                 Decision::Opt { mutable, .. } => {
                     ctx.family_policy

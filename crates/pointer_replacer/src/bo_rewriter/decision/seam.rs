@@ -3613,7 +3613,7 @@ fn complete_interface_inventory(
         .filter_map(|(&(callee, index), node)| {
             decisions
                 .get(node)
-                .map(|decision| form_of(decision))
+                .map(|decision| super::cursor_native::wrapper::parameter_form(decision))
                 .filter(|form| *form != Form::Raw)
                 .map(|form| ((callee, index), form))
         })
@@ -3979,7 +3979,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                 let expected = param_key
                     .get(&(*callee, arg.index))
                     .and_then(|k| decision_of.get(k))
-                    .map_or(Form::Raw, |d| form_of(d));
+                    .map_or(Form::Raw, |d| {
+                        super::cursor_native::wrapper::parameter_form(d)
+                    });
                 let raw_boundary_observation = raw_boundary.tracks_call_argument(
                     site.caller,
                     &tcx.def_path_str(callee.to_def_id()),

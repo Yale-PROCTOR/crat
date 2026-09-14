@@ -80,6 +80,16 @@ pub(crate) fn plan(
                     Form::Ref { mutable: *mutable }
                 }
                 Decision::Slice { mutable, .. } => Form::Slice { mutable: *mutable },
+                Decision::Cursor { mutable, plan } if plan.wrapper && plan.parameter => {
+                    if plan.optional {
+                        Form::Opt {
+                            mutable: *mutable,
+                            slice: true,
+                        }
+                    } else {
+                        Form::Slice { mutable: *mutable }
+                    }
+                }
                 Decision::Opt { mutable, slice, .. } => Form::Opt {
                     mutable: *mutable,
                     slice: *slice,

@@ -2343,6 +2343,18 @@ impl Plan {
 
 fn cursor_extent_evidence(cursor: &super::decision::cursor_native::CursorPlan) -> String {
     use super::decision::cursor_native::DeliveredBaseProvider;
+    if let Some(parent) = cursor.parent_cursor {
+        return format!("derived-cursor-base:hir{}", parent.local_id.as_u32());
+    }
+    if cursor.wrapper && cursor.parameter {
+        return "delivered-parameter-slice:runtime-binding-length".to_owned();
+    }
+    if cursor.wrapper && cursor.fallback {
+        return "fallback-base:extent-receipted-at-constructor".to_owned();
+    }
+    if cursor.wrapper && cursor.delivered_base.is_none() {
+        return "optional-wrapper:delivered-reference-constructors-or-none".to_owned();
+    }
     match &cursor.delivered_base {
         Some(base) => {
             let mut evidence = format!(
@@ -2410,6 +2422,7 @@ fn cursor_bridge(
     let (expected, found, argument) = match kind {
         "cursor-constructor" | "cursor-declaration" => (form, "raw", "local"),
         "cursor-element" => ("element", form, "indexed-element"),
+        "cursor-address" => ("raw", form, "address-only-operand"),
         "cursor-advance" => (form, form, "checked-index-update"),
         "cursor-length" => ("usize", form, "retained-base-length"),
         "raw-op-cursor-t1" => ("raw", form, "bare-local"),
@@ -2448,7 +2461,11 @@ fn cursor_bridge(
         kind,
     )
     .with_forms(expected, found, argument)
-    .with_extent(BridgeExtentKind::Evidence(cursor_extent_evidence(cursor)));
+    .with_extent(if cursor.fallback && kind == "cursor-constructor" {
+        BridgeExtentKind::Fallback
+    } else {
+        BridgeExtentKind::Evidence(cursor_extent_evidence(cursor))
+    });
     if boundary.is_some() || local_boundary.is_some() {
         bridge.retention = BridgeRetentionTier::T1;
     }
@@ -2543,9 +2560,8 @@ fn cursor_obligations(
             match edit.bridge_kind {
                 "raw-op-cursor-t1" => count == 1 && local_count == 0,
                 "raw-op-cursor-local" => count == 0 && local_count == 1,
-                "cursor-constructor" | "cursor-element" | "cursor-advance" | "cursor-length" => {
-                    count == 0 && local_count == 0
-                }
+                "cursor-constructor" | "cursor-element" | "cursor-advance" | "cursor-length"
+                | "cursor-address" => count == 0 && local_count == 0,
                 _ => false,
             }
         });
@@ -2607,7 +2623,16 @@ fn cursor_obligations(
                 composition_parent: None,
                 dependency_classes: BTreeSet::new(),
                 evidence: MechanicalEvidence {
-                    extent: MechanicalExtent::Evidence(cursor_extent_evidence(cursor)),
+                    extent: if cursor.fallback
+                        && edit.is_some_and(|edit| edit.bridge_kind == "cursor-constructor")
+                    {
+                        MechanicalExtent::Fallback {
+                            receipt: super::mechanical_receipt::FALLBACK_EXTENT_RECEIPT.to_owned(),
+                            waiver_id: super::mechanical_receipt::SLICE_EXTENT_WAIVER_ID.to_owned(),
+                        }
+                    } else {
+                        MechanicalExtent::Evidence(cursor_extent_evidence(cursor))
+                    },
                     retention: if bridge.retention == BridgeRetentionTier::T1 {
                         MechanicalRetention::T1
                     } else {
@@ -3884,7 +3909,9 @@ pub(crate) fn plan(
             }
         }
         let (mutable, use_edits_in, optional, fat, box_plan) = match decision {
-            Decision::Cursor { mutable, plan } => (mutable, Some(&plan.uses), false, true, None),
+            Decision::Cursor { mutable, plan } => {
+                (mutable, Some(&plan.uses), plan.optional, true, None)
+            }
             Decision::Ref { mutable } => (mutable, None, false, false, None),
             // The direct callee supplies this local's type. There is no local
             // declaration span to edit; the signature owner is planned by E2.
@@ -4130,9 +4157,20 @@ pub(crate) fn plan(
             let base = if nested_slice {
                 super::decision::declaration::emitted_type(decision, pointee, None)
                     .expect("nested admission has a raw pointer element")
-            } else if cursor_plan.is_some() {
+            } else if let Some(cursor) = cursor_plan {
                 let mutability = if *mutable { "mut " } else { "" };
-                format!("(&{mutability}[{pointee}], ::core::primitive::usize)")
+                if cursor.wrapper && cursor.parameter {
+                    format!("&{mutability}[{pointee}]")
+                } else if cursor.wrapper {
+                    let name = if *mutable {
+                        "SliceCursorMut"
+                    } else {
+                        "SliceCursor"
+                    };
+                    format!("crate::slice_cursor::{name}<'_, {pointee}>")
+                } else {
+                    format!("(&{mutability}[{pointee}], ::core::primitive::usize)")
+                }
             } else if box_plan.is_some() {
                 if fat {
                     format!("Box<[{pointee}]>")
@@ -4983,6 +5021,11 @@ mod tests {
             local_id: rustc_hir::ItemLocalId::from_u32(index),
         };
         let cursor = CursorPlan {
+            parent_cursor: None,
+            wrapper: false,
+            parameter: false,
+            optional: false,
+            fallback: false,
             uses: vec![UseEdit {
                 span: rustc_span::DUMMY_SP,
                 replacement: "p.0.as_ptr().add(p.1)".into(),

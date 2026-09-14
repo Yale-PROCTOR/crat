@@ -5,6 +5,10 @@ pub(super) fn emitted(input: &str) -> String {
         let capture = crate::bo_rewriter::ast_transform::capture_ast(tcx).unwrap();
         let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
         println!(
+            "CURSOR-FAMILY {:?}",
+            ctx.raw_boundary_artifacts.additive_family_receipts
+        );
+        println!(
             "CURSOR-NATIVE plans {:?}; decisions {:?}",
             table.cursor_receipts,
             table
@@ -157,15 +161,14 @@ fn native_admission_binds_real_model_to_compiler_identity() {
     }).unwrap();
 }
 
-// These are requested production-emission RED witnesses. Keep their observed
-// failure explicit until shared Cursor form/renderer support is authorized.
+// R394 migrates these standing witnesses to the legacy-shaped wrapper.
 #[test]
 fn requested_negative_offset_emits_cursor_index() {
     let source = emitted(
         "pub unsafe fn witness(a: &[i32; 4]) -> i32 { let p: *const i32 = a.as_ptr().add(2); *p.offset(-1) }",
     );
     assert!(
-        source.contains("checked_add_signed"),
+        source.contains("slice_cursor::SliceCursor"),
         "cursor index absent: {source}"
     );
     compile(
@@ -186,7 +189,7 @@ fn requested_unknown_offset_emits_cursor_index() {
         ),
     );
     assert!(
-        source.contains("checked_add_signed"),
+        source.contains("slice_cursor::SliceCursor"),
         "cursor index absent: {source}"
     );
 }
@@ -197,7 +200,7 @@ fn requested_raw_callee_emits_current_cursor_view() {
         "unsafe fn raw_read(p: *const i32) -> i32 { p.read() } pub unsafe fn witness(a: &[i32; 4], flag: bool) -> i32 { let p: *const i32 = a.as_ptr().offset(if flag { 1 } else { 2 }); *p.offset(-1) + raw_read(p) }",
     );
     assert!(
-        source.contains("checked_add_signed") && source.contains("as_ptr"),
+        source.contains("slice_cursor::SliceCursor") && source.contains("as_ptr"),
         "current cursor view absent: {source}"
     );
     compile(
@@ -210,16 +213,16 @@ fn requested_raw_callee_emits_current_cursor_view() {
 
 #[test]
 fn cursor_unbounded_offsets_and_raw_aliases_remain_held() {
-    for input in [
+    for (index, input) in [
         "pub unsafe fn witness(a: &[i32;4], delta: isize) -> i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(delta) }",
         "pub unsafe fn witness(a: &[i32;4], flag: bool) -> i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(if flag { -1 } else { 2 }) }",
         "pub unsafe fn witness(a: &mut [i32;4]) -> i32 { let p:*mut i32=a.as_mut_ptr().add(2); let q:*mut i32=&raw mut *p; *p=7; *q=8; *p.offset(-1) }",
         "unsafe extern \"C\" { fn opaque(p:*const i32) -> i32; } pub unsafe fn witness(a:&[i32;4]) -> i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(-1) + opaque(p) }",
-    ] {
+    ].into_iter().enumerate() {
         let source = emitted(input);
-        assert!(
-            !source.contains("::core::primitive::usize"),
-            "unsupported cursor admitted: {source}"
+        assert_eq!(
+            source.contains("slice_cursor::SliceCursor"), index < 2,
+            "R394 admits dynamic indices; raw aliases and unknown retention stay held: {source}"
         );
     }
 }
@@ -230,7 +233,7 @@ fn cursor_mutable_array_reference_keeps_writes_at_checked_index() {
         "pub unsafe fn witness(a: &mut [i32;4]) -> i32 { let p:*mut i32=a.as_mut_ptr().add(2); *p.offset(-1)=9; *p }",
     );
     assert!(
-        source.contains("checked_add_signed") && source.contains("&mut [i32]"),
+        source.contains("slice_cursor::SliceCursorMut"),
         "mutable cursor missing: {source}"
     );
     compile(
@@ -264,8 +267,8 @@ fn cursor_checks_intermediate_positions_not_just_final_dereference() {
         "pub unsafe fn witness(a:&[i32;4])->i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(-3).offset(3) }",
     );
     assert!(
-        !source.contains("::core::primitive::usize"),
-        "an intermediate position leaves the proved window: {source}"
+        source.contains("slice_cursor::SliceCursor"),
+        "R394 does not require a static intermediate window: {source}"
     );
     let source = emitted(
         "pub unsafe fn witness(a:&[i32;4])->i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(2).offset(-1) }",
@@ -286,7 +289,7 @@ fn cursor_preserves_raw_identifier_bindings() {
         "pub unsafe fn witness(a:&[i32;4])->i32 { let r#type:*const i32=a.as_ptr().add(2); *r#type.offset(-1) }",
     );
     assert!(
-        source.contains("::core::primitive::usize"),
+        source.contains("slice_cursor::SliceCursor"),
         "raw identifier cursor did not survive: {source}"
     );
     compile(

@@ -185,7 +185,25 @@ pub(crate) fn emitted_type(
                 if *inner_mutable { "mut " } else { "" },
             ));
         }
-        Decision::Cursor { mutable, .. } => {
+        Decision::Cursor { mutable, plan } => {
+            if plan.wrapper {
+                if plan.parameter {
+                    return emitted_type(
+                        &Decision::Slice {
+                            mutable: *mutable,
+                            uses: vec![],
+                        },
+                        pointee,
+                        lifetime,
+                    );
+                }
+                return Some(super::cursor_native::wrapper::type_text(
+                    *mutable,
+                    plan.optional,
+                    pointee,
+                    lifetime,
+                ));
+            }
             let lifetime = lifetime.map_or_else(String::new, |name| {
                 format!("'{} ", name.trim_start_matches('\''))
             });

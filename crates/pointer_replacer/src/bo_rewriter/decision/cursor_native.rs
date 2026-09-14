@@ -16,9 +16,20 @@ mod admission;
 mod delivered;
 #[path = "cursor/emission.rs"]
 mod emission;
+#[path = "cursor/foreign.rs"]
+pub(crate) mod foreign;
+#[path = "cursor/wrapper.rs"]
+pub(crate) mod wrapper;
+#[path = "cursor/wrapper_ast.rs"]
+pub(crate) mod wrapper_ast;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CursorPlan {
+    pub(crate) parent_cursor: Option<rustc_hir::HirId>,
+    pub(crate) wrapper: bool,
+    pub(crate) parameter: bool,
+    pub(crate) optional: bool,
+    pub(crate) fallback: bool,
     pub(crate) uses: Vec<super::emitability::UseEdit>,
     pub(crate) use_hirs: Vec<rustc_hir::HirId>,
     pub(crate) base: Local,
@@ -71,6 +82,7 @@ pub(crate) enum CursorHold {
     IndexRangeMissing,
     WindowMissing,
     BaseMissing,
+    BaseModelRaw,
     LayoutUnbuilt,
     ScheduleMissing,
     RawBoundaryUnbuilt,
@@ -109,6 +121,9 @@ pub(crate) fn promote(
                 .enabled(subject.fn_did, super::super::additive::FamilyStage::Return)
             {
                 return None;
+            }
+            if let Some(plan) = wrapper::plan(ctx, subject, decision, entries) {
+                return Some((index, plan));
             }
             let proposed = match decision {
                 Decision::Degraded(record) => {
@@ -149,6 +164,16 @@ pub(crate) fn promote(
             local: subject.local,
             disposition: proposed.as_ref().map(|_| ()).map_err(|e| *e),
         });
+        if proposed == Err(CursorHold::BaseModelRaw)
+            && let Decision::Degraded(record) = decision
+        {
+            record.reason = DegradeReason::CursorBaseModelRaw;
+        }
+        if proposed == Err(CursorHold::BaseMissing)
+            && let Decision::Degraded(record) = decision
+        {
+            record.reason = DegradeReason::CursorBaseUnavailable;
+        }
         if let Ok(plan) = proposed {
             *decision = Decision::Cursor {
                 mutable: subject.mutable,
@@ -344,3 +369,7 @@ mod delivered_tests;
 #[cfg(test)]
 #[path = "cursor/custody_tests.rs"]
 mod custody_tests;
+
+#[cfg(test)]
+#[path = "cursor/wrapper_tests.rs"]
+mod wrapper_tests;

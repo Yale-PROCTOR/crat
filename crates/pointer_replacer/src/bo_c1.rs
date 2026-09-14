@@ -230,6 +230,46 @@ struct RawBoundaryCustodyObservation {
     declaration_indices: Vec<usize>,
 }
 
+// Recognize the complete emitted path and generic shape, not an identifier
+// substring or alias. The declaration observer independently rejects type holes.
+fn cursor_wrapper_mutability(source: &str) -> Option<bool> {
+    let syn::Type::Path(ty) = syn::parse_str::<syn::Type>(source).ok()? else {
+        return None;
+    };
+    if ty.qself.is_some() || ty.path.leading_colon.is_some() {
+        return None;
+    }
+    let segments = ty.path.segments.iter().collect::<Vec<_>>();
+    let [root, module, wrapper] = segments.as_slice() else {
+        return None;
+    };
+    if root.ident != "crate"
+        || module.ident != "slice_cursor"
+        || !matches!(root.arguments, syn::PathArguments::None)
+        || !matches!(module.arguments, syn::PathArguments::None)
+    {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &wrapper.arguments else {
+        return None;
+    };
+    let args = args.args.iter().collect::<Vec<_>>();
+    if !matches!(
+        args.as_slice(),
+        [
+            syn::GenericArgument::Lifetime(_),
+            syn::GenericArgument::Type(_)
+        ]
+    ) {
+        return None;
+    }
+    match wrapper.ident.to_string().as_str() {
+        "SliceCursor" => Some(false),
+        "SliceCursorMut" => Some(true),
+        _ => None,
+    }
+}
+
 fn raw_boundary_custody_observed_form(
     shape: &crate::bo_rewriter::delivery_custody::TypeShape,
 ) -> Result<Option<crate::bo_rewriter::DeliveryForm>, &'static str> {
@@ -256,7 +296,11 @@ fn raw_boundary_custody_observed_form(
                 && matches!(pointee.as_ref(), TypeShape::Slice { .. })
                 && path.trim_start_matches("::") == "core::primitive::usize"
             {
-                Ok(Some(DeliveryForm::Cursor { mutable: *mutable }))
+                Ok(Some(DeliveryForm::Cursor {
+                    mutable: *mutable,
+                    optional: false,
+                    wrapper: false,
+                }))
             } else {
                 Err("unresolved-cursor-type")
             }
@@ -278,7 +322,15 @@ fn raw_boundary_custody_observed_form(
                 slice: matches!(payload.as_ref(), TypeShape::Slice { .. }),
             }))
         }
-        TypeShape::Named { .. } => Err("unresolved-type"),
+        TypeShape::Named { path } => cursor_wrapper_mutability(path)
+            .map(|mutable| {
+                Some(DeliveryForm::Cursor {
+                    mutable,
+                    optional,
+                    wrapper: true,
+                })
+            })
+            .ok_or("unresolved-type"),
         TypeShape::RawPointer { .. } | TypeShape::Slice { .. } | TypeShape::Option { .. } => {
             Ok(None)
         }
@@ -26113,13 +26165,60 @@ fn r219_custody_observe(
 }
 
 #[test]
+fn slicecursor_custody_recognizes_the_emitted_wrapper() {
+    for mutable in [false, true] {
+        for optional in [false, true] {
+            let mut expectation = r219_custody_expectation("f", "p");
+            expectation.parameter_index = None;
+            expectation.expected_form = crate::bo_rewriter::DeliveryForm::Cursor {
+                mutable,
+                optional,
+                wrapper: true,
+            };
+            let wrapper = if mutable {
+                "SliceCursorMut"
+            } else {
+                "SliceCursor"
+            };
+            let payload = format!("crate::slice_cursor::{wrapper}<'_, i32>");
+            let valid_type = if optional {
+                format!("Option<{payload}>")
+            } else {
+                payload
+            };
+            let source = format!("fn f() {{ let p: {valid_type} = todo!(); }}");
+            let report = r219_custody_observe(&[expectation.clone()], &["f::p#1"], &source, &[]);
+            assert!(report.issues.is_empty(), "{report:?}");
+            assert!(report.delivered_by_tree.contains("f::p#1"), "{report:?}");
+            for wrong in [
+                "user::slice_cursor::SliceCursor<'_, i32>",
+                "crate::slice_cursor::SliceCursor",
+                "crate::slice_cursor::SliceCursor<'_, i32, bool>",
+                "crate::slice_cursor::SliceCursor<'_, _>",
+                "(&[i32], ::core::primitive::usize)",
+                "&[i32]",
+            ] {
+                let source = format!("fn f() {{ let p: {wrong} = todo!(); }}");
+                let report =
+                    r219_custody_observe(&[expectation.clone()], &["f::p#1"], &source, &[]);
+                assert!(report.delivered_by_tree.is_empty(), "{wrong}: {report:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn cursor_custody_requires_exact_base_index_tuple() {
     use crate::bo_rewriter::DeliveryForm;
     for mutable in [false, true] {
         let qualifier = if mutable { "mut " } else { "" };
         let mut expectation = r219_custody_expectation("f", "p");
         expectation.parameter_index = None;
-        expectation.expected_form = DeliveryForm::Cursor { mutable };
+        expectation.expected_form = DeliveryForm::Cursor {
+            mutable,
+            optional: false,
+            wrapper: false,
+        };
         let source =
             format!("fn f() {{ let p: (&{qualifier}[i32], ::core::primitive::usize) = todo!(); }}");
         let report = r219_custody_observe(&[expectation], &["f::p#1"], &source, &[]);
@@ -26138,7 +26237,11 @@ fn cursor_custody_requires_exact_base_index_tuple() {
     ] {
         let mut expectation = r219_custody_expectation("f", "p");
         expectation.parameter_index = None;
-        expectation.expected_form = DeliveryForm::Cursor { mutable: false };
+        expectation.expected_form = DeliveryForm::Cursor {
+            mutable: false,
+            optional: false,
+            wrapper: false,
+        };
         let source = format!("fn f() {{ let p: {actual_type} = todo!(); }}");
         let report = r219_custody_observe(&[expectation], &["f::p#1"], &source, &[]);
         assert!(

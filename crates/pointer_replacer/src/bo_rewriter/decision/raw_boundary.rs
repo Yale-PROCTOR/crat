@@ -2534,7 +2534,19 @@ pub(crate) fn template_for(
             }
         }
         Decision::NestedSlice { .. } => Err(RawBoundaryBlockReason::TemplateUnavailable),
-        Decision::Cursor { mutable, .. } => {
+        Decision::Cursor { mutable, plan } => {
+            if plan.wrapper && !plan.optional {
+                if ownership == Some(OwnershipContract::Consume) {
+                    return Err(RawBoundaryBlockReason::OwnershipTransfer);
+                }
+                return match (*mutable, target.mutability) {
+                    (false, RawMutability::Const) | (true, RawMutability::Const) => {
+                        Ok(BridgeTemplate::SliceToRawConst)
+                    }
+                    (true, RawMutability::Mut) => Ok(BridgeTemplate::SliceMutToRawMut),
+                    (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
+                };
+            }
             if ownership == Some(OwnershipContract::Consume) {
                 return Err(RawBoundaryBlockReason::OwnershipTransfer);
             }
@@ -2710,7 +2722,8 @@ impl RawBoundaryDispositionIndex {
                     if let Some((owner, reason)) = box_site_owner(decision, site) {
                         return Ok(RawBoundaryDisposition::OwnedByOtherArm { owner, reason });
                     }
-                    let contract = super::raw_boundary_contracts::classify_contract(
+                    let contract = super::cursor_native::foreign::for_decision(
+                        decision,
                         &site.key.callee,
                         site.key.argument_index,
                         &site.target,

@@ -508,6 +508,11 @@ pub(super) fn plan(
         return Err(CursorHold::UseUnbuilt);
     }
     Ok(CursorPlan {
+        parent_cursor: None,
+        wrapper: false,
+        parameter: false,
+        optional: false,
+        fallback: false,
         uses: visitor.uses,
         use_hirs: visitor.use_hirs,
         base: root_local,

@@ -89,6 +89,7 @@ mod shared_pair_ast;
 mod shared_pair_tests;
 pub(crate) mod sibling_audit;
 pub(crate) mod sign_facts;
+mod slice_cursor_prelude;
 pub(crate) mod use_census;
 pub(crate) mod verify;
 #[cfg(test)]
@@ -411,6 +412,8 @@ pub(crate) struct DeliveryExpectation {
 pub(crate) enum DeliveryForm {
     Cursor {
         mutable: bool,
+        optional: bool,
+        wrapper: bool,
     },
     Borrowed {
         mutable: bool,
@@ -432,8 +435,20 @@ fn delivery_form(decision: &decision::Decision) -> Option<DeliveryForm> {
                 slice: false,
             })
         }
-        decision::Decision::Cursor { mutable, .. } => {
-            Some(DeliveryForm::Cursor { mutable: *mutable })
+        decision::Decision::Cursor { mutable, plan } => {
+            if plan.wrapper && plan.parameter {
+                Some(DeliveryForm::Borrowed {
+                    mutable: *mutable,
+                    optional: plan.optional,
+                    slice: true,
+                })
+            } else {
+                Some(DeliveryForm::Cursor {
+                    mutable: *mutable,
+                    optional: plan.optional,
+                    wrapper: plan.wrapper,
+                })
+            }
         }
         decision::Decision::NestedSlice { mutable, .. }
         | decision::Decision::Slice { mutable, .. } => Some(DeliveryForm::Borrowed {
@@ -5504,6 +5519,14 @@ fn validate_cursor_delivered_bases(
             | decision::Decision::Box(_)
             | decision::Decision::Degraded(_) => continue,
         };
+        if !decision::cursor_native::wrapper::parent_available(table, subject, cursor) {
+            planned.hold_terminal_class(
+                bridge_receipt::SignatureClassId::of(subject.fn_did),
+                decision::Arm::Surface,
+                "cursor-parent-unavailable",
+                "derived cursor parent was not delivered".to_owned(),
+            );
+        }
         let Some(base) = &cursor.delivered_base else { continue };
         let node = (subject.fn_did, base.binding);
         let valid_binding = base.binding == base.window_binding
@@ -5514,7 +5537,7 @@ fn validate_cursor_delivered_bases(
             && {
                 let ty = tcx.typeck(subject.fn_did).node_type(base.binding);
                 matches!(ty.kind(), TyKind::Ref(_, pointee, mutability)
-                if matches!(pointee.kind(), TyKind::Slice(_)) && (!subject.mutable || mutability.is_mut()))
+                if (matches!(pointee.kind(), TyKind::Slice(_)) || (cursor.wrapper && matches!(pointee.kind(), TyKind::Array(..)))) && (!subject.mutable || mutability.is_mut()))
             };
         // Reject a planned change even when its current type happens to be a
         // slice: that change can be withdrawn independently during recovery.
@@ -5555,6 +5578,13 @@ fn validate_cursor_delivered_bases(
                 let rustc_hir::Node::Expr(init) = tcx.hir_node(*hir) else { return false };
                 if init.span != edit.span {
                     return false;
+                }
+                if cursor.wrapper {
+                    return decision::cursor_native::wrapper::source_binding(
+                        tcx,
+                        subject.fn_did,
+                        init,
+                    ) == Some(base.binding);
                 }
                 let source = match init.kind {
                     rustc_hir::ExprKind::MethodCall(_, receiver, [], _) => receiver,
