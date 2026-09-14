@@ -10,12 +10,63 @@ pub unsafe fn inspect(info: *const Info) -> i32 {
 }
 "#;
 
+#[test]
+fn wave5r_e0596_shared_field_borrow_into_readonly_callee() {
+    let source = emitted(
+        r#"
+        #![allow(dead_code, unused_unsafe)]
+        pub struct Part { value: i32 }
+        pub struct Whole { a: Part, b: Part }
+        unsafe fn child(p: *mut Part) {}
+        pub unsafe fn wrapper(p: *mut Whole) {
+            child(&mut (*p).a);
+            child(&mut (*p).b);
+        }
+    "#,
+    );
+    assert!(
+        source.contains("p: &Whole"),
+        "readonly root stays shared: {source}"
+    );
+    assert!(
+        !source.contains("&mut (*p)"),
+        "field borrow has shared permission: {source}"
+    );
+}
+
+#[test]
+fn wave5r_e0596_written_field_keeps_mutable_permission() {
+    let source = emitted(
+        r#"
+        #![allow(dead_code, unused_unsafe)]
+        pub struct Part { value: i32 }
+        pub struct Whole { a: Part }
+        unsafe fn child(p: *mut Part) { (*p).value += 1; }
+        pub unsafe fn wrapper(p: *mut Whole) { child(&mut (*p).a); }
+    "#,
+    );
+    assert!(
+        source.contains("p: &mut Whole"),
+        "written root needs mutable permission: {source}"
+    );
+}
+
 fn emitted(input: &str) -> String {
     emitted_reverting(input, None)
 }
 
 fn emitted_reverting(input: &str, reverted_function: Option<&str>) -> String {
-    let source = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+    let source = ast_source_reverting(input, reverted_function);
+    println!("EMITTED\n{source}");
+    assert!(
+        super::verify::type_checks_str(&source),
+        "emitted source must type-check:\n{source}"
+    );
+    source
+}
+
+fn ast_source_reverting(input: &str, reverted_function: Option<&str>) -> String {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("capture original AST");
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
@@ -58,13 +109,83 @@ fn emitted_reverting(input: &str, reverted_function: Option<&str>) -> String {
         .next()
         .expect("one source file")
     })
-    .expect("input type-checks");
-    println!("EMITTED\n{source}");
+    .expect("input type-checks")
+}
+
+const FIELD_CALL: &str = r#"
+    #![allow(dead_code, unused_unsafe)]
+    pub struct Part { value: i32 }
+    pub struct Whole { a: Part }
+    unsafe fn child(p: *mut Part) {}
+    pub unsafe fn wrapper(p: *mut Whole) { child(&mut (*p).a); }
+"#;
+
+#[test]
+fn wave5r_e0596_reverted_caller_retains_valid_original_borrow() {
+    let source = emitted_reverting(FIELD_CALL, Some("wrapper"));
+    assert!(source.contains("p: *mut Whole"));
+    assert!(source.contains("&mut (*p).a"));
+}
+
+#[test]
+fn wave5r_e0596_reverted_callee_withdraws_shared_repair() {
+    let source = ast_source_reverting(FIELD_CALL, Some("child"));
+    assert!(source.contains("child(p: *mut Part)"), "{source}");
     assert!(
-        super::verify::type_checks_str(&source),
-        "emitted source must type-check:\n{source}"
+        source.contains("&mut (*p).a"),
+        "no permission repair for a raw callee: {source}"
     );
-    source
+    assert!(
+        !super::verify::type_checks_str(&source),
+        "the ordinary compiler gate must hold this incomplete reversion"
+    );
+}
+
+#[test]
+fn wave5r_e0382_indirect_growth_callback_has_no_lend_certificate() {
+    use super::decision::ownership_fields_effects::{EffectsHold, NativeEffects};
+    let source = r#"
+        pub struct Parser { data: *mut u8, grow: unsafe fn(*mut u8, usize) -> *mut u8 }
+        pub unsafe fn csv_increase_buffer(p: *mut Parser) {
+            (*p).data = ((*p).grow)((*p).data, 16);
+        }
+    "#;
+    ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let program = super::collect_program(tcx);
+        let function = program
+            .functions
+            .iter()
+            .copied()
+            .find(|f| tcx.def_path_str(f.to_def_id()) == "csv_increase_buffer")
+            .unwrap();
+        let effects = NativeEffects::derive(&program);
+        assert!(
+            matches!(effects.certify(function, 0), Err(EffectsHold::Opaque(_))),
+            "an indirect realloc callback cannot receive the landed no-consume certificate"
+        );
+    })
+    .expect("native callback fixture compiles");
+}
+
+#[test]
+fn wave5r_e0499_overlapping_mutable_arguments_require_a_hold() {
+    let raw = "unsafe fn add(a: *mut i32, b: *mut i32) { *a += *b; } fn caller() { let mut diff = 1; unsafe { add(&mut diff, &mut diff); } }";
+    assert!(super::verify::type_checks_str(raw));
+    let references = raw.replace("*mut i32", "&mut i32");
+    assert!(
+        !super::verify::type_checks_str(&references),
+        "compiler aliasing hold remains required"
+    );
+}
+
+#[test]
+fn wave5r_e0503_live_field_borrow_requires_a_hold() {
+    let raw = "struct State { flags: i32 } fn caller() { let mut state = State { flags: 1 }; let p: *mut i32 = &mut state.flags; state.flags += 1; unsafe { *p += 1; } }";
+    assert!(super::verify::type_checks_str(raw));
+    assert!(
+        !super::verify::type_checks_str(&raw.replace("*mut i32", "&mut i32")),
+        "use through the owner while a mutable field reference is live stays held"
+    );
 }
 
 #[test]

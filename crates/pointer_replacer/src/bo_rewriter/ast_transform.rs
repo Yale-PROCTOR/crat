@@ -3880,7 +3880,10 @@ fn transform_with<'tcx>(
     // function becomes the safe inner; the pristine capture supplies the raw
     // outer declaration and attributes. One function-span claim makes the
     // two-item replacement one edit region.
+    super::wave5r_pointer_cast::apply(tcx, table, reverts, &mut krate, &mut guard)?;
+    super::wave5r_field_borrow::apply(tcx, table, reverts, &mut krate, &mut guard)?;
     apply_surface_plans(capture, table, reverts, &mut krate, &mut guard)?;
+    super::wave5r_helper_path::qualify(tcx, capture, table, reverts, &mut krate);
 
     // **Each pass counts its OWN refusals**, at the site where it was turned
     // away. This used to recompute `decls.refused` here by summing
