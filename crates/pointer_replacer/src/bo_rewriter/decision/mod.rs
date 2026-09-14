@@ -49,6 +49,7 @@ pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod local_callee_extent;
 pub(crate) mod nested_slice;
 pub(crate) mod option;
+mod option_ops;
 pub(crate) mod outbound_expression;
 pub(crate) mod overlapping_pairs;
 pub(crate) mod ownership_fields_cache_binding;

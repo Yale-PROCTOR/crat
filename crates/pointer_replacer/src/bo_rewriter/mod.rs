@@ -158,6 +158,8 @@ mod native_return_replay_tests;
 #[cfg(test)]
 mod nested_use_tests;
 #[cfg(test)]
+mod option_ops_tests;
+#[cfg(test)]
 mod option_projection_tests;
 #[cfg(test)]
 mod option_receiver_tests;

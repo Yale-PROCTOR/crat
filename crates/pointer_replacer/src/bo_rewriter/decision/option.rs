@@ -363,7 +363,7 @@ pub(crate) fn plan_values(
                     .map(|site| (site.rhs, site.span, false)),
             );
             for site in &uses.sites {
-                if site.operation == "deferred-boundary-or-copy" {
+                if matches!(site.operation, "deferred-boundary-or-copy" | "return-raw") {
                     continue;
                 }
                 receipts.push(receipt(
@@ -747,6 +747,15 @@ pub(crate) fn plan_operations(
         };
         let node = (subject.fn_did, subject.hir_id);
         let Some(uses) = uses.get(&node) else { continue };
+        super::option_ops::plan_raw_returns(
+            tcx,
+            table,
+            subject,
+            source,
+            uses,
+            &mut out,
+            &mut body_edits,
+        );
         for site in uses
             .sites
             .iter()

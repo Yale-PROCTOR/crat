@@ -1608,6 +1608,11 @@ fn collect_opt_uses_with_family(
                     return;
                 }
                 if self.expanded
+                    && super::option_ops::collect_raw_return(self.tcx, expr, key, self.out)
+                {
+                    return;
+                }
+                if self.expanded
                     && matches!(self.tcx.parent_hir_node(expr.hir_id),
                     rustc_hir::Node::Expr(parent) if matches!(parent.kind,
                         ExprKind::Assign(lhs, _, _) if lhs.hir_id == expr.hir_id))
