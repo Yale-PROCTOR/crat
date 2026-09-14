@@ -207,6 +207,12 @@ pub(crate) fn collect(
         else {
             continue;
         };
+        if contract.returns_alias_of == Some(fact.argument_index) {
+            // #1a does not yet carry the returned-child custody needed to
+            // replace the parent pointer. Exact-count memcpy destination
+            // ownership is the separately bounded #1b transaction.
+            continue;
+        }
         if matches!(
             contract.extent,
             ArgumentExtent::ByteCount | ArgumentExtent::ElementCount
@@ -332,6 +338,17 @@ impl CandidateIndex {
         let Some(candidate) = self.by_subject.get(&(subject.fn_did, subject.hir_id)) else {
             return Selection::Keep(KeepReason::NoContractOperation);
         };
+        let sites = candidate
+            .sites
+            .iter()
+            .filter(|site| !matches!(site.requirement, Requirement::LocalAccess))
+            .cloned()
+            .collect::<Vec<_>>();
+        if sites.is_empty() {
+            return Selection::Keep(KeepReason::NonLength(NonLengthHold::Existing(
+                "local-callee-contract-deferred-1a".to_owned(),
+            )));
+        }
         select(
             &SubjectFacts {
                 key: candidate.subject.clone(),
@@ -347,7 +364,7 @@ impl CandidateIndex {
                 }),
                 non_length: Ok(()),
             },
-            &candidate.sites,
+            &sites,
             None,
         )
     }

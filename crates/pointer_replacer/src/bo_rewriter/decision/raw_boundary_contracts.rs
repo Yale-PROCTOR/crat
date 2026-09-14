@@ -626,9 +626,9 @@ mod tests {
     }
 
     #[test]
-    fn rb_retalias_metadata_is_exactly_the_seven_existing_symbols() {
+    fn rb_retalias_metadata_is_exactly_the_eight_existing_symbols() {
         let expected = std::collections::BTreeSet::from([
-            "fgets", "strcat", "strchr", "strcpy", "strncat", "strncpy", "strstr",
+            "fgets", "memcpy", "strcat", "strchr", "strcpy", "strncat", "strncpy", "strstr",
         ]);
         let observed = TABLE
             .iter()
