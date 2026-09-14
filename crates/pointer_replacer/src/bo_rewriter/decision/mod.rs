@@ -981,6 +981,9 @@ pub(crate) struct DecisionTable {
     pub option_value_initializers: Vec<(LocalDefId, rustc_hir::HirId)>,
     pub option_mut_bindings: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub option_composed_uses: Vec<((LocalDefId, rustc_hir::HirId), Span)>,
+    /// Contract-driven slice promotions, keyed by the exact compiler subject.
+    pub(crate) contract_extent_promotions:
+        FxHashMap<(LocalDefId, rustc_hir::HirId), contract_extent::Promotion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1088,6 +1091,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) local_callee_extent:
         &'a FxHashMap<(LocalDefId, rustc_hir::HirId), local_callee_extent::LocalCalleeAccess>,
+    pub(crate) contract_extent: &'a contract_extent::CandidateIndex,
     pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
     pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
     pub(crate) input_interfaces: &'a interface::InputInterfaces,
@@ -1151,6 +1155,35 @@ pub(crate) fn decide_with_raw_fallbacks(
     construction_values::settle(ctx, &mut entries);
     let cursor_receipts = cursor_native::promote(ctx, &mut entries);
     cursor_native::observe(ctx, &entries, &cursor_receipts);
+    let contract_extent_promotions = entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let nullable = match decision {
+                Decision::Slice { .. } => false,
+                Decision::Opt { slice: true, .. } => true,
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Opt { slice: false, .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => return None,
+            };
+            let existing_slice = ctx
+                .facts
+                .raw_only_uses
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|uses| {
+                    uses.iter()
+                        .any(|(op, _)| emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
+                        && ctx.fat.is_array(subject.fn_did, subject.local)
+                });
+            if existing_slice {
+                return None;
+            }
+            ctx.contract_extent
+                .promotion(subject, nullable, ctx.fat)
+                .map(|promotion| ((subject.fn_did, subject.hir_id), promotion))
+        })
+        .collect();
     let option_mut_bindings = entries
         .iter()
         .filter_map(|(subject, decision)| {
@@ -1226,6 +1259,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         option_value_initializers: Vec::new(),
         option_mut_bindings,
         option_composed_uses: Vec::new(),
+        contract_extent_promotions,
     }
 }
 
@@ -1659,6 +1693,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         void_pointee,
         thin_extent,
         local_callee_extent,
+        contract_extent,
         declaration_pointees,
         declaration_patterns,
         input_interfaces: _,
@@ -1839,6 +1874,32 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         None if counted.is_some() => Form::Slice,
         None => Form::Plain,
     };
+    let contract_form = match form {
+        Form::Plain => Some(contract_extent::CurrentForm::Ref {
+            mutable: subject.mutable,
+            nullable: false,
+        }),
+        Form::Opt { slice: false } => Some(contract_extent::CurrentForm::Ref {
+            mutable: subject.mutable,
+            nullable: true,
+        }),
+        Form::Slice | Form::Opt { slice: true } => None,
+    };
+    if let Some(contract_form) = contract_form
+        && matches!(
+            contract_extent.select(subject, contract_form, Some(SlotKind::Ref), fat),
+            contract_extent::Selection::Promote(_)
+        )
+    {
+        form = if matches!(
+            contract_form,
+            contract_extent::CurrentForm::Ref { nullable: true, .. }
+        ) {
+            Form::Opt { slice: true }
+        } else {
+            Form::Slice
+        };
+    }
     if let Some(receiver) = return_receivers
         .and_then(|receivers| receivers.plans.get(&(subject.fn_did, subject.hir_id)))
     {
@@ -2350,6 +2411,7 @@ mod self_consistency_tests {
             option_value_initializers: Vec::new(),
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
+            contract_extent_promotions: Default::default(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

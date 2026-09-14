@@ -5262,6 +5262,7 @@ mod tests {
             option_value_initializers: Vec::new(),
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
+            contract_extent_promotions: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -5333,6 +5334,7 @@ mod tests {
             option_value_initializers: Vec::new(),
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
+            contract_extent_promotions: Default::default(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

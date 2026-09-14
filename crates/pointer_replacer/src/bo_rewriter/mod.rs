@@ -136,6 +136,8 @@ mod callee_input_tests;
 #[cfg(test)]
 mod cast_of_local_bridge_tests;
 #[cfg(test)]
+mod contract_extent_integration_tests;
+#[cfg(test)]
 mod counted_void_tests;
 #[cfg(test)]
 mod declaration_pattern_tests;
@@ -6753,6 +6755,12 @@ fn finish_decide<'tcx>(
     // `&[T]` carries its own checked extent and is out of this class (R365-2).
     let local_callee_extent_subjects =
         decision::local_callee_extent::collect(tcx, &subjects, &facts, &full_slice_uses);
+    let contract_extent_candidates = decision::contract_extent::collect(
+        &subjects,
+        &facts,
+        &ctors,
+        &local_callee_extent_subjects,
+    );
     let return_parameter_nodes = subjects
         .iter()
         .filter(|subject| {
@@ -7018,6 +7026,7 @@ fn finish_decide<'tcx>(
                     void_pointee: &void_pointee_subjects,
                     thin_extent: &thin_extent_subjects,
                     local_callee_extent: &local_callee_extent_subjects,
+                    contract_extent: &contract_extent_candidates,
                     declaration_pointees: &declaration_pointees,
                     declaration_patterns: &declaration_patterns,
                     input_interfaces: &input_interfaces,

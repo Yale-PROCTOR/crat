@@ -256,6 +256,9 @@ pub(crate) struct Arg {
     pub direct_storage: Option<(HirId, Span)>,
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<super::raw_boundary::RawMutability>,
+    /// Exact Rust array receiver of `.as_ptr()` / `.as_mut_ptr()`. Every
+    /// element of an array value is initialized before this expression exists.
+    pub initialized_array_elements: Option<u64>,
     /// Exact syntactic place identity after peeling address/cast wrappers.
     /// Distinct field projections remain distinct even when `place_root` is
     /// the same aggregate local.
@@ -523,6 +526,20 @@ fn direct_mutable_storage(expr: &Expr<'_>) -> Option<(HirId, Span)> {
         return None;
     };
     Some((binding, storage.span))
+}
+
+fn initialized_array_decay(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> Option<u64> {
+    let expr = peel_casts(expr);
+    let ExprKind::MethodCall(segment, receiver, _, _) = expr.kind else { return None };
+    if !matches!(segment.ident.name.as_str(), "as_ptr" | "as_mut_ptr") {
+        return None;
+    }
+    let mut ty = tcx.typeck(owner).expr_ty(receiver);
+    while let rustc_middle::ty::TyKind::Ref(_, inner, _) = ty.kind() {
+        ty = *inner;
+    }
+    let rustc_middle::ty::TyKind::Array(_, length) = ty.kind() else { return None };
+    length.try_to_target_usize(tcx)
 }
 
 #[derive(Debug, Default)]
@@ -899,6 +916,11 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             direct_storage: direct_mutable_storage(arg),
                                             adapter_operand_span,
                                             adapter_operand_mutability,
+                                            initialized_array_elements: initialized_array_decay(
+                                                self.tcx,
+                                                self.fn_did,
+                                                arg,
+                                            ),
                                             place_identity: Self::exact_place_identity(arg),
                                         }
                                     })

@@ -100,6 +100,8 @@ impl AccessReason {
 /// The typed hold: which callee, which parameter, read or write, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalCalleeAccess {
+    pub(crate) callee_id: LocalDefId,
+    pub(crate) parameter_index: usize,
     pub callee: String,
     pub parameter: String,
     /// `read` or `write`, from the callee parameter's own pointee mutability.
@@ -186,6 +188,11 @@ fn parameter_access(
         _ => "read",
     };
     Some(LocalCalleeAccess {
+        callee_id: param.fn_did,
+        parameter_index: match param.kind {
+            SubjectKind::Param { hir_index } => hir_index,
+            SubjectKind::Local => unreachable!("local callee access is classified on a parameter"),
+        },
         callee: tcx.def_path_str(param.fn_did.to_def_id()),
         parameter: param
             .param_name

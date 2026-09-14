@@ -1974,6 +1974,7 @@ mod a5_cast_role_tests {
                         direct_storage: None,
                         adapter_operand_span: inner,
                         adapter_operand_mutability: Some(RawMutability::Const),
+                        initialized_array_elements: None,
                         place_identity: None,
                     }],
                 }],
