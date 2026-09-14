@@ -22,7 +22,11 @@ use rustc_span::{
     def_id::{DefId, LocalDefId},
 };
 
-use super::{Subject, box_facts::BoxExprEdit, construction::ConstructionFacts};
+use super::{
+    Subject,
+    box_facts::{BoxExprEdit, BoxShape},
+    construction::ConstructionFacts,
+};
 use crate::utils::rustc::RustProgram;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,6 +58,9 @@ pub(crate) struct CallObligation {
     argument_span: Span,
     call_span: Span,
     scalar_arguments: BTreeSet<usize>,
+    deallocator_events:
+        Option<Vec<crate::analyses::borrow_ownership::source_events::SourceEventKey>>,
+    raw_argument_type: String,
 }
 impl CallObligation {
     pub(crate) fn key(&self) -> SourceCallKey {
@@ -78,6 +85,16 @@ impl CallObligation {
 
     pub(crate) fn scalar_arguments(&self) -> &BTreeSet<usize> {
         &self.scalar_arguments
+    }
+
+    pub(crate) fn deallocator_events(
+        &self,
+    ) -> Option<&[crate::analyses::borrow_ownership::source_events::SourceEventKey]> {
+        self.deallocator_events.as_deref()
+    }
+
+    pub(crate) fn raw_argument_type(&self) -> &str {
+        &self.raw_argument_type
     }
 }
 #[derive(Clone, Debug)]
@@ -117,6 +134,8 @@ pub(crate) struct SourcePlan {
     owner: LocalDefId,
     binding: HirId,
     count: String,
+    shape: BoxShape,
+    nonempty: bool,
     element: String,
     constructor: BoxExprEdit,
     scalar_edits: Vec<BoxExprEdit>,
@@ -139,6 +158,14 @@ impl SourcePlan {
 
     pub(crate) fn count(&self) -> &str {
         &self.count
+    }
+
+    pub(crate) fn shape(&self) -> BoxShape {
+        self.shape
+    }
+
+    pub(crate) fn nonempty(&self) -> bool {
+        self.nonempty
     }
 
     pub(crate) fn element(&self) -> &str {
@@ -412,7 +439,12 @@ pub(crate) fn derive<'tcx>(
                     continue;
                 }
                 let did = definition(callee).ok_or(SourceHold::UnsupportedOwnerUse)?;
-                if !typeck.expr_ty(expression).is_unit() {
+                if !typeck.expr_ty(expression).is_unit()
+                    && !matches!(
+                        typeck.expr_ty(expression).kind(),
+                        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool
+                    )
+                {
                     return Err(SourceHold::UnsupportedOwnerUse);
                 }
                 covered.insert(operand.hir_id.local_id.as_u32());
@@ -457,6 +489,9 @@ pub(crate) fn derive<'tcx>(
         let ExprKind::Unary(rustc_hir::UnOp::Deref, operand) = access.kind else {
             return Err(SourceHold::UnsupportedOwnerUse);
         };
+        if constructor.shape == BoxShape::Sized && !root_path(operand, binding) {
+            return Err(SourceHold::UnsupportedOwnerUse);
+        }
         let root = if root_path(operand, binding) {
             operand
         } else {
@@ -482,7 +517,11 @@ pub(crate) fn derive<'tcx>(
         covered.insert(root.hir_id.local_id.as_u32());
         scalar_edits.push(BoxExprEdit {
             span: edit.span,
-            replacement: edit.replacement.clone(),
+            replacement: if constructor.shape == BoxShape::Sized {
+                format!("(*{root_spelling})")
+            } else {
+                edit.replacement.clone()
+            },
             receipt: "native-box-slice-access",
         });
     }
@@ -638,6 +677,12 @@ pub(crate) fn derive<'tcx>(
                 root_spelling: root_spelling.clone(),
             });
         } else {
+            let deallocator_events = callee.as_local().and_then(|local| {
+                super::ownership_fields_deallocator::derive(program, local, argument)
+                    .ok()
+                    .filter(|p| p.matches(program, local, argument))
+                    .map(|p| p.events().to_vec())
+            });
             calls.push(CallObligation {
                 key: call.key,
                 callee,
@@ -645,19 +690,35 @@ pub(crate) fn derive<'tcx>(
                 argument_span,
                 call_span: expression.span,
                 scalar_arguments: scalar_arguments(expression, typeck)?,
+                deallocator_events,
+                raw_argument_type: typeck
+                    .expr_ty(match expression.kind {
+                        ExprKind::Call(_, args) => &args[argument],
+                        _ => unreachable!(),
+                    })
+                    .to_string(),
             });
         }
     }
-    if frees.len() != 1 {
+    let transfers: Vec<_> = calls
+        .iter()
+        .filter(|c| c.deallocator_events.is_some())
+        .collect();
+    if frees.len() + transfers.len() != 1 {
         return Err(SourceHold::FreeIdentity);
     }
-    let free = &frees[0];
-    if free.span.lo() < init.span.hi()
+    let (close_key, close_span) = if let Some(free) = frees.first() {
+        (free.key, free.span)
+    } else {
+        (transfers[0].key, transfers[0].call_span)
+    };
+    if close_span.lo() < init.span.hi()
         || scalar_edits
             .iter()
-            .any(|edit| edit.span.lo() < init.span.hi() || edit.span.hi() > free.span.lo())
+            .any(|edit| edit.span.lo() < init.span.hi() || edit.span.hi() > close_span.lo())
         || calls.iter().any(|call| {
-            call.call_span.lo() < init.span.hi() || call.call_span.hi() > free.span.lo()
+            call.call_span.lo() < init.span.hi()
+                || (call.key != close_key && call.call_span.hi() > close_span.lo())
         })
     {
         return Err(SourceHold::UnsupportedOwnerUse);
@@ -708,7 +769,7 @@ pub(crate) fn derive<'tcx>(
                     return Err(SourceHold::NormalExitCoverage);
                 }
                 state = State::Live;
-            } else if call.key == free.key {
+            } else if call.key == close_key {
                 if state != State::Live {
                     return Err(SourceHold::NormalExitCoverage);
                 }
@@ -743,6 +804,8 @@ pub(crate) fn derive<'tcx>(
         owner: subject.fn_did,
         binding,
         count: constructor.count,
+        shape: constructor.shape,
+        nonempty: constructor.nonempty,
         element: constructor.element.to_string(),
         constructor: constructor.edit,
         scalar_edits,

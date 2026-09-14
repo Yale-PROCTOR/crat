@@ -1,4 +1,4 @@
-//! R376 source-identified zeroed numeric boxed-slice constructors.
+//! Source-identified zeroed numeric Box and boxed-slice constructors.
 use rustc_hir::{Expr, ExprKind, Node, QPath, def::Res};
 use rustc_middle::ty::{FloatTy, IntTy, Ty, TyCtxt, TyKind, UintTy};
 use rustc_span::{
@@ -6,13 +6,18 @@ use rustc_span::{
     def_id::{DefId, LocalDefId},
 };
 
-use super::{box_facts::BoxExprEdit, ownership_fields_source::SourceHold};
+use super::{
+    box_facts::{BoxExprEdit, BoxShape},
+    ownership_fields_source::SourceHold,
+};
 
 pub(crate) struct Constructor<'tcx> {
     pub(crate) allocation: &'tcx Expr<'tcx>,
     pub(crate) allocator: DefId,
     pub(crate) element: Ty<'tcx>,
     pub(crate) count: String,
+    pub(crate) shape: BoxShape,
+    pub(crate) nonempty: bool,
     pub(crate) edit: BoxExprEdit,
 }
 
@@ -57,11 +62,12 @@ pub(crate) fn derive<'tcx>(
         .unwrap_or_else(|| tcx.item_name(allocator));
     let signature = tcx.fn_sig(allocator).skip_binder().skip_binder();
     // A widening integer cast is not enough to establish the foreign ABI.
-    // calloc takes size_t: both unsigned arguments must have pointer width.
-    if symbol.as_str() != "calloc"
+    // All allocator arguments must be size_t, including its unsigned width.
+    let is_malloc = symbol.as_str() == "malloc";
+    if (!is_malloc && symbol.as_str() != "calloc")
         || signature.c_variadic
         || signature.abi != (rustc_abi::ExternAbi::C { unwind: false })
-        || signature.inputs().len() != 2
+        || signature.inputs().len() != (if is_malloc { 1 } else { 2 })
         || signature
             .inputs()
             .iter()
@@ -70,6 +76,67 @@ pub(crate) fn derive<'tcx>(
             if matches!(pointee.kind(), TyKind::Adt(def, _) if Some(def.did()) == tcx.lang_items().c_void()))
     {
         return Err(SourceHold::ConstructorIdentity);
+    }
+    if is_malloc {
+        let [bytes] = arguments else { return Err(SourceHold::ConstructorShape) };
+        let peeled = peel_size_t(typeck, bytes, pointer_bits)?;
+        let (shape, count, replacement) = if exact_size(tcx, typeck, peeled, element, pointer_bits)
+        {
+            (
+                BoxShape::Sized,
+                "1".into(),
+                format!("::std::boxed::Box::new({zero})"),
+            )
+        } else {
+            let ExprKind::Binary(operator, left, right) = peeled.kind else {
+                return Err(SourceHold::ConstructorShape);
+            };
+            if operator.node != rustc_hir::BinOpKind::Mul {
+                return Err(SourceHold::ConstructorShape);
+            }
+            let factor = if exact_size(tcx, typeck, right, element, pointer_bits) {
+                left
+            } else if exact_size(tcx, typeck, left, element, pointer_bits) {
+                right
+            } else {
+                return Err(SourceHold::ConstructorShape);
+            };
+            let bound =
+                unsigned_bound(typeck, factor, pointer_bits).ok_or(SourceHold::ConstructorShape)?;
+            let maximum_bytes = (1u128 << (pointer_bits - 1)) - 1;
+            if bound == 0
+                || bound
+                    .checked_mul((element_bits / 8) as u128)
+                    .is_none_or(|bytes| bytes > maximum_bytes)
+            {
+                return Err(SourceHold::ConstructorShape);
+            }
+            // Keep the complete byte expression, including all source casts,
+            // operand order and side effects, evaluated once at the allocation.
+            // Exact sizeof and the bound above make this division lossless.
+            let original = tcx
+                .sess
+                .source_map()
+                .span_to_snippet(bytes.span)
+                .map_err(|_| SourceHold::Missing("constructor-byte-spelling"))?;
+            let count = format!("((({original}) as usize) / ::core::mem::size_of::<{element}>())");
+            let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
+            (BoxShape::Slice, count, replacement)
+        };
+        return Ok(Constructor {
+            allocation,
+            allocator,
+            element,
+            count,
+            shape,
+            nonempty: shape == BoxShape::Sized
+                || matches!(peeled.kind,ExprKind::Binary(_,left,right) if [left,right].iter().any(|e|matches!(e.kind,ExprKind::Lit(lit) if matches!(lit.node,rustc_ast::LitKind::Int(value,_) if value.get()>0)))),
+            edit: BoxExprEdit {
+                span: init.span,
+                replacement,
+                receipt: "native-malloc-zero-numeric",
+            },
+        });
     }
     let [count_expression, size_expression] = arguments else {
         return Err(SourceHold::ConstructorShape);
@@ -142,6 +209,65 @@ pub(crate) fn derive<'tcx>(
             },
         },
         count,
+        shape: BoxShape::Slice,
+        nonempty: matches!(count_expression.kind,ExprKind::Lit(lit) if matches!(lit.node,rustc_ast::LitKind::Int(value,_) if value.get()>0)),
+    })
+}
+
+fn peel_size_t<'tcx>(
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    mut expression: &'tcx Expr<'tcx>,
+    pointer_bits: u64,
+) -> Result<&'tcx Expr<'tcx>, SourceHold> {
+    if unsigned_bits(typeck.expr_ty(expression), pointer_bits) != Some(pointer_bits) {
+        return Err(SourceHold::ConstructorShape);
+    }
+    while let ExprKind::Cast(inner, _) = expression.kind {
+        if unsigned_bits(typeck.expr_ty(inner), pointer_bits) != Some(pointer_bits) {
+            return Err(SourceHold::ConstructorShape);
+        }
+        expression = inner;
+    }
+    Ok(expression)
+}
+
+fn exact_size<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expression: &'tcx Expr<'tcx>,
+    element: Ty<'tcx>,
+    pointer_bits: u64,
+) -> bool {
+    let Ok(expression) = peel_size_t(typeck, expression, pointer_bits) else { return false };
+    let ExprKind::Call(callee, arguments) = expression.kind else { return false };
+    let Some(did) = definition(callee) else { return false };
+    arguments.is_empty()
+        && tcx.is_diagnostic_item(Symbol::intern("mem_size_of"), did)
+        && matches!(typeck.expr_ty(callee).kind(), TyKind::FnDef(actual, args)
+            if *actual == did && args.type_at(0) == element)
+}
+
+fn unsigned_bound(
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    expression: &Expr<'_>,
+    pointer_bits: u64,
+) -> Option<u128> {
+    let bits = unsigned_bits(typeck.expr_ty(expression), pointer_bits)?;
+    if let ExprKind::Lit(literal) = expression.kind
+        && let rustc_ast::LitKind::Int(value, _) = literal.node
+    {
+        return Some(value.get());
+    }
+    if let ExprKind::Cast(inner, _) = expression.kind {
+        let inner_bits = unsigned_bits(typeck.expr_ty(inner), pointer_bits)?;
+        return (inner_bits <= bits)
+            .then(|| unsigned_bound(typeck, inner, pointer_bits))
+            .flatten();
+    }
+    Some(if bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
     })
 }
 
@@ -228,6 +354,100 @@ mod tests {
     const USIZE_CALLOC: &str =
         "unsafe extern \"C\" { fn calloc(n:usize,s:usize)->*mut core::ffi::c_void; }";
     const C_ULONG_CALLOC: &str = "unsafe extern \"C\" { fn calloc(n:libc::c_ulong,s:libc::c_ulong)->*mut core::ffi::c_void; }";
+    const USIZE_MALLOC: &str =
+        "unsafe extern \"C\" { fn malloc(n:usize)->*mut core::ffi::c_void; }";
+
+    #[test]
+    fn constructor_malloc_sized_uses_typed_zero() {
+        assert_eq!(
+            inspect(
+                USIZE_MALLOC,
+                "u16",
+                "malloc(core::mem::size_of::<u16>()) as *mut u16"
+            ),
+            Ok((
+                "1".into(),
+                "::std::boxed::Box::new(0u16)".into(),
+                "native-malloc-zero-numeric"
+            ))
+        );
+    }
+
+    #[test]
+    fn constructor_malloc_literal_slice_preserves_complete_byte_expression() {
+        for bytes in [
+            "3 * core::mem::size_of::<f32>()",
+            "core::mem::size_of::<f32>() * 3",
+        ] {
+            let (count, edit, receipt) =
+                inspect(USIZE_MALLOC, "f32", &format!("malloc({bytes}) as *mut f32")).unwrap();
+            assert_eq!(
+                count,
+                format!("((({bytes}) as usize) / ::core::mem::size_of::<f32>())")
+            );
+            assert_eq!(
+                edit,
+                format!("::std::vec![0.0f32; {count}].into_boxed_slice()")
+            );
+            assert_eq!(edit.matches(bytes).count(), 1);
+            assert_eq!(receipt, "native-malloc-zero-numeric");
+        }
+    }
+
+    #[test]
+    fn constructor_malloc_bounded_effectful_factor_evaluates_once() {
+        let bytes = "(next(&mut n) as usize) * core::mem::size_of::<u16>()";
+        let (count, edit, _) = inspect(
+            &format!("{USIZE_MALLOC} fn next(n:&mut i32)->u16 {{ *n+=1; *n as u16 }}"),
+            "u16",
+            &format!("malloc({bytes}) as *mut u16"),
+        )
+        .unwrap();
+        assert_eq!(
+            count,
+            format!("((({bytes}) as usize) / ::core::mem::size_of::<u16>())")
+        );
+        assert_eq!(edit.matches("next(&mut n)").count(), 1);
+    }
+
+    #[test]
+    fn constructor_malloc_faults_hold_unbounded_narrowing_and_wrong_size() {
+        for bytes in [
+            "n as usize * core::mem::size_of::<f32>()",
+            "(3 * core::mem::size_of::<f32>()) as u8 as usize",
+            "3 * (core::mem::size_of::<f32>() as u8 as usize)",
+            "3 * core::mem::size_of::<u32>()",
+            "0 * core::mem::size_of::<f32>()",
+            "usize::MAX * core::mem::size_of::<f32>()",
+        ] {
+            assert_eq!(
+                inspect(USIZE_MALLOC, "f32", &format!("malloc({bytes}) as *mut f32")),
+                Err(SourceHold::ConstructorShape),
+                "{bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_malloc_faults_require_c_allocator_and_size_t_abi() {
+        for declarations in [
+            "unsafe fn malloc(n:usize)->*mut core::ffi::c_void { core::ptr::null_mut() }",
+            "unsafe extern \"C-unwind\" { fn malloc(n:usize)->*mut core::ffi::c_void; }",
+            "unsafe extern \"C\" { fn malloc(n:u32)->*mut core::ffi::c_void; }",
+            "unsafe extern \"C\" { fn malloc(n:isize)->*mut core::ffi::c_void; }",
+            "unsafe extern \"C\" { #[link_name=\"not_malloc\"] fn malloc(n:usize)->*mut core::ffi::c_void; }",
+        ] {
+            assert_eq!(
+                inspect(
+                    declarations,
+                    "f32",
+                    "malloc(core::mem::size_of::<f32>() as _) as *mut f32"
+                ),
+                Err(SourceHold::ConstructorIdentity),
+                "{declarations}"
+            );
+        }
+    }
 
     #[test]
     fn constructor_literal_f32_preserves_existing_rendering() {

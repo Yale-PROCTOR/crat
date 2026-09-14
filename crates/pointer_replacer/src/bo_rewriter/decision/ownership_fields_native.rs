@@ -403,6 +403,35 @@ fn stable_raw_formal(table: &DecisionTable, callee: LocalDefId, argument: usize)
         == Some(&super::seam::Form::Raw)
 }
 
+/// Pinned Linux System-allocation / libc-free contract. The complete current
+/// crate graph must contain no user global allocator, including dependencies.
+/// Numeric nonempty payloads avoid the dangling zero-layout sentinel.
+pub(crate) fn c_free_allocator_compatible(tcx: rustc_middle::ty::TyCtxt<'_>) -> bool {
+    tcx.sess.target.os == "linux"
+        && !tcx.has_global_allocator(rustc_span::def_id::LOCAL_CRATE)
+        && tcx.crates(()).iter().all(|c| !tcx.has_global_allocator(*c))
+        && tcx
+            .crates(())
+            .iter()
+            .any(|c| tcx.crate_name(*c).as_str() == "std")
+}
+pub(crate) fn raw_lend_argument(
+    shape: BoxShape,
+    name: &str,
+    element: &str,
+    target: &str,
+) -> String {
+    let value = match shape {
+        BoxShape::Sized => format!("::core::ptr::from_mut(&mut *({name}))"),
+        BoxShape::Slice => format!("<[_]>::as_mut_ptr(&mut *({name}))"),
+    };
+    if target == format!("*mut {element}") {
+        value
+    } else {
+        format!("({value} as {target})")
+    }
+}
+
 fn derive_bundle(
     inputs: &Inputs<'_, '_>,
     table: &DecisionTable,
@@ -411,9 +440,6 @@ fn derive_bundle(
     subject: &super::Subject,
     source: &SourcePlan,
 ) -> Result<Bundle, NativeHold> {
-    if source.calls().is_empty() {
-        return Err(NativeHold::Missing("native-lend-call-inventory"));
-    }
     let tcx = inputs.program.tcx;
     let name = subject.param_name.as_ref().ok_or(NativeHold::Identity)?;
     let mut edits = vec![source.constructor().clone()];
@@ -452,7 +478,7 @@ fn derive_bundle(
         let [site] = matching.as_slice() else {
             return Err(NativeHold::Missing("native-lend-source-join"));
         };
-        if site.callee_may_yield_pointer {
+        if site.callee_may_yield_pointer && obligation.deallocator_events().is_none() {
             return Err(NativeHold::Missing("native-pointer-yield"));
         }
         let emitted = formal::resolve(
@@ -465,27 +491,78 @@ fn derive_bundle(
             argument,
         )
         .map_err(NativeHold::Call)?;
-        let lend_expression = match (emitted.emitted(), emitted.terminal()) {
-            (FormalForm::MutableRaw, super::seam::Form::Raw)
-                if stable_raw_formal(table, callee, argument) =>
+        let consumes = obligation.deallocator_events().is_some();
+        let lend_expression = if consumes {
+            if !source.nonempty() {
+                return Err(NativeHold::Missing("native-transfer-nonempty"));
+            }
+            if !c_free_allocator_compatible(tcx) {
+                return Err(NativeHold::Missing("native-transfer-allocator-contract"));
+            }
+            receipts.push("native-transfer-allocator=linux-System;global-allocators=none;nonempty=numeric-layout".into());
+            if emitted.terminal() != super::seam::Form::Raw
+                || !stable_raw_formal(table, callee, argument)
             {
-                format!("<[_]>::as_mut_ptr(&mut *({name}))")
+                return Err(NativeHold::FinalInterface);
             }
-            (FormalForm::MutableReference, super::seam::Form::Slice { mutable: true }) => {
-                format!("&mut *({name})")
+            let proof =
+                super::ownership_fields_deallocator::derive(inputs.program, callee, argument)
+                    .map_err(|_| NativeHold::Missing("native-deallocator-summary"))?;
+            if !proof.matches(inputs.program, callee, argument)
+                || Some(proof.events()) != obligation.deallocator_events()
+            {
+                return Err(NativeHold::Identity);
             }
-            _ => return Err(NativeHold::FinalInterface),
+            receipts.push(format!("native-box-transfer {:?} callee={} argument={argument} original-C-free-events={:?} caller-after=dead",key,tcx.def_path_str(callee.to_def_id()),proof.events()));
+            format!(
+                "(::std::boxed::Box::into_raw({name}) as {})",
+                obligation.raw_argument_type()
+            )
+        } else {
+            formal::require_nonconsuming(effects, &emitted).map_err(NativeHold::Call)?;
+            let Some(RetentionVerdict::NoRetain { certificate }) =
+                inputs.retention.get(callee, argument)
+            else {
+                return Err(NativeHold::Call(Hold::Lend(LendHold::Retention)));
+            };
+            inputs
+                .retention
+                .verify_certificate(callee, argument, certificate)
+                .map_err(|_| NativeHold::Call(Hold::Lend(LendHold::Retention)))?;
+            match (source.shape(), emitted.emitted(), emitted.terminal()) {
+                (BoxShape::Slice, FormalForm::MutableRaw, super::seam::Form::Raw)
+                    if stable_raw_formal(table, callee, argument) =>
+                {
+                    raw_lend_argument(
+                        source.shape(),
+                        name,
+                        source.element(),
+                        obligation.raw_argument_type(),
+                    )
+                }
+                (BoxShape::Sized, FormalForm::MutableRaw, super::seam::Form::Raw)
+                    if stable_raw_formal(table, callee, argument) =>
+                {
+                    raw_lend_argument(
+                        source.shape(),
+                        name,
+                        source.element(),
+                        obligation.raw_argument_type(),
+                    )
+                }
+                (
+                    BoxShape::Slice,
+                    FormalForm::MutableReference,
+                    super::seam::Form::Slice { mutable: true },
+                )
+                | (
+                    BoxShape::Sized,
+                    FormalForm::MutableReference,
+                    super::seam::Form::Ref { mutable: true },
+                ) => format!("&mut *({name})"),
+                _ => return Err(NativeHold::FinalInterface),
+            }
         };
-        formal::require_nonconsuming(effects, &emitted).map_err(NativeHold::Call)?;
-        let Some(RetentionVerdict::NoRetain { certificate }) =
-            inputs.retention.get(callee, argument)
-        else {
-            return Err(NativeHold::Call(Hold::Lend(LendHold::Retention)));
-        };
-        inputs
-            .retention
-            .verify_certificate(callee, argument, certificate)
-            .map_err(|_| NativeHold::Call(Hold::Lend(LendHold::Retention)))?;
         let sig = tcx.fn_sig(callee.to_def_id()).skip_binder().skip_binder();
         // The source permit accounts for every nonpointer operand separately.
         // Only literal/local/cast scalar reads commute with the peer borrows.
@@ -498,7 +575,14 @@ fn derive_bundle(
         let scalar_indices: BTreeSet<_> = (0..sig.inputs().len())
             .filter(|index| !pointer_indices.contains(index))
             .collect();
-        if !sig.output().is_unit()
+        if (!sig.output().is_unit()
+            && !matches!(
+                sig.output().kind(),
+                rustc_middle::ty::TyKind::Int(_)
+                    | rustc_middle::ty::TyKind::Uint(_)
+                    | rustc_middle::ty::TyKind::Float(_)
+                    | rustc_middle::ty::TyKind::Bool
+            ))
             || &scalar_indices != obligation.scalar_arguments()
             || scalar_indices.iter().any(|index| {
                 !matches!(
@@ -569,16 +653,22 @@ fn derive_bundle(
             // Select the inherent slice operation directly; a source trait
             // method on Box must not capture the generated view operation.
             replacement: lend_expression,
-            receipt: "native-box-lend-t1",
+            receipt: if consumes {
+                "native-box-transfer-to-c-free"
+            } else {
+                "native-box-lend-t1"
+            },
         });
-        receipts.push(format!("native-box-lend {:?} arg={argument} formal_model={:?} emitted={} T1=verified nonconsuming=verified interval=argument-list-through-return protector=call source-reference-inventory=complete",key,emitted.model_kind(),emitted.terminal().key()));
+        if !consumes {
+            receipts.push(format!("native-box-lend {:?} arg={argument} formal_model={:?} emitted={} T1=verified nonconsuming=verified interval=argument-list-through-return protector=call source-reference-inventory=complete",key,emitted.model_kind(),emitted.terminal().key()));
+        }
         checked_calls.insert(key);
         formals.push(emitted);
     }
     // SourcePlan proves a fresh numeric root per allocation occurrence, no source aliases/escaping storage,
     // no reference-taking or rebinding, and all normal paths through its exact
-    // C free. Each owner-using call above is separately proved nonretaining and
-    // nonconsuming. That completes the all-roots account for extra unwinding
+    // C free or proven consuming call. Kept-owner calls are separately proved
+    // nonretaining and nonconsuming; transfer calls keep their original callee free. That completes the all-roots account for extra unwinding
     // closes of this scalar root; it is not inferred from an empty loan set.
     for at in source.unwind_obligations() {
         receipts.push(format!("native-unwind-close-permit source-call={at:?} all-roots=fresh-local-closed-uses-and-verified-T1 payload={}/nonrecursive; actual-waiver-sites=emitted-MIR-ledger",source.element()));
@@ -608,11 +698,17 @@ fn derive_bundle(
     {
         return Err(NativeHold::Identity);
     }
-    receipts.push(format!("native-box-continuations calls={checked_calls:?} free_keys={required:?} scope-exit=exact-C-free"));
+    let transfer_keys = source
+        .calls()
+        .iter()
+        .filter(|c| c.deallocator_events().is_some())
+        .map(|c| c.key())
+        .collect::<BTreeSet<_>>();
+    receipts.push(format!("native-box-continuations calls={checked_calls:?} free_keys={required:?} transfer_keys={transfer_keys:?} scope-exit=closed-by-explicit-source-sink"));
     Ok(Bundle {
         source_elements: source.count().parse::<u64>().ok(),
         plan: BoxPlan {
-            shape: BoxShape::Slice,
+            shape: source.shape(),
             optional: false,
             expr_edits: edits,
             delete_statements: Vec::new(),

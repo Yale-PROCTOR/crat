@@ -82,6 +82,8 @@ pub(crate) mod mechanical_receipt;
 mod construction_values_tests;
 pub(crate) mod ownership_fields;
 #[cfg(test)]
+mod ownership_fields_bodylocal_tests;
+#[cfg(test)]
 mod ownership_fields_cp2_tests;
 #[cfg(test)]
 mod ownership_fields_native_tests;
