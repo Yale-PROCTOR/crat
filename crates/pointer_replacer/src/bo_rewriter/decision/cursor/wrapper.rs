@@ -327,7 +327,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         if Some(e.hir_id) == self.init {
             return;
         }
-        // R130's compiler-resolved address observations are scalar operations:
+        // Only comparison/difference observations are scalar operations:
         // the resulting pointer is consumed by the comparison/difference, never
         // retained. Each operand owns its own edit and typed cursor receipt.
         if let Some(operand) = self
@@ -335,6 +335,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             .facts
             .address_observations
             .iter()
+            .filter(|observation| scalar_address_operation(observation.op))
             .flat_map(|observation| &observation.operands)
             .find(|operand| {
                 operand.node == (self.subject.fn_did, self.subject.hir_id) && operand.span == e.span
@@ -362,7 +363,9 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             .facts
             .address_observations
             .iter()
-            .any(|observation| observation.span == e.span)
+            .any(|observation| {
+                scalar_address_operation(observation.op) && observation.span == e.span
+            })
         {
             intravisit::walk_expr(self, e);
             return;
@@ -824,4 +827,11 @@ pub(crate) fn parent_available(
                 }
             })
     })
+}
+
+fn scalar_address_operation(op: &str) -> bool {
+    matches!(
+        op,
+        "lt" | "le" | "gt" | "ge" | "eq" | "ne" | "ptr-eq" | "difference"
+    )
 }
