@@ -7,6 +7,9 @@
 //! restore the two prior `Option<&Binn>` / `Option<&i32>` deliveries.
 use std::collections::BTreeMap;
 
+#[path = "exclusion_rederivation_bzip2_fixture.rs"]
+mod bzip2_fixture;
+
 use super::{A5Mode, WholeProgramAttestation, additive::FamilyFallbackReceipt, decision};
 
 /// `binn_get_bool` / `is_bool_str` reduced from binn with both pointees `i32`
@@ -729,4 +732,40 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
             assert!(!by_owner.contains_key(&farthest));
         });
     }
+}
+
+/// The batch-7 stop (main 034): bzip2's `blocksort` trio composed with
+/// slicecursor's `87c290ec..7968e4a3` (bisected against this fixture: wave-6o,
+/// 6r, 6v, 6l and 5c each pass) lost both `eclass#2` slices as `unrestored` —
+/// the cursor candidate for `fallbackSimpleSort::fmap` at `Return` holds the two
+/// mutually dependent classes (`fallbackQSort3` ↔ `fallbackSimpleSort`, the
+/// pass-on at arg 1) and R220's protected walk requested nothing. Under the
+/// repair the request-less root restores and the nearest changed neighbour
+/// yields its cursor candidate; both slices deliver. On this branch the shape
+/// is a regression guard (no cursor hook here); its RED is the composition.
+#[test]
+fn bzip2_blocksort_pass_on_keeps_both_eclass_slices() {
+    let outcome = decide(bzip2_fixture::BZIP2_BLOCKSORT).expect("the batch-7 stop must not recur");
+    assert_eq!(
+        form(&outcome, "fallbackQSort3::eclass"),
+        "slice-shared",
+        "{:?}",
+        outcome.forms
+    );
+    assert_eq!(
+        form(&outcome, "fallbackSimpleSort::eclass"),
+        "slice-shared",
+        "{:?}",
+        outcome.forms
+    );
+    assert!(
+        outcome
+            .receipts
+            .iter()
+            .all(|receipt| receipt.subjects.iter().all(|(label, old, new)| {
+                !label.ends_with("::eclass#2") || old == "raw" || old == new
+            })),
+        "no receipt withdraws a delivered eclass slice: {:#?}",
+        outcome.receipts
+    );
 }
