@@ -243,9 +243,20 @@ pub(crate) fn explicit_declarations(
     table: &super::DecisionTable,
 ) -> Vec<super::seam::ExplicitDeclarationSite> {
     use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+    // One explicit declaration per node: a site another producer already
+    // registered for this subject is not duplicated (the AST pass refuses
+    // duplicates). The cursor's site exists only for a `Cursor` decision.
+    let declared = table
+        .seams
+        .explicit_declarations
+        .iter()
+        .filter(|site| site.category == "local")
+        .filter_map(|site| site.node)
+        .collect::<rustc_hash::FxHashSet<_>>();
     table
         .entries
         .iter()
+        .filter(|(subject, _)| !declared.contains(&(subject.fn_did, subject.hir_id)))
         .filter_map(|(subject, decision)| match decision {
             Decision::Cursor { plan, .. } => {
                 plan.explicit_declaration.as_ref().map(|emitted_type| {
