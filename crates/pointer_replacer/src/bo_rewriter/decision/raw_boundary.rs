@@ -4938,16 +4938,42 @@ impl RawBoundaryDispositionIndex {
             }
         }
         for observation in &emitability.address_observations {
+            // Wave-6o: an EQUALITY operand that is not a safe subject (no
+            // decision, or a degraded one) keeps its raw text; the safe
+            // operands still receive their views. Ordering keeps the
+            // all-operands rule: a cursor shape is not opened here.
+            let raw_partner = |operand: &super::emitability::AddressOperand| {
+                matches!(observation.op, "eq" | "ne")
+                    && decisions
+                        .get(&operand.node)
+                        .is_none_or(|(_, decision)| match decision {
+                            super::Decision::Degraded(_) => true,
+                            super::Decision::Ref { .. }
+                            | super::Decision::InferredRef { .. }
+                            | super::Decision::Slice { .. }
+                            | super::Decision::Opt { .. }
+                            | super::Decision::Box(_)
+                            | super::Decision::NestedSlice { .. }
+                            | super::Decision::Cursor { .. } => false,
+                        })
+            };
             if observation.operands.is_empty()
+                || observation.operands.iter().all(raw_partner)
                 || !observation.operands.iter().all(|operand| {
-                    emitability.address_use_class(operand.node)
-                        == super::emitability::AddressUseClass::ValueOnly
+                    raw_partner(operand)
+                        || emitability.address_use_class(operand.node)
+                            == super::emitability::AddressUseClass::ValueOnly
                 })
             {
                 continue;
             }
             let mut views = Vec::with_capacity(observation.operands.len());
+            let mut viewed = 0usize;
             for (operand_index, operand) in observation.operands.iter().enumerate() {
+                if raw_partner(operand) {
+                    continue;
+                }
+                viewed += 1;
                 let Some((_, decision)) = decisions.get(&operand.node).copied() else {
                     views.clear();
                     break;
@@ -4980,7 +5006,7 @@ impl RawBoundaryDispositionIndex {
                     target_type: observation.target_type.clone(),
                 });
             }
-            if views.len() != observation.operands.len() {
+            if views.len() != viewed {
                 continue;
             }
             for view in &views {

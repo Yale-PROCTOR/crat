@@ -1171,7 +1171,17 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                         .into_iter()
                         .filter_map(|side| self.address_operand(side))
                         .collect::<Vec<_>>();
-                    if operands.len() == 2 {
+                    // Wave-6o: an EQUALITY against a raw-typed expression that
+                    // is not a local (a call result, a field) is still a value
+                    // observation of the one local operand; the other side
+                    // stays raw text. Ordering stays two-sided (cursor shapes).
+                    let one_sided_equality = operands.len() == 1
+                        && matches!(op.node, Eq | Ne)
+                        && [lhs, rhs].into_iter().all(|side| {
+                            raw_target_type(self.tcx, self.tcx.typeck(self.fn_did).expr_ty(side))
+                                .is_some()
+                        });
+                    if operands.len() == 2 || one_sided_equality {
                         let op = match op.node {
                             Lt => "lt",
                             Le => "le",
@@ -1818,6 +1828,11 @@ fn collect_opt_uses_with_family(
                 }
                 if self.expanded
                     && super::option_ops::collect_raw_return(self.tcx, expr, key, self.out)
+                {
+                    return;
+                }
+                if self.expanded
+                    && super::option_ops::collect_address_observation(self.tcx, expr, key, self.out)
                 {
                     return;
                 }

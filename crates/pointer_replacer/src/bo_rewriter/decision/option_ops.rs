@@ -1,7 +1,9 @@
-//! Consuming raw returns of optional locals. Parameter returns retain E2 ownership.
+//! Consuming raw returns of optional locals (parameter returns retain E2
+//! ownership), and optional operands of pointer comparisons, whose view the
+//! raw boundary's address arm supplies.
 
 use rustc_hash::FxHashMap;
-use rustc_hir::{Expr, ExprKind, HirId, Node, def_id::LocalDefId};
+use rustc_hir::{BinOpKind, Expr, ExprKind, HirId, Node, def_id::LocalDefId};
 use rustc_middle::ty::{TyCtxt, TyKind};
 
 use super::{
@@ -156,4 +158,95 @@ fn raw_return_expression(
         "{name}.map_or(core::ptr::{null}::<{}>(), |value| {address})",
         target.pointee
     ))
+}
+
+/// Defer a direct operand of a pointer comparison (casts peeled upward) to the
+/// raw boundary's address view; `plan_address_observations` then requires that
+/// view to exist. Not a use with no image, so the family is not withdrawn here.
+pub(super) fn collect_address_observation(
+    tcx: TyCtxt<'_>,
+    expression: &Expr<'_>,
+    node: (LocalDefId, HirId),
+    uses: &mut FxHashMap<(LocalDefId, HirId), OptUses>,
+) -> bool {
+    let mut operand = expression;
+    while let Node::Expr(parent) = tcx.parent_hir_node(operand.hir_id)
+        && matches!(parent.kind, ExprKind::Cast(inner, _) if inner.hir_id == operand.hir_id)
+    {
+        operand = parent;
+    }
+    let Node::Expr(parent) = tcx.parent_hir_node(operand.hir_id) else { return false };
+    let ExprKind::Binary(op, lhs, rhs) = parent.kind else { return false };
+    if !matches!(
+        op.node,
+        BinOpKind::Eq
+            | BinOpKind::Ne
+            | BinOpKind::Lt
+            | BinOpKind::Le
+            | BinOpKind::Gt
+            | BinOpKind::Ge
+    ) || (lhs.hir_id != operand.hir_id && rhs.hir_id != operand.hir_id)
+    {
+        return false;
+    }
+    let typeck = tcx.typeck(node.0);
+    if ![lhs, rhs]
+        .into_iter()
+        .all(|side| matches!(typeck.expr_ty(side).kind(), TyKind::RawPtr(..)))
+    {
+        return false;
+    }
+    let entry = uses.entry(node).or_default();
+    entry.non_test_uses += 1;
+    entry.sites.push(OptUseSite {
+        hir_id: expression.hir_id,
+        span: expression.span,
+        operation: "address-observation",
+    });
+    true
+}
+
+/// An `address-observation` site is applied exactly when the seam plan carries
+/// the address view for that operand; otherwise the typed hold.
+pub(super) fn plan_address_observations(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    subject: &Subject,
+    source: Form,
+    uses: &OptUses,
+    receipts: &mut Vec<OptionPresentationReceiptPlan>,
+) {
+    for site in uses
+        .sites
+        .iter()
+        .filter(|site| site.operation == "address-observation")
+    {
+        let view = table.seams.edits.iter().find(|edit| {
+            edit.source_shape == "raw-op-address-observation"
+                && edit.bridge.caller == subject.fn_did
+                && edit.span.source_callsite() == site.span.source_callsite()
+        });
+        let (adapter, reason) = match view {
+            Some(view) => (view.spec.template_key().to_owned(), None),
+            None => (
+                String::new(),
+                Some(MechanicalTerminalReason::EvidenceMissing(
+                    "option-address-view:missing".to_owned(),
+                )),
+            ),
+        };
+        // A comparison observes the address only; no callee, no retention.
+        receipts.push(super::option::receipt(
+            tcx,
+            subject,
+            site.hir_id,
+            MechanicalFamily::OptUseUnsupported,
+            "address-observation",
+            source,
+            Form::Raw,
+            adapter,
+            reason,
+            MechanicalEvidence::default(),
+        ));
+    }
 }

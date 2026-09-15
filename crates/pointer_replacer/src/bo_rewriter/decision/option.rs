@@ -363,7 +363,10 @@ pub(crate) fn plan_values(
                     .map(|site| (site.rhs, site.span, false)),
             );
             for site in &uses.sites {
-                if matches!(site.operation, "deferred-boundary-or-copy" | "return-raw") {
+                if matches!(
+                    site.operation,
+                    "deferred-boundary-or-copy" | "return-raw" | "address-observation"
+                ) {
                     continue;
                 }
                 receipts.push(receipt(
@@ -756,6 +759,7 @@ pub(crate) fn plan_operations(
             &mut out,
             &mut body_edits,
         );
+        super::option_ops::plan_address_observations(tcx, table, subject, source, uses, &mut out);
         for site in uses
             .sites
             .iter()

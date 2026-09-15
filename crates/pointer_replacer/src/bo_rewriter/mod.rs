@@ -205,6 +205,8 @@ mod native_return_replay_tests;
 #[cfg(test)]
 mod nested_use_tests;
 #[cfg(test)]
+mod option_cmp_tests;
+#[cfg(test)]
 mod option_decl_tests;
 #[cfg(test)]
 mod option_ops_tests;
