@@ -213,6 +213,8 @@ mod option_ops_tests;
 #[cfg(test)]
 mod option_projection_tests;
 #[cfg(test)]
+mod option_reborrow_tests;
+#[cfg(test)]
 mod option_receiver_tests;
 #[cfg(test)]
 mod option_thin_extent_tests;

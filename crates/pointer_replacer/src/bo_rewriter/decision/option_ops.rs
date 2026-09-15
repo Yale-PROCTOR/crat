@@ -3,8 +3,13 @@
 //! raw boundary's address arm supplies.
 
 use rustc_hash::FxHashMap;
-use rustc_hir::{BinOpKind, Expr, ExprKind, HirId, Node, def_id::LocalDefId};
+use rustc_hir::{
+    BinOpKind, Expr, ExprKind, HirId, Node,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
 use rustc_middle::ty::{TyCtxt, TyKind};
+use rustc_span::Span;
 
 use super::{
     DecisionTable, Subject, SubjectKind,
@@ -246,6 +251,166 @@ pub(super) fn plan_address_observations(
             Form::Raw,
             adapter,
             reason,
+            MechanicalEvidence::default(),
+        ));
+    }
+}
+
+/// One reborrow per call: when a MUTABLE thin optional is accessed through
+/// `as_mut()` at two or more places inside one call's argument list — the
+/// disjoint-field views `f(&mut (*value).a, &mut (*value).b)` wave-6p
+/// certifies — each access borrows the Option mutably for the whole call and
+/// the compiler refuses the second (E0499). The call is wrapped in a block
+/// that reborrows the Option ONCE, `let value = value.as_deref_mut().unwrap();`,
+/// under which the original argument text is already right; the call's inner
+/// edits are composed into the block (the same mechanism a composed Option
+/// initializer uses) and the subject's own accessor edits inside it are
+/// retired. The unwrap is the existing required-dereference idiom: the C code
+/// dereferences the pointer at these arguments unconditionally.
+pub(super) fn plan_call_reborrows(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    subject: &Subject,
+    source: Form,
+    receipts: &mut Vec<OptionPresentationReceiptPlan>,
+    edits: &mut Vec<((LocalDefId, HirId), UseEdit)>,
+    composed: &mut Vec<((LocalDefId, HirId), Span)>,
+) {
+    let Form::Opt {
+        mutable: true,
+        slice: false,
+    } = source
+    else {
+        return;
+    };
+    let node = (subject.fn_did, subject.hir_id);
+    let Some(name) = subject.param_name.as_deref() else { return };
+    let Some((_, decision)) = table
+        .entries
+        .iter()
+        .find(|(candidate, _)| (candidate.fn_did, candidate.hir_id) == node)
+    else {
+        return;
+    };
+    let uses = match decision {
+        super::Decision::Opt { uses, .. } => uses,
+        super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::Slice { .. }
+        | super::Decision::NestedSlice { .. }
+        | super::Decision::Cursor { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Degraded(_) => return,
+    };
+    let Some(body_id) = tcx.hir_node_by_def_id(subject.fn_did).body_id() else { return };
+    struct Calls<'a>(Vec<&'a Expr<'a>>);
+    impl<'tcx> Visitor<'tcx> for Calls<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Call(..) = expr.kind {
+                self.0.push(expr);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut calls = Calls(Vec::new());
+    calls.visit_body(tcx.hir_body(body_id));
+    let sm = tcx.sess.source_map();
+    let unsafe_fn = tcx
+        .fn_sig(subject.fn_did)
+        .skip_binder()
+        .skip_binder()
+        .safety
+        .is_unsafe();
+    for call in calls.0 {
+        let ExprKind::Call(callee, _) = call.kind else { continue };
+        let call_span = call.span.source_callsite();
+        let inside = |span: Span| {
+            let span = span.source_callsite();
+            call_span.lo() <= span.lo() && span.hi() <= call_span.hi()
+        };
+        let own = uses
+            .iter()
+            .filter(|edit| inside(edit.span))
+            .collect::<Vec<_>>();
+        if own.len() < 2 {
+            continue;
+        }
+        let reason = if own.iter().any(|edit| edit.bridge_kind != "subject-use") {
+            Some("option-call-reborrow:non-dereference-use-inside-call")
+        } else if own
+            .iter()
+            .any(|edit| inside(edit.span) && callee.span.contains(edit.span))
+        {
+            Some("option-call-reborrow:subject-in-callee-position")
+        } else if own.iter().any(|edit| {
+            !(edit.replacement.contains(".as_mut().unwrap()")
+                || edit.replacement.contains(".as_deref_mut()"))
+        }) {
+            Some("option-call-reborrow:accessor-not-a-mutable-reborrow")
+        } else {
+            None
+        };
+        let own_spans = own
+            .iter()
+            .map(|edit| edit.span.source_callsite())
+            .collect::<Vec<_>>();
+        let all = super::construction::collect_composable_edits(table, call_span);
+        // Everything inside the call that is not this subject's own accessor:
+        // other subjects' edits, argument bridges, body adapters.
+        let others = all
+            .iter()
+            .filter(|(span, _)| !own_spans.contains(span))
+            .cloned()
+            .collect::<Vec<_>>();
+        let foreign_inside_bridge = others.iter().any(|(outer, _)| {
+            others.iter().any(|(inner, _)| {
+                inner != outer && outer.lo() <= inner.lo() && inner.hi() <= outer.hi()
+            })
+        });
+        let original = sm.span_to_snippet(call_span).unwrap_or_default();
+        let composed_text = if reason.is_some() {
+            Err(String::new())
+        } else if foreign_inside_bridge {
+            Err("option-call-reborrow:nested-foreign-edits".to_owned())
+        } else if original.is_empty() {
+            Err("option-call-reborrow:call-text-unavailable".to_owned())
+        } else {
+            super::construction::compose_initializer(call_span, &original, &others)
+                .map_err(|why| format!("option-call-reborrow:{why}"))
+        };
+        // A call that is not hoisted keeps its pre-existing per-access
+        // rendering: that is not a failure of the Option family (the compiler
+        // decides E0499 per call at verify time), so the skip is recorded on
+        // the receipt's adapter and does not withdraw the owner.
+        let (adapter, terminal) = match (reason, composed_text) {
+            (Some(reason), _) => (format!("skipped:{reason}"), None),
+            (None, Err(why)) => (format!("skipped:{why}"), None),
+            (None, Ok(text)) => {
+                let replacement =
+                    format!("({{ let {name} = {name}.as_deref_mut().unwrap(); {text} }})");
+                edits.push((
+                    node,
+                    UseEdit {
+                        span: call_span,
+                        replacement,
+                        bridge_kind: "option-value-composed",
+                    },
+                ));
+                composed.extend(all.iter().map(|(span, _)| (node, *span)));
+                ("option-call-reborrow".to_owned(), None)
+            }
+        };
+        let _ = unsafe_fn;
+        receipts.push(super::option::receipt(
+            tcx,
+            subject,
+            call.hir_id,
+            MechanicalFamily::OptUseUnsupported,
+            "call-reborrow",
+            source,
+            source,
+            adapter,
+            terminal,
             MechanicalEvidence::default(),
         ));
     }

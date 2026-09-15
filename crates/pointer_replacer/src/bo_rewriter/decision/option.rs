@@ -731,6 +731,7 @@ pub(crate) fn plan_operations(
     let tcx = program.tcx;
     let mut out = Vec::new();
     let mut body_edits = Vec::new();
+    let mut composed_calls: Vec<((LocalDefId, HirId), Span)> = Vec::new();
     for (subject, decision) in &table.entries {
         if !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option) {
             continue;
@@ -760,6 +761,15 @@ pub(crate) fn plan_operations(
             &mut body_edits,
         );
         super::option_ops::plan_address_observations(tcx, table, subject, source, uses, &mut out);
+        super::option_ops::plan_call_reborrows(
+            tcx,
+            table,
+            subject,
+            source,
+            &mut out,
+            &mut body_edits,
+            &mut composed_calls,
+        );
         for site in uses
             .sites
             .iter()
@@ -1222,6 +1232,7 @@ pub(crate) fn plan_operations(
         plan.nullability_fact = "exact-null-argument".to_owned();
         out.push(plan);
     }
+    table.option_composed_uses.extend(composed_calls);
     for (node, edit) in body_edits {
         let decision = &mut table
             .entries
