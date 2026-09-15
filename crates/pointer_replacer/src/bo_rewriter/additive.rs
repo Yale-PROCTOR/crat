@@ -373,49 +373,6 @@ fn moved(
         .collect()
 }
 
-/// Owners whose call-side transactions landed NEW sites on `owner`'s class: a
-/// caller's moved argument produces pair / C sites on the callee's class
-/// without any callee decision moving (binn `binn_get_bool` → `is_bool_str`).
-fn induced_by(
-    prior: &StageSnapshot,
-    candidate: &StageSnapshot,
-    owner: SignatureClassId,
-) -> BTreeSet<SignatureClassId> {
-    use super::bridge_receipt::BridgeCalleeId;
-    let prior_keys = prior
-        .plan
-        .class_finalization
-        .classes
-        .get(&owner)
-        .map(|class| {
-            class
-                .sites
-                .iter()
-                .map(|site| site.key.receipt_key())
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    let mut owners = BTreeSet::new();
-    for site in candidate
-        .plan
-        .class_finalization
-        .classes
-        .get(&owner)
-        .map(|class| class.sites.as_slice())
-        .unwrap_or_default()
-    {
-        if prior_keys.contains(&site.key.receipt_key()) {
-            continue;
-        }
-        owners.insert(SignatureClassId::of(site.key.caller));
-        if let BridgeCalleeId::Local(callee) = site.key.callee {
-            owners.insert(SignatureClassId::of(callee));
-        }
-    }
-    owners.remove(&owner);
-    owners
-}
-
 /// The candidates of `anchor` a terminal site names: a call INTO the anchor
 /// dropped or collided at `arg{N}` names the anchor's parameter `N` (wave-4's
 /// `copyFileName::from` at the caller's `arg1`, while `to` at `arg0` is
@@ -467,9 +424,9 @@ pub(crate) fn withdrawals(
     let anchors = anchors(prior, candidate, policy, soundness, &enabled);
 
     // R397-6(a): resolve each anchor to the candidates that moved. A direct
-    // anchor's own moved subjects come first, then the callers / callees whose
-    // moved arguments induced its new sites; only an owner with no moved
-    // candidate anywhere near it falls back as a whole (the R220 floor). A
+    // anchor excludes its own moved candidates, narrowed to those its terminal
+    // sites name; an anchor that moved nothing falls back as a whole (the R220
+    // floor — its own non-decision mechanics are the cheapest thing to drop). A
     // restore anchor searches its interface component nearest-first and stops
     // at the first distance carrying a changed owner, instead of withdrawing
     // every changed owner the component can reach.
@@ -498,20 +455,16 @@ pub(crate) fn withdrawals(
                     request(*anchor, scoped_cause(*anchor, cause), own);
                     continue;
                 }
-                let mut induced = false;
-                for owner in induced_by(prior, candidate, *anchor) {
-                    if !enabled(owner) {
-                        continue;
-                    }
-                    let subjects = moved(prior, candidate, policy, owner);
-                    if !subjects.is_empty() {
-                        request(owner, scoped_cause(*anchor, cause), subjects);
-                        induced = true;
-                    }
-                }
-                if !induced {
-                    request(*anchor, cause.clone(), Vec::new());
-                }
+                // The anchor moved no decision of its own: R220's owner
+                // fallback drops only its non-decision mechanics at this stage
+                // (the seam / interface edges it generated) and is the cheapest
+                // input change that can dissolve its terminal — tulipindicators
+                // `ti_sma_start`'s new dependency on a held caller dissolves
+                // this way while the caller keeps both of its slices. If the
+                // loss persists, the next round treats the anchor as a restore
+                // root and asks its nearest changed neighbour for the moved
+                // candidate that induced the terminal (binn `binn_get_bool`).
+                request(*anchor, cause.clone(), Vec::new());
             }
             Anchor::Restore => {
                 let mut frontier = vec![(*anchor, vec![*anchor])];
@@ -683,6 +636,7 @@ fn anchors(
     for owner in protected {
         let mut pending = vec![owner];
         let mut seen = BTreeSet::new();
+        let before = (requested.len(), restore.len());
         while let Some(current) = pending.pop() {
             if !seen.insert(current) || requested.contains_key(&current) {
                 continue;
@@ -759,6 +713,12 @@ fn anchors(
                 continue;
             }
             restore.insert(current);
+        }
+        // Mutually dependent held classes (binn `is_bool_str` ↔ `binn_get_bool`)
+        // walk each other's held dependency and request nothing; the lost root
+        // is then a restore anchor, not an `unrestored` failure.
+        if (requested.len(), restore.len()) == before {
+            restore.insert(owner);
         }
     }
     for owner in restore {

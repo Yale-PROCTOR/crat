@@ -89,33 +89,67 @@ fn binn_failed_optional_candidate_excludes_only_itself() {
         "the failed candidate itself keeps its prior form: {:?}",
         outcome.forms
     );
-    // R220 retries the excluded candidate at each later stage with that
-    // stage's carrier; every retry fails on the same anchor and is excluded
-    // again for exactly the same identity. No owner-scoped fallback occurs.
+    // Two rounds per stage, three stages (R220 retries the excluded candidate
+    // with each later stage's carrier): first the anchor — the callee class 6,
+    // which moved nothing — falls back as an owner (the R220 floor; it drops
+    // only class 6's own Option-stage mechanics, and class 6 has no Option
+    // candidate), the loss persists, and the restore search from 6 finds its
+    // nearest changed neighbour 7 and excludes exactly the moved candidate
+    // `pbool`. No whole-family withdrawal of the caller ever happens.
+    let summary = outcome
+        .receipts
+        .iter()
+        .map(|receipt| {
+            (
+                receipt.family.as_str(),
+                receipt.scope.as_str(),
+                receipt.owner_path.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        outcome
-            .receipts
-            .iter()
-            .map(|receipt| receipt.family.as_str())
-            .collect::<Vec<_>>(),
-        vec!["Option", "Declaration", "Return"],
+        summary,
+        vec![
+            ("Option", "owner", "is_bool_str"),
+            ("Option", "subject", "binn_get_bool"),
+            ("Declaration", "owner", "is_bool_str"),
+            ("Declaration", "subject", "binn_get_bool"),
+            ("Return", "owner", "is_bool_str"),
+            ("Return", "subject", "binn_get_bool"),
+        ],
         "{:#?}",
         outcome.receipts
     );
-    for receipt in &outcome.receipts {
-        assert_eq!(receipt.scope, "subject", "{receipt:#?}");
-        assert_eq!(receipt.owner_path, "binn_get_bool", "{receipt:#?}");
+    for receipt in outcome
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.scope == "owner")
+    {
         // The anchor is the callee class 6 either way; which terminal it
         // carries depends on whether the A5 pair edit over the call still
         // collides with the older `value` subject-use inside it (the landed
         // planner) or a composition has removed that collision and the
         // `blocked-subject:kind-raw` refusal is what remains.
         assert!(
-            receipt.cause.starts_with(
-                "exclusion-rederivation:anchor=6:newer-family-collision:class=6|arm=pair|"
-            ) || receipt.cause
-                == "exclusion-rederivation:anchor=6:unwitnessed-family-refusal:blocked-subject:kind-raw",
-            "the receipt names the anchor terminal it resolves: {receipt:#?}"
+            receipt
+                .cause
+                .starts_with("newer-family-collision:class=6|arm=pair|")
+                || receipt.cause == "unwitnessed-family-refusal:blocked-subject:kind-raw",
+            "{receipt:#?}"
+        );
+        assert!(
+            receipt.subjects.iter().all(|(_, old, new)| old == new),
+            "the owner fallback of class 6 moves none of its decisions: {receipt:#?}"
+        );
+    }
+    for receipt in outcome
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.scope == "subject")
+    {
+        assert_eq!(
+            receipt.cause, "exclusion-rederivation:anchor=6:restore-family-interface-path:[6, 7]",
+            "{receipt:#?}"
         );
         assert_eq!(
             receipt
@@ -508,6 +542,85 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
                 excluded, both,
                 "both contracted positions of the overlapping call are excluded together: \
                  {request:#?}"
+            );
+        });
+    }
+
+    /// tulipindicators `ti_sma_start` (the −2 of report 010): an anchor whose
+    /// terminal is a NEW dependency on a held neighbour, and which moved no
+    /// decision of its own, falls back as an owner (R220: its own stage
+    /// mechanics generated the edge) — it never sacrifices the neighbour's
+    /// moved candidate (`ti_sma::options#3`), which report 010's induced-owner
+    /// step did.
+    #[test]
+    fn an_anchor_that_moved_nothing_falls_back_as_an_owner_before_any_neighbour_yields() {
+        with_chain(|prior| {
+            let near = owner(&prior, "near_value");
+            let far = owner(&prior, "far_value");
+            let farthest = owner(&prior, "farthest_value");
+            // `far` (the callee, like ti_sma_start) newly depends on the held
+            // caller `near` (like ti_sma, blocked by its own refusal), whose
+            // candidate `near_value` moved at this stage.
+            let mut inputs = class_inputs(&prior);
+            inputs
+                .iter_mut()
+                .find(|input| input.id == near)
+                .unwrap()
+                .block_reasons
+                .push("blocked-subject:slice-use-unsupported".to_owned());
+            inputs
+                .iter_mut()
+                .find(|input| input.id == far)
+                .unwrap()
+                .depends_on
+                .push(near);
+            let mut candidate = prior.clone();
+            candidate.plan.class_finalization = plan::finalize_class_inputs(inputs);
+            for (subject, decision) in &mut candidate.table.entries {
+                if subject.param_name.as_deref() == Some("near_value") {
+                    *decision = Decision::Slice {
+                        mutable: false,
+                        uses: vec![],
+                    };
+                }
+            }
+            assert!(!candidate.plan.class_finalization.classes[&far].is_ready());
+            let requests = additive::withdrawals(
+                &prior,
+                &candidate,
+                &FamilyPolicy::at(FamilyStage::SliceUse),
+                &[],
+            );
+            let by_owner = requests
+                .iter()
+                .map(|request| {
+                    (
+                        request.owner,
+                        (request.cause.clone(), request.subjects.clone()),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let (cause, subjects) = by_owner
+                .get(&far)
+                .unwrap_or_else(|| panic!("the anchor `far` yields as an owner: {requests:#?}"));
+            assert_eq!(
+                cause,
+                &format!("new-family-dependency:{}", near.order_key()),
+                "{requests:#?}"
+            );
+            assert!(
+                subjects.is_empty(),
+                "owner scope, the R220 floor: {requests:#?}"
+            );
+            // `near` may yield for ITS OWN refusal (its candidate is the one
+            // that failed there), never for `far`'s terminal.
+            assert!(
+                !by_owner.contains_key(&farthest)
+                    && by_owner.get(&near).is_none_or(|(cause, _)| {
+                        cause.contains(&format!("anchor={}:", near.order_key()))
+                    }),
+                "the neighbour's moved candidate `near_value` is not excluded for `far`'s \
+                 terminal: {requests:#?}"
             );
         });
     }
