@@ -248,6 +248,11 @@ pub(crate) struct LifetimeEligibility {
     annotated_receiver_permits: FxHashMap<NodeKey, AnnotatedReceiverPermit>,
     output_storage_permits: FxHashMap<(LocalDefId, FnSignatureSlot), OutputStorageLifetimePermit>,
     output_storage_escapes: FxHashSet<(NodeKey, NodeKey)>,
+    /// wave-6f: `(stored subject, rhs span)` of every field store into a
+    /// converting struct field. Admitted by the field transaction after this
+    /// eligibility is derived; consulted by the escape gate beside the
+    /// output-storage permits.
+    field_store_permits: FxHashSet<(NodeKey, rustc_span::Span)>,
     failures: FxHashMap<NodeKey, LifetimeFailure>,
     web_roots: BTreeSet<String>,
     web_members: BTreeMap<String, String>,
@@ -292,6 +297,18 @@ impl LifetimeEligibility {
 
     pub(crate) fn permits_output_storage(&self, source: NodeKey, target: NodeKey) -> bool {
         self.output_storage_escapes.contains(&(source, target))
+    }
+
+    /// wave-6f: a field store discharged by a converting struct field.
+    pub(crate) fn permits_field_store(&self, source: NodeKey, span: rustc_span::Span) -> bool {
+        self.field_store_permits.contains(&(source, span))
+    }
+
+    pub(crate) fn admit_field_stores(
+        &mut self,
+        permits: impl IntoIterator<Item = (NodeKey, rustc_span::Span)>,
+    ) {
+        self.field_store_permits.extend(permits);
     }
 
     pub(crate) fn is_output_source(&self, source: NodeKey) -> bool {
@@ -358,6 +375,7 @@ impl LifetimeEligibility {
             annotated_receiver_permits: FxHashMap::default(),
             output_storage_permits: FxHashMap::default(),
             output_storage_escapes: FxHashSet::default(),
+            field_store_permits: FxHashSet::default(),
             failures: FxHashMap::default(),
             web_roots: BTreeSet::new(),
             web_members: BTreeMap::new(),

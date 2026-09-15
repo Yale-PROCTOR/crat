@@ -12156,6 +12156,7 @@ mod run {
                 artifact.ownership_native.as_str(),
             ),
             ("exposure", artifact.exposure.as_str()),
+            ("field-transactions", artifact.field_transactions.as_str()),
             ("d4-edges", artifact.d4_edges.as_str()),
             ("pairs", artifact.pairs.as_str()),
             ("addresses", artifact.addresses.as_str()),

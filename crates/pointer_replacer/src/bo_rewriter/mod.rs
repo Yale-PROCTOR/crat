@@ -82,6 +82,7 @@ pub(crate) mod mechanical_receipt;
 mod construction_values_tests;
 #[cfg(test)]
 mod exclusion_rederivation_tests;
+mod field_reference_ast;
 pub(crate) mod ownership_fields;
 #[cfg(test)]
 mod ownership_fields_bodylocal_tests;
@@ -114,6 +115,8 @@ mod wave5r_field_borrow;
 mod wave5r_helper_path;
 #[cfg(test)]
 mod wave5r_tests;
+#[cfg(test)]
+mod wave6f_field_reference_tests;
 pub(crate) mod wave6r_child_access;
 mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;
@@ -377,6 +380,8 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) custody_expectations: Vec<DeliveryExpectation>,
     pub(crate) additive_family_receipts: Vec<additive::FamilyFallbackReceipt>,
     pub(crate) exposure: String,
+    /// wave-6f: the struct-field reference transactions, applied and held.
+    pub(crate) field_transactions: String,
     pub(crate) d4_edges: String,
     pub(crate) pairs: String,
     pub(crate) addresses: String,
@@ -1530,7 +1535,21 @@ pub(crate) fn effective_withheld_classes(
 ) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
     let mut withheld = reverted.clone();
     withheld.extend(emission_plan.held_classes());
-    emission_plan.effective_reverted_classes(&withheld, reverted_atoms)
+    let mut effective = emission_plan.effective_reverted_classes(&withheld, reverted_atoms);
+    // wave-6f: a field transaction is one edit region across its owners — a
+    // reverted owner withdraws the field, and the field's other owners with it.
+    loop {
+        let before = effective.len();
+        for owners in &emission_plan.field_transaction_owners {
+            if owners.iter().any(|owner| effective.contains(owner)) {
+                effective.extend(owners.iter().copied());
+            }
+        }
+        if effective.len() == before {
+            break;
+        }
+    }
+    effective
 }
 
 fn refresh_raw_boundary_receipt_events(
@@ -6991,6 +7010,12 @@ fn finish_decide<'tcx>(
     let mut family_receipts = Vec::new();
     let original_c9_plans = retained_c9_plans.clone();
     let mut a5_role_profile = None;
+    // wave-6f: fields a finalization refused, with the cause; grows only, so
+    // the re-derivation below terminates.
+    let mut withdrawn_fields: std::collections::BTreeMap<
+        decision::field_reference::FieldKey,
+        String,
+    > = std::collections::BTreeMap::new();
     let mut a5_roles: Vec<decision::co_conversion::PairSiteDecision> = Vec::new();
     let mut a5_role_proofs: Vec<decision::seam::A5PositionProof> = Vec::new();
     let a5_role_bound = facts
@@ -7050,6 +7075,17 @@ fn finish_decide<'tcx>(
         let ownership_fields =
             decision::ownership_fields_hook::Inputs::discover(&model, &slots, &subjects)
                 .with_native_candidates(native_ownership_candidates.clone());
+        // wave-6f: the field-transaction candidates, from the frozen model and
+        // the program's syntax; refused fields are excluded at this input.
+        let field_candidates = decision::field_reference::derive(
+            &program,
+            &slots,
+            &model,
+            &subjects,
+            &withdrawn_fields,
+        );
+        decision::field_reference::lift_store_walls(tcx, &field_candidates, &mut slice_uses);
+        let slice_uses = slice_uses;
         let ctx_of =
             |gate, coconv, lifetime_eligibility, raw_boundary, exposure, return_receivers| {
                 decision::Ctx {
@@ -7081,6 +7117,7 @@ fn finish_decide<'tcx>(
                     lifetime_eligibility,
                     raw_boundary,
                     exposure,
+                    field_reference: Some(&field_candidates),
                 }
             };
 
@@ -7105,7 +7142,7 @@ fn finish_decide<'tcx>(
             .copied()
             .filter(|owner| family_policy.enabled(*owner, additive::FamilyStage::Return))
             .collect::<rustc_hash::FxHashSet<_>>();
-        let lifetime_eligibility = decision::lifetime::derive_return_eligibility(
+        let mut lifetime_eligibility = decision::lifetime::derive_return_eligibility(
             &program,
             &return_family_functions,
             &facts.return_sites,
@@ -7120,6 +7157,8 @@ fn finish_decide<'tcx>(
             fnptr_web_wall_s,
             &preliminary_exposure,
         );
+        lifetime_eligibility.admit_field_stores(field_candidates.store_permit_pairs());
+        let lifetime_eligibility = lifetime_eligibility;
         // Candidate receiver interfaces use only the already-derived native
         // permits. Actual settled interfaces are checked before emission.
         let mut receiver_prototype = hypothetical.clone();
@@ -7272,6 +7311,21 @@ fn finish_decide<'tcx>(
             },
         );
         table.exposure = Some(exposure.clone());
+
+        // wave-6f: finalize every field transaction against the settled table;
+        // a refused field is excluded at the candidate input and the stage is
+        // re-derived, so its dependents reproduce their prior decisions.
+        let (field_transactions, refused_fields) =
+            decision::field_reference::finalize(tcx, &field_candidates, &table, &exposure);
+        if !refused_fields.is_empty() {
+            let before = withdrawn_fields.len();
+            withdrawn_fields.extend(refused_fields);
+            if withdrawn_fields.len() <= before {
+                return Err("field-transaction-invariant:no-strict-progress".to_owned());
+            }
+            continue;
+        }
+        table.field_transactions = field_transactions;
 
         // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by
         // `decide_one`, which is handed one subject at a time. Runs here, over the
@@ -7568,6 +7622,7 @@ fn finish_decide<'tcx>(
         append_surface_declaration_plans(tcx, &exposure, &mut table);
         append_inferred_local_declaration_plans(tcx, &mut table);
         decision::slice_construction_values::append_declarations(tcx, &mut table);
+        append_field_load_declaration_plans(&mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
@@ -7767,6 +7822,7 @@ fn finish_decide<'tcx>(
             custody_expectations: Vec::new(),
             additive_family_receipts: family_receipts,
             exposure: exposure.receipts_tsv(),
+            field_transactions: table.field_transactions.receipt_tsv(tcx),
             d4_edges: coconv.edge_receipts_tsv(tcx, &subjects),
             pairs: coconv.pair_receipts_tsv(tcx),
             addresses: raw_boundary.addresses_tsv(tcx),
@@ -8436,6 +8492,37 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
     }
     table.seams.explicit_declarations.extend(declarations);
     table.seams.zero_bridges.extend(receives);
+}
+
+/// wave-6f: a local loaded from a converting field receives its explicit
+/// declaration exactly as an inferred local receives its callee's type.
+fn append_field_load_declaration_plans(table: &mut decision::DecisionTable) {
+    use bridge_receipt::SignatureClassId;
+
+    let mut declarations = Vec::new();
+    for transaction in &table.field_transactions.applied {
+        for (node, emitted_type) in &transaction.load_locals {
+            let Some((subject, _)) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| (subject.fn_did, subject.hir_id) == *node)
+            else {
+                continue;
+            };
+            let Some(name) = subject.param_name.as_deref() else { continue };
+            declarations.push(decision::seam::ExplicitDeclarationSite {
+                owner_class: SignatureClassId::of(node.0),
+                caller: node.0,
+                node: Some(*node),
+                span: Some(subject.binding_span),
+                category: "local",
+                replacement: Some(format!("{name}: {emitted_type}")),
+                emitted_type: emitted_type.clone(),
+                arm: "glue",
+            });
+        }
+    }
+    table.seams.explicit_declarations.extend(declarations);
 }
 
 fn derive_arm_requirements(

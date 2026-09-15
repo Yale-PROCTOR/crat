@@ -1544,6 +1544,12 @@ fn escape_block_reason(
         {
             None
         }
+        // wave-6f: a store into a struct field that converts with it.
+        EscapeKind::FieldStore
+            if lifetime_eligibility.permits_field_store(escape.subject, escape.span) =>
+        {
+            None
+        }
         EscapeKind::FieldStore => Some(BlockReason::EscapesViaFieldStore),
         EscapeKind::StaticStore => Some(BlockReason::EscapesViaStaticStore),
     }

@@ -48,6 +48,7 @@ pub(crate) mod declaration;
 pub(crate) mod declaration_pattern;
 pub(crate) mod emitability;
 pub(crate) mod exposure;
+pub(crate) mod field_reference;
 pub(crate) mod interface;
 pub(crate) mod io_domain;
 pub(crate) mod lifetime;
@@ -1014,6 +1015,8 @@ pub(crate) struct DecisionTable {
     /// Contract-driven slice promotions, keyed by the exact compiler subject.
     pub(crate) contract_extent_promotions:
         FxHashMap<(LocalDefId, rustc_hir::HirId), contract_extent::Promotion>,
+    /// wave-6f: the finalized struct-field reference transactions.
+    pub field_transactions: field_reference::FieldTransactions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1154,6 +1157,9 @@ pub(crate) struct Ctx<'a, 'tcx> {
     /// hypothetically but lift only when every boundary site is open.
     pub(crate) raw_boundary: Option<&'a raw_boundary::RawBoundaryDispositionIndex>,
     pub(crate) exposure: Option<&'a exposure::ExposurePolicy>,
+    /// wave-6f: field transaction candidates — store-escape discharges, load
+    /// permits and the stored form a converting field asks of its source.
+    pub(crate) field_reference: Option<&'a field_reference::FieldCandidates>,
 }
 
 pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
@@ -1292,6 +1298,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         option_mut_bindings,
         option_composed_uses: Vec::new(),
         contract_extent_promotions,
+        field_transactions: Default::default(),
     }
 }
 
@@ -1685,6 +1692,14 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                     mutable,
                     callee: permit.callee(),
                 }
+            } else if ctx
+                .field_reference
+                .and_then(|fields| fields.load_permit((subject.fn_did, subject.hir_id)))
+                .is_some()
+            {
+                // wave-6f: the converting field supplies the local's type; the
+                // explicit declaration is planned by the field transaction.
+                Decision::Ref { mutable }
             } else {
                 degrade(
                     subject,
@@ -1749,6 +1764,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         lifetime_eligibility,
         raw_boundary,
         exposure,
+        field_reference,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
     // R261-3, before every other rung: a subject whose own type reaches the
@@ -1967,6 +1983,24 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             seam::Form::Raw | seam::Form::Ref { .. } => form,
         };
     }
+    // **wave-6f (W6F-1).** A subject stored into a converting FAT field carries
+    // that buffer: its own body has no arithmetic (the field's readers do), so
+    // form selection above chose the thin form. The field's op-facts supply the
+    // need and the subject's own fatness the licence — the S3.2′-2 authority
+    // split, with the field standing in for the subject's uses. Without the
+    // licence the form stays thin and the finalizer refuses the store rather
+    // than widening a one-element claim.
+    if matches!(form, Form::Plain)
+        && let Some(required) = field_reference
+            .and_then(|fields| fields.required_store_form((subject.fn_did, subject.hir_id)))
+        && matches!(
+            required,
+            seam::Form::Slice { .. } | seam::Form::Opt { slice: true, .. }
+        )
+        && fat.is_array(subject.fn_did, subject.local)
+    {
+        form = Form::Slice;
+    }
     if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
         let node = (subject.fn_did, subject.hir_id);
         let address_candidate = facts.is_value_observation_candidate(node);
@@ -2083,6 +2117,12 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                     .inferred_permit((subject.fn_did, subject.hir_id))
                     .is_some()
             })
+            // wave-6f: a local loaded from a converting field takes its type
+            // from the field, exactly as an inferred local takes it from a
+            // callee's return.
+            && field_reference
+                .and_then(|fields| fields.load_permit((subject.fn_did, subject.hir_id)))
+                .is_none()
         {
             return degrade(subject, decl_site, residual_reason(subject.ctor.as_ref()));
         }
@@ -2471,6 +2511,7 @@ mod self_consistency_tests {
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
+            field_transactions: Default::default(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

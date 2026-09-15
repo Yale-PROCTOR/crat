@@ -113,7 +113,7 @@ pub(crate) fn decl_ty_kind(form: DeclForm, mutable: bool, pointee: P<Ty>) -> TyK
     decl_ty_kind_with_lifetime(form, mutable, pointee, None)
 }
 
-fn ast_lifetime(name: &str) -> Lifetime {
+pub(crate) fn ast_lifetime(name: &str) -> Lifetime {
     Lifetime {
         id: DUMMY_NODE_ID,
         ident: Ident::new(
@@ -123,7 +123,7 @@ fn ast_lifetime(name: &str) -> Lifetime {
     }
 }
 
-fn decl_ty_kind_with_lifetime(
+pub(crate) fn decl_ty_kind_with_lifetime(
     form: DeclForm,
     mutable: bool,
     mut pointee: P<Ty>,
@@ -272,7 +272,10 @@ fn decl_ty_kind_with_lifetime(
     }
 }
 
-fn generated_lifetime_param(name: &str, outlives: impl Iterator<Item = String>) -> GenericParam {
+pub(crate) fn generated_lifetime_param(
+    name: &str,
+    outlives: impl Iterator<Item = String>,
+) -> GenericParam {
     GenericParam {
         id: DUMMY_NODE_ID,
         ident: ast_lifetime(name).ident,
@@ -3753,6 +3756,10 @@ fn transform_with<'tcx>(
         }
     }
 
+    // wave-6f: struct items, their impls and the storing signatures, after the
+    // declaration passes so a stored parameter's reference layer exists.
+    super::field_reference_ast::apply(tcx, capture, table, reverts, &mut krate, &mut guard)?;
+
     // **ARMS 2 AND 3 CONSUME THE SHARED BUILDER** (M-2). Their visitors carry no
     // site check, so their revert semantics live entirely in how these maps are
     // built — and production builds them in exactly ONE place.
@@ -4968,6 +4975,18 @@ pub(crate) fn filtered_inputs(
                 &mut out.uses,
                 (u.span.lo().0, u.span.hi().0),
                 u.replacement.clone(),
+                &mut out.use_key_collisions,
+            );
+        }
+    }
+    // wave-6f: a field transaction's expression edits, active only while none
+    // of its owners is reverted (the plan closes the revert set over them).
+    for transaction in table.field_transactions.active(&reverts.fns) {
+        for edit in &transaction.expression_edits {
+            insert_counting(
+                &mut out.uses,
+                (edit.span.lo().0, edit.span.hi().0),
+                edit.replacement.clone(),
                 &mut out.use_key_collisions,
             );
         }

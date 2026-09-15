@@ -3255,6 +3255,7 @@ fn build_candidate(
     argument_index: usize,
     return_tied: bool,
     counted: Option<&super::counted_void::Contract>,
+    field_tied: bool,
 ) -> Result<Option<Candidate>, SeamBlock> {
     if counted.is_some() && found != Form::Raw {
         return Err(SeamBlock::UnnameableOperand);
@@ -3293,7 +3294,13 @@ fn build_candidate(
         }
     });
     let (retention, waiver_id) = if found == Form::Raw && expected != Form::Raw {
-        inbound_retention(retention_facts, callee, argument_index, return_tied)?
+        inbound_retention(
+            retention_facts,
+            callee,
+            argument_index,
+            return_tied,
+            field_tied,
+        )?
     } else {
         (BridgeRetentionTier::None, None)
     };
@@ -3466,6 +3473,7 @@ fn inbound_retention(
     callee: LocalDefId,
     argument_index: usize,
     return_tied: bool,
+    field_tied: bool,
 ) -> Result<(BridgeRetentionTier, Option<String>), SeamBlock> {
     use super::raw_boundary::{RetentionEventKind, RetentionVerdict};
 
@@ -3473,6 +3481,17 @@ fn inbound_retention(
         Some(RetentionVerdict::NoRetain { .. }) => Ok((BridgeRetentionTier::T1, None)),
         Some(RetentionVerdict::Retains { sink, .. })
             if sink.kind == RetentionEventKind::Return && return_tied =>
+        {
+            Ok((BridgeRetentionTier::T1, None))
+        }
+        // wave-6f: the retention is a store into a converting struct field and
+        // the callee's signature ties the parameter to that struct's lifetime;
+        // the reference escapes the call exactly as the type says it does.
+        Some(RetentionVerdict::Retains { sink, .. })
+            if matches!(
+                sink.kind,
+                RetentionEventKind::FieldOrGlobalStore | RetentionEventKind::OutputStorage
+            ) && field_tied =>
         {
             Ok((BridgeRetentionTier::T1, None))
         }
@@ -4159,6 +4178,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                 .function(*callee)
                 .and_then(|plan| plan.lifetime_for(super::lifetime::FnSignatureSlot::RETURN))
                 .is_some();
+            // wave-6f: parameters a field transaction ties to the callee's
+            // struct lifetime — the retention is in the signature.
+            let field_tied_params = table.field_transactions.tied_parameters(*callee);
             let mut candidates = Vec::with_capacity(positions.len());
             let mut input_candidates = Vec::with_capacity(positions.len());
             for pos in &positions {
@@ -4302,6 +4324,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             pos.index,
                             return_tied,
                             counted,
+                            field_tied_params.contains(&pos.index),
                         )
                     },
                 );
@@ -4328,6 +4351,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             pos.index,
                             return_tied,
                             counted,
+                            field_tied_params.contains(&pos.index),
                         )
                     })
                     .map(|candidate| {

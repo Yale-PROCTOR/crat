@@ -1599,6 +1599,24 @@ pub(crate) struct Plan {
     /// A5 calls after terminal-interface validation/re-planning. The AST graft
     /// consumes this sealed plan; it never recomputes the terminal verdict.
     pub terminal_call_plans: super::decision::seam::TerminalCallPlans,
+    /// wave-6f: the owner classes of each applied field transaction — one
+    /// edit region across functions, reverted together.
+    pub field_transaction_owners: Vec<BTreeSet<SignatureClassId>>,
+}
+
+/// wave-6f: does a field transaction plan this local's explicit declaration?
+fn typed_field_load(table: &DecisionTable, subject: &super::decision::Subject) -> bool {
+    let node = (subject.fn_did, subject.hir_id);
+    table
+        .field_transactions
+        .applied
+        .iter()
+        .any(|transaction| transaction.load_locals.iter().any(|(n, _)| *n == node))
+        && table
+            .seams
+            .explicit_declarations
+            .iter()
+            .any(|site| site.category == "local" && site.node == Some(node))
 }
 
 fn terminal_seam_site(
@@ -4201,7 +4219,10 @@ pub(crate) fn plan(
             }
         }
         let planned_declaration = inferred_box || typed_pattern || typed_receiver;
-        let (ty_file, declaration_edit) = if planned_declaration {
+        // wave-6f: a local loaded from a converting field carries an explicit
+        // declaration planned by the field transaction; no type span to splice.
+        let typed_field_load = typed_field_load(table, subject);
+        let (ty_file, declaration_edit) = if planned_declaration || typed_field_load {
             match span_to_loc(subject.binding_span) {
                 Ok((file, _, _)) => (file, None),
                 Err(reason) => {
@@ -5145,6 +5166,12 @@ pub(crate) fn plan(
         declaration_receipt_plans,
         unowned_a5_proof_sites,
         terminal_call_plans: super::decision::seam::TerminalCallPlans::candidates(&table.seams),
+        field_transaction_owners: table
+            .field_transactions
+            .owner_sets()
+            .into_iter()
+            .map(|owners| owners.into_iter().map(SignatureClassId::of).collect())
+            .collect(),
     }
 }
 
@@ -5430,6 +5457,7 @@ mod tests {
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
+            field_transactions: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -5580,6 +5608,7 @@ mod tests {
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
+            field_transactions: Default::default(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

@@ -447,6 +447,12 @@ pub(crate) fn splice_fn_prints_per_file(
     collect_fn_spans(&krate.items, &mut spans);
     let mut printed: Vec<(rustc_span::Span, String)> = Vec::new();
     collect_fn_prints(&krate.items, &mut printed);
+    // wave-6f: a struct or impl item is reprinted only when a field transaction
+    // claimed an edit inside it; the parity instrument's reprint-all path never
+    // sees one.
+    if let Some(edited) = edited {
+        collect_item_prints_containing(&krate.items, edited, &mut printed);
+    }
     // A raw-boundary surface replacement deliberately represents one original
     // function span with TWO printed items: raw outer first, safe inner second.
     // Collapse that pair into one splice. No unrelated duplicate span is
@@ -598,6 +604,34 @@ pub(crate) fn splice_fn_prints(
         .and_then(|key| files.get(&key).cloned())
         .unwrap_or_default();
     (text, s)
+}
+
+/// wave-6f: struct and impl items that contain an edited span.
+pub(crate) fn collect_item_prints_containing(
+    items: &[rustc_ast::ptr::P<rustc_ast::Item>],
+    edited: &[rustc_span::Span],
+    out: &mut Vec<(rustc_span::Span, String)>,
+) {
+    use rustc_ast_pretty::pprust;
+    for item in items {
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &item.kind
+        {
+            collect_item_prints_containing(inner, edited, out);
+            continue;
+        }
+        if !matches!(
+            item.kind,
+            rustc_ast::ItemKind::Struct(..) | rustc_ast::ItemKind::Impl(..)
+        ) {
+            continue;
+        }
+        let span = item_span_with_attrs(item);
+        if span.from_expansion() || !edited.iter().any(|e| span.contains(*e)) {
+            continue;
+        }
+        out.push((span, pprust::item_to_string(item)));
+    }
 }
 
 pub(crate) fn collect_fn_prints(

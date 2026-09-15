@@ -1344,7 +1344,12 @@ fn the_accounting_identity_survives_a_revert() {
 
 /// The two-file crate whose rewrite breaks it, mirroring `ht`'s corpus shape:
 /// a rewritten parameter stored into a raw-pointer struct field.
-const BREAKS_ON_REWRITE: &str = "pub struct Holder {\n    pub slot: *mut i32,\n}\npub unsafe fn stash(value: *mut i32, holder: *mut Holder) {\n    (*holder).slot = value;\n}\n";
+// wave-6f: the raw field is also returned bare by `peek`, which holds the
+// field transaction (`field-transaction-incomplete:use-shape`) — so the store
+// into the RAW field stays the genuinely ill-typed rewrite these loop
+// witnesses need. Without `peek`, W6F-1 converts `slot` and the "bad" rewrite
+// compiles.
+const BREAKS_ON_REWRITE: &str = "pub struct Holder {\n    pub slot: *mut i32,\n}\npub unsafe fn stash(value: *mut i32, holder: *mut Holder) {\n    (*holder).slot = value;\n}\npub unsafe fn peek(holder: *mut Holder) -> *mut i32 {\n    (*holder).slot\n}\n";
 
 fn diagnose_after_rewrite(files: &[(&str, &str)]) -> (verify::Diagnosis, Fixture) {
     let fixture = Fixture::new(files);
@@ -4976,9 +4981,11 @@ mod coconv_witnesses {
                 "pub unsafe fn subject(p: *mut i32) { *p = 1; sink(p); }\n",
                 "escapes-via-foreign-arg",
             ),
+            // wave-6f (W6F-1): a store into a shared model-Ref struct field is
+            // discharged by the field transaction; the escape no longer blocks.
             (
                 "pub unsafe fn subject(p: *mut i32, s: *mut S) { *p = 1; (*s).f = p; }\n",
-                "escapes-via-field-store",
+                "-",
             ),
             (
                 "pub unsafe fn subject(p: *mut i32) { *p = 1; G = p; }\n",
@@ -10276,7 +10283,10 @@ fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
          pub unsafe fn f(h: *mut Holder, p: *const i32) { (*h).p = p; }\n",
         "f::p",
     );
-    assert_eq!(field_disposition, "degraded");
+    // wave-6f (W6F-1): the field row now delivers through the field
+    // transaction (`Holder.p` becomes `&'a i32`); the E2 analysis fact stays
+    // frozen — `FieldHeld` is still the recorded lifetime finding.
+    assert_eq!(field_disposition, "ref");
     assert_eq!(
         field_failure,
         super::decision::lifetime::LifetimeFailure::FieldHeld,
