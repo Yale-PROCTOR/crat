@@ -279,8 +279,12 @@ fn w6f_lodepng_slice_field_with_size_delivers() {
 
     let (source, emitted_count, reverted_count) = emitted_source(lodepng_emitted());
     assert_eq!(reverted_count, 0);
-    assert_eq!(emitted_count, 7);
+    // 7 at W6F-2; 10 with the yield refinement (R407-8 §2): `inflatev`'s
+    // three parameters reach `custom_inflate`, a `fn(*mut u8, *const u8,
+    // size_t) -> u32` that can hand no pointer back.
+    assert_eq!(emitted_count, 10);
     for needle in [
+        "fn inflatev(mut out: &mut u8, mut in_0: &u8,",
         "pub struct LodePNGBitReader<'a> {",
         "pub data: Option<&'a [u8]>,",
         "impl<'a> ::core::marker::Copy for LodePNGBitReader<'a> { }",
@@ -544,4 +548,74 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
         !source.contains("impl ::core::clone::Clone for node"),
         "{source}"
     );
+}
+
+/// wave-6s2's pin (tulipindicators `fuzzer::check_output::options#4`,
+/// relay wave-6f/005 §2): the indirect callee `start: fn(*const f64) -> i32`
+/// returns no pointer and has no writable carrier, so it cannot hand a child
+/// of the argument back; the slice delivers and the indirect site takes the
+/// raw view `options.as_ptr()` under T2.
+const CHECK_OUTPUT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_camel_case_types)]
+ #[repr(C)] pub struct ti_indicator_info { pub start: Option<unsafe extern "C" fn(*const f64) -> i32>, pub options: i32 }
+ pub unsafe extern "C" fn check_output(mut info: *const ti_indicator_info, mut size: i32, mut options: *const f64) -> i32 {
+    let mut s: i32 = 0;
+    s = (*info).start.expect("non-null function pointer")(options);
+    let mut k: i32 = 0;
+    let mut acc: f64 = 0.0;
+    while k < (*info).options { acc += *options.offset(k as isize); k += 1; }
+    s + acc as i32
+ }
+"#;
+
+/// Witness 9 (W6F-2 refinement, R407-8 §2): an indirect callee's yield
+/// verdict is read from the function-pointer SIGNATURE — the same predicate
+/// the direct arm applies to a definition — instead of defaulting to "may
+/// yield". Control: a pointer-returning function pointer keeps the hold.
+#[test]
+fn w6f_indirect_callee_yield_is_read_from_the_signature() {
+    let observed = observe(CHECK_OUTPUT);
+    for (label, decision) in &observed.decisions {
+        println!("W6F-CHECK-OUTPUT {label} => {decision}");
+    }
+    let outcome = emitted("check-output", CHECK_OUTPUT);
+    let (source, emitted_count, reverted_count) = emitted_source(&outcome);
+    // `info` (a shared reference) and `options` (the slice).
+    assert_eq!((emitted_count, reverted_count), (2, 0), "{source}");
+    assert!(source.contains("mut options: &[f64]"), "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("(*info).start.expect(\"non-null function pointer\")(options.as_ptr());"),
+        "{source}"
+    );
+    assert!(flat.contains("acc += options[(k) as usize];"), "{source}");
+
+    // Control: `child: fn(*const u8) -> *mut u8` may hand a child back.
+    let control = CHECK_OUTPUT
+        .replace("fn(*const f64) -> i32", "fn(*const f64) -> *mut f64")
+        .replace(
+            "s = (*info).start.expect(\"non-null function pointer\")(options);",
+            "s = *(*info).start.expect(\"non-null function pointer\")(options) as i32;",
+        );
+    let held = observe(&control);
+    assert!(
+        decision_of(&held, "check_output::options").contains("Degraded"),
+        "{}",
+        decision_of(&held, "check_output::options")
+    );
+}
+
+const H35: &str = include_str!("wave6f_fixture_h35.rs");
+
+/// Probe (E): the brotli `H35.params` shape — the c2rust `ref mut fresh`
+/// store idiom and the field passed at a local callee's parameter.
+#[test]
+fn w6f_probe_h35_field_argument() {
+    let observed = observe(H35);
+    for (label, decision) in &observed.decisions {
+        println!("W6F-H35-DECISION {label} => {decision}");
+    }
+    let outcome = emitted("h35", H35);
+    let (source, _, _) = emitted_source(&outcome);
+    println!("W6F-H35-SOURCE\n{source}");
 }

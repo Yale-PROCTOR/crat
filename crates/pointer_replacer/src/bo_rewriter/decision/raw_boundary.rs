@@ -72,7 +72,16 @@ pub(crate) fn may_carry_pointer<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u3
 /// A void-like FFI pointee is treated as carrying, because `*mut c_void` walks
 /// to a field-free ADT that would otherwise read as provably pointer-free.
 pub(crate) fn callee_may_yield_pointer(tcx: TyCtxt<'_>, callee: DefId) -> bool {
-    let signature = tcx.fn_sig(callee).skip_binder().skip_binder();
+    signature_may_yield_pointer(tcx, tcx.fn_sig(callee).skip_binder().skip_binder())
+}
+
+/// The same predicate over a SIGNATURE alone — what an indirect call (a
+/// function-pointer operand) offers in place of a definition (R407-8 §2):
+/// exact evidence from the pointer's type, never a default.
+pub(crate) fn signature_may_yield_pointer<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    signature: rustc_middle::ty::FnSig<'tcx>,
+) -> bool {
     if may_carry_pointer(tcx, signature.output(), CARRIER_WALK_DEPTH) {
         return true;
     }
@@ -497,15 +506,24 @@ fn mir_candidates(
                 TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
                 _ => return None,
             };
-            let (key, callee) = match operand_callee(func) {
-                Some(callee) => (symbol_key(tcx, callee, functions), Some(callee)),
+            let (key, callee, may_yield_pointer) = match operand_callee(func) {
+                Some(callee) => (
+                    symbol_key(tcx, callee, functions),
+                    Some(callee),
+                    callee_may_yield_pointer(tcx, callee),
+                ),
                 // wave-6f (W6F-2): a function-pointer operand — keyed by its
-                // pointer signature, no definition.
+                // pointer signature, no definition; the yield verdict is the
+                // signature's (R407-8 §2).
                 None => match func.ty(&body.local_decls, tcx).kind() {
-                    TyKind::FnPtr(sig_tys, header) => (
-                        indirect_symbol_key(sig_tys.with(*header).skip_binder()),
-                        None,
-                    ),
+                    TyKind::FnPtr(sig_tys, header) => {
+                        let signature = sig_tys.with(*header).skip_binder();
+                        (
+                            indirect_symbol_key(signature),
+                            None,
+                            signature_may_yield_pointer(tcx, signature),
+                        )
+                    }
                     _ => return None,
                 },
             };
@@ -515,6 +533,7 @@ fn mir_candidates(
                 statement_index: data.statements.len() as u32,
                 callee: key,
                 did: callee,
+                may_yield_pointer,
             })
         })
         .collect()
@@ -567,8 +586,8 @@ impl RawBoundarySiteFacts {
                     direct_storage_span: fact.direct_storage.map(|(_, span)| span),
                     adapter_operand_span: fact.adapter_operand_span,
                     adapter_operand_mutability: fact.adapter_operand_mutability,
-                    callee_may_yield_pointer: unique_candidate_did(&fact.callee, &candidates)
-                        .is_none_or(|did| callee_may_yield_pointer(tcx, did)),
+                    callee_may_yield_pointer: unique_candidate(&fact.callee, &candidates)
+                        .is_none_or(|site| site.may_yield_pointer),
                 }),
                 Err(reason) => out.failures.push(RawBoundarySiteFailure {
                     caller: tcx.def_path_str(fact.caller.to_def_id()),
@@ -638,11 +657,8 @@ impl RawBoundarySiteFacts {
                             direct_storage_span: argument.direct_storage.map(|(_, span)| span),
                             adapter_operand_span: argument.adapter_operand_span,
                             adapter_operand_mutability: argument.adapter_operand_mutability,
-                            callee_may_yield_pointer: unique_candidate_did(
-                                &callee_key,
-                                &candidates,
-                            )
-                            .is_none_or(|did| callee_may_yield_pointer(tcx, did)),
+                            callee_may_yield_pointer: unique_candidate(&callee_key, &candidates)
+                                .is_none_or(|site| site.may_yield_pointer),
                         }),
                         Err(reason) => out.failures.push(RawBoundarySiteFailure {
                             caller: tcx.def_path_str(call.caller.to_def_id()),
@@ -733,6 +749,10 @@ pub(crate) struct MirCallCandidate {
     /// `None` for an INDIRECT call (a function-pointer operand): there is no
     /// definition to read, and the carrier walk fails closed.
     pub did: Option<DefId>,
+    /// Whether the callee can hand a pointer back (its return, or a writable
+    /// carrier among its inputs) — read from the definition for a direct
+    /// call and from the function-pointer signature for an indirect one.
+    pub may_yield_pointer: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3746,13 +3766,13 @@ impl RawBoundaryDispositionIndex {
 /// The resolved callee of the one matching candidate, when there is exactly
 /// one. Ambiguity and absence answer `None`, and the carrier question then
 /// fails closed at the caller.
-fn unique_candidate_did(
+fn unique_candidate<'c>(
     expected: &ForeignSymbolKey,
-    candidates: &[MirCallCandidate],
-) -> Option<DefId> {
+    candidates: &'c [MirCallCandidate],
+) -> Option<&'c MirCallCandidate> {
     let mut matching = candidates.iter().filter(|site| site.callee == *expected);
     let site = matching.next()?;
-    matching.next().is_none().then_some(site.did).flatten()
+    matching.next().is_none().then_some(site)
 }
 
 /// Zero and multiple matches stay typed rather than choosing by traversal
@@ -4447,6 +4467,7 @@ mod tests {
                 statement_index: 3,
                 callee: expected.clone(),
                 did: Some(CRATE_DEF_ID.to_def_id()),
+                may_yield_pointer: true,
             }],
         );
         assert_eq!(site, Ok((7, 3)));
@@ -4464,6 +4485,7 @@ mod tests {
             statement_index: 0,
             callee: expected.clone(),
             did: Some(CRATE_DEF_ID.to_def_id()),
+            may_yield_pointer: true,
         };
         assert_eq!(
             select_unique_site(&expected, &[one.clone(), one]),
@@ -4483,6 +4505,7 @@ mod tests {
                     statement_index: 1,
                     callee: local,
                     did: Some(CRATE_DEF_ID.to_def_id()),
+                    may_yield_pointer: true,
                 }],
             ),
             Err(SiteMatchFailure::CalleeMismatch)
