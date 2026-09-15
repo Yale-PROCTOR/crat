@@ -67,6 +67,7 @@ pub(crate) mod mixed_boundary;
 mod mixed_boundary_tests;
 pub(crate) mod native_result_expression;
 pub(crate) mod nested_slice;
+pub(crate) mod null_init_declaration;
 pub(crate) mod option;
 mod option_ops;
 pub(crate) mod outbound_expression;
@@ -1835,6 +1836,8 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         {
             decision
         }
+        // Wave-6o: an unannotated null-initialized local receives its type.
+        Decision::Opt { .. } if null_init_declaration::admits(ctx, subject, &decision) => decision,
         Decision::Slice { mutable, .. }
             if receiver.is_some_and(|receiver| {
                 receiver.receiver_form == seam::Form::Slice { mutable }

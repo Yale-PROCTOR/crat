@@ -3927,6 +3927,10 @@ fn transform_with<'tcx>(
                         })
                 })
             && !super::decision::void_region::typed_receiver(table, subject, decision)
+            // Wave-6o: placed by `ExplicitLocalDeclVisitor`, not by this arm.
+            && !super::decision::null_init_declaration::has_explicit_declaration(
+                table, subject, decision,
+            )
         {
             insert_counting(
                 &mut decisions,

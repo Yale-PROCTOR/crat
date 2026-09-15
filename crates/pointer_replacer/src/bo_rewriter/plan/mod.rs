@@ -4432,6 +4432,12 @@ pub(crate) fn plan(
                 continue;
             }
         }
+        // Wave-6o: an unannotated null-initialized local whose type is
+        // inserted by its own explicit declaration site anchors like a receiver.
+        let typed_receiver = typed_receiver
+            || super::decision::null_init_declaration::has_explicit_declaration(
+                table, subject, decision,
+            );
         let planned_declaration = inferred_box || typed_pattern || typed_receiver;
         // wave-6f: a local loaded from a converting field carries an explicit
         // declaration planned by the field transaction; no type span to splice.

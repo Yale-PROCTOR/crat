@@ -205,6 +205,8 @@ mod native_return_replay_tests;
 #[cfg(test)]
 mod nested_use_tests;
 #[cfg(test)]
+mod option_decl_tests;
+#[cfg(test)]
 mod option_ops_tests;
 #[cfg(test)]
 mod option_projection_tests;
@@ -8008,6 +8010,7 @@ fn finish_decide<'tcx>(
         decision::box_param::append_interface_dependencies(&mut table);
         decision::void_region::append_receiver_declarations(&mut table);
         append_literal_local_declaration_plans(tcx, &ctors, &mut table);
+        decision::null_init_declaration::append_explicit_declarations(tcx, &mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
