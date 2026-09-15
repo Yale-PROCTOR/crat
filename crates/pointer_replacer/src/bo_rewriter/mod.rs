@@ -5826,7 +5826,12 @@ fn validate_cursor_delivered_bases(
             DeliveredBaseProvider::TableElement => {
                 cursor.wrapper
                     && cursor.fallback
-                    && !subject.mutable
+                    && (!subject.mutable
+                        || decision::cursor_native::wrapper::table_named_once(
+                            tcx,
+                            subject.fn_did,
+                            base.binding,
+                        ))
                     && !overrides_base
                     && table.entries.iter().any(|(candidate, choice)| {
                         (candidate.fn_did, candidate.hir_id) == node

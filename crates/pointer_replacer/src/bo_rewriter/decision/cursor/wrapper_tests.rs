@@ -114,23 +114,39 @@ fn slicecursor_nullable_parameter() {
 }
 
 #[test]
-fn slicecursor_written_table_element_is_held() {
-    // A mutable cursor over a table element would fabricate an exclusive view
-    // beside the table's other elements; it stays held.
+fn slicecursor_written_table_element_is_admitted_when_loaded_once() {
+    // Expectation migrated (relay 003): a written element loaded once from the
+    // table is the function's only view of its buffer and takes the exclusive
+    // fallback base.
     let input = "pub unsafe fn previous(outputs: *mut *mut f64, k: isize) { let output: *mut f64 = *outputs.offset(0); *output.offset(k) = 1.; }";
-    ::utils::compilation::run_compiler_on_str(input, |tcx| {
-        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
-        let (_, decision) = table
-            .entries
-            .iter()
-            .find(|(s, _)| s.param_name.as_deref() == Some("output"))
-            .unwrap();
-        let super::Decision::Degraded(record) = decision else {
-            panic!("raw table admitted: {decision:?}");
-        };
-        assert_eq!(record.reason.key(), "cursor-base-unavailable");
-    })
-    .unwrap();
+    let source = emitted(input);
+    assert!(
+        source.contains("crate::slice_cursor::SliceCursorMut::from_raw_parts_mut(outputs["),
+        "exclusive fallback base absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let mut a = [0., 0., 0.]; let mut t = [a.as_mut_ptr()]; unsafe { previous(&mut t, 2) }; assert_eq!(a, [0., 0., 1.]); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_written_table_element_mutable_element_read_only_stays_shared() {
+    // Hold pin kept from the pre-relay-003 form: a written element whose table is
+    // loaded twice never takes a mutable view (see the second-view witness); a
+    // read-only element still takes the shared form even when loaded twice.
+    let input = "pub unsafe fn previous(outputs: *const *mut f64, k: isize) -> f64 { let output: *mut f64 = *outputs.offset(0); *output.offset(k) + *(*outputs.offset(0)).offset(1) }";
+    let source = emitted(input);
+    assert!(
+        source.contains("crate::slice_cursor::SliceCursor::from_raw_parts(outputs["),
+        "shared fallback base absent: {source}"
+    );
+    assert!(
+        !source.contains("SliceCursorMut::from_raw_parts_mut(outputs["),
+        "read-only element must not take a mutable view: {source}"
+    );
 }
 
 #[test]
@@ -394,6 +410,90 @@ pub unsafe fn adx(size: i32, inputs: *const *const f64) -> f64 {
         assert!(
             composed.contains("SliceCursor::from_raw_parts(inputs[1]"),
             "{composed}"
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn slicecursor_written_table_element_takes_exclusive_fallback_base() {
+    // tulipindicators `ti_decay`: the output cursor is loaded once from the
+    // delivered table, written through `*output++`, and read back at `-1`.
+    // The element is the function's only view of that buffer.
+    let input = r#"
+pub unsafe fn decay(size: i32, inputs: *const *const f64, outputs: *const *mut f64, scale: f64) -> i32 {
+    let input: *const f64 = *inputs.offset(0);
+    let mut output: *mut f64 = *outputs.offset(0);
+    *output = *input.offset(0);
+    output = output.offset(1);
+    let mut i = 1;
+    while i < size {
+        let d = *output.offset(-1) - scale;
+        *output = if *input.offset(i as isize) > d { *input.offset(i as isize) } else { d };
+        output = output.offset(1);
+        i += 1;
+    }
+    0
+}
+"#;
+    let source = emitted(input);
+    save_fixture("table-element-written-output", input, &source);
+    assert!(
+        source.contains("crate::slice_cursor::SliceCursorMut::from_raw_parts_mut(outputs["),
+        "exclusive table-element base absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let x = [5., 1., 2., 9.]; let mut o = [0.; 4]; let t = [x.as_ptr()]; let u = [o.as_mut_ptr()]; assert_eq!(unsafe { decay(4, &t, &u, 1.) }, 0); assert_eq!(o, [5., 4., 3., 9.]); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_written_table_element_with_second_view_is_held() {
+    // A second load of the same table is a second view of a buffer the
+    // mutable cursor would claim exclusively; the cursor stays held.
+    // The outer stays a delivered slice here (two element loads, one written
+    // through the cursor, one read inline), so the refusal is this rule's own.
+    let input = "pub unsafe fn previous(outputs: *const *mut f64, k: isize) -> f64 { let output: *mut f64 = *outputs.offset(0); *output.offset(k) = 1.; *(*outputs.offset(0)).offset(1) }";
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        assert!(
+            table
+                .entries
+                .iter()
+                .any(|(s, d)| s.param_name.as_deref() == Some("outputs")
+                    && matches!(d, super::Decision::Slice { .. })),
+            "fixture premise: the outer table must be a delivered slice"
+        );
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("output"))
+            .unwrap();
+        let super::Decision::Degraded(record) = decision else {
+            panic!("second view admitted: {decision:?}");
+        };
+        assert_eq!(record.reason.key(), "cursor-base-unavailable");
+    })
+    .unwrap();
+}
+
+#[test]
+fn slicecursor_written_table_element_with_escaping_table_is_held() {
+    // The table itself escaping to a callee is another route to the buffer.
+    let input = "unsafe extern \"C\" { fn sink(t: *mut *mut f64); } pub unsafe fn previous(outputs: *mut *mut f64, k: isize) { let output: *mut f64 = *outputs.offset(0); *output.offset(k) = 1.; sink(outputs); }";
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("output"))
+            .unwrap();
+        assert!(
+            matches!(decision, super::Decision::Degraded(_)),
+            "escaping table admitted: {decision:?}"
         );
     })
     .unwrap();

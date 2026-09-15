@@ -87,17 +87,14 @@ struct Base {
 /// `let p: *const T = *table.offset(k)` with `table` a delivered slice. The
 /// loaded element is a bare raw base and takes the same receipted fallback as
 /// a raw path; the constructor composes the outer's own element rewrite so the
-/// two edits never collide at the initializer span. A mutable element would
-/// fabricate an exclusive view beside the table's other elements and stays held.
+/// two edits never collide at the initializer span. A written element takes the
+/// exclusive view only when the table is named once in the function (relay 003).
 fn table_element_base(
     ctx: &Ctx<'_, '_>,
     s: &Subject,
     e: &hir::Expr<'_>,
     entries: &[(Subject, Decision)],
 ) -> Result<Base, CursorHold> {
-    if s.mutable {
-        return Err(CursorHold::BaseMissing);
-    }
     if !model_ref(ctx, s) {
         return Err(CursorHold::RefMissing);
     }
@@ -105,6 +102,12 @@ fn table_element_base(
         return Err(CursorHold::BaseMissing);
     };
     let root = source_binding(ctx.tcx, s.fn_did, pointer).ok_or(CursorHold::BaseMissing)?;
+    // A written element takes an exclusive view only when it is the function's
+    // only view of that buffer: the table is named exactly once (this load),
+    // so no other element load and no escape of the table exists (relay 003).
+    if s.mutable && !table_named_once(ctx.tcx, s.fn_did, root) {
+        return Err(CursorHold::BaseMissing);
+    }
     let (_, decision) = entries
         .iter()
         .find(|(source, _)| source.fn_did == s.fn_did && source.hir_id == root)
@@ -126,8 +129,9 @@ fn table_element_base(
     Ok(Base {
         parent_cursor: None,
         expression: format!(
-            "unsafe {{ {}::from_raw_parts({}, crate::FALLBACK_SLICE_EXTENT) }}",
-            constructor(false),
+            "unsafe {{ {}::from_raw_parts{}({}, crate::FALLBACK_SLICE_EXTENT) }}",
+            constructor(s.mutable),
+            if s.mutable { "_mut" } else { "" },
             element.replacement
         ),
         binding: None,
@@ -141,6 +145,28 @@ fn table_element_base(
         fallback: true,
         composed: vec![element.span],
     })
+}
+/// Exactly one path expression in the owner's body resolves to `binding`.
+pub(crate) fn table_named_once(
+    tcx: ty::TyCtxt<'_>,
+    owner: rustc_hir::def_id::LocalDefId,
+    binding: hir::HirId,
+) -> bool {
+    struct Names {
+        binding: hir::HirId,
+        count: usize,
+    }
+    impl<'v> Visitor<'v> for Names {
+        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
+            if local(e) == Some(self.binding) {
+                self.count += 1;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut names = Names { binding, count: 0 };
+    names.visit_body(tcx.hir_body_owned_by(owner));
+    names.count == 1
 }
 fn base(
     ctx: &Ctx<'_, '_>,
