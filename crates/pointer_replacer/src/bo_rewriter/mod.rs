@@ -239,6 +239,8 @@ mod thin_extent_tests;
 #[cfg(test)]
 mod void_pointee_tests;
 #[cfg(test)]
+mod wave5c_preservation_witness_tests;
+#[cfg(test)]
 mod zero_syntax_custody_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

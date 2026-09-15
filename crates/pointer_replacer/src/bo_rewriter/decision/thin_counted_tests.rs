@@ -1,5 +1,5 @@
 //! Native two-half counted-source witnesses, derived from brotli entropy chains.
-const ENTROPY: &str = r###"
+pub(crate) const ENTROPY: &str = r###"
             unsafe extern "C" fn ShannonEntropy(mut population:
                     *const u32, mut size: usize, mut total: *mut usize)
                 -> f64 {

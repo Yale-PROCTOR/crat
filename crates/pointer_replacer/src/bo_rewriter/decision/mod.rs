@@ -85,7 +85,7 @@ pub(crate) mod surface_argument;
 pub(crate) mod thin_counted;
 pub(crate) mod thin_counted_entropy;
 #[cfg(test)]
-mod thin_counted_tests;
+pub(crate) mod thin_counted_tests;
 pub(crate) mod thin_extent;
 pub(crate) mod universe;
 pub(crate) mod void_pointee;
