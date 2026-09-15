@@ -36,7 +36,7 @@ pub(crate) fn derive<'tcx>(
         return Err(SourceHold::ConstructorShape);
     }
     let pointer_bits = tcx.data_layout.pointer_size.bits();
-    let (zero, element_bits) = numeric_zero(element, pointer_bits)?;
+    let (zero, element_bits) = zero_value(tcx, element, pointer_bits)?;
     let mut allocation = init;
     while let ExprKind::Cast(inner, _) = allocation.kind {
         if !matches!(typeck.expr_ty(allocation).kind(), TyKind::RawPtr(..))
@@ -353,6 +353,59 @@ fn unsigned_bits(ty: Ty<'_>, pointer_bits: u64) -> Option<u64> {
     })
 }
 
+/// A spelled all-zero value for a numeric scalar, a raw pointer (null), an
+/// array of such, or a `repr(C)` struct whose fields are all such (every
+/// field named, so the literal is complete and needs no `unsafe`). C's
+/// `malloc` leaves the object indeterminate; the C program writes before it
+/// reads, so any valid initial value is behaviour-preserving, and all-zero is
+/// a valid value of every such type.
+fn zero_value<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    element: Ty<'tcx>,
+    pointer_bits: u64,
+) -> Result<(String, u64), SourceHold> {
+    match element.kind() {
+        TyKind::RawPtr(_, rustc_hir::Mutability::Mut) => {
+            Ok(("::core::ptr::null_mut()".into(), pointer_bits))
+        }
+        TyKind::RawPtr(_, rustc_hir::Mutability::Not) => {
+            Ok(("::core::ptr::null()".into(), pointer_bits))
+        }
+        TyKind::Array(inner, length) => {
+            let length = length
+                .try_to_target_usize(tcx)
+                .ok_or(SourceHold::ConstructorShape)?;
+            let (zero, bits) = zero_value(tcx, *inner, pointer_bits)?;
+            Ok((
+                format!("[{zero}; {length}]"),
+                bits.checked_mul(length)
+                    .ok_or(SourceHold::ConstructorShape)?,
+            ))
+        }
+        TyKind::Adt(def, args) if def.is_struct() && def.repr().c() && def.did().is_local() => {
+            let mut fields = Vec::new();
+            for field in def.non_enum_variant().fields.iter() {
+                let (zero, _) = zero_value(tcx, field.ty(tcx, args), pointer_bits)?;
+                fields.push(format!("{}: {zero}", field.name));
+            }
+            let layout = tcx
+                .layout_of(
+                    rustc_middle::ty::TypingEnv::fully_monomorphized().as_query_input(element),
+                )
+                .map_err(|_| SourceHold::ConstructorShape)?;
+            Ok((
+                format!(
+                    "crate::{} {{ {} }}",
+                    tcx.def_path_str(def.did()),
+                    fields.join(", ")
+                ),
+                layout.size.bits(),
+            ))
+        }
+        _ => numeric_zero(element, pointer_bits),
+    }
+}
+
 fn numeric_zero(element: Ty<'_>, pointer_bits: u64) -> Result<(String, u64), SourceHold> {
     let bits = match element.kind() {
         TyKind::Int(kind) => match kind {
@@ -388,7 +441,10 @@ mod tests {
         ::utils::compilation::run_compiler_on_str(&source, |tcx| {
             let owner = tcx
                 .hir_body_owners()
-                .find(|owner| tcx.item_name(owner.to_def_id()).as_str() == "probe")
+                .find(|owner| {
+                    tcx.opt_item_name(owner.to_def_id())
+                        .is_some_and(|name| name.as_str() == "probe")
+                })
                 .expect("fixture owner");
             let ExprKind::Block(block, _) = tcx.hir_body_owned_by(owner).value.kind else {
                 panic!("fixture block")
@@ -520,6 +576,67 @@ mod tests {
                 ),
                 Err(SourceHold::ConstructorShape),
                 "{bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_repr_c_struct_zero_names_every_field() {
+        let declarations = format!(
+            "{C_ULONG_MALLOC} #[repr(C)] #[derive(Copy,Clone)] pub struct Inner {{ pub v: [f32; 2] }} #[repr(C)] #[derive(Copy,Clone)] pub struct Rec {{ pub width: i32, pub data: *mut f32, pub name: *const u8, pub inner: Inner }} pub type Alias = Rec;"
+        );
+        assert_eq!(
+            inspect(
+                &declarations,
+                "Rec",
+                "malloc(core::mem::size_of::<Rec>() as libc::c_ulong) as *mut Alias"
+            ),
+            Ok((
+                "1".into(),
+                "::std::boxed::Box::new(crate::Rec { width: 0i32, data: ::core::ptr::null_mut(), name: ::core::ptr::null(), inner: crate::Inner { v: [0.0f32; 2] } })".into(),
+                "native-malloc-zero-numeric"
+            ))
+        );
+    }
+
+    #[test]
+    fn constructor_struct_zero_faults_hold_non_c_layout_and_non_zeroable_fields() {
+        for (declaration, element) in [
+            (
+                "#[derive(Copy,Clone)] pub struct Plain { pub a: i32 }",
+                "Plain",
+            ),
+            (
+                "#[repr(C)] #[derive(Copy,Clone)] pub struct Flag { pub a: bool }",
+                "Flag",
+            ),
+            (
+                "#[repr(C)] #[derive(Copy,Clone)] pub struct Refd { pub a: &'static u8 }",
+                "Refd",
+            ),
+            (
+                "#[repr(C)] #[derive(Copy,Clone)] pub struct Text { pub a: char }",
+                "Text",
+            ),
+            (
+                "#[repr(C)] #[derive(Copy,Clone)] pub enum Tag { A, B }",
+                "Tag",
+            ),
+            (
+                "#[repr(C)] #[derive(Copy,Clone)] pub union U { pub a: i32, pub b: f32 }",
+                "U",
+            ),
+        ] {
+            assert_eq!(
+                inspect(
+                    &format!("{C_ULONG_MALLOC} {declaration}"),
+                    element,
+                    &format!(
+                        "malloc(core::mem::size_of::<{element}>() as libc::c_ulong) as *mut {element}"
+                    )
+                ),
+                Err(SourceHold::ConstructorShape),
+                "{declaration}"
             );
         }
     }

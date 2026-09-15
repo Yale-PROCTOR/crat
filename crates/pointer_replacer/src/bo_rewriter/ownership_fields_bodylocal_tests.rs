@@ -250,6 +250,148 @@ pub unsafe extern "C" fn heman_ops_percentiles(mut src: *mut libc::c_float, mut 
 }
 
 #[test]
+fn r399_heman_points_create_real_shape_struct_zero_and_return_transfer() {
+    // `heman_points_create::img#5`: `malloc(sizeof(heman_image_s))` cast to the
+    // alias `heman_points`, field stores, a nested allocation into a field,
+    // and the owner RETURNED raw to the caller (freed in `heman_points_destroy`).
+    let input = format!(
+        r#"{}
+extern "C" {{ fn memcpy(d: *mut libc::c_void, s: *const libc::c_void, n: libc::c_ulong) -> *mut libc::c_void; }}
+#[repr(C)] #[derive(Copy, Clone)] pub struct heman_image_s {{ pub width: libc::c_int, pub height: libc::c_int, pub nbands: libc::c_int, pub data: *mut libc::c_float }}
+pub type heman_points = heman_image_s;
+pub unsafe extern "C" fn heman_points_create(mut xy: *mut libc::c_float, mut npoints: libc::c_int, mut nbands: libc::c_int) -> *mut heman_image_s {{
+    let mut img = malloc(::std::mem::size_of::<heman_image_s>() as libc::c_ulong) as *mut heman_points;
+    (*img).width = npoints;
+    (*img).height = 1 as libc::c_int;
+    (*img).nbands = nbands;
+    let mut nbytes = (::std::mem::size_of::<libc::c_float>() as libc::c_ulong).wrapping_mul(npoints as libc::c_ulong).wrapping_mul(nbands as libc::c_ulong) as libc::c_int;
+    (*img).data = malloc(nbytes as libc::c_ulong) as *mut libc::c_float;
+    memcpy((*img).data as *mut libc::c_void, xy as *const libc::c_void, nbytes as libc::c_ulong);
+    return img;
+}}
+pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
+    free((*victim).data as *mut libc::c_void);
+    free(victim as *mut libc::c_void);
+}}"#,
+        c_declarations()
+    );
+    let s = verify(&input, "img", BoxShape::Sized, true);
+    assert!(
+        s.contains("return ::std::boxed::Box::into_raw(img);"),
+        "{s}"
+    );
+    assert!(s.contains("::std::boxed::Box::new(crate::heman_image_s { width: 0i32, height: 0i32, nbands: 0i32, data: ::core::ptr::null_mut() })"), "{s}");
+}
+
+#[test]
+fn r399_aggregate_owner_with_an_unsupplied_field_holds() {
+    // F04: the zero literal is a placeholder only when the program supplies
+    // every field itself.
+    let input = format!(
+        "{} #[repr(C)] #[derive(Copy, Clone)] pub struct Pair {{ pub x: i32, pub y: i32 }} pub unsafe fn f(n: i32) -> i32 {{ let mut p = malloc(core::mem::size_of::<Pair>()) as *mut Pair; (*p).x = n; let v = (*p).x; free(p as *mut core::ffi::c_void); v }}",
+        declarations()
+    );
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, d) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+            .unwrap();
+        assert!(matches!(d, Decision::Degraded(_)), "{d:?}");
+        assert!(
+            ctx.raw_boundary_artifacts
+                .ownership_native
+                .contains("native-aggregate-fields-supplied"),
+            "{}",
+            ctx.raw_boundary_artifacts.ownership_native
+        );
+    })
+    .unwrap();
+    let supplied = input.replace("(*p).x = n;", "(*p).x = n; (*p).y = n + 1;");
+    let s = verify(&supplied, "p", BoxShape::Sized, false);
+    assert!(
+        s.contains("::std::boxed::Box::new(crate::Pair { x: 0i32, y: 0i32 })"),
+        "{s}"
+    );
+}
+
+#[test]
+fn r399_return_transfer_faults_uncovered_live_exit_and_zero_capable_slice() {
+    // An early raw-null return while the owner is live is an uncovered exit
+    // (the source permit refuses it); a returned boxed slice with a dynamic
+    // count could be empty and would hand C `free` a dangling sentinel.
+    let uncovered = format!(
+        "{} pub unsafe fn make(n: usize) -> *mut u32 {{ let mut buffer = malloc(core::mem::size_of::<u32>()) as *mut u32; *buffer = 1; if n != 0 {{ return buffer; }} 0 as *mut u32 }}",
+        declarations()
+    );
+    ::utils::compilation::run_compiler_on_str(&uncovered, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (subject, d) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("buffer"))
+            .unwrap();
+        assert!(matches!(d, Decision::Degraded(_)), "{d:?}");
+        let result = super::decision::ownership_fields_source::derive(
+            &super::collect_program(tcx),
+            subject,
+            &ctx.constructions,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(super::decision::ownership_fields_source::SourceHold::NormalExitCoverage)
+            ),
+            "{result:?}"
+        );
+    })
+    .unwrap();
+    let zero_capable = format!(
+        "{} pub unsafe fn make(n: usize) -> *mut u32 {{ let mut buffer = calloc(n, core::mem::size_of::<u32>()) as *mut u32; return buffer; }}",
+        declarations()
+    );
+    ::utils::compilation::run_compiler_on_str(&zero_capable, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, d) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("buffer"))
+            .unwrap();
+        assert!(matches!(d, Decision::Degraded(_)), "{d:?}");
+        assert!(
+            ctx.raw_boundary_artifacts
+                .ownership_native
+                .contains("native-transfer-nonempty"),
+            "{}",
+            ctx.raw_boundary_artifacts.ownership_native
+        );
+    })
+    .unwrap();
+}
+
+#[test]
 fn r395_heman_percentiles_real_shape_sizeof_first_wrapping_mul_count() {
     // `heman_ops_percentiles::vals#292`: sizeof-first operand order, an
     // index-written buffer read back in a loop, the C free at the end.

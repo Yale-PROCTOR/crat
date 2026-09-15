@@ -146,8 +146,15 @@ pub(crate) struct SourcePlan {
     /// `retained_sink`, and never itself an R101 waiver authorization.
     unwind_obligations: Vec<SourceCallKey>,
     mir_aliases: BTreeSet<u32>,
+    /// The owner handed to the caller raw at a `return`: the close is the
+    /// transfer, the caller's C free stays where it is.
+    return_transfer: Option<Span>,
 }
 impl SourcePlan {
+    pub(crate) fn return_transfer(&self) -> Option<Span> {
+        self.return_transfer
+    }
+
     pub(crate) fn owner(&self) -> LocalDefId {
         self.owner
     }
@@ -444,6 +451,31 @@ pub(crate) fn derive<'tcx>(
         .ok_or(SourceHold::Identity)?;
     let mut expressions = Expressions::default();
     expressions.visit_body(tcx.hir_body(body_id));
+    // F04 (R350-4): an aggregate owner is admitted only when the source
+    // supplies every field through the root before anything reads it — the
+    // spelled zero literal is then a placeholder the program overwrites.
+    if let TyKind::Adt(def, _) = element.kind() {
+        let supplied: BTreeSet<_> = expressions
+            .0
+            .iter()
+            .filter_map(|e| {
+                let ExprKind::Assign(lhs, _, _) = e.kind else { return None };
+                let ExprKind::Field(base, ident) = lhs.kind else { return None };
+                let ExprKind::Unary(rustc_hir::UnOp::Deref, operand) = base.kind else {
+                    return None;
+                };
+                root_path(operand, binding).then_some(ident.name)
+            })
+            .collect();
+        if def
+            .non_enum_variant()
+            .fields
+            .iter()
+            .any(|field| !supplied.contains(&field.name))
+        {
+            return Err(SourceHold::Missing("native-aggregate-fields-supplied"));
+        }
+    }
     // Whole-caller reference/closure absence is a deliberately narrow scope.
     // Merely recognizing the scalar deref nested inside &*root is not enough.
     if expressions.0.iter().any(|e| {
@@ -460,7 +492,15 @@ pub(crate) fn derive<'tcx>(
     let mut covered = BTreeSet::new();
     let mut root_calls = Vec::new();
     let mut boundary_arguments = FxHashSet::default();
+    let mut returns = Vec::new();
     for &expression in &expressions.0 {
+        if let ExprKind::Ret(Some(returned)) = expression.kind
+            && let Ok(operand) = peel(returned, typeck)
+            && root_path(operand, binding)
+        {
+            covered.insert(operand.hir_id.local_id.as_u32());
+            returns.push(returned);
+        }
         if let ExprKind::Call(callee, arguments) = expression.kind {
             for (index, argument) in arguments.iter().enumerate() {
                 let Ok(operand) = peel(argument, typeck) else { continue };
@@ -499,8 +539,13 @@ pub(crate) fn derive<'tcx>(
     let uses = slice_uses
         .get(&key)
         .ok_or(SourceHold::UnsupportedOwnerUse)?;
-    if uses.unsupported.is_some()
-        || !uses.return_handoffs.is_empty()
+    if uses
+        .unsupported
+        .is_some_and(|span| !returns.iter().any(|r| r.span == span))
+        || uses
+            .return_handoffs
+            .iter()
+            .any(|site| !returns.iter().any(|r| r.span == site.span))
         || uses
             .raw_uses
             .iter()
@@ -733,13 +778,15 @@ pub(crate) fn derive<'tcx>(
         .iter()
         .filter(|c| c.deallocator_events.is_some())
         .collect();
-    if frees.len() + transfers.len() != 1 {
+    if frees.len() + transfers.len() + returns.len() != 1 {
         return Err(SourceHold::FreeIdentity);
     }
     let (close_key, close_span) = if let Some(free) = frees.first() {
-        (free.key, free.span)
+        (Some(free.key), free.span)
+    } else if let Some(transfer) = transfers.first() {
+        (Some(transfer.key), transfer.call_span)
     } else {
-        (transfers[0].key, transfers[0].call_span)
+        (None, returns[0].span)
     };
     if close_span.lo() < init.span.hi()
         || scalar_edits
@@ -747,7 +794,7 @@ pub(crate) fn derive<'tcx>(
             .any(|edit| edit.span.lo() < init.span.hi() || edit.span.hi() > close_span.lo())
         || calls.iter().any(|call| {
             call.call_span.lo() < init.span.hi()
-                || (call.key != close_key && call.call_span.hi() > close_span.lo())
+                || (Some(call.key) != close_key && call.call_span.hi() > close_span.lo())
         })
     {
         return Err(SourceHold::UnsupportedOwnerUse);
@@ -798,7 +845,7 @@ pub(crate) fn derive<'tcx>(
                     return Err(SourceHold::NormalExitCoverage);
                 }
                 state = State::Live;
-            } else if call.key == close_key {
+            } else if Some(call.key) == close_key {
                 if state != State::Live {
                     return Err(SourceHold::NormalExitCoverage);
                 }
@@ -818,6 +865,29 @@ pub(crate) fn derive<'tcx>(
             TerminatorKind::FalseEdge { real_target, .. }
             | TerminatorKind::FalseUnwind { real_target, .. } => vec![*real_target],
             TerminatorKind::Return if state != State::Live => Vec::new(),
+            // A return transfer: this block must hand the owner (an alias of
+            // it) to the return place; any other live exit is uncovered.
+            TerminatorKind::Return
+                if close_key.is_none()
+                    && data.statements.iter().rev().find_map(|statement| {
+                        let StatementKind::Assign(box (destination, rvalue)) = &statement.kind
+                        else {
+                            return None;
+                        };
+                        (destination.as_local() == Some(rustc_middle::mir::RETURN_PLACE)).then(
+                            || match rvalue {
+                                Rvalue::Use(operand)
+                                | Rvalue::Cast(CastKind::PtrToPtr, operand, _) => {
+                                    plain_local(operand)
+                                        .is_some_and(|local| aliases.contains(&local.as_u32()))
+                                }
+                                _ => false,
+                            },
+                        )
+                    }) == Some(true) =>
+            {
+                Vec::new()
+            }
             TerminatorKind::Return => return Err(SourceHold::NormalExitCoverage),
             _ => return Err(SourceHold::UnsupportedControlFlow),
         };
@@ -842,6 +912,7 @@ pub(crate) fn derive<'tcx>(
         calls,
         unwind_obligations: unwind_obligations.into_iter().collect(),
         mir_aliases: aliases,
+        return_transfer: returns.first().map(|r| r.span),
     })
 }
 

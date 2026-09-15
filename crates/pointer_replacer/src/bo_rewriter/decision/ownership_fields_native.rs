@@ -214,7 +214,12 @@ impl Candidates {
             else {
                 continue;
             };
-            if *prior_key != "box-param-caller-unknown" {
+            // Locals the prior path held on their caller (F01) or on an
+            // aggregate initializer (F04) are native candidates.
+            if !matches!(
+                *prior_key,
+                "box-param-caller-unknown" | "box-initializer-unsupported"
+            ) {
                 continue;
             }
             let Some(slot) = inputs
@@ -688,6 +693,22 @@ fn derive_bundle(
     // closes of this scalar root; it is not inferred from an empty loan set.
     for at in source.unwind_obligations() {
         receipts.push(format!("native-unwind-close-permit source-call={at:?} all-roots=fresh-local-closed-uses-and-verified-T1 payload={}/nonrecursive; actual-waiver-sites=emitted-MIR-ledger",source.element()));
+    }
+    if let Some(span) = source.return_transfer() {
+        // Ownership leaves as a raw pointer exactly as in C; the caller's C
+        // free is untouched, so the allocation must be C-free compatible.
+        if !source.nonempty() {
+            return Err(NativeHold::Missing("native-transfer-nonempty"));
+        }
+        if !c_free_allocator_compatible(tcx) {
+            return Err(NativeHold::Missing("native-transfer-allocator-contract"));
+        }
+        receipts.push(format!("native-box-transfer-at-return span={span:?} allocator=linux-System;global-allocators=none;nonempty=numeric-layout caller-free=unchanged"));
+        edits.push(BoxExprEdit {
+            span,
+            replacement: format!("::std::boxed::Box::into_raw({name})"),
+            receipt: "native-box-transfer-at-return",
+        });
     }
     let required: BTreeSet<_> = source.frees().iter().map(|site| site.key()).collect();
     let frees = plan_frees(&required, source.frees()).map_err(NativeHold::Source)?;
