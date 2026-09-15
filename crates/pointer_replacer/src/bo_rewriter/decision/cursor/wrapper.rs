@@ -321,8 +321,16 @@ fn base(
         return Err(CursorHold::RefMissing);
     }
     // A raw base gets the same explicitly receipted fallback as a raw-to-slice
-    // construction. Calls and opaque expressions need their own producer.
-    if !matches!(raw_origin.kind, hir::ExprKind::Path(_)) {
+    // construction. Calls and opaque expressions need their own producer. A raw
+    // pointer FIELD of a struct is a bare raw base for a shared cursor only: an
+    // exclusive view over a field the struct may hand out again is not proven.
+    let field_base = matches!(raw_origin.kind, hir::ExprKind::Field(..))
+        && !s.mutable
+        && matches!(
+            ctx.tcx.typeck(s.fn_did).expr_ty(raw_origin).kind(),
+            ty::RawPtr(..)
+        );
+    if !matches!(raw_origin.kind, hir::ExprKind::Path(_)) && !field_base {
         return Err(CursorHold::BaseMissing);
     }
     let method = if s.mutable {

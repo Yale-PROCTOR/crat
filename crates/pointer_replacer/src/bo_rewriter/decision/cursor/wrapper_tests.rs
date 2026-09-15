@@ -653,3 +653,90 @@ fn slicecursor_whole_cursor_to_local_slice_parameter() {
         ),
     );
 }
+
+#[test]
+fn slicecursor_struct_field_raw_base_shared() {
+    // genann `genann_train`: a shared cursor over a raw pointer field of a
+    // struct, offset at construction, read at `k - 1`.
+    let input = r#"
+pub struct Net { pub output: *const f64, pub hidden: i32 }
+pub unsafe fn train(ann: *const Net, h: i32, n: i32) -> f64 {
+    let base = if h != 0 { (*ann).hidden * (h - 1) } else { 0 };
+    let i_0: *const f64 = ((*ann).output).offset(base as isize);
+    let mut acc = 0.;
+    let mut k = 1;
+    while k <= n {
+        acc += *i_0.offset((k - 1) as isize);
+        k += 1;
+    }
+    acc
+}
+"#;
+    let source = emitted(input);
+    save_fixture("struct-field-raw-base", input, &source);
+    assert!(
+        source.contains("crate::slice_cursor::SliceCursor::from_raw_parts(((*ann).output)"),
+        "struct-field fallback base absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let out = [1., 2., 3., 4., 5.]; let net = Net { output: out.as_ptr(), hidden: 2 }; assert_eq!(unsafe { train(&net, 2, 3) }, 3. + 4. + 5.); assert_eq!(unsafe { train(&net, 0, 2) }, 1. + 2.); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_struct_field_raw_base_written_is_held() {
+    // A written cursor over a struct's raw pointer field would be an exclusive
+    // view over a field the struct may hand out again; it stays held.
+    let input = "pub struct Net { pub output: *mut f64 } pub unsafe fn zero(ann: *mut Net, n: isize, k: isize) { let o: *mut f64 = ((*ann).output).offset(n); *o.offset(k) = 0.; }";
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("o"))
+            .unwrap();
+        let super::Decision::Degraded(record) = decision else {
+            panic!("written field base admitted: {decision:?}");
+        };
+        assert_eq!(record.reason.key(), "cursor-base-unavailable");
+    })
+    .unwrap();
+}
+
+#[test]
+fn slicecursor_table_element_with_direct_caller() {
+    // tulipindicators `ti_sma` is called directly (the smoke tests), so its
+    // `inputs` parameter carries a caller-side input plan; the table-element
+    // base makes no window claim on the outer and must still admit.
+    let input = r#"
+pub unsafe fn sma(size: i32, inputs: *const *const f64, period: i32) -> f64 {
+    let input: *const f64 = *inputs.offset(0);
+    let mut sum = 0.;
+    let mut i = 0;
+    while i < period { sum += *input.offset(i as isize); i += 1; }
+    i = period;
+    while i < size {
+        sum += *input.offset(i as isize);
+        sum -= *input.offset((i - period) as isize);
+        i += 1;
+    }
+    sum
+}
+pub unsafe fn caller(t: *const *const f64) -> f64 { sma(4, t, 2) }
+"#;
+    let source = emitted(input);
+    save_fixture("table-element-with-direct-caller", input, &source);
+    assert!(
+        source.contains("crate::slice_cursor::SliceCursor::from_raw_parts(inputs["),
+        "table-element base absent under a direct caller: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let x = [1., 2., 3., 4.]; let t = x.as_ptr(); assert_eq!(unsafe { caller(&t) }, 3. + 4.); }",
+        ),
+    );
+}

@@ -5822,7 +5822,9 @@ fn validate_cursor_delivered_bases(
                         .is_some_and(plan::SignatureClassPlan::is_ready)
             }
             // The outer table is a delivered slice whose element the cursor
-            // loads; the cursor's own extent is the receipted fallback.
+            // loads; the cursor's own extent is the receipted fallback, so a
+            // caller-side input plan on the outer (`overrides_base`) changes
+            // nothing the base relies on.
             DeliveredBaseProvider::TableElement => {
                 cursor.wrapper
                     && cursor.fallback
@@ -5832,7 +5834,6 @@ fn validate_cursor_delivered_bases(
                             subject.fn_did,
                             base.binding,
                         ))
-                    && !overrides_base
                     && table.entries.iter().any(|(candidate, choice)| {
                         (candidate.fn_did, candidate.hir_id) == node
                             && match choice {
