@@ -26,14 +26,20 @@ pub unsafe fn prepare_h65(s: *mut H65, cache: *mut i32) {
 fn wave6r_h65_descendant_free_callee_discharges_write_through_shared_view() {
     let source = super::emitted(INPUT);
     assert!(source.contains("s: &H65"), "{source}");
+    // The callee's formal is raw on this branch (the bridge); a class split
+    // that applies its shared formal makes the plain shared borrow the right
+    // text instead. Either way the shared root is never borrowed mutably.
     assert!(
-        source.contains("prepare_h6(core::ptr::from_ref(&(*s).ha).cast_mut()"),
+        source.contains("prepare_h6(core::ptr::from_ref(&(*s).ha).cast_mut()")
+            || source.contains("prepare_h6(&(*s).ha"),
         "{source}"
     );
     assert!(
-        source.contains("prepare_hrolling(core::ptr::from_ref(&(*s).hb).cast_mut()"),
+        source.contains("prepare_hrolling(core::ptr::from_ref(&(*s).hb).cast_mut()")
+            || source.contains("prepare_hrolling(&(*s).hb"),
         "{source}"
     );
+    assert!(!source.contains("&mut (*s)"), "{source}");
 }
 
 /// The raw-boundary disposition rows of `prepare_h65`'s first argument to

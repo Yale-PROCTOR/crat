@@ -57,12 +57,13 @@ fn wave6r_url_fresh_result_callee_discharges_write_through_shared_view() {
     assert!(row.contains("\tshared-ref-to-mut-raw\t"), "{row}");
     assert!(!row.contains("write-through-shared-view"), "{row}");
     let source = super::emitted(INPUT);
+    // Raw formal on this branch (the bridge); a class split applying the
+    // shared formal makes the bare `url` the right text instead.
     assert!(
-        source.contains("url_get_hostname(url: *mut Url"),
-        "{source}"
-    );
-    assert!(
-        source.contains("url_get_hostname(core::ptr::from_ref(url).cast_mut(), "),
+        (source.contains("url_get_hostname(url: *mut Url")
+            && source.contains("url_get_hostname(core::ptr::from_ref(url).cast_mut(), "))
+            || (source.contains("url_get_hostname(url: &Url")
+                && source.contains("url_get_hostname(url, ")),
         "{source}"
     );
 }
