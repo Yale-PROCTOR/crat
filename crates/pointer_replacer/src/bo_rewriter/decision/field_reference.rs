@@ -109,6 +109,10 @@ pub(crate) enum Rhs {
     Null,
     /// A subject binding of the storing function (a parameter or a local).
     Subject(NodeKey),
+    /// Any other raw-pointer expression (a call result, a field read); an
+    /// OWNED field takes it through the `from_raw` bridge, a reference field
+    /// holds.
+    RawExpression,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +131,11 @@ pub(crate) enum SiteKind {
     Offset,
     /// `(PLACE.f).is_null()` — the method call span.
     IsNull,
+    /// `callee(.., PLACE.f, ..)` — the argument span (owned fields only).
+    CallArgument,
+    /// `local = PLACE.f` — the field span; the local is an already-declared
+    /// subject (owned fields only).
+    Assignment,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +152,15 @@ pub(crate) struct Site {
     /// The index/offset operand rendered as a `usize` expression
     /// (`Element` / `Offset` only).
     pub index_text: Option<String>,
+    /// `CallArgument` only: the local callee's parameter node and its
+    /// depth-0 MODEL kind (the ownership verdict that decides move vs view).
+    pub consumer: Option<(NodeKey, SlotKind)>,
+    /// The field's base place `(*base).f`: the base local when it is a
+    /// subject, and whether its declared type is a raw pointer.
+    pub base: Option<NodeKey>,
+    pub raw_base: bool,
+    /// `Store` only: the whole assignment expression.
+    pub assign_span: Option<Span>,
 }
 
 /// One function whose signature mentions the struct.
@@ -158,6 +176,8 @@ pub(crate) struct Candidate {
     pub key: FieldKey,
     pub struct_path: String,
     pub field_name: String,
+    /// W6F-3: the field is model-`Owning` and becomes `Option<Box<T>>`.
+    pub owning: bool,
     pub form: Form,
     pub sites: Vec<Site>,
     pub mentions: Vec<Mention>,
@@ -220,7 +240,16 @@ pub(crate) struct ExpressionEdit {
     pub span: Span,
     pub replacement: String,
     pub kind: &'static str,
+    /// W6F-3: the replacement WRAPS the node — `replacement` is a template
+    /// with [`WRAP_PLACEHOLDER`] standing for the node's current expression,
+    /// applied structurally after the use grafts so inner rewrites survive.
+    pub wrap: bool,
 }
+
+/// The placeholder an owned-field wrap template carries for the wrapped node.
+pub(crate) const WRAP_PLACEHOLDER: &str = "__crat_inner";
+/// The assigned place of a raw-base store (`owned-field-raw-store` edits).
+pub(crate) const WRAP_PLACE: &str = "__crat_place";
 
 /// A function's signature plan: the generated lifetime, the parameters that
 /// carry it and whether the return type mentions the struct.
@@ -237,6 +266,9 @@ pub(crate) struct FieldTransaction {
     pub key: FieldKey,
     pub struct_path: String,
     pub field_name: String,
+    /// W6F-3: an owned field (`Option<Box<T>>`); no lifetime, the struct's
+    /// derived `Copy` / `Clone` impls become empty inherent impls.
+    pub owning: bool,
     pub form: Form,
     /// Every function carrying a site or a mention.
     pub owners: Vec<LocalDefId>,
@@ -251,6 +283,9 @@ pub(crate) struct FieldTransaction {
     pub expression_edits: Vec<ExpressionEdit>,
     /// Loaded locals that receive an explicit declaration.
     pub load_locals: Vec<(NodeKey, String)>,
+    /// W6F-3: the rendered form of each owned call-argument site (its
+    /// consumer's decided form), so the seam glues by identity.
+    pub argument_forms: Vec<(Span, Form)>,
     pub site_count: usize,
 }
 
@@ -271,6 +306,15 @@ impl FieldTransactions {
             .filter(|plan| plan.owner == callee)
             .flat_map(|plan| plan.lifetime_positions.iter().copied())
             .collect()
+    }
+
+    /// W6F-3: the form an owned-field call argument renders to.
+    pub(crate) fn argument_form(&self, span: Span) -> Option<Form> {
+        self.applied
+            .iter()
+            .flat_map(|t| t.argument_forms.iter())
+            .find(|(argument, _)| *argument == span)
+            .map(|(_, form)| *form)
     }
 
     pub(crate) fn owner_sets(&self) -> Vec<Vec<LocalDefId>> {
@@ -296,14 +340,20 @@ impl FieldTransactions {
 
     pub(crate) fn receipt_tsv(&self, tcx: TyCtxt<'_>) -> String {
         let mut out = String::from(
-            "struct\tfield\tstatus\tform\tsites\towners\timpls\tsignature_plans\tcause\n",
+            "struct\tfield\tstatus\tform\tsites\towners\timpls\tsignature_plans\tbridges\tcause\n",
         );
         for t in &self.applied {
+            let count = |kind: &str| {
+                t.expression_edits
+                    .iter()
+                    .filter(|edit| edit.kind == kind)
+                    .count()
+            };
             out.push_str(&format!(
-                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\t-\n",
+                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={}\t-\n",
                 t.struct_path,
                 t.field_name,
-                t.form.key(),
+                if t.owning { "opt-box" } else { t.form.key() },
                 t.site_count,
                 t.owners
                     .iter()
@@ -316,15 +366,83 @@ impl FieldTransactions {
                     .map(|p| tcx.def_path_str(p.owner.to_def_id()))
                     .collect::<Vec<_>>()
                     .join(","),
+                count("owned-field-raw-move"),
+                count("owned-field-raw-view"),
+                count("owned-field-raw-store"),
             ));
         }
         for (struct_path, field, cause) in &self.held {
             out.push_str(&format!(
-                "{struct_path}\t{field}\theld\t-\t-\t-\t-\t-\t{cause}\n"
+                "{struct_path}\t{field}\theld\t-\t-\t-\t-\t-\t-\t{cause}\n"
             ));
         }
         out
     }
+}
+
+fn wants_slice_of(sites: &[Site]) -> bool {
+    sites
+        .iter()
+        .any(|site| matches!(site.kind, SiteKind::Element | SiteKind::Offset))
+}
+
+/// The structs the program handles BY VALUE somewhere: a `*p` read as a
+/// value (not as the base of a field place), a by-value parameter, local or
+/// return of the struct type. An owned field cannot live in such a struct
+/// (`Copy` is gone, and a copy would duplicate the owner).
+fn structs_copied_by_value(
+    program: &RustProgram<'_>,
+    struct_dids: &FxHashSet<LocalDefId>,
+) -> FxHashSet<LocalDefId> {
+    struct ByValue<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        owner: LocalDefId,
+        structs: &'a FxHashSet<LocalDefId>,
+        out: &'a mut FxHashSet<LocalDefId>,
+    }
+    impl<'tcx> Visitor<'tcx> for ByValue<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Unary(UnOp::Deref, _) = expr.kind
+                && let Some(did) = adt_local(self.tcx.typeck(self.owner).expr_ty(expr))
+                && self.structs.contains(&did)
+            {
+                let base_of_place = match self.tcx.parent_hir_node(expr.hir_id) {
+                    Node::Expr(parent) => match parent.kind {
+                        ExprKind::Field(base, _) => base.hir_id == expr.hir_id,
+                        ExprKind::AddrOf(_, _, inner) => inner.hir_id == expr.hir_id,
+                        ExprKind::Assign(lhs, _, _) => lhs.hir_id == expr.hir_id,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !base_of_place {
+                    self.out.insert(did);
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let tcx = program.tcx;
+    let mut out = FxHashSet::default();
+    for &owner in &program.functions {
+        let sig = tcx.fn_sig(owner).skip_binder().skip_binder();
+        for ty in sig.inputs().iter().chain(std::iter::once(&sig.output())) {
+            if let Some(did) = adt_local(*ty)
+                && struct_dids.contains(&did)
+            {
+                out.insert(did);
+            }
+        }
+        let Some(body_id) = tcx.hir_node_by_def_id(owner).body_id() else { continue };
+        ByValue {
+            tcx,
+            owner,
+            structs: struct_dids,
+            out: &mut out,
+        }
+        .visit_body(tcx.hir_body(body_id));
+    }
+    out
 }
 
 fn adt_local(ty: Ty<'_>) -> Option<LocalDefId> {
@@ -380,6 +498,12 @@ struct Collector<'a, 'tcx> {
     owner: LocalDefId,
     subjects: &'a FxHashMap<HirId, NodeKey>,
     targets: &'a FxHashMap<FieldKey, usize>,
+    /// The owned-field candidates among `targets`.
+    owning: &'a FxHashSet<FieldKey>,
+    /// `(callee, hir index)` → the parameter subject.
+    parameters: &'a FxHashMap<(LocalDefId, usize), NodeKey>,
+    /// Depth-0 model kind per parameter subject.
+    parameter_kinds: &'a FxHashMap<NodeKey, SlotKind>,
     struct_dids: &'a FxHashSet<LocalDefId>,
     sites: &'a mut FxHashMap<FieldKey, Vec<Site>>,
     holds: &'a mut FxHashMap<FieldKey, String>,
@@ -390,7 +514,7 @@ impl<'tcx> Collector<'_, 'tcx> {
         self.holds.entry(key).or_insert(cause);
     }
 
-    fn rhs(&self, expr: &Expr<'_>) -> Result<Rhs, &'static str> {
+    fn rhs(&self, key: FieldKey, expr: &Expr<'_>) -> Result<Rhs, &'static str> {
         if super::emitability::is_zero_literal(expr) {
             return Ok(Rhs::Null);
         }
@@ -399,10 +523,44 @@ impl<'tcx> Collector<'_, 'tcx> {
         {
             return match self.subjects.get(&binding) {
                 Some(node) => Ok(Rhs::Subject(*node)),
+                None if self.owning.contains(&key) => Ok(Rhs::RawExpression),
                 None => Err("store-source-not-a-subject"),
             };
         }
+        if self.owning.contains(&key) {
+            return Ok(Rhs::RawExpression);
+        }
         Err("store-source-raw-expression")
+    }
+
+    /// The local callee's parameter at `index`, with its depth-0 model kind.
+    fn callee_parameter(&self, callee: &Expr<'_>, index: usize) -> Option<(NodeKey, SlotKind)> {
+        let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else { return None };
+        let Res::Def(rustc_hir::def::DefKind::Fn, did) = path.res else { return None };
+        let callee = did.as_local()?;
+        let node = *self.parameters.get(&(callee, index))?;
+        let kind = *self.parameter_kinds.get(&node)?;
+        Some((node, kind))
+    }
+
+    /// `(*base).f`: the base local when it is a subject, and whether the
+    /// base's declared type is a raw pointer (the place may be uninitialized
+    /// memory — a fresh allocation — so no store through it may drop).
+    fn field_base(&self, field: &Expr<'tcx>) -> (Option<NodeKey>, bool) {
+        let ExprKind::Field(base, _) = field.kind else { return (None, false) };
+        let ExprKind::Unary(UnOp::Deref, pointer) = base.kind else { return (None, false) };
+        let raw = matches!(
+            self.tcx.typeck(self.owner).expr_ty(pointer).kind(),
+            TyKind::RawPtr(..)
+        );
+        let subject = match pointer.kind {
+            ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                Res::Local(binding) => self.subjects.get(&binding).copied(),
+                _ => None,
+            },
+            _ => None,
+        };
+        (subject, raw)
     }
 
     fn field_key(&self, field: &Expr<'tcx>) -> Option<FieldKey> {
@@ -432,6 +590,7 @@ impl<'tcx> Collector<'_, 'tcx> {
             return;
         };
         let owner = self.owner;
+        let (base, raw_base) = self.field_base(field);
         let site = |kind, span, rhs, local, index_text| Site {
             owner,
             kind,
@@ -440,7 +599,12 @@ impl<'tcx> Collector<'_, 'tcx> {
             rhs,
             local,
             index_text,
+            consumer: None,
+            base,
+            raw_base,
+            assign_span: None,
         };
+        let owning = self.owning.contains(&key);
         let Node::Expr(parent) = tcx.parent_hir_node(field.hir_id) else {
             // `let x = PLACE.f;`
             if let Node::LetStmt(local) = tcx.parent_hir_node(field.hir_id)
@@ -458,21 +622,46 @@ impl<'tcx> Collector<'_, 'tcx> {
                     self.hold(key, "load-consumer-not-a-subject".to_owned());
                     return;
                 };
-                self.push(
-                    key,
-                    site(SiteKind::Load, field.span, None, Some(node), None),
-                );
+                let mut load = site(SiteKind::Load, field.span, None, Some(node), None);
+                if owning {
+                    load.consumer = self.parameter_kinds.get(&node).map(|kind| (node, *kind));
+                }
+                self.push(key, load);
                 return;
             }
             self.hold(key, "field-use-outside-expression".to_owned());
             return;
         };
         match parent.kind {
-            ExprKind::Assign(lhs, rhs, _) if lhs.hir_id == field.hir_id => match self.rhs(rhs) {
-                Ok(value) => self.push(
-                    key,
-                    site(SiteKind::Store, rhs.span, Some(value), None, None),
-                ),
+            // `local = PLACE.f` — a load into an already-declared subject
+            // (owned fields only: the value moves or is viewed by the local's
+            // ownership verdict; a reference field holds).
+            ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == field.hir_id && owning => {
+                let target = match lhs.kind {
+                    ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                        Res::Local(binding) => self.subjects.get(&binding).copied(),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(node) = target else {
+                    self.hold(
+                        key,
+                        "field-transaction-incomplete:assigned-to-non-subject".to_owned(),
+                    );
+                    return;
+                };
+                let mut load = site(SiteKind::Assignment, field.span, None, Some(node), None);
+                load.consumer = self.parameter_kinds.get(&node).map(|kind| (node, *kind));
+                self.push(key, load);
+            }
+            ExprKind::Assign(lhs, rhs, _) if lhs.hir_id == field.hir_id => match self.rhs(key, rhs)
+            {
+                Ok(value) => {
+                    let mut store = site(SiteKind::Store, rhs.span, Some(value), None, None);
+                    store.assign_span = Some(parent.span);
+                    self.push(key, store);
+                }
                 Err(cause) => self.hold(key, cause.to_owned()),
             },
             ExprKind::Unary(UnOp::Deref, _) => {
@@ -510,6 +699,23 @@ impl<'tcx> Collector<'_, 'tcx> {
                     _ => self.hold(key, format!("field-method-unsupported:{method}")),
                 }
             }
+            ExprKind::Call(callee, args) if owning => {
+                let Some(index) = args.iter().position(|arg| arg.hir_id == field.hir_id) else {
+                    self.hold(key, "field-transaction-incomplete:call-argument".to_owned());
+                    return;
+                };
+                match self.callee_parameter(callee, index) {
+                    Some(consumer) => {
+                        let mut site = site(SiteKind::CallArgument, field.span, None, None, None);
+                        site.consumer = Some(consumer);
+                        self.push(key, site);
+                    }
+                    None => self.hold(
+                        key,
+                        "field-transaction-incomplete:call-argument-foreign".to_owned(),
+                    ),
+                }
+            }
             ExprKind::Call(..) => {
                 self.hold(key, "field-transaction-incomplete:call-argument".to_owned())
             }
@@ -544,7 +750,7 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
                         if !self.targets.contains_key(&key) {
                             continue;
                         }
-                        match self.rhs(field.expr) {
+                        match self.rhs(key, field.expr) {
                             Ok(value) => {
                                 let owner = self.owner;
                                 self.push(
@@ -557,6 +763,10 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
                                         rhs: Some(value),
                                         local: None,
                                         index_text: None,
+                                        consumer: None,
+                                        base: None,
+                                        raw_base: false,
+                                        assign_span: None,
                                     },
                                 );
                             }
@@ -591,6 +801,33 @@ pub(crate) fn derive(
     let mutability = mutability_analysis(program);
     let fatness = fatness_analysis(program);
 
+    // W6F-3 inputs: the parameter subjects with their depth-0 model kinds
+    // (the ownership verdict a call-argument site is decided by), and the
+    // structs the program copies by value (`*p` read as a value, a by-value
+    // parameter / local / return) — an owned field cannot live in a `Copy`.
+    let parameters: FxHashMap<(LocalDefId, usize), NodeKey> = subjects
+        .iter()
+        .filter_map(|s| match s.kind {
+            SubjectKind::Param { hir_index } => Some(((s.fn_did, hir_index), (s.fn_did, s.hir_id))),
+            SubjectKind::Local => None,
+        })
+        .collect();
+    let parameter_kinds: FxHashMap<NodeKey, SlotKind> = subjects
+        .iter()
+        .filter_map(|s| {
+            let slot = slots
+                .fn_local_slots
+                .get(&s.fn_did)?
+                .slot_for_local_depth(s.local, 0)?;
+            Some((
+                (s.fn_did, s.hir_id),
+                *model.get(&SlotRef::Local(s.fn_did, slot))?,
+            ))
+        })
+        .collect();
+    let copied_by_value = structs_copied_by_value(program, &struct_dids);
+    let mut owning_fields: FxHashSet<FieldKey> = FxHashSet::default();
+
     // 1. Model-Ref, depth-1, shared fields of program-defined structs.
     let mut targets: FxHashMap<FieldKey, usize> = FxHashMap::default();
     let mut names: BTreeMap<FieldKey, (String, String)> = BTreeMap::new();
@@ -618,9 +855,12 @@ pub(crate) fn derive(
                 field_index,
             };
             let Some(slot_id) = slots.field_slots.slot_for_field_depth(slot, 0) else { continue };
-            if model.get(&SlotRef::Field(slot_id)) != Some(&SlotKind::Ref) {
-                continue;
-            }
+            let owning = match model.get(&SlotRef::Field(slot_id)) {
+                Some(SlotKind::Ref) => false,
+                // W6F-3: an owned field — `Option<Box<T>>`.
+                Some(SlotKind::Owning) => true,
+                Some(SlotKind::Raw) | None => continue,
+            };
             let field_name = field_def.name.to_string();
             names.insert(key, (struct_path.clone(), field_name.clone()));
             if let Some(cause) = withdrawn.get(&key) {
@@ -664,6 +904,20 @@ pub(crate) fn derive(
                     field_name,
                     "struct-tuple-shape".into(),
                 ));
+                continue;
+            }
+            if owning {
+                if copied_by_value.contains(&struct_did) {
+                    out.holds.push((
+                        key,
+                        struct_path.clone(),
+                        field_name,
+                        "field-transaction-incomplete:struct-copied-by-value".into(),
+                    ));
+                    continue;
+                }
+                owning_fields.insert(key);
+                targets.insert(key, field_index);
                 continue;
             }
             if self_referential {
@@ -714,6 +968,9 @@ pub(crate) fn derive(
             owner,
             subjects: &subject_by_binding,
             targets: &targets,
+            owning: &owning_fields,
+            parameters: &parameters,
+            parameter_kinds: &parameter_kinds,
             struct_dids: &struct_dids,
             sites: &mut sites,
             holds: &mut holds,
@@ -805,18 +1062,44 @@ pub(crate) fn derive(
     // 4. Assemble candidates, in declaration order; one converting field per
     // struct this wave (one generated lifetime per struct).
     let mut converting_structs: FxHashSet<LocalDefId> = FxHashSet::default();
+    let mut owning_structs: FxHashSet<LocalDefId> = FxHashSet::default();
+    // A struct with both a reference candidate and an owned candidate takes
+    // the reference one (declaration order); the owned one holds typed.
+    let reference_structs: FxHashSet<LocalDefId> = targets
+        .keys()
+        .filter(|key| !owning_fields.contains(key))
+        .map(|key| key.struct_did)
+        .collect();
     for (&key, (struct_path, field_name)) in &names {
         if !targets.contains_key(&key) {
             continue;
         }
         let (struct_path, field_name) = (struct_path.clone(), field_name.clone());
         let key_sites = sites.remove(&key).unwrap_or_default();
+        let owning = owning_fields.contains(&key);
         let mut cause = holds.remove(&key);
-        if cause.is_none() && converting_structs.contains(&key.struct_did) {
+        // An owned field carries no lifetime: several may convert in one
+        // struct, and a container mention needs no instantiation.
+        if cause.is_none() && !owning && converting_structs.contains(&key.struct_did) {
             cause = Some("field-transaction-incomplete:multi-field-struct".to_owned());
         }
-        if cause.is_none() {
+        if cause.is_none() && owning && reference_structs.contains(&key.struct_did) {
+            cause = Some("field-transaction-incomplete:mixed-owning-and-reference".to_owned());
+        }
+        if cause.is_none() && !owning {
             cause = container_holds.get(&key.struct_did).cloned();
+        }
+        if cause.is_none() && owning {
+            // The union / static / alias holds still apply; a struct that
+            // contains the struct is fine (the container needs no lifetime).
+            if let Some(hold) = container_holds.get(&key.struct_did)
+                && !hold.ends_with("nested-container")
+            {
+                cause = Some(hold.clone());
+            }
+        }
+        if cause.is_none() && owning && wants_slice_of(&key_sites) {
+            cause = Some("field-transaction-incomplete:owned-slice".to_owned());
         }
         let wants_slice = key_sites
             .iter()
@@ -861,7 +1144,7 @@ pub(crate) fn derive(
         // function whose signature does not name the struct, is held.
         let mut mentions = Vec::new();
         let mut stored_by_fn: FxHashMap<LocalDefId, Vec<NodeKey>> = FxHashMap::default();
-        for site in &key_sites {
+        for site in key_sites.iter().filter(|_| !owning) {
             let Some(Rhs::Subject(node)) = site.rhs else { continue };
             let Some(subject) = subjects.iter().find(|s| (s.fn_did, s.hir_id) == node) else {
                 continue;
@@ -877,7 +1160,7 @@ pub(crate) fn derive(
             .get(&key.struct_did)
             .cloned()
             .unwrap_or_default();
-        for (owner, in_return, simple) in &fn_mentions {
+        for (owner, in_return, simple) in fn_mentions.iter().filter(|_| !owning) {
             if !simple {
                 cause.get_or_insert_with(|| {
                     "field-transaction-incomplete:signature-shape".to_owned()
@@ -908,7 +1191,11 @@ pub(crate) fn derive(
             out.holds.push((key, struct_path, field_name, cause));
             continue;
         }
-        converting_structs.insert(key.struct_did);
+        if owning {
+            owning_structs.insert(key.struct_did);
+        } else {
+            converting_structs.insert(key.struct_did);
+        }
         for site in &key_sites {
             match site.kind {
                 SiteKind::Store | SiteKind::Literal => {
@@ -930,6 +1217,7 @@ pub(crate) fn derive(
                 key,
                 struct_path,
                 field_name,
+                owning,
                 form,
                 sites: key_sites,
                 mentions,
@@ -1020,6 +1308,7 @@ pub(crate) fn finalize(
         let mut cause: Option<String> = None;
         let mut edits = Vec::new();
         let mut load_locals = Vec::new();
+        let mut argument_forms = Vec::new();
         for owner in &candidate.owners {
             if matches!(
                 exposure.plan(*owner),
@@ -1028,7 +1317,19 @@ pub(crate) fn finalize(
                 cause.get_or_insert_with(|| "field-transaction-incomplete:surface-plan".to_owned());
             }
         }
-        for site in &candidate.sites {
+        if candidate.owning {
+            owned_sites(
+                tcx,
+                candidate,
+                table,
+                &decision_of,
+                &mut cause,
+                &mut edits,
+                &mut load_locals,
+                &mut argument_forms,
+            );
+        }
+        for site in candidate.sites.iter().filter(|_| !candidate.owning) {
             let field = candidate.form;
             match site.kind {
                 SiteKind::Literal | SiteKind::Store => match site.rhs {
@@ -1037,6 +1338,7 @@ pub(crate) fn finalize(
                         span: site.span,
                         replacement: "None".to_owned(),
                         kind: "field-null",
+                        wrap: false,
                     }),
                     Some(Rhs::Subject(node)) => {
                         let Some(decision) = decision_of(node) else {
@@ -1084,6 +1386,7 @@ pub(crate) fn finalize(
                                     span: site.span,
                                     replacement: rendered,
                                     kind: "field-store-glue",
+                                    wrap: false,
                                 });
                             }
                             Err(block) => {
@@ -1092,7 +1395,7 @@ pub(crate) fn finalize(
                             }
                         }
                     }
-                    None => {
+                    Some(Rhs::RawExpression) | None => {
                         cause.get_or_insert_with(|| "store-source-unknown".to_owned());
                     }
                 },
@@ -1121,6 +1424,7 @@ pub(crate) fn finalize(
                                 span: site.span,
                                 replacement: rendered,
                                 kind: "field-load-glue",
+                                wrap: false,
                             });
                         }
                         Err(block) => {
@@ -1152,6 +1456,7 @@ pub(crate) fn finalize(
                             span: site.span,
                             replacement: accessor(&site.field_text, field),
                             kind: "field-deref",
+                            wrap: false,
                         });
                     }
                 }
@@ -1162,6 +1467,7 @@ pub(crate) fn finalize(
                         span: site.span,
                         replacement: format!("{}[{index}]", accessor(&site.field_text, field)),
                         kind: "field-element",
+                        wrap: false,
                     });
                 }
                 SiteKind::Offset => {
@@ -1174,6 +1480,7 @@ pub(crate) fn finalize(
                             accessor(&site.field_text, field)
                         ),
                         kind: "field-offset",
+                        wrap: false,
                     });
                 }
                 SiteKind::IsNull => edits.push(ExpressionEdit {
@@ -1181,7 +1488,13 @@ pub(crate) fn finalize(
                     span: site.span,
                     replacement: format!("{}.is_none()", site.field_text),
                     kind: "field-is-null",
+                    wrap: false,
                 }),
+                SiteKind::CallArgument | SiteKind::Assignment => {
+                    cause.get_or_insert_with(|| {
+                        "field-transaction-incomplete:call-argument".to_owned()
+                    });
+                }
             }
         }
         // A stored parameter must itself be a delivered reference form so the
@@ -1232,7 +1545,10 @@ pub(crate) fn finalize(
                 .sites
                 .iter()
                 .filter(|site| {
-                    matches!(site.kind, SiteKind::Load) || matches!(site.rhs, Some(Rhs::Subject(_)))
+                    matches!(
+                        site.kind,
+                        SiteKind::Load | SiteKind::CallArgument | SiteKind::Assignment
+                    ) || matches!(site.rhs, Some(Rhs::Subject(_)))
                 })
                 .map(|site| site.owner)
                 .chain(
@@ -1247,6 +1563,7 @@ pub(crate) fn finalize(
             key: candidate.key,
             struct_path: candidate.struct_path.clone(),
             field_name: candidate.field_name.clone(),
+            owning: candidate.owning,
             form: candidate.form,
             owners: candidate.owners.clone(),
             dependent_owners,
@@ -1254,6 +1571,7 @@ pub(crate) fn finalize(
             signature_plans,
             expression_edits: edits,
             load_locals,
+            argument_forms,
             site_count: candidate.sites.len(),
         });
     }
@@ -1270,6 +1588,264 @@ fn subject_label(table: &DecisionTable, node: NodeKey) -> String {
             _ => s.label.clone(),
         })
         .unwrap_or_else(|| "?".to_owned())
+}
+
+/// W6F-3 — the site vocabulary of an OWNED field (`Option<Box<T>>`).
+///
+/// Every consumer is decided by the MODEL's ownership verdict on the slot the
+/// field's value reaches (a call-argument parameter, a loaded local): `Owning`
+/// moves the value out (`take()`), `Ref` views it (`as_deref`), and the form
+/// the consumer was DECIDED into picks the bridge — a delivered `Box` /
+/// reference takes the value directly, a raw-decided consumer takes it through
+/// `Box::into_raw` / `core::ptr::from_mut` (R130). A store takes a delivered
+/// `Box` directly and any raw pointer through the `from_raw` bridge (the field's
+/// own `Owning` verdict is the ownership evidence for the stored value).
+/// A decision that keeps the subject's declared raw type is NOT a safe form;
+/// every other disposition is (exhaustive, so a new disposition is decided
+/// here rather than falling through).
+fn delivers_safe_form(decision: &Decision) -> bool {
+    match decision {
+        Decision::Degraded(_) => false,
+        Decision::Cursor { .. }
+        | Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_) => true,
+    }
+}
+
+fn owned_sites<'t>(
+    tcx: TyCtxt<'_>,
+    candidate: &Candidate,
+    table: &'t DecisionTable,
+    decision_of: &dyn Fn(NodeKey) -> Option<&'t Decision>,
+    cause: &mut Option<String>,
+    edits: &mut Vec<ExpressionEdit>,
+    load_locals: &mut Vec<(NodeKey, String)>,
+    argument_forms: &mut Vec<(Span, Form)>,
+) {
+    let null_mut = "core::ptr::null_mut()";
+    let null_const = "core::ptr::null()";
+    // Move the owned value out to a raw owning consumer.
+    // Every owned template is rendered around the WRAP placeholder: the AST
+    // wrap pass substitutes the node's current (inner-edited) expression.
+    let inner = WRAP_PLACEHOLDER;
+    let move_to_raw = || format!("{inner}.take().map_or({null_mut}, Box::into_raw)");
+    // A raw VIEW of the owned value (the C alias), mutability by the target.
+    let view_to_raw = |mutable: bool| {
+        if mutable {
+            format!("{inner}.as_deref_mut().map_or({null_mut}, core::ptr::from_mut)")
+        } else {
+            format!("{inner}.as_deref().map_or({null_const}, core::ptr::from_ref)")
+        }
+    };
+    let from_raw =
+        || format!("core::ptr::NonNull::new({inner}).map(|__p| Box::from_raw(__p.as_ptr()))");
+    // A raw-decided consumer keeps its DECLARED pointer type; the view's
+    // mutability follows it (`*mut` takes `from_mut`, `*const` `from_ref`).
+    let raw_target_mutable = |node: NodeKey| -> bool {
+        table
+            .entries
+            .iter()
+            .find(|(s, _)| (s.fn_did, s.hir_id) == node)
+            .is_some_and(|(s, _)| {
+                let Node::Pat(pattern) = tcx.hir_node(s.hir_id) else { return s.mutable };
+                match tcx.typeck(s.fn_did).pat_ty(pattern).kind() {
+                    TyKind::RawPtr(_, mutability) => mutability.is_mut(),
+                    _ => s.mutable,
+                }
+            })
+    };
+    // The form a delivered consumer takes the value in.
+    // Returns the template and the edit kind (`raw-move` / `raw-view` are the
+    // receipted bridges: the value leaves the safe form at that site).
+    let consumer_edit = |node: NodeKey, kind: SlotKind| -> Result<(String, &'static str), String> {
+        let decision = decision_of(node).ok_or_else(|| "consumer-unknown".to_owned())?;
+        match (kind, decision) {
+            (SlotKind::Owning, Decision::Box(plan)) => Ok((
+                if plan.optional {
+                    format!("{inner}.take()")
+                } else {
+                    format!("{inner}.take().unwrap()")
+                },
+                "owned-field-move",
+            )),
+            (SlotKind::Owning, Decision::Degraded(_)) => {
+                Ok((move_to_raw(), "owned-field-raw-move"))
+            }
+            (SlotKind::Ref, Decision::Ref { mutable }) => Ok((
+                format!(
+                    "{inner}.{}().unwrap()",
+                    if *mutable { "as_deref_mut" } else { "as_deref" }
+                ),
+                "owned-field-view",
+            )),
+            (
+                SlotKind::Ref,
+                Decision::Opt {
+                    mutable,
+                    slice: false,
+                    ..
+                },
+            ) => Ok((
+                format!(
+                    "{inner}.{}()",
+                    if *mutable { "as_deref_mut" } else { "as_deref" }
+                ),
+                "owned-field-view",
+            )),
+            (SlotKind::Ref, Decision::Degraded(_)) => Ok((
+                view_to_raw(raw_target_mutable(node)),
+                "owned-field-raw-view",
+            )),
+            (SlotKind::Raw, _) => Err(format!("consumer-model-raw:{}", subject_label(table, node))),
+            (_, other) => Err(format!(
+                "consumer-form-unsupported:{}:{}",
+                subject_label(table, node),
+                seam::form_of(other).key()
+            )),
+        }
+    };
+    for site in &candidate.sites {
+        match site.kind {
+            SiteKind::Literal | SiteKind::Store => {
+                let replacement = match site.rhs {
+                    Some(Rhs::Null) => "None".to_owned(),
+                    Some(Rhs::Subject(node)) => match decision_of(node) {
+                        Some(Decision::Box(plan)) => {
+                            if plan.optional {
+                                inner.to_owned()
+                            } else {
+                                format!("Some({inner})")
+                            }
+                        }
+                        Some(Decision::Degraded(_)) | None => from_raw(),
+                        Some(other) => {
+                            cause.get_or_insert_with(|| {
+                                format!(
+                                    "store-source-form-unsupported:{}:{}",
+                                    subject_label(table, node),
+                                    seam::form_of(other).key()
+                                )
+                            });
+                            continue;
+                        }
+                    },
+                    Some(Rhs::RawExpression) => from_raw(),
+                    None => {
+                        cause.get_or_insert_with(|| "store-source-unknown".to_owned());
+                        continue;
+                    }
+                };
+                // Through a raw base the place may be uninitialized memory (a
+                // fresh allocation), so the store never drops: `ptr::write`
+                // keeps C's overwrite semantics (the old value, if any, leaks
+                // exactly as C leaked it). Through a safe base the place is
+                // valid and the assignment drops the old owner (waiver 101).
+                let through_raw = site.raw_base
+                    && site
+                        .base
+                        .is_none_or(|node| !decision_of(node).is_some_and(delivers_safe_form));
+                match (through_raw, site.kind, site.assign_span) {
+                    (true, SiteKind::Store, Some(assign_span)) => {
+                        edits.push(ExpressionEdit {
+                            owner: site.owner,
+                            span: assign_span,
+                            replacement: format!(
+                                "core::ptr::write(&raw mut {WRAP_PLACE}, {replacement})"
+                            ),
+                            kind: "owned-field-raw-store",
+                            wrap: true,
+                        });
+                    }
+                    _ => edits.push(ExpressionEdit {
+                        owner: site.owner,
+                        span: site.span,
+                        replacement,
+                        kind: "owned-field-store",
+                        wrap: true,
+                    }),
+                }
+            }
+            SiteKind::Load => {
+                let Some(local) = site.local else { continue };
+                let Some(kind) = site.consumer.map(|(_, kind)| kind) else {
+                    cause.get_or_insert_with(|| "load-consumer-model-unknown".to_owned());
+                    continue;
+                };
+                match consumer_edit(local, kind) {
+                    Ok((replacement, kind)) => edits.push(ExpressionEdit {
+                        owner: site.owner,
+                        span: site.span,
+                        replacement,
+                        kind,
+                        wrap: true,
+                    }),
+                    Err(why) => {
+                        cause.get_or_insert_with(|| format!("load-{why}"));
+                        continue;
+                    }
+                }
+                // A delivered local receives an explicit declaration.
+                if let Some(decision) = decision_of(local)
+                    && let Some((subject, _)) = table
+                        .entries
+                        .iter()
+                        .find(|(s, _)| (s.fn_did, s.hir_id) == local)
+                    && delivers_safe_form(decision)
+                    && let Some(pointee) = local_pointee(tcx, subject)
+                    && let Some(emitted) =
+                        super::declaration::emitted_type(decision, &pointee, None)
+                {
+                    load_locals.push((local, emitted));
+                }
+            }
+            SiteKind::CallArgument | SiteKind::Assignment => {
+                let Some((node, kind)) = site.consumer else {
+                    cause.get_or_insert_with(|| "call-argument-consumer-unknown".to_owned());
+                    continue;
+                };
+                match consumer_edit(node, kind) {
+                    Ok((replacement, kind)) => {
+                        if site.kind == SiteKind::CallArgument
+                            && let Some(decision) = decision_of(node)
+                        {
+                            argument_forms.push((site.span, seam::form_of(decision)));
+                        }
+                        edits.push(ExpressionEdit {
+                            owner: site.owner,
+                            span: site.span,
+                            replacement,
+                            kind,
+                            wrap: true,
+                        })
+                    }
+                    Err(why) => {
+                        cause.get_or_insert_with(|| format!("argument-{why}"));
+                    }
+                }
+            }
+            SiteKind::Deref => edits.push(ExpressionEdit {
+                owner: site.owner,
+                span: site.span,
+                replacement: format!("{inner}.as_deref_mut().unwrap()"),
+                kind: "owned-field-deref",
+                wrap: true,
+            }),
+            SiteKind::IsNull => edits.push(ExpressionEdit {
+                owner: site.owner,
+                span: site.span,
+                replacement: format!("{inner}.is_none()"),
+                kind: "owned-field-is-null",
+                wrap: true,
+            }),
+            SiteKind::Element | SiteKind::Offset => {
+                cause.get_or_insert_with(|| "field-transaction-incomplete:owned-slice".to_owned());
+            }
+        }
+    }
 }
 
 fn local_pointee(tcx: TyCtxt<'_>, subject: &Subject) -> Option<String> {

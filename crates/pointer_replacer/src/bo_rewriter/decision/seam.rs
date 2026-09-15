@@ -3763,7 +3763,12 @@ fn complete_interface_inventory(
             ) {
                 disposition
             } else if let Some(argument) = argument {
-                let found = argument_form(mir_site.caller, &argument.shape, decisions);
+                // W6F-3: an owned field's argument is rendered in its
+                // consumer's form by the field transaction.
+                let found = table
+                    .field_transactions
+                    .argument_form(argument.span)
+                    .unwrap_or_else(|| argument_form(mir_site.caller, &argument.shape, decisions));
                 if matches!(glue(expected, found, None), Ok(None)) {
                     plan.zero_bridges.push(ZeroBridgeSite {
                         owner_class: SignatureClassId::of(mir_site.callee),
@@ -4104,8 +4109,14 @@ pub(crate) fn synthesize_with_raw_boundary(
                         true,
                         false,
                     ),
+                    // W6F-3: an owned field's call argument is rendered by the
+                    // field transaction in the consumer's own form; the seam
+                    // sees that form, not the raw place.
                     ArgShape::RawExpr { .. } => (
-                        Form::Raw,
+                        table
+                            .field_transactions
+                            .argument_form(arg.span)
+                            .unwrap_or(Form::Raw),
                         sm.span_to_snippet(arg.span).ok(),
                         arg.array_start_blind.unwrap_or(true),
                         true,

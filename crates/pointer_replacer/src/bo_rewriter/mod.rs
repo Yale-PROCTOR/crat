@@ -6698,13 +6698,18 @@ fn finish_decide<'tcx>(
             decision::Decision::Degraded(_) => false,
         }
     }
-    let box_facts = decision::box_facts::BoxOwnershipFacts::derive(&program, &slots, &model)?;
     let mut subjects = collect_subjects(tcx, &program, &mut_facts);
     // S3.1: the second universe. Appended rather than merged into
     // `collect_subjects` so the parameter census keeps measuring the parameter
     // predicate — a census whose denominator silently gained a population is not
     // the same instrument.
     subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
+    // wave-6f (W6F-3), TEST ONLY: a fixture may stand in for a coming analysis
+    // frame by overriding slot kinds by name (era-5c's owned fields). Never
+    // compiled into a census binary.
+    #[cfg(test)]
+    let model = test_model_override::apply(tcx, &program, &slots, &subjects, model);
+    let box_facts = decision::box_facts::BoxOwnershipFacts::derive(&program, &slots, &model)?;
 
     // The freed-slot fact, stamped over BOTH universes from ONE walk of the
     // production recognizer — the same `free_sites` the S2-2 census asks. Two
@@ -8492,6 +8497,94 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
     }
     table.seams.explicit_declarations.extend(declarations);
     table.seams.zero_bridges.extend(receives);
+}
+
+/// wave-6f (W6F-3), TEST ONLY: slot-kind overrides by name, so a fixture can
+/// carry a coming analysis frame's verdicts (owned fields, Box locals) before
+/// that frame lands. Keyed by struct name / field index and by subject label.
+#[cfg(test)]
+pub(crate) mod test_model_override {
+    use std::sync::Mutex;
+
+    use rustc_hash::FxHashMap;
+
+    use crate::analyses::borrow_ownership::{
+        SlotKind, crate_slots::CrateSlots, slots::StructFieldSlot, solver::SlotRef,
+    };
+
+    /// `(marker, fields, locals)`: the override applies only to a program whose
+    /// source carries `marker` verbatim — the compiler runs its callback on
+    /// its own thread and the suite runs fixtures concurrently, so a global
+    /// override must name its fixture.
+    type Override = (
+        String,
+        Vec<(String, usize, SlotKind)>,
+        Vec<(String, SlotKind)>,
+    );
+    static OVERRIDE: Mutex<Option<Override>> = Mutex::new(None);
+
+    pub(crate) fn set(
+        marker: &str,
+        fields: Vec<(String, usize, SlotKind)>,
+        locals: Vec<(String, SlotKind)>,
+    ) {
+        *OVERRIDE.lock().unwrap() = Some((marker.to_owned(), fields, locals));
+    }
+
+    pub(crate) fn clear() {
+        *OVERRIDE.lock().unwrap() = None;
+    }
+
+    pub(crate) fn apply(
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        program: &crate::utils::rustc::RustProgram<'_>,
+        slots: &CrateSlots,
+        subjects: &[super::decision::Subject],
+        mut model: FxHashMap<SlotRef, SlotKind>,
+    ) -> FxHashMap<SlotRef, SlotKind> {
+        let Some((marker, fields, locals)) = OVERRIDE.lock().unwrap().clone() else {
+            return model;
+        };
+        let marked = tcx
+            .sess
+            .source_map()
+            .files()
+            .iter()
+            .any(|file| file.src.as_ref().is_some_and(|src| src.contains(&marker)));
+        if !marked {
+            return model;
+        }
+        for &struct_did in &program.structs {
+            let name = tcx.item_name(struct_did.to_def_id()).to_string();
+            for (struct_name, field_index, kind) in &fields {
+                if *struct_name != name {
+                    continue;
+                }
+                let slot = StructFieldSlot {
+                    struct_did,
+                    field_index: *field_index,
+                };
+                if let Some(id) = slots.field_slots.slot_for_field_depth(slot, 0) {
+                    model.insert(SlotRef::Field(id), *kind);
+                }
+            }
+        }
+        for subject in subjects {
+            for (label, kind) in &locals {
+                if *label != subject.label {
+                    continue;
+                }
+                if let Some(id) = slots
+                    .fn_local_slots
+                    .get(&subject.fn_did)
+                    .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                {
+                    model.insert(SlotRef::Local(subject.fn_did, id), *kind);
+                }
+            }
+        }
+        model
+    }
 }
 
 /// wave-6f: a local loaded from a converting field receives its explicit

@@ -30,8 +30,12 @@ use super::{
 
 /// A struct's converting field: index, declared form, the struct's lifetime.
 struct StructPlan {
-    field_index: usize,
-    form: DeclForm,
+    /// The converting fields: index and declared form. A reference struct
+    /// carries exactly one; an owned struct may carry several.
+    fields: Vec<(usize, DeclForm)>,
+    /// W6F-3: owned fields — no lifetime; the derived `Copy` / `Clone`
+    /// impls become empty inherent impls (a `Box` field is not `Copy`).
+    owning: bool,
     lifetime: String,
     name: Symbol,
 }
@@ -161,22 +165,30 @@ impl MutVisitor for Apply<'_> {
                     self.failures.push(format!("struct-shape:{did:?}"));
                     return;
                 };
-                let Some(field) = fields.get_mut(plan.field_index) else {
-                    self.failures.push(format!("field-index:{did:?}"));
-                    return;
-                };
-                let TyKind::Ptr(inner) = &field.ty.kind else {
-                    self.failures.push(format!("field-not-raw:{did:?}"));
-                    return;
-                };
                 if !self.guard.claim(item.id, item.span, "field:struct") {
                     self.failures.push(format!("struct-claim-refused:{did:?}"));
                     return;
                 }
-                let pointee = inner.ty.clone();
-                field.ty.kind =
-                    decl_ty_kind_with_lifetime(plan.form, false, pointee, Some(&plan.lifetime));
-                insert_lifetime_param(generics, &plan.lifetime);
+                for &(field_index, form) in &plan.fields {
+                    let Some(field) = fields.get_mut(field_index) else {
+                        self.failures.push(format!("field-index:{did:?}"));
+                        return;
+                    };
+                    let TyKind::Ptr(inner) = &field.ty.kind else {
+                        self.failures.push(format!("field-not-raw:{did:?}"));
+                        return;
+                    };
+                    let pointee = inner.ty.clone();
+                    field.ty.kind = decl_ty_kind_with_lifetime(
+                        form,
+                        false,
+                        pointee,
+                        (!plan.owning).then_some(plan.lifetime.as_str()),
+                    );
+                }
+                if !plan.owning {
+                    insert_lifetime_param(generics, &plan.lifetime);
+                }
                 self.placed_structs.insert(did);
             } else if let Some(struct_did) = self.impls.get(&did)
                 && let Some(plan) = self.structs.get(struct_did)
@@ -184,6 +196,16 @@ impl MutVisitor for Apply<'_> {
             {
                 if !self.guard.claim(item.id, item.span, "field:impl") {
                     self.failures.push(format!("impl-claim-refused:{did:?}"));
+                    return;
+                }
+                if plan.owning {
+                    // A derived `Copy` / `Clone` cannot hold a `Box` field:
+                    // the impl becomes an empty inherent impl — the item keeps
+                    // its span (and so its reprint), the trait is gone.
+                    im.of_trait = None;
+                    im.items.clear();
+                    self.placed_impls.insert(did);
+                    rustc_ast::mut_visit::walk_item(self, item);
                     return;
                 }
                 insert_lifetime_param(&mut im.generics, &plan.lifetime);
@@ -277,27 +299,43 @@ pub(super) fn apply(
     let mut signatures: FxHashMap<LocalDefId, (LocalDefId, Vec<usize>)> = FxHashMap::default();
     for transaction in &active {
         let struct_did = transaction.key.struct_did;
-        let Some(form) = decl_form(transaction.form) else {
-            return Err(format!(
-                "field-transaction-ast:form-unrenderable:{}",
-                transaction.struct_path
-            ));
+        let form = if transaction.owning {
+            DeclForm::Box {
+                slice: false,
+                optional: true,
+                pointee_override: None,
+            }
+        } else {
+            let Some(form) = decl_form(transaction.form) else {
+                return Err(format!(
+                    "field-transaction-ast:form-unrenderable:{}",
+                    transaction.struct_path
+                ));
+            };
+            form
         };
-        if structs.contains_key(&struct_did) {
-            return Err(format!(
-                "field-transaction-ast:multi-field-struct:{}",
-                transaction.struct_path
-            ));
+        match structs.get_mut(&struct_did) {
+            Some(plan) if plan.owning && transaction.owning => {
+                plan.fields.push((transaction.key.field_index, form));
+            }
+            Some(_) => {
+                return Err(format!(
+                    "field-transaction-ast:multi-field-struct:{}",
+                    transaction.struct_path
+                ));
+            }
+            None => {
+                structs.insert(
+                    struct_did,
+                    StructPlan {
+                        fields: vec![(transaction.key.field_index, form)],
+                        owning: transaction.owning,
+                        lifetime: "'a".to_owned(),
+                        name: tcx.item_name(struct_did.to_def_id()),
+                    },
+                );
+            }
         }
-        structs.insert(
-            struct_did,
-            StructPlan {
-                field_index: transaction.key.field_index,
-                form,
-                lifetime: "'a".to_owned(),
-                name: tcx.item_name(struct_did.to_def_id()),
-            },
-        );
         for im in &transaction.impls {
             impls.insert(*im, struct_did);
         }
@@ -349,6 +387,173 @@ pub(super) fn apply(
             impls.len(),
             apply.placed_signatures.len(),
             signatures.len()
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// W6F-3: owned-field wraps
+// ---------------------------------------------------------------------------
+
+/// Replaces the one `__crat_inner` path in a parsed wrap template with the
+/// wrapped node's current expression.
+struct Substitute {
+    inner: Option<rustc_ast::ExprKind>,
+    place: Option<rustc_ast::ExprKind>,
+    substituted: usize,
+    placed: usize,
+}
+
+impl MutVisitor for Substitute {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        if let rustc_ast::ExprKind::Path(None, path) = &e.kind
+            && path.segments.len() == 1
+        {
+            let name = path.segments[0].ident.name.as_str();
+            if name == super::decision::field_reference::WRAP_PLACEHOLDER {
+                if let Some(inner) = self.inner.take() {
+                    e.kind = inner;
+                }
+                self.substituted += 1;
+                return;
+            }
+            if name == super::decision::field_reference::WRAP_PLACE {
+                if let Some(place) = self.place.take() {
+                    e.kind = place;
+                }
+                self.placed += 1;
+                return;
+            }
+        }
+        rustc_ast::mut_visit::walk_expr(self, e);
+    }
+}
+
+/// Post-order over the grafted tree: an owned-field wrap closes over the
+/// node's CURRENT expression, so an inner use graft (a reborrowed parameter,
+/// a nested wrap) is already in place.
+struct Wraps<'a> {
+    /// span → (template, edit kind)
+    edits: &'a FxHashMap<(u32, u32), (&'a str, &'static str)>,
+    guard: &'a mut Composition,
+    placed: FxHashSet<(u32, u32)>,
+    failures: Vec<String>,
+}
+
+impl MutVisitor for Wraps<'_> {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        rustc_ast::mut_visit::walk_expr(self, e);
+        if e.span.is_dummy() {
+            return;
+        }
+        let key = (e.span.lo().0, e.span.hi().0);
+        let Some(&(template, kind)) = self.edits.get(&key) else { return };
+        if !self.placed.insert(key) {
+            self.failures.push(format!("wrap-multi-matched:{key:?}"));
+            return;
+        }
+        if !self.guard.claim(e.id, e.span, "field:wrap") {
+            self.failures.push(format!("wrap-claim-refused:{key:?}"));
+            return;
+        }
+        let parsed = match super::ast_transform::graft_expr(template) {
+            Ok(parsed) => parsed,
+            Err(offending) => {
+                self.failures.push(format!("wrap-parse:{offending}"));
+                return;
+            }
+        };
+        let mut wrapped = parsed;
+        // A null test wraps its RECEIVER: `<field>.is_null()` becomes
+        // `<field>.is_none()`, the raw method call itself is consumed.
+        // A raw-base store wraps the whole assignment: the PLACE and the
+        // value are substituted separately.
+        let (inner, place) = match (kind, &mut e.kind) {
+            ("owned-field-is-null", rustc_ast::ExprKind::MethodCall(call)) => (
+                std::mem::replace(&mut call.receiver.kind, rustc_ast::ExprKind::Dummy),
+                None,
+            ),
+            ("owned-field-raw-store", rustc_ast::ExprKind::Assign(lhs, rhs, _)) => (
+                std::mem::replace(&mut rhs.kind, rustc_ast::ExprKind::Dummy),
+                Some(std::mem::replace(&mut lhs.kind, rustc_ast::ExprKind::Dummy)),
+            ),
+            ("owned-field-is-null" | "owned-field-raw-store", _) => {
+                self.failures.push(format!("wrap-shape:{kind}:{key:?}"));
+                return;
+            }
+            _ => (
+                std::mem::replace(&mut e.kind, rustc_ast::ExprKind::Dummy),
+                None,
+            ),
+        };
+        let expects_place = place.is_some();
+        let mut substitute = Substitute {
+            inner: Some(inner),
+            place,
+            substituted: 0,
+            placed: 0,
+        };
+        substitute.visit_expr(&mut wrapped);
+        let expects_inner = template.contains(super::decision::field_reference::WRAP_PLACEHOLDER);
+        if substitute.substituted != usize::from(expects_inner)
+            || substitute.placed != usize::from(expects_place)
+        {
+            self.failures.push(format!(
+                "wrap-placeholder-count:{key:?}:{}:{}",
+                substitute.substituted, substitute.placed
+            ));
+        }
+        e.kind = wrapped.kind;
+    }
+}
+
+/// Applies the wrapping expression edits of every active owned-field
+/// transaction. Runs after the use-graft pass and before the seam pass.
+pub(crate) fn apply_wraps(
+    table: &DecisionTable,
+    reverts: &RevertSet,
+    krate: &mut rustc_ast::Crate,
+    guard: &mut Composition,
+) -> Result<(), String> {
+    let mut edits: FxHashMap<(u32, u32), (&str, &'static str)> = FxHashMap::default();
+    for transaction in table.field_transactions.active(&reverts.fns) {
+        for edit in transaction.expression_edits.iter().filter(|edit| edit.wrap) {
+            if edits
+                .insert(
+                    (edit.span.lo().0, edit.span.hi().0),
+                    (edit.replacement.as_str(), edit.kind),
+                )
+                .is_some()
+            {
+                return Err(format!(
+                    "field-transaction-wrap:key-collision:{:?}",
+                    edit.span
+                ));
+            }
+        }
+    }
+    if edits.is_empty() {
+        return Ok(());
+    }
+    let mut wraps = Wraps {
+        edits: &edits,
+        guard,
+        placed: FxHashSet::default(),
+        failures: Vec::new(),
+    };
+    wraps.visit_crate(krate);
+    if !wraps.failures.is_empty() {
+        return Err(format!(
+            "field-transaction-wrap:{}",
+            wraps.failures.join(";")
+        ));
+    }
+    if wraps.placed.len() != edits.len() {
+        return Err(format!(
+            "field-transaction-wrap:unplaced {}/{}",
+            wraps.placed.len(),
+            edits.len()
         ));
     }
     Ok(())

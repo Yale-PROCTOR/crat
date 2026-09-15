@@ -25,7 +25,12 @@ const CTX: &str = include_str!("wave6f_fixture_ctx.rs");
 struct Observed {
     decisions: Vec<(String, String)>,
     /// `(struct, field, status, form, cause)` rows of the field receipt.
+    /// `(struct, field, status, form, cause)` per receipt row.
     fields: Vec<(String, String, String, String, String)>,
+    /// `(struct, field, bridges)` per applied row (W6F-3 receipt counts).
+    bridges: Vec<(String, String, String)>,
+    /// `(caller, replacement)` per planned seam edit.
+    seam_edits: Vec<(String, String)>,
 }
 
 fn observe(source: &str) -> Observed {
@@ -49,6 +54,15 @@ fn observe(source: &str) -> Observed {
         for blocked in &table.seams.blocked {
             println!("W6F-BLOCKED {blocked:?}");
         }
+        let seam_edits: Vec<(String, String)> = table
+            .seams
+            .edits
+            .iter()
+            .map(|edit| (edit.caller_fn.clone(), edit.replacement.clone()))
+            .collect();
+        for (caller, replacement) in &seam_edits {
+            println!("W6F-SEAM {caller} {replacement}");
+        }
         for site in &ctx.raw_boundary_sites.sites {
             println!(
                 "W6F-SITE {} {:?} #{} {} shape={}",
@@ -66,21 +80,35 @@ fn observe(source: &str) -> Observed {
             );
         }
         println!("W6F-DISPOSITIONS\n{}", ctx.raw_boundary.receipts_tsv());
-        let fields = receipt
+        let rows: Vec<Vec<String>> = receipt
             .lines()
             .skip(1)
-            .map(|line| {
-                let cells: Vec<&str> = line.split('\t').collect();
+            .map(|line| line.split('\t').map(str::to_owned).collect())
+            .collect();
+        let fields = rows
+            .iter()
+            .map(|cells| {
                 (
-                    cells[0].to_owned(),
-                    cells[1].to_owned(),
-                    cells[2].to_owned(),
-                    cells[3].to_owned(),
-                    cells[8].to_owned(),
+                    cells[0].clone(),
+                    cells[1].clone(),
+                    cells[2].clone(),
+                    cells[3].clone(),
+                    // cause (after the W6F-3 `bridges` column)
+                    cells[9].clone(),
                 )
             })
             .collect();
-        Observed { decisions, fields }
+        let bridges = rows
+            .iter()
+            .filter(|cells| cells[2] == "applied")
+            .map(|cells| (cells[0].clone(), cells[1].clone(), cells[8].clone()))
+            .collect();
+        Observed {
+            decisions,
+            fields,
+            bridges,
+            seam_edits,
+        }
     })
     .unwrap()
 }
@@ -402,4 +430,118 @@ fn w6f_indirect_call_argument_bridges_under_t2() {
     ] {
         assert!(source.contains(needle), "missing {needle:?} in\n{source}");
     }
+}
+
+const BST: &str = include_str!("wave6f_fixture_bst.rs");
+
+/// era-5c's coming frame for bst (relay 003), stated as slot-kind overrides:
+/// the two `node` fields `Owning`, the owning parameters / locals `Owning`,
+/// the walkers `Ref`.
+fn bst_frame() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-bst-frame",
+        vec![
+            ("node".to_owned(), 1, SlotKind::Owning),
+            ("node".to_owned(), 2, SlotKind::Owning),
+        ],
+        vec![
+            ("insert::node".to_owned(), SlotKind::Owning),
+            ("deleteNode::root".to_owned(), SlotKind::Owning),
+            ("newNode::temp".to_owned(), SlotKind::Owning),
+            ("deleteNode::temp".to_owned(), SlotKind::Owning),
+            ("deleteNode::temp_0".to_owned(), SlotKind::Owning),
+            ("minValueNode::node".to_owned(), SlotKind::Ref),
+            ("deleteNode::temp_1".to_owned(), SlotKind::Ref),
+            ("inorder::root".to_owned(), SlotKind::Ref),
+        ],
+    );
+}
+
+/// Witness 8 (W6F-3, relay 003) — owned fields. Without the frame the model
+/// leaves the fields Raw and the transaction holds them (RED control); under
+/// the era-5c-shaped frame both `node` fields become `Option<Box<node>>`
+/// with null = `None`, a fresh store `Some(..)`/moved Option, a load
+/// `.as_deref()`, a move-out `.take()`, every raw consumer a receipted
+/// bridge, and the C `free` untouched.
+#[test]
+fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
+    // RED control: the landed model has no Owning field verdict here, so the
+    // fields are not candidates at all and every stored subject degrades.
+    let control = observe(BST);
+    assert!(control.fields.is_empty(), "{:?}", control.fields);
+    assert!(decision_of(&control, "insert::node").contains("Degraded"));
+
+    bst_frame();
+    let observed = observe(BST);
+    let outcome = emitted("bst", BST);
+    super::test_model_override::clear();
+    for field in ["left", "right"] {
+        let row = field_row(&observed, "node", field);
+        assert_eq!(
+            (row.2.as_str(), row.3.as_str()),
+            ("applied", "opt-box"),
+            "{row:?}"
+        );
+    }
+    assert_eq!(
+        observed.bridges,
+        vec![
+            (
+                "node".to_owned(),
+                "left".to_owned(),
+                "raw-move=3;raw-view=1;raw-store=3".to_owned()
+            ),
+            (
+                "node".to_owned(),
+                "right".to_owned(),
+                "raw-move=4;raw-view=1;raw-store=4".to_owned()
+            ),
+        ]
+    );
+    // The seam sees an owned argument in its consumer's form: no glue is
+    // planned over a field site (a planned glue would stack on the wrap).
+    assert!(
+        observed
+            .seam_edits
+            .iter()
+            .all(|(_, replacement)| !replacement.contains(".left")
+                && !replacement.contains(".right")),
+        "{:?}",
+        observed.seam_edits
+    );
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    assert_eq!((emitted_count, reverted), (1, 0), "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        // the declaration: null = None, ABI preserved (NPO)
+        "pub left: Option<Box<node>>,",
+        "pub right: Option<Box<node>>,",
+        // a fresh allocation is written, never dropped through raw memory
+        "core::ptr::write(&raw mut (*temp).left, None);",
+        // a Ref-frame walker views the child
+        "inorder((*root.unwrap()).left.as_deref());",
+        // a raw owning consumer receives the moved Box (receipted raw-move)
+        "core::ptr::write(&raw mut (*node).left, core::ptr::NonNull::new(insert((*node).left.take().map_or(core::ptr::null_mut(), Box::into_raw), key)).map(|__p| Box::from_raw(__p.as_ptr())));",
+        // the null test
+        "if ((*root).left).is_none() {",
+        "while !node.is_null() && !((*node).left).is_none() {",
+        // a raw view for a raw-declared walker (receipted raw-view)
+        "node = (*node).left.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut);",
+        // a move-out into a raw owning local
+        "let mut temp = (*root).right.take().map_or(core::ptr::null_mut(), Box::into_raw);",
+        // the C free site is untouched
+        "free(root as *mut ::std::ffi::c_void); return temp;",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+    // A struct owning a Box is not Copy: the derives are withdrawn.
+    assert!(
+        !source.contains("impl ::core::marker::Copy for node"),
+        "{source}"
+    );
+    assert!(
+        !source.contains("impl ::core::clone::Clone for node"),
+        "{source}"
+    );
 }

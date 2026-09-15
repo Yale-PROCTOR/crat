@@ -3777,6 +3777,12 @@ fn transform_with<'tcx>(
     let mut g = UseGraftVisitor::new(&uses, &mut guard);
     g.visit_crate(&mut krate);
     let mut grafts = g.finish();
+    // wave-6f (W6F-3): owned-field wraps, post-order over the grafted tree.
+    // A wrapped node keeps its span, so a use edit nested INSIDE a wrap is
+    // reached either way; running after the use pass makes the other nesting
+    // (a use graft that swallowed a field site) surface as `unplaced` instead
+    // of being overwritten silently.
+    super::field_reference_ast::apply_wraps(table, reverts, &mut krate, &mut guard)?;
     let mut deletes = StatementDeleteVisitor::new(&statement_deletes, &mut guard);
     deletes.visit_crate(&mut krate);
     let delete_stats = deletes.finish();
@@ -4982,7 +4988,13 @@ pub(crate) fn filtered_inputs(
     // wave-6f: a field transaction's expression edits, active only while none
     // of its owners is reverted (the plan closes the revert set over them).
     for transaction in table.field_transactions.active(&reverts.fns) {
-        for edit in &transaction.expression_edits {
+        // Wrapping edits compose in the AST (`field_reference_ast::apply_wraps`)
+        // after this text channel has grafted their inner edits.
+        for edit in transaction
+            .expression_edits
+            .iter()
+            .filter(|edit| !edit.wrap)
+        {
             insert_counting(
                 &mut out.uses,
                 (edit.span.lo().0, edit.span.hi().0),
