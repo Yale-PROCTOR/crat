@@ -289,6 +289,17 @@ const TABLE: &[ContractRow] = &[
     return_alias_row("memcpy", 1, PointeeAccess::Read)
         .with(ArgumentExtent::ByteCount)
         .with_count(2, true),
+    // R410-9 (a): `memmove` §7.24.2.2 is `memcpy`'s shape; `memset` §7.24.6.1
+    // writes exactly `n` bytes at position 0 and returns it.
+    return_alias_row("memmove", 0, PointeeAccess::Write)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, true),
+    return_alias_row("memmove", 1, PointeeAccess::Read)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, true),
+    return_alias_row("memset", 0, PointeeAccess::Write)
+        .with(ArgumentExtent::ByteCount)
+        .with_count(2, true),
     return_alias_row("strstr", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     return_alias_row("strstr", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("utime", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
@@ -587,12 +598,32 @@ mod tests {
         let memcpy_source =
             classify_contract(&callee("memcpy", true), 1, &target(RawMutability::Const))
                 .expect("memcpy source contract");
-        for contract in [memcpy_dest, memcpy_source] {
+        // R410-9 (a): `memmove` is `memcpy`'s shape; `memset` writes exactly
+        // `n` bytes at position 0 and returns it.
+        let memmove_dest =
+            classify_contract(&callee("memmove", true), 0, &target(RawMutability::Mut))
+                .expect("memmove destination contract");
+        let memmove_source =
+            classify_contract(&callee("memmove", true), 1, &target(RawMutability::Const))
+                .expect("memmove source contract");
+        let memset_dest =
+            classify_contract(&callee("memset", true), 0, &target(RawMutability::Mut))
+                .expect("memset destination contract");
+        for contract in [
+            memcpy_dest,
+            memcpy_source,
+            memmove_dest,
+            memmove_source,
+            memset_dest,
+        ] {
             assert_eq!(contract.extent, ArgumentExtent::ByteCount);
             assert_eq!(contract.count_argument_index, Some(2));
             assert!(contract.count_is_exact);
             assert_eq!(contract.returns_alias_of, Some(0));
         }
+        assert_eq!(memmove_dest.access, PointeeAccess::Write);
+        assert_eq!(memmove_source.access, PointeeAccess::Read);
+        assert_eq!(memset_dest.access, PointeeAccess::Write);
 
         let bounded = classify_contract(
             &callee("strncasecmp", true),
@@ -657,8 +688,11 @@ mod tests {
 
     #[test]
     fn rb_retalias_metadata_is_exactly_the_eight_existing_symbols() {
+        // R410-9 (a): `memmove` and `memset` return their argument 0 as
+        // `memcpy` does (§7.24.2.2, §7.24.6.1) — ten symbols.
         let expected = std::collections::BTreeSet::from([
-            "fgets", "memcpy", "strcat", "strchr", "strcpy", "strncat", "strncpy", "strstr",
+            "fgets", "memcpy", "memmove", "memset", "strcat", "strchr", "strcpy", "strncat",
+            "strncpy", "strstr",
         ]);
         let observed = TABLE
             .iter()

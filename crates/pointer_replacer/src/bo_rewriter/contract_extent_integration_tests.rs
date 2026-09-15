@@ -1258,3 +1258,161 @@ fn ce_v01_a_void_cast_counted_position_holds_the_thin_form() {
     );
     assert!(!source.contains("&u8"), "{source}");
 }
+
+/// R410-9 (a): `memmove` and `memset` rows. `memmove(dest, src, n)` is
+/// `memcpy`'s shape (position 0 `Write` `ByteCount` returns-alias, position 1
+/// `Read` `ByteCount`, the exact count at argument 2); `memset(s, c, n)` writes
+/// exactly `n` bytes at position 0 and returns it.
+#[test]
+fn ce_m01_memmove_promotes_both_byte_slices_with_the_exact_count() {
+    let source = r#"
+        #![allow(dead_code, unused_unsafe, unused_mut)]
+        extern "C" { fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8; }
+        unsafe fn shift(dest: *mut u8, src: *const u8, n: usize) {
+            memmove(dest, src, n);
+        }
+        pub unsafe fn caller(n: usize) -> u8 {
+            let mut dest = [0u8; 8];
+            let src = [1u8; 8];
+            shift(dest.as_mut_ptr(), src.as_ptr(), n);
+            dest[0]
+        }
+    "#;
+    let plans = attested_promotions(source);
+    assert_eq!(plans.len(), 2, "plans={plans:#?}");
+    let output = attested_emitted(source);
+    assert!(output.contains("dest: &mut [u8]"), "{output}");
+    assert!(output.contains("src: &[u8]"), "{output}");
+    assert!(
+        output.contains("memmove(dest.as_mut_ptr(), src.as_ptr(), n)"),
+        "{output}"
+    );
+    assert!(!output.contains("FALLBACK_SLICE_EXTENT"), "{output}");
+}
+
+#[test]
+fn ce_m02_memset_promotes_the_destination_with_the_exact_count() {
+    let source = r#"
+        #![allow(dead_code, unused_unsafe, unused_mut)]
+        extern "C" { fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8; }
+        unsafe fn clear(s: *mut u8, n: usize) {
+            memset(s, 0, n);
+        }
+        pub unsafe fn caller(n: usize) -> u8 {
+            let mut buf = [1u8; 8];
+            clear(buf.as_mut_ptr(), n);
+            buf[0]
+        }
+    "#;
+    let plans = promotions(source);
+    assert_eq!(plans.len(), 1, "plans={plans:#?}");
+    assert!(
+        matches!(
+            &plans[0].length,
+            super::decision::contract_extent::LengthPlan::Evidence {
+                elements,
+                source: super::decision::contract_extent::LengthSource::ExactContract {
+                    argument_index: 2,
+                    ..
+                },
+            } if elements.trim() == "n"
+        ),
+        "{plans:#?}"
+    );
+    let output = emitted(source);
+    assert!(output.contains("s: &mut [u8]"), "{output}");
+    assert!(output.contains("memset(s.as_mut_ptr(), 0, n)"), "{output}");
+    assert!(
+        output.contains("core::slice::from_raw_parts_mut(buf.as_mut_ptr(), (n) as usize)"),
+        "{output}"
+    );
+}
+
+/// The thin-extent consequence (R272-1): a thin `&mut u8` at a `ByteCount`
+/// position is a one-element claim written `n` bytes; it holds
+/// `held:thin-extent` (the chain promotes it only where its caller admits).
+#[test]
+fn ce_m03_a_thin_reference_at_a_memset_position_holds() {
+    let source = r#"
+        #![allow(dead_code, unused_unsafe, unused_mut)]
+        extern "C" { fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8; }
+        static mut SAVED: *mut u8 = 0 as *mut u8;
+        unsafe fn clear(s: *mut u8, n: usize) {
+            memset(s, 0, n);
+        }
+        pub unsafe fn caller(x: *mut u8, n: usize) {
+            SAVED = x;
+            clear(x, n);
+        }
+    "#;
+    let decisions = super::emit_tests::decisions_of(source);
+    let s = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "s" && *is_param)
+        .expect("CE-M03 `s` subject");
+    assert_ne!(
+        s.2, "<emitted>",
+        "a thin reference must not reach memset: {decisions:#?}"
+    );
+    let output = emitted(source);
+    assert!(!output.contains("s: &mut u8"), "{output}");
+}
+
+/// A byte count that spells the pointee's own size is ONE element: a thin
+/// `&mut S` written `size_of::<S>()` bytes is exactly the claim it carries
+/// (R272-1's rule is about extent, not about the row's kind), so the position
+/// neither holds the thin form nor promotes a slice of one struct.
+#[test]
+fn ce_m04_a_size_of_pointee_byte_count_is_one_element() {
+    let source = r#"
+        #![allow(dead_code, unused_unsafe, unused_mut)]
+        extern "C" { fn memset(s: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void; }
+        #[repr(C)]
+        pub struct Stat { pub dev: u64, pub ino: u64 }
+        unsafe fn clear(st: *mut Stat) {
+            memset(st as *mut core::ffi::c_void, 0, ::std::mem::size_of::<Stat>() as usize);
+        }
+        pub unsafe fn caller() -> u64 {
+            let mut st = Stat { dev: 1, ino: 2 };
+            clear(&mut st);
+            st.dev
+        }
+    "#;
+    let plans = promotions(source);
+    assert!(plans.is_empty(), "{plans:#?}");
+    let output = emitted(source);
+    assert!(output.contains("st: &mut Stat"), "{output}");
+    assert!(!output.contains("[Stat]"), "{output}");
+    assert!(!output.contains("slice::from_mut("), "{output}");
+    assert!(
+        output.contains("memset(core::ptr::from_mut(st).cast::<core::ffi::c_void>(), 0,"),
+        "{output}"
+    );
+}
+
+/// The negative half: a `size_of` of ANOTHER type (`[Stat; 4]`) is not the
+/// pointee's own size, so the position keeps its multi-element extent and the
+/// thin form holds.
+#[test]
+fn ce_m05_a_size_of_another_type_keeps_the_multi_element_extent() {
+    let source = r#"
+        #![allow(dead_code, unused_unsafe, unused_mut)]
+        extern "C" { fn memset(s: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void; }
+        #[repr(C)]
+        pub struct Stat { pub dev: u64, pub ino: u64 }
+        static mut SAVED: *mut Stat = 0 as *mut Stat;
+        unsafe fn clear(st: *mut Stat) {
+            memset(st as *mut core::ffi::c_void, 0, ::std::mem::size_of::<[Stat; 4]>() as usize);
+        }
+        pub unsafe fn caller(p: *mut Stat) {
+            SAVED = p;
+            clear(p);
+        }
+    "#;
+    let decisions = super::emit_tests::decisions_of(source);
+    let st = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "st" && *is_param)
+        .expect("CE-M05 `st` subject");
+    assert_eq!(st.2, "held:thin-extent", "{decisions:#?}");
+}

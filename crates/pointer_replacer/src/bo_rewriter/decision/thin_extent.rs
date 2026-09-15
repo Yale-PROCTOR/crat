@@ -52,12 +52,57 @@ pub(crate) fn position_consumes_many_elements(
         .is_ok_and(|contract| !contract.extent.fits_one_element())
 }
 
+/// A byte count that spells the pointee's OWN size — `memset(p, 0,
+/// size_of::<T>())` on a `*mut T` — is exactly one element: the claim a thin
+/// reference carries. Read from the count operand's spelling beneath its
+/// casts, against the operand's own pointee (a `c_void` position types the
+/// argument, not the row). Anything else at a `ByteCount` position keeps the
+/// row's multi-element extent.
+pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallArgFact) -> bool {
+    let Some(count) = &fact.contract_count else { return false };
+    let pointee = fact.operand_pointee.trim().trim_start_matches("::");
+    if pointee.is_empty() || pointee == "c_void" || pointee.ends_with("::c_void") {
+        return false;
+    }
+    let mut spelling = count.expression.split_whitespace().collect::<String>();
+    // Peel the trailing `as <ty>` casts and grouping parentheses C2Rust
+    // wraps a `size_of` in.
+    loop {
+        if let Some((head, _)) = spelling.rsplit_once("as")
+            && head.ends_with(')')
+        {
+            spelling = head.to_owned();
+        } else if spelling.starts_with('(') && spelling.ends_with(')') && spelling.len() > 2 {
+            spelling = spelling[1..spelling.len() - 1].to_owned();
+        } else {
+            break;
+        }
+    }
+    let spelling = spelling.as_str();
+    [
+        "::std::mem::size_of::<",
+        "std::mem::size_of::<",
+        "::core::mem::size_of::<",
+        "core::mem::size_of::<",
+        "size_of::<",
+    ]
+    .iter()
+    .any(|prefix| {
+        spelling
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(">()"))
+            .is_some_and(|argument| argument.trim_start_matches("::") == pointee)
+    })
+}
+
 /// Subjects that reach such a position. A subject in this set may not take a
 /// THIN reference form.
 pub(crate) fn collect(facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)> {
     let mut out = FxHashSet::default();
     for fact in &facts.foreign_call_args {
-        if !position_consumes_many_elements(&fact.callee, fact.argument_index, &fact.target) {
+        if !position_consumes_many_elements(&fact.callee, fact.argument_index, &fact.target)
+            || byte_count_is_one_element(fact)
+        {
             continue;
         }
         if let Some(root) = fact.direct_subject_root() {

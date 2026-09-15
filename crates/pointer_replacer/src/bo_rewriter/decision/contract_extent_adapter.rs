@@ -345,6 +345,11 @@ pub(crate) fn collect(
         });
         let requirement = match contract.extent {
             ArgumentExtent::OneElement => Requirement::OneElement,
+            // A byte count spelling the pointee's own size is one element
+            // (`thin_extent::byte_count_is_one_element`): no slice to build.
+            ArgumentExtent::ByteCount if super::thin_extent::byte_count_is_one_element(fact) => {
+                Requirement::OneElement
+            }
             ArgumentExtent::Lifecycle => Requirement::Lifecycle,
             ArgumentExtent::NulTerminated => Requirement::NulTerminated,
             ArgumentExtent::ByteCount if contract.count_is_exact => Requirement::ExactAccess(count),
