@@ -191,10 +191,11 @@ pub(crate) mod fixture {
             .and_then(|files| files.values().next().cloned())
             .unwrap_or_else(|| {
                 panic!(
-                    "fixture delivers no tree: {}\nsubjects:\n{}\narms:\n{}\nreverts: {:#?}",
+                    "fixture delivers no tree: {}\nsubjects:\n{}\narms:\n{}\nbridge events: {:#?}\nreverts: {:#?}",
                     capture.escalation,
                     capture.subject_receipt,
                     capture.raw_boundary_artifacts.arm_outcomes,
+                    capture.raw_boundary_artifacts.bridge_events,
                     capture.reverts
                 )
             });
@@ -477,6 +478,63 @@ pub unsafe fn info_copy(dest: *mut Info, source: *mut Info) -> u32 {
             text.contains("= (*source).iccp_name;")
                 && (text.contains("__crat_a5_raw_") || text.contains("__crat_pair_raw_")),
             "the raw field read is hoisted verbatim into the call snapshot:\n{}",
+            got.emitted
+        );
+    }
+
+    /// **Bucket (c), `body-unnameable-rhs`.** json.h
+    /// `json_extract_get_array_size(array)`: `let mut element: *const Element
+    /// = (*array).start;` then `element = (*element).next;` in the loop —
+    /// `array` and `element` settle shared references, but every RHS is a raw
+    /// field read (`raw-expr`), which the body seam refused as unnameable.
+    /// Batch 6: `json_extract_get_array_size::{array#1, element#5}` ×2 owners.
+    /// The body-adapter producer (Item E wave 2) is gated by a def-path
+    /// allowlist of eight corpus functions (`emitability::WAVE2_BODY_FUNCTIONS`),
+    /// so the fixture carries the corpus path `src::json::json_extract_get_array_size`.
+    const JSON_ARRAY_SIZE_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+pub mod src {
+    pub mod json {
+        #[repr(C)]
+        pub struct Element { pub value: u64, pub next: *const Element }
+        #[repr(C)]
+        pub struct Array { pub start: *const Element, pub length: usize }
+        pub unsafe fn json_extract_get_array_size(array: *const Array) -> u64 {
+            let mut total: u64 = 0;
+            let mut i: usize = 0;
+            let mut element: *const Element = (*array).start;
+            while i < (*array).length {
+                total = total.wrapping_add((*element).value);
+                element = (*element).next;
+                i = i.wrapping_add(1);
+            }
+            total
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn a_pure_raw_field_read_rhs_takes_the_reference_glue() {
+        let got = run(JSON_ARRAY_SIZE_SHAPE);
+        for key in [
+            "src::json::json_extract_get_array_size::array#1",
+            "src::json::json_extract_get_array_size::element#4",
+        ] {
+            assert_eq!(
+                column(&got.subjects, key, "exclusion"),
+                "-",
+                "{key}\n{}",
+                got.subjects
+            );
+            assert_eq!(column(&got.subjects, key, "placed"), "1", "{key}");
+        }
+        let text = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("array: &Array"), "{}", got.emitted);
+        assert!(
+            text.contains("element: &Element = &*(*array).start;")
+                && text.contains("element = &*(*element).next;"),
+            "the initializer and the assignment are the raw field reads under the reference glue:\n{}",
             got.emitted
         );
     }

@@ -6040,6 +6040,13 @@ pub(crate) fn synthesize_with_raw_boundary(
                 });
                 continue;
             }
+            // wave-5d2 (c): a raw-pointer EXPRESSION without effects (the HIR
+            // producer's own verdict) is a raw source like a raw local — it
+            // takes the same raw → reference glue over its whole text
+            // (`&*((*array).start)`), under the same receipts.
+            ArgShape::RawExpr { root } if !site.side_effecting => {
+                (Form::Raw, site.rhs_span, root, true)
+            }
             ArgShape::RawExpr { .. } | ArgShape::Cast { .. } | ArgShape::Other => {
                 plan.body_blocked.push(BlockedBody {
                     owner_class: SignatureClassId::of(site.owner),
