@@ -347,6 +347,7 @@ fn native_hold_kind(hold: &NativeHold) -> &'static str {
             EffectsHold::Retirement(_) => "Call::NativeEffects::Retirement",
             EffectsHold::Opaque(_) => "Call::NativeEffects::Opaque",
             EffectsHold::Cycle(_) => "Call::NativeEffects::Cycle",
+            EffectsHold::Escape(_) => "Call::NativeEffects::Escape",
         },
         NativeHold::Call(Hold::Lend(lend)) => match lend {
             LendHold::Missing(_) => "Call::Lend::Missing",
@@ -519,16 +520,31 @@ fn derive_bundle(
                 obligation.raw_argument_type()
             )
         } else {
-            formal::require_nonconsuming(effects, &emitted).map_err(NativeHold::Call)?;
-            let Some(RetentionVerdict::NoRetain { certificate }) =
-                inputs.retention.get(callee, argument)
-            else {
-                return Err(NativeHold::Call(Hold::Lend(LendHold::Retention)));
+            let nonconsuming_scope =
+                formal::require_nonconsuming(effects, &emitted).map_err(NativeHold::Call)?;
+            receipts.push(format!(
+                "native-nonconsuming-proof {:?} arg={argument} scope={nonconsuming_scope}",
+                key
+            ));
+            let retention_scope = match inputs.retention.get(callee, argument) {
+                Some(RetentionVerdict::NoRetain { certificate }) => {
+                    inputs
+                        .retention
+                        .verify_certificate(callee, argument, certificate)
+                        .map_err(|_| NativeHold::Call(Hold::Lend(LendHold::Retention)))?;
+                    "raw-boundary-t1-certificate"
+                }
+                // T1's frontier stops at core pointer arithmetic on the formal;
+                // the native trace follows the derived pointer instead.
+                _ => effects
+                    .certify_no_retention(callee, argument)
+                    .map_err(|_| NativeHold::Call(Hold::Lend(LendHold::Retention)))?
+                    .scope(),
             };
-            inputs
-                .retention
-                .verify_certificate(callee, argument, certificate)
-                .map_err(|_| NativeHold::Call(Hold::Lend(LendHold::Retention)))?;
+            receipts.push(format!(
+                "native-noretention-proof {:?} arg={argument} scope={retention_scope}",
+                key
+            ));
             match (source.shape(), emitted.emitted(), emitted.terminal()) {
                 (BoxShape::Slice, FormalForm::MutableRaw, super::seam::Form::Raw)
                     if stable_raw_formal(table, callee, argument) =>

@@ -134,6 +134,87 @@ fn r395_heman_gaussian_row_malloc_local_lends_and_keeps_owner() {
     assert!(!s.contains("Box::into_raw"));
 }
 
+fn c_declarations() -> &'static str {
+    r#"#![allow(non_camel_case_types)] pub mod libc { pub use core::ffi::c_int; pub use core::ffi::c_ulong; pub use core::ffi::c_float; pub use core::ffi::c_void; } extern "C" { fn malloc(n:libc::c_ulong)->*mut libc::c_void; fn free(p:*mut libc::c_void); }"#
+}
+
+#[test]
+fn r395_heman_gaussian_splat_real_shape_wrapping_mul_count() {
+    // The corpus shape of `generate_gaussian_splat::gaussian_row#3`: a
+    // `wrapping_mul` byte count from a `c_int` parameter, a raw callee that
+    // reads/writes through the formal and frees only its own allocation,
+    // loop-carried `offset` reads, the C free at the end.
+    let input = format!(
+        r#"{}
+pub unsafe extern "C" fn generate_gaussian_row(mut target: *mut libc::c_int, mut fwidth: libc::c_int) {{
+    let mut nbytes = (fwidth as libc::c_ulong).wrapping_mul(::std::mem::size_of::<libc::c_int>() as libc::c_ulong) as libc::c_int;
+    let mut tmp = malloc(nbytes as libc::c_ulong) as *mut libc::c_int;
+    *tmp.offset(0 as libc::c_int as isize) = 1 as libc::c_int;
+    *target.offset(0 as libc::c_int as isize) = *tmp.offset(0 as libc::c_int as isize);
+    let mut col = 1 as libc::c_int;
+    while col < fwidth {{
+        *target.offset(col as isize) = 0 as libc::c_int;
+        *tmp.offset(col as isize) = 0 as libc::c_int;
+        col += 1;
+    }}
+    free(tmp as *mut libc::c_void);
+}}
+pub unsafe extern "C" fn generate_gaussian_splat(mut target: *mut libc::c_float, mut fwidth: libc::c_int) {{
+    let mut gaussian_row = malloc((fwidth as libc::c_ulong).wrapping_mul(::std::mem::size_of::<libc::c_int>() as libc::c_ulong)) as *mut libc::c_int;
+    generate_gaussian_row(gaussian_row, fwidth);
+    let mut scale = 0.5f32;
+    let mut j = 0 as libc::c_int;
+    while j < fwidth {{
+        let mut i = 0 as libc::c_int;
+        while i < fwidth {{
+            *target = (*gaussian_row.offset(i as isize) * *gaussian_row.offset(j as isize)) as libc::c_float * scale;
+            target = target.offset(1);
+            i += 1;
+        }}
+        j += 1;
+    }}
+    free(gaussian_row as *mut libc::c_void);
+}}"#,
+        c_declarations()
+    );
+    let s = verify(&input, "gaussian_row", BoxShape::Slice, false);
+    assert!(!s.contains("Box::into_raw"));
+    assert_eq!(
+        s.matches("(fwidth as libc::c_ulong).wrapping_mul(::std::mem::size_of::<libc::c_int>() as libc::c_ulong)")
+            .count(),
+        2,
+        "the complete byte expression is kept once at each allocation"
+    );
+}
+
+#[test]
+fn r395_heman_percentiles_real_shape_sizeof_first_wrapping_mul_count() {
+    // `heman_ops_percentiles::vals#292`: sizeof-first operand order, an
+    // index-written buffer read back in a loop, the C free at the end.
+    let input = format!(
+        r#"{}
+pub unsafe extern "C" fn heman_ops_percentiles(mut src: *const libc::c_float, mut npixels: libc::c_int) -> libc::c_float {{
+    let mut vals = malloc((::std::mem::size_of::<libc::c_float>() as libc::c_ulong).wrapping_mul(npixels as libc::c_ulong)) as *mut libc::c_float;
+    let mut i = 0 as libc::c_int;
+    while i < npixels {{
+        *vals.offset(i as isize) = *src.offset(i as isize);
+        i += 1;
+    }}
+    let mut acc = 0.0f32;
+    let mut k = 0 as libc::c_int;
+    while k < npixels {{
+        acc += *vals.offset(k as isize);
+        k += 1;
+    }}
+    free(vals as *mut libc::c_void);
+    acc
+}}"#,
+        c_declarations()
+    );
+    let s = verify(&input, "vals", BoxShape::Slice, false);
+    assert!(!s.contains("Box::into_raw"));
+}
+
 #[test]
 fn r395_lodepng_shaped_local_transfers_to_freeing_callee() {
     // A body-local reduction of a C allocator/cleanup wrapper. The historical

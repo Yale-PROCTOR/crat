@@ -153,10 +153,10 @@ pub(crate) fn resolve(
 pub(crate) fn require_nonconsuming(
     effects: &NativeEffects<'_>,
     formal: &NativeFormal,
-) -> Result<(), Hold> {
+) -> Result<&'static str, Hold> {
     formal.require_lend()?;
     match effects.certify(formal.callee, formal.argument) {
-        Ok(proof) if proof.matches(effects, formal.callee, formal.argument) => Ok(()),
+        Ok(proof) if proof.matches(effects, formal.callee, formal.argument) => Ok(proof.scope()),
         Ok(_) => Err(Hold::Identity),
         Err(EffectsHold::Retirement(_)) => Err(Hold::Lend(LendHold::ConsumingCallee)),
         Err(other) => Err(Hold::NativeEffects(other)),

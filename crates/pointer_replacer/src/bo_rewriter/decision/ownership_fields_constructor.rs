@@ -87,6 +87,35 @@ pub(crate) fn derive<'tcx>(
                 "1".into(),
                 format!("::std::boxed::Box::new({zero})"),
             )
+        } else if wrapping_product_has_exact_size(tcx, typeck, peeled, element, pointer_bits) {
+            // The derived corpus spells `n * sizeof(T)` as a `wrapping_mul`
+            // chain with a dynamic factor. The complete byte expression is
+            // kept and evaluated once; the count is its exact quotient by
+            // `size_of::<T>()`. Conditional on a UB-free input (§28): the C
+            // program allocated exactly these bytes and every T-typed access
+            // lies within them, so the quotient bounds every valid index; a
+            // wrapped product mis-sizes the C allocation and its first
+            // out-of-bounds access is the input's own UB.
+            let original = tcx
+                .sess
+                .source_map()
+                .span_to_snippet(bytes.span)
+                .map_err(|_| SourceHold::Missing("constructor-byte-spelling"))?;
+            let count = format!("((({original}) as usize) / ::core::mem::size_of::<{element}>())");
+            let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
+            return Ok(Constructor {
+                allocation,
+                allocator,
+                element,
+                count,
+                shape: BoxShape::Slice,
+                nonempty: false,
+                edit: BoxExprEdit {
+                    span: init.span,
+                    replacement,
+                    receipt: "native-malloc-zero-numeric-wrapping-count",
+                },
+            });
         } else {
             let ExprKind::Binary(operator, left, right) = peeled.kind else {
                 return Err(SourceHold::ConstructorShape);
@@ -245,6 +274,37 @@ fn exact_size<'tcx>(
         && tcx.is_diagnostic_item(Symbol::intern("mem_size_of"), did)
         && matches!(typeck.expr_ty(callee).kind(), TyKind::FnDef(actual, args)
             if *actual == did && args.type_at(0) == element)
+}
+
+/// A `wrapping_mul` chain over size_t-width unsigned operands in which one
+/// factor is exactly `size_of::<T>()`. Every operand must stay at the pointer
+/// width through its casts, so no factor is narrowed on the way to `malloc`.
+fn wrapping_product_has_exact_size<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expression: &'tcx Expr<'tcx>,
+    element: Ty<'tcx>,
+    pointer_bits: u64,
+) -> bool {
+    let Ok(expression) = peel_size_t(typeck, expression, pointer_bits) else { return false };
+    let ExprKind::MethodCall(segment, receiver, [argument], _) = expression.kind else {
+        return false;
+    };
+    let Some(method) = typeck.type_dependent_def_id(expression.hir_id) else { return false };
+    let is_wrapping_mul = segment.ident.name.as_str() == "wrapping_mul"
+        && tcx.item_name(method).as_str() == "wrapping_mul"
+        && tcx.impl_of_method(method).is_some_and(|imp| {
+            tcx.trait_id_of_impl(imp).is_none()
+                && unsigned_bits(tcx.type_of(imp).skip_binder(), pointer_bits) == Some(pointer_bits)
+        });
+    is_wrapping_mul
+        && [receiver, argument].iter().all(|operand| {
+            unsigned_bits(typeck.expr_ty(operand), pointer_bits) == Some(pointer_bits)
+        })
+        && [receiver, argument].iter().any(|operand| {
+            exact_size(tcx, typeck, operand, element, pointer_bits)
+                || wrapping_product_has_exact_size(tcx, typeck, operand, element, pointer_bits)
+        })
 }
 
 fn unsigned_bound(
@@ -408,6 +468,60 @@ mod tests {
             format!("((({bytes}) as usize) / ::core::mem::size_of::<u16>())")
         );
         assert_eq!(edit.matches("next(&mut n)").count(), 1);
+    }
+
+    const C_ULONG_MALLOC: &str =
+        "unsafe extern \"C\" { fn malloc(n:libc::c_ulong)->*mut core::ffi::c_void; }";
+
+    #[test]
+    fn constructor_malloc_wrapping_mul_chain_divides_complete_byte_expression() {
+        // The derived corpus spells `n * sizeof(T)` as `wrapping_mul`, in either
+        // operand order, sometimes with a second dynamic factor.
+        for bytes in [
+            "(n as libc::c_ulong).wrapping_mul(core::mem::size_of::<i32>() as libc::c_ulong)",
+            "(core::mem::size_of::<i32>() as libc::c_ulong).wrapping_mul(n as libc::c_ulong)",
+            "(n as libc::c_ulong).wrapping_mul(core::mem::size_of::<i32>() as libc::c_ulong).wrapping_mul((n + 1) as libc::c_ulong)",
+        ] {
+            let (count, edit, receipt) = inspect(
+                C_ULONG_MALLOC,
+                "i32",
+                &format!("malloc({bytes}) as *mut i32"),
+            )
+            .unwrap();
+            assert_eq!(
+                count,
+                format!("((({bytes}) as usize) / ::core::mem::size_of::<i32>())"),
+                "{bytes}"
+            );
+            assert_eq!(
+                edit,
+                format!("::std::vec![0i32; {count}].into_boxed_slice()")
+            );
+            assert_eq!(edit.matches(bytes).count(), 1);
+            assert_eq!(receipt, "native-malloc-zero-numeric-wrapping-count");
+        }
+    }
+
+    #[test]
+    fn constructor_malloc_wrapping_mul_faults_require_exact_sizeof_factor() {
+        for bytes in [
+            "(n as libc::c_ulong).wrapping_mul(core::mem::size_of::<u32>() as libc::c_ulong)",
+            "(n as libc::c_ulong).wrapping_mul(4 as libc::c_ulong)",
+            "(n as libc::c_ulong).wrapping_add(core::mem::size_of::<i32>() as libc::c_ulong)",
+            "(n as libc::c_ulong).wrapping_mul(core::mem::size_of::<i32>() as u32 as libc::c_ulong)",
+            "((n as libc::c_ulong).wrapping_mul(core::mem::size_of::<i32>() as libc::c_ulong) as u32) as libc::c_ulong",
+            "(n as libc::c_ulong).wrapping_mul((core::mem::size_of::<i32>() as u32).wrapping_mul(1) as libc::c_ulong)",
+        ] {
+            assert_eq!(
+                inspect(
+                    C_ULONG_MALLOC,
+                    "i32",
+                    &format!("malloc({bytes}) as *mut i32")
+                ),
+                Err(SourceHold::ConstructorShape),
+                "{bytes}"
+            );
+        }
     }
 
     #[test]
