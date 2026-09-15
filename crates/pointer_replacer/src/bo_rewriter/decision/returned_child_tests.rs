@@ -168,3 +168,25 @@ fn w5c_returned_child_returned_argument_stays_refused() {
         decision(&table, "kmRay2IntersectTriangle::ray")
     );
 }
+
+/// A callee whose retention is unknown (it passes the argument on to an
+/// opaque function, a T2-waived boundary) may hand the argument back; a
+/// pointer-free pointee does not settle that, so the view stays refused.
+#[test]
+fn w5c_returned_child_unknown_retention_stays_refused() {
+    let input = fixture()
+        .replace(
+            "pub unsafe fn kmVec2Subtract(",
+            "extern \"C\" { fn opaque(p: *const kmVec2) -> *mut kmVec2; }\npub unsafe fn kmVec2Subtract(",
+        )
+        .replace(
+            "    (*pOut).y = (*pV1).y - (*pV2).y;\n    return pOut;",
+            "    (*pOut).y = (*pV1).y - (*pV2).y;\n    return opaque(pV2);",
+        );
+    let table = decisions(&input);
+    assert!(
+        !matches!(decision(&table, "kmRay2IntersectTriangle::ray"), super::Decision::Ref { .. }),
+        "{:?}",
+        decision(&table, "kmRay2IntersectTriangle::ray")
+    );
+}
