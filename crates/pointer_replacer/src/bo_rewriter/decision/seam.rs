@@ -4305,13 +4305,28 @@ pub(crate) fn synthesize_with_raw_boundary(
             // A converted position whose storage root is also the root of a
             // RAW argument of the same call takes the callee's pristine raw
             // twin: no view is formed beside a raw alias (wave-6v, R408-7).
-            let aliased_twin = super::counted_void::aliased_storage_twin(
-                site,
-                &positions
-                    .iter()
-                    .map(|pos| (pos.index, pos.found))
-                    .collect::<Vec<_>>(),
-            );
+            // A call the PAIR machinery owns (a same-object PAIR view placed
+            // by co-conversion) keeps its own ordering proof instead.
+            let pair_owned_call = coconv.pair_sites().iter().any(|pair| {
+                pair.caller == site.caller
+                    && pair.callee == *callee
+                    && pair
+                        .call_span
+                        .source_callsite()
+                        .contains(site.span.source_callsite())
+                    && pair.role != super::co_conversion::PairRole::Blocked
+            });
+            let aliased_twin = (!pair_owned_call)
+                .then(|| {
+                    super::counted_void::aliased_storage_twin(
+                        site,
+                        &positions
+                            .iter()
+                            .map(|pos| (pos.index, pos.found))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .flatten();
             if let Some(indices) = &aliased_twin {
                 super::counted_void::record_alias_twin(
                     table,
