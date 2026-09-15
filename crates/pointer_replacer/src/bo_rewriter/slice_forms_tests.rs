@@ -1471,3 +1471,74 @@ fn wave6s_km_vec4_transform_array_class_hold_reproduced() {
         "{held:?}"
     );
 }
+
+/// brotli `EvaluateNode` → `ComputeDistanceShortcut`: the slice base passed
+/// AS-IS into a parameter that settles in the same slice form — a zero-syntax
+/// position the seam planner records only as a revert twin.
+const EVALUATE_NODE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ #[repr(C)] #[derive(Clone, Copy)] pub struct U { pub cost: f32, pub shortcut: u32 }
+ #[repr(C)] #[derive(Clone, Copy)] pub struct ZopfliNode { pub length: u32, pub distance: u32, pub dcode_insert_length: u32, pub u: U }
+ unsafe fn ZopfliNodeCopyLength(mut self_0: *const ZopfliNode) -> u32 { return (*self_0).length & 0x1ffffff; }
+ unsafe fn ComputeDistanceShortcut(block_start: usize, pos: usize, gap: usize, mut nodes: *const ZopfliNode) -> u32 {
+    let clen = ZopfliNodeCopyLength(&*nodes.offset(pos as isize)) as usize;
+    if pos == 0 { return 0; }
+    if pos.wrapping_sub(clen) == block_start { return 0; }
+    return (*nodes.offset(pos.wrapping_sub(clen) as isize)).u.shortcut;
+ }
+ pub unsafe fn EvaluateNode(block_start: usize, pos: usize, gap: usize, mut nodes: *mut ZopfliNode) {
+    let mut node_cost = (*nodes.offset(pos as isize)).u.cost;
+    (*nodes.offset(pos as isize)).u.shortcut = ComputeDistanceShortcut(block_start, pos, gap, nodes);
+    if node_cost <= 1.0 { (*nodes.offset(pos as isize)).u.cost = 0.0; }
+ }
+"#;
+
+#[test]
+fn wave6s_evaluate_node_bare_pass_on_into_same_form_parameter() {
+    let (source, receipts) = emit_with_family_receipts(EVALUATE_NODE);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut nodes: &mut [ZopfliNode]"), "{source}");
+    assert!(source.contains("mut nodes: &[ZopfliNode]"), "{source}");
+    let joined = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        joined.contains("ComputeDistanceShortcut(block_start, pos, gap, nodes)"),
+        "the same-form pass-on stays zero-syntax: {source}"
+    );
+    assert!(joined.contains("nodes[pos].u.shortcut ="), "{source}");
+}
+
+/// brotli `FindBlocksLiteral::cost`: a delivered slice base cast to `*mut
+/// c_void` at a foreign counted callee (`memset`).
+const FIND_BLOCKS_COST: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" { fn memset(s: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void; }
+ pub unsafe fn FindBlocks(mut cost: *mut f64, num_histograms: usize, mut insert: *const f64) -> usize {
+    let mut best: usize = 0;
+    memset(cost as *mut core::ffi::c_void, 0, core::mem::size_of::<f64>().wrapping_mul(num_histograms));
+    let mut k: usize = 0;
+    let mut min_cost = 1e99f64;
+    while k < num_histograms {
+        *cost.offset(k as isize) += *insert.offset(k as isize);
+        if *cost.offset(k as isize) < min_cost { min_cost = *cost.offset(k as isize); best = k; }
+        k = k.wrapping_add(1);
+    }
+    best
+ }
+"#;
+
+/// Relay 004 §1's first ask: the cast-argument bridge. It already exists —
+/// this pins it (`VoidFromSliceMut`, T2 at the foreign counted callee).
+#[test]
+fn wave6s_cast_argument_bridge_already_exists() {
+    let (source, receipts) = emit_with_family_receipts(FIND_BLOCKS_COST);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("cost: &mut [f64]"), "{source}");
+    assert!(
+        source.contains("memset(cost.as_mut_ptr().cast::<core::ffi::c_void>(), 0,"),
+        "{source}"
+    );
+}

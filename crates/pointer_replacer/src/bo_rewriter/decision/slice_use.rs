@@ -426,6 +426,38 @@ pub(crate) fn receipt_plans(
                                     && uses.computed_argument_views.iter().any(|view| {
                                         view.use_span == observed.span && view.borrowed
                                     });
+                                // wave-6s (report 006): a bare pass-on into a
+                                // parameter settled in the SAME slice form is a
+                                // zero-syntax position — the seam planner records
+                                // only its revert twin, never an adapter — so the
+                                // carrier this branch looks for cannot exist.
+                                let same_form_parameter = match parameters.as_slice() {
+                                    [(_, decision)] => match decision {
+                                        Decision::Slice {
+                                            mutable: parameter_mutable,
+                                            ..
+                                        } => {
+                                            matches!(source, Form::Slice { mutable } if mutable || !*parameter_mutable)
+                                        }
+                                        Decision::Ref { .. }
+                                        | Decision::InferredRef { .. }
+                                        | Decision::Opt { .. }
+                                        | Decision::Box(_)
+                                        | Decision::NestedSlice { .. }
+                                        | Decision::Cursor { .. }
+                                        | Decision::Degraded(_) => false,
+                                    },
+                                    _ => false,
+                                };
+                                let zero_syntax_pass_on = carriers.is_empty()
+                                    && observed.source_shape == "bare-local"
+                                    && same_form_parameter
+                                    && table.seams.revert_found_form_edits.iter().any(|twin| {
+                                        twin.owner_class == SignatureClassId::of(callee)
+                                            && twin.source_node == node
+                                            && twin.span.source_callsite()
+                                                == boundary_span.source_callsite()
+                                    });
                                 if !settled_safe {
                                     reason = Some(MechanicalTerminalReason::EvidenceMissing(
                                         format!(
@@ -433,6 +465,11 @@ pub(crate) fn receipt_plans(
                                             parameters.len()
                                         ),
                                     ));
+                                } else if zero_syntax_pass_on {
+                                    adapter = "owned-existing-c-interface-zero-syntax".to_owned();
+                                    target_form_override = Some(source.key().to_owned());
+                                    boundary_evidence =
+                                        "existing-c-same-form-parameter:zero-syntax".to_owned();
                                 } else if element_view {
                                     adapter = "computed-suffix-view-element".to_owned();
                                     target_form_override = Some(
