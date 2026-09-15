@@ -1702,11 +1702,14 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         .return_receivers
         .is_some_and(|receivers| receivers.failures.contains_key(&receiver_node));
     // R410-9 (b): a string-literal construction types its own local.
+
+    // wave-4 R410-9 (b): a string-literal construction types its own local
+    // (`append_literal_local_declaration_plans`); a literal has no root to
+    // widen and no interface to move, so wave-6a's refusals do not apply.
     let literal_construction = matches!(
         ctx.constructions.by_binding.get(&receiver_node),
         Some(construction::Construction::StringLiteral { .. })
     );
-
     // EXHAUSTIVE, not `matches!(.., Degraded(_))` — the import denylist rejects
     // the bypass shape and is right to: a new emitting disposition must be a
     // compile error here, because a form this veto does not name is a form that

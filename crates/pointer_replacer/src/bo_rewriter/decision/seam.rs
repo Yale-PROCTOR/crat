@@ -4581,6 +4581,25 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
+                    // wave-5c's thin-count proof is the same evidence from the
+                    // callee's own body: the reader walks exactly
+                    // `count_parameter` elements of the parameter.
+                    let count_companions = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| {
+                            table
+                                .entries
+                                .iter()
+                                .find(|(subject, _)| (subject.fn_did, subject.hir_id) == *key)
+                        })
+                        .and_then(|(subject, _)| {
+                            super::thin_counted::prove(tcx, subject, facts).ok()
+                        })
+                        .map_or(count_companions.clone(), |proof| {
+                            let mut companions = count_companions.clone();
+                            companions.push(proof.count_parameter);
+                            companions
+                        });
                     let arm = if contract_count.is_some() {
                         LenEvidence::Contract
                     } else {

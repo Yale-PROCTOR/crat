@@ -411,12 +411,17 @@ fn wave6s_storeh2_survives_its_thin_raw_caller() {
     assert!(source.contains("self_0: &mut H2"), "{source}");
     // The caller's thin raw `data` is adapted at the call. Under the arm-C
     // charge probe (report 004) the adjacency arm licensed the FOLLOWING
-    // argument `mask` as the length — a bit mask, not an extent — which is
-    // ruling B's pre-existing selection, recorded there as an observation.
+    // argument `mask` as the length — a bit mask, not an extent. Wave-4
+    // R408-1 (report 024) licenses a sibling only on a count position of the
+    // callee's own contract, so the construction takes the fallback extent.
+    let compact = source.split_whitespace().collect::<String>();
     assert!(
-        source.contains("StoreH2(self_0, core::slice::from_raw_parts(data, "),
+        compact.contains(
+            "StoreH2(self_0,core::slice::from_raw_parts(data,crate::FALLBACK_SLICE_EXTENT),"
+        ),
         "{source}"
     );
+    assert!(!compact.contains("(mask)asusize"), "{source}");
 }
 
 /// Negative controls: the arithmetic consumed by anything other than the
