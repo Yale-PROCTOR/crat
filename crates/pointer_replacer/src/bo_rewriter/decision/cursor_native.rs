@@ -68,6 +68,9 @@ pub(crate) enum DeliveredBaseProvider {
     /// cursor's raw base; the base is fallback-receipted, the link carries the
     /// outer's revert dependency only.
     TableElement,
+    /// The binding is a delivered slice PARAMETER (`p: &[T]` at the safe body);
+    /// the window is the binding's runtime length.
+    SliceParameter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

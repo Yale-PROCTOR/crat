@@ -2555,6 +2555,9 @@ fn cursor_extent_evidence(cursor: &super::decision::cursor_native::CursorPlan) -
                 DeliveredBaseProvider::TableElement => {
                     evidence.push_str(";outer-table-element:extent-fallback-receipted")
                 }
+                DeliveredBaseProvider::SliceParameter => {
+                    evidence.push_str(";delivered-parameter-slice:runtime-binding-length")
+                }
             }
             evidence
         }

@@ -168,12 +168,49 @@ pub(crate) fn table_named_once(
     names.visit_body(tcx.hir_body_owned_by(owner));
     names.count == 1
 }
+/// c2rust spells pointer arithmetic as `&*p.offset(k) as *const T`; the value
+/// is `p.offset(k)`. Only a pointee-preserving cast is peeled (`&T` / `*mut T`
+/// to `*const T`); a reinterpreting cast stays a cast base.
+fn peel_reborrow_idiom<'h, 'tcx>(
+    tcx: ty::TyCtxt<'tcx>,
+    owner: rustc_hir::def_id::LocalDefId,
+    mut e: &'h hir::Expr<'h>,
+) -> &'h hir::Expr<'h> {
+    fn pointee<'tcx>(t: ty::Ty<'tcx>) -> Option<ty::Ty<'tcx>> {
+        match *t.kind() {
+            ty::RawPtr(p, _) | ty::Ref(_, p, _) => Some(p),
+            _ => None,
+        }
+    }
+    loop {
+        match e.kind {
+            hir::ExprKind::Cast(inner, _) => {
+                let typeck = tcx.typeck(owner);
+                if pointee(typeck.expr_ty(e)).is_some()
+                    && pointee(typeck.expr_ty(e)) == pointee(typeck.expr_ty(inner))
+                {
+                    e = inner;
+                } else {
+                    return e;
+                }
+            }
+            hir::ExprKind::AddrOf(hir::BorrowKind::Ref, _, inner)
+                if matches!(inner.kind, hir::ExprKind::Unary(hir::UnOp::Deref, _)) =>
+            {
+                let hir::ExprKind::Unary(_, pointer) = inner.kind else { unreachable!() };
+                e = pointer;
+            }
+            _ => return e,
+        }
+    }
+}
 fn base(
     ctx: &Ctx<'_, '_>,
     s: &Subject,
     e: &hir::Expr<'_>,
     entries: &[(Subject, Decision)],
 ) -> Result<Base, CursorHold> {
+    let e = peel_reborrow_idiom(ctx.tcx, s.fn_did, e);
     if let Some(raw) = table_origin(ctx, s, e, entries, &mut rustc_hash::FxHashSet::default()) {
         if raw {
             return Err(CursorHold::BaseModelRaw);
@@ -239,6 +276,33 @@ fn base(
             composed: vec![],
         });
     }
+    // A delivered slice PARAMETER is the base itself at the safe body
+    // (`in_0: &[T]`); the window is the binding's runtime length.
+    if let Some(binding) = local(e)
+        && let Some((source, decision)) = entries
+            .iter()
+            .find(|(source, _)| source.fn_did == s.fn_did && source.hir_id == binding)
+        && matches!(source.kind, SubjectKind::Param { .. })
+        && let Some(mutable) = slice_mutability(decision)
+    {
+        if s.mutable && !mutable {
+            return Err(CursorHold::ScheduleMissing);
+        }
+        return Ok(Base {
+            parent_cursor: None,
+            expression: format!("{}::new({})", constructor(s.mutable), text(ctx, e)?),
+            binding: Some(binding),
+            local: source.local,
+            delivered: Some(DeliveredBase {
+                binding,
+                window_binding: binding,
+                initializer: None,
+                provider: DeliveredBaseProvider::SliceParameter,
+            }),
+            fallback: false,
+            composed: vec![],
+        });
+    }
     if let Some(binding) = local(e)
         && let Some((source, decision)) = entries
             .iter()
@@ -291,7 +355,7 @@ fn base(
         && let Some((source, source_decision)) = entries
             .iter()
             .find(|(source, _)| source.fn_did == s.fn_did && source.hir_id == binding)
-        && candidate_shape(ctx, source, source_decision)
+        && candidate_shape_in(ctx, source, source_decision, entries)
     {
         if s.mutable && !source.mutable {
             return Err(CursorHold::ScheduleMissing);
@@ -463,6 +527,55 @@ impl Uses<'_, '_> {
         self.hirs.push(e.hir_id);
     }
 
+    /// The bare subject, possibly under an offset chain, is the right-hand side
+    /// of an assignment into a shared peer cursor of this family; the peer owns
+    /// that edit (`data = start`, `end = data.offset(k)`).
+    fn assigned_to_shared_peer(&self, e: &hir::Expr<'_>) -> bool {
+        let mut node = e.hir_id;
+        loop {
+            let hir::Node::Expr(parent) = self.ctx.tcx.parent_hir_node(node) else {
+                return false;
+            };
+            match parent.kind {
+                hir::ExprKind::MethodCall(_, receiver, [_], _)
+                    if receiver.hir_id == node
+                        && emission::method(
+                            self.ctx.tcx,
+                            self.subject.fn_did,
+                            parent,
+                            &["offset", "add", "sub"],
+                        ) =>
+                {
+                    node = parent.hir_id;
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == node => {
+                    return local(lhs).is_some_and(|peer| {
+                        peer != self.subject.hir_id
+                            && self.entries.iter().any(|(other, decision)| {
+                                other.fn_did == self.subject.fn_did
+                                    && other.hir_id == peer
+                                    && !other.mutable
+                                    && candidate_shape(self.ctx, other, decision)
+                            })
+                    });
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn peer_index(&self, e: &hir::Expr<'_>, peer: hir::HirId) -> Result<String, CursorHold> {
+        if local(e) == Some(peer) {
+            return Ok("0isize".into());
+        }
+        if let hir::ExprKind::MethodCall(_, receiver, [delta], _) = e.kind {
+            let prior = self.peer_index(receiver, peer)?;
+            let d = delta_text(self.ctx, self.subject, e, delta)?;
+            return Ok(format!("({prior}).wrapping_add({d})"));
+        }
+        Err(CursorHold::UseUnbuilt)
+    }
+
     fn index(&self, e: &hir::Expr<'_>) -> Result<String, CursorHold> {
         if local(e) == Some(self.subject.hir_id) {
             return Ok("0isize".into());
@@ -496,11 +609,11 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         {
             let value = if self.optional {
                 format!(
-                    "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor.as_ptr())",
+                    "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor.addr())",
                     self.name
                 )
             } else {
-                format!("{}.as_ptr()", self.name)
+                format!("{}.addr()", self.name)
             };
             let value =
                 if operand.target.mutability == super::super::raw_boundary::RawMutability::Mut {
@@ -521,6 +634,162 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             })
         {
             intravisit::walk_expr(self, e);
+            return;
+        }
+        // A comparison with an offset-chain operand has no address observation
+        // (the shared collector wants two bare locals): each side rooted at this
+        // subject takes the derived cursor's address, `S.offset_by(k).addr()`.
+        if let hir::ExprKind::Binary(op, lhs, rhs) = e.kind
+            && matches!(
+                op.node,
+                hir::BinOpKind::Lt
+                    | hir::BinOpKind::Le
+                    | hir::BinOpKind::Gt
+                    | hir::BinOpKind::Ge
+                    | hir::BinOpKind::Eq
+                    | hir::BinOpKind::Ne
+            )
+            && !self.optional
+            && [lhs, rhs].iter().any(|side| {
+                source_binding(self.ctx.tcx, self.subject.fn_did, side) == Some(self.subject.hir_id)
+            })
+            && [lhs, rhs].iter().any(|side| {
+                matches!(side.kind, hir::ExprKind::MethodCall(..))
+                    && source_binding(self.ctx.tcx, self.subject.fn_did, side).is_some_and(|root| {
+                        root == self.subject.hir_id
+                            || self.entries.iter().any(|(other, decision)| {
+                                other.fn_did == self.subject.fn_did
+                                    && other.hir_id == root
+                                    && candidate_shape_in(self.ctx, other, decision, self.entries)
+                            })
+                    })
+            })
+            && !self
+                .ctx
+                .facts
+                .address_observations
+                .iter()
+                .any(|observation| observation.span == e.span)
+        {
+            for side in [lhs, rhs] {
+                if source_binding(self.ctx.tcx, self.subject.fn_did, side)
+                    != Some(self.subject.hir_id)
+                {
+                    self.visit_expr(side);
+                    continue;
+                }
+                match self.index(side) {
+                    Ok(d) if local(side) == Some(self.subject.hir_id) => {
+                        let _ = d;
+                        self.push(side, format!("{}.addr()", self.name), "cursor-address");
+                    }
+                    Ok(d) => self.push(
+                        side,
+                        format!("{}.offset_by({d}).addr()", self.name),
+                        "cursor-address",
+                    ),
+                    Err(hold) => {
+                        self.hold.get_or_insert(hold);
+                    }
+                }
+            }
+            return;
+        }
+        // A difference whose other operand is not a bare local has no address
+        // observation; the receiver chain rooted at this subject takes its
+        // address and the other operand is left to its own subject.
+        if let hir::ExprKind::MethodCall(_, receiver, [other], _) = e.kind
+            && emission::method(self.ctx.tcx, self.subject.fn_did, e, &["offset_from"])
+            && source_binding(self.ctx.tcx, self.subject.fn_did, receiver)
+                == Some(self.subject.hir_id)
+            && !self
+                .ctx
+                .facts
+                .address_observations
+                .iter()
+                .any(|observation| observation.span == e.span)
+        {
+            let address = |derived: &str| {
+                if self.optional {
+                    format!(
+                        "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor{derived}.addr())",
+                        self.name
+                    )
+                } else {
+                    format!("{}{derived}.addr()", self.name)
+                }
+            };
+            match self.index(receiver) {
+                Ok(_) if local(receiver) == Some(self.subject.hir_id) => {
+                    let value = address("");
+                    self.push(receiver, value, "cursor-address");
+                }
+                Ok(d) => {
+                    let value = address(&format!(".offset_by({d})"));
+                    self.push(receiver, value, "cursor-address");
+                }
+                Err(hold) => {
+                    self.hold.get_or_insert(hold);
+                }
+            }
+            self.visit_expr(other);
+            return;
+        }
+        // The c2rust reborrow idiom `&*S.offset(k) as *const T` rooted at this
+        // subject: a peer's constructor when it initialises or is assigned into
+        // a cursor candidate (that peer owns the edit); otherwise the derived
+        // address, where a raw value is compared or differenced.
+        if matches!(e.kind, hir::ExprKind::Cast(..) | hir::ExprKind::AddrOf(..))
+            && let chain = peel_reborrow_idiom(self.ctx.tcx, self.subject.fn_did, e)
+            && !std::ptr::eq(chain, e)
+            && !matches!(chain.kind, hir::ExprKind::AddrOf(..))
+            && source_binding(self.ctx.tcx, self.subject.fn_did, chain) == Some(self.subject.hir_id)
+        {
+            let parent = self.ctx.tcx.parent_hir_node(e.hir_id);
+            let peer_owned = match parent {
+                hir::Node::LetStmt(decl) => {
+                    decl.init.is_some_and(|init| init.hir_id == e.hir_id)
+                        && self.entries.iter().any(|(other, decision)| {
+                            other.fn_did == self.subject.fn_did
+                                && other.hir_id == decl.pat.hir_id
+                                && candidate_shape(self.ctx, other, decision)
+                        })
+                }
+                hir::Node::Expr(parent) => match parent.kind {
+                    hir::ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == e.hir_id => local(lhs)
+                        .is_some_and(|peer| {
+                            self.entries.iter().any(|(other, decision)| {
+                                other.fn_did == self.subject.fn_did
+                                    && other.hir_id == peer
+                                    && candidate_shape(self.ctx, other, decision)
+                            })
+                        }),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if peer_owned {
+                return;
+            }
+            let raw_operand = matches!(parent, hir::Node::Expr(parent) if matches!(parent.kind,
+                hir::ExprKind::Binary(..))
+                || matches!(parent.kind, hir::ExprKind::MethodCall(_, _, [arg], _)
+                    if arg.hir_id == e.hir_id
+                        && emission::method(self.ctx.tcx, self.subject.fn_did, parent, &["offset_from"])));
+            if raw_operand && !self.optional {
+                match self.index(chain) {
+                    Ok(d) => self.push(
+                        e,
+                        format!("{}.offset_by({d}).addr()", self.name),
+                        "cursor-address",
+                    ),
+                    Err(hold) => {
+                        self.hold.get_or_insert(hold);
+                    }
+                }
+                return;
+            }
+            self.hold.get_or_insert(CursorHold::BorrowedElementUnbuilt);
             return;
         }
         if matches!(e.kind, hir::ExprKind::AddrOf(..)) && contains(e, self.subject.hir_id) {
@@ -547,6 +816,45 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         if let hir::ExprKind::Assign(lhs, rhs, _) = e.kind
             && local(lhs) == Some(self.subject.hir_id)
         {
+            // A shared cursor re-pointed from a peer cursor of the same base
+            // family: `data = start` needs no edit (the wrapper is `Copy`),
+            // `end = data.offset(k)` takes the peer's derived cursor. Both
+            // peers are cursors of this family or neither is emitted.
+            if !self.subject.mutable
+                && !self.optional
+                && let Some(peer) = source_binding(self.ctx.tcx, self.subject.fn_did, rhs)
+                && peer != self.subject.hir_id
+                && self.entries.iter().any(|(other, decision)| {
+                    other.fn_did == self.subject.fn_did
+                        && other.hir_id == peer
+                        && !other.mutable
+                        && candidate_shape(self.ctx, other, decision)
+                })
+            {
+                if local(rhs) != Some(peer)
+                    && let Ok(d) = self.peer_index(rhs, peer)
+                {
+                    let name = emission::binding_name(
+                        self.ctx.tcx,
+                        self.entries
+                            .iter()
+                            .find(|(other, _)| other.hir_id == peer)
+                            .map(|(other, _)| other)
+                            .expect("peer entry"),
+                    );
+                    match name {
+                        Ok(name) => {
+                            self.push(rhs, format!("{name}.offset_by({d})"), "cursor-advance")
+                        }
+                        Err(hold) => {
+                            self.hold.get_or_insert(hold);
+                        }
+                    }
+                } else if local(rhs) != Some(peer) {
+                    self.hold.get_or_insert(CursorHold::UseUnbuilt);
+                }
+                return;
+            }
             match self.index(rhs) {
                 Ok(d) => {
                     self.push(
@@ -565,11 +873,16 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                 Err(hold) => {
                     if self.optional && !self.subject.mutable {
                         match base(self.ctx, self.subject, rhs, self.entries) {
-                            Ok(b) if b.delivered.is_some() && !b.fallback => self.push(
-                                e,
-                                format!("{} = Some({})", self.name, b.expression),
-                                "cursor-constructor",
-                            ),
+                            Ok(b)
+                                if (b.delivered.is_some() || b.parent_cursor.is_some())
+                                    && !b.fallback =>
+                            {
+                                self.push(
+                                    e,
+                                    format!("{} = Some({})", self.name, b.expression),
+                                    "cursor-constructor",
+                                )
+                            }
                             _ => {
                                 self.hold.get_or_insert(hold);
                             }
@@ -687,7 +1000,12 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             return;
         }
         if local(e) == Some(self.subject.hir_id) {
-            self.hold.get_or_insert(CursorHold::UseUnbuilt);
+            // The bare subject as the right-hand side of an assignment into a
+            // shared peer cursor (`data = start`) is the peer's edit or no edit.
+            let assigned_to_peer = !self.subject.mutable && self.assigned_to_shared_peer(e);
+            if !assigned_to_peer {
+                self.hold.get_or_insert(CursorHold::UseUnbuilt);
+            }
         }
         if self.exclusive_base && self.base == local(e) && self.base.is_some() {
             self.hold.get_or_insert(CursorHold::ScheduleMissing);
@@ -724,9 +1042,157 @@ fn ordering_degraded(decision: &Decision) -> bool {
         | Decision::Cursor { .. } => false,
     }
 }
+/// The option family degraded this null-initialised subject at a use.
+fn optional_degraded(decision: &Decision) -> bool {
+    match decision {
+        Decision::Degraded(record) => {
+            matches!(
+                record.reason,
+                super::super::DegradeReason::OptUseUnsupported
+            )
+        }
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Cursor { .. } => false,
+    }
+}
 fn selected(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
     ctx.sign.may_be_negative(s.fn_did, s.local)
         || (ordering_participant(ctx, s) && ordering_degraded(decision))
+}
+/// A null-initialised local the option family degrades (`opt-use-unsupported`)
+/// whose every assignment is an offset chain (or the reborrow idiom) rooted at
+/// a cursor root of this family: the optional cursor form covers it.
+fn derived_from_cursor_root(
+    ctx: &Ctx<'_, '_>,
+    s: &Subject,
+    decision: &Decision,
+    entries: &[(Subject, Decision)],
+) -> bool {
+    if !s.null_init || s.ptr_depth != 1 || !optional_degraded(decision) {
+        return false;
+    }
+    struct Assigns<'a, 'tcx> {
+        ctx: &'a Ctx<'a, 'tcx>,
+        owner: rustc_hir::def_id::LocalDefId,
+        subject: hir::HirId,
+        entries: &'a [(Subject, Decision)],
+        rooted: usize,
+        other: usize,
+    }
+    impl<'v> Visitor<'v> for Assigns<'_, '_> {
+        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = e.kind
+                && local(lhs) == Some(self.subject)
+            {
+                let rhs = peel_reborrow_idiom(self.ctx.tcx, self.owner, rhs);
+                let root = source_binding(self.ctx.tcx, self.owner, rhs);
+                if root == Some(self.subject) {
+                    // a self-advance; not a root
+                } else if root.is_some_and(|root| {
+                    self.entries.iter().any(|(other, decision)| {
+                        other.fn_did == self.owner
+                            && other.hir_id == root
+                            && (selected(self.ctx, other, decision)
+                                || derives_cursor(self.ctx, other, decision, self.entries))
+                    })
+                }) {
+                    self.rooted += 1;
+                } else {
+                    self.other += 1;
+                }
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut assigns = Assigns {
+        ctx,
+        owner: s.fn_did,
+        subject: s.hir_id,
+        entries,
+        rooted: 0,
+        other: 0,
+    };
+    assigns.visit_body(ctx.tcx.hir_body_owned_by(s.fn_did));
+    assigns.rooted > 0 && assigns.other == 0
+}
+/// The subject is the root of another subject's cursor candidate — its
+/// initializer or an assignment into it is an offset chain (or the c2rust
+/// reborrow idiom) rooted here — and the other families degrade it: the
+/// derived cursors need their parent in this family.
+fn derives_cursor(
+    ctx: &Ctx<'_, '_>,
+    s: &Subject,
+    decision: &Decision,
+    entries: &[(Subject, Decision)],
+) -> bool {
+    if !ordering_degraded(decision) || s.ptr_depth != 1 {
+        return false;
+    }
+    struct Roots<'a, 'tcx> {
+        ctx: &'a Ctx<'a, 'tcx>,
+        owner: rustc_hir::def_id::LocalDefId,
+        subject: hir::HirId,
+        entries: &'a [(Subject, Decision)],
+        found: bool,
+    }
+    impl<'v> Visitor<'v> for Roots<'_, '_> {
+        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = e.kind
+                && let Some(target) = local(lhs)
+                && source_binding(
+                    self.ctx.tcx,
+                    self.owner,
+                    peel_reborrow_idiom(self.ctx.tcx, self.owner, rhs),
+                ) == Some(self.subject)
+                && self.entries.iter().any(|(other, decision)| {
+                    other.fn_did == self.owner
+                        && other.hir_id == target
+                        && other.hir_id != self.subject
+                        && selected(self.ctx, other, decision)
+                })
+            {
+                self.found = true;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let inits = entries.iter().any(|(other, other_decision)| {
+        other.fn_did == s.fn_did
+            && other.hir_id != s.hir_id
+            && selected(ctx, other, other_decision)
+            && ctx
+                .constructions
+                .init_hirs
+                .get(&(other.fn_did, other.hir_id))
+                .is_some_and(|init| {
+                    source_binding(
+                        ctx.tcx,
+                        s.fn_did,
+                        peel_reborrow_idiom(
+                            ctx.tcx,
+                            s.fn_did,
+                            ctx.tcx.hir_node(*init).expect_expr(),
+                        ),
+                    ) == Some(s.hir_id)
+                })
+    });
+    if inits {
+        return true;
+    }
+    let mut roots = Roots {
+        ctx,
+        owner: s.fn_did,
+        subject: s.hir_id,
+        entries,
+        found: false,
+    };
+    roots.visit_body(ctx.tcx.hir_body_owned_by(s.fn_did));
+    roots.found
 }
 pub(super) fn plan(
     ctx: &Ctx<'_, '_>,
@@ -734,7 +1200,11 @@ pub(super) fn plan(
     decision: &Decision,
     entries: &[(Subject, Decision)],
 ) -> Option<Result<CursorPlan, CursorHold>> {
-    if !selected(ctx, subject, decision) || subject.ptr_depth != 1 {
+    if (!selected(ctx, subject, decision)
+        && !derives_cursor(ctx, subject, decision, entries)
+        && !derived_from_cursor_root(ctx, subject, decision, entries))
+        || subject.ptr_depth != 1
+    {
         return None;
     }
     match decision {
@@ -769,7 +1239,11 @@ pub(super) fn plan(
     offsets.visit_body(ctx.tcx.hir_body_owned_by(subject.fn_did));
     // An end marker (`p < end`) may carry no arithmetic of its own; ordering
     // participation admits it beside the walked cursor.
-    if !offsets.found && !ordering_participant(ctx, subject) {
+    if !offsets.found
+        && !ordering_participant(ctx, subject)
+        && !derives_cursor(ctx, subject, decision, entries)
+        && !derived_from_cursor_root(ctx, subject, decision, entries)
+    {
         return None;
     }
     Some(build(ctx, subject, entries))
@@ -1044,10 +1518,20 @@ fn table_origin(
 }
 
 fn candidate_shape(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
+    candidate_shape_in(ctx, s, decision, &[])
+}
+/// `entries` lets a root selected only through its derived cursors count.
+fn candidate_shape_in(
+    ctx: &Ctx<'_, '_>,
+    s: &Subject,
+    decision: &Decision,
+    entries: &[(Subject, Decision)],
+) -> bool {
     let uses = ctx.facts.raw_only_uses.get(&(s.fn_did, s.hir_id));
     s.ptr_depth == 1
-        && !s.null_init
-        && selected(ctx, s, decision)
+        && (selected(ctx, s, decision)
+            || derives_cursor(ctx, s, decision, entries)
+            || (s.null_init && optional_degraded(decision)))
         && (uses.is_some_and(|uses| {
             uses.iter()
                 .any(|(op, _)| ["offset", "add", "sub"].contains(&op.as_str()))

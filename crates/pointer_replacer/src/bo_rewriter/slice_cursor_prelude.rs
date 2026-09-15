@@ -248,6 +248,35 @@ pub(crate) const SLICE_CURSOR_PRELUDE: &str = r#"pub mod slice_cursor {
     impl_readable_index!(SliceCursorMut, isize, usize, i32);
     impl_readable_index!(SliceCursor, isize, usize, i32);
     impl_mutable_index!(isize, usize, i32);
+
+    // ---- BO addendum (slicecursor lane, relay 009; the legacy text above is
+    // preserved verbatim). An ADDRESS view of the cursor's position, used only
+    // for orderings and differences: it never indexes, so a position past the
+    // window (a C address computed before a clamp) is a value, not a panic.
+    // `pos()` is the index the R394-1 form names.
+    impl<'a, T> SliceCursorMut<'a, T> {
+        pub fn pos(&self) -> usize {
+            self.pos
+        }
+
+        pub fn addr(&self) -> *const T {
+            self.base.as_ptr().wrapping_add(self.pos)
+        }
+
+        pub fn addr_mut(&mut self) -> *mut T {
+            self.base.as_mut_ptr().wrapping_add(self.pos)
+        }
+    }
+
+    impl<'a, T> SliceCursor<'a, T> {
+        pub fn pos(&self) -> usize {
+            self.pos
+        }
+
+        pub fn addr(&self) -> *const T {
+            self.base.as_ptr().wrapping_add(self.pos)
+        }
+    }
 }"#;
 
 #[cfg(test)]

@@ -171,7 +171,9 @@ fn slicecursor_read_only_element_of_mutable_table_takes_fallback_base() {
 
 #[test]
 fn slicecursor_cast_table_is_held() {
-    let input = "pub unsafe fn previous(outputs: *mut *mut f64, k: isize) -> f64 { let output: *mut f64 = (*outputs.offset(0)) as *mut f64; *output.offset(k) }";
+    // Expectation migrated (relay 009): a pointee-PRESERVING cast is the
+    // c2rust idiom and peels; a reinterpreting cast stays a cast base and holds.
+    let input = "pub unsafe fn previous(outputs: *mut *mut f64, k: isize) -> u8 { let output: *mut u8 = (*outputs.offset(0)) as *mut u8; *output.offset(k) }";
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
         let (_, decision) = table
@@ -763,7 +765,7 @@ pub unsafe fn entropy(mut population: *const u32, size: usize) -> u64 {
         "derived end declaration absent: {source}"
     );
     assert!(
-        source.contains(".as_ptr() < ") || source.contains(".as_ptr()) < "),
+        source.contains(".addr() < ") || source.contains(".addr()) < "),
         "ordering address view absent: {source}"
     );
     compile(
@@ -794,13 +796,80 @@ pub unsafe fn chunk_len(chunk: *mut u8, end: *mut u8) -> usize {
         "wrapper absent: {source}"
     );
     assert!(
-        source.contains(".as_ptr()") && source.contains("offset_from("),
+        source.contains(".addr()") && source.contains("offset_from("),
         "address views absent: {source}"
     );
     compile(
         &source,
         Some(
             "fn main() { let b = [0u8, 0, 0, 2, 9, 9, 9, 9]; assert_eq!(unsafe { chunk_len(&b[..], &b[8..]) }, 10); let c = [9u8, 9]; assert_eq!(unsafe { chunk_len(&c[..], &c[2..]) }, 0); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_count_zeros_cursor_from_cursor() {
+    // lodepng `countZeros`: a parameter cursor, two derived locals, a bound
+    // taken against a derived temporary, and a cursor-from-cursor assignment.
+    let input = r#"
+pub unsafe fn count_zeros(mut data: *const u8, size: usize, pos: usize) -> u32 {
+    let mut start = data.offset(pos as isize);
+    let mut end = start.offset(6);
+    if end > data.offset(size as isize) {
+        end = data.offset(size as isize);
+    }
+    data = start;
+    while data != end && *data == 0 {
+        data = data.offset(1);
+    }
+    data.offset_from(start) as u32
+}
+"#;
+    let source = emitted(input);
+    save_fixture("count-zeros", input, &source);
+    assert!(
+        source.contains("slice_cursor::SliceCursor::new(data)"),
+        "parameter cursor absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let b = [0u8, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0]; assert_eq!(unsafe { count_zeros(&b, 12, 1) }, 3); assert_eq!(unsafe { count_zeros(&b, 12, 5) }, 6); assert_eq!(unsafe { count_zeros(&b, 12, 9) }, 3); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_reborrow_idiom_from_slice_parameter() {
+    // lodepng `encodeLZ77`: null-initialised cursors assigned the c2rust
+    // reborrow idiom `&*in_0.offset(k) as *const u8` over a slice parameter,
+    // compared for identity and differenced.
+    let input = r#"
+pub unsafe fn match_len(in_0: *const u8, insize: usize, pos: usize, back: usize) -> u32 {
+    let mut lastptr = 0 as *const u8;
+    let mut foreptr = 0 as *const u8;
+    let mut backptr = 0 as *const u8;
+    let limit = if insize < pos + 6 { insize } else { pos + 6 };
+    lastptr = &*in_0.offset(limit as isize) as *const u8;
+    foreptr = &*in_0.offset(pos as isize) as *const u8;
+    backptr = &*in_0.offset((pos - back) as isize) as *const u8;
+    while foreptr != lastptr && *backptr == *foreptr {
+        backptr = backptr.offset(1);
+        foreptr = foreptr.offset(1);
+    }
+    foreptr.offset_from(&*in_0.offset(pos as isize) as *const u8) as u32
+}
+"#;
+    let source = emitted(input);
+    save_fixture("reborrow-idiom-from-slice-parameter", input, &source);
+    assert!(
+        source.contains("Option<crate::slice_cursor::SliceCursor"),
+        "optional cursors absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let b = [1u8, 2, 3, 1, 2, 3, 9]; assert_eq!(unsafe { match_len(&b, 7, 3, 3) }, 3); assert_eq!(unsafe { match_len(&b, 7, 1, 1) }, 0); }",
         ),
     );
 }

@@ -5716,6 +5716,7 @@ fn validate_cursor_delivered_bases(
                     && matches!(
                         base.provider,
                         decision::cursor_native::DeliveredBaseProvider::TableElement
+                            | decision::cursor_native::DeliveredBaseProvider::SliceParameter
                     )
                     && let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) = init.kind
                 {
@@ -5825,6 +5826,29 @@ fn validate_cursor_delivered_bases(
             // loads; the cursor's own extent is the receipted fallback, so a
             // caller-side input plan on the outer (`overrides_base`) changes
             // nothing the base relies on.
+            // The base is a delivered slice parameter; the cursor's window is
+            // that binding's runtime length, so the parameter's Slice decision
+            // is the whole condition.
+            DeliveredBaseProvider::SliceParameter => {
+                cursor.wrapper
+                    && !cursor.fallback
+                    && table.entries.iter().any(|(candidate, choice)| {
+                        (candidate.fn_did, candidate.hir_id) == node
+                            && matches!(candidate.kind, decision::SubjectKind::Param { .. })
+                            && match choice {
+                                decision::Decision::Slice { mutable, .. } => {
+                                    !subject.mutable || *mutable
+                                }
+                                decision::Decision::NestedSlice { .. }
+                                | decision::Decision::Ref { .. }
+                                | decision::Decision::InferredRef { .. }
+                                | decision::Decision::Opt { .. }
+                                | decision::Decision::Box(_)
+                                | decision::Decision::Cursor { .. }
+                                | decision::Decision::Degraded(_) => false,
+                            }
+                    })
+            }
             DeliveredBaseProvider::TableElement => {
                 cursor.wrapper
                     && cursor.fallback
