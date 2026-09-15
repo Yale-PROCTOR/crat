@@ -427,14 +427,29 @@ fn w5c_thin_count_runtime_field_count_admits_array_sources() {
     }
 }
 #[test]
-fn w5c_thin_count_first_element_reference_source_stays_held() {
-    // c2rust's `&a[0]`: the seam would render it `slice::from_ref`, one element.
-    use super::thin_counted::Hold;
+fn w5c_thin_count_first_element_reference_source_delivers_over_the_array_start() {
+    // c2rust's `&a[0]` at the third metablock site: the seam renders the array
+    // start, never a one-element `slice::from_ref` (W-C6).
     let input = metablock_fixture();
-    assert_eq!(proof(&input).unwrap_err(), Hold::CallerSource);
+    let p = proof(&input).unwrap();
+    assert_eq!(
+        (p.count_parameter, p.callers, p.count),
+        (1, 3, super::thin_counted::Count::Runtime)
+    );
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
-    assert!(emitted.contains("population: *const u32"), "{emitted}");
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("population: &[u32]"), "{emitted}");
     assert!(!emitted.contains("slice::from_ref"), "{emitted}");
+    assert!(
+        flat.contains("BitsEntropy(core::slice::from_raw_parts(((*combined_histo.as_mut_ptr().offset(j as isize)).data_).as_mut_ptr(), ((*self_0).alphabet_size_) as usize), (*self_0).alphabet_size_)"),
+        "{emitted}"
+    );
+    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
+    if let Ok(root) = std::env::var("CRAT_W5C_FIXTURE_CAPTURE") {
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(format!("{root}/metablock-full-original.rs"), &input).unwrap();
+        std::fs::write(format!("{root}/metablock-full-emitted.rs"), &emitted).unwrap();
+    }
 }
 #[test]
 fn w5c_thin_count_offset_zero_array_start_source() {
@@ -451,4 +466,145 @@ fn w5c_thin_count_offset_zero_array_start_source() {
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
     let past = fixture(18, "run").replace("depth_histo.as_ptr()", "depth_histo.as_ptr().offset(1)");
     assert_eq!(proof(&past).unwrap_err(), Hold::CallerSource);
+}
+
+/// The `encode` histogram copy: `ShouldCompress` forwards its 256-array with
+/// the constant count, and `ShouldUseComplexStaticContextMap` calls the reader
+/// DIRECTLY with c2rust's `&a[0]` over a nested array (`[[u32; 32]; 13]`) and
+/// the constant 32 — the corpus `caller-source` hold of report 009 §5.
+const ENCODE_CONTEXT: &str = r###"
+unsafe extern "C" fn ShouldUseComplexStaticContextMap(mut input: *const u8, mut start_pos: usize,
+    mut length: usize, mut mask: usize) -> i32 {
+    let mut entropy: [f64; 3] = [0.; 3];
+    let mut context_histo: [[u32; 32]; 13] = [[0; 32]; 13];
+    let mut i: usize = 0;
+    let mut dummy: usize = 0;
+    let end_pos = start_pos.wrapping_add(length);
+    while start_pos.wrapping_add(64) <= end_pos {
+        let stride_end_pos = start_pos.wrapping_add(64);
+        let mut context = 0usize;
+        let mut pos = start_pos.wrapping_add(1);
+        while pos < stride_end_pos {
+            let data = *input.offset((pos & mask) as isize);
+            context = (data as usize) & 7;
+            context_histo[context][(data >> 3) as usize & 31] =
+                context_histo[context][(data >> 3) as usize & 31].wrapping_add(1);
+            pos = pos.wrapping_add(1);
+        }
+        start_pos = start_pos.wrapping_add(4096);
+    }
+    entropy[2] = 0.0;
+    i = 0;
+    while i < 13 {
+        entropy[2] += ShannonEntropy(&mut *(*context_histo.as_mut_ptr().offset(i as isize)).as_mut_ptr().offset(0), 32usize, &mut dummy);
+        i = i.wrapping_add(1);
+    }
+    (entropy[2] > 0.0) as i32
+}
+"###;
+const SHOULD_COMPRESS: &str = r###"
+unsafe extern "C" fn ShouldCompress(mut data: *const u8,
+    mask: usize, last_flush_pos: u64, bytes: usize,
+    num_literals: usize, num_commands: usize) -> i32 {
+    if bytes <= 2 as i32 as usize {
+        return 0 as i32;
+    }
+    if num_commands <
+            (bytes >>
+                        8 as
+                            i32).wrapping_add(2 as i32 as usize)
+        {
+        if num_literals as f64 >
+                0.99f64 * bytes as f64 {
+            let mut literal_histo: [u32; 256] =
+                [0 as i32 as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0];
+            static mut kSampleRate: u32 =
+                13 as i32 as u32;
+            static mut kMinEntropy: f64 = 7.92f64;
+            let bit_cost_threshold =
+                bytes as f64 * kMinEntropy /
+                    kSampleRate as f64;
+            let mut t =
+                bytes.wrapping_add(kSampleRate as
+                                usize).wrapping_sub(1 as i32 as
+                            usize).wrapping_div(kSampleRate as usize);
+            let mut pos = last_flush_pos as u32;
+            let mut i: usize = 0;
+            i = 0 as i32 as usize;
+            while i < t {
+                literal_histo[*data.offset((pos as usize & mask) as
+                                        isize) as usize] =
+                    (literal_histo[*data.offset((pos as usize & mask) as
+                                                isize) as usize]).wrapping_add(1);
+                pos =
+                    (pos as u32).wrapping_add(kSampleRate) as u32
+                        as u32;
+                i = i.wrapping_add(1);
+            }
+            if BitsEntropy(literal_histo.as_ptr(),
+                        256 as i32 as usize) > bit_cost_threshold {
+                return 0 as i32;
+            }
+        }
+    }
+    return 1 as i32;
+}
+"###;
+fn encode_fixture() -> String {
+    format!(
+        "#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case,non_upper_case_globals)]\n{ENTROPY}\n{SHOULD_COMPRESS}\n{ENCODE_CONTEXT}\npub unsafe fn run(data:*const u8)->i32 {{ ShouldCompress(data, 1023, 0, 1000, 999, 3) + ShouldUseComplexStaticContextMap(data, 0, 1000, 1023) }}"
+    )
+}
+#[test]
+fn w5c_thin_count_direct_reader_caller_over_a_nested_array_start() {
+    let input = encode_fixture();
+    let p = proof(&input).unwrap();
+    assert_eq!(
+        (p.count_parameter, p.callers, p.count),
+        (1, 1, super::thin_counted::Count::Constant)
+    );
+    let table = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        crate::bo_rewriter::decide_table(tcx).unwrap()
+    })
+    .unwrap();
+    for label in ["BitsEntropy::population", "ShannonEntropy::population"] {
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.label == label)
+            .unwrap();
+        assert!(
+            matches!(decision, super::Decision::Slice { mutable: false, .. }),
+            "{label}: {decision:?}"
+        );
+    }
+    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    // (The driver's own thin `data` still takes g24's `from_ref`; the two
+    // histogram calls below are what this witness is about.)
+    assert!(
+        !flat.contains("ShannonEntropy(core::slice::from_ref"),
+        "{emitted}"
+    );
+    assert!(flat.contains("ShannonEntropy(core::slice::from_raw_parts((*context_histo.as_mut_ptr().offset(i as isize)).as_mut_ptr(), (32usize) as usize), 32usize, &mut dummy)"), "{emitted}");
+    assert!(flat.contains("BitsEntropy(core::slice::from_raw_parts(literal_histo.as_ptr(), (256 as i32 as usize) as usize), 256 as i32 as usize)"), "{emitted}");
+    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
+    if let Ok(root) = std::env::var("CRAT_W5C_FIXTURE_CAPTURE") {
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(format!("{root}/encode-context-original.rs"), &input).unwrap();
+        std::fs::write(format!("{root}/encode-context-emitted.rs"), &emitted).unwrap();
+    }
 }

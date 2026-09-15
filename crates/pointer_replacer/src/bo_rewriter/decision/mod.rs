@@ -29,6 +29,9 @@ use crate::analyses::borrow_ownership::{
 };
 
 pub(crate) mod a5_site_proof;
+pub(crate) mod array_start;
+#[cfg(test)]
+mod array_start_tests;
 pub(crate) mod box_facts;
 pub(crate) mod callee_parameter_input;
 pub(crate) mod co_conversion;

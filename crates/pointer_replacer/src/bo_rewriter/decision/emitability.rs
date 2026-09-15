@@ -221,7 +221,7 @@ impl ArgShape {
 /// temporary roots at nothing. Deref is included deliberately — that is the
 /// C2Rust shape, and stopping at it would make every `(*p).field` argument look
 /// unrelated to `p`.
-fn place_root(expr: &Expr<'_>) -> (Option<HirId>, bool) {
+pub(crate) fn place_root(expr: &Expr<'_>) -> (Option<HirId>, bool) {
     let mut cur = expr;
     let mut through_deref = false;
     loop {
@@ -259,6 +259,10 @@ pub(crate) struct Arg {
     /// Exact Rust array receiver of `.as_ptr()` / `.as_mut_ptr()`. Every
     /// element of an array value is initialized before this expression exists.
     pub initialized_array_elements: Option<u64>,
+    /// W-C6: `Some(blind)` when the argument is c2rust's `&a[0]` over a
+    /// declared array; the seam's overlap gate then reads the array place's
+    /// visibility instead of treating the raw spelling as blind.
+    pub array_start_blind: Option<bool>,
     /// Exact syntactic place identity after peeling address/cast wrappers.
     /// Distinct field projections remain distinct even when `place_root` is
     /// the same aggregate local.
@@ -460,6 +464,9 @@ pub(crate) fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
         // Compiler-identified, argument-free null constructors are pure None
         // values. A same-spelled user function keeps its ordinary call.
         return ArgShape::NullLit;
+    }
+    if let Some(start) = super::array_start::idiom(tcx, expr) {
+        return ArgShape::RawExpr { root: start.root };
     }
     match &expr.kind {
         // Casts first: both the null form and the strip-the-cast forms are
@@ -891,13 +898,18 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             .copied()
                                             .and_then(|ty| raw_target_type(self.tcx, ty));
                                         let shape = classify_arg(self.tcx, arg);
+                                        let array_start = super::array_start::idiom(self.tcx, arg);
                                         let adapter_operand_span = match shape {
                                             ArgShape::AddrOfCast { inner, .. }
                                             | ArgShape::CastOfLocal { inner, .. } => inner,
-                                            _ => arg.span,
+                                            _ => {
+                                                array_start.as_ref().map_or(arg.span, |s| s.operand)
+                                            }
                                         };
-                                        let adapter_operand_mutability =
-                                            match typeck.expr_ty(peel_casts(arg)).kind() {
+                                        let adapter_operand_mutability = array_start
+                                            .as_ref()
+                                            .map(|s| s.mutability)
+                                            .or(match typeck.expr_ty(peel_casts(arg)).kind() {
                                                 rustc_middle::ty::TyKind::RawPtr(_, mutability) => {
                                                     Some(if mutability.is_mut() {
                                                         super::raw_boundary::RawMutability::Mut
@@ -906,7 +918,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                                     })
                                                 }
                                                 _ => None,
-                                            };
+                                            });
                                         Arg {
                                             index,
                                             span: arg.span,
@@ -921,6 +933,9 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                                 self.fn_did,
                                                 arg,
                                             ),
+                                            array_start_blind: array_start
+                                                .as_ref()
+                                                .map(|s| s.blind),
                                             place_identity: Self::exact_place_identity(arg),
                                         }
                                     })
@@ -947,13 +962,16 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                             };
                             let shape = classify_arg(self.tcx, arg);
                             let root_through_deref = place_root(arg).1;
+                            let array_start = super::array_start::idiom(self.tcx, arg);
                             let adapter_operand_span = match shape {
                                 ArgShape::AddrOfCast { inner, .. }
                                 | ArgShape::CastOfLocal { inner, .. } => inner,
-                                _ => arg.span,
+                                _ => array_start.as_ref().map_or(arg.span, |s| s.operand),
                             };
-                            let adapter_operand_mutability =
-                                match typeck.expr_ty(peel_casts(arg)).kind() {
+                            let adapter_operand_mutability = array_start
+                                .as_ref()
+                                .map(|s| s.mutability)
+                                .or(match typeck.expr_ty(peel_casts(arg)).kind() {
                                     rustc_middle::ty::TyKind::RawPtr(_, mutability) => {
                                         Some(if mutability.is_mut() {
                                             super::raw_boundary::RawMutability::Mut
@@ -962,7 +980,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                         })
                                     }
                                     _ => None,
-                                };
+                                });
                             let contract_count = super::raw_boundary_contracts::classify_contract(
                                 &symbol, index, &target,
                             )

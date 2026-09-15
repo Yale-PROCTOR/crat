@@ -207,13 +207,18 @@ fn expression<'tcx>(
         _ => None,
     }
 }
-// `a.as_ptr().offset(0)` is the array's start, the address `a.as_ptr()` names.
-// c2rust's `&a[0]` — `&mut *a.as_mut_ptr().offset(0)` — is NOT peeled: the seam
-// renders that reference `slice::from_ref`, one element, and the reader's
-// `checked_sub(count)` would then fail at runtime; it stays `CallerSource`
-// until the seam renders the array start for that shape.
+// `a.as_ptr().offset(0)` is the array's start, the address `a.as_ptr()` names;
+// so is c2rust's `&a[0]` — `&mut *a.as_mut_ptr().offset(0)` — which the seam
+// now renders over its `a.as_mut_ptr()` operand (W-C6, `array_start::idiom`),
+// never as a one-element `slice::from_ref`.
 fn array_start<'a>(tcx: TyCtxt<'_>, owner: LocalDefId, e: &'a Expr<'a>) -> &'a Expr<'a> {
     let mut e = peel(e);
+    if super::array_start::idiom(tcx, e).is_some()
+        && let ExprKind::AddrOf(_, _, inner) = e.kind
+        && let ExprKind::Unary(rustc_hir::UnOp::Deref, place) = peel(inner).kind
+    {
+        e = peel(place);
+    }
     while let ExprKind::MethodCall(segment, receiver, [offset], _) = e.kind
         && segment.ident.name.as_str() == "offset"
         && constant(tcx, owner, offset, 4) == Some(0)
@@ -291,34 +296,46 @@ fn forwarder_source(
     let calls = closed_calls(tcx, owner, facts)?;
     let mut count_kind = Count::Constant;
     for call in calls {
-        let source = call
-            .args
-            .iter()
-            .find(|a| a.index == parameter)
-            .and_then(|a| expression(tcx, call.caller, a.span))
-            .ok_or(Hold::CallerSource)?;
-        let capacity = array_capacity(tcx, call.caller, source).ok_or(Hold::CallerSource)?;
-        let count = call
-            .args
-            .iter()
-            .find(|a| a.index == forwarder.count_parameter)
-            .and_then(|a| expression(tcx, call.caller, a.span))
-            .ok_or(Hold::CallerCount)?;
-        // A constant count must fit the array; a foldable count outside its
-        // range is such a constant. Anything else is a runtime count.
-        match constant(tcx, call.caller, count, 24) {
-            Some(value)
-                if value > capacity
-                    || value > ((1u128 << (tcx.data_layout.pointer_size.bits() - 1)) - 1) / 4 =>
-            {
-                return Err(Hold::CallerCount);
-            }
-            Some(_) => {}
-            None if foldable(tcx, call.caller, count, 24) => return Err(Hold::CallerCount),
-            None => count_kind = Count::Runtime,
+        if array_source(tcx, call, parameter, forwarder.count_parameter)? == Count::Runtime {
+            count_kind = Count::Runtime;
         }
     }
     Ok((forwarder, calls.len(), count_kind))
+}
+
+// One incoming call binds its count to the array it passes at `parameter`.
+fn array_source(
+    tcx: TyCtxt<'_>,
+    call: &super::emitability::CallSite,
+    parameter: usize,
+    count_parameter: usize,
+) -> Result<Count, Hold> {
+    let source = call
+        .args
+        .iter()
+        .find(|a| a.index == parameter)
+        .and_then(|a| expression(tcx, call.caller, a.span))
+        .ok_or(Hold::CallerSource)?;
+    let capacity = array_capacity(tcx, call.caller, source).ok_or(Hold::CallerSource)?;
+    let count = call
+        .args
+        .iter()
+        .find(|a| a.index == count_parameter)
+        .and_then(|a| expression(tcx, call.caller, a.span))
+        .ok_or(Hold::CallerCount)?;
+    // A constant count must fit the array; a foldable count outside its
+    // range is such a constant. Anything else is a runtime count.
+    match constant(tcx, call.caller, count, 24) {
+        Some(value)
+            if value > capacity
+                || value > ((1u128 << (tcx.data_layout.pointer_size.bits() - 1)) - 1) / 4 =>
+        {
+            Err(Hold::CallerCount)
+        }
+        Some(_) => Ok(Count::Constant),
+        None if foldable(tcx, call.caller, count, 24) => Err(Hold::CallerCount),
+        None => Ok(Count::Runtime),
+    }
 }
 
 // A reader's safe signature affects every incoming call. Admit only complete
@@ -339,7 +356,16 @@ fn reader_sources(
             .find(|a| a.index == parameter)
             .ok_or(Hold::CallerSource)?;
         let super::emitability::ArgShape::BareLocal(binding) = arg.shape else {
-            return Err(Hold::CallerSource);
+            // A direct caller binding its own array and count to the reader
+            // (`ShouldUseComplexStaticContextMap` → `ShannonEntropy`), checked
+            // exactly like a forwarder's incoming call.
+            if array_source(tcx, call, parameter, parameter + 1)? == Count::Runtime {
+                count = Count::Runtime;
+            }
+            if !members.contains(&call.caller) {
+                members.push(call.caller);
+            }
+            continue;
         };
         let body = tcx.hir_body_owned_by(call.caller);
         let index = body

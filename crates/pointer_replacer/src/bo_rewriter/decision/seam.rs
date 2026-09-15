@@ -4088,7 +4088,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     ArgShape::RawExpr { .. } => (
                         Form::Raw,
                         sm.span_to_snippet(arg.span).ok(),
-                        true,
+                        arg.array_start_blind.unwrap_or(true),
                         true,
                         false,
                     ),
@@ -4114,7 +4114,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // The two reads are kept in step by CONSTRUCTION: `text` is
                 // the snippet of exactly this span, so a shape whose operand
                 // moves moves both or neither.
-                let Some(text_span) = text_span_of(arg.shape, arg.span) else {
+                let Some(text_span) = text_span_of(arg.shape, arg.span)
+                    .map(|span| super::array_start::text_span(arg, span))
+                else {
                     // Unreachable — the shapes with no nameable operand are
                     // blocked above. Fail-closed rather than defaulting to
                     // `arg.span`, which would hand the AST layer a subtree the

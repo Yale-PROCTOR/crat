@@ -1979,6 +1979,7 @@ mod a5_cast_role_tests {
                         adapter_operand_span: inner,
                         adapter_operand_mutability: Some(RawMutability::Const),
                         initialized_array_elements: None,
+                        array_start_blind: None,
                         place_identity: None,
                     }],
                 }],
