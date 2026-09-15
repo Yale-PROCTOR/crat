@@ -1215,6 +1215,18 @@ fn certify<'tcx, 's>(
     )
     .map_err(|form| hold(format!("return-certificate-owner-use:{callee_path}:{form}")))?;
     let dead_null_returns = uses.dead_null_returns.clone();
+    // R410-5 §2: each removed malloc guard is receipted (`dead-alloc-guard`,
+    // the resource-scope waiver beside addendum 101).
+    let dead_guard_receipts: Vec<String> = uses
+        .dead_guards
+        .iter()
+        .map(|span| {
+            format!(
+                "dead-alloc-guard site={}",
+                super::emitability::EmitabilityFacts::site(tcx, *span)
+            )
+        })
+        .collect();
     let deleted = plan.delete_statements.clone();
     let owner_edits: Vec<BoxExprEdit> = uses
         .edits
@@ -1262,6 +1274,7 @@ fn certify<'tcx, 's>(
     plan.receipts.push(format!(
         "return-certificate-owner callee={callee_path} source={source_receipt} model={kind:?}"
     ));
+    plan.receipts.extend(dead_guard_receipts.iter().cloned());
     let Some(decl) = tcx.hir_node_by_def_id(callee).fn_decl() else {
         return Err(hold("return-certificate-allocation:no-decl".to_owned()));
     };
@@ -1376,6 +1389,7 @@ fn certify<'tcx, 's>(
     let mut certificate = certificate_stub;
     certificate.receivers = planned_receivers;
     certificate.returned_receivers = returned_receivers;
+    certificate.receipts.extend(dead_guard_receipts);
     certificate.receipts.push(format!(
         "return-certificate callee={callee_path} output={output_type} source={source_receipt} model={kind:?} null_returns={} receivers={} [{}] returned_receivers={}",
         null_returns.len(),

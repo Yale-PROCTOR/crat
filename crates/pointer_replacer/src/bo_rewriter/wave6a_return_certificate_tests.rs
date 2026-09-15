@@ -128,6 +128,14 @@ fn w6a_a1_quadtree_node_new_returns_a_box_and_the_receiver_owns_it() {
         "{}",
         out.artifacts.return_certificate_receipts
     );
+    // R410-5 §2: the removed malloc guard is receipted per site.
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("quadtree_node_new\tadmitted\tdead-alloc-guard site="),
+        "{}",
+        out.artifacts.return_certificate_receipts
+    );
     let declarations =
         super::delivery_custody::inventory_source("lib.rs", &out.source).expect("inventory");
     for (owner, binding) in [("quadtree_node_new", "node"), ("test_node", "node")] {
