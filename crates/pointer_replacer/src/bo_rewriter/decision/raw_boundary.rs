@@ -1835,6 +1835,15 @@ pub(crate) enum BridgeTemplate {
     OptSliceToRaw,
     OptSliceMutToWritableRawConst,
     OptSliceToRawMut,
+    /// Wave-6o. A THIN optional subject reaching a `c_void` position through
+    /// a cast (`memset(item as *mut c_void, ..)`): the same null-map as the
+    /// typed cells, with the pointee erased inside the `Some` arm so both
+    /// arms of `map_or` agree on `*c_void`. `None` stays null; a shared
+    /// optional at a `*mut` position needs the negative-write evidence the
+    /// typed twin needs. Optional SLICES stay unavailable here (K19').
+    OptRefMutToVoidMut,
+    OptRefToVoidConst,
+    OptRefToVoidMut,
     BoxBorrowViewToRaw,
     KnownFreeDrop,
 }
@@ -1865,7 +1874,10 @@ impl BridgeTemplate {
             | Self::OptRefToRawConst
             | Self::OptRefToRawMut
             | Self::OptSliceToRaw
-            | Self::OptSliceToRawMut => "option-to-raw-null-map",
+            | Self::OptSliceToRawMut
+            | Self::OptRefMutToVoidMut
+            | Self::OptRefToVoidConst
+            | Self::OptRefToVoidMut => "option-to-raw-null-map",
             Self::OptRefMutToWritableRawConst | Self::OptSliceMutToWritableRawConst => {
                 "returned-child-option-mut-to-raw-const"
             }
@@ -2052,6 +2064,24 @@ impl BridgeTemplate {
                 let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
                 Ok(BridgeRender::Edit(format!(
                     "{argument}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_ptr().cast_mut())"
+                )))
+            }
+            Self::OptRefMutToVoidMut => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), |value| core::ptr::from_mut(value).cast::<{pointee}>())"
+                )))
+            }
+            Self::OptRefToVoidConst => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref().map_or(core::ptr::null::<{pointee}>(), |value| core::ptr::from_ref(value).cast::<{pointee}>())"
+                )))
+            }
+            Self::OptRefToVoidMut => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |value| core::ptr::from_ref(value).cast::<{pointee}>().cast_mut())"
                 )))
             }
             Self::BoxBorrowViewToRaw if box_slice => {
@@ -2477,7 +2507,23 @@ pub(crate) fn template_for(
             // carry that same open obligation already; widening it to a new
             // cell is the seat's call, not this arm's.
             Decision::Slice { mutable: false, .. } => Err(RawBoundaryBlockReason::SharedToMut),
-            Decision::Opt { .. }
+            // Wave-6o: the thin optional cells, mirroring the typed `Opt`
+            // arm below with the pointee erased inside the `Some` arm.
+            Decision::Opt {
+                mutable: true,
+                slice: false,
+                ..
+            } if target.mutability == RawMutability::Mut => Ok(BridgeTemplate::OptRefMutToVoidMut),
+            Decision::Opt { slice: false, .. } if target.mutability == RawMutability::Const => {
+                Ok(BridgeTemplate::OptRefToVoidConst)
+            }
+            Decision::Opt {
+                mutable: false,
+                slice: false,
+                ..
+            } if has_negative_write_evidence => Ok(BridgeTemplate::OptRefToVoidMut),
+            Decision::Opt { slice: false, .. } => Err(RawBoundaryBlockReason::SharedToMut),
+            Decision::Opt { slice: true, .. }
             | Decision::Box(_)
             | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }

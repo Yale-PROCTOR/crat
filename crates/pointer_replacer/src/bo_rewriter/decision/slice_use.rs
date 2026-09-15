@@ -191,6 +191,7 @@ fn shared_to_mut(template: raw_boundary::BridgeTemplate) -> bool {
         | BridgeTemplate::RefSharedToRawMut
         | BridgeTemplate::SliceToRawMut
         | BridgeTemplate::OptRefToRawMut
+        | BridgeTemplate::OptRefToVoidMut
         | BridgeTemplate::OptSliceToRawMut => true,
         BridgeTemplate::Depth2NpoConst
         | BridgeTemplate::Depth2NpoMut
@@ -213,6 +214,8 @@ fn shared_to_mut(template: raw_boundary::BridgeTemplate) -> bool {
         | BridgeTemplate::SliceToRawConst
         | BridgeTemplate::OptRefMutToRawMut
         | BridgeTemplate::OptRefToRawConst
+        | BridgeTemplate::OptRefMutToVoidMut
+        | BridgeTemplate::OptRefToVoidConst
         | BridgeTemplate::OptSliceToRaw
         | BridgeTemplate::BoxBorrowViewToRaw
         | BridgeTemplate::CursorSharedToRawConst
