@@ -476,12 +476,15 @@ fn w6v2_escaping_cast_stays_held_and_a_constant_width_forwards() {
 /// binn.rs:2629 `binn_list_int32` → :2493 `binn_list_get` → :1561
 /// `binn_list_get_value` (reassigned from `binn_ptr`, held) → :1254 `binn_ptr`.
 /// The two forwarders pass their `void *` on unchanged; the leaf keeps its raw
-/// parameter, so every forward crosses an outbound raw seam — build 2b's
-/// shape. Build 2 holds them: the reduced chain showed that a delivered byte
-/// view handed to the raw position was emitted WITHOUT a bridge (an ill-typed
-/// tree), and `binn_list_get`'s own forward was withdrawn by the seam's
-/// positive-retention verdict (`binn_list_get_value` stores a derived pointer
-/// into `*value`).
+/// parameter, so every forward crosses an outbound raw seam. Under build 2b
+/// the byte-view bridge exists and the descendant question is discharged by
+/// the frame-confined out-param, but the retention verdict still holds the
+/// chain: `binn_list_get_value`'s `ptr` reaches `binn_ptr`, which RETURNS it,
+/// and the returned alias — not the parameter — is what the leaf stores into
+/// `*value`. A positive sink reached through a dependency's return is outside
+/// the stack-storage certificate (report 003, next shape), so every forward
+/// is withdrawn as a dropped class site and the parameters stay
+/// `held:void-pointee` — never an unbridged view.
 const CHAIN: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
 #[repr(C)]
@@ -524,7 +527,7 @@ pub unsafe fn binn_list_int32(mut list: *mut core::ffi::c_void, mut pos: i32) ->
 "#;
 
 #[test]
-fn w6v2_forwards_into_raw_positions_stay_held() {
+fn w6v2_forwards_into_a_returned_alias_chain_stay_held() {
     let rows = by_function(CHAIN);
     assert!(
         rows.contains(&(
@@ -553,7 +556,193 @@ fn w6v2_forwards_into_raw_positions_stay_held() {
     assert!(
         compact(&source)
             .contains("fnbinn_list_int32(mutlist:*mutcore::ffi::c_void,mutpos:i32)->i32"),
-        "no view without a bridge: {source}"
+        "a withdrawn forward keeps its raw parameter: {source}"
     );
     assert!(super::verify::type_checks_str(&source));
+}
+
+/// R406-6 finding B, the direct shape: `get_value` stores the pointer it is
+/// handed into the caller's out-parameter `*value`; `get_type` passes
+/// `&mut value` where `value` is its own local that never leaves its frame
+/// (only a scalar field is read out of it). `get_type`'s `ptr` is a thin
+/// subject whose only raw seam is that call: positive retention before, T1
+/// under the stack-storage certificate now.
+const CONFINED: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+#[repr(C)]
+pub struct binn { pub header: i32, pub type_0: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
+pub unsafe fn get_value(mut ptr: *mut u8, mut pos: i32, mut value: *mut binn) -> i32 {
+    if ptr.is_null() || value.is_null() { return 0 as i32; }
+    (*value).type_0 = *ptr as i32 + pos;
+    (*value).ptr = ptr as *mut core::ffi::c_void;
+    return 1 as i32;
+}
+pub unsafe fn get_type(mut ptr: *mut u8, mut pos: i32) -> i32 {
+    let mut value = binn { header: 0, type_0: 0, size: 0, ptr: 0 as *mut core::ffi::c_void };
+    if get_value(ptr, pos, &mut value) == 0 as i32 { return 0 as i32; }
+    return value.type_0;
+}
+"#;
+
+#[test]
+fn w6v2_stack_confined_out_param_retention_is_t1() {
+    let rows = by_function(CONFINED);
+    assert!(
+        rows.contains(&(
+            "get_type".to_owned(),
+            "ptr".to_owned(),
+            "<emitted>".to_owned()
+        )),
+        "the retained-into-confined-storage subject delivers: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(CONFINED).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fnget_type(mutptr:&u8,mutpos:i32)->i32")
+            || c.contains("fnget_type(mutptr:&mutu8,mutpos:i32)->i32"),
+        "the subject takes its reference form: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe {
+        let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
+        println!("{} {}", get_type(buffer.as_mut_ptr(), 0), get_type(buffer.as_mut_ptr(), 1));
+    }}"#;
+    let emitted_main = r#"fn main() { unsafe {
+        let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
+        println!("{} {}", get_type(&mut buffer[0], 0), get_type(&mut buffer[0], 1));
+    }}"#;
+    let original = run_binary(&format!("{CONFINED}\n{main}"));
+    assert_eq!(original, b"224 225\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+}
+
+/// The certificate's own line: a caller local whose pointer-carrying field is
+/// read out (`value.ptr` handed on) is NOT frame-confined, and the forward
+/// stays held; so does one whose address is taken at a second call.
+#[test]
+fn w6v2_escaping_out_param_storage_keeps_the_hold() {
+    for input in [
+        CONFINED.replace(
+            "return value.type_0;",
+            "sink(value.ptr); return value.type_0;",
+        ) + "\nunsafe fn sink(p: *mut core::ffi::c_void) {}",
+        CONFINED.replace(
+            "return value.type_0;",
+            "touch(&mut value); return value.type_0;",
+        ) + "\nunsafe fn touch(p: *mut binn) {}",
+        // The callee also hands the pointer to a callee that keeps it: the
+        // confined out-param does not discharge a sink reached elsewhere.
+        CONFINED.replace(
+            "(*value).ptr = ptr as *mut core::ffi::c_void;",
+            "(*value).ptr = ptr as *mut core::ffi::c_void; keep(ptr);",
+        ) + "\nstatic mut KEPT: *mut u8 = 0 as *mut u8;\nunsafe fn keep(p: *mut u8) { KEPT = p; }",
+    ] {
+        let rows = by_function(&input);
+        assert!(
+            !rows.contains(&(
+                "get_type".to_owned(),
+                "ptr".to_owned(),
+                "<emitted>".to_owned()
+            )),
+            "an escaping out-param local keeps the hold: {rows:?}"
+        );
+        let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+        assert!(super::verify::type_checks_str(&source));
+    }
+}
+
+/// R406-6 finding A: the byte-view bridges at a `c_void` position, cell by
+/// cell — the shared view under negative-write evidence, and the three
+/// optional views — render the R130 bridge text with `None` mapped to null.
+#[test]
+fn w6v2_byte_view_void_templates_render_the_bridge() {
+    use super::decision::{
+        Decision,
+        raw_boundary::{BridgeRender, BridgeTemplate, RawMutability, RawTargetType, template_for},
+    };
+    let target = |mutability| RawTargetType {
+        rendered: "*mut core::ffi::c_void".to_owned(),
+        pointee: "core::ffi::c_void".to_owned(),
+        mutability,
+        depth2: None,
+    };
+    let shared = Decision::Slice {
+        mutable: false,
+        uses: Vec::new(),
+    };
+    assert_eq!(
+        template_for(&shared, &target(RawMutability::Mut), None, true),
+        Ok(BridgeTemplate::VoidFromSliceCastMut)
+    );
+    assert!(template_for(&shared, &target(RawMutability::Mut), None, false).is_err());
+    let cells = [
+        (
+            Decision::Opt {
+                mutable: true,
+                slice: true,
+                uses: Vec::new(),
+            },
+            RawMutability::Mut,
+            true,
+            BridgeTemplate::OptSliceMutToVoidMut,
+            "x.as_deref_mut().map_or(core::ptr::null_mut::<core::ffi::c_void>(), |slice| slice.as_mut_ptr().cast::<core::ffi::c_void>())",
+        ),
+        (
+            Decision::Opt {
+                mutable: false,
+                slice: true,
+                uses: Vec::new(),
+            },
+            RawMutability::Const,
+            false,
+            BridgeTemplate::OptSliceToVoidConst,
+            "x.as_deref().map_or(core::ptr::null::<core::ffi::c_void>(), |slice| slice.as_ptr().cast::<core::ffi::c_void>())",
+        ),
+        (
+            Decision::Opt {
+                mutable: false,
+                slice: true,
+                uses: Vec::new(),
+            },
+            RawMutability::Mut,
+            true,
+            BridgeTemplate::OptSliceToVoidMut,
+            "x.as_deref().map_or(core::ptr::null_mut::<core::ffi::c_void>(), |slice| slice.as_ptr().cast::<core::ffi::c_void>().cast_mut())",
+        ),
+    ];
+    for (decision, mutability, negative_write, template, rendered) in cells {
+        assert_eq!(
+            template_for(&decision, &target(mutability), None, negative_write),
+            Ok(template)
+        );
+        assert_eq!(
+            template.render("x", mutability, false, Some("core::ffi::c_void")),
+            Ok(BridgeRender::Edit(rendered.to_owned()))
+        );
+    }
+    assert_eq!(
+        BridgeTemplate::VoidFromSliceCastMut.render(
+            "x",
+            RawMutability::Mut,
+            false,
+            Some("core::ffi::c_void")
+        ),
+        Ok(BridgeRender::Edit(
+            "x.as_ptr().cast::<core::ffi::c_void>().cast_mut()".to_owned()
+        ))
+    );
+    // A shared optional view at a `*mut` position without the evidence stays closed.
+    assert!(
+        template_for(
+            &Decision::Opt {
+                mutable: false,
+                slice: true,
+                uses: Vec::new()
+            },
+            &target(RawMutability::Mut),
+            None,
+            false
+        )
+        .is_err()
+    );
 }

@@ -382,15 +382,18 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
 /// the bare binding as an argument of a LOCAL call, and EVERY pass-on reaches a
 /// position that carries a typed-width contract. It takes the byte view and
 /// inherits the element and the width (re-keyed by the sibling the forwarder
-/// passes as the discriminant); its own seams are safe-to-safe and a raw
-/// caller's count is the inherited width.
+/// passes as the discriminant); its seams are safe-to-safe and a raw caller's
+/// count is the inherited width.
 ///
-/// A pass-on that reaches a raw or held position is NOT taken (build 2b): the
-/// forwarder would need the seam's outbound R130 bridge at that position, and
-/// the reduced chain fixture showed the byte view handed to a `*mut c_void`
-/// position without a bridge (an ill-typed tree) — so until that bridge is
-/// confirmed the parameter stays `held:void-pointee`. Sibling-COUNT contracts
-/// (the parent lane's) are the parent's `prove_forward` and are not taken here.
+/// A pass-on that reaches a raw or held `void *` position is NOT taken: the
+/// parent lane's witnesses pin that a wrapper of a HELD counted pair holds with
+/// it (`csv_fwrite` over a held `csv_fwrite2`), and a byte view bridged into a
+/// raw void position would deliver that wrapper instead. The bridge itself
+/// exists (R406-6, `raw_boundary`'s byte-view void templates, a blocked site
+/// dropping the class) and serves every other safe form at a void position;
+/// the forwarder shape over it is the seat's call (report 003). Sibling-COUNT
+/// contracts (the parent lane's) are the parent's `prove_forward` and are not
+/// taken here.
 pub(crate) fn prove_forward_only(
     tcx: TyCtxt<'_>,
     s: &Subject,
@@ -503,8 +506,8 @@ pub(crate) fn prove_forward_only(
     }
     let (element, width) = match inherited {
         Some((element, width)) if !reaches_raw => (element, width),
-        // Unreachable while a raw position returns above; kept as the typed
-        // shape build 2b fills in.
+        // Unreachable while a raw position returns above; the typed shape a
+        // raw-position forward would take (no width travels).
         Some((element, _)) => (element, WidthTable::unknown()),
         None => return None,
     };
@@ -559,4 +562,73 @@ pub(crate) fn root_rule<'tcx>(
             }
         }
     }
+}
+
+/// Is this caller local FRAME-CONFINED — storage whose contents never leave
+/// the caller (R406-6, finding B)? A callee that stores a pointer derived from
+/// a bridged view into such a local retains it only for the caller's frame,
+/// where the view itself is live, so the retention is T1.
+///
+/// Every use of the local in the caller's body must be one of: (1) an address
+/// taken INSIDE the certified call (`&mut local` at `call_span`); (2) a field
+/// read whose field type cannot carry a pointer, not under an address-of; (3)
+/// a whole-value read when the local's own type cannot carry a pointer; (4)
+/// an assignment target (`local = ..`, `local.f = ..`). Anything else — an
+/// address taken at another site, a pointer-carrying field read, a move or
+/// copy of a pointer-carrying value, a return, a closure capture — is an
+/// escape or an unknown, and the local is not confined.
+pub(crate) fn frame_confined<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: LocalDefId,
+    local: HirId,
+    call_span: rustc_span::Span,
+) -> bool {
+    let body = tcx.hir_body_owned_by(caller);
+    let typeck = tcx.typeck(caller);
+    let mut uses = Uses {
+        target: local,
+        found: Vec::new(),
+        writes: FxHashMap::default(),
+        closures: false,
+    };
+    uses.visit_expr(body.value);
+    if uses.closures {
+        return false;
+    }
+    let carries = |ty: Ty<'tcx>| super::raw_boundary::may_carry_pointer(tcx, ty, 4);
+    let assigned = |e: &Expr<'_>| match tcx.parent_hir_node(e.hir_id) {
+        Node::Expr(parent) => matches!(parent.kind,
+            ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) if lhs.hir_id == e.hir_id),
+        _ => false,
+    };
+    for use_ in uses.found {
+        // The outermost field projection over this use, if any.
+        let mut place = use_;
+        while let Node::Expr(parent) = tcx.parent_hir_node(place.hir_id)
+            && let ExprKind::Field(base, _) = parent.kind
+            && base.hir_id == place.hir_id
+        {
+            place = parent;
+        }
+        let parent = tcx.parent_hir_node(place.hir_id);
+        let confined = match parent {
+            Node::Expr(parent) => match parent.kind {
+                ExprKind::AddrOf(_, _, operand) if operand.hir_id == place.hir_id => {
+                    place.hir_id == use_.hir_id && call_span.contains(parent.span)
+                }
+                ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _)
+                    if lhs.hir_id == place.hir_id =>
+                {
+                    true
+                }
+                _ => !carries(typeck.expr_ty(place)),
+            },
+            Node::Stmt(_) | Node::LetStmt(_) | Node::Block(_) => !carries(typeck.expr_ty(place)),
+            _ => false,
+        };
+        if !confined && !assigned(place) {
+            return false;
+        }
+    }
+    true
 }

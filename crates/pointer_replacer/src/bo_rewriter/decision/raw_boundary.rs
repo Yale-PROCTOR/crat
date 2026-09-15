@@ -101,6 +101,24 @@ pub(crate) fn signature_may_yield_pointer<'tcx>(
     })
 }
 
+/// Is this parameter type output storage a callee could stash a pointer in —
+/// a `*mut` / `&mut` whose pointee is void-like or can carry a pointer? The
+/// second half of [`callee_may_yield_pointer`], per position.
+fn output_storage_pointee<'tcx>(tcx: TyCtxt<'tcx>, input: Ty<'tcx>) -> bool {
+    let pointee = match input.kind() {
+        TyKind::RawPtr(pointee, mutability) => {
+            (*mutability == rustc_middle::mir::Mutability::Mut).then_some(*pointee)
+        }
+        TyKind::Ref(_, pointee, mutability) => {
+            (*mutability == rustc_middle::mir::Mutability::Mut).then_some(*pointee)
+        }
+        _ => None,
+    };
+    pointee.is_some_and(|pointee| {
+        void_like(tcx, pointee) || may_carry_pointer(tcx, pointee, CARRIER_WALK_DEPTH - 1)
+    })
+}
+
 /// `c_void` and its kin walk to a field-free ADT, which the carrier walk would
 /// otherwise call provably pointer-free. Output storage of unknown shape is
 /// exactly the case that must fail closed.
@@ -431,6 +449,20 @@ pub(crate) struct RawBoundarySiteFact {
     /// Can this callee hand a pointer back — by return or by output storage?
     /// Fails closed: an unresolved callee answers `true`.
     pub callee_may_yield_pointer: bool,
+    /// wave-6v2 (R406-6): the sibling argument positions of this call whose
+    /// operand is `&mut local` over a caller local that never leaves the
+    /// caller's frame (`binn_counted::frame_confined`). A callee that retains
+    /// the subject only by storing through one of these parameters retains it
+    /// into storage that dies with the caller — T1, not positive retention.
+    pub frame_confined_outputs: Vec<usize>,
+    /// wave-6v2 (R406-6): every way this callee could hand a descendant of
+    /// the subject back to the caller ends in the caller's own frame — its
+    /// return type cannot carry a pointer and every other output-storage
+    /// position (a `*mut` / `&mut` parameter whose pointee is void-like or can
+    /// carry a pointer) is a frame-confined operand at this call. A shared
+    /// view then needs no returned-child permission: there is no descendant
+    /// the caller could write through.
+    pub descendants_frame_confined: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -588,6 +620,8 @@ impl RawBoundarySiteFacts {
                     adapter_operand_mutability: fact.adapter_operand_mutability,
                     callee_may_yield_pointer: unique_candidate(&fact.callee, &candidates)
                         .is_none_or(|site| site.may_yield_pointer),
+                    frame_confined_outputs: Vec::new(),
+                    descendants_frame_confined: false,
                 }),
                 Err(reason) => out.failures.push(RawBoundarySiteFailure {
                     caller: tcx.def_path_str(fact.caller.to_def_id()),
@@ -620,6 +654,22 @@ impl RawBoundarySiteFacts {
                         &callee_key,
                         argument.span,
                     );
+                    let frame_confined_outputs = call
+                        .args
+                        .iter()
+                        .filter(|sibling| sibling.index != argument.index)
+                        .filter(|sibling| {
+                            sibling.direct_storage.is_some_and(|(local, _)| {
+                                super::binn_counted::frame_confined(
+                                    tcx,
+                                    call.caller,
+                                    local,
+                                    call.span,
+                                )
+                            })
+                        })
+                        .map(|sibling| sibling.index)
+                        .collect::<Vec<_>>();
                     match select_unique_site(&callee_key, &candidates) {
                         Ok((block, statement_index)) => out.sites.push(RawBoundarySiteFact {
                             key: RawBoundarySiteKey {
@@ -659,6 +709,18 @@ impl RawBoundarySiteFacts {
                             adapter_operand_mutability: argument.adapter_operand_mutability,
                             callee_may_yield_pointer: unique_candidate(&callee_key, &candidates)
                                 .is_none_or(|site| site.may_yield_pointer),
+                            frame_confined_outputs: frame_confined_outputs.clone(),
+                            descendants_frame_confined: {
+                                let signature = tcx.fn_sig(callee).skip_binder().skip_binder();
+                                !may_carry_pointer(tcx, signature.output(), CARRIER_WALK_DEPTH)
+                                    && signature.inputs().iter().enumerate().all(
+                                        |(index, input)| {
+                                            index == argument.index
+                                                || !output_storage_pointee(tcx, *input)
+                                                || frame_confined_outputs.contains(&index)
+                                        },
+                                    )
+                            },
                         }),
                         Err(reason) => out.failures.push(RawBoundarySiteFailure {
                             caller: tcx.def_path_str(call.caller.to_def_id()),
@@ -1564,6 +1626,93 @@ fn evaluate_retention(
 }
 
 impl RetentionSummaries {
+    /// wave-6v2 (R406-6): the parameter's retention when EVERY positive sink
+    /// is a store through an output parameter of the callee itself (`store _s
+    /// through _p`): the output-parameter indices those sinks name, and the
+    /// verdict the parameter would carry with those sinks discharged — no
+    /// retention when the body is otherwise clean, attested and every local
+    /// dependency is no-retain; otherwise the first residual unknown (the
+    /// existing waiver path); `None` for any other positive sink, including
+    /// one reached through a dependency. A caller whose operands at those
+    /// positions are frame-confined locals discharges the sinks: the stored
+    /// pointer lives exactly as long as the caller's frame.
+    pub(crate) fn output_storage_discharge(
+        &self,
+        callee: LocalDefId,
+        argument_index: usize,
+    ) -> Option<(Vec<usize>, RetentionVerdict)> {
+        let facts = self.facts.get(&(callee, argument_index))?;
+        if facts.retains.is_empty()
+            || facts
+                .retains
+                .iter()
+                .any(|step| step.kind != RetentionEventKind::OutputStorage)
+        {
+            return None;
+        }
+        let mut parameters = Vec::new();
+        for step in &facts.retains {
+            let local = step
+                .detail
+                .rsplit("through _")
+                .next()?
+                .parse::<usize>()
+                .ok()?;
+            // MIR local `_p` of an argument is 1-based; the position is `p - 1`.
+            parameters.push(local.checked_sub(1)?);
+        }
+        parameters.sort_unstable();
+        parameters.dedup();
+        let residual_unknown = facts
+            .unknowns
+            .iter()
+            .find(|(reason, _)| **reason != RetentionUnknownReason::OutputStorage)
+            .map(|(reason, steps)| (*reason, steps.clone()));
+        let dependency_verdicts = facts
+            .dependencies
+            .iter()
+            .map(|dependency| {
+                (
+                    dependency,
+                    self.rows
+                        .get(&(dependency.callee, dependency.argument_index)),
+                )
+            })
+            .collect::<Vec<_>>();
+        if dependency_verdicts
+            .iter()
+            .any(|(_, verdict)| matches!(verdict, Some(RetentionVerdict::Retains { .. })))
+        {
+            return None;
+        }
+        let residual = if !self.attested {
+            RetentionVerdict::Unknown {
+                reason: RetentionUnknownReason::AttestationAbsent,
+                frontier: facts.steps.clone(),
+            }
+        } else if let Some((reason, frontier)) = residual_unknown {
+            RetentionVerdict::Unknown { reason, frontier }
+        } else if let Some((dependency, _)) = dependency_verdicts
+            .iter()
+            .find(|(_, verdict)| !matches!(verdict, Some(RetentionVerdict::NoRetain { .. })))
+        {
+            RetentionVerdict::Unknown {
+                reason: RetentionUnknownReason::LocalSummaryUnknown,
+                frontier: vec![dependency.step.clone()],
+            }
+        } else {
+            RetentionVerdict::NoRetain {
+                certificate: RetentionCertificate {
+                    function: facts.function_path.clone(),
+                    argument_index,
+                    steps: facts.steps.clone(),
+                    attestation: "stack-storage-certificate",
+                },
+            }
+        };
+        Some((parameters, residual))
+    }
+
     pub(crate) fn derive(
         program: &RustProgram<'_>,
         origins: Option<&OriginSummaries>,
@@ -1959,6 +2108,15 @@ pub(crate) enum BridgeTemplate {
     OptRefMutToVoidMut,
     OptRefToVoidConst,
     OptRefToVoidMut,
+    /// Wave-6v2 (R406-6). A delivered BYTE VIEW — a counted `&[u8]` /
+    /// `Option<&[u8]>` — reaching a `c_void` position: the slice's raw view
+    /// carries its whole extent (K19'), the pointee is erased in the `Some`
+    /// arm, `None` stays null, and a shared view at a `*mut` position needs
+    /// the negative-write evidence the typed twin (`SliceToRawMut`) needs.
+    VoidFromSliceCastMut,
+    OptSliceMutToVoidMut,
+    OptSliceToVoidConst,
+    OptSliceToVoidMut,
     BoxBorrowViewToRaw,
     KnownFreeDrop,
 }
@@ -1969,6 +2127,7 @@ impl BridgeTemplate {
             Self::Depth2NpoConst | Self::Depth2NpoMut => "depth2-npo-bridge",
             Self::VoidFromMut | Self::VoidFromRef | Self::VoidFromMutAsConst => "void-generic-raw",
             Self::VoidFromSlice | Self::VoidFromSliceMut => "void-generic-raw-slice",
+            Self::VoidFromSliceCastMut => "shared-slice-to-mut-void",
             Self::VoidFromRefCastMut => "shared-ref-to-mut-raw",
             Self::RawCastMut => "raw-cast-mut",
             Self::RawCastConst => "raw-cast-const",
@@ -1992,7 +2151,10 @@ impl BridgeTemplate {
             | Self::OptSliceToRawMut
             | Self::OptRefMutToVoidMut
             | Self::OptRefToVoidConst
-            | Self::OptRefToVoidMut => "option-to-raw-null-map",
+            | Self::OptRefToVoidMut
+            | Self::OptSliceMutToVoidMut
+            | Self::OptSliceToVoidConst
+            | Self::OptSliceToVoidMut => "option-to-raw-null-map",
             Self::OptRefMutToWritableRawConst | Self::OptSliceMutToWritableRawConst => {
                 "returned-child-option-mut-to-raw-const"
             }
@@ -2046,8 +2208,14 @@ impl BridgeTemplate {
             | Self::VoidFromRefCastMut
             | Self::VoidFromMutAsConst
             | Self::VoidFromSlice
-            | Self::VoidFromSliceMut => {
+            | Self::VoidFromSliceMut
+            | Self::VoidFromSliceCastMut => {
                 let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                if self == Self::VoidFromSliceCastMut {
+                    return Ok(BridgeRender::Edit(format!(
+                        "{argument}.as_ptr().cast::<{pointee}>().cast_mut()"
+                    )));
+                }
                 let source = match self {
                     Self::VoidFromMut => format!("core::ptr::from_mut({argument})"),
                     Self::VoidFromRef => format!("core::ptr::from_ref({argument})"),
@@ -2197,6 +2365,24 @@ impl BridgeTemplate {
                 let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
                 Ok(BridgeRender::Edit(format!(
                     "{argument}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |value| core::ptr::from_ref(value).cast::<{pointee}>().cast_mut())"
+                )))
+            }
+            Self::OptSliceMutToVoidMut => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_mut_ptr().cast::<{pointee}>())"
+                )))
+            }
+            Self::OptSliceToVoidConst => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref().map_or(core::ptr::null::<{pointee}>(), |slice| slice.as_ptr().cast::<{pointee}>())"
+                )))
+            }
+            Self::OptSliceToVoidMut => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_ptr().cast::<{pointee}>().cast_mut())"
                 )))
             }
             Self::BoxBorrowViewToRaw if box_slice => {
@@ -2621,6 +2807,14 @@ pub(crate) fn template_for(
             // (`RefSharedToRawMut`, `SliceToRawMut`, `VoidFromRefCastMut`)
             // carry that same open obligation already; widening it to a new
             // cell is the seat's call, not this arm's.
+            // Wave-6v2 (R406-6): the void twin of `SliceToRawMut` — a shared
+            // byte view at a `*mut c_void` position under negative-write
+            // evidence. The descendant question is asked upstream at every
+            // `*mut` target since R283-3 (`returned_child_permission`), the
+            // same way it is for the typed twin.
+            Decision::Slice { mutable: false, .. } if has_negative_write_evidence => {
+                Ok(BridgeTemplate::VoidFromSliceCastMut)
+            }
             Decision::Slice { mutable: false, .. } => Err(RawBoundaryBlockReason::SharedToMut),
             // Wave-6o: the thin optional cells, mirroring the typed `Opt`
             // arm below with the pointee erased inside the `Some` arm.
@@ -2638,8 +2832,24 @@ pub(crate) fn template_for(
                 ..
             } if has_negative_write_evidence => Ok(BridgeTemplate::OptRefToVoidMut),
             Decision::Opt { slice: false, .. } => Err(RawBoundaryBlockReason::SharedToMut),
-            Decision::Opt { slice: true, .. }
-            | Decision::Box(_)
+            // Wave-6v2 (R406-6): the optional byte-view cells.
+            Decision::Opt {
+                mutable: true,
+                slice: true,
+                ..
+            } if target.mutability == RawMutability::Mut => {
+                Ok(BridgeTemplate::OptSliceMutToVoidMut)
+            }
+            Decision::Opt { slice: true, .. } if target.mutability == RawMutability::Const => {
+                Ok(BridgeTemplate::OptSliceToVoidConst)
+            }
+            Decision::Opt {
+                mutable: false,
+                slice: true,
+                ..
+            } if has_negative_write_evidence => Ok(BridgeTemplate::OptSliceToVoidMut),
+            Decision::Opt { slice: true, .. } => Err(RawBoundaryBlockReason::SharedToMut),
+            Decision::Box(_)
             | Decision::NestedSlice { .. }
             | Decision::Cursor { .. }
             | Decision::Degraded(_) => Err(RawBoundaryBlockReason::TemplateUnavailable),
@@ -3156,6 +3366,9 @@ impl RawBoundaryDispositionIndex {
                                     retention.pointee_pointer_free(callee, site.key.argument_index)
                                 }),
                             )
+                            // wave-6v2 (R406-6): no descendant can reach the
+                            // caller except through frame-confined storage.
+                            && !site.descendants_frame_confined
                         {
                             // **R283-3 widened this arm to `*mut` positions.**
                             // It used to run only at `*const` targets, so a
@@ -3215,10 +3428,47 @@ impl RawBoundaryDispositionIndex {
                             }
                             Ok(RawBoundaryDisposition::T1 { template, evidence })
                         }
-                        RetentionVerdict::Retains { sink, .. } => Err((
-                            RawBoundaryBlockReason::PositiveRetention,
-                            format!("{sink:?}"),
-                        )),
+                        RetentionVerdict::Retains { sink, .. } => {
+                            // wave-6v2 (R406-6): retention into caller-owned
+                            // stack storage that never escapes the caller is
+                            // discharged — the referent dies with the caller's
+                            // frame — and the parameter takes the verdict it
+                            // would carry without those sinks: T1 when the
+                            // rest is clean, the waiver path when the rest is
+                            // unknown.
+                            let discharged = site.callee_local.and_then(|callee| {
+                                retention
+                                    .output_storage_discharge(callee, site.key.argument_index)
+                                    .filter(|(outputs, _)| {
+                                        outputs.iter().all(|index| {
+                                            site.frame_confined_outputs.contains(index)
+                                        })
+                                    })
+                            });
+                            match discharged {
+                                Some((outputs, RetentionVerdict::NoRetain { .. })) => {
+                                    evidence = format!(
+                                        "{evidence};stack-storage-certificate:outputs={outputs:?}"
+                                    );
+                                    Ok(RawBoundaryDisposition::T1 { template, evidence })
+                                }
+                                Some((outputs, RetentionVerdict::Unknown { reason, .. })) => {
+                                    evidence = format!(
+                                        "{evidence};stack-storage-certificate:outputs={outputs:?}"
+                                    );
+                                    Ok(RawBoundaryDisposition::T2 {
+                                        template,
+                                        reason,
+                                        waiver_id: RAW_BOUNDARY_WAIVER_ID,
+                                        evidence,
+                                    })
+                                }
+                                Some((_, RetentionVerdict::Retains { .. })) | None => Err((
+                                    RawBoundaryBlockReason::PositiveRetention,
+                                    format!("{sink:?}"),
+                                )),
+                            }
+                        }
                         RetentionVerdict::Unknown { reason, .. } => {
                             Ok(RawBoundaryDisposition::T2 {
                                 template,

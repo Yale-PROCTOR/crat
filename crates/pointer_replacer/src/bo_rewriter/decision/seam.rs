@@ -5135,9 +5135,14 @@ pub(crate) fn synthesize_with_raw_boundary(
     }
     for (key, disposition, site) in raw_boundary.emission_sites() {
         let Some(template) = disposition.template() else {
+            // A delivered counted byte view (wave-6v2) converts after the
+            // co-conversion gate ran, so a blocked outbound site on it is
+            // registered here as a dropped class site — the class withdraws —
+            // rather than left without a bridge (an ill-typed tree).
             if let super::raw_boundary::RawBoundaryDisposition::Blocked { reason, .. } = disposition
-                && site.target.depth2.is_some()
                 && let Some((owner_did, node)) = site.node
+                && (site.target.depth2.is_some()
+                    || table.counted_void.contains_key(&(owner_did, node)))
                 && decision_of
                     .get(&(owner_did, node))
                     .is_some_and(|decision| !matches!(decision, Decision::Degraded(_)))
