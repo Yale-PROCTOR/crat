@@ -3557,7 +3557,8 @@ pub(crate) fn build_a5_raw_view(
             | "addr-of-mut"
             | "addr-of-cast"
             | "addr-of-mut-cast"
-    ) {
+    ) && !super::raw_boundary::a5_raw_expr_view_admits(source_shape, argument)
+    {
         return Err(SeamBlock::A5RawViewUnavailable);
     }
     let target = target.ok_or(SeamBlock::A5RawViewUnavailable)?;

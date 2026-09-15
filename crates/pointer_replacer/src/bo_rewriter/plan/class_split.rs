@@ -150,6 +150,7 @@ pub(crate) mod fixture {
     pub(crate) struct Receipts {
         pub(crate) subjects: String,
         pub(crate) arm_outcomes: String,
+        pub(crate) class_collisions: String,
         pub(crate) emitted: String,
     }
 
@@ -188,10 +189,19 @@ pub(crate) mod fixture {
             .emitted_files
             .as_ref()
             .and_then(|files| files.values().next().cloned())
-            .unwrap_or_else(|| panic!("fixture delivers no tree: {}", capture.escalation));
+            .unwrap_or_else(|| {
+                panic!(
+                    "fixture delivers no tree: {}\nsubjects:\n{}\narms:\n{}\nreverts: {:#?}",
+                    capture.escalation,
+                    capture.subject_receipt,
+                    capture.raw_boundary_artifacts.arm_outcomes,
+                    capture.reverts
+                )
+            });
         Receipts {
             subjects: capture.subject_receipt,
             arm_outcomes: capture.raw_boundary_artifacts.arm_outcomes,
+            class_collisions: capture.raw_boundary_artifacts.class_collisions,
             emitted,
         }
     }
@@ -342,6 +352,132 @@ pub unsafe fn caller(q: *mut i32, r: *mut i32) {
                 .starts_with("terminal-not-applied:blocked-subject:"),
             "{}",
             got.subjects
+        );
+    }
+
+    /// **Bucket (b).** brotli `BrotliFree(m, p)` called from
+    /// `CleanupZopfliCostModel` as `BrotliFree(m, (*self_0).literal_costs_ as
+    /// *mut c_void)`: `m` settles `&mut MemoryManager`; `p` is a void pointee
+    /// (raw); the cast argument through the raw `self_0` is blind to borrowck,
+    /// so the A5 machinery gives `p`'s position the raw-view role — and
+    /// refused it because the argument is a `raw-expr`, holding the class
+    /// (`dropped-site:a5-raw-view-template-unavailable`; batch 6
+    /// `BrotliFree::m#1`). The caller's `m` is model-Raw and `self_0` a
+    /// reference, as the corpus's `CleanupZopfliCostModel` has them. The
+    /// view of a pure raw expression is the expression itself, hoisted.
+    const BROTLI_FREE_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+#[repr(C)]
+pub struct MemoryManager {
+    pub opaque: *mut core::ffi::c_void,
+    pub free_func: Option<unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void)>,
+}
+#[repr(C)]
+pub struct CostModel { pub literal_costs_: *mut f32 }
+pub unsafe fn brotli_free(m: *mut MemoryManager, p: *mut core::ffi::c_void) {
+    ((*m).free_func).expect("non-null function pointer")((*m).opaque, p);
+}
+pub unsafe fn cleanup(m: *mut MemoryManager, self_0: *mut CostModel) {
+    *(m as *mut u8) = 0;
+    brotli_free(m, (*self_0).literal_costs_ as *mut core::ffi::c_void);
+    (*self_0).literal_costs_ = 0 as *mut f32;
+}
+"#;
+
+    /// The A5 seam path now renders the view; the row's NEXT wall is the
+    /// cross-class interval collision between the callee-owned raw-view call
+    /// rewrite and the caller class's own edit inside the same call (the
+    /// caller's `self_0` converts) — wave-5d's collision composition. Asserted
+    /// as measured: the template hold is gone, the collision hold is what
+    /// remains. (Rule inert → the exclusion is the template hold again; that
+    /// is fault F5.)
+    #[test]
+    fn a_pure_raw_expression_argument_takes_the_a5_passthrough_view() {
+        let got = run(BROTLI_FREE_SHAPE);
+        let exclusion = column(&got.subjects, "brotli_free::m#1", "exclusion");
+        assert!(
+            !exclusion.contains("a5-raw-view-template-unavailable"),
+            "the raw-expression view renders:\n{}",
+            got.subjects
+        );
+        assert_eq!(
+            exclusion, "terminal-not-applied:cross-class-interval-collision",
+            "the next wall is the collision composition (wave-5d):\n{}",
+            got.subjects
+        );
+    }
+
+    /// **Bucket (b), the delivering shape — a CONTROL of the pair path.** lodepng `lodepng_info_copy(dest,
+    /// source)` calls `lodepng_assign_icc(dest, (*source).iccp_name,
+    /// (*source).iccp_profile, size)`: `dest` and `source` are model-Raw in
+    /// the caller (`kind-raw`), `info` settles `&mut Info` in the callee, and
+    /// the `(*source).…` field reads at the raw positions are raw
+    /// expressions whose roots may alias `dest` — the A5 machinery makes
+    /// `info` the primary and the field reads raw views, and refused them as
+    /// `raw-expr`. Batch 6: `lodepng_assign_icc::info#1` = `dropped-site:
+    /// a5-raw-view-template-unavailable`. With a raw caller there is no
+    /// caller-class edit inside the call, so the hoisted views compose and
+    /// `info` delivers. In the small crate `name` is a co-conversion NODE, so the
+    /// view goes through the PAIR path (`pair_raw_view_expression`, which
+    /// already passes a raw expression through) rather than the A5 seam path
+    /// the corpus row took — measured: this test is GREEN with the admission
+    /// inert. It is kept as the rendering control for the hoisted-field-read
+    /// shape; the corpus row's own path is witnessed by the BrotliFree shape.
+    /// (The corpus's third pointer, `profile`, is left out:
+    /// it is degraded early there — `held:local-callee-access-extent` — while
+    /// in a small crate it settles `&u8` and the LATE A5 reclassification to
+    /// a raw view leaves its planned body adapter `core::ptr::from_ref(profile)`
+    /// in place, `E0308`, function revert — a pre-existing defect of the late
+    /// reclassification path, recorded in report 002, not this rule's.)
+    const LODEPNG_ASSIGN_ICC_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+#[repr(C)]
+pub struct Info {
+    pub iccp_defined: u32,
+    pub iccp_name: *mut i8,
+    pub iccp_profile: *mut u8,
+    pub iccp_profile_size: u32,
+}
+extern "C" {
+    fn lodepng_malloc(n: usize) -> *mut core::ffi::c_void;
+    fn alloc_string(s: *const i8) -> *mut i8;
+}
+pub unsafe fn assign_icc(info: *mut Info, name: *const i8, size: u32) -> u32 {
+    if size == 0 { return 100; }
+    (*info).iccp_name = alloc_string(name);
+    (*info).iccp_profile = lodepng_malloc(size as usize) as *mut u8;
+    if (*info).iccp_name.is_null() || (*info).iccp_profile.is_null() { return 83; }
+    (*info).iccp_profile_size = size;
+    0
+}
+pub unsafe fn info_copy(dest: *mut Info, source: *mut Info) -> u32 {
+    *(dest as *mut u8) = 0;
+    *(source as *mut u8) = 0;
+    if (*source).iccp_defined != 0 {
+        let e = assign_icc(dest, (*source).iccp_name, (*source).iccp_profile_size);
+        if e != 0 { return e; }
+    }
+    0
+}
+"#;
+
+    #[test]
+    fn a_hoisted_field_read_view_with_a_raw_caller_delivers_the_primary() {
+        let got = run(LODEPNG_ASSIGN_ICC_SHAPE);
+        assert_eq!(
+            column(&got.subjects, "assign_icc::info#1", "exclusion"),
+            "-",
+            "{}",
+            got.subjects
+        );
+        assert_eq!(column(&got.subjects, "assign_icc::info#1", "placed"), "1");
+        let text = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("info: &mut Info"), "{}", got.emitted);
+        assert!(
+            text.contains("= (*source).iccp_name;")
+                && (text.contains("__crat_a5_raw_") || text.contains("__crat_pair_raw_")),
+            "the raw field read is hoisted verbatim into the call snapshot:\n{}",
+            got.emitted
         );
     }
 

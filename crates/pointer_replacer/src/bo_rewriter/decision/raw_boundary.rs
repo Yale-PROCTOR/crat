@@ -309,6 +309,124 @@ pub(crate) fn raw_target_type(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<RawTargetTy
     })
 }
 
+/// **wave-5d2 (b) — an A5 raw view of a raw-pointer EXPRESSION.**
+///
+/// The A5 fallback hoists a raw-view argument into the call's snapshot
+/// (`let __crat_a5_raw_N: *T = <view>;` before the call). For a bare local or
+/// an address-of the hoisted value is the binding itself; a `raw-expr`
+/// argument (`buf.as_ptr()`, `(*s).field`, `(*s).field as *mut c_void`) is
+/// already the raw value the callee's position takes, so the view is the
+/// expression verbatim — the seam's existing `raw-passthrough` template.
+///
+/// Hoisting evaluates the expression BEFORE the arguments to its left, so the
+/// expression must be free of effects: a syntactic allow-list of place reads,
+/// projections, dereferences, casts, arithmetic and the pointer / slice
+/// methods that only compute an address. Any other call, an assignment, a
+/// block, a closure, `|` / `&&` (closures and short-circuits) or `?` refuses (the site keeps its typed hold). Every one
+/// of the batch-6 sites this admits (65 in brotli / lodepng) is of the shape
+/// `X.as_ptr()`, `(*s).f`, `(*s).f as *mut c_void` or `((*s).arr).as_mut_ptr()`.
+pub(crate) fn a5_raw_expr_view_admits(source_shape: &str, argument: &str) -> bool {
+    const ADDRESS_METHODS: [&str; 11] = [
+        "as_ptr",
+        "as_mut_ptr",
+        "offset",
+        "add",
+        "sub",
+        "wrapping_add",
+        "wrapping_sub",
+        "cast",
+        "cast_mut",
+        "cast_const",
+        "len",
+    ];
+    if source_shape != "raw-expr" {
+        return false;
+    }
+    let text = argument.trim();
+    if text.is_empty()
+        || text.contains(['{', '}', ';', '?', '|'])
+        || text.contains("=>")
+        || text.contains("&&")
+    {
+        return false;
+    }
+    // `=` outside `==` / `!=` / `<=` / `>=` is an assignment.
+    let bytes = text.as_bytes();
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte != b'=' {
+            continue;
+        }
+        let previous = index.checked_sub(1).map(|i| bytes[i]);
+        let next = bytes.get(index + 1).copied();
+        if !matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) && next != Some(b'=') {
+            return false;
+        }
+    }
+    // Every call is a method call from the allow-list.
+    let mut identifier_start = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if ch.is_alphanumeric() || ch == '_' {
+            identifier_start.get_or_insert(index);
+            continue;
+        }
+        if let Some(start) = identifier_start.take() {
+            let name = &text[start..index];
+            let rest = text[index..].trim_start();
+            if rest.starts_with('(') {
+                let before = text[..start].trim_end();
+                let is_method = before.ends_with('.');
+                if !is_method || !ADDRESS_METHODS.contains(&name) {
+                    return false;
+                }
+            }
+        }
+    }
+    // A trailing identifier is a place read, never a call.
+    true
+}
+
+#[cfg(test)]
+mod a5_raw_expr_view_tests {
+    use super::a5_raw_expr_view_admits;
+
+    #[test]
+    fn the_batch6_shapes_are_admitted() {
+        for text in [
+            "dist_bits.as_ptr()",
+            "histogram.as_ptr()",
+            "(*self_0).block_lengths_",
+            "(*self_0).literal_costs_ as *mut libc::c_void",
+            "((*h).code_length_histo).as_mut_ptr()",
+            "(posdata.distance_cache).as_mut_ptr()",
+            "p.offset(i as isize)",
+            "(*source).iccp_profile",
+        ] {
+            assert!(a5_raw_expr_view_admits("raw-expr", text), "{text}");
+        }
+    }
+
+    #[test]
+    fn effects_and_other_shapes_are_refused() {
+        for text in [
+            "next_line(fp)",
+            "(*m).free_func.expect(\"non-null\")(p)",
+            "q.unwrap()",
+            "{ let t = p; t }",
+            "p = q",
+            "|x| x",
+            "f()?",
+            "",
+        ] {
+            assert!(!a5_raw_expr_view_admits("raw-expr", text), "{text}");
+        }
+        assert!(!a5_raw_expr_view_admits("bare-local", "p"));
+        assert!(!a5_raw_expr_view_admits("cast", "p as *mut u8"));
+        // Comparisons are not assignments.
+        assert!(a5_raw_expr_view_admits("raw-expr", "(*s).a == (*s).b"));
+    }
+}
+
 /// Render the already-selected same-object PAIR raw-view role.
 ///
 /// This is intentionally distinct from [`template_for`]: PAIR has already
