@@ -192,6 +192,42 @@ pub(crate) fn promote(
             };
         }
     }
+    // A caller's whole-cursor argument admits only once its local callee's
+    // parameter is a cursor; that is decided in the same pass, so a boundary
+    // hold is re-planned against the committed entries, to a bounded fixpoint.
+    for _round in 0..4 {
+        let retry = receipts
+            .iter()
+            .enumerate()
+            .filter(|(_, receipt)| receipt.disposition == Err(CursorHold::RawBoundaryUnbuilt))
+            .filter_map(|(slot, receipt)| {
+                entries
+                    .iter()
+                    .position(|(subject, _)| {
+                        subject.fn_did == receipt.owner && subject.hir_id == receipt.hir_id
+                    })
+                    .map(|index| (slot, index))
+            })
+            .collect::<Vec<_>>();
+        let mut progressed = false;
+        for (slot, index) in retry {
+            let (subject, decision) = &entries[index];
+            let Some(Ok(plan)) = wrapper::plan(ctx, subject, decision, entries) else {
+                continue;
+            };
+            let prior = decision.clone();
+            receipts[slot].disposition = Ok(());
+            committed.push((index, slot, prior));
+            entries[index].1 = Decision::Cursor {
+                mutable: entries[index].0.mutable,
+                plan,
+            };
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
     compose_nested_uses(ctx, entries, &committed, &mut receipts);
     receipts
 }

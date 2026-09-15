@@ -12148,7 +12148,7 @@ fn c_n2_seed_without_settled_signature_subject_has_no_pointless_wrapper() {
     let fixture = Fixture::new(&[(
         "lib.rs",
         "#![allow(dead_code, unused_unsafe)]\n\
-         pub unsafe extern \"C\" fn api(p: *const i32) -> *const i32 { p.offset(-1) }\n",
+         pub unsafe extern \"C\" fn api(p: *const i32) -> *const i32 { p.offset(-1) as *const i32 }\n",
     )]);
     let original = std::fs::read_to_string(fixture.root()).unwrap();
     let decisions = decisions_of(&original);
@@ -12158,7 +12158,8 @@ fn c_n2_seed_without_settled_signature_subject_has_no_pointless_wrapper() {
     // (`*p.offset(-1)`), and this fixture RETURNS the offset instead of
     // dereferencing it, so the subject settles as a cursor use. Both reasons
     // are degradations, so either establishes this fixture's actual premise —
-    // the subject has no admitted signature — and the purpose assertions below
+    // the subject has no admitted signature (the cast keeps the returned
+    // pointer off the slicecursor lane's raw-return bridge, relay 005) — and the purpose assertions below
     // are unchanged.
     assert_eq!(
         reason_of(&decisions, "p", true),

@@ -372,12 +372,68 @@ struct Uses<'a, 'tcx> {
     base: Option<hir::HirId>,
     optional: bool,
     exclusive_base: bool,
+    tail: Option<hir::HirId>,
     bridges: Vec<super::CursorBridge>,
     edits: Vec<UseEdit>,
     hirs: Vec<hir::HirId>,
     hold: Option<CursorHold>,
 }
 impl Uses<'_, '_> {
+    /// A derived pointer leaving the function through its raw return: the tail
+    /// view's address under the raw-boundary T2 receipt (retained by the caller).
+    /// The seam planner owns a return that is lifetime-planned; a return permit
+    /// on this subject leaves the site to it.
+    fn raw_return(&mut self, value: &hir::Expr<'_>) {
+        let owner = self.subject.fn_did;
+        let output = self
+            .ctx
+            .tcx
+            .fn_sig(owner)
+            .skip_binder()
+            .skip_binder()
+            .output();
+        let ty::RawPtr(_, output_mutability) = *output.kind() else {
+            self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
+            return;
+        };
+        if self.optional
+            || self.ctx.lifetime_eligibility.is_some_and(|eligibility| {
+                eligibility
+                    .return_permit((owner, self.subject.hir_id))
+                    .is_some()
+            })
+        {
+            self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
+            return;
+        }
+        let method = match (self.subject.mutable, output_mutability) {
+            (true, _) => "as_mut_ptr",
+            (false, ty::Mutability::Not) => "as_ptr",
+            (false, ty::Mutability::Mut) => {
+                self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
+                return;
+            }
+        };
+        match self.index(value) {
+            Ok(d) if local(value) == Some(self.subject.hir_id) => {
+                self.push(
+                    value,
+                    format!("{}.{method}()", self.name),
+                    "raw-op-cursor-return",
+                );
+                let _ = d;
+            }
+            Ok(d) => self.push(
+                value,
+                format!("{}.offset_by({d}).{method}()", self.name),
+                "raw-op-cursor-return",
+            ),
+            Err(hold) => {
+                self.hold.get_or_insert(hold);
+            }
+        }
+    }
+
     fn view(&self) -> String {
         if self.optional {
             format!(
@@ -517,6 +573,18 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             }
             return;
         }
+        if let hir::ExprKind::Ret(Some(value)) = e.kind
+            && source_binding(self.ctx.tcx, self.subject.fn_did, value) == Some(self.subject.hir_id)
+        {
+            self.raw_return(value);
+            return;
+        }
+        if Some(e.hir_id) == self.tail
+            && source_binding(self.ctx.tcx, self.subject.fn_did, e) == Some(self.subject.hir_id)
+        {
+            self.raw_return(e);
+            return;
+        }
         // Only a deref whose pointer chain is rooted at this subject is this
         // subject's element; an enclosing deref of another pointer that merely
         // carries the subject inside its offset operand is walked instead.
@@ -580,7 +648,13 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                         }) {
                             self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
                         }
-                    } else if target.and_then(|(_, d)| slice_mutability(d)).is_some() {
+                    } else if !self.optional
+                        && target
+                            .and_then(|(_, d)| {
+                                slice_mutability(d).or_else(|| cursor_parameter_mutability(d))
+                            })
+                            .is_some()
+                    {
                         self.push(
                             arg,
                             format!(
@@ -725,6 +799,13 @@ fn build(
         base: b.binding,
         optional,
         exclusive_base: subject.mutable || b.fallback,
+        tail: {
+            let body = ctx.tcx.hir_body_owned_by(subject.fn_did);
+            match body.value.kind {
+                hir::ExprKind::Block(block, _) => block.expr.map(|e| e.hir_id),
+                _ => Some(body.value.hir_id),
+            }
+        },
         bridges: vec![],
         edits: vec![],
         hirs: vec![],
@@ -813,6 +894,23 @@ fn slice_mutability(decision: &Decision) -> Option<bool> {
         Decision::Cursor { .. }
         | Decision::Ref { .. }
         | Decision::InferredRef { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::NestedSlice { .. }
+        | Decision::Degraded(_) => None,
+    }
+}
+/// A local callee's parameter that is itself a wrapper cursor is a slice at
+/// its safe body (`parameter_form`); the caller hands it the tail view.
+fn cursor_parameter_mutability(decision: &Decision) -> Option<bool> {
+    match decision {
+        Decision::Cursor { mutable, plan } if plan.wrapper && plan.parameter && !plan.optional => {
+            Some(*mutable)
+        }
+        Decision::Cursor { .. }
+        | Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
         | Decision::Opt { .. }
         | Decision::Box(_)
         | Decision::NestedSlice { .. }

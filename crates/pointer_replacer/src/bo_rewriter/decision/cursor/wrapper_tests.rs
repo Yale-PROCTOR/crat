@@ -568,3 +568,88 @@ pub unsafe fn sort(fmap: *mut u32, eclass: *const u32, lo: i32, hi: i32) {
         ),
     );
 }
+
+#[test]
+fn slicecursor_returned_derived_pointer_takes_raw_return_bridge() {
+    // json.h `json_write_minified_value`: the function keeps its raw return and
+    // returns `data.offset(k)` from a bidirectional cursor parameter.
+    let input = r#"
+pub unsafe fn write_value(kind: i32, data: *mut i8, k: isize) -> *mut i8 {
+    if kind == 1 {
+        *data.offset(0) = 110;
+        *data.offset(1) = 117;
+        return data.offset(2);
+    }
+    let peeked = *data.offset(k);
+    *data.offset(0) = peeked;
+    data.offset(1)
+}
+"#;
+    let source = emitted(input);
+    save_fixture("returned-derived-pointer", input, &source);
+    assert!(
+        source.contains("slice_cursor::SliceCursorMut"),
+        "wrapper absent: {source}"
+    );
+    assert!(
+        source.contains(".as_mut_ptr()"),
+        "raw return bridge absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let mut b = [7i8, 7, 7, 7, 9, 7, 7, 7]; let base = b.as_mut_ptr(); let r = unsafe { write_value(1, &mut b[2..], 0) }; assert_eq!(r, unsafe { base.add(4) }); assert_eq!(&b[2..4], &[110, 117]); let r = unsafe { write_value(0, &mut b[2..], 2) }; assert_eq!(r, unsafe { base.add(3) }); assert_eq!(b[2], 9); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_whole_cursor_to_local_cursor_parameter() {
+    // A cursor passed whole to a local callee whose parameter is itself a
+    // wrapper cursor takes the callee's slice form at the seam.
+    let input = r#"
+pub unsafe fn inner(p: *mut i8, k: isize) -> *mut i8 {
+    let peeked = *p.offset(k);
+    *p.offset(0) = peeked;
+    p.offset(1)
+}
+pub unsafe fn outer(data: *mut i8, flag: i32, k: isize) -> *mut i8 {
+    if flag != 0 {
+        return inner(data, k);
+    }
+    *data.offset(0) = *data.offset(k) + 1;
+    data.offset(1)
+}
+"#;
+    let source = emitted(input);
+    save_fixture("whole-cursor-to-local-cursor-parameter", input, &source);
+    assert!(
+        source.contains("data.as_slice_mut()"),
+        "cursor-to-cursor seam absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let mut b = [1i8, 2, 3, 4]; let base = b.as_mut_ptr(); let r = unsafe { outer(&mut b[1..], 1, 2) }; assert_eq!(r, unsafe { base.add(2) }); assert_eq!(b, [1, 4, 3, 4]); let r = unsafe { outer(&mut b[2..], 0, 1) }; assert_eq!(r, unsafe { base.add(3) }); assert_eq!(b, [1, 4, 5, 4]); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_whole_cursor_to_local_slice_parameter() {
+    // A cursor handed whole to a local callee whose parameter is a plain slice
+    // takes the tail view at the argument (charter §1(d)).
+    let input = "pub unsafe fn sum2(p: *const i8) -> i8 { *p.offset(0) + *p.offset(1) } pub unsafe fn outer(data: *const i8, k: isize) -> i8 { let a = *data.offset(k); a + sum2(data) }";
+    let source = emitted(input);
+    save_fixture("whole-cursor-to-local-slice-parameter", input, &source);
+    assert!(
+        source.contains("sum2(data.as_slice())"),
+        "cursor tail view at the slice argument absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let b = [1i8, 2, 3, 4]; assert_eq!(unsafe { outer(&b[1..], 2) }, 4 + 2 + 3); }",
+        ),
+    );
+}

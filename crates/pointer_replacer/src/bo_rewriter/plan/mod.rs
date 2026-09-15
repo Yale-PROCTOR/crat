@@ -2605,6 +2605,7 @@ fn cursor_bridge(
         "cursor-length" => ("usize", form, "retained-base-length"),
         "raw-op-cursor-t1" => ("raw", form, "bare-local"),
         "raw-op-cursor-local" => ("raw", form, "ephemeral-local"),
+        "raw-op-cursor-return" => ("raw", form, "returned-tail"),
         _ => unreachable!("validated cursor operation"),
     };
     let mut bridge = BridgeSitePlan::local(
@@ -2646,6 +2647,13 @@ fn cursor_bridge(
     });
     if boundary.is_some() || local_boundary.is_some() {
         bridge.retention = BridgeRetentionTier::T1;
+    }
+    // The caller retains a returned tail address: retention-unknown, under the
+    // raw-boundary T2 waiver receipt.
+    if kind == "raw-op-cursor-return" {
+        bridge.arm = Arm::Addr.key().to_owned();
+        bridge.retention = BridgeRetentionTier::T2;
+        bridge.waiver_id = Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned());
     }
     bridge
 }
@@ -2738,8 +2746,12 @@ fn cursor_obligations(
             match edit.bridge_kind {
                 "raw-op-cursor-t1" => count == 1 && local_count == 0,
                 "raw-op-cursor-local" => count == 0 && local_count == 1,
-                "cursor-constructor" | "cursor-element" | "cursor-advance" | "cursor-length"
-                | "cursor-address" => count == 0 && local_count == 0,
+                "cursor-constructor"
+                | "cursor-element"
+                | "cursor-advance"
+                | "cursor-length"
+                | "cursor-address"
+                | "raw-op-cursor-return" => count == 0 && local_count == 0,
                 _ => false,
             }
         });
@@ -2811,10 +2823,14 @@ fn cursor_obligations(
                     } else {
                         MechanicalExtent::Evidence(cursor_extent_evidence(cursor))
                     },
-                    retention: if bridge.retention == BridgeRetentionTier::T1 {
-                        MechanicalRetention::T1
-                    } else {
-                        MechanicalRetention::None
+                    retention: match bridge.retention {
+                        BridgeRetentionTier::T1 => MechanicalRetention::T1,
+                        BridgeRetentionTier::T2 => MechanicalRetention::T2 {
+                            waiver_id: bridge.waiver_id.clone().unwrap_or_else(|| {
+                                super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()
+                            }),
+                        },
+                        BridgeRetentionTier::None => MechanicalRetention::None,
                     },
                     ..MechanicalEvidence::default()
                 },

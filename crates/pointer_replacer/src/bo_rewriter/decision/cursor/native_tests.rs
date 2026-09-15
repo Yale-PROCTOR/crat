@@ -299,14 +299,33 @@ fn cursor_preserves_raw_identifier_bindings() {
 }
 
 #[test]
-fn requested_return_keeps_typed_cursor_hold() {
+fn requested_return_takes_raw_return_bridge() {
+    // Expectation migrated (relay 005): a derived pointer returned from a
+    // wrapper cursor takes the tail address under the raw-boundary T2 receipt.
     let input =
         "pub unsafe fn witness(p: *const i32, delta: isize) -> *const i32 { p.offset(delta) }";
-    assert_typed_hold(input, "p");
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+            .unwrap();
+        let Decision::Cursor { plan, .. } = decision else {
+            panic!("returned cursor tail not bridged: {decision:?}")
+        };
+        assert!(
+            plan.uses
+                .iter()
+                .any(|edit| edit.bridge_kind == "raw-op-cursor-return"),
+            "{plan:?}"
+        );
+    })
+    .unwrap();
     let source = emitted(input);
     assert!(
-        source.contains("*const i32"),
-        "unsupported cursor return must hold: {source}"
+        source.contains(".as_ptr()") && source.contains("-> *const i32"),
+        "raw return bridge absent: {source}"
     );
 }
 

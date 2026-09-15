@@ -1643,6 +1643,15 @@ fn glue_with_nonempty(
         (NestedSlice { .. }, _) | (_, NestedSlice { .. }) => {
             return Err(SeamBlock::NestedBoundaryUnbuilt);
         }
+        // A wrapper cursor handed whole to a slice position: the cursor's own
+        // use edit renders its tail view (`as_slice` / `as_slice_mut`) at the
+        // argument, so the seam adds nothing; mutability is still checked.
+        (Slice { mutable: w }, Cursor { mutable: h }) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            None
+        }
         (Cursor { .. }, _) | (_, Cursor { .. }) => return Err(SeamBlock::CursorBoundaryUnbuilt),
         // ---- identities and coercions: no edit ----
         (Ref { mutable: w }, Ref { mutable: h }) => {
