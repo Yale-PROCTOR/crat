@@ -231,6 +231,28 @@ fn r399_heman_gaussian_row_tmp_real_shape_narrowed_nbytes_local() {
     let s = verify(&gaussian_fixture(), "tmp", BoxShape::Slice, false);
     assert!(s.contains("let mut tmp: ::std::boxed::Box<[i32]> = ::std::vec![0i32; (((nbytes as libc::c_ulong) as usize) / ::core::mem::size_of::<i32>())].into_boxed_slice();"), "{s}");
     assert!(s.contains("::std::mem::drop(tmp);"), "{s}");
+    // The census (AST) emission path must annotate the same declarations and
+    // the custody instrument must find them by tree (R402-2(a)).
+    let outcome = super::rewrite_core_injected(
+        ::utils::compilation::str_to_input(&gaussian_fixture()),
+        None,
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
+        true,
+        Some((
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = outcome else { panic!("{outcome:?}") };
+    for owner in ["tmp", "gaussian_row"] {
+        assert!(
+            source.contains(&format!("let mut {owner}: ::std::boxed::Box<[i32]> =")),
+            "{owner}: {source}"
+        );
+    }
 }
 
 #[test]
@@ -699,20 +721,38 @@ pub unsafe extern "C" fn political_3(mut width: libc::c_int, mut ncolors: libc::
 }
 
 #[test]
-fn r402_annotated_binding_has_its_type_replaced_in_place() {
-    // bzip2 spells its owners `let mut v: *mut T = malloc(..)`: the
-    // declared type is replaced, the pattern kept.
+fn r402_annotated_binding_stays_held_without_an_ast_declaration_channel() {
+    // bzip2 spells its owners `let mut v: *mut T = malloc(..)`: the AST
+    // emission has no channel to replace a declared type by a Box type, so
+    // the owner is a typed hold (`native-annotated-binding`).
     let input = format!(
         "{} pub unsafe fn prepare(n: usize) -> u32 {{ let mut buffer: *mut u32 = calloc(4, core::mem::size_of::<u32>()) as *mut u32; *buffer.offset(1) = 9; let value = *buffer.offset(1); free(buffer as *mut core::ffi::c_void); value }}",
         declarations()
     );
-    let s = verify(&input, "buffer", BoxShape::Slice, false);
-    assert!(
-        s.contains(
-            "let mut buffer: ::std::boxed::Box<[u32]> = ::std::vec![0u32; 4].into_boxed_slice();"
-        ),
-        "{s}"
-    );
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, d) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("buffer"))
+            .unwrap();
+        assert!(matches!(d, Decision::Degraded(_)), "{d:?}");
+        assert!(
+            ctx.raw_boundary_artifacts
+                .ownership_native
+                .contains("native-annotated-binding"),
+            "{}",
+            ctx.raw_boundary_artifacts.ownership_native
+        );
+    })
+    .unwrap();
 }
 
 #[test]

@@ -441,6 +441,61 @@ pub(crate) fn raw_lend_argument(
     }
 }
 
+const DECLARATION_TYPE_RECEIPT: &str = "native-box-declaration-type";
+
+/// R402-2(a): register the explicit declaration type of every native Box
+/// owner as a `local` explicit-declaration site, so both emission paths
+/// annotate the binding (`let mut p: ::std::boxed::Box<[T]> = …`).
+pub(crate) fn complete_declarations(
+    table: &super::DecisionTable,
+    plan: &mut super::seam::SeamPlan,
+) {
+    for (subject, decision) in &table.entries {
+        let box_plan = match decision {
+            Decision::Box(plan) => plan,
+            Decision::Degraded(_)
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Opt { .. } => continue,
+        };
+        let Some(emitted_type) = box_plan
+            .receipts
+            .iter()
+            .find_map(|receipt| receipt.strip_prefix(DECLARATION_TYPE_RECEIPT))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if subject.ty_span.is_some() {
+            continue;
+        }
+        let node = (subject.fn_did, subject.hir_id);
+        if plan
+            .explicit_declarations
+            .iter()
+            .any(|site| site.node == Some(node) && site.category == "local")
+        {
+            continue;
+        }
+        plan.explicit_declarations
+            .push(super::seam::ExplicitDeclarationSite {
+                owner_class: crate::bo_rewriter::bridge_receipt::SignatureClassId::of(
+                    subject.fn_did,
+                ),
+                caller: subject.fn_did,
+                node: Some(node),
+                span: Some(subject.binding_span.shrink_to_hi()),
+                category: "local",
+                replacement: Some(format!(": {emitted_type}")),
+                emitted_type: emitted_type.to_owned(),
+                arm: "surface",
+            });
+    }
+}
+
 /// R402-2(b): a `Box` decision the emission stage withdrew — its owner's
 /// signature class held, or its edits unplaceable — is reported DEGRADED with
 /// the withdrawal reason and never expected or counted delivered. Any other
@@ -528,33 +583,18 @@ fn derive_bundle(
     let name = subject.param_name.as_ref().ok_or(NativeHold::Identity)?;
     let mut edits = vec![source.constructor().clone()];
     // R402-2(a): every delivered declaration carries its explicit type. The
-    // source binding is unannotated (`let mut p = malloc(..) as *mut T`), so
-    // the pattern itself is respelled `p: Box<T>` / `p: Box<[T]>`.
+    // type is registered as an explicit local declaration site (the same
+    // channel wave-6k's construction values use), which the text path splices
+    // after the pattern and the AST path places as `local.ty`. An annotated
+    // binding (`let v: *mut T = …`) has no AST channel for a Box type yet and
+    // stays held.
+    if subject.ty_span.is_some() {
+        return Err(NativeHold::Missing("native-annotated-binding"));
+    }
     let payload = match source.shape() {
         BoxShape::Sized => source.element_spelling().to_owned(),
         BoxShape::Slice => format!("[{}]", source.element_spelling()),
     };
-    edits.push(match subject.ty_span {
-        // An annotated binding (`let v: *mut T = …`) keeps its pattern and
-        // has its type replaced in place.
-        Some(ty_span) => BoxExprEdit {
-            span: ty_span,
-            replacement: format!("::std::boxed::Box<{payload}>"),
-            receipt: "native-box-declaration-type",
-        },
-        None => {
-            let binding = tcx
-                .sess
-                .source_map()
-                .span_to_snippet(subject.binding_span)
-                .map_err(|_| NativeHold::Missing("native-binding-spelling"))?;
-            BoxExprEdit {
-                span: subject.binding_span,
-                replacement: format!("{binding}: ::std::boxed::Box<{payload}>"),
-                receipt: "native-box-declaration-type",
-            }
-        }
-    });
     edits.extend_from_slice(source.scalar_edits());
     let mut receipts = vec![format!(
         "native-owning-source owner={} local={} generation=Missing source-root={:?}",
@@ -562,6 +602,9 @@ fn derive_bundle(
         subject.local.as_u32(),
         subject.hir_id
     )];
+    receipts.push(format!(
+        "{DECLARATION_TYPE_RECEIPT} ::std::boxed::Box<{payload}>"
+    ));
     receipts.push(format!("native-box-slice-uses count={} element={} length-unchanged=closed-root-uses source-aliases={:?} indexing=delivered-slice-walker",source.count(),source.element(),source.mir_aliases()));
     receipts.push(format!("native-generated-unwind-permit operations=allocation-helpers-and-slice-bounds-checks all-roots=fresh-local-closed-uses-and-verified-T1 payload={}/nonrecursive; actual-waiver-sites=emitted-MIR-ledger",source.element()));
     let mut formals = Vec::new();
