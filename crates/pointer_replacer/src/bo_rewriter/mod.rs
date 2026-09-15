@@ -108,6 +108,7 @@ mod wave5r_field_borrow;
 mod wave5r_helper_path;
 #[cfg(test)]
 mod wave5r_tests;
+pub(crate) mod wave6r_child_access;
 mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;
 
@@ -8834,7 +8835,7 @@ pub(crate) struct DecideCtx {
     constructions: decision::construction::ConstructionFacts,
     raw_boundary_sites: decision::raw_boundary::RawBoundarySiteFacts,
     retention: decision::raw_boundary::RetentionSummaries,
-    raw_boundary: decision::raw_boundary::RawBoundaryDispositionIndex,
+    pub(crate) raw_boundary: decision::raw_boundary::RawBoundaryDispositionIndex,
     exposure: decision::exposure::ExposurePolicy,
     raw_boundary_artifacts: RawBoundaryArtifacts,
     e2_artifacts: E2Artifacts,

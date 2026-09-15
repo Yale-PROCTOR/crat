@@ -1,0 +1,117 @@
+//! Reduced from brotli PrepareDistanceCacheH65 at checkpoint 2: the shared
+//! root's field address reaches a raw formal whose pointee carries pointer
+//! fields, so the callee "may yield a pointer" by output storage and the
+//! write-through-shared-view hold fires although the callee never lets a
+//! descendant of the argument escape.
+const INPUT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+pub struct H6 { num: i32, extra: *mut u8 }
+pub struct HROLLING { tag: i32, extra: *mut u8 }
+pub struct H65 { ha: H6, hb: HROLLING }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prepare_h6(s: *mut H6, cache: *mut i32) {
+    *cache = (*s).num;
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prepare_hrolling(s: *mut HROLLING, cache: *mut i32) {
+    *cache += (*s).tag;
+}
+pub unsafe fn prepare_h65(s: *mut H65, cache: *mut i32) {
+    prepare_h6(&mut (*s).ha, cache);
+    prepare_hrolling(&mut (*s).hb, cache);
+}
+"#;
+
+#[test]
+fn wave6r_h65_descendant_free_callee_discharges_write_through_shared_view() {
+    let source = super::emitted(INPUT);
+    assert!(source.contains("s: &H65"), "{source}");
+    assert!(
+        source.contains("prepare_h6(core::ptr::from_ref(&(*s).ha).cast_mut()"),
+        "{source}"
+    );
+    assert!(
+        source.contains("prepare_hrolling(core::ptr::from_ref(&(*s).hb).cast_mut()"),
+        "{source}"
+    );
+}
+
+/// The raw-boundary disposition rows of `prepare_h65`'s first argument to
+/// `prepare_h6`, as the census exports them.
+fn h6_arg0_disposition(input: &str) -> String {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = super::super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::super::A5Mode::PreciseReplay,
+                Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        let rows = ctx.raw_boundary.receipts_tsv();
+        println!("DISPOSITIONS\n{rows}");
+        rows.lines()
+            .find(|line| line.starts_with("prepare_h65\t") && line.contains("\tprepare_h6\t0\t"))
+            .expect("the H6 arg0 site is inventoried")
+            .to_owned()
+    })
+    .expect("input type-checks")
+}
+
+fn held(input: &str) {
+    let row = h6_arg0_disposition(input);
+    assert!(
+        row.contains("\tblocked\t")
+            && row.contains("ordinary-argument-permission:write-through-shared-view"),
+        "the hold must stand: {row}"
+    );
+}
+
+#[test]
+fn wave6r_child_access_discharge_is_receipted() {
+    let row = h6_arg0_disposition(INPUT);
+    assert!(row.contains("\tshared-ref-to-mut-raw\t"), "{row}");
+    assert!(!row.contains("write-through-shared-view"), "{row}");
+}
+/// The callee stores the argument itself: the retention row is not NoRetain.
+#[test]
+fn wave6r_child_access_global_store_keeps_hold() {
+    held(
+        &INPUT
+            .replace(
+                "    *cache = (*s).num;\n",
+                "    *cache = (*s).num;\n    KEEP = s;\n",
+            )
+            .replace(
+                "pub struct H65",
+                "pub static mut KEEP: *mut H6 = core::ptr::null_mut();\npub struct H65",
+            ),
+    );
+}
+
+/// A derivation the retention summary does not track — the raw address of a
+/// place under the argument — escapes through a global: the body scan refuses.
+#[test]
+fn wave6r_child_access_raw_address_derivation_keeps_hold() {
+    held(
+        &INPUT
+            .replace(
+                "    *cache = (*s).num;\n",
+                "    *cache = (*s).num;\n    let q = &raw mut (*s).extra;\n    KEEP2 = q;\n",
+            )
+            .replace(
+                "pub struct H65",
+                "pub static mut KEEP2: *mut *mut u8 = core::ptr::null_mut();\npub struct H65",
+            ),
+    );
+}
+
+/// A local callee that retains the argument transitively: the retention row
+/// depends on it and is not NoRetain.
+#[test]
+fn wave6r_child_access_transitive_retaining_callee_keeps_hold() {
+    held(&INPUT.replace(
+        "    *cache = (*s).num;\n",
+        "    *cache = (*s).num;\n    keep(s);\n",
+    ).replace("pub struct H65", "pub static mut KEEP3: *mut H6 = core::ptr::null_mut();\npub unsafe fn keep(p: *mut H6) { KEEP3 = p; }\npub struct H65"));
+}

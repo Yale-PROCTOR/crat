@@ -1594,6 +1594,14 @@ impl RetentionSummaries {
         } else {
             evaluate_retention(&facts, attested)
         };
+        crate::bo_rewriter::wave6r_child_access::discharge(
+            program,
+            &rows,
+            type_backed_children
+                .values_mut()
+                .flatten()
+                .map(|record| &mut record.evidence),
+        );
         Self {
             rows,
             facts,
