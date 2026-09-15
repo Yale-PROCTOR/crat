@@ -138,6 +138,8 @@ pub(crate) fn resolve(
             super::seam::Form::Raw => FormalForm::MutableRaw,
             super::seam::Form::Ref { mutable: true }
             | super::seam::Form::Slice { mutable: true } => FormalForm::MutableReference,
+            super::seam::Form::Ref { mutable: false }
+            | super::seam::Form::Slice { mutable: false } => FormalForm::SharedReference,
             _ => return Err(Hold::Lend(LendHold::Formal)),
         }
     };
@@ -211,7 +213,6 @@ mod tests {
             )
             .unwrap();
             assert_eq!(formal.model_kind(), Kind::Owning);
-            assert_eq!(formal.emitted(), FormalForm::MutableRaw);
             let Some(super::super::raw_boundary::RetentionVerdict::NoRetain { certificate }) =
                 ctx.retention.get(callee, 1)
             else {
@@ -220,10 +221,25 @@ mod tests {
             ctx.retention
                 .verify_certificate(callee, 1, certificate)
                 .unwrap();
-            assert!(matches!(
-                require_nonconsuming(&NativeEffects::derive(&program), &formal),
-                Err(Hold::Lend(LendHold::ConsumingCallee))
-            ));
+            // The invariant: the owner is NEVER lent into a callee that frees
+            // it. Two admissible readings of this chain (R407-9 / R217-2(a)
+            // golden migration): without wave-6a's W6A-C1 the formal stays
+            // raw and the lend arm refuses it as consuming; with W6A-C1 the
+            // formal is a Box parameter (`edt(input, output) { free(output) }`
+            // with `pl2` never used after) and the lend arm refuses it as
+            // owning — the move rule takes over.
+            let verdict = require_nonconsuming(&NativeEffects::derive(&program), &formal);
+            assert!(
+                matches!(
+                    (formal.emitted(), &verdict),
+                    (
+                        FormalForm::MutableRaw,
+                        Err(Hold::Lend(LendHold::ConsumingCallee))
+                    ) | (FormalForm::Box, Err(Hold::Lend(LendHold::OwningCallee)))
+                ),
+                "{:?} / {verdict:?}",
+                formal.emitted()
+            );
         })
         .unwrap();
     }

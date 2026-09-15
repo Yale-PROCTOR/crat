@@ -521,6 +521,44 @@ fn synthetic_hook_a_valid_lend_does_not_cover_raw_return_or_consuming_boundary()
 }
 
 #[test]
+fn r407_shared_reference_formal_renders_a_shared_borrow() {
+    // era-5c 001 STOP 2: under era-5b's frame a read-only formal decides
+    // `Ref { mutable: false }`; the lend arm renders `&*(owner)` for it and
+    // the owner stays the caller's. A Box formal still refuses the lend.
+    with_fixture("fixture", |bundle, _| {
+        let call = &bundle.lends.as_ref().unwrap()[0];
+        let mut sites = call.sites.clone();
+        for site in &mut sites {
+            let mut formal = site.formal.clone().unwrap();
+            formal.form = lend::FormalForm::SharedReference;
+            site.formal = Ok(formal);
+        }
+        let plan = lend::plan_call(&call.inventory, &sites).unwrap();
+        for (argument, code) in &plan.arguments {
+            let place = &sites
+                .iter()
+                .find(|s| s.edge.argument == *argument)
+                .unwrap()
+                .place;
+            assert_eq!(code, &format!("&*({place})"));
+        }
+        assert!(
+            plan.receipts
+                .iter()
+                .all(|r| r.form == lend::FormalForm::SharedReference)
+        );
+        let mut owning = call.sites.clone();
+        let mut formal = owning[0].formal.clone().unwrap();
+        formal.form = lend::FormalForm::Box;
+        owning[0].formal = Ok(formal);
+        assert!(matches!(
+            lend::plan_call(&call.inventory, &owning),
+            Err(lend::LendHold::OwningCallee)
+        ));
+    });
+}
+
+#[test]
 fn synthetic_hook_recursive_close_requires_suppression_lowering() {
     with_fixture("leaked", |mut bundle, payload| {
         let key = bundle.construction_proof.as_ref().copied().unwrap();

@@ -730,6 +730,29 @@ fn derive_bundle(
                     FormalForm::MutableReference,
                     super::seam::Form::Ref { mutable: true },
                 ) => format!("&mut *({name})"),
+                // A thin formal over a slice owner: the callee decided a
+                // reference to ONE element (its uses are direct derefs), so
+                // the lend is the first element, never a widened slice.
+                (
+                    BoxShape::Slice,
+                    FormalForm::MutableReference,
+                    super::seam::Form::Ref { mutable: true },
+                ) => format!("&mut (*({name}))[0]"),
+                (
+                    BoxShape::Slice,
+                    FormalForm::SharedReference,
+                    super::seam::Form::Slice { mutable: false },
+                )
+                | (
+                    BoxShape::Sized,
+                    FormalForm::SharedReference,
+                    super::seam::Form::Ref { mutable: false },
+                ) => format!("&*({name})"),
+                (
+                    BoxShape::Slice,
+                    FormalForm::SharedReference,
+                    super::seam::Form::Ref { mutable: false },
+                ) => format!("&(*({name}))[0]"),
                 _ => return Err(NativeHold::FinalInterface),
             }
         };

@@ -27,6 +27,8 @@ pub enum Payload {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormalForm {
     MutableReference,
+    /// `&T` / `&[T]`: the callee only reads; the owner is lent as `&*(b)`.
+    SharedReference,
     MutableRaw,
     /// The emitted signature admits an owner; its call needs the move rule.
     Box,
@@ -270,6 +272,7 @@ pub fn plan_call(inventory: &CallInventory, sites: &[LendSite]) -> Result<LendPl
         actuals.insert(e.argument, actual);
         let code = match (&site.payload, formal.form) {
             (_, FormalForm::MutableReference) => format!("&mut *({})", site.place),
+            (_, FormalForm::SharedReference) => format!("&*({})", site.place),
             (Payload::Slice(_), FormalForm::MutableRaw) => format!("({}).as_mut_ptr()", site.place),
             (Payload::Sized(_), FormalForm::MutableRaw) => {
                 format!("core::ptr::from_mut(&mut *({}))", site.place)
