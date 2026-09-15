@@ -42,6 +42,16 @@ fn countdown_guard(condition: &Expr<'_>) -> Option<HirId> {
     }
 }
 
+/// `while i < C`: the bounded index and its bound.
+fn bounded_guard(condition: &Expr<'_>) -> Option<(HirId, HirId)> {
+    let ExprKind::Binary(op, left, right) = condition.kind else { return None };
+    match op.node {
+        BinOpKind::Lt => Some((local_of(left)?, local_of(right)?)),
+        BinOpKind::Gt => Some((local_of(right)?, local_of(left)?)),
+        _ => None,
+    }
+}
+
 /// `x = x.wrapping_sub(1)` / `x = x - 1` / `x -= 1`.
 fn is_decrement(e: &Expr<'_>, x: HirId) -> bool {
     match e.kind {
@@ -217,7 +227,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
     let (alias, cast, byte, alias_name) = alias?;
     // Every write to the alias is the advance; every read is a cursor read.
     let advances = facts.writes.get(&alias).cloned().unwrap_or_default();
-    if advances.is_empty() || !advances.iter().all(|w| is_advance(w, alias)) {
+    if !advances.iter().all(|w| is_advance(w, alias)) {
         return None;
     }
     let mut counted_loop: Option<(HirId, HirId)> = None;
@@ -232,6 +242,8 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         Some(())
     };
     let mut reads = Vec::new();
+    // Indexed reads `*alias.offset(idx)`: (the deref, the index expression, the use).
+    let mut indexed: Vec<(&Expr<'_>, &Expr<'_>, &Expr<'_>)> = Vec::new();
     for use_ in facts.uses.get(&alias)?.clone() {
         let Node::Expr(parent) = tcx.parent_hir_node(use_.hir_id) else { return None };
         match parent.kind {
@@ -247,23 +259,61 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
                     bridge_kind: "counted-void-cursor-read",
                 });
             }
-            // `alias = alias.offset(1)`: the receiver use inside the advance.
-            ExprKind::MethodCall(_, receiver, [_], _) if receiver.hir_id == use_.hir_id => {
-                let Node::Expr(assign) = tcx.parent_hir_node(parent.hir_id) else { return None };
-                if !is_advance(assign, alias) {
-                    return None;
+            ExprKind::MethodCall(segment, receiver, [argument], _)
+                if receiver.hir_id == use_.hir_id && segment.ident.name.as_str() == "offset" =>
+            {
+                let Node::Expr(grand) = tcx.parent_hir_node(parent.hir_id) else { return None };
+                match grand.kind {
+                    // `alias = alias.offset(1)`: the advance.
+                    ExprKind::Assign(..) if is_advance(grand, alias) => {
+                        in_loop(use_)?;
+                        reads.push(UseEdit {
+                            span: parent.span,
+                            replacement: format!("&{alias_name}[1..]"),
+                            bridge_kind: "counted-void-cursor-advance",
+                        });
+                    }
+                    // `*alias.offset(idx)`: an indexed read.
+                    ExprKind::Unary(rustc_hir::UnOp::Deref, _) if rvalue(tcx, grand) => {
+                        indexed.push((grand, argument, use_));
+                    }
+                    _ => return None,
                 }
-                in_loop(use_)?;
-                reads.push(UseEdit {
-                    span: parent.span,
-                    replacement: format!("&{alias_name}[1..]"),
-                    bridge_kind: "counted-void-cursor-advance",
-                });
             }
             // The advance's own left-hand side, and the `let` binding.
             ExprKind::Assign(lhs, _, _) if lhs.hir_id == use_.hir_id => {}
             _ => return None,
         }
+    }
+    if !indexed.is_empty() {
+        if !advances.is_empty() || !reads.is_empty() {
+            return None;
+        }
+        let (count, index_reads) = indexed_reads(tcx, &facts, &params, alias, &indexed)?;
+        if count == s.hir_id {
+            return None;
+        }
+        let count_index = params.iter().position(|p| *p == count)?;
+        uses.push(UseEdit {
+            span: cast.span,
+            replacement: if nullable {
+                format!("{name}.unwrap_or(&[])")
+            } else {
+                name.clone()
+            },
+            bridge_kind: "counted-void-read-alias",
+        });
+        uses.extend(index_reads.into_iter().map(|(span, idx)| UseEdit {
+            span,
+            replacement: format!("({alias_name}[({idx}) as usize] as {byte})"),
+            bridge_kind: "counted-void-indexed-read",
+        }));
+        return Some(Contract {
+            count_index,
+            element: ByteElement::Read,
+            nullable,
+            uses,
+        });
     }
     let (lp, count) = counted_loop?;
     if !params.contains(&count) || count == s.hir_id {
@@ -300,7 +350,8 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
             _ => None,
         })
         .collect();
-    if body_block.expr.is_some()
+    if advances.is_empty()
+        || body_block.expr.is_some()
         || tail.len() != 2
         || !(tail.iter().any(|e| is_advance(e, alias))
             && tail.iter().any(|e| is_decrement(e, count)))
@@ -337,5 +388,106 @@ impl Facts<'_> {
         let Some(ExprKind::If(condition, _, _)) = block.expr.map(|x| x.kind) else { return None };
         let _ = self.owner;
         countdown_guard(peel(condition))
+    }
+}
+
+/// Every indexed read must sit in ONE `while i < C` loop (C a parameter) and
+/// index by `i` itself or by a copy `let t = i;` made at the top level of that
+/// loop's body, with no write to `i` in the body before the copy (or, for a
+/// direct index, before and within the statement holding the read). The
+/// guard then bounds the read: `index < C` at the read.
+fn indexed_reads<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    facts: &Facts<'tcx>,
+    params: &[HirId],
+    alias: HirId,
+    indexed: &[(&'tcx Expr<'tcx>, &'tcx Expr<'tcx>, &'tcx Expr<'tcx>)],
+) -> Option<(HirId, Vec<(rustc_span::Span, String)>)> {
+    let sm = tcx.sess.source_map();
+    let mut count: Option<HirId> = None;
+    let mut out = Vec::new();
+    for (deref, idx, use_) in indexed {
+        let (Some(lp), _) = facts.context.get(&use_.hir_id).copied()? else { return None };
+        let Node::Expr(loop_expr) = tcx.hir_node(lp) else { return None };
+        let ExprKind::Loop(block, _, LoopSource::While, _) = loop_expr.kind else { return None };
+        let Some(ExprKind::If(condition, then, _)) = block.expr.map(|x| x.kind) else {
+            return None;
+        };
+        let (i, c) = bounded_guard(peel(condition))?;
+        if !params.contains(&c) || c == alias {
+            return None;
+        }
+        match count {
+            None => count = Some(c),
+            Some(seen) if seen == c => {}
+            Some(_) => return None,
+        }
+        let ExprKind::Block(body, _) = then.kind else { return None };
+        let x = local_of(strip(idx))?;
+        // Which top-level statement of the loop body holds `e`?
+        let holder = |e: HirId| -> Option<usize> {
+            body.stmts.iter().position(|st| {
+                let mut node = e;
+                loop {
+                    if node == st.hir_id {
+                        return true;
+                    }
+                    match tcx.parent_hir_node(node) {
+                        Node::Expr(p) => node = p.hir_id,
+                        Node::Stmt(p) => node = p.hir_id,
+                        Node::LetStmt(p) => node = p.hir_id,
+                        Node::Block(p) => node = p.hir_id,
+                        Node::Arm(p) => node = p.hir_id,
+                        _ => return false,
+                    }
+                }
+            })
+        };
+        let writes_i_before = |limit: usize, inclusive: bool| -> bool {
+            facts.writes.get(&i).is_some_and(|ws| {
+                ws.iter().any(|w| {
+                    let lhs = match w.kind {
+                        ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) => lhs.hir_id,
+                        _ => return true,
+                    };
+                    match holder(lhs) {
+                        Some(k) => k < limit || (inclusive && k == limit),
+                        // A write outside this loop body is not between the
+                        // guard and the read.
+                        None => false,
+                    }
+                })
+            })
+        };
+        if x == i {
+            let r = holder(deref.hir_id)?;
+            if writes_i_before(r, true) {
+                return None;
+            }
+        } else {
+            // `let x = i;` as a top-level statement of the loop body, `x` never written.
+            let m = body.stmts.iter().position(|st| {
+                matches!(st.kind, StmtKind::Let(decl)
+                    if matches!(decl.pat.kind, PatKind::Binding(_, id, _, None) if id == x)
+                        && decl.init.is_some_and(|init| local_of(init) == Some(i)))
+            })?;
+            if facts.writes.contains_key(&x) || writes_i_before(m, false) {
+                return None;
+            }
+            if holder(deref.hir_id)? <= m {
+                return None;
+            }
+        }
+        out.push((deref.span, sm.span_to_snippet(idx.span).ok()?));
+    }
+    Some((count?, out))
+}
+
+fn strip<'a>(mut e: &'a Expr<'a>) -> &'a Expr<'a> {
+    loop {
+        match e.kind {
+            ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => e = inner,
+            _ => return e,
+        }
     }
 }

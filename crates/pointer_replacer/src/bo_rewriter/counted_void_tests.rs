@@ -1012,3 +1012,97 @@ fn w6v_forwarded_write_pair_takes_the_destination_view() {
         b"[255, 255, 255, 255]\n".to_vec()
     );
 }
+
+// ---- report 007: the indexed read twin (libcsv `csv_parse`) ----
+
+/// rs-crown/libcsv `csv_parse` reduced: the alias is never advanced; the one
+/// read is `*us.offset(fresh as isize)` where `fresh` copies the loop index
+/// `pos` at the top of a `while pos < len` iteration, before `pos` moves.
+const CSV_PARSE: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+static mut SINK: u64 = 0;
+unsafe fn note(c: u8) { SINK = SINK.wrapping_mul(31).wrapping_add(c as u64); }
+unsafe fn csv_parse(mut s: *const core::ffi::c_void, mut len: u64, mut skip: u64) -> u64 {
+    if s.is_null() { return 0 as i32 as u64; }
+    let mut us = s as *const u8;
+    let mut pos = 0 as i32 as u64;
+    let mut c: u8 = 0;
+    pos = skip;
+    while pos < len {
+        if pos == 1 { note(255); }
+        let fresh17 = pos;
+        pos = pos.wrapping_add(1);
+        c = *us.offset(fresh17 as isize);
+        match c as i32 {
+            32 => { note(1); }
+            _ => { note(c); }
+        }
+    }
+    return pos;
+}
+"#;
+
+#[test]
+fn w6v_indexed_read_alias_under_a_bounded_guard_delivers() {
+    let rows = super::emit_tests::decisions_of(CSV_PARSE);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "s" && *p && r == "<emitted>"),
+        "the read parameter delivers: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(CSV_PARSE).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fncsv_parse(muts:Option<&[u8]>,mutlen:u64,mutskip:u64)->u64"),
+        "{source}"
+    );
+    assert!(c.contains("letmutus=s.unwrap_or(&[]);"), "{source}");
+    assert!(
+        c.contains("c=(us[(fresh17asisize)asusize]asu8);"),
+        "indexed checked read: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe {
+        let text = b"ab cd";
+        println!("{} {} {}", csv_parse(text.as_ptr().cast(), 5, 0), csv_parse(text.as_ptr().cast(), 5, 3), csv_parse(core::ptr::null(), 5, 0));
+        println!("{}", SINK);
+    }}"#;
+    let emitted_main = r#"fn main() { unsafe {
+        let text = b"ab cd";
+        println!("{} {} {}", csv_parse(Some(&text[..]), 5, 0), csv_parse(Some(&text[..]), 5, 3), csv_parse(None, 5, 0));
+        println!("{}", SINK);
+    }}"#;
+    let original = run_binary(&format!("{CSV_PARSE}\n{main}"));
+    assert_eq!(original, b"5 5 0\n2897846636319\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+}
+
+#[test]
+fn w6v_indexed_read_alias_holds_when_the_index_moves_before_its_copy() {
+    // `pos` is incremented before `fresh17` copies it: the copy may equal `len`.
+    let input = CSV_PARSE.replace(
+        "        if pos == 1 { note(255); }",
+        "        if pos == 1 { note(255); pos = pos.wrapping_add(1); }",
+    );
+    assert_ne!(input, CSV_PARSE);
+    let rows = super::emit_tests::decisions_of(&input);
+    assert!(
+        rows.iter()
+            .filter(|(n, p, _)| n == "s" && *p)
+            .all(|(_, _, r)| r != "<emitted>"),
+        "an index moved before its copy holds the parameter: {rows:?}"
+    );
+}
+
+#[test]
+fn w6v_indexed_read_alias_holds_when_the_index_is_not_the_guarded_one() {
+    let input = CSV_PARSE.replace("let fresh17 = pos;", "let fresh17 = skip;");
+    assert_ne!(input, CSV_PARSE);
+    let rows = super::emit_tests::decisions_of(&input);
+    assert!(
+        rows.iter()
+            .filter(|(n, p, _)| n == "s" && *p)
+            .all(|(_, _, r)| r != "<emitted>"),
+        "an index that is not the guard's holds the parameter: {rows:?}"
+    );
+}
