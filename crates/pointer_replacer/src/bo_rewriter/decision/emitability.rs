@@ -1102,7 +1102,16 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 call_span: expr.span,
                                 argument_index: index,
                                 argument_span: arg.span,
-                                root: shape.place_root(),
+                                // wave-6s: a borrowed computed view under
+                                // casts (`&mut *p.offset(e) as *mut T as
+                                // *mut c_void`) roots at `p` like the bare
+                                // raw expression does; the suffix view is
+                                // rendered on this site's own seam.
+                                root: shape.place_root().or_else(|| {
+                                    matches!(shape, ArgShape::AddrOfCast { .. })
+                                        .then(|| place_root(arg).0)
+                                        .flatten()
+                                }),
                                 root_through_deref,
                                 shape: shape.key(),
                                 source_type: format!("{source_ty:?}"),

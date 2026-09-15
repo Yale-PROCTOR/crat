@@ -1629,3 +1629,94 @@ const GENERATE_CRC_LENGTH_GIVEN: &str = r#"
     lodepng_set32bitInt(chunk.offset((8 as libc::c_int as isize) + (length as isize)), CRC);
  }
 "#;
+
+/// **Borrow-deref-double-cast view at a foreign position (relay 008 §3,
+/// routed from wave-6s2).** brotli `MakeUncompressedStream`:
+/// `memcpy(&mut *output.offset(result) as *mut u8 as *mut c_void, …)`. The
+/// spine already walks the casts; what was missing is the foreign call fact's
+/// ROOT — `AddrOfCast` carried none, so the site was never a raw-boundary
+/// argument of `output` and the collector's cursor verdict took it
+/// (`slice-cursor-use` at `60f52cff`). Rooted, the site is the subject's own
+/// C-arm seam and the view renders `(&mut (output)[result..]).as_mut_ptr()`.
+#[test]
+fn wave6s_borrow_deref_double_cast_view_at_a_foreign_position() {
+    let (source, receipts) = emit_with_family_receipts(MEMSET_DOUBLE_CAST);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("fnfill(mutoutput:&mut[uint8_t]"), "{source}");
+    assert!(
+        flat.contains(
+            "memset((&mut(output)[(result)asusize..]).as_mut_ptr().cast::<core::ffi::c_void>(),"
+        ),
+        "{source}"
+    );
+    assert_eq!(receipts.trim(), "[]", "no family withdrawal: {receipts}");
+}
+
+/// The faithful brotli shape: `output` (the `memcpy` destination, a T2
+/// open-boundary void bridge) is admitted by the root; `input` (the source,
+/// a SHARED view at a pointer-returning foreign callee) holds under the
+/// returned-child permission rule `write-through-shared-view` — wave-6r's
+/// family, whose descendant-free discharge does not reach `memcpy`'s second
+/// argument at this frame. Without the per-subject walk (wave-5d) the hold
+/// withdraws the function's SliceUse stage, so both stay raw here.
+#[test]
+fn wave6s_make_uncompressed_stream_input_holds_at_the_write_through_rule() {
+    let (source, receipts) = emit_with_family_receipts(MAKE_UNCOMPRESSED_STREAM);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        receipts.contains("write-through-shared-view") || receipts.contains("memcpy:arg=1"),
+        "the hold is wave-6r's permission rule at memcpy's source argument: {receipts}"
+    );
+}
+
+const MEMSET_DOUBLE_CAST: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ mod libc { pub type c_void = core::ffi::c_void; pub type c_int = i32; pub type c_ulong = u64; }
+ pub type uint8_t = u8;
+ pub type size_t = libc::c_ulong;
+ unsafe extern "C" { fn memset(d: *mut libc::c_void, c: libc::c_int, n: libc::c_ulong) -> *mut libc::c_void; }
+ unsafe extern "C" fn fill(mut output: *mut uint8_t, mut result: size_t, mut n: size_t) {
+    *output.offset(0 as libc::c_int as isize) = 1 as libc::c_int as uint8_t;
+    memset(&mut *output.offset(result as isize) as *mut uint8_t as *mut libc::c_void, 0 as libc::c_int, n);
+ }
+"#;
+
+const MAKE_UNCOMPRESSED_STREAM: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ mod libc { pub type c_void = core::ffi::c_void; pub type c_int = i32; pub type c_ulong = u64; pub type c_uint = u32; }
+ pub type uint8_t = u8;
+ pub type size_t = libc::c_ulong;
+ unsafe extern "C" { fn memcpy(d: *mut libc::c_void, s: *const libc::c_void, n: libc::c_ulong) -> *mut libc::c_void; }
+ unsafe extern "C" fn MakeUncompressedStream(mut input: *const uint8_t, mut input_size: size_t, mut output: *mut uint8_t) -> size_t {
+    let mut size = input_size;
+    let mut result = 0 as libc::c_int as size_t;
+    let mut offset = 0 as libc::c_int as size_t;
+    if input_size == 0 as libc::c_int as libc::c_ulong {
+        *output.offset(0 as libc::c_int as isize) = 6 as libc::c_int as uint8_t;
+        return 1 as libc::c_int as size_t;
+    }
+    let fresh95 = result;
+    result = result.wrapping_add(1);
+    *output.offset(fresh95 as isize) = 0x21 as libc::c_int as uint8_t;
+    while size > 0 as libc::c_int as libc::c_ulong {
+        let mut chunk_size = if size > (1 as libc::c_int as size_t) << 24 { (1 as libc::c_int as size_t) << 24 } else { size };
+        let fresh96 = result;
+        result = result.wrapping_add(1);
+        *output.offset(fresh96 as isize) = (chunk_size >> 8 as libc::c_int) as uint8_t;
+        memcpy(&mut *output.offset(result as isize) as *mut uint8_t as *mut libc::c_void,
+            &*input.offset(offset as isize) as *const uint8_t as *const libc::c_void, chunk_size as libc::c_ulong);
+        result = (result as libc::c_ulong).wrapping_add(chunk_size as libc::c_ulong) as size_t as size_t;
+        offset = (offset as libc::c_ulong).wrapping_add(chunk_size as libc::c_ulong) as size_t as size_t;
+        size = (size as libc::c_ulong).wrapping_sub(chunk_size as libc::c_ulong) as size_t as size_t;
+    }
+    let fresh97 = result;
+    result = result.wrapping_add(1);
+    *output.offset(fresh97 as isize) = 3 as libc::c_int as uint8_t;
+    return result;
+ }
+"#;
