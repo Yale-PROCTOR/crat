@@ -563,6 +563,43 @@ impl<'tcx> Collector<'_, 'tcx> {
         (subject, raw)
     }
 
+    /// `let ref mut b = PLACE.f;` — `b`'s uses in the owner. The idiom is
+    /// admitted only when the binding is used exactly once, as the place of a
+    /// plain assignment `*b = v`; returns that assignment and `v`.
+    fn ref_binding_store(&self, binding: HirId) -> Option<(&'tcx Expr<'tcx>, &'tcx Expr<'tcx>)> {
+        struct Uses<'tcx> {
+            binding: HirId,
+            uses: Vec<&'tcx Expr<'tcx>>,
+        }
+        impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+                if let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind
+                    && path.res == Res::Local(self.binding)
+                {
+                    self.uses.push(expr);
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+        let body = self.tcx.hir_body_owned_by(self.owner);
+        let mut uses = Uses {
+            binding,
+            uses: Vec::new(),
+        };
+        uses.visit_body(body);
+        let [use_expr] = uses.uses.as_slice() else { return None };
+        let Node::Expr(deref) = self.tcx.parent_hir_node(use_expr.hir_id) else { return None };
+        if !matches!(deref.kind, ExprKind::Unary(UnOp::Deref, inner) if inner.hir_id == use_expr.hir_id)
+        {
+            return None;
+        }
+        let Node::Expr(assign) = self.tcx.parent_hir_node(deref.hir_id) else { return None };
+        match assign.kind {
+            ExprKind::Assign(lhs, rhs, _) if lhs.hir_id == deref.hir_id => Some((assign, rhs)),
+            _ => None,
+        }
+    }
+
     fn field_key(&self, field: &Expr<'tcx>) -> Option<FieldKey> {
         let ExprKind::Field(base, _) = field.kind else { return None };
         let typeck = self.tcx.typeck(self.owner);
@@ -614,10 +651,33 @@ impl<'tcx> Collector<'_, 'tcx> {
                     self.hold(key, "load-into-annotated-local".to_owned());
                     return;
                 }
-                let rustc_hir::PatKind::Binding(_, binding, _, None) = local.pat.kind else {
+                let rustc_hir::PatKind::Binding(mode, binding, _, None) = local.pat.kind else {
                     self.hold(key, "load-into-pattern".to_owned());
                     return;
                 };
+                // c2rust's field-store idiom (E): `let ref mut fresh = PLACE.f;
+                // *fresh = v;` — a by-reference binding whose one use is the
+                // write through it IS the store of `v` into the field.
+                if let rustc_hir::ByRef::Yes(mutability) = mode.0 {
+                    match self.ref_binding_store(binding) {
+                        Some((assign, value)) if mutability.is_mut() => {
+                            match self.rhs(key, value) {
+                                Ok(rhs) => {
+                                    let mut store =
+                                        site(SiteKind::Store, value.span, Some(rhs), None, None);
+                                    store.assign_span = Some(assign.span);
+                                    self.push(key, store);
+                                }
+                                Err(cause) => self.hold(key, cause.to_owned()),
+                            }
+                        }
+                        _ => self.hold(
+                            key,
+                            "field-transaction-incomplete:ref-binding-use".to_owned(),
+                        ),
+                    }
+                    return;
+                }
                 let Some(node) = self.subjects.get(&binding).copied() else {
                     self.hold(key, "load-consumer-not-a-subject".to_owned());
                     return;
@@ -716,8 +776,31 @@ impl<'tcx> Collector<'_, 'tcx> {
                     ),
                 }
             }
-            ExprKind::Call(..) => {
-                self.hold(key, "field-transaction-incomplete:call-argument".to_owned())
+            // E: a reference field at a LOCAL callee's parameter is a seam
+            // position whose found form is the field's own (`argument_form`);
+            // the seam glues it like any other argument. A foreign callee (or
+            // the callee expression itself) holds.
+            ExprKind::Call(callee, args) => {
+                let is_argument = args.iter().any(|arg| arg.hir_id == field.hir_id);
+                if !is_argument {
+                    self.hold(key, "field-transaction-incomplete:call-argument".to_owned());
+                    return;
+                }
+                if !matches!(
+                    callee.kind,
+                    ExprKind::Path(QPath::Resolved(_, path))
+                        if matches!(path.res, Res::Def(rustc_hir::def::DefKind::Fn, did) if did.is_local())
+                ) {
+                    self.hold(
+                        key,
+                        "field-transaction-incomplete:call-argument-foreign".to_owned(),
+                    );
+                    return;
+                }
+                self.push(
+                    key,
+                    site(SiteKind::CallArgument, field.span, None, None, None),
+                );
             }
             ExprKind::AddrOf(..) => self.hold(
                 key,
@@ -1059,8 +1142,10 @@ pub(crate) fn derive(
         }
     }
 
-    // 4. Assemble candidates, in declaration order; one converting field per
-    // struct this wave (one generated lifetime per struct).
+    // 4. Assemble candidates, in declaration order. Every converting
+    // reference field of a struct shares the struct's ONE generated lifetime
+    // (E lifted the one-field-per-struct hold: brotli's `BlockEncoder`
+    // stores `block_types_` and `block_lengths_` from one signature).
     let mut converting_structs: FxHashSet<LocalDefId> = FxHashSet::default();
     let mut owning_structs: FxHashSet<LocalDefId> = FxHashSet::default();
     // A struct with both a reference candidate and an owned candidate takes
@@ -1078,11 +1163,6 @@ pub(crate) fn derive(
         let key_sites = sites.remove(&key).unwrap_or_default();
         let owning = owning_fields.contains(&key);
         let mut cause = holds.remove(&key);
-        // An owned field carries no lifetime: several may convert in one
-        // struct, and a container mention needs no instantiation.
-        if cause.is_none() && !owning && converting_structs.contains(&key.struct_did) {
-            cause = Some("field-transaction-incomplete:multi-field-struct".to_owned());
-        }
         if cause.is_none() && owning && reference_structs.contains(&key.struct_did) {
             cause = Some("field-transaction-incomplete:mixed-owning-and-reference".to_owned());
         }
@@ -1101,9 +1181,15 @@ pub(crate) fn derive(
         if cause.is_none() && owning && wants_slice_of(&key_sites) {
             cause = Some("field-transaction-incomplete:owned-slice".to_owned());
         }
-        let wants_slice = key_sites
-            .iter()
-            .any(|site| matches!(site.kind, SiteKind::Element | SiteKind::Offset));
+        // The field is fat when it is walked itself, or (E) when it is handed
+        // to a callee that walks it — Foster's `Arr` fact is flow-insensitive
+        // over the program, so a call-argument site of an array-walking callee
+        // marks the field `Arr`; a thin field there would be widened at the
+        // callee, which is never done.
+        let wants_slice = key_sites.iter().any(|site| {
+            matches!(site.kind, SiteKind::Element | SiteKind::Offset)
+                || (site.kind == SiteKind::CallArgument && !owning && fat.contains(&key))
+        });
         if cause.is_none() && wants_slice && !fat.contains(&key) {
             cause = Some("field-fat-unlicensed".to_owned());
         }
@@ -1160,6 +1246,18 @@ pub(crate) fn derive(
             .get(&key.struct_did)
             .cloned()
             .unwrap_or_default();
+        // E: a mention that forwards its own parameter, bare, into a tied
+        // position of a storing (or itself tied) callee carries the same tie
+        // — transitively, to a fixpoint over the mentions.
+        if !owning {
+            forward_ties(
+                tcx,
+                &fn_mentions,
+                &parameters,
+                &subject_by_binding,
+                &mut stored_by_fn,
+            );
+        }
         for (owner, in_return, simple) in fn_mentions.iter().filter(|_| !owning) {
             if !simple {
                 cause.get_or_insert_with(|| {
@@ -1227,6 +1325,84 @@ pub(crate) fn derive(
         );
     }
     out
+}
+
+/// The transitive lifetime tie (E): for every mention `F` of the struct, a
+/// call `G(.., p, ..)` where `G` ties that position and `p` is a bare
+/// parameter of `F` ties `p` in `F` too. Iterated to a fixpoint; each owner
+/// is walked once per round.
+fn forward_ties(
+    tcx: TyCtxt<'_>,
+    mentions: &[(LocalDefId, bool, bool)],
+    parameters: &FxHashMap<(LocalDefId, usize), NodeKey>,
+    subjects: &FxHashMap<HirId, NodeKey>,
+    tied: &mut FxHashMap<LocalDefId, Vec<NodeKey>>,
+) {
+    struct Calls<'a, 'tcx> {
+        subjects: &'a FxHashMap<HirId, NodeKey>,
+        /// `(callee, argument index, the bare local argument's subject)`
+        out: Vec<(LocalDefId, usize, NodeKey)>,
+        _marker: std::marker::PhantomData<&'tcx ()>,
+    }
+    impl<'tcx> Visitor<'tcx> for Calls<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Call(callee, args) = expr.kind
+                && let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind
+                && let Res::Def(rustc_hir::def::DefKind::Fn, did) = path.res
+                && let Some(callee) = did.as_local()
+            {
+                for (index, arg) in args.iter().enumerate() {
+                    if let ExprKind::Path(QPath::Resolved(_, path)) = arg.kind
+                        && let Res::Local(binding) = path.res
+                        && let Some(node) = self.subjects.get(&binding)
+                    {
+                        self.out.push((callee, index, *node));
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    // Position of each parameter subject in its function.
+    let position_of: FxHashMap<NodeKey, usize> = parameters
+        .iter()
+        .map(|(&(_, index), &node)| (node, index))
+        .collect();
+    let calls: Vec<(LocalDefId, Vec<(LocalDefId, usize, NodeKey)>)> = mentions
+        .iter()
+        .filter_map(|&(owner, _, _)| {
+            let body_id = tcx.hir_node_by_def_id(owner).body_id()?;
+            let mut calls = Calls {
+                subjects,
+                out: Vec::new(),
+                _marker: std::marker::PhantomData,
+            };
+            calls.visit_body(tcx.hir_body(body_id));
+            Some((owner, calls.out))
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for (owner, calls) in &calls {
+            for &(callee, index, node) in calls {
+                let tied_position = tied
+                    .get(&callee)
+                    .is_some_and(|nodes| nodes.iter().any(|n| position_of.get(n) == Some(&index)));
+                // Only a PARAMETER of the caller can carry the tie.
+                if tied_position
+                    && node.0 == *owner
+                    && position_of.contains_key(&node)
+                    && !tied.get(owner).is_some_and(|nodes| nodes.contains(&node))
+                {
+                    tied.entry(*owner).or_default().push(node);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// Lift the slice-use wall of a stored subject whose EVERY use is a store
@@ -1490,9 +1666,13 @@ pub(crate) fn finalize(
                     kind: "field-is-null",
                     wrap: false,
                 }),
-                SiteKind::CallArgument | SiteKind::Assignment => {
+                // E: the seam reads the argument in the field's own form and
+                // glues it to the callee's (identity for `&T` at `&T`,
+                // `.unwrap()` for `Option<&T>` at `&T`, a hold otherwise).
+                SiteKind::CallArgument => argument_forms.push((site.span, field)),
+                SiteKind::Assignment => {
                     cause.get_or_insert_with(|| {
-                        "field-transaction-incomplete:call-argument".to_owned()
+                        "field-transaction-incomplete:assignment".to_owned()
                     });
                 }
             }
@@ -1574,6 +1754,39 @@ pub(crate) fn finalize(
             argument_forms,
             site_count: candidate.sites.len(),
         });
+    }
+    // One generated lifetime per struct: a function whose signature would
+    // carry the lifetimes of TWO structs is held on the later struct (in
+    // declaration order) — the plan has one name per signature this wave.
+    let mut struct_of_owner: FxHashMap<LocalDefId, LocalDefId> = FxHashMap::default();
+    let mut two_struct: Vec<FieldKey> = Vec::new();
+    for transaction in &out.applied {
+        if transaction.owning {
+            continue;
+        }
+        for plan in &transaction.signature_plans {
+            match struct_of_owner.get(&plan.owner) {
+                Some(other) if *other != transaction.key.struct_did => {
+                    two_struct.push(transaction.key);
+                }
+                Some(_) => {}
+                None => {
+                    struct_of_owner.insert(plan.owner, transaction.key.struct_did);
+                }
+            }
+        }
+    }
+    for key in two_struct {
+        if let Some(index) = out.applied.iter().position(|t| t.key == key) {
+            let transaction = out.applied.remove(index);
+            let cause = "field-transaction-incomplete:two-struct-signature".to_owned();
+            out.held.push((
+                transaction.struct_path,
+                transaction.field_name,
+                cause.clone(),
+            ));
+            refused.insert(key, cause);
+        }
     }
     (out, refused)
 }

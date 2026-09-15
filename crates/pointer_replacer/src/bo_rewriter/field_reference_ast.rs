@@ -315,12 +315,14 @@ pub(super) fn apply(
             form
         };
         match structs.get_mut(&struct_did) {
-            Some(plan) if plan.owning && transaction.owning => {
+            // Several fields of one struct: owned ones carry no lifetime,
+            // reference ones share the struct's single generated lifetime.
+            Some(plan) if plan.owning == transaction.owning => {
                 plan.fields.push((transaction.key.field_index, form));
             }
             Some(_) => {
                 return Err(format!(
-                    "field-transaction-ast:multi-field-struct:{}",
+                    "field-transaction-ast:mixed-owning-and-reference:{}",
                     transaction.struct_path
                 ));
             }
@@ -354,7 +356,22 @@ pub(super) fn apply(
                 };
                 indices.push(hir_index);
             }
-            signatures.insert(plan.owner, (struct_did, indices));
+            // A second field of the same struct stored by the same signature
+            // adds its positions to the one plan.
+            let entry = signatures
+                .entry(plan.owner)
+                .or_insert_with(|| (struct_did, Vec::new()));
+            if entry.0 != struct_did {
+                return Err(format!(
+                    "field-transaction-ast:two-struct-signature:{}",
+                    transaction.struct_path
+                ));
+            }
+            for index in indices {
+                if !entry.1.contains(&index) {
+                    entry.1.push(index);
+                }
+            }
         }
     }
     let mut apply = Apply {

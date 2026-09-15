@@ -607,15 +607,108 @@ fn w6f_indirect_callee_yield_is_read_from_the_signature() {
 
 const H35: &str = include_str!("wave6f_fixture_h35.rs");
 
-/// Probe (E): the brotli `H35.params` shape — the c2rust `ref mut fresh`
-/// store idiom and the field passed at a local callee's parameter.
+/// Witness 10 (E, R407-8 §4): the brotli `H35.params` shape. RED control:
+/// with the `ref mut fresh` idiom refused the field holds. GREEN: the c2rust
+/// store idiom `let ref mut fresh = (*s).f; *fresh = v;` is the field's
+/// store site (kept verbatim — `fresh` reborrows the converted place); the
+/// field at a local callee's `&T` parameter is an identity seam (no `&*`);
+/// the storing signature AND the caller that forwards its own parameter into
+/// the tied position carry the lifetime (`HasherSetupH35<'a>`).
 #[test]
-fn w6f_probe_h35_field_argument() {
+fn w6f_h35_ref_mut_store_idiom_and_field_argument_deliver() {
     let observed = observe(H35);
-    for (label, decision) in &observed.decisions {
-        println!("W6F-H35-DECISION {label} => {decision}");
+    let row = field_row(&observed, "H35", "params");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "ref-shared"),
+        "{row:?}"
+    );
+    for label in [
+        "InitializeH35::params",
+        "HashMemAllocInBytesH35::params",
+        "HasherSetupH35::params",
+    ] {
+        assert_eq!(
+            decision_of(&observed, label),
+            "Ref { mutable: false }",
+            "{label}"
+        );
     }
     let outcome = emitted("h35", H35);
-    let (source, _, _) = emitted_source(&outcome);
-    println!("W6F-H35-SOURCE\n{source}");
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    assert_eq!((emitted_count, reverted), (6, 0), "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "pub struct H35<'a> { pub fresh: i32, pub params: &'a BrotliEncoderParams, }",
+        "fn InitializeH35<'a>(mut self_0: &mut H35<'a>, mut params: &'a BrotliEncoderParams) {",
+        "let ref mut fresh15 = (*self_0).params; *fresh15 = params;",
+        "fn PrepareH35(mut self_0: &H35, mut one_shot: i32, mut input_size: size_t) -> size_t { return HashMemAllocInBytesH35((*self_0).params, one_shot, input_size); }",
+        "fn HasherSetupH35<'a>(mut h: &mut H35<'a>, mut params: &'a BrotliEncoderParams, mut input_size: size_t) -> size_t { InitializeH35(h, params);",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+
+    // A nullable field (`Option<&'a T>`) at the same `&T` parameter is glued
+    // by the seam (`.unwrap()`), the null store is `None`.
+    let nullable = H35.replace(
+        "unsafe extern \"C\" fn PrepareH35(",
+        "unsafe extern \"C\" fn ResetH35(mut self_0: *mut H35) {\n    let ref mut fresh16 = (*self_0).params;\n    *fresh16 = 0 as *const BrotliEncoderParams;\n}\nunsafe extern \"C\" fn PrepareH35(",
+    );
+    let observed = observe(&nullable);
+    let row = field_row(&observed, "H35", "params");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "opt-ref-shared"),
+        "{row:?}"
+    );
+    let outcome = emitted("h35-nullable", &nullable);
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    assert_eq!((emitted_count, reverted), (7, 0), "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "pub params: Option<&'a BrotliEncoderParams>,",
+        "let ref mut fresh16 = (*self_0).params; *fresh16 = None;",
+        "let ref mut fresh15 = (*self_0).params; *fresh15 = Some(params);",
+        "HashMemAllocInBytesH35((*self_0).params.unwrap(), one_shot, input_size);",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+}
+
+const BLOCK_ENCODER: &str = include_str!("wave6f_fixture_block_encoder.rs");
+
+/// Witness 11 (E): brotli `BlockEncoder` — TWO reference fields of one
+/// struct share its one generated lifetime (`block_types_`, `block_lengths_`;
+/// the one-field-per-struct hold is lifted); a field handed to a
+/// slice-walking callee is fat by Foster's `Arr` fact even without its own
+/// element read (`block_lengths_` is only ever passed on), so nothing thin is
+/// widened at the callee; both stores are the `ref mut fresh` idiom.
+#[test]
+fn w6f_block_encoder_two_fields_share_the_lifetime_and_walkers_take_slices() {
+    let observed = observe(BLOCK_ENCODER);
+    for (field, form) in [
+        ("block_types_", "opt-slice-shared"),
+        ("block_lengths_", "opt-slice-shared"),
+    ] {
+        let row = field_row(&observed, "BlockEncoder", field);
+        assert_eq!(
+            (row.2.as_str(), row.3.as_str()),
+            ("applied", form),
+            "{row:?}"
+        );
+    }
+    let outcome = emitted("block-encoder", BLOCK_ENCODER);
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    assert_eq!((emitted_count, reverted), (9, 0), "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "pub struct BlockEncoder<'a> { pub histogram_length_: size_t, pub num_block_types_: size_t, pub block_types_: Option<&'a [u8]>, pub block_lengths_: Option<&'a [u32]>, pub num_blocks_: size_t, }",
+        "fn InitBlockEncoder<'a>(mut self_0: &mut BlockEncoder<'a>, mut histogram_length: size_t, mut num_block_types: size_t, mut block_types: &'a [u8], mut block_lengths: &'a [u32], num_blocks: size_t) {",
+        "let ref mut fresh10 = (*self_0).block_types_; *fresh10 = Some(block_types); let ref mut fresh11 = (*self_0).block_lengths_; *fresh11 = Some(block_lengths);",
+        "return BuildAndStoreBlockSplitCode((*self_0).block_types_.unwrap(), (*self_0).block_lengths_.unwrap(), (*self_0).num_blocks_);",
+        "let mut block_type = ((*self_0).block_types_).unwrap()[(block_ix) as usize];",
+        "block_types_: None, block_lengths_: None,",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
 }
