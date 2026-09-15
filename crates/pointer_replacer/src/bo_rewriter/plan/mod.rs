@@ -33,6 +33,7 @@
 //! the breadth in S2–S3 fills arms rather than reshaping the type.
 
 pub(crate) mod callee_parameter_input;
+pub(crate) mod class_split;
 pub(crate) mod native_return;
 pub(crate) mod outbound_expression;
 pub(crate) mod outbound_return;
@@ -1195,7 +1196,9 @@ pub(crate) fn finalize_signature_classes(
                 .and_modify(|class| class.required_arms = class.required_arms.union(required))
                 .or_insert_with(|| ClassInput::new(id, required));
         }
-        if let Some(reason) = degraded_reason.filter(|_| !required.is_empty()) {
+        if let Some(reason) = degraded_reason.filter(|_| {
+            !required.is_empty() && !class_split::raw_form_discharges(table, subject, required)
+        }) {
             degraded.entry(id).or_default().push(reason.to_owned());
         }
     }
@@ -1269,7 +1272,14 @@ pub(crate) fn finalize_signature_classes(
         .iter()
         .map(|edit| (SignatureClassId::of(edit.bridge.caller), edit.owner_class))
         .collect::<Vec<_>>();
-    dependency_edges.extend(table.seams.interface_dependencies.iter().copied());
+    dependency_edges.extend(
+        table
+            .seams
+            .interface_dependencies
+            .iter()
+            .copied()
+            .filter(|&edge| class_split::keeps_interface_dependency(table, edge)),
+    );
     dependency_edges.extend(table.seams.generated_item_dependencies.iter().copied());
     dependency_edges.extend(
         planned
