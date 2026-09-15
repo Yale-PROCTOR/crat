@@ -439,7 +439,9 @@ fn w5c_thin_count_first_element_reference_source_delivers_over_the_array_start()
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
     let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.contains("population: &[u32]"), "{emitted}");
-    assert!(!emitted.contains("slice::from_ref"), "{emitted}");
+    // On the call, not the file: slicecursor's verbatim prelude carries a
+    // `slice::from_ref` helper once a cursor wrapper survives.
+    assert!(!flat.contains("BitsEntropy(core::slice::from_ref"), "{emitted}");
     assert!(
         flat.contains("BitsEntropy(core::slice::from_raw_parts(((*combined_histo.as_mut_ptr().offset(j as isize)).data_).as_mut_ptr(), ((*self_0).alphabet_size_) as usize), (*self_0).alphabet_size_)"),
         "{emitted}"

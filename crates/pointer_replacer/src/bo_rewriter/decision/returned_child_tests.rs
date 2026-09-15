@@ -101,13 +101,37 @@ fn w5c_returned_child_pointer_free_no_retain_admits_the_shared_view() {
         "{:?}",
         decision(&table, "kmRay2IntersectTriangle::ray")
     );
+    // The site itself: T1 `ref-shared-to-raw-const` on the local summary.
+    let site = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::A5Mode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        ctx.raw_boundary
+            .receipts_tsv()
+            .lines()
+            .filter(|l| {
+                l.contains("kmRay2IntersectTriangle::ray#1") && l.contains("kmVec2Subtract\t2")
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .unwrap();
+    assert!(
+        site.iter()
+            .any(|l| l.contains("\tT1\tref-shared-to-raw-const\t")),
+        "{site:?}"
+    );
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
     let text = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        text.contains("pub unsafe fn kmRay2IntersectTriangle(ray: &kmRay2,"),
-        "{emitted}"
-    );
     // `&kmVec2` coerces to `*const kmVec2`: the T1 site needs no bridge text.
+    // (Whether the owner's CLASS is applied is a placement fact: over the
+    // batch-8 composition the return reborrow of `kmVec2Subtract(…)` and this
+    // argument's glue nest across two classes — report 015.)
     assert!(
         text.contains("kmVec2Subtract(&mut tmp, &mut intersect, &(*ray).start)"),
         "{emitted}"
@@ -120,12 +144,14 @@ fn w5c_returned_child_pointer_free_no_retain_admits_the_shared_view() {
     }
 }
 
-/// The ARGUMENT's pointee (`kmVec2`, what `pV2` points to) reaching a pointer
-/// could hand a child back through a load: the view stays refused. (A pointer
-/// elsewhere in `kmRay2` is unreachable through `&(*ray).start` and does not
-/// matter.)
+/// W-C5's own verdict: the ARGUMENT's pointee (`kmVec2`, what `pV2` points
+/// to) reaching a pointer could hand a child back through a load, so the
+/// pointee is not pointer-free and W-C5 admits nothing. (The final decision
+/// is no longer this control's to assert: over the batch-8 composition
+/// another lane's returned-child evidence admits the site on its own — the
+/// pointer handed back is `pOut`, argument 0 — which is sound here.)
 #[test]
-fn w5c_returned_child_pointer_bearing_pointee_stays_refused() {
+fn w5c_returned_child_pointer_bearing_pointee_is_not_pointer_free() {
     let input = fixture()
         .replace(
             "pub struct kmVec2 { pub x: f32, pub y: f32 }",
@@ -139,15 +165,18 @@ fn w5c_returned_child_pointer_bearing_pointee_stays_refused() {
             "y: (*p1).x - (*p2).x }",
             "y: (*p1).x - (*p2).x, aux: 0 as *mut f32 }",
         );
-    let table = decisions(&input);
-    assert!(
-        !matches!(
-            decision(&table, "kmRay2IntersectTriangle::ray"),
-            super::Decision::Ref { .. }
-        ),
-        "{:?}",
-        decision(&table, "kmRay2IntersectTriangle::ray")
-    );
+    let parameters = |input: &str| {
+        ::utils::compilation::run_compiler_on_str(input, |tcx| {
+            let vec2 = tcx
+                .hir_body_owners()
+                .find(|d| tcx.item_name(d.to_def_id()).as_str() == "kmVec2Subtract")
+                .unwrap();
+            super::returned_child_descent::pointer_free_parameters(tcx, vec2).collect::<Vec<_>>()
+        })
+        .unwrap()
+    };
+    assert!(parameters(&input).is_empty());
+    assert_eq!(parameters(&fixture()), vec![0, 1, 2]);
 }
 
 /// A callee that hands the argument itself back retains it: the view stays

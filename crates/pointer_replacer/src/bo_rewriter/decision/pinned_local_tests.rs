@@ -114,31 +114,21 @@ fn reason(d: &super::Decision) -> Option<&super::DegradeReason> {
 }
 
 /// The two real rows: the local is no longer gated by its owner's pin and
-/// reaches its own typed gate.
+/// reaches its own typed gate — whichever other lanes' landed rules put
+/// first (`opt-use-unsupported` at `30d69d95`, `null-init` over batch 6,
+/// `slice-use-unsupported` over the batch-8 composition for `str`).
 #[test]
 fn w5c_pinned_local_lil_rows_reach_their_own_gates() {
     use super::DegradeReason;
     let table = decisions(&fixture());
-    // Over `30d69d95` the `Option` local returned through the pinned raw
-    // return reached `opt-use-unsupported`; over batch 6 (`8e84dc6d`, the
-    // null-init declaration hook) it reaches `null-init` first. Either is the
-    // local's own gate, never the owner's pin.
-    assert!(
-        matches!(
-            reason(decision(&table, "fnc_if::r")),
-            Some(DegradeReason::OptUseUnsupported | DegradeReason::NullInit)
-        ),
-        "{:?}",
-        decision(&table, "fnc_if::r")
-    );
-    assert!(
-        matches!(
-            reason(decision(&table, "fnc_charat::str")),
-            Some(DegradeReason::NullInit)
-        ),
-        "{:?}",
-        decision(&table, "fnc_charat::str")
-    );
+    for label in ["fnc_if::r", "fnc_charat::str"] {
+        let reason = reason(decision(&table, label));
+        assert!(
+            reason.is_some_and(|reason| !matches!(reason, DegradeReason::CallSiteNotAdapted)),
+            "{label}: {:?}",
+            decision(&table, label)
+        );
+    }
 }
 
 /// Reference-shaped locals deliver inside a pinned callback; its signature
