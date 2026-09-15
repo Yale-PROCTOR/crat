@@ -31,7 +31,10 @@ use crate::{
         canonical_statement_group, canonicalize_function_with_view, validate_skeleton_view,
     },
     printf::{parse_print_macro_statement, validate_print_macro_statement},
-    skeleton::{annotate_function, collect_opaque_nested_ifs, render_statement_group},
+    skeleton::{
+        annotate_function, collect_opaque_nested_ifs, is_supported_two_argument_main_0,
+        render_statement_group,
+    },
 };
 
 const REPLACEMENT_SCHEMA_VERSION: u64 = 1;
@@ -1061,16 +1064,19 @@ fn validate_supported_transformation(
             "returned variadic functions are unsupported".to_owned(),
         ));
     }
-    if function.sig.decl.inputs.iter().any(|parameter| {
-        !matches!(
-            parameter.pat.kind,
-            PatKind::Ident(BindingMode(ByRef::No, _), _, None)
-        )
-    }) {
+    let allow_wildcards = is_supported_two_argument_main_0(function);
+    if function
+        .sig
+        .decl
+        .inputs
+        .iter()
+        .any(|parameter| simple_parameter_pattern(parameter, allow_wildcards).is_none())
+    {
         return Err(item_error(
             ReplacementErrorKind::InvalidTransformation,
             requested,
-            "every returned parameter must use a simple by-value identifier pattern".to_owned(),
+            "every returned parameter must use a simple by-value identifier pattern (or `_` for two-argument `main_0`)"
+                .to_owned(),
         ));
     }
     if function.generics.params.iter().any(|parameter| {
@@ -1291,6 +1297,7 @@ fn validate_transformed_header(
             ),
         ));
     }
+    let allow_wildcards = is_supported_two_argument_main_0(current);
     for (index, (source, target)) in current
         .sig
         .decl
@@ -1299,20 +1306,24 @@ fn validate_transformed_header(
         .zip(&transformed.sig.decl.inputs)
         .enumerate()
     {
-        let source_name = simple_parameter_name(source).ok_or_else(|| {
-            item_error(
-                ReplacementErrorKind::TargetResolution,
-                requested,
-                format!("current parameter {index} is not a simple identifier"),
-            )
-        })?;
-        let target_name = simple_parameter_name(target).expect("returned header was checked");
-        if source_name != target_name {
+        let source_pattern =
+            simple_parameter_pattern(source, allow_wildcards).ok_or_else(|| {
+                item_error(
+                    ReplacementErrorKind::TargetResolution,
+                    requested,
+                    format!("current parameter {index} is not a supported parameter pattern"),
+                )
+            })?;
+        let target_pattern =
+            simple_parameter_pattern(target, allow_wildcards).expect("returned header was checked");
+        if source_pattern != target_pattern {
             return Err(item_error(
                 ReplacementErrorKind::InvalidTransformation,
                 requested,
                 format!(
-                    "returned parameter {index} is named `{target_name}` rather than `{source_name}`"
+                    "returned parameter {index} uses pattern `{}` rather than `{}`",
+                    target_pattern.description(),
+                    source_pattern.description()
                 ),
             ));
         }
@@ -1325,6 +1336,34 @@ fn simple_parameter_name(parameter: &rustc_ast::Param) -> Option<String> {
         return None;
     };
     Some(ident.to_string())
+}
+
+#[derive(PartialEq, Eq)]
+enum SimpleParameterPattern {
+    Identifier(String),
+    Wildcard,
+}
+
+impl SimpleParameterPattern {
+    fn description(&self) -> &str {
+        match self {
+            Self::Identifier(name) => name,
+            Self::Wildcard => "_",
+        }
+    }
+}
+
+fn simple_parameter_pattern(
+    parameter: &rustc_ast::Param,
+    allow_wildcard: bool,
+) -> Option<SimpleParameterPattern> {
+    match &parameter.pat.kind {
+        PatKind::Ident(BindingMode(ByRef::No, _), ident, None) => {
+            Some(SimpleParameterPattern::Identifier(ident.to_string()))
+        }
+        PatKind::Wild if allow_wildcard => Some(SimpleParameterPattern::Wildcard),
+        _ => None,
+    }
 }
 
 fn signature_types(function: &rustc_ast::Fn) -> Vec<String> {

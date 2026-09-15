@@ -1387,7 +1387,7 @@ fn parameter_name(param: &rustc_ast::Param, index: usize) -> String {
     }
 }
 
-fn is_supported_two_argument_main_0(function: &rustc_ast::Fn) -> bool {
+pub(crate) fn is_supported_two_argument_main_0(function: &rustc_ast::Fn) -> bool {
     function.ident.name.as_str() == "main_0" && function.sig.decl.inputs.len() == 2
 }
 
