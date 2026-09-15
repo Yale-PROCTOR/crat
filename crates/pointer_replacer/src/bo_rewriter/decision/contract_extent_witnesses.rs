@@ -25,6 +25,7 @@ fn subject() -> SubjectFacts {
             nullable: false,
         },
         array: Some(true),
+        contract_alone: false,
         non_length: Ok(()),
         decline: None,
     }
@@ -130,6 +131,36 @@ fn ce_p05_fatness_is_a_required_independent_conjunct() {
         select(&subject(), &[], None),
         Selection::Keep(KeepReason::NoContractOperation)
     );
+}
+
+/// R407-14: the contract positions alone lift the `Ptr` hold when every site
+/// is NUL-terminated; a missing lookup, or any non-NUL site, still holds.
+#[test]
+fn ce_p15_contract_alone_lifts_ptr_fatness_for_nul_only_sites() {
+    let mut s = subject();
+    s.array = Some(false);
+    s.contract_alone = true;
+    let p = promotion(select(&s, &[site(Requirement::NulTerminated)], None));
+    assert!(p.contract_alone);
+    assert_eq!(
+        p.length,
+        LengthPlan::Fallback(FallbackReason::NulTerminated)
+    );
+    assert_eq!(
+        select(
+            &s,
+            &[site(Requirement::NulTerminated), site(Requirement::UpperBound(None))],
+            None
+        ),
+        Selection::Keep(KeepReason::FatnessPtr)
+    );
+    s.array = None;
+    assert_eq!(
+        select(&s, &[site(Requirement::NulTerminated)], None),
+        Selection::Keep(KeepReason::FatnessMissing)
+    );
+    let arr = promotion(select(&subject(), &[site(Requirement::NulTerminated)], None));
+    assert!(!arr.contract_alone, "an `Arr` admission is not contract-alone");
 }
 
 #[test]

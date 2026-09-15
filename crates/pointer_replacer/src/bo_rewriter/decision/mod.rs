@@ -1888,12 +1888,17 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         }),
         Form::Slice | Form::Opt { slice: true } => None,
     };
+    // R407-14: a contract-alone promotion (every use a READ-ONLY NUL-terminated
+    // contract position) takes the SHARED slice form: the contract's access is
+    // positive evidence of the read, where the conservative mutability of an
+    // unmodelled libc call is only the absence of one; `&mut` -> `&` never
+    // widens a permission.
+    let mut contract_alone = false;
     if let Some(contract_form) = contract_form
-        && matches!(
-            contract_extent.select(subject, contract_form, Some(SlotKind::Ref), fat),
-            contract_extent::Selection::Promote(_)
-        )
+        && let contract_extent::Selection::Promote(promotion) =
+            contract_extent.select(subject, contract_form, Some(SlotKind::Ref), fat)
     {
+        contract_alone = promotion.contract_alone;
         form = if matches!(
             contract_form,
             contract_extent::CurrentForm::Ref { nullable: true, .. }
@@ -2210,7 +2215,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             );
         }
         return Decision::Opt {
-            mutable: subject.mutable,
+            mutable: subject.mutable && !contract_alone,
             slice,
             uses: wave5r::optional_uses(tcx, subject, slice, uses.rewrites),
         };
@@ -2282,7 +2287,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         );
     }
     Decision::Slice {
-        mutable: subject.mutable,
+        mutable: subject.mutable && !contract_alone,
         uses: uses.rewrites,
     }
 }

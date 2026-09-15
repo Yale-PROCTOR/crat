@@ -81,6 +81,16 @@ impl Promotion {
         }
     }
 
+    /// The `contract_extent_fatness` receipt column: the fatness conjunct
+    /// that admitted the promotion.
+    pub(crate) fn receipt_fatness(&self) -> &'static str {
+        if self.contract_alone {
+            "contract-alone"
+        } else {
+            "arr"
+        }
+    }
+
     pub(crate) fn receipt_waiver(&self) -> &'static str {
         match self.length {
             LengthPlan::Evidence { .. } => "-",
@@ -136,6 +146,9 @@ pub(crate) struct CandidateIndex {
     declines: FxHashMap<(LocalDefId, HirId), DeclineCause>,
     /// The same for the nullable form, whose use wall is the Option walker's.
     nullable_declines: FxHashMap<(LocalDefId, HirId), DeclineCause>,
+    /// R407-14: subjects whose EVERY use is a foreign NUL-terminated contract
+    /// position — the contract positions alone admit them over `Ptr` fatness.
+    contract_alone: FxHashSet<(LocalDefId, HirId)>,
 }
 
 /// The candidate's own pre-selection Slice-use facts. A raw use at a LOCAL
@@ -268,6 +281,9 @@ pub(crate) fn collect(
         .map(|subject| ((subject.fn_did, subject.hir_id), subject))
         .collect::<FxHashMap<_, _>>();
     let mut by_subject = FxHashMap::<_, Candidate>::default();
+    // R407-14: the foreign NUL-terminated positions by argument span — the
+    // identity the slice walker records a boundary use under.
+    let mut nul_positions = FxHashSet::<(LocalDefId, u32, u32)>::default();
     for fact in &facts.foreign_call_args {
         let Some(root) = fact.direct_subject_root() else {
             continue;
@@ -278,6 +294,13 @@ pub(crate) fn collect(
         else {
             continue;
         };
+        if contract.extent == ArgumentExtent::NulTerminated {
+            nul_positions.insert((
+                fact.caller,
+                fact.argument_span.lo().0,
+                fact.argument_span.hi().0,
+            ));
+        }
         if contract.returns_alias_of == Some(fact.argument_index) && !fact.return_unused {
             // #1b: a returned alias of this argument (`memcpy` returns its
             // destination) is admitted only where the caller discards the
@@ -543,9 +566,38 @@ pub(crate) fn collect(
             })
         })
     };
+    // R407-14 (contract-alone): every use of the subject is a foreign
+    // NUL-terminated contract position — no dereference or index (`rewrites`),
+    // no return handoff, no raw-only operation, no unsupported use, and every
+    // raw use a foreign boundary at a NUL position. The contract positions
+    // alone then admit the subject over `Ptr` fatness: the slice is read only
+    // through `as_ptr()`.
+    let contract_alone = |node: (LocalDefId, HirId)| -> bool {
+        slice_uses.get(&node).is_some_and(|uses| {
+            uses.unsupported.is_none()
+                && uses.rewrites.is_empty()
+                && uses.return_handoffs.is_empty()
+                && facts
+                    .raw_only_uses
+                    .get(&node)
+                    .is_none_or(|ops| ops.is_empty())
+                && !uses.raw_uses.is_empty()
+                && uses.raw_uses.iter().all(|raw| {
+                    !raw.native_element
+                        && raw.boundary_span.is_some_and(|span| {
+                            nul_positions.contains(&(node.0, span.lo().0, span.hi().0))
+                        })
+                })
+        })
+    };
+    let contract_alone_nodes = by_subject
+        .keys()
+        .copied()
+        .filter(|&node| contract_alone(node))
+        .collect::<FxHashSet<_>>();
     // A candidate that would PROMOTE under the pure selector's own gates
-    // (BO `Ref`, depth 1, `Arr`, at least one multi-element site) and is not
-    // declined at this iteration. The chain is decided as a greatest fixpoint:
+    // (BO `Ref`, depth 1, `Arr` or contract-alone, at least one multi-element
+    // site) and is not declined at this iteration. The chain is decided as a greatest fixpoint:
     // every candidate starts promotable, a decline removes it, and a removal
     // may decline the callee it fed (thin caller) or the caller it carried
     // (local-callee boundary), until nothing moves.
@@ -553,7 +605,8 @@ pub(crate) fn collect(
         !declined.contains_key(&node)
             && model_ref(node)
             && subjects.get(&node).is_some_and(|subject| {
-                subject.ptr_depth == 1 && fat.is_array(node.0, subject.local)
+                subject.ptr_depth == 1
+                    && (fat.is_array(node.0, subject.local) || contract_alone_nodes.contains(&node))
             })
             && by_subject.get(&node).is_some_and(|candidate| {
                 candidate.sites.iter().any(|site| {
@@ -678,6 +731,7 @@ pub(crate) fn collect(
         by_subject,
         declines,
         nullable_declines,
+        contract_alone: contract_alone_nodes,
     }
 }
 
@@ -785,6 +839,7 @@ impl CandidateIndex {
                         crate::analyses::type_qualifier::foster::fatness::Fatness::Arr
                     )
                 }),
+                contract_alone: self.contract_alone.contains(&node),
                 non_length: Ok(()),
                 decline: declines.get(&node).cloned(),
             },

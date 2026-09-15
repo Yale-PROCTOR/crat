@@ -33,6 +33,11 @@ pub(crate) struct SubjectFacts {
     pub form: CurrentForm,
     /// `Some(true)` = Arr, `Some(false)` = Ptr, `None` = lookup missing.
     pub array: Option<bool>,
+    /// R407-14: EVERY use of the subject is a foreign NUL-terminated contract
+    /// position (no dereference, index, arithmetic, local callee, store or
+    /// return). Read by the adapter from the subject's own use facts; lifts
+    /// the `Ptr` fatness hold ONLY when every site here is NUL-terminated.
+    pub contract_alone: bool,
     pub non_length: Result<(), NonLengthHold>,
     /// R397-6(b): the up-front decline for this form, read from the subject's
     /// own pre-selection use facts. Checked after every promotability gate, so
@@ -139,6 +144,10 @@ pub(crate) struct Promotion {
     pub length: LengthPlan,
     /// All supporting multi-element sites, retained through entry/exit plans.
     pub sites: Vec<ContractSite>,
+    /// R407-14: admitted on the contract positions ALONE — the whole-program
+    /// fatness says `Ptr`, but every use of the subject is a foreign
+    /// NUL-terminated contract position, read only through `as_ptr()`.
+    pub contract_alone: bool,
 }
 
 /// R397-6(b): why a contract candidate is DECLINED before selection.
@@ -266,8 +275,16 @@ pub(crate) fn select(
     if sites.is_empty() {
         return Selection::Keep(KeepReason::NoContractOperation);
     }
+    // R407-14: the contract positions alone admit a `Ptr`-fat subject whose
+    // every use is a NUL-terminated position; the slice is read only through
+    // `as_ptr()`, so no element is ever addressed beyond the C string.
+    let contract_alone = subject.contract_alone
+        && sites
+            .iter()
+            .all(|site| matches!(site.requirement, Requirement::NulTerminated));
     match subject.array {
         Some(true) => {}
+        Some(false) if contract_alone => {}
         Some(false) => return Selection::Keep(KeepReason::FatnessPtr),
         None => return Selection::Keep(KeepReason::FatnessMissing),
     }
@@ -344,13 +361,16 @@ pub(crate) fn select(
             Requirement::OneElement | Requirement::Lifecycle => unreachable!("filtered above"),
         }
     };
+    let contract_alone = subject.array == Some(false) && contract_alone;
     Selection::Promote(Promotion {
         subject: subject.key.clone(),
         construction: subject.construction.clone(),
-        mutable,
+        // A contract-alone promotion is the shared form: every position reads.
+        mutable: mutable && !contract_alone,
         nullable,
         length,
         sites,
+        contract_alone,
     })
 }
 

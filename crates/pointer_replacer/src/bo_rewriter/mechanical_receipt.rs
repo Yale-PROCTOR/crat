@@ -1721,7 +1721,9 @@ pub(crate) fn render_slice_use_rows(rows: &[SliceUseAdapterReceiptRow]) -> Strin
                 row.contract_extent
                     .as_ref()
                     .map_or("-", super::decision::contract_extent::Promotion::receipt_waiver),
-                if row.contract_extent.is_some() { "arr" } else { "-" },
+                row.contract_extent
+                    .as_ref()
+                    .map_or("-", super::decision::contract_extent::Promotion::receipt_fatness),
                 row.terminal.stage.key(),
                 row.terminal.state.key(),
                 row.terminal

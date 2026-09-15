@@ -24500,9 +24500,12 @@ fn raw_boundary_wave2_corpus_census() {
     // the receipt carries one line per control row plus its header. Wave-4
     // #1a (2026-09-15): 76 -> 57 rows — 19 contract-selected sites delivered
     // and retired with their receipts, 5 re-classed `slice-use-unsupported`.
+    // R407-14 (contract-alone): 57 -> 49 — the 8 `thin-extent` rows whose
+    // every use is a NUL-terminated read position now promote to the shared
+    // slice; retired by rule, confirmed by the batch census.
     assert_eq!(
         controls.libc_hold_receipt.lines().count(),
-        58,
+        50,
         "libc contract hold receipt population drift"
     );
     assert_eq!(

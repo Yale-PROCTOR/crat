@@ -141,6 +141,14 @@ fn attested_promotions(source: &str) -> Vec<super::decision::contract_extent::Pr
 }
 
 fn attested_emitted(source: &str) -> String {
+    let super::RewriteOutcome::Emitted { source, .. } = attested_rewrite(source) else {
+        panic!("attested contract-extent fixture must emit")
+    };
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    source
+}
+
+fn attested_rewrite(source: &str) -> super::RewriteOutcome {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "crat-wave4-attested-{}-{}",
@@ -157,11 +165,7 @@ fn attested_emitted(source: &str) -> String {
         &|_| {},
     );
     let _ = std::fs::remove_dir_all(&dir);
-    let super::RewriteOutcome::Emitted { source, .. } = outcome else {
-        panic!("attested contract-extent fixture must emit")
-    };
-    assert!(super::verify::type_checks_str(&source), "{source}");
-    source
+    outcome
 }
 
 #[test]
@@ -953,4 +957,174 @@ fn ce_f03_fwrite_over_a_non_byte_element_keeps_the_units_gap() {
         ),
         "{plans:#?}"
     );
+}
+
+/// R407-14 (contract-alone): bzip2's `fopen_output_safely` shape — `open` and
+/// `fdopen` are not in the fatness libc table, so both parameters read `Ptr`,
+/// and their ONLY uses are foreign NUL-terminated contract positions.
+const CE_A01_CONTRACT_ALONE: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+extern "C" {
+    fn open(path: *const i8, flags: i32, mode: i32) -> i32;
+    fn fdopen(fd: i32, mode: *const i8) -> *mut u8;
+}
+static mut OUT_NAME: [i8; 8] = [0; 8];
+unsafe fn fopen_output_safely(name: *mut i8, mode: *const i8) -> *mut u8 {
+    let fh = open(name, 1, 0o600);
+    if fh == -1 {
+        return 0 as *mut u8;
+    }
+    fdopen(fh, mode)
+}
+pub unsafe fn compress() -> *mut u8 {
+    fopen_output_safely(OUT_NAME.as_mut_ptr(), b"wb\0".as_ptr() as *const i8)
+}
+"#;
+
+#[test]
+fn ce_a01_a_nul_contract_alone_parameter_promotes_over_ptr_fatness() {
+    let plans = attested_promotions(CE_A01_CONTRACT_ALONE);
+    assert_eq!(
+        plans.len(),
+        2,
+        "both NUL-only parameters promote: {plans:#?}"
+    );
+    for plan in &plans {
+        assert!(plan.contract_alone, "{plan:#?}");
+        assert_eq!(
+            plan.length,
+            super::decision::contract_extent::LengthPlan::Fallback(
+                super::decision::contract_extent::FallbackReason::NulTerminated
+            )
+        );
+    }
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = attested_rewrite(CE_A01_CONTRACT_ALONE)
+    else {
+        panic!("CE-A01 must emit");
+    };
+    assert!(source.contains("name: &[i8]"), "{source}");
+    assert!(source.contains("mode: &[i8]"), "{source}");
+    assert!(source.contains("open(name.as_ptr(), 1, 0o600)"), "{source}");
+    assert!(source.contains("fdopen(fh, mode.as_ptr())"), "{source}");
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "core::slice::from_raw_parts(OUT_NAME.as_mut_ptr(), crate::FALLBACK_SLICE_EXTENT)"
+        ),
+        "the array-decay caller takes the waived fallback extent:\n{source}"
+    );
+    assert!(
+        flat.contains(
+            "core::slice::from_raw_parts(b\"wb\\0\".as_ptr() as *const i8, crate::FALLBACK_SLICE_EXTENT)"
+        ),
+        "the literal caller takes the waived fallback extent:\n{source}"
+    );
+    let rendered =
+        super::mechanical_receipt::render_slice_use_rows(&raw_boundary_artifacts.slice_use_rows);
+    assert_eq!(
+        rendered
+            .lines()
+            .filter(|line| line.contains("\tcontract-alone\tterminal\tapplied\t"))
+            .count(),
+        2,
+        "the fatness column names the contract-alone admission at both terminal sites:\n{rendered}"
+    );
+    assert!(!rendered.contains("\tarr\t"), "{rendered}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// The negative half of R407-14: one dereference beside the NUL position and
+/// the parameter is no longer contract-alone; `Ptr` fatness holds it.
+const CE_A02_NOT_ALONE: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+extern "C" {
+    fn open(path: *const i8, flags: i32, mode: i32) -> i32;
+}
+unsafe fn open_nonempty(name: *const i8) -> i32 {
+    if *name == 0 {
+        return -1;
+    }
+    open(name, 1, 0o600)
+}
+"#;
+
+#[test]
+fn ce_a02_a_dereference_beside_the_nul_position_keeps_the_fatness_hold() {
+    let plans = promotions(CE_A02_NOT_ALONE);
+    assert!(plans.is_empty(), "{plans:#?}");
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(CE_A02_NOT_ALONE) else {
+        panic!("CE-A02 must emit");
+    };
+    assert!(!source.contains("[i8]"), "{source}");
+}
+
+/// The model gate (wave-6v 008): a caller-side contract never outruns the
+/// model's kind of the callee it forwards to. `find_local::name` is `Raw` to
+/// the model (the mutable/reset copy shape of R213), so its `strcmp` position
+/// carries no caller: `find::name`'s local boundary use is not carried into a
+/// parameter that cannot promote, and `find::name` is declined at that
+/// boundary instead of taking a slice it would bridge raw.
+const CE_D06_RAW_CALLEE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments)]
+extern "C" {
+    fn strcmp(a: *const i8, b: *const i8) -> i32;
+}
+static mut KEY: [i8; 2] = [120, 0];
+unsafe fn find_local(name: *mut i8, clear: bool) -> i32 {
+    let mut dst: *mut i8 = 0 as *mut i8;
+    dst = name;
+    if clear {
+        dst = 0 as *mut i8;
+    }
+    if dst.is_null() {
+        return 0;
+    }
+    *dst += 1;
+    strcmp(name, b"x\0".as_ptr() as *const i8)
+}
+unsafe fn find(name: *mut i8, clear: bool) -> i32 {
+    find_local(name, clear)
+}
+pub unsafe fn top() -> i32 {
+    find(KEY.as_mut_ptr(), false)
+}
+"#;
+
+#[test]
+fn ce_d06_a_model_raw_callee_carries_no_caller() {
+    let decisions = super::emit_tests::decisions_of(CE_D06_RAW_CALLEE);
+    let find_local = decisions
+        .iter()
+        .find(|(name, is_param, reason)| name == "name" && *is_param && reason == "kind-raw")
+        .is_some();
+    assert!(
+        find_local,
+        "the callee parameter is model-Raw: {decisions:#?}"
+    );
+    let plans = promotions(CE_D06_RAW_CALLEE);
+    assert!(plans.is_empty(), "{plans:#?}");
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = super::rewrite_m1(CE_D06_RAW_CALLEE)
+    else {
+        panic!("CE-D06 must emit");
+    };
+    assert!(
+        raw_boundary_artifacts
+            .contract_candidate_declines
+            .lines()
+            .any(|line| line.starts_with("find\t")
+                && line.contains("contract-candidate-declined:local-callee-boundary")
+                && line.contains("via-local-callee:")),
+        "{}",
+        raw_boundary_artifacts.contract_candidate_declines
+    );
+    assert!(!source.contains("&[i8]"), "{source}");
+    assert!(!source.contains("&mut [i8]"), "{source}");
 }
