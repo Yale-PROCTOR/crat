@@ -71,6 +71,46 @@ fn slice_form_evidence(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
     }) && ctx.fat.is_array(subject.fn_did, subject.local)
 }
 
+/// R397-6(b) / R398-1: a candidate whose local is an argument of a LOCAL
+/// callee sits on a shared interface. Attempting it adds an interface edge
+/// that withdraws the callee's prior deliveries and then fails at the call
+/// adapter, so it is declined before selection and keeps its typed hold.
+pub(crate) fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
+    use rustc_hir::{
+        ExprKind, QPath,
+        def::{DefKind, Res},
+        intravisit::Visitor,
+    };
+    struct Find<'tcx> {
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        binding: rustc_hir::HirId,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if let ExprKind::Call(callee, args) = expr.kind
+                && let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
+                && let Res::Def(DefKind::Fn, def_id) = path.res
+                && def_id.is_local()
+                && args.iter().any(|arg| {
+                    matches!(&arg.kind, ExprKind::Path(path)
+                        if self.typeck.qpath_res(path, arg.hir_id) == Res::Local(self.binding))
+                })
+            {
+                self.found = true;
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut find = Find {
+        typeck: tcx.typeck(subject.fn_did),
+        binding: subject.hir_id,
+        found: false,
+    };
+    find.visit_body(tcx.hir_body_owned_by(subject.fn_did));
+    find.found
+}
+
 pub(super) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
     let node = (subject.fn_did, subject.hir_id);
     ctx.family_policy
@@ -80,6 +120,7 @@ pub(super) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
             .enabled(subject.fn_did, FamilyStage::SliceConstruction)
         && construction::slice_constructor_available(ctx.constructions, node)
         && slice_form_evidence(ctx, subject)
+        && !argument_of_local_callee(ctx.tcx, subject)
         && emitted_type(ctx.tcx, subject, subject.mutable).is_some()
 }
 

@@ -178,3 +178,87 @@ fn wave6k_withdrawn_owner_restores_the_untyped_offset_copy() {
     assert!(!source.contains("from_raw_parts_mut"), "{source}");
     assert!(!source.contains("dst: &mut [f32]"), "{source}");
 }
+
+/// heman `transform_to_distance` → `edt`: the caller's offset copies `f` / `z`
+/// are arguments of a LOCAL callee whose own parameters were delivered before.
+/// A candidate on a shared interface must be declined up front (R397-6(b)):
+/// attempting it withdraws the callee's prior delivery (R398-1).
+const TRANSFORM_EDT: &str = r#"
+    pub unsafe fn edt(f: *mut f32, z: *mut f32, n: i32) {
+        *z.offset(0) = -1.0;
+        *z.offset(1) = 1.0;
+        let mut q = 1;
+        while q < n {
+            *z.offset(q as isize) = *f.offset(q as isize) - *z.offset((q - 1) as isize);
+            q += 1;
+        }
+    }
+    pub unsafe fn transform(ff: *mut f32, zz: *mut f32, width: i32, height: i32) {
+        let mut x = 0;
+        while x < width {
+            let mut f = ff.offset((height * x) as isize);
+            let mut z = zz.offset(((height + 1) * x) as isize);
+            let mut y = 0;
+            while y < height {
+                *f.offset(y as isize) = (x + y) as f32;
+                y += 1;
+            }
+            edt(f, z, height);
+            x += 1;
+        }
+    }
+"#;
+
+#[test]
+fn wave6k_copy_passed_to_a_local_callee_is_declined_and_the_callee_keeps_its_delivery() {
+    ::utils::compilation::run_compiler_on_str(TRANSFORM_EDT, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        for (subject, decision) in &table.entries {
+            println!("DECISION {} {decision:?}", subject.label);
+        }
+        for receipt in &ctx.raw_boundary_artifacts.additive_family_receipts {
+            println!(
+                "WITHDRAWAL {:?}",
+                (
+                    &receipt.family,
+                    &receipt.owner_path,
+                    &receipt.cause,
+                    &receipt.subjects
+                )
+            );
+        }
+        let decision_of = |label: &str| {
+            table
+                .entries
+                .iter()
+                .find(|(s, _)| s.label == label)
+                .map(|(_, d)| d.clone())
+                .unwrap_or_else(|| panic!("no subject {label}"))
+        };
+        assert!(
+            matches!(decision_of("edt::f"), Decision::Slice { .. }),
+            "the callee keeps its delivered slice: {:?}",
+            decision_of("edt::f")
+        );
+        assert!(
+            matches!(decision_of("transform::f"), Decision::Degraded(_)),
+            "a copy on a shared interface is declined up front: {:?}",
+            decision_of("transform::f")
+        );
+        assert!(
+            !ctx.raw_boundary_artifacts
+                .additive_family_receipts
+                .iter()
+                .any(|r| r.owner_path == "edt"),
+            "no withdrawal may touch the callee"
+        );
+    })
+    .expect("input compiles");
+}
