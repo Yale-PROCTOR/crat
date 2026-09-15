@@ -438,6 +438,53 @@ pub(crate) fn raw_lend_argument(
     }
 }
 
+/// The peer argument's MIR local is outside the derivation closure of the
+/// subject's allocation result, so it cannot point into the fresh object;
+/// an escaped allocation (stored into memory) proves nothing.
+fn fresh_allocation_peer_disjoint(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    subject: &super::Subject,
+    source: &SourcePlan,
+    key: SourceCallKey,
+    peer_index: usize,
+) -> Result<String, &'static str> {
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(subject.fn_did)
+        .borrow();
+    let start = rustc_middle::mir::Local::from_u32(source.allocation_local());
+    let (closure, escape) = super::ownership_fields_effects::derivation_closure(
+        tcx,
+        &body,
+        subject.fn_did.local_def_index.as_u32(),
+        start,
+    );
+    if escape.is_some() || !closure.contains(&subject.local) {
+        return Err("fresh-allocation-escapes");
+    }
+    let data = &body.basic_blocks[rustc_middle::mir::BasicBlock::from_u32(key.block)];
+    let rustc_middle::mir::TerminatorKind::Call { args, .. } = &data.terminator().kind else {
+        return Err("peer-site-not-a-call");
+    };
+    let peer =
+        args.get(peer_index)
+            .and_then(|arg| match &arg.node {
+                rustc_middle::mir::Operand::Copy(place)
+                | rustc_middle::mir::Operand::Move(place) => place.as_local(),
+                rustc_middle::mir::Operand::Constant(_) => None,
+            })
+            .ok_or("peer-operand-not-a-local")?;
+    if closure.contains(&peer) {
+        return Err("peer-derived-from-subject");
+    }
+    Ok(format!(
+        "subject_local={} allocation_local={} peer_local={} closure={:?}",
+        subject.local.as_u32(),
+        start.as_u32(),
+        peer.as_u32(),
+        closure.iter().map(|l| l.as_u32()).collect::<Vec<_>>()
+    ))
+}
+
 fn derive_bundle(
     inputs: &Inputs<'_, '_>,
     table: &DecisionTable,
@@ -648,7 +695,21 @@ fn derive_bundle(
                 peer.source_span,
             );
             if proof.verdict != A5SiteProofVerdict::Clear {
-                return Err(NativeHold::Peer(proof.reason));
+                // A fresh allocation whose pointer never escapes (the source
+                // permit) is disjoint from every peer not derived from it.
+                let disjoint = fresh_allocation_peer_disjoint(
+                    tcx,
+                    subject,
+                    source,
+                    key,
+                    peer.key.argument_index,
+                )
+                .map_err(|_| NativeHold::Peer(proof.reason))?;
+                receipts.push(format!(
+                    "native-box-pair {:?} peer={} disjoint=fresh-allocation-derivation-closure({disjoint}) a5={}",
+                    key, peer.key.argument_index, proof.reason
+                ));
+                continue;
             }
             for a in [argument, peer.key.argument_index] {
                 let Some(proof_key) = proof.site_key(a) else {

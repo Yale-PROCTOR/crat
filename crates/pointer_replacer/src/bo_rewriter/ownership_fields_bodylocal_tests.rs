@@ -55,12 +55,21 @@ fn verify(input: &str, owner_name: &str, shape: BoxShape, transfer: bool) -> Str
         source,
         reverted_count,
         unplaceable,
+        degradations,
+        first_diags,
         ..
     } = outcome
     else {
         panic!("{outcome:?}")
     };
     println!("R395_EMITTED_BEGIN {owner_name}\n{source}\nR395_EMITTED_END");
+    println!(
+        "R395_OUTCOME reverted={reverted_count} degradations={:?} first_diags={first_diags:?}",
+        degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key(), d.reason.detail()))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(reverted_count, 0);
     assert!(unplaceable.is_empty());
     assert!(super::verify::type_checks_str(&source));
@@ -397,6 +406,169 @@ fn r399_return_transfer_faults_uncovered_live_exit_and_zero_capable_slice() {
             ctx.raw_boundary_artifacts
                 .ownership_native
                 .contains("native-transfer-nonempty"),
+            "{}",
+            ctx.raw_boundary_artifacts.ownership_native
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn r401_heman_edt_with_payload_loop_owners_lend_under_native_proofs() {
+    // `transform_to_coordfield::pl1#45` / `pl2#53`: two `calloc` owners
+    // allocated per loop iteration, written / read through `offset`, lent to
+    // the raw callee `edt_with_payload` (which only reads `payload_in` and
+    // writes `payload_out` through `offset`), freed at the iteration's end.
+    let input = format!(
+        r#"{}
+pub mod uint {{ pub type uint16_t = u16; }}
+use uint::uint16_t;
+unsafe extern "C" fn edt_with_payload(mut f: *mut libc::c_float, mut d: *mut libc::c_float, mut z: *mut libc::c_float, mut w: *mut uint16_t, mut n: libc::c_int, mut payload_in: *mut libc::c_float, mut payload_out: *mut libc::c_float) {{
+    let mut k = 0 as libc::c_int;
+    *w.offset(0 as libc::c_int as isize) = 0 as libc::c_int as uint16_t;
+    *z.offset(0 as libc::c_int as isize) = -1.0f32;
+    let mut q_0 = 0 as libc::c_int;
+    while q_0 < n {{
+        while *z.offset((k + 1 as libc::c_int) as isize) < q_0 as libc::c_float {{
+            k += 1;
+        }}
+        *d.offset(q_0 as isize) = ((q_0 - *w.offset(k as isize) as libc::c_int) * (q_0 - *w.offset(k as isize) as libc::c_int)) as libc::c_float + *f.offset(*w.offset(k as isize) as isize);
+        *payload_out.offset((q_0 * 2 as libc::c_int) as isize) = *payload_in.offset((*w.offset(k as isize) as libc::c_int * 2 as libc::c_int) as isize);
+        *payload_out.offset((q_0 * 2 as libc::c_int + 1 as libc::c_int) as isize) = *payload_in.offset((*w.offset(k as isize) as libc::c_int * 2 as libc::c_int + 1 as libc::c_int) as isize);
+        q_0 += 1;
+    }}
+}}
+pub unsafe extern "C" fn transform_to_coordfield(mut data: *mut libc::c_float, mut width: libc::c_int, mut height: libc::c_int, mut ff: *mut libc::c_float, mut dd: *mut libc::c_float, mut zz: *mut libc::c_float, mut ww: *mut uint16_t) {{
+    let mut x = 0 as libc::c_int;
+    while x < width {{
+        let mut pl1 = calloc((height * 2 as libc::c_int) as libc::c_ulong, ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as *mut libc::c_float;
+        let mut pl2 = calloc((height * 2 as libc::c_int) as libc::c_ulong, ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as *mut libc::c_float;
+        let mut f = ff.offset((height * x) as isize);
+        let mut d = dd.offset((height * x) as isize);
+        let mut z = zz.offset(((height + 1 as libc::c_int) * x) as isize);
+        let mut w = ww.offset((height * x) as isize);
+        let mut y = 0 as libc::c_int;
+        while y < height {{
+            *f.offset(y as isize) = *data.offset(((y * width) as isize) + (x as isize));
+            *pl1.offset((y * 2 as libc::c_int) as isize) = *data.offset(((2 as libc::c_int * (y * width + x)) as isize) + (0 as libc::c_int as isize));
+            *pl1.offset((y * 2 as libc::c_int + 1 as libc::c_int) as isize) = *data.offset(((2 as libc::c_int * (y * width + x)) as isize) + (1 as libc::c_int as isize));
+            y += 1;
+        }}
+        edt_with_payload(f, d, z, w, height, pl1, pl2);
+        let mut y_0 = 0 as libc::c_int;
+        while y_0 < height {{
+            *data.offset(((y_0 * width) as isize) + (x as isize)) = *d.offset(y_0 as isize) + *pl2.offset((2 as libc::c_int * y_0) as isize) + *pl2.offset((2 as libc::c_int * y_0 + 1 as libc::c_int) as isize);
+            y_0 += 1;
+        }}
+        free(pl1 as *mut libc::c_void);
+        free(pl2 as *mut libc::c_void);
+        x += 1;
+    }}
+}}"#,
+        c_declarations().replace("extern \"C\" { fn malloc", "extern \"C\" { fn calloc(n:libc::c_ulong,s:libc::c_ulong)->*mut libc::c_void; fn malloc")
+    );
+    // The decision stage admits both owners (the callee proofs and the
+    // fresh-allocation peer disjointness hold); the emission stage withdraws
+    // them under the raw-boundary signature class of the call, whose sibling
+    // arguments `f, d, z, w` are `copy-source-coupled` cursor aliases — the
+    // typed frontier this witness pins (`signature-class-held`).
+    let decided = |owner: &str| {
+        ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let (_, decision) = table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some(owner))
+                .unwrap();
+            let Decision::Box(plan) = decision else { panic!("{decision:?}") };
+            assert_eq!(plan.shape, BoxShape::Slice);
+            assert!(
+                plan.receipts
+                    .iter()
+                    .any(|r| r.contains("disjoint=fresh-allocation-derivation-closure")),
+                "{:?}",
+                plan.receipts
+            );
+            let _ = &ctx;
+        })
+        .unwrap();
+    };
+    decided("pl1");
+    decided("pl2");
+    let outcome = super::rewrite_core_injected(
+        ::utils::compilation::str_to_input(&input),
+        None,
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        false,
+        Some((
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    );
+    let super::RewriteOutcome::Emitted { degradations, .. } = outcome else {
+        panic!("{outcome:?}")
+    };
+    for owner in [
+        "transform_to_coordfield::pl1#13",
+        "transform_to_coordfield::pl2#21",
+    ] {
+        let row = degradations
+            .iter()
+            .find(|d| d.subject == owner)
+            .expect(owner);
+        assert_eq!(
+            row.reason.key(),
+            "signature-class-held",
+            "{owner}: {}",
+            row.reason.detail()
+        );
+        assert!(
+            row.reason.detail().contains("copy-source-coupled"),
+            "{}",
+            row.reason.detail()
+        );
+    }
+}
+
+#[test]
+fn r401_peer_derived_from_the_subject_is_not_disjoint() {
+    // `callee(p, p.offset(1))`: the second peer is derived from the subject's
+    // own allocation. The source permit already refuses every alias-forming
+    // use of the root, so the native closure's premise (no peer derived from
+    // the allocation) is enforced upstream; this control pins that refusal.
+    let input = format!(
+        "{} unsafe fn pair(a: *mut u32, b: *mut u32) {{ *a += *b; }} pub unsafe fn prepare() -> u32 {{ let mut buffer = calloc(4, core::mem::size_of::<u32>()) as *mut u32; *buffer = 1; pair(buffer, buffer.offset(1)); let value = *buffer; free(buffer as *mut core::ffi::c_void); value }}",
+        declarations()
+    );
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, d) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("buffer"))
+            .unwrap();
+        assert!(matches!(d, Decision::Degraded(_)), "{d:?}");
+        assert!(
+            ctx.raw_boundary_artifacts
+                .ownership_native
+                .contains("\tSource::UnsupportedOwnerUse\t"),
             "{}",
             ctx.raw_boundary_artifacts.ownership_native
         );

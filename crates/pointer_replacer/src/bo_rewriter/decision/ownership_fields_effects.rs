@@ -682,7 +682,34 @@ fn trace_parameter<'tcx>(
     parameter: usize,
     at: &dyn Fn(rustc_middle::mir::BasicBlock, usize) -> closure::Site,
 ) -> (BTreeSet<Local>, Option<closure::Site>) {
-    let mut tainted = BTreeSet::from([Local::from_usize(parameter + 1)]);
+    trace_local(tcx, body, Local::from_usize(parameter + 1), at)
+}
+
+/// The derivation closure of one pointer-carrying local: every local that
+/// may hold that pointer or one derived from it (copies, casts, aggregates,
+/// pointer arithmetic and other call results, loads through it of
+/// non-scalar type), plus the first site where it is stored into memory.
+pub(crate) fn derivation_closure<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    function: u32,
+    start: Local,
+) -> (BTreeSet<Local>, Option<EffectsSite>) {
+    let at = |block: rustc_middle::mir::BasicBlock, statement: usize| closure::Site {
+        function,
+        block: block.as_u32(),
+        statement,
+    };
+    trace_local(tcx, body, start, &at)
+}
+
+fn trace_local<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    start: Local,
+    at: &dyn Fn(rustc_middle::mir::BasicBlock, usize) -> closure::Site,
+) -> (BTreeSet<Local>, Option<closure::Site>) {
+    let mut tainted = BTreeSet::from([start]);
     let mut escape = None;
     loop {
         let before = tainted.len();
