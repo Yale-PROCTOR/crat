@@ -22,9 +22,21 @@ pub(crate) enum Hold {
     IncompleteCallers,
     CalleeEmission,
 }
+/// How each incoming count binds the source array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Count {
+    /// Every incoming count folds to a constant within the array's capacity.
+    Constant,
+    /// Some incoming count is a runtime value (a field, a parameter, a call).
+    /// Admitted because the reader walks exactly `count` elements: on a UB-free
+    /// input (§28) `from_raw_parts(start, count)` covers only bytes the input
+    /// reads, and the reader's `len().checked_sub(count)` guards the rest.
+    Runtime,
+}
 #[derive(Debug, Clone)]
 pub(crate) struct Proof {
     pub count_parameter: usize,
+    pub count: Count,
     pub callers: usize,
     pub reader: Option<thin_counted_entropy::ReaderProof>,
     pub members: Vec<LocalDefId>,
@@ -133,6 +145,38 @@ fn constant(tcx: TyCtxt<'_>, owner: LocalDefId, e: &Expr<'_>, fuel: usize) -> Op
     };
     (value <= max(tcx, types.expr_ty(e))?).then_some(value)
 }
+// The shapes `constant` folds. A foldable count that `constant` rejects is a
+// constant outside its range, never a runtime value.
+fn foldable(tcx: TyCtxt<'_>, owner: LocalDefId, e: &Expr<'_>, fuel: usize) -> bool {
+    if fuel == 0 {
+        return false;
+    }
+    match peel(e).kind {
+        ExprKind::Lit(l) => matches!(l.node, rustc_ast::LitKind::Int(..)),
+        ExprKind::Cast(inner, _) => foldable(tcx, owner, inner, fuel - 1),
+        ExprKind::Binary(op, l, r) => {
+            matches!(
+                op.node,
+                rustc_hir::BinOpKind::Add | rustc_hir::BinOpKind::Sub | rustc_hir::BinOpKind::Mul
+            ) && foldable(tcx, owner, l, fuel - 1)
+                && foldable(tcx, owner, r, fuel - 1)
+        }
+        ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+            let Res::Local(id) = path.res else { return false };
+            let Node::Pat(pat) = tcx.hir_node(id) else { return false };
+            matches!(
+                pat.kind,
+                PatKind::Binding(
+                    rustc_hir::BindingMode(_, rustc_hir::Mutability::Not),
+                    _,
+                    _,
+                    None
+                )
+            ) && matches!(tcx.parent_hir_node(id), Node::LetStmt(stmt) if stmt.init.is_some_and(|init| foldable(tcx, owner, init, fuel - 1)))
+        }
+        _ => false,
+    }
+}
 struct Find<'tcx> {
     span: rustc_span::Span,
     found: Vec<&'tcx Expr<'tcx>>,
@@ -163,8 +207,23 @@ fn expression<'tcx>(
         _ => None,
     }
 }
+// `a.as_ptr().offset(0)` is the array's start, the address `a.as_ptr()` names.
+// c2rust's `&a[0]` — `&mut *a.as_mut_ptr().offset(0)` — is NOT peeled: the seam
+// renders that reference `slice::from_ref`, one element, and the reader's
+// `checked_sub(count)` would then fail at runtime; it stays `CallerSource`
+// until the seam renders the array start for that shape.
+fn array_start<'a>(tcx: TyCtxt<'_>, owner: LocalDefId, e: &'a Expr<'a>) -> &'a Expr<'a> {
+    let mut e = peel(e);
+    while let ExprKind::MethodCall(segment, receiver, [offset], _) = e.kind
+        && segment.ident.name.as_str() == "offset"
+        && constant(tcx, owner, offset, 4) == Some(0)
+    {
+        e = peel(receiver);
+    }
+    e
+}
 fn array_capacity(tcx: TyCtxt<'_>, owner: LocalDefId, e: &Expr<'_>) -> Option<u128> {
-    let e = peel(e);
+    let e = array_start(tcx, owner, e);
     let ExprKind::MethodCall(_, receiver, [], _) = e.kind else { return None };
     let did = tcx.typeck(owner).type_dependent_def_id(e.hir_id)?;
     if tcx.crate_name(did.krate).as_str() != "core"
@@ -219,7 +278,7 @@ fn forwarder_source(
     owner: LocalDefId,
     parameter: usize,
     facts: &EmitabilityFacts,
-) -> Result<(thin_counted_entropy::ForwarderProof, usize), Hold> {
+) -> Result<(thin_counted_entropy::ForwarderProof, usize, Count), Hold> {
     let sig = tcx.fn_sig(owner).skip_binder().skip_binder();
     if sig.inputs().len() != 2 {
         return Err(Hold::OutsideScope);
@@ -230,6 +289,7 @@ fn forwarder_source(
         return Err(Hold::CallerCount);
     }
     let calls = closed_calls(tcx, owner, facts)?;
+    let mut count_kind = Count::Constant;
     for call in calls {
         let source = call
             .args
@@ -238,20 +298,27 @@ fn forwarder_source(
             .and_then(|a| expression(tcx, call.caller, a.span))
             .ok_or(Hold::CallerSource)?;
         let capacity = array_capacity(tcx, call.caller, source).ok_or(Hold::CallerSource)?;
-        let value = call
+        let count = call
             .args
             .iter()
             .find(|a| a.index == forwarder.count_parameter)
             .and_then(|a| expression(tcx, call.caller, a.span))
-            .and_then(|e| constant(tcx, call.caller, e, 24))
             .ok_or(Hold::CallerCount)?;
-        if value > capacity
-            || value > ((1u128 << (tcx.data_layout.pointer_size.bits() - 1)) - 1) / 4
-        {
-            return Err(Hold::CallerCount);
+        // A constant count must fit the array; a foldable count outside its
+        // range is such a constant. Anything else is a runtime count.
+        match constant(tcx, call.caller, count, 24) {
+            Some(value)
+                if value > capacity
+                    || value > ((1u128 << (tcx.data_layout.pointer_size.bits() - 1)) - 1) / 4 =>
+            {
+                return Err(Hold::CallerCount);
+            }
+            Some(_) => {}
+            None if foldable(tcx, call.caller, count, 24) => return Err(Hold::CallerCount),
+            None => count_kind = Count::Runtime,
         }
     }
-    Ok((forwarder, calls.len()))
+    Ok((forwarder, calls.len(), count_kind))
 }
 
 // A reader's safe signature affects every incoming call. Admit only complete
@@ -261,9 +328,10 @@ fn reader_sources(
     owner: LocalDefId,
     parameter: usize,
     facts: &EmitabilityFacts,
-) -> Result<(usize, Vec<LocalDefId>), Hold> {
+) -> Result<(usize, Vec<LocalDefId>, Count), Hold> {
     let calls = closed_calls(tcx, owner, facts)?;
     let mut members = vec![owner];
+    let mut count = Count::Constant;
     for call in calls {
         let arg = call
             .args
@@ -279,21 +347,25 @@ fn reader_sources(
             .iter()
             .position(|p| p.pat.hir_id == binding)
             .ok_or(Hold::CallerSource)?;
-        let (forwarder, _) = forwarder_source(tcx, call.caller, index, facts).map_err(|hold| {
-            if hold == Hold::OutsideScope {
-                Hold::CallerSource
-            } else {
-                hold
-            }
-        })?;
+        let (forwarder, _, kind) =
+            forwarder_source(tcx, call.caller, index, facts).map_err(|hold| {
+                if hold == Hold::OutsideScope {
+                    Hold::CallerSource
+                } else {
+                    hold
+                }
+            })?;
         if forwarder.callee != owner || forwarder.callee_parameter != parameter {
             return Err(Hold::CallerSource);
         }
         if !members.contains(&call.caller) {
             members.push(call.caller);
         }
+        if kind == Count::Runtime {
+            count = Count::Runtime;
+        }
     }
-    Ok((calls.len(), members))
+    Ok((calls.len(), members, count))
 }
 
 pub(crate) fn prove(
@@ -311,18 +383,21 @@ pub(crate) fn prove(
         if reader.count_parameter != hir_index + 1 {
             return Err(Hold::CallerCount);
         }
-        let (callers, members) = reader_sources(tcx, subject.fn_did, hir_index, facts)?;
+        let (callers, members, count) = reader_sources(tcx, subject.fn_did, hir_index, facts)?;
         return Ok(Proof {
             count_parameter: reader.count_parameter,
+            count,
             callers,
             reader: Some(reader),
             members,
         });
     }
-    let (forwarder, callers) = forwarder_source(tcx, subject.fn_did, hir_index, facts)?;
-    let (_, members) = reader_sources(tcx, forwarder.callee, forwarder.callee_parameter, facts)?;
+    let (forwarder, callers, _) = forwarder_source(tcx, subject.fn_did, hir_index, facts)?;
+    let (_, members, count) =
+        reader_sources(tcx, forwarder.callee, forwarder.callee_parameter, facts)?;
     Ok(Proof {
         count_parameter: forwarder.count_parameter,
+        count,
         callers,
         reader: None,
         members,

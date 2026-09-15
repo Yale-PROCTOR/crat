@@ -170,9 +170,14 @@ fn w5c_thin_count_mutated_count_and_unknown_helper_hold() {
         "size = 1; let mut retval = ShannonEntropy",
     );
     assert!(matches!(proof(&changed), Err(Hold::CalleeAccess(_))));
+    // A count the caller computes at runtime is admitted, typed as such: the
+    // reader walks exactly `count` elements (§28), and its `checked_sub` guards.
     let unknown = fixture(18, "run").replace("18usize)", "opaque())")
         + "\nunsafe fn opaque()->usize {static mut N:usize=18;N}";
-    assert_eq!(proof(&unknown).unwrap_err(), Hold::CallerCount);
+    assert_eq!(
+        proof(&unknown).unwrap().count,
+        super::thin_counted::Count::Runtime
+    );
     let fallback = fixture(18, "run").replace("18usize)", "1024usize)");
     assert_eq!(proof(&fallback).unwrap_err(), Hold::CallerCount);
 }
@@ -322,4 +327,128 @@ fn w5c_thin_count_other_reader_gate_holds_wrapper() {
         !matches!(decision, super::Decision::Slice { .. }),
         "{decision:?}"
     );
+}
+
+/// `src::enc::metablock::BlockSplitterFinishBlockLiteral`, reduced: the count
+/// is the splitter's runtime field `alphabet_size_`; the sources are histogram
+/// field arrays behind the splitter's raw pointer and a local pair, one of them
+/// spelled `&mut *(…).data_.as_mut_ptr().offset(0)`.
+const METABLOCK: &str = r###"
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct HistogramLiteral { pub data_: [u32; 256], pub total_count_: usize, pub bit_cost_: f64 }
+#[repr(C)]
+pub struct BlockSplitterLiteral { pub alphabet_size_: usize, pub num_blocks_: usize, pub block_size_: usize,
+    pub curr_histogram_ix_: usize, pub last_histogram_ix_: [usize; 2], pub last_entropy_: [f64; 2],
+    pub histograms_: *mut HistogramLiteral, pub split_threshold_: f64 }
+unsafe fn HistogramAddHistogramLiteral(self_0: *mut HistogramLiteral, v: *const HistogramLiteral) {
+    let mut i: usize = 0;
+    (*self_0).total_count_ = (*self_0).total_count_.wrapping_add((*v).total_count_);
+    while i < 256 {
+        (*self_0).data_[i] = (*self_0).data_[i].wrapping_add((*v).data_[i]);
+        i = i.wrapping_add(1);
+    }
+}
+unsafe fn BlockSplitterFinishBlockLiteral(self_0: *mut BlockSplitterLiteral, is_final: i32) {
+    let last_entropy = ((*self_0).last_entropy_).as_mut_ptr();
+    let histograms = (*self_0).histograms_;
+    if (*self_0).num_blocks_ == 0 {
+        *last_entropy.offset(0) = BitsEntropy(((*histograms.offset(0)).data_).as_ptr(), (*self_0).alphabet_size_);
+        *last_entropy.offset(1) = *last_entropy.offset(0);
+        (*self_0).num_blocks_ = (*self_0).num_blocks_.wrapping_add(1);
+    } else if (*self_0).block_size_ > 0 {
+        let entropy = BitsEntropy(((*histograms.offset((*self_0).curr_histogram_ix_ as isize)).data_).as_ptr(), (*self_0).alphabet_size_);
+        let mut combined_histo: [HistogramLiteral; 2] = [HistogramLiteral { data_: [0; 256], total_count_: 0, bit_cost_: 0. }; 2];
+        let mut combined_entropy: [f64; 2] = [0.; 2];
+        let mut j: usize = 0;
+        while j < 2 {
+            let last_histogram_ix = (*self_0).last_histogram_ix_[j];
+            combined_histo[j] = *histograms.offset((*self_0).curr_histogram_ix_ as isize);
+            HistogramAddHistogramLiteral(&mut *combined_histo.as_mut_ptr().offset(j as isize), &mut *histograms.offset(last_histogram_ix as isize));
+            combined_entropy[j] = BitsEntropy(&mut *((*combined_histo.as_mut_ptr().offset(j as isize)).data_).as_mut_ptr().offset(0), (*self_0).alphabet_size_);
+            j = j.wrapping_add(1);
+        }
+        (*self_0).split_threshold_ = combined_entropy[0] - entropy - *last_entropy.offset(0);
+    }
+}
+pub unsafe fn run(self_0: *mut BlockSplitterLiteral) { BlockSplitterFinishBlockLiteral(self_0, 0); BlockSplitterFinishBlockLiteral(self_0, 1); }
+"###;
+fn metablock_fixture() -> String {
+    format!(
+        "#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case)]\n{ENTROPY}\n{METABLOCK}"
+    )
+}
+#[test]
+fn w5c_thin_count_runtime_field_count_admits_array_sources() {
+    // The two `data_.as_ptr()` sites alone: `alphabet_size_` is a runtime field.
+    let input = metablock_fixture().replace(
+        "combined_entropy[j] = BitsEntropy(&mut *((*combined_histo.as_mut_ptr().offset(j as isize)).data_).as_mut_ptr().offset(0), (*self_0).alphabet_size_);",
+        "combined_entropy[j] = combined_histo[j].bit_cost_;",
+    );
+    let p = proof(&input).unwrap();
+    assert_eq!(
+        (p.count_parameter, p.callers, p.count),
+        (1, 2, super::thin_counted::Count::Runtime)
+    );
+    let table = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        crate::bo_rewriter::decide_table(tcx).unwrap()
+    })
+    .unwrap();
+    for label in ["BitsEntropy::population", "ShannonEntropy::population"] {
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.label == label)
+            .unwrap();
+        assert!(
+            matches!(decision, super::Decision::Slice { mutable: false, .. }),
+            "{label}: {decision:?}"
+        );
+    }
+    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(emitted.contains("population: &[u32]"));
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "BitsEntropy(core::slice::from_raw_parts(((*histograms.offset(0)).data_).as_ptr(), ((*self_0).alphabet_size_) as usize), (*self_0).alphabet_size_)"
+        ),
+        "{emitted}"
+    );
+    assert!(
+        flat.contains("population.len().checked_sub(size as usize)"),
+        "{emitted}"
+    );
+    assert!(!emitted.contains("FALLBACK_SLICE_EXTENT"));
+    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
+    if let Ok(root) = std::env::var("CRAT_W5C_FIXTURE_CAPTURE") {
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(format!("{root}/metablock-original.rs"), &input).unwrap();
+        std::fs::write(format!("{root}/metablock-emitted.rs"), &emitted).unwrap();
+    }
+}
+#[test]
+fn w5c_thin_count_first_element_reference_source_stays_held() {
+    // c2rust's `&a[0]`: the seam would render it `slice::from_ref`, one element.
+    use super::thin_counted::Hold;
+    let input = metablock_fixture();
+    assert_eq!(proof(&input).unwrap_err(), Hold::CallerSource);
+    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(emitted.contains("population: *const u32"), "{emitted}");
+    assert!(!emitted.contains("slice::from_ref"), "{emitted}");
+}
+#[test]
+fn w5c_thin_count_offset_zero_array_start_source() {
+    use super::thin_counted::Hold;
+    let start =
+        fixture(18, "run").replace("depth_histo.as_ptr()", "depth_histo.as_ptr().offset(0)");
+    let p = proof(&start).unwrap();
+    assert_eq!(
+        (p.callers, p.count),
+        (1, super::thin_counted::Count::Constant)
+    );
+    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&start).unwrap();
+    assert!(emitted.contains("population: &[u32]"));
+    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
+    let past = fixture(18, "run").replace("depth_histo.as_ptr()", "depth_histo.as_ptr().offset(1)");
+    assert_eq!(proof(&past).unwrap_err(), Hold::CallerSource);
 }
