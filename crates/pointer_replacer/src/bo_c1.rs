@@ -436,10 +436,19 @@ fn raw_boundary_delivery_custody(
                 }
                 Ok(_) => "different-form",
                 Err(reason) => {
-                    report.issues.push(format!(
-                        "delivery-custody:{reason}:{}:owner={}:binding={}",
-                        expected.subject_key, expected.emitted_owner, expected.binding
-                    ));
+                    // R402-2: an untyped or unresolved declaration is a custody
+                    // disagreement only for a subject the LEDGER delivers. An
+                    // expectation the ledger did not deliver (a typed exclusion,
+                    // a degraded row) legitimately leaves the original
+                    // declaration — for an inferred local that is `let p = …`
+                    // — and is a state, not an issue; the identity sets still
+                    // catch a ledger/tree disagreement either way.
+                    if report.delivered_by_ledger.contains(&expected.subject_key) {
+                        report.issues.push(format!(
+                            "delivery-custody:{reason}:{}:owner={}:binding={}",
+                            expected.subject_key, expected.emitted_owner, expected.binding
+                        ));
+                    }
                     reason
                 }
             }
@@ -26525,6 +26534,29 @@ fn r219_custody_invalid_parse_fails_closed() {
             .iter()
             .any(|issue| issue.starts_with("delivery-custody:parse:")),
         "{report:?}"
+    );
+}
+
+/// R402-2 — an inferred local the ledger did NOT deliver keeps its original
+/// untyped declaration in the tree; that is the excluded row's state, not a
+/// custody issue. The same declaration IS an issue once the ledger claims it.
+#[test]
+fn r402_custody_undelivered_inferred_local_is_a_state_not_an_issue() {
+    let mut expectation = r219_custody_expectation("f", "p");
+    expectation.parameter_index = None;
+    let source = "fn f() { let p = &1; }";
+    let report = r219_custody_observe(&[expectation.clone()], &[], source, &[]);
+    assert!(report.issues.is_empty(), "{report:?}");
+    assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    assert_eq!(report.observations.len(), 1, "{report:?}");
+    assert_eq!(report.observations[0].state, "inferred-type", "{report:?}");
+    let claimed = r219_custody_observe(&[expectation], &["f::p#1"], source, &[]);
+    assert!(
+        claimed
+            .issues
+            .iter()
+            .any(|issue| issue.starts_with("delivery-custody:inferred-type:")),
+        "{claimed:?}"
     );
 }
 
