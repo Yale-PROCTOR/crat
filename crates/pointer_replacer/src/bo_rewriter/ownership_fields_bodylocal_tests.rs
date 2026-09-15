@@ -626,6 +626,79 @@ fn r401_peer_derived_from_the_subject_is_not_disjoint() {
 }
 
 #[test]
+fn r403_heman_elevations_pointer_array_owner_depth_two() {
+    // `heman_generate_archipelago_political_3::elevations#9`: a `malloc`ed
+    // array of raw pointers (`*mut *mut heman_image`), filled by index from a
+    // producer, read through `(**elevations.offset(i)).data`, each element
+    // destroyed by a callee, the array freed. The outer owner becomes
+    // `Box<[*mut heman_image_s]>`; the inner pointers stay raw.
+    let input = format!(
+        r#"{}
+#[repr(C)] #[derive(Copy, Clone)] pub struct heman_image_s {{ pub width: libc::c_int, pub data: *mut libc::c_float }}
+pub type heman_image = heman_image_s;
+unsafe extern "C" fn make(mut width: libc::c_int) -> *mut heman_image {{
+    let mut img = malloc(::std::mem::size_of::<heman_image_s>() as libc::c_ulong) as *mut heman_image;
+    (*img).width = width;
+    (*img).data = malloc((::std::mem::size_of::<libc::c_float>() as libc::c_ulong).wrapping_mul(width as libc::c_ulong)) as *mut libc::c_float;
+    return img;
+}}
+unsafe extern "C" fn heman_image_destroy(mut img: *mut heman_image) {{
+    free((*img).data as *mut libc::c_void);
+    free(img as *mut libc::c_void);
+}}
+pub unsafe extern "C" fn political_3(mut width: libc::c_int, mut ncolors: libc::c_int) -> libc::c_float {{
+    let mut elevations = malloc((::std::mem::size_of::<*mut heman_image>() as libc::c_ulong).wrapping_mul(ncolors as libc::c_ulong)) as *mut *mut heman_image;
+    let mut cindex = 0 as libc::c_int;
+    while cindex < ncolors {{
+        *elevations.offset(cindex as isize) = make(width);
+        cindex += 1;
+    }}
+    let mut acc = 0.0f32;
+    let mut cindex_0 = 0 as libc::c_int;
+    while cindex_0 < ncolors {{
+        let mut src = ((**elevations.offset(cindex_0 as isize)).data).offset(0 as isize);
+        acc += *src;
+        heman_image_destroy(*elevations.offset(cindex_0 as isize));
+        cindex_0 += 1;
+    }}
+    free(elevations as *mut libc::c_void);
+    acc
+}}"#,
+        c_declarations()
+    );
+    let s = verify(&input, "elevations", BoxShape::Slice, false);
+    assert!(s.contains("let mut elevations: ::std::boxed::Box<[*mut crate::heman_image_s]> = ::std::vec![::core::ptr::null_mut(); "), "{s}");
+    assert!(
+        s.contains("heman_image_destroy(elevations[(cindex_0) as usize]);"),
+        "{s}"
+    );
+    // Control: only one owned level is admitted; a `*mut *mut *mut` owner
+    // (a table of pointer tables) stays outside the permit.
+    let deeper = format!(
+        "{} pub unsafe fn table(n: usize) -> usize {{ let mut t = malloc((core::mem::size_of::<*mut *mut u32>() as libc::c_ulong).wrapping_mul(n as libc::c_ulong)) as *mut *mut *mut u32; *t.offset(0) = core::ptr::null_mut(); let v = (*t.offset(0)).is_null() as usize; free(t as *mut libc::c_void); v }}",
+        c_declarations()
+    );
+    ::utils::compilation::run_compiler_on_str(&deeper, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, d) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("t") && s.ptr_depth == 3)
+            .unwrap();
+        assert!(matches!(d, Decision::Degraded(_)), "{d:?}");
+        let _ = &ctx;
+    })
+    .unwrap();
+}
+
+#[test]
 fn r395_heman_percentiles_real_shape_sizeof_first_wrapping_mul_count() {
     // `heman_ops_percentiles::vals#292`: sizeof-first operand order, an
     // index-written buffer read back in a loop, the C free at the end.

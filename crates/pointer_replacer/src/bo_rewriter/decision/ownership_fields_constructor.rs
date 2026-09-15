@@ -40,10 +40,7 @@ pub(crate) fn derive<'tcx>(
     }
     let pointer_bits = tcx.data_layout.pointer_size.bits();
     let (zero, element_bits) = zero_value(tcx, element, pointer_bits)?;
-    let element_spelling = match element.kind() {
-        TyKind::Adt(def, _) => format!("crate::{}", tcx.def_path_str(def.did())),
-        _ => element.to_string(),
-    };
+    let element_spelling = spell_element(tcx, element);
     let mut allocation = init;
     while let ExprKind::Cast(inner, _) = allocation.kind {
         if !matches!(typeck.expr_ty(allocation).kind(), TyKind::RawPtr(..))
@@ -451,6 +448,23 @@ fn unsigned_bits(ty: Ty<'_>, pointer_bits: u64) -> Option<u64> {
         UintTy::U128 => 128,
         UintTy::Usize => pointer_bits,
     })
+}
+
+/// The element type as the emitted binding must spell it: numeric scalars
+/// by name, local structs by their crate-rooted path (the source site may
+/// know them only through an alias), raw pointers and arrays of those.
+fn spell_element<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
+    match ty.kind() {
+        TyKind::Adt(def, _) => format!("crate::{}", tcx.def_path_str(def.did())),
+        TyKind::RawPtr(inner, rustc_hir::Mutability::Mut) => {
+            format!("*mut {}", spell_element(tcx, *inner))
+        }
+        TyKind::RawPtr(inner, rustc_hir::Mutability::Not) => {
+            format!("*const {}", spell_element(tcx, *inner))
+        }
+        TyKind::Array(inner, length) => format!("[{}; {}]", spell_element(tcx, *inner), length),
+        _ => ty.to_string(),
+    }
 }
 
 /// A spelled all-zero value for a numeric scalar, a raw pointer (null), an

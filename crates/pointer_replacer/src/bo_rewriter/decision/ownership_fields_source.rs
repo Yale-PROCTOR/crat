@@ -419,7 +419,7 @@ pub(crate) fn derive<'tcx>(
     if !program.functions.contains(&subject.fn_did)
         || subject.hir_id.owner.def_id != subject.fn_did
         || !matches!(subject.kind, super::SubjectKind::Local)
-        || subject.ptr_depth != 1
+        || !matches!(subject.ptr_depth, 1 | 2)
     {
         return Err(SourceHold::Identity);
     }

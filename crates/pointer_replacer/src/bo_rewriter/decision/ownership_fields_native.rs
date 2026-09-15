@@ -208,19 +208,22 @@ impl Candidates {
                 | Decision::Opt { .. }
                 | Decision::Box(_) => continue,
             };
-            let super::DegradeReason::BoxFailure {
-                failure: BoxPlanFailure::NativeEvidenceHeld { prior_key, .. },
-            } = &degraded.reason
-            else {
-                continue;
-            };
-            // Locals the prior path held on their caller (F01) or on an
-            // aggregate initializer (F04) are native candidates.
-            if !matches!(
-                *prior_key,
-                "box-param-caller-unknown" | "box-initializer-unsupported"
-            ) {
-                continue;
+            // Locals the prior path held on their caller (F01), on an
+            // aggregate initializer (F04), or on pointer depth (F03: an array
+            // of raw pointers whose outer owner is the subject and whose
+            // elements stay raw) are native candidates.
+            match &degraded.reason {
+                super::DegradeReason::BoxFailure {
+                    failure: BoxPlanFailure::NativeEvidenceHeld { prior_key, .. },
+                } if matches!(
+                    *prior_key,
+                    "box-param-caller-unknown" | "box-initializer-unsupported"
+                ) => {}
+                // The source permit decides which depth it admits.
+                super::DegradeReason::BoxFailure {
+                    failure: BoxPlanFailure::PointerDepth,
+                } => {}
+                _ => continue,
             }
             let Some(slot) = inputs
                 .slots
