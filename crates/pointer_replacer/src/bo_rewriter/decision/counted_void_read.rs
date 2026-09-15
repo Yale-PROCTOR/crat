@@ -16,7 +16,7 @@ use super::{
     emitability::UseEdit,
 };
 
-fn local_of(e: &Expr<'_>) -> Option<HirId> {
+pub(super) fn local_of(e: &Expr<'_>) -> Option<HirId> {
     match e.kind {
         ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
             Res::Local(id) => Some(id),
@@ -26,7 +26,7 @@ fn local_of(e: &Expr<'_>) -> Option<HirId> {
     }
 }
 
-fn is_zero(e: &Expr<'_>) -> bool {
+pub(super) fn is_zero(e: &Expr<'_>) -> bool {
     matches!(e.kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v.get() == 0))
 }
 
@@ -131,7 +131,7 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx> {
     }
 }
 
-fn peel<'a>(mut e: &'a Expr<'a>) -> &'a Expr<'a> {
+pub(super) fn peel<'a>(mut e: &'a Expr<'a>) -> &'a Expr<'a> {
     while let ExprKind::DropTemps(inner) = e.kind {
         e = inner;
     }
@@ -139,7 +139,7 @@ fn peel<'a>(mut e: &'a Expr<'a>) -> &'a Expr<'a> {
 }
 
 /// Is `e` read as a value (not assigned, not borrowed)?
-fn rvalue(tcx: TyCtxt<'_>, e: &Expr<'_>) -> bool {
+pub(super) fn rvalue(tcx: TyCtxt<'_>, e: &Expr<'_>) -> bool {
     match tcx.parent_hir_node(e.hir_id) {
         Node::Expr(parent) => match parent.kind {
             ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) => lhs.hir_id != e.hir_id,
@@ -485,7 +485,7 @@ fn indexed_reads<'tcx>(
     Some((count?, out))
 }
 
-fn strip<'a>(mut e: &'a Expr<'a>) -> &'a Expr<'a> {
+pub(super) fn strip<'a>(mut e: &'a Expr<'a>) -> &'a Expr<'a> {
     loop {
         match e.kind {
             ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => e = inner,

@@ -112,10 +112,12 @@ pub(crate) fn collect(
     tcx: TyCtxt<'_>,
     subjects: &[Subject],
     pointees: &mut DeclarationPointees,
+    model_raw: impl Fn(&Subject) -> bool,
 ) -> Contracts {
     let mut out = Contracts::default();
     let mut proven: Vec<(&Subject, Contract)> = subjects
         .iter()
+        .filter(|s| !model_raw(s))
         .filter_map(|s| {
             prove(tcx, s)
                 .or_else(|| super::counted_void_read::prove(tcx, s))
@@ -131,7 +133,7 @@ pub(crate) fn collect(
             .collect();
         let mut added = 0;
         for s in subjects {
-            if known.contains_key(&(s.fn_did, s.hir_id)) {
+            if known.contains_key(&(s.fn_did, s.hir_id)) || model_raw(s) {
                 continue;
             }
             if let Some(contract) = prove_forward(tcx, s, subjects, &known) {

@@ -6812,7 +6812,22 @@ fn finish_decide<'tcx>(
 
     perturb(&mut subjects);
     let mut declaration_pointees = decision::declaration::collect(tcx, &subjects);
-    let counted_void = decision::counted_void::collect(tcx, &subjects, &mut declaration_pointees);
+    let counted_void =
+        decision::counted_void::collect(tcx, &subjects, &mut declaration_pointees, |subject| {
+            // BO's kind first (the ladder's own rule): a contract is never
+            // proven against a `Raw` verdict, so a forwarder cannot take a
+            // view its raw callee would not.
+            slots
+                .fn_local_slots
+                .get(&subject.fn_did)
+                .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                .is_some_and(|slot| {
+                    matches!(
+                        model.get(&SlotRef::Local(subject.fn_did, slot)),
+                        Some(SlotKind::Raw)
+                    )
+                })
+        });
     let (io_domain_subjects, io_domain_budget_exhausted) =
         decision::io_domain::collect(tcx, &subjects);
     let void_pointee_subjects = decision::void_pointee::collect(tcx, &subjects);

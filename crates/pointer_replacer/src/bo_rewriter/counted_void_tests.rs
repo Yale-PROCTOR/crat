@@ -1202,3 +1202,74 @@ fn w6v_void_handle_holds_when_the_cast_is_offset() {
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
+
+// ---- report 008: the model gate (a forwarder never outruns a raw callee) ----
+
+/// rs-crown/libcsv `csv_write2` reduced (the src side is 006's read cursor):
+/// every write through `cdest` sits in a block guarded by `dest_size > chars`,
+/// each such block is followed by a (saturating) increment of `chars`, and
+/// `chars` never decreases — so the k-th write lands at index k < dest_size.
+const CSV_WRITE: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+unsafe fn csv_write2(mut dest: *mut core::ffi::c_void, mut dest_size: u64,
+    mut src: *const core::ffi::c_void, mut src_size: u64, mut quote: u8) -> u64 {
+    let mut cdest = dest as *mut u8;
+    let mut csrc = src as *const u8;
+    let mut chars = 0 as i32 as u64;
+    if src.is_null() { return 0 as i32 as u64; }
+    if dest.is_null() { dest_size = 0 as i32 as u64; }
+    if dest_size > 0 as i32 as u64 {
+        *cdest = quote;
+        let fresh28 = *cdest;
+        cdest = cdest.offset(1);
+    }
+    chars = chars.wrapping_add(1);
+    while src_size != 0 {
+        if *csrc as i32 == quote as i32 {
+            if dest_size > chars {
+                *cdest = quote;
+                let fresh29 = *cdest;
+                cdest = cdest.offset(1);
+            }
+            if chars < 18446744073709551615 as u64 { chars = chars.wrapping_add(1); }
+        }
+        if dest_size > chars {
+            *cdest = *csrc;
+            let fresh30 = *cdest;
+            cdest = cdest.offset(1);
+        }
+        if chars < 18446744073709551615 as u64 { chars = chars.wrapping_add(1); }
+        src_size = src_size.wrapping_sub(1);
+        csrc = csrc.offset(1);
+    }
+    if dest_size > chars { *cdest = quote; }
+    if chars < 18446744073709551615 as u64 { chars = chars.wrapping_add(1); }
+    return chars;
+}
+unsafe fn csv_write(mut dest: *mut core::ffi::c_void, mut dest_size: u64,
+    mut src: *const core::ffi::c_void, mut src_size: u64) -> u64 {
+    return csv_write2(dest, dest_size, src, src_size, 0x22 as i32 as u8);
+}
+"#;
+
+/// The model kinds `csv_write2::dest` (a `*mut` cursor written and advanced)
+/// `Raw`; the forwarder `csv_write::dest` would otherwise prove a forward
+/// contract and take a view its raw callee cannot receive. Contracts are
+/// proven only against a non-`Raw` model kind, so the forwarder stays held.
+#[test]
+fn w6v_forwarder_never_outruns_the_models_raw_callee() {
+    let rows = super::emit_tests::decisions_of(CSV_WRITE);
+    let dest: Vec<_> = rows.iter().filter(|(n, p, _)| n == "dest" && *p).collect();
+    assert_eq!(dest.len(), 2, "{rows:?}");
+    assert!(
+        dest.iter().any(|(_, _, r)| r == "kind-raw"),
+        "the callee's dest is the model's Raw: {rows:?}"
+    );
+    assert!(
+        dest.iter().all(|(_, _, r)| r != "<emitted>"),
+        "no forwarder takes a view into a raw callee: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(CSV_WRITE).unwrap();
+    assert!(!source.contains("dest: Option<&mut ["), "{source}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
