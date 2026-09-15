@@ -4329,28 +4329,29 @@ pub(crate) fn synthesize_with_raw_boundary(
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, pos)| {
-                    (shared_read_call.is_some() && super::shared_read_pairs::admits(
-                        mut_facts,
-                        *callee,
-                        pos.index,
-                        pos.expected,
-                        conflicts[idx]
-                            .iter()
-                            .filter(|peer| peer.proof.verdict != A5SiteProofVerdict::Clear)
-                            .map(|peer| {
-                                let index = if peer.left == pos.index {
-                                    peer.right
-                                } else {
-                                    peer.left
-                                };
-                                let form = positions
-                                    .iter()
-                                    .find(|position| position.index == index)
-                                    .expect("conflict peer comes from positions")
-                                    .expected;
-                                (index, form)
-                            }),
-                    ))
+                    (shared_read_call.is_some()
+                        && super::shared_read_pairs::admits(
+                            mut_facts,
+                            *callee,
+                            pos.index,
+                            pos.expected,
+                            conflicts[idx]
+                                .iter()
+                                .filter(|peer| peer.proof.verdict != A5SiteProofVerdict::Clear)
+                                .map(|peer| {
+                                    let index = if peer.left == pos.index {
+                                        peer.right
+                                    } else {
+                                        peer.left
+                                    };
+                                    let form = positions
+                                        .iter()
+                                        .find(|position| position.index == index)
+                                        .expect("conflict peer comes from positions")
+                                        .expected;
+                                    (index, form)
+                                }),
+                        ))
                     .then_some(pos.index)
                 })
                 .collect::<BTreeSet<_>>();

@@ -89,6 +89,7 @@ pub(crate) mod plan;
 mod shared_pair_ast;
 #[cfg(test)]
 mod shared_pair_tests;
+mod shared_read_arguments;
 pub(crate) mod sibling_audit;
 pub(crate) mod sign_facts;
 mod slice_cursor_prelude;
@@ -99,7 +100,6 @@ mod wave5d_accumulator_tests;
 #[cfg(test)]
 mod wave5d_tests;
 mod wave5r_cast;
-mod shared_read_arguments;
 mod wave5r_field_borrow;
 mod wave5r_helper_path;
 #[cfg(test)]
