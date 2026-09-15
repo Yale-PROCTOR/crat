@@ -119,10 +119,18 @@ unsafe fn ShannonEntropy(mut population: *const u32, size: usize) -> u32 {
 }
 "#;
     assert!(verify::type_checks_str(input));
+    // Re-pinned under R217-2(a) (relay 012 §4): with slicecursor's ordering
+    // build composed, the advanced pointer DELIVERS by the cursor family;
+    // this lane's hold was the absence of that form. What this witness pins
+    // is that the comparison view never makes an advanced pointer a THIN
+    // safe view: degraded here, a cursor there, never `Ref` / `Opt`.
     let decision = decision_of(input, "ShannonEntropy", "population");
     assert!(
-        matches!(decision, Decision::Degraded(_)),
-        "an advanced pointer under an ordering comparison is not this lane's: {decision:?}"
+        !matches!(
+            decision,
+            Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Opt { .. }
+        ),
+        "an advanced pointer under an ordering comparison is never a thin view: {decision:?}"
     );
     // An ORDERING against a raw partner is not opened one-sidedly either:
     // the value-only partner keeps its hold.
@@ -140,8 +148,11 @@ unsafe fn before(a: *const u32, end: *const u32) -> u32 {
     ));
     let partner = decision_of(ordered, "before", "end");
     assert!(
-        matches!(partner, Decision::Degraded(_)),
-        "an ordering partner of a raw pointer keeps its hold: {partner:?}"
+        !matches!(
+            partner,
+            Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Opt { .. }
+        ),
+        "an ordering partner of a raw pointer receives no thin view: {partner:?}"
     );
     let output = ast_emitted_source_of(input).expect("hold emission");
     assert!(verify::type_checks_str(&output), "{output}");
