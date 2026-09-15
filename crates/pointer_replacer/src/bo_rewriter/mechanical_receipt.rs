@@ -2295,7 +2295,18 @@ pub(crate) fn reconcile_outbound_return_rows(
                 } else {
                     MechanicalMechanism::ReturnAdapter
                 }
-            || event.evidence.extent != MechanicalExtent::None
+            || event.evidence.extent
+                != if bridge.site.position.contains(":through_raw_field=")
+                    && bridge.extent == BridgeExtentKind::Fallback
+                {
+                    // W6L-1 wave 2: the slice return's fabricated extent.
+                    MechanicalExtent::Fallback {
+                        receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                        waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
+                    }
+                } else {
+                    MechanicalExtent::None
+                }
             || event.evidence.terminal_contract
                 != (TerminalContract::Required {
                     interface: row.terminal_interface.clone(),
@@ -2320,7 +2331,20 @@ pub(crate) fn reconcile_outbound_return_rows(
             || bridge.expected_form != row.target_form
             || bridge.found_form != row.source_form
             || bridge.argument_kind != event.argument_kind
-            || bridge.extent != BridgeExtentKind::None
+            || bridge.extent
+                != if bridge.site.position.contains(":through_raw_field=")
+                    && event.evidence.extent
+                        == (MechanicalExtent::Fallback {
+                            receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                            waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
+                        })
+                {
+                    // W6L-1 wave 2: the slice return's fabricated extent is
+                    // receipted on both sides.
+                    BridgeExtentKind::Fallback
+                } else {
+                    BridgeExtentKind::None
+                }
         {
             return Err(format!(
                 "outbound-return specialized/common/bridge drift at {key}"

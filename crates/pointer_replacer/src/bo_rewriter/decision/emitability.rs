@@ -752,12 +752,20 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                 raw_target_type(self.tcx, self.tcx.typeck(self.fn_did).expr_ty(expr))
         {
             let shape = classify_arg(self.tcx, expr);
+            // W6L-1 wave 2: `&*(*p).field.as_ptr().offset(k) as *const T` is
+            // an `AddrOfCast` argument shape, which roots at nothing for
+            // argument purposes; as a RETURN expression its root is the
+            // borrowed place's base, exactly as `place_root` reads it.
+            let root = shape.place_root().or_else(|| match &peel_casts(expr).kind {
+                ExprKind::AddrOf(_, _, operand) => place_root(operand).0,
+                _ => None,
+            });
             self.facts.return_sites.push(ReturnSiteFact {
                 hir_id: expr.hir_id,
                 owner: self.fn_did,
                 span: expr.span,
-                root: shape
-                    .place_root()
+                // wave-6s2: the C2Rust constant-reslice return roots at its place too.
+                root: root
                     .or_else(|| super::slice_passon::c2rust_constant_reslice_root(self.tcx, expr)),
                 source_shape: shape.key(),
                 source_type,

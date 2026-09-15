@@ -28,8 +28,19 @@
 //!
 //! Multiple parameters feeding one return are a typed hold
 //! (`lifetime-origin-ambiguous`), per the charter: no guessed lifetime.
+//!
+//! Wave 2 adds two things. (1) The **pointee** class: a return derived from
+//! the parameter's OWN pointee through a non-bare expression (brotli
+//! `StartPosQueueAt`: `&*(*self_0).q_.as_ptr().offset(k) as *const PosData`,
+//! an inline array field). NB5-O records `Arg/deref0 → Return` directly, so
+//! no collapse is needed and the bridge is the existing T1 reborrow; the
+//! existing rule only missed it because no SUBJECT escapes via the return.
+//! (2) The **slice form**: when a caller walks or indexes the result, the
+//! callee returns `&'a mut [T]` built with `core::slice::from_raw_parts_mut`
+//! and the addendum-77 fallback extent receipt; thin callers of such a callee
+//! are held `lifetime-seam-incompatible` rather than mis-typed.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{mir::RETURN_PLACE, ty::TyKind};
 
@@ -55,14 +66,18 @@ use crate::{
 pub(crate) struct ThroughRawFieldReuse {
     pub(crate) parameter: FnSignatureSlot,
     pub(crate) traversal: Vec<String>,
+    /// The return is a slice (`&'a mut [T]` over the fallback extent) because
+    /// at least one caller walks or indexes the result.
+    pub(crate) slice: bool,
 }
 
 impl ThroughRawFieldReuse {
     pub(crate) fn receipt_key(&self) -> String {
         format!(
-            "through_raw_field={}\tparameter={}",
+            "through_raw_field={}\tparameter={}\tform={}",
             self.traversal.join(","),
-            self.parameter.receipt_key()
+            self.parameter.receipt_key(),
+            if self.slice { "slice" } else { "thin" }
         )
     }
 }
@@ -73,10 +88,13 @@ impl ThroughRawFieldReuse {
 #[derive(Clone, Debug)]
 pub(crate) struct CalleePermit {
     pub(crate) parameter_node: NodeKey,
+    pub(crate) parameter: FnSignatureSlot,
     pub(crate) parameter_origin: OriginSlot,
     pub(crate) return_origin: OriginSlot,
-    pub(crate) reuse: ThroughRawFieldReuse,
-    pub(crate) overlay: OriginSummary,
+    /// `None` is the pointee class: the summary already carries the edge and
+    /// the existing T1 reborrow applies.
+    pub(crate) reuse: Option<ThroughRawFieldReuse>,
+    pub(crate) overlay: Option<OriginSummary>,
 }
 
 fn traversal_key(root_index: u32, deref_depth: u8, depth: u8, field: bool) -> String {
@@ -97,6 +115,7 @@ pub(crate) fn derive_callee(
     model: &FxHashMap<SlotRef, SlotKind>,
     decisions: &FxHashMap<NodeKey, &Decision>,
     subjects: &[Subject],
+    slice: bool,
 ) -> Result<CalleePermit, LifetimeFailure> {
     let summary = origins
         .and_then(|origins| origins.get(&callee))
@@ -159,14 +178,18 @@ pub(crate) fn derive_callee(
         });
     };
     let root = *root;
-    // A bare parameter source belongs to the existing E2 return permit; this
-    // rule owns only origins that pass through raw storage.
-    if sources
+    // Every source is either the parameter's own pointee (the pointee class:
+    // `deref0`, no field) or reached through raw storage. A mix has no single
+    // honest bridge tier and is held.
+    let pointee_sources = sources
         .iter()
-        .any(|(_, slot)| slot.place.deref_depth == 0 && slot.place.field.is_none())
-    {
-        return Err(LifetimeFailure::OriginConflict);
-    }
+        .filter(|(_, slot)| slot.place.deref_depth == 0 && slot.place.field.is_none())
+        .count();
+    let pointee_class = match pointee_sources {
+        0 => false,
+        n if n == sources.len() => true,
+        _ => return Err(LifetimeFailure::OriginConflict),
+    };
     let parameter_origin = summary
         .slots
         .iter_enumerated()
@@ -194,8 +217,8 @@ pub(crate) fn derive_callee(
     let parameter_node = (parameter.fn_did, parameter.hir_id);
     // EXHAUSTIVE: the parameter must be a plain reference in the safe
     // variant; every other disposition has no borrow to lend the return.
-    match decisions.get(&parameter_node) {
-        Some(Decision::Ref { .. }) => {}
+    let parameter_mutable = match decisions.get(&parameter_node) {
+        Some(Decision::Ref { mutable }) => *mutable,
         Some(
             Decision::InferredRef { .. }
             | Decision::Slice { .. }
@@ -206,6 +229,29 @@ pub(crate) fn derive_callee(
             | Decision::Degraded(_),
         )
         | None => return Err(LifetimeFailure::OriginConflict),
+    };
+    let parameter = FnSignatureSlot::arg(root.as_u32() as usize, 0, 0);
+    let _ = program;
+    // A return through raw storage does not point into `*p`, so tying it to
+    // an EXCLUSIVE borrow of `*p` would forbid the caller every read of `*p`
+    // while the view lives (heman's callers read `(*img).nbands` in the loop
+    // that walks the view: E0503, a revert that takes the owner's other
+    // deliveries down). Only a shared parameter can lend its lifetime this
+    // way; the pointee class is exactly the case where the exclusive tie is
+    // right, so it is exempt.
+    if !pointee_class && parameter_mutable {
+        return Err(LifetimeFailure::ParameterBorrowHeld);
+    }
+
+    if pointee_class {
+        return Ok(CalleePermit {
+            parameter_node,
+            parameter,
+            parameter_origin,
+            return_origin,
+            reuse: None,
+            overlay: None,
+        });
     }
     let mut traversal = sources
         .iter()
@@ -222,16 +268,33 @@ pub(crate) fn derive_callee(
     traversal.dedup();
     let mut overlay = summary.clone();
     overlay.subset.insert(parameter_origin, return_origin);
-    let _ = program;
     Ok(CalleePermit {
         parameter_node,
+        parameter,
         parameter_origin,
         return_origin,
-        reuse: ThroughRawFieldReuse {
-            parameter: FnSignatureSlot::arg(root.as_u32() as usize, 0, 0),
+        reuse: Some(ThroughRawFieldReuse {
+            parameter,
             traversal,
-        },
-        overlay,
+            slice,
+        }),
+        overlay: Some(overlay),
+    })
+}
+
+/// Whether the caller local walks or indexes the value it receives — the
+/// uses a thin reference cannot serve, so the callee must return a slice.
+pub(crate) fn arithmetic_use(
+    raw_only_uses: &FxHashMap<NodeKey, Vec<(String, rustc_span::Span)>>,
+    node: NodeKey,
+) -> bool {
+    raw_only_uses.get(&node).is_some_and(|uses| {
+        uses.iter().any(|(op, _)| {
+            matches!(
+                op.as_str(),
+                "offset" | "wrapping_offset" | "add" | "sub" | "wrapping_add" | "wrapping_sub"
+            )
+        })
     })
 }
 
@@ -306,29 +369,36 @@ pub(crate) fn is_safe_view(decision: Option<&&Decision>) -> bool {
     }
 }
 
-/// Direct local callees named by the caller locals this rule may serve.
+/// Direct local callees named by at least one `return-not-adapted` caller
+/// local, with EVERY call-result local of that callee — the return form is
+/// decided from all of them so it never moves between family stages (a
+/// walking caller degraded at an early stage still fixes the form).
 pub(crate) fn candidate_callees(
     subjects: &[Subject],
     decisions: &FxHashMap<NodeKey, &Decision>,
     constructions: &super::construction::ConstructionFacts,
-) -> FxHashSet<LocalDefId> {
+) -> FxHashMap<LocalDefId, Vec<NodeKey>> {
     use super::construction::{CallResultTarget, Construction};
-    subjects
+    let mut callers = FxHashMap::<LocalDefId, Vec<NodeKey>>::default();
+    let mut named = FxHashMap::<LocalDefId, bool>::default();
+    for subject in subjects
         .iter()
-        .filter(|subject| {
-            matches!(subject.ctor, Some(Construction::CallResult))
-                && is_return_residual(decisions.get(&(subject.fn_did, subject.hir_id)))
-        })
-        .filter_map(|subject| {
-            match constructions
-                .call_result_targets
-                .get(&(subject.fn_did, subject.hir_id))?
-            {
-                CallResultTarget::DirectLocal(callee) => Some(*callee),
-                CallResultTarget::Indirect
-                | CallResultTarget::Foreign
-                | CallResultTarget::Unresolved => None,
+        .filter(|subject| matches!(subject.ctor, Some(Construction::CallResult)))
+    {
+        let node = (subject.fn_did, subject.hir_id);
+        let Some(target) = constructions.call_result_targets.get(&node) else {
+            continue;
+        };
+        match target {
+            CallResultTarget::DirectLocal(callee) => {
+                callers.entry(*callee).or_default().push(node);
+                *named.entry(*callee).or_default() |= is_return_residual(decisions.get(&node));
             }
-        })
-        .collect()
+            CallResultTarget::Indirect
+            | CallResultTarget::Foreign
+            | CallResultTarget::Unresolved => {}
+        }
+    }
+    callers.retain(|callee, _| named.get(callee).copied().unwrap_or(false));
+    callers
 }

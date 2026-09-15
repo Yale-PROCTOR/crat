@@ -194,6 +194,15 @@ pub(crate) fn plan(
             } else {
                 base
             }
+        } else if lifetime_plan
+            .through_raw_field()
+            .is_some_and(|reuse| reuse.slice)
+        {
+            // W6L-1 wave 2: a return manufactured from raw storage whose
+            // callers walk or index it is a slice over the fallback extent.
+            Form::Slice {
+                mutable: mutability.is_mut(),
+            }
         } else {
             // Preserve the established scalar return interface, including its
             // existing shared-to-mutable gate in seam synthesis.

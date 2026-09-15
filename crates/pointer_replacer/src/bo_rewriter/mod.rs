@@ -7401,6 +7401,7 @@ fn finish_decide<'tcx>(
             fnptr_web.clone(),
             fnptr_web_wall_s,
             &preliminary_exposure,
+            &facts.raw_only_uses,
         );
         lifetime_eligibility.admit_field_stores(field_candidates.store_permit_pairs());
         let lifetime_eligibility = lifetime_eligibility;

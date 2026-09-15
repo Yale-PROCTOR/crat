@@ -17,11 +17,12 @@ use super::super::{
         seam::{Form, SeamEdit, TerminalCallPlans},
     },
     mechanical_receipt::{
-        CanonicalCallee, CanonicalLocation, CanonicalSiteKey, MechanicalEvidence, MechanicalExtent,
-        MechanicalFamily, MechanicalMechanism, MechanicalObligationEvent, MechanicalObligationKey,
-        MechanicalObligationPlan, MechanicalRetention, MechanicalStage, MechanicalState,
-        MechanicalSubjectKey, NativeReturnEvidence, NegativeWriteEvidence,
-        OutboundReturnBridgeReceiptRow, OutboundReturnReceiptPlan, OutboundReturnRequirement,
+        CanonicalCallee, CanonicalLocation, CanonicalSiteKey, FALLBACK_EXTENT_RECEIPT,
+        MechanicalEvidence, MechanicalExtent, MechanicalFamily, MechanicalMechanism,
+        MechanicalObligationEvent, MechanicalObligationKey, MechanicalObligationPlan,
+        MechanicalRetention, MechanicalStage, MechanicalState, MechanicalSubjectKey,
+        NativeReturnEvidence, NegativeWriteEvidence, OutboundReturnBridgeReceiptRow,
+        OutboundReturnReceiptPlan, OutboundReturnRequirement, SLICE_EXTENT_WAIVER_ID,
         TerminalContract,
     },
 };
@@ -214,7 +215,17 @@ fn capture_one(
         || seam.bridge.found_form != seam.found.key()
         || interface.form == Form::Raw
         || seam.call_span != site.span
-        || seam.bridge.extent != BridgeExtentKind::None
+        || seam.bridge.extent
+            != if lifetime
+                .through_raw_field()
+                .is_some_and(|reuse| reuse.slice)
+            {
+                // W6L-1 wave 2: the slice return carries the fabricated
+                // extent; every other return has none.
+                BridgeExtentKind::Fallback
+            } else {
+                BridgeExtentKind::None
+            }
         || seam.bridge.waiver_id.is_some() != lifetime.through_raw_field().is_some()
     {
         return Err("native-return:native-common-evidence-mismatch".into());
@@ -332,6 +343,14 @@ fn capture_one(
         terminal_interface: interface.form.key().into(),
     };
     let negative_write = NegativeWriteEvidence::NotApplicable;
+    let extent = if seam.bridge.extent == BridgeExtentKind::Fallback {
+        MechanicalExtent::Fallback {
+            receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+            waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
+        }
+    } else {
+        MechanicalExtent::None
+    };
     let event = MechanicalObligationEvent {
         key: required.key.clone(),
         owner_path,
@@ -345,7 +364,7 @@ fn capture_one(
         composition_parent: None,
         dependency_classes: BTreeSet::from([input.key.owner_class]),
         evidence: MechanicalEvidence {
-            extent: MechanicalExtent::None,
+            extent,
             retention: retention.clone(),
             negative_write: negative_write.clone(),
             terminal_contract: TerminalContract::Required {

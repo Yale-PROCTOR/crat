@@ -5873,7 +5873,10 @@ pub(crate) fn synthesize_with_raw_boundary(
             });
             continue;
         };
-        let same_borrowed_family = matches!(expected, Form::Slice { .. } | Form::Opt { .. });
+        // W6L-1: a return manufactured from raw storage is always a raw
+        // expression at the site, whatever the parameter's own form.
+        let same_borrowed_family = through_raw_field.is_none()
+            && matches!(expected, Form::Slice { .. } | Form::Opt { .. });
         let found = if same_borrowed_family {
             decision_of
                 .get(&node)
@@ -5930,9 +5933,16 @@ pub(crate) fn synthesize_with_raw_boundary(
         }
         // Move the existing borrowed value into its return slot, optionally
         // adding Some. Borrowing a local wrapper would lose the origin lifetime.
+        let slice_from_raw = through_raw_field.is_some_and(|reuse| reuse.slice)
+            && matches!(expected, Form::Slice { .. });
         let mut spec = GlueSpec::core(
             if let Some(offset) = suffix_offset {
                 GlueCore::Suffix { offset }
+            } else if slice_from_raw {
+                // W6L-1 wave 2: `core::slice::from_raw_parts{_mut}(E,
+                // FALLBACK_SLICE_EXTENT)` — the addendum-77 fabricated extent,
+                // receipted below.
+                GlueCore::FromRawParts
             } else if same_borrowed_family {
                 GlueCore::Bare
             } else {
@@ -5940,6 +5950,9 @@ pub(crate) fn synthesize_with_raw_boundary(
             },
             expected_mutable,
         );
+        if slice_from_raw {
+            spec = spec.with_fabricated_len();
+        }
         if wrap_borrowed_payload {
             spec = spec.wrapped();
         }
@@ -5981,7 +5994,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 expected_form: expected.key().to_owned(),
                 found_form: found.key().to_owned(),
                 argument_kind: "return-seam".to_owned(),
-                extent: BridgeExtentKind::None,
+                extent: receipt_extent(&spec),
                 retention,
                 waiver_id,
                 unsafe_context: unsafe_context_for(tcx, site.owner, &spec),
@@ -5996,7 +6009,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             } else {
                 SeamFamily::Reborrow
             },
-            len_arm: None,
+            len_arm: slice_from_raw.then_some(LenArm::Fabricated(LenEvidence::None)),
             spec,
             arg_span: operand_span,
             expected,

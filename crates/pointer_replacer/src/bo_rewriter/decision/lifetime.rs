@@ -131,6 +131,9 @@ pub(crate) enum LifetimeFailure {
     /// W6L-1: a mutable returned view would sit beside another safe view of
     /// the same pointee type in the caller.
     ViewPairHeld,
+    /// W6L-1: the parameter that would lend its lifetime is an exclusive
+    /// reference, and the returned memory is not its pointee.
+    ParameterBorrowHeld,
 }
 
 /// The only token that may discharge one `escapes-via-return` row. Its
@@ -442,6 +445,7 @@ pub(crate) fn derive_return_eligibility(
     web: Result<FnPtrWeb, LifetimeFailure>,
     web_wall_s: f64,
     exposure: &super::exposure::ExposurePolicy,
+    raw_only_uses: &FxHashMap<NodeKey, Vec<(String, Span)>>,
 ) -> LifetimeEligibility {
     let derive_started = std::time::Instant::now();
     let mut result = LifetimeEligibility::default();
@@ -605,17 +609,17 @@ pub(crate) fn derive_return_eligibility(
         }
     }
 
-    // W6L-1: returns reached through raw storage of one parameter. Derived
-    // only for callees a `return-not-adapted` caller local actually names,
-    // keyed by the callee's parameter, and never where a bare-parameter
-    // return permit already exists.
+    // W6L-1: returns reached through raw storage of one parameter (or
+    // derived from the parameter's own pointee through a non-bare
+    // expression). Derived only for callees a `return-not-adapted` caller
+    // local actually names, keyed by the callee's parameter, and never where
+    // a bare-parameter return permit already exists.
     if let Ok(web) = &web {
-        let mut callees =
-            super::return_through_raw_field::candidate_callees(subjects, &decisions, constructions)
-                .into_iter()
-                .collect::<Vec<_>>();
-        callees.sort_unstable_by_key(|did| did.local_def_index.as_u32());
-        for callee in callees {
+        let callees =
+            super::return_through_raw_field::candidate_callees(subjects, &decisions, constructions);
+        let mut callees = callees.into_iter().collect::<Vec<_>>();
+        callees.sort_unstable_by_key(|(did, _)| did.local_def_index.as_u32());
+        for (callee, callers) in callees {
             if web.contains(callee)
                 && matches!(
                     exposure.plan(callee),
@@ -627,8 +631,11 @@ pub(crate) fn derive_return_eligibility(
                     .insert(callee, LifetimeFailure::FnPtrWebHeld);
                 continue;
             }
+            let slice = callers.iter().any(|caller| {
+                super::return_through_raw_field::arithmetic_use(raw_only_uses, *caller)
+            });
             let permit = match super::return_through_raw_field::derive_callee(
-                program, callee, origins, slots, model, &decisions, subjects,
+                program, callee, origins, slots, model, &decisions, subjects, slice,
             ) {
                 Ok(permit) => permit,
                 Err(failure) => {
@@ -641,11 +648,21 @@ pub(crate) fn derive_return_eligibility(
             }
             let required = [permit.parameter_origin, permit.return_origin];
             let tie = ReturnTie {
-                sources: vec![permit.reuse.parameter],
+                sources: vec![permit.parameter],
                 target: FnSignatureSlot::RETURN,
             };
+            let summary = match (&permit.overlay, origins.and_then(|o| o.get(&callee))) {
+                (Some(overlay), _) => overlay,
+                (None, Some(summary)) => summary,
+                (None, None) => {
+                    result
+                        .through_raw_field_failures
+                        .insert(callee, LifetimeFailure::OriginAbsent);
+                    continue;
+                }
+            };
             if let Err(failure) = plan_function_with_return_ties(
-                &permit.overlay,
+                summary,
                 &required,
                 &BTreeSet::new(),
                 std::slice::from_ref(&tie),
@@ -658,12 +675,14 @@ pub(crate) fn derive_return_eligibility(
                 ReturnLifetimePermit::new(
                     permit.parameter_node,
                     callee,
-                    vec![(permit.reuse.parameter, permit.parameter_origin)],
+                    vec![(permit.parameter, permit.parameter_origin)],
                     (FnSignatureSlot::RETURN, permit.return_origin),
                 ),
             );
-            result.through_raw_field.insert(callee, permit.reuse);
-            result.derived_summaries.insert(callee, permit.overlay);
+            if let (Some(reuse), Some(overlay)) = (permit.reuse, permit.overlay) {
+                result.through_raw_field.insert(callee, reuse);
+                result.derived_summaries.insert(callee, overlay);
+            }
         }
     }
 
@@ -859,6 +878,18 @@ pub(crate) fn derive_return_eligibility(
             );
             continue;
         }
+        // W6L-1 wave 2: the callee's return form is one form for every
+        // caller — a walking caller needs the slice, a thin caller cannot
+        // take it (and a thin return cannot serve a walk). Hold, never
+        // mis-type.
+        if let Some(reuse) = result.through_raw_field.get(&callee)
+            && reuse.slice != super::return_through_raw_field::arithmetic_use(raw_only_uses, key)
+        {
+            result
+                .failures
+                .insert(key, LifetimeFailure::SeamIncompatible);
+            continue;
+        }
         // W6L-1: a mutable view manufactured from raw storage must be the only
         // safe view of its pointee type in the caller.
         if result.through_raw_field.contains_key(&callee)
@@ -920,6 +951,7 @@ impl LifetimeFailure {
             Self::SeamIncompatible => "lifetime-seam-incompatible",
             Self::OriginAmbiguous => "lifetime-origin-ambiguous",
             Self::ViewPairHeld => "lifetime-view-pair-held",
+            Self::ParameterBorrowHeld => "lifetime-parameter-borrow-held",
         }
     }
 }
