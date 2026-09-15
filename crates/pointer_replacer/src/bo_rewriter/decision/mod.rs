@@ -44,6 +44,7 @@ pub(crate) mod contract_extent_adapter;
 #[cfg(test)]
 mod counted_extent_tests;
 pub(crate) mod counted_void;
+mod counted_void_handle;
 mod counted_void_loop;
 mod counted_void_read;
 pub(crate) mod cursor_native;
@@ -2003,7 +2004,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 && (!has_arithmetic || is_array)
             {
                 Form::Opt {
-                    slice: (has_arithmetic && is_array) || counted.is_some(),
+                    slice: (has_arithmetic && is_array)
+                        || counted.is_some_and(|c| c.handle.is_none()),
                 }
             } else {
                 let (op, span) = uses.first().expect("a recorded use vector is non-empty");
@@ -2015,8 +2017,9 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             }
         }
         None if nullable_value => Form::Opt {
-            slice: counted.is_some(),
+            slice: counted.is_some_and(|c| c.handle.is_none()),
         },
+        None if counted.is_some_and(|c| c.handle.is_some()) => Form::Plain,
         None if counted.is_some_and(|c| c.nullable) => Form::Opt { slice: true },
         None if counted.is_some() => Form::Slice,
         None => Form::Plain,

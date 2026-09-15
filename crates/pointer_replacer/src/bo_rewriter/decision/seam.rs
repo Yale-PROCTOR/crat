@@ -3346,6 +3346,7 @@ fn build_candidate(
             element: contract.element,
             arg_index: argument_index,
             route,
+            handle_pointee: contract.handle.as_deref().map(rustc_span::Symbol::intern),
         });
     }
     let replacement = spec

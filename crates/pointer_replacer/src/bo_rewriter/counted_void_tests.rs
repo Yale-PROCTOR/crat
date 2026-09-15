@@ -122,6 +122,7 @@ fn w6v_zero_length_bridge_never_retags_null() {
         element: ByteElement::Write,
         arg_index: 0,
         route: Route::Direct,
+        handle_pointee: None,
     };
     let mut spec = GlueSpec::core(GlueCore::FromRawParts, true).with_len("n");
     spec.counted_byte = Some(counted);
@@ -252,6 +253,7 @@ fn w6v_adapter_preserves_a_count_named_like_its_pointer_temporary() {
         element: ByteElement::Write,
         arg_index: 0,
         route: Route::Direct,
+        handle_pointee: None,
     };
     let spec = GlueSpec::core(GlueCore::FromRawParts, true).with_len("__crat_counted_ptr");
     let rendered = render_bridge(&spec, counted, "p").unwrap();
@@ -1105,4 +1107,98 @@ fn w6v_indexed_read_alias_holds_when_the_index_is_not_the_guarded_one() {
             .all(|(_, _, r)| r != "<emitted>"),
         "an index that is not the guard's holds the parameter: {rows:?}"
     );
+}
+
+// ---- report 007: a `void *` handle to ONE struct (bzip2 `BZ2_bzerror` / `BZ2_bzread`) ----
+
+/// rs-crown/bzip2 reduced: the handle is cast to `*mut bzFile` and only
+/// dereferenced as a single struct (field reads), and forwarded raw.
+const BZ_HANDLE: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables, non_camel_case_types)]
+#[repr(C)]
+pub struct bzFile { pub lastErr: i32, pub writing: u8 }
+unsafe fn BZ2_bzRead(bzerror: *mut i32, b: *mut core::ffi::c_void, len: i32) -> i32 {
+    *bzerror = (*(b as *mut bzFile)).lastErr;
+    len
+}
+unsafe fn BZ2_bzerror(mut b: *mut core::ffi::c_void, mut errnum: *mut i32) -> i32 {
+    let mut err: i32 = (*(b as *mut bzFile)).lastErr;
+    if err > 0 as i32 { err = 0 as i32 }
+    *errnum = err;
+    return err * -(1 as i32);
+}
+unsafe fn BZ2_bzread(mut b: *mut core::ffi::c_void, mut len: i32) -> i32 {
+    let mut bzerr: i32 = 0;
+    if (*(b as *mut bzFile)).lastErr == 4 as i32 { return 0 as i32 }
+    let nread = BZ2_bzRead(&mut bzerr, b, len);
+    if bzerr == 0 as i32 || bzerr == 4 as i32 { return nread } else { return -(1 as i32) };
+}
+"#;
+
+#[test]
+fn w6v_void_handle_to_one_struct_takes_the_reference_form() {
+    let rows = super::emit_tests::decisions_of(BZ_HANDLE);
+    assert!(
+        rows.iter()
+            .filter(|(n, p, r)| n == "b" && *p && r == "<emitted>")
+            .count()
+            >= 2,
+        "the non-forwarding handles deliver: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(BZ_HANDLE).unwrap();
+    let c = compact(&source);
+    // Read-only through the handle: the shared reference form.
+    assert!(
+        c.contains("fnBZ2_bzerror(mutb:&bzFile,muterrnum:&muti32)->i32"),
+        "the handle is a reference to one struct: {source}"
+    );
+    assert!(
+        c.contains("fnBZ2_bzRead(bzerror:&muti32,b:&bzFile,len:i32)->i32"),
+        "{source}"
+    );
+    // The raw forwarder bridges its handle at the call: cast to the declared
+    // pointee, reborrowed as one element.
+    assert!(
+        c.contains("BZ2_bzRead(&mutbzerr,&*((b)as*constbzFile),len)"),
+        "the raw argument is cast to the declared pointee and reborrowed: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe {
+        let mut f = bzFile { lastErr: -3, writing: 0 };
+        let mut e = 0i32;
+        let p = &mut f as *mut bzFile as *mut core::ffi::c_void;
+        println!("{} {} {}", BZ2_bzerror(p, &mut e), e, BZ2_bzread(p, 7));
+    }}"#;
+    let emitted_main = r#"fn main() { unsafe {
+        let mut f = bzFile { lastErr: -3, writing: 0 };
+        let mut e = 0i32;
+        let p = &mut f as *mut bzFile as *mut core::ffi::c_void;
+        println!("{} {} {}", BZ2_bzerror(&f, &mut e), e, BZ2_bzread(p, 7));
+    }}"#;
+    let original = run_binary(&format!("{BZ_HANDLE}\n{main}"));
+    assert_eq!(original, b"3 -3 -1\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+}
+
+#[test]
+fn w6v_void_handle_holds_when_the_cast_is_offset() {
+    // `&bzFile as *const bzFile` is a legal cast, so an offset past the one
+    // element would compile and read outside the referent: the handle holds.
+    let input = BZ_HANDLE.replace(
+        "    let mut err: i32 = (*(b as *mut bzFile)).lastErr;",
+        "    let mut err: i32 = (*(b as *const bzFile).offset(1)).lastErr;",
+    );
+    assert_ne!(input, BZ_HANDLE);
+    let rows = super::emit_tests::decisions_of(&input);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "b" && *p && r != "<emitted>"),
+        "an offset handle holds: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        !compact(&source).contains("fnBZ2_bzerror(mutb:&bzFile"),
+        "{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
 }

@@ -312,6 +312,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
             count_index,
             element: ByteElement::Read,
             nullable,
+            handle: None,
             uses,
         });
     }
@@ -375,6 +376,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         count_index,
         element: ByteElement::Read,
         nullable,
+        handle: None,
         uses,
     })
 }

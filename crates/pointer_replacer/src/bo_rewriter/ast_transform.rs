@@ -1938,8 +1938,8 @@ impl<'a> SeamGraftVisitor<'a> {
     fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
         use super::decision::seam::{GlueCore, NullArm};
         let spec = &target.spec;
-        if spec.counted_byte.is_some() {
-            return super::decision::counted_void::bridge_ast(e);
+        if let Some(counted) = spec.counted_byte {
+            return super::decision::counted_void::bridge_ast(spec, counted, e);
         }
         if let Some(address) = &spec.shared_address {
             return super::shared_pair_ast::build(e, address);

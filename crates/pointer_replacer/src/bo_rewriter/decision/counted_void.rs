@@ -40,6 +40,9 @@ pub(crate) struct Contract {
     /// The parameter is null-tested (or forwards to a null-tested one): its
     /// form is `Option<&[u8]>` and a raw caller bridges through the null arm.
     pub(crate) nullable: bool,
+    /// A `void *` handle to ONE struct: the declared pointee type's text. The
+    /// form is a plain reference; no count, no use edits beyond null tests.
+    pub(crate) handle: Option<String>,
     pub(crate) uses: Vec<UseEdit>,
 }
 fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
@@ -96,6 +99,7 @@ fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
             ByteElement::Read
         },
         nullable: false,
+        handle: None,
         uses: vec![UseEdit {
             span: access.span,
             replacement,
@@ -115,6 +119,7 @@ pub(crate) fn collect(
         .filter_map(|s| {
             prove(tcx, s)
                 .or_else(|| super::counted_void_read::prove(tcx, s))
+                .or_else(|| super::counted_void_handle::prove(tcx, s))
                 .map(|c| (s, c))
         })
         .collect();
@@ -150,7 +155,10 @@ pub(crate) fn collect(
                     tcx,
                     tcx.typeck(s.fn_did).pat_ty(pat),
                 ),
-                pointee: contract.element.pointee().to_owned(),
+                pointee: contract
+                    .handle
+                    .clone()
+                    .unwrap_or_else(|| contract.element.pointee().to_owned()),
             },
         );
         out.insert((s.fn_did, s.hir_id), contract);
@@ -264,11 +272,15 @@ fn prove_forward(
                 if count_index == params.iter().position(|p| *p == s.hir_id)? {
                     return None;
                 }
+                if contract.handle.is_some() {
+                    return None;
+                }
                 nullable |= contract.nullable;
                 forwarded = Some(Contract {
                     count_index,
                     element: contract.element,
                     nullable: contract.nullable,
+                    handle: None,
                     uses: Vec::new(),
                 });
             }
@@ -283,6 +295,9 @@ fn prove_forward(
 
 pub(crate) fn install(contracts: &Contracts, uses: &mut FxHashMap<Key, SliceUses>) {
     for (key, c) in contracts {
+        if c.handle.is_some() {
+            continue;
+        }
         uses.insert(
             *key,
             SliceUses {
@@ -299,7 +314,7 @@ pub(crate) fn install_opt(
     uses: &mut FxHashMap<Key, super::emitability::OptUses>,
 ) {
     for (key, c) in contracts {
-        if c.nullable {
+        if c.nullable && c.handle.is_none() {
             uses.insert(
                 *key,
                 super::emitability::OptUses {
@@ -336,6 +351,9 @@ pub(crate) enum Route {
     /// Two bridged positions without a disjointness proof: the call keeps its
     /// original arguments and is routed to the callee's pristine raw twin.
     RawTwin,
+    /// A `void *` handle to one struct: the raw argument is cast to the
+    /// declared pointee and reborrowed at the argument itself (no snapshot).
+    Handle,
 }
 impl Route {
     pub(crate) fn key(self) -> &'static str {
@@ -343,6 +361,7 @@ impl Route {
             Self::Direct => "direct",
             Self::Split => "split",
             Self::RawTwin => "raw-twin",
+            Self::Handle => "handle",
         }
     }
 }
@@ -353,6 +372,8 @@ pub(crate) struct CountedByte {
     pub(crate) element: ByteElement,
     pub(crate) arg_index: usize,
     pub(crate) route: Route,
+    /// The handle's declared pointee (route `Handle` only).
+    pub(crate) handle_pointee: Option<rustc_span::Symbol>,
 }
 
 /// The raw twin's name: the original body under this name, called from every
@@ -403,6 +424,16 @@ pub(crate) fn render_bridge(
         // Zero syntax at the argument: the call itself is renamed to the twin.
         return Some(text.to_owned());
     }
+    if counted.route == Route::Handle {
+        let pointee = counted.handle_pointee?;
+        // SAFETY: the input passes a pointer to one `T` here (its own
+        // contract); the reborrow is of exactly that element.
+        return Some(if spec.mutable {
+            format!("&mut *(({text}) as *mut {pointee})")
+        } else {
+            format!("&*(({text}) as *const {pointee})")
+        });
+    }
     let super::seam::SeamLen::Licensed(count) = spec.len.as_ref()? else { return None };
     if spec.core != super::seam::GlueCore::FromRawParts || spec.unwrap.is_some() {
         return None;
@@ -434,23 +465,55 @@ pub(crate) fn render_bridge(
     ))
 }
 
-/// The argument-level graft is the identity: the argument subtree stays where
-/// it is and is moved into the closure call by [`graft_calls`], which owns the
-/// whole call expression. The seam still claims the node, so the placement is
-/// counted exactly once and a colliding transform is refused.
-pub(crate) fn bridge_ast(argument: &rustc_ast::Expr) -> Option<rustc_ast::ExprKind> {
-    Some(argument.kind.clone())
+/// The argument-level graft is the identity for counted routes: the argument
+/// subtree stays where it is and is moved into the closure call by
+/// [`graft_calls`], which owns the whole call expression. The seam still
+/// claims the node, so the placement is counted exactly once and a colliding
+/// transform is refused. A handle argument is cast and reborrowed in place.
+pub(crate) fn bridge_ast(
+    spec: &super::seam::GlueSpec,
+    counted: CountedByte,
+    argument: &rustc_ast::Expr,
+) -> Option<rustc_ast::ExprKind> {
+    if counted.route != Route::Handle {
+        return Some(argument.kind.clone());
+    }
+    const MARKER: &str = "__crat_handle_original_argument";
+    let text = render_bridge(spec, counted, MARKER)?;
+    let parsed = crate::bo_rewriter::ast_transform::graft_expr(&text).ok()?;
+    struct Replace<'a> {
+        argument: &'a rustc_ast::Expr,
+        count: usize,
+    }
+    impl rustc_ast::mut_visit::MutVisitor for Replace<'_> {
+        fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+            if matches!(&e.kind, rustc_ast::ExprKind::Path(None, p) if p.segments.len() == 1 && p.segments[0].ident.name.as_str() == MARKER)
+            {
+                *e = self.argument.clone();
+                self.count += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, e);
+        }
+    }
+    let mut visitor = Replace { argument, count: 0 };
+    let mut root = rustc_ast::ptr::P(parsed);
+    rustc_ast::mut_visit::MutVisitor::visit_expr(&mut visitor, &mut root);
+    (visitor.count == 1).then(|| root.kind.clone())
 }
 
 pub(crate) fn active<'a>(ctx: &super::Ctx<'a, '_>, s: &Subject) -> Option<&'a Contract> {
     use crate::bo_rewriter::additive::FamilyStage;
-    (ctx.family_policy
-        .enabled_for((s.fn_did, s.hir_id), FamilyStage::Declaration)
-        && ctx
+    let contract = ctx.counted_void.get(&(s.fn_did, s.hir_id))?;
+    let declaration = ctx
+        .family_policy
+        .enabled_for((s.fn_did, s.hir_id), FamilyStage::Declaration);
+    // A handle has no slice uses to place; a counted view has.
+    let uses = contract.handle.is_some()
+        || ctx
             .family_policy
-            .enabled_for((s.fn_did, s.hir_id), FamilyStage::SliceUse))
-    .then(|| ctx.counted_void.get(&(s.fn_did, s.hir_id)))
-    .flatten()
+            .enabled_for((s.fn_did, s.hir_id), FamilyStage::SliceUse);
+    (declaration && uses).then_some(contract)
 }
 
 pub(crate) fn owns_address(
@@ -712,6 +775,9 @@ pub(crate) fn count_argument<'tcx>(
     arg_index: usize,
 ) -> Result<(String, Route), super::seam::SeamBlock> {
     use super::seam::SeamBlock;
+    if c.handle.is_some() {
+        return Ok((String::new(), Route::Handle));
+    }
     let body = tcx.hir_body_owned_by(site.caller).value;
     let Some(ExprKind::Call(_, args)) =
         find_expr(body, site.span).map(|call| strip_casts(call).kind)
@@ -985,6 +1051,9 @@ pub(crate) fn record_call<'tcx>(
     spec: &super::seam::GlueSpec,
 ) {
     let Some(counted) = spec.counted_byte else { return };
+    if counted.route == Route::Handle {
+        return;
+    }
     let Some((param, contract)) = contract_at(table, callee, index) else { return };
     let body = tcx.hir_body_owned_by(site.caller).value;
     let count_form = find_expr(body, site.span)
@@ -1026,17 +1095,28 @@ fn contract_at(
     callee: LocalDefId,
     index: usize,
 ) -> Option<(HirId, &Contract)> {
+    use super::Decision;
     table.entries.iter().find_map(|(s, d)| {
-        (s.fn_did == callee
-            && matches!(s.kind,SubjectKind::Param{hir_index} if hir_index == index)
-            && slice_edits(d).is_some())
-        .then(|| {
-            table
-                .counted_void
-                .get(&(s.fn_did, s.hir_id))
-                .map(|c| (s.hir_id, c))
-        })
-        .flatten()
+        if s.fn_did != callee
+            || !matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == index)
+        {
+            return None;
+        }
+        let c = table.counted_void.get(&(s.fn_did, s.hir_id))?;
+        let live = if c.handle.is_some() {
+            match d {
+                Decision::Ref { .. } | Decision::InferredRef { .. } => true,
+                Decision::Opt { slice, .. } => !slice,
+                Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => false,
+            }
+        } else {
+            slice_edits(d).is_some()
+        };
+        live.then_some((s.hir_id, c))
     })
 }
 
