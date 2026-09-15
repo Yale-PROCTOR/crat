@@ -215,6 +215,8 @@ mod option_projection_tests;
 #[cfg(test)]
 mod option_receiver_tests;
 #[cfg(test)]
+mod option_thin_extent_tests;
+#[cfg(test)]
 mod option_void_tests;
 #[cfg(test)]
 mod ordinary_argument_permission_tests;

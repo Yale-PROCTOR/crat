@@ -43,15 +43,19 @@ fn admitted_comparison(input: &str, function: &str, binding: &str, expected: &st
 }
 
 /// rgba::rgba_from_rgb_string — `str == strstr(str, "rgb(")`: the other
-/// operand is a foreign call result, not a subject.
+/// operand is a foreign call result, not a subject. Migrated under R217-2(a)
+/// by the thin-extent hold at the `Opt` form (relay 006): `strstr` reads to
+/// the NUL, so the corpus row itself now holds `held:thin-extent`
+/// (`option_thin_extent_tests`); the comparison shape is witnessed against
+/// a foreign call result that does not take the subject.
 #[test]
 fn wave6o_rgba_shared_subject_equals_foreign_call_result() {
     let input = r#"
 #![allow(dead_code, unused_mut, non_snake_case)]
-unsafe extern "C" { fn strstr(h: *const i8, n: *const i8) -> *mut i8; }
+unsafe extern "C" { fn locate() -> *mut i8; }
 unsafe fn rgba_from_rgb_string(str: *const i8) -> i32 {
     if str.is_null() { return 0; }
-    if str == strstr(str, b"rgb(\0".as_ptr() as *const i8) as *const i8 {
+    if str == locate() as *const i8 {
         return 1;
     }
     return *str as i32;
@@ -61,7 +65,7 @@ unsafe fn rgba_from_rgb_string(str: *const i8) -> i32 {
         input,
         "rgba_from_rgb_string",
         "str",
-        "if str.as_deref().map_or(core::ptr::null::<i8>(), core::ptr::from_ref) == strstr(",
+        "if str.as_deref().map_or(core::ptr::null::<i8>(), core::ptr::from_ref) == locate(",
     );
 }
 

@@ -70,6 +70,7 @@ pub(crate) mod nested_slice;
 pub(crate) mod null_init_declaration;
 pub(crate) mod option;
 mod option_ops;
+pub(crate) mod option_thin_extent;
 pub(crate) mod outbound_expression;
 pub(crate) mod overlapping_pairs;
 pub(crate) mod ownership_fields_cache_binding;
@@ -2549,6 +2550,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 EmitabilityFacts::site(tcx, site.span),
                 DegradeReason::OptUseUnsupported,
             );
+        }
+        // Wave-6o (R402-8): the thin-extent holds, LAST in this arm on the
+        // same placement rule — only a would-be thin `Opt` emission converts.
+        if !slice
+            && depth2_npo.is_none()
+            && let Some(reason) =
+                option_thin_extent::hold(subject, thin_extent, local_callee_extent)
+        {
+            return degrade(subject, decl_site, reason);
         }
         return Decision::Opt {
             mutable: subject.mutable && !contract_alone,
