@@ -462,7 +462,7 @@ pub(crate) fn splice_fn_prints_per_file(
     for (span, text) in printed {
         if let Some((previous_span, previous_text)) = surface_combined.last_mut()
             && *previous_span == span
-            && text.contains("fn __crat_safe_")
+            && (text.contains("fn __crat_safe_") || text.contains("fn __crat_raw_"))
         {
             previous_text.push('\n');
             previous_text.push_str(&text);

@@ -151,11 +151,40 @@ pub(crate) fn placeholder(index: usize) -> String {
     format!("__crat_cv_{index}")
 }
 
+/// How one counted call is emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// One bridged position: the closure snapshot.
+    Direct,
+    /// Two bridged positions whose roots are provably distinct allocations:
+    /// the closure snapshot with both views.
+    Split,
+    /// Two bridged positions without a disjointness proof: the call keeps its
+    /// original arguments and is routed to the callee's pristine raw twin.
+    RawTwin,
+}
+impl Route {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Split => "split",
+            Self::RawTwin => "raw-twin",
+        }
+    }
+}
+
 /// One byte-view adapter inside a snapshotted call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CountedByte {
     pub(crate) element: ByteElement,
     pub(crate) arg_index: usize,
+    pub(crate) route: Route,
+}
+
+/// The raw twin's name: the original body under this name, called from every
+/// site that could not be split.
+pub(crate) fn raw_twin_name(callee: &str) -> String {
+    format!("__crat_raw_{callee}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,6 +211,7 @@ pub(crate) struct CallPlan {
     pub(crate) callee: LocalDefId,
     pub(crate) call_span: rustc_span::Span,
     pub(crate) count_index: usize,
+    pub(crate) route: Route,
     pub(crate) bridged: Vec<BridgedArg>,
     /// Typed receipt of the count argument's form (R397-4): `elements:<n>*size_of::<T>`
     /// when the byte count is an exact element count times an element size,
@@ -190,7 +220,15 @@ pub(crate) struct CallPlan {
     pub(crate) count_form: String,
 }
 
-pub(crate) fn render_bridge(spec: &super::seam::GlueSpec, counted: CountedByte) -> Option<String> {
+pub(crate) fn render_bridge(
+    spec: &super::seam::GlueSpec,
+    counted: CountedByte,
+    text: &str,
+) -> Option<String> {
+    if counted.route == Route::RawTwin {
+        // Zero syntax at the argument: the call itself is renamed to the twin.
+        return Some(text.to_owned());
+    }
     let super::seam::SeamLen::Licensed(count) = spec.len.as_ref()? else { return None };
     if spec.core != super::seam::GlueCore::FromRawParts || spec.optional || spec.unwrap.is_some() {
         return None;
@@ -481,7 +519,7 @@ fn root_rule<'tcx>(
 }
 
 /// The count argument's value plan for one bridged position at one call: the
-/// closure snapshot's count parameter, or a typed hold.
+/// closure snapshot's count parameter and the call's route, or a typed hold.
 pub(crate) fn count_argument<'tcx>(
     tcx: TyCtxt<'tcx>,
     table: &super::DecisionTable,
@@ -489,22 +527,8 @@ pub(crate) fn count_argument<'tcx>(
     callee: LocalDefId,
     c: &Contract,
     arg_index: usize,
-) -> Result<String, super::seam::SeamBlock> {
+) -> Result<(String, Route), super::seam::SeamBlock> {
     use super::seam::SeamBlock;
-    // Two byte views at one call may cover overlapping bytes: a program-defined
-    // byte loop (unlike libc `memcpy`) is defined on overlap, so overlap is not
-    // the input's fault, and one raw access under a live view is as forbidden
-    // as two views. Without a disjointness proof, a call bridges one position
-    // at most; a read+write callee therefore holds at every call.
-    if site
-        .args
-        .iter()
-        .filter(|argument| contract_at(table, callee, argument.index).is_some())
-        .count()
-        > 1
-    {
-        return Err(SeamBlock::SiteOverlap);
-    }
     let body = tcx.hir_body_owned_by(site.caller).value;
     let Some(ExprKind::Call(_, args)) =
         find_expr(body, site.span).map(|call| strip_casts(call).kind)
@@ -517,8 +541,243 @@ pub(crate) fn count_argument<'tcx>(
     let count = args.get(c.count_index).ok_or(SeamBlock::LengthUnknown)?;
     let argument = args.get(arg_index).ok_or(SeamBlock::UnnameableOperand)?;
     let form = count_form(tcx, site.caller, count);
-    root_rule(tcx, table, site.caller, argument, &form)?;
-    Ok(placeholder(c.count_index))
+    let bridged = site
+        .args
+        .iter()
+        .filter(|argument| contract_at(table, callee, argument.index).is_some())
+        .map(|argument| argument.index)
+        .collect::<Vec<_>>();
+    let route = match bridged.as_slice() {
+        [_] => Route::Direct,
+        // Two byte views at one call may cover overlapping bytes: a
+        // program-defined byte loop (unlike libc `memcpy`) is defined on
+        // overlap, so overlap is not the input's fault, and one raw access
+        // under a live view is as forbidden as two views. Two positions are
+        // bridged only when their roots are provably distinct allocations;
+        // otherwise the call keeps its raw arguments and calls the raw twin.
+        [a, b] => {
+            let (Some(left), Some(right)) = (args.get(*a), args.get(*b)) else {
+                return Err(SeamBlock::UnnameableOperand);
+            };
+            if disjoint_roots(tcx, site.caller, left, right) {
+                Route::Split
+            } else if only_counted_params_convert(table, callee) {
+                Route::RawTwin
+            } else {
+                return Err(SeamBlock::SiteOverlap);
+            }
+        }
+        _ => return Err(SeamBlock::SiteOverlap),
+    };
+    if route != Route::RawTwin {
+        root_rule(tcx, table, site.caller, argument, &form)?;
+    }
+    Ok((placeholder(c.count_index), route))
+}
+
+/// The raw twin is the callee's pristine body, so it is only a faithful target
+/// when no parameter other than the counted ones is emitted in a safe form.
+fn only_counted_params_convert(table: &super::DecisionTable, callee: LocalDefId) -> bool {
+    table.entries.iter().all(|(s, d)| {
+        s.fn_did != callee
+            || !matches!(s.kind, SubjectKind::Param { .. })
+            || matches!(d, super::Decision::Degraded(_))
+            || table.counted_void.contains_key(&(s.fn_did, s.hir_id))
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootClass {
+    /// Assigned exactly once from `malloc` / `calloc` (directly or through a
+    /// transparent local wrapper), otherwise only null, never address-taken.
+    Fresh,
+    /// A parameter of the caller that is never reassigned or address-taken.
+    Parameter,
+    Other,
+}
+
+/// Two argument roots are distinct allocations when one is a fresh allocation
+/// of this call and the other is another fresh allocation or a value that
+/// existed before it (a stable parameter). Anything else is unproved.
+fn disjoint_roots<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: LocalDefId,
+    left: &'tcx Expr<'tcx>,
+    right: &'tcx Expr<'tcx>,
+) -> bool {
+    let (Root::Value(a), Root::Value(b)) = (value_root(left), value_root(right)) else {
+        return false;
+    };
+    if a == b {
+        return false;
+    }
+    let facts = LocalFacts::collect(tcx, caller);
+    matches!(
+        (facts.class(tcx, caller, a), facts.class(tcx, caller, b)),
+        (RootClass::Fresh, RootClass::Fresh)
+            | (RootClass::Fresh, RootClass::Parameter)
+            | (RootClass::Parameter, RootClass::Fresh)
+    )
+}
+
+/// Per-local facts of one body: every value written to the local (its `let`
+/// initializer and every assignment), and whether its address is ever taken.
+struct LocalFacts<'tcx> {
+    written: FxHashMap<HirId, Vec<&'tcx Expr<'tcx>>>,
+    addressed: rustc_hash::FxHashSet<HirId>,
+    closures: bool,
+}
+impl<'tcx> LocalFacts<'tcx> {
+    fn collect(tcx: TyCtxt<'tcx>, owner: LocalDefId) -> Self {
+        struct Walk<'tcx> {
+            tcx: TyCtxt<'tcx>,
+            owner: LocalDefId,
+            facts: LocalFacts<'tcx>,
+        }
+        impl<'tcx> Visitor<'tcx> for Walk<'tcx> {
+            fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+                if let PatKind::Binding(mode, id, _, _) = local.pat.kind {
+                    if mode.0 != rustc_ast::ByRef::No {
+                        self.facts.addressed.insert(id);
+                    }
+                    if let Some(init) = local.init {
+                        self.facts.written.entry(id).or_default().push(init);
+                    }
+                }
+                intravisit::walk_local(self, local);
+            }
+
+            fn visit_pat(&mut self, p: &'tcx rustc_hir::Pat<'tcx>) {
+                if let PatKind::Binding(mode, id, _, _) = p.kind
+                    && mode.0 != rustc_ast::ByRef::No
+                {
+                    self.facts.addressed.insert(id);
+                }
+                intravisit::walk_pat(self, p);
+            }
+
+            fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+                let local_of = |e: &Expr<'_>| match e.kind {
+                    ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
+                        rustc_hir::def::Res::Local(id) => Some(id),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match e.kind {
+                    ExprKind::Assign(lhs, rhs, _) => {
+                        if let Some(id) = local_of(lhs) {
+                            self.facts.written.entry(id).or_default().push(rhs);
+                        }
+                    }
+                    ExprKind::AssignOp(_, lhs, _) => {
+                        if let Some(id) = local_of(lhs) {
+                            self.facts.written.entry(id).or_default().push(e);
+                        }
+                    }
+                    ExprKind::AddrOf(_, _, inner) => {
+                        if let Some(id) = local_of(inner) {
+                            self.facts.addressed.insert(id);
+                        }
+                    }
+                    ExprKind::Closure(..) => self.facts.closures = true,
+                    _ => {}
+                }
+                if local_of(e).is_some()
+                    && !self.tcx.typeck(self.owner).expr_adjustments(e).is_empty()
+                {
+                    // An auto-ref adjustment is an address taken without syntax.
+                    self.facts.addressed.insert(local_of(e).unwrap());
+                }
+                intravisit::walk_expr(self, e);
+            }
+        }
+        let mut walk = Walk {
+            tcx,
+            owner,
+            facts: LocalFacts {
+                written: FxHashMap::default(),
+                addressed: rustc_hash::FxHashSet::default(),
+                closures: false,
+            },
+        };
+        walk.visit_expr(tcx.hir_body_owned_by(owner).value);
+        walk.facts
+    }
+
+    fn class(&self, tcx: TyCtxt<'tcx>, owner: LocalDefId, id: HirId) -> RootClass {
+        if self.closures || self.addressed.contains(&id) {
+            return RootClass::Other;
+        }
+        let written = self.written.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+        let is_param = tcx
+            .hir_body_owned_by(owner)
+            .params
+            .iter()
+            .any(|p| matches!(p.pat.kind, PatKind::Binding(_, pid, _, _) if pid == id));
+        if is_param {
+            return if written.is_empty() {
+                RootClass::Parameter
+            } else {
+                RootClass::Other
+            };
+        }
+        let allocations = written
+            .iter()
+            .filter(|e| is_allocation_call(tcx, owner, e))
+            .count();
+        let nulls = written.iter().filter(|e| is_null_literal(e)).count();
+        if allocations == 1 && allocations + nulls == written.len() && written.len() <= 2 {
+            RootClass::Fresh
+        } else {
+            RootClass::Other
+        }
+    }
+}
+
+fn is_null_literal(e: &Expr<'_>) -> bool {
+    matches!(strip_casts(e).kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v.get() == 0))
+}
+
+/// `malloc(..)` / `calloc(..)` (a foreign item), or a local function whose whole
+/// body is `return malloc(..)` / `return calloc(..)` (lodepng's `lodepng_malloc`).
+fn is_allocation_call(tcx: TyCtxt<'_>, owner: LocalDefId, e: &Expr<'_>) -> bool {
+    let ExprKind::Call(callee, _) = strip_casts(e).kind else { return false };
+    let ExprKind::Path(path) = &callee.kind else { return false };
+    let rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Fn, did) =
+        tcx.typeck(owner).qpath_res(path, callee.hir_id)
+    else {
+        return false;
+    };
+    if tcx.is_foreign_item(did) {
+        return matches!(tcx.item_name(did).as_str(), "malloc" | "calloc");
+    }
+    let Some(local) = did.as_local() else { return false };
+    if !tcx.hir_maybe_body_owned_by(local).is_some() {
+        return false;
+    }
+    let body = tcx.hir_body_owned_by(local).value;
+    let ExprKind::Block(block, _) = body.kind else { return false };
+    let returned = match (block.stmts, block.expr) {
+        ([], Some(tail)) => tail,
+        ([stmt], None) => match stmt.kind {
+            rustc_hir::StmtKind::Semi(e) | rustc_hir::StmtKind::Expr(e) => e,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let value = match returned.kind {
+        ExprKind::Ret(Some(value)) => value,
+        _ => returned,
+    };
+    let ExprKind::Call(inner, _) = strip_casts(value).kind else { return false };
+    let ExprKind::Path(inner_path) = &inner.kind else { return false };
+    matches!(
+        tcx.typeck(local).qpath_res(inner_path, inner.hir_id),
+        rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Fn, inner_did)
+            if tcx.is_foreign_item(inner_did)
+                && matches!(tcx.item_name(inner_did).as_str(), "malloc" | "calloc")
+    )
 }
 
 /// Record one placed byte-view adapter into its call's plan (seam pass 3).
@@ -552,10 +811,11 @@ pub(crate) fn record_call<'tcx>(
         callee,
         call_span: site.span,
         count_index: contract.count_index,
+        route: counted.route,
         bridged: Vec::new(),
         count_form,
     });
-    let Some(bridge) = render_bridge(spec, counted) else { return };
+    let Some(bridge) = render_bridge(spec, counted, "") else { return };
     if call.bridged.iter().all(|b| b.index != counted.arg_index) {
         call.bridged.push(BridgedArg {
             index: counted.arg_index,
@@ -586,7 +846,9 @@ fn contract_at(
     })
 }
 
-/// Snapshot every counted call: `(|__crat_cv_0, ..| callee(..))(a0, ..)`.
+/// Snapshot every counted call: `(|__crat_cv_0, ..| callee(..))(a0, ..)`; route
+/// every unproved two-position call to the callee's pristine raw twin and emit
+/// that twin once per callee.
 ///
 /// Runs after the argument seams. A bridged argument whose callee subject was
 /// withheld is passed through unchanged; a call with no surviving bridged
@@ -596,6 +858,8 @@ pub(crate) fn graft_calls(
     reverts: &crate::bo_rewriter::ast_transform::RevertSet,
     guard: &mut crate::bo_rewriter::ast_transform::Composition,
     krate: &mut rustc_ast::Crate,
+    pristine: &rustc_ast::Crate,
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
 ) -> Result<(), String> {
     let mut by_span: FxHashMap<(u32, u32), (&CallPlan, Vec<&BridgedArg>)> = FxHashMap::default();
     for call in calls.iter().filter(|call| reverts.keeps(call.owner_class)) {
@@ -625,6 +889,7 @@ pub(crate) fn graft_calls(
         failure: None,
         unsafe_fn: false,
         yielded: Vec::new(),
+        twins: std::collections::BTreeMap::new(),
     };
     rustc_ast::mut_visit::MutVisitor::visit_crate(&mut visitor, krate);
     if let Some(why) = visitor.failure {
@@ -638,8 +903,85 @@ pub(crate) fn graft_calls(
     if !unmatched.is_empty() {
         return Err(format!("unmatched counted-void call spans: {unmatched:?}"));
     }
+    for (_, (callee, name)) in visitor.twins {
+        insert_raw_twin(krate, pristine, global_map, callee, &name)?;
+    }
     Ok(())
 }
+
+/// Clone the callee's PRISTINE item (the input's body, before any edit), rename
+/// it to the raw twin, and place it right after the converted item.
+fn insert_raw_twin(
+    krate: &mut rustc_ast::Crate,
+    pristine: &rustc_ast::Crate,
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    callee: LocalDefId,
+    name: &str,
+) -> Result<(), String> {
+    fn find<'a>(
+        items: &'a [rustc_ast::ptr::P<rustc_ast::Item>],
+        global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+        callee: LocalDefId,
+    ) -> Option<&'a rustc_ast::Item> {
+        for item in items {
+            if global_map.get(&item.id) == Some(&callee)
+                && matches!(item.kind, rustc_ast::ItemKind::Fn(_))
+            {
+                return Some(item);
+            }
+            if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, ..)) =
+                &item.kind
+                && let Some(found) = find(inner, global_map, callee)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    fn place(
+        items: &mut ThinVec<rustc_ast::ptr::P<rustc_ast::Item>>,
+        global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+        callee: LocalDefId,
+        twin: &rustc_ast::Item,
+    ) -> bool {
+        for index in 0..items.len() {
+            if global_map.get(&items[index].id) == Some(&callee)
+                && matches!(items[index].kind, rustc_ast::ItemKind::Fn(_))
+            {
+                items.insert(index + 1, rustc_ast::ptr::P(twin.clone()));
+                return true;
+            }
+            if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, ..)) =
+                &mut items[index].kind
+                && place(inner, global_map, callee, twin)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    let Some(original) = find(&pristine.items, global_map, callee) else {
+        return Err(format!(
+            "counted-void raw twin: pristine item for {callee:?} not found"
+        ));
+    };
+    let mut twin = original.clone();
+    let rustc_ast::ItemKind::Fn(function) = &mut twin.kind else { unreachable!() };
+    function.ident = rustc_span::Ident::new(rustc_span::Symbol::intern(name), function.ident.span);
+    twin.vis = rustc_ast::Visibility {
+        kind: rustc_ast::VisibilityKind::Inherited,
+        span: rustc_span::DUMMY_SP,
+        tokens: None,
+    };
+    if !place(&mut krate.items, global_map, callee, &twin) {
+        return Err(format!(
+            "counted-void raw twin: converted item for {callee:?} not found"
+        ));
+    }
+    Ok(())
+}
+
+use thin_vec::ThinVec;
 
 struct CallGraft<'a> {
     calls: &'a FxHashMap<(u32, u32), (&'a CallPlan, Vec<&'a BridgedArg>)>,
@@ -649,6 +991,8 @@ struct CallGraft<'a> {
     unsafe_fn: bool,
     /// Calls yielded to another family's replacement (R410-2(d)).
     yielded: Vec<((u32, u32), rustc_span::Span)>,
+    /// Callees whose raw twin must be emitted, with the twin's name.
+    twins: std::collections::BTreeMap<u32, (LocalDefId, String)>,
 }
 
 impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
@@ -709,6 +1053,33 @@ impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
             ));
             return;
         };
+        if call.route == Route::RawTwin {
+            // The arguments stay exactly as written; only the callee name moves.
+            let rustc_ast::ExprKind::Path(None, path) = &mut callee.kind else {
+                self.failure = Some(format!(
+                    "counted-void raw-twin call at {}..{} has no plain path callee",
+                    key.0, key.1
+                ));
+                return;
+            };
+            let Some(last) = path.segments.last_mut() else {
+                self.failure = Some("counted-void raw-twin call: empty callee path".to_owned());
+                return;
+            };
+            let name = raw_twin_name(last.ident.name.as_str());
+            if !self.guard.claim(e.id, e.span, "counted-void-call") {
+                self.failure = Some(format!(
+                    "counted-void call at {}..{} collided with another AST transform",
+                    key.0, key.1
+                ));
+                return;
+            }
+            last.ident = rustc_span::Ident::new(rustc_span::Symbol::intern(&name), last.ident.span);
+            self.twins
+                .insert(call.callee.local_def_index.as_u32(), (call.callee, name));
+            self.consumed.insert(key);
+            return;
+        }
         let arity = args.len();
         if call.count_index >= arity || kept.iter().any(|b| b.index >= arity) {
             self.failure = Some(format!(

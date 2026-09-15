@@ -1475,7 +1475,7 @@ impl GlueSpec {
         enclosing_unsafe_fn: bool,
     ) -> Option<String> {
         if let Some(counted) = self.counted_byte {
-            return super::counted_void::render_bridge(self, counted);
+            return super::counted_void::render_bridge(self, counted, text);
         }
         if let Some(address) = &self.shared_address {
             return address.render(text);
@@ -3318,7 +3318,7 @@ fn build_candidate(
     callee: LocalDefId,
     argument_index: usize,
     return_tied: bool,
-    counted: Option<&super::counted_void::Contract>,
+    counted: Option<(&super::counted_void::Contract, super::counted_void::Route)>,
     field_tied: bool,
 ) -> Result<Option<Candidate>, SeamBlock> {
     if counted.is_some() && found != Form::Raw {
@@ -3338,13 +3338,14 @@ fn build_candidate(
         spec
     };
     let mut spec = spec;
-    if let Some(contract) = counted {
+    if let Some((contract, route)) = counted {
         if len_text.is_none() {
             return Err(SeamBlock::LengthUnknown);
         }
         spec.counted_byte = Some(super::counted_void::CountedByte {
             element: contract.element,
             arg_index: argument_index,
+            route,
         });
     }
     let replacement = spec
@@ -4331,7 +4332,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                     input_candidates.push(Err(block));
                     continue;
                 }
-                let (len_text, len_evidence) = if let Some(Ok(count)) = counted_len {
+                let counted = counted.and_then(|contract| match &counted_len {
+                    Some(Ok((_, route))) => Some((contract, *route)),
+                    _ => None,
+                });
+                let (len_text, len_evidence) = if let Some(Ok((count, _))) = counted_len {
                     (Some(count), Some(LenEvidence::Elsewhere))
                 } else if wants_len {
                     // Wave-4 #1b: a contract-extent promotion with an exact

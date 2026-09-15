@@ -115,16 +115,17 @@ fn w6v_unbounded_and_narrowed_accesses_remain_held() {
 #[test]
 fn w6v_zero_length_bridge_never_retags_null() {
     use super::decision::{
-        counted_void::{ByteElement, CountedByte, render_bridge},
+        counted_void::{ByteElement, CountedByte, Route, render_bridge},
         seam::{GlueCore, GlueSpec},
     };
     let counted = CountedByte {
         element: ByteElement::Write,
         arg_index: 0,
+        route: Route::Direct,
     };
     let mut spec = GlueSpec::core(GlueCore::FromRawParts, true).with_len("n");
     spec.counted_byte = Some(counted);
-    let rendered = render_bridge(&spec, counted).expect("typed byte bridge");
+    let rendered = render_bridge(&spec, counted, "p").expect("typed byte bridge");
     assert!(rendered.contains("if __crat_counted_len == 0"));
     let input = format!(
         "pub unsafe fn zero(__crat_cv_0: *mut core::ffi::c_void,n: usize) {{ let _: &mut [core::mem::MaybeUninit<u8>] = {rendered}; }}"
@@ -242,15 +243,16 @@ fn w6v_scalar_memory_read_is_snapshotted_before_the_view() {
 #[test]
 fn w6v_adapter_preserves_a_count_named_like_its_pointer_temporary() {
     use super::decision::{
-        counted_void::{ByteElement, CountedByte, render_bridge},
+        counted_void::{ByteElement, CountedByte, Route, render_bridge},
         seam::{GlueCore, GlueSpec},
     };
     let counted = CountedByte {
         element: ByteElement::Write,
         arg_index: 0,
+        route: Route::Direct,
     };
     let spec = GlueSpec::core(GlueCore::FromRawParts, true).with_len("__crat_counted_ptr");
-    let rendered = render_bridge(&spec, counted).unwrap();
+    let rendered = render_bridge(&spec, counted, "p").unwrap();
     let source = format!(
         "unsafe fn length(__crat_cv_0: *mut core::ffi::c_void, __crat_counted_ptr: usize) -> usize {{ let view: &mut [core::mem::MaybeUninit<u8>] = {rendered}; view.len() }} fn main() {{ let mut bytes=[0u8;4]; println!(\"{{}}\",unsafe{{length(bytes.as_mut_ptr().cast(),4)}}); }}"
     );
@@ -258,17 +260,18 @@ fn w6v_adapter_preserves_a_count_named_like_its_pointer_temporary() {
 }
 
 #[test]
-fn w6v_addressed_pointer_storage_copy_holds_and_keeps_its_meaning() {
-    // The copy destination is the source pointer's own storage. A copy call
-    // bridges no position (two counted positions at one call), so the input's
-    // meaning is kept exactly; the runtime check pins that.
+fn w6v_addressed_pointer_storage_copy_routes_to_the_raw_twin() {
+    // The copy destination is the source pointer's own storage (a storage
+    // root, never a fresh allocation): no disjointness proof, so the call keeps
+    // its raw arguments and calls the pristine raw twin; the runtime check pins
+    // that the input's meaning is kept exactly.
     let helper = format!(
         "{COPY}\npub unsafe fn copy_pointer_storage() -> u8 {{ let data=[7u8;8]; let mut src: *const core::ffi::c_void=data.as_ptr().cast(); let dst: *mut core::ffi::c_void=&raw mut src as *mut *const core::ffi::c_void as *mut core::ffi::c_void; lodepng_memcpy(dst,src,1); (src as usize & 0xff) as u8 }}"
     );
-    let emitted = super::emit_tests::ast_emitted_source_of(&helper).unwrap();
+    let emitted = check(&helper, &["dst", "src"]);
     assert!(
-        !emitted.contains("dst: &mut [") && !emitted.contains("src: &[u8]"),
-        "no view at a two-position copy: {emitted}"
+        compact(&emitted).contains("__crat_raw_lodepng_memcpy(dst,src,1)"),
+        "the unproved copy calls the raw twin with its arguments untouched: {emitted}"
     );
     let main = r#"fn main() { unsafe { println!("{}", copy_pointer_storage()); } }"#;
     let original = run_binary(&format!("{helper}\n{main}"));
@@ -432,24 +435,30 @@ fn withdrawals_of(input: &str) -> Vec<String> {
     .expect("fixture compiles")
 }
 
-/// The copy shape at a real call: two counted positions at one call may cover
-/// overlapping bytes, so the call holds typed and BOTH callee parameters stay
-/// raw (no disjointness proof exists at this site or at lodepng's LZ77 sites).
+/// The copy shape at a real call: `mem` is a fresh `malloc` local and `leaves`
+/// a parameter that is never reassigned, so the two roots are distinct
+/// allocations and the call is split (both views, closure snapshot).
 #[test]
-fn w6v_bpm_sort_two_counted_positions_hold_as_site_overlap() {
+fn w6v_bpm_sort_direct_malloc_local_vs_parameter_splits() {
     let input = format!("{COPY64}{BPM_SORT}");
-    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let source = check(&input, &["dst", "src"]);
+    let routes = routes_of(&input);
     assert!(
-        !source.contains("dst: &mut [") && !source.contains("src: &[u8]"),
-        "a read+write byte callee keeps raw parameters at a real call: {source}"
+        routes
+            .iter()
+            .any(|(c, r)| c.ends_with("bpmnode_sort") && r == "split"),
+        "fresh local vs parameter is split: {routes:?}"
     );
-    assert!(super::verify::type_checks_str(&source));
+    assert!(
+        !source.contains("__crat_raw_lodepng_memcpy"),
+        "no twin needed: {source}"
+    );
     let withdrawals = withdrawals_of(&input);
     assert!(
-        withdrawals
+        !withdrawals
             .iter()
-            .any(|line| line.contains("seam-site-overlap")),
-        "typed hold at the copy call: {withdrawals:?}"
+            .any(|line| line.contains("lodepng_memcpy")),
+        "no withdrawal at the copy call: {withdrawals:?}"
     );
 }
 
@@ -607,9 +616,11 @@ unsafe fn inflateHuffmanBlock(mut out: *mut ucvector, mut start: u64, mut backwa
 fn w6v_overlapping_self_copy_never_forms_two_views() {
     let helper = format!("{COPY64}{INFLATE_BACKREF}");
     let source = super::emit_tests::ast_emitted_source_of(&helper).unwrap();
+    // Both roots are the same buffer: the call keeps its raw arguments and
+    // calls the pristine raw twin; no view is formed at this call.
     assert!(
-        !(source.contains("dst: &mut [") && source.contains("src: &[u8]")),
-        "a copy within one buffer may overlap; two live views are forbidden: {source}"
+        compact(&source).contains("__crat_raw_lodepng_memcpy(((*out).data).offset(startasisize)as*mutcore::ffi::c_void,((*out).data).offset(backwardasisize)as*constcore::ffi::c_void,length)"),
+        "a copy within one buffer may overlap; it must call the raw twin unchanged: {source}"
     );
     assert!(super::verify::type_checks_str(&source));
     // The byte loop itself stays exactly as the input wrote it (forward,
@@ -623,4 +634,192 @@ fn w6v_overlapping_self_copy_never_forms_two_views() {
     let original = run_binary(&format!("{helper}\n{main}"));
     assert_eq!(original, b"[1, 2, 3, 1, 2, 3, 1, 2]\n".to_vec());
     assert_eq!(original, run_binary(&format!("{source}\n{main}")));
+}
+
+// ---- report 005: the split callee (R399-6) ----
+//
+// A read+write byte callee converts, and every call whose two roots are NOT
+// provably distinct allocations is routed to a pristine raw twin
+// `__crat_raw_<callee>` (the original body under a new name). A call is split
+// when one root is a fresh allocation local of the caller (`malloc` / `calloc`,
+// directly or through a transparent local wrapper such as `lodepng_malloc`,
+// assigned exactly once, never address-taken) and the other is another fresh
+// local or a caller parameter that is never reassigned.
+
+const ALLOC_WRAPPER: &str = r#"
+unsafe fn lodepng_malloc(mut size: u64) -> *mut core::ffi::c_void {
+    return malloc(size as usize);
+}
+"#;
+/// rs-crown/lodepng `alloc_string_sized` (site 825): fresh `out` vs parameter `in_0`.
+const ALLOC_STRING: &str = r#"
+unsafe fn alloc_string_sized(mut in_0: *const i8, mut insize: u64) -> *mut i8 {
+    let mut out = lodepng_malloc(insize.wrapping_add(1 as i32 as u64)) as *mut i8;
+    if !out.is_null() {
+        lodepng_memcpy(out as *mut core::ffi::c_void, in_0 as *const core::ffi::c_void, insize);
+        *out.offset(insize as isize) = 0 as i32 as i8;
+    }
+    return out;
+}
+"#;
+/// rs-crown/lodepng `readChunk_tEXt` (site 8125): `key` is null-initialised and
+/// assigned once from the wrapper; `data` is a parameter.
+const READ_CHUNK: &str = r#"
+unsafe fn readChunk_tEXt(mut data: *const u8, mut chunkLength: u64) -> u32 {
+    let mut key = 0 as *mut i8;
+    let mut length: u64 = 0;
+    while length < chunkLength && *data.offset(length as isize) as i32 != 0 { length = length.wrapping_add(1); }
+    key = lodepng_malloc(length.wrapping_add(1)) as *mut i8;
+    if key.is_null() { return 83; }
+    lodepng_memcpy(key as *mut core::ffi::c_void, data as *const core::ffi::c_void, length);
+    *key.offset(length as isize) = 0;
+    let first = *key as u32;
+    free(key as *mut core::ffi::c_void);
+    first
+}
+"#;
+/// rs-crown/lodepng `lodepng_color_mode_copy` (site 4488): two parameters — no
+/// disjointness proof, so the call keeps the raw signature.
+const COLOR_MODE_COPY: &str = r#"
+#[repr(C)]
+pub struct LodePNGColorMode { pub colortype: i32, pub bitdepth: u32, pub palette: *mut u8, pub palettesize: u64 }
+unsafe fn lodepng_color_mode_copy(mut dest: *mut LodePNGColorMode, mut source: *const LodePNGColorMode) {
+    lodepng_memcpy(dest as *mut core::ffi::c_void, source as *const core::ffi::c_void,
+        ::std::mem::size_of::<LodePNGColorMode>() as u64);
+}
+"#;
+
+fn routes_of(input: &str) -> Vec<(String, String)> {
+    ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
+        let table = super::decide_table(tcx).expect("fixture yields a decision table");
+        table
+            .seams
+            .counted_void_calls
+            .iter()
+            .map(|call| {
+                (
+                    tcx.def_path_str(call.caller.to_def_id()),
+                    call.route.key().to_owned(),
+                )
+            })
+            .collect()
+    })
+    .expect("fixture compiles")
+}
+
+#[test]
+fn w6v_split_fresh_wrapper_local_vs_parameter_delivers_the_copy() {
+    let input = format!("{COPY64}{ALLOC_WRAPPER}{ALLOC_STRING}{INFLATE_BACKREF}");
+    let source = check(&input, &["dst", "src"]);
+    assert!(
+        source.contains("src: &[u8]"),
+        "shared byte declaration: {source}"
+    );
+    let routes = routes_of(&input);
+    assert!(
+        routes
+            .iter()
+            .any(|(c, r)| c.ends_with("alloc_string_sized") && r == "split"),
+        "the fresh-vs-parameter call is split: {routes:?}"
+    );
+    assert!(
+        routes
+            .iter()
+            .any(|(c, r)| c.ends_with("inflateHuffmanBlock") && r == "raw-twin"),
+        "the in-buffer copy keeps the raw signature: {routes:?}"
+    );
+    let compact_source = compact(&source);
+    assert!(
+        compact_source.contains("fn__crat_raw_lodepng_memcpy(mutdst:*mutcore::ffi::c_void,mutsrc:*constcore::ffi::c_void,mutsize:u64)"),
+        "a pristine raw twin is emitted: {source}"
+    );
+    assert!(
+        compact_source.contains("__crat_raw_lodepng_memcpy(((*out).data).offset(startasisize)"),
+        "the in-buffer call is routed to the raw twin with its arguments untouched: {source}"
+    );
+    assert_eq!(
+        source.matches("fn __crat_raw_lodepng_memcpy").count(),
+        1,
+        "one twin per callee: {source}"
+    );
+    let main = r#"fn main() { unsafe {
+        let text = b"hello\0";
+        let copy = alloc_string_sized(text.as_ptr().cast(), 5);
+        let s = std::ffi::CStr::from_ptr(copy).to_str().unwrap().to_owned();
+        free(copy as *mut core::ffi::c_void);
+        let mut bytes = [1u8, 2, 3, 0, 0, 0, 0, 0];
+        let mut v = ucvector { data: bytes.as_mut_ptr(), size: 8, allocsize: 8 };
+        inflateHuffmanBlock(&mut v, 3, 0, 5);
+        println!("{s} {:?}", bytes);
+    }}"#;
+    let original = run_binary(&format!("{input}\n{main}"));
+    assert_eq!(original, b"hello [1, 2, 3, 1, 2, 3, 1, 2]\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{main}")));
+}
+
+#[test]
+fn w6v_split_bpm_sort_and_null_initialised_key_are_fresh_roots() {
+    let input = format!(
+        "{COPY64}{ALLOC_WRAPPER}{}{READ_CHUNK}",
+        BPM_SORT
+            .replace("malloc((", "lodepng_malloc((")
+            .replace(".wrapping_mul(num) as usize)", ".wrapping_mul(num))")
+    );
+    assert!(
+        input.contains("let mut mem = lodepng_malloc("),
+        "fixture uses the wrapper: {input}"
+    );
+    let source = check(&input, &["dst", "src"]);
+    let routes = routes_of(&input);
+    for owner in ["bpmnode_sort", "readChunk_tEXt"] {
+        assert!(
+            routes
+                .iter()
+                .any(|(c, r)| c.ends_with(owner) && r == "split"),
+            "{owner} is split: {routes:?}"
+        );
+    }
+    assert!(
+        !source.contains("__crat_raw_lodepng_memcpy"),
+        "no twin when every call splits: {source}"
+    );
+    let main = r#"fn main() { unsafe {
+        let mut leaves = [BPMNode { weight: 0, index: 0, tail: core::ptr::null_mut(), in_use: 0 }; 3];
+        for (i, l) in leaves.iter_mut().enumerate() { l.weight = i as i32 * 10; l.index = i as u32; }
+        bpmnode_sort(leaves.as_mut_ptr(), 3);
+        println!("{:?} {}", leaves.iter().map(|l| (l.weight, l.index)).collect::<Vec<_>>(), readChunk_tEXt(b"key\0value".as_ptr(), 9));
+    }}"#;
+    let input = input.replace("pub in_use: i32", "pub in_use: i64"); // padding-free struct: the byte copy reads no padding
+    let source = check(&input, &["dst", "src"]);
+    let original = run_binary(&format!("{input}\n{main}"));
+    assert_eq!(original, b"[(20, 2), (10, 1), (0, 0)] 107\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{main}")));
+}
+
+#[test]
+fn w6v_split_refuses_two_parameters_and_a_reassigned_fresh_local() {
+    // Two parameters: no proof.
+    let input = format!("{COPY64}{ALLOC_WRAPPER}{ALLOC_STRING}{COLOR_MODE_COPY}");
+    let routes = routes_of(&input);
+    assert!(
+        routes
+            .iter()
+            .any(|(c, r)| c.ends_with("lodepng_color_mode_copy") && r == "raw-twin"),
+        "two parameters keep the raw signature: {routes:?}"
+    );
+    // A fresh local that is reassigned from the parameter is no longer fresh.
+    let reassigned = ALLOC_STRING.replace(
+        "    if !out.is_null() {",
+        "    if insize == 0 { out = in_0 as *mut i8; }\n    if !out.is_null() {",
+    );
+    let input = format!("{COPY64}{ALLOC_WRAPPER}{reassigned}");
+    let routes = routes_of(&input);
+    assert!(
+        routes
+            .iter()
+            .any(|(c, r)| c.ends_with("alloc_string_sized") && r == "raw-twin"),
+        "a reassigned local is not a fresh root: {routes:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(super::verify::type_checks_str(&source));
 }

@@ -3938,6 +3938,8 @@ fn transform_with<'tcx>(
         reverts,
         &mut guard,
         &mut krate,
+        &capture.krate,
+        &capture.map.global_map,
     )?;
 
     // **C-9 — mandatory companion emission.** The plan is already filtered by
