@@ -91,6 +91,8 @@ mod ownership_fields_bodylocal_tests;
 mod ownership_fields_cp2_tests;
 #[cfg(test)]
 mod ownership_fields_native_tests;
+#[cfg(test)]
+mod pair_disjointness_tests;
 pub(crate) mod plan;
 #[cfg(test)]
 mod raw_initializer_tests;
@@ -7149,6 +7151,15 @@ fn finish_decide<'tcx>(
         analysis.a5_mode,
         analysis.attestation,
     );
+    // wave-6p (R400-4): pair-disjointness certificates ride the attested A5
+    // index; an unavailable index attaches nothing.
+    let a5_site_proofs = if a5_site_proofs.is_available() {
+        a5_site_proofs.with_pair_certificates(
+            decision::pair_disjointness::PairDisjointnessIndex::derive(&program),
+        )
+    } else {
+        a5_site_proofs
+    };
     let web_started = std::time::Instant::now();
     let fnptr_web = decision::lifetime::derive_fn_ptr_web(&program, analysis.attestation);
     let fnptr_web_wall_s = web_started.elapsed().as_secs_f64();

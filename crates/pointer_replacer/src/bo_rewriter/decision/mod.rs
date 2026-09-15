@@ -80,6 +80,7 @@ pub(crate) mod ownership_fields_native;
 #[cfg(test)]
 mod ownership_fields_roles_tests;
 pub(crate) mod ownership_fields_source;
+pub(crate) mod pair_disjointness;
 pub(crate) mod pending_sibling;
 pub(crate) mod pinned_local;
 #[cfg(test)]

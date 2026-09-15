@@ -147,6 +147,10 @@ pub(crate) struct A5SeamProofIndex {
     guard: &'static str,
     global_setup_wall_s: f64,
     pair_classification_wall_s: f64,
+    /// wave-6p (R400-4): disjointness certificates consulted when the audited
+    /// verdict is not `Clear`. Absent until attached; never attached to an
+    /// unavailable index, so the certificates ride only the attested world.
+    certificates: Option<super::pair_disjointness::PairDisjointnessIndex>,
 }
 
 impl A5SeamProofIndex {
@@ -193,7 +197,33 @@ impl A5SeamProofIndex {
             guard,
             global_setup_wall_s: 0.0,
             pair_classification_wall_s: 0.0,
+            certificates: None,
         }
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.unavailable.is_none()
+    }
+
+    /// Attach the pair-disjointness certificates (wave-6p). A certificate can
+    /// only turn a non-`Clear` audited verdict into `Clear`; it never touches a
+    /// verdict the audit already cleared, and an unavailable index (mode not
+    /// precise, world unattested) keeps every lookup undeterminable exactly as
+    /// before.
+    pub(crate) fn with_pair_certificates(
+        mut self,
+        certificates: super::pair_disjointness::PairDisjointnessIndex,
+    ) -> Self {
+        if self.is_available() {
+            self.certificates = Some(certificates);
+        }
+        self
+    }
+
+    pub(crate) fn pair_certificates(
+        &self,
+    ) -> Option<&super::pair_disjointness::PairDisjointnessIndex> {
+        self.certificates.as_ref()
     }
 
     fn from_audits(
@@ -238,6 +268,7 @@ impl A5SeamProofIndex {
             guard: ATTESTED_GUARD,
             global_setup_wall_s,
             pair_classification_wall_s: started.elapsed().as_secs_f64(),
+            certificates: None,
         }
     }
 
@@ -254,6 +285,37 @@ impl A5SeamProofIndex {
         if let Some(reason) = self.unavailable {
             return A5PeerProof::undeterminable(reason);
         }
+        let audited = self.audited(caller, callee, left, right, left_span, right_span);
+        if audited.verdict == A5SiteProofVerdict::Clear {
+            return audited;
+        }
+        let Some(certificates) = &self.certificates else {
+            return audited;
+        };
+        match certificates.certify(caller, callee, left, right, left_span, right_span) {
+            Ok(kind) => A5PeerProof {
+                verdict: A5SiteProofVerdict::Clear,
+                reason: kind.key(),
+                family: super::pair_disjointness::CERTIFICATE_FAMILY,
+                location: audited.location,
+                left_site: audited.left_site,
+                right_site: audited.right_site,
+            },
+            // The audited verdict and its reason stay byte-identical for an
+            // unproved pair; the `why` lives in the certificate ledger.
+            Err(_) => audited,
+        }
+    }
+
+    fn audited(
+        &self,
+        caller: u32,
+        callee: u32,
+        left: usize,
+        right: usize,
+        left_span: Span,
+        right_span: Span,
+    ) -> A5PeerProof {
         let (left, right) = canonical_one_pair(left, right);
         let Some(candidates) = self.rows.get(&(caller, callee, left, right)) else {
             return A5PeerProof::undeterminable("seam-a5-site-unresolved");
