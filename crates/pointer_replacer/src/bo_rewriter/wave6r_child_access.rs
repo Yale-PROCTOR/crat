@@ -1,26 +1,32 @@
 //! K18′, callee side: a descendant-free callee position.
 //!
-//! The type-backed child walk follows the call's RETURN local; a callee whose
-//! return carries no pointer leaves it `Unknown`, and the shared-source hold
-//! `write-through-shared-view` fires on the possibility that the callee hands
-//! a descendant of the argument back through output storage. This module
-//! answers that possibility on the callee's own body: the argument's alias
-//! set has a `NoRetain` certificate (nothing transparently derived from it is
-//! returned, stored, or passed to a retaining or unknown call — transitively
+//! The type-backed child walk assumes a contract-less callee MAY hand back a
+//! descendant of the argument and classifies what the caller then does with
+//! the call's result; a callee returning no pointer local leaves it `Unknown`,
+//! and one returning a FRESH pointer the caller later frees reads as `Writes`.
+//! Both fire the shared-source hold `write-through-shared-view`. This module
+//! answers the premise on the callee's own body: the argument's alias set has
+//! a `NoRetain` certificate (the accepted retention instrument, transitive
 //! through local callees) AND the body forms no non-transparent derivation of
-//! that alias set at all (no address-of / raw-address of a place under it, no
-//! `Offset`, no aggregate capture, no cast to a non-pointer), so no descendant
-//! exists to hand back. Only then is the child access `Unused`.
+//! that alias set (no address-of / raw address of a place under it, no
+//! `Offset`, no aggregate capture, no cast to a non-pointer), returns none of
+//! it, stores none of it through a projection, and every local callee that
+//! receives an alias is descendant-free at that position in turn; a libc call
+//! whose contract row says it returns an alias of the argument extends the
+//! alias set with its result. No descendant then exists to hand back, and the
+//! child access is `Unused` — the caller's use of a fresh result is its own
+//! business.
 
-use rustc_hash::FxHashMap;
-use rustc_hir::def_id::LocalDefId;
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::{
-    mir::{BinOp, Body, Local, Operand, Rvalue, StatementKind},
+    mir::{BinOp, Body, Local, Operand, Rvalue, StatementKind, TerminatorKind},
     ty::{Ty, TyCtxt, TyKind},
 };
 
 use super::decision::{
-    raw_boundary::{CARRIER_WALK_DEPTH, RetentionVerdict, may_carry_pointer},
+    raw_boundary::{RetentionVerdict, raw_target_type, symbol_key},
+    raw_boundary_contracts::classify_contract,
     returned_child::{ChildAccess, ReturnedChildEvidence},
 };
 use crate::utils::rustc::RustProgram;
@@ -35,8 +41,30 @@ fn operand_local(operand: &Operand<'_>) -> Option<Local> {
     operand.place().and_then(|place| place.as_local())
 }
 
-/// The transparent alias closure of the parameter, then the refusal scan.
-fn descendant_free(body: &Body<'_>, parameter: Local) -> bool {
+fn resolved(operand: &Operand<'_>) -> Option<DefId> {
+    let constant = operand.constant()?;
+    let TyKind::FnDef(callee, _) = *constant.ty().kind() else { return None };
+    Some(callee)
+}
+
+/// Whether `parameter` of `function` is descendant-free. `visited` breaks
+/// recursion through local callees; a cycle is refused (conservative).
+fn descendant_free(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    function: LocalDefId,
+    parameter: Local,
+    visited: &mut FxHashSet<(LocalDefId, Local)>,
+) -> bool {
+    if !visited.insert((function, parameter)) {
+        return false;
+    }
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(function)
+        .borrow();
+    let body: &Body<'_> = &body;
+    // Transparent alias closure: copies, pointer casts, and the results of
+    // libc calls whose contract row returns an alias of an alias.
     let mut aliases = vec![parameter];
     let mut changed = true;
     while changed {
@@ -59,8 +87,42 @@ fn descendant_free(body: &Body<'_>, parameter: Local) -> bool {
                     changed = true;
                 }
             }
+            if let TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } = &data.terminator().kind
+                && let Some(callee) = resolved(func)
+                && callee
+                    .as_local()
+                    .is_none_or(|local| !functions.contains(&local))
+                && let Some(result) = destination.as_local()
+                && pointer(body.local_decls[result].ty)
+                && !aliases.contains(&result)
+            {
+                let key = symbol_key(tcx, callee, functions);
+                let returns_alias = args.iter().enumerate().any(|(index, argument)| {
+                    operand_local(&argument.node).is_some_and(|local| aliases.contains(&local))
+                        && raw_target_type(tcx, argument.node.ty(body, tcx)).is_some_and(|target| {
+                            classify_contract(&key, index, &target)
+                                .is_ok_and(|contract| contract.returns_alias_of == Some(index))
+                        })
+                });
+                if returns_alias {
+                    aliases.push(result);
+                    changed = true;
+                }
+            }
         }
     }
+    let is_alias =
+        |operand: &Operand<'_>| operand_local(operand).is_some_and(|l| aliases.contains(&l));
+    let hands_out = |place: &rustc_middle::mir::Place<'_>| {
+        place
+            .as_local()
+            .is_none_or(|local| local == rustc_middle::mir::RETURN_PLACE)
+    };
     for data in body.basic_blocks.iter() {
         for statement in &data.statements {
             let StatementKind::Assign(assignment) = &statement.kind else { continue };
@@ -69,41 +131,114 @@ fn descendant_free(body: &Body<'_>, parameter: Local) -> bool {
                 Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
                     aliases.contains(&place.local)
                 }
-                Rvalue::BinaryOp(BinOp::Offset, operands) => {
-                    operand_local(&operands.0).is_some_and(|local| aliases.contains(&local))
-                }
-                Rvalue::Aggregate(_, operands) => operands
-                    .iter()
-                    .any(|operand| operand_local(operand).is_some_and(|l| aliases.contains(&l))),
+                Rvalue::BinaryOp(BinOp::Offset, operands) => is_alias(&operands.0),
+                Rvalue::Aggregate(_, operands) => operands.iter().any(is_alias),
+                // A copy or pointer cast of an alias stored through any
+                // projection, or into the return place, hands it out; a cast
+                // to a non-pointer is an image the scan cannot follow.
                 Rvalue::Cast(_, operand, ty) => {
-                    operand_local(operand).is_some_and(|local| aliases.contains(&local))
-                        && !pointer(*ty)
+                    is_alias(operand) && (!pointer(*ty) || hands_out(lhs))
                 }
-                Rvalue::Use(operand) => {
-                    operand_local(operand).is_some_and(|local| aliases.contains(&local))
-                        && lhs.as_local().is_none()
-                }
+                Rvalue::Use(operand) => is_alias(operand) && hands_out(lhs),
                 _ => false,
             };
             if derived {
                 return false;
             }
         }
+        match &data.terminator().kind {
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => {
+                let Some(callee) = resolved(func) else {
+                    if args.iter().any(|argument| is_alias(&argument.node)) {
+                        return false;
+                    }
+                    continue;
+                };
+                if matches!(data.terminator().kind, TerminatorKind::TailCall { .. })
+                    && args.iter().any(|argument| is_alias(&argument.node))
+                {
+                    return false;
+                }
+                if let Some(local) = callee.as_local().filter(|local| functions.contains(local)) {
+                    for (index, argument) in args.iter().enumerate() {
+                        if is_alias(&argument.node)
+                            && !descendant_free(
+                                tcx,
+                                functions,
+                                local,
+                                Local::from_usize(index + 1),
+                                visited,
+                            )
+                        {
+                            return false;
+                        }
+                    }
+                }
+                // Foreign callees: the retention certificate already refuses
+                // an unknown or retaining contract; a known no-retain row that
+                // returns an alias was folded into the alias set above — unless
+                // its result lands somewhere other than a plain local, which
+                // hands the alias out directly.
+                if callee
+                    .as_local()
+                    .is_none_or(|local| !functions.contains(&local))
+                    && let TerminatorKind::Call { destination, .. } = &data.terminator().kind
+                    && destination
+                        .as_local()
+                        .is_none_or(|l| l == rustc_middle::mir::RETURN_PLACE)
+                {
+                    let key = symbol_key(tcx, callee, functions);
+                    let returns_alias = args.iter().enumerate().any(|(index, argument)| {
+                        is_alias(&argument.node)
+                            && raw_target_type(tcx, argument.node.ty(body, tcx)).is_some_and(
+                                |target| {
+                                    classify_contract(&key, index, &target).is_ok_and(|contract| {
+                                        contract.returns_alias_of == Some(index)
+                                    })
+                                },
+                            )
+                    });
+                    if returns_alias {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     true
 }
 
-/// Rewrite the `Unknown` type-backed records whose callee position is
-/// descendant-free. The retention rows are the same summaries the raw-boundary
-/// disposition consumes; nothing is re-derived.
+/// The body scan alone (no retention row), for the witnesses.
+#[cfg(test)]
+pub(crate) fn position_is_descendant_free(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    function: LocalDefId,
+    index: usize,
+) -> bool {
+    descendant_free(
+        tcx,
+        functions,
+        function,
+        Local::from_usize(index + 1),
+        &mut FxHashSet::default(),
+    )
+}
+
+/// Rewrite the type-backed records whose callee position is descendant-free.
+/// The retention rows are the same summaries the raw-boundary disposition
+/// consumes; nothing is re-derived.
 pub(crate) fn discharge<'a>(
     program: &RustProgram<'_>,
     rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
     records: impl Iterator<Item = &'a mut ReturnedChildEvidence>,
 ) {
     let tcx: TyCtxt<'_> = program.tcx;
+    let mut memo = FxHashMap::<(LocalDefId, usize), bool>::default();
     for record in records {
-        if !matches!(record.access, ChildAccess::Unknown { .. }) {
+        if matches!(record.access, ChildAccess::Unused) {
             continue;
         }
         let Some(callee) = record.key.callee.as_local() else { continue };
@@ -111,22 +246,24 @@ pub(crate) fn discharge<'a>(
             continue;
         }
         let index = record.key.parent_argument_index;
-        let output = tcx
-            .fn_sig(callee.to_def_id())
-            .skip_binder()
-            .skip_binder()
-            .output();
-        if may_carry_pointer(tcx, output, CARRIER_WALK_DEPTH) {
-            continue;
-        }
         if !matches!(
             rows.get(&(callee, index)),
             Some(RetentionVerdict::NoRetain { .. })
         ) {
             continue;
         }
-        let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
-        if index >= body.arg_count || !descendant_free(&body, Local::from_usize(index + 1)) {
+        let free = *memo.entry((callee, index)).or_insert_with(|| {
+            let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+            index < body.arg_count
+                && descendant_free(
+                    tcx,
+                    &program.functions,
+                    callee,
+                    Local::from_usize(index + 1),
+                    &mut FxHashSet::default(),
+                )
+        });
+        if !free {
             continue;
         }
         record.access = ChildAccess::Unused;

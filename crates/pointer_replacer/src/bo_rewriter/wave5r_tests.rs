@@ -406,3 +406,6 @@ mod wave6r_shared_root_tests;
 
 #[path = "wave6r_child_access_tests.rs"]
 mod wave6r_child_access_tests;
+
+#[path = "wave6r_url_tests.rs"]
+mod wave6r_url_tests;
