@@ -262,3 +262,24 @@ fn wave6k_copy_passed_to_a_local_callee_is_declined_and_the_callee_keeps_its_del
     })
     .expect("input compiles");
 }
+
+/// wave-6s2's pin (relay wave-6k/011 §2): a local initialised by a call to a
+/// LOCAL callee whose return the return family converts is the return
+/// receiver's; this rule must not plan a `from_raw_parts` over it.
+const BARE_RESLICE_RETURN: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn chunk_data(mut chunk: *mut u8) -> *mut u8 { return chunk.offset(8); }
+ pub unsafe fn use_it(mut chunk: *mut u8) -> u8 { let a = *chunk.offset(2); let d = chunk_data(chunk); a.wrapping_add(*d.offset(1)) }
+"#;
+
+#[test]
+fn wave6k_call_initialised_slice_local_yields_to_the_return_receiver() {
+    let (source, _) = emitted(BARE_RESLICE_RETURN, "d");
+    let text = compact(&source);
+    assert!(
+        text.contains("fnchunk_data<'a>(mutchunk:&'a[u8])->&'a[u8]{return&chunk[8..];}"),
+        "{source}"
+    );
+    assert!(text.contains("letd:&[u8]=chunk_data(chunk);"), "{source}");
+    assert!(!text.contains("from_raw_parts(chunk_data("), "{source}");
+}

@@ -27,7 +27,7 @@ pub(crate) fn emitted_type(tcx: TyCtxt<'_>, subject: &Subject, mutable: bool) ->
         return None;
     }
     let initializer = local.init?;
-    if initializer.span.from_expansion() {
+    if initializer.span.from_expansion() || call_initialised(initializer) {
         return None;
     }
     let typeck = tcx.typeck(subject.fn_did);
@@ -43,6 +43,25 @@ pub(crate) fn emitted_type(tcx: TyCtxt<'_>, subject: &Subject, mutable: bool) ->
         &declaration::pointee_source(tcx, *pointee),
         None,
     )
+}
+
+/// A call result is never this rule's value: a LOCAL callee's converted
+/// return is the return receiver's (a `from_raw_parts` over it is ill-typed),
+/// a foreign allocator's is the Box family's. Casts and parentheses around
+/// the call are peeled; `p.offset(k)`-style method calls on a place remain
+/// this rule's offset-derived copies.
+fn call_initialised(initializer: &rustc_hir::Expr<'_>) -> bool {
+    use rustc_hir::ExprKind;
+    let mut expr = initializer;
+    loop {
+        match expr.kind {
+            ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) | ExprKind::Type(inner, _) => {
+                expr = inner;
+            }
+            ExprKind::Call(..) => return true,
+            _ => return false,
+        }
+    }
 }
 
 fn slice_mutability(decision: &Decision) -> Option<bool> {
