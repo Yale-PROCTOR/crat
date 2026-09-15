@@ -4019,7 +4019,8 @@ pub(crate) fn plan(
         let typed_pattern = table
             .declaration_patterns
             .contains_key(&(subject.fn_did, subject.hir_id))
-            || super::decision::construction_values::has_declaration(table, subject);
+            || super::decision::construction_values::has_declaration(table, subject)
+            || super::decision::slice_construction_values::has_declaration(table, subject);
         let typed_receiver = table
             .return_receivers
             .plans

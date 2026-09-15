@@ -78,6 +78,7 @@ pub(crate) mod seam;
 pub(crate) mod shared_read_pairs;
 pub(crate) mod sibling_overlap;
 pub(crate) mod slice_carrier;
+pub(crate) mod slice_construction_values;
 pub(crate) mod slice_use;
 pub(crate) mod surface_argument;
 pub(crate) mod thin_extent;
@@ -1640,6 +1641,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             DegradeReason::SliceCursorUse,
         ),
         Decision::Ref { .. } if construction_values::permits(ctx, subject) => decision,
+        Decision::Slice { .. } if slice_construction_values::permits(ctx, subject) => decision,
         Decision::Ref { mutable } => {
             if receiver_failed {
                 degrade(
@@ -2032,6 +2034,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // even pinned.
         if subject.ty_span.is_none()
             && !construction_values::permits(ctx, subject)
+            && !slice_construction_values::permits(ctx, subject)
             && !(family_policy
                 .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
                 && declaration_patterns.contains_key(&(subject.fn_did, subject.hir_id)))

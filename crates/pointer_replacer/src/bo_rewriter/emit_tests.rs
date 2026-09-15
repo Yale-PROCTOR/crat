@@ -3006,6 +3006,11 @@ fn one_comparison_opens_its_parameter_and_local_operand_alike() {
 /// upstream expected reason moves. The independent `annotated=0` and
 /// `raw_op=offset` assertions below remain unchanged.
 ///
+/// Second migration (wave-6k, R217-2(a)): the depth-1 copy now HAS a value
+/// plan (an explicit slice declaration over item 2's constructor), so the
+/// fixture moves to a depth-2 copy, which that rule refuses; the local still
+/// degrades at `copy-source-coupled` and still carries the `.offset()` fact.
+///
 /// The join must still report `annotated=0` **and** `raw_op=offset` on that
 /// same subject. If it cannot, it has inherited the ordering it exists to
 /// bypass, and every "zero" it certifies in the reachability table is worth
@@ -3018,7 +3023,7 @@ fn one_comparison_opens_its_parameter_and_local_operand_alike() {
 #[test]
 fn the_facts_join_reports_facts_the_decision_never_reached() {
     let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
-               pub unsafe fn f(a: *mut i32) -> i32 { let p = a; *p.offset(1) }\n";
+               pub unsafe fn f(a: *mut *mut i32) -> i32 { let p = a; **p.offset(1) }\n";
     let fixture = Fixture::new(&[("lib.rs", src)]);
     let (reason, facts) =
         ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {

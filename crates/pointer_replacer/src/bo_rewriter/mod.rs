@@ -96,6 +96,8 @@ mod shared_pair_tests;
 mod shared_read_arguments;
 pub(crate) mod sibling_audit;
 pub(crate) mod sign_facts;
+#[cfg(test)]
+mod slice_construction_values_tests;
 mod slice_cursor_prelude;
 pub(crate) mod use_census;
 pub(crate) mod verify;
@@ -7544,6 +7546,7 @@ fn finish_decide<'tcx>(
             decision::construction::plan_slice_constructions(tcx, &table, &ctors, &family_policy);
         append_surface_declaration_plans(tcx, &exposure, &mut table);
         append_inferred_local_declaration_plans(tcx, &mut table);
+        decision::slice_construction_values::append_declarations(tcx, &mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
