@@ -257,6 +257,8 @@ mod sibling_audit_transport_tests;
 #[cfg(test)]
 mod sibling_overlap_tests;
 #[cfg(test)]
+mod slice_passon_tests;
+#[cfg(test)]
 mod slice_use_inventory_tests;
 #[cfg(test)]
 mod thin_extent_tests;
