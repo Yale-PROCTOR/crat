@@ -6825,7 +6825,7 @@ fn finish_decide<'tcx>(
 
     perturb(&mut subjects);
     let mut declaration_pointees = decision::declaration::collect(tcx, &subjects);
-    let counted_void =
+    let mut counted_void =
         decision::counted_void::collect(tcx, &subjects, &mut declaration_pointees, |subject| {
             // BO's kind first (the ladder's own rule): a contract is never
             // proven against a `Raw` verdict, so a forwarder cannot take a
@@ -6855,6 +6855,11 @@ fn finish_decide<'tcx>(
     );
     let void_region_receivers =
         decision::void_region::receivers(tcx, &subjects, &ctors, &void_region);
+    // Composition seam (wave-6v × wave-6b): one void parameter, one hook. A
+    // subject wave-6b's region reader delivers keeps no counted contract —
+    // both would plan the same call, and the counted graft would then meet
+    // the region bridge's node instead of the call.
+    counted_void.retain(|key, _| !void_region.contains_key(key));
     let original_body_adapters = facts.body_adapters.clone();
     let thin_extent_subjects = decision::thin_extent::collect(&facts);
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
