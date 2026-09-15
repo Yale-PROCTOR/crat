@@ -37,6 +37,9 @@ impl ByteElement {
 pub(crate) struct Contract {
     pub(crate) count_index: usize,
     pub(crate) element: ByteElement,
+    /// The parameter is null-tested (or forwards to a null-tested one): its
+    /// form is `Option<&[u8]>` and a raw caller bridges through the null arm.
+    pub(crate) nullable: bool,
     pub(crate) uses: Vec<UseEdit>,
 }
 fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
@@ -92,6 +95,7 @@ fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         } else {
             ByteElement::Read
         },
+        nullable: false,
         uses: vec![UseEdit {
             span: access.span,
             replacement,
@@ -106,8 +110,35 @@ pub(crate) fn collect(
     pointees: &mut DeclarationPointees,
 ) -> Contracts {
     let mut out = Contracts::default();
-    for s in subjects {
-        let Some(contract) = prove(tcx, s) else { continue };
+    let mut proven: Vec<(&Subject, Contract)> = subjects
+        .iter()
+        .filter_map(|s| {
+            prove(tcx, s)
+                .or_else(|| super::counted_void_read::prove(tcx, s))
+                .map(|c| (s, c))
+        })
+        .collect();
+    // Forwarded parameters, to a fixpoint (a wrapper of a wrapper).
+    loop {
+        let known: FxHashMap<Key, Contract> = proven
+            .iter()
+            .map(|(s, c)| ((s.fn_did, s.hir_id), c.clone()))
+            .collect();
+        let mut added = 0;
+        for s in subjects {
+            if known.contains_key(&(s.fn_did, s.hir_id)) {
+                continue;
+            }
+            if let Some(contract) = prove_forward(tcx, s, subjects, &known) {
+                proven.push((s, contract));
+                added += 1;
+            }
+        }
+        if added == 0 {
+            break;
+        }
+    }
+    for (s, contract) in proven {
         let Some(span) = s.ty_span else { continue };
         let Ok(original_alias) = tcx.sess.source_map().span_to_snippet(span) else { continue };
         let Node::Pat(pat) = tcx.hir_node(s.hir_id) else { continue };
@@ -126,6 +157,130 @@ pub(crate) fn collect(
     }
     out
 }
+/// A `void *` parameter whose only uses are null tests and ONE pass-through as
+/// the counted pointer argument of a local counted callee, with a sibling
+/// parameter passed unchanged as that callee's count: the pair travels together
+/// and the parameter takes the callee's contract (element, nullability).
+fn prove_forward(
+    tcx: TyCtxt<'_>,
+    s: &Subject,
+    subjects: &[Subject],
+    known: &FxHashMap<Key, Contract>,
+) -> Option<Contract> {
+    if s.ptr_depth != 1 || !matches!(s.kind, SubjectKind::Param { .. }) {
+        return None;
+    }
+    let Node::Pat(pat) = tcx.hir_node(s.hir_id) else { return None };
+    if !super::void_pointee::has_void_pointee(tcx, tcx.typeck(s.fn_did).pat_ty(pat), 1) {
+        return None;
+    }
+    let body = tcx.hir_body_owned_by(s.fn_did);
+    let params = body
+        .params
+        .iter()
+        .map(|p| match p.pat.kind {
+            PatKind::Binding(_, id, _, None) => Some(id),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    struct Uses<'tcx> {
+        target: HirId,
+        found: Vec<&'tcx Expr<'tcx>>,
+        writes: bool,
+        closures: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = e.kind
+                && path.res == rustc_hir::def::Res::Local(self.target)
+            {
+                self.found.push(e);
+            }
+            match e.kind {
+                ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) if matches!(lhs.kind, ExprKind::Path(rustc_hir::QPath::Resolved(_, p)) if p.res == rustc_hir::def::Res::Local(self.target)) =>
+                {
+                    self.writes = true;
+                }
+                ExprKind::Closure(..) => self.closures = true,
+                _ => {}
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut uses = Uses {
+        target: s.hir_id,
+        found: Vec::new(),
+        writes: false,
+        closures: false,
+    };
+    uses.visit_expr(body.value);
+    if uses.writes || uses.closures {
+        return None;
+    }
+    let name = s.param_name.as_ref()?;
+    let typeck = tcx.typeck(s.fn_did);
+    let mut edits = Vec::new();
+    let mut forwarded: Option<Contract> = None;
+    let mut nullable = false;
+    for use_ in uses.found {
+        let Node::Expr(parent) = tcx.parent_hir_node(use_.hir_id) else { return None };
+        match parent.kind {
+            ExprKind::MethodCall(segment, receiver, [], _)
+                if receiver.hir_id == use_.hir_id && segment.ident.name.as_str() == "is_null" =>
+            {
+                nullable = true;
+                edits.push(UseEdit {
+                    span: parent.span,
+                    replacement: format!("{name}.is_none()"),
+                    bridge_kind: "counted-void-null-test",
+                });
+            }
+            ExprKind::Call(callee, args) => {
+                if forwarded.is_some() {
+                    return None;
+                }
+                let index = args.iter().position(|a| a.hir_id == use_.hir_id)?;
+                let ExprKind::Path(path) = &callee.kind else { return None };
+                let rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Fn, did) =
+                    typeck.qpath_res(path, callee.hir_id)
+                else {
+                    return None;
+                };
+                let callee = did.as_local()?;
+                let (_, contract) = known.iter().find(|((f, h), _)| {
+                    *f == callee
+                        && subjects.iter().any(|t| {
+                            t.fn_did == callee
+                                && t.hir_id == *h
+                                && matches!(t.kind, SubjectKind::Param { hir_index } if hir_index == index)
+                        })
+                })?;
+                let count = args.get(contract.count_index)?;
+                let ExprKind::Path(rustc_hir::QPath::Resolved(_, count_path)) = count.kind else {
+                    return None;
+                };
+                let rustc_hir::def::Res::Local(count_local) = count_path.res else { return None };
+                let count_index = params.iter().position(|p| *p == count_local)?;
+                if count_index == params.iter().position(|p| *p == s.hir_id)? {
+                    return None;
+                }
+                nullable |= contract.nullable;
+                forwarded = Some(Contract {
+                    count_index,
+                    element: contract.element,
+                    nullable: contract.nullable,
+                    uses: Vec::new(),
+                });
+            }
+            _ => return None,
+        }
+    }
+    let mut contract = forwarded?;
+    contract.nullable = nullable;
+    contract.uses = edits;
+    Some(contract)
+}
+
 pub(crate) fn install(contracts: &Contracts, uses: &mut FxHashMap<Key, SliceUses>) {
     for (key, c) in contracts {
         uses.insert(
@@ -135,6 +290,25 @@ pub(crate) fn install(contracts: &Contracts, uses: &mut FxHashMap<Key, SliceUses
                 ..Default::default()
             },
         );
+    }
+}
+
+/// The optional form reads its rewrites from the Option use map.
+pub(crate) fn install_opt(
+    contracts: &Contracts,
+    uses: &mut FxHashMap<Key, super::emitability::OptUses>,
+) {
+    for (key, c) in contracts {
+        if c.nullable {
+            uses.insert(
+                *key,
+                super::emitability::OptUses {
+                    rewrites: c.uses.clone(),
+                    non_test_uses: 1,
+                    ..Default::default()
+                },
+            );
+        }
     }
 }
 
@@ -230,7 +404,7 @@ pub(crate) fn render_bridge(
         return Some(text.to_owned());
     }
     let super::seam::SeamLen::Licensed(count) = spec.len.as_ref()? else { return None };
-    if spec.core != super::seam::GlueCore::FromRawParts || spec.optional || spec.unwrap.is_some() {
+    if spec.core != super::seam::GlueCore::FromRawParts || spec.unwrap.is_some() {
         return None;
     }
     let (pointer, ctor) = if spec.mutable {
@@ -239,6 +413,15 @@ pub(crate) fn render_bridge(
         ("const", "from_raw_parts")
     };
     let text = placeholder(counted.arg_index);
+    if spec.optional {
+        // Null is `None`; a non-null pointer with a zero count is an empty
+        // view; otherwise the counted view (the same obligations as below).
+        return Some(format!(
+            "{{ let (__crat_counted_ptr, __crat_counted_len) = (({text}) as *{pointer} {}, ({count}) as usize); if __crat_counted_ptr.is_null() {{ None }} else if __crat_counted_len == 0 {{ Some(&{} []) }} else {{ Some(unsafe {{ core::slice::{ctor}(__crat_counted_ptr, __crat_counted_len) }}) }} }}",
+            counted.element.pointee(),
+            if spec.mutable { "mut" } else { "" }
+        ));
+    }
     // SAFETY: the source is a raw full-extent pointer, never a thin reference.
     // Original byte reads establish initialized u8; writes use MaybeUninit.
     // The zero-count branch never constructs a slice from a null pointer.
@@ -1203,15 +1386,19 @@ impl rustc_ast::mut_visit::MutVisitor for Substitute {
     }
 }
 
+/// The use edits of a counted view: a slice, or its optional twin.
 fn slice_edits(decision: &super::Decision) -> Option<&[UseEdit]> {
     use super::Decision;
     match decision {
         Decision::Slice { uses, .. } => Some(uses),
-        Decision::Cursor { .. }
+        Decision::Opt {
+            slice: true, uses, ..
+        } => Some(uses),
+        Decision::Opt { slice: false, .. }
+        | Decision::Cursor { .. }
         | Decision::Ref { .. }
         | Decision::InferredRef { .. }
         | Decision::NestedSlice { .. }
-        | Decision::Opt { .. }
         | Decision::Box(_)
         | Decision::Degraded(_) => None,
     }

@@ -73,7 +73,7 @@ fn w6v_lodepng_memset_count_is_num_not_value() {
 #[test]
 fn w6v_fill_raw_caller_uses_exact_count() {
     let input = format!(
-        "{FILL}\nunsafe fn fill_caller(dst: *mut core::ffi::c_void, n: usize) {{ lodepng_memset(dst, 255, n); }}"
+        "{FILL}\nunsafe fn fill_caller(dst: *mut core::ffi::c_void, n: usize) {{ lodepng_memset(dst, 255, n.wrapping_add(0)); }}"
     );
     let source = check(&input, &["dst"]);
     assert!(
@@ -81,7 +81,7 @@ fn w6v_fill_raw_caller_uses_exact_count() {
         "count must be the snapshot of n, not value=255: {source}"
     );
     assert!(
-        compact(&source).contains(")(dst,255,n)"),
+        compact(&source).contains(")(dst,255,n.wrapping_add(0))"),
         "every original argument is evaluated once, in order, before the call: {source}"
     );
     assert!(
@@ -165,8 +165,10 @@ fn run_binary(source: &str) -> Vec<u8> {
 
 #[test]
 fn w6v_emitted_fill_matches_zero_and_uninitialized_writes() {
+    // The caller's count is an expression, so the caller stays raw and the
+    // bridge (null at count zero, an uninitialised destination) is exercised.
     let helper = format!(
-        "{FILL}\npub unsafe fn fill_caller(dst: *mut core::ffi::c_void, n: usize) {{ lodepng_memset(dst, 255, n); }}"
+        "{FILL}\npub unsafe fn fill_caller(dst: *mut core::ffi::c_void, n: usize) {{ lodepng_memset(dst, 255, n.wrapping_add(0)); }}"
     );
     let emitted = check(&helper, &["dst"]);
     let main = r#"fn main() { unsafe {
@@ -822,4 +824,191 @@ fn w6v_split_refuses_two_parameters_and_a_reassigned_fresh_local() {
     );
     let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
     assert!(super::verify::type_checks_str(&source));
+}
+
+// ---- report 006: counted read aliases and forwarded counted parameters ----
+//
+// rs-crown/libcsv: a `void *` READ parameter is cast once to a byte pointer and
+// read through a cursor (`*csrc`, `csrc = csrc.offset(1)`) inside a loop that
+// counts a sibling parameter down to zero; wrappers forward the pair unchanged.
+// Reads become checked indexing over the counted view (R394-1), the cursor a
+// re-slice; a null-tested parameter becomes `Option<&[u8]>`.
+
+/// rs-crown/libcsv `csv_write2` (src side) and `csv_fwrite2`, reduced; `sink`
+/// stands for `fputc`.
+const CSV_READ: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+static mut SINK: u64 = 0;
+unsafe fn sink(c: i32) -> i32 { SINK = SINK.wrapping_mul(31).wrapping_add(c as u64); 0 }
+unsafe fn csv_fwrite2(mut src: *const core::ffi::c_void, mut src_size: u64, mut quote: u8) -> i32 {
+    let mut csrc = src as *const u8;
+    if src.is_null() { return 0 as i32; }
+    if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }
+    while src_size != 0 {
+        if *csrc as i32 == quote as i32 {
+            if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }
+        }
+        if sink(*csrc as i32) == -(1 as i32) { return -(1 as i32); }
+        src_size = src_size.wrapping_sub(1);
+        csrc = csrc.offset(1);
+    }
+    if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }
+    return 0 as i32;
+}
+unsafe fn csv_fwrite(mut src: *const core::ffi::c_void, mut src_size: u64) -> i32 {
+    return csv_fwrite2(src, src_size, 0x22 as i32 as u8);
+}
+"#;
+
+#[test]
+fn w6v_read_cursor_alias_delivers_an_optional_byte_view() {
+    let rows = super::emit_tests::decisions_of(CSV_READ);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "src" && *p && r == "<emitted>"),
+        "the read parameter delivers: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(CSV_READ).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fncsv_fwrite2(mutsrc:Option<&[u8]>,mutsrc_size:u64,mutquote:u8)"),
+        "null-tested read view: {source}"
+    );
+    assert!(c.contains("ifsrc.is_none()"), "null test moves: {source}");
+    assert!(
+        c.contains("letmutcsrc=src.unwrap_or(&[]);"),
+        "the alias is the view: {source}"
+    );
+    assert!(
+        c.contains("(csrc[0]asu8)"),
+        "cursor reads are checked: {source}"
+    );
+    assert!(
+        c.contains("csrc=&csrc[1..];"),
+        "the advance is a re-slice: {source}"
+    );
+    assert!(
+        c.contains("fncsv_fwrite(mutsrc:Option<&[u8]>,mutsrc_size:u64)"),
+        "the forwarding wrapper takes the same view: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe {
+        let text = b"a\"b";
+        csv_fwrite(text.as_ptr().cast(), 3);
+        csv_fwrite(core::ptr::null(), 3);
+        csv_fwrite(text.as_ptr().cast(), 0);
+        println!("{}", SINK);
+    }}"#;
+    let emitted_main = r#"fn main() { unsafe {
+        let text = b"a\"b";
+        csv_fwrite(Some(&text[..]), 3);
+        csv_fwrite(None, 3);
+        csv_fwrite(Some(&text[..0]), 0);
+        println!("{}", SINK);
+    }}"#;
+    let original = run_binary(&format!("{CSV_READ}\n{main}"));
+    assert_eq!(original, b"1022524480959\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+}
+
+/// A wrapper of the wrapper forwards the pair too: the forward contract closes
+/// to a fixpoint along the chain.
+#[test]
+fn w6v_read_alias_forward_chain_closes() {
+    let input = format!(
+        "{CSV_READ}\nunsafe fn caller(p: *const core::ffi::c_void, n: u64) -> i32 {{ csv_fwrite(p, n) }}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        compact(&source).contains("fncaller(p:Option<&[u8]>,n:u64)->i32{csv_fwrite(p,n)}"),
+        "the chain takes the view: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+}
+
+/// A raw caller of the forwarding wrapper (its count is an expression, so it
+/// is no forwarder itself): the optional counted bridge maps a null pointer to
+/// `None` and a non-null pointer with its count to the view.
+#[test]
+fn w6v_read_alias_raw_caller_bridges_through_the_null_arm() {
+    let input = format!(
+        "{CSV_READ}\nunsafe fn caller(p: *const core::ffi::c_void, n: u64) -> i32 {{ csv_fwrite(p, n.wrapping_add(0)) }}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("if__crat_counted_ptr.is_null(){None}elseif__crat_counted_len==0{Some(&[])}else{Some(unsafe{core::slice::from_raw_parts(__crat_counted_ptr,__crat_counted_len)})}"),
+        "the optional counted bridge: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe {
+        let text = b"a\"b";
+        caller(text.as_ptr().cast(), 3);
+        caller(core::ptr::null(), 3);
+        caller(text.as_ptr().cast(), 0);
+        println!("{}", SINK);
+    }}"#;
+    let original = run_binary(&format!("{input}\n{main}"));
+    assert_eq!(original, b"1022524480959\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{main}")));
+}
+
+#[test]
+fn w6v_read_alias_holds_when_the_cursor_is_read_outside_the_counted_loop() {
+    // A read after the loop is not bounded by the count: the parameter stays
+    // typed-held and nothing is rewritten.
+    let input = CSV_READ.replace(
+        "    if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }\n    return 0 as i32;",
+        "    if sink(*csrc as i32) == -(1 as i32) { return -(1 as i32); }\n    return 0 as i32;",
+    );
+    assert_ne!(input, CSV_READ);
+    let rows = super::emit_tests::decisions_of(&input);
+    assert!(
+        rows.iter()
+            .filter(|(n, p, _)| n == "src" && *p)
+            .all(|(_, _, r)| r != "<emitted>"),
+        "an unbounded read holds the parameter: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(!source.contains("Option<&[u8]>"), "{source}");
+    assert!(super::verify::type_checks_str(&source));
+}
+
+#[test]
+fn w6v_read_alias_holds_when_the_alias_escapes() {
+    // The alias's address value observed as an integer has no image.
+    let input = CSV_READ.replace(
+        "        csrc = csrc.offset(1);\n    }",
+        "        csrc = csrc.offset(1);\n    }\n    let _keep = csrc as usize;",
+    );
+    assert_ne!(input, CSV_READ);
+    let rows = super::emit_tests::decisions_of(&input);
+    assert!(
+        rows.iter()
+            .filter(|(n, p, _)| n == "src" && *p)
+            .all(|(_, _, r)| r != "<emitted>"),
+        "an escaping alias holds the parameter: {rows:?}"
+    );
+}
+
+/// A wrapper forwarding a WRITE pair takes the destination view itself.
+#[test]
+fn w6v_forwarded_write_pair_takes_the_destination_view() {
+    let helper = format!(
+        "{FILL}\npub unsafe fn fill_caller(dst: *mut core::ffi::c_void, n: usize) {{ lodepng_memset(dst, 255, n); }}"
+    );
+    let emitted = check(&helper, &["dst"]);
+    assert!(
+        compact(&emitted).contains("fnfill_caller(dst:&mut[core::mem::MaybeUninit<u8>],n:usize){lodepng_memset(dst,255,n);}"),
+        "the forwarder takes the write view: {emitted}"
+    );
+    let main = r#"fn main() { unsafe {
+        let mut bytes=[core::mem::MaybeUninit::<u8>::uninit();4];
+        fill_caller(&mut bytes,4);
+        println!("{:?}",bytes.map(|b|b.assume_init()));
+    }}"#;
+    assert_eq!(
+        run_binary(&format!("{emitted}\n{main}")),
+        b"[255, 255, 255, 255]\n".to_vec()
+    );
 }

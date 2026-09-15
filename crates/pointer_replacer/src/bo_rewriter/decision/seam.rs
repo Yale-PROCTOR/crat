@@ -4317,7 +4317,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                     input_candidates.push(Err(SeamBlock::UnnameableOperand));
                     continue;
                 };
-                let counted = super::counted_void::parameter(table, *callee, pos.index);
+                // A safe-found argument at a counted position is an ordinary
+                // safe-to-safe seam; the counted plan is for raw arguments.
+                let counted = (pos.found == Form::Raw)
+                    .then(|| super::counted_void::parameter(table, *callee, pos.index))
+                    .flatten();
                 let wants_len = matches!(
                     pos.expected,
                     Form::Slice { .. } | Form::Opt { slice: true, .. }

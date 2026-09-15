@@ -7195,12 +7195,13 @@ fn finish_decide<'tcx>(
             additive::FamilyStage::SliceUse,
         );
         decision::counted_void::install(&counted_void, &mut slice_uses);
-        let current_opt_uses = additive::select_uses(
+        let mut current_opt_uses = additive::select_uses(
             &return_opt_uses,
             &full_opt_uses,
             &family_policy,
             additive::FamilyStage::Return,
         );
+        decision::counted_void::install_opt(&counted_void, &mut current_opt_uses);
         let opt_uses = additive::select_uses(
             &current_opt_uses,
             &prior_opt_uses,
