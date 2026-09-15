@@ -620,6 +620,14 @@ pub(crate) fn derive_return_eligibility(
         let mut callees = callees.into_iter().collect::<Vec<_>>();
         callees.sort_unstable_by_key(|(did, _)| did.local_def_index.as_u32());
         for (callee, callers) in callees {
+            // An empty caller list names a callee whose raw interface another
+            // family's delivery already consumes (see `candidate_callees`).
+            if callers.is_empty() {
+                result
+                    .through_raw_field_failures
+                    .insert(callee, LifetimeFailure::SeamIncompatible);
+                continue;
+            }
             if web.contains(callee)
                 && matches!(
                     exposure.plan(callee),

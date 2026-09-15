@@ -450,6 +450,27 @@ pub(crate) fn is_safe_view(decision: Option<&&Decision>) -> bool {
     }
 }
 
+/// EXHAUSTIVE: a call-result local delivered by a construction OVER the raw
+/// call (a sealed slice constructor, an optional or cursor form) — another
+/// family's delivery that consumes the callee's raw interface.
+pub(crate) fn is_raw_call_construction(decision: Option<&&Decision>) -> bool {
+    match decision {
+        Some(
+            Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. },
+        ) => true,
+        Some(
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_),
+        )
+        | None => false,
+    }
+}
+
 /// Direct local callees named by at least one `return-not-adapted` caller
 /// local, with EVERY call-result local of that callee — the return form is
 /// decided from all of them so it never moves between family stages (a
@@ -462,6 +483,7 @@ pub(crate) fn candidate_callees(
     use super::construction::{CallResultTarget, Construction};
     let mut callers = FxHashMap::<LocalDefId, Vec<NodeKey>>::default();
     let mut named = FxHashMap::<LocalDefId, bool>::default();
+    let mut served_elsewhere = FxHashMap::<LocalDefId, bool>::default();
     for subject in subjects
         .iter()
         .filter(|subject| matches!(subject.ctor, Some(Construction::CallResult)))
@@ -473,7 +495,14 @@ pub(crate) fn candidate_callees(
         match target {
             CallResultTarget::DirectLocal(callee) => {
                 callers.entry(*callee).or_default().push(node);
-                *named.entry(*callee).or_default() |= is_return_residual(decisions.get(&node));
+                let decision = decisions.get(&node);
+                *named.entry(*callee).or_default() |= is_return_residual(decision);
+                // A call-result local another family already delivers from
+                // the RAW call (a sealed slice constructor over the result,
+                // an optional receiver) consumes the callee's raw interface;
+                // changing that interface would break it. Such a callee is
+                // not this rule's.
+                *served_elsewhere.entry(*callee).or_default() |= is_raw_call_construction(decision);
             }
             CallResultTarget::Indirect
             | CallResultTarget::Foreign
@@ -482,6 +511,12 @@ pub(crate) fn candidate_callees(
     }
     callers.retain(|callee, _| named.get(callee).copied().unwrap_or(false));
     callers
+        .into_iter()
+        .map(|(callee, nodes)| {
+            let served = served_elsewhere.get(&callee).copied().unwrap_or(false);
+            (callee, if served { Vec::new() } else { nodes })
+        })
+        .collect()
 }
 
 /// The dead-return parameter of a callee: the bare parameter its `return`

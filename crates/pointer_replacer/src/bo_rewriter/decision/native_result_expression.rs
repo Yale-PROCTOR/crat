@@ -32,7 +32,7 @@ use rustc_middle::ty::{TyCtxt, TyKind};
 use rustc_span::Span;
 
 use super::{
-    DecisionTable, SubjectKind,
+    Decision, DecisionTable, SubjectKind,
     raw_boundary::{self, RawBoundaryBlockReason, RawTargetType},
     return_interface::ReturnInterface,
     seam::{self, Form, GlueSpec},
@@ -204,7 +204,46 @@ fn inside_call_argument(tcx: TyCtxt<'_>, call: &Expr<'_>) -> bool {
     }
 }
 
-fn consumer_of(tcx: TyCtxt<'_>, call: &Expr<'_>, form: Form) -> Consumer {
+/// The receiving place of `place = callee(..)`, when it is a local: what the
+/// decision table delivers it as. EXHAUSTIVE over the decision vocabulary so
+/// a new form is placed on purpose.
+enum AssignedPlace {
+    /// Stays raw in the output (degraded or undecided): the carrier's.
+    Raw,
+    /// Another family constructs the place's form OVER the raw call (a
+    /// sealed slice, an optional receiver, a cursor): the call is theirs.
+    ConstructedElsewhere,
+    /// A safe reference or box: assigning a raw view into it is unbuilt.
+    Delivered,
+}
+
+fn assigned_place(table: &DecisionTable, owner: LocalDefId, lhs: &Expr<'_>) -> AssignedPlace {
+    let ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = lhs.kind else {
+        return AssignedPlace::Raw;
+    };
+    let rustc_hir::def::Res::Local(binding) = path.res else {
+        return AssignedPlace::Raw;
+    };
+    let decision = table
+        .entries
+        .iter()
+        .find(|(subject, _)| subject.fn_did == owner && subject.hir_id == binding)
+        .map(|(_, decision)| decision);
+    match decision {
+        None | Some(Decision::Degraded(_)) => AssignedPlace::Raw,
+        Some(
+            Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. },
+        ) => AssignedPlace::ConstructedElsewhere,
+        Some(Decision::Ref { .. } | Decision::InferredRef { .. } | Decision::Box(_)) => {
+            AssignedPlace::Delivered
+        }
+    }
+}
+
+fn consumer_of(tcx: TyCtxt<'_>, table: &DecisionTable, call: &Expr<'_>, form: Form) -> Consumer {
     if inside_call_argument(tcx, call) {
         return Consumer::Elsewhere;
     }
@@ -253,13 +292,18 @@ fn consumer_of(tcx: TyCtxt<'_>, call: &Expr<'_>, form: Form) -> Consumer {
                 Consumer::Position(ResultPosition::Cast, covers)
             }
             ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == child => {
-                if matches!(
+                if !matches!(
                     tcx.typeck(expr.hir_id.owner.def_id).expr_ty(lhs).kind(),
                     TyKind::RawPtr(..)
                 ) {
-                    Consumer::Position(ResultPosition::Assign, None)
-                } else {
-                    Consumer::Unbuilt("assign-to-non-raw-place")
+                    return Consumer::Unbuilt("assign-to-non-raw-place");
+                }
+                // The place's OUTPUT form decides: a raw view may only be
+                // assigned into a place that stays raw.
+                match assigned_place(table, expr.hir_id.owner.def_id, lhs) {
+                    AssignedPlace::Raw => Consumer::Position(ResultPosition::Assign, None),
+                    AssignedPlace::ConstructedElsewhere => Consumer::Elsewhere,
+                    AssignedPlace::Delivered => Consumer::Unbuilt("assign-to-delivered-place"),
                 }
             }
             // An argument position is the outbound-expression carrier's; the
@@ -336,7 +380,8 @@ pub(crate) fn plan(
                 callee,
                 reason,
             };
-            let (position, covers_initializer) = match consumer_of(tcx, call, interface.form) {
+            let (position, covers_initializer) = match consumer_of(tcx, table, call, interface.form)
+            {
                 Consumer::Position(position, covers) => (position, covers),
                 Consumer::Elsewhere => continue,
                 Consumer::Unbuilt(shape) => {
