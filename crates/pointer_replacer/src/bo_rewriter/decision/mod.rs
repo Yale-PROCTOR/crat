@@ -66,6 +66,9 @@ pub(crate) mod ownership_fields_native;
 #[cfg(test)]
 mod ownership_fields_roles_tests;
 pub(crate) mod ownership_fields_source;
+pub(crate) mod pinned_local;
+#[cfg(test)]
+mod pinned_local_tests;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
 pub(crate) mod raw_place_values;
@@ -1979,7 +1982,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             )
         });
         let blocks = match gate {
-            RefGate::LiftAdaptable => !emitability::RefKind::is_adaptable(refs) && !surface_handles,
+            RefGate::LiftAdaptable => {
+                !emitability::RefKind::is_adaptable(refs)
+                    && !surface_handles
+                    && !pinned_local::exempt(subject)
+            }
         };
         if blocks {
             return degrade(
