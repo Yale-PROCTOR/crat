@@ -25,6 +25,11 @@ unsafe fn lodepng_memset(mut dst: *mut core::ffi::c_void,
 }
 "#;
 
+/// Whitespace-free view of an emitted source, for shape assertions.
+fn compact(source: &str) -> String {
+    source.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn check(input: &str, names: &[&str]) -> String {
     let rows = super::emit_tests::decisions_of(input);
     for name in names {
@@ -72,8 +77,12 @@ fn w6v_fill_raw_caller_uses_exact_count() {
     );
     let source = check(&input, &["dst"]);
     assert!(
-        source.contains("(n) as usize"),
-        "count must be n, not value=255: {source}"
+        source.contains("(__crat_cv_2) as usize"),
+        "count must be the snapshot of n, not value=255: {source}"
+    );
+    assert!(
+        compact(&source).contains(")(dst,255,n)"),
+        "every original argument is evaluated once, in order, before the call: {source}"
     );
     assert!(
         !source.contains("FALLBACK_SLICE_EXTENT"),
@@ -106,15 +115,19 @@ fn w6v_unbounded_and_narrowed_accesses_remain_held() {
 #[test]
 fn w6v_zero_length_bridge_never_retags_null() {
     use super::decision::{
-        counted_void::{ByteElement, render_bridge},
+        counted_void::{ByteElement, CountedByte, render_bridge},
         seam::{GlueCore, GlueSpec},
     };
+    let counted = CountedByte {
+        element: ByteElement::Write,
+        arg_index: 0,
+    };
     let mut spec = GlueSpec::core(GlueCore::FromRawParts, true).with_len("n");
-    spec.counted_byte = Some(ByteElement::Write);
-    let rendered = render_bridge(&spec, ByteElement::Write, "p").expect("typed byte bridge");
+    spec.counted_byte = Some(counted);
+    let rendered = render_bridge(&spec, counted).expect("typed byte bridge");
     assert!(rendered.contains("if __crat_counted_len == 0"));
     let input = format!(
-        "pub unsafe fn zero(p: *mut core::ffi::c_void,n: usize) {{ let _: &mut [core::mem::MaybeUninit<u8>] = {rendered}; }}"
+        "pub unsafe fn zero(__crat_cv_0: *mut core::ffi::c_void,n: usize) {{ let _: &mut [core::mem::MaybeUninit<u8>] = {rendered}; }}"
     );
     assert!(super::verify::type_checks_str(&input));
 }
@@ -187,54 +200,345 @@ fn w6v_emitted_copy_preserves_signed_byte_bits() {
 }
 
 #[test]
-fn w6v_addressed_count_requires_a_call_snapshot() {
-    let input = format!(
-        "{FILL}\nunsafe fn alias_count() {{ let mut n=8usize; let p: *mut core::ffi::c_void = &mut n as *mut usize as *mut core::ffi::c_void; lodepng_memset(p,0,n); }}"
+fn w6v_addressed_count_is_snapshotted_before_the_view() {
+    // The count's own storage is the fill destination. The closure call reads
+    // `n` before the byte view over it exists; the callee then overwrites it.
+    let helper = format!(
+        "{FILL}\npub unsafe fn alias_count() -> u64 {{ let mut n=8usize; let p: *mut core::ffi::c_void = &mut n as *mut usize as *mut core::ffi::c_void; lodepng_memset(p,1,n); n as u64 }}"
     );
-    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let emitted = check(&helper, &["dst"]);
     assert!(
-        !source.contains("dst: &mut ["),
-        "addressed count must not be read again behind a new mutable view: {source}"
+        compact(&emitted).contains(")(p,1,n)"),
+        "the count is read once, before any view: {emitted}"
     );
-    assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe { println!("{}", alias_count()); } }"#;
+    let original = run_binary(&format!("{helper}\n{main}"));
+    assert_eq!(original, b"72340172838076673\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{emitted}\n{main}")));
 }
 
 #[test]
-fn w6v_scalar_memory_read_requires_a_call_snapshot() {
-    let input = format!(
-        "{FILL}\nunsafe fn fill_from_value(dst: *mut core::ffi::c_void, n: usize) {{ lodepng_memset(dst, *(dst as *const i32), n); }}"
+fn w6v_scalar_memory_read_is_snapshotted_before_the_view() {
+    // The fill value is read out of the destination itself; the read happens
+    // in the closure call's argument list, before the view is formed.
+    let helper = format!(
+        "{FILL}\npub unsafe fn fill_from_value(dst: *mut core::ffi::c_void, n: usize) {{ lodepng_memset(dst, *(dst as *const i32), n); }}"
     );
-    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let emitted = check(&helper, &["dst"]);
     assert!(
-        !source.contains("dst: &mut ["),
-        "a scalar memory read after a new mutable view needs an argument snapshot: {source}"
+        compact(&emitted).contains(")(dst,*(dstas*consti32),n)"),
+        "the value read precedes the view: {emitted}"
     );
-    assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe {
+        let mut bytes = [0x2Au8, 0, 0, 0, 9, 9, 9, 9];
+        fill_from_value(bytes.as_mut_ptr().cast(), 8);
+        println!("{:?}", bytes);
+    }}"#;
+    let original = run_binary(&format!("{helper}\n{main}"));
+    assert_eq!(original, b"[42, 42, 42, 42, 42, 42, 42, 42]\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{emitted}\n{main}")));
 }
 
 #[test]
 fn w6v_adapter_preserves_a_count_named_like_its_pointer_temporary() {
     use super::decision::{
-        counted_void::{ByteElement, render_bridge},
+        counted_void::{ByteElement, CountedByte, render_bridge},
         seam::{GlueCore, GlueSpec},
     };
+    let counted = CountedByte {
+        element: ByteElement::Write,
+        arg_index: 0,
+    };
     let spec = GlueSpec::core(GlueCore::FromRawParts, true).with_len("__crat_counted_ptr");
-    let rendered = render_bridge(&spec, ByteElement::Write, "p").unwrap();
+    let rendered = render_bridge(&spec, counted).unwrap();
     let source = format!(
-        "unsafe fn length(p: *mut core::ffi::c_void, __crat_counted_ptr: usize) -> usize {{ let view: &mut [core::mem::MaybeUninit<u8>] = {rendered}; view.len() }} fn main() {{ let mut bytes=[0u8;4]; println!(\"{{}}\",unsafe{{length(bytes.as_mut_ptr().cast(),4)}}); }}"
+        "unsafe fn length(__crat_cv_0: *mut core::ffi::c_void, __crat_counted_ptr: usize) -> usize {{ let view: &mut [core::mem::MaybeUninit<u8>] = {rendered}; view.len() }} fn main() {{ let mut bytes=[0u8;4]; println!(\"{{}}\",unsafe{{length(bytes.as_mut_ptr().cast(),4)}}); }}"
     );
     assert_eq!(run_binary(&source), b"4\n");
 }
 
 #[test]
-fn w6v_addressed_pointer_storage_requires_a_call_snapshot() {
-    let input = format!(
-        "{COPY}\nunsafe fn copy_pointer_storage() {{ let data=[1u8;8]; let mut src: *const core::ffi::c_void=data.as_ptr().cast(); let dst: *mut core::ffi::c_void=&raw mut src as *mut *const core::ffi::c_void as *mut core::ffi::c_void; lodepng_memcpy(dst,src,1); }}"
+fn w6v_addressed_pointer_storage_is_snapshotted_before_the_view() {
+    // The copy destination is the source pointer's own storage: both pointer
+    // values are captured before either view exists, so the copy sees the
+    // original source bytes and writes them over the pointer variable.
+    let helper = format!(
+        "{COPY}\npub unsafe fn copy_pointer_storage() -> u8 {{ let data=[7u8;8]; let mut src: *const core::ffi::c_void=data.as_ptr().cast(); let dst: *mut core::ffi::c_void=&raw mut src as *mut *const core::ffi::c_void as *mut core::ffi::c_void; lodepng_memcpy(dst,src,1); (src as usize & 0xff) as u8 }}"
+    );
+    let emitted = check(&helper, &["dst", "src"]);
+    assert!(
+        compact(&emitted).contains(")(dst,src,1)"),
+        "both pointer values precede the views: {emitted}"
+    );
+    let main = r#"fn main() { unsafe { println!("{}", copy_pointer_storage()); } }"#;
+    let original = run_binary(&format!("{helper}\n{main}"));
+    assert_eq!(original, b"7\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{emitted}\n{main}")));
+}
+
+// ---- report 004: the count-argument value plan at the real call shapes ----
+//
+// The corpus callees take `size_t` counts and index with `size_t`; the
+// fixtures below keep those widths (`u64`) so the byte-count forms are the
+// corpus forms verbatim: `(n as u64).wrapping_mul(size_of::<T>() as u64)` and
+// `(size_of::<T>() as u64).wrapping_mul(n)`.
+
+const FILL64: &str = r#"
+#![allow(dead_code, unused_mut, non_upper_case_globals, non_snake_case)]
+extern "C" { fn malloc(n: usize) -> *mut core::ffi::c_void; fn free(p: *mut core::ffi::c_void); }
+unsafe fn lodepng_memset(mut dst: *mut core::ffi::c_void,
+    mut value: i32, mut num: u64) {
+    let mut i: u64 = 0;
+    i = 0;
+    while i < num {
+        *(dst as *mut i8).offset(i as isize) = value as i8;
+        i = i.wrapping_add(1);
+    }
+}
+"#;
+const COPY64: &str = r#"
+#![allow(dead_code, unused_mut, non_upper_case_globals, non_snake_case)]
+extern "C" { fn malloc(n: usize) -> *mut core::ffi::c_void; fn free(p: *mut core::ffi::c_void); }
+unsafe fn lodepng_memcpy(mut dst: *mut core::ffi::c_void,
+    mut src: *const core::ffi::c_void, mut size: u64) {
+    let mut i: u64 = 0;
+    i = 0;
+    while i < size {
+        *(dst as *mut i8).offset(i as isize) = *(src as *const i8).offset(i as isize);
+        i = i.wrapping_add(1);
+    }
+}
+"#;
+/// rs-crown/lodepng `HuffmanTree_makeTable`: the count is the function-local
+/// static `headsize` times `size_of::<c_uint>()`.
+const MAKE_TABLE: &str = r#"
+static mut headsize: u32 = (1 as u32) << 9 as u32;
+unsafe fn HuffmanTree_makeTable(mut numcodes: u64) -> u32 {
+    let mut maxlens = malloc(((headsize as u64).wrapping_mul(::std::mem::size_of::<u32>() as u64)) as usize) as *mut u32;
+    if maxlens.is_null() { return 83 as i32 as u32; }
+    lodepng_memset(maxlens as *mut core::ffi::c_void, 0 as i32,
+        (headsize as u64).wrapping_mul(::std::mem::size_of::<u32>() as u64));
+    let mut i: u64 = 0;
+    while i < numcodes {
+        *maxlens.offset(i as isize) = *maxlens.offset(i as isize) + 1;
+        i = i.wrapping_add(1);
+    }
+    let mut total: u32 = 0;
+    i = 0;
+    while i < headsize as u64 {
+        total = total.wrapping_add(*maxlens.offset(i as isize));
+        i = i.wrapping_add(1);
+    }
+    free(maxlens as *mut core::ffi::c_void);
+    total
+}
+"#;
+/// rs-crown/lodepng `bpmnode_sort`: `size_of::<BPMNode>() * num` bytes copied
+/// back from a scratch allocation.
+const BPM_SORT: &str = r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct BPMNode { pub weight: i32, pub index: u32, pub tail: *mut BPMNode, pub in_use: i32 }
+unsafe fn bpmnode_sort(mut leaves: *mut BPMNode, mut num: u64) {
+    let mut mem = malloc((::std::mem::size_of::<BPMNode>() as u64).wrapping_mul(num) as usize) as *mut BPMNode;
+    let mut counter: u64 = 0;
+    let mut i: u64 = 0;
+    while i < num {
+        *mem.offset(i as isize) = *leaves.offset((num - 1 - i) as isize);
+        i = i.wrapping_add(1);
+    }
+    counter = counter.wrapping_add(1);
+    if counter & 1 as i32 as u64 != 0 {
+        lodepng_memcpy(leaves as *mut core::ffi::c_void,
+            mem as *const core::ffi::c_void,
+            (::std::mem::size_of::<BPMNode>() as u64).wrapping_mul(num));
+    }
+    free(mem as *mut core::ffi::c_void);
+}
+"#;
+/// rs-crown/lodepng `color_tree_init`: the destination is an array field of a
+/// thin (single-element) struct reference; the count equals that array's size.
+const COLOR_TREE: &str = r#"
+#[repr(C)]
+pub struct ColorTree { pub children: [*mut ColorTree; 16], pub index: i32 }
+unsafe fn color_tree_init(mut tree: *mut ColorTree) {
+    lodepng_memset(((*tree).children).as_mut_ptr() as *mut core::ffi::c_void, 0 as i32,
+        (16 as i32 as u64).wrapping_mul(::std::mem::size_of::<*mut ColorTree>() as u64));
+    (*tree).index = -(1 as i32);
+}
+"#;
+
+fn count_forms_of(input: &str) -> Vec<(String, String)> {
+    ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
+        let table = super::decide_table(tcx).expect("fixture yields a decision table");
+        table
+            .seams
+            .counted_void_calls
+            .iter()
+            .map(|call| {
+                (
+                    tcx.def_path_str(call.caller.to_def_id()),
+                    call.count_form.clone(),
+                )
+            })
+            .collect()
+    })
+    .expect("fixture compiles")
+}
+
+#[test]
+fn w6v_make_table_static_times_size_of_count_delivers() {
+    let input = format!("{FILL64}{MAKE_TABLE}");
+    let source = check(&input, &["dst"]);
+    // The count is evaluated exactly once, before any byte view exists: the
+    // caller spells `headsize` three times in the input (the allocation, the
+    // count, the summation bound) and exactly three times in the output —
+    // never a fourth time inside a generated adapter.
+    let caller = source
+        .split("fn HuffmanTree_makeTable")
+        .nth(1)
+        .expect("caller emitted");
+    assert_eq!(
+        caller.matches("headsize").count(),
+        3,
+        "the count expression is snapshotted once before the call: {caller}"
+    );
+    assert!(
+        source.contains("__crat_cv_2"),
+        "count placeholder: {source}"
+    );
+    let forms = count_forms_of(&input);
+    assert!(
+        forms
+            .iter()
+            .any(|(owner, form)| owner.ends_with("HuffmanTree_makeTable")
+                && form == "elements:(headsize as u64)*size_of::<u32>"),
+        "typed element-count receipt: {forms:?}"
+    );
+}
+
+#[test]
+fn w6v_bpm_sort_size_of_times_num_count_delivers() {
+    let input = format!("{COPY64}{BPM_SORT}");
+    let source = check(&input, &["dst", "src"]);
+    assert!(
+        source.contains("src: &[u8]"),
+        "shared byte declaration: {source}"
+    );
+    let forms = count_forms_of(&input);
+    assert!(
+        forms
+            .iter()
+            .any(|(owner, form)| owner.ends_with("bpmnode_sort")
+                && form == "elements:num*size_of::<BPMNode>"),
+        "typed element-count receipt: {forms:?}"
+    );
+}
+
+#[test]
+fn w6v_color_tree_array_field_of_thin_reference_fits_its_count() {
+    let input = format!("{FILL64}{COLOR_TREE}");
+    let rows = super::emit_tests::decisions_of(&input);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "tree" && *p && r == "<emitted>"),
+        "the fixture must keep its thin struct reference: {rows:?}"
+    );
+    check(&input, &["dst"]);
+}
+
+#[test]
+fn w6v_thin_reference_root_with_an_unfitting_count_is_held() {
+    let input = format!("{FILL64}{COLOR_TREE}").replace("(16 as i32 as u64)", "(32 as i32 as u64)");
+    let rows = super::emit_tests::decisions_of(&input);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "tree" && *p && r == "<emitted>"),
+        "the fixture must keep its thin struct reference: {rows:?}"
     );
     let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
     assert!(
         !source.contains("dst: &mut ["),
-        "pointer argument storage must be evaluated before any new aliasing view: {source}"
+        "a count beyond the thin referent's array field must not widen it: {source}"
     );
     assert!(super::verify::type_checks_str(&source));
+}
+
+#[test]
+fn w6v_make_table_runtime_matches_original() {
+    let helper = format!("{FILL64}{MAKE_TABLE}");
+    let emitted = check(&helper, &["dst"]);
+    let main = r#"fn main() { unsafe { println!("{}", HuffmanTree_makeTable(7)); } }"#;
+    let original = run_binary(&format!("{helper}\n{main}"));
+    assert_eq!(original, b"7\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{emitted}\n{main}")));
+}
+
+#[test]
+fn w6v_bpm_sort_runtime_matches_original() {
+    let helper = format!("{COPY64}{BPM_SORT}");
+    let emitted = check(&helper, &["dst", "src"]);
+    let main = r#"fn main() { unsafe {
+        let mut leaves = [BPMNode { weight: 0, index: 0, tail: core::ptr::null_mut(), in_use: 0 }; 3];
+        for (i, l) in leaves.iter_mut().enumerate() { l.weight = i as i32 * 10; l.index = i as u32; }
+        bpmnode_sort(leaves.as_mut_ptr(), 3);
+        println!("{:?}", leaves.iter().map(|l| (l.weight, l.index)).collect::<Vec<_>>());
+    }}"#;
+    let original = run_binary(&format!("{helper}\n{main}"));
+    assert_eq!(original, b"[(20, 2), (10, 1), (0, 0)]\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{emitted}\n{main}")));
+}
+
+/// rs-crown/lodepng `decodeGeneric` (site 9122): the destination is the
+/// loaded value of a depth-two output parameter; the count is a plain local.
+const DECODE_GENERIC: &str = r#"
+unsafe fn decodeGeneric(mut out: *mut *mut u8, mut outsize: u64) -> u32 {
+    *out = malloc(outsize as usize) as *mut u8;
+    if (*out).is_null() { return 83; }
+    lodepng_memset(*out as *mut core::ffi::c_void, 0 as i32, outsize);
+    let first = **out;
+    free(*out as *mut core::ffi::c_void);
+    first as u32
+}
+"#;
+/// rs-crown/lodepng `filter` (site 10357): the destination is a local array's
+/// `as_mut_ptr()`; the count is a literal element count times the element size.
+const FILTER_COUNT: &str = r#"
+unsafe fn filter(mut bytes: u64) -> u32 {
+    let mut count: [u32; 256] = [0; 256];
+    lodepng_memset(count.as_mut_ptr() as *mut core::ffi::c_void, 0 as i32,
+        (256 as i32 as u64).wrapping_mul(::std::mem::size_of::<u32>() as u64));
+    let mut i: u64 = 0;
+    while i < bytes { count[(i % 256) as usize] += 1; i = i.wrapping_add(1); }
+    let mut total: u32 = 0;
+    i = 0;
+    while i < 256 { total = total.wrapping_add(count[i as usize]); i = i.wrapping_add(1); }
+    total
+}
+"#;
+
+#[test]
+fn w6v_decode_generic_loaded_out_parameter_destination_delivers() {
+    let helper = format!("{FILL64}{DECODE_GENERIC}");
+    let emitted = check(&helper, &["dst"]);
+    let main = r#"fn main() { unsafe { let mut out: *mut u8 = core::ptr::null_mut(); println!("{}", decodeGeneric(&mut out, 16)); } }"#;
+    let original = run_binary(&format!("{helper}\n{main}"));
+    assert_eq!(original, b"0\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{emitted}\n{main}")));
+}
+
+#[test]
+fn w6v_filter_local_array_destination_delivers() {
+    let helper = format!("{FILL64}{FILTER_COUNT}");
+    let emitted = check(&helper, &["dst"]);
+    let forms = count_forms_of(&helper);
+    assert!(
+        forms.iter().any(|(owner, form)| owner.ends_with("filter")
+            && form == "elements:(256 as i32 as u64)*size_of::<u32>"),
+        "typed element-count receipt: {forms:?}"
+    );
+    let main = r#"fn main() { unsafe { println!("{}", filter(1000)); } }"#;
+    let original = run_binary(&format!("{helper}\n{main}"));
+    assert_eq!(original, b"1000\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{emitted}\n{main}")));
 }

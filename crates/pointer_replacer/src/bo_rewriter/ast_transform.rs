@@ -1922,13 +1922,8 @@ impl<'a> SeamGraftVisitor<'a> {
     fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
         use super::decision::seam::{GlueCore, NullArm};
         let spec = &target.spec;
-        if let Some(element) = spec.counted_byte {
-            let argument = if target.arg_span == e.span {
-                e
-            } else {
-                find_by_span(e, target.arg_span)?
-            };
-            return super::decision::counted_void::bridge_ast(spec, element, argument);
+        if spec.counted_byte.is_some() {
+            return super::decision::counted_void::bridge_ast(e);
         }
         if let Some(address) = &spec.shared_address {
             return super::shared_pair_ast::build(e, address);
@@ -3868,6 +3863,12 @@ fn transform_with<'tcx>(
             "unmatched PAIR raw-view call spans: {unmatched_pair_raw:?}"
         ));
     }
+    super::decision::counted_void::graft_calls(
+        &table.seams.counted_void_calls,
+        reverts,
+        &mut guard,
+        &mut krate,
+    )?;
 
     // **C-9 — mandatory companion emission.** The plan is already filtered by
     // the accepted model. Reverts use the mark's callee owner, matching the
