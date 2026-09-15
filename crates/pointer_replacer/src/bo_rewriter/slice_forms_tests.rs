@@ -1031,6 +1031,18 @@ fn emit_with_family_receipts(input: &str) -> (String, String) {
         );
         let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
             .expect("native emission plan");
+        for edits in emission.plan.by_file.values() {
+            for edit in edits {
+                println!(
+                    "EDIT {}..{} {:?} owner={:?} kind={:?}",
+                    edit.lo,
+                    edit.hi,
+                    edit.replacement,
+                    edit.owner_path,
+                    edit.bridge.as_ref().map(|b| b.bridge_kind.clone())
+                );
+            }
+        }
         for (id, class) in &emission.plan.class_finalization.classes {
             println!(
                 "CLASS {} ready={} holds={:?}",
@@ -1324,4 +1336,138 @@ fn wave6s_forward_computed_view_delivers_the_scalar_reference_base() {
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(source.contains("base: &[i32]"), "{source}");
     assert!(source.contains("scalar(&(&(base)[1..])[0])"), "{source}");
+}
+
+/// brotli `ComputeDistanceCost`: a computed sub-view bound to a local
+/// (`let cmd: *const Command = &*cmds.offset(i) as *const Command`) that a
+/// local callee and field reads consume.
+const COMPUTE_DISTANCE_COST: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ #[repr(C)] #[derive(Clone, Copy)] pub struct Command { pub insert_len_: u32, pub copy_len_: u32, pub dist_extra_: u32, pub cmd_prefix_: u16, pub dist_prefix_: u16 }
+ unsafe fn CommandCopyLen(mut self_0: *const Command) -> u32 { return (*self_0).copy_len_ & 0x1ffffff; }
+ pub unsafe fn ComputeDistanceCost(mut cmds: *const Command, mut num_commands: usize) -> i32 {
+    let mut i: usize = 0;
+    let mut total: u32 = 0;
+    while i < num_commands {
+        let mut cmd: *const Command = &*cmds.offset(i as isize) as *const Command;
+        if CommandCopyLen(cmd) != 0 && (*cmd).cmd_prefix_ as i32 >= 128 {
+            total = total.wrapping_add((*cmd).dist_prefix_ as u32);
+        }
+        i = i.wrapping_add(1);
+    }
+    return total as i32;
+ }
+"#;
+
+#[test]
+fn wave6s_compute_distance_cost_computed_view_bound_to_local() {
+    let (source, receipts) = emit_with_family_receipts(COMPUTE_DISTANCE_COST);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("cmds: &[Command]"), "{source}");
+    assert!(
+        source.contains("let mut cmd: &Command = &(cmds)[i];"),
+        "the bound view composes with the destination's identity-cast peel: {source}"
+    );
+    assert!(source.contains("self_0: &Command"), "{source}");
+}
+
+/// heman `kmVec4TransformArray`: derived pointers bound to locals and passed
+/// on (`let in_0 = pV.offset(i * vStride); … kmVec4Transform(out, in_0, pM)`).
+const KM_VEC4_TRANSFORM_ARRAY: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ #[repr(C)] #[derive(Clone, Copy)] pub struct kmVec4 { pub x: f32, pub y: f32, pub z: f32, pub w: f32 }
+ #[repr(C)] #[derive(Clone, Copy)] pub struct kmMat4 { pub mat: [f32; 16] }
+ unsafe fn kmVec4Transform(mut pOut: *mut kmVec4, mut pV: *const kmVec4, mut pM: *const kmMat4) {
+    (*pOut).x = (*pV).x * (*pM).mat[0] + (*pV).y * (*pM).mat[4] + (*pV).z * (*pM).mat[8] + (*pV).w * (*pM).mat[12];
+    (*pOut).y = (*pV).x * (*pM).mat[1] + (*pV).y * (*pM).mat[5] + (*pV).z * (*pM).mat[9] + (*pV).w * (*pM).mat[13];
+    (*pOut).z = (*pV).x * (*pM).mat[2] + (*pV).y * (*pM).mat[6] + (*pV).z * (*pM).mat[10] + (*pV).w * (*pM).mat[14];
+    (*pOut).w = (*pV).x * (*pM).mat[3] + (*pV).y * (*pM).mat[7] + (*pV).z * (*pM).mat[11] + (*pV).w * (*pM).mat[15];
+ }
+ pub unsafe fn kmVec4TransformArray(mut pOut: *mut kmVec4, mut outStride: u32, mut pV: *const kmVec4, mut vStride: u32, mut pM: *const kmMat4, mut count: u32) {
+    let mut i = 0u32;
+    while i < count {
+        let mut in_0 = pV.offset(i.wrapping_mul(vStride) as isize);
+        let mut out = pOut.offset(i.wrapping_mul(outStride) as isize);
+        kmVec4Transform(out, in_0, pM);
+        i = i.wrapping_add(1);
+    }
+ }
+"#;
+
+/// **Third caller-side witness for wave-5d — RED, same-function form.** The
+/// derived local `out` (degraded `copy-source-coupled`) is the raw source of
+/// the converted `kmVec4Transform::pOut: &mut kmVec4`, so the arm-C charge
+/// lands on it and holds its own class (`blocked-subject:copy-source-coupled`)
+/// although `pV` / `pOut` both plan their suffix raw views.
+#[test]
+#[ignore = "RED for wave-5d's per-subject preservation / arm-C charge (report wave-6s/005)"]
+fn wave6s_km_vec4_transform_array_derived_pointers_bound_to_locals() {
+    let (source, receipts) = emit_with_family_receipts(KM_VEC4_TRANSFORM_ARRAY);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("pV: &[kmVec4]"), "{source}");
+    assert!(source.contains("pOut: &mut [kmVec4]"), "{source}");
+    assert!(
+        source.contains("let mut in_0 = (&(pV)[(i.wrapping_mul(vStride)) as usize..]).as_ptr();"),
+        "{source}"
+    );
+}
+
+/// The same fixture pinning today's hold: both bases plan the suffix raw view
+/// and the class holds on the derived local's arm-C charge.
+#[test]
+fn wave6s_km_vec4_transform_array_class_hold_reproduced() {
+    let decisions = ::utils::compilation::run_compiler_on_str(KM_VEC4_TRANSFORM_ARRAY, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native corpus-mode decisions");
+        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+            .expect("native emission plan");
+        let held = emission
+            .plan
+            .class_finalization
+            .classes
+            .values()
+            .filter(|class| !class.is_ready())
+            .flat_map(|class| class.hold_reasons().to_vec())
+            .collect::<Vec<_>>();
+        (
+            table
+                .entries
+                .iter()
+                .map(|(subject, decision)| format!("{} {decision:?}", subject.label))
+                .collect::<Vec<_>>(),
+            held,
+        )
+    })
+    .expect("input type-checks");
+    let (entries, held) = decisions;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.starts_with("kmVec4TransformArray::pV Slice")
+                && entry.contains("(&(pV)[(i.wrapping_mul(vStride)) as usize..]).as_ptr()")),
+        "{entries:#?}"
+    );
+    assert!(
+        entries.iter().any(
+            |entry| entry.starts_with("kmVec4TransformArray::pOut Slice")
+                && entry
+                    .contains("(&mut (pOut)[(i.wrapping_mul(outStride)) as usize..]).as_mut_ptr()")
+        ),
+        "{entries:#?}"
+    );
+    assert!(
+        held.iter()
+            .any(|reason| reason == "blocked-subject:copy-source-coupled"),
+        "{held:?}"
+    );
 }

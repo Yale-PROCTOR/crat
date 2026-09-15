@@ -194,7 +194,12 @@ pub(crate) struct ComputedArgumentView {
     /// The spine borrowed the element (`&*` / `&mut *`) rather than passing
     /// the arithmetic itself.
     pub(crate) borrowed: bool,
+    /// The `&*…` / `&mut *…` expression itself, when the spine borrows.
+    pub(crate) borrow_span: Option<Span>,
     pub(crate) mutable: bool,
+    /// A call argument (rendered on its seam by `lower`) rather than a body
+    /// copy (rendered by the slice-use receipt planner).
+    pub(crate) argument: bool,
 }
 
 /// Recognise a computed sub-view argument rooted at `expr` (the subject's
@@ -215,10 +220,35 @@ pub(crate) fn computed_view_spine<'tcx>(
         .map(|(outer, _, _)| outer)
 }
 
+/// Where a spine ends: the consumer of its outermost expression.
+enum SpineEnd {
+    /// One argument of a call.
+    Argument,
+    /// The initializer of `let <binding> = …` or the value of `<binding> = …`.
+    Copy {
+        destination: HirId,
+    },
+    Other,
+}
+
 fn spine<'tcx>(
     tcx: TyCtxt<'tcx>,
     expr: &'tcx Expr<'tcx>,
-) -> Option<(&'tcx Expr<'tcx>, Option<bool>, &'tcx Expr<'tcx>)> {
+) -> Option<(&'tcx Expr<'tcx>, Option<(bool, Span)>, &'tcx Expr<'tcx>)> {
+    spine_end(tcx, expr).and_then(|(operand, borrowed, delta, end)| {
+        matches!(end, SpineEnd::Argument).then_some((operand, borrowed, delta))
+    })
+}
+
+fn spine_end<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+) -> Option<(
+    &'tcx Expr<'tcx>,
+    Option<(bool, Span)>,
+    &'tcx Expr<'tcx>,
+    SpineEnd,
+)> {
     let owner = expr.hir_id.owner.def_id;
     let rustc_hir::Node::Expr(call) = tcx.parent_hir_node(expr.hir_id) else {
         return None;
@@ -237,11 +267,26 @@ fn spine<'tcx>(
     let mut operand = call;
     let mut borrowed = None;
     loop {
-        let rustc_hir::Node::Expr(parent) = tcx.parent_hir_node(operand.hir_id) else {
-            return None;
+        let parent = match tcx.parent_hir_node(operand.hir_id) {
+            rustc_hir::Node::Expr(parent) => parent,
+            rustc_hir::Node::LetStmt(local)
+                if local.init.is_some_and(|init| init.hir_id == operand.hir_id) =>
+            {
+                let rustc_hir::PatKind::Binding(_, destination, _, None) = local.pat.kind else {
+                    return None;
+                };
+                return Some((operand, borrowed, delta, SpineEnd::Copy { destination }));
+            }
+            _ => return None,
         };
         match parent.kind {
             ExprKind::Cast(inner, _) if inner.hir_id == operand.hir_id => operand = parent,
+            ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == operand.hir_id => {
+                let Some(destination) = local(lhs) else {
+                    return Some((operand, borrowed, delta, SpineEnd::Other));
+                };
+                return Some((operand, borrowed, delta, SpineEnd::Copy { destination }));
+            }
             ExprKind::Unary(rustc_hir::UnOp::Deref, inner)
                 if inner.hir_id == operand.hir_id && borrowed.is_none() =>
             {
@@ -255,7 +300,7 @@ fn spine<'tcx>(
                 if place.hir_id != parent.hir_id {
                     return None;
                 }
-                borrowed = Some(mutability == rustc_hir::Mutability::Mut);
+                borrowed = Some((mutability == rustc_hir::Mutability::Mut, borrow.span));
                 operand = borrow;
             }
             // The spine ends at the call argument: the consumer must be a
@@ -265,11 +310,53 @@ fn spine<'tcx>(
                     .iter()
                     .any(|argument| argument.hir_id == operand.hir_id) =>
             {
-                return Some((operand, borrowed, delta));
+                return Some((operand, borrowed, delta, SpineEnd::Argument));
             }
-            _ => return None,
+            _ => return Some((operand, borrowed, delta, SpineEnd::Other)),
         }
     }
+}
+
+/// A computed sub-view copied into a LOCAL: `let q = &*p.offset(e) as *const T`
+/// / `q = p.offset(e)`. The copy is the collector's body-copy raw use with the
+/// view attached; the receipt planner renders it by the destination's form.
+pub(crate) fn computed_body_copy_view<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+    key: (LocalDefId, HirId),
+) -> Option<(SliceRawUse, ComputedArgumentView)> {
+    let (operand, borrowed, delta, end) = spine_end(tcx, expr)?;
+    let SpineEnd::Copy { destination } = end else {
+        return None;
+    };
+    // A self-advance (`p = p.offset(e)`) is the classifier's reslice, not a
+    // copy into another binding.
+    if destination == key.1 || !forward_delta(tcx, delta) {
+        return None;
+    }
+    let typeck = tcx.typeck(key.0);
+    let target = raw_target_type(tcx, typeck.expr_ty(operand))?;
+    Some((
+        SliceRawUse {
+            hir_id: expr.hir_id,
+            span: expr.span,
+            boundary_span: None,
+            source_shape: "body-copy",
+            target,
+            native_element: false,
+            destination: Some(destination),
+            contract: None,
+        },
+        ComputedArgumentView {
+            use_span: expr.span,
+            argument_span: operand.span,
+            index: index_text(tcx, delta)?,
+            borrowed: borrowed.is_some(),
+            borrow_span: borrowed.map(|(_, span)| span),
+            mutable: borrowed.is_some_and(|(mutable, _)| mutable),
+            argument: false,
+        },
+    ))
 }
 
 /// Forward-only: the delta, under its `as isize` casts, is a non-negative
@@ -324,7 +411,9 @@ pub(crate) fn computed_argument_view<'tcx>(
             argument_span: operand.span,
             index,
             borrowed: borrowed.is_some(),
-            mutable: borrowed.unwrap_or(false),
+            borrow_span: borrowed.map(|(_, span)| span),
+            mutable: borrowed.is_some_and(|(mutable, _)| mutable),
+            argument: true,
         },
     ))
 }
@@ -471,7 +560,12 @@ fn lower_computed_argument_views(
         };
         let Some(views) = slice_uses
             .get(&node)
-            .map(|uses| uses.computed_argument_views.as_slice())
+            .map(|uses| {
+                uses.computed_argument_views
+                    .iter()
+                    .filter(|view| view.argument)
+                    .collect::<Vec<_>>()
+            })
             .filter(|views| !views.is_empty())
         else {
             continue;

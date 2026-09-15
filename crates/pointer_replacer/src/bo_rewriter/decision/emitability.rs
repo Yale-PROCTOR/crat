@@ -2137,6 +2137,18 @@ fn collect_slice_uses_with_family(
                     intravisit::walk_expr(self, expr);
                     return;
                 }
+                // wave-6s: the same view copied into a local; the receipt
+                // planner renders it by the destination's form.
+                if self.expanded
+                    && let Some((site, view)) =
+                        super::slice_forms::computed_body_copy_view(self.tcx, expr, key)
+                {
+                    let entry = self.out.entry(key).or_default();
+                    entry.raw_uses.push(site);
+                    entry.computed_argument_views.push(view);
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
                 // Classify BEFORE taking the entry: `classify` reads `self`, and
                 // holding the map entry across it would be a borrow conflict.
                 let classified = self.classify(expr, key);

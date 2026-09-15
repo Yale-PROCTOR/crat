@@ -719,6 +719,12 @@ fn every_golden_outcome_is_attributed() {
     // so the program EMITS a thin reference where it degraded; the golden
     // (the reslice family's `&p[1..]`) still differs, and g18 stays in the
     // standing set as a text mismatch, no longer as a program-level Degraded.
+    // **wave-6s (report 005) built the rebind arm**: g18 now EMITS — with the
+    // destination as the thin reference the analysis decides for it
+    // (`let q: &i32 = &(p)[1]; *q`) rather than the ratified slice rebind
+    // (`let q: &[i32] = &p[1..]; q[0]`), so the golden stays in the standing
+    // RED set on a text difference, no longer on program-level Degraded. The
+    // ratified bytes are untouched pending the seat's re-ratification.
     const EXPECTED_DEGRADED: &[&str] = &[];
     assert_eq!(
         degraded.iter().copied().collect::<Vec<_>>(),

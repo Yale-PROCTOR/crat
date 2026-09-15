@@ -3917,6 +3917,16 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
             "self-advance",
             "    p = p.offset(1);\n    let _v = *p;\n    core::ptr::null_mut()",
         ),
+        // **wave-6s (report 005) built the rebind arm**: a forward derived
+        // pointer bound to a local is a computed sub-view copy, rendered by
+        // the destination's form (`&mut p[1]` into a thin reference, the
+        // suffix's pointer into a raw local). The RETURNED alias of this
+        // body is still refused downstream (`escapes-via-return` on `q`);
+        // this pin reads the decision-time attribution of `p`.
+        (
+            "rebind",
+            "    let q: *mut i32 = p.offset(1 as isize);\n    q",
+        ),
     ] {
         assert_eq!(
             reason_for(body),
@@ -3928,14 +3938,6 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
     // NEGATIVE — every known neighbour, each refused with its own attribution.
     for (label, body) in [
         ("borrow of deref", "    &mut *p.offset(1 as isize)"),
-        // **REBIND is ratified spec (g18) but its ARM is not built** — its
-        // market is 0 and S3.6-gated, so mechanism follows market. It stays a
-        // negative control, and the reason it is refused has changed from "out
-        // of scope" to "in scope, unbuilt". Both mean: must not emit.
-        (
-            "rebind",
-            "    let q: *mut i32 = p.offset(1 as isize);\n    q",
-        ),
     ] {
         let got = reason_for(body);
         // Each retained neighbour keeps its own refusal attribution.
@@ -3943,7 +3945,6 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
             // Addendum 210 A / item-3 design: this cursor-derived use remains
             // refused. Each neighbour retains its own observed attribution.
             "borrow of deref" => &["slice-cursor-use"],
-            "rebind" => &["slice-cursor-use"],
             _ => unreachable!("every negative neighbour has its own attribution"),
         };
         assert!(

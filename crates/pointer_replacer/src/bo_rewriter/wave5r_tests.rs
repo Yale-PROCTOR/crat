@@ -395,7 +395,14 @@ fn wave5r_e0308_raw_destination_keeps_its_initializer() {
         source.contains("q: *mut Item"),
         "a model-Raw local remains raw: {source}"
     );
-    assert!(source.contains("&mut *p.offset(1) as *mut Item"));
+    // wave-6s (report 005): the base `p` now delivers as a slice and the raw
+    // destination receives the suffix's pointer under the existing body raw
+    // alias receipt; the identity-cast peel still does not fire on a raw
+    // destination.
+    assert!(
+        source.contains("let q: *mut Item = (&mut (p)[1..]).as_mut_ptr();"),
+        "{source}"
+    );
 }
 
 #[path = "wave6r_option_tests.rs"]

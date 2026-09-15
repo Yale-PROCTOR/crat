@@ -638,7 +638,84 @@ pub(crate) fn receipt_plans(
                         target.fn_did == subject.fn_did && target.hir_id == binding
                     })
                 });
-                if let Some((destination, target_form)) =
+                // wave-6s: a computed sub-view copied into the destination
+                // (`let q = &*p.offset(e) as *const T`, `q = p.offset(e)`).
+                let computed = uses
+                    .computed_argument_views
+                    .iter()
+                    .find(|view| !view.argument && view.use_span == observed.span);
+                let source_mutable_view = match source {
+                    Form::Slice { mutable } => mutable,
+                    Form::Opt { .. }
+                    | Form::NestedSlice { .. }
+                    | Form::Cursor { .. }
+                    | Form::Raw
+                    | Form::Ref { .. } => false,
+                };
+                if let Some(view) = computed
+                    && let Some((_, decision)) = destination
+                    && let Some(target_form) = safe_destination_form(decision)
+                {
+                    // The destination's own form picks the view: a thin
+                    // reference takes the checked element, a slice the suffix.
+                    target_form_override = Some(target_form.to_owned());
+                    let name = subject.param_name.as_deref().expect("named slice use");
+                    let rendered = match decision {
+                        Decision::Ref { mutable } | Decision::InferredRef { mutable, .. }
+                            if !*mutable || source_mutable_view =>
+                        {
+                            let amp = if *mutable { "&mut " } else { "&" };
+                            adapter = "computed-element-copy".to_owned();
+                            Some(format!("{amp}({name})[{}]", view.index))
+                        }
+                        Decision::Slice { mutable, .. } if !*mutable || source_mutable_view => {
+                            let amp = if *mutable { "&mut " } else { "&" };
+                            adapter = "computed-suffix-copy".to_owned();
+                            Some(format!("{amp}({name})[{}..]", view.index))
+                        }
+                        Decision::Ref { .. }
+                        | Decision::InferredRef { .. }
+                        | Decision::Slice { .. }
+                        | Decision::Opt { .. }
+                        | Decision::Box(_)
+                        | Decision::NestedSlice { .. }
+                        | Decision::Cursor { .. }
+                        | Decision::Degraded(_) => None,
+                    };
+                    match rendered {
+                        Some(replacement) => {
+                            boundary_evidence = "computed-view-copy-checked-index".to_owned();
+                            // When the destination's own initializer adapter
+                            // (the identity-cast peel) already owns the whole
+                            // value, the view replaces the borrow it keeps.
+                            let span = match view.borrow_span {
+                                Some(borrow)
+                                    if table
+                                        .seams
+                                        .body_edits
+                                        .iter()
+                                        .any(|edit| edit.span == view.argument_span) =>
+                                {
+                                    borrow
+                                }
+                                _ => view.argument_span,
+                            };
+                            body_edits.push((
+                                node,
+                                emitability::UseEdit {
+                                    span,
+                                    replacement,
+                                    bridge_kind: "subject-use",
+                                },
+                            ));
+                        }
+                        None => {
+                            reason = Some(MechanicalTerminalReason::EvidenceMissing(format!(
+                                "computed-view-destination-unbuilt:{target_form}"
+                            )));
+                        }
+                    }
+                } else if let Some((destination, target_form)) =
                     destination.and_then(|(subject, decision)| {
                         safe_destination_form(decision).map(|form| (subject, form))
                     })
@@ -775,6 +852,20 @@ pub(crate) fn receipt_plans(
                         negative_write = NegativeWriteEvidence::Missing;
                     } else {
                         let name = subject.param_name.as_deref().expect("named slice use");
+                        // wave-6s: the raw alias of a computed view is the
+                        // suffix's pointer, replacing the whole copied value.
+                        let (alias, alias_span) = match computed {
+                            Some(view) => (
+                                format!(
+                                    "(&{}({name})[{}..])",
+                                    if source_mutable_view { "mut " } else { "" },
+                                    view.index
+                                ),
+                                view.argument_span,
+                            ),
+                            None => (name.to_owned(), observed.span),
+                        };
+                        let name = alias.as_str();
                         let replacement = raw_boundary::pair_raw_view_expression(Some(decision), target, name, "bare-local")
                             .or_else(|| {
                                 (read_only && target.mutability == raw_boundary::RawMutability::Mut).then(|| match source {
@@ -799,11 +890,16 @@ pub(crate) fn receipt_plans(
                                     mechanism = MechanicalMechanism::SharedRefToMutRaw;
                                 }
                             }
-                            adapter = "body-slice-raw-view".to_owned();
+                            adapter = if computed.is_some() {
+                                "computed-suffix-raw-view"
+                            } else {
+                                "body-slice-raw-view"
+                            }
+                            .to_owned();
                             body_edits.push((
                                 node,
                                 emitability::UseEdit {
-                                    span: observed.span,
+                                    span: alias_span,
                                     replacement,
                                     bridge_kind: "subject-use",
                                 },
