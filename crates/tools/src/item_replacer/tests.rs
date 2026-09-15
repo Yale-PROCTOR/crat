@@ -2888,6 +2888,79 @@ pub mod distractor {
 }
 
 #[test]
+fn two_argument_main_0_preserves_wildcard_parameters() {
+    let source = r#"
+unsafe fn main_0(
+    _: core::ffi::c_int,
+    _: *mut *mut core::ffi::c_char,
+) -> core::ffi::c_int {
+    0
+}
+pub fn main() { unsafe { ::std::process::exit(main_0(0, core::ptr::null_mut()) as i32) } }
+"#;
+    let transformation = r#"
+unsafe fn main_0(_: core::ffi::c_int, _: &mut [&mut [i8]]) -> core::ffi::c_int {
+    #[proctor(0)] 1
+}"#;
+
+    let extended = replace_extended(source, &request("main_0", "main_0", transformation)).unwrap();
+    let output = &extended.replacement.source;
+    let text = compact(output);
+    assert!(text.contains(
+        "unsafe fn main_0(_: core::ffi::c_int, _: &mut [&mut [i8]]) -> core::ffi::c_int"
+    ));
+    assert!(!text.contains("__proctor_wrapper_main_0"));
+    assert!(text.contains("main_0(argc, command_line_arg_slices.as_mut_slice())"));
+    compile(output);
+
+    let metadata = crate::ReplacementObservationMetadata::from_output(
+        &extended,
+        extended.replacement.source.as_bytes(),
+        b"{}",
+        extended.observation_source.as_bytes(),
+    );
+    let observations =
+        crate::extract_observations_from_source(&extended.observation_source, &metadata).unwrap();
+    assert!(observations.observations.is_empty());
+    assert!(observations.printf_observations.is_empty());
+
+    let mismatched = r#"
+unsafe fn main_0(argc: core::ffi::c_int, _: &mut [&mut [i8]]) -> core::ffi::c_int {
+    #[proctor(0)] argc
+}"#;
+    let error = replace(source, &request("main_0", "main_0", mismatched)).unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
+    assert!(
+        error
+            .message
+            .contains("uses pattern `argc` rather than `_`")
+    );
+}
+
+#[test]
+fn wildcard_and_destructuring_parameters_remain_unsupported_elsewhere() {
+    for (source, path, name, transformation) in [
+        (
+            "unsafe fn f(value: i32) { let _ = value; }",
+            "f",
+            "f",
+            "unsafe fn f(_: i32) { #[proctor(0)] return; }",
+        ),
+        (
+            r#"unsafe fn main_0(first: (i32, i32), second: i32) { let _ = (first, second); }
+pub fn main() { unsafe { main_0((0, 0), 0) } }"#,
+            "main_0",
+            "main_0",
+            "unsafe fn main_0((_, _): (i32, i32), _: i32) { #[proctor(0)] return; }",
+        ),
+    ] {
+        let error = replace(source, &request(path, name, transformation)).unwrap_err();
+        assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
+        assert!(error.message.contains("simple by-value identifier"));
+    }
+}
+
+#[test]
 fn one_unsupported_item_aborts_multi_item_transaction() {
     let source = r#"
 pub unsafe fn good(value: *const i32) -> i32 { *value }

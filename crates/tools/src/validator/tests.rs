@@ -991,6 +991,71 @@ fn parameter_count_and_names_are_exact() {
 }
 
 #[test]
+fn two_argument_main_0_accepts_matching_wildcard_parameters() {
+    let skeleton = r#"unsafe fn main_0(_: i32, _: &mut [&mut [i8]]) -> i32 {
+        #[proctor(0)] todo!()
+    }"#;
+    let validation_request = ValidationRequest {
+        schema_version: 1,
+        expected_functions: vec![expected_function(7, "main_0", skeleton)],
+        transformation: r#"unsafe fn main_0(_: i32, _: &mut [&mut [i8]]) -> i32 {
+            #[proctor(0)] 0
+        }"#
+        .to_owned(),
+    };
+
+    assert_eq!(validate(&validation_request), ValidationResponse::Valid);
+}
+
+#[test]
+fn wildcard_parameter_support_is_limited_to_two_argument_main_0() {
+    for (name, skeleton) in [
+        ("f", "unsafe fn f(_: i32, _: i32) { #[proctor(0)] return; }"),
+        (
+            "main_0",
+            "unsafe fn main_0(_: i32) { #[proctor(0)] return; }",
+        ),
+    ] {
+        let validation_request = ValidationRequest {
+            schema_version: 1,
+            expected_functions: vec![expected_function(7, name, skeleton)],
+            transformation: skeleton.to_owned(),
+        };
+        assert_eq!(
+            codes(&validate(&validation_request)),
+            ["invalid_expected_skeleton"],
+            "{skeleton}"
+        );
+    }
+}
+
+#[test]
+fn main_0_wildcards_must_be_preserved_exactly() {
+    let skeleton = r#"unsafe fn main_0(_: (i32, i32), _: &mut [&mut [i8]]) -> i32 {
+        #[proctor(0)] todo!()
+    }"#;
+    for transformation in [
+        r#"unsafe fn main_0(value: (i32, i32), _: &mut [&mut [i8]]) -> i32 {
+            #[proctor(0)] 0
+        }"#,
+        r#"unsafe fn main_0((_, _): (i32, i32), _: &mut [&mut [i8]]) -> i32 {
+            #[proctor(0)] 0
+        }"#,
+    ] {
+        let validation_request = ValidationRequest {
+            schema_version: 1,
+            expected_functions: vec![expected_function(7, "main_0", skeleton)],
+            transformation: transformation.to_owned(),
+        };
+        assert_eq!(
+            codes(&validate(&validation_request)),
+            ["parameter_name_mismatch"],
+            "{transformation}"
+        );
+    }
+}
+
+#[test]
 fn formatting_and_redundant_type_parentheses_are_ignored() {
     assert_valid(
         "unsafe fn f(mut p: Option<&'static mut [i32; 4]>) -> (i32, usize) { #[proctor(0)] todo!() }",

@@ -25,6 +25,7 @@ use smallvec::SmallVec;
 use crate::{
     CallableCorrespondence, CurrentObservationItem, ExtendedReplacementOutput,
     printf::{eligible_printf_statement, parse_print_macro_statement, supported_printf_call},
+    skeleton::is_supported_two_argument_main_0,
 };
 
 pub const OBSERVATION_SCHEMA_VERSION: u64 = 1;
@@ -1664,6 +1665,7 @@ fn pair_bindings(
     if source_fn.sig.decl.inputs.len() != target_fn.sig.decl.inputs.len() {
         return Err(correspondence_error("parameter count differs"));
     }
+    let allow_wildcards = is_supported_two_argument_main_0(target_fn);
     let mut result = HashMap::new();
     for (index, (source_parameter, target_parameter)) in source_fn
         .sig
@@ -1673,6 +1675,15 @@ fn pair_bindings(
         .zip(&target_fn.sig.decl.inputs)
         .enumerate()
     {
+        match (&source_parameter.pat.kind, &target_parameter.pat.kind) {
+            (PatKind::Wild, PatKind::Wild) if allow_wildcards => continue,
+            (PatKind::Wild, _) | (_, PatKind::Wild) => {
+                return Err(correspondence_error(&format!(
+                    "parameter {index} has an unsupported or mismatched wildcard pattern"
+                )));
+            }
+            _ => {}
+        }
         let (source_name, source_id) = simple_binding(&source_parameter.pat, ast_to_hir, tcx)
             .ok_or_else(|| {
                 correspondence_error(&format!("source parameter {index} is not a simple binding"))
@@ -5752,6 +5763,47 @@ unsafe fn target(mut left: &i32, mut right: &i32) -> i32 {
                 .code,
             "binding_correspondence"
         );
+    }
+
+    #[test]
+    fn wildcard_parameter_pairing_is_limited_to_two_argument_main_0() {
+        let valid = r#"
+unsafe fn source_copy(_: i32, _: i32) { return; }
+unsafe fn main_0(_: i32, _: i32) { return; }
+"#;
+        let document = extract_case(valid, "source_copy", "main_0", vec![]).unwrap();
+        assert!(document.observations.is_empty());
+
+        for (source, target) in [
+            (
+                r#"unsafe fn source_copy(_: i32, _: i32) { return; }
+unsafe fn target(_: i32, _: i32) { return; }"#,
+                "target",
+            ),
+            (
+                r#"unsafe fn source_copy(_: i32, _: i32) { return; }
+unsafe fn main_0(value: i32, _: i32) { let _ = value; }"#,
+                "main_0",
+            ),
+            (
+                r#"unsafe fn source_copy((_, _): (i32, i32), _: i32) { return; }
+unsafe fn main_0((_, _): (i32, i32), _: i32) { return; }"#,
+                "main_0",
+            ),
+            (
+                r#"unsafe fn source_copy(_: i32) { return; }
+unsafe fn main_0(_: i32) { return; }"#,
+                "main_0",
+            ),
+        ] {
+            assert_eq!(
+                extract_case(source, "source_copy", target, vec![])
+                    .unwrap_err()
+                    .code,
+                "binding_correspondence",
+                "{source}"
+            );
+        }
     }
 
     #[test]

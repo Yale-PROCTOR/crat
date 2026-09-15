@@ -19,6 +19,7 @@ use crate::{
         canonical_statement_group, canonicalize_function_with_view, validate_skeleton_view,
     },
     printf::{parse_print_macro_statement, validate_print_macro_statement},
+    skeleton::is_supported_two_argument_main_0,
 };
 
 const SCHEMA_VERSION: u64 = 1;
@@ -527,13 +528,17 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
     if function.sig.decl.c_variadic() {
         return Err("variadic functions are unsupported");
     }
-    if function.sig.decl.inputs.iter().any(|parameter| {
-        !matches!(
-            parameter.pat.kind,
-            PatKind::Ident(BindingMode(ByRef::No, _), _, None)
-        )
-    }) {
-        return Err("every parameter must be a simple by-value identifier pattern");
+    let allow_wildcards = is_supported_two_argument_main_0(function);
+    if function
+        .sig
+        .decl
+        .inputs
+        .iter()
+        .any(|parameter| !is_supported_parameter_pattern(&parameter.pat, allow_wildcards))
+    {
+        return Err(
+            "every parameter must be a simple by-value identifier pattern (or `_` for two-argument `main_0`)",
+        );
     }
     if function
         .generics
@@ -555,6 +560,13 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
         );
     }
     Ok(())
+}
+
+fn is_supported_parameter_pattern(pattern: &Pat, allow_wildcard: bool) -> bool {
+    matches!(
+        pattern.kind,
+        PatKind::Ident(BindingMode(ByRef::No, _), _, None)
+    ) || allow_wildcard && matches!(pattern.kind, PatKind::Wild)
 }
 
 fn validate_expected_block(
@@ -1125,17 +1137,17 @@ fn validate_signature(expected: &ParsedExpected, result: &Item) -> Vec<Validatio
     for (index, (expected_param, result_param)) in
         expected_params.iter().zip(result_params).enumerate()
     {
-        let expected_name = simple_pattern_name(&expected_param.pat);
-        let result_name = simple_pattern_name(&result_param.pat);
-        if expected_name != result_name {
+        let expected_pattern = parameter_pattern(&expected_param.pat);
+        let result_pattern = parameter_pattern(&result_param.pat);
+        if expected_pattern != result_pattern {
             errors.push(error(
                 "parameter_name_mismatch",
                 function_message(
                     expected,
                     format!(
-                        "parameter {index} must be named `{}` but was `{}`; restore the target parameter name",
-                        expected_name.unwrap_or("<pattern>"),
-                        result_name.unwrap_or("<pattern>")
+                        "parameter {index} must use pattern `{}` but used `{}`; restore the target parameter pattern",
+                        expected_pattern.description(),
+                        result_pattern.description()
                     ),
                 ),
             ));
@@ -1186,6 +1198,33 @@ fn simple_pattern_name(pat: &Pat) -> Option<&str> {
         return None;
     };
     Some(ident.name.as_str())
+}
+
+#[derive(PartialEq, Eq)]
+enum ParameterPattern<'a> {
+    Identifier(&'a str),
+    Wildcard,
+    Unsupported,
+}
+
+impl ParameterPattern<'_> {
+    fn description(&self) -> &str {
+        match self {
+            Self::Identifier(name) => name,
+            Self::Wildcard => "_",
+            Self::Unsupported => "<unsupported pattern>",
+        }
+    }
+}
+
+fn parameter_pattern(pattern: &Pat) -> ParameterPattern<'_> {
+    match &pattern.kind {
+        PatKind::Ident(BindingMode(ByRef::No, _), ident, None) => {
+            ParameterPattern::Identifier(ident.name.as_str())
+        }
+        PatKind::Wild => ParameterPattern::Wildcard,
+        _ => ParameterPattern::Unsupported,
+    }
 }
 
 fn canonical_return(return_ty: &FnRetTy) -> String {
