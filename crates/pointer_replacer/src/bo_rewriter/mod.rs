@@ -1178,7 +1178,7 @@ fn rewrite_core_injected_with_config(
         }
         let e1_subject_receipt = if census_once {
             decide_ctx.raw_boundary_artifacts.custody_expectations =
-                delivery_expectations(tcx, &table);
+                delivery_expectations(tcx, &table, &emission_plan);
             e1_subject_seed_tsv(tcx, &table, &decide_ctx, &emission_plan)?
         } else {
             String::new()
@@ -9800,12 +9800,35 @@ fn e2_artifacts_from_table(
 fn delivery_expectations(
     tcx: TyCtxt<'_>,
     table: &decision::DecisionTable,
+    emission_plan: &plan::Plan,
 ) -> Vec<DeliveryExpectation> {
+    let unplaced = emission_plan
+        .unplaceable
+        .iter()
+        .map(|row| (row.subject.as_str(), row.reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
     table
         .entries
         .iter()
         .filter_map(|(subject, decided)| {
             let expected_form = delivery_form(decided)?;
+            // A withdrawn Box decision is degraded, never an expectation.
+            if decision::ownership_fields_native::withdrawn_box_reason(
+                decided,
+                emission_plan,
+                bridge_receipt::SignatureClassId::of(subject.fn_did),
+                unplaced
+                    .get(
+                        subject
+                            .identity_key(&tcx.def_path_str(subject.fn_did.to_def_id()))
+                            .as_str(),
+                    )
+                    .copied(),
+            )
+            .is_some()
+            {
+                return None;
+            }
             let owner_fn = tcx.def_path_str(subject.fn_did.to_def_id());
             let emitted_owner = match table.exposure.as_ref().map(|e| e.plan(subject.fn_did)) {
                 Some(
@@ -9933,13 +9956,25 @@ fn e1_subject_seed_tsv(
         };
         let unplaced_reason = unplaced.remove(key.as_str());
         let class = bridge_receipt::SignatureClassId::of(subject.fn_did);
+        // R402-2(b): a Box decision withdrawn at emission is reported degraded
+        // with its withdrawal reason, never as a placed box row.
+        let (decision_key, reason, reason_detail) =
+            match decision::ownership_fields_native::withdrawn_box_reason(
+                decision,
+                emission_plan,
+                class,
+                unplaced_reason,
+            ) {
+                Some(withdrawal) => ("degraded", "box-withdrawn-at-emission", withdrawal),
+                None => (decision_key, reason, reason_detail),
+            };
         let live = emission_plan
             .class_finalization
             .classes
             .get(&class)
             .is_some_and(plan::SignatureClassPlan::is_ready);
         let applied = terminal_application(decision, live).is_some();
-        let placed = applied && unplaced_reason.is_none();
+        let placed = applied && unplaced_reason.is_none() && decision_key != "degraded";
         let exclusion = unplaced_reason
             .map(|reason| format!("unplaceable:{reason}"))
             .or_else(|| {

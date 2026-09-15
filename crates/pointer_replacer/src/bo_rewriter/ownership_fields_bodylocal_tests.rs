@@ -63,6 +63,30 @@ fn verify(input: &str, owner_name: &str, shape: BoxShape, transfer: bool) -> Str
         panic!("{outcome:?}")
     };
     println!("R395_EMITTED_BEGIN {owner_name}\n{source}\nR395_EMITTED_END");
+    // R402-2(a): the custody instrument must read an explicit, fully spelled
+    // owning type on the delivered declaration.
+    let declarations =
+        super::delivery_custody::inventory_source("fixture.rs", &source).expect("custody parse");
+    let declaration = declarations
+        .iter()
+        .find(|d| d.binding == owner_name && d.parameter_index.is_none())
+        .unwrap_or_else(|| panic!("declaration of {owner_name}: {declarations:?}"));
+    assert!(
+        declaration.type_is_fully_explicit,
+        "{owner_name}: {:?}",
+        declaration.explicit_type
+    );
+    assert!(
+        matches!(
+            declaration.effective_type_shape(),
+            Some(super::delivery_custody::TypeShape::OwningBox { path, payload })
+                if path == "std::boxed::Box"
+                    && matches!(payload.as_ref(), super::delivery_custody::TypeShape::Slice { .. })
+                        == (shape == BoxShape::Slice)
+        ),
+        "{owner_name}: {:?}",
+        declaration.effective_type_shape()
+    );
     println!(
         "R395_OUTCOME reverted={reverted_count} degradations={:?} first_diags={first_diags:?}",
         degradations
@@ -205,7 +229,7 @@ fn r399_heman_gaussian_row_tmp_real_shape_narrowed_nbytes_local() {
     // `generate_gaussian_row::tmp#68`: the byte count is the `c_int` local
     // `nbytes`, initialised once from the `wrapping_mul` chain.
     let s = verify(&gaussian_fixture(), "tmp", BoxShape::Slice, false);
-    assert!(s.contains("let mut tmp = ::std::vec![0i32; (((nbytes as libc::c_ulong) as usize) / ::core::mem::size_of::<i32>())].into_boxed_slice();"), "{s}");
+    assert!(s.contains("let mut tmp: ::std::boxed::Box<[i32]> = ::std::vec![0i32; (((nbytes as libc::c_ulong) as usize) / ::core::mem::size_of::<i32>())].into_boxed_slice();"), "{s}");
     assert!(s.contains("::std::mem::drop(tmp);"), "{s}");
 }
 
@@ -302,7 +326,7 @@ pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
         s.contains("return ::std::boxed::Box::into_raw(img);"),
         "{s}"
     );
-    assert!(s.contains("::std::boxed::Box::new(crate::heman_image_s { width: 0i32, height: 0i32, nbands: 0i32, data: ::core::ptr::null_mut() })"), "{s}");
+    assert!(s.contains("let mut img: ::std::boxed::Box<crate::heman_image_s> = ::std::boxed::Box::new(crate::heman_image_s { width: 0i32, height: 0i32, nbands: 0i32, data: ::core::ptr::null_mut() });"), "{s}");
 }
 
 #[test]
@@ -508,14 +532,20 @@ pub unsafe extern "C" fn transform_to_coordfield(mut data: *mut libc::c_float, m
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         false,
-        false,
-        false,
+        true,
+        true,
         Some((
             super::A5Mode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
-    let super::RewriteOutcome::Emitted { degradations, .. } = outcome else {
+    let super::RewriteOutcome::Emitted {
+        degradations,
+        e1_subject_receipt,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
         panic!("{outcome:?}")
     };
     for owner in [
@@ -536,6 +566,25 @@ pub unsafe extern "C" fn transform_to_coordfield(mut data: *mut libc::c_float, m
             row.reason.detail().contains("copy-source-coupled"),
             "{}",
             row.reason.detail()
+        );
+        // R402-2(b): the withdrawn Box row is DEGRADED in the E1 seed with its
+        // withdrawal reason (never a placed box row) and is no custody
+        // expectation, so the strict instrument sees no inferred-type claim.
+        let seed = e1_subject_receipt
+            .lines()
+            .find(|line| line.starts_with(&format!("{owner}\t")))
+            .unwrap_or_else(|| panic!("{owner} seed row: {e1_subject_receipt}"));
+        let columns: Vec<&str> = seed.split('\t').collect();
+        assert_eq!(columns[7], "degraded", "{seed}");
+        assert_eq!(columns[8], "box-withdrawn-at-emission", "{seed}");
+        assert!(columns[9].starts_with("signature-class-held:"), "{seed}");
+        assert_eq!(columns[11], "0", "{seed}");
+        assert!(
+            !raw_boundary_artifacts
+                .custody_expectations
+                .iter()
+                .any(|e| e.subject_key == owner),
+            "{owner} must not be a custody expectation"
         );
     }
 }

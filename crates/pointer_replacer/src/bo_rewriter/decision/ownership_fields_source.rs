@@ -152,8 +152,13 @@ pub(crate) struct SourcePlan {
     /// The MIR local that receives the allocator's result: the one source of
     /// every pointer into this fresh allocation while the root never escapes.
     allocation_local: u32,
+    element_spelling: String,
 }
 impl SourcePlan {
+    pub(crate) fn element_spelling(&self) -> &str {
+        &self.element_spelling
+    }
+
     pub(crate) fn return_transfer(&self) -> Option<Span> {
         self.return_transfer
     }
@@ -921,6 +926,7 @@ pub(crate) fn derive<'tcx>(
         mir_aliases: aliases,
         return_transfer: returns.first().map(|r| r.span),
         allocation_local: allocator_destination.as_u32(),
+        element_spelling: constructor.element_spelling,
     })
 }
 

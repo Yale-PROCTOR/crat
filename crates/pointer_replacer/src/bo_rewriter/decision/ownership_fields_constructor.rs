@@ -15,6 +15,9 @@ pub(crate) struct Constructor<'tcx> {
     pub(crate) allocation: &'tcx Expr<'tcx>,
     pub(crate) allocator: DefId,
     pub(crate) element: Ty<'tcx>,
+    /// The element type as it must be spelled at the binding (`i32`, or a
+    /// crate-rooted path for a local struct), for the explicit Box annotation.
+    pub(crate) element_spelling: String,
     pub(crate) count: String,
     pub(crate) shape: BoxShape,
     pub(crate) nonempty: bool,
@@ -37,6 +40,10 @@ pub(crate) fn derive<'tcx>(
     }
     let pointer_bits = tcx.data_layout.pointer_size.bits();
     let (zero, element_bits) = zero_value(tcx, element, pointer_bits)?;
+    let element_spelling = match element.kind() {
+        TyKind::Adt(def, _) => format!("crate::{}", tcx.def_path_str(def.did())),
+        _ => element.to_string(),
+    };
     let mut allocation = init;
     while let ExprKind::Cast(inner, _) = allocation.kind {
         if !matches!(typeck.expr_ty(allocation).kind(), TyKind::RawPtr(..))
@@ -119,6 +126,7 @@ pub(crate) fn derive<'tcx>(
                 allocation,
                 allocator,
                 element,
+                element_spelling: element_spelling.clone(),
                 count,
                 shape: BoxShape::Slice,
                 nonempty: false,
@@ -169,6 +177,7 @@ pub(crate) fn derive<'tcx>(
             allocation,
             allocator,
             element,
+            element_spelling: element_spelling.clone(),
             count,
             shape,
             nonempty: shape == BoxShape::Sized
@@ -241,6 +250,7 @@ pub(crate) fn derive<'tcx>(
         allocation,
         allocator,
         element,
+        element_spelling,
         edit: BoxExprEdit {
             span: init.span,
             replacement: format!("::std::vec![{zero}; {count}].into_boxed_slice()"),

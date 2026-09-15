@@ -438,6 +438,34 @@ pub(crate) fn raw_lend_argument(
     }
 }
 
+/// R402-2(b): a `Box` decision the emission stage withdrew — its owner's
+/// signature class held, or its edits unplaceable — is reported DEGRADED with
+/// the withdrawal reason and never expected or counted delivered. Any other
+/// decision is left to the seed writer's own accounting.
+pub(crate) fn withdrawn_box_reason(
+    decision: &Decision,
+    emission_plan: &crate::bo_rewriter::plan::Plan,
+    owner_class: crate::bo_rewriter::bridge_receipt::SignatureClassId,
+    unplaced_reason: Option<&'static str>,
+) -> Option<String> {
+    match decision {
+        Decision::Box(_) => {}
+        Decision::Degraded(_)
+        | Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. }
+        | Decision::Opt { .. } => return None,
+    }
+    if let Some(reason) = unplaced_reason {
+        return Some(format!("unplaceable:{reason}"));
+    }
+    emission_plan
+        .class_hold_reason(owner_class)
+        .map(|reason| format!("signature-class-held:{reason}"))
+}
+
 /// The peer argument's MIR local is outside the derivation closure of the
 /// subject's allocation result, so it cannot point into the fresh object;
 /// an escaped allocation (stored into memory) proves nothing.
@@ -496,6 +524,26 @@ fn derive_bundle(
     let tcx = inputs.program.tcx;
     let name = subject.param_name.as_ref().ok_or(NativeHold::Identity)?;
     let mut edits = vec![source.constructor().clone()];
+    // R402-2(a): every delivered declaration carries its explicit type. The
+    // source binding is unannotated (`let mut p = malloc(..) as *mut T`), so
+    // the pattern itself is respelled `p: Box<T>` / `p: Box<[T]>`.
+    let binding = tcx
+        .sess
+        .source_map()
+        .span_to_snippet(subject.binding_span)
+        .map_err(|_| NativeHold::Missing("native-binding-spelling"))?;
+    if subject.ty_span.is_some() {
+        return Err(NativeHold::Missing("native-annotated-binding"));
+    }
+    let payload = match source.shape() {
+        BoxShape::Sized => source.element_spelling().to_owned(),
+        BoxShape::Slice => format!("[{}]", source.element_spelling()),
+    };
+    edits.push(BoxExprEdit {
+        span: subject.binding_span,
+        replacement: format!("{binding}: ::std::boxed::Box<{payload}>"),
+        receipt: "native-box-declaration-type",
+    });
     edits.extend_from_slice(source.scalar_edits());
     let mut receipts = vec![format!(
         "native-owning-source owner={} local={} generation=Missing source-root={:?}",
