@@ -17,6 +17,7 @@ fn cursor(mutable: bool) -> Decision {
             delivered_base: None,
             bridges: vec![],
             local_bridges: vec![],
+            composed_edit_spans: vec![],
             uses: Vec::new(),
             base: Local::from_u32(1),
             component: Vec::new(),

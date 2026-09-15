@@ -4876,6 +4876,25 @@ pub(crate) fn filtered_inputs(
         .filter(|(node, _)| reverts.keeps_subject(node.0, node.1))
         .map(|(_, span)| (span.lo().0, span.hi().0))
         .collect::<FxHashSet<_>>();
+    // A cursor constructor composed over an outer table's element rewrite owns
+    // that span; the outer's own edit there is skipped, as for constructions.
+    let composed_cursor_edits = table
+        .entries
+        .iter()
+        .filter(|(subject, _)| reverts.keeps_subject(subject.fn_did, subject.hir_id))
+        .filter_map(|(_, decision)| match decision {
+            super::decision::Decision::Cursor { plan, .. } => Some(&plan.composed_edit_spans),
+            super::decision::Decision::Ref { .. }
+            | super::decision::Decision::InferredRef { .. }
+            | super::decision::Decision::NestedSlice { .. }
+            | super::decision::Decision::Slice { .. }
+            | super::decision::Decision::Opt { .. }
+            | super::decision::Decision::Box(_)
+            | super::decision::Decision::Degraded(_) => None,
+        })
+        .flatten()
+        .map(|span| (span.lo().0, span.hi().0))
+        .collect::<FxHashSet<_>>();
     for (subject, decision) in &table.entries {
         let use_edits = match decision {
             super::decision::Decision::Cursor { plan, .. } => Some(&plan.uses),
@@ -4913,6 +4932,7 @@ pub(crate) fn filtered_inputs(
             if composed_slice_edits.contains(&key)
                 || (composed_option_edits.contains(&key)
                     && u.bridge_kind != "option-value-composed")
+                || (composed_cursor_edits.contains(&key) && u.bridge_kind != "cursor-constructor")
             {
                 continue;
             }

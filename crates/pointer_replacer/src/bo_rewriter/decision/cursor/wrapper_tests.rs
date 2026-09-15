@@ -114,8 +114,10 @@ fn slicecursor_nullable_parameter() {
 }
 
 #[test]
-fn slicecursor_undelivered_table_is_held() {
-    let input = "pub unsafe fn previous(outputs: *mut *mut f64, k: isize) -> f64 { let output: *mut f64 = *outputs.offset(0); *output.offset(k) }";
+fn slicecursor_written_table_element_is_held() {
+    // A mutable cursor over a table element would fabricate an exclusive view
+    // beside the table's other elements; it stays held.
+    let input = "pub unsafe fn previous(outputs: *mut *mut f64, k: isize) { let output: *mut f64 = *outputs.offset(0); *output.offset(k) = 1.; }";
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
         let (_, decision) = table
@@ -129,6 +131,26 @@ fn slicecursor_undelivered_table_is_held() {
         assert_eq!(record.reason.key(), "cursor-base-unavailable");
     })
     .unwrap();
+}
+
+#[test]
+fn slicecursor_read_only_element_of_mutable_table_takes_fallback_base() {
+    // Expectation migrated from `slicecursor_undelivered_table_is_held`: the
+    // read-only element of a delivered outer table is a bare raw base and takes
+    // the receipted fallback (charter §1(c)); the `*mut` element coerces to the
+    // shared constructor's `*const`.
+    let input = "pub unsafe fn previous(outputs: *mut *mut f64, k: isize) -> f64 { let output: *mut f64 = *outputs.offset(0); *output.offset(k) }";
+    let source = emitted(input);
+    assert!(
+        source.contains("crate::slice_cursor::SliceCursor::from_raw_parts(outputs["),
+        "fallback base absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let mut a = [1., 2., 3.]; let t = [a.as_mut_ptr()]; assert_eq!(unsafe { previous(&t, 2) }, 3.); }",
+        ),
+    );
 }
 
 #[test]
@@ -247,4 +269,132 @@ fn slicecursor_integer_address_escape_is_not_a_scalar_comparison() {
         !source.contains("slice_cursor::SliceCursor"),
         "integer address escape is not licensed by scalar comparison evidence: {source}"
     );
+}
+
+#[test]
+fn slicecursor_table_element_shared_fallback_two_inputs() {
+    // tulipindicators `ti_adx`: input cursors loaded from the delivered outer
+    // table `inputs: &[*const f64]`; the loaded element is a bare raw base.
+    let input = r#"
+pub unsafe fn adx(size: i32, inputs: *const *const f64) -> f64 {
+    let high: *const f64 = *inputs.offset(0);
+    let low: *const f64 = *inputs.offset(1);
+    let mut acc = 0.;
+    let mut i = 1isize;
+    while i < size as isize {
+        acc += *high.offset(i) - *low.offset(i - 1);
+        i += 1;
+    }
+    acc
+}
+"#;
+    let source = emitted(input);
+    save_fixture("table-element-two-inputs", input, &source);
+    assert!(
+        source.contains("crate::slice_cursor::SliceCursor::from_raw_parts(inputs["),
+        "table-element fallback base absent: {source}"
+    );
+    assert!(
+        !source.contains("*inputs.offset"),
+        "outer element rewrite lost under the composed constructor: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let h = [1., 2., 4.]; let l = [0.5, 1., 1.5]; let t = [h.as_ptr(), l.as_ptr()]; assert_eq!(unsafe { adx(3, &t) }, 4.5); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_table_element_shared_fallback_with_raw_output_table() {
+    // tulipindicators `ti_mom`: one shared input cursor beside a forward-only
+    // output loaded from a second table; the input takes the receipted
+    // fallback base composed over the outer's element rewrite.
+    let input = r#"
+pub unsafe fn mom(size: i32, inputs: *const *const f64, period: i32, outputs: *const *mut f64) -> i32 {
+    let input: *const f64 = *inputs.offset(0);
+    let mut output: *mut f64 = *outputs.offset(0);
+    let mut i = period;
+    while i < size {
+        *output = *input.offset(i as isize) - *input.offset((i - period) as isize);
+        output = output.offset(1);
+        i += 1;
+    }
+    0
+}
+"#;
+    let source = emitted(input);
+    save_fixture("table-element-raw-output", input, &source);
+    assert!(
+        source.contains("crate::slice_cursor::SliceCursor::from_raw_parts(inputs["),
+        "table-element fallback base absent: {source}"
+    );
+    // The forward-only output is the slice family's existing composed
+    // fallback over the same outer-table shape; the cursor mirrors it.
+    assert!(
+        source.contains("core::slice::from_raw_parts_mut(outputs["),
+        "forward-only output fallback absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let x = [1., 3., 6., 10.]; let mut o = [0.; 2]; let t = [x.as_ptr()]; let u = [o.as_mut_ptr()]; assert_eq!(unsafe { mom(4, &t, 2, &u) }, 0); assert_eq!(o, [5., 7.]); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_table_element_composition_owns_the_initializer_key() {
+    // The outer's element rewrite is composed into the constructor text; the
+    // AST use map must carry exactly one edit at the initializer span, with no
+    // overwritten key (the census gates `use_key_collisions` at 0).
+    let input = r#"
+pub unsafe fn adx(size: i32, inputs: *const *const f64) -> f64 {
+    let low: *const f64 = *inputs.offset(1);
+    let mut acc = 0.;
+    let mut i = 1isize;
+    while i < size as isize {
+        acc += *low.offset(i - 1);
+        i += 1;
+    }
+    acc
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let (subject, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("low"))
+            .unwrap();
+        let super::Decision::Cursor { plan, .. } = decision else {
+            panic!("table element not admitted: {decision:?}");
+        };
+        assert_eq!(plan.composed_edit_spans.len(), 1, "{plan:?}");
+        let init = *ctx
+            .constructions
+            .init_hirs
+            .get(&(subject.fn_did, subject.hir_id))
+            .unwrap();
+        let init_span = tcx.hir_node(init).expect_expr().span;
+        assert_eq!(plan.composed_edit_spans[0], init_span);
+        let reverts = crate::bo_rewriter::ast_transform::revert_set_from_classes_and_atoms(
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &table,
+        )
+        .unwrap();
+        let inputs = crate::bo_rewriter::ast_transform::filtered_inputs(&table, &reverts);
+        assert_eq!(inputs.use_key_collisions, 0);
+        let composed = inputs
+            .uses
+            .get(&(init_span.lo().0, init_span.hi().0))
+            .expect("constructor at the initializer span");
+        assert!(
+            composed.contains("SliceCursor::from_raw_parts(inputs[1]"),
+            "{composed}"
+        );
+    })
+    .unwrap();
 }

@@ -4827,8 +4827,13 @@ fn composed_by_slice_constructor(edits: &[plan::Edit], inner_index: usize) -> bo
                 inner.justification,
                 plan::Justification::KindDecision { .. } | plan::Justification::SeamAdapter { .. }
             );
+        // A wrapper cursor constructor composed over its outer table's element
+        // rewrite; the AST pass applies only the constructor at that span.
+        let cursor = outer.edit_kind == "cursor-constructor"
+            && inner.edit_kind == "subject-use"
+            && outer.owner_class == inner.owner_class;
         outer_index != inner_index
-            && (slice || option)
+            && (slice || option || cursor)
             && outer.lo <= inner.lo
             && inner.hi <= outer.hi
     })
@@ -5579,6 +5584,19 @@ fn validate_cursor_delivered_bases(
                 if init.span != edit.span {
                     return false;
                 }
+                if cursor.wrapper
+                    && matches!(
+                        base.provider,
+                        decision::cursor_native::DeliveredBaseProvider::TableElement
+                    )
+                    && let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) = init.kind
+                {
+                    return decision::cursor_native::wrapper::source_binding(
+                        tcx,
+                        subject.fn_did,
+                        pointer,
+                    ) == Some(base.binding);
+                }
                 if cursor.wrapper {
                     return decision::cursor_native::wrapper::source_binding(
                         tcx,
@@ -5674,6 +5692,27 @@ fn validate_cursor_delivered_bases(
                         .classes
                         .get(&bridge_receipt::SignatureClassId::of(subject.fn_did))
                         .is_some_and(plan::SignatureClassPlan::is_ready)
+            }
+            // The outer table is a delivered slice whose element the cursor
+            // loads; the cursor's own extent is the receipted fallback.
+            DeliveredBaseProvider::TableElement => {
+                cursor.wrapper
+                    && cursor.fallback
+                    && !subject.mutable
+                    && !overrides_base
+                    && table.entries.iter().any(|(candidate, choice)| {
+                        (candidate.fn_did, candidate.hir_id) == node
+                            && match choice {
+                                decision::Decision::Slice { .. } => true,
+                                decision::Decision::NestedSlice { .. }
+                                | decision::Decision::Ref { .. }
+                                | decision::Decision::InferredRef { .. }
+                                | decision::Decision::Opt { .. }
+                                | decision::Decision::Box(_)
+                                | decision::Decision::Cursor { .. }
+                                | decision::Decision::Degraded(_) => false,
+                            }
+                    })
             }
         };
         if !valid_binding || !provider_delivered || !valid_initializer || !exact_cursor_source {

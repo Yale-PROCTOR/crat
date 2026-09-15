@@ -38,6 +38,9 @@ pub(crate) struct CursorPlan {
     pub(crate) delivered_base: Option<DeliveredBase>,
     pub(crate) bridges: Vec<CursorBridge>,
     pub(crate) local_bridges: Vec<CursorLocalBridge>,
+    /// Outer-subject use edits composed into the constructor text; the AST
+    /// pass applies the constructor at that span and skips these.
+    pub(crate) composed_edit_spans: Vec<rustc_span::Span>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +61,10 @@ pub(crate) enum DeliveredBaseProvider {
         producer: super::box_facts::BoxPlan,
         elements: u64,
     },
+    /// The binding is a delivered outer table whose loaded element is the
+    /// cursor's raw base; the base is fallback-receipted, the link carries the
+    /// outer's revert dependency only.
+    TableElement,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

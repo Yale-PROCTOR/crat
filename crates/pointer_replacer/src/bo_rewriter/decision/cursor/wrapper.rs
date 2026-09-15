@@ -81,6 +81,66 @@ struct Base {
     local: Local,
     delivered: Option<DeliveredBase>,
     fallback: bool,
+    composed: Vec<rustc_span::Span>,
+}
+/// A shared cursor over an element loaded from a delivered outer table:
+/// `let p: *const T = *table.offset(k)` with `table` a delivered slice. The
+/// loaded element is a bare raw base and takes the same receipted fallback as
+/// a raw path; the constructor composes the outer's own element rewrite so the
+/// two edits never collide at the initializer span. A mutable element would
+/// fabricate an exclusive view beside the table's other elements and stays held.
+fn table_element_base(
+    ctx: &Ctx<'_, '_>,
+    s: &Subject,
+    e: &hir::Expr<'_>,
+    entries: &[(Subject, Decision)],
+) -> Result<Base, CursorHold> {
+    if s.mutable {
+        return Err(CursorHold::BaseMissing);
+    }
+    if !model_ref(ctx, s) {
+        return Err(CursorHold::RefMissing);
+    }
+    let hir::ExprKind::Unary(hir::UnOp::Deref, pointer) = e.kind else {
+        return Err(CursorHold::BaseMissing);
+    };
+    let root = source_binding(ctx.tcx, s.fn_did, pointer).ok_or(CursorHold::BaseMissing)?;
+    let (_, decision) = entries
+        .iter()
+        .find(|(source, _)| source.fn_did == s.fn_did && source.hir_id == root)
+        .ok_or(CursorHold::BaseMissing)?;
+    let uses = match decision {
+        Decision::Slice { uses, .. } => uses,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Cursor { .. }
+        | Decision::Degraded(_) => return Err(CursorHold::BaseMissing),
+    };
+    let element = uses
+        .iter()
+        .find(|edit| edit.span.source_callsite() == e.span.source_callsite())
+        .ok_or(CursorHold::BaseMissing)?;
+    Ok(Base {
+        parent_cursor: None,
+        expression: format!(
+            "unsafe {{ {}::from_raw_parts({}, crate::FALLBACK_SLICE_EXTENT) }}",
+            constructor(false),
+            element.replacement
+        ),
+        binding: None,
+        local: s.local,
+        delivered: Some(DeliveredBase {
+            binding: root,
+            window_binding: root,
+            initializer: ctx.constructions.init_hirs.get(&(s.fn_did, root)).copied(),
+            provider: DeliveredBaseProvider::TableElement,
+        }),
+        fallback: true,
+        composed: vec![element.span],
+    })
 }
 fn base(
     ctx: &Ctx<'_, '_>,
@@ -89,11 +149,10 @@ fn base(
     entries: &[(Subject, Decision)],
 ) -> Result<Base, CursorHold> {
     if let Some(raw) = table_origin(ctx, s, e, entries, &mut rustc_hash::FxHashSet::default()) {
-        return Err(if raw {
-            CursorHold::BaseModelRaw
-        } else {
-            CursorHold::BaseMissing
-        });
+        if raw {
+            return Err(CursorHold::BaseModelRaw);
+        }
+        return table_element_base(ctx, s, e, entries);
     }
     if let hir::ExprKind::MethodCall(_, receiver, [delta], _) = e.kind
         && emission::method(ctx.tcx, s.fn_did, e, &["offset", "add", "sub"])
@@ -151,6 +210,7 @@ fn base(
                 provider: DeliveredBaseProvider::OriginalSlice,
             }),
             fallback: false,
+            composed: vec![],
         });
     }
     if let Some(binding) = local(e)
@@ -198,6 +258,7 @@ fn base(
                 provider: DeliveredBaseProvider::Slice { producer },
             }),
             fallback: false,
+            composed: vec![],
         });
     }
     if let Some(binding) = local(e)
@@ -223,6 +284,7 @@ fn base(
             local: source.local,
             delivered: None,
             fallback: false,
+            composed: vec![],
         });
     }
     let mut raw_origin = e;
@@ -253,6 +315,7 @@ fn base(
         local: s.local,
         delivered: None,
         fallback: true,
+        composed: vec![],
     })
 }
 fn delta_text(
@@ -595,6 +658,7 @@ fn build(
             local: subject.local,
             delivered: None,
             fallback: false,
+            composed: vec![],
         }
     } else if parameter {
         if !model_ref(ctx, subject) {
@@ -607,6 +671,7 @@ fn build(
             local: subject.local,
             delivered: None,
             fallback: false,
+            composed: vec![],
         }
     } else {
         if subject.ty_span.is_none() {
@@ -664,6 +729,7 @@ fn build(
         delivered_base: b.delivered,
         bridges: v.bridges,
         local_bridges: vec![],
+        composed_edit_spans: b.composed,
     })
 }
 

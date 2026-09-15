@@ -493,6 +493,12 @@ fn nested_ast_composition(
         let option_value_over_inner = outer.key.bridge_kind == "option-value-composed"
             && inner.key.bridge_kind != "option-value-composed"
             && contains(outer, inner);
+        // A wrapper cursor constructor composed over its outer table's element
+        // rewrite (`*table.offset(k)` → `table[k]`): the outer edit is part of
+        // the constructor text and the AST pass applies only the constructor.
+        let cursor_constructor_over_element = outer.key.bridge_kind == "cursor-constructor"
+            && inner.key.bridge_kind == "subject-use"
+            && contains(outer, inner);
         // L07 (§39 addendum 272, R272-3). The five outer/inner kind pairs the
         // J'' frame measures as STRICT CONTAINMENTS, entering under exactly
         // the dependency discipline `bridge_over_subject` already uses: the
@@ -530,6 +536,7 @@ fn nested_ast_composition(
             && strictly_contains(outer, inner))
             || slice_construction_over_inner
             || option_value_over_inner
+            || cursor_constructor_over_element
             || raw_receiver_over_argument
     };
     if composable(left, right) {
@@ -2377,6 +2384,9 @@ fn cursor_extent_evidence(cursor: &super::decision::cursor_native::CursorPlan) -
                 DeliveredBaseProvider::Box { elements, .. } => evidence.push_str(&format!(
                     ";producer-box-slice:elements={elements}:fabricated=false"
                 )),
+                DeliveredBaseProvider::TableElement => {
+                    evidence.push_str(";outer-table-element:extent-fallback-receipted")
+                }
             }
             evidence
         }
@@ -5037,6 +5047,7 @@ mod tests {
             extent: 8,
             delivered_base: None,
             local_bridges: vec![],
+            composed_edit_spans: vec![],
             bridges: vec![CursorBridge {
                 call_hir: hir(2),
                 callee: subject.fn_did,

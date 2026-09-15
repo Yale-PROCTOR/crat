@@ -415,6 +415,8 @@ fn provider_minimum(provider: &DeliveredBaseProvider) -> Option<u64> {
             }
         }
         DeliveredBaseProvider::Box { elements, .. } => Some(*elements),
+        // Nothing is proven about an element loaded from a table.
+        DeliveredBaseProvider::TableElement => None,
     }
 }
 
@@ -833,5 +835,6 @@ fn build<'tcx>(
         }),
         bridges: uses.bridges,
         local_bridges,
+        composed_edit_spans: vec![],
     })
 }

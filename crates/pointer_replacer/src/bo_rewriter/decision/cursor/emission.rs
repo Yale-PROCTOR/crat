@@ -521,5 +521,6 @@ pub(super) fn plan(
         delivered_base: None,
         bridges: visitor.bridges,
         local_bridges: vec![],
+        composed_edit_spans: vec![],
     })
 }
