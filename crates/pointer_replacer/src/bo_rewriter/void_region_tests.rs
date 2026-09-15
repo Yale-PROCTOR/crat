@@ -342,3 +342,155 @@ fn w6b_two_views_of_one_region_are_not_emitted_together() {
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
+
+/// A width reader whose caller's source is a delivered byte slice (rs-crown/brotli
+/// `Hash14`-shaped reader over a counted buffer): the reader is bridged from the
+/// slice itself, `&data[..4]`, with no raw pointer in between.
+pub(super) const READ32_SLICE_SOURCE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type uint32_t = u32;
+pub type size_t = usize;
+unsafe extern "C" fn BrotliUnalignedRead32(mut p: *const core::ffi::c_void) -> uint32_t {
+    return *(p as *const uint32_t);
+}
+unsafe extern "C" fn checksum(mut data: *const uint8_t, mut len: size_t) -> uint32_t {
+    let mut i: size_t = 0;
+    let mut acc: uint32_t = 0;
+    while i < len {
+        acc = acc.wrapping_add(*data.offset(i as isize) as uint32_t);
+        i = i.wrapping_add(1);
+    }
+    return acc ^ BrotliUnalignedRead32(data as *const core::ffi::c_void);
+}
+"#;
+
+#[test]
+fn w6b_width_reader_from_a_delivered_slice_source() {
+    let rows = super::emit_tests::decisions_of(READ32_SLICE_SOURCE);
+    assert_eq!(reason(&rows, "p"), "<emitted>", "{rows:?}");
+    assert_eq!(reason(&rows, "data"), "<emitted>", "{rows:?}");
+    let source = super::emit_tests::ast_emitted_source_of(READ32_SLICE_SOURCE).expect("AST output");
+    let flat = compact(&source);
+    assert!(
+        flat.contains("fnchecksum(mutdata:&[uint8_t]"),
+        "the source is a slice: {source}"
+    );
+    assert!(
+        flat.contains("BrotliUnalignedRead32(&(data)[..4])"),
+        "the reader takes a checked prefix of the slice, no raw pointer: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// H42 (rs-crown/brotli `src::enc::encode::{AddrH42,HeadH42,TinyHashH42,BanksH42,
+/// PrepareH42,FindLongestMatchH42}`, reduced: 4 banks of 16 slots): a
+/// multi-bank last region, a three-accessor caller that hands region pointers
+/// to libc `memset` raw, and a read-only caller of all four.
+pub(super) const H42: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type uint16_t = u16;
+pub type uint32_t = u32;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct SlotH42 {
+    pub delta: uint16_t,
+    pub next: uint16_t,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct BankH42 {
+    pub slots: [SlotH42; 16],
+}
+#[repr(C)]
+pub struct H42 {
+    pub free_slot_idx: [uint16_t; 4],
+    pub max_hops: size_t,
+    pub extra: *mut core::ffi::c_void,
+}
+unsafe extern "C" fn AddrH42(mut extra: *mut core::ffi::c_void) -> *mut uint32_t {
+    return extra as *mut uint32_t;
+}
+unsafe extern "C" fn HeadH42(mut extra: *mut core::ffi::c_void) -> *mut uint16_t {
+    return &mut *((AddrH42 as unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut uint32_t)(extra))
+        .offset(((1 as i32) << 4 as i32) as isize) as *mut uint32_t as *mut uint16_t;
+}
+unsafe extern "C" fn TinyHashH42(mut extra: *mut core::ffi::c_void) -> *mut uint8_t {
+    return &mut *((HeadH42 as unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut uint16_t)(extra))
+        .offset(((1 as i32) << 4 as i32) as isize) as *mut uint16_t as *mut uint8_t;
+}
+unsafe extern "C" fn BanksH42(mut extra: *mut core::ffi::c_void) -> *mut BankH42 {
+    return &mut *((TinyHashH42 as unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut uint8_t)(extra))
+        .offset(16 as i32 as isize) as *mut uint8_t as *mut BankH42;
+}
+extern "C" {
+    fn memset(_: *mut core::ffi::c_void, _: i32, _: usize) -> *mut core::ffi::c_void;
+}
+unsafe extern "C" fn PrepareH42(mut self_0: *mut H42, one_shot: i32, input_size: size_t) {
+    let mut addr = AddrH42((*self_0).extra);
+    let mut head = HeadH42((*self_0).extra);
+    let mut tiny_hash = TinyHashH42((*self_0).extra);
+    if one_shot != 0 && input_size <= 4 {
+        let mut i: size_t = 0;
+        while i < input_size {
+            *addr.offset(i as isize) = 0xcccccccc as u32;
+            *head.offset(i as isize) = 0xcccc as i32 as uint16_t;
+            i = i.wrapping_add(1);
+        }
+    } else {
+        memset(addr as *mut core::ffi::c_void, 0xcc as i32, 4 * 16);
+        memset(head as *mut core::ffi::c_void, 0 as i32, 2 * 16);
+    }
+    memset(tiny_hash as *mut core::ffi::c_void, 0 as i32, 16);
+}
+unsafe extern "C" fn FindLongestMatchH42(mut self_0: *mut H42, key: size_t, cur_ix: size_t) -> size_t {
+    let mut addr = AddrH42((*self_0).extra);
+    let mut head = HeadH42((*self_0).extra);
+    let mut tiny_hashes = TinyHashH42((*self_0).extra);
+    let mut banks = BanksH42((*self_0).extra);
+    let bank = key & (4 as i32 - 1 as i32) as usize;
+    let mut hops = (*self_0).max_hops;
+    let mut delta = cur_ix.wrapping_sub(*addr.offset(key as isize) as usize);
+    let mut slot = *head.offset(key as isize) as size_t;
+    let mut backward: size_t = 0;
+    loop {
+        let fresh = hops;
+        hops = hops.wrapping_sub(1);
+        if !(fresh != 0) { break; }
+        let last = slot;
+        backward = backward.wrapping_add(delta);
+        if *tiny_hashes.offset((cur_ix & 15) as isize) as i32 != key as uint8_t as i32 { continue; }
+        slot = (*banks.offset(bank as isize)).slots[last as usize].next as size_t;
+        delta = (*banks.offset(bank as isize)).slots[last as usize].delta as size_t;
+    }
+    return backward;
+}
+"#;
+
+#[test]
+fn w6b_h42_multi_bank_chain_delivers() {
+    let reasons = param_reasons(H42, "extra");
+    assert_eq!(reasons.len(), 4, "{reasons:?}");
+    assert!(reasons.iter().all(|r| r == "<emitted>"), "{reasons:?}");
+    let source = super::emit_tests::ast_emitted_source_of(H42).expect("AST output");
+    let flat = compact(&source);
+    assert_eq!(
+        flat.matches("from_raw_parts_mut((((*self_0).extra)as*mutu8).add(112),crate::FALLBACK_SLICE_EXTENT*core::mem::size_of::<BankH42>())").count(),
+        1,
+        "the multi-bank last region takes the fallback exactly once (FindLongestMatch): {source}"
+    );
+    assert_eq!(
+        flat.matches("from_raw_parts_mut((((*self_0).extra)as*mutu8),64)")
+            .count(),
+        2,
+        "both callers bridge the root region exactly: {source}"
+    );
+    // The raw region pointers keep flowing raw into libc memset (the corpus's PrepareH4x).
+    assert!(
+        flat.contains("memset(addras*mutcore::ffi::c_void,"),
+        "{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}

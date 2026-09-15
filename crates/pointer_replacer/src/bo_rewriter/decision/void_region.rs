@@ -626,6 +626,9 @@ pub(crate) struct Bridge {
     /// `None` renders the fallback arm.
     pub(crate) len_text: Option<String>,
     pub(crate) fallback_len_text: String,
+    /// The caller's argument is a DELIVERED slice: a width reader takes a
+    /// checked prefix of it (`&s[..N]`), no raw pointer in between.
+    pub(crate) from_slice: bool,
 }
 
 impl Bridge {
@@ -634,7 +637,21 @@ impl Bridge {
             offset_bytes: region.offset_bytes,
             len_text: region.len_text(),
             fallback_len_text: region.fallback_len_text(),
+            from_slice: false,
         }
+    }
+
+    pub(crate) fn from_slice(region: &Region) -> Self {
+        Self {
+            from_slice: true,
+            ..Self::of(region)
+        }
+    }
+
+    /// `&(<slice>)[..N]` — the reader's width as a checked prefix of the
+    /// caller's own slice. Safe: no `unsafe` wrapper.
+    pub(crate) fn render_slice(&self, text: &str) -> String {
+        format!("&({text})[..{}]", self.len_text())
     }
 
     pub(crate) fn len_text(&self) -> &str {
@@ -700,10 +717,14 @@ pub(crate) fn bridge_ast(
 ) -> Option<rustc_ast::ExprKind> {
     use rustc_ast::mut_visit::MutVisitor;
     const ARG: &str = "__CRAT_VOID_REGION_ARG";
-    let rendered = crate::bo_rewriter::mechanical_receipt::present_unsafe_text(
-        bridge.render(ARG, mutable),
-        enclosing_unsafe_fn,
-    );
+    let rendered = if bridge.from_slice {
+        bridge.render_slice(ARG)
+    } else {
+        crate::bo_rewriter::mechanical_receipt::present_unsafe_text(
+            bridge.render(ARG, mutable),
+            enclosing_unsafe_fn,
+        )
+    };
     let mut parsed = crate::bo_rewriter::ast_transform::graft_expr(&rendered).ok()?;
 
     struct Replace {

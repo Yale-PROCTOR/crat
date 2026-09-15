@@ -1489,7 +1489,11 @@ impl GlueSpec {
             super::super::mechanical_receipt::present_unsafe_text(inner, enclosing_unsafe_fn)
         };
         if let Some(region) = &self.void_region {
-            return Some(unsafe_expr(region.render(text, self.mutable)));
+            return Some(if region.from_slice {
+                region.render_slice(text)
+            } else {
+                unsafe_expr(region.render(text, self.mutable))
+            });
         }
         if let Some(raw) = self.raw_boundary.as_ref() {
             let rendered = if raw.force_explicit {
@@ -3333,13 +3337,22 @@ fn build_candidate(
     if counted.is_some() && found != Form::Raw {
         return Err(SeamBlock::UnnameableOperand);
     }
-    // wave-6b: a region position takes only a raw buffer expression; every
+    // wave-6b: a region position takes a raw buffer expression, or — for a
+    // width reader only — a delivered slice, read as a checked prefix. Every
     // other found form is a view the region bridge cannot re-derive.
-    if region.is_some() && (found != Form::Raw || literal_null) {
+    let region_from_slice = region.is_some_and(|region| {
+        region.shape == super::void_region::Shape::WidthRead && matches!(found, Form::Slice { .. })
+    });
+    if region.is_some() && !region_from_slice && (found != Form::Raw || literal_null) {
         return Err(SeamBlock::UnnameableOperand);
     }
     let answer = if literal_null {
         glue_null(expected)?
+    } else if region_from_slice {
+        // A delivered slice into a width reader: `&s[..N]`, a safe prefix
+        // view rather than the zero-syntax pass-through a slice-to-slice
+        // position would otherwise take.
+        Some((GlueSpec::core(GlueCore::Bare, false), SeamFamily::Safe))
     } else {
         glue(expected, found, len_text)?
     };
@@ -3364,10 +3377,14 @@ fn build_candidate(
         });
     }
     if let Some(region) = region {
-        if spec.core != GlueCore::FromRawParts {
-            return Err(SeamBlock::UnnameableOperand);
+        if region_from_slice {
+            spec.void_region = Some(super::void_region::Bridge::from_slice(region));
+        } else {
+            if spec.core != GlueCore::FromRawParts {
+                return Err(SeamBlock::UnnameableOperand);
+            }
+            spec.void_region = Some(super::void_region::Bridge::of(region));
         }
-        spec.void_region = Some(super::void_region::Bridge::of(region));
         spec.len = Some(match region.len_text() {
             Some(exact) => SeamLen::Licensed(exact),
             None => SeamLen::Fabricated,
