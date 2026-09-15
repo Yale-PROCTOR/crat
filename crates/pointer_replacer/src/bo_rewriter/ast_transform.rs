@@ -3646,6 +3646,7 @@ fn transform_with<'tcx>(
             .contains_key(&(subject.fn_did, subject.hir_id))
             && !super::decision::construction_values::has_declaration(table, subject)
             && !super::decision::slice_construction_values::has_declaration(table, subject)
+            && !super::decision::raw_place_values::has_declaration(table, subject)
             && !table
                 .return_receivers
                 .plans

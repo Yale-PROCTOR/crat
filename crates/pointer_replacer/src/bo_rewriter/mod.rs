@@ -90,6 +90,8 @@ mod ownership_fields_cp2_tests;
 #[cfg(test)]
 mod ownership_fields_native_tests;
 pub(crate) mod plan;
+#[cfg(test)]
+mod raw_place_values_tests;
 mod shared_pair_ast;
 #[cfg(test)]
 mod shared_pair_tests;

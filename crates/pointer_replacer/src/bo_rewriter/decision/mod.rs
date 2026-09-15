@@ -68,6 +68,7 @@ mod ownership_fields_roles_tests;
 pub(crate) mod ownership_fields_source;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
+pub(crate) mod raw_place_values;
 pub(crate) mod raw_receiver;
 pub(crate) mod receiver_input;
 pub(crate) mod return_alias;
@@ -1642,6 +1643,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         ),
         Decision::Ref { .. } if construction_values::permits(ctx, subject) => decision,
         Decision::Slice { .. } if slice_construction_values::permits(ctx, subject) => decision,
+        Decision::Ref { mutable } if raw_place_values::permits(ctx, subject, mutable) => decision,
         Decision::Ref { mutable } => {
             if receiver_failed {
                 degrade(
@@ -2035,6 +2037,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         if subject.ty_span.is_none()
             && !construction_values::permits(ctx, subject)
             && !slice_construction_values::permits(ctx, subject)
+            && !raw_place_values::permits(ctx, subject, subject.mutable)
             && !(family_policy
                 .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
                 && declaration_patterns.contains_key(&(subject.fn_did, subject.hir_id)))
