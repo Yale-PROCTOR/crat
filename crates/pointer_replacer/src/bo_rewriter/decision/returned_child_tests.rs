@@ -185,7 +185,10 @@ fn w5c_returned_child_unknown_retention_stays_refused() {
         );
     let table = decisions(&input);
     assert!(
-        !matches!(decision(&table, "kmRay2IntersectTriangle::ray"), super::Decision::Ref { .. }),
+        !matches!(
+            decision(&table, "kmRay2IntersectTriangle::ray"),
+            super::Decision::Ref { .. }
+        ),
         "{:?}",
         decision(&table, "kmRay2IntersectTriangle::ray")
     );
