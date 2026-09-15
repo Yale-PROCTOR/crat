@@ -12017,6 +12017,10 @@ mod run {
             ("atoms", artifact.atoms.as_str()),
             ("atom-outcomes", artifact.atom_outcomes.as_str()),
             ("final-reverts", artifact.final_reverts.as_str()),
+            (
+                "contract-candidate-declines",
+                artifact.contract_candidate_declines.as_str(),
+            ),
             ("bridge-receipts", bridge_receipts.as_str()),
             (
                 "unsafe-context-presentation",

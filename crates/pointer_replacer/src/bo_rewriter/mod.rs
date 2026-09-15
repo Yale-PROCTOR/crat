@@ -389,6 +389,8 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
+    /// R397-6(b): contract candidates declined at the selection input.
+    pub(crate) contract_candidate_declines: String,
     pub(crate) interface_inventory: String,
     /// R261-3 rider (addendum 264): subjects whose io-domain type walk ran out
     /// of depth budget without deciding. A nonzero count reopens the depth
@@ -6753,14 +6755,26 @@ fn finish_decide<'tcx>(
     );
     // After `full_slice_uses`, deliberately: a callee parameter that can become
     // `&[T]` carries its own checked extent and is out of this class (R365-2).
-    let local_callee_extent_subjects =
+    let mut local_callee_extent_subjects =
         decision::local_callee_extent::collect(tcx, &subjects, &facts, &full_slice_uses);
     let contract_extent_candidates = decision::contract_extent_adapter::collect(
         &subjects,
         &facts,
         &ctors,
         &local_callee_extent_subjects,
+        &full_slice_uses,
     );
+    // R395-2 at a contract-extent callee: a thin caller argument may not be
+    // widened into the callee's slice form. Fix-2's own classification wins
+    // where both apply.
+    for (node, access) in decision::contract_extent_adapter::caller_thin_holds(
+        &subjects,
+        &facts,
+        &contract_extent_candidates,
+        tcx,
+    ) {
+        local_callee_extent_subjects.entry(node).or_insert(access);
+    }
     let return_parameter_nodes = subjects
         .iter()
         .filter(|subject| {
@@ -7763,6 +7777,7 @@ fn finish_decide<'tcx>(
             class_costs: bridge_receipt::class_cost_header(),
             class_collisions: bridge_receipt::class_collision_header(),
             unresolved_classes: bridge_receipt::unresolved_class_header(),
+            contract_candidate_declines: contract_extent_candidates.declines_tsv(tcx, &subjects),
             interface_inventory: table.seams.interface_inventory_tsv(tcx),
             sites_from_non_subject_arguments: table.seams.sites_from_non_subject_arguments(),
             converted_callee_without_site_receipt: table

@@ -7,8 +7,9 @@ use super::{
     Subject, SubjectKind,
     construction::{Construction, ConstructionFacts},
     contract_extent::*,
-    emitability::{ArgShape, EmitabilityFacts},
-    local_callee_extent::LocalCalleeAccess,
+    emitability::{ArgShape, EmitabilityFacts, SliceUses},
+    local_callee_extent::{AccessReason, LocalCalleeAccess},
+    raw_boundary::RawMutability,
     raw_boundary_contracts::{ArgumentExtent, PointeeAccess, classify_contract},
 };
 use crate::{analyses::borrow_ownership::SlotKind, bo_rewriter::fat_facts::FatFacts};
@@ -127,6 +128,42 @@ struct Candidate {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CandidateIndex {
     by_subject: FxHashMap<(LocalDefId, HirId), Candidate>,
+    /// R397-6(b): candidates declined at the selection INPUT, with the cause.
+    declines: FxHashMap<(LocalDefId, HirId), DeclineCause>,
+}
+
+/// The candidate's own pre-selection Slice-use facts. A raw use at a LOCAL
+/// callee argument is recognized by its exact argument span in `call_args`,
+/// the same identity `raw_boundary_argument_paths` records it under.
+fn use_summary(
+    owner: LocalDefId,
+    uses: Option<&SliceUses>,
+    local_boundaries: &rustc_hash::FxHashSet<(LocalDefId, u32, u32)>,
+) -> UseSummary {
+    let Some(uses) = uses else {
+        return UseSummary::default();
+    };
+    let mut summary = UseSummary {
+        unsupported: uses.unsupported.is_some(),
+        ..UseSummary::default()
+    };
+    for raw in &uses.raw_uses {
+        match raw.boundary_span {
+            Some(span) => {
+                if local_boundaries.contains(&(owner, span.lo().0, span.hi().0)) {
+                    summary.local_callee_boundary_uses += 1;
+                }
+            }
+            None => match raw.source_shape {
+                "pointer-distance" if raw.contract.is_some() => {}
+                "body-copy" => {}
+                "raw-discard" if raw.target.mutability == RawMutability::Const => {}
+                "field-store" => summary.field_store_uses += 1,
+                _ => summary.unsupported_raw_uses += 1,
+            },
+        }
+    }
+    summary
 }
 
 fn subject_key(subject: &Subject) -> String {
@@ -198,6 +235,7 @@ pub(crate) fn collect(
     facts: &EmitabilityFacts,
     constructions: &ConstructionFacts,
     local_callee_extent: &FxHashMap<(LocalDefId, HirId), LocalCalleeAccess>,
+    slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
 ) -> CandidateIndex {
     let subjects = subjects
         .iter()
@@ -331,10 +369,131 @@ pub(crate) fn collect(
             .sites
             .sort_by(|left, right| left.site.cmp(&right.site));
     }
-    CandidateIndex { by_subject }
+    // R397-6(b): the up-front decline, read from the candidate's own uses
+    // before any selection. A declined candidate is never attempted, so no
+    // owner or class transaction can withdraw a sibling on its account.
+    let local_boundaries = facts
+        .call_args
+        .values()
+        .flatten()
+        .flat_map(|call| {
+            call.args
+                .iter()
+                .map(move |argument| (call.caller, argument.span.lo().0, argument.span.hi().0))
+        })
+        .collect::<rustc_hash::FxHashSet<_>>();
+    let declines = by_subject
+        .keys()
+        .filter_map(|&node| {
+            decline(&use_summary(
+                node.0,
+                slice_uses.get(&node),
+                &local_boundaries,
+            ))
+            .map(|cause| (node, cause))
+        })
+        .collect();
+    CandidateIndex {
+        by_subject,
+        declines,
+    }
+}
+
+/// R395-2 at a LOCAL callee whose parameter reaches a FOREIGN multi-element
+/// position: the callee's parameter may take a contract-extent slice form, and
+/// a thin `&T` caller argument would then be widened by `from_ref`/`from_mut`
+/// into that slice — one element of provenance handed to `strlen`, `strcmp`,
+/// `memcpy` through `as_ptr()`. The caller subject is held exactly as fix-2
+/// holds a caller of a body-indexing parameter; the callee keeps its own
+/// candidate, whose raw wrapper takes the pointer's full provenance.
+pub(crate) fn caller_thin_holds(
+    subjects: &[Subject],
+    facts: &EmitabilityFacts,
+    index: &CandidateIndex,
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+) -> FxHashMap<(LocalDefId, HirId), LocalCalleeAccess> {
+    let mut out = FxHashMap::default();
+    for subject in subjects {
+        let SubjectKind::Param { hir_index } = subject.kind else { continue };
+        let node = (subject.fn_did, subject.hir_id);
+        let Some(candidate) = index.by_subject.get(&node) else { continue };
+        let Some(site) = candidate
+            .sites
+            .iter()
+            .find(|site| !matches!(site.requirement, Requirement::LocalAccess))
+        else {
+            continue;
+        };
+        let Some(calls) = facts.call_args.get(&subject.fn_did) else { continue };
+        for call in calls {
+            for argument in call
+                .args
+                .iter()
+                .filter(|argument| argument.index == hir_index)
+            {
+                let root = match argument.shape {
+                    ArgShape::BareLocal(root) | ArgShape::CastOfLocal { binding: root, .. } => root,
+                    _ => continue,
+                };
+                out.entry((call.caller, root))
+                    .or_insert_with(|| LocalCalleeAccess {
+                        callee_id: subject.fn_did,
+                        parameter_index: hir_index,
+                        callee: tcx.def_path_str(subject.fn_did.to_def_id()),
+                        parameter: subject
+                            .param_name
+                            .clone()
+                            .unwrap_or_else(|| "<unnamed>".to_owned()),
+                        access: if subject.mutable { "write" } else { "read" },
+                        reason: AccessReason::ForeignContract {
+                            contract: site.contract.clone(),
+                        },
+                    });
+            }
+        }
+    }
+    out
 }
 
 impl CandidateIndex {
+    /// R397-6(b): the declined candidates, for the receipt.
+    pub(crate) fn declines(&self) -> impl Iterator<Item = (&(LocalDefId, HirId), &DeclineCause)> {
+        self.declines.iter()
+    }
+
+    /// One TSV row per declined candidate, ordered by owner path and binding.
+    pub(crate) fn declines_tsv(
+        &self,
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        subjects: &[Subject],
+    ) -> String {
+        let mut rows = subjects
+            .iter()
+            .filter_map(|subject| {
+                let node = (subject.fn_did, subject.hir_id);
+                let cause = self.declines.get(&node)?;
+                let candidate = self.by_subject.get(&node)?;
+                Some(format!(
+                    "{}\t{}\t{}\t{}\t{}\n",
+                    tcx.def_path_str(subject.fn_did.to_def_id()),
+                    subject.label,
+                    candidate.subject,
+                    cause.receipt(),
+                    candidate
+                        .sites
+                        .iter()
+                        .map(|site| site.contract.as_str())
+                        .collect::<Vec<_>>()
+                        .join(";"),
+                ))
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        let mut out = String::from("owner_path\tsubject\tsubject_key\treceipt\tcontract_sites\n");
+        out.extend(rows);
+        out
+    }
+
     pub(crate) fn select(
         &self,
         subject: &Subject,
@@ -342,7 +501,11 @@ impl CandidateIndex {
         model_kind: Option<SlotKind>,
         fat: &FatFacts,
     ) -> Selection {
-        let Some(candidate) = self.by_subject.get(&(subject.fn_did, subject.hir_id)) else {
+        let node = (subject.fn_did, subject.hir_id);
+        if let Some(cause) = self.declines.get(&node) {
+            return Selection::Keep(KeepReason::Declined(cause.clone()));
+        }
+        let Some(candidate) = self.by_subject.get(&node) else {
             return Selection::Keep(KeepReason::NoContractOperation);
         };
         let sites = candidate

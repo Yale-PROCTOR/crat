@@ -137,8 +137,74 @@ pub(crate) struct Promotion {
     pub sites: Vec<ContractSite>,
 }
 
+/// R397-6(b): why a contract candidate is DECLINED before selection.
+///
+/// A candidate that is never attempted withdraws no sibling, so every cause
+/// here is one whose terminal outcome is already fixed by the candidate's own
+/// pre-selection Slice-use facts; the ladder resumes at the thin-extent hold.
+/// Causes the plan stage decides later (class reverts, interface restoration,
+/// pair overlap) are NOT readable here and are not claimed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeclineCause {
+    /// A use of the subject that no slice form has an image for.
+    SliceUseUnsupported,
+    /// A raw use at a LOCAL callee argument: the slice-use adapter needs an
+    /// interface carrier there, and a zero-syntax carrier is unwired (10 of 10
+    /// corpus subjects with this shape reclassified at the third census).
+    LocalCalleeBoundary,
+    /// A raw use stored into a field: positive retention, always terminal.
+    FieldStore,
+    /// A raw use with no boundary that is neither a pointer distance, a copy
+    /// into a local, nor a discarded const view.
+    UnsupportedRawUse,
+}
+
+impl DeclineCause {
+    pub(crate) fn key(&self) -> &'static str {
+        match self {
+            Self::SliceUseUnsupported => "slice-use-unsupported",
+            Self::LocalCalleeBoundary => "local-callee-boundary",
+            Self::FieldStore => "field-store",
+            Self::UnsupportedRawUse => "unsupported-raw-use",
+        }
+    }
+
+    /// The typed receipt text.
+    pub(crate) fn receipt(&self) -> String {
+        format!("contract-candidate-declined:{}", self.key())
+    }
+}
+
+/// The candidate's own pre-selection Slice-use facts, summarized.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UseSummary {
+    pub unsupported: bool,
+    pub local_callee_boundary_uses: usize,
+    pub field_store_uses: usize,
+    pub unsupported_raw_uses: usize,
+}
+
+/// The up-front decline. Pure; the first fixed cause in ladder order wins.
+pub(crate) fn decline(summary: &UseSummary) -> Option<DeclineCause> {
+    if summary.unsupported {
+        return Some(DeclineCause::SliceUseUnsupported);
+    }
+    if summary.local_callee_boundary_uses > 0 {
+        return Some(DeclineCause::LocalCalleeBoundary);
+    }
+    if summary.field_store_uses > 0 {
+        return Some(DeclineCause::FieldStore);
+    }
+    if summary.unsupported_raw_uses > 0 {
+        return Some(DeclineCause::UnsupportedRawUse);
+    }
+    None
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum KeepReason {
+    /// R397-6(b): declined before selection; the ladder resumes unchanged.
+    Declined(DeclineCause),
     ExistingForm,
     ModelNotRef,
     Depth,
@@ -257,4 +323,71 @@ pub(crate) fn select(
         length,
         sites,
     })
+}
+
+#[cfg(test)]
+mod decline_tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_summary_is_not_declined() {
+        assert_eq!(decline(&UseSummary::default()), None);
+    }
+
+    #[test]
+    fn each_fixed_cause_declines_with_its_own_typed_receipt() {
+        let cases = [
+            (
+                UseSummary {
+                    unsupported: true,
+                    ..Default::default()
+                },
+                DeclineCause::SliceUseUnsupported,
+                "contract-candidate-declined:slice-use-unsupported",
+            ),
+            (
+                UseSummary {
+                    local_callee_boundary_uses: 1,
+                    ..Default::default()
+                },
+                DeclineCause::LocalCalleeBoundary,
+                "contract-candidate-declined:local-callee-boundary",
+            ),
+            (
+                UseSummary {
+                    field_store_uses: 2,
+                    ..Default::default()
+                },
+                DeclineCause::FieldStore,
+                "contract-candidate-declined:field-store",
+            ),
+            (
+                UseSummary {
+                    unsupported_raw_uses: 1,
+                    ..Default::default()
+                },
+                DeclineCause::UnsupportedRawUse,
+                "contract-candidate-declined:unsupported-raw-use",
+            ),
+        ];
+        for (summary, cause, receipt) in cases {
+            let got = decline(&summary).expect("declined");
+            assert_eq!(got, cause, "{summary:?}");
+            assert_eq!(got.receipt(), receipt);
+        }
+    }
+
+    /// The ladder order: the use wall is reported before a boundary cause, so
+    /// a receipt never names a carrier problem on a subject that has no slice
+    /// image at all.
+    #[test]
+    fn the_use_wall_is_reported_first() {
+        let summary = UseSummary {
+            unsupported: true,
+            local_callee_boundary_uses: 3,
+            field_store_uses: 1,
+            unsupported_raw_uses: 1,
+        };
+        assert_eq!(decline(&summary), Some(DeclineCause::SliceUseUnsupported));
+    }
 }

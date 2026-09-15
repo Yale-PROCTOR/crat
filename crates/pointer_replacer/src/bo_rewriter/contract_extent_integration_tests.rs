@@ -414,3 +414,169 @@ fn ce_w09_non_length_and_identity_failures_remain_held() {
     "#;
     assert!(promotions(local_name).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// R397-6(b) — the up-front decline, and R395-2 at a contract-extent callee.
+// ---------------------------------------------------------------------------
+
+/// `from` is a NUL-terminated contract candidate that is ALSO handed to a
+/// local callee that RETAINS it. Attempted, the candidate reaches the
+/// slice-use adapter's local-callee site, finds positive retention there and
+/// terminally reclassifies (`slice-use-evidence-held`; brotli 3021 / 3022 /
+/// 3024 at the third census — 10 of 10 corpus contract candidates with a
+/// local-callee use reclassified, 0 delivered); the owner's family transaction
+/// then withdraws it. Declined up front, the candidate is never attempted: the
+/// subject keeps the thin-extent backstop instead of a terminal
+/// `slice-use-unsupported`, the typed receipt names the cause, and the sibling
+/// `to` is delivered with no transaction at all.
+const CE_D01_LOCAL_CALLEE_BOUNDARY: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+extern "C" {
+    fn strlen(s: *const i8) -> usize;
+}
+static mut SAVED: *const i8 = 0 as *const i8;
+unsafe fn keep(p: *const i8) {
+    SAVED = p;
+}
+pub unsafe fn ce_d01(to: *mut i8, from: *const i8) -> usize {
+    *to.offset(1) = 0;
+    keep(from);
+    strlen(from)
+}
+"#;
+
+#[test]
+fn ce_d01_local_callee_boundary_declines_the_candidate_up_front() {
+    let decisions = super::emit_tests::decisions_of(CE_D01_LOCAL_CALLEE_BOUNDARY);
+    let reason = |name: &str| {
+        decisions
+            .iter()
+            .find(|(subject, is_param, _)| subject == name && *is_param)
+            .map(|(_, _, reason)| reason.as_str())
+            .unwrap_or_else(|| panic!("no parameter {name}: {decisions:#?}"))
+    };
+    assert_eq!(
+        reason("from"),
+        "held:thin-extent",
+        "a declined candidate resumes the ladder at the thin-extent backstop: {decisions:#?}"
+    );
+    assert_eq!(reason("to"), "<emitted>", "{decisions:#?}");
+    let super::RewriteOutcome::Emitted {
+        raw_boundary_artifacts,
+        source,
+        ..
+    } = super::rewrite_m1(CE_D01_LOCAL_CALLEE_BOUNDARY)
+    else {
+        panic!("CE-D01 must emit");
+    };
+    let declines = &raw_boundary_artifacts.contract_candidate_declines;
+    let rows = declines.lines().skip(1).collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "exactly one declined candidate: {declines}");
+    assert!(
+        rows[0].starts_with("ce_d01\tce_d01::from\t")
+            && rows[0].contains("\tcontract-candidate-declined:local-callee-boundary\t")
+            && rows[0].ends_with("\tstrlen:pinned-libc-0.2.184:0:nul-terminated"),
+        "the typed receipt names the subject, the cause and the contract: {declines}"
+    );
+    // Never attempted: no family transaction touches the owner.
+    assert!(
+        raw_boundary_artifacts
+            .additive_family_receipts
+            .iter()
+            .all(|receipt| receipt.owner_path != "ce_d01"),
+        "{:#?}",
+        raw_boundary_artifacts.additive_family_receipts
+    );
+    assert!(source.contains("to: &mut [i8]"), "{source}");
+    assert!(source.contains("from: *const i8"), "{source}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// The lil shape (third census, `lil_find_var::name#3` → `lil_find_local_var::
+/// name#3`): the callee's parameter is promoted to a contract-extent slice
+/// because `strcmp` reads it to the NUL, and the caller's THIN `&i8` was then
+/// widened into it with `core::slice::from_ref` — one element of provenance
+/// handed to a NUL-terminated read through `as_ptr()`. R395-2 forbids exactly
+/// that widening; the caller is held as fix-2 holds a caller of a body-indexing
+/// parameter, and the callee's raw wrapper takes the pointer's full provenance
+/// under the slice-extent waiver instead.
+const CE_D02_CALLER_THIN: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+extern "C" {
+    fn strcmp(a: *const i8, b: *const i8) -> i32;
+}
+unsafe fn find_local(name: *const i8) -> i32 {
+    strcmp(name, b"x\0".as_ptr() as *const i8)
+}
+pub unsafe fn find(name: *const i8) -> i32 {
+    find_local(name)
+}
+"#;
+
+#[test]
+fn ce_d02_a_thin_caller_argument_is_held_instead_of_widened_into_the_contract_slice() {
+    let decisions = super::emit_tests::decisions_of(CE_D02_CALLER_THIN);
+    let reason = |name: &str| {
+        decisions
+            .iter()
+            .find(|(subject, is_param, _)| subject == name && *is_param)
+            .map(|(_, _, reason)| reason.as_str())
+            .unwrap_or_else(|| panic!("no parameter {name}: {decisions:#?}"))
+    };
+    // Both parameters are named `name`; the callee's is decided first in
+    // source order, so distinguish by position in the artifact rows.
+    let names = decisions
+        .iter()
+        .filter(|(subject, is_param, _)| subject == "name" && *is_param)
+        .map(|(_, _, reason)| reason.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names.len(), 2, "{decisions:#?}");
+    let _ = reason;
+    assert!(
+        names.contains(&"<emitted>"),
+        "the callee's contract slice is delivered: {decisions:#?}"
+    );
+    assert!(
+        names.contains(&"held:local-callee-access-extent"),
+        "the caller's thin argument is held, not widened: {decisions:#?}"
+    );
+    let detail = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(CE_D02_CALLER_THIN),
+        |tcx| {
+            let table = super::decide_table(tcx)?;
+            Ok::<_, String>(
+                table
+                    .entries
+                    .iter()
+                    .filter_map(|(_, decision)| match decision {
+                        super::decision::Decision::Degraded(record) => Some(record.reason.detail()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        },
+    )
+    .expect("CE-D02 fixture compiles")
+    .expect("CE-D02 decision table");
+    assert!(
+        detail.iter().any(|detail| {
+            detail.starts_with("find_local:name:read:foreign-contract:")
+                && detail.contains("strcmp")
+        }),
+        "the hold names the callee, the parameter and the foreign contract: {detail:#?}"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(CE_D02_CALLER_THIN)
+    else {
+        panic!("CE-D02 must emit");
+    };
+    assert!(
+        !source.contains("from_ref(name)") && !source.contains("from_mut(name)"),
+        "no thin reference is widened at the local callee:\n{source}"
+    );
+    assert!(
+        source.contains("core::slice::from_raw_parts(name, crate::FALLBACK_SLICE_EXTENT)"),
+        "the callee's raw wrapper carries the pointer's own provenance:\n{source}"
+    );
+    assert!(source.contains("strcmp(name.as_ptr()"), "{source}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
