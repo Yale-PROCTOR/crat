@@ -393,6 +393,26 @@ fn test_expr_closure() {
 }
 
 #[test]
+fn test_expr_async_block() {
+    run_test(
+        "
+        fn f() {
+            let _future = async { 1 };
+        }",
+    )
+}
+
+#[test]
+fn test_expr_await() {
+    run_test(
+        "
+        fn f() {
+            let _future = async { core::future::ready(1).await };
+        }",
+    )
+}
+
+#[test]
 fn test_expr_assign() {
     run_test(
         "

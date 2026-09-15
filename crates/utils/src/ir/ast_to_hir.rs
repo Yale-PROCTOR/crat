@@ -709,8 +709,24 @@ impl<'tcx> AstToHirMapper<'tcx> {
                 assert_eq!(*label, hlabel);
                 self.map_block_to_block(block, hblock);
             }
-            ExprKind::Gen(..) => todo!(),
-            ExprKind::Await(..) => todo!(),
+            ExprKind::Gen(_, block, ..) => {
+                let hir::ExprKind::Closure(hir::Closure { def_id, body, .. }) = hexpr.kind else {
+                    panic!()
+                };
+                self.add_global(&mut expr.id, *def_id);
+                let body = self.tcx.hir_body(*body);
+                let hir::ExprKind::Block(hblock, None) = body.value.kind else { panic!() };
+                self.map_block_to_block(block, hblock);
+            }
+            ExprKind::Await(awaited, _) => {
+                let hir::ExprKind::Match(into_future, _, hir::MatchSource::AwaitDesugar) =
+                    hexpr.kind
+                else {
+                    panic!()
+                };
+                let hir::ExprKind::Call(_, [hawaited]) = into_future.kind else { panic!() };
+                self.map_expr_to_expr(awaited, hawaited);
+            }
             ExprKind::Use(expr, _) => {
                 let hir::ExprKind::Use(hexpr, _) = hexpr.kind else { panic!() };
                 self.map_expr_to_expr(expr, hexpr);
