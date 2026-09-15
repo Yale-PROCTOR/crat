@@ -484,10 +484,25 @@ pub(crate) fn count_argument<'tcx>(
     tcx: TyCtxt<'tcx>,
     table: &super::DecisionTable,
     site: &super::emitability::CallSite,
+    callee: LocalDefId,
     c: &Contract,
     arg_index: usize,
 ) -> Result<String, super::seam::SeamBlock> {
     use super::seam::SeamBlock;
+    // Two byte views at one call may cover overlapping bytes: a program-defined
+    // byte loop (unlike libc `memcpy`) is defined on overlap, so overlap is not
+    // the input's fault, and one raw access under a live view is as forbidden
+    // as two views. Without a disjointness proof, a call bridges one position
+    // at most; a read+write callee therefore holds at every call.
+    if site
+        .args
+        .iter()
+        .filter(|argument| contract_at(table, callee, argument.index).is_some())
+        .count()
+        > 1
+    {
+        return Err(SeamBlock::SiteOverlap);
+    }
     let body = tcx.hir_body_owned_by(site.caller).value;
     let Some(ExprKind::Call(_, args)) =
         find_expr(body, site.span).map(|call| strip_casts(call).kind)

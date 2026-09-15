@@ -258,17 +258,17 @@ fn w6v_adapter_preserves_a_count_named_like_its_pointer_temporary() {
 }
 
 #[test]
-fn w6v_addressed_pointer_storage_is_snapshotted_before_the_view() {
-    // The copy destination is the source pointer's own storage: both pointer
-    // values are captured before either view exists, so the copy sees the
-    // original source bytes and writes them over the pointer variable.
+fn w6v_addressed_pointer_storage_copy_holds_and_keeps_its_meaning() {
+    // The copy destination is the source pointer's own storage. A copy call
+    // bridges no position (two counted positions at one call), so the input's
+    // meaning is kept exactly; the runtime check pins that.
     let helper = format!(
         "{COPY}\npub unsafe fn copy_pointer_storage() -> u8 {{ let data=[7u8;8]; let mut src: *const core::ffi::c_void=data.as_ptr().cast(); let dst: *mut core::ffi::c_void=&raw mut src as *mut *const core::ffi::c_void as *mut core::ffi::c_void; lodepng_memcpy(dst,src,1); (src as usize & 0xff) as u8 }}"
     );
-    let emitted = check(&helper, &["dst", "src"]);
+    let emitted = super::emit_tests::ast_emitted_source_of(&helper).unwrap();
     assert!(
-        compact(&emitted).contains(")(dst,src,1)"),
-        "both pointer values precede the views: {emitted}"
+        !emitted.contains("dst: &mut [") && !emitted.contains("src: &[u8]"),
+        "no view at a two-position copy: {emitted}"
     );
     let main = r#"fn main() { unsafe { println!("{}", copy_pointer_storage()); } }"#;
     let original = run_binary(&format!("{helper}\n{main}"));
@@ -417,19 +417,65 @@ fn w6v_make_table_static_times_size_of_count_delivers() {
     );
 }
 
+/// Typed family-site withdrawal causes of a fixture (the seam block that
+/// withdrew a declaration), as the census receipts carry them.
+fn withdrawals_of(input: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx(tcx).expect("fixture yields a decision table");
+        format!("{:#?}", ctx.raw_boundary_artifacts.additive_family_receipts)
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("unsatisfied-family-site"))
+            .map(str::to_owned)
+            .collect()
+    })
+    .expect("fixture compiles")
+}
+
+/// The copy shape at a real call: two counted positions at one call may cover
+/// overlapping bytes, so the call holds typed and BOTH callee parameters stay
+/// raw (no disjointness proof exists at this site or at lodepng's LZ77 sites).
 #[test]
-fn w6v_bpm_sort_size_of_times_num_count_delivers() {
+fn w6v_bpm_sort_two_counted_positions_hold_as_site_overlap() {
     let input = format!("{COPY64}{BPM_SORT}");
-    let source = check(&input, &["dst", "src"]);
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
     assert!(
-        source.contains("src: &[u8]"),
-        "shared byte declaration: {source}"
+        !source.contains("dst: &mut [") && !source.contains("src: &[u8]"),
+        "a read+write byte callee keeps raw parameters at a real call: {source}"
     );
+    assert!(super::verify::type_checks_str(&source));
+    let withdrawals = withdrawals_of(&input);
+    assert!(
+        withdrawals
+            .iter()
+            .any(|line| line.contains("seam-site-overlap")),
+        "typed hold at the copy call: {withdrawals:?}"
+    );
+}
+
+/// The `size_of::<T>() * n` operand order (R397-4), receipted at a
+/// single-pointer callee with the `bpmnode_sort` count expression.
+#[test]
+fn w6v_size_of_times_num_count_form_is_receipted() {
+    let input = format!(
+        "{FILL64}{}",
+        BPM_SORT
+            .replace("unsafe fn bpmnode_sort", "unsafe fn bpmnode_clear")
+            .replace(
+                "lodepng_memcpy(leaves as *mut core::ffi::c_void,\n            mem as *const core::ffi::c_void,",
+                "lodepng_memset(leaves as *mut core::ffi::c_void, 0 as i32,"
+            )
+    );
+    assert!(
+        input.contains("lodepng_memset(leaves"),
+        "fixture rewrite applied: {input}"
+    );
+    check(&input, &["dst"]);
     let forms = count_forms_of(&input);
     assert!(
         forms
             .iter()
-            .any(|(owner, form)| owner.ends_with("bpmnode_sort")
+            .any(|(owner, form)| owner.ends_with("bpmnode_clear")
                 && form == "elements:num*size_of::<BPMNode>"),
         "typed element-count receipt: {forms:?}"
     );
@@ -477,7 +523,7 @@ fn w6v_make_table_runtime_matches_original() {
 #[test]
 fn w6v_bpm_sort_runtime_matches_original() {
     let helper = format!("{COPY64}{BPM_SORT}");
-    let emitted = check(&helper, &["dst", "src"]);
+    let emitted = super::emit_tests::ast_emitted_source_of(&helper).unwrap();
     let main = r#"fn main() { unsafe {
         let mut leaves = [BPMNode { weight: 0, index: 0, tail: core::ptr::null_mut(), in_use: 0 }; 3];
         for (i, l) in leaves.iter_mut().enumerate() { l.weight = i as i32 * 10; l.index = i as u32; }
@@ -541,4 +587,40 @@ fn w6v_filter_local_array_destination_delivers() {
     let original = run_binary(&format!("{helper}\n{main}"));
     assert_eq!(original, b"1000\n".to_vec());
     assert_eq!(original, run_binary(&format!("{emitted}\n{main}")));
+}
+
+/// rs-crown/lodepng `inflateHuffmanBlock` (sites 2409/2428): a back-reference
+/// copy INSIDE one buffer. The destination and source ranges may overlap
+/// (`distance < length`), which the original byte loop handles by design; two
+/// live safe views over overlapping bytes are never emitted (R395-2), so this
+/// call must hold and the callee keeps its raw parameters.
+const INFLATE_BACKREF: &str = r#"
+#[repr(C)]
+pub struct ucvector { pub data: *mut u8, pub size: u64, pub allocsize: u64 }
+unsafe fn inflateHuffmanBlock(mut out: *mut ucvector, mut start: u64, mut backward: u64, mut length: u64) {
+    lodepng_memcpy(((*out).data).offset(start as isize) as *mut core::ffi::c_void,
+        ((*out).data).offset(backward as isize) as *const core::ffi::c_void, length);
+}
+"#;
+
+#[test]
+fn w6v_overlapping_self_copy_never_forms_two_views() {
+    let helper = format!("{COPY64}{INFLATE_BACKREF}");
+    let source = super::emit_tests::ast_emitted_source_of(&helper).unwrap();
+    assert!(
+        !(source.contains("dst: &mut [") && source.contains("src: &[u8]")),
+        "a copy within one buffer may overlap; two live views are forbidden: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+    // The byte loop itself stays exactly as the input wrote it (forward,
+    // element by element), so overlapping windows keep their C meaning.
+    let main = r#"fn main() { unsafe {
+        let mut bytes = [1u8, 2, 3, 0, 0, 0, 0, 0];
+        let mut v = ucvector { data: bytes.as_mut_ptr(), size: 8, allocsize: 8 };
+        inflateHuffmanBlock(&mut v, 3, 0, 5);
+        println!("{:?}", bytes);
+    }}"#;
+    let original = run_binary(&format!("{helper}\n{main}"));
+    assert_eq!(original, b"[1, 2, 3, 1, 2, 3, 1, 2]\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{main}")));
 }

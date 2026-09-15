@@ -4166,7 +4166,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                     Form::Slice { .. } | Form::Opt { slice: true, .. }
                 ) && !pos.literal_null;
                 let counted_len = counted.map(|contract| {
-                    super::counted_void::count_argument(tcx, table, site, contract, pos.index)
+                    super::counted_void::count_argument(
+                        tcx, table, site, *callee, contract, pos.index,
+                    )
                 });
                 if let Some(Err(block)) = counted_len {
                     candidates.push(Err(block));
