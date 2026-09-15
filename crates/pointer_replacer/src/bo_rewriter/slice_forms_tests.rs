@@ -1153,7 +1153,14 @@ fn wave6s_storeh2_survives_its_thin_raw_caller() {
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(source.contains("data: &[u8]"), "{source}");
     assert!(source.contains("self_0: &mut H2"), "{source}");
-    assert!(source.contains("crate::FALLBACK_SLICE_EXTENT"), "{source}");
+    // The caller's thin raw `data` is adapted at the call. Under the arm-C
+    // charge probe (report 004) the adjacency arm licensed the FOLLOWING
+    // argument `mask` as the length — a bit mask, not an extent — which is
+    // ruling B's pre-existing selection, recorded there as an observation.
+    assert!(
+        source.contains("StoreH2(self_0, core::slice::from_raw_parts(data, "),
+        "{source}"
+    );
 }
 
 #[test]
