@@ -339,9 +339,45 @@ fn peel<'tcx>(
     }
     Ok(expression)
 }
+/// A reference to static data: a literal, or a `transmute` of one.
+fn static_reference(
+    tcx: TyCtxt<'_>,
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    expression: &Expr<'_>,
+) -> bool {
+    match expression.kind {
+        ExprKind::Lit(_) => true,
+        ExprKind::Call(callee, [argument]) => {
+            let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return false };
+            let Res::Def(_, did) = path.res else { return false };
+            tcx.item_name(did).as_str() == "transmute"
+                && matches!(typeck.expr_ty(argument).kind(), TyKind::Ref(..))
+                && static_reference(tcx, typeck, argument)
+        }
+        _ => false,
+    }
+}
 fn root_path(expression: &Expr<'_>, binding: HirId) -> bool {
     matches!(expression.kind, ExprKind::Path(QPath::Resolved(_, path))
         if path.res == Res::Local(binding))
+}
+/// `expression` names a local bound by `let a = root.offset(start)` — the
+/// shape the view-alias permit admits (its start and uses are checked there).
+fn view_alias_of(
+    tcx: TyCtxt<'_>,
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    expression: &Expr<'_>,
+    binding: HirId,
+) -> bool {
+    let ExprKind::Path(QPath::Resolved(_, path)) = expression.kind else { return false };
+    let Res::Local(alias) = path.res else { return false };
+    let Node::LetStmt(local) = tcx.parent_hir_node(alias) else { return false };
+    let Some(init) = local.init else { return false };
+    let ExprKind::MethodCall(_, receiver, [_], _) = init.kind else { return false };
+    root_path(receiver, binding)
+        && typeck
+            .type_dependent_def_id(init.hir_id)
+            .is_some_and(|did| tcx.item_name(did).as_str() == "offset")
 }
 /// The raw-pointer locals reachable from `seeds` through plain copies and
 /// pointer-to-pointer casts (both directions), a must-alias set.
@@ -540,25 +576,39 @@ pub(crate) fn derive<'tcx>(
     expressions.visit_body(tcx.hir_body(body_id));
     // F04 (R350-4): an aggregate owner is admitted only when the source
     // supplies every field through the root before anything reads it — the
-    // spelled zero literal is then a placeholder the program overwrites.
+    // spelled zero literal is then a placeholder the program overwrites. A
+    // whole-element store (`*root = v`, `*root.offset(k) = v`, or the same
+    // through a view alias of the root) supplies every field at once.
     if let TyKind::Adt(def, _) = element.kind() {
-        let supplied: BTreeSet<_> = expressions
-            .0
-            .iter()
-            .filter_map(|e| {
-                let ExprKind::Assign(lhs, _, _) = e.kind else { return None };
-                let ExprKind::Field(base, ident) = lhs.kind else { return None };
-                let ExprKind::Unary(rustc_hir::UnOp::Deref, operand) = base.kind else {
-                    return None;
-                };
-                root_path(operand, binding).then_some(ident.name)
-            })
-            .collect();
-        if def
-            .non_enum_variant()
-            .fields
-            .iter()
-            .any(|field| !supplied.contains(&field.name))
+        let mut supplied = BTreeSet::new();
+        let mut whole = false;
+        for e in &expressions.0 {
+            let ExprKind::Assign(lhs, _, _) = e.kind else { continue };
+            match lhs.kind {
+                ExprKind::Field(base, ident) => {
+                    if let ExprKind::Unary(rustc_hir::UnOp::Deref, operand) = base.kind
+                        && root_path(operand, binding)
+                    {
+                        supplied.insert(ident.name);
+                    }
+                }
+                ExprKind::Unary(rustc_hir::UnOp::Deref, operand) => {
+                    let place = match operand.kind {
+                        ExprKind::MethodCall(_, receiver, [_], _) => receiver,
+                        _ => operand,
+                    };
+                    whole |=
+                        root_path(place, binding) || view_alias_of(tcx, typeck, place, binding);
+                }
+                _ => {}
+            }
+        }
+        if !whole
+            && def
+                .non_enum_variant()
+                .fields
+                .iter()
+                .any(|field| !supplied.contains(&field.name))
         {
             return Err(SourceHold::Missing("native-aggregate-fields-supplied"));
         }
@@ -566,13 +616,15 @@ pub(crate) fn derive<'tcx>(
     // Whole-caller reference/closure absence is a deliberately narrow scope.
     // Merely recognizing the scalar deref nested inside &*root is not enough.
     // A string / byte-string literal is a `&'static` reference to static
-    // data (the corpus's assertion messages); it cannot alias the owner.
+    // data (the corpus's assertion messages), and so is a `transmute` of one
+    // (the corpus's `__PRETTY_FUNCTION__` spelling); neither can alias the
+    // owner.
     if expressions.0.iter().any(|e| {
         matches!(
             e.kind,
             ExprKind::AddrOf(..) | ExprKind::Closure(..) | ExprKind::InlineAsm(..)
         ) || (matches!(typeck.expr_ty(e).kind(), TyKind::Ref(..))
-            && !matches!(e.kind, ExprKind::Lit(_)))
+            && !static_reference(tcx, typeck, e))
     }) {
         return Err(SourceHold::UnsupportedOwnerUse);
     }

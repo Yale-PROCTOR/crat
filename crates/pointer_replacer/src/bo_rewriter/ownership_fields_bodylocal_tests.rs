@@ -379,6 +379,33 @@ pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
         }
     })
     .unwrap();
+    // A sized owner's `(*img)` reads through the Box unchanged: the plan
+    // carries no access edit whose text equals the source (such an edit only
+    // claimed the interval and collided with a call bridge composed over the
+    // same `memcpy` argument on batch 8's line — main 035).
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("img"))
+            .unwrap();
+        let Decision::Box(plan) = decision else { panic!("{decision:?}") };
+        let access: Vec<_> = plan
+            .expr_edits
+            .iter()
+            .filter(|e| e.receipt == "native-box-slice-access")
+            .collect();
+        assert!(access.is_empty(), "{access:?}");
+    })
+    .unwrap();
     // The census (AST) path must graft the struct-literal constructor too.
     let outcome = super::rewrite_core_injected(
         ::utils::compilation::str_to_input(&input),
@@ -1584,6 +1611,141 @@ fn r407_view_alias_start_must_be_pure() {
     );
     assert!(s.contains("row[1]=9;"), "{s}");
 }
+
+#[test]
+fn r407_real_horizon_scan_hull_buffer_struct_view_alias() {
+    // The verbatim corpus `horizon_scan` tail (`hull_buffer#242`): a
+    // `malloc(sizeof(kmVec3) * pathlen * nsweeps)` owner of `kmVec3` values
+    // (repr(C), rule E's zero), one per-sweep alias
+    // `convex_hull = hull_buffer.offset(sweep * pathlen)` written and read
+    // as `*convex_hull.offset(k)` (struct values by copy, some as arguments
+    // of local callees), freed at the end. The function's raw parameters
+    // and the other raw locals are the class siblings.
+    let input = format!(
+        r#"{}
+extern "C" {{ fn __assert_fail(a: *const libc::c_char, f: *const libc::c_char, l: libc::c_uint, fun: *const libc::c_char) -> !; fn heman_image_texel(img: *mut heman_image, x: libc::c_int, y: libc::c_int) -> *mut libc::c_float; }}
+#[repr(C)] #[derive(Copy, Clone)] pub struct heman_image_s {{ pub width: libc::c_int, pub height: libc::c_int, pub nbands: libc::c_int, pub data: *mut libc::c_float }}
+pub type heman_image = heman_image_s;
+#[derive(Copy, Clone)] #[repr(C)] pub struct kmVec3 {{ pub x: libc::c_float, pub y: libc::c_float, pub z: libc::c_float }}
+static mut _occlusion_scale: libc::c_float = 1.0f32;
+unsafe extern "C" fn azimuth_slope(mut a: kmVec3, mut b: kmVec3) -> libc::c_float {{ (b.z - a.z) / ((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y)) }}
+unsafe extern "C" fn compute_occlusion(mut thispt: kmVec3, mut horizonpt: kmVec3) -> libc::c_float {{ horizonpt.z - thispt.z }}
+{}"#,
+        c_declarations().replace("pub mod libc { pub use core::ffi::c_int;", "pub mod libc { pub use core::ffi::c_char; pub use core::ffi::c_uint; pub use core::ffi::c_int;"),
+        HORIZON_SCAN_BODY
+    );
+    let s = verify(&input, "hull_buffer", BoxShape::Slice, false);
+    assert!(
+        s.contains("let mut hull_buffer: ::std::boxed::Box<[crate::kmVec3]> = ::std::vec![crate::kmVec3 { x: 0.0f32, y: 0.0f32, z: 0.0f32 };"),
+        "{s}"
+    );
+    assert!(
+        s.contains("let mut convex_hull: &mut [crate::kmVec3] = &mut (*(hull_buffer))[((sweep * pathlen) as isize) as usize..];"),
+        "{s}"
+    );
+    assert!(
+        s.contains("convex_hull[(0 as libc::c_int) as usize] = thispt;"),
+        "{s}"
+    );
+    assert!(
+        s.contains("horizonpt = convex_hull[(fresh4) as usize];"),
+        "{s}"
+    );
+    assert!(s.contains("::std::mem::drop(hull_buffer);"), "{s}");
+}
+
+const HORIZON_SCAN_BODY: &str = r#"unsafe extern "C" fn horizon_scan(mut heightmap: *mut heman_image, mut result: *mut heman_image, mut startpts: *mut libc::c_int, mut nsweeps: libc::c_int, mut pathlen: libc::c_int, mut dx: libc::c_int, mut dy: libc::c_int) {
+    let mut w = (*heightmap).width;
+    let mut h = (*heightmap).height;
+    let mut cellw = _occlusion_scale / (if w > h { w } else { h }) as libc::c_float;
+    let mut cellh = _occlusion_scale / (if w > h { w } else { h }) as libc::c_float;
+    let mut hull_buffer = malloc(
+        (::std::mem::size_of::<kmVec3>() as libc::c_ulong)
+            .wrapping_mul(pathlen as libc::c_ulong)
+            .wrapping_mul(nsweeps as libc::c_ulong),
+    ) as *mut kmVec3;
+    let mut sweep: libc::c_int = 0;
+    sweep = 0 as libc::c_int;
+    while sweep < nsweeps {
+        let mut convex_hull = hull_buffer.offset((sweep * pathlen) as isize);
+        let mut p_0 = startpts.offset((sweep * 2 as libc::c_int) as isize);
+        let mut i_0 = *p_0.offset(0 as libc::c_int as isize);
+        let mut j_0 = *p_0.offset(1 as libc::c_int as isize);
+        let mut thispt = kmVec3 { x: 0., y: 0., z: 0. };
+        let mut horizonpt = kmVec3 { x: 0., y: 0., z: 0. };
+        thispt.x = i_0 as libc::c_float * cellw;
+        thispt.y = j_0 as libc::c_float * cellh;
+        thispt
+            .z = *heman_image_texel(
+            heightmap,
+            if 0 as libc::c_int
+                > (if w - 1 as libc::c_int > i_0 { i_0 } else { w - 1 as libc::c_int })
+            {
+                0 as libc::c_int
+            } else if w - 1 as libc::c_int > i_0 {
+                i_0
+            } else {
+                w - 1 as libc::c_int
+            },
+            if 0 as libc::c_int
+                > (if h - 1 as libc::c_int > j_0 { j_0 } else { h - 1 as libc::c_int })
+            {
+                0 as libc::c_int
+            } else if h - 1 as libc::c_int > j_0 {
+                j_0
+            } else {
+                h - 1 as libc::c_int
+            },
+        );
+        let mut stack_top = 0 as libc::c_int;
+        *convex_hull.offset(0 as libc::c_int as isize) = thispt;
+        i_0 += dx;
+        j_0 += dy;
+        while i_0 >= 0 as libc::c_int && i_0 < w && j_0 >= 0 as libc::c_int && j_0 < h {
+            thispt.x = i_0 as libc::c_float * cellw;
+            thispt.y = j_0 as libc::c_float * cellh;
+            thispt.z = *heman_image_texel(heightmap, i_0, j_0);
+            while stack_top > 0 as libc::c_int {
+                let mut s1 = azimuth_slope(
+                    thispt,
+                    *convex_hull.offset(stack_top as isize),
+                );
+                let mut s2 = azimuth_slope(
+                    thispt,
+                    *convex_hull.offset((stack_top - 1 as libc::c_int) as isize),
+                );
+                if s1 >= s2 {
+                    break;
+                }
+                stack_top -= 1;
+            }
+            let fresh4 = stack_top;
+            stack_top = stack_top + 1;
+            horizonpt = *convex_hull.offset(fresh4 as isize);
+            if stack_top < pathlen {} else {
+                __assert_fail(
+                    b"stack_top < pathlen\0" as *const u8 as *const libc::c_char,
+                    b"../src/lighting.c\0" as *const u8 as *const libc::c_char,
+                    213 as libc::c_int as libc::c_uint,
+                    (*::std::mem::transmute::<
+                        &[u8; 65],
+                        &[libc::c_char; 65],
+                    >(
+                        b"void horizon_scan(heman_image *, heman_image *, int *, int, int)\0",
+                    ))
+                        .as_ptr(),
+                );
+            }
+            *convex_hull.offset(stack_top as isize) = thispt;
+            let mut occlusion = compute_occlusion(thispt, horizonpt);
+            *heman_image_texel(result, i_0, j_0) += 1.0f32 / 16.0f32 * occlusion;
+            i_0 += dx;
+            j_0 += dy;
+        }
+        sweep += 1;
+    }
+    free(hull_buffer as *mut libc::c_void);
+}"#;
 
 const TRANSFORM_TO_DISTANCE_BODY: &str = r#"unsafe extern "C" fn transform_to_distance(mut sdf:
         *mut heman_image) {
