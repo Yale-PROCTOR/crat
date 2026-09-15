@@ -24701,12 +24701,12 @@ fn raw_boundary_wave2_corpus_census() {
     let current_adapters = raw_boundary_program_artifacts(&ledger_dir, "raw-boundary-adapters.tsv")
         .expect("read current adapter receipts");
     let mut observed_pair_sites = BTreeSet::new();
-    // wave-6p (R400-4): a controlled site whose verdict moved to `clear` on a
-    // pair-disjointness CERTIFICATE is a retirement by evidence, not a moved
-    // verdict. It is accepted only when its `a5_peer_proofs` receipt carries
-    // the certificate family AND the retirement control lists the site
-    // `delivered-safe` AND the parameter is in fact delivered (the class check
-    // below); anything else stays a divergence.
+    // wave-6p (R400-4 / R406-2): a controlled site whose verdict moved to
+    // `clear` on a pair-disjointness CERTIFICATE is a retirement by evidence,
+    // not a moved verdict. It is accepted only when its `a5_peer_proofs`
+    // receipt carries the certificate family AND the retirement control lists
+    // the site with its measured class AND the class check below agrees;
+    // anything else stays a divergence.
     let mut certified_pair_sites = BTreeSet::new();
     for (program, text) in current_adapters {
         for row in named_tsv_rows(&text) {
@@ -24775,11 +24775,12 @@ fn raw_boundary_wave2_corpus_census() {
         if observed == expected {
             continue;
         }
+        // R406-2 (general form): a certified `clear` is accepted iff the
+        // retirement control lists the site — ANY class — and the class check
+        // below agrees with the measured class. Every moved site is declared.
         let certified_clear = observed == "clear"
             && certified_pair_sites.contains(&(program.clone(), key.clone()))
-            && retirement_rows
-                .get(&(program.clone(), key.clone()))
-                .is_some_and(|(_, class, _)| class == "delivered-safe");
+            && retirement_rows.contains_key(&(program.clone(), key.clone()));
         if observed != "missing" && !certified_clear {
             pair_divergences.push_str(&format!(
                 "{program}\t{key}\tpair-site-verdict-moved:{expected}\t{observed}\n"
