@@ -333,6 +333,77 @@ pub(crate) fn position_is_descendant_free(
     )
 }
 
+/// The returned-alias continuation at ONE call site: a callee position whose
+/// only retention is returning the parameter retains nothing beyond a call
+/// whose result the caller discards. The retention row itself is untouched
+/// (a caller that keeps the result keeps the sink); the site's effective
+/// verdict becomes a no-retain certificate that names the discarded return.
+pub(crate) fn site_retention(
+    retention: &super::decision::raw_boundary::RetentionSummaries,
+    caller: LocalDefId,
+    key: &super::decision::raw_boundary::RawBoundarySiteKey,
+    callee: LocalDefId,
+) -> Option<RetentionVerdict> {
+    use super::decision::raw_boundary::{RetentionCertificate, RetentionEventKind, RetentionStep};
+    let base = retention.get(callee, key.argument_index)?;
+    let RetentionVerdict::Retains { sink, path } = base else {
+        return Some(base.clone());
+    };
+    let return_only = sink.kind == RetentionEventKind::Return
+        && path
+            .iter()
+            .all(|step| step.kind == RetentionEventKind::Return);
+    if !return_only {
+        return Some(base.clone());
+    }
+    match retention.type_backed_child_access(caller, key) {
+        Some(ChildAccess::Unused) => Some(RetentionVerdict::NoRetain {
+            certificate: RetentionCertificate {
+                function: key.callee.path.clone(),
+                argument_index: key.argument_index,
+                steps: vec![
+                    sink.clone(),
+                    RetentionStep {
+                        location: format!("bb{}:s{}", key.block, key.statement_index),
+                        kind: RetentionEventKind::KnownNoRetainCall,
+                        detail: RETURNED_ALIAS_DISCARDED.to_owned(),
+                    },
+                ],
+                attestation: "closed_world_frozen_graph",
+            },
+        }),
+        _ => Some(base.clone()),
+    }
+}
+
+pub(crate) const RETURNED_ALIAS_DISCARDED: &str = "returned-alias-discarded";
+
+/// Certificate replay for a site: a site certificate (its last step is the
+/// discarded-return marker) is re-derived from the callee's row and the
+/// caller's child record and must be equal; every other certificate is the
+/// callee row's and replays through the collector's own check.
+pub(crate) fn verify_certificate(
+    retention: &super::decision::raw_boundary::RetentionSummaries,
+    caller: LocalDefId,
+    key: &super::decision::raw_boundary::RawBoundarySiteKey,
+    callee: LocalDefId,
+    certificate: &super::decision::raw_boundary::RetentionCertificate,
+) -> Result<(), &'static str> {
+    if certificate
+        .steps
+        .last()
+        .is_some_and(|step| step.detail == RETURNED_ALIAS_DISCARDED)
+    {
+        return match site_retention(retention, caller, key, callee) {
+            Some(RetentionVerdict::NoRetain {
+                certificate: expected,
+            }) if &expected == certificate => Ok(()),
+            _ => Err("retention-certificate-invalid"),
+        };
+    }
+    retention.verify_certificate(callee, key.argument_index, certificate)
+}
+
 /// Rewrite the type-backed records whose callee position is descendant-free.
 /// The retention rows are the same summaries the raw-boundary disposition
 /// consumes; nothing is re-derived.

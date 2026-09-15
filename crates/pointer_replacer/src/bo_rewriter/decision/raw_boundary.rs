@@ -2900,13 +2900,15 @@ impl RawBoundaryDispositionIndex {
                             let foster_immutable = !mut_facts.is_defaulted(callee, local)
                                 && !mut_facts.is_mutable(callee, local);
                             (
-                                retention
-                                    .get(callee, site.key.argument_index)
-                                    .cloned()
-                                    .unwrap_or(RetentionVerdict::Unknown {
+                                crate::bo_rewriter::wave6r_child_access::site_retention(
+                                    retention, node.0, &site.key, callee,
+                                )
+                                .unwrap_or(
+                                    RetentionVerdict::Unknown {
                                         reason: RetentionUnknownReason::LocalSummaryUnknown,
                                         frontier: Vec::new(),
-                                    }),
+                                    },
+                                ),
                                 None,
                                 foster_immutable.then_some(NegativeWriteEvidence::FosterImmutable),
                                 format!(
@@ -3130,13 +3132,14 @@ impl RawBoundaryDispositionIndex {
                         RetentionVerdict::NoRetain { certificate } => {
                             let certificate_started = std::time::Instant::now();
                             let certificate_invalid = site.callee_local.is_some()
-                                && retention
-                                    .verify_certificate(
-                                        site.callee_local.expect("local"),
-                                        site.key.argument_index,
-                                        &certificate,
-                                    )
-                                    .is_err();
+                                && crate::bo_rewriter::wave6r_child_access::verify_certificate(
+                                    retention,
+                                    node.0,
+                                    &site.key,
+                                    site.callee_local.expect("local"),
+                                    &certificate,
+                                )
+                                .is_err();
                             certificate_replay_wall_s +=
                                 certificate_started.elapsed().as_secs_f64();
                             if certificate_invalid {

@@ -409,3 +409,6 @@ mod wave6r_child_access_tests;
 
 #[path = "wave6r_url_tests.rs"]
 mod wave6r_url_tests;
+
+#[path = "wave6r_returned_alias_tests.rs"]
+mod wave6r_returned_alias_tests;
