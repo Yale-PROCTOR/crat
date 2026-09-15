@@ -326,7 +326,10 @@ fn w6a_c1_caller_reading_after_the_transfer_holds_typed() {
 fn w6a_c1_allocation_lent_before_the_transfer_holds_typed() {
     let out = emitted("boxparam-lent", &with_prelude(LENT_BEFORE));
     let src = compact(&out.source);
-    assert!(!src.contains("Box<i32>"), "{}", out.source);
+    // The FORMAL stays raw (no chain); the caller's local is not this rule's
+    // to hold — on batch 8's composition ownership/fields' native rule boxes
+    // it and transfers through `Box::into_raw` at the raw consuming callee.
+    assert!(src.contains("fnconsume(mutp:*muti32){"), "{}", out.source);
     assert_eq!(
         reason_of(&out.degradations, "consume::p").as_deref(),
         Some("box-param-caller-retains"),

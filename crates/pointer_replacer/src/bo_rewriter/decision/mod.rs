@@ -1692,6 +1692,35 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
             DegradeReason::SliceCursorUse,
         ),
+        // wave-6a (relay 007 §3a, wave-6s2 006; R395-2): before any rule that
+        // types an unannotated slice local by its constructor — a receiver of
+        // a local callee is the return family's, a Ref-rooted construction
+        // widens — the refusal, then the receiver arms, answer first.
+        Decision::Slice { .. } | Decision::Opt { slice: true, .. }
+            if !receiver
+                .is_some_and(|receiver| receiver.receiver_form == seam::form_of(&decision))
+                && slice_local_construction::refuses(ctx, subject) =>
+        {
+            degrade(
+                subject,
+                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                residual_reason(subject.ctor.as_ref()),
+            )
+        }
+        Decision::Slice { mutable, .. }
+            if receiver.is_some_and(|receiver| {
+                receiver.receiver_form == seam::Form::Slice { mutable }
+            }) =>
+        {
+            decision
+        }
+        Decision::Opt { mutable, slice, .. }
+            if receiver.is_some_and(|receiver| {
+                receiver.receiver_form == seam::Form::Opt { mutable, slice }
+            }) =>
+        {
+            decision
+        }
         Decision::Ref { .. } if construction_values::permits(ctx, subject) => decision,
         Decision::Slice { .. } if slice_construction_values::permits(ctx, subject) => decision,
         Decision::Ref { mutable } if raw_place_values::permits(ctx, subject, mutable) => decision,

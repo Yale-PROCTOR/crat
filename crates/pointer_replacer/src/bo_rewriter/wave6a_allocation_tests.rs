@@ -847,3 +847,28 @@ fn w6a_t1_caller_using_the_buffer_after_transfer_is_held() {
         out.artifacts.flexible_tail_receipts
     );
 }
+
+/// **Relay 007 §3a (wave-6s2 006).** A receiver of a LOCAL callee is the
+/// return-receiver family's: this rule never types it by a constructor —
+/// on batch 8's composition the return family converts `chunk_data`'s
+/// return to `&'a [u8]` and a `from_raw_parts` over it is E0308. Here (no
+/// return family) the receiver keeps its residual reason and its raw text.
+#[test]
+fn w6a_b1_receiver_of_a_local_callee_is_not_typed_by_its_constructor() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub unsafe fn chunk_data(mut chunk: *mut u8) -> *mut u8 { return chunk.offset(8 as i32 as isize); }\n\
+               pub unsafe fn reader(mut chunk: *mut u8) -> u8 { let mut d = chunk_data(chunk); return *d.offset(0 as i32 as isize); }\n";
+    let out = emitted("receiver-of-local-callee", src);
+    let text = compact(&out.source);
+    assert!(!text.contains("from_raw_parts"), "{}", out.source);
+    assert!(
+        text.contains("letmutd=chunk_data(chunk);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        reason_of(&out.degradations, "reader::d").is_some(),
+        "{:#?}",
+        out.degradations
+    );
+}

@@ -14,7 +14,6 @@
 //! The rule adds no form, no reason and no variant. It names the population on
 //! which the veto's premise ("no splice target ⇒ cannot emit") does not hold.
 
-use rustc_hash::FxHashMap;
 use rustc_hir::{Expr, ExprKind, HirId, QPath, UnOp, def::Res, def_id::LocalDefId};
 use rustc_middle::ty::{TyCtxt, TyKind};
 
@@ -25,7 +24,7 @@ use super::{
     seam::{ExplicitDeclarationSite, Form},
 };
 use crate::{
-    analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef},
+    analyses::borrow_ownership::{SlotKind, solver::SlotRef},
     bo_rewriter::{
         additive::{FamilyPolicy, FamilyStage},
         bridge_receipt::SignatureClassId,
@@ -112,39 +111,52 @@ fn initializer_root(tcx: TyCtxt<'_>, owner: LocalDefId, init_hir: HirId) -> Opti
 /// as a Box would fail the constructor's type check and be measured by the
 /// verify loop, never silently widened); raw pointer values loaded from
 /// fields, statics and allocator results carry no binding to widen.
-fn root_is_a_reference_candidate(
-    tcx: TyCtxt<'_>,
-    model: &FxHashMap<SlotRef, SlotKind>,
-    slots: &CrateSlots,
-    subjects: &[Subject],
-    constructions: &ConstructionFacts,
-    subject: &Subject,
-) -> bool {
-    let Some(&init_hir) = constructions
+fn root_is_a_reference_candidate(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    let Some(&init_hir) = ctx
+        .constructions
         .init_hirs
         .get(&(subject.fn_did, subject.hir_id))
     else {
         return false;
     };
-    let Some(root) = initializer_root(tcx, subject.fn_did, init_hir) else {
+    let Some(root) = initializer_root(ctx.tcx, subject.fn_did, init_hir) else {
         return false;
     };
-    let Some(source) = subjects
+    let Some(source) = ctx
+        .subjects
         .iter()
         .find(|candidate| candidate.fn_did == subject.fn_did && candidate.hir_id == root)
     else {
         return false;
     };
-    let Some(universe) = slots.fn_local_slots.get(&source.fn_did) else {
+    let Some(universe) = ctx.slots.fn_local_slots.get(&source.fn_did) else {
         return false;
     };
     let Some(slot) = universe.slot_for_local_depth(source.local, 0) else {
         return false;
     };
-    match model.get(&SlotRef::Local(source.fn_did, slot)) {
-        Some(SlotKind::Ref) => true,
-        Some(SlotKind::Raw | SlotKind::Owning) | None => false,
+    match ctx.model.get(&SlotRef::Local(source.fn_did, slot)) {
+        Some(SlotKind::Ref) => {}
+        Some(SlotKind::Raw | SlotKind::Owning) | None => return false,
     }
+    // A Ref root delivered FAT (`&[T]`) is not widened by a construction over
+    // it (wave-6k's genann shape: `c = class.offset(i * 3)` with `class` a
+    // slice parameter); a THIN one (`&T`) is. The Slice arm's own need and
+    // licence predict which without re-running the ladder (`decide_one` is
+    // not side-effect free: a counted-void plan is consumed once): every
+    // raw-only use of the root is arithmetic and fatness concludes array.
+    let fat = ctx
+        .facts
+        .raw_only_uses
+        .get(&(source.fn_did, source.hir_id))
+        .is_some_and(|uses| {
+            !uses.is_empty()
+                && uses
+                    .iter()
+                    .all(|(op, _)| super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
+        })
+        && ctx.fat.is_array(source.fn_did, source.local);
+    !fat
 }
 
 /// The predicate shared by the decision veto and the planner.
@@ -161,17 +173,83 @@ fn inferred(
         && slice_constructor_available(constructions, (subject.fn_did, subject.hir_id))
 }
 
+/// The initializer is a call to a LOCAL callee: the return family may convert
+/// that callee's return (`-> &'a [T]`), and a `from_raw_parts` constructor
+/// over it would be ill-typed (wave-6s2 006; relay wave-6a/007 §3a). Such a
+/// receiver is the return-receiver family's to type, never a constructor's.
+fn call_result_of_local_callee(constructions: &ConstructionFacts, subject: &Subject) -> bool {
+    let node = (subject.fn_did, subject.hir_id);
+    matches!(
+        constructions.by_binding.get(&node),
+        Some(super::construction::Construction::CallResult)
+    ) && matches!(
+        constructions.call_result_targets.get(&node),
+        Some(super::construction::CallResultTarget::DirectLocal(_))
+    )
+}
+
+/// R397-6(b) / R398-1: a candidate that is an argument of a LOCAL callee sits
+/// on a shared interface — attempting it adds an interface edge that withdraws
+/// the callee's prior deliveries (the wall of report 001) — so it is declined
+/// up front and keeps its typed hold. (The same predicate wave-6k's rule
+/// carries; here so that this rule declines it too.)
+fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
+    use rustc_hir::{
+        ExprKind, QPath,
+        def::{DefKind, Res},
+        intravisit::Visitor,
+    };
+    struct Find<'tcx> {
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        binding: HirId,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if let ExprKind::Call(callee, args) = expr.kind
+                && let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
+                && let Res::Def(DefKind::Fn, def_id) = path.res
+                && def_id.is_local()
+                && args.iter().any(|arg| {
+                    matches!(&arg.kind, ExprKind::Path(path)
+                        if self.typeck.qpath_res(path, arg.hir_id) == Res::Local(self.binding))
+                })
+            {
+                self.found = true;
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut find = Find {
+        typeck: tcx.typeck(subject.fn_did),
+        binding: subject.hir_id,
+        found: false,
+    };
+    find.visit_body(tcx.hir_body_owned_by(subject.fn_did));
+    find.found
+}
+
+/// **The refusal every constructor-typing rule shares** (this lane's W6A-B1
+/// and wave-6k's `slice_construction_values`): an unannotated slice local is
+/// NOT typed by its sealed constructor when (a) its initializer's root is a
+/// binding the model calls `Ref` — the constructor would widen a thin
+/// reference or form a second live safe view (R395-2) — or (b) its
+/// initializer is a call to a local callee, whose settled return form the
+/// return-receiver family already reads (a constructor over a converted
+/// return is E0308), or (c) it is an argument of a local callee (a shared
+/// interface, R397-6(b)). `decide_one` asks this BEFORE either rule and
+/// before the receiver arms, so a matching receiver plan still delivers.
+pub(crate) fn refuses(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    matches!(subject.kind, SubjectKind::Local)
+        && subject.ty_span.is_none()
+        && (call_result_of_local_callee(ctx.constructions, subject)
+            || argument_of_local_callee(ctx.tcx, subject)
+            || root_is_a_reference_candidate(ctx, subject))
+}
+
 /// Decision-phase hook: the veto in `decide_one` keeps this decision.
 pub(crate) fn inferred_binding(ctx: &Ctx<'_, '_>, subject: &Subject, decision: &Decision) -> bool {
-    inferred(ctx.family_policy, ctx.constructions, subject, decision)
-        && !root_is_a_reference_candidate(
-            ctx.tcx,
-            ctx.model,
-            ctx.slots,
-            ctx.subjects,
-            ctx.constructions,
-            subject,
-        )
+    inferred(ctx.family_policy, ctx.constructions, subject, decision) && !refuses(ctx, subject)
 }
 
 /// **The declaration carries its type anyway.** The delivery-custody
