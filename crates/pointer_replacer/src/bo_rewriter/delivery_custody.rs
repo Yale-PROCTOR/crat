@@ -68,6 +68,11 @@ pub(crate) struct Declaration {
     pub(crate) explicit_type: Option<String>,
     pub(crate) rendered_type: Option<String>,
     pub(crate) type_shape: TypeShape,
+    /// The crate-level `type` alias the declared type named, when `type_shape`
+    /// was resolved through it (ONE level; wave-5d report 010 STOP 1). The
+    /// declaration is explicitly typed either way -- the alias only hid the
+    /// shape from the census, it never made the row deliverable.
+    pub(crate) type_alias: Option<String>,
     /// Whether the complete declared type is present without inference holes.
     pub(crate) type_is_fully_explicit: bool,
     /// Exact syntax connecting a by-value let-pattern component to an inline
@@ -275,6 +280,7 @@ impl DeclarationVisitor<'_> {
                 explicit_type: explicit_type.clone(),
                 rendered_type: rendered_type.clone(),
                 type_shape: type_shape.clone(),
+                type_alias: None,
                 type_is_fully_explicit: ty.is_some_and(declared_type_is_fully_explicit),
                 typed_component: None,
             });
@@ -527,6 +533,44 @@ impl<'ast> Visitor<'ast> for DeclarationVisitor<'_> {
     }
 }
 
+/// C2Rust names raw-pointer typedefs (`type ContextLut = *const uint8_t;`)
+/// and declares locals by them. Such a declaration is explicitly typed, but
+/// `observed_type` can only see a `Named` path, which the census classifier
+/// cannot place (wave-5d report 010 STOP 1: brotli `literal_context_lut`, 48
+/// rows, decided `Ref`, unplaced, raw in the tree -- an instrument gap, not a
+/// delivery). Resolve ONE level through the crate's own generic-free `type`
+/// items so the classifier sees the alias's shape; anything else stays as it
+/// was, and a resolved shape that is itself only a name stays unreadable.
+fn resolve_type_aliases(krate: &ast::Crate, declarations: &mut [Declaration]) {
+    let aliases = krate
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::TyAlias(alias)
+                if alias.generics.params.is_empty()
+                    && alias.bounds.is_empty()
+                    && alias.ty.is_some() =>
+            {
+                Some((alias.ident.name.to_string(), alias.ty.as_deref()?))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    if aliases.is_empty() {
+        return;
+    }
+    for declaration in declarations {
+        let TypeShape::Named { path } = &declaration.type_shape else { continue };
+        let Some(target) = aliases.get(path.as_str()) else { continue };
+        let resolved = observed_type(target);
+        if matches!(resolved, TypeShape::Named { .. } | TypeShape::Inferred) {
+            continue;
+        }
+        declaration.type_alias = Some(path.clone());
+        declaration.type_shape = resolved;
+    }
+}
+
 pub(crate) fn inventory_source(name: &str, source: &str) -> Result<Vec<Declaration>, String> {
     rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
         let psess = ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
@@ -569,6 +613,7 @@ pub(crate) fn inventory_source(name: &str, source: &str) -> Result<Vec<Declarati
         if let Some(error) = visitor.error {
             return Err(error);
         }
+        resolve_type_aliases(&krate, &mut visitor.declarations);
         visitor
             .declarations
             .sort_by_key(|row| (row.binding_span.lo, row.binding_span.hi));
@@ -622,6 +667,47 @@ fn custody_manifest_inventory() {
         serde_json::to_vec_pretty(&outputs).expect("custody output schema"),
     )
     .expect("custody output");
+}
+
+/// wave-5d report 010 STOP 1: a local declared by a C2Rust raw-pointer
+/// typedef is explicitly typed; the census must read the alias's shape (one
+/// level, generic-free, crate-level) rather than stop on the name. A generic
+/// alias and an alias to a bare name stay unresolved, and the alias name is
+/// kept on the row for the receipt.
+#[test]
+fn custody_resolves_one_level_of_raw_pointer_type_alias() {
+    let source = "type ContextLut = *const u8; type Named = ContextLut; type Gen<T> = *const T; \
+                  unsafe fn f(p: *const u8) { let lut: ContextLut = p; let named: Named = p; \
+                  let g: Gen<u8> = p; let plain: *const u8 = p; }";
+    let rows = inventory_source("alias.rs", source).expect("alias syntax");
+    let row = |binding: &str| rows.iter().find(|row| row.binding == binding).unwrap();
+    let lut = row("lut");
+    assert_eq!(
+        lut.type_shape,
+        TypeShape::RawPointer {
+            mutable: false,
+            pointee: Box::new(TypeShape::Named {
+                path: "u8".to_owned()
+            }),
+        }
+    );
+    assert_eq!(lut.type_alias.as_deref(), Some("ContextLut"));
+    assert!(lut.type_is_fully_explicit);
+    assert_eq!(lut.explicit_type.as_deref(), Some("ContextLut"));
+    // one level only: an alias whose target is itself a bare name stays a name
+    assert_eq!(
+        row("named").type_shape,
+        TypeShape::Named {
+            path: "Named".to_owned()
+        }
+    );
+    assert!(row("named").type_alias.is_none());
+    // generic aliases are not resolved
+    assert!(matches!(&row("g").type_shape, TypeShape::Named { path } if path == "Gen<u8>"));
+    assert!(row("g").type_alias.is_none());
+    // an already-explicit raw pointer is untouched
+    assert!(row("plain").type_alias.is_none());
+    assert_eq!(row("plain").type_shape, lut.type_shape);
 }
 
 #[test]
