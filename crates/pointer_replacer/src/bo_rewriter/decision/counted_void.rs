@@ -578,10 +578,21 @@ pub(crate) fn count_argument<'tcx>(
 /// The raw twin is the callee's pristine body, so it is only a faithful target
 /// when no parameter other than the counted ones is emitted in a safe form.
 fn only_counted_params_convert(table: &super::DecisionTable, callee: LocalDefId) -> bool {
+    use super::Decision;
     table.entries.iter().all(|(s, d)| {
+        let converted = match d {
+            Decision::Degraded(_) => false,
+            Decision::Cursor { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => true,
+        };
         s.fn_did != callee
             || !matches!(s.kind, SubjectKind::Param { .. })
-            || matches!(d, super::Decision::Degraded(_))
+            || !converted
             || table.counted_void.contains_key(&(s.fn_did, s.hir_id))
     })
 }
