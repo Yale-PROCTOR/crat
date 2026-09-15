@@ -3936,9 +3936,7 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
     }
 
     // NEGATIVE — every known neighbour, each refused with its own attribution.
-    for (label, body) in [
-        ("borrow of deref", "    &mut *p.offset(1 as isize)"),
-    ] {
+    for (label, body) in [("borrow of deref", "    &mut *p.offset(1 as isize)")] {
         let got = reason_for(body);
         // Each retained neighbour keeps its own refusal attribution.
         let allowed: &[&str] = match label {
