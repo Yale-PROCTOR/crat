@@ -887,3 +887,72 @@ fn w6v2_returned_alias_stored_globally_keeps_the_hold() {
         );
     }
 }
+
+/// R410-3 §1: the descendant discharge of the R283-3 arm needs the callee's
+/// BODY, not its signature. `keep` looks harmless by signature (returns an
+/// `i32`; its only output storage is the confined `out`) but stores a pointer
+/// DERIVED from the argument (`p.cast()`) into a global: a shared view bridged
+/// into it would leave `SharedReadOnly` provenance in `KEPT`, UB on any later
+/// write. The subject stays held; with a clean body the confined out-param
+/// discharges the sink and it delivers. (An OPEN foreign call in the callee
+/// is the standing T2 waiver path — retention-unknown — not this arm's.)
+const KEEP: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+#[repr(C)]
+pub struct binn { pub header: i32, pub type_0: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
+static mut KEPT: *mut u8 = 0 as *mut u8;
+extern "C" { fn stash(p: *mut i8); }
+unsafe fn keep(mut p: *mut u8, mut out: *mut binn) -> i32 {
+    (*out).type_0 = *p as i32;
+    (*out).ptr = p as *mut core::ffi::c_void;
+    //ESCAPE//
+    return 1 as i32;
+}
+pub unsafe fn probe(mut s: *mut u8) -> i32 {
+    let mut out = binn { header: 0, type_0: 0, size: 0, ptr: 0 as *mut core::ffi::c_void };
+    if keep(s, &mut out) == 0 as i32 { return 0 as i32; }
+    return out.type_0;
+}
+"#;
+
+#[test]
+fn w6v2_descendant_discharge_needs_the_callee_body() {
+    for (name, escape) in [("derived-global-store", "KEPT = p.cast::<i8>() as *mut u8;")] {
+        let input = KEEP.replace("//ESCAPE//", escape);
+        let rows = by_function(&input);
+        assert!(
+            !rows.contains(&("probe".to_owned(), "s".to_owned(), "<emitted>".to_owned())),
+            "{name}: the body has no evidence of confinement — held: {rows:?}"
+        );
+        let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+        assert!(super::verify::type_checks_str(&source));
+    }
+    let clean = KEEP.replace("//ESCAPE//", "");
+    let rows = by_function(&clean);
+    assert!(
+        rows.contains(&("probe".to_owned(), "s".to_owned(), "<emitted>".to_owned())),
+        "with a clean body the confined out-param discharges: {rows:?}"
+    );
+}
+
+/// R410-2(d): a width reader (`return *(p as *const u32)`) is wave-6b's
+/// region shape; this lane's typed-width rule yields so the region wins.
+#[test]
+fn w6v2_width_reader_yields_to_the_region() {
+    let input = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+unsafe fn BrotliUnalignedRead32(mut p: *const core::ffi::c_void) -> u32 {
+    return *(p as *const u32);
+}
+unsafe fn tail(mut p: *const core::ffi::c_void) -> u64 {
+    *(p as *const u32) as u64
+}
+"#;
+    let rows = super::emit_tests::decisions_of(input);
+    assert!(
+        rows.iter()
+            .filter(|(n, p, _)| n == "p" && *p)
+            .all(|(_, _, r)| r == "held:void-pointee"),
+        "the width readers are the region's: {rows:?}"
+    );
+}

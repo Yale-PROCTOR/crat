@@ -1073,6 +1073,50 @@ fn output_operand<'tcx>(
     None
 }
 
+/// wave-6v2 (R410-3): `core`'s raw-pointer methods, by what they do with the
+/// receiver's provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorePointerMethod {
+    /// Returns a pointer derived from the receiver (`offset`, `add`, `cast`, ..).
+    Derive,
+    /// Observes the receiver or reads through it; retains nothing.
+    Observe,
+    /// Writes a VALUE through the receiver (`write`, `write_unaligned`, ..).
+    Write,
+}
+
+/// The tag a modeled core-pointer-method step carries in its detail.
+const CORE_POINTER_METHOD_TAG: &str = "core-pointer-method";
+
+fn core_pointer_method(tcx: TyCtxt<'_>, callee: DefId) -> Option<CorePointerMethod> {
+    let path = tcx.def_path_str(callee);
+    let (prefix, name) = path.rsplit_once("::")?;
+    if !(prefix.starts_with("core::ptr::") || prefix.starts_with("std::ptr::"))
+        || !prefix.contains("<impl *")
+    {
+        return None;
+    }
+    Some(match name {
+        "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub"
+        | "byte_offset" | "byte_add" | "byte_sub" | "cast" | "cast_mut" | "cast_const" => {
+            CorePointerMethod::Derive
+        }
+        "is_null" | "offset_from" | "byte_offset_from" | "read" | "read_unaligned"
+        | "read_volatile" | "addr" | "align_offset" | "is_aligned" => CorePointerMethod::Observe,
+        "write"
+        | "write_unaligned"
+        | "write_volatile"
+        | "write_bytes"
+        | "copy_from"
+        | "copy_from_nonoverlapping"
+        | "copy_to"
+        | "copy_to_nonoverlapping"
+        | "swap"
+        | "replace" => CorePointerMethod::Write,
+        _ => return None,
+    })
+}
+
 /// wave-6v2 (R407-11): the ONE raw-pointer parameter this local is a
 /// transparent alias of (`_p -> .. -> local` through the body's alias edges),
 /// or `None` when it is rooted at no parameter or at more than one.
@@ -1480,7 +1524,32 @@ fn collect_retention_facts<'tcx>(
             block,
             statement_index: data.statements.len(),
         };
-        let Some(callee) = operand_callee(func).and_then(|callee| callee.as_local()) else {
+        let Some(callee_did) = operand_callee(func) else { continue };
+        if core_pointer_method(tcx, callee_did) == Some(CorePointerMethod::Derive)
+            && let Some(source) = args
+                .first()
+                .and_then(|receiver| receiver.node.place())
+                .and_then(|place| place.as_local())
+            && matches!(body.local_decls[source].ty.kind(), TyKind::RawPtr(..))
+            && let Some(destination) = destination.as_local()
+            && matches!(body.local_decls[destination].ty.kind(), TyKind::RawPtr(..))
+        {
+            aliases.push((
+                source,
+                destination,
+                retention_step(
+                    call,
+                    RetentionEventKind::Transparent,
+                    format!(
+                        "{} _{}->_{}",
+                        tcx.def_path_str(callee_did),
+                        source.as_u32(),
+                        destination.as_u32()
+                    ),
+                ),
+            ));
+        }
+        let Some(callee) = callee_did.as_local() else {
             continue;
         };
         let operands = args
@@ -1832,6 +1901,81 @@ fn collect_retention_facts<'tcx>(
                 continue;
             };
             if !is_reachable(local) {
+                continue;
+            }
+            // wave-6v2 (R410-3): `core`'s raw-pointer methods are modeled for
+            // the SINK walk — a derived pointer (`offset`, `add`, `cast`, ..)
+            // is an alias of the receiver (the edge is in `aliases`, so a store
+            // of it is a sink here), and a `write*` of a reachable VALUE
+            // through the receiver is a store through it — while the call
+            // itself stays the open step it always was for the no-retain
+            // CERTIFICATE (the existing T2 tier is unchanged; only the
+            // descendant check reads the tag and accepts these steps).
+            if let Some(callee) = operand_callee(func)
+                && let Some(method) = core_pointer_method(tcx, callee)
+            {
+                let open = |detail: String, facts: &mut RetentionBodyFacts| {
+                    let step = retention_step(location, RetentionEventKind::UnknownCall, detail);
+                    facts
+                        .unknowns
+                        .entry(RetentionUnknownReason::OpenBoundary)
+                        .or_default()
+                        .push(step.clone());
+                    step
+                };
+                let step = match method {
+                    CorePointerMethod::Derive | CorePointerMethod::Observe => open(
+                        format!(
+                            "{} arg{index} {CORE_POINTER_METHOD_TAG}",
+                            tcx.def_path_str(callee)
+                        ),
+                        &mut facts,
+                    ),
+                    CorePointerMethod::Write if index == 0 => open(
+                        format!(
+                            "{} receiver {CORE_POINTER_METHOD_TAG}",
+                            tcx.def_path_str(callee)
+                        ),
+                        &mut facts,
+                    ),
+                    CorePointerMethod::Write => {
+                        let receiver = args
+                            .first()
+                            .and_then(|receiver| receiver.node.place())
+                            .and_then(|place| place.as_local());
+                        let root = receiver.and_then(|receiver| {
+                            if receiver.as_usize() > 0 && receiver.as_usize() <= body.arg_count {
+                                Some(receiver)
+                            } else {
+                                parameter_alias_root(body, &aliases, receiver)
+                            }
+                        });
+                        let (reason, kind) = if root.is_some() {
+                            (
+                                RetentionUnknownReason::OutputStorage,
+                                RetentionEventKind::OutputStorage,
+                            )
+                        } else {
+                            (
+                                RetentionUnknownReason::FieldOrGlobalStore,
+                                RetentionEventKind::FieldOrGlobalStore,
+                            )
+                        };
+                        let step = retention_step(
+                            location,
+                            kind,
+                            format!(
+                                "store _{} through _{}",
+                                local.as_u32(),
+                                root.or(receiver).map_or(0, |local| local.as_u32())
+                            ),
+                        );
+                        facts.retains.push(step.clone());
+                        facts.unknowns.entry(reason).or_default().push(step.clone());
+                        step
+                    }
+                };
+                facts.steps.push(step);
                 continue;
             }
             let Some(callee) = operand_callee(func) else {
@@ -2196,6 +2340,105 @@ fn evaluate_retention(
 }
 
 impl RetentionSummaries {
+    /// wave-6v2 (R410-3): does the callee's BODY store no pointer derived from
+    /// this argument anywhere but the named confined output positions? Every
+    /// positive sink is `store _s through _p` with `p` confined, the walk has
+    /// no open step (no unknown call, no fn-pointer, no unresolved callee, no
+    /// multi-definition), and every local dependency is descendant-free in
+    /// turn: a discharged one has its sinks confined or transposed inside this
+    /// body (the transposed ones are this body's retains, checked here), an
+    /// undischarged one may have no sink and no open step at all.
+    pub(crate) fn descendant_free(
+        &self,
+        callee: LocalDefId,
+        argument_index: usize,
+        confined_outputs: &[usize],
+    ) -> bool {
+        self.descendant_free_in(callee, argument_index, Some(confined_outputs), false, 0)
+    }
+
+    fn descendant_free_in(
+        &self,
+        callee: LocalDefId,
+        argument_index: usize,
+        confined_outputs: Option<&[usize]>,
+        returns_continued: bool,
+        depth: usize,
+    ) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        let Some(facts) = self.facts.get(&(callee, argument_index)) else {
+            return false;
+        };
+        let sink_confined = |step: &RetentionStep| {
+            // A `return` of the argument is the caller's alias, accounted in
+            // the caller's own walk when the dependency was continued.
+            (returns_continued && step.kind == RetentionEventKind::Return)
+                || step.kind == RetentionEventKind::OutputStorage
+                    && confined_outputs.is_some_and(|outputs| {
+                        step.detail
+                            .rsplit("through _")
+                            .next()
+                            .and_then(|local| local.parse::<usize>().ok())
+                            .and_then(|local| local.checked_sub(1))
+                            .is_some_and(|position| outputs.contains(&position))
+                    })
+        };
+        if !facts.retains.iter().all(sink_confined) {
+            return false;
+        }
+        // A multi-definition alias withholds the no-retain CERTIFICATE (which
+        // value a local holds is unknown) but hides no store: every store of
+        // or through a reachable local is in `retains`, checked above. Every
+        // other open step (an unknown call, a fn-pointer, an unresolved
+        // callee, an unaccounted returned alias) may hide one and rejects.
+        // A modeled core pointer method is an open step for the CERTIFICATE
+        // only: its derived pointer is an alias whose stores are in `retains`.
+        if facts.unknowns.iter().any(|(reason, steps)| {
+            !matches!(
+                reason,
+                RetentionUnknownReason::OutputStorage | RetentionUnknownReason::MultiDef
+            ) && steps
+                .iter()
+                .any(|step| !step.detail.ends_with(CORE_POINTER_METHOD_TAG))
+        }) {
+            return false;
+        }
+        facts.dependencies.iter().all(|dependency| {
+            let confined =
+                if dependency.discharged_by_stack_storage || dependency.continued_returned_alias {
+                    // Discharged inside this body: the callee's own output
+                    // sinks were confined or transposed here.
+                    self.facts
+                        .get(&(dependency.callee, dependency.argument_index))
+                        .map(|callee_facts| {
+                            callee_facts
+                                .retains
+                                .iter()
+                                .filter_map(|step| {
+                                    step.detail
+                                        .rsplit("through _")
+                                        .next()
+                                        .and_then(|local| local.parse::<usize>().ok())
+                                        .and_then(|local| local.checked_sub(1))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+            self.descendant_free_in(
+                dependency.callee,
+                dependency.argument_index,
+                Some(&confined),
+                dependency.continued_returned_alias,
+                depth + 1,
+            )
+        })
+    }
+
     /// wave-6v2 (R406-6): the parameter's retention when EVERY positive sink
     /// is a store through an output parameter of the callee itself (`store _s
     /// through _p`): the output-parameter indices those sinks name, and the
@@ -3991,9 +4234,19 @@ impl RawBoundaryDispositionIndex {
                                     retention.pointee_pointer_free(callee, site.key.argument_index)
                                 }),
                             )
-                            // wave-6v2 (R406-6): no descendant can reach the
-                            // caller except through frame-confined storage.
-                            && !site.descendants_frame_confined
+                            // wave-6v2 (R406-6 / R410-3): no descendant can
+                            // reach the caller except through frame-confined
+                            // storage — by the callee's signature AND by its
+                            // body: no pointer derived from the argument is
+                            // stored anywhere but such storage.
+                            && !(site.descendants_frame_confined
+                                && site.callee_local.is_some_and(|callee| {
+                                    retention.descendant_free(
+                                        callee,
+                                        site.key.argument_index,
+                                        &site.frame_confined_outputs,
+                                    )
+                                }))
                         {
                             // **R283-3 widened this arm to `*mut` positions.**
                             // It used to run only at `*const` targets, so a
