@@ -546,7 +546,9 @@ pub mod src {
     /// `missing-required-arm:c`) and `ptype` (`Option<&mut i32>`) is withdrawn.
     /// Batch 6: `ptype#2` = `blocked-subject:kind-raw`. (The small crate's
     /// fresh solve calls `plimit` `copy-source-coupled` instead of `kind-raw`;
-    /// the class mechanism is identical.)
+    /// the class mechanism is identical. `buf` is a void pointer as binn's
+    /// `ptr` is, so it stays raw — `held:void-pointee` — and the body's copy
+    /// `p = buf as *mut u8` needs no adapter once the class is released.)
     const BINN_C_SOURCE_SHAPE: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
 pub unsafe fn advance(mut p: *mut u8, plimit: *mut u8) -> *mut u8 {
@@ -554,8 +556,8 @@ pub unsafe fn advance(mut p: *mut u8, plimit: *mut u8) -> *mut u8 {
     p = p.offset(1);
     p
 }
-pub unsafe fn is_valid(buf: *mut u8, size: i32, ptype: *mut i32) -> i32 {
-    let mut p = buf;
+pub unsafe fn is_valid(buf: *mut core::ffi::c_void, size: i32, ptype: *mut i32) -> i32 {
+    let mut p = buf as *mut u8;
     let plimit = p.offset(size as isize);
     if !ptype.is_null() && *ptype != 0 { return 0; }
     p = advance(p, plimit);
@@ -596,7 +598,7 @@ pub unsafe fn is_valid(buf: *mut u8, size: i32, ptype: *mut i32) -> i32 {
             got.subjects
         );
         assert_eq!(
-            column(&got.arm_outcomes, "is_valid::plimit#5", "required_arms"),
+            column(&got.arm_outcomes, "is_valid::plimit#6", "required_arms"),
             "c"
         );
     }
