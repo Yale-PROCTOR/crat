@@ -216,6 +216,7 @@ mod tests {
             return_certificates: Default::default(),
             allocator_contracts: Default::default(),
             void_region: Default::default(),
+            void_region_receivers: Default::default(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),

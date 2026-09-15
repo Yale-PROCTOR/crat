@@ -831,6 +831,11 @@ pub(crate) fn plan_slice_constructions(
         if table.option_value_initializers.contains(&node) {
             continue;
         }
+        // wave-6b: a region receiver's value is the accessor's raw result
+        // wrapped with the region's own count; its receiver plan owns it.
+        if super::void_region::receives_region(&table.void_region_receivers, node, mutable) {
+            continue;
+        }
         if table
             .slice_use_receipts
             .iter()

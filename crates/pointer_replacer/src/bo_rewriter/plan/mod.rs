@@ -1313,6 +1313,8 @@ pub(crate) fn finalize_signature_classes(
         )
     }));
     let dependency_edges = super::revert_closure::narrow(table, dependency_edges, planned);
+    // wave-6b: a region receiver's caller class depends on its accessor's.
+    dependency_edges.extend(super::decision::void_region::receiver_dependencies(table));
     for (dependent, dependency) in dependency_edges {
         if dependent == dependency || !by_class.contains_key(&dependency) {
             continue;
@@ -4331,7 +4333,10 @@ pub(crate) fn plan(
         // wave-6f: a local loaded from a converting field carries an explicit
         // declaration planned by the field transaction; no type span to splice.
         let typed_field_load = typed_field_load(table, subject);
-        let (ty_file, declaration_edit) = if planned_declaration || typed_field_load {
+        // wave-6b: a region receiver is declared by its explicit-type site.
+        let typed_receiver = typed_receiver
+            || super::decision::void_region::typed_receiver(table, subject, decision);
+        let (ty_file, declaration_edit) = if planned_declaration || typed_field_load || inferred_box || typed_pattern || typed_receiver {
             match span_to_loc(subject.binding_span) {
                 Ok((file, _, _)) => (file, None),
                 Err(reason) => {
@@ -5550,6 +5555,7 @@ mod tests {
             return_certificates: Default::default(),
             allocator_contracts: Default::default(),
             void_region: Default::default(),
+            void_region_receivers: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
@@ -5706,6 +5712,7 @@ mod tests {
             return_certificates: Default::default(),
             allocator_contracts: Default::default(),
             void_region: Default::default(),
+            void_region_receivers: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

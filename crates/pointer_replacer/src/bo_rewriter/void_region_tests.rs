@@ -494,3 +494,43 @@ fn w6b_h42_multi_bank_chain_delivers() {
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
+
+/// Build 3: the accessor-result locals of a caller receive the region as a
+/// typed slice — an explicit declaration, the raw result wrapped with the
+/// region's exact element count, indexed uses. `addr` is model-Raw in the
+/// analysis frame (as `StoreH4x::addr` is in the corpus) and keeps its raw
+/// form beside the delivered three.
+#[test]
+fn w6b_h40_caller_locals_receive_region_slices() {
+    let rows = super::emit_tests::decisions_of(H40);
+    for name in ["head", "tiny_hash", "banks"] {
+        let reasons: Vec<_> = rows
+            .iter()
+            .filter(|(n, p, _)| n == name && !*p)
+            .map(|(_, _, r)| r.clone())
+            .collect();
+        assert_eq!(reasons, vec!["<emitted>"], "{name}: {rows:?}");
+    }
+    let source = super::emit_tests::ast_emitted_source_of(H40).expect("AST output");
+    let flat = compact(&source);
+    for needle in [
+        // the caller is an `unsafe fn`: no redundant inner `unsafe` block
+        "letmuthead:&mut[u16]=core::slice::from_raw_parts_mut(HeadH40(",
+        "letmuttiny_hash:&mut[u8]=core::slice::from_raw_parts_mut(TinyHashH40(",
+        "letmutbanks:&mut[crate::BankH40]=core::slice::from_raw_parts_mut(BanksH40(",
+        // exact element counts 32/2 and 16/1; the fallback count for the last
+        ".add(64),32)),16);",
+        ".add(96),16)),16);",
+        "crate::FALLBACK_SLICE_EXTENT*core::mem::size_of::<BankH40>())),crate::FALLBACK_SLICE_EXTENT);",
+        "head[key]",
+        "tiny_hash[(ix&15)]",
+        "banks[bank].slots[idxasusize].delta",
+    ] {
+        assert!(flat.contains(needle), "{needle} missing: {source}");
+    }
+    assert!(
+        !flat.contains("head.offset(") && !flat.contains("banks.offset("),
+        "no raw arithmetic remains on the delivered locals: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}

@@ -993,6 +993,7 @@ pub(crate) struct DecisionTable {
     /// wave-6a: allocator-contract owners (admitted / held).
     pub(crate) allocator_contracts: allocator_contract::Plans,
     pub(crate) void_region: void_region::Contracts,
+    pub(crate) void_region_receivers: void_region::Receivers,
     pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
     pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
@@ -1143,6 +1144,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) return_certificates: &'a return_certificate::Certificates,
     pub(crate) allocator_contracts: &'a allocator_contract::Plans,
     pub(crate) void_region: &'a void_region::Contracts,
+    pub(crate) void_region_receivers: &'a void_region::Receivers,
     pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
@@ -1286,6 +1288,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         return_certificates: ctx.return_certificates.clone(),
         allocator_contracts: ctx.allocator_contracts.clone(),
         void_region: ctx.void_region.clone(),
+        void_region_receivers: ctx.void_region_receivers.clone(),
         nested_receipts: Vec::new(),
         cursor_receipts,
         sibling_overlap_inventory: Default::default(),
@@ -1782,6 +1785,13 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         {
             decision
         }
+        // wave-6b: an accessor-result local receives its region as a typed
+        // slice (declared explicitly, the raw result wrapped with the count).
+        Decision::Slice { mutable, .. }
+            if void_region::receives_region(ctx.void_region_receivers, receiver_node, mutable) =>
+        {
+            decision
+        }
         Decision::Opt { mutable, slice, .. }
             if receiver.is_some_and(|receiver| {
                 receiver.receiver_form == seam::Form::Opt { mutable, slice }
@@ -1808,6 +1818,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         return_certificates: _,
         allocator_contracts: _,
         void_region: _,
+        void_region_receivers: _,
         void_pointee,
         thin_extent,
         local_callee_extent,
@@ -2631,6 +2642,7 @@ mod self_consistency_tests {
             return_certificates: Default::default(),
             allocator_contracts: Default::default(),
             void_region: Default::default(),
+            void_region_receivers: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

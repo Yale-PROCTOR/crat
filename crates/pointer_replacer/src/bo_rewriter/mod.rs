@@ -6844,6 +6844,8 @@ fn finish_decide<'tcx>(
         &facts.referenced,
         &mut declaration_pointees,
     );
+    let void_region_receivers =
+        decision::void_region::receivers(tcx, &subjects, &ctors, &void_region);
     let original_body_adapters = facts.body_adapters.clone();
     let thin_extent_subjects = decision::thin_extent::collect(&facts);
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
@@ -7260,6 +7262,7 @@ fn finish_decide<'tcx>(
                     return_certificates: &return_certificates,
                     allocator_contracts: &allocator_contracts,
                     void_region: &void_region,
+                    void_region_receivers: &void_region_receivers,
                     return_receivers,
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,
@@ -7807,6 +7810,7 @@ fn finish_decide<'tcx>(
         decision::return_certificate::append_interface_dependencies(&mut table);
         decision::flexible_tail::append_interface_dependencies(&mut table);
         decision::box_param::append_interface_dependencies(&mut table);
+        decision::void_region::append_receiver_declarations(&mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =

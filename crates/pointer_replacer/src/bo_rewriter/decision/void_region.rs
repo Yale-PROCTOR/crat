@@ -832,3 +832,327 @@ pub(crate) fn overlapping_calls(
     }
     blocked
 }
+
+// ---------------------------------------------------------------------------
+// Build 3 — region receivers: the caller local that receives an accessor's
+// raw result becomes a typed slice over the region.
+// ---------------------------------------------------------------------------
+
+/// One caller local `let L = A(buffer)` where `A` is an admitted accessor:
+/// `L` is declared `&mut [T]` / `&[T]` and the raw result is wrapped with the
+/// region's exact element count (the fallback count for a last region).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Receiver {
+    pub(crate) node: Key,
+    pub(crate) callee: LocalDefId,
+    pub(crate) initializer_hir: HirId,
+    pub(crate) initializer_span: Span,
+    /// The element type as the callee's raw return spells it, resolved.
+    pub(crate) element: String,
+    pub(crate) mutable: bool,
+    /// The element count text: exact, or the named fallback const.
+    pub(crate) count_text: String,
+    pub(crate) fabricated: bool,
+    /// The caller is an `unsafe fn`: no redundant inner `unsafe` block.
+    pub(crate) enclosing_unsafe_fn: bool,
+}
+
+pub(crate) type Receivers = FxHashMap<Key, Receiver>;
+
+impl Receiver {
+    pub(crate) fn declared_type(&self) -> String {
+        format!(
+            "&{}[{}]",
+            if self.mutable { "mut " } else { "" },
+            self.element
+        )
+    }
+
+    /// The initializer with the adapted call inside: the raw result of the
+    /// accessor becomes a slice of exactly the region's elements.
+    pub(crate) fn render(&self, adapted_call: &str) -> String {
+        let ctor = if self.mutable {
+            "from_raw_parts_mut"
+        } else {
+            "from_raw_parts"
+        };
+        crate::bo_rewriter::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::{ctor}({adapted_call}, {})", self.count_text),
+            self.enclosing_unsafe_fn,
+        )
+    }
+}
+
+/// Every local initialised by a direct call to an admitted accessor whose own
+/// shape wants a slice. The decision ladder still decides the local (its uses,
+/// its sign, its construction); this only names the receiver the veto may
+/// admit and the emitter must type.
+pub(crate) fn receivers(
+    tcx: TyCtxt<'_>,
+    subjects: &[Subject],
+    constructions: &super::construction::ConstructionFacts,
+    contracts: &Contracts,
+) -> Receivers {
+    use super::construction::{CallResultTarget, Construction};
+    let mut out = Receivers::default();
+    for subject in subjects {
+        if subject.kind != SubjectKind::Local || subject.ty_span.is_some() {
+            continue;
+        }
+        let node = (subject.fn_did, subject.hir_id);
+        if constructions.by_binding.get(&node) != Some(&Construction::CallResult) {
+            continue;
+        }
+        let Some(CallResultTarget::DirectLocal(callee)) =
+            constructions.call_result_targets.get(&node).copied()
+        else {
+            continue;
+        };
+        let Some(region) = contracts
+            .iter()
+            .find(|((owner, _), _)| *owner == callee)
+            .map(|(_, region)| region)
+        else {
+            continue;
+        };
+        if region.shape != Shape::Accessor || (subject.mutable && !region.mutable) {
+            continue;
+        }
+        let (Some(&initializer_hir), Some(&initializer_span)) = (
+            constructions.init_hirs.get(&node),
+            constructions.init_spans.get(&node),
+        ) else {
+            continue;
+        };
+        let initializer = tcx.hir_node(initializer_hir).expect_expr();
+        let exact = match initializer.kind {
+            ExprKind::Call(function, _) => matches!(function.kind,
+                ExprKind::Path(QPath::Resolved(_, path))
+                    if matches!(path.res, Res::Def(_, did) if did == callee.to_def_id())),
+            _ => false,
+        };
+        if !exact || initializer.span != initializer_span {
+            continue;
+        }
+        let signature = tcx.fn_sig(callee).skip_binder().skip_binder();
+        let TyKind::RawPtr(pointee, _) = signature.output().kind() else { continue };
+        let element = super::declaration::pointee_source(tcx, *pointee);
+        let (count_text, fabricated) = match region.len_bytes {
+            Some(bytes) if region.element_size > 0 && bytes % region.element_size == 0 => {
+                ((bytes / region.element_size).to_string(), false)
+            }
+            Some(_) => continue,
+            None => (super::seam::FABRICATED_LEN_PATH.to_owned(), true),
+        };
+        out.insert(
+            node,
+            Receiver {
+                node,
+                callee,
+                initializer_hir,
+                initializer_span,
+                element,
+                mutable: subject.mutable,
+                count_text,
+                fabricated,
+                enclosing_unsafe_fn: tcx
+                    .fn_sig(subject.fn_did)
+                    .skip_binder()
+                    .skip_binder()
+                    .safety
+                    .is_unsafe(),
+            },
+        );
+    }
+    out
+}
+
+/// The veto's question: is this unannotated local a region receiver whose
+/// ladder decision is the slice it wants?
+pub(crate) fn receives_region(receivers: &Receivers, node: Key, mutable: bool) -> bool {
+    receivers
+        .get(&node)
+        .is_some_and(|receiver| receiver.mutable == mutable)
+}
+
+/// The explicit declaration of every delivered region receiver — the type the
+/// custody instrument requires a delivered local to carry — and its receipt.
+pub(crate) fn append_receiver_declarations(table: &mut super::DecisionTable) {
+    use crate::bo_rewriter::bridge_receipt::{BridgeRetentionTier, SignatureClassId};
+    let mut declarations = Vec::new();
+    let mut bridges = Vec::new();
+    for (subject, decision) in &table.entries {
+        let node = (subject.fn_did, subject.hir_id);
+        let Some(receiver) = table.void_region_receivers.get(&node) else { continue };
+        let admitted = match decision {
+            super::Decision::Slice { mutable, .. } => *mutable == receiver.mutable,
+            super::Decision::Ref { .. }
+            | super::Decision::InferredRef { .. }
+            | super::Decision::NestedSlice { .. }
+            | super::Decision::Opt { .. }
+            | super::Decision::Box(_)
+            | super::Decision::Cursor { .. }
+            | super::Decision::Degraded(_) => false,
+        };
+        if !admitted || !accessor_delivered(table, receiver.callee) {
+            continue;
+        }
+        let Some(name) = subject.param_name.as_deref() else { continue };
+        let owner_class = SignatureClassId::of(receiver.callee);
+        let emitted_type = receiver.declared_type();
+        let binding_prefix = if subject.mut_binding { "mut " } else { "" };
+        declarations.push(super::seam::ExplicitDeclarationSite {
+            owner_class,
+            caller: subject.fn_did,
+            node: Some(node),
+            span: Some(subject.binding_span),
+            category: "local",
+            replacement: Some(format!("{binding_prefix}{name}: {emitted_type}")),
+            emitted_type: emitted_type.clone(),
+            arm: "glue",
+        });
+        bridges.push(super::seam::ZeroBridgeSite {
+            owner_class,
+            caller: subject.fn_did,
+            span: Some(receiver.initializer_span),
+            arm: "c",
+            position: format!(
+                "region-receiver:type={emitted_type}:count={}:{}",
+                receiver.count_text,
+                if receiver.fabricated {
+                    "len-fabricated"
+                } else {
+                    "len-elsewhere"
+                }
+            ),
+            bridge_kind: "void-region-receiver",
+            expected_form: receiver.declared_form(),
+            found_form: "raw",
+            argument_kind: "return-call-result",
+            retention: BridgeRetentionTier::T2,
+            waiver_id: Some(
+                crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
+            ),
+            unsafe_context: None,
+        });
+    }
+    table.seams.explicit_declarations.extend(declarations);
+    table.seams.zero_bridges.extend(bridges);
+}
+
+impl Receiver {
+    pub(crate) fn declared_form(&self) -> &'static str {
+        if self.mutable {
+            "slice-mut"
+        } else {
+            "slice-shared"
+        }
+    }
+}
+
+/// The receivers whose local is delivered as the slice and whose class is kept.
+pub(crate) fn delivered_receivers<'a>(
+    table: &'a super::DecisionTable,
+    reverts: &crate::bo_rewriter::ast_transform::RevertSet,
+) -> Vec<&'a Receiver> {
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+    let mut out = table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let node = (subject.fn_did, subject.hir_id);
+            let receiver = table.void_region_receivers.get(&node)?;
+            let delivered = match decision {
+                super::Decision::Slice { mutable, .. } => *mutable == receiver.mutable,
+                super::Decision::Ref { .. }
+                | super::Decision::InferredRef { .. }
+                | super::Decision::NestedSlice { .. }
+                | super::Decision::Opt { .. }
+                | super::Decision::Box(_)
+                | super::Decision::Cursor { .. }
+                | super::Decision::Degraded(_) => false,
+            };
+            (delivered
+                && accessor_delivered(table, receiver.callee)
+                && reverts.keeps(SignatureClassId::of(receiver.callee))
+                && reverts.keeps(SignatureClassId::of(subject.fn_did))
+                && reverts.keeps_subject(subject.fn_did, subject.hir_id))
+            .then_some(receiver)
+        })
+        .collect::<Vec<_>>();
+    out.sort_by_key(|receiver| {
+        (
+            receiver.node.0.local_def_index.as_u32(),
+            receiver.node.1.local_id.as_u32(),
+        )
+    });
+    out
+}
+
+/// Is this subject a delivered region receiver whose explicit declaration
+/// site is planned? The plan then places it by its binding (no type splice of
+/// its own) and the AST declaration pass leaves it to the explicit-type pass.
+pub(crate) fn typed_receiver(
+    table: &super::DecisionTable,
+    subject: &Subject,
+    decision: &super::Decision,
+) -> bool {
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+    let node = (subject.fn_did, subject.hir_id);
+    let Some(receiver) = table.void_region_receivers.get(&node) else { return false };
+    let delivered = match decision {
+        super::Decision::Slice { mutable, .. } => *mutable == receiver.mutable,
+        super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::NestedSlice { .. }
+        | super::Decision::Opt { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Cursor { .. }
+        | super::Decision::Degraded(_) => false,
+    };
+    delivered
+        && accessor_delivered(table, receiver.callee)
+        && table.seams.explicit_declarations.iter().any(|site| {
+            site.category == "local"
+                && site.node == Some(node)
+                && site.owner_class == SignatureClassId::of(receiver.callee)
+                && site.emitted_type == receiver.declared_type()
+        })
+}
+
+/// Is the accessor's own region parameter decided as the byte slice in this
+/// table? A receiver over an accessor that fell back to its raw parameter is
+/// not emitted: the two must move together.
+fn accessor_delivered(table: &super::DecisionTable, callee: LocalDefId) -> bool {
+    table.entries.iter().any(|(s, d)| {
+        s.fn_did == callee
+            && table.void_region.contains_key(&(s.fn_did, s.hir_id))
+            && decided_slice(d)
+    })
+}
+
+/// The class dependency each delivered region receiver introduces: the
+/// caller's class depends on the accessor's, so a withdrawn accessor takes
+/// its receivers with it.
+pub(crate) fn receiver_dependencies(
+    table: &super::DecisionTable,
+) -> Vec<(
+    crate::bo_rewriter::bridge_receipt::SignatureClassId,
+    crate::bo_rewriter::bridge_receipt::SignatureClassId,
+)> {
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+    table
+        .entries
+        .iter()
+        .filter(|(subject, decision)| typed_receiver(table, subject, decision))
+        .filter_map(|(subject, _)| {
+            let receiver = table
+                .void_region_receivers
+                .get(&(subject.fn_did, subject.hir_id))?;
+            Some((
+                SignatureClassId::of(subject.fn_did),
+                SignatureClassId::of(receiver.callee),
+            ))
+        })
+        .collect()
+}

@@ -2491,6 +2491,8 @@ enum ReceiverGraft<'a> {
     Retired(&'a super::decision::receiver_input::ReceiverInputPlan),
     Raw(&'a super::decision::raw_receiver::RawReceiverPlan),
     SharedOption(&'a super::decision::return_receiver::ReceiverPlan),
+    /// wave-6b: an accessor's raw result received as a typed region slice.
+    Region(&'a super::decision::void_region::Receiver),
 }
 
 impl ReceiverGraft<'_> {
@@ -2500,6 +2502,7 @@ impl ReceiverGraft<'_> {
             Self::Raw(input) => input.render(call),
             Self::Outbound(input) => input.render(call),
             Self::SharedOption(input) => input.render_coercion(call),
+            Self::Region(receiver) => receiver.render(call),
         }
     }
 }
@@ -3713,6 +3716,7 @@ fn transform_with<'tcx>(
                                 && site.emitted_type == receiver.receiver_type()
                         })
                 })
+            && !super::decision::void_region::typed_receiver(table, subject, decision)
         {
             insert_counting(
                 &mut decisions,
@@ -4085,6 +4089,19 @@ fn transform_with<'tcx>(
         {
             return Err(format!(
                 "receiver-input-invariant:duplicate-coercion:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    for receiver in super::decision::void_region::delivered_receivers(table, reverts) {
+        let span = receiver.initializer_span;
+        let key = (span.lo().0, span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Region(receiver))
+            .is_some()
+        {
+            return Err(format!(
+                "receiver-input-invariant:duplicate-region-plan:{}..{}",
                 key.0, key.1
             ));
         }
