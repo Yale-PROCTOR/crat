@@ -90,7 +90,7 @@ pub(crate) fn inherit_wrapped_payloads(
         .iter()
         .filter(|(subject, decision)| {
             ctx.family_policy
-                .enabled(subject.fn_did, FamilyStage::Option)
+                .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option)
                 && matches!(subject.kind, SubjectKind::Local)
                 && match decision {
                     Decision::Opt { slice: false, .. } => true,
@@ -123,7 +123,7 @@ pub(crate) fn inherit_wrapped_payloads(
     // Every successful round removes at least one thin Option candidate.
     for _ in 0..thin_options {
         let candidates = entries.iter().enumerate().filter_map(|(index, (subject, decision))| {
-            if !ctx.family_policy.enabled(subject.fn_did, FamilyStage::Option)
+            if !ctx.family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option)
                 || !matches!(subject.kind, SubjectKind::Local) {
                 return None;
             }
@@ -318,7 +318,7 @@ pub(crate) fn plan_values(
         .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
         .collect();
     for (subject, decision) in &table.entries {
-        if !family_policy.enabled(subject.fn_did, FamilyStage::Option) {
+        if !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option) {
             continue;
         }
         let (mutable, slice) = match decision {
@@ -729,7 +729,7 @@ pub(crate) fn plan_operations(
     let mut out = Vec::new();
     let mut body_edits = Vec::new();
     for (subject, decision) in &table.entries {
-        if !family_policy.enabled(subject.fn_did, FamilyStage::Option) {
+        if !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option) {
             continue;
         }
         let source = match decision {

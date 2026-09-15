@@ -224,8 +224,10 @@ pub(crate) fn bridge_ast(argument: &rustc_ast::Expr) -> Option<rustc_ast::ExprKi
 pub(crate) fn active<'a>(ctx: &super::Ctx<'a, '_>, s: &Subject) -> Option<&'a Contract> {
     use crate::bo_rewriter::additive::FamilyStage;
     (ctx.family_policy
-        .enabled(s.fn_did, FamilyStage::Declaration)
-        && ctx.family_policy.enabled(s.fn_did, FamilyStage::SliceUse))
+        .enabled_for((s.fn_did, s.hir_id), FamilyStage::Declaration)
+        && ctx
+            .family_policy
+            .enabled_for((s.fn_did, s.hir_id), FamilyStage::SliceUse))
     .then(|| ctx.counted_void.get(&(s.fn_did, s.hir_id)))
     .flatten()
 }

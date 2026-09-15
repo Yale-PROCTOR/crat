@@ -45,9 +45,17 @@ impl FamilyStage {
     }
 }
 
+pub(crate) type SubjectKey = (LocalDefId, HirId);
+
 pub(crate) struct FamilyPolicy {
     pub(crate) stage: FamilyStage,
     pub(crate) withdrawn: BTreeSet<(FamilyStage, SignatureClassId)>,
+    /// R397-6(a): a candidate that failed terminally is excluded at the
+    /// selection input for exactly its own identity. Its owner and every
+    /// sibling keep the stage, so the deterministic pipeline re-derives their
+    /// prior result instead of the whole family falling back.
+    /// Keyed by the binding's item-local id: the owner fixes the `HirId` owner.
+    pub(crate) withdrawn_subjects: BTreeSet<(FamilyStage, SignatureClassId, u32)>,
 }
 
 impl FamilyPolicy {
@@ -55,6 +63,7 @@ impl FamilyPolicy {
         Self {
             stage,
             withdrawn: BTreeSet::new(),
+            withdrawn_subjects: BTreeSet::new(),
         }
     }
 
@@ -71,6 +80,28 @@ impl FamilyPolicy {
         }
         family <= stage
     }
+
+    /// The (owner, subject)-scoped gate: an owner-level withdrawal or this
+    /// subject's own exclusion at a stage both drop the subject to that stage's
+    /// predecessor profile; a sibling's exclusion never does.
+    pub(crate) fn enabled_for(&self, subject: SubjectKey, family: FamilyStage) -> bool {
+        let owner = SignatureClassId::of(subject.0);
+        let mut stage = self.stage;
+        while self.withdrawn.contains(&(stage, owner))
+            || self
+                .withdrawn_subjects
+                .contains(&(stage, owner, subject.1.local_id.as_u32()))
+        {
+            let Some(previous) = stage.previous() else { return false };
+            stage = previous;
+        }
+        family <= stage
+    }
+
+    /// Strict transaction progress counts both scopes.
+    pub(crate) fn exclusions(&self) -> usize {
+        self.withdrawn.len() + self.withdrawn_subjects.len()
+    }
 }
 
 #[derive(Clone)]
@@ -83,6 +114,9 @@ pub(crate) struct StageSnapshot {
 pub(crate) struct FamilyWithdrawal {
     pub(crate) owner: SignatureClassId,
     pub(crate) cause: String,
+    /// Empty: the owner falls back (R220). Otherwise exactly these candidates
+    /// of `owner` are excluded at the selection input (R397-6(a)).
+    pub(crate) subjects: Vec<HirId>,
 }
 
 /// A concrete old rendering error, tied to one binding and its actual site.
@@ -257,37 +291,28 @@ fn class_changed(
                 .filter(|(s, _)| s.fn_did == owner.local_def_id()))
 }
 
-pub(crate) fn withdrawals(
-    prior: &StageSnapshot,
-    candidate: &StageSnapshot,
-    policy: &FamilyPolicy,
-    soundness: &[SoundnessWithdrawal],
-) -> Vec<FamilyWithdrawal> {
+/// Which owners the R220 generator would have withdrawn, before R397-6(a)
+/// scopes each of them to the candidates that actually moved.
+enum Anchor {
+    /// The owner carries a new terminal of its own (a collision, a dropped
+    /// site, an unwitnessed refusal, a new dependency, a changed disposition).
+    /// The terminal sites are carried so the exclusion can be attributed to
+    /// exactly the candidates they name — ALL new terminal sites of the owner,
+    /// never the first alone: a call that drops one site per contracted
+    /// position (wave-6v's `seam-site-overlap`) names every position, and
+    /// excluding one of them would leave a live view beside a raw access.
+    Direct(Vec<super::bridge_receipt::BridgeSiteKey>),
+    /// A prior delivery of this owner is lost and the owner itself has no
+    /// transaction left to withdraw: the cause is elsewhere in its interface
+    /// component.
+    Restore,
+}
+
+type RelatedGraph = BTreeMap<SignatureClassId, BTreeSet<SignatureClassId>>;
+
+fn related_graph(candidate: &StageSnapshot) -> RelatedGraph {
     use super::bridge_receipt::BridgeCalleeId;
-    if policy.stage == FamilyStage::Core {
-        return Vec::new();
-    }
-    let protected = losses(prior, candidate, soundness)
-        .into_iter()
-        .map(|s| SignatureClassId::of(s.fn_did))
-        .collect::<BTreeSet<_>>();
-    let witnessed_owners = soundness
-        .iter()
-        .map(|s| SignatureClassId::of(s.subject.0))
-        .filter(|owner| !protected.contains(owner))
-        .collect::<BTreeSet<_>>();
-    let enabled = |owner: SignatureClassId| policy.enabled(owner.local_def_id(), policy.stage);
-    let prior_sites = prior
-        .plan
-        .class_finalization
-        .classes
-        .values()
-        .filter(|c| c.is_ready())
-        .flat_map(|c| c.sites.iter())
-        .filter(|s| s.edit_key != "-")
-        .map(|s| s.edit_key.clone())
-        .collect::<BTreeSet<_>>();
-    let mut related_graph = BTreeMap::<SignatureClassId, BTreeSet<SignatureClassId>>::new();
+    let mut related_graph = RelatedGraph::new();
     let mut connect = |left, right| {
         if left != right {
             related_graph.entry(left).or_default().insert(right);
@@ -317,31 +342,260 @@ pub(crate) fn withdrawals(
             }
         }
     }
-    let related_changes = |root| {
-        let mut pending = vec![(root, vec![root])];
-        let mut seen = BTreeSet::new();
-        let mut changed = Vec::new();
-        while let Some((owner, path)) = pending.pop() {
-            if !seen.insert(owner) {
-                continue;
+    related_graph
+}
+
+/// The candidates of `owner` at this stage: subjects whose candidate decision
+/// is a safe form that differs from the predecessor's (or is new), and that are
+/// not already excluded at this stage. A loss is a symptom, never a candidate.
+fn moved(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    policy: &FamilyPolicy,
+    owner: SignatureClassId,
+) -> Vec<HirId> {
+    candidate
+        .table
+        .entries
+        .iter()
+        .filter(|(subject, decision)| {
+            subject.fn_did == owner.local_def_id()
+                && safe(decision)
+                && policy.enabled_for((subject.fn_did, subject.hir_id), policy.stage)
+                && prior
+                    .table
+                    .entries
+                    .iter()
+                    .find(|(s, _)| (s.fn_did, s.hir_id) == (subject.fn_did, subject.hir_id))
+                    .is_none_or(|(_, old)| old != decision)
+        })
+        .map(|(subject, _)| subject.hir_id)
+        .collect()
+}
+
+/// Owners whose call-side transactions landed NEW sites on `owner`'s class: a
+/// caller's moved argument produces pair / C sites on the callee's class
+/// without any callee decision moving (binn `binn_get_bool` → `is_bool_str`).
+fn induced_by(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    owner: SignatureClassId,
+) -> BTreeSet<SignatureClassId> {
+    use super::bridge_receipt::BridgeCalleeId;
+    let prior_keys = prior
+        .plan
+        .class_finalization
+        .classes
+        .get(&owner)
+        .map(|class| {
+            class
+                .sites
+                .iter()
+                .map(|site| site.key.receipt_key())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut owners = BTreeSet::new();
+    for site in candidate
+        .plan
+        .class_finalization
+        .classes
+        .get(&owner)
+        .map(|class| class.sites.as_slice())
+        .unwrap_or_default()
+    {
+        if prior_keys.contains(&site.key.receipt_key()) {
+            continue;
+        }
+        owners.insert(SignatureClassId::of(site.key.caller));
+        if let BridgeCalleeId::Local(callee) = site.key.callee {
+            owners.insert(SignatureClassId::of(callee));
+        }
+    }
+    owners.remove(&owner);
+    owners
+}
+
+/// The candidates of `anchor` a terminal site names: a call INTO the anchor
+/// dropped or collided at `arg{N}` names the anchor's parameter `N` (wave-4's
+/// `copyFileName::from` at the caller's `arg1`, while `to` at `arg0` is
+/// untouched); a surface / address site names its subject outright. Empty
+/// when the site names no candidate of the anchor's own.
+fn named_by(
+    candidate: &StageSnapshot,
+    anchor: SignatureClassId,
+    site: &super::bridge_receipt::BridgeSiteKey,
+) -> Vec<HirId> {
+    use super::bridge_receipt::BridgeCalleeId;
+    let subjects = candidate
+        .table
+        .entries
+        .iter()
+        .filter(|(subject, _)| subject.fn_did == anchor.local_def_id());
+    if site.callee == BridgeCalleeId::Local(anchor.local_def_id())
+        && let Some(index) = site.position.strip_prefix("arg")
+        && let Ok(index) = index.parse::<usize>()
+    {
+        return subjects
+            .filter(|(subject, _)| {
+                matches!(subject.kind, decision::SubjectKind::Param { hir_index } if hir_index == index)
+            })
+            .map(|(subject, _)| subject.hir_id)
+            .collect();
+    }
+    if site.caller == anchor.local_def_id() && matches!(site.arm.as_str(), "surface" | "addr") {
+        let named = site.position.split('@').next().unwrap_or_default();
+        return subjects
+            .filter(|(subject, _)| format!("{}#{}", subject.label, subject.local.as_u32()) == named)
+            .map(|(subject, _)| subject.hir_id)
+            .collect();
+    }
+    Vec::new()
+}
+
+pub(crate) fn withdrawals(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    policy: &FamilyPolicy,
+    soundness: &[SoundnessWithdrawal],
+) -> Vec<FamilyWithdrawal> {
+    if policy.stage == FamilyStage::Core {
+        return Vec::new();
+    }
+    let related_graph = related_graph(candidate);
+    let enabled = |owner: SignatureClassId| policy.enabled(owner.local_def_id(), policy.stage);
+    let anchors = anchors(prior, candidate, policy, soundness, &enabled);
+
+    // R397-6(a): resolve each anchor to the candidates that moved. A direct
+    // anchor's own moved subjects come first, then the callers / callees whose
+    // moved arguments induced its new sites; only an owner with no moved
+    // candidate anywhere near it falls back as a whole (the R220 floor). A
+    // restore anchor searches its interface component nearest-first and stops
+    // at the first distance carrying a changed owner, instead of withdrawing
+    // every changed owner the component can reach.
+    let mut requested = BTreeMap::<SignatureClassId, (String, Vec<HirId>)>::new();
+    let mut request = |owner: SignatureClassId, cause: String, subjects: Vec<HirId>| {
+        requested.entry(owner).or_insert((cause, subjects));
+    };
+    let scoped_cause = |anchor: SignatureClassId, cause: &str| {
+        format!(
+            "exclusion-rederivation:anchor={}:{cause}",
+            anchor.order_key()
+        )
+    };
+    for (anchor, (cause, kind)) in &anchors {
+        match kind {
+            Anchor::Direct(sites) => {
+                let mut own = moved(prior, candidate, policy, *anchor);
+                let named = sites
+                    .iter()
+                    .flat_map(|site| named_by(candidate, *anchor, site))
+                    .collect::<Vec<_>>();
+                if own.iter().any(|hir| named.contains(hir)) {
+                    own.retain(|hir| named.contains(hir));
+                }
+                if !own.is_empty() {
+                    request(*anchor, scoped_cause(*anchor, cause), own);
+                    continue;
+                }
+                let mut induced = false;
+                for owner in induced_by(prior, candidate, *anchor) {
+                    if !enabled(owner) {
+                        continue;
+                    }
+                    let subjects = moved(prior, candidate, policy, owner);
+                    if !subjects.is_empty() {
+                        request(owner, scoped_cause(*anchor, cause), subjects);
+                        induced = true;
+                    }
+                }
+                if !induced {
+                    request(*anchor, cause.clone(), Vec::new());
+                }
             }
-            if owner != root && enabled(owner) && class_changed(prior, candidate, owner) {
-                changed.push((
-                    owner,
-                    path.iter()
-                        .map(|owner| owner.order_key())
-                        .collect::<Vec<_>>(),
-                ));
-            }
-            for &next in related_graph.get(&owner).into_iter().flatten() {
-                let mut next_path = path.clone();
-                next_path.push(next);
-                pending.push((next, next_path));
+            Anchor::Restore => {
+                let mut frontier = vec![(*anchor, vec![*anchor])];
+                let mut seen = BTreeSet::from([*anchor]);
+                while !frontier.is_empty() {
+                    let mut next = Vec::new();
+                    let mut layer = Vec::new();
+                    for (owner, path) in frontier {
+                        for &neighbour in related_graph.get(&owner).into_iter().flatten() {
+                            if !seen.insert(neighbour) {
+                                continue;
+                            }
+                            let mut next_path = path.clone();
+                            next_path.push(neighbour);
+                            if enabled(neighbour) && class_changed(prior, candidate, neighbour) {
+                                layer.push((neighbour, next_path.clone()));
+                            }
+                            next.push((neighbour, next_path));
+                        }
+                    }
+                    if !layer.is_empty() {
+                        for (owner, path) in layer {
+                            let path = path
+                                .iter()
+                                .map(|owner| owner.order_key())
+                                .collect::<Vec<_>>();
+                            let cause = format!("restore-family-interface-path:{path:?}");
+                            let subjects = moved(prior, candidate, policy, owner);
+                            if subjects.is_empty() {
+                                request(owner, cause, Vec::new());
+                            } else {
+                                request(owner, scoped_cause(*anchor, &cause), subjects);
+                            }
+                        }
+                        break;
+                    }
+                    frontier = next;
+                }
             }
         }
-        changed
-    };
-    let mut requested = BTreeMap::<SignatureClassId, String>::new();
+    }
+    requested
+        .into_iter()
+        .map(|(owner, (cause, subjects))| FamilyWithdrawal {
+            owner,
+            cause,
+            subjects,
+        })
+        .collect()
+}
+
+/// The R220 generator, unchanged in what it observes: which owners carry a new
+/// terminal, and which prior deliveries are lost with no transaction of their
+/// own left to withdraw. Scoping is `withdrawals`' job.
+fn anchors(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    policy: &FamilyPolicy,
+    soundness: &[SoundnessWithdrawal],
+    enabled: &impl Fn(SignatureClassId) -> bool,
+) -> BTreeMap<SignatureClassId, (String, Anchor)> {
+    let protected = losses(prior, candidate, soundness)
+        .into_iter()
+        .map(|s| SignatureClassId::of(s.fn_did))
+        .collect::<BTreeSet<_>>();
+    let witnessed_owners = soundness
+        .iter()
+        .map(|s| SignatureClassId::of(s.subject.0))
+        .filter(|owner| !protected.contains(owner))
+        .collect::<BTreeSet<_>>();
+    let prior_sites = prior
+        .plan
+        .class_finalization
+        .classes
+        .values()
+        .filter(|c| c.is_ready())
+        .flat_map(|c| c.sites.iter())
+        .filter(|s| s.edit_key != "-")
+        .map(|s| s.edit_key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut requested = BTreeMap::<SignatureClassId, (String, Anchor)>::new();
+    // Restore anchors are kept apart so they never count as a covering request
+    // for a collision partner or a later protected owner (R220 parity).
+    let mut restore = BTreeSet::<SignatureClassId>::new();
     // Exact predecessor edit identity (including replacement digest) establishes
     // age. Generated A5/C sites keep the stage that introduced the transaction;
     // their generic bridge-kind strings do not establish precedence.
@@ -354,11 +608,31 @@ pub(crate) fn withdrawals(
             (true, true) | (false, false) => None,
         };
         if let Some(owner) = newer.filter(|owner| enabled(*owner)) {
+            let newer_edit_key = if old_left {
+                &collision.right_edit_key
+            } else {
+                &collision.left_edit_key
+            };
+            let site = candidate
+                .plan
+                .class_finalization
+                .classes
+                .get(&owner)
+                .and_then(|class| {
+                    class
+                        .sites
+                        .iter()
+                        .find(|site| site.edit_key == *newer_edit_key)
+                })
+                .map(|site| site.key.clone());
             requested.insert(
                 owner,
-                format!(
-                    "newer-family-collision:{}|{}",
-                    collision.left_edit_key, collision.right_edit_key
+                (
+                    format!(
+                        "newer-family-collision:{}|{}",
+                        collision.left_edit_key, collision.right_edit_key
+                    ),
+                    Anchor::Direct(site.into_iter().collect()),
                 ),
             );
         }
@@ -368,17 +642,24 @@ pub(crate) fn withdrawals(
             continue;
         }
         let old = prior.plan.class_finalization.classes.get(owner);
-        let new_dropped = class.sites.iter().find(|site| {
-            matches!(site.state, plan::ClassSiteState::Dropped(_))
-                && !old.is_some_and(|old| old.sites.contains(site))
-                && site.key.bridge_kind != "missing-required-site"
-        });
-        if let Some(site) = new_dropped {
+        let new_dropped = class
+            .sites
+            .iter()
+            .filter(|site| {
+                matches!(site.state, plan::ClassSiteState::Dropped(_))
+                    && !old.is_some_and(|old| old.sites.contains(site))
+                    && site.key.bridge_kind != "missing-required-site"
+            })
+            .collect::<Vec<_>>();
+        if let Some(site) = new_dropped.first() {
             requested.entry(*owner).or_insert_with(|| {
-                format!(
-                    "unsatisfied-family-site:{}:{:?}",
-                    site.key.receipt_key(),
-                    site.state
+                (
+                    format!(
+                        "unsatisfied-family-site:{}:{:?}",
+                        site.key.receipt_key(),
+                        site.state
+                    ),
+                    Anchor::Direct(new_dropped.iter().map(|site| site.key.clone()).collect()),
                 )
             });
             continue;
@@ -389,9 +670,12 @@ pub(crate) fn withdrawals(
                 && !old.is_some_and(|old| old.hold_reasons().contains(reason))
         });
         if let Some(reason) = new_refusal {
-            requested
-                .entry(*owner)
-                .or_insert_with(|| format!("unwitnessed-family-refusal:{reason}"));
+            requested.entry(*owner).or_insert_with(|| {
+                (
+                    format!("unwitnessed-family-refusal:{reason}"),
+                    Anchor::Direct(Vec::new()),
+                )
+            });
         }
     }
     // A dependency casualty yields at the changed root transaction. Do not
@@ -405,13 +689,15 @@ pub(crate) fn withdrawals(
             }
             let Some(class) = candidate.plan.class_finalization.classes.get(&current) else {
                 if enabled(current) {
-                    requested.insert(current, "missing-prior-family-class".to_owned());
+                    requested.insert(
+                        current,
+                        (
+                            "missing-prior-family-class".to_owned(),
+                            Anchor::Direct(Vec::new()),
+                        ),
+                    );
                 } else {
-                    for (owner, path) in related_changes(current) {
-                        requested
-                            .entry(owner)
-                            .or_insert_with(|| format!("restore-family-interface-path:{path:?}"));
-                    }
+                    restore.insert(current);
                 }
                 continue;
             };
@@ -439,7 +725,10 @@ pub(crate) fn withdrawals(
             if let Some(dependency) = new_dependency.filter(|_| enabled(current)) {
                 requested.insert(
                     current,
-                    format!("new-family-dependency:{}", dependency.order_key()),
+                    (
+                        format!("new-family-dependency:{}", dependency.order_key()),
+                        Anchor::Direct(Vec::new()),
+                    ),
                 );
                 continue;
             }
@@ -460,20 +749,24 @@ pub(crate) fn withdrawals(
                 continue;
             }
             if enabled(current) && class_changed(prior, candidate, current) {
-                requested.insert(current, "restore-prior-family-disposition".to_owned());
+                requested.insert(
+                    current,
+                    (
+                        "restore-prior-family-disposition".to_owned(),
+                        Anchor::Direct(Vec::new()),
+                    ),
+                );
                 continue;
             }
-            for (owner, path) in related_changes(current) {
-                requested
-                    .entry(owner)
-                    .or_insert_with(|| format!("restore-family-interface-path:{path:?}"));
-            }
+            restore.insert(current);
         }
     }
+    for owner in restore {
+        requested
+            .entry(owner)
+            .or_insert(("lost-prior-delivery".to_owned(), Anchor::Restore));
+    }
     requested
-        .into_iter()
-        .map(|(owner, cause)| FamilyWithdrawal { owner, cause })
-        .collect()
 }
 
 pub(crate) fn select_uses<T: Clone>(
@@ -486,7 +779,7 @@ pub(crate) fn select_uses<T: Clone>(
         .keys()
         .chain(predecessor.keys())
         .filter_map(|key| {
-            let source = if policy.enabled(key.0, family) {
+            let source = if policy.enabled_for(*key, family) {
                 current
             } else {
                 predecessor
@@ -498,6 +791,11 @@ pub(crate) fn select_uses<T: Clone>(
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct FamilyFallbackReceipt {
+    /// `owner`: the whole owner fell back to its predecessor stage (the R220
+    /// transaction). `subject`: R397-6(a) — only the named candidate rows are
+    /// excluded at the selection input; the owner and its siblings keep the
+    /// stage.
+    pub(crate) scope: String,
     pub(crate) family: String,
     pub(crate) owner_local_def_id: u32,
     pub(crate) owner_path: String,

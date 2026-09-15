@@ -1159,7 +1159,7 @@ pub(crate) fn decide_with_raw_fallbacks(
                 }
                 Decision::Opt { mutable, .. } => {
                     ctx.family_policy
-                        .enabled(subject.fn_did, FamilyStage::Option)
+                        .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option)
                         && *mutable
                         && !subject.mut_binding
                         && ctx
@@ -1192,13 +1192,19 @@ pub(crate) fn decide_with_raw_fallbacks(
         declaration_patterns: ctx
             .declaration_patterns
             .iter()
-            .filter(|(node, _)| ctx.family_policy.enabled(node.0, FamilyStage::Declaration))
+            .filter(|(node, _)| {
+                ctx.family_policy
+                    .enabled_for(**node, FamilyStage::Declaration)
+            })
             .map(|(node, carrier)| (*node, carrier.clone()))
             .collect(),
         declaration_pointees: ctx
             .declaration_pointees
             .iter()
-            .filter(|(node, _)| ctx.family_policy.enabled(node.0, FamilyStage::Declaration))
+            .filter(|(node, _)| {
+                ctx.family_policy
+                    .enabled_for(**node, FamilyStage::Declaration)
+            })
             .map(|(node, pointee)| (*node, pointee.clone()))
             .collect(),
         entries,
@@ -1568,7 +1574,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     }
     let typed_pattern = ctx
         .family_policy
-        .enabled(subject.fn_did, FamilyStage::Declaration)
+        .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
         && ctx
             .declaration_patterns
             .contains_key(&(subject.fn_did, subject.hir_id));
@@ -1682,7 +1688,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if io_domain.contains(&(subject.fn_did, subject.hir_id)) {
         return degrade(subject, decl_site, DegradeReason::IoDomainType);
     }
-    let option_enabled = family_policy.enabled(subject.fn_did, FamilyStage::Option);
+    let option_enabled =
+        family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option);
     let depth2_npo = matches!(subject.kind, SubjectKind::Local)
         .then(|| facts.depth2_npo_target((subject.fn_did, subject.hir_id)))
         .flatten();
@@ -1693,7 +1700,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // bypass the frozen kind, use, borrowing or lifetime gates below. Earlier
     // family stages deliberately retain the pre-item alias disposition.
     let alias_supported = subject.decl_shape == DeclShape::Alias
-        && family_policy.enabled(subject.fn_did, FamilyStage::Declaration)
+        && family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
         && declaration_pointees.contains_key(&(subject.fn_did, subject.hir_id));
     if subject.decl_shape != DeclShape::RawPtr && !alias_supported {
         return degrade(
@@ -1955,7 +1962,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // even pinned.
         if subject.ty_span.is_none()
             && !construction_values::permits(ctx, subject)
-            && !(family_policy.enabled(subject.fn_did, FamilyStage::Declaration)
+            && !(family_policy
+                .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
                 && declaration_patterns.contains_key(&(subject.fn_did, subject.hir_id)))
             && !lifetime_eligibility.is_some_and(|eligibility| {
                 eligibility
@@ -2074,7 +2082,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             && depth2_npo.is_none()
             && (!option_enabled
                 || (slice
-                    && !family_policy.enabled(subject.fn_did, FamilyStage::SliceConstruction))
+                    && !family_policy.enabled_for(
+                        (subject.fn_did, subject.hir_id),
+                        FamilyStage::SliceConstruction,
+                    ))
                 || !construction::slice_constructor_available(
                     constructions,
                     (subject.fn_did, subject.hir_id),
@@ -2144,11 +2155,13 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // initializer identity still fails closed under the historical reason;
     // otherwise the sealed construction plan carries evidence or §77 fallback.
     if matches!(subject.kind, SubjectKind::Local)
-        && (!family_policy.enabled(subject.fn_did, FamilyStage::SliceConstruction)
-            || !construction::slice_constructor_available(
-                constructions,
-                (subject.fn_did, subject.hir_id),
-            ))
+        && (!family_policy.enabled_for(
+            (subject.fn_did, subject.hir_id),
+            FamilyStage::SliceConstruction,
+        ) || !construction::slice_constructor_available(
+            constructions,
+            (subject.fn_did, subject.hir_id),
+        ))
     {
         return degrade(subject, decl_site, DegradeReason::SliceLocalConstruction);
     }
@@ -2160,7 +2173,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         return degrade(
             subject,
             EmitabilityFacts::site(tcx, span),
-            if family_policy.enabled(subject.fn_did, FamilyStage::SliceUse)
+            if family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::SliceUse)
                 && uses.unsupported_is_cursor
             {
                 DegradeReason::SliceCursorUse

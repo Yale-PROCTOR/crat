@@ -238,7 +238,7 @@ pub(crate) fn receipt_plans(
     let mut plans = Vec::new();
     let mut body_edits = Vec::new();
     for (subject, decision) in &table.entries {
-        if !family_policy.enabled(subject.fn_did, FamilyStage::SliceUse) {
+        if !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::SliceUse) {
             continue;
         }
         let mut cursor_only = false;

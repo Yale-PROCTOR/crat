@@ -80,6 +80,8 @@ pub(crate) mod mechanical_receipt;
 // R351 ownership/fields consumers arrive from the preserved lane commits.
 #[cfg(test)]
 mod construction_values_tests;
+#[cfg(test)]
+mod exclusion_rederivation_tests;
 pub(crate) mod ownership_fields;
 #[cfg(test)]
 mod ownership_fields_bodylocal_tests;
@@ -6573,11 +6575,18 @@ fn restored_reference_copy_sites(
             | decision::Decision::Box(_)
             | decision::Decision::Degraded(_) => false,
         };
+        // A subject-scoped exclusion (R397-6(a)) restores a copied source to
+        // raw exactly like an owner rollback does; the destination's adapter
+        // is needed either way.
         if !is_reference
-            || !policy
+            || !(policy
                 .withdrawn
                 .iter()
                 .any(|(_, owner)| owner.local_def_id() == destination.fn_did)
+                || policy
+                    .withdrawn_subjects
+                    .iter()
+                    .any(|(_, owner, _)| owner.local_def_id() == destination.fn_did))
         {
             continue;
         }
@@ -6948,7 +6957,11 @@ fn finish_decide<'tcx>(
         .map(|site| site.args.len())
         .sum::<usize>();
     loop {
-        let profile = (family_policy.stage, family_policy.withdrawn.clone());
+        let profile = (
+            family_policy.stage,
+            family_policy.withdrawn.clone(),
+            family_policy.withdrawn_subjects.clone(),
+        );
         if a5_role_profile.as_ref() != Some(&profile) {
             a5_roles.clear();
             a5_role_proofs.clear();
@@ -7599,13 +7612,16 @@ fn finish_decide<'tcx>(
             // A future registration must prove its exact prior mis-rendering.
             let requests = additive::withdrawals(prior, &candidate, &family_policy, &[]);
             if !requests.is_empty() {
-                let old_count = family_policy.withdrawn.len();
+                let old_count = family_policy.exclusions();
                 for request in &requests {
                     retired.capture(prior, &candidate, request, family_policy.stage);
                     let owner = tcx.def_path_str(request.owner.local_def_id().to_def_id());
                     let mut subject_rows = Vec::new();
                     for (subject, current) in &table.entries {
-                        if subject.fn_did != request.owner.local_def_id() {
+                        if subject.fn_did != request.owner.local_def_id()
+                            || !(request.subjects.is_empty()
+                                || request.subjects.contains(&subject.hir_id))
+                        {
                             continue;
                         }
                         let old = prior
@@ -7622,17 +7638,36 @@ fn finish_decide<'tcx>(
                         ));
                     }
                     family_receipts.push(additive::FamilyFallbackReceipt {
+                        scope: if request.subjects.is_empty() {
+                            "owner"
+                        } else {
+                            "subject"
+                        }
+                        .to_owned(),
                         family: format!("{:?}", family_policy.stage),
                         owner_local_def_id: request.owner.order_key(),
                         owner_path: owner,
                         cause: request.cause.clone(),
                         subjects: subject_rows,
                     });
-                    family_policy
-                        .withdrawn
-                        .insert((family_policy.stage, request.owner));
+                    // R397-6(a): a subject-scoped request excludes exactly the
+                    // named candidates at the selection input; the owner keeps
+                    // the stage and its siblings re-derive their prior result.
+                    if request.subjects.is_empty() {
+                        family_policy
+                            .withdrawn
+                            .insert((family_policy.stage, request.owner));
+                    } else {
+                        for &hir_id in &request.subjects {
+                            family_policy.withdrawn_subjects.insert((
+                                family_policy.stage,
+                                request.owner,
+                                hir_id.local_id.as_u32(),
+                            ));
+                        }
+                    }
                 }
-                if family_policy.withdrawn.len() <= old_count {
+                if family_policy.exclusions() <= old_count {
                     return Err(
                         "additive-family-fallback-invariant:no-strict-transaction-progress"
                             .to_owned(),

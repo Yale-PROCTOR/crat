@@ -123,10 +123,10 @@ pub(crate) fn promote(
         .iter()
         .enumerate()
         .filter_map(|(index, (subject, decision))| {
-            if !ctx
-                .family_policy
-                .enabled(subject.fn_did, super::super::additive::FamilyStage::Return)
-            {
+            if !ctx.family_policy.enabled_for(
+                (subject.fn_did, subject.hir_id),
+                super::super::additive::FamilyStage::Return,
+            ) {
                 return None;
             }
             if let Some(plan) = wrapper::plan(ctx, subject, decision, entries) {

@@ -173,7 +173,9 @@ pub(crate) fn augment(
     subjects: &mut [Subject],
 ) {
     for subject in subjects {
-        if subject.mutable || !policy.enabled(subject.fn_did, FamilyStage::Declaration) {
+        if subject.mutable
+            || !policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
+        {
             continue;
         }
         let node = (subject.fn_did, subject.hir_id);

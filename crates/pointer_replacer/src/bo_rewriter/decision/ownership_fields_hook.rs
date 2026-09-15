@@ -353,8 +353,8 @@ pub(crate) fn plan(
         Ok(plan) => return Ok(plan),
         Err(failure) => failure,
     };
-    if ctx.family_policy.enabled(
-        subject.fn_did,
+    if ctx.family_policy.enabled_for(
+        (subject.fn_did, subject.hir_id),
         super::super::additive::FamilyStage::Ownership,
     ) && let Some(plan) = ctx
         .ownership_fields

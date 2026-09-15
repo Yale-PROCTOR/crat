@@ -742,8 +742,8 @@ pub(crate) fn plan_slice_constructions(
     let mut plans = Vec::new();
     let mut known_lengths = FxHashMap::default();
     for (subject, decision) in &table.entries {
-        if !family_policy.enabled(
-            subject.fn_did,
+        if !family_policy.enabled_for(
+            (subject.fn_did, subject.hir_id),
             super::super::additive::FamilyStage::SliceConstruction,
         ) {
             continue;

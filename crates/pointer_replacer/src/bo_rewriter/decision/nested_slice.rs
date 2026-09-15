@@ -618,7 +618,9 @@ pub(crate) fn promote(
     let mut owners = table
         .entries
         .iter()
-        .filter(|(s, _)| s.ptr_depth == 2 && policy.enabled(s.fn_did, FamilyStage::Return))
+        .filter(|(s, _)| {
+            s.ptr_depth == 2 && policy.enabled_for((s.fn_did, s.hir_id), FamilyStage::Return)
+        })
         .map(|(s, _)| s.fn_did)
         .collect::<Vec<_>>();
     owners.sort_by_key(|o| o.local_def_index.as_u32());
