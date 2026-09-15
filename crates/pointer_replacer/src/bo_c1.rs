@@ -23041,6 +23041,69 @@ fn raw_boundary_capture_error_row(error: &str) -> report::Row {
     row
 }
 
+/// R407-2: a PROBE runs a named subset of the corpus so a composition defect
+/// can be bisected by hook in minutes instead of a 40-minute event. It is a
+/// harness knob, not an instrument change: it exists only for a diagnostic
+/// run -- a formal run refuses it outright, because a formal census covers all
+/// 20 frozen programs or it is not a census -- and a probe never reaches the
+/// aggregate path (no ledger, no controls, no verdict): it writes the
+/// per-program rows and a receipt that says `status=probe`.
+fn raw_boundary_probe_programs(
+    diagnostic_run: bool,
+    only: Option<&str>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(only) = only else {
+        return Ok(None);
+    };
+    if !diagnostic_run {
+        return Err(format!(
+            "CRAT_RAW_BOUNDARY_ONLY_PROGRAMS={only:?} is set but CRAT_RAW_BOUNDARY_RUN_KIND is not \
+             `diagnostic`: a formal census covers all 20 frozen programs (R407-2)"
+        ));
+    }
+    let mut selected = Vec::new();
+    for name in only
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if !CORPUS.iter().any(|program| program.name == name) {
+            return Err(format!(
+                "CRAT_RAW_BOUNDARY_ONLY_PROGRAMS names {name:?}, not a corpus program"
+            ));
+        }
+        if !selected.iter().any(|seen| seen == name) {
+            selected.push(name.to_owned());
+        }
+    }
+    if selected.is_empty() {
+        return Err("CRAT_RAW_BOUNDARY_ONLY_PROGRAMS is set but names no program".to_owned());
+    }
+    Ok(Some(selected))
+}
+
+#[test]
+fn r407_probe_programs_only_for_a_diagnostic_run() {
+    assert_eq!(raw_boundary_probe_programs(false, None), Ok(None));
+    assert_eq!(raw_boundary_probe_programs(true, None), Ok(None));
+    assert_eq!(
+        raw_boundary_probe_programs(true, Some("bzip2, heman,bzip2")),
+        Ok(Some(vec!["bzip2".to_owned(), "heman".to_owned()]))
+    );
+    let formal = raw_boundary_probe_programs(false, Some("bzip2")).unwrap_err();
+    assert!(formal.contains("formal census covers all 20"), "{formal}");
+    assert!(
+        raw_boundary_probe_programs(true, Some("nosuch"))
+            .unwrap_err()
+            .contains("not a corpus program")
+    );
+    assert!(
+        raw_boundary_probe_programs(true, Some(" , "))
+            .unwrap_err()
+            .contains("names no program")
+    );
+}
+
 fn raw_boundary_typed_failure(row: &report::Row) -> bool {
     row.get(raw_schema::STATUS).is_some_and(|status| {
         status == "worker-abort"
@@ -23279,6 +23342,13 @@ fn raw_boundary_wave2_corpus_census() {
     let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
     let diagnostic_run =
         std::env::var("CRAT_RAW_BOUNDARY_RUN_KIND").is_ok_and(|kind| kind == "diagnostic");
+    let probe_programs = raw_boundary_probe_programs(
+        diagnostic_run,
+        std::env::var("CRAT_RAW_BOUNDARY_ONLY_PROGRAMS")
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     let reaggregation_rows = std::env::var_os("CRAT_RAW_BOUNDARY_REAGGREGATE_ROWS");
     let ledger_dir = if reaggregation_rows.is_some() {
         PathBuf::from(
@@ -23307,7 +23377,11 @@ fn raw_boundary_wave2_corpus_census() {
             .collect::<Vec<_>>()
     } else {
         let mut rows = Vec::new();
-        for program in CORPUS {
+        for program in CORPUS.iter().filter(|program| {
+            probe_programs
+                .as_ref()
+                .is_none_or(|selected| selected.iter().any(|name| name == program.name))
+        }) {
             let outcome = orchestrate::run_child_env_with_memory_limit_mib(
                 program.name,
                 &recipe.workspace_program_file(&root, *program),
@@ -23322,6 +23396,16 @@ fn raw_boundary_wave2_corpus_census() {
                 ),
             );
             let row = raw_boundary_worker_row(program.name, &outcome);
+            if raw_boundary_typed_failure(&row) {
+                // R407-5: a failed worker's stderr is written at once, so the cause of
+                // an abort survives the parent stopping later on another program (the
+                // batch-7 attempt-2 brotli abort had no readable cause).
+                fs::write(
+                    artifact_dir.join(format!("{}.raw-boundary-census.err", program.name)),
+                    &outcome.stderr,
+                )
+                .expect("write failed worker stderr");
+            }
             if raw_boundary_typed_failure(&row)
                 && (row.get(raw_schema::STATUS) == Some("worker-abort") || diagnostic_run)
             {
@@ -23346,6 +23430,32 @@ fn raw_boundary_wave2_corpus_census() {
         }
         rows
     };
+    if let Some(selected) = &probe_programs {
+        // A probe stops here: per-program rows and a receipt, never the aggregate.
+        assert_eq!(rows.len(), selected.len());
+        let per_program = rows
+            .iter()
+            .map(report::to_kv_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(artifact_dir.join("per-program.kv"), per_program).expect("write probe rows");
+        let typed = rows
+            .iter()
+            .filter(|row| raw_boundary_typed_failure(row))
+            .count();
+        fs::write(
+            artifact_dir.join("census-receipt.txt"),
+            format!(
+                "status=probe\nrun_kind=diagnostic\ndata=false\nprobe_programs={}\ntyped_failures={}\nnote=a probe is not a census: no ledger, no controls, no verdict\n",
+                selected.join(","),
+                typed,
+            ),
+        )
+        .expect("write probe receipt");
+        raw_boundary_write_manifest(&artifact_dir).expect("write probe artifact manifest");
+        return;
+    }
     assert_eq!(rows.len(), 20);
     if !raw_boundary_census_rows_have_data(&rows, diagnostic_run, recipe.attestation) {
         let per_program = rows
