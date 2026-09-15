@@ -138,13 +138,8 @@ fn c_declarations() -> &'static str {
     r#"#![allow(non_camel_case_types)] pub mod libc { pub use core::ffi::c_int; pub use core::ffi::c_ulong; pub use core::ffi::c_float; pub use core::ffi::c_void; } extern "C" { fn malloc(n:libc::c_ulong)->*mut libc::c_void; fn free(p:*mut libc::c_void); }"#
 }
 
-#[test]
-fn r395_heman_gaussian_splat_real_shape_wrapping_mul_count() {
-    // The corpus shape of `generate_gaussian_splat::gaussian_row#3`: a
-    // `wrapping_mul` byte count from a `c_int` parameter, a raw callee that
-    // reads/writes through the formal and frees only its own allocation,
-    // loop-carried `offset` reads, the C free at the end.
-    let input = format!(
+fn gaussian_fixture() -> String {
+    format!(
         r#"{}
 pub unsafe extern "C" fn generate_gaussian_row(mut target: *mut libc::c_int, mut fwidth: libc::c_int) {{
     let mut nbytes = (fwidth as libc::c_ulong).wrapping_mul(::std::mem::size_of::<libc::c_int>() as libc::c_ulong) as libc::c_int;
@@ -176,7 +171,16 @@ pub unsafe extern "C" fn generate_gaussian_splat(mut target: *mut libc::c_float,
     free(gaussian_row as *mut libc::c_void);
 }}"#,
         c_declarations()
-    );
+    )
+}
+
+#[test]
+fn r395_heman_gaussian_splat_real_shape_wrapping_mul_count() {
+    // The corpus shape of `generate_gaussian_splat::gaussian_row#3`: a
+    // `wrapping_mul` byte count from a `c_int` parameter, a raw callee that
+    // reads/writes through the formal and frees only its own allocation,
+    // loop-carried `offset` reads, the C free at the end.
+    let input = gaussian_fixture();
     let s = verify(&input, "gaussian_row", BoxShape::Slice, false);
     assert!(!s.contains("Box::into_raw"));
     assert_eq!(
@@ -185,6 +189,15 @@ pub unsafe extern "C" fn generate_gaussian_splat(mut target: *mut libc::c_float,
         2,
         "the complete byte expression is kept once at each allocation"
     );
+}
+
+#[test]
+fn r399_heman_gaussian_row_tmp_real_shape_narrowed_nbytes_local() {
+    // `generate_gaussian_row::tmp#68`: the byte count is the `c_int` local
+    // `nbytes`, initialised once from the `wrapping_mul` chain.
+    let s = verify(&gaussian_fixture(), "tmp", BoxShape::Slice, false);
+    assert!(s.contains("let mut tmp = ::std::vec![0i32; (((nbytes as libc::c_ulong) as usize) / ::core::mem::size_of::<i32>())].into_boxed_slice();"), "{s}");
+    assert!(s.contains("::std::mem::drop(tmp);"), "{s}");
 }
 
 #[test]

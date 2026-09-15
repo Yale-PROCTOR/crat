@@ -79,15 +79,27 @@ pub(crate) fn derive<'tcx>(
     }
     if is_malloc {
         let [bytes] = arguments else { return Err(SourceHold::ConstructorShape) };
-        let peeled = peel_size_t(typeck, bytes, pointer_bits)?;
-        let (shape, count, replacement) = if exact_size(tcx, typeck, peeled, element, pointer_bits)
+        // A narrowed byte local is the one shape whose casts are not all
+        // size_t-width; every other arm peels only size_t casts.
+        let peeled = peel_size_t(typeck, bytes, pointer_bits).ok();
+        let (shape, count, replacement) = if peeled
+            .is_some_and(|peeled| exact_size(tcx, typeck, peeled, element, pointer_bits))
         {
             (
                 BoxShape::Sized,
                 "1".into(),
                 format!("::std::boxed::Box::new({zero})"),
             )
-        } else if wrapping_product_has_exact_size(tcx, typeck, peeled, element, pointer_bits) {
+        } else if peeled.is_some_and(|peeled| {
+            wrapping_product_has_exact_size(tcx, typeck, peeled, element, pointer_bits)
+        }) || narrowed_byte_local_has_exact_size(
+            tcx,
+            owner,
+            typeck,
+            bytes,
+            element,
+            pointer_bits,
+        ) {
             // The derived corpus spells `n * sizeof(T)` as a `wrapping_mul`
             // chain with a dynamic factor. The complete byte expression is
             // kept and evaluated once; the count is its exact quotient by
@@ -117,6 +129,7 @@ pub(crate) fn derive<'tcx>(
                 },
             });
         } else {
+            let Some(peeled) = peeled else { return Err(SourceHold::ConstructorShape) };
             let ExprKind::Binary(operator, left, right) = peeled.kind else {
                 return Err(SourceHold::ConstructorShape);
             };
@@ -159,7 +172,7 @@ pub(crate) fn derive<'tcx>(
             count,
             shape,
             nonempty: shape == BoxShape::Sized
-                || matches!(peeled.kind,ExprKind::Binary(_,left,right) if [left,right].iter().any(|e|matches!(e.kind,ExprKind::Lit(lit) if matches!(lit.node,rustc_ast::LitKind::Int(value,_) if value.get()>0)))),
+                || peeled.is_some_and(|peeled| matches!(peeled.kind,ExprKind::Binary(_,left,right) if [left,right].iter().any(|e|matches!(e.kind,ExprKind::Lit(lit) if matches!(lit.node,rustc_ast::LitKind::Int(value,_) if value.get()>0))))),
             edit: BoxExprEdit {
                 span: init.span,
                 replacement,
@@ -305,6 +318,83 @@ fn wrapping_product_has_exact_size<'tcx>(
             exact_size(tcx, typeck, operand, element, pointer_bits)
                 || wrapping_product_has_exact_size(tcx, typeck, operand, element, pointer_bits)
         })
+}
+
+/// `malloc(nbytes as size_t)` where `nbytes` is a `let` local of the same
+/// body, initialised exactly once from a `wrapping_mul` chain with the exact
+/// `size_of::<T>()` factor and narrowed through integer casts on the way
+/// (`… as c_int`), never reassigned or borrowed. Conditional on a UB-free
+/// input the narrowed value is the product: a narrowed mismatch mis-sizes the
+/// C allocation and its first access past it is the input's own UB.
+fn narrowed_byte_local_has_exact_size<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expression: &'tcx Expr<'tcx>,
+    element: Ty<'tcx>,
+    pointer_bits: u64,
+) -> bool {
+    if unsigned_bits(typeck.expr_ty(expression), pointer_bits) != Some(pointer_bits) {
+        return false;
+    }
+    let mut operand = expression;
+    while let ExprKind::Cast(inner, _) = operand.kind {
+        if !typeck.expr_ty(operand).is_integral() || !typeck.expr_ty(inner).is_integral() {
+            return false;
+        }
+        operand = inner;
+    }
+    let ExprKind::Path(QPath::Resolved(_, path)) = operand.kind else { return false };
+    let Res::Local(binding) = path.res else { return false };
+    let Node::Pat(pattern) = tcx.hir_node(binding) else { return false };
+    if !matches!(
+        pattern.kind,
+        rustc_hir::PatKind::Binding(
+            rustc_hir::BindingMode::NONE | rustc_hir::BindingMode::MUT,
+            ..
+        )
+    ) {
+        return false;
+    }
+    let Node::LetStmt(local) = tcx.parent_hir_node(binding) else { return false };
+    let Some(init) = local.init else { return false };
+    if local.els.is_some() {
+        return false;
+    }
+    // The binding must keep its initial value: no assignment, no borrow.
+    struct Single {
+        binding: rustc_hir::HirId,
+        stable: bool,
+    }
+    impl<'v> rustc_hir::intravisit::Visitor<'v> for Single {
+        fn visit_expr(&mut self, e: &'v Expr<'v>) {
+            let is_binding = |e: &Expr<'_>| matches!(e.kind, ExprKind::Path(QPath::Resolved(_, path)) if path.res == Res::Local(self.binding));
+            match e.kind {
+                ExprKind::Assign(lhs, ..) | ExprKind::AssignOp(_, lhs, _) if is_binding(lhs) => {
+                    self.stable = false;
+                }
+                ExprKind::AddrOf(_, _, inner) if is_binding(inner) => self.stable = false,
+                _ => {}
+            }
+            rustc_hir::intravisit::walk_expr(self, e);
+        }
+    }
+    let mut single = Single {
+        binding,
+        stable: true,
+    };
+    rustc_hir::intravisit::Visitor::visit_body(&mut single, tcx.hir_body_owned_by(owner));
+    if !single.stable {
+        return false;
+    }
+    let mut product = init;
+    while let ExprKind::Cast(inner, _) = product.kind {
+        if !typeck.expr_ty(product).is_integral() || !typeck.expr_ty(inner).is_integral() {
+            return false;
+        }
+        product = inner;
+    }
+    wrapping_product_has_exact_size(tcx, typeck, product, element, pointer_bits)
 }
 
 fn unsigned_bound(
@@ -555,6 +645,45 @@ mod tests {
             );
             assert_eq!(edit.matches(bytes).count(), 1);
             assert_eq!(receipt, "native-malloc-zero-numeric-wrapping-count");
+        }
+    }
+
+    #[test]
+    fn constructor_malloc_narrowed_byte_local_divides_by_its_initializer_factor() {
+        // heman `generate_gaussian_row::tmp`: the byte count is a `c_int`
+        // local initialised once from the `wrapping_mul` chain and widened
+        // back at the allocation.
+        let (count, edit, receipt) = inspect(
+            C_ULONG_MALLOC,
+            "i32",
+            "let nbytes = (n as libc::c_ulong).wrapping_mul(core::mem::size_of::<i32>() as libc::c_ulong) as i32; malloc(nbytes as libc::c_ulong) as *mut i32",
+        )
+        .unwrap();
+        assert_eq!(
+            count,
+            "(((nbytes as libc::c_ulong) as usize) / ::core::mem::size_of::<i32>())"
+        );
+        assert_eq!(
+            edit,
+            format!("::std::vec![0i32; {count}].into_boxed_slice()")
+        );
+        assert_eq!(receipt, "native-malloc-zero-numeric-wrapping-count");
+    }
+
+    #[test]
+    fn constructor_malloc_narrowed_byte_local_faults_hold_reassigned_borrowed_or_unrelated() {
+        for body in [
+            "let mut nbytes = (n as libc::c_ulong).wrapping_mul(core::mem::size_of::<i32>() as libc::c_ulong) as i32; nbytes = 4; malloc(nbytes as libc::c_ulong) as *mut i32",
+            "let mut nbytes = (n as libc::c_ulong).wrapping_mul(core::mem::size_of::<i32>() as libc::c_ulong) as i32; let r = &mut nbytes; *r += 1; malloc(nbytes as libc::c_ulong) as *mut i32",
+            "let nbytes = (n as libc::c_ulong).wrapping_mul(core::mem::size_of::<u32>() as libc::c_ulong) as i32; malloc(nbytes as libc::c_ulong) as *mut i32",
+            "let nbytes = n * 4; malloc(nbytes as libc::c_ulong) as *mut i32",
+            "let nbytes: libc::c_ulong = 16; malloc(nbytes) as *mut i32",
+        ] {
+            assert_eq!(
+                inspect(C_ULONG_MALLOC, "i32", body),
+                Err(SourceHold::ConstructorShape),
+                "{body}"
+            );
         }
     }
 
