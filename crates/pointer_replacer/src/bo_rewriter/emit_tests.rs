@@ -2863,7 +2863,7 @@ fn a_locals_row_carries_no_arg_index_while_a_parameter_keeps_one() {
 /// A sibling of [`locals_of`] rather than a widening of it: `locals_of` is the
 /// instrument the S3.1 witnesses above are written against, and changing what
 /// it returns would put those tests under Rider 4 for no gain here.
-fn artifact_rows_of(src: &str) -> Vec<crate::coverage_recon::schema::Row> {
+pub(super) fn artifact_rows_of(src: &str) -> Vec<crate::coverage_recon::schema::Row> {
     let fixture = Fixture::new(&[("lib.rs", src)]);
     ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
         let table = super::decide_table(tcx).expect("fixture yields a decision table");

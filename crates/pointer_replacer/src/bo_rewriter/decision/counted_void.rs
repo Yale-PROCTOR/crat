@@ -142,7 +142,9 @@ pub(crate) fn collect(
             if known.contains_key(&(s.fn_did, s.hir_id)) || model_raw(s) {
                 continue;
             }
-            if let Some(contract) = prove_forward(tcx, s, subjects, &known) {
+            if let Some(contract) = prove_forward(tcx, s, subjects, &known)
+                .or_else(|| super::binn_counted::prove_forward_only(tcx, s, subjects, &known))
+            {
                 proven.push((s, contract));
                 added += 1;
             }
@@ -839,7 +841,12 @@ pub(crate) fn count_argument<'tcx>(
     };
     if let Some(width) = &c.width {
         // wave-6v2: the count is the callee's own width (table), never an
-        // argument's value; the root rule reads the literal discriminant.
+        // argument's value; the root rule reads the literal discriminant. A
+        // forward-only parameter of unknown width has no count for a raw
+        // caller: the site holds typed.
+        if width.is_unknown() {
+            return Err(SeamBlock::LengthUnknown);
+        }
         if route != Route::RawTwin {
             let discriminant = width.discriminant.map(|k| args.get(k)).flatten();
             super::binn_counted::root_rule(tcx, table, site.caller, argument, width, discriminant)?;

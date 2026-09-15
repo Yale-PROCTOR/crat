@@ -14,6 +14,27 @@ fn delivers(rows: &[(String, bool, String)], name: &str) -> bool {
         .any(|(n, p, r)| n == name && *p && r == "<emitted>")
 }
 
+/// `(function, parameter, reason)` for every parameter row.
+fn by_function(input: &str) -> Vec<(String, String, String)> {
+    super::emit_tests::artifact_rows_of(input)
+        .iter()
+        .filter(|r| r.arg_index.is_some())
+        .map(|r| {
+            (
+                r.fn_path
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&r.fn_path)
+                    .to_owned(),
+                r.param_name.clone().unwrap_or_default(),
+                r.degrade_reason
+                    .clone()
+                    .unwrap_or_else(|| "<emitted>".to_owned()),
+            )
+        })
+        .collect()
+}
+
 fn reason(rows: &[(String, bool, String)], name: &str) -> String {
     rows.iter()
         .find(|(n, p, _)| n == name && *p)
@@ -420,12 +441,12 @@ pub unsafe fn widen(mut src: *mut core::ffi::c_void, mut kind: i32) -> f64 {
     assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
 }
 
-/// Every other use holds, typed in the family: a pass-on (binn.rs:1286
-/// `binn_type` hands `ptr` to `binn_get_ptr_type` AND casts it to the struct)
-/// and an escaping cast (:2116 `copy_raw_value` stores `psource` through
-/// `pdest`). Build 2's shapes; this build keeps them `held:void-pointee`.
+/// An escaping cast (binn.rs:2116 `copy_raw_value` stores `psource` through
+/// `pdest`) holds, typed in the family; a pure forward of a constant-width
+/// position (`wrap`) inherits the width (build 2). `binn_type` (:1286) both
+/// forwards and casts to the struct: still held.
 #[test]
-fn w6v2_pass_on_and_escaping_cast_stay_held() {
+fn w6v2_escaping_cast_stays_held_and_a_constant_width_forwards() {
     let input = format!(
         "{MAGIC}\nunsafe fn copy_raw_value(mut psource: *mut core::ffi::c_void, mut pdest: *mut core::ffi::c_void, mut data_store: i32) -> i32 {{ match data_store {{ 32 => {{ *(pdest as *mut i8) = *(psource as *mut i8); }} 192 => {{ *(pdest as *mut *mut i8) = psource as *mut i8; }} _ => return 0 as i32, }} return 1 as i32; }}\nunsafe fn wrap(mut p: *mut core::ffi::c_void) -> i32 {{ binn_get_ptr_type(p) }}"
     );
@@ -434,11 +455,105 @@ fn w6v2_pass_on_and_escaping_cast_stay_held() {
         delivers(&rows, "ptr"),
         "the magic read still delivers: {rows:?}"
     );
-    for held in ["psource", "p"] {
-        assert_eq!(
-            reason(&rows, held),
-            "held:void-pointee",
-            "{held} stays in the family: {rows:?}"
+    assert_eq!(
+        reason(&rows, "psource"),
+        "held:void-pointee",
+        "the escaping cast stays in the family: {rows:?}"
+    );
+    // Build 2: a pure forward of a constant-width position inherits the width.
+    assert!(
+        delivers(&rows, "p"),
+        "the forwarder inherits the constant width: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        compact(&source).contains("fnwrap(mutp:Option<&[u8]>)->i32{binn_get_ptr_type(p)}"),
+        "the forward is a safe-to-safe seam: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+}
+
+/// binn.rs:2629 `binn_list_int32` → :2493 `binn_list_get` → :1561
+/// `binn_list_get_value` (reassigned from `binn_ptr`, held) → :1254 `binn_ptr`.
+/// The two forwarders pass their `void *` on unchanged; the leaf keeps its raw
+/// parameter, so every forward crosses an outbound raw seam — build 2b's
+/// shape. Build 2 holds them: the reduced chain showed that a delivered byte
+/// view handed to the raw position was emitted WITHOUT a bridge (an ill-typed
+/// tree), and `binn_list_get`'s own forward was withdrawn by the seam's
+/// positive-retention verdict (`binn_list_get_value` stores a derived pointer
+/// into `*value`).
+const CHAIN: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+#[repr(C)]
+pub struct binn { pub header: i32, pub type_0: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
+unsafe fn binn_get_ptr_type(mut ptr: *mut core::ffi::c_void) -> i32 {
+    if ptr.is_null() { return 0 as i32; }
+    match *(ptr as *mut u32) {
+        522367263 => return 1 as i32,
+        _ => return 2 as i32,
+    };
+}
+pub unsafe fn binn_ptr(mut ptr: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let mut item = 0 as *mut binn;
+    match binn_get_ptr_type(ptr) {
+        1 => { item = ptr as *mut binn; return (*item).ptr; }
+        2 => return ptr,
+        _ => return 0 as *mut core::ffi::c_void,
+    };
+}
+pub unsafe fn binn_list_get_value(mut ptr: *mut core::ffi::c_void, mut pos: i32, mut value: *mut binn) -> i32 {
+    ptr = binn_ptr(ptr);
+    if ptr.is_null() || value.is_null() { return 0 as i32; }
+    let mut p = ptr as *mut u8;
+    if *p as i32 != 0xe0 as i32 { return 0 as i32; }
+    (*value).type_0 = *p.offset(pos as isize) as i32;
+    (*value).ptr = p.offset(pos as isize) as *mut core::ffi::c_void;
+    return 1 as i32;
+}
+pub unsafe fn binn_list_get(mut ptr: *mut core::ffi::c_void, mut pos: i32, mut type_0: i32, mut pvalue: *mut i32) -> i32 {
+    let mut value = binn { header: 0, type_0: 0, size: 0, ptr: 0 as *mut core::ffi::c_void };
+    if binn_list_get_value(ptr, pos, &mut value) == 0 as i32 { return 0 as i32; }
+    *pvalue = value.type_0;
+    return 1 as i32;
+}
+pub unsafe fn binn_list_int32(mut list: *mut core::ffi::c_void, mut pos: i32) -> i32 {
+    let mut value: i32 = 0;
+    binn_list_get(list, pos, 0x61 as i32, &mut value);
+    return value;
+}
+"#;
+
+#[test]
+fn w6v2_forwards_into_raw_positions_stay_held() {
+    let rows = by_function(CHAIN);
+    assert!(
+        rows.contains(&(
+            "binn_get_ptr_type".to_owned(),
+            "ptr".to_owned(),
+            "<emitted>".to_owned()
+        )),
+        "the leaf read delivers: {rows:?}"
+    );
+    for (function, parameter) in [
+        ("binn_list_int32", "list"),
+        ("binn_list_get", "ptr"),
+        ("binn_list_get_value", "ptr"),
+        ("binn_ptr", "ptr"),
+    ] {
+        assert!(
+            rows.contains(&(
+                function.to_owned(),
+                parameter.to_owned(),
+                "held:void-pointee".to_owned()
+            )),
+            "{function}::{parameter} stays in the family: {rows:?}"
         );
     }
+    let source = super::emit_tests::ast_emitted_source_of(CHAIN).unwrap();
+    assert!(
+        compact(&source)
+            .contains("fnbinn_list_int32(mutlist:*mutcore::ffi::c_void,mutpos:i32)->i32"),
+        "no view without a bridge: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
 }

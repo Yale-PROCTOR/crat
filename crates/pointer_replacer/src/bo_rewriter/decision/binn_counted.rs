@@ -54,6 +54,8 @@ impl WidthTable {
     /// The count text at a snapshotted call.
     pub(crate) fn render(&self) -> String {
         match self.discriminant {
+            // An unknown width never renders: `count_argument` holds the site.
+            None if self.arms.is_empty() => "0".to_owned(),
             None => format!("core::mem::size_of::<{}>()", self.arms[0].1),
             Some(k) => {
                 let arms = self
@@ -72,6 +74,7 @@ impl WidthTable {
     /// The typed receipt of the count's form.
     pub(crate) fn receipt(&self) -> String {
         match self.discriminant {
+            None if self.arms.is_empty() => "width:inherited-unknown".to_owned(),
             None => format!("width:size_of::<{}>", self.arms[0].1),
             Some(k) => format!(
                 "width-table:arg{k}:{{{}}}",
@@ -82,6 +85,20 @@ impl WidthTable {
                     .join(",")
             ),
         }
+    }
+
+    /// No width is known here: a forward-only parameter whose pass-ons reach
+    /// a raw or held position. Safe callers pass their own view through; a
+    /// raw caller's site holds (`seam-len-unknown`).
+    pub(crate) fn unknown() -> Self {
+        Self {
+            discriminant: None,
+            arms: Vec::new(),
+        }
+    }
+
+    pub(crate) fn is_unknown(&self) -> bool {
+        self.arms.is_empty()
     }
 
     /// The same table keyed on another parameter index (a forwarder's own
@@ -97,7 +114,7 @@ impl WidthTable {
     /// when there is no discriminant; `None` when it cannot be known statically.
     fn width_for(&self, literal: Option<u128>) -> Option<u64> {
         match self.discriminant {
-            None => Some(self.arms[0].2),
+            None => self.arms.first().map(|(_, _, size)| *size),
             Some(_) => self
                 .arms
                 .iter()
@@ -355,6 +372,145 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
     Some(Contract {
         count_index: width.discriminant.unwrap_or(own_index),
         element: ByteElement::Read,
+        nullable,
+        width: Some(width),
+        uses: edits,
+    })
+}
+
+/// A forward-only `void *` parameter: its uses are null tests and pass-ons of
+/// the bare binding as an argument of a LOCAL call, and EVERY pass-on reaches a
+/// position that carries a typed-width contract. It takes the byte view and
+/// inherits the element and the width (re-keyed by the sibling the forwarder
+/// passes as the discriminant); its own seams are safe-to-safe and a raw
+/// caller's count is the inherited width.
+///
+/// A pass-on that reaches a raw or held position is NOT taken (build 2b): the
+/// forwarder would need the seam's outbound R130 bridge at that position, and
+/// the reduced chain fixture showed the byte view handed to a `*mut c_void`
+/// position without a bridge (an ill-typed tree) — so until that bridge is
+/// confirmed the parameter stays `held:void-pointee`. Sibling-COUNT contracts
+/// (the parent lane's) are the parent's `prove_forward` and are not taken here.
+pub(crate) fn prove_forward_only(
+    tcx: TyCtxt<'_>,
+    s: &Subject,
+    subjects: &[Subject],
+    known: &FxHashMap<(LocalDefId, HirId), Contract>,
+) -> Option<Contract> {
+    if s.ptr_depth != 1 || !matches!(s.kind, SubjectKind::Param { .. }) {
+        return None;
+    }
+    let Node::Pat(pat) = tcx.hir_node(s.hir_id) else { return None };
+    let typeck = tcx.typeck(s.fn_did);
+    if !super::void_pointee::has_void_pointee(tcx, typeck.pat_ty(pat), 1) {
+        return None;
+    }
+    let body = tcx.hir_body_owned_by(s.fn_did);
+    let params = body
+        .params
+        .iter()
+        .map(|p| match p.pat.kind {
+            PatKind::Binding(_, id, _, None) => Some(id),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let own_index = params.iter().position(|p| *p == s.hir_id)?;
+    let mut uses = Uses {
+        target: s.hir_id,
+        found: Vec::new(),
+        writes: FxHashMap::default(),
+        closures: false,
+    };
+    uses.visit_expr(body.value);
+    if uses.closures || uses.writes.contains_key(&s.hir_id) {
+        return None;
+    }
+    let name = s.param_name.as_ref()?;
+    let mut nullable = false;
+    let mut edits = Vec::new();
+    let mut pass_ons = 0usize;
+    let mut inherited: Option<(ByteElement, WidthTable)> = None;
+    let mut reaches_raw = false;
+    for use_ in uses.found {
+        let Node::Expr(parent) = tcx.parent_hir_node(use_.hir_id) else { return None };
+        match parent.kind {
+            ExprKind::MethodCall(segment, receiver, [], _)
+                if receiver.hir_id == use_.hir_id && segment.ident.name.as_str() == "is_null" =>
+            {
+                nullable = true;
+                edits.push(UseEdit {
+                    span: parent.span,
+                    replacement: format!("{name}.is_none()"),
+                    bridge_kind: "binn-counted-null-test",
+                });
+            }
+            ExprKind::Call(callee, args) => {
+                let index = args.iter().position(|a| a.hir_id == use_.hir_id)?;
+                let ExprKind::Path(path) = &callee.kind else { return None };
+                let Res::Def(rustc_hir::def::DefKind::Fn, did) =
+                    typeck.qpath_res(path, callee.hir_id)
+                else {
+                    return None;
+                };
+                // A foreign position is wave-4's pinned-contract territory.
+                let callee = did.as_local().filter(|_| !tcx.is_foreign_item(did))?;
+                pass_ons += 1;
+                let position = known.iter().find(|((f, h), _)| {
+                    *f == callee
+                        && subjects.iter().any(|t| {
+                            t.fn_did == callee
+                                && t.hir_id == *h
+                                && matches!(t.kind, SubjectKind::Param { hir_index } if hir_index == index)
+                        })
+                });
+                let Some((_, contract)) = position else {
+                    reaches_raw = true;
+                    return None;
+                };
+                // A sibling-count contract is the parent's forward; a void
+                // position that already forwards an unknown width is a raw
+                // position for the width's purpose.
+                let Some(width) = contract.width.as_ref() else { return None };
+                let width = match width.discriminant {
+                    None => width.clone(),
+                    Some(k) => {
+                        let discriminant = local_of(args.get(k)?)?;
+                        let sibling = params.iter().position(|p| *p == discriminant)?;
+                        if sibling == own_index {
+                            return None;
+                        }
+                        width.rekey(sibling)
+                    }
+                };
+                nullable |= contract.nullable;
+                match &inherited {
+                    None => inherited = Some((contract.element, width)),
+                    Some((element, known_width)) => {
+                        if *element != contract.element
+                            || known_width.is_unknown() != width.is_unknown()
+                            || (!width.is_unknown() && *known_width != width)
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    if pass_ons == 0 {
+        return None;
+    }
+    let (element, width) = match inherited {
+        Some((element, width)) if !reaches_raw => (element, width),
+        // Unreachable while a raw position returns above; kept as the typed
+        // shape build 2b fills in.
+        Some((element, _)) => (element, WidthTable::unknown()),
+        None => return None,
+    };
+    Some(Contract {
+        count_index: width.discriminant.unwrap_or(own_index),
+        element,
         nullable,
         width: Some(width),
         uses: edits,
