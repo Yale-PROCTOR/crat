@@ -122,6 +122,8 @@ pub(crate) mod wave6r_child_access;
 #[cfg(test)]
 mod wave6a_allocation_tests;
 #[cfg(test)]
+mod wave6a_box_param_tests;
+#[cfg(test)]
 mod wave6a_fixture_tulip;
 mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;
@@ -373,6 +375,8 @@ pub(crate) struct E2Timings {
 pub(crate) struct RawBoundaryArtifacts {
     /// wave-6a W6A-T1: flexible-tail struct transactions (admitted / held).
     pub(crate) flexible_tail_receipts: String,
+    /// wave-6a W6A-C1: Box-parameter chains (admitted / held).
+    pub(crate) box_param_receipts: String,
     /// R369 FIELD-CP observer, captured from the same frozen decision pass.
     pub(crate) ownership_native: String,
     pub(crate) shared_permissions: Vec<decision::overlapping_pairs::consumer::Permission>,
@@ -7019,6 +7023,17 @@ fn finish_decide<'tcx>(
     // construction facts and the subject universe (no model, no analysis).
     let flexible_tails =
         decision::flexible_tail::derive(tcx, &program.functions, &ctors, &subjects);
+    // wave-6a W6A-C1: Box-parameter chains of consuming callees (the model is
+    // read only to refuse a chain whose members are not all Owning).
+    let box_params = decision::box_param::derive(
+        tcx,
+        &program.functions,
+        &ctors,
+        &subjects,
+        &box_facts,
+        &slots,
+        &model,
+    );
     let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
     let mut predecessor: Option<additive::StageSnapshot> = None;
     let mut native_ownership_candidates = decision::ownership_fields_native::Candidates::default();
@@ -7130,6 +7145,7 @@ fn finish_decide<'tcx>(
                     tcx,
                     counted_void: &counted_void,
                     flexible_tails: &flexible_tails,
+                    box_params: &box_params,
                     return_receivers,
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,
@@ -7670,6 +7686,7 @@ fn finish_decide<'tcx>(
         decision::field_reference::reconcile_a5_raw_views(tcx, &mut table)?;
         // wave-6a W6A-B1: explicit types on constructor-typed slice locals.
         decision::slice_local_construction::append_explicit_declarations(tcx, &mut table);
+        decision::box_param::append_explicit_declarations(tcx, &mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
@@ -7857,6 +7874,7 @@ fn finish_decide<'tcx>(
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
             flexible_tail_receipts: table.flexible_tails.receipts_tsv(),
+            box_param_receipts: table.box_params.receipts_tsv(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             shared_permissions: table.seams.shared_required.clone(),
             shared_pair_receipts: String::new(),

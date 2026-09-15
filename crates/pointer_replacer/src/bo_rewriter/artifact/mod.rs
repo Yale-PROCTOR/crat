@@ -212,6 +212,7 @@ mod tests {
         DecisionTable {
             counted_void: Default::default(),
             flexible_tails: Default::default(),
+            box_params: Default::default(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),

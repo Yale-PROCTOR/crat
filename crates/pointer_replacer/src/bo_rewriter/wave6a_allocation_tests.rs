@@ -286,15 +286,15 @@ pub(super) fn rewrite_precise(name: &str, src: &str) -> super::RewriteOutcome {
     result
 }
 
-struct Emitted {
-    source: String,
-    reverted: usize,
-    emitted: usize,
-    degradations: Vec<super::decision::Degradation>,
-    artifacts: super::RawBoundaryArtifacts,
+pub(super) struct Emitted {
+    pub(super) source: String,
+    pub(super) reverted: usize,
+    pub(super) emitted: usize,
+    pub(super) degradations: Vec<super::decision::Degradation>,
+    pub(super) artifacts: super::RawBoundaryArtifacts,
 }
 
-fn emitted(name: &str, src: &str) -> Emitted {
+pub(super) fn emitted(name: &str, src: &str) -> Emitted {
     match rewrite_precise(name, src) {
         super::RewriteOutcome::Emitted {
             source,
@@ -319,11 +319,14 @@ fn emitted(name: &str, src: &str) -> Emitted {
     }
 }
 
-fn compact(text: &str) -> String {
+pub(super) fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn reason_of(degradations: &[super::decision::Degradation], subject: &str) -> Option<String> {
+pub(super) fn reason_of(
+    degradations: &[super::decision::Degradation],
+    subject: &str,
+) -> Option<String> {
     degradations
         .iter()
         .find(|d| d.subject == subject)

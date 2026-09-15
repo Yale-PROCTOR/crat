@@ -1613,6 +1613,15 @@ impl BoxOwnershipFacts {
         MinimalWalk::new(program, slots, model).walk()
     }
 
+    /// wave-6a W6A-C1: the same facts with one boundary hold lifted — a
+    /// transfer into a callee whose formal the chain plans as the owner is a
+    /// move, not a boundary.
+    pub(crate) fn without_boundary_hold(&self, slot: SlotRef) -> Self {
+        let mut facts = self.clone();
+        facts.boundary_held.remove(&slot);
+        facts
+    }
+
     pub(crate) fn endpoints(&self) -> &[EndpointFact] {
         &self.endpoints
     }

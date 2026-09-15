@@ -5487,6 +5487,7 @@ mod tests {
         let table = DecisionTable {
             counted_void: Default::default(),
             flexible_tails: Default::default(),
+            box_params: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
@@ -5639,6 +5640,7 @@ mod tests {
         let table = DecisionTable {
             counted_void: Default::default(),
             flexible_tails: Default::default(),
+            box_params: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
