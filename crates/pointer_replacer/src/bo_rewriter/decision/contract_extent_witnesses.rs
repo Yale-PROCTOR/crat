@@ -26,6 +26,7 @@ fn subject() -> SubjectFacts {
         },
         array: Some(true),
         non_length: Ok(()),
+        decline: None,
     }
 }
 

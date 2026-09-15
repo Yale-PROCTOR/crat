@@ -86,11 +86,6 @@ pub(crate) enum AccessReason {
     VoidPointee { cast_to: String },
     /// The body offsets or indexes the parameter.
     PointerArithmetic { op: String },
-    /// Wave-4 candidate #1 (R397-6 / R395-2): the parameter reaches a FOREIGN
-    /// position whose pinned contract consumes more than one element, so it
-    /// may take a contract-extent slice form; a thin caller argument would be
-    /// widened into it by `from_ref`. Carries the first such contract site.
-    ForeignContract { contract: String },
 }
 
 impl AccessReason {
@@ -98,7 +93,6 @@ impl AccessReason {
         match self {
             Self::VoidPointee { cast_to } => format!("void-pointee-cast-to:{cast_to}"),
             Self::PointerArithmetic { op } => format!("pointer-arithmetic:{op}"),
-            Self::ForeignContract { contract } => format!("foreign-contract:{contract}"),
         }
     }
 }

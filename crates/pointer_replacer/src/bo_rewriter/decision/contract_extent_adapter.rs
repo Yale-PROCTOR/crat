@@ -8,11 +8,14 @@ use super::{
     construction::{Construction, ConstructionFacts},
     contract_extent::*,
     emitability::{ArgShape, EmitabilityFacts, OptUses, SliceUses},
-    local_callee_extent::{AccessReason, LocalCalleeAccess},
+    local_callee_extent::LocalCalleeAccess,
     raw_boundary::RawMutability,
     raw_boundary_contracts::{ArgumentExtent, PointeeAccess, classify_contract},
 };
-use crate::{analyses::borrow_ownership::SlotKind, bo_rewriter::fat_facts::FatFacts};
+use crate::{
+    analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef},
+    bo_rewriter::fat_facts::FatFacts,
+};
 
 /// Receipt fields are single-line TSV cells. Keep the compiler spelling in the
 /// semantic plan and normalize only the copy written to a receipt.
@@ -244,6 +247,9 @@ pub(crate) fn collect(
     local_callee_extent: &FxHashMap<(LocalDefId, HirId), LocalCalleeAccess>,
     slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
     opt_uses: &FxHashMap<(LocalDefId, HirId), OptUses>,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    slots: &CrateSlots,
+    fat: &FatFacts,
 ) -> CandidateIndex {
     let subjects = subjects
         .iter()
@@ -390,6 +396,54 @@ pub(crate) fn collect(
                 .map(move |argument| (call.caller, argument.span.lo().0, argument.span.hi().0))
         })
         .collect::<rustc_hash::FxHashSet<_>>();
+    // R395-2: a caller argument that DENOTES a would-be-thin caller subject —
+    // BO `Ref` at its own slot and no array arithmetic of its own — would be
+    // widened into the promoted slice by `from_ref`. Counted per candidate
+    // parameter over every call site; the callee is declined, never the caller
+    // re-decided.
+    let would_be_thin = |caller: LocalDefId, root: HirId| -> bool {
+        let Some(subject) = subjects.get(&(caller, root)) else {
+            return false;
+        };
+        let model_ref = slots
+            .fn_local_slots
+            .get(&caller)
+            .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+            .is_some_and(|slot| model.get(&SlotRef::Local(caller, slot)) == Some(&SlotKind::Ref));
+        let own_slice = facts
+            .raw_only_uses
+            .get(&(caller, root))
+            .is_some_and(|uses| {
+                uses.iter()
+                    .any(|(op, _)| super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
+                    && fat.is_array(caller, subject.local)
+            });
+        model_ref && !own_slice
+    };
+    let thin_caller_arguments = |node: (LocalDefId, HirId)| -> usize {
+        let Some(subject) = subjects.get(&node) else { return 0 };
+        let SubjectKind::Param { hir_index } = subject.kind else { return 0 };
+        facts
+            .call_args
+            .get(&node.0)
+            .into_iter()
+            .flatten()
+            .flat_map(|call| {
+                call.args
+                    .iter()
+                    .map(move |argument| (call.caller, argument))
+            })
+            .filter(|(caller, argument)| {
+                argument.index == hir_index
+                    && match argument.shape {
+                        ArgShape::BareLocal(root) | ArgShape::CastOfLocal { binding: root, .. } => {
+                            would_be_thin(*caller, root)
+                        }
+                        _ => false,
+                    }
+            })
+            .count()
+    };
     let declines_for = |nullable: bool| {
         by_subject
             .keys()
@@ -402,8 +456,9 @@ pub(crate) fn collect(
                 } else {
                     uses.is_some_and(|uses| uses.unsupported.is_some())
                 };
-                decline(&use_summary(node.0, uses, unsupported, &local_boundaries))
-                    .map(|cause| (node, cause))
+                let mut summary = use_summary(node.0, uses, unsupported, &local_boundaries);
+                summary.thin_caller_arguments = thin_caller_arguments(node);
+                decline(&summary).map(|cause| (node, cause))
             })
             .collect::<FxHashMap<_, _>>()
     };
@@ -416,115 +471,60 @@ pub(crate) fn collect(
     }
 }
 
-/// R395-2 at a LOCAL callee whose parameter reaches a FOREIGN multi-element
-/// position: the callee's parameter may take a contract-extent slice form, and
-/// a thin `&T` caller argument would then be widened by `from_ref`/`from_mut`
-/// into that slice — one element of provenance handed to `strlen`, `strcmp`,
-/// `memcpy` through `as_ptr()`. The caller subject is held exactly as fix-2
-/// holds a caller of a body-indexing parameter; the callee keeps its own
-/// candidate, whose raw wrapper takes the pointer's full provenance.
-pub(crate) fn caller_thin_holds(
-    subjects: &[Subject],
-    facts: &EmitabilityFacts,
-    index: &CandidateIndex,
-    fat: &FatFacts,
-    tcx: rustc_middle::ty::TyCtxt<'_>,
-) -> FxHashMap<(LocalDefId, HirId), LocalCalleeAccess> {
-    let mut out = FxHashMap::default();
-    for subject in subjects {
-        let SubjectKind::Param { hir_index } = subject.kind else { continue };
-        let node = (subject.fn_did, subject.hir_id);
-        let Some(candidate) = index.by_subject.get(&node) else { continue };
-        // A callee parameter that is a slice by its OWN arithmetic is not
-        // promoted by the contract (the same `existing_slice` test as the
-        // promotion loop); its widened callers stay R365-2's census item.
-        let existing_slice = facts.raw_only_uses.get(&node).is_some_and(|uses| {
-            uses.iter()
-                .any(|(op, _)| super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
-                && fat.is_array(subject.fn_did, subject.local)
-        });
-        if existing_slice {
-            continue;
-        }
-        let Some(site) = candidate
-            .sites
-            .iter()
-            .find(|site| !matches!(site.requirement, Requirement::LocalAccess))
-        else {
-            continue;
-        };
-        let Some(calls) = facts.call_args.get(&subject.fn_did) else { continue };
-        for call in calls {
-            for argument in call
-                .args
-                .iter()
-                .filter(|argument| argument.index == hir_index)
-            {
-                let root = match argument.shape {
-                    ArgShape::BareLocal(root) | ArgShape::CastOfLocal { binding: root, .. } => root,
-                    _ => continue,
-                };
-                out.entry((call.caller, root))
-                    .or_insert_with(|| LocalCalleeAccess {
-                        callee_id: subject.fn_did,
-                        parameter_index: hir_index,
-                        callee: tcx.def_path_str(subject.fn_did.to_def_id()),
-                        parameter: subject
-                            .param_name
-                            .clone()
-                            .unwrap_or_else(|| "<unnamed>".to_owned()),
-                        access: if subject.mutable { "write" } else { "read" },
-                        reason: AccessReason::ForeignContract {
-                            contract: site.contract.clone(),
-                        },
-                    });
-            }
-        }
-    }
-    out
-}
-
 impl CandidateIndex {
     /// R397-6(b): the declined candidates, for the receipt.
     pub(crate) fn declines(&self) -> impl Iterator<Item = (&(LocalDefId, HirId), &DeclineCause)> {
         self.declines.iter()
     }
 
-    /// One TSV row per declined candidate and form, ordered by owner path.
+    /// One TSV row per declined candidate and form — only candidates that
+    /// would otherwise PROMOTE (the decline is read after every promotability
+    /// gate in [`select`]).
     pub(crate) fn declines_tsv(
         &self,
         tcx: rustc_middle::ty::TyCtxt<'_>,
         subjects: &[Subject],
+        model: &FxHashMap<SlotRef, SlotKind>,
+        slots: &CrateSlots,
+        fat: &FatFacts,
     ) -> String {
-        let mut rows = subjects
-            .iter()
-            .flat_map(|subject| {
-                let node = (subject.fn_did, subject.hir_id);
-                [
-                    ("plain", &self.declines),
-                    ("nullable", &self.nullable_declines),
-                ]
-                .into_iter()
-                .filter_map(move |(form, declines)| {
-                    let cause = declines.get(&node)?;
-                    let candidate = self.by_subject.get(&node)?;
-                    Some(format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\n",
-                        tcx.def_path_str(subject.fn_did.to_def_id()),
-                        subject.label,
-                        candidate.subject,
-                        form,
-                        cause.receipt(),
-                        candidate
-                            .sites
-                            .iter()
-                            .map(|site| site.contract.as_str())
-                            .collect::<Vec<_>>()
-                            .join(";"),
-                    ))
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        for subject in subjects {
+            let node = (subject.fn_did, subject.hir_id);
+            let Some(candidate) = self.by_subject.get(&node) else { continue };
+            let model_kind = slots
+                .fn_local_slots
+                .get(&subject.fn_did)
+                .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                .and_then(|slot| model.get(&SlotRef::Local(subject.fn_did, slot)))
+                .copied();
+            for (form, nullable) in [("plain", false), ("nullable", true)] {
+                let selection = self.select(
+                    subject,
+                    CurrentForm::Ref {
+                        mutable: subject.mutable,
+                        nullable,
+                    },
+                    model_kind,
+                    fat,
+                );
+                let Selection::Keep(KeepReason::Declined(cause)) = selection else { continue };
+                rows.push(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    tcx.def_path_str(subject.fn_did.to_def_id()),
+                    subject.label,
+                    candidate.subject,
+                    form,
+                    cause.receipt(),
+                    candidate
+                        .sites
+                        .iter()
+                        .map(|site| site.contract.as_str())
+                        .collect::<Vec<_>>()
+                        .join(";"),
+                ));
+            }
+        }
         rows.sort();
         let mut out =
             String::from("owner_path\tsubject\tsubject_key\tform\treceipt\tcontract_sites\n");
@@ -548,9 +548,6 @@ impl CandidateIndex {
             | CurrentForm::Slice
             | CurrentForm::Other => &self.declines,
         };
-        if let Some(cause) = declines.get(&node) {
-            return Selection::Keep(KeepReason::Declined(cause.clone()));
-        }
         let Some(candidate) = self.by_subject.get(&node) else {
             return Selection::Keep(KeepReason::NoContractOperation);
         };
@@ -579,6 +576,7 @@ impl CandidateIndex {
                     )
                 }),
                 non_length: Ok(()),
+                decline: declines.get(&node).cloned(),
             },
             &sites,
             None,

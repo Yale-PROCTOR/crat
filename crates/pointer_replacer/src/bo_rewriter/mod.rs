@@ -6755,7 +6755,7 @@ fn finish_decide<'tcx>(
     );
     // After `full_slice_uses`, deliberately: a callee parameter that can become
     // `&[T]` carries its own checked extent and is out of this class (R365-2).
-    let mut local_callee_extent_subjects =
+    let local_callee_extent_subjects =
         decision::local_callee_extent::collect(tcx, &subjects, &facts, &full_slice_uses);
     let return_parameter_nodes = subjects
         .iter()
@@ -6898,7 +6898,8 @@ fn finish_decide<'tcx>(
     );
     // After both full use maps, deliberately: R397-6(b)'s up-front decline
     // reads the candidate's own pre-selection use walls — the slice walker's
-    // for a plain form, the Option walker's for a nullable one.
+    // for a plain form, the Option walker's for a nullable one — and, for
+    // R395-2, the model kind and fatness of every caller argument's subject.
     let contract_extent_candidates = decision::contract_extent_adapter::collect(
         &subjects,
         &facts,
@@ -6906,20 +6907,10 @@ fn finish_decide<'tcx>(
         &local_callee_extent_subjects,
         &full_slice_uses,
         &full_opt_uses,
-    );
-    // R395-2 at a contract-extent callee: a thin caller argument may not be
-    // widened into the callee's contract slice form. Fix-2's own
-    // classification wins where both apply; a callee parameter that is a
-    // slice by its own arithmetic stays in R365-2's class, not this one.
-    for (node, access) in decision::contract_extent_adapter::caller_thin_holds(
-        &subjects,
-        &facts,
-        &contract_extent_candidates,
+        &model,
+        &slots,
         &fat,
-        tcx,
-    ) {
-        local_callee_extent_subjects.entry(node).or_insert(access);
-    }
+    );
 
     // Complete the frozen A5 site's legacy drops-elaborated reads before the
     // const-MIR fn-pointer collector becomes the terminal const-body reader
@@ -7783,7 +7774,8 @@ fn finish_decide<'tcx>(
             class_costs: bridge_receipt::class_cost_header(),
             class_collisions: bridge_receipt::class_collision_header(),
             unresolved_classes: bridge_receipt::unresolved_class_header(),
-            contract_candidate_declines: contract_extent_candidates.declines_tsv(tcx, &subjects),
+            contract_candidate_declines: contract_extent_candidates
+                .declines_tsv(tcx, &subjects, &model, &slots, &fat),
             interface_inventory: table.seams.interface_inventory_tsv(tcx),
             sites_from_non_subject_arguments: table.seams.sites_from_non_subject_arguments(),
             converted_callee_without_site_receipt: table

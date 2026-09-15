@@ -34,6 +34,10 @@ pub(crate) struct SubjectFacts {
     /// `Some(true)` = Arr, `Some(false)` = Ptr, `None` = lookup missing.
     pub array: Option<bool>,
     pub non_length: Result<(), NonLengthHold>,
+    /// R397-6(b): the up-front decline for this form, read from the subject's
+    /// own pre-selection use facts. Checked after every promotability gate, so
+    /// `Keep(Declined)` names exactly a candidate that would otherwise promote.
+    pub decline: Option<DeclineCause>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +161,12 @@ pub(crate) enum DeclineCause {
     /// A raw use with no boundary that is neither a pointer distance, a copy
     /// into a local, nor a discarded const view.
     UnsupportedRawUse,
+    /// R395-2: a caller hands this parameter a THIN reference subject (BO
+    /// `Ref`, no array arithmetic of its own). Promoting the parameter would
+    /// widen that one-element reference into the slice with `from_ref` and
+    /// hand it to the foreign read; the candidate is declined instead and the
+    /// caller keeps its prior form.
+    ThinCallerArgument,
 }
 
 impl DeclineCause {
@@ -166,6 +176,7 @@ impl DeclineCause {
             Self::LocalCalleeBoundary => "local-callee-boundary",
             Self::FieldStore => "field-store",
             Self::UnsupportedRawUse => "unsupported-raw-use",
+            Self::ThinCallerArgument => "thin-caller-argument",
         }
     }
 
@@ -182,6 +193,7 @@ pub(crate) struct UseSummary {
     pub local_callee_boundary_uses: usize,
     pub field_store_uses: usize,
     pub unsupported_raw_uses: usize,
+    pub thin_caller_arguments: usize,
 }
 
 /// The up-front decline. Pure; the first fixed cause in ladder order wins.
@@ -197,6 +209,9 @@ pub(crate) fn decline(summary: &UseSummary) -> Option<DeclineCause> {
     }
     if summary.unsupported_raw_uses > 0 {
         return Some(DeclineCause::UnsupportedRawUse);
+    }
+    if summary.thin_caller_arguments > 0 {
+        return Some(DeclineCause::ThinCallerArgument);
     }
     None
 }
@@ -277,6 +292,9 @@ pub(crate) fn select(
                 return Selection::Keep(KeepReason::WrongConstruction);
             }
         }
+    }
+    if let Some(cause) = &subject.decline {
+        return Selection::Keep(KeepReason::Declined(cause.clone()));
     }
     let length = if let Some(backing) = backing {
         if backing.subject != subject.key {
@@ -369,6 +387,14 @@ mod decline_tests {
                 DeclineCause::UnsupportedRawUse,
                 "contract-candidate-declined:unsupported-raw-use",
             ),
+            (
+                UseSummary {
+                    thin_caller_arguments: 1,
+                    ..Default::default()
+                },
+                DeclineCause::ThinCallerArgument,
+                "contract-candidate-declined:thin-caller-argument",
+            ),
         ];
         for (summary, cause, receipt) in cases {
             let got = decline(&summary).expect("declined");
@@ -387,6 +413,7 @@ mod decline_tests {
             local_callee_boundary_uses: 3,
             field_store_uses: 1,
             unsupported_raw_uses: 1,
+            thin_caller_arguments: 2,
         };
         assert_eq!(decline(&summary), Some(DeclineCause::SliceUseUnsupported));
     }
