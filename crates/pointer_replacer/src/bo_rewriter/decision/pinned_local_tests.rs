@@ -119,10 +119,14 @@ fn reason(d: &super::Decision) -> Option<&super::DegradeReason> {
 fn w5c_pinned_local_lil_rows_reach_their_own_gates() {
     use super::DegradeReason;
     let table = decisions(&fixture());
+    // Over `30d69d95` the `Option` local returned through the pinned raw
+    // return reached `opt-use-unsupported`; over batch 6 (`8e84dc6d`, the
+    // null-init declaration hook) it reaches `null-init` first. Either is the
+    // local's own gate, never the owner's pin.
     assert!(
         matches!(
             reason(decision(&table, "fnc_if::r")),
-            Some(DegradeReason::OptUseUnsupported)
+            Some(DegradeReason::OptUseUnsupported | DegradeReason::NullInit)
         ),
         "{:?}",
         decision(&table, "fnc_if::r")
