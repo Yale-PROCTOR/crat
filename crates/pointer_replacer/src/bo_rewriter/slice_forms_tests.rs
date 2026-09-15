@@ -1372,9 +1372,10 @@ fn wave6s_km_vec4_transform_array_derived_pointers_bound_to_locals() {
     );
 }
 
-/// brotli `EvaluateNode` → `ComputeDistanceShortcut`: the slice base passed
-/// AS-IS into a parameter that settles in the same slice form — a zero-syntax
-/// position the seam planner records only as a revert twin.
+/// brotli `EvaluateNode` → `ComputeDistanceShortcut`: a MUTABLE slice base
+/// passed as-is into a parameter that settles as a SHARED slice — the
+/// `&mut [T] → &[T]` coercion is zero syntax; wave-5c's same-slice carrier
+/// (W-C1) completes it through its coercion arm (report 006).
 const EVALUATE_NODE: &str = r#"
  #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
  #[repr(C)] #[derive(Clone, Copy)] pub struct U { pub cost: f32, pub shortcut: u32 }

@@ -91,8 +91,8 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
         .collect::<Vec<_>>();
     let [(_, source)] = sources.as_slice() else { return Err(Hold::Source) };
     let form = super::seam::form_of(source);
-    let mutable = match form {
-        Form::Slice { mutable } => mutable,
+    match form {
+        Form::Slice { .. } => {}
         // `NestedSlice` is a composition arm, added where wave-5d's variant
         // meets this rule for the first time (batch 4). It DECLINES, with every
         // other non-plain-slice form: the same-slice carrier reasons about one
@@ -108,7 +108,7 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
         | Form::NestedSlice { .. } => {
             return Err(Hold::Source);
         }
-    };
+    }
     let parameters = table
         .entries
         .iter()
@@ -120,9 +120,32 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
         .collect::<Vec<_>>();
     let [(_, parameter)] = parameters.as_slice() else { return Err(Hold::Form) };
     let required = super::seam::form_of(parameter);
-    if required != form || plan.source_form != form.key() || plan.candidate_form != form.key() {
+    // wave-6s (report 006, R401-4 landing): a MUTABLE slice source into a
+    // SHARED slice parameter is the same zero-syntax position — `&mut [T]`
+    // coerces to `&[T]` at the call, the existing input twin is the shared
+    // form's, and nothing is widened; the reverse (shared into mutable) is
+    // not a coercion and stays `Form`-held.
+    let coerces = matches!(
+        (required, form),
+        (
+            Form::Slice { mutable: false },
+            Form::Slice { mutable: true }
+        )
+    );
+    if (required != form && !coerces)
+        || plan.source_form != form.key()
+        || plan.candidate_form != form.key()
+    {
         return Err(Hold::Form);
     }
+    let required_mutable = match required {
+        Form::Slice { mutable } => mutable,
+        Form::Raw
+        | Form::Ref { .. }
+        | Form::Opt { .. }
+        | Form::Cursor { .. }
+        | Form::NestedSlice { .. } => return Err(Hold::Form),
+    };
     let carriers = table
         .seams
         .revert_found_form_edits
@@ -151,7 +174,7 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
     };
     if spec.core != super::seam::GlueCore::FromRawParts
         || spec.optional
-        || spec.mutable != mutable
+        || spec.mutable != required_mutable
         || spec.len.is_none()
     {
         return Err(Hold::CarrierForm);
@@ -166,7 +189,7 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
     {
         return Err(Hold::Dependency);
     }
-    Ok(form)
+    Ok(required)
 }
 
 pub(crate) fn complete(tcx: TyCtxt<'_>, table: &mut DecisionTable) {

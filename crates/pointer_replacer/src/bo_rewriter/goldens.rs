@@ -727,10 +727,12 @@ fn every_golden_outcome_is_attributed() {
     // RED set on a text difference, no longer on program-level Degraded. The
     // ratified bytes are untouched pending the seat's re-ratification.
     // **R401-4 (wave-6s report 006)**: the arm-C charge no longer falls on
-    // the raw SOURCE of a Raw→safe edge, so g06's owning-local class is no
-    // longer held for its in-crate caller's argument and the golden takes the
-    // Emitted arm; it remains a standing RED on text (the move-reroute arm).
-    const EXPECTED_DEGRADED: &[&str] = &[];
+    // the raw SOURCE of a Raw→safe edge. g06's callee class was the one
+    // atomic emission that kept the golden on the Emitted arm; with the
+    // caller no longer held for its raw argument the whole program is
+    // attempted and degrades at the unbuilt move-reroute arm, so g06 now
+    // takes the Degraded arm (it remains one of the standing RED goldens).
+    const EXPECTED_DEGRADED: &[&str] = &["g06_move_reroute"];
     assert_eq!(
         degraded.iter().copied().collect::<Vec<_>>(),
         EXPECTED_DEGRADED,
