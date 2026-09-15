@@ -4319,7 +4319,10 @@ pub(crate) fn synthesize_with_raw_boundary(
             let aliased_twin = (!pair_owned_call)
                 .then(|| {
                     super::counted_void::aliased_storage_twin(
+                        tcx,
+                        table,
                         site,
+                        *callee,
                         &positions
                             .iter()
                             .map(|pos| (pos.index, pos.found))
@@ -4327,7 +4330,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     )
                 })
                 .flatten();
-            if let Some(indices) = &aliased_twin {
+            if let Some(Ok(indices)) = &aliased_twin {
                 super::counted_void::record_alias_twin(
                     table,
                     &mut counted_void_calls,
@@ -4372,12 +4375,20 @@ pub(crate) fn synthesize_with_raw_boundary(
             let mut candidates = Vec::with_capacity(positions.len());
             let mut input_candidates = Vec::with_capacity(positions.len());
             for pos in &positions {
-                if aliased_twin.is_some() {
-                    // Zero syntax at every position: the twin takes the
-                    // original arguments.
-                    candidates.push(Ok(None));
-                    input_candidates.push(Ok(None));
-                    continue;
+                match &aliased_twin {
+                    Some(Ok(_)) => {
+                        // Zero syntax at every position: the twin takes the
+                        // original arguments.
+                        candidates.push(Ok(None));
+                        input_candidates.push(Ok(None));
+                        continue;
+                    }
+                    Some(Err(block)) => {
+                        candidates.push(Err(*block));
+                        input_candidates.push(Err(*block));
+                        continue;
+                    }
+                    None => {}
                 }
                 let Some(text) = pos.text.as_deref() else {
                     candidates.push(Err(SeamBlock::UnnameableOperand));

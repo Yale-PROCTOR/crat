@@ -817,7 +817,9 @@ pub(crate) fn count_argument<'tcx>(
             };
             if disjoint_roots(tcx, site.caller, left, right) {
                 Route::Split
-            } else if only_counted_params_convert(table, callee) {
+            } else if only_counted_params_convert(table, callee)
+                && twin_is_a_leaf(tcx, table, callee)
+            {
                 Route::RawTwin
             } else {
                 return Err(SeamBlock::SiteOverlap);
@@ -829,6 +831,50 @@ pub(crate) fn count_argument<'tcx>(
         root_rule(tcx, table, site.caller, argument, &form)?;
     }
     Ok((placeholder(c.count_index), route))
+}
+
+/// The raw twin is the callee's pristine body under a new name: it calls every
+/// local function with the input's raw arguments, so it compiles only when none
+/// of those callees converts a parameter or its return (the leaf gate, relay
+/// 011 §2). A call through a function pointer is not a local function here.
+pub(crate) fn twin_is_a_leaf(
+    tcx: TyCtxt<'_>,
+    table: &super::DecisionTable,
+    callee: LocalDefId,
+) -> bool {
+    use super::Decision;
+    struct LocalCalls {
+        found: Vec<LocalDefId>,
+    }
+    impl<'v> Visitor<'v> for LocalCalls {
+        fn visit_expr(&mut self, e: &'v Expr<'v>) {
+            if let ExprKind::Call(target, _) = e.kind
+                && let ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = target.kind
+                && let rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Fn, def_id) = path.res
+                && let Some(local) = def_id.as_local()
+            {
+                self.found.push(local);
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut calls = LocalCalls { found: Vec::new() };
+    calls.visit_expr(tcx.hir_body_owned_by(callee).value);
+    calls.found.iter().all(|g| {
+        table.entries.iter().all(|(s, d)| {
+            s.fn_did != *g
+                || match d {
+                    Decision::Degraded(_) => true,
+                    Decision::Cursor { .. }
+                    | Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Slice { .. }
+                    | Decision::NestedSlice { .. }
+                    | Decision::Opt { .. }
+                    | Decision::Box(_) => false,
+                }
+        })
+    })
 }
 
 /// The raw twin is the callee's pristine body, so it is only a faithful target
@@ -1105,9 +1151,12 @@ pub(crate) fn record_call<'tcx>(
 /// same pointee), the call takes the pristine raw twin. Returns the converted
 /// positions' indices.
 pub(crate) fn aliased_storage_twin(
+    tcx: TyCtxt<'_>,
+    table: &super::DecisionTable,
     site: &super::emitability::CallSite,
+    callee: LocalDefId,
     positions: &[(usize, super::seam::Form)],
-) -> Option<Vec<usize>> {
+) -> Option<Result<Vec<usize>, super::seam::SeamBlock>> {
     use super::seam::Form;
     let converted: rustc_hash::FxHashSet<usize> = positions.iter().map(|(i, _)| *i).collect();
     let root_of = |index: usize| {
@@ -1131,7 +1180,16 @@ pub(crate) fn aliased_storage_twin(
             false
         }
     });
-    coercible.then(|| positions.iter().map(|(i, _)| *i).collect())
+    if !coercible {
+        return None;
+    }
+    // The twin is the pristine body; without a leaf body it cannot be
+    // emitted, and the aliased call holds typed instead.
+    Some(if twin_is_a_leaf(tcx, table, callee) {
+        Ok(positions.iter().map(|(i, _)| *i).collect())
+    } else {
+        Err(super::seam::SeamBlock::SiteOverlap)
+    })
 }
 
 /// The plan row for an aliased-storage call: every converted position keeps

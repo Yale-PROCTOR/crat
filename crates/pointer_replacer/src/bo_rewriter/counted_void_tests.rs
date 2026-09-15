@@ -1463,3 +1463,48 @@ fn w6v_hoist_needs_a_read_of_the_borrowed_local_and_a_pure_place_borrow() {
     assert_eq!(original, b"81\n".to_vec());
     assert_eq!(run_binary(&format!("{source}\n{main}")), original);
 }
+
+/// The pristine twin is the input's body under a new name. When that body calls
+/// a local function whose signature converts, the twin would call it with raw
+/// arguments and fail to compile — the site holds `seam-site-overlap` instead
+/// of taking a twin that cannot be emitted (relay 011 §2, the leaf gate).
+#[test]
+fn w6v_raw_twin_is_refused_when_the_callee_body_calls_a_converted_local() {
+    let input = KM_SCALE
+        .replace(
+            "unsafe fn kmQuaternionScale(",
+            "unsafe fn kmQuaternionLength(mut q: *const kmQuaternion) -> f32 { (*q).x + (*q).w }\n\
+         unsafe fn kmQuaternionScale(",
+        )
+        .replace(
+            "    let _k = pIn.offset(0);\n}",
+            "    let _k = pIn.offset(0);\n    let _l = kmQuaternionLength(pOut);\n}",
+        );
+    assert_ne!(input, KM_SCALE);
+    let rows = super::emit_tests::decisions_of(&input);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "q" && *p && r == "<emitted>"),
+        "the helper converts, so the pristine body would not compile: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let c = compact(&source);
+    assert!(
+        !source.contains("__crat_raw_"),
+        "no twin is emitted: {source}"
+    );
+    assert!(
+        c.contains("fnkmQuaternionLength(mutq:&kmQuaternion)")
+            && c.contains("kmQuaternionLength(&*pOut)"),
+        "the helper converts and the callee bridges into it: {source}"
+    );
+    assert!(
+        c.contains("fnkmQuaternionScale(mutpOut:*mutkmQuaternion,"),
+        "the aliased call's class holds (seam-site-overlap) instead of taking a twin: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let main = "fn main() { unsafe { let q = kmQuaternion { x: 1., y: 0., z: 0., w: 2. }; println!(\"{}\", slerp(&q, 0.5)); } }";
+    let original = run_binary(&format!("{input}\n{main}"));
+    assert_eq!(original, b"3\n".to_vec());
+    assert_eq!(run_binary(&format!("{source}\n{main}")), original);
+}
