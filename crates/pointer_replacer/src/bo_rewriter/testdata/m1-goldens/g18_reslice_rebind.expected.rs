@@ -5,6 +5,6 @@ extern "C" {
 }
 
 pub unsafe fn g18_second(p: &[i32]) -> i32 {
-    let q: &[i32] = &p[1..];
-    q[0]
+    let q: &i32 = &(p)[1];
+    *q
 }

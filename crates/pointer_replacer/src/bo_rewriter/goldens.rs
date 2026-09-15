@@ -105,10 +105,11 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // S3.2′-5) and g16 (unannotated-`let` Box, S3.2) are all ratified and
     // allocated — an allocation of free numbers, not a reassignment.
     //
-    // **g18 lands RED and stays RED.** Its market is 0 today and S3.6-gated, so
-    // the rebind ARM is not built here: mechanism follows market. It enters the
-    // standing red set as ratified spec, the same standing as g04–g08 —
-    // goldens are spec, not census.
+    // **g18 landed RED (2026-08-07)**: its market was 0 and S3.6-gated, so the
+    // rebind ARM was not built then. wave-6s built it as the bound-view rule
+    // (report 005) and the seat re-ratified the expected text as the thin
+    // reference the analysis decides for `q` (R401-4, report 006); g18 is
+    // GREEN from that landing.
     "g17_reslice_advance",
     "g18_reslice_rebind",
     // **S3.6-1, RATIFIED 2026-08-09 on their sha256-anchored bytes.** Call-site
@@ -1206,14 +1207,15 @@ fn reference_typed_params_are_collected_with_their_own_shape() {
 #[test]
 fn the_ast_layer_reproduces_every_green_golden() {
     // Pre-existing RED on the SPAN layer: g04/g05/g08 Box+drop, g06 move
-    // reroute, g07 non-dropping store, g18 reslice rebind (arm unbuilt).
+    // reroute, g07 non-dropping store. g18 (reslice rebind) left this list
+    // when wave-6s built the bound-view arm and the seat re-ratified its
+    // text as the thin form the analysis decides (R401-4, report 006).
     const RED: &[&str] = &[
         "g04_box_drop",
         "g05_opt_box",
         "g06_move_reroute",
         "g07_nonDropping_store",
         "g08_drop_all_paths",
-        "g18_reslice_rebind",
     ];
     let mut compared = 0usize;
     let mut differing: Vec<&str> = Vec::new();
