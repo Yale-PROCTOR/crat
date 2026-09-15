@@ -256,12 +256,37 @@ pub unsafe fn init_command(self_0: *mut Command, distance_code: u64) {
 }
 "#;
 
+    /// The same shape with the pair left UNCERTIFIED by wave-6p's rules
+    /// (batch 8): the two field addresses are rooted at two different raw
+    /// parameters that may alias, and both fields are `u32`, so neither the
+    /// distinct-fresh-roots, the strict-aliasing type rule nor the
+    /// disjoint-fields-of-one-object certificate clears it. The raw view
+    /// remains, and so does the pair-charged partner.
+    const UNCERTIFIED_PAIR_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+#[repr(C)]
+pub struct Command { pub insert_len_: u32, pub dist_prefix_: u32, pub dist_extra_: u32 }
+pub unsafe fn prefix_encode(distance_code: u64, code: *mut u32, extra_bits: *mut u32) {
+    if distance_code < 16 {
+        *code = distance_code as u32;
+        *(extra_bits as *mut u8) = 0;
+        return;
+    }
+    *code = (distance_code >> 1) as u32;
+    *(extra_bits as *mut u8) = (distance_code & 1) as u8;
+}
+pub unsafe fn init_command(self_0: *mut Command, other: *mut Command, distance_code: u64) {
+    (*self_0).insert_len_ = 1;
+    prefix_encode(distance_code, &mut (*self_0).dist_prefix_, &mut (*other).dist_extra_);
+}
+"#;
+
     /// The pair-charged raw partner no longer vetoes its class: `code` places
     /// as `&mut u16`, `extra_bits` keeps `*mut u32`, and the call site carries
     /// the A5 raw view that was already planned for it.
     #[test]
     fn pair_charged_raw_partner_does_not_hold_its_class() {
-        let got = run(BROTLI_PAIR_SHAPE);
+        let got = run(UNCERTIFIED_PAIR_SHAPE);
         assert_eq!(
             column(&got.subjects, "prefix_encode::extra_bits#3", "reason"),
             "kind-raw",
@@ -290,7 +315,7 @@ pub unsafe fn init_command(self_0: *mut Command, distance_code: u64) {
         );
         let signature = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            signature.contains("code: &mut u16, extra_bits: *mut u32"),
+            signature.contains("code: &mut u32, extra_bits: *mut u32"),
             "the sibling places and the partner stays raw:\n{}",
             got.emitted
         );
@@ -301,23 +326,56 @@ pub unsafe fn init_command(self_0: *mut Command, distance_code: u64) {
         );
     }
 
-    /// The control on the same fixture: `init_command::self_0` is a degraded
-    /// NODE (borrowed into a raw parameter) whose required arm is `d4` — a
-    /// form-changing arm — so its class stays held exactly as before.
+    /// The disjoint-field shape of the corpus row itself. At this head the A5
+    /// raw view is what presents it (the rule's original witness); on batch
+    /// 8's composition wave-6p's disjoint-fields certificate clears the pair
+    /// outright and both parameters deliver without a view — either way
+    /// `code` places and `extra_bits` stays raw, which is what is asserted.
     #[test]
-    fn form_changing_arm_on_a_degraded_partner_still_holds() {
+    fn the_corpus_disjoint_field_shape_places_code_either_way() {
         let got = run(BROTLI_PAIR_SHAPE);
         assert_eq!(
-            column(&got.arm_outcomes, "init_command::self_0#1", "required_arms"),
-            "d4"
+            column(&got.subjects, "prefix_encode::code#2", "placed"),
+            "1",
+            "{}",
+            got.subjects
         );
         assert_eq!(
-            column(
-                &got.arm_outcomes,
-                "init_command::self_0#1",
-                "blocking_reason"
-            ),
-            "blocked-subject:borrowed-into-raw-param"
+            column(&got.subjects, "prefix_encode::extra_bits#3", "reason"),
+            "kind-raw"
+        );
+        let signature = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            signature.contains("code: &mut u16, extra_bits: *mut u32"),
+            "{}",
+            got.emitted
+        );
+    }
+
+    /// The control: `caller::r` (the zero-syntax dependency fixture below) is
+    /// a degraded NODE (stored into a `static mut`) whose required arm is `d4`
+    /// — a form-changing arm — so its class stays held exactly as before and
+    /// its sibling `q` is withdrawn. (Moved off the disjoint-field pair shape
+    /// at batch 8: wave-6p's certificate clears that pair, and the caller's
+    /// `self_0` no longer degrades there.)
+    #[test]
+    fn form_changing_arm_on_a_degraded_partner_still_holds() {
+        let got = run(ZERO_SYNTAX_DEPENDENCY_SHAPE);
+        assert_eq!(
+            column(&got.arm_outcomes, "caller::r#2", "required_arms"),
+            "d4",
+            "{}",
+            got.arm_outcomes
+        );
+        assert_eq!(
+            column(&got.arm_outcomes, "caller::r#2", "blocking_reason"),
+            "blocked-subject:escapes-via-static-store"
+        );
+        assert!(
+            column(&got.subjects, "caller::q#1", "exclusion")
+                .starts_with("terminal-not-applied:blocked-subject:escapes-via-static-store"),
+            "{}",
+            got.subjects
         );
     }
 
@@ -569,8 +627,11 @@ pub unsafe fn is_valid(buf: *mut core::ffi::c_void, size: i32, ptype: *mut i32) 
 
     /// The C-charged coupling is NOT this module's: it is released by R401-4
     /// (wave-6s `bc46254e`, "charge the C adapter arm to the converted target
-    /// only"), measured GREEN on this fixture with that change applied and RED
-    /// without it. Ignored until that hook is on the head; un-ignore then.
+    /// only"), measured GREEN on this fixture composed over that hook
+    /// (batch-8 composition) and RED at the batch-6 base, where the partner
+    /// owes `c` as a raw source and the class reports `missing-required-arm:c`
+    /// (report 001's packet carries that log). Ignored until the hook is on
+    /// the landed head; un-ignore then — one test-only commit.
     #[test]
     #[ignore = "RED by design: released by wave-6s bc46254e (R401-4), not by the class split"]
     fn c_charged_raw_source_partner_is_released_by_the_target_only_charge() {
@@ -581,25 +642,6 @@ pub unsafe fn is_valid(buf: *mut core::ffi::c_void, size: i32, ptype: *mut i32) 
             got.emitted.contains("ptype: Option<&mut i32>"),
             "{}",
             got.emitted
-        );
-    }
-
-    /// What the C-charged shape looks like at this head, so the dependency is
-    /// measured rather than asserted: the partner owes `c` as a raw source and
-    /// the class reports `missing-required-arm:c`.
-    #[test]
-    fn c_charged_raw_source_partner_holds_its_class_at_this_head() {
-        let got = run(BINN_C_SOURCE_SHAPE);
-        let exclusion = column(&got.subjects, "is_valid::ptype#3", "exclusion");
-        assert!(
-            exclusion.starts_with("terminal-not-applied:blocked-subject:")
-                && exclusion.contains("missing-required-arm:c"),
-            "{exclusion}\n{}",
-            got.subjects
-        );
-        assert_eq!(
-            column(&got.arm_outcomes, "is_valid::plimit#6", "required_arms"),
-            "c"
         );
     }
 }
