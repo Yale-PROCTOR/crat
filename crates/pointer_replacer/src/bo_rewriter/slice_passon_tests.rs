@@ -9,6 +9,12 @@
 //! pins below fix those five outcomes; the two `#[ignore]`d witnesses
 //! reproduce the two class-level walls the corpus rows wait on, each named
 //! for the lane that owns it.
+//!
+//! Model gate (relay 002 §4): a caller-side form never outruns the model's
+//! kind of the callee it forwards to — every pass-on here takes the callee
+//! parameter's OWN settled form (same-form zero syntax, the thin element, or
+//! the raw bridge exactly because the callee's parameter stays raw); no pin
+//! and no rule of this lane converts a callee on the caller's behalf.
 
 fn emit_with_receipts(input: &str) -> (String, String) {
     let receipts = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -459,5 +465,87 @@ fn wave6s2_reslice_return_controls_stay_held() {
     assert!(
         source.contains("fn backward(mut chunk: *const u8) -> *const u8"),
         "a negative literal is the bidirectional family's: {source}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pins of wave-6f's W6F-2 on the Slice family (R407-8): a delivered slice at
+// an argument of a call THROUGH A FUNCTION POINTER is an inventoried
+// `<indirect>` raw-boundary site — the raw view under the T2 waiver, the
+// callee keeping the pointer type its signature names. Model gate: the
+// caller's form never outruns the callee it forwards to — the bridge exists
+// exactly because the indirect callee's parameter stays raw. RED until W6F-2
+// with its return-type refinement is on the head (the lane's own W6S2-3 was
+// withdrawn in its favour, report 004 / relay 002).
+// ---------------------------------------------------------------------------
+
+/// **Witness (tulipindicators `fuzzer::check_output::options#4`, batch-6 row,
+/// sole).** `(*info).start.expect(..)(options)` is a call through a function
+/// pointer, which the boundary planner does not inventory; the bare argument
+/// was refused and the whole subject held. It is the raw view under the T2
+/// waiver: `(..)(options.as_ptr())`, while the counted read `options[k]`
+/// delivers.
+const CHECK_OUTPUT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_camel_case_types)]
+ #[repr(C)] pub struct ti_indicator_info { pub start: Option<unsafe extern "C" fn(*const f64) -> i32>, pub options: i32 }
+ pub unsafe extern "C" fn check_output(mut info: *const ti_indicator_info, mut size: i32, mut options: *const f64) -> i32 {
+    let mut s: i32 = 0;
+    s = (*info).start.expect("non-null function pointer")(options);
+    let mut k: i32 = 0;
+    let mut acc: f64 = 0.0;
+    while k < (*info).options { acc += *options.offset(k as isize); k += 1; }
+    s + acc as i32
+ }
+"#;
+
+#[test]
+#[ignore = "pin of wave-6f W6F-2 (+ the return-type refinement of relay wave-6f/005 §2): RED until both are on the head; un-ignore then"]
+fn wave6s2_fn_pointer_call_argument_takes_the_t2_raw_view() {
+    let (source, receipts) = emit_with_receipts(CHECK_OUTPUT);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut options: &[f64]"), "{source}");
+    let text = joined(&source);
+    assert!(
+        text.contains("(*info).start.expect(\"non-null function pointer\")(options.as_ptr());"),
+        "{source}"
+    );
+    assert!(text.contains("acc += options[(k) as usize];"), "{source}");
+    assert!(receipts.contains("retention=T2"), "{receipts}");
+}
+
+/// **Controls.** A SHARED slice at a `*mut` function-pointer parameter has
+/// no negative-write evidence and holds; a function pointer that returns a
+/// raw pointer may hand a child of the argument back and holds. Both keep the
+/// raw parameter.
+const FN_POINTER_CONTROLS: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn writer(mut f: unsafe extern "C" fn(*mut u8) -> i32, mut buf: *const u8, n: usize) -> i32 {
+    let a = *buf.offset(n as isize);
+    f(buf as *mut u8) + a as i32
+ }
+ pub unsafe fn child(mut g: unsafe extern "C" fn(*const u8) -> *mut u8, mut buf: *const u8, n: usize) -> u8 {
+    let a = *buf.offset(n as isize);
+    let r = g(buf);
+    a.wrapping_add(*r)
+ }
+"#;
+
+#[test]
+#[ignore = "pin of wave-6f W6F-2's holds on the Slice family (shared source at a `*mut` parameter; a pointer-returning function pointer): un-ignore with the witness above and re-phrase the receipt keys to W6F-2's"]
+fn wave6s2_fn_pointer_call_controls_stay_held() {
+    let (source, receipts) = emit_with_receipts(FN_POINTER_CONTROLS);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(!source.contains("as_ptr()"), "{source}");
+    assert!(
+        source.contains("mut buf: *const u8, n: usize) -> i32"),
+        "{source}"
+    );
+    assert!(
+        source.contains("mut buf: *const u8, n: usize) -> u8"),
+        "{source}"
+    );
+    assert!(
+        receipts.contains("returned-child") || receipts.contains("negative-write-absent"),
+        "{receipts}"
     );
 }
