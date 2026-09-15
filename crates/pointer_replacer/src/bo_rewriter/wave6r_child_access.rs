@@ -33,13 +33,78 @@ use crate::utils::rustc::RustProgram;
 
 pub(crate) const PROVENANCE: &str = "k18-callee-descendant-free";
 
-/// A `core` raw-pointer method that takes the pointer by value and hands
-/// nothing back: `is_null`. Every other `Rust`-ABI method on a tracked
-/// pointer stays an unknown call for the retention collector and refuses the
-/// descendant-free scan (`offset`, `add`, `cast`, … derive a new pointer the
-/// contract table cannot see).
-pub(crate) fn core_pointer_no_retain(tcx: TyCtxt<'_>, callee: DefId) -> bool {
-    tcx.crate_name(callee.krate).as_str() == "core" && tcx.item_name(callee).as_str() == "is_null"
+/// How a `core` raw-pointer method treats the pointer it receives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CorePointerCall {
+    /// Takes the pointer by value and hands nothing back (`is_null`).
+    NoRetain,
+    /// Hands back the SAME allocation at another offset or spelling
+    /// (`offset`, `add`, `sub`, `cast`, `cast_mut`, `cast_const`): the
+    /// result is a transparent alias of the receiver, so the ordinary sinks
+    /// decide what becomes of it. `wrapping_*` is deliberately left unknown:
+    /// wave-5c's W-C2 control (`counted_extent_tests`) pins it as an open
+    /// boundary, and moving that expectation is that lane's call.
+    AliasResult,
+}
+
+/// Classify a `Rust`-ABI callee; `None` for anything the table does not
+/// know, which stays an unknown call for the retention collector and refuses
+/// the descendant-free scan.
+pub(crate) fn core_pointer_call(tcx: TyCtxt<'_>, callee: DefId) -> Option<CorePointerCall> {
+    if tcx.crate_name(callee.krate).as_str() != "core" {
+        return None;
+    }
+    match tcx.item_name(callee).as_str() {
+        "is_null" => Some(CorePointerCall::NoRetain),
+        "offset" | "add" | "sub" | "cast" | "cast_mut" | "cast_const" => {
+            Some(CorePointerCall::AliasResult)
+        }
+        _ => None,
+    }
+}
+
+/// The retention collector's alias edge for a block whose terminator is an
+/// alias-result core call on a raw-pointer local: `receiver -> result`.
+pub(crate) fn core_pointer_alias_edge<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    block: rustc_middle::mir::BasicBlock,
+    data: &rustc_middle::mir::BasicBlockData<'tcx>,
+) -> Option<(Local, Local, super::decision::raw_boundary::RetentionStep)> {
+    let TerminatorKind::Call {
+        func,
+        args,
+        destination,
+        ..
+    } = &data.terminator().kind
+    else {
+        return None;
+    };
+    let callee = resolved(func)?;
+    if core_pointer_call(tcx, callee) != Some(CorePointerCall::AliasResult) {
+        return None;
+    }
+    let receiver = operand_local(&args.first()?.node)?;
+    let result = destination.as_local()?;
+    if !matches!(body.local_decls[receiver].ty.kind(), TyKind::RawPtr(..))
+        || !matches!(body.local_decls[result].ty.kind(), TyKind::RawPtr(..))
+    {
+        return None;
+    }
+    Some((
+        receiver,
+        result,
+        super::decision::raw_boundary::RetentionStep {
+            location: format!("bb{}:s{}", block.as_u32(), data.statements.len()),
+            kind: super::decision::raw_boundary::RetentionEventKind::Transparent,
+            detail: format!(
+                "_{}->_{} core-{}",
+                receiver.as_u32(),
+                result.as_u32(),
+                tcx.item_name(callee).as_str()
+            ),
+        },
+    ))
 }
 
 fn pointer(ty: Ty<'_>) -> bool {
@@ -110,6 +175,16 @@ fn descendant_free(
                 && pointer(body.local_decls[result].ty)
                 && !aliases.contains(&result)
             {
+                if core_pointer_call(tcx, callee) == Some(CorePointerCall::AliasResult)
+                    && args
+                        .first()
+                        .and_then(|argument| operand_local(&argument.node))
+                        .is_some_and(|receiver| aliases.contains(&receiver))
+                {
+                    aliases.push(result);
+                    changed = true;
+                    continue;
+                }
                 let key = symbol_key(tcx, callee, functions);
                 let returns_alias = args.iter().enumerate().any(|(index, argument)| {
                     operand_local(&argument.node).is_some_and(|local| aliases.contains(&local))
@@ -195,7 +270,19 @@ fn descendant_free(
                     .is_none_or(|local| !functions.contains(&local))
                     && !symbol_key(tcx, callee, functions).abi.starts_with('C')
                     && args.iter().any(|argument| is_alias(&argument.node))
-                    && !core_pointer_no_retain(tcx, callee)
+                    && core_pointer_call(tcx, callee).is_none()
+                {
+                    return false;
+                }
+                // An alias-result core call whose result lands outside a plain
+                // local (a static, a field, the return place) hands the alias
+                // out directly.
+                if core_pointer_call(tcx, callee) == Some(CorePointerCall::AliasResult)
+                    && args
+                        .first()
+                        .is_some_and(|argument| is_alias(&argument.node))
+                    && let TerminatorKind::Call { destination, .. } = &data.terminator().kind
+                    && hands_out(destination)
                 {
                     return false;
                 }

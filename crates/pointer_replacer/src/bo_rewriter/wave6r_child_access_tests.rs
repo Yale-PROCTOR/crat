@@ -129,3 +129,58 @@ fn wave6r_child_access_null_test_in_callee_is_no_retain() {
     assert!(row.contains("\tshared-ref-to-mut-raw\t"), "{row}");
     assert!(!row.contains("write-through-shared-view"), "{row}");
 }
+
+/// Reduced from brotli `StoreH3`: the callee advances its parameter with a
+/// core `offset` and reads through the result. `offset` is a `Rust`-ABI
+/// method, filed as an unknown call by the retention collector, so the
+/// position never earned NoRetain and every shared caller stayed held.
+#[test]
+fn wave6r_child_access_core_offset_read_in_callee_is_no_retain() {
+    let row = h6_arg0_disposition(&INPUT.replace(
+        "    *cache = (*s).num;\n",
+        "    let next = s.offset(1);\n    *cache = (*next).num;\n",
+    ));
+    assert!(row.contains("\tshared-ref-to-mut-raw\t"), "{row}");
+    assert!(!row.contains("write-through-shared-view"), "{row}");
+}
+
+/// The `offset` result is an alias: storing it in a global retains it.
+#[test]
+fn wave6r_child_access_core_offset_result_stored_keeps_hold() {
+    held(
+        &INPUT
+            .replace(
+                "    *cache = (*s).num;\n",
+                "    KEEP4 = s.offset(1);\n    *cache = (*s).num;\n",
+            )
+            .replace(
+                "pub struct H65",
+                "pub static mut KEEP4: *mut H6 = core::ptr::null_mut();\npub struct H65",
+            ),
+    );
+}
+
+/// The `offset` result reaches a foreign callee with no contract row: only
+/// the retention collector sees that sink (the scan defers foreign callees
+/// to the certificate). The unknown foreign call also makes the root mutable
+/// upstream, so the site is a T2 bridge; what the alias edge decides is its
+/// retention reason — an open boundary reached through the `offset` result,
+/// never a no-retain certificate.
+#[test]
+fn wave6r_child_access_core_offset_result_into_unmodeled_foreign_is_retention_unknown() {
+    let row = h6_arg0_disposition(
+        &INPUT
+            .replace(
+                "    *cache = (*s).num;\n",
+                "    sink(s.offset(1));\n    *cache = (*s).num;\n",
+            )
+            .replace(
+                "pub struct H65",
+                "unsafe extern \"C\" { fn sink(p: *mut H6); }\npub struct H65",
+            ),
+    );
+    assert!(
+        row.contains("\tT2\t") && row.contains("retention-open-boundary"),
+        "{row}"
+    );
+}

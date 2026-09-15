@@ -162,3 +162,17 @@ fn wave6r_scan_core_offset_result_stored_is_not_descendant_free() {
         "is_null keeps the position free"
     );
 }
+
+/// An `offset` result landing in a static directly (no local in between).
+#[test]
+fn wave6r_scan_core_offset_into_static_is_not_descendant_free() {
+    let input = SCAN.replace(
+        "pub unsafe fn fresh(",
+        "pub unsafe fn offset_into_static(url: *mut Url) -> i32 { KEEP = url.offset(1) as *mut c_void; (*url).len }\npub unsafe fn offset_read(url: *mut Url) -> i32 { let next = url.offset(1); (*next).len }\npub unsafe fn fresh(",
+    );
+    assert!(!scan(&input, "offset_into_static", 0));
+    assert!(
+        scan(&input, "offset_read", 0),
+        "an offset that is only read through stays free"
+    );
+}
