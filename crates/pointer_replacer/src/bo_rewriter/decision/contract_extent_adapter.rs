@@ -7,7 +7,7 @@ use super::{
     Subject, SubjectKind,
     construction::{Construction, ConstructionFacts},
     contract_extent::*,
-    emitability::{ArgShape, EmitabilityFacts, SliceUses},
+    emitability::{ArgShape, EmitabilityFacts, OptUses, SliceUses},
     local_callee_extent::{AccessReason, LocalCalleeAccess},
     raw_boundary::RawMutability,
     raw_boundary_contracts::{ArgumentExtent, PointeeAccess, classify_contract},
@@ -128,8 +128,11 @@ struct Candidate {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CandidateIndex {
     by_subject: FxHashMap<(LocalDefId, HirId), Candidate>,
-    /// R397-6(b): candidates declined at the selection INPUT, with the cause.
+    /// R397-6(b): candidates declined at the selection INPUT, with the cause,
+    /// for the plain form (the slice walker's use wall).
     declines: FxHashMap<(LocalDefId, HirId), DeclineCause>,
+    /// The same for the nullable form, whose use wall is the Option walker's.
+    nullable_declines: FxHashMap<(LocalDefId, HirId), DeclineCause>,
 }
 
 /// The candidate's own pre-selection Slice-use facts. A raw use at a LOCAL
@@ -138,13 +141,17 @@ pub(crate) struct CandidateIndex {
 fn use_summary(
     owner: LocalDefId,
     uses: Option<&SliceUses>,
+    unsupported: bool,
     local_boundaries: &rustc_hash::FxHashSet<(LocalDefId, u32, u32)>,
 ) -> UseSummary {
     let Some(uses) = uses else {
-        return UseSummary::default();
+        return UseSummary {
+            unsupported,
+            ..UseSummary::default()
+        };
     };
     let mut summary = UseSummary {
-        unsupported: uses.unsupported.is_some(),
+        unsupported,
         ..UseSummary::default()
     };
     for raw in &uses.raw_uses {
@@ -236,6 +243,7 @@ pub(crate) fn collect(
     constructions: &ConstructionFacts,
     local_callee_extent: &FxHashMap<(LocalDefId, HirId), LocalCalleeAccess>,
     slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
+    opt_uses: &FxHashMap<(LocalDefId, HirId), OptUses>,
 ) -> CandidateIndex {
     let subjects = subjects
         .iter()
@@ -382,20 +390,29 @@ pub(crate) fn collect(
                 .map(move |argument| (call.caller, argument.span.lo().0, argument.span.hi().0))
         })
         .collect::<rustc_hash::FxHashSet<_>>();
-    let declines = by_subject
-        .keys()
-        .filter_map(|&node| {
-            decline(&use_summary(
-                node.0,
-                slice_uses.get(&node),
-                &local_boundaries,
-            ))
-            .map(|cause| (node, cause))
-        })
-        .collect();
+    let declines_for = |nullable: bool| {
+        by_subject
+            .keys()
+            .filter_map(|&node| {
+                let uses = slice_uses.get(&node);
+                let unsupported = if nullable {
+                    opt_uses
+                        .get(&node)
+                        .is_some_and(|uses| uses.unsupported.is_some())
+                } else {
+                    uses.is_some_and(|uses| uses.unsupported.is_some())
+                };
+                decline(&use_summary(node.0, uses, unsupported, &local_boundaries))
+                    .map(|cause| (node, cause))
+            })
+            .collect::<FxHashMap<_, _>>()
+    };
+    let declines = declines_for(false);
+    let nullable_declines = declines_for(true);
     CandidateIndex {
         by_subject,
         declines,
+        nullable_declines,
     }
 }
 
@@ -410,6 +427,7 @@ pub(crate) fn caller_thin_holds(
     subjects: &[Subject],
     facts: &EmitabilityFacts,
     index: &CandidateIndex,
+    fat: &FatFacts,
     tcx: rustc_middle::ty::TyCtxt<'_>,
 ) -> FxHashMap<(LocalDefId, HirId), LocalCalleeAccess> {
     let mut out = FxHashMap::default();
@@ -417,6 +435,17 @@ pub(crate) fn caller_thin_holds(
         let SubjectKind::Param { hir_index } = subject.kind else { continue };
         let node = (subject.fn_did, subject.hir_id);
         let Some(candidate) = index.by_subject.get(&node) else { continue };
+        // A callee parameter that is a slice by its OWN arithmetic is not
+        // promoted by the contract (the same `existing_slice` test as the
+        // promotion loop); its widened callers stay R365-2's census item.
+        let existing_slice = facts.raw_only_uses.get(&node).is_some_and(|uses| {
+            uses.iter()
+                .any(|(op, _)| super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
+                && fat.is_array(subject.fn_did, subject.local)
+        });
+        if existing_slice {
+            continue;
+        }
         let Some(site) = candidate
             .sites
             .iter()
@@ -461,7 +490,7 @@ impl CandidateIndex {
         self.declines.iter()
     }
 
-    /// One TSV row per declined candidate, ordered by owner path and binding.
+    /// One TSV row per declined candidate and form, ordered by owner path.
     pub(crate) fn declines_tsv(
         &self,
         tcx: rustc_middle::ty::TyCtxt<'_>,
@@ -469,27 +498,36 @@ impl CandidateIndex {
     ) -> String {
         let mut rows = subjects
             .iter()
-            .filter_map(|subject| {
+            .flat_map(|subject| {
                 let node = (subject.fn_did, subject.hir_id);
-                let cause = self.declines.get(&node)?;
-                let candidate = self.by_subject.get(&node)?;
-                Some(format!(
-                    "{}\t{}\t{}\t{}\t{}\n",
-                    tcx.def_path_str(subject.fn_did.to_def_id()),
-                    subject.label,
-                    candidate.subject,
-                    cause.receipt(),
-                    candidate
-                        .sites
-                        .iter()
-                        .map(|site| site.contract.as_str())
-                        .collect::<Vec<_>>()
-                        .join(";"),
-                ))
+                [
+                    ("plain", &self.declines),
+                    ("nullable", &self.nullable_declines),
+                ]
+                .into_iter()
+                .filter_map(move |(form, declines)| {
+                    let cause = declines.get(&node)?;
+                    let candidate = self.by_subject.get(&node)?;
+                    Some(format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\n",
+                        tcx.def_path_str(subject.fn_did.to_def_id()),
+                        subject.label,
+                        candidate.subject,
+                        form,
+                        cause.receipt(),
+                        candidate
+                            .sites
+                            .iter()
+                            .map(|site| site.contract.as_str())
+                            .collect::<Vec<_>>()
+                            .join(";"),
+                    ))
+                })
             })
             .collect::<Vec<_>>();
         rows.sort();
-        let mut out = String::from("owner_path\tsubject\tsubject_key\treceipt\tcontract_sites\n");
+        let mut out =
+            String::from("owner_path\tsubject\tsubject_key\tform\treceipt\tcontract_sites\n");
         out.extend(rows);
         out
     }
@@ -502,7 +540,15 @@ impl CandidateIndex {
         fat: &FatFacts,
     ) -> Selection {
         let node = (subject.fn_did, subject.hir_id);
-        if let Some(cause) = self.declines.get(&node) {
+        let declines = match form {
+            CurrentForm::Ref { nullable: true, .. } => &self.nullable_declines,
+            CurrentForm::Ref {
+                nullable: false, ..
+            }
+            | CurrentForm::Slice
+            | CurrentForm::Other => &self.declines,
+        };
+        if let Some(cause) = declines.get(&node) {
             return Selection::Keep(KeepReason::Declined(cause.clone()));
         }
         let Some(candidate) = self.by_subject.get(&node) else {

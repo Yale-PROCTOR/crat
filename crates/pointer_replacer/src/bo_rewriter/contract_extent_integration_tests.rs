@@ -471,13 +471,21 @@ fn ce_d01_local_callee_boundary_declines_the_candidate_up_front() {
     };
     let declines = &raw_boundary_artifacts.contract_candidate_declines;
     let rows = declines.lines().skip(1).collect::<Vec<_>>();
-    assert_eq!(rows.len(), 1, "exactly one declined candidate: {declines}");
-    assert!(
-        rows[0].starts_with("ce_d01\tce_d01::from\t")
-            && rows[0].contains("\tcontract-candidate-declined:local-callee-boundary\t")
-            && rows[0].ends_with("\tstrlen:pinned-libc-0.2.184:0:nul-terminated"),
-        "the typed receipt names the subject, the cause and the contract: {declines}"
+    assert_eq!(
+        rows.len(),
+        2,
+        "one declined candidate, receipted under both forms: {declines}"
     );
+    for (row, form) in rows.iter().zip(["nullable", "plain"]) {
+        assert!(
+            row.starts_with("ce_d01\tce_d01::from\t")
+                && row.contains(&format!(
+                    "\t{form}\tcontract-candidate-declined:local-callee-boundary\t"
+                ))
+                && row.ends_with("\tstrlen:pinned-libc-0.2.184:0:nul-terminated"),
+            "the typed receipt names the subject, the form, the cause and the contract: {declines}"
+        );
+    }
     // Never attempted: no family transaction touches the owner.
     assert!(
         raw_boundary_artifacts
