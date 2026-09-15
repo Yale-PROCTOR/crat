@@ -356,6 +356,10 @@ pub(crate) enum Route {
     /// A `void *` handle to one struct: the raw argument is cast to the
     /// declared pointee and reborrowed at the argument itself (no snapshot).
     Handle,
+    /// A converted `&mut` place argument beside an argument that READS the
+    /// same local: every unconverted argument is evaluated into a `let`
+    /// before the call, so the borrow starts after the reads.
+    Hoist,
 }
 impl Route {
     pub(crate) fn key(self) -> &'static str {
@@ -364,6 +368,7 @@ impl Route {
             Self::Split => "split",
             Self::RawTwin => "raw-twin",
             Self::Handle => "handle",
+            Self::Hoist => "hoist",
         }
     }
 }
@@ -1175,6 +1180,130 @@ pub(crate) fn record_alias_twin(
     });
 }
 
+/// A converted `&mut` position whose argument is a pure place borrow of a
+/// local (`&mut local`, or a reference local reborrowed), while some OTHER
+/// argument of the same call reads that local: json.h's
+/// `json_get_value_size(&mut state, (f & state.flags_bitset) as i32)`. In C
+/// the address is taken and the read follows; with the view the borrow would
+/// be live across the read (E0503). Every unconverted argument is hoisted
+/// into a `let` before the call — the address-of has no effect, so the order
+/// of effects is the input's. Returns the converted positions.
+pub(crate) fn aliased_read_hoist(
+    tcx: TyCtxt<'_>,
+    site: &super::emitability::CallSite,
+    positions: &[(usize, super::seam::Form, super::seam::Form)],
+) -> Option<Vec<usize>> {
+    use super::{emitability::ArgShape, seam::Form};
+    let body = tcx.hir_body_owned_by(site.caller).value;
+    let ExprKind::Call(_, args) = find_expr(body, site.span).map(|call| strip_casts(call).kind)?
+    else {
+        return None;
+    };
+    if args.iter().any(|argument| argument.span.from_expansion()) {
+        return None;
+    }
+    let converted: rustc_hash::FxHashSet<usize> = positions.iter().map(|(i, _, _)| *i).collect();
+    let mut roots = Vec::new();
+    for (index, expected, _) in positions {
+        if !matches!(
+            expected,
+            Form::Ref { mutable: true }
+                | Form::Slice { mutable: true }
+                | Form::Opt { mutable: true, .. }
+        ) {
+            continue;
+        }
+        let shape = site.args.iter().find(|a| a.index == *index)?.shape;
+        // Only a pure place borrow may be evaluated after the other arguments.
+        let root = match shape {
+            ArgShape::AddrOf {
+                mutable: true,
+                base: Some(base),
+                through_deref: false,
+            } => base,
+            ArgShape::BareLocal(base) => base,
+            _ => continue,
+        };
+        roots.push(root);
+    }
+    if roots.is_empty() {
+        return None;
+    }
+    let reads = args.iter().enumerate().any(|(i, argument)| {
+        !converted.contains(&i) && roots.iter().any(|root| mentions_local(argument, *root))
+    });
+    reads.then(|| positions.iter().map(|(i, _, _)| *i).collect())
+}
+
+fn mentions_local(expr: &Expr<'_>, local: HirId) -> bool {
+    struct Mentions {
+        local: HirId,
+        found: bool,
+    }
+    impl<'v> Visitor<'v> for Mentions {
+        fn visit_expr(&mut self, e: &'v Expr<'v>) {
+            if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = e.kind
+                && path.res == rustc_hir::def::Res::Local(self.local)
+            {
+                self.found = true;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut visitor = Mentions {
+        local,
+        found: false,
+    };
+    visitor.visit_expr(expr);
+    visitor.found
+}
+
+/// The plan row for a hoisted call: the converted positions keep their
+/// arguments in the call, every other argument moves into a `let` before it.
+pub(crate) fn record_hoist(
+    table: &super::DecisionTable,
+    calls: &mut std::collections::BTreeMap<(u32, u32, u32), CallPlan>,
+    site: &super::emitability::CallSite,
+    callee: LocalDefId,
+    indices: &[usize],
+) {
+    let bridged = indices
+        .iter()
+        .filter_map(|index| {
+            let param = table.entries.iter().find_map(|(s, _)| {
+                (s.fn_did == callee
+                    && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == *index))
+                .then_some(s.hir_id)
+            })?;
+            Some(BridgedArg {
+                index: *index,
+                param,
+                element: ByteElement::Read,
+                mutable: true,
+                bridge: String::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if bridged.is_empty() {
+        return;
+    }
+    let key = (
+        site.caller.local_def_index.as_u32(),
+        site.span.lo().0,
+        site.span.hi().0,
+    );
+    calls.entry(key).or_insert_with(|| CallPlan {
+        owner_class: crate::bo_rewriter::bridge_receipt::SignatureClassId::of(callee),
+        caller: site.caller,
+        callee,
+        call_span: site.span,
+        count_index: 0,
+        route: Route::Hoist,
+        bridged,
+        count_form: "aliased-read".to_owned(),
+    });
+}
+
 fn contract_at(
     table: &super::DecisionTable,
     callee: LocalDefId,
@@ -1439,6 +1568,10 @@ impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
             self.consumed.insert(key);
             return;
         }
+        if call.route == Route::Hoist {
+            self.graft_hoist(e, key, kept);
+            return;
+        }
         let arity = args.len();
         if call.count_index >= arity || kept.iter().any(|b| b.index >= arity) {
             self.failure = Some(format!(
@@ -1498,6 +1631,84 @@ impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
         if !self.guard.claim(e.id, e.span, "counted-void-call") {
             self.failure = Some(format!(
                 "counted-void call at {}..{} collided with another AST transform",
+                key.0, key.1
+            ));
+            return;
+        }
+        self.consumed.insert(key);
+        e.kind = parsed.kind;
+    }
+}
+
+impl CallGraft<'_> {
+    /// `{ let __crat_cv_i = <arg i>; .. callee(<converted args>, __crat_cv_i, ..) }`:
+    /// the unconverted arguments are evaluated, in order, before the call
+    /// forms its `&mut` borrow.
+    fn graft_hoist(&mut self, e: &mut rustc_ast::Expr, key: (u32, u32), kept: &[&BridgedArg]) {
+        let rustc_ast::ExprKind::Call(callee, args) = &mut e.kind else {
+            return;
+        };
+        let arity = args.len();
+        if kept.iter().any(|b| b.index >= arity) {
+            self.failure = Some(format!(
+                "counted-void hoist at {}..{} has arity {arity}, outside its plan",
+                key.0, key.1
+            ));
+            return;
+        }
+        let converted = |i: usize| kept.iter().any(|b| b.index == i);
+        let lets = (0..arity)
+            .filter(|i| !converted(*i))
+            .map(|i| format!("let {} = {}_orig;", placeholder(i), placeholder(i)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let call_args = (0..arity)
+            .map(|i| {
+                if converted(i) {
+                    format!("{}_orig", placeholder(i))
+                } else {
+                    placeholder(i)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let call = crate::bo_rewriter::mechanical_receipt::present_unsafe_text(
+            format!("__crat_cv_callee({call_args})"),
+            self.unsafe_fn,
+        );
+        let text = format!("{{ {lets} {call} }}");
+        let mut parsed = match crate::bo_rewriter::ast_transform::graft_expr(&text) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.failure = Some(format!(
+                    "counted-void hoist at {}..{} did not round-trip: {text}",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        let mut subst = Substitute {
+            callee: Some(std::mem::replace(callee, rustc_ast::ptr::P(dummy_expr()))),
+            originals: std::mem::take(args).into_iter().map(Some).collect(),
+            substituted: 0,
+        };
+        rustc_ast::mut_visit::MutVisitor::visit_expr(&mut subst, &mut parsed);
+        if subst.substituted != arity + 1
+            || subst.callee.is_some()
+            || subst.originals.iter().any(Option::is_some)
+        {
+            self.failure = Some(format!(
+                "counted-void hoist at {}..{} substituted {} of {} operands",
+                key.0,
+                key.1,
+                subst.substituted,
+                arity + 1
+            ));
+            return;
+        }
+        if !self.guard.claim(e.id, e.span, "counted-void-call") {
+            self.failure = Some(format!(
+                "counted-void hoist at {}..{} collided with another AST transform",
                 key.0, key.1
             ));
             return;

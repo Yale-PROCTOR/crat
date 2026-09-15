@@ -1340,3 +1340,109 @@ fn w6v_same_local_at_two_converted_positions_never_emits_two_views() {
     };
     assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
 }
+
+/// json.h's `json_parse_ex`: `json_get_value_size(&mut state, (flags & state.flags_bitset) as i32)`
+/// — a converted `&mut` argument followed by an argument that reads the same local
+/// (batch 6's E0503, 2 rows / 11 identities).
+const JSON_STATE: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct State { pub flags: u64, pub dom_size: u64, pub offset: u64 }
+pub unsafe extern "C" fn get_value_size(mut state: *mut State, mut is_global: i32) -> i32 {
+    let flags = (*state).flags;
+    (*state).dom_size = ((*state).dom_size).wrapping_add(8);
+    if is_global != 0 { return 1; }
+    (*state).offset = (*state).offset.wrapping_add(1);
+    return 0;
+}
+pub unsafe extern "C" fn parse(mut flags: u64) -> i32 {
+    let mut state: State = State { flags: 0, dom_size: 0, offset: 0 };
+    state.flags = flags;
+    let mut input_error: i32 = 0;
+    input_error = get_value_size(&mut state, (1 as u64 & state.flags) as i32);
+    return input_error + state.offset as i32 + state.dom_size as i32;
+}
+"#;
+
+#[test]
+fn w6v_read_of_the_borrowed_local_in_a_later_argument_is_hoisted() {
+    let rows = super::emit_tests::decisions_of(JSON_STATE);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "state" && *p && r == "<emitted>"),
+        "the callee parameter delivers: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(JSON_STATE).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fnget_value_size(mutstate:&mutState,"),
+        "the callee takes the view: {source}"
+    );
+    assert!(
+        c.contains(
+            "{let__crat_cv_1=(1asu64&state.flags)asi32;get_value_size(&mutstate,__crat_cv_1)}"
+        ),
+        "the read is evaluated before the borrow: {source}"
+    );
+    assert!(
+        super::verify::type_checks_str(&source),
+        "output compiles: {source}"
+    );
+    let main = "fn main() { unsafe { println!(\"{} {}\", parse(0), parse(1)); } }";
+    let original = run_binary(&format!("{JSON_STATE}\n{main}"));
+    assert_eq!(original, b"9 9\n".to_vec());
+    assert_eq!(run_binary(&format!("{source}\n{main}")), original);
+}
+
+/// Controls: no read of the borrowed local in another argument → the call is
+/// left as written; a converted argument that is not a pure place borrow (a
+/// call result) is never reordered behind the read.
+#[test]
+fn w6v_hoist_needs_a_read_of_the_borrowed_local_and_a_pure_place_borrow() {
+    let no_read = JSON_STATE.replace(
+        "get_value_size(&mut state, (1 as u64 & state.flags) as i32)",
+        "get_value_size(&mut state, (1 as u64 & flags) as i32)",
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&no_read).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("input_error=get_value_size(&mutstate,(1asu64&flags)asi32);"),
+        "no read of `state` in another argument: the call stays: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+
+    // A converted argument that is a pointer READ (`(*hp).sp`, not a place
+    // borrow) beside an argument that overwrites that field: the order of
+    // effects is the input's only if the read stays first — never hoisted.
+    let impure = JSON_STATE
+        .replace(
+            "pub unsafe extern \"C\" fn parse(",
+            "#[repr(C)] pub struct Holder { pub sp: *mut State, pub flags: u64 }\n\
+             pub unsafe extern \"C\" fn swap_in(mut h: *mut Holder, mut alt: *mut State) -> i32 { (*h).sp = alt; 1 }\n\
+             pub unsafe extern \"C\" fn parse2(mut flags: u64) -> i32 {\n\
+                 let mut a: State = State { flags: 0, dom_size: 0, offset: 0 };\n\
+                 let mut b: State = State { flags: 0, dom_size: 0, offset: 0 };\n\
+                 let mut h: Holder = Holder { sp: &mut a, flags: flags };\n\
+                 let hp: *mut Holder = &mut h;\n\
+                 let e = get_value_size((*hp).sp, swap_in(hp, &mut b));\n\
+                 return e + a.dom_size as i32 * 10 + b.dom_size as i32;\n\
+             }\n\
+             pub unsafe extern \"C\" fn parse(",
+        );
+    let rows = super::emit_tests::decisions_of(&impure);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "state" && *p && r == "<emitted>"),
+        "the control's callee parameter delivers: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&impure).unwrap();
+    assert!(
+        !compact(&source).contains("let__crat_cv_1=swap_in"),
+        "a pointer-read argument is never reordered behind the write: {source}"
+    );
+    let main = "fn main() { unsafe { println!(\"{}\", parse2(0)); } }";
+    let original = run_binary(&format!("{impure}\n{main}"));
+    assert_eq!(original, b"81\n".to_vec());
+    assert_eq!(run_binary(&format!("{source}\n{main}")), original);
+}

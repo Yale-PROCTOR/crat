@@ -4336,6 +4336,31 @@ pub(crate) fn synthesize_with_raw_boundary(
                     indices,
                 );
             }
+            // A converted `&mut` place beside an argument that READS the same
+            // local: the unconverted arguments are hoisted before the call
+            // (wave-6v; json.h's E0503). The positions themselves are ordinary.
+            if aliased_twin.is_none()
+                && !pair_owned_call
+                && !positions
+                    .iter()
+                    .any(|pos| super::counted_void::parameter(table, *callee, pos.index).is_some())
+                && let Some(indices) = super::counted_void::aliased_read_hoist(
+                    tcx,
+                    site,
+                    &positions
+                        .iter()
+                        .map(|pos| (pos.index, pos.expected, pos.found))
+                        .collect::<Vec<_>>(),
+                )
+            {
+                super::counted_void::record_hoist(
+                    table,
+                    &mut counted_void_calls,
+                    site,
+                    *callee,
+                    &indices,
+                );
+            }
             let return_tied = table
                 .lifetime_plan
                 .function(*callee)
