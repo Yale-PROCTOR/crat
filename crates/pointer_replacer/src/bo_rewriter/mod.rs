@@ -7920,6 +7920,7 @@ fn finish_decide<'tcx>(
         decision::flexible_tail::append_interface_dependencies(&mut table);
         decision::box_param::append_interface_dependencies(&mut table);
         decision::void_region::append_receiver_declarations(&mut table);
+        append_literal_local_declaration_plans(tcx, &ctors, &mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
@@ -8703,6 +8704,70 @@ fn append_surface_declaration_plans(
                 arm: "surface",
             });
     }
+}
+
+/// R410-9 (b): an unannotated local built from a string-literal construction
+/// is typed by that construction — `&[T]` at the declaration, the same
+/// explicit-declaration seam the inferred receivers use.
+fn append_literal_local_declaration_plans(
+    tcx: TyCtxt<'_>,
+    ctors: &decision::construction::ConstructionFacts,
+    table: &mut decision::DecisionTable,
+) {
+    use bridge_receipt::SignatureClassId;
+
+    let mut declarations = Vec::new();
+    for plan in &table.slice_constructions {
+        // Another producer (wave-6a's W6A-B1 constructor typing) may already
+        // type this local; one explicit declaration per node.
+        if table
+            .seams
+            .explicit_declarations
+            .iter()
+            .any(|site| site.category == "local" && site.node == Some(plan.node))
+        {
+            continue;
+        }
+        if plan.replacement.is_none()
+            || !matches!(
+                ctors.by_binding.get(&plan.node),
+                Some(decision::construction::Construction::StringLiteral { .. })
+            )
+        {
+            continue;
+        }
+        let Some((subject, _)) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| (subject.fn_did, subject.hir_id) == plan.node)
+        else {
+            continue;
+        };
+        if subject.ty_span.is_some() {
+            continue;
+        }
+        let Some(name) = subject.param_name.as_deref() else { continue };
+        // The element is the initializer's own pointee (`*const c_char`), the
+        // declaration having none to read.
+        let TyKind::RawPtr(pointee, _) =
+            *tcx.typeck(subject.fn_did).node_type(plan.init_hir).kind()
+        else {
+            continue;
+        };
+        let emitted_type = format!("&[{}]", decision::declaration::pointee_source(tcx, pointee));
+        let binding_prefix = if subject.mut_binding { "mut " } else { "" };
+        declarations.push(decision::seam::ExplicitDeclarationSite {
+            owner_class: SignatureClassId::of(subject.fn_did),
+            caller: subject.fn_did,
+            node: Some(plan.node),
+            span: Some(subject.binding_span),
+            category: "local",
+            replacement: Some(format!("{binding_prefix}{name}: {emitted_type}")),
+            emitted_type,
+            arm: "surface",
+        });
+    }
+    table.seams.explicit_declarations.extend(declarations);
 }
 
 fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision::DecisionTable) {

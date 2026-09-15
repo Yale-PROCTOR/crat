@@ -1416,3 +1416,136 @@ fn ce_m05_a_size_of_another_type_keeps_the_multi_element_extent() {
         .expect("CE-M05 `st` subject");
     assert_eq!(st.2, "held:thin-extent", "{decisions:#?}");
 }
+
+/// R410-9 (b): the counted-literal shape (wave-6k 010's 8 string-literal
+/// copies) — libtree's `print_error`: a local initialized by a conditional of
+/// NUL-terminated byte-string literals and read only at NUL contract
+/// positions. It takes `&[i8]` with each literal's own byte length as the
+/// evidence and `.as_ptr()` at the foreign seam.
+const CE_S01_CONDITIONAL_LITERAL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" {
+    fn strlen(s: *const i8) -> usize;
+    fn strcpy(dest: *mut i8, src: *const i8) -> *mut i8;
+}
+pub unsafe fn print_error(color: i32, p: *mut i8) -> usize {
+    let mut box_vertical = (if color != 0 {
+        b"    \x1B[0;31m|\x1B[0m\0" as *const u8 as *const i8
+    } else {
+        b"    |\0" as *const u8 as *const i8
+    }) as *mut i8;
+    let n = strlen(box_vertical);
+    strcpy(p, box_vertical);
+    n
+}
+"#;
+
+#[test]
+fn ce_s01_a_conditional_of_nul_literals_takes_the_slice_with_literal_lengths() {
+    let source = emitted(CE_S01_CONDITIONAL_LITERAL);
+    assert!(
+        source.contains(r#"core::slice::from_raw_parts(b"    \x1B[0;31m|\x1B[0m\0" as *const u8 as *const i8, 17usize)"#),
+        "{source}"
+    );
+    assert!(
+        source.contains(
+            r#"core::slice::from_raw_parts(b"    |\0" as *const u8 as *const i8, 6usize)"#
+        ),
+        "{source}"
+    );
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("let mut box_vertical: &[i8] = (if color != 0 {"),
+        "{source}"
+    );
+    assert!(flat.contains("strlen(box_vertical.as_ptr())"), "{source}");
+    assert!(
+        flat.contains("strcpy(p, box_vertical.as_ptr())"),
+        "{source}"
+    );
+    assert!(
+        !flat.contains("as *mut i8;"),
+        "the outer cast is gone:\n{source}"
+    );
+    assert!(!flat.contains("FALLBACK_SLICE_EXTENT"), "{source}");
+}
+
+/// libtree's `recurse`: the literal local is handed to a LOCAL callee whose
+/// parameter reads it at a NUL position — the chain carries the literal
+/// slice zero-syntax into `print_line(color: &[i8])`.
+const CE_S02_LITERAL_INTO_LOCAL_CALLEE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" {
+    fn strlen(s: *const i8) -> usize;
+}
+unsafe fn print_line(depth: usize, color: *const i8) -> usize {
+    depth + strlen(color)
+}
+pub unsafe fn recurse(depth: usize, excluded: i32) -> usize {
+    let mut bold_color = (if excluded != 0 {
+        b"\x1B[0;35m\0" as *const u8 as *const i8
+    } else {
+        b"\x1B[1;36m\0" as *const u8 as *const i8
+    }) as *mut i8;
+    print_line(depth, bold_color)
+}
+"#;
+
+#[test]
+fn ce_s02_a_literal_local_carries_into_its_local_callee() {
+    let source = emitted(CE_S02_LITERAL_INTO_LOCAL_CALLEE);
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("fn print_line(depth: usize, color: &[i8])"),
+        "{source}"
+    );
+    assert!(flat.contains("depth + strlen(color.as_ptr())"), "{source}");
+    assert!(
+        flat.contains("let mut bold_color: &[i8] = (if excluded != 0 {"),
+        "{source}"
+    );
+    assert!(
+        source.contains(
+            r#"core::slice::from_raw_parts(b"\x1B[0;35m\0" as *const u8 as *const i8, 8usize)"#
+        ),
+        "{source}"
+    );
+    assert!(flat.contains("print_line(depth, bold_color)"), "{source}");
+    assert!(!flat.contains("FALLBACK_SLICE_EXTENT"), "{source}");
+}
+
+/// A single literal (no conditional) and the write-through hold: a literal is
+/// read-only, so a position that WRITES it (`strcpy` destination) is not a
+/// slice of it — the local keeps its raw form rather than a `&mut [i8]`.
+#[test]
+fn ce_s03_a_lone_literal_promotes_and_a_written_literal_does_not() {
+    let read_only = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" { fn strlen(s: *const i8) -> usize; }
+pub unsafe fn f() -> usize {
+    let s = b"abc\0" as *const u8 as *const i8;
+    strlen(s)
+}
+"#;
+    let source = emitted(read_only);
+    assert!(
+        source.contains(r#"let s: &[i8] = core::slice::from_raw_parts(b"abc\0" as *const u8 as *const i8, 4usize);"#),
+        "{source}"
+    );
+    assert!(source.contains("strlen(s.as_ptr())"), "{source}");
+
+    let written = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" { fn strcpy(dest: *mut i8, src: *const i8) -> *mut i8; }
+pub unsafe fn g(src: *const i8) {
+    let d = b"abc\0" as *const u8 as *mut i8;
+    strcpy(d, src);
+}
+"#;
+    let source = emitted(written);
+    assert!(
+        source.contains(r#"let d = b"abc\0" as *const u8 as *mut i8;"#),
+        "the written literal keeps its raw form:\n{source}"
+    );
+    assert!(!source.contains("d: &"), "{source}");
+}

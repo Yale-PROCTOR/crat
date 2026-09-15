@@ -1659,7 +1659,9 @@ fn residual_reason(ctor: Option<&construction::Construction>) -> DegradeReason {
         Some(C::PlaceRead | C::ArrayDecay | C::IndexAddr | C::AddrOf) => {
             DegradeReason::PlaceReadPointee
         }
-        Some(C::CopyOf | C::Other) | None => DegradeReason::CopySourceCoupled,
+        Some(C::CopyOf | C::Other | C::StringLiteral { .. }) | None => {
+            DegradeReason::CopySourceCoupled
+        }
         // The null-init gate above owns this class and fires before the
         // residue can. Kept explicit rather than folded into an arm it does not
         // belong to, so the ordering is legible where it matters.
@@ -1699,6 +1701,11 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let receiver_failed = ctx
         .return_receivers
         .is_some_and(|receivers| receivers.failures.contains_key(&receiver_node));
+    // R410-9 (b): a string-literal construction types its own local.
+    let literal_construction = matches!(
+        ctx.constructions.by_binding.get(&receiver_node),
+        Some(construction::Construction::StringLiteral { .. })
+    );
 
     // EXHAUSTIVE, not `matches!(.., Degraded(_))` — the import denylist rejects
     // the bypass shape and is right to: a new emitting disposition must be a
@@ -1715,6 +1722,9 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
             DegradeReason::SliceCursorUse,
         ),
+        // wave-4 R410-9 (b): a string-literal construction has no root to
+        // widen and no local-callee result to receive; it types its own local.
+        Decision::Slice { mutable: false, .. } if literal_construction => decision,
         // wave-6a (relay 007 §3a, wave-6s2 006; R395-2): before any rule that
         // types an unannotated slice local by its constructor — a receiver of
         // a local callee is the return family's, a Ref-rooted construction
@@ -2262,10 +2272,19 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // holding. Without this placement 158 subjects would be attributed to a
         // gate that is not blocking them, 121 of them in functions that are not
         // even pinned.
+        // R410-9 (b): a string-literal construction types its own local
+        // (`append_literal_local_declaration_plans`), so it is a splice target.
+        let literal_construction = matches!(
+            constructions
+                .by_binding
+                .get(&(subject.fn_did, subject.hir_id)),
+            Some(construction::Construction::StringLiteral { .. })
+        );
         if subject.ty_span.is_none()
             && !construction_values::permits(ctx, subject)
             && !slice_construction_values::permits(ctx, subject)
             && !raw_place_values::permits(ctx, subject, subject.mutable)
+            && !literal_construction
             && !(family_policy
                 .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
                 && declaration_patterns.contains_key(&(subject.fn_did, subject.hir_id)))

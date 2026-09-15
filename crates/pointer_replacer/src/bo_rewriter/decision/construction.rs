@@ -75,8 +75,20 @@ pub(crate) enum Construction {
     /// A call to something that is not a known allocator — the length, if any,
     /// belongs to the callee's contract and is not visible here.
     CallResult,
+    /// R410-9 (b): a NUL-terminated byte-string literal, or an `if` chain
+    /// whose every arm is one — `b"..\0" as *const u8 as *const c_char`. Each
+    /// arm's byte length is the literal's own, statically.
+    StringLiteral { arms: Vec<LiteralArm> },
     /// A `let` with an initializer the recognizer does not classify.
     Other,
+}
+
+/// One literal arm of a [`Construction::StringLiteral`]: the arm's whole
+/// expression (the literal with its casts) and its byte length, NUL included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiteralArm {
+    pub span: rustc_span::Span,
+    pub bytes: usize,
 }
 
 impl Construction {
@@ -101,6 +113,7 @@ impl Construction {
             Construction::IndexAddr => "interior-index",
             Construction::PlaceRead => "place-read",
             Construction::CallResult => "call-result",
+            Construction::StringLiteral { .. } => "literal-bytes",
             Construction::Other => "other",
         }
     }
@@ -115,6 +128,7 @@ impl Construction {
             Construction::IndexAddr => "index-addr",
             Construction::PlaceRead => "place-read",
             Construction::CallResult => "call-result",
+            Construction::StringLiteral { .. } => "string-literal",
             Construction::Other => "other",
         }
     }
@@ -162,6 +176,10 @@ pub(crate) enum SliceLengthSource {
     SealedContract {
         contract: String,
     },
+    /// R410-9 (b): each arm's literal byte length, NUL included.
+    LiteralBytes {
+        arms: Vec<usize>,
+    },
     Fallback,
 }
 
@@ -187,6 +205,13 @@ impl SliceLengthSource {
                 owner.local_def_index.as_u32()
             ),
             Self::SealedContract { contract } => format!("sealed-contract:{contract}"),
+            Self::LiteralBytes { arms } => format!(
+                "literal-bytes:{}",
+                arms.iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(";")
+            ),
             Self::Fallback => FALLBACK_EXTENT_RECEIPT.to_owned(),
         }
     }
@@ -490,6 +515,19 @@ fn select_length(
     {
         return length;
     }
+    if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
+        return SliceLengthPlan {
+            expression: arms
+                .iter()
+                .map(|arm| format!("{}usize", arm.bytes))
+                .collect::<Vec<_>>()
+                .join("|"),
+            source: SliceLengthSource::LiteralBytes {
+                arms: arms.iter().map(|arm| arm.bytes).collect(),
+            },
+            provenance: Vec::new(),
+        };
+    }
     if let Some(length) = associated_local_length(facts, node, known) {
         return length;
     }
@@ -529,6 +567,52 @@ pub(crate) fn render_slice_constructor(
     present_unsafe_text(body, enclosing_unsafe_fn)
 }
 
+/// R410-9 (b): render a [`Construction::StringLiteral`] initializer — the
+/// initializer's own text with every literal arm wrapped in
+/// `core::slice::from_raw_parts(<arm>, <bytes>usize)` and the outer casts
+/// around the `if` chain (or the lone literal) dropped, so the value is the
+/// chain itself. A nullable form is not a literal's: held.
+fn render_literal_slices(
+    tcx: TyCtxt<'_>,
+    init_hir: HirId,
+    init_span: Span,
+    initializer: &str,
+    arms: &[LiteralArm],
+    nullable: bool,
+) -> Result<String, String> {
+    if nullable {
+        return Err("literal-is-never-null".to_owned());
+    }
+    let sm = tcx.sess.source_map();
+    let root = match tcx.hir_node(init_hir) {
+        rustc_hir::Node::Expr(expr) => Collector::peel_casts(expr),
+        _ => return Err("literal initializer is not an expression".to_owned()),
+    };
+    // The chain (`if .. else ..`) is the value; a lone literal's arm IS the
+    // whole initializer, casts included.
+    let base = match arms {
+        [only] if !matches!(root.kind, rustc_hir::ExprKind::If(..)) => only.span,
+        _ => root.span,
+    };
+    let root_text = sm
+        .span_to_snippet(base)
+        .map_err(|_| "literal initializer unrenderable".to_owned())?;
+    let edits = arms
+        .iter()
+        .map(|arm| {
+            let text = sm
+                .span_to_snippet(arm.span)
+                .map_err(|_| "literal arm unrenderable".to_owned())?;
+            Ok((
+                arm.span,
+                format!("core::slice::from_raw_parts({text}, {}usize)", arm.bytes),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let _ = (init_span, initializer);
+    compose_initializer(base, &root_text, &edits)
+}
+
 /// R206 E09: bind the selected allocation argument once, and bind every
 /// preceding argument first (notably realloc's pointer). All bindings remain
 /// inside the original initializer, preserving left-to-right evaluation.
@@ -560,6 +644,7 @@ fn bind_allocation_arguments(
         } => (*argument_index as usize, Some(element_type)),
         SliceLengthSource::AssociatedArgument { .. }
         | SliceLengthSource::SealedContract { .. }
+        | SliceLengthSource::LiteralBytes { .. }
         | SliceLengthSource::Fallback => {
             return Ok((
                 Vec::new(),
@@ -935,33 +1020,47 @@ pub(crate) fn plan_slice_constructions(
             wrapper_inserted: !enclosing_unsafe_fn,
             edition: 2018,
         };
-        let rendered = bind_allocation_arguments(
-            tcx,
-            subject,
-            init_hir,
-            init_span,
-            &initializer,
-            &composed_edits,
-            &length,
-        )
-        .map(|(bindings, initializer, length_expression)| {
-            length.expression = length_expression;
-            let constructor = render_slice_constructor(
-                &initializer,
-                &element_type,
-                mutable,
-                nullable,
-                &length.expression,
-                true,
-                subject.local.as_u32(),
-            );
-            let body = if bindings.is_empty() {
-                constructor
+        let rendered =
+            if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
+                // R410-9 (b): each literal arm is its own construction with its
+                // own byte length; the outer `as *mut c_char` cast is dropped with
+                // the arms' casts kept inside `from_raw_parts` (a `*mut` operand
+                // coerces). A literal is read-only: no mutable slice of one.
+                if mutable {
+                    Err("literal-is-read-only".to_owned())
+                } else {
+                    render_literal_slices(tcx, init_hir, init_span, &initializer, arms, nullable)
+                        .map(|body| present_unsafe_text(body, enclosing_unsafe_fn))
+                }
             } else {
-                format!("{{ {} {constructor} }}", bindings.join(" "))
+                bind_allocation_arguments(
+                    tcx,
+                    subject,
+                    init_hir,
+                    init_span,
+                    &initializer,
+                    &composed_edits,
+                    &length,
+                )
+                .map(|(bindings, initializer, length_expression)| {
+                    length.expression = length_expression;
+                    let constructor = render_slice_constructor(
+                        &initializer,
+                        &element_type,
+                        mutable,
+                        nullable,
+                        &length.expression,
+                        true,
+                        subject.local.as_u32(),
+                    );
+                    let body = if bindings.is_empty() {
+                        constructor
+                    } else {
+                        format!("{{ {} {constructor} }}", bindings.join(" "))
+                    };
+                    present_unsafe_text(body, enclosing_unsafe_fn)
+                })
             };
-            present_unsafe_text(body, enclosing_unsafe_fn)
-        });
         let mut inherited_length = length.clone();
         if !length.is_fallback()
             && let Some(name) = &subject.param_name
@@ -1090,8 +1189,47 @@ impl Collector<'_, '_> {
         e
     }
 
+    /// The outer casts only — the same peel, named for the literal chain
+    /// whose arms keep their own casts.
+    fn peel_casts<'h>(e: &'h rustc_hir::Expr<'h>) -> &'h rustc_hir::Expr<'h> {
+        Self::peel(e)
+    }
+
+    /// R410-9 (b): every arm of the (possibly conditional) expression is a
+    /// NUL-terminated byte-string literal under its casts.
+    fn literal_arms(e: &rustc_hir::Expr<'_>, out: &mut Vec<LiteralArm>) -> bool {
+        match &Self::peel(e).kind {
+            rustc_hir::ExprKind::Lit(lit) => match &lit.node {
+                rustc_ast::LitKind::ByteStr(bytes, _) if bytes.last() == Some(&0) => {
+                    out.push(LiteralArm {
+                        span: e.span,
+                        bytes: bytes.len(),
+                    });
+                    true
+                }
+                _ => false,
+            },
+            rustc_hir::ExprKind::If(_, then, Some(otherwise)) => {
+                Self::literal_arms(then, out) && Self::literal_arms(otherwise, out)
+            }
+            rustc_hir::ExprKind::Block(block, None) => match (block.stmts, block.expr) {
+                ([], Some(tail)) => Self::literal_arms(tail, out),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn classify(&self, init: &rustc_hir::Expr<'_>) -> Construction {
         let e = Self::peel(init);
+        let mut arms = Vec::new();
+        if matches!(
+            e.kind,
+            rustc_hir::ExprKind::Lit(_) | rustc_hir::ExprKind::If(..)
+        ) && Self::literal_arms(init, &mut arms)
+        {
+            return Construction::StringLiteral { arms };
+        }
         match &e.kind {
             rustc_hir::ExprKind::Call(callee, args) => {
                 let name = match &callee.kind {
