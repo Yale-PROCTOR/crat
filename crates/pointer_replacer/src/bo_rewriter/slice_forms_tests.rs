@@ -1659,19 +1659,23 @@ fn wave6s_borrow_deref_double_cast_view_at_a_foreign_position() {
 /// open-boundary void bridge) is admitted by the root; `input` (the source,
 /// a SHARED view at a pointer-returning foreign callee) holds under the
 /// returned-child permission rule `write-through-shared-view` — wave-6r's
-/// family, whose descendant-free discharge does not reach `memcpy`'s second
-/// argument at this frame. Without the per-subject walk (wave-5d) the hold
-/// withdraws the function's SliceUse stage, so both stay raw here.
+/// family. Alone (this lane's tree) the hold withdraws the function's
+/// SliceUse stage and both stay raw; composed with wave-6r's libc
+/// negative-write contract at `memcpy`'s source (relay 009 §2, batch 8)
+/// both deliver, `input` through the suffix view. Either outcome is the
+/// rule that owns it (R217-2(a)); this lane's own claim is the rooted view.
 #[test]
-fn wave6s_make_uncompressed_stream_input_holds_at_the_write_through_rule() {
+fn wave6s_make_uncompressed_stream_source_is_wave6r_s_rule() {
     let (source, receipts) = emit_with_family_receipts(MAKE_UNCOMPRESSED_STREAM);
     println!("EMITTED {source}");
     println!("FAMILY RECEIPTS {receipts}");
     assert!(super::verify::type_checks_str(&source), "{source}");
-    assert!(
-        receipts.contains("write-through-shared-view") || receipts.contains("memcpy:arg=1"),
-        "the hold is wave-6r's permission rule at memcpy's source argument: {receipts}"
-    );
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    let delivered = flat.contains("mutinput:&[uint8_t]")
+        && flat.contains("mutoutput:&mut[uint8_t]")
+        && flat.contains("memcpy((&mut(output)[(result)asusize..]).as_mut_ptr().cast::<core::ffi::c_void>(),(&(input)[(offset)asusize..]).as_ptr().cast::<core::ffi::c_void>(),");
+    let held = receipts.contains("write-through-shared-view") || receipts.contains("memcpy:arg=1");
+    assert!(delivered || held, "{source}\n{receipts}");
 }
 
 const MEMSET_DOUBLE_CAST: &str = r#"
