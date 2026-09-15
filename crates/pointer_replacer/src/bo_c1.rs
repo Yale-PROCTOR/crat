@@ -24497,10 +24497,12 @@ fn raw_boundary_wave2_corpus_census() {
     assert_eq!(controls.io_domain_migrations.lines().count(), 1);
     // The re-pin is identity-exact in both directions: every control row is
     // consumed exactly once (an unused row is already a divergence above), and
-    // the receipt carries one line per control row plus its header.
+    // the receipt carries one line per control row plus its header. Wave-4
+    // #1a (2026-09-15): 76 -> 57 rows — 19 contract-selected sites delivered
+    // and retired with their receipts, 5 re-classed `slice-use-unsupported`.
     assert_eq!(
         controls.libc_hold_receipt.lines().count(),
-        77,
+        58,
         "libc contract hold receipt population drift"
     );
     assert_eq!(
