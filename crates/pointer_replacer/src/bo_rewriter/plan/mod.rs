@@ -3533,7 +3533,59 @@ pub(crate) fn plan(
             )),
         }
     }
+    for input in table.seams.native_result_expressions.plans.values() {
+        let owner = input.owner_class();
+        let bridge = input.bridge();
+        match span_to_loc(input.call_span) {
+            Ok((file, lo, hi)) => preclass_sites.push(ClassSite {
+                atom_ids: Vec::new(),
+                key: bridge.materialize(owner, file_key_label(&file), lo as u32, hi as u32),
+                edit_key: "-".into(),
+                state: ClassSiteState::EditReady,
+                expected_form: bridge.expected_form,
+                found_form: bridge.found_form,
+                argument_kind: bridge.argument_kind,
+                extent: bridge.extent,
+                retention: bridge.retention,
+                waiver_id: bridge.waiver_id,
+                unsafe_context: bridge.unsafe_context,
+            }),
+            Err(reason) => preclass_sites.push(ClassSite::dropped(
+                owner,
+                SignatureClassId::of(input.caller),
+                Arm::C,
+                "native-result-expression-site-unlocated",
+                reason,
+            )),
+        }
+    }
+    for unavailable in table.seams.native_result_expressions.unavailable.values() {
+        let owner = SignatureClassId::of(unavailable.callee);
+        let mut site = ClassSite::dropped(
+            owner,
+            SignatureClassId::of(unavailable.caller),
+            Arm::C,
+            "native-result-expression-unavailable",
+            format!("native-result-expression:{:?}", unavailable.reason),
+        );
+        site.key.position = format!(
+            "native-result-expression:{}:{}",
+            unavailable.caller.local_def_index.as_u32(),
+            unavailable.call_hir.local_id.as_u32()
+        );
+        preclass_sites.push(site);
+    }
     for unavailable in table.seams.raw_receivers.unavailable.values() {
+        // wave-6l: a cast initializer the receiving twin refused is served by
+        // the native-result-expression carrier at the inner call.
+        if unavailable.initializer_span.is_some_and(|span| {
+            table
+                .seams
+                .native_result_expressions
+                .covers_initializer(span)
+        }) {
+            continue;
+        }
         let owner = SignatureClassId::of(unavailable.callee);
         let mut site = ClassSite::dropped(
             owner,

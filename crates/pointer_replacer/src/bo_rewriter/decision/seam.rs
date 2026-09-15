@@ -785,6 +785,9 @@ pub(crate) struct TerminalCallPlans {
     pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
     pub(crate) outbound_expressions: super::outbound_expression::OutboundExpressionPlans,
     pub(crate) raw_receivers: super::raw_receiver::RawReceiverPlans,
+    /// wave-6l: native results consumed at deref / cast / assignment positions.
+    pub(crate) native_result_expressions:
+        super::native_result_expression::NativeResultExpressionPlans,
     pub(crate) receiver_inputs: super::receiver_input::ReceiverInputMap,
     pub(crate) callee_parameter_inputs: super::callee_parameter_input::InputPlans,
     pub(crate) surface_arguments: Vec<super::surface_argument::SurfaceArgumentPlan>,
@@ -867,6 +870,7 @@ impl TerminalCallPlans {
             native_return_sites: seams.native_return_sites.clone(),
             outbound_expressions: seams.outbound_expressions.clone(),
             raw_receivers: seams.raw_receivers.clone(),
+            native_result_expressions: seams.native_result_expressions.clone(),
             receiver_inputs: seams.receiver_inputs.clone(),
             surface_arguments: seams.surface_arguments.clone(),
             callee_parameter_inputs: seams.callee_parameter_inputs.clone(),
@@ -3037,6 +3041,9 @@ pub(crate) struct SeamPlan {
     pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
     pub(crate) outbound_expressions: super::outbound_expression::OutboundExpressionPlans,
     pub(crate) raw_receivers: super::raw_receiver::RawReceiverPlans,
+    /// wave-6l: native results consumed at deref / cast / assignment positions.
+    pub(crate) native_result_expressions:
+        super::native_result_expression::NativeResultExpressionPlans,
     pub(crate) receiver_inputs: super::receiver_input::ReceiverInputMap,
     pub(crate) callee_parameter_inputs: super::callee_parameter_input::InputPlans,
     pub(crate) surface_arguments: Vec<super::surface_argument::SurfaceArgumentPlan>,

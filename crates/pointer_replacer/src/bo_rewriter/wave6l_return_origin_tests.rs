@@ -1122,17 +1122,18 @@ pub unsafe extern "C" fn heman_ops_warp_core(mut secondary: *mut heman_image, mu
 }
 "#;
 
-/// RED (wave 5, queued in report 005): every one of these callers keeps its
-/// delivery — the changed return interface is bridged at the cast
+/// Wave 5 — every one of these callers keeps its delivery: the changed
+/// return interface is restored to the call's original raw type at the cast
 /// initializer, the immediate derefs, the compound assignment and the
-/// assignment receiver — and the callee's class is placed.
+/// assignment receiver (the receiving-local twin's own shape), and the
+/// callee's class is placed. Each site is a receipted T2 view.
 #[test]
-#[ignore = "wave-6l build queued: expression-position and cast receivers of a changed return interface (report 005)"]
-fn w6l_red_expression_position_receivers_keep_the_callee_class_placed() {
+fn w6l_expression_position_receivers_keep_the_callee_class_placed() {
     let RewriteOutcome::Emitted {
         source,
         reverted_count,
         degradations,
+        raw_boundary_artifacts,
         ..
     } = emitted(
         "heman-expression-receivers",
@@ -1160,4 +1161,88 @@ fn w6l_red_expression_position_receivers_keep_the_callee_class_placed() {
         "{degradations:?}"
     );
     assert!(text.contains("letmuttexel:&mut[f32]="), "{text}");
+    // (a) the cast initializer: the twin inside the cast.
+    assert!(
+        text.contains("letmutN={let__crat_native_result_14_10:&mut[f32]=(__crat_safe_heman_image_texel(normals,x,y));(__crat_native_result_14_10.as_mut_ptr())as*mutf32}as*mutkmVec3;"),
+        "{text}"
+    );
+    // (b) the immediate deref read and the compound assignment.
+    assert!(
+        text.contains("p.z=*{let__crat_native_result_15_24:&mut[f32]="),
+        "{text}"
+    );
+    assert!(text.contains("as*mutf32}+=v;"), "{text}");
+    // (c) the assignment into an existing raw local.
+    assert!(text.contains("src={let__crat_native_result_"), "{text}");
+    let views = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| {
+            event.site.bridge_kind == "native-result-expression-raw"
+                && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(views.len(), 4, "{views:#?}");
+    for event in &views {
+        assert_eq!(
+            event.state,
+            super::bridge_receipt::BridgeReceiptState::Applied
+        );
+        assert_eq!(
+            event.retention,
+            super::bridge_receipt::BridgeRetentionTier::T2
+        );
+        assert_eq!(
+            event.waiver_id.as_deref(),
+            Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
+        );
+    }
+    assert!(
+        raw_boundary_artifacts.outbound_return_error.is_none(),
+        "{:?}",
+        raw_boundary_artifacts.outbound_return_error
+    );
+}
+
+/// Wave 5 — a result position outside the served shapes (the receiver of a
+/// method call) holds the callee's class typed; nothing reverts and no site
+/// is passed over silently.
+#[test]
+fn w6l_unserved_result_position_holds_the_callee_class_typed() {
+    let source = HEMAN_EXPRESSION_RECEIVERS.replace(
+        "    *heman_image_texel(result, i, j) += v;\n",
+        "    if heman_image_texel(result, i, j).is_null() { return; }\n",
+    );
+    let RewriteOutcome::Emitted {
+        reverted_count,
+        degradations,
+        ..
+    } = emitted(
+        "heman-unserved-position",
+        &source,
+        &[
+            "heman_draw_points",
+            "heman_image_texel",
+            "heman_lighting_apply",
+            "heman_lighting_compute_normals",
+            "heman_ops_accumulate",
+            "heman_ops_warp_core",
+        ],
+    )
+    else {
+        panic!("heman unserved position emission degraded");
+    };
+    assert_eq!(reverted_count, 0);
+    let img = degradations
+        .iter()
+        .find(|d| d.subject == "heman_image_texel::img#1")
+        .expect("the callee's class hold");
+    let reason = format!("{:?}", img.reason);
+    assert!(
+        reason.contains(
+            "native-result-expression-unavailable:native-result-expression:PositionUnbuilt("
+        ) && reason.contains("method-receiver"),
+        "{:?}",
+        img.reason
+    );
 }

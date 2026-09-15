@@ -7899,6 +7899,8 @@ fn finish_decide<'tcx>(
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
             decision::raw_receiver::plan(&program, &table, &ctors, &retention);
+        table.seams.native_result_expressions =
+            decision::native_result_expression::plan(&program, &table);
         table.seams.native_return_sites = facts.return_sites.clone();
         table.seams.outbound_expressions = decision::outbound_expression::plan(
             &program,

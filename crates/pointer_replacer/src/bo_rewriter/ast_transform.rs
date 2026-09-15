@@ -2501,6 +2501,7 @@ impl MutVisitor for C9GraftVisitor<'_> {
 #[derive(Clone, Copy)]
 enum ReceiverGraft<'a> {
     Outbound(&'a super::decision::outbound_expression::OutboundExpressionPlan),
+    Expression(&'a super::decision::native_result_expression::NativeResultExpressionPlan),
     Retired(&'a super::decision::receiver_input::ReceiverInputPlan),
     Raw(&'a super::decision::raw_receiver::RawReceiverPlan),
     SharedOption(&'a super::decision::return_receiver::ReceiverPlan),
@@ -2514,6 +2515,7 @@ impl ReceiverGraft<'_> {
             Self::Retired(input) => input.render(call),
             Self::Raw(input) => input.render(call),
             Self::Outbound(input) => input.render(call),
+            Self::Expression(input) => input.render(call),
             Self::SharedOption(input) => input.render_coercion(call),
             Self::Region(receiver) => receiver.render(call),
         }
@@ -4046,6 +4048,24 @@ fn transform_with<'tcx>(
         {
             return Err(format!(
                 "outbound-expression-invariant:duplicate-plan:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    for input in table
+        .seams
+        .native_result_expressions
+        .plans
+        .values()
+        .filter(|input| input.active(&classes))
+    {
+        let key = (input.call_span.lo().0, input.call_span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Expression(input))
+            .is_some()
+        {
+            return Err(format!(
+                "native-result-expression-invariant:duplicate-plan:{}..{}",
                 key.0, key.1
             ));
         }
