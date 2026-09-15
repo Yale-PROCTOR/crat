@@ -2079,7 +2079,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             .is_some_and(|hir| emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr()))
             || opt_uses
                 .get(&(subject.fn_did, subject.hir_id))
-                .is_some_and(|uses| uses.null_assigned));
+                .is_some_and(|uses| uses.null_assigned)
+            // Wave-6o: a caller's null-literal argument is the parameter's
+            // construction-site null literal.
+            || option_ops::param_receives_null_literal(facts, subject));
     let mut form = match raw_uses {
         Some(uses) => {
             let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);

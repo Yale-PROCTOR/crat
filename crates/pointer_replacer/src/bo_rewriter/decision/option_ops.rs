@@ -13,7 +13,7 @@ use rustc_span::Span;
 
 use super::{
     DecisionTable, Subject, SubjectKind,
-    emitability::{OptUseSite, OptUses, UseEdit},
+    emitability::{ArgShape, EmitabilityFacts, OptUseSite, OptUses, UseEdit},
     lifetime::FnSignatureSlot,
     raw_boundary::{RawMutability, raw_target_type},
     seam::Form,
@@ -414,4 +414,22 @@ pub(super) fn plan_call_reborrows(
             MechanicalEvidence::default(),
         ));
     }
+}
+
+/// Wave-6o (relay 009). A PARAMETER that some local caller passes the null
+/// literal is nullable by that caller's evidence — the argument is the
+/// parameter's construction site, and a null literal there is the same fact
+/// as `let p = 0 as *mut T` at a local. The optional form follows (null =
+/// `None`, the existing `null-argument` carrier renders the literal); a plain
+/// reference at such a parameter would be `arg-null-literal` at the class
+/// gate, which is what the corpus shows.
+pub(super) fn param_receives_null_literal(facts: &EmitabilityFacts, subject: &Subject) -> bool {
+    let SubjectKind::Param { hir_index } = subject.kind else { return false };
+    facts.call_args.get(&subject.fn_did).is_some_and(|sites| {
+        sites.iter().any(|site| {
+            site.args
+                .iter()
+                .any(|arg| arg.index == hir_index && matches!(arg.shape, ArgShape::NullLit))
+        })
+    })
 }

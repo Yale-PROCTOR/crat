@@ -4691,8 +4691,14 @@ mod coconv_witnesses {
     #[test]
     fn d4_w1_blocked_member_does_not_block_clean_sibling() {
         // TWO call sites of one callee: `via` supplies a clean bare local, and
-        // `nulls` supplies a null literal. The null blocks `t::p`, and `via::x`
-        // — whose own argument is unobjectionable — is blocked with it.
+        // `casts` supplies a cast-of-address argument. The cast blocks `t::p`,
+        // and `via::x` — whose own argument is unobjectionable — is blocked
+        // with it.
+        //
+        // Migrated under R217-2(a) by wave-6o (relay 009): the null literal
+        // that used to play the blocker now makes the parameter OPTIONAL (a
+        // caller's null literal is the parameter's construction-site null), so
+        // the blocked member is witnessed with the cast form instead.
         //
         // The `aliased(q, q)` shape cannot witness this: BO itself refuses the
         // doubly-passed binding, so `q` is not a node and there is no edge to
@@ -4700,12 +4706,12 @@ mod coconv_witnesses {
         let rows = census(&format!(
             "{PRE}pub unsafe fn t(p: *mut i32) {{ *p = 1; }}\n\
              pub unsafe fn via(x: *mut i32) {{ t(x); }}\n\
-             pub unsafe fn nulls() {{ t(0 as *mut i32); }}\n"
+             pub unsafe fn casts() {{ let mut y: i32 = 0; let _ = &mut y; t((&mut y) as *mut i32); }}\n"
         ));
         let p = row(&rows, "t", 1);
         let x = row(&rows, "via", 1);
         assert_eq!(p["class_id"], x["class_id"], "{p:?} vs {x:?}");
-        assert_eq!(p["node_block"], "arg-null-literal", "{p:?}");
+        assert_eq!(p["node_block"], "arg-cast-form-unbuilt", "{p:?}");
         assert_eq!(p["member_admissible"], "0", "{p:?}");
         assert_eq!(x["member_admissible"], "1", "{x:?}");
         assert_eq!(x["edge_routes"], "arm-a", "{x:?}");
@@ -4737,10 +4743,13 @@ mod coconv_witnesses {
 
     #[test]
     fn d4_w1_production_keeps_clean_sibling_safe() {
+        // Migrated under R217-2(a) by wave-6o (relay 009): the null-literal
+        // caller no longer blocks `target::p` (it makes it optional), so the
+        // blocked member is the cast-of-address caller.
         let source = format!(
             "{PRE}pub unsafe fn target(p: *mut i32) {{ *p = 1; }}\n\
              pub unsafe fn via(x: *mut i32) {{ target(x); }}\n\
-             pub unsafe fn nulls() {{ target(0 as *mut i32); }}\n"
+             pub unsafe fn casts() {{ let mut y: i32 = 0; let _ = &mut y; target((&mut y) as *mut i32); }}\n"
         );
         let super::super::RewriteOutcome::Emitted { source, .. } =
             super::super::rewrite_m1(&source)
@@ -4812,7 +4821,14 @@ mod coconv_witnesses {
                 .cloned()
                 .unwrap_or_default()
         };
-        assert_eq!(case("0 as *mut i32"), "arg-null-literal");
+        // Migrated under R217-2(a) by wave-6o (relay 009): a caller's null
+        // literal is the parameter's construction-site null and selects the
+        // optional form instead of blocking the class.
+        assert_eq!(
+            case("0 as *mut i32"),
+            "-",
+            "a null-literal argument makes the parameter optional; it is not a block"
+        );
         assert_eq!(case("(&mut x) as *mut i32"), "arg-cast-form-unbuilt");
         assert_eq!(
             case("1usize as *mut i32"),
