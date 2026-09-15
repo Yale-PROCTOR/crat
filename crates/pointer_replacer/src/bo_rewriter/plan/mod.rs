@@ -1262,13 +1262,12 @@ pub(crate) fn finalize_signature_classes(
         }
     }
 
-    let seam_adapter_edges = table
+    let mut dependency_edges = table
         .seams
         .edits
         .iter()
         .map(|edit| (SignatureClassId::of(edit.bridge.caller), edit.owner_class))
-        .collect::<BTreeSet<_>>();
-    let mut dependency_edges = seam_adapter_edges.iter().copied().collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     dependency_edges.extend(table.seams.interface_dependencies.iter().copied());
     dependency_edges.extend(table.seams.generated_item_dependencies.iter().copied());
     dependency_edges.extend(
@@ -1313,21 +1312,9 @@ pub(crate) fn finalize_signature_classes(
             SignatureClassId::of(receiver.callee),
         )
     }));
-    let narrowed = super::revert_closure::call_adapter_only_edges(
-        table,
-        dependency_edges
-            .iter()
-            .copied()
-            .filter(|edge| !seam_adapter_edges.contains(edge)),
-    );
+    let dependency_edges = super::revert_closure::narrow(table, dependency_edges, planned);
     for (dependent, dependency) in dependency_edges {
         if dependent == dependency || !by_class.contains_key(&dependency) {
-            continue;
-        }
-        if narrowed.contains(&(dependent, dependency)) {
-            planned
-                .narrowed_dependency_edges
-                .insert((dependent, dependency));
             continue;
         }
         if let Some(class) = by_class.get_mut(&dependent) {

@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{bridge_receipt::SignatureClassId, decision::DecisionTable};
+use super::{bridge_receipt::SignatureClassId, decision::DecisionTable, plan::Plan};
 
 pub(crate) type Edge = (SignatureClassId, SignatureClassId);
 
@@ -57,4 +57,24 @@ pub(crate) fn call_adapter_only_edges(
     }
     structural.extend(other_edges);
     adapter.difference(&structural).copied().collect()
+}
+
+/// The planner's one hook: drop the bare call-adapter edges from the
+/// finalization dependency list and record them on the plan for the atom
+/// closure. Every other edge passes through unchanged.
+pub(crate) fn narrow(table: &DecisionTable, edges: Vec<Edge>, planned: &mut Plan) -> Vec<Edge> {
+    let adapter = table
+        .seams
+        .edits
+        .iter()
+        .map(|edit| (SignatureClassId::of(edit.bridge.caller), edit.owner_class))
+        .collect::<BTreeSet<_>>();
+    let narrowed = call_adapter_only_edges(
+        table,
+        edges.iter().copied().filter(|edge| !adapter.contains(edge)),
+    );
+    let (dropped, kept): (Vec<_>, Vec<_>) =
+        edges.into_iter().partition(|edge| narrowed.contains(edge));
+    planned.narrowed_dependency_edges.extend(dropped);
+    kept
 }

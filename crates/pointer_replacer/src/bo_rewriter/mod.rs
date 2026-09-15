@@ -2290,6 +2290,8 @@ fn verify_and_revert(
                 &effective_reverted,
                 &reverted_atoms,
                 &class_paths,
+                &reverted,
+                Some(&emission_plan),
             );
             refresh_raw_boundary_receipt_events_with_renders(
                 &mut facts.raw_boundary_artifacts,
@@ -2745,8 +2747,13 @@ fn verify_and_revert(
             facts.files_touched = final_edited;
             facts.bisect_probes = probes;
             facts.escalated = Some(escalation);
-            facts.raw_boundary_artifacts.final_reverts =
-                render_raw_boundary_final_reverts(&final_reverted, &reverted_atoms, &class_paths);
+            facts.raw_boundary_artifacts.final_reverts = render_raw_boundary_final_reverts(
+                &final_reverted,
+                &reverted_atoms,
+                &class_paths,
+                &reverted,
+                Some(&emission_plan),
+            );
             refresh_raw_boundary_receipt_events_with_renders(
                 &mut facts.raw_boundary_artifacts,
                 &emission_plan,
@@ -3893,23 +3900,43 @@ fn atom_fallback(reason: &'static str) -> AtomSelection {
     }
 }
 
+/// wave-6k (relay 009 §3): the fourth column attributes every identity —
+/// `verify-reverted` (the loop reverted it from a diagnostic or a bisect),
+/// `held:<reason>` (held at plan finalization; `dependency-class-held:<root>`
+/// is the planning-time closure) or `closure:partition` (reached only by the
+/// input-reversion closure at the partition). The first two columns are the
+/// ones every consumer parses.
 fn render_raw_boundary_final_reverts(
     functions: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     atoms: &std::collections::BTreeSet<String>,
     display_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+    verify_reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    emission_plan: Option<&plan::Plan>,
 ) -> String {
-    let mut out = String::from("kind\tidentity\tclass_id\n");
+    let mut out = String::from("kind\tidentity\tclass_id\tattribution\n");
     for &function in functions {
         let path = display_paths
             .get(&function)
             .map_or("<unknown-local-class>", String::as_str);
+        let attribution = if verify_reverted.contains(&function) {
+            "verify-reverted".to_owned()
+        } else if let Some(reason) = emission_plan.and_then(|plan| {
+            plan.class_finalization
+                .classes
+                .get(&function)
+                .and_then(|class| class.hold_reasons().first())
+        }) {
+            format!("held:{reason}")
+        } else {
+            "closure:partition".to_owned()
+        };
         out.push_str(&format!(
-            "function\t{path}\tlocal-def-index:{}\n",
+            "function\t{path}\tlocal-def-index:{}\t{attribution}\n",
             function.order_key()
         ));
     }
     for atom in atoms {
-        out.push_str(&format!("atom\t{atom}\t-\n"));
+        out.push_str(&format!("atom\t{atom}\t-\tatom-reverted\n"));
     }
     out
 }

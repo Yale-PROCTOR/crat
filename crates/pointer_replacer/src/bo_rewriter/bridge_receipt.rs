@@ -577,6 +577,8 @@ mod tests {
                         &reverted,
                         &BTreeSet::new(),
                         &labels,
+                        &reverted,
+                        None,
                     );
                     assert!(receipt.contains("function\tsame\tlocal-def-index:"));
                     assert!(receipt.contains(&target.order_key().to_string()));

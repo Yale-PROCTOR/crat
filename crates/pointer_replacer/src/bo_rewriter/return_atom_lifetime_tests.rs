@@ -222,14 +222,15 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
             let effective = emission.plan.effective_reverted_classes(&held, &atoms);
             let paths = emission.plan.class_finalization.classes.keys().map(|owner|
                 (*owner, tcx.def_path_str(owner.local_def_id().to_def_id()))).collect();
-            artifacts.final_reverts = super::render_raw_boundary_final_reverts(&effective, &atoms, &paths);
+            artifacts.final_reverts = super::render_raw_boundary_final_reverts(&effective, &atoms, &paths, &held, Some(&emission.plan));
             let rows = artifacts.final_reverts.lines().skip(1)
                 .map(|line| line.split('\t').collect::<Vec<_>>()).collect::<Vec<_>>();
             let choose_name = tcx.def_path_str(subject.fn_did.to_def_id());
             let independent_name = tcx.def_path_str(independent.fn_did.to_def_id());
-            assert_eq!(rows.iter().filter(|row| row.as_slice() == ["function", choose_name.as_str(),
+            // wave-6k: a fourth `attribution` column follows the three identity columns.
+            assert_eq!(rows.iter().filter(|row| row[..3] == ["function", choose_name.as_str(),
                 format!("local-def-index:{}", owner.order_key()).as_str()]).count(), 1);
-            assert_eq!(rows.iter().filter(|row| row.as_slice() == ["atom", atom.as_str(), "-"]).count(), 1);
+            assert_eq!(rows.iter().filter(|row| row[..3] == ["atom", atom.as_str(), "-"]).count(), 1);
             assert!(!rows.iter().any(|row| row.first() == Some(&"function") && row.get(1) == Some(&independent_name.as_str())));
             println!("J17/J18 refreshed common/unsafe receipts and final reverts:\n{}", artifacts.final_reverts);
             let events = emission.plan.bridge_events_with_atoms(&held, &atoms);
