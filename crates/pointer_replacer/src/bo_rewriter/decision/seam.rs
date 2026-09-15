@@ -5286,6 +5286,15 @@ pub(crate) fn synthesize_with_raw_boundary(
             Ok(super::raw_boundary::BridgeRender::ZeroSyntax) => true,
             Ok(super::raw_boundary::BridgeRender::Lifecycle) | Err(_) => continue,
         };
+        // wave-6b: an argument site inside an admitted region rewrite is
+        // replaced with the whole returned expression it sits in; it has no
+        // seam of its own.
+        if site
+            .node
+            .is_some_and(|(owner, _)| super::void_region::owns_span(table, owner, site.span))
+        {
+            continue;
+        }
         let found = site
             .node
             .and_then(|node| decision_of.get(&node).copied())

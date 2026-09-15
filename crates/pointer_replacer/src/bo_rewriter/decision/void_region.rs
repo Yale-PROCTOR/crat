@@ -1156,3 +1156,18 @@ pub(crate) fn receiver_dependencies(
         })
         .collect()
 }
+
+/// Does an admitted region rewrite of `owner` replace the expression this
+/// span lies in? A seam site there (the inner accessor call's own argument,
+/// the root cast) renders no syntax of its own: the rewrite replaces the whole
+/// returned expression.
+pub(crate) fn owns_span(table: &super::DecisionTable, owner: LocalDefId, span: Span) -> bool {
+    table.entries.iter().any(|(s, d)| {
+        s.fn_did == owner
+            && decided_slice(d)
+            && table
+                .void_region
+                .get(&(s.fn_did, s.hir_id))
+                .is_some_and(|region| region.replaced.contains(span))
+    })
+}
