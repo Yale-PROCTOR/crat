@@ -1431,6 +1431,7 @@ fn assert_function_record_json_key_order(record: &ItemRecord) {
         "\"source_signature\"",
         "\"target_signature\"",
         "\"foreign_function_names\"",
+        "\"foreign_static_names\"",
         "\"signature_dependencies\"",
         "\"dependencies\"",
     ] {
@@ -2703,6 +2704,7 @@ fn record_variants_serialize_only_their_defined_fields() {
             "source_signature",
             "target_signature",
             "foreign_function_names",
+            "foreign_static_names",
             "signature_dependencies",
             "dependencies"
         ]
@@ -5159,6 +5161,10 @@ pub mod parser {
         ["free", "strlen"]
     );
     assert_eq!(
+        function(&records, "parser::scan").foreign_static_names,
+        ["FOREIGN_COUNTER"]
+    );
+    assert_eq!(
         function(&records, "parser::release").foreign_function_names,
         ["free"]
     );
@@ -5167,6 +5173,9 @@ pub mod parser {
             .foreign_function_names
             .is_empty()
     );
+    for path in ["local_abi", "parser::release", "parser::scalar"] {
+        assert!(function(&records, path).foreign_static_names.is_empty());
+    }
 
     assert!(function(&records, "local_abi").dependencies.is_empty());
     assert_eq!(function(&records, "parser::scan").dependencies, [0]);
@@ -5176,6 +5185,46 @@ pub mod parser {
             .is_empty()
     );
     assert_eq!(function(&records, "parser::scalar").dependencies, [0]);
+}
+
+#[test]
+fn collects_foreign_static_names_with_aliases_and_explicit_link_names() {
+    let records = generate(
+        r#"unsafe extern "C" {
+    static mut stdin: *mut core::ffi::c_void;
+    static mut stderr: *mut core::ffi::c_void;
+    #[link_name = "stdout"]
+    static mut rust_stdout: *mut core::ffi::c_void;
+    static mut unused_stream: *mut core::ffi::c_void;
+}
+
+use stdin as input_stream;
+
+pub unsafe fn streams() {
+    let _ = rust_stdout;
+    let _ = input_stream;
+    let _ = stderr;
+    let _ = stderr;
+}
+
+pub unsafe fn no_streams() {}
+"#,
+    );
+
+    assert_eq!(
+        function(&records, "streams").foreign_static_names,
+        ["rust_stdout", "stderr", "stdin", "stdout"]
+    );
+    assert!(
+        function(&records, "streams")
+            .foreign_function_names
+            .is_empty()
+    );
+    assert!(
+        function(&records, "no_streams")
+            .foreign_static_names
+            .is_empty()
+    );
 }
 
 #[test]
@@ -6340,6 +6389,7 @@ fn metadata_labels_exactly_match_transformation_dispositions() {
         "\"statement_dispositions\"",
         "\"statement_pair_metadata\"",
         "\"foreign_function_names\"",
+        "\"foreign_static_names\"",
     ]
     .map(|key| json.find(key).unwrap());
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));

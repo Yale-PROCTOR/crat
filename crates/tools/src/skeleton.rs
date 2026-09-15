@@ -68,6 +68,7 @@ pub struct FunctionRecord {
     pub source_signature: String,
     pub target_signature: String,
     pub foreign_function_names: Vec<String>,
+    pub foreign_static_names: Vec<String>,
     pub signature_dependencies: Vec<u64>,
     pub dependencies: Vec<u64>,
 }
@@ -429,7 +430,7 @@ fn make_function_record<'tcx>(
     let hitem = tcx.hir_node_by_def_id(surface.def_id).expect_item();
     let signature_dependencies = collect_signature_dependencies(hitem, item_ids, tcx);
     let dependencies = collect_dependencies(hitem, item_ids, tcx);
-    let foreign_function_names = collect_foreign_function_names(hitem, tcx);
+    let (foreign_function_names, foreign_static_names) = collect_foreign_names(hitem, tcx);
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
     validate_function_body(&source, &surface.path)?;
@@ -651,6 +652,7 @@ fn make_function_record<'tcx>(
         source_signature,
         target_signature,
         foreign_function_names,
+        foreign_static_names,
         signature_dependencies,
         dependencies,
     })))
@@ -4861,30 +4863,46 @@ fn collect_signature_dependencies<'tcx>(
     visitor.dependencies.into_iter().collect()
 }
 
-struct ForeignFunctionVisitor<'tcx> {
+struct ForeignNameVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    names: BTreeSet<String>,
+    function_names: BTreeSet<String>,
+    static_names: BTreeSet<String>,
 }
 
-impl ForeignFunctionVisitor<'_> {
+impl ForeignNameVisitor<'_> {
     fn add_res(&mut self, res: Res) {
-        let Res::Def(DefKind::Fn, def_id) = res else {
+        let Res::Def(kind, def_id) = res else {
             return;
         };
-        if self.tcx.is_foreign_item(def_id) {
-            let rust_name = self.tcx.item_name(def_id);
-            self.names.insert(rust_name.to_string());
-            if let Some(symbol) = local_c_foreign_function_symbol(def_id, self.tcx)
-                && symbol != rust_name
-                && self.tcx.codegen_fn_attrs(def_id).link_name.is_some()
-            {
-                self.names.insert(symbol.to_string());
+        if !self.tcx.is_foreign_item(def_id) {
+            return;
+        }
+        let rust_name = self.tcx.item_name(def_id);
+        match kind {
+            DefKind::Fn => {
+                self.function_names.insert(rust_name.to_string());
+                if let Some(symbol) = local_c_foreign_function_symbol(def_id, self.tcx)
+                    && symbol != rust_name
+                    && self.tcx.codegen_fn_attrs(def_id).link_name.is_some()
+                {
+                    self.function_names.insert(symbol.to_string());
+                }
             }
+            DefKind::Static { .. } => {
+                self.static_names.insert(rust_name.to_string());
+                if let Some(symbol) = local_c_foreign_static_symbol(def_id, self.tcx)
+                    && symbol != rust_name
+                    && self.tcx.codegen_fn_attrs(def_id).link_name.is_some()
+                {
+                    self.static_names.insert(symbol.to_string());
+                }
+            }
+            _ => {}
         }
     }
 }
 
-impl<'tcx> Visitor<'tcx> for ForeignFunctionVisitor<'tcx> {
+impl<'tcx> Visitor<'tcx> for ForeignNameVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
@@ -4897,17 +4915,42 @@ impl<'tcx> Visitor<'tcx> for ForeignFunctionVisitor<'tcx> {
     }
 }
 
-fn collect_foreign_function_names<'tcx>(
+fn local_c_foreign_static_symbol(def_id: DefId, tcx: TyCtxt<'_>) -> Option<Symbol> {
+    if !matches!(tcx.def_kind(def_id), DefKind::Static { .. }) || !tcx.is_foreign_item(def_id) {
+        return None;
+    }
+    let parent = tcx.parent(def_id).as_local()?;
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(parent) else {
+        return None;
+    };
+    let hir::ItemKind::ForeignMod { abi, .. } = item.kind else {
+        return None;
+    };
+    if !matches!(abi, rustc_abi::ExternAbi::C { unwind: false }) {
+        return None;
+    }
+    Some(
+        tcx.codegen_fn_attrs(def_id)
+            .link_name
+            .unwrap_or_else(|| tcx.item_name(def_id)),
+    )
+}
+
+fn collect_foreign_names<'tcx>(
     item: &'tcx hir::Item<'tcx>,
     tcx: TyCtxt<'tcx>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let hir::ItemKind::Fn { body, .. } = item.kind else { unreachable!() };
-    let mut visitor = ForeignFunctionVisitor {
+    let mut visitor = ForeignNameVisitor {
         tcx,
-        names: BTreeSet::new(),
+        function_names: BTreeSet::new(),
+        static_names: BTreeSet::new(),
     };
     visitor.visit_body(tcx.hir_body(body));
-    visitor.names.into_iter().collect()
+    (
+        visitor.function_names.into_iter().collect(),
+        visitor.static_names.into_iter().collect(),
+    )
 }
 
 #[cfg(test)]
