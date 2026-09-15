@@ -7627,7 +7627,7 @@ fn finish_decide<'tcx>(
         append_surface_declaration_plans(tcx, &exposure, &mut table);
         append_inferred_local_declaration_plans(tcx, &mut table);
         decision::slice_construction_values::append_declarations(tcx, &mut table);
-        append_field_load_declaration_plans(&mut table);
+        append_field_load_declaration_plans(&mut table)?;
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
@@ -8589,12 +8589,34 @@ pub(crate) mod test_model_override {
 
 /// wave-6f: a local loaded from a converting field receives its explicit
 /// declaration exactly as an inferred local receives its callee's type.
-fn append_field_load_declaration_plans(table: &mut decision::DecisionTable) {
+/// One explicit declaration per node (R410-2(a)): a load local another
+/// producer already declared (the raw-place-value reborrow, a construction
+/// plan, a Box owner) is skipped here — its declared type must be the
+/// decision's, which is what this hook would have written too; a
+/// disagreement is an error, never a second declaration.
+fn append_field_load_declaration_plans(table: &mut decision::DecisionTable) -> Result<(), String> {
     use bridge_receipt::SignatureClassId;
 
     let mut declarations = Vec::new();
     for transaction in &table.field_transactions.applied {
         for (node, emitted_type) in &transaction.load_locals {
+            if let Some(existing) = table
+                .seams
+                .explicit_declarations
+                .iter()
+                .find(|site| site.category == "local" && site.node == Some(*node))
+            {
+                if existing.emitted_type != *emitted_type {
+                    return Err(format!(
+                        "field-load-declaration-type-mismatch:{}:{}:{}!={}",
+                        node.0.local_def_index.as_u32(),
+                        node.1.local_id.as_u32(),
+                        existing.emitted_type,
+                        emitted_type
+                    ));
+                }
+                continue;
+            }
             let Some((subject, _)) = table
                 .entries
                 .iter()
@@ -8616,6 +8638,7 @@ fn append_field_load_declaration_plans(table: &mut decision::DecisionTable) {
         }
     }
     table.seams.explicit_declarations.extend(declarations);
+    Ok(())
 }
 
 fn derive_arm_requirements(

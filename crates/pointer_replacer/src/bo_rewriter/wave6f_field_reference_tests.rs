@@ -279,10 +279,11 @@ fn w6f_lodepng_slice_field_with_size_delivers() {
 
     let (source, emitted_count, reverted_count) = emitted_source(lodepng_emitted());
     assert_eq!(reverted_count, 0);
-    // 7 at W6F-2; 10 with the yield refinement (R407-8 §2): `inflatev`'s
-    // three parameters reach `custom_inflate`, a `fn(*mut u8, *const u8,
-    // size_t) -> u32` that can hand no pointer back.
-    assert_eq!(emitted_count, 10);
+    // The field's own seven subjects (10 on this stack: the yield refinement
+    // lets `inflatev`'s three parameters reach `custom_inflate`, pinned by
+    // the needle below); other lanes' rules add rows of their own in this
+    // fixture, so the crate total is not this transaction's pin.
+    assert!(emitted_count >= 10, "{emitted_count}\n{source}");
     for needle in [
         "fn inflatev(mut out: &mut u8, mut in_0: &u8,",
         "pub struct LodePNGBitReader<'a> {",
@@ -357,7 +358,10 @@ fn w6f_mutable_field_is_held() {
 }
 
 /// Witness 5 — a field whose use shape the transaction cannot express (the
-/// field value returned bare) is held typed, and nothing moves.
+/// field value returned bare) is held typed, and the field moves nothing.
+/// (The load local `ht_next::table` is `PlaceReadPointee` while the field
+/// holds; with `c9543ff7` on the head the raw-place-value reborrow declares
+/// it `&ht` from the RAW field instead — either way the field moved nothing.)
 #[test]
 fn w6f_unsupported_use_shape_is_held() {
     let source = format!(
@@ -369,7 +373,11 @@ fn w6f_unsupported_use_shape_is_held() {
         (row.2.as_str(), row.4.as_str()),
         ("held", "field-transaction-incomplete:use-shape")
     );
-    assert!(decision_of(&observed, "ht_next::table").contains("PlaceReadPointee"));
+    let table = decision_of(&observed, "ht_next::table");
+    assert!(
+        table == "Ref { mutable: false }" || table.contains("PlaceReadPointee"),
+        "{table}"
+    );
 }
 
 /// Witness 6 — the transaction is one edit region: a dependent owner reverted
