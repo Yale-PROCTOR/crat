@@ -403,7 +403,10 @@ fn w6p_same_place_is_refused_before_any_rule() {
         let mut_facts =
             crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
         let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
-            &program, &mut_facts, None,
+            &program,
+            &mut_facts,
+            None,
+            &Default::default(),
         );
         let function = |name: &str| {
             *program
@@ -697,6 +700,7 @@ fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
             &program,
             &mut_facts,
             Some(&sites),
+            &Default::default(),
         );
         assert_eq!(
             with.certify_recorded(
@@ -719,6 +723,7 @@ fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
             &program,
             &mut_facts,
             Some(&sites),
+            &Default::default(),
         );
         assert_eq!(
             without.certify_recorded(
@@ -742,6 +747,7 @@ fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
             &program,
             &mut_facts,
             Some(&sites),
+            &Default::default(),
         );
         assert_eq!(
             unresolved.certify_recorded(
@@ -765,7 +771,10 @@ fn w6p_fn_pointer_allocator_without_the_web_stays_unproved() {
         let mut_facts =
             crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
         let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
-            &program, &mut_facts, None,
+            &program,
+            &mut_facts,
+            None,
+            &Default::default(),
         );
         let function = |name: &str| {
             *program
@@ -781,4 +790,233 @@ fn w6p_fn_pointer_allocator_without_the_web_stays_unproved() {
         );
     })
     .expect("fn-pointer allocator control compilation");
+}
+
+/// brotli `FindLongestMatchH65` → `FindLongestMatchH6(&mut (*self_0).ha, dictionary,
+/// data, …, distance_cache, …, out)` / `FindLongestMatchHROLLING(&mut (*self_0).hb, …)`,
+/// called from `CreateBackwardReferencesNH65(privat, &(*params).dictionary, …,
+/// dist_cache, …, &mut sr)`. Report 002: the whole family reverted at compile
+/// once its pairs were certified; the round-1 diagnostics were not retained, so
+/// this fixture reproduces the shape and reads them.
+const FIND_LONGEST_MATCH_FAMILY: &str = r#"
+    #[repr(C)]
+    pub struct HasherCommon { pub is_prepared_: i32, pub dict_num_lookups: u64 }
+    #[repr(C)]
+    pub struct H6 { pub common: *mut HasherCommon, pub buckets_: *mut u32, pub hash_shift_: i32 }
+    #[repr(C)]
+    pub struct HROLLING { pub common: *mut HasherCommon, pub state: u32, pub table: *mut u32 }
+    #[repr(C)]
+    pub struct H65 { pub ha: H6, pub hb: HROLLING, pub hb_common: HasherCommon, pub extra: *mut core::ffi::c_void, pub common: *mut HasherCommon }
+    #[repr(C)]
+    pub struct BrotliEncoderDictionary { pub words: *const u8, pub cutoffTransformsCount: u32 }
+    #[repr(C)]
+    pub struct DistanceParams { pub max_distance: u64 }
+    #[repr(C)]
+    pub struct BrotliEncoderParams { pub dictionary: BrotliEncoderDictionary, pub dist: DistanceParams }
+    #[repr(C)]
+    pub struct HasherSearchResult { pub len: u64, pub distance: u64, pub score: u64, pub len_code_delta: i32 }
+    pub unsafe fn FindLongestMatchH6(self_0: *mut H6, dictionary: *const BrotliEncoderDictionary, data: *const u8, ring_buffer_mask: u64, distance_cache: *const i32, cur_ix: u64, max_length: u64, max_backward: u64, dictionary_distance: u64, max_distance: u64, out: *mut HasherSearchResult) {
+        let mut best_score = (*out).score;
+        let mut best_len = (*out).len;
+        (*out).len = 0;
+        (*out).len_code_delta = 0;
+        let mut i = 0;
+        while i < 4 {
+            let backward = *distance_cache.offset(i as isize) as u64;
+            if backward <= max_backward && backward <= max_distance {
+                let prev_ix = cur_ix.wrapping_sub(backward) & ring_buffer_mask;
+                if *data.offset(prev_ix as isize) == *data.offset((cur_ix & ring_buffer_mask) as isize) {
+                    best_len = best_len.wrapping_add(1);
+                    best_score = best_score.wrapping_add(max_length);
+                    (*out).len = best_len;
+                    (*out).distance = backward;
+                    (*out).score = best_score;
+                }
+            }
+            i += 1;
+        }
+        (*self_0).hash_shift_ = (*dictionary).cutoffTransformsCount as i32;
+        (*(*self_0).common).dict_num_lookups = (*(*self_0).common).dict_num_lookups.wrapping_add(dictionary_distance);
+    }
+    pub unsafe fn FindLongestMatchHROLLING(self_0: *mut HROLLING, dictionary: *const BrotliEncoderDictionary, data: *const u8, ring_buffer_mask: u64, distance_cache: *const i32, cur_ix: u64, max_length: u64, max_backward: u64, dictionary_distance: u64, max_distance: u64, out: *mut HasherSearchResult) {
+        let backward = *distance_cache.offset(0) as u64;
+        if backward <= max_backward && backward <= max_distance && max_length > 0 {
+            let prev_ix = cur_ix.wrapping_sub(backward) & ring_buffer_mask;
+            (*self_0).state = *data.offset(prev_ix as isize) as u32;
+            (*out).len = max_length;
+            (*out).distance = backward.wrapping_add(dictionary_distance);
+        }
+        (*self_0).state = (*self_0).state.wrapping_add((*dictionary).cutoffTransformsCount);
+    }
+    pub unsafe fn FindLongestMatchH65(self_0: *mut H65, dictionary: *const BrotliEncoderDictionary, data: *const u8, ring_buffer_mask: u64, distance_cache: *const i32, cur_ix: u64, max_length: u64, max_backward: u64, dictionary_distance: u64, max_distance: u64, out: *mut HasherSearchResult) {
+        FindLongestMatchH6(&mut (*self_0).ha, dictionary, data, ring_buffer_mask, distance_cache, cur_ix, max_length, max_backward, dictionary_distance, max_distance, out);
+        FindLongestMatchHROLLING(&mut (*self_0).hb, dictionary, data, ring_buffer_mask, distance_cache, cur_ix, max_length, max_backward, dictionary_distance, max_distance, out);
+    }
+    pub unsafe fn CreateBackwardReferencesNH65(privat: *mut H65, params: *const BrotliEncoderParams, ringbuffer: *const u8, ringbuffer_mask: u64, dist_cache: *mut i32, position: u64, max_length: u64) {
+        let mut sr = HasherSearchResult { len: 0, distance: 0, score: 0, len_code_delta: 0 };
+        sr.score = 4;
+        FindLongestMatchH65(privat, &(*params).dictionary, ringbuffer, ringbuffer_mask, dist_cache, position, max_length, position, 16, (*params).dist.max_distance, &mut sr);
+        if sr.score > 4 {
+            *dist_cache.offset(0) = sr.distance as i32;
+        }
+    }
+"#;
+
+/// The reduction emits with no revert through the census's path entry. The
+/// corpus function did revert (report 002); its round-1 diagnostics are not
+/// retained by the instrument, and this reduction does not reproduce the
+/// cause — report 003 STOP 1.
+#[test]
+fn w6p_find_longest_match_family_reduction_emits_without_a_revert() {
+    let (source, reverted, diags) = path_emission(FIND_LONGEST_MATCH_FAMILY, "flm");
+    println!("W6P_FLM_SOURCE_BEGIN\n{source}\nW6P_FLM_SOURCE_END");
+    assert_eq!(
+        reverted, 0,
+        "the family must emit without a revert: {diags:?}"
+    );
+}
+
+/// binn `binn_load(data, value)` → `binn_is_valid(data, &mut (*value).type_0,
+/// &mut (*value).count, &mut (*value).size)`: `value` is null-checked, so it
+/// delivers as `Option<&mut binn>`, and three disjoint-field views under one
+/// Option-form root are each bridged through `value.as_mut().unwrap()` — three
+/// live `&mut` borrows of the Option: E0499 (report 002's confirmed revert).
+const BINN_LOAD: &str = r#"
+    #[repr(C)]
+    pub struct binn { pub header: i32, pub type_0: i32, pub count: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
+    pub unsafe fn binn_is_valid(ptr: *mut core::ffi::c_void, ptype: *mut i32, pcount: *mut i32, psize: *mut i32) -> i32 {
+        if ptr.is_null() { return 0; }
+        let p = ptr as *mut u8;
+        *ptype = *p as i32;
+        *pcount = *p.offset(1) as i32;
+        *psize = *p.offset(2) as i32;
+        1
+    }
+    pub unsafe fn binn_load(data: *mut core::ffi::c_void, value: *mut binn) -> i32 {
+        if data.is_null() || value.is_null() { return 0; }
+        (*value).header = 0x1f22b11f;
+        if binn_is_valid(data, &mut (*value).type_0, &mut (*value).count, &mut (*value).size) == 0 {
+            return 0;
+        }
+        (*value).ptr = data;
+        1
+    }
+"#;
+
+fn path_emission(source: &str, tag: &str) -> (String, usize, Vec<String>) {
+    let dir = std::env::temp_dir().join(format!("crat-w6p-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let root = dir.join("lib.rs");
+    std::fs::write(&root, source).expect("fixture file");
+    let outcome = bo_rewriter::rewrite_m1_path_a5_injected(
+        &root,
+        A5Mode::PreciseReplay,
+        Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        &|_| {},
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    match outcome {
+        bo_rewriter::RewriteOutcome::Emitted {
+            source,
+            reverted_count,
+            first_diags,
+            ..
+        } => (
+            source,
+            reverted_count,
+            first_diags.iter().map(|diag| format!("{diag:?}")).collect(),
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn w6p_option_root_multi_view_is_refused_and_emits_without_a_revert() {
+    // The refusal, on the index.
+    ::utils::compilation::run_compiler_on_str(BINN_LOAD, |tcx| {
+        let (_table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
+            .expect("binn_load fixture decision");
+        let ledger = ctx
+            .a5_site_proofs
+            .pair_certificates()
+            .expect("certificates ride the attested index")
+            .ledger();
+        assert!(
+            ledger
+                .iter()
+                .any(|row| row.outcome == Err(Unproved::OptionRootMultiView)),
+            "two views under the nullable root `value` are refused: {ledger:?}"
+        );
+        assert!(
+            ledger
+                .iter()
+                .all(|row| row.outcome != Ok(CertificateKind::DisjointFields)),
+            "{ledger:?}"
+        );
+    })
+    .expect("binn_load fixture compilation");
+    // The emission, through the census's path entry: no revert (RED before the
+    // refusal: two E0499 on `value`, `red-binn-load-option-root-e0499.log`).
+    let (source, reverted, diags) = path_emission(BINN_LOAD, "binn-load");
+    for diag in &diags {
+        println!("W6P_BINN diag {diag}");
+    }
+    println!("W6P_BINN_SOURCE_BEGIN\n{source}\nW6P_BINN_SOURCE_END");
+    assert_eq!(reverted, 0, "binn_load must not revert: {diags:?}");
+}
+
+/// The same three field views under a NON-nullable root (`value` never
+/// null-tested, never null-assigned) keep their disjoint-fields certificate
+/// and emit without a revert: `&mut value.type_0, &mut value.count,
+/// &mut value.size` are disjoint borrows through one `&mut binn`.
+const BINN_LOAD_PLAIN: &str = r#"
+    #[repr(C)]
+    pub struct binn { pub header: i32, pub type_0: i32, pub count: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
+    pub unsafe fn binn_is_valid(ptr: *mut core::ffi::c_void, ptype: *mut i32, pcount: *mut i32, psize: *mut i32) -> i32 {
+        if ptr.is_null() { return 0; }
+        let p = ptr as *mut u8;
+        *ptype = *p as i32;
+        *pcount = *p.offset(1) as i32;
+        *psize = *p.offset(2) as i32;
+        1
+    }
+    pub unsafe fn binn_load(data: *mut core::ffi::c_void, value: *mut binn) -> i32 {
+        if data.is_null() { return 0; }
+        (*value).header = 0x1f22b11f;
+        if binn_is_valid(data, &mut (*value).type_0, &mut (*value).count, &mut (*value).size) == 0 {
+            return 0;
+        }
+        (*value).ptr = data;
+        1
+    }
+"#;
+
+#[test]
+fn w6p_plain_root_multi_view_keeps_the_certificate_and_emits() {
+    ::utils::compilation::run_compiler_on_str(BINN_LOAD_PLAIN, |tcx| {
+        let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
+            .expect("plain binn_load fixture decision");
+        dump(tcx, &table);
+        let ledger = ctx
+            .a5_site_proofs
+            .pair_certificates()
+            .expect("certificates ride the attested index")
+            .ledger();
+        assert!(
+            ledger
+                .iter()
+                .any(|row| row.outcome == Ok(CertificateKind::DisjointFields)),
+            "{ledger:?}"
+        );
+        assert!(
+            ledger
+                .iter()
+                .all(|row| row.outcome != Err(Unproved::OptionRootMultiView)),
+            "{ledger:?}"
+        );
+    })
+    .expect("plain binn_load fixture compilation");
+    let (source, reverted, diags) = path_emission(BINN_LOAD_PLAIN, "binn-load-plain");
+    println!("W6P_BINN_PLAIN_SOURCE_BEGIN\n{source}\nW6P_BINN_PLAIN_SOURCE_END");
+    assert_eq!(reverted, 0, "{diags:?}");
 }

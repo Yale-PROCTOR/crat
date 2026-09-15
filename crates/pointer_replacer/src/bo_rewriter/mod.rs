@@ -7163,6 +7163,12 @@ fn finish_decide<'tcx>(
                 &program,
                 &mut_facts,
                 fnptr_web.as_ref().ok().map(|web| web.mir_call_sites()),
+                &facts
+                    .raw_only_uses
+                    .iter()
+                    .filter(|(_, uses)| uses.iter().any(|(op, _)| op == "is_null"))
+                    .map(|((_, hir_id), _)| *hir_id)
+                    .collect(),
             ),
         )
     } else {
