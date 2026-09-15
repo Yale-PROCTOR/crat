@@ -73,11 +73,23 @@ pub(super) fn prepare(
     if site.args.len() != 2 {
         return None;
     }
+    // Only a settled shared reference endpoint qualifies; every other
+    // disposition (including a mutable reference) keeps the pair hold.
+    let shared_endpoint = |d: &super::Decision| match d {
+        super::Decision::Ref { mutable } => !mutable,
+        super::Decision::InferredRef { .. }
+        | super::Decision::Slice { .. }
+        | super::Decision::NestedSlice { .. }
+        | super::Decision::Opt { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Cursor { .. }
+        | super::Decision::Degraded(_) => false,
+    };
     let subject = |index| {
         table.entries.iter().find_map(|(s, d)| {
             (s.fn_did == callee
                 && matches!(s.kind, super::SubjectKind::Param { hir_index } if hir_index == index)
-                && matches!(d, super::Decision::Ref { mutable: false }))
+                && shared_endpoint(d))
             .then_some(s.hir_id)
         })
     };
@@ -494,6 +506,59 @@ pub unsafe extern "C" fn ExtendLastCommand(last_command: *mut Command, s: *mut S
             .replace("&mut (*s).dist);", "&mut (*advance(s)).dist);")
             + "pub unsafe fn advance(s: *mut State) -> *mut State { (*s).counter += 1; s }";
         unsupported_call(&source, "CommandRestoreDistanceCode");
+    }
+
+    /// The endpoint predicate is a second gate behind the native immutable
+    /// facts: even on the supported shape, a mutable reference endpoint must
+    /// refuse the whole two-argument transaction.
+    #[test]
+    fn wave6k_shared_pair_mutable_reference_endpoint_refuses_preparation() {
+        let source = mutable_state_command();
+        ::utils::compilation::run_compiler_on_str(&source, move |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::bo_rewriter::A5Mode::PreciseReplay,
+                    Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .expect("native shared construction");
+            let callee = table
+                .entries
+                .iter()
+                .find(|(subject, _)| {
+                    tcx.def_path_str(subject.fn_did.to_def_id())
+                        .ends_with("CommandRestoreDistanceCode")
+                })
+                .unwrap()
+                .0
+                .fn_did;
+            let sites = ctx.facts.call_args.get(&callee).unwrap();
+            assert!(
+                sites
+                    .iter()
+                    .any(|site| prepare(tcx, &table, callee, site).is_some()),
+                "control: the supported shape prepares"
+            );
+            let mut hypothetical = table.clone();
+            for (subject, decision) in &mut hypothetical.entries {
+                if subject.fn_did == callee
+                    && matches!(
+                        subject.kind,
+                        super::super::SubjectKind::Param { hir_index: 1 }
+                    )
+                {
+                    *decision = Decision::Ref { mutable: true };
+                }
+            }
+            assert!(
+                sites
+                    .iter()
+                    .all(|site| prepare(tcx, &hypothetical, callee, site).is_none()),
+                "a mutable reference endpoint must not prepare"
+            );
+        })
+        .expect("input compiles");
     }
 
     fn native_control(source: &str, check: impl FnOnce(&MutFacts, LocalDefId) + Send) {
