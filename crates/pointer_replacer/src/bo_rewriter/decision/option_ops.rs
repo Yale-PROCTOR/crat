@@ -433,3 +433,20 @@ pub(super) fn param_receives_null_literal(facts: &EmitabilityFacts, subject: &Su
         })
     })
 }
+
+/// `&*e` / `&mut *e` (under casts) where `e` is RAW-typed: the address of one
+/// element of an unknown allocation. A slice built from it by `from_ref` is
+/// one element long; see `plan_values`.
+pub(super) fn address_of_raw_dereference(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    expression: &Expr<'_>,
+) -> bool {
+    let mut expr = expression;
+    while let ExprKind::Cast(inner, _) = expr.kind {
+        expr = inner;
+    }
+    let ExprKind::AddrOf(_, _, place) = expr.kind else { return false };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, base) = place.kind else { return false };
+    matches!(tcx.typeck(owner).expr_ty(base).kind(), TyKind::RawPtr(..))
+}

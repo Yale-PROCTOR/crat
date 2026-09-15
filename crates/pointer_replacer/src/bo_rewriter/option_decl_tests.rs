@@ -171,12 +171,14 @@ unsafe fn get_bracketpart(count: i32) -> *mut Binn {{
 
 /// Relay 010 — brotli `BrotliFindAllStaticDictionaryMatches::{s,s_0,s_1,s_2}`:
 /// an unannotated null-initialized local whose form is an optional SLICE
-/// (`s = &*data.offset(l) as *const u8; *s.offset(k)`) receives
-/// `Option<&[u8]>`. The VALUE is the existing nullable-slice plan (here, with
-/// `data` still raw in the reduction, the one-element `from_ref` carrier;
-/// with wave-6s's computed view, `Some(&data[l..])`).
+/// (`s = &*data.offset(l) as *const u8; *s.offset(k)`) is admitted at the
+/// declaration. Its VALUE, with `data` still raw in this reduction, would be
+/// the one-element `from_ref` carrier — refused typed (R410-7 STOP 1(b):
+/// `option-slice-value:one-element-carrier`) until the base delivers a real
+/// view (wave-6s's `Some(&data[l..])`), so the subject holds at the VALUE,
+/// not at the declaration.
 #[test]
-fn wave6o_unannotated_null_init_optional_slice_receives_its_type() {
+fn wave6o_unannotated_null_init_optional_slice_is_admitted_and_holds_at_the_one_element_value() {
     let input = r#"
 #![allow(dead_code, unused_mut, non_snake_case)]
 unsafe fn FindAllStaticDictionaryMatches(data: *const u8, l: usize, k: usize, n: usize) -> u32 {
@@ -192,19 +194,43 @@ unsafe fn FindAllStaticDictionaryMatches(data: *const u8, l: usize, k: usize, n:
     assert!(verify::type_checks_str(input));
     let (decision, receipts) = decisions_and_receipts(input, "FindAllStaticDictionaryMatches", "s");
     assert!(
-        matches!(decision, Decision::Opt { slice: true, .. }),
-        "the unannotated null-initialized optional slice must be admitted: {decision:?}"
+        receipts
+            .iter()
+            .any(|(operation, _, _)| operation == "null-initialization"),
+        "the declaration admits the optional slice into the family: {decision:?} {receipts:?}"
     );
     assert!(
         receipts
             .iter()
-            .any(|(operation, state, _)| operation == "null-initialization" && state == "Applied"),
-        "{receipts:?}"
+            .any(|(operation, _, reason)| operation == "nullable-assignment"
+                && reason.contains("option-slice-value:one-element-carrier")),
+        "the one-element carrier must be the typed hold: {receipts:?}"
     );
-    let output = ast_emitted_source_of(input).expect("native emission");
-    assert!(
-        output.contains("let mut s: Option<&[u8]> = None;"),
-        "{output}"
-    );
+    let output = ast_emitted_source_of(input).expect("hold emission");
+    assert!(!output.contains("core::slice::from_ref(&*data"), "{output}");
     assert!(verify::type_checks_str(&output), "{output}");
+}
+
+/// The control: an optional slice valued from a delivered SLICE base keeps
+/// its value (no one-element carrier is involved).
+#[test]
+fn wave6o_optional_slice_from_a_slice_base_keeps_its_value() {
+    let input = r#"
+#![allow(dead_code, unused_mut, non_snake_case)]
+unsafe fn scan(data: *const u8, k: usize, n: usize) -> u32 {
+    let mut s = 0 as *const u8;
+    if n > 1 { s = data; }
+    if s.is_null() { return 0; }
+    return *s.offset(k as isize) as u32;
+}
+"#;
+    assert!(verify::type_checks_str(input));
+    let (decision, receipts) = decisions_and_receipts(input, "scan", "s");
+    eprintln!("WAVE6O_SLICE_BASE_CONTROL {decision:?} {receipts:?}");
+    assert!(
+        !receipts
+            .iter()
+            .any(|(_, _, reason)| reason.contains("one-element-carrier")),
+        "a slice base is not the one-element carrier: {receipts:?}"
+    );
 }

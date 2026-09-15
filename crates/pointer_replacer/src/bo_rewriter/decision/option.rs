@@ -498,6 +498,20 @@ pub(crate) fn plan_values(
                     "option-value-encloses-declaration".to_owned(),
                 ));
             }
+            // Wave-6o (R410-7, STOP 1(b)): an optional SLICE valued at the
+            // address of a RAW dereference (`&*data.offset(l)`) with no inner
+            // view composed would take the one-element `from_ref` carrier and
+            // panic on an index past it where C reads validly. Typed hold
+            // until the base delivers a real view.
+            if reason.is_none()
+                && slice
+                && composed.is_empty()
+                && super::option_ops::address_of_raw_dereference(tcx, subject.fn_did, expression)
+            {
+                reason = Some(MechanicalTerminalReason::EvidenceMissing(
+                    "option-slice-value:one-element-carrier".to_owned(),
+                ));
+            }
             let unsafe_fn = tcx
                 .fn_sig(subject.fn_did)
                 .skip_binder()
