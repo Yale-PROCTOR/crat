@@ -1128,3 +1128,133 @@ fn ce_d06_a_model_raw_callee_carries_no_caller() {
     assert!(!source.contains("&[i8]"), "{source}");
     assert!(!source.contains("&mut [i8]"), "{source}");
 }
+
+/// R408-1 (relay 028 §1): ruling B's adjacency arm licensed a VALUE as a slice
+/// length — lodepng's `lodepng_set32bitInt(chunk.offset(8 + length), CRC)`
+/// planned `from_raw_parts_mut(chunk.offset(..), (CRC) as usize)`. A sibling
+/// argument is a length only with evidence: a count position of the callee's
+/// own pinned contract that names it (D1's op-fact discipline); otherwise the
+/// construction takes the fallback extent and its receipt.
+const CE_L01_VALUE_IS_NOT_A_LENGTH: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments)]
+static mut SAVED: *mut u8 = 0 as *mut u8;
+unsafe fn set32bit(buffer: *mut u8, value: u32) {
+    *buffer.offset(0) = (value >> 24) as u8;
+    *buffer.offset(1) = (value >> 16) as u8;
+    *buffer.offset(2) = (value >> 8) as u8;
+    *buffer.offset(3) = value as u8;
+}
+pub unsafe fn generate_crc(chunk: *mut u8, length: usize, crc: u32) {
+    SAVED = chunk;
+    set32bit(chunk.offset(8 + length as isize), crc);
+}
+"#;
+
+#[test]
+fn ce_l01_an_adjacent_value_is_not_licensed_as_the_length() {
+    let super::RewriteOutcome::Emitted { source, .. } =
+        super::rewrite_m1(CE_L01_VALUE_IS_NOT_A_LENGTH)
+    else {
+        panic!("CE-L01 must emit");
+    };
+    assert!(source.contains("buffer: &mut [u8]"), "{source}");
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !flat.contains("(crc) as usize"),
+        "the value `crc` is not a length:\n{source}"
+    );
+    assert!(
+        flat.contains("core::slice::from_raw_parts_mut(chunk.offset(8 + length as isize), crate::FALLBACK_SLICE_EXTENT)"),
+        "the raw argument takes the waived fallback extent:\n{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// The licensed half: the callee's own pinned count position names the
+/// sibling (`strncpy(dst, src, n)` in the callee: `n` bounds the read of
+/// `src`), so `n` is evidence and the caller's construction takes it.
+const CE_L02_COUNT_POSITION_LICENSES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments)]
+extern "C" {
+    fn strncpy(dest: *mut i8, src: *const i8, n: usize) -> *mut i8;
+}
+static mut SAVED: *const i8 = 0 as *const i8;
+unsafe fn read_n(src: *const i8, n: usize) -> i8 {
+    let mut buf = [0i8; 16];
+    strncpy(buf.as_mut_ptr(), src, n);
+    buf[0]
+}
+pub unsafe fn caller(base: *const i8, n: usize) -> i8 {
+    SAVED = base;
+    read_n(base.offset(1), n)
+}
+"#;
+
+#[test]
+fn ce_l02_a_count_position_of_the_callee_licenses_the_sibling() {
+    let super::RewriteOutcome::Emitted { source, .. } =
+        super::rewrite_m1(CE_L02_COUNT_POSITION_LICENSES)
+    else {
+        panic!("CE-L02 must emit");
+    };
+    assert!(source.contains("src: &[i8]"), "{source}");
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("core::slice::from_raw_parts(base.offset(1), (n) as usize)"),
+        "the callee's count position names `n`, so the sibling is licensed:\n{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// R408-2 (relay 028 §2): lodepng `lodepng_save_file::buffer` — a thin `&u8`
+/// was used as the `buffersize`-byte buffer of
+/// `fwrite(buffer as *const c_void, 1, buffersize, file)` (E0606 at the void
+/// cast). The counted position holds the thin form (`held:thin-extent`) even
+/// through the void cast; with a caller that admits, #1b's `fwrite` rider
+/// promotes it instead.
+const CE_V01_VOID_CAST_COUNTED_POSITION: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments)]
+extern "C" {
+    fn fwrite(ptr: *const core::ffi::c_void, size: usize, nmemb: usize, stream: *mut u8) -> usize;
+}
+unsafe fn save_file(buffer: *const u8, buffersize: usize, file: *mut u8) -> usize {
+    fwrite(buffer as *const core::ffi::c_void, 1, buffersize, file)
+}
+pub unsafe fn top(x: *const u8, file: *mut u8) -> usize {
+    let first = *x;
+    save_file(x, first as usize, file)
+}
+"#;
+
+#[test]
+fn ce_v01_a_void_cast_counted_position_holds_the_thin_form() {
+    // (a) The classifier reaches the counted position through the void cast:
+    // `save_file::buffer` is in the thin-extent set, so no thin `&u8` can be
+    // emitted there (the corpus E0606 of wave-6v 009).
+    let held = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(CE_V01_VOID_CAST_COUNTED_POSITION),
+        |tcx| {
+            let (_table, ctx) = super::decide_table_with_ctx(tcx)?;
+            let held = super::decision::thin_extent::collect(&ctx.facts);
+            Ok::<_, String>(
+                ctx.subjects
+                    .iter()
+                    .filter(|subject| held.contains(&(subject.fn_did, subject.hir_id)))
+                    .map(|subject| subject.label.clone())
+                    .collect::<Vec<_>>(),
+            )
+        },
+    )
+    .expect("CE-V01 fixture compiles")
+    .expect("CE-V01 decision table");
+    assert_eq!(held, vec!["save_file::buffer".to_owned()], "{held:?}");
+    // (b) End to end: #1b's `fwrite` rider promotes the position with its
+    // caller's chain; nothing thin reaches the void cast.
+    let source = emitted(CE_V01_VOID_CAST_COUNTED_POSITION);
+    assert!(source.contains("buffer: &[u8]"), "{source}");
+    assert!(
+        source.contains("fwrite(buffer.as_ptr().cast::<core::ffi::c_void>(), 1, buffersize, file)"),
+        "{source}"
+    );
+    assert!(!source.contains("&u8"), "{source}");
+}

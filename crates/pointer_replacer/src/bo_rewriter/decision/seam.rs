@@ -4206,13 +4206,44 @@ pub(crate) fn synthesize_with_raw_boundary(
                             } => Some(elements.trim().to_owned()),
                             _ => None,
                         });
-                    let contract_companion = contract_count.as_deref().and_then(|elements| {
+                    let parameter_named = |elements: &str| {
                         tcx.fn_arg_idents(callee.to_def_id())
                             .iter()
                             .position(|ident| {
                                 ident.is_some_and(|ident| ident.name.as_str() == elements)
                             })
-                    });
+                    };
+                    let contract_companion = contract_count.as_deref().and_then(parameter_named);
+                    // R408-1: ruling B's adjacency arm licenses the adjacent
+                    // integer ONLY with evidence that it is a COUNT — a count
+                    // position of the callee parameter's own pinned contract
+                    // names it (`strncpy(dst, src, n)`: `n` bounds `src`; D1's
+                    // op-fact discipline). An adjacent VALUE (`mask`, `CRC`) is
+                    // not a length: the construction fabricates, and the arm
+                    // keeps its signature evidence for the derivability split.
+                    let count_companions = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| table.contract_extent_promotions.get(key))
+                        .map(|promotion| {
+                            promotion
+                                .sites
+                                .iter()
+                                .filter_map(|site| match &site.requirement {
+                                    super::contract_extent::Requirement::ExactAccess(Some(
+                                        count,
+                                    ))
+                                    | super::contract_extent::Requirement::UpperBound(Some(
+                                        count,
+                                    ))
+                                    | super::contract_extent::Requirement::ElementCount(Some(
+                                        count,
+                                    )) => count.elements.as_deref().ok(),
+                                    _ => None,
+                                })
+                                .filter_map(|elements| parameter_named(elements.trim()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
                     let arm = if contract_count.is_some() {
                         LenEvidence::Contract
                     } else {
@@ -4223,7 +4254,10 @@ pub(crate) fn synthesize_with_raw_boundary(
                         LenEvidence::Preceding => pos.index.checked_sub(1),
                         LenEvidence::Contract => contract_companion,
                         LenEvidence::Elsewhere | LenEvidence::None => None,
-                    };
+                    }
+                    .filter(|index| {
+                        arm == LenEvidence::Contract || count_companions.contains(index)
+                    });
                     // A CALL in the spelling (`f(`, `size_of::<T>(`) is the
                     // hazard; grouping parentheses are not.
                     let licensed_spelling =

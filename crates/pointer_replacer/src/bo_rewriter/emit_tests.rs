@@ -7693,6 +7693,12 @@ fn force_br_w3_slice_targets(table: &mut super::decision::DecisionTable) {
 
 /// BR-W3 RED: raw slice constructors are explicit unsafe bridges, prefer the
 /// carried companion extent, and use only the named fallback otherwise.
+///
+/// Re-premised by R408-1 (wave-4, 2026-09-15): an adjacent integer is a
+/// companion EXTENT only with count evidence — a count position of the
+/// callee parameter's own pinned contract naming it. These forced targets
+/// carry none (`let _ = (p, n)`), so every construction takes the named
+/// fallback and the events carry no `Evidence("n")`.
 #[test]
 fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
     use super::bridge_receipt::{BridgeExtentKind, BridgeRetentionTier};
@@ -7700,11 +7706,15 @@ fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
     let attempt = e3_attempt_with(BR_W3_RAW_SLICES, true, &force_br_w3_slice_targets);
     let source = e2_root_text(&attempt);
     assert!(
-        source.contains("licensed_shared(core::slice::from_raw_parts(read_p, (n) as usize), n)"),
+        source.contains(
+            "licensed_shared(core::slice::from_raw_parts(read_p, crate::FALLBACK_SLICE_EXTENT), n)"
+        ),
         "{source}"
     );
     assert!(
-        source.contains("licensed_mut(core::slice::from_raw_parts_mut(write_p, (n) as usize), n)"),
+        source.contains(
+            "licensed_mut(core::slice::from_raw_parts_mut(write_p, crate::FALLBACK_SLICE_EXTENT), n)"
+        ),
         "{source}"
     );
     assert!(
@@ -7748,13 +7758,11 @@ fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
                 && event.state == super::bridge_receipt::BridgeReceiptState::Applied
         })
         .collect::<Vec<_>>();
-    assert!(applied.iter().any(|event| {
-        event.site.bridge_kind == "c-raw-slice-shared"
-            && matches!(&event.extent, BridgeExtentKind::Evidence(source) if source == "n")
+    assert!(!applied.iter().any(|event| {
+        matches!(&event.extent, BridgeExtentKind::Evidence(source) if source == "n")
     }));
     assert!(applied.iter().any(|event| {
-        event.site.bridge_kind == "c-raw-slice-mut"
-            && matches!(&event.extent, BridgeExtentKind::Evidence(source) if source == "n")
+        event.site.bridge_kind == "c-raw-slice-mut" && event.extent == BridgeExtentKind::Fallback
     }));
     assert!(applied.iter().any(|event| {
         event.site.bridge_kind == "c-raw-slice-shared" && event.extent == BridgeExtentKind::Fallback
@@ -11183,6 +11191,13 @@ fn e_adapt_w3_n3_unattested_site_fails_closed_with_typed_reason() {
 
 /// E-ADAPT-W3-N6 — evidence-backed extents remain preferred after the overlap
 /// gate opens. Both raw slice arguments have their own following count.
+///
+/// Re-premised by R408-1 (wave-4, 2026-09-15): a following integer is an
+/// extent only when a count position of the callee's own pinned contract
+/// names it; `target` reads one element under `if a_len != 0`, which is no
+/// count, so both placements fabricate with the named fallback and their
+/// signature evidence (`len-following`) survives only in the derivability
+/// column.
 #[test]
 fn e_adapt_w3_n6_clear_site_prefers_licensed_extent() {
     let attempt = e3_attempt_with(E3_CLEAR_LICENSED, true, &|table| {
@@ -11198,8 +11213,13 @@ fn e_adapt_w3_n6_clear_site_prefers_licensed_extent() {
         .filter(|row| row.first() == Some(&"placed"))
         .collect::<Vec<_>>();
     assert_eq!(placed.len(), 2, "{}", attempt.receipt);
-    assert!(placed.iter().all(|row| row[len_arm] == "len-following"));
-    assert!(!e2_root_text(&attempt).contains("FALLBACK_SLICE_EXTENT"));
+    assert!(placed.iter().all(|row| row[len_arm] == "len-fabricated"));
+    assert_eq!(
+        e2_root_text(&attempt)
+            .matches("crate::FALLBACK_SLICE_EXTENT")
+            .count(),
+        2
+    );
 }
 
 /// E-ADAPT-W3-N7 — absent sound extent evidence uses only the named fallback,
