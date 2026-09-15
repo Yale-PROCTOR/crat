@@ -237,6 +237,37 @@ fn is_written(tcx: TyCtxt<'_>, e: &Expr<'_>) -> bool {
     }
 }
 
+/// Is `e` (through casts and temporaries) the operand of a `return`, or the
+/// value the enclosing body evaluates to?
+fn is_returned_value(tcx: TyCtxt<'_>, e: &Expr<'_>) -> bool {
+    let mut id = e.hir_id;
+    loop {
+        match tcx.parent_hir_node(id) {
+            Node::Expr(parent) => match parent.kind {
+                ExprKind::Ret(Some(operand)) => return operand.hir_id == id,
+                ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) if inner.hir_id == id => {
+                    id = parent.hir_id;
+                }
+                ExprKind::Block(block, _)
+                    if block.hir_id == id || block.expr.is_some_and(|tail| tail.hir_id == id) =>
+                {
+                    id = parent.hir_id;
+                }
+                _ => return false,
+            },
+            Node::Block(block) => {
+                if !block.expr.is_some_and(|tail| tail.hir_id == id) {
+                    return false;
+                }
+                id = block.hir_id;
+            }
+            // The body's own value.
+            Node::Item(_) | Node::ImplItem(_) | Node::TraitItem(_) => return true,
+            _ => return false,
+        }
+    }
+}
+
 fn size_of<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, ty: Ty<'tcx>) -> Option<u64> {
     tcx.layout_of(TypingEnv::post_analysis(tcx, owner).as_query_input(ty))
         .ok()
@@ -314,6 +345,15 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         }
     }
     if reads.is_empty() {
+        return None;
+    }
+    // R410-2(d): a width reader — every typed read is the value RETURNED
+    // (`return *(p as *const u32)`) — is wave-6b's region shape, and the
+    // region wins; this rule yields.
+    if reads
+        .iter()
+        .all(|(deref, _, _, _)| is_returned_value(tcx, deref))
+    {
         return None;
     }
     let width = if reads.iter().all(|(_, _, _, arm)| arm.is_none()) {
