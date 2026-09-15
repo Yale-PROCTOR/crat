@@ -648,6 +648,21 @@ impl Bridge {
         }
     }
 
+    /// Is this a width reader's exact-width bridge (never a fallback, never an
+    /// accessor region)? The only bridge a computed slice view may feed.
+    pub(crate) fn reads_width(&self) -> bool {
+        self.offset_bytes == 0 && self.len_text.is_some() && !self.from_slice
+    }
+
+    /// The same width read over a slice view supplied by the caller (wave-6s's
+    /// computed suffix): a checked prefix of that view.
+    pub(crate) fn as_prefix_of_view(&self) -> Self {
+        Self {
+            from_slice: true,
+            ..self.clone()
+        }
+    }
+
     /// `&(<slice>)[..N]` — the reader's width as a checked prefix of the
     /// caller's own slice. Safe: no `unsafe` wrapper.
     pub(crate) fn render_slice(&self, text: &str) -> String {

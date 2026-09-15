@@ -1943,14 +1943,17 @@ impl<'a> SeamGraftVisitor<'a> {
         }
         if let Some(region) = &spec.void_region {
             let argument = if target.arg_span == e.span {
-                e
+                e.clone()
             } else {
-                find_by_span(e, target.arg_span)?
+                find_by_span(e, target.arg_span)?.clone()
             };
+            // wave-6b × wave-6s: a width read over a computed suffix view takes
+            // the view's shaped subtree, then the prefix.
+            let argument = super::slice_forms_ast::argument(argument, spec.forward_slice.as_ref())?;
             return super::decision::void_region::bridge_ast(
                 region,
                 spec.mutable,
-                argument,
+                &argument,
                 self.current_unsafe_fn,
             );
         }
