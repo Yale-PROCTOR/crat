@@ -118,6 +118,7 @@ pub(crate) mod thin_counted_tests;
 pub(crate) mod thin_extent;
 pub(crate) mod universe;
 pub(crate) mod void_pointee;
+pub(crate) mod void_region;
 mod wave5r;
 
 use emitability::EmitabilityFacts;
@@ -991,6 +992,7 @@ pub(crate) struct DecisionTable {
     pub(crate) return_certificates: return_certificate::Certificates,
     /// wave-6a: allocator-contract owners (admitted / held).
     pub(crate) allocator_contracts: allocator_contract::Plans,
+    pub(crate) void_region: void_region::Contracts,
     pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
     pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
@@ -1140,6 +1142,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) box_params: &'a box_param::Chains,
     pub(crate) return_certificates: &'a return_certificate::Certificates,
     pub(crate) allocator_contracts: &'a allocator_contract::Plans,
+    pub(crate) void_region: &'a void_region::Contracts,
     pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
@@ -1282,6 +1285,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         box_params: ctx.box_params.clone(),
         return_certificates: ctx.return_certificates.clone(),
         allocator_contracts: ctx.allocator_contracts.clone(),
+        void_region: ctx.void_region.clone(),
         nested_receipts: Vec::new(),
         cursor_receipts,
         sibling_overlap_inventory: Default::default(),
@@ -1803,6 +1807,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         box_params: _,
         return_certificates: _,
         allocator_contracts: _,
+        void_region: _,
         void_pointee,
         thin_extent,
         local_callee_extent,
@@ -1942,7 +1947,13 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // real extent and therefore sound — the seat kept that arm as is, and this
     // hold sits below it so it cannot pre-empt it.
     let counted = counted_void::active(ctx, subject);
-    if counted.is_none() && void_pointee.contains(&(subject.fn_did, subject.hir_id)) {
+    // wave-6b: a void parameter whose body REINTERPRETS the buffer at a proven
+    // region (accessor chain, width reader) is a byte slice over that region.
+    let region = void_region::active(ctx, subject);
+    if counted.is_none()
+        && region.is_none()
+        && void_pointee.contains(&(subject.fn_did, subject.hir_id))
+    {
         return degrade(subject, decl_site, DegradeReason::VoidPointee);
     }
 
@@ -2023,6 +2034,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         None if counted.is_some_and(|c| c.handle.is_some()) => Form::Plain,
         None if counted.is_some_and(|c| c.nullable) => Form::Opt { slice: true },
         None if counted.is_some() => Form::Slice,
+        None if region.is_some() => Form::Slice,
         None => Form::Plain,
     };
     let contract_form = match form {
@@ -2125,7 +2137,22 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // [`RefGate::LiftAdaptable`] the
     // adaptable population passes and the pinned population still blocks, which
     // is the hypothetical `co_conversion` builds its node set from.
-    if let Some(refs) = facts.referenced.get(&subject.fn_did)
+    // wave-6b: a reference from inside a sibling accessor's replaced chain
+    // expression is deleted with that chain and pins nothing.
+    let refs_outside_regions: Vec<(emitability::RefKind, Span)> = facts
+        .referenced
+        .get(&subject.fn_did)
+        .map(|refs| {
+            refs.iter()
+                .filter(|(_, span)| {
+                    region.is_none()
+                        || !void_region::covers_sibling(ctx.void_region, subject.fn_did, *span)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(refs) = (!refs_outside_regions.is_empty()).then_some(&refs_outside_regions)
         && let Some((_kind, span)) = refs.first()
     {
         let surface_handles = exposure.is_some_and(|policy| {
@@ -2467,6 +2494,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // (no sign fact) is not refused on a lookup miss.
     if counted.is_none()
         && counted_void::active(ctx, subject).is_none()
+        && region.is_none()
         && sign.may_be_negative(subject.fn_did, subject.local)
     {
         return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
@@ -2485,7 +2513,9 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         );
     }
     Decision::Slice {
-        mutable: subject.mutable && !contract_alone,
+        // Composition arm (wave-4 R407-14 x wave-6b): a delivered region carries
+        // its own mutability; otherwise wave-4's NUL-contract-alone narrowing.
+        mutable: region.map_or(subject.mutable && !contract_alone, |region| region.mutable),
         uses: uses.rewrites,
     }
 }
@@ -2600,6 +2630,7 @@ mod self_consistency_tests {
             box_params: Default::default(),
             return_certificates: Default::default(),
             allocator_contracts: Default::default(),
+            void_region: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

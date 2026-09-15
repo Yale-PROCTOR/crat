@@ -1102,6 +1102,8 @@ pub(crate) struct RawBoundaryGlue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GlueSpec {
     pub(crate) counted_byte: Option<super::counted_void::CountedByte>,
+    /// wave-6b: the argument is a void buffer bridged as one typed region.
+    pub(crate) void_region: Option<super::void_region::Bridge>,
     pub shared_address: Option<super::overlapping_pairs::consumer::SharedAddress>,
     pub core: GlueCore,
     /// The EXPECTED side's mutability — selects `&`/`&mut` and
@@ -1154,6 +1156,7 @@ impl GlueSpec {
     pub(crate) fn core(core: GlueCore, mutable: bool) -> Self {
         Self {
             counted_byte: None,
+            void_region: None,
             shared_address: None,
             core,
             mutable,
@@ -1217,6 +1220,7 @@ impl GlueSpec {
     pub(crate) fn literal_none(mutable: bool) -> Self {
         Self {
             counted_byte: None,
+            void_region: None,
             shared_address: None,
             core: GlueCore::Bare,
             mutable,
@@ -1238,6 +1242,7 @@ impl GlueSpec {
     ) -> Self {
         Self {
             counted_byte: None,
+            void_region: None,
             shared_address: None,
             core: GlueCore::Bare,
             mutable: target_mutability == super::raw_boundary::RawMutability::Mut,
@@ -1483,6 +1488,9 @@ impl GlueSpec {
         let unsafe_expr = |inner: String| {
             super::super::mechanical_receipt::present_unsafe_text(inner, enclosing_unsafe_fn)
         };
+        if let Some(region) = &self.void_region {
+            return Some(unsafe_expr(region.render(text, self.mutable)));
+        }
         if let Some(raw) = self.raw_boundary.as_ref() {
             let rendered = if raw.force_explicit {
                 raw.template.render_explicit(
@@ -3320,8 +3328,14 @@ fn build_candidate(
     return_tied: bool,
     counted: Option<(&super::counted_void::Contract, super::counted_void::Route)>,
     field_tied: bool,
+    region: Option<&super::void_region::Region>,
 ) -> Result<Option<Candidate>, SeamBlock> {
     if counted.is_some() && found != Form::Raw {
+        return Err(SeamBlock::UnnameableOperand);
+    }
+    // wave-6b: a region position takes only a raw buffer expression; every
+    // other found form is a view the region bridge cannot re-derive.
+    if region.is_some() && (found != Form::Raw || literal_null) {
         return Err(SeamBlock::UnnameableOperand);
     }
     let answer = if literal_null {
@@ -3349,6 +3363,16 @@ fn build_candidate(
             handle_pointee: contract.handle.as_deref().map(rustc_span::Symbol::intern),
         });
     }
+    if let Some(region) = region {
+        if spec.core != GlueCore::FromRawParts {
+            return Err(SeamBlock::UnnameableOperand);
+        }
+        spec.void_region = Some(super::void_region::Bridge::of(region));
+        spec.len = Some(match region.len_text() {
+            Some(exact) => SeamLen::Licensed(exact),
+            None => SeamLen::Fabricated,
+        });
+    }
     let replacement = spec
         .render_in_context(text, enclosing_unsafe_fn)
         .ok_or(SeamBlock::LengthUnknown)?;
@@ -3359,7 +3383,13 @@ fn build_candidate(
             LenArm::Licensed(evidence)
         }
     });
-    let (retention, waiver_id) = if found == Form::Raw && expected != Form::Raw {
+    let (retention, waiver_id) = if let Some(region) = region {
+        // wave-6b: the accessor RETURNS a raw pointer into the bridged region
+        // by design, and the bridged view is a temporary of the call — no safe
+        // view of the buffer outlives it. The retained raw alias is receipted
+        // under the T2 waiver like every return-carried alias.
+        super::void_region::retention(region)
+    } else if found == Form::Raw && expected != Form::Raw {
         inbound_retention(
             retention_facts,
             callee,
@@ -4057,6 +4087,9 @@ pub(crate) fn synthesize_with_raw_boundary(
         .sort_by_key(|permission| permission.receipt());
     plan.pair_sites = coconv.pair_sites().to_vec();
     let mut a5_raw_calls = BTreeMap::<(u32, u32, u32, u32), A5RawViewCall>::new();
+    // wave-6b: accessor regions of one buffer that a caller would hold live
+    // together must be disjoint ranges.
+    let overlapping_regions = super::void_region::overlapping_calls(tcx, facts, table);
     let mut counted_void_calls = BTreeMap::new();
 
     // subject key -> decision, and (fn, param index) -> subject key.
@@ -4414,12 +4447,21 @@ pub(crate) fn synthesize_with_raw_boundary(
                     input_candidates.push(Err(block));
                     continue;
                 }
+                let region = super::void_region::parameter(table, *callee, pos.index);
+                if region.is_some() && overlapping_regions.contains(&(site.caller, site.span)) {
+                    candidates.push(Err(SeamBlock::PositiveRetention));
+                    input_candidates.push(Err(SeamBlock::PositiveRetention));
+                    continue;
+                }
                 let counted = counted.and_then(|contract| match &counted_len {
                     Some(Ok((_, route))) => Some((contract, *route)),
                     _ => None,
                 });
                 let (len_text, len_evidence) = if let Some(Ok((count, _))) = counted_len {
                     (Some(count), Some(LenEvidence::Elsewhere))
+                } else if let Some(region) = region {
+                    // wave-6b: the byte length is the callee's own region.
+                    (region.len_text(), Some(LenEvidence::Elsewhere))
                 } else if wants_len {
                     // Wave-4 #1b: a contract-extent promotion with an exact
                     // count names the companion argument itself. The count
@@ -4553,6 +4595,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             return_tied,
                             counted,
                             field_tied_params.contains(&pos.index),
+                            region,
                         )
                     },
                 );
@@ -4580,6 +4623,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             return_tied,
                             counted,
                             field_tied_params.contains(&pos.index),
+                            region,
                         )
                     })
                     .map(|candidate| {
@@ -5447,7 +5491,8 @@ pub(crate) fn synthesize_with_raw_boundary(
             .unwrap_or_default();
         plan.edits.push(SeamEdit {
             raw_outbound: None,
-            zero_syntax: super::counted_void::owns_address(table, site),
+            zero_syntax: super::counted_void::owns_address(table, site)
+                || super::void_region::owns_address(table, site),
             span: site.span,
             call_span: site.span,
             replacement,

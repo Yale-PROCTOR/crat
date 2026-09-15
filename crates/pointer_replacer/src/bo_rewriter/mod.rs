@@ -260,6 +260,8 @@ mod thin_extent_tests;
 #[cfg(test)]
 mod void_pointee_tests;
 #[cfg(test)]
+mod void_region_tests;
+#[cfg(test)]
 mod wave5c_preservation_witness_tests;
 #[cfg(test)]
 mod zero_syntax_custody_tests;
@@ -6836,6 +6838,12 @@ fn finish_decide<'tcx>(
     let declaration_patterns = decision::declaration_pattern::collect(tcx, &subjects);
     let input_interfaces = decision::interface::collect(tcx, &subjects, &program.functions);
     let mut facts = decision::emitability::collect(tcx, &program.functions);
+    let void_region = decision::void_region::collect(
+        tcx,
+        &subjects,
+        &facts.referenced,
+        &mut declaration_pointees,
+    );
     let original_body_adapters = facts.body_adapters.clone();
     let thin_extent_subjects = decision::thin_extent::collect(&facts);
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
@@ -7212,6 +7220,7 @@ fn finish_decide<'tcx>(
             additive::FamilyStage::SliceUse,
         );
         decision::counted_void::install(&counted_void, &mut slice_uses);
+        decision::void_region::install(&void_region, &mut slice_uses);
         let mut current_opt_uses = additive::select_uses(
             &return_opt_uses,
             &full_opt_uses,
@@ -7250,6 +7259,7 @@ fn finish_decide<'tcx>(
                     box_params: &box_params,
                     return_certificates: &return_certificates,
                     allocator_contracts: &allocator_contracts,
+                    void_region: &void_region,
                     return_receivers,
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,

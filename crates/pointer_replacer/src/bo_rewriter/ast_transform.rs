@@ -1941,6 +1941,19 @@ impl<'a> SeamGraftVisitor<'a> {
         if let Some(counted) = spec.counted_byte {
             return super::decision::counted_void::bridge_ast(spec, counted, e);
         }
+        if let Some(region) = &spec.void_region {
+            let argument = if target.arg_span == e.span {
+                e
+            } else {
+                find_by_span(e, target.arg_span)?
+            };
+            return super::decision::void_region::bridge_ast(
+                region,
+                spec.mutable,
+                argument,
+                self.current_unsafe_fn,
+            );
+        }
         if let Some(address) = &spec.shared_address {
             return super::shared_pair_ast::build(e, address);
         }
