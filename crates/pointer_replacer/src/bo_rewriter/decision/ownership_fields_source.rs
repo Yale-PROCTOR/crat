@@ -610,13 +610,20 @@ pub(crate) fn derive<'tcx>(
             return Err(SourceHold::UnsupportedOwnerUse);
         }
         covered.insert(root.hir_id.local_id.as_u32());
+        let replacement = if constructor.shape == BoxShape::Sized {
+            format!("(*{root_spelling})")
+        } else {
+            edit.replacement.clone()
+        };
+        // A sized owner's `(*root)` already reads through the Box; an edit
+        // whose text equals the source would only claim the interval (and
+        // collide with a call bridge composed over the same argument).
+        if tcx.sess.source_map().span_to_snippet(edit.span).as_deref() == Ok(&replacement) {
+            continue;
+        }
         scalar_edits.push(BoxExprEdit {
             span: edit.span,
-            replacement: if constructor.shape == BoxShape::Sized {
-                format!("(*{root_spelling})")
-            } else {
-                edit.replacement.clone()
-            },
+            replacement,
             receipt: "native-box-slice-access",
         });
     }

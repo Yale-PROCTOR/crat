@@ -544,7 +544,20 @@ pub unsafe extern "C" fn transform_to_coordfield(mut data: *mut libc::c_float, m
     // them under the raw-boundary signature class of the call, whose sibling
     // arguments `f, d, z, w` are `copy-source-coupled` cursor aliases — the
     // typed frontier this witness pins (`signature-class-held`).
-    let decided = |owner: &str| {
+    // Two admissible readings of the composed line (R217-2(a), main 035):
+    // on this lane's base the owners DECIDE Box and the emission stage
+    // withdraws them under the class; under the batch-8 composition the
+    // cursor aliases `f, d` become slice views at an earlier stage, the
+    // callee `edt_with_payload` takes a dependency on the held owner class,
+    // and the additive stage EXCLUDES the changed candidates of that class —
+    // the owners among them — at the ownership stage (R397-6(a)), named by
+    // the receipt `exclusion-rederivation:…:new-family-dependency:…`.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Reading {
+        DecidedBox,
+        ExcludedWithDependency,
+    }
+    let decided = |owner: &str| -> Reading {
         ::utils::compilation::run_compiler_on_str(&input, |tcx| {
             let (table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
@@ -554,26 +567,55 @@ pub unsafe extern "C" fn transform_to_coordfield(mut data: *mut libc::c_float, m
                 )),
             )
             .unwrap();
-            let (_, decision) = table
+            let (subject, decision) = table
                 .entries
                 .iter()
                 .find(|(s, _)| s.param_name.as_deref() == Some(owner))
                 .unwrap();
-            let Decision::Box(plan) = decision else { panic!("{decision:?}") };
-            assert_eq!(plan.shape, BoxShape::Slice);
-            assert!(
-                plan.receipts
-                    .iter()
-                    .any(|r| r.contains("disjoint=fresh-allocation-derivation-closure")),
-                "{:?}",
-                plan.receipts
-            );
-            let _ = &ctx;
+            match decision {
+                Decision::Box(plan) => {
+                    assert_eq!(plan.shape, BoxShape::Slice);
+                    assert!(
+                        plan.receipts
+                            .iter()
+                            .any(|r| r.contains("disjoint=fresh-allocation-derivation-closure")),
+                        "{:?}",
+                        plan.receipts
+                    );
+                    Reading::DecidedBox
+                }
+                Decision::Degraded(_) => {
+                    let key = subject.identity_key("transform_to_coordfield");
+                    let receipt = ctx
+                        .raw_boundary_artifacts
+                        .additive_family_receipts
+                        .iter()
+                        .find(|r| {
+                            r.family == "Ownership"
+                                && r.owner_path == "transform_to_coordfield"
+                                && r.cause.starts_with("exclusion-rederivation:")
+                                && r.cause.contains(":new-family-dependency:")
+                                && r.subjects.iter().any(|(s, _, _)| *s == key)
+                        });
+                    assert!(
+                        receipt.is_some(),
+                        "{owner}: {decision:?}\n{:?}",
+                        ctx.raw_boundary_artifacts.additive_family_receipts
+                    );
+                    Reading::ExcludedWithDependency
+                }
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. }
+                | Decision::Opt { .. } => panic!("{owner}: {decision:?}"),
+            }
         })
-        .unwrap();
+        .unwrap()
     };
-    decided("pl1");
-    decided("pl2");
+    let reading = decided("pl1");
+    assert_eq!(decided("pl2"), reading);
     let outcome = super::rewrite_core_injected(
         ::utils::compilation::str_to_input(&input),
         None,
@@ -600,33 +642,47 @@ pub unsafe extern "C" fn transform_to_coordfield(mut data: *mut libc::c_float, m
         "transform_to_coordfield::pl1#13",
         "transform_to_coordfield::pl2#21",
     ] {
+        // A withdrawn Box row degrades under its identity key (`…#13`); a
+        // row degraded at decision under the plain label.
+        let label = owner.split('#').next().unwrap();
         let row = degradations
             .iter()
-            .find(|d| d.subject == owner)
+            .find(|d| d.subject == owner || d.subject == label)
             .expect(owner);
-        assert_eq!(
-            row.reason.key(),
-            "signature-class-held",
-            "{owner}: {}",
-            row.reason.detail()
-        );
-        assert!(
-            row.reason.detail().contains("copy-source-coupled"),
-            "{}",
-            row.reason.detail()
-        );
-        // R402-2(b): the withdrawn Box row is DEGRADED in the E1 seed with its
-        // withdrawal reason (never a placed box row) and is no custody
-        // expectation, so the strict instrument sees no inferred-type claim.
         let seed = e1_subject_receipt
             .lines()
             .find(|line| line.starts_with(&format!("{owner}\t")))
             .unwrap_or_else(|| panic!("{owner} seed row: {e1_subject_receipt}"));
         let columns: Vec<&str> = seed.split('\t').collect();
         assert_eq!(columns[7], "degraded", "{seed}");
-        assert_eq!(columns[8], "box-withdrawn-at-emission", "{seed}");
-        assert!(columns[9].starts_with("signature-class-held:"), "{seed}");
         assert_eq!(columns[11], "0", "{seed}");
+        match reading {
+            Reading::DecidedBox => {
+                assert_eq!(
+                    row.reason.key(),
+                    "signature-class-held",
+                    "{owner}: {}",
+                    row.reason.detail()
+                );
+                assert!(
+                    row.reason.detail().contains("copy-source-coupled"),
+                    "{}",
+                    row.reason.detail()
+                );
+                // R402-2(b): the withdrawn Box row is DEGRADED in the E1 seed
+                // with its withdrawal reason (never a placed box row) and is
+                // no custody expectation, so the strict instrument sees no
+                // inferred-type claim.
+                assert_eq!(columns[8], "box-withdrawn-at-emission", "{seed}");
+                assert!(columns[9].starts_with("signature-class-held:"), "{seed}");
+            }
+            Reading::ExcludedWithDependency => {
+                // Excluded before emission: the row degrades on its own
+                // (prior) reason and never becomes a Box row anywhere.
+                assert_ne!(row.reason.key(), "signature-class-held", "{owner}");
+                assert_ne!(columns[8], "box-withdrawn-at-emission", "{seed}");
+            }
+        }
         assert!(
             !raw_boundary_artifacts
                 .custody_expectations
@@ -918,28 +974,63 @@ unsafe extern "C" fn _match(mut mask: *mut heman_image, mut mask_color: heman_co
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
-    let super::RewriteOutcome::Emitted { degradations, .. } = outcome else {
+    let super::RewriteOutcome::Emitted {
+        degradations,
+        source,
+        reverted_count,
+        ..
+    } = outcome
+    else {
         panic!("{outcome:?}")
     };
-    for owner in [
-        "heman_ops_percentiles::vals#292",
-        "heman_ops_percentiles::percentiles#328",
-    ] {
-        let row = degradations
-            .iter()
-            .find(|d| d.subject == owner)
-            .expect(owner);
-        assert_eq!(
-            row.reason.key(),
-            "signature-class-held",
-            "{owner}: {}",
-            row.reason.detail()
-        );
-        assert!(
-            row.reason.detail().contains("blocked-subject:kind-raw"),
-            "{}",
-            row.reason.detail()
-        );
+    // Two admissible readings (R217-2(a), main 035): on this lane's base the
+    // owner class holds on the raw parameters (`blocked-subject:kind-raw`)
+    // and both owners are withdrawn; under the batch-8 composition
+    // (wave-5d's per-subject scope) the raw siblings no longer hold the
+    // class and both owners DELIVER — `Box<[f32]>` on the binding, the C
+    // frees as drops, the callee lent raw (its class is held:
+    // `qselect::v` is a Box-parameter candidate that lends).
+    let held = |owner: &str| degradations.iter().find(|d| d.subject == owner).cloned();
+    match (
+        held("heman_ops_percentiles::vals#292"),
+        held("heman_ops_percentiles::percentiles#328"),
+    ) {
+        (Some(vals), Some(percentiles)) => {
+            for row in [vals, percentiles] {
+                assert_eq!(
+                    row.reason.key(),
+                    "signature-class-held",
+                    "{}: {}",
+                    row.subject,
+                    row.reason.detail()
+                );
+                assert!(
+                    row.reason.detail().contains("blocked-subject:kind-raw"),
+                    "{}",
+                    row.reason.detail()
+                );
+            }
+        }
+        (None, None) => {
+            assert_eq!(reverted_count, 0, "{source}");
+            for owner in ["vals", "percentiles"] {
+                assert!(
+                    source.contains(&format!("let mut {owner}: ::std::boxed::Box<[f32]> =")),
+                    "{owner}: {source}"
+                );
+                assert!(
+                    source.contains(&format!("::std::mem::drop({owner})")),
+                    "{owner}: {source}"
+                );
+            }
+            assert!(
+                source.contains(
+                    "qselect(<[_]>::as_mut_ptr(&mut *(vals)), npixels, tier * npixels / nsteps)"
+                ),
+                "{source}"
+            );
+        }
+        (vals, percentiles) => panic!("one owner delivered, one held: {vals:?} {percentiles:?}"),
     }
 }
 
