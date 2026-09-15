@@ -55,6 +55,8 @@ pub(crate) struct CallObligation {
     key: SourceCallKey,
     callee: DefId,
     argument: usize,
+    /// The lent local: the owner itself, or one of its view aliases.
+    lent: LentLocal,
     argument_span: Span,
     call_span: Span,
     scalar_arguments: BTreeSet<usize>,
@@ -62,9 +64,34 @@ pub(crate) struct CallObligation {
         Option<Vec<crate::analyses::borrow_ownership::source_events::SourceEventKey>>,
     raw_argument_type: String,
 }
+/// Which local is lent at a call: the owner or a view alias of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LentLocal {
+    pub(crate) hir_id: HirId,
+    pub(crate) spelling: String,
+    pub(crate) is_view_alias: bool,
+}
+
+/// `let mut a = root.offset(start);` — a per-iteration alias of the owner
+/// whose every use is an element access or a raw argument to a local callee.
+/// Emitted as a runtime-checked mutable view `&mut (*root)[(start) as usize..]`
+/// (R394-1: the bounds checks replace a static window proof).
+#[derive(Clone, Debug)]
+pub(crate) struct ViewAlias {
+    pub(crate) hir_id: HirId,
+    pub(crate) spelling: String,
+    pub(crate) initializer_span: Span,
+    pub(crate) start: String,
+    pub(crate) access_edits: Vec<BoxExprEdit>,
+}
+
 impl CallObligation {
     pub(crate) fn key(&self) -> SourceCallKey {
         self.key
+    }
+
+    pub(crate) fn lent(&self) -> &LentLocal {
+        &self.lent
     }
 
     pub(crate) fn callee(&self) -> DefId {
@@ -153,8 +180,13 @@ pub(crate) struct SourcePlan {
     /// every pointer into this fresh allocation while the root never escapes.
     allocation_local: u32,
     element_spelling: String,
+    view_aliases: Vec<ViewAlias>,
 }
 impl SourcePlan {
+    pub(crate) fn view_aliases(&self) -> &[ViewAlias] {
+        &self.view_aliases
+    }
+
     pub(crate) fn element_spelling(&self) -> &str {
         &self.element_spelling
     }
@@ -311,6 +343,39 @@ fn root_path(expression: &Expr<'_>, binding: HirId) -> bool {
     matches!(expression.kind, ExprKind::Path(QPath::Resolved(_, path))
         if path.res == Res::Local(binding))
 }
+/// The raw-pointer locals reachable from `seeds` through plain copies and
+/// pointer-to-pointer casts (both directions), a must-alias set.
+fn copy_closure(body: &rustc_middle::mir::Body<'_>, seeds: BTreeSet<u32>) -> BTreeSet<u32> {
+    let mut aliases = seeds;
+    loop {
+        let before = aliases.len();
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                let Some(destination) = destination.as_local() else { continue };
+                let operand = match rvalue {
+                    Rvalue::Use(operand) | Rvalue::Cast(CastKind::PtrToPtr, operand, _) => operand,
+                    _ => continue,
+                };
+                let Some(source) = plain_local(operand) else { continue };
+                if !matches!(body.local_decls[destination].ty.kind(), TyKind::RawPtr(..))
+                    || !matches!(body.local_decls[source].ty.kind(), TyKind::RawPtr(..))
+                {
+                    continue;
+                }
+                if aliases.contains(&source.as_u32()) || aliases.contains(&destination.as_u32()) {
+                    aliases.insert(source.as_u32());
+                    aliases.insert(destination.as_u32());
+                }
+            }
+        }
+        if before == aliases.len() {
+            return aliases;
+        }
+    }
+}
 fn plain_local(operand: &Operand<'_>) -> Option<Local> {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => place.as_local(),
@@ -324,7 +389,23 @@ fn scalar_arguments(
     expression: &Expr<'_>,
     typeck: &rustc_middle::ty::TypeckResults<'_>,
 ) -> Result<BTreeSet<usize>, SourceHold> {
-    fn pure(expression: &Expr<'_>, typeck: &rustc_middle::ty::TypeckResults<'_>) -> bool {
+    let ExprKind::Call(_, arguments) = expression.kind else { return Err(SourceHold::Identity) };
+    let mut scalars = BTreeSet::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if typeck.expr_ty(argument).is_raw_ptr() {
+            continue;
+        }
+        if !pure(argument, typeck) {
+            return Err(SourceHold::UnsupportedOwnerUse);
+        }
+        scalars.insert(index);
+    }
+    Ok(scalars)
+}
+/// A side-effect-free scalar read: literals, locals, casts, arithmetic and
+/// comparisons over those.
+fn pure(expression: &Expr<'_>, typeck: &rustc_middle::ty::TypeckResults<'_>) -> bool {
+    {
         if !matches!(
             typeck.expr_ty(expression).kind(),
             TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool
@@ -367,18 +448,6 @@ fn scalar_arguments(
             _ => false,
         }
     }
-    let ExprKind::Call(_, arguments) = expression.kind else { return Err(SourceHold::Identity) };
-    let mut scalars = BTreeSet::new();
-    for (index, argument) in arguments.iter().enumerate() {
-        if typeck.expr_ty(argument).is_raw_ptr() {
-            continue;
-        }
-        if !pure(argument, typeck) {
-            return Err(SourceHold::UnsupportedOwnerUse);
-        }
-        scalars.insert(index);
-    }
-    Ok(scalars)
 }
 /// Actual MIR reads (including pointer bases of payload stores), excluding
 /// StorageLive/Dead and writes of the fresh initializer into its destination.
@@ -548,6 +617,51 @@ pub(crate) fn derive<'tcx>(
             }
         }
     }
+    // View aliases: `let mut a = root.offset(start);` with a pure `start`,
+    // a plain raw-pointer binding, inside a slice owner. The root use in the
+    // initializer is covered here; the alias's own uses are accounted below.
+    let mut alias_bindings: Vec<(HirId, &Expr<'_>, &Expr<'_>)> = Vec::new();
+    let mut alias_receivers: BTreeSet<(u32, Span)> = BTreeSet::new();
+    if constructor.shape == BoxShape::Slice {
+        struct Lets<'tcx>(Vec<&'tcx rustc_hir::LetStmt<'tcx>>);
+        impl<'tcx> Visitor<'tcx> for Lets<'tcx> {
+            fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+                self.0.push(local);
+                intravisit::walk_local(self, local);
+            }
+        }
+        let mut lets = Lets(Vec::new());
+        lets.visit_body(tcx.hir_body(body_id));
+        for local in lets.0 {
+            let Some(init) = local.init else { continue };
+            let ExprKind::MethodCall(_, receiver, [start], _) = init.kind else { continue };
+            if !root_path(receiver, binding) {
+                continue;
+            }
+            let Some(did) = typeck.type_dependent_def_id(init.hir_id) else { continue };
+            if tcx.crate_name(did.krate).as_str() != "core"
+                || tcx.item_name(did).as_str() != "offset"
+                || !typeck.expr_ty(init).is_raw_ptr()
+                || local.els.is_some()
+                || local.ty.is_some()
+                || !pure(start, typeck)
+            {
+                continue;
+            }
+            let rustc_hir::PatKind::Binding(
+                rustc_hir::BindingMode::NONE | rustc_hir::BindingMode::MUT,
+                alias,
+                _,
+                None,
+            ) = local.pat.kind
+            else {
+                continue;
+            };
+            covered.insert(receiver.hir_id.local_id.as_u32());
+            alias_receivers.insert((receiver.hir_id.local_id.as_u32(), receiver.span));
+            alias_bindings.push((alias, init, start));
+        }
+    }
     let names = FxHashMap::from_iter([(key, root_spelling.clone())]);
     let slice_uses = super::emitability::collect_slice_uses(
         tcx,
@@ -560,17 +674,23 @@ pub(crate) fn derive<'tcx>(
     let uses = slice_uses
         .get(&key)
         .ok_or(SourceHold::UnsupportedOwnerUse)?;
-    if uses
-        .unsupported
-        .is_some_and(|span| !returns.iter().any(|r| r.span == span))
-        || uses
-            .return_handoffs
-            .iter()
-            .any(|site| !returns.iter().any(|r| r.span == site.span))
-        || uses
-            .raw_uses
-            .iter()
-            .any(|u| !covered.contains(&u.hir_id.local_id.as_u32()) || u.boundary_span.is_none())
+    // The walker reports a view alias's initializer as a cursor use of the
+    // root; that use is accounted by the alias's own permit above.
+    let is_alias_receiver = |hir: u32, span: Span| alias_receivers.contains(&(hir, span));
+    if uses.unsupported.is_some_and(|span| {
+        !returns.iter().any(|r| r.span == span)
+            && !alias_receivers
+                .iter()
+                .any(|(_, receiver)| *receiver == span)
+    }) || uses
+        .return_handoffs
+        .iter()
+        .any(|site| !returns.iter().any(|r| r.span == site.span))
+        || uses.raw_uses.iter().any(|u| {
+            !covered.contains(&u.hir_id.local_id.as_u32())
+                || (u.boundary_span.is_none()
+                    && !is_alias_receiver(u.hir_id.local_id.as_u32(), u.span))
+        })
     {
         return Err(SourceHold::UnsupportedOwnerUse);
     }
@@ -645,6 +765,143 @@ pub(crate) fn derive<'tcx>(
     if all_uses != covered {
         return Err(SourceHold::UnsupportedOwnerUse);
     }
+    // Each view alias: every use is an element access the slice walker
+    // rewrites or a raw argument to a LOCAL callee (a call obligation with
+    // the callee proofs); anything else (a copy, a free, a return, a
+    // reassignment, an address) holds.
+    let mut view_aliases = Vec::new();
+    let mut alias_calls: Vec<(&Expr<'_>, DefId, usize, Span, LentLocal)> = Vec::new();
+    for (alias, init, start) in alias_bindings {
+        let Node::Pat(pattern) = tcx.hir_node(alias) else { return Err(SourceHold::Identity) };
+        let rustc_hir::PatKind::Binding(_, _, ident, _) = pattern.kind else {
+            return Err(SourceHold::Identity);
+        };
+        let spelling = ident.name.to_string();
+        let mut alias_covered = BTreeSet::new();
+        let mut alias_boundary = FxHashSet::default();
+        for &expression in &expressions.0 {
+            if let ExprKind::Assign(lhs, ..) | ExprKind::AssignOp(_, lhs, _) = expression.kind
+                && root_path(lhs, alias)
+            {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            }
+            let ExprKind::Call(callee, arguments) = expression.kind else { continue };
+            for (index, argument) in arguments.iter().enumerate() {
+                let Ok(operand) = peel(argument, typeck) else { continue };
+                if !root_path(operand, alias) {
+                    continue;
+                }
+                let did = definition(callee).ok_or(SourceHold::UnsupportedOwnerUse)?;
+                if did.as_local().is_none()
+                    || !typeck.expr_ty(expression).is_unit()
+                        && !matches!(
+                            typeck.expr_ty(expression).kind(),
+                            TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool
+                        )
+                {
+                    return Err(SourceHold::UnsupportedOwnerUse);
+                }
+                alias_covered.insert(operand.hir_id.local_id.as_u32());
+                alias_boundary.insert((
+                    subject.fn_did,
+                    alias,
+                    argument.span.lo().0,
+                    argument.span.hi().0,
+                ));
+                alias_calls.push((
+                    expression,
+                    did,
+                    index,
+                    argument.span,
+                    LentLocal {
+                        hir_id: alias,
+                        spelling: spelling.clone(),
+                        is_view_alias: true,
+                    },
+                ));
+            }
+        }
+        let alias_key = (subject.fn_did, alias);
+        let alias_names = FxHashMap::from_iter([(alias_key, spelling.clone())]);
+        let alias_slice_uses = super::emitability::collect_slice_uses(
+            tcx,
+            &[subject.fn_did],
+            &alias_names,
+            &FxHashSet::from_iter([alias_key]),
+            &FxHashSet::default(),
+            &alias_boundary,
+        );
+        let alias_uses = alias_slice_uses
+            .get(&alias_key)
+            .ok_or(SourceHold::UnsupportedOwnerUse)?;
+        if alias_uses.unsupported.is_some()
+            || !alias_uses.return_handoffs.is_empty()
+            || alias_uses.raw_uses.iter().any(|u| {
+                !alias_covered.contains(&u.hir_id.local_id.as_u32()) || u.boundary_span.is_none()
+            })
+        {
+            return Err(SourceHold::UnsupportedOwnerUse);
+        }
+        let mut access_edits = Vec::new();
+        for edit in &alias_uses.rewrites {
+            let access = expressions
+                .0
+                .iter()
+                .find(|e| e.span == edit.span)
+                .ok_or(SourceHold::UnsupportedOwnerUse)?;
+            let ExprKind::Unary(rustc_hir::UnOp::Deref, operand) = access.kind else {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            };
+            let ExprKind::MethodCall(_, receiver, arguments, _) = operand.kind else {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            };
+            let did = typeck
+                .type_dependent_def_id(operand.hir_id)
+                .ok_or(SourceHold::UnsupportedOwnerUse)?;
+            if !root_path(receiver, alias)
+                || arguments.len() != 1
+                || tcx.crate_name(did.krate).as_str() != "core"
+                || tcx.item_name(did).as_str() != "offset"
+                || typeck.expr_ty(access) != *element
+            {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            }
+            alias_covered.insert(receiver.hir_id.local_id.as_u32());
+            access_edits.push(BoxExprEdit {
+                span: edit.span,
+                replacement: edit.replacement.clone(),
+                receipt: "native-box-view-alias-access",
+            });
+        }
+        access_edits.sort_by_key(|e| (e.span.lo(), e.span.hi()));
+        if access_edits
+            .windows(2)
+            .any(|w| w[0].span.hi() > w[1].span.lo())
+        {
+            return Err(SourceHold::UnsupportedOwnerUse);
+        }
+        let alias_all_uses: BTreeSet<_> = expressions
+            .0
+            .iter()
+            .filter(|e| root_path(e, alias))
+            .map(|e| e.hir_id.local_id.as_u32())
+            .collect();
+        if alias_all_uses != alias_covered {
+            return Err(SourceHold::UnsupportedOwnerUse);
+        }
+        let start_spelling = tcx
+            .sess
+            .source_map()
+            .span_to_snippet(start.span)
+            .map_err(|_| SourceHold::Missing("view-alias-start-spelling"))?;
+        view_aliases.push(ViewAlias {
+            hir_id: alias,
+            spelling,
+            initializer_span: init.span,
+            start: start_spelling,
+            access_edits,
+        });
+    }
 
     // Join every native MIR call to exactly one resolved HIR call. The key
     // includes both identities; no source-order zip or name repair is used.
@@ -706,35 +963,7 @@ pub(crate) fn derive<'tcx>(
     let allocator_destination = allocation_call
         .destination
         .ok_or(SourceHold::ConstructorShape)?;
-    let mut aliases = BTreeSet::from([subject.local.as_u32()]);
-    loop {
-        let before = aliases.len();
-        for data in body.basic_blocks.iter() {
-            for statement in &data.statements {
-                let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else {
-                    continue;
-                };
-                let Some(destination) = destination.as_local() else { continue };
-                let operand = match rvalue {
-                    Rvalue::Use(operand) | Rvalue::Cast(CastKind::PtrToPtr, operand, _) => operand,
-                    _ => continue,
-                };
-                let Some(source) = plain_local(operand) else { continue };
-                if !matches!(body.local_decls[destination].ty.kind(), TyKind::RawPtr(..))
-                    || !matches!(body.local_decls[source].ty.kind(), TyKind::RawPtr(..))
-                {
-                    continue;
-                }
-                if aliases.contains(&source.as_u32()) || aliases.contains(&destination.as_u32()) {
-                    aliases.insert(source.as_u32());
-                    aliases.insert(destination.as_u32());
-                }
-            }
-        }
-        if before == aliases.len() {
-            break;
-        }
-    }
+    let aliases = copy_closure(&body, BTreeSet::from([subject.local.as_u32()]));
     if !aliases.contains(&allocator_destination.as_u32()) {
         return Err(SourceHold::ConstructorIdentity);
     }
@@ -747,9 +976,37 @@ pub(crate) fn derive<'tcx>(
             return Err(SourceHold::UnsupportedOwnerUse);
         }
     }
+    // An alias's MIR locals: the derivation closure of the allocation result
+    // minus the owner's own copy aliases, restricted to the alias's name.
+    let alias_locals: BTreeSet<u32> = {
+        let names: BTreeSet<_> = view_aliases.iter().map(|a| a.spelling.as_str()).collect();
+        let seeds = body
+            .var_debug_info
+            .iter()
+            .filter(|info| names.contains(info.name.as_str()))
+            .filter_map(|info| match info.value {
+                rustc_middle::mir::VarDebugInfoContents::Place(place) => {
+                    place.as_local().map(|l| l.as_u32())
+                }
+                _ => None,
+            })
+            .collect();
+        copy_closure(&body, seeds)
+    };
+    let owner_lent = LentLocal {
+        hir_id: binding,
+        spelling: root_spelling.clone(),
+        is_view_alias: false,
+    };
     let mut frees = Vec::new();
     let mut calls = Vec::new();
-    for (expression, callee, argument, argument_span) in root_calls {
+    let every_call = root_calls
+        .into_iter()
+        .map(|(expression, callee, argument, span)| {
+            (expression, callee, argument, span, owner_lent.clone())
+        })
+        .chain(alias_calls);
+    for (expression, callee, argument, argument_span, lent) in every_call {
         let matched: Vec<_> = mir_calls
             .values()
             .filter(|c| c.expression.hir_id == expression.hir_id && c.callee == callee)
@@ -763,8 +1020,16 @@ pub(crate) fn derive<'tcx>(
             .get(argument)
             .and_then(|arg| plain_local(&arg.node))
             .ok_or(SourceHold::UnsupportedOwnerUse)?;
-        if !aliases.contains(&actual.as_u32()) {
+        let expected_locals = if lent.is_view_alias {
+            &alias_locals
+        } else {
+            &aliases
+        };
+        if !expected_locals.contains(&actual.as_u32()) {
             return Err(SourceHold::Identity);
+        }
+        if lent.is_view_alias && c_function(tcx, callee, "free") {
+            return Err(SourceHold::UnsupportedOwnerUse);
         }
         if c_function(tcx, callee, "free") {
             if argument != 0 {
@@ -789,6 +1054,7 @@ pub(crate) fn derive<'tcx>(
                 key: call.key,
                 callee,
                 argument,
+                lent,
                 argument_span,
                 call_span: expression.span,
                 scalar_arguments: scalar_arguments(expression, typeck)?,
@@ -947,6 +1213,7 @@ pub(crate) fn derive<'tcx>(
         return_transfer: returns.first().map(|r| r.span),
         allocation_local: allocator_destination.as_u32(),
         element_spelling: constructor.element_spelling,
+        view_aliases,
     })
 }
 

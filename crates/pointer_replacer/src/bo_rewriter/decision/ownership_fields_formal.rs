@@ -129,6 +129,16 @@ pub(crate) fn resolve(
         | Decision::Degraded(_) => false,
     };
     let terminal = crate::bo_rewriter::terminal_parameter_form(table, classes, callee, argument);
+    let wrapper_cursor_parameter = match decision {
+        Decision::Cursor { plan, .. } => plan.parameter && plan.wrapper,
+        Decision::Box(_)
+        | Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Degraded(_) => false,
+    };
     let emitted = if live && is_box {
         FormalForm::Box
     } else {
@@ -140,6 +150,12 @@ pub(crate) fn resolve(
             | super::seam::Form::Slice { mutable: true } => FormalForm::MutableReference,
             super::seam::Form::Ref { mutable: false }
             | super::seam::Form::Slice { mutable: false } => FormalForm::SharedReference,
+            // A cursor PARAMETER with the legacy wrapper is emitted as a plain
+            // slice (`&mut [T]`; the wrapper is built inside the callee), so
+            // the caller lends exactly as to a mutable slice formal.
+            super::seam::Form::Cursor { mutable: true } if wrapper_cursor_parameter => {
+                FormalForm::MutableReference
+            }
             _ => return Err(Hold::Lend(LendHold::Formal)),
         }
     };
@@ -339,6 +355,84 @@ mod tests {
             .unwrap();
             assert_eq!(recovered.emitted(), FormalForm::MutableRaw);
             assert!(recovered.require_lend().is_ok());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn r408_shared_reference_formal_resolves_under_a_live_class() {
+        // era-5c 002 / R408-3: under era-5b's joint pass a read-only formal
+        // models `Ref { mutable: false }`; the terminal resolver maps a live
+        // shared reference or shared slice formal to `SharedReference`, and
+        // a non-freeing callee admits the lend.
+        let source =
+            bo::ownership_fields_native_tests::native_fixture_source("edt", "edt(pl1,pl2);");
+        ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+            let (mut table, ctx) = bo::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    bo::A5Mode::PreciseReplay,
+                    Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let program = bo::collect_program(tcx);
+            let callee = *program
+                .functions
+                .iter()
+                .find(|id| tcx.def_path_str(id.to_def_id()) == "edt")
+                .unwrap();
+            let mut prepared = bo::prepare_plan_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )
+            .unwrap();
+            let id = SignatureClassId::of(callee);
+            prepared.plan.class_finalization.classes.insert(
+                id,
+                bo::plan::SignatureClassPlan {
+                    id,
+                    required_arms: Default::default(),
+                    site_keys: Vec::new(),
+                    edit_keys: Vec::new(),
+                    depends_on: Vec::new(),
+                    disposition: bo::plan::SignatureClassDisposition::Ready,
+                    sites: Vec::new(),
+                },
+            );
+            // Deliberate finalized-interface perturbation of the read-only
+            // formal `input` (argument 0): the joint pass's reading.
+            for shared in [
+                Decision::Ref { mutable: false },
+                Decision::Slice {
+                    mutable: false,
+                    uses: Vec::new(),
+                },
+            ] {
+                let row = table
+                    .entries
+                    .iter_mut()
+                    .find(|(s, _)| {
+                        s.fn_did == callee && matches!(s.kind, SubjectKind::Param { hir_index: 0 })
+                    })
+                    .unwrap();
+                row.1 = shared;
+                let formal = resolve(
+                    tcx,
+                    &ctx.slots,
+                    &ctx.model,
+                    &table,
+                    &prepared.plan.class_finalization,
+                    callee,
+                    0,
+                )
+                .unwrap();
+                assert_eq!(formal.emitted(), FormalForm::SharedReference);
+                assert!(formal.require_lend().is_ok());
+                assert!(require_nonconsuming(&NativeEffects::derive(&program), &formal).is_ok());
+            }
         })
         .unwrap();
     }

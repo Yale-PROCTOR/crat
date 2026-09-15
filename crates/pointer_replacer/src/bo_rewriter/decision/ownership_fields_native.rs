@@ -52,6 +52,9 @@ struct Bundle {
 pub(crate) struct Candidates {
     bundles: FxHashMap<Node, Bundle>,
     pub(crate) holds: FxHashMap<Node, NativeHold>,
+    /// Owners whose bundle was re-derived once at the ownership stage after
+    /// a callee's interface class was restored beneath the return-stage proof.
+    refreshed: FxHashSet<Node>,
     /// Observation only: the primary diagnosis before the native stage.
     /// Kept apart from native holds and final decisions, including on success.
     primary: FxHashMap<Node, (String, String)>,
@@ -240,7 +243,7 @@ impl Candidates {
             let bundle = source::derive(inputs.program, subject, inputs.constructions)
                 .map_err(NativeHold::Source)
                 .and_then(|source| {
-                    derive_bundle(inputs, table, classes, &effects, subject, &source)
+                    derive_bundle(inputs, table, classes, &effects, subject, &source, false)
                 });
             match bundle {
                 Ok(bundle) => {
@@ -258,6 +261,97 @@ impl Candidates {
     /// unchanged model owns the kind, and the final stage checks interfaces.
     pub(crate) fn plan(&self, node: Node) -> Option<&BoxPlan> {
         self.bundles.get(&node).map(|bundle| &bundle.plan)
+    }
+
+    /// The ownership stage's recheck. A formal proof taken at the return
+    /// stage can be stale here when a callee's interface class was restored
+    /// (its formal is raw again): the bundle is re-derived ONCE against the
+    /// current table and classes — the lend bridge changes text, nothing else
+    /// — and the stage re-runs with the refreshed plan; a bundle that cannot
+    /// be re-derived invalidates its owner exactly as before.
+    pub(crate) fn refresh_or_invalidate(
+        &mut self,
+        inputs: &Inputs<'_, '_>,
+        table: &DecisionTable,
+        classes: &ClassFinalization,
+    ) -> (FxHashSet<LocalDefId>, bool) {
+        let effects = NativeEffects::derive(inputs.program);
+        let mut refreshed = false;
+        let stale: Vec<Node> = self
+            .invalid_owner_nodes(inputs, table, classes)
+            .into_iter()
+            .filter(|node| !self.refreshed.contains(node))
+            .collect();
+        for node in stale {
+            let Some((subject, _)) = table
+                .entries
+                .iter()
+                .find(|(s, _)| (s.fn_did, s.hir_id) == node)
+            else {
+                continue;
+            };
+            let bundle = source::derive(inputs.program, subject, inputs.constructions)
+                .map_err(NativeHold::Source)
+                .and_then(|source| {
+                    derive_bundle(inputs, table, classes, &effects, subject, &source, true)
+                });
+            self.refreshed.insert(node);
+            match bundle {
+                Ok(bundle) => {
+                    self.bundles.insert(node, bundle);
+                    refreshed = true;
+                }
+                Err(hold) => {
+                    self.bundles.remove(&node);
+                    self.holds.insert(node, hold);
+                }
+            }
+        }
+        (self.invalid_owners(inputs, table, classes), refreshed)
+    }
+
+    fn invalid_owner_nodes(
+        &self,
+        inputs: &Inputs<'_, '_>,
+        table: &DecisionTable,
+        classes: &ClassFinalization,
+    ) -> Vec<Node> {
+        let mut invalid = Vec::new();
+        for (&node, bundle) in &self.bundles {
+            if !table.entries.iter().any(|(s, d)| {
+                let selected = match d {
+                    Decision::Box(plan) => plan == &bundle.plan,
+                    Decision::Degraded(_)
+                    | Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Slice { .. }
+                    | Decision::NestedSlice { .. }
+                    | Decision::Cursor { .. }
+                    | Decision::Opt { .. } => false,
+                };
+                (s.fn_did, s.hir_id) == node && selected
+            }) {
+                continue;
+            }
+            if bundle.formals.iter().any(|proof| {
+                let (callee, argument) = proof.identity();
+                formal::resolve(
+                    inputs.program.tcx,
+                    inputs.slots,
+                    inputs.model,
+                    table,
+                    classes,
+                    callee,
+                    argument,
+                )
+                .map_or(true, |current| current != *proof)
+                    || (proof.terminal() == super::seam::Form::Raw
+                        && !stable_raw_formal(table, callee, argument))
+            }) {
+                invalid.push(node);
+            }
+        }
+        invalid
     }
 
     pub(crate) fn invalid_owners(
@@ -296,7 +390,8 @@ impl Candidates {
                 )
                 .map_or(true, |current| current != *proof)
                     || (proof.terminal() == super::seam::Form::Raw
-                        && !stable_raw_formal(table, callee, argument))
+                        && !stable_raw_formal(table, callee, argument)
+                        && !self.refreshed.contains(&node))
                 {
                     invalid.insert(node.0);
                 }
@@ -339,6 +434,36 @@ fn under_slice_construction(
             .init
             .is_some_and(|init| init.span.contains(span) && init.span != span)
     })
+}
+
+/// The argument spans a selected native Box plan renders itself (a lend or a
+/// transfer, through the owner or one of its views). The seam plans no call
+/// glue at these positions.
+pub(crate) fn owned_argument_spans<'a>(
+    entries: impl Iterator<Item = &'a (super::Subject, Decision)>,
+) -> FxHashSet<(LocalDefId, rustc_span::Span)> {
+    let mut spans = FxHashSet::default();
+    for (subject, decision) in entries {
+        let plan = match decision {
+            Decision::Box(plan) => plan,
+            Decision::Degraded(_)
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Opt { .. } => continue,
+        };
+        for edit in &plan.expr_edits {
+            if matches!(
+                edit.receipt,
+                "native-box-lend-t1" | "native-box-transfer-to-c-free"
+            ) {
+                spans.insert((subject.fn_did, edit.span));
+            }
+        }
+    }
+    spans
 }
 
 fn outer_owning(
@@ -477,11 +602,13 @@ pub(crate) fn raw_lend_argument(
 }
 
 const DECLARATION_TYPE_RECEIPT: &str = "native-box-declaration-type";
+const VIEW_ALIAS_TYPE_RECEIPT: &str = "native-box-view-alias-type";
 
 /// R402-2(a): register the explicit declaration type of every native Box
 /// owner as a `local` explicit-declaration site, so both emission paths
 /// annotate the binding (`let mut p: ::std::boxed::Box<[T]> = …`).
 pub(crate) fn complete_declarations(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
     table: &super::DecisionTable,
     plan: &mut super::seam::SeamPlan,
 ) {
@@ -508,26 +635,43 @@ pub(crate) fn complete_declarations(
             continue;
         }
         let node = (subject.fn_did, subject.hir_id);
-        if plan
-            .explicit_declarations
-            .iter()
-            .any(|site| site.node == Some(node) && site.category == "local")
-        {
-            continue;
+        let mut declarations = vec![(node, subject.binding_span, emitted_type.to_owned())];
+        // The owner's view aliases: `let mut a = root.offset(e)` becomes
+        // `let mut a: &mut [T] = &mut (*root)[(e) as usize..]`.
+        for receipt in &box_plan.receipts {
+            let Some(rest) = receipt.strip_prefix(VIEW_ALIAS_TYPE_RECEIPT) else { continue };
+            let mut parts = rest.trim().splitn(2, ' ');
+            let (Some(local_id), Some(ty)) = (parts.next(), parts.next()) else { continue };
+            let Ok(local_id) = local_id.parse::<u32>() else { continue };
+            let alias = rustc_hir::HirId {
+                owner: subject.hir_id.owner,
+                local_id: rustc_hir::ItemLocalId::from_u32(local_id),
+            };
+            let span = tcx.hir_span(alias);
+            declarations.push(((subject.fn_did, alias), span, ty.to_owned()));
         }
-        plan.explicit_declarations
-            .push(super::seam::ExplicitDeclarationSite {
-                owner_class: crate::bo_rewriter::bridge_receipt::SignatureClassId::of(
-                    subject.fn_did,
-                ),
-                caller: subject.fn_did,
-                node: Some(node),
-                span: Some(subject.binding_span.shrink_to_hi()),
-                category: "local",
-                replacement: Some(format!(": {emitted_type}")),
-                emitted_type: emitted_type.to_owned(),
-                arm: "surface",
-            });
+        for (node, binding_span, emitted_type) in declarations {
+            if plan
+                .explicit_declarations
+                .iter()
+                .any(|site| site.node == Some(node) && site.category == "local")
+            {
+                continue;
+            }
+            plan.explicit_declarations
+                .push(super::seam::ExplicitDeclarationSite {
+                    owner_class: crate::bo_rewriter::bridge_receipt::SignatureClassId::of(
+                        subject.fn_did,
+                    ),
+                    caller: subject.fn_did,
+                    node: Some(node),
+                    span: Some(binding_span.shrink_to_hi()),
+                    category: "local",
+                    replacement: Some(format!(": {emitted_type}")),
+                    emitted_type,
+                    arm: "surface",
+                });
+        }
     }
 }
 
@@ -613,7 +757,20 @@ fn derive_bundle(
     effects: &NativeEffects<'_>,
     subject: &super::Subject,
     source: &SourcePlan,
+    final_stage: bool,
 ) -> Result<Bundle, NativeHold> {
+    // At the ownership stage (the last), a callee class that is not ready
+    // keeps its raw signature in the emitted program: a raw formal is final.
+    let raw_is_final = |callee: LocalDefId, argument: usize| {
+        stable_raw_formal(table, callee, argument)
+            || (final_stage
+                && !classes
+                    .classes
+                    .get(&crate::bo_rewriter::bridge_receipt::SignatureClassId::of(
+                        callee,
+                    ))
+                    .is_some_and(crate::bo_rewriter::plan::SignatureClassPlan::is_ready))
+    };
     let tcx = inputs.program.tcx;
     let name = subject.param_name.as_ref().ok_or(NativeHold::Identity)?;
     let mut edits = vec![source.constructor().clone()];
@@ -647,6 +804,17 @@ fn derive_bundle(
             "native-access-under-slice-construction",
         ));
     }
+    for alias in source.view_aliases() {
+        if source.shape() != BoxShape::Slice {
+            return Err(NativeHold::Missing("native-view-alias-shape"));
+        }
+        edits.push(BoxExprEdit {
+            span: alias.initializer_span,
+            replacement: format!("&mut (*({name}))[({}) as usize..]", alias.start),
+            receipt: "native-box-view-alias",
+        });
+        edits.extend_from_slice(&alias.access_edits);
+    }
     let mut receipts = vec![format!(
         "native-owning-source owner={} local={} generation=Missing source-root={:?}",
         subject.fn_did.local_def_index.as_u32(),
@@ -656,6 +824,19 @@ fn derive_bundle(
     receipts.push(format!(
         "{DECLARATION_TYPE_RECEIPT} ::std::boxed::Box<{payload}>"
     ));
+    for alias in source.view_aliases() {
+        receipts.push(format!(
+            "{VIEW_ALIAS_TYPE_RECEIPT} {} &mut [{}]",
+            alias.hir_id.local_id.as_u32(),
+            source.element_spelling()
+        ));
+        receipts.push(format!(
+            "native-box-view-alias alias={} start=({}) accesses={} runtime-checked=slice-start-and-index(R394-1) owner-untouched-while-live=borrow-checker",
+            alias.spelling,
+            alias.start,
+            alias.access_edits.len()
+        ));
+    }
     receipts.push(format!("native-box-slice-uses count={} element={} length-unchanged=closed-root-uses source-aliases={:?} indexing=delivered-slice-walker",source.count(),source.element(),source.mir_aliases()));
     receipts.push(format!("native-generated-unwind-permit operations=allocation-helpers-and-slice-bounds-checks all-roots=fresh-local-closed-uses-and-verified-T1 payload={}/nonrecursive; actual-waiver-sites=emitted-MIR-ledger",source.element()));
     let mut formals = Vec::new();
@@ -667,12 +848,17 @@ fn derive_bundle(
             .ok_or(NativeHold::Missing("native-local-callee"))?;
         let argument = obligation.argument();
         let key = obligation.key();
+        // The lent local is the owner or one of its view aliases; the
+        // raw-boundary site is keyed by that local's own binding.
+        let lent = obligation.lent();
+        let name: &str = &lent.spelling;
+        let lent_node = (subject.fn_did, lent.hir_id);
         let matching: Vec<_> = inputs
             .sites
             .sites
             .iter()
             .filter(|site| {
-                site.node == Some((subject.fn_did, subject.hir_id))
+                site.node == Some(lent_node)
                     && site.callee_local == Some(callee)
                     && site.key.block == key.block
                     && site.key.statement_index as usize == key.statement
@@ -698,6 +884,10 @@ fn derive_bundle(
         )
         .map_err(NativeHold::Call)?;
         let consumes = obligation.deallocator_events().is_some();
+        if consumes && lent.is_view_alias {
+            // A view never transfers ownership; only the owner does.
+            return Err(NativeHold::Call(Hold::Lend(LendHold::MoveInsteadOfLend)));
+        }
         let lend_expression = if consumes {
             if !source.nonempty() {
                 return Err(NativeHold::Missing("native-transfer-nonempty"));
@@ -706,9 +896,7 @@ fn derive_bundle(
                 return Err(NativeHold::Missing("native-transfer-allocator-contract"));
             }
             receipts.push("native-transfer-allocator=linux-System;global-allocators=none;nonempty=numeric-layout".into());
-            if emitted.terminal() != super::seam::Form::Raw
-                || !stable_raw_formal(table, callee, argument)
-            {
+            if emitted.terminal() != super::seam::Form::Raw || !raw_is_final(callee, argument) {
                 return Err(NativeHold::FinalInterface);
             }
             let proof =
@@ -752,7 +940,7 @@ fn derive_bundle(
             ));
             match (source.shape(), emitted.emitted(), emitted.terminal()) {
                 (BoxShape::Slice, FormalForm::MutableRaw, super::seam::Form::Raw)
-                    if stable_raw_formal(table, callee, argument) =>
+                    if raw_is_final(callee, argument) =>
                 {
                     raw_lend_argument(
                         source.shape(),
@@ -762,7 +950,7 @@ fn derive_bundle(
                     )
                 }
                 (BoxShape::Sized, FormalForm::MutableRaw, super::seam::Form::Raw)
-                    if stable_raw_formal(table, callee, argument) =>
+                    if raw_is_final(callee, argument) =>
                 {
                     raw_lend_argument(
                         source.shape(),
@@ -780,6 +968,11 @@ fn derive_bundle(
                     BoxShape::Sized,
                     FormalForm::MutableReference,
                     super::seam::Form::Ref { mutable: true },
+                )
+                | (
+                    BoxShape::Slice,
+                    FormalForm::MutableReference,
+                    super::seam::Form::Cursor { mutable: true },
                 ) => format!("&mut *({name})"),
                 // A thin formal over a slice owner: the callee decided a
                 // reference to ONE element (its uses are direct derefs), so
@@ -840,7 +1033,11 @@ fn derive_bundle(
         {
             return Err(NativeHold::Missing("native-complete-pointer-call-shape"));
         }
-        receipts.push(format!("native-box-call-scalar-evaluation {key:?} arguments={scalar_indices:?} effect-free=literal-local-cast"));
+        // E5C-3 (era-5c 002 claim 4): the lend/transfer invalidates no read
+        // in the argument list — the scalar operands are literals, scalar
+        // locals, casts and arithmetic over them, never a read through the
+        // owner or one of its views — so no hoist is owed at this site.
+        receipts.push(format!("native-box-call-scalar-evaluation {key:?} arguments={scalar_indices:?} effect-free=literal-local-cast reads-through-owner=none hoist=not-owed"));
         let peers: Vec<_> = inputs
             .sites
             .sites
@@ -1207,7 +1404,8 @@ mod audit_tests {
                 assert!(outer_owning(&ctx.slots, &ctx.model, subject));
                 let source = source::derive(&program, subject, &ctx.constructions).unwrap();
                 let bundle =
-                    derive_bundle(&inputs, &table, &classes, &effects, subject, &source).unwrap();
+                    derive_bundle(&inputs, &table, &classes, &effects, subject, &source, false)
+                        .unwrap();
                 assert_eq!(bundle.formals.len(), 1);
                 assert_eq!(bundle.formals[0].emitted(), FormalForm::MutableReference);
                 assert_eq!(

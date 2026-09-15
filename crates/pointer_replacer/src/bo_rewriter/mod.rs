@@ -7720,7 +7720,7 @@ fn finish_decide<'tcx>(
                 &prepared.plan.class_finalization,
             );
         } else if family_policy.stage == additive::FamilyStage::Ownership {
-            let invalid = native_ownership_candidates.invalid_owners(
+            let (invalid, refreshed) = native_ownership_candidates.refresh_or_invalidate(
                 &native_inputs,
                 &table,
                 &prepared.plan.class_finalization,
@@ -7732,7 +7732,7 @@ fn finish_decide<'tcx>(
                     bridge_receipt::SignatureClassId::of(owner),
                 ));
             }
-            if withdrawn {
+            if withdrawn || refreshed {
                 continue;
             }
         }

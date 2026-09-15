@@ -3657,6 +3657,8 @@ fn complete_interface_inventory(
     let Some(web) = lifetime_eligibility.fnptr_web() else {
         return;
     };
+    let native_owned_spans =
+        super::ownership_fields_native::owned_argument_spans(table.entries.iter());
 
     // Derive the required universe before observing any bridge/inventory row.
     // Base-path parameter decisions are the source of truth for emitted type
@@ -3769,7 +3771,36 @@ fn complete_interface_inventory(
                     .field_transactions
                     .argument_form(argument.span)
                     .unwrap_or_else(|| argument_form(mir_site.caller, &argument.shape, decisions));
-                if matches!(glue(expected, found, None), Ok(None)) {
+                // A native Box lend/transfer renders this argument in the
+                // emitted form itself; the interface is satisfied without
+                // glue, and the callee's class depends on the caller's
+                // ownership transaction exactly as on any safe source.
+                let native_owned = native_owned_spans.contains(&(mir_site.caller, argument.span));
+                if native_owned {
+                    plan.zero_bridges.push(ZeroBridgeSite {
+                        owner_class: SignatureClassId::of(mir_site.callee),
+                        caller: mir_site.caller,
+                        span: Some(argument.span),
+                        arm: receipt_arm(expected, found),
+                        position: format!("arg{index}"),
+                        // The identity carrier the callee-parameter input
+                        // maps; `found_form` names the ownership arm.
+                        bridge_kind: "interface-call-zero-syntax",
+                        expected_form: expected.key(),
+                        found_form: "native-box-lend",
+                        argument_kind: argument.shape.key(),
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                        unsafe_context: None,
+                    });
+                    if mir_site.caller != mir_site.callee {
+                        plan.interface_dependencies.push((
+                            SignatureClassId::of(mir_site.callee),
+                            SignatureClassId::of(mir_site.caller),
+                        ));
+                    }
+                    "zero-syntax"
+                } else if matches!(glue(expected, found, None), Ok(None)) {
                     plan.zero_bridges.push(ZeroBridgeSite {
                         owner_class: SignatureClassId::of(mir_site.callee),
                         caller: mir_site.caller,
@@ -3969,6 +4000,12 @@ pub(crate) fn synthesize_with_raw_boundary(
         decision_of.insert((subject.fn_did, subject.hir_id), decision);
         labels.insert((subject.fn_did, subject.hir_id), subject.label.clone());
     }
+    // Argument spans the ownership family already renders: a native Box
+    // owner's lend/transfer (through the owner or one of its views) IS the
+    // argument text, so no call glue is planned there — exactly as an
+    // A5-owned or PAIR-owned position is left to its arm.
+    let native_owned_spans =
+        super::ownership_fields_native::owned_argument_spans(table.entries.iter());
     let mut param_key: FxHashMap<(LocalDefId, usize), (LocalDefId, HirId)> = FxHashMap::default();
     for subject in subjects {
         if let SubjectKind::Param { hir_index } = subject.kind {
@@ -4743,7 +4780,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     });
                     continue;
                 }
-                if a5_call_owns_argument {
+                if a5_call_owns_argument || native_owned_spans.contains(&(site.caller, pos.span)) {
                     continue;
                 }
                 let input_rendering = match &input_candidates[idx] {
@@ -5854,7 +5891,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     super::construction_values::complete(tcx, table, &mut plan);
     super::raw_place_values::complete(tcx, table, &mut plan);
     super::raw_initializer::complete(tcx, table, &mut plan);
-    super::ownership_fields_native::complete_declarations(table, &mut plan);
+    super::ownership_fields_native::complete_declarations(tcx, table, &mut plan);
     complete_interface_inventory(
         facts,
         table,

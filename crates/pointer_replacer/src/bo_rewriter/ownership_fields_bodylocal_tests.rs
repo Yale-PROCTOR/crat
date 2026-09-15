@@ -29,8 +29,10 @@ fn verify(input: &str, owner_name: &str, shape: BoxShape, transfer: bool) -> Str
             "actual model grant"
         );
         println!(
-            "R395_NATIVE {} {decision:?}\n{}",
-            subject.label, ctx.raw_boundary_artifacts.ownership_native
+            "R395_NATIVE {} {decision:?}\n{}\nR395_FAMILY {:?}",
+            subject.label,
+            ctx.raw_boundary_artifacts.ownership_native,
+            ctx.raw_boundary_artifacts.additive_family_receipts
         );
         assert!(
             matches!(decision,Decision::Box(plan) if plan.shape==shape),
@@ -1381,6 +1383,335 @@ unsafe extern "C" fn qselect(mut v: *mut libc::c_float,
 }"#;
 
 #[test]
+fn r407_real_transform_to_distance_view_aliases_meet_the_owner_class_hold() {
+    // The verbatim corpus `transform_to_distance` + `edt`: four `calloc`
+    // owners whose every use is through a per-iteration alias
+    // `let mut f = ff.offset(height * x)` (written/read as `*f.offset(y)`,
+    // passed raw to `edt`), freed at the end. The native producer admits the
+    // alias as a runtime-checked mutable view over the owner (R394-1) and
+    // derives a bundle for every owner; the seam plans no call glue at the
+    // lent alias arguments (the lend is the argument text) and `edt`'s
+    // interface takes a dependency on the owner's class. The frontier is
+    // that class: the alias subjects stay `Degraded(copy-source-coupled)`
+    // siblings with a c-arm requirement, which holds the whole owner class
+    // (`blocked-subject:copy-source-coupled`, `missing-required-arm:c`) —
+    // the sibling hold R407-12 exempts a local-only Box plan from (wave-5d's
+    // per-subject scope). Pinned: no interval collision, every bundle
+    // derived, the dependency taken, the owners withdrawn with the class.
+    let input = format!(
+        r#"{}
+pub mod uint {{ pub type uint16_t = u16; }}
+use uint::uint16_t;
+#[repr(C)] #[derive(Copy, Clone)] pub struct heman_image_s {{ pub width: libc::c_int, pub height: libc::c_int, pub nbands: libc::c_int, pub data: *mut libc::c_float }}
+pub type heman_image = heman_image_s;
+pub static mut INF: libc::c_float = 1E20f64 as libc::c_float;
+{}"#,
+        c_declarations().replace("extern \"C\" { fn malloc", "extern \"C\" { fn calloc(n:libc::c_ulong,s:libc::c_ulong)->*mut libc::c_void; fn malloc"),
+        TRANSFORM_TO_DISTANCE_BODY
+    );
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        for name in ["ff", "dd", "zz", "ww"] {
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some(name))
+                .unwrap();
+            let slot = ctx.slots.fn_local_slots[&subject.fn_did]
+                .slot_for_local_depth(subject.local, 0)
+                .unwrap();
+            assert_eq!(
+                ctx.model.get(&super::SlotRef::Local(subject.fn_did, slot)),
+                Some(&super::SlotKind::Owning),
+                "{name}: actual model grant"
+            );
+            // The native bundle exists (the alias permit admitted every use);
+            // the final decision does not carry it.
+            let row = ctx
+                .raw_boundary_artifacts
+                .ownership_native
+                .lines()
+                .find(|row| row.starts_with(&format!("transform_to_distance::{name}#")))
+                .unwrap_or_else(|| panic!("{name}: no native audit row"));
+            assert!(
+                row.contains("\ttrue\tnot-selected\tCandidateNotSelected\t"),
+                "{name}: {row}"
+            );
+            assert!(
+                matches!(decision, Decision::Degraded(_)),
+                "{name}: {decision:?}"
+            );
+        }
+        let ownership_receipts = ctx
+            .raw_boundary_artifacts
+            .additive_family_receipts
+            .iter()
+            .filter(|r| r.family == "Ownership")
+            .map(|r| format!("{}: {}", r.owner_path, r.cause))
+            .collect::<Vec<_>>();
+        assert!(
+            ownership_receipts
+                .iter()
+                .all(|cause| !cause.contains("newer-family-collision")),
+            "{ownership_receipts:?}"
+        );
+        assert!(
+            ownership_receipts
+                .iter()
+                .any(|cause| cause.starts_with("edt: new-family-dependency:")),
+            "{ownership_receipts:?}"
+        );
+        assert!(
+            ownership_receipts
+                .iter()
+                .any(|cause| cause.starts_with("transform_to_distance: ")),
+            "{ownership_receipts:?}"
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn r407_per_iteration_alias_is_admitted_and_its_owner_class_holds() {
+    // The `transform_to_*` shape in miniature: a per-iteration alias
+    // `let mut row = buffer.offset(x * 4)` is the only handle on the owner
+    // inside the loop (written, read, passed to a local callee whose formal
+    // is a live shared slice). The alias permit derives the bundle; the seam
+    // plans no glue at the lent alias argument; the owner class holds on the
+    // alias sibling (`blocked-subject:copy-source-coupled`) — the exact
+    // R407-12 frontier, named in the ownership-stage receipt.
+    let input = format!(
+        "{} unsafe fn read(p:*mut u32, k:usize)->u32 {{ *p.offset(k as isize) }} pub unsafe fn prepare()->u32 {{ let mut buffer=calloc(8,core::mem::size_of::<u32>()) as *mut u32; let mut x=0isize; let mut total=0; while x<2 {{ let mut row=buffer.offset(x*4); *row.offset(1)=9; total+=read(row, 1); x+=1; }} free(buffer as *mut core::ffi::c_void); total }}",
+        declarations()
+    );
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("buffer"))
+            .unwrap();
+        assert!(matches!(decision, Decision::Degraded(_)), "{decision:?}");
+        let row = ctx
+            .raw_boundary_artifacts
+            .ownership_native
+            .lines()
+            .find(|row| row.starts_with("prepare::buffer#"))
+            .unwrap();
+        assert!(
+            row.contains("\ttrue\tnot-selected\tCandidateNotSelected\t"),
+            "{row}"
+        );
+        let receipt = ctx
+            .raw_boundary_artifacts
+            .additive_family_receipts
+            .iter()
+            .find(|r| r.family == "Ownership" && r.owner_path == "prepare")
+            .expect("ownership-stage receipt");
+        assert_eq!(
+            receipt.cause,
+            "unwitnessed-family-refusal:blocked-subject:copy-source-coupled"
+        );
+        // The composition itself held: no glue collided at the lent alias
+        // argument, and the callee's interface took its dependency on the
+        // owner's class (which is what falls with that class).
+        let callee = ctx
+            .raw_boundary_artifacts
+            .additive_family_receipts
+            .iter()
+            .find(|r| r.family == "Ownership" && r.owner_path == "read")
+            .expect("callee ownership-stage receipt");
+        assert!(
+            callee.cause.starts_with("new-family-dependency:"),
+            "{}",
+            callee.cause
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn r407_view_alias_start_must_be_pure() {
+    // The view's start is evaluated once at the binding; an effectful start
+    // (`next()`) or one reading through the owner (`*buffer`) is not a
+    // runtime-checked view of the owner and holds it.
+    for start in ["next() as isize", "*buffer as isize"] {
+        let input = format!(
+            "{} static mut COUNTER: usize = 0; unsafe fn next()->usize {{ COUNTER+=1; COUNTER }} pub unsafe fn prepare()->u32 {{ let mut buffer=calloc(8,core::mem::size_of::<u32>()) as *mut u32; let mut row=buffer.offset({start}); *row.offset(1)=9; let value=*row.offset(1); free(buffer as *mut core::ffi::c_void); value }}",
+            declarations()
+        );
+        ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+            let (table, _ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let (_, d) = table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("buffer"))
+                .unwrap();
+            assert!(matches!(d, Decision::Degraded(_)), "{start}: {d:?}");
+        })
+        .unwrap();
+    }
+    // Control: a pure start delivers the view.
+    let input = format!(
+        "{} pub unsafe fn prepare(k: isize)->u32 {{ let mut buffer=calloc(8,core::mem::size_of::<u32>()) as *mut u32; let mut row=buffer.offset(k * 2); *row.offset(1)=9; let value=*row.offset(1); free(buffer as *mut core::ffi::c_void); value }}",
+        declarations()
+    );
+    let s = verify(&input, "buffer", BoxShape::Slice, false);
+    assert!(
+        s.contains("let mut row: &mut [u32]=&mut (*(buffer))[(k * 2) as usize..];"),
+        "{s}"
+    );
+    assert!(s.contains("row[1]=9;"), "{s}");
+}
+
+const TRANSFORM_TO_DISTANCE_BODY: &str = r#"unsafe extern "C" fn transform_to_distance(mut sdf:
+        *mut heman_image) {
+    let mut width = (*sdf).width;
+    let mut height = (*sdf).height;
+    let mut size = width * height;
+    let mut ff =
+        calloc(size as libc::c_ulong,
+                ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+            *mut libc::c_float;
+    let mut dd =
+        calloc(size as libc::c_ulong,
+                ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+            *mut libc::c_float;
+    let mut zz =
+        calloc(((height + 1 as libc::c_int) *
+                            (width + 1 as libc::c_int)) as libc::c_ulong,
+                ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+            *mut libc::c_float;
+    let mut ww =
+        calloc(size as libc::c_ulong,
+                ::std::mem::size_of::<uint16_t>() as libc::c_ulong) as
+            *mut uint16_t;
+    let mut x: libc::c_int = 0;
+    x = 0 as libc::c_int;
+    while x < width {
+        let mut f = ff.offset((height * x) as isize);
+        let mut d = dd.offset((height * x) as isize);
+        let mut z =
+            zz.offset(((height + 1 as libc::c_int) * x) as isize);
+        let mut w = ww.offset((height * x) as isize);
+        let mut y = 0 as libc::c_int;
+        while y < height {
+            *f.offset(y as isize) =
+                *((*sdf).data).offset(((y * width) as isize) +
+                            (x as isize));
+            y += 1;
+        }
+        edt(f, d, z, w, height);
+        let mut y_0 = 0 as libc::c_int;
+        while y_0 < height {
+            *((*sdf).data).offset(((y_0 * width) as isize) +
+                            (x as isize)) = *d.offset(y_0 as isize);
+            y_0 += 1;
+        }
+        x += 1;
+    }
+    let mut y_1: libc::c_int = 0;
+    y_1 = 0 as libc::c_int;
+    while y_1 < height {
+        let mut f_0 = ff.offset((width * y_1) as isize);
+        let mut d_0 = dd.offset((width * y_1) as isize);
+        let mut z_0 =
+            zz.offset(((width + 1 as libc::c_int) * y_1) as isize);
+        let mut w_0 = ww.offset((width * y_1) as isize);
+        let mut x_0 = 0 as libc::c_int;
+        while x_0 < width {
+            *f_0.offset(x_0 as isize) =
+                *((*sdf).data).offset(((y_1 * width) as isize) +
+                            (x_0 as isize));
+            x_0 += 1;
+        }
+        edt(f_0, d_0, z_0, w_0, width);
+        let mut x_1 = 0 as libc::c_int;
+        while x_1 < width {
+            *((*sdf).data).offset(((y_1 * width) as isize) +
+                            (x_1 as isize)) = *d_0.offset(x_1 as isize);
+            x_1 += 1;
+        }
+        y_1 += 1;
+    }
+    free(ff as *mut libc::c_void);
+    free(dd as *mut libc::c_void);
+    free(zz as *mut libc::c_void);
+    free(ww as *mut libc::c_void);
+}
+unsafe extern "C" fn edt(mut f: *mut libc::c_float,
+    mut d: *mut libc::c_float, mut z: *mut libc::c_float,
+    mut w: *mut uint16_t, mut n: libc::c_int) {
+    let mut k = 0 as libc::c_int;
+    let mut s: libc::c_float = 0.;
+    *w.offset(0 as libc::c_int as isize) =
+        0 as libc::c_int as uint16_t;
+    *z.offset(0 as libc::c_int as isize) = -INF;
+    *z.offset(1 as libc::c_int as isize) = INF;
+    let mut q = 1 as libc::c_int;
+    while q < n {
+        s =
+            (*f.offset(q as isize) + (q * q) as libc::c_float -
+                        (*f.offset(*w.offset(k as isize) as isize) +
+                                (*w.offset(k as isize) as libc::c_int *
+                                            *w.offset(k as isize) as libc::c_int) as libc::c_float)) /
+                (2 as libc::c_int * q -
+                            2 as libc::c_int * *w.offset(k as isize) as libc::c_int) as
+                    libc::c_float;
+        while s <= *z.offset(k as isize) {
+            k -= 1;
+            s =
+                (*f.offset(q as isize) + (q * q) as libc::c_float -
+                            (*f.offset(*w.offset(k as isize) as isize) +
+                                    (*w.offset(k as isize) as libc::c_int *
+                                                *w.offset(k as isize) as libc::c_int) as libc::c_float)) /
+                    (2 as libc::c_int * q -
+                                2 as libc::c_int * *w.offset(k as isize) as libc::c_int) as
+                        libc::c_float;
+        }
+        k += 1;
+        *w.offset(k as isize) = q as uint16_t;
+        *z.offset(k as isize) = s;
+        *z.offset((k + 1 as libc::c_int) as isize) = INF;
+        q += 1;
+    }
+    k = 0 as libc::c_int;
+    let mut q_0 = 0 as libc::c_int;
+    while q_0 < n {
+        while *z.offset((k + 1 as libc::c_int) as isize) <
+                q_0 as libc::c_float {
+            k += 1;
+        }
+        *d.offset(q_0 as isize) =
+            ((q_0 - *w.offset(k as isize) as libc::c_int) *
+                            (q_0 - *w.offset(k as isize) as libc::c_int)) as
+                    libc::c_float + *f.offset(*w.offset(k as isize) as isize);
+        q_0 += 1;
+    }
+}"#;
+
+#[test]
 fn r395_heman_percentiles_real_shape_sizeof_first_wrapping_mul_count() {
     // `heman_ops_percentiles::vals#292`: sizeof-first operand order, an
     // index-written buffer read back in a loop, the C free at the end.
@@ -1469,6 +1800,53 @@ fn r395_scalar_arithmetic_call_arguments_are_pure_but_effectful_ones_hold() {
         assert!(matches!(d, Decision::Degraded(_)), "{d:?}");
     })
     .unwrap();
+}
+
+#[test]
+fn r408_argument_reading_through_the_owner_holds_no_hoist_is_owed() {
+    // E5C-3 (relay 022 §2): a lend/transfer argument list may not carry a
+    // read the borrow/move invalidates. The scalar-argument permit admits
+    // only literals, scalar locals, casts and arithmetic over them, so an
+    // argument reading THROUGH the owner (`read(buffer, *buffer.offset(1))`)
+    // or through a view of it (`read(buffer, *row)`) holds the owner — no
+    // read is hoisted. Each case pairs with a delivering control whose only
+    // difference is the argument.
+    let fixture = |prefix: &str, argument: &str| {
+        format!(
+            "{} unsafe fn read(p:*mut u32, k:usize)->u32 {{ *p.offset(k as isize) }} pub unsafe fn prepare()->u32 {{ let mut buffer=calloc(4,core::mem::size_of::<u32>()) as *mut u32; {prefix} let value=read(buffer, {argument}); free(buffer as *mut core::ffi::c_void); value }}",
+            declarations()
+        )
+    };
+    for (prefix, argument) in [
+        ("*buffer=1;", "*buffer.offset(1) as usize"),
+        (
+            "let mut row=buffer.offset(1); *row.offset(0)=2;",
+            "*row.offset(0) as usize",
+        ),
+    ] {
+        ::utils::compilation::run_compiler_on_str(&fixture(prefix, argument), |tcx| {
+            let (table, _ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let (_, d) = table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("buffer"))
+                .unwrap();
+            assert!(matches!(d, Decision::Degraded(_)), "{argument}: {d:?}");
+        })
+        .unwrap();
+        let s = verify(&fixture(prefix, "1"), "buffer", BoxShape::Slice, false);
+        assert!(
+            s.contains("read(<[_]>::as_mut_ptr(&mut *(buffer)), 1)"),
+            "{s}"
+        );
+    }
 }
 
 #[test]
