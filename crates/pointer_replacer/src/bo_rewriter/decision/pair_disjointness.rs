@@ -234,6 +234,10 @@ impl PairDisjointnessIndex {
         let local_functions: FxHashSet<LocalDefId> = program.functions.iter().copied().collect();
         let allocators = allocator_wrappers(tcx, &local_functions, indirect_calls);
         let unions = union_member_classes(tcx, program);
+        // Member closures are shared across every pair: brotli's ~3k functions
+        // ask about the same few hundred pointee types, and recomputing the
+        // closure per pair cost the first census its 20-minute slot.
+        let mut closures: FxHashMap<TypeClass, FxHashSet<TypeClass>> = FxHashMap::default();
 
         let mut sites: FxHashMap<(u32, u32), Vec<SiteRecord>> = FxHashMap::default();
         for &caller in &program.functions {
@@ -284,7 +288,7 @@ impl PairDisjointnessIndex {
                     let (Some(a), Some(b)) = (pointees[left], pointees[right]) else {
                         continue;
                     };
-                    let verdict = type_rule(tcx, a, b, &unions);
+                    let verdict = type_rule(tcx, a, b, &unions, &mut closures);
                     type_verdicts.insert(
                         (callee.local_def_index.as_u32(), left, right),
                         PairTypeVerdict { verdict },
@@ -505,6 +509,7 @@ fn type_rule<'tcx>(
     a: Ty<'tcx>,
     b: Ty<'tcx>,
     unions: &[FxHashSet<TypeClass>],
+    closures: &mut FxHashMap<TypeClass, FxHashSet<TypeClass>>,
 ) -> Result<(), Unproved> {
     let ca = type_class(tcx, a);
     let cb = type_class(tcx, b);
@@ -520,8 +525,14 @@ fn type_rule<'tcx>(
     if is_union_class(tcx, &ca) || is_union_class(tcx, &cb) {
         return Err(Unproved::UnionPointee);
     }
-    let members_a = member_closure(tcx, &ca);
-    let members_b = member_closure(tcx, &cb);
+    let members_a = closures
+        .entry(ca.clone())
+        .or_insert_with(|| member_closure(tcx, &ca))
+        .clone();
+    let members_b = closures
+        .entry(cb.clone())
+        .or_insert_with(|| member_closure(tcx, &cb))
+        .clone();
     if members_a.contains(&TypeClass::Unresolved) || members_b.contains(&TypeClass::Unresolved) {
         return Err(Unproved::TypeUnresolved);
     }
