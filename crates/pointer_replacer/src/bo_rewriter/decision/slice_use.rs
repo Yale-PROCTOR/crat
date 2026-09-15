@@ -376,6 +376,17 @@ pub(crate) fn receipt_plans(
                                     },
                                     _ => false,
                                 };
+                                // wave-6a W6A-B1: a safe slice passed at a
+                                // settled slice parameter needs no carrier.
+                                let zero_syntax_parameter = match parameters.as_slice() {
+                                    [(_, decision)] => {
+                                        super::slice_local_construction::zero_syntax_slice_pass(
+                                            source,
+                                            super::seam::form_of(decision),
+                                        )
+                                    }
+                                    _ => None,
+                                };
                                 let carriers = table
                                     .seams
                                     .edits
@@ -402,6 +413,16 @@ pub(crate) fn receipt_plans(
                                         "existing-c-carrier:expected={};found={}",
                                         carrier.expected.key(),
                                         carrier.found.key()
+                                    );
+                                } else if carriers.is_empty()
+                                    && let Some(expected) = zero_syntax_parameter
+                                {
+                                    adapter = "owned-existing-c-interface:zero-syntax".to_owned();
+                                    target_form_override = Some(expected.key().to_owned());
+                                    boundary_evidence = format!(
+                                        "existing-c-zero-syntax:expected={};found={}",
+                                        expected.key(),
+                                        source.key()
                                     );
                                 } else {
                                     reason = Some(MechanicalTerminalReason::EvidenceMissing(

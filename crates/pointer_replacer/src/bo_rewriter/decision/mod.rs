@@ -101,6 +101,7 @@ pub(crate) mod slice_input;
 mod slice_input_root_tests;
 #[cfg(test)]
 mod slice_input_tests;
+pub(crate) mod slice_local_construction;
 pub(crate) mod slice_use;
 pub(crate) mod surface_argument;
 pub(crate) mod thin_counted;
@@ -1711,6 +1712,12 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         Decision::InferredRef { .. } => decision,
         Decision::Box(ref plan) if plan.inferred_binding => decision,
         Decision::Opt { .. } if typed_pattern => decision,
+        // wave-6a W6A-B1: the sealed constructor types the initializer.
+        Decision::Slice { .. } | Decision::Opt { slice: true, .. }
+            if slice_local_construction::inferred_binding(ctx, subject, &decision) =>
+        {
+            decision
+        }
         Decision::Slice { mutable, .. }
             if receiver.is_some_and(|receiver| {
                 receiver.receiver_form == seam::Form::Slice { mutable }

@@ -4166,7 +4166,9 @@ pub(crate) fn plan(
         // the rewritten initializer. It still needs a file anchor for its value
         // edits, but deliberately has no declaration splice. Every other form
         // retains the long-standing syntactic-pointee requirement.
-        let inferred_box = box_plan.is_some_and(|plan| plan.inferred_binding);
+        let inferred_box = box_plan.is_some_and(|plan| plan.inferred_binding)
+            // wave-6a W6A-B1: an unannotated slice local typed by its constructor.
+            || super::decision::slice_local_construction::planner_inferred(table, subject, decision);
         let typed_pattern = table
             .declaration_patterns
             .contains_key(&(subject.fn_did, subject.hir_id))

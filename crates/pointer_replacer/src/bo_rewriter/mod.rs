@@ -118,6 +118,8 @@ mod wave5r_tests;
 #[cfg(test)]
 mod wave6f_field_reference_tests;
 pub(crate) mod wave6r_child_access;
+#[cfg(test)]
+mod wave6a_allocation_tests;
 mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;
 
@@ -7656,6 +7658,8 @@ fn finish_decide<'tcx>(
         decision::slice_construction_values::append_declarations(tcx, &mut table);
         append_field_load_declaration_plans(&mut table)?;
         decision::field_reference::reconcile_a5_raw_views(tcx, &mut table)?;
+        // wave-6a W6A-B1: explicit types on constructor-typed slice locals.
+        decision::slice_local_construction::append_explicit_declarations(tcx, &mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
