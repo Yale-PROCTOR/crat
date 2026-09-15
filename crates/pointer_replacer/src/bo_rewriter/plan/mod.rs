@@ -548,6 +548,62 @@ fn nested_ast_composition(
     }
 }
 
+/// R397 collision composition (wave-5d): an A5 T2-fallback wrapper — the
+/// whole-call `pair` site owned by the callee class — over another class's
+/// edit inside one of the call's UNSELECTED arguments. `A5RawGraftVisitor`
+/// walks the call's children first and pretty-prints the transformed call,
+/// substituting only the selected views' arguments with raw views; an edit in
+/// any other argument therefore survives verbatim in the rendered wrapper. An
+/// edit inside a selected view's argument would be overwritten by that raw
+/// view and still collides. The selected arguments are the wrapper's sibling
+/// `pair:arg{N}` sites of the same call; a wrapper without them gives the
+/// planner no way to tell selected from unselected and still collides. The
+/// outer depends on the inner (the existing containment discipline).
+fn a5_wrapper_over_unselected_argument(
+    left: &ClassSite,
+    right: &ClassSite,
+    all_sites: &[ClassSite],
+) -> Option<(SignatureClassId, SignatureClassId)> {
+    let composable = |outer: &ClassSite, inner: &ClassSite| {
+        let wrapper = outer.key.arm == "pair"
+            && outer.key.bridge_kind == "a5-site-proof-t2-fallback"
+            && outer.key.position.starts_with("args=");
+        if !wrapper
+            || outer.key.owner_class == inner.key.owner_class
+            || !matches!(inner.key.arm.as_str(), "c" | "glue" | "surface")
+            || outer.key.file != inner.key.file
+            || !(outer.key.lo < inner.key.lo && inner.key.hi < outer.key.hi)
+        {
+            return false;
+        }
+        let selected = all_sites
+            .iter()
+            .filter(|site| {
+                site.key.owner_class == outer.key.owner_class
+                    && site.key.caller == outer.key.caller
+                    && site.key.arm == "pair"
+                    && site.key.bridge_kind == outer.key.bridge_kind
+                    && site.key.position.starts_with("arg")
+                    && !site.key.position.starts_with("args=")
+                    && site.key.file == outer.key.file
+                    && outer.key.lo <= site.key.lo
+                    && site.key.hi <= outer.key.hi
+            })
+            .collect::<Vec<_>>();
+        !selected.is_empty()
+            && selected
+                .iter()
+                .all(|view| inner.key.hi <= view.key.lo || view.key.hi <= inner.key.lo)
+    };
+    if composable(left, right) {
+        Some((left.key.owner_class, right.key.owner_class))
+    } else if composable(right, left) {
+        Some((right.key.owner_class, left.key.owner_class))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct A5ProofResolution {
     kind: &'static str,
@@ -742,7 +798,9 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
             if !intervals_overlap(left, right) {
                 continue;
             }
-            if let Some((outer, inner)) = nested_ast_composition(left, right) {
+            if let Some((outer, inner)) = nested_ast_composition(left, right)
+                .or_else(|| a5_wrapper_over_unselected_argument(left, right, &all_sites))
+            {
                 if outer != inner {
                     composed_dependencies.insert((outer, inner));
                 }

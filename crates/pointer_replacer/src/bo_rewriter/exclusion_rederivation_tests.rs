@@ -836,3 +836,134 @@ fn bzip2_blocksort_pass_on_keeps_both_eclass_slices() {
         outcome.receipts
     );
 }
+
+/// The collision composition (R397 / relay 014 §5): brotli's 49 `a5-site-proof-
+/// t2-fallback` × `raw-cast-const` rows — `EvaluateNode`'s edit on the argument
+/// `nodes` inside `ComputeDistanceCache`'s A5 wrapper (lib.rs 7503003..7503119,
+/// the selected views at arg 1 and arg 3, `nodes` at arg 2). The AST layer
+/// renders the wrapper from the transformed call and replaces only the selected
+/// views, so an edit inside an UNSELECTED argument survives verbatim; the
+/// planner must compose it (outer depends on inner) instead of colliding.
+mod a5_wrapper_over_unselected_argument {
+    use crate::bo_rewriter::{
+        bridge_receipt::SignatureClassId,
+        decision::{Arm, RequiredArmSet},
+        plan::{self, ClassInput, ClassSite},
+    };
+
+    const CALL: (u32, u32) = (7_503_003, 7_503_119);
+    const ARG1: (u32, u32) = (7_503_028, 7_503_047); // starting_dist_cache (selected)
+    const ARG2: (u32, u32) = (7_503_050, 7_503_055); // nodes (unselected)
+    const ARG3: (u32, u32) = (7_503_061, 7_503_118); // dist_cache (selected)
+
+    /// The whole-call wrapper and its selected `arg{N}` view sites share ONE
+    /// physical edit key, as the planner records them (R231).
+    fn wrapper(owner: SignatureClassId, caller: SignatureClassId) -> ClassInput {
+        let mut whole = ClassSite::edit(
+            owner,
+            caller,
+            Arm::Pair,
+            "lib.rs",
+            CALL.0,
+            CALL.1,
+            "a5-site-proof-t2-fallback",
+        );
+        whole.key.position = "args=arg=1,arg=3".to_owned();
+        let mut input = ClassInput::new(owner, RequiredArmSet::default());
+        for (position, (lo, hi)) in [("arg1", ARG1), ("arg3", ARG3)] {
+            let mut site = ClassSite::edit(
+                owner,
+                caller,
+                Arm::Pair,
+                "lib.rs",
+                lo,
+                hi,
+                "a5-site-proof-t2-fallback",
+            );
+            site.key.position = position.to_owned();
+            site.edit_key.clone_from(&whole.edit_key);
+            input.sites.push(site);
+        }
+        input.sites.push(whole);
+        input
+    }
+
+    fn inner(owner: SignatureClassId, (lo, hi): (u32, u32)) -> ClassInput {
+        ClassInput::new(owner, RequiredArmSet::default()).with_site(ClassSite::edit(
+            owner,
+            owner,
+            Arm::C,
+            "lib.rs",
+            lo,
+            hi,
+            "raw-cast-const",
+        ))
+    }
+
+    fn with_two(test: impl FnOnce(SignatureClassId, SignatureClassId) + Send) {
+        ::utils::compilation::run_compiler_on_str(
+            "pub unsafe fn callee(p: *const i32) -> i32 { *p }\npub unsafe fn caller(p: *const i32) -> i32 { callee(p) }",
+            |tcx| {
+                let owners = tcx
+                    .hir_body_owners()
+                    .filter(|d| tcx.def_kind(*d) == rustc_hir::def::DefKind::Fn)
+                    .collect::<Vec<_>>();
+                test(SignatureClassId::of(owners[0]), SignatureClassId::of(owners[1]));
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_edit_in_an_unselected_argument_composes_under_the_wrapper() {
+        with_two(|callee, caller| {
+            let f = plan::finalize_class_inputs(vec![wrapper(callee, caller), inner(caller, ARG2)]);
+            assert!(f.collisions.is_empty(), "{:#?}", f.collisions);
+            assert!(
+                f.classes[&callee].is_ready(),
+                "{:?}",
+                f.classes[&callee].hold_reasons()
+            );
+            assert!(
+                f.classes[&caller].is_ready(),
+                "{:?}",
+                f.classes[&caller].hold_reasons()
+            );
+            assert!(
+                f.classes[&callee].depends_on.contains(&caller),
+                "the wrapper depends on the inner edit it renders over: {:?}",
+                f.classes[&callee].depends_on
+            );
+        });
+    }
+
+    /// An edit inside a SELECTED view's argument would be overwritten by the
+    /// raw view the wrapper substitutes there: it still collides.
+    #[test]
+    fn an_edit_in_a_selected_argument_still_collides() {
+        with_two(|callee, caller| {
+            let f = plan::finalize_class_inputs(vec![
+                wrapper(callee, caller),
+                inner(caller, (ARG1.0 + 2, ARG1.0 + 7)),
+            ]);
+            // Both the whole-call wrapper and the selected `arg1` view collide
+            // with the inner edit.
+            assert_eq!(f.collisions.len(), 2, "{:#?}", f.collisions);
+            assert!(!f.classes[&callee].is_ready());
+            assert!(!f.classes[&caller].is_ready());
+        });
+    }
+
+    /// A wrapper whose selected views are not recorded as `arg{N}` sites gives
+    /// the planner no way to tell selected from unselected: it still collides.
+    #[test]
+    fn a_wrapper_without_selected_view_sites_still_collides() {
+        with_two(|callee, caller| {
+            let mut w = wrapper(callee, caller);
+            w.sites
+                .retain(|site| site.key.position.starts_with("args="));
+            let f = plan::finalize_class_inputs(vec![w, inner(caller, ARG2)]);
+            assert_eq!(f.collisions.len(), 1, "{:#?}", f.collisions);
+        });
+    }
+}
