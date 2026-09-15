@@ -496,11 +496,14 @@ pub(crate) fn derive<'tcx>(
     }
     // Whole-caller reference/closure absence is a deliberately narrow scope.
     // Merely recognizing the scalar deref nested inside &*root is not enough.
+    // A string / byte-string literal is a `&'static` reference to static
+    // data (the corpus's assertion messages); it cannot alias the owner.
     if expressions.0.iter().any(|e| {
         matches!(
             e.kind,
             ExprKind::AddrOf(..) | ExprKind::Closure(..) | ExprKind::InlineAsm(..)
-        ) || matches!(typeck.expr_ty(e).kind(), TyKind::Ref(..))
+        ) || (matches!(typeck.expr_ty(e).kind(), TyKind::Ref(..))
+            && !matches!(e.kind, ExprKind::Lit(_)))
     }) {
         return Err(SourceHold::UnsupportedOwnerUse);
     }
@@ -880,6 +883,10 @@ pub(crate) fn derive<'tcx>(
             }
             | TerminatorKind::Assert { target, .. } => vec![*target],
             TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().to_vec(),
+            // A diverging call (`__assert_fail`, `abort`) and an unreachable
+            // block end the path without returning: the owner is neither
+            // freed nor dropped there, exactly as in C.
+            TerminatorKind::Call { target: None, .. } | TerminatorKind::Unreachable => Vec::new(),
             TerminatorKind::FalseEdge { real_target, .. }
             | TerminatorKind::FalseUnwind { real_target, .. } => vec![*real_target],
             TerminatorKind::Return if state != State::Live => Vec::new(),
