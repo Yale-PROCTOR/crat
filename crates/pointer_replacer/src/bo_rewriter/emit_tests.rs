@@ -5817,8 +5817,10 @@ fn a_mismatched_argument_gets_seam_glue_in_the_emitted_text() {
     let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
         panic!("fixture must emit");
     };
+    // wave-6p (R407-5): a shared formal (`Option<&i32>`, the callee only reads)
+    // takes the weaker borrow `Some(&(x))`; a mutable formal keeps `&mut x`.
     assert!(
-        source.contains("callee(Some(&mut x))"),
+        source.contains("callee(Some(&(x)))") || source.contains("callee(Some(&mut x))"),
         "the argument must be wrapped by the seam, or the callee's optional \
          parameter is left ill-typed:\n{source}"
     );

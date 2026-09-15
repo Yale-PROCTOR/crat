@@ -1020,3 +1020,126 @@ fn w6p_plain_root_multi_view_keeps_the_certificate_and_emits() {
     println!("W6P_BINN_PLAIN_SOURCE_BEGIN\n{source}\nW6P_BINN_PLAIN_SOURCE_END");
     assert_eq!(reverted, 0, "{diags:?}");
 }
+
+/// brotli `ChooseDistanceParams` → `ComputeDistanceCost(cmds, num_commands,
+/// &mut orig_params.dist, &mut orig_params.dist, &mut dist_cost_0)`: the SAME
+/// place passed twice as `&mut` into two SHARED formals (`*const
+/// BrotliDistanceParams`). The two `&mut` borrows coerce to `&` but are still
+/// two mutable borrows of one place — E0499 — and that one error's class revert
+/// closed over ~260 brotli functions (report 003). With the shared-argument
+/// weakening (R407-5) both arguments emit as `&(orig_params.dist)`.
+const COMPUTE_DISTANCE_COST: &str = r#"
+    #[repr(C)]
+    pub struct Command { pub insert_len_: u32, pub copy_len_: u32, pub dist_extra_: u32, pub cmd_prefix_: u16, pub dist_prefix_: u16 }
+    #[repr(C)]
+    pub struct BrotliDistanceParams { pub distance_postfix_bits: u32, pub num_direct_distance_codes: u32, pub alphabet_size_max: u32, pub alphabet_size_limit: u32, pub max_distance: u64 }
+    #[repr(C)]
+    pub struct BrotliEncoderParams { pub quality: i32, pub dist: BrotliDistanceParams }
+    pub unsafe fn ComputeDistanceCost(cmds: *const Command, num_commands: u64, orig_params: *const BrotliDistanceParams, new_params: *const BrotliDistanceParams, cost: *mut f64) -> i32 {
+        let mut equal_params = 0;
+        if (*orig_params).distance_postfix_bits == (*new_params).distance_postfix_bits
+            && (*orig_params).num_direct_distance_codes == (*new_params).num_direct_distance_codes {
+            equal_params = 1;
+        }
+        let mut i = 0u64;
+        let mut extra_bits = 0.0f64;
+        while i < num_commands {
+            let cmd: *const Command = &*cmds.offset(i as isize) as *const Command;
+            if (*cmd).cmd_prefix_ as i32 >= 128 {
+                if equal_params == 0 && (*cmd).dist_extra_ as u64 > (*new_params).max_distance {
+                    return 0;
+                }
+                extra_bits += (*cmd).dist_prefix_ as f64;
+            }
+            i += 1;
+        }
+        *cost = extra_bits;
+        1
+    }
+    pub unsafe fn ChooseDistanceParams(params: *mut BrotliEncoderParams, cmds: *const Command, num_commands: u64) {
+        let mut orig_params = BrotliEncoderParams { quality: (*params).quality, dist: BrotliDistanceParams { distance_postfix_bits: 0, num_direct_distance_codes: 0, alphabet_size_max: 0, alphabet_size_limit: 0, max_distance: 0 } };
+        orig_params.dist = BrotliDistanceParams { distance_postfix_bits: (*params).dist.distance_postfix_bits, num_direct_distance_codes: (*params).dist.num_direct_distance_codes, alphabet_size_max: 0, alphabet_size_limit: 0, max_distance: (*params).dist.max_distance };
+        let mut new_params = BrotliEncoderParams { quality: 0, dist: BrotliDistanceParams { distance_postfix_bits: 1, num_direct_distance_codes: 4, alphabet_size_max: 0, alphabet_size_limit: 0, max_distance: 1024 } };
+        let mut dist_cost = 0.0f64;
+        let skip = (ComputeDistanceCost(cmds, num_commands, &mut orig_params.dist, &mut new_params.dist, &mut dist_cost) == 0) as i32;
+        if skip == 0 {
+            (*params).dist = new_params.dist;
+        }
+        let mut dist_cost_0 = 0.0f64;
+        ComputeDistanceCost(cmds, num_commands, &mut orig_params.dist, &mut orig_params.dist, &mut dist_cost_0);
+        if dist_cost_0 < dist_cost {
+            (*params).dist = orig_params.dist;
+        }
+    }
+"#;
+
+#[test]
+fn w6p_shared_formal_takes_a_shared_borrow_of_the_place_passed_twice() {
+    let (source, reverted, diags) = path_emission(COMPUTE_DISTANCE_COST, "cdc");
+    for diag in &diags {
+        println!("W6P_CDC diag {diag}");
+    }
+    println!("W6P_CDC_SOURCE_BEGIN\n{source}\nW6P_CDC_SOURCE_END");
+    assert_eq!(
+        reverted, 0,
+        "ComputeDistanceCost must not revert: {diags:?}"
+    );
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("&(orig_params.dist),&(orig_params.dist),&mutdist_cost_0"),
+        "both shared formals receive the weaker borrow:\n{source}"
+    );
+    assert!(
+        compact.contains("&(orig_params.dist),&(new_params.dist),&mutdist_cost"),
+        "the distinct-place call is weakened too:\n{source}"
+    );
+    assert!(
+        !compact.contains("&mutorig_params.dist"),
+        "no `&mut` spelling survives at the shared formals:\n{source}"
+    );
+}
+
+#[test]
+fn w6p_debug_wave6r_held() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+pub struct H6 { num: i32 }
+pub struct HROLLING { tag: i32 }
+pub struct H65 { ha: H6, hb: HROLLING }
+pub unsafe fn prepare_h6(s: *mut H6, cache: *mut i32) {
+    *cache = (*s).num + (s as usize) as i32;
+}
+pub unsafe fn prepare_hrolling(s: *mut HROLLING, cache: *mut i32) {
+    *cache += (s as usize) as i32;
+}
+pub unsafe fn prepare_h65(s: *mut H65, cache: *mut i32) {
+    prepare_h6(&mut (*s).ha, cache);
+    prepare_hrolling(&mut (*s).hb, cache);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise()).expect("d");
+        for edit in &table.seams.edits {
+            println!(
+                "W6P_DBG_SEAM {} => {} #{} family={:?} text={:?} key={}",
+                edit.caller_fn,
+                edit.owner_fn,
+                edit.param_index,
+                edit.family,
+                edit.replacement,
+                edit.spec.template_key()
+            );
+        }
+        let emission =
+            bo_rewriter::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+                .expect("e");
+        for class in emission.plan.held_classes() {
+            println!(
+                "W6P_DBG_HELD {} {:?}",
+                tcx.def_path_str(class.local_def_id().to_def_id()),
+                emission.plan.class_hold_reason(class)
+            );
+        }
+    })
+    .expect("c");
+}

@@ -1111,6 +1111,9 @@ pub(crate) struct GlueSpec {
     pub(crate) void_region: Option<super::void_region::Bridge>,
     pub(crate) forward_slice: Option<super::slice_forms::ForwardView>,
     pub shared_address: Option<super::overlapping_pairs::consumer::SharedAddress>,
+    /// wave-6p (R407-5): an `&mut place` argument at a SHARED formal is emitted
+    /// as `&(place)` / `Some(&(place))` — a strictly weaker borrow.
+    pub shared_weakening: Option<super::shared_weakening::SharedWeakening>,
     pub core: GlueCore,
     /// The EXPECTED side's mutability — selects `&`/`&mut` and
     /// `from_ref`/`from_mut`.
@@ -1165,6 +1168,7 @@ impl GlueSpec {
             void_region: None,
             forward_slice: None,
             shared_address: None,
+            shared_weakening: None,
             core,
             mutable,
             unwrap: None,
@@ -1230,6 +1234,7 @@ impl GlueSpec {
             void_region: None,
             forward_slice: None,
             shared_address: None,
+            shared_weakening: None,
             core: GlueCore::Bare,
             mutable,
             unwrap: None,
@@ -1253,6 +1258,7 @@ impl GlueSpec {
             void_region: None,
             forward_slice: None,
             shared_address: None,
+            shared_weakening: None,
             core: GlueCore::Bare,
             mutable: target_mutability == super::raw_boundary::RawMutability::Mut,
             unwrap: None,
@@ -1332,6 +1338,9 @@ impl GlueSpec {
     pub(crate) fn template_key(&self) -> &'static str {
         if self.shared_address.is_some() {
             return "shared-pair-address";
+        }
+        if let Some(weakening) = &self.shared_weakening {
+            return weakening.key();
         }
         if let Some(raw) = self.raw_boundary.as_ref() {
             return raw.template.key();
@@ -1496,6 +1505,9 @@ impl GlueSpec {
         }
         let shifted = self.forward_slice.as_ref().map(|view| view.render(text));
         let text = shifted.as_deref().unwrap_or(text);
+        if let Some(weakening) = &self.shared_weakening {
+            return weakening.render(text);
+        }
         let unsafe_expr = |inner: String| {
             super::super::mechanical_receipt::present_unsafe_text(inner, enclosing_unsafe_fn)
         };
@@ -3258,6 +3270,53 @@ impl Candidate {
     }
 }
 
+/// wave-6p (R407-5): an `&mut place` argument at a SHARED formal. Replaces the
+/// zero-syntax coercion (`&T` expected) or the bare `Some(p)` wrap
+/// (`Option<&T>` expected) with the weaker borrow `&(place)` /
+/// `Some(&(place))`; every other candidate is left alone.
+fn shared_weakening_candidate(
+    tcx: TyCtxt<'_>,
+    weakenings: &super::shared_weakening::SharedWeakenings,
+    expected: Form,
+    argument_span: Span,
+    text: &str,
+    current: &Result<Option<Candidate>, SeamBlock>,
+) -> Option<Candidate> {
+    let optional = match (expected, current) {
+        (Form::Ref { mutable: false }, Ok(None)) => false,
+        (
+            Form::Opt {
+                mutable: false,
+                slice: false,
+                ..
+            },
+            Ok(Some(candidate)),
+        ) if candidate.spec.core == GlueCore::Bare
+            && candidate.spec.optional
+            && candidate.spec.unwrap.is_none()
+            && candidate.spec.null_arm == NullArm::None
+            && candidate.spec.shared_address.is_none()
+            && candidate.spec.raw_boundary.is_none() =>
+        {
+            true
+        }
+        _ => return None,
+    };
+    let weakening = weakenings.at(tcx, argument_span, optional)?;
+    let replacement = weakening.render(text)?;
+    let mut spec = GlueSpec::core(GlueCore::Bare, false);
+    spec.optional = optional;
+    spec.shared_weakening = Some(weakening);
+    Some(Candidate {
+        spec,
+        replacement,
+        family: SeamFamily::Safe,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    })
+}
+
 fn shared_candidate(
     address: &super::overlapping_pairs::consumer::SharedAddress,
     text: &str,
@@ -4134,6 +4193,8 @@ pub(crate) fn synthesize_with_raw_boundary(
     plan.shared_required
         .sort_by_key(|permission| permission.receipt());
     plan.pair_sites = coconv.pair_sites().to_vec();
+    // wave-6p (R407-5): `&mut place` at a shared formal → `&(place)`.
+    let shared_weakenings = super::shared_weakening::SharedWeakenings::derive(tcx, facts);
     let mut a5_raw_calls = BTreeMap::<(u32, u32, u32, u32), A5RawViewCall>::new();
     // wave-6b: accessor regions of one buffer that a caller would hold live
     // together must be disjoint ranges.
@@ -4211,6 +4272,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                 source_shape: &'static str,
                 source_type: String,
                 target: Option<super::raw_boundary::RawTargetType>,
+                /// `&mut (*p).f`: the borrowed place is reached through a
+                /// deref of the root (wave-6r's shared-root bridge shape).
+                through_deref: bool,
             }
             let mut positions: Vec<Pos> = Vec::new();
             for arg in &site.args {
@@ -4374,6 +4438,13 @@ pub(crate) fn synthesize_with_raw_boundary(
                     source_shape: arg.shape.key(),
                     source_type: arg.source_type.clone(),
                     target: arg.target.clone(),
+                    through_deref: matches!(
+                        arg.shape,
+                        ArgShape::AddrOf {
+                            through_deref: true,
+                            ..
+                        }
+                    ),
                 });
             }
 
@@ -4694,6 +4765,26 @@ pub(crate) fn synthesize_with_raw_boundary(
                         )
                     },
                 );
+                // Only a place of the caller's OWN object (`&mut local.f`, no
+                // deref): a place through a pointer root (`&mut (*s).f`) is
+                // wave-6r's shared-root bridge shape, whose address edit sits
+                // inside this argument's interval; and not at a READ/READ pair
+                // wave-6k's consumer owns.
+                if pos.source_shape == "addr-of-mut"
+                    && !pos.through_deref
+                    && shared_pairs.at(*callee, site).is_none()
+                    && let Some(current) = candidates.last_mut()
+                    && let Some(weakened) = shared_weakening_candidate(
+                        tcx,
+                        &shared_weakenings,
+                        pos.expected,
+                        pos.span,
+                        text,
+                        current,
+                    )
+                {
+                    *current = Ok(Some(weakened));
+                }
                 let input = if pos.root.is_some() {
                     let input_found = a5_argument_expression_form(pos.source_shape, Form::Raw)
                         .unwrap_or(Form::Raw);

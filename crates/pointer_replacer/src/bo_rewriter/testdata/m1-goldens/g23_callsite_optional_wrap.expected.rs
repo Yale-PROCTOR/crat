@@ -4,5 +4,5 @@ pub unsafe fn g23_probe(p: Option<&i32>) -> i32 {
 }
 pub fn g23_caller() -> i32 {
     let mut x: i32 = 7;
-    unsafe { g23_probe(Some(&mut x)) }
+    unsafe { g23_probe(Some(&(x))) }
 }

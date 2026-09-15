@@ -2073,6 +2073,9 @@ impl<'a> SeamGraftVisitor<'a> {
         if let Some(address) = &spec.shared_address {
             return super::shared_pair_ast::build(e, address);
         }
+        if let Some(weakening) = &spec.shared_weakening {
+            return super::decision::shared_weakening::build(e, weakening);
+        }
         if let Some(raw) = spec.raw_boundary.as_ref() {
             let argument = if target.arg_span == e.span {
                 e.clone()
