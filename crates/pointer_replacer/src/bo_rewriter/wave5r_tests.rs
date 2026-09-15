@@ -182,18 +182,18 @@ fn wave5r_e0596_reverted_caller_retains_valid_original_borrow() {
     assert!(source.contains("&mut (*p).a"));
 }
 
+/// Migrated by wave-6r (R217-2(a)): a withdrawn callee class keeps its raw
+/// formal, and the shared root's field address now bridges read-only under
+/// the callee's negative-write evidence instead of failing the compile gate.
 #[test]
-fn wave5r_e0596_reverted_callee_withdraws_shared_repair() {
-    let source = ast_source_reverting(FIELD_CALL, Some("child"));
+fn wave5r_e0596_reverted_callee_bridges_shared_root_read_only() {
+    let source = emitted_reverting(FIELD_CALL, Some("child"));
     assert!(source.contains("child(p: *mut Part)"), "{source}");
     assert!(
-        source.contains("&mut (*p).a"),
-        "no permission repair for a raw callee: {source}"
+        source.contains("child(core::ptr::from_ref(&(*p).a).cast_mut())"),
+        "the raw callee receives a read-only view of the shared root: {source}"
     );
-    assert!(
-        !super::verify::type_checks_str(&source),
-        "the ordinary compiler gate must hold this incomplete reversion"
-    );
+    assert!(!source.contains("&mut (*p).a"), "{source}");
 }
 
 #[test]
@@ -392,3 +392,6 @@ fn wave5r_e0308_raw_destination_keeps_its_initializer() {
 
 #[path = "wave6r_option_tests.rs"]
 mod wave6r_option_tests;
+
+#[path = "wave6r_shared_root_tests.rs"]
+mod wave6r_shared_root_tests;

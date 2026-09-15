@@ -18,6 +18,7 @@ pub(super) fn complete_casts(
     plan: &mut super::seam::SeamPlan,
 ) {
     literal::hold_shared_origins(tcx, plan);
+    crate::bo_rewriter::wave6r_shared_root::complete_outbound(table, plan);
 
     use rustc_middle::ty::TyKind;
 

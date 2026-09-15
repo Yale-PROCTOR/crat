@@ -105,6 +105,7 @@ mod wave5r_helper_path;
 #[cfg(test)]
 mod wave5r_tests;
 mod wave6r_option_reborrow;
+pub(crate) mod wave6r_shared_root;
 
 #[cfg(test)]
 mod additive_tests;
@@ -5141,6 +5142,8 @@ fn seal_terminal_outbound_calls(
             if let Some(current) = current {
                 let reference_view =
                     decision::raw_boundary::outbound_reference_view(current, old.source_shape);
+                let reference_view =
+                    wave6r_shared_root::terminal_view(current, old, reference_view);
                 let effective_source = reference_view.as_ref().unwrap_or(current);
                 if let Some(view) = &reference_view {
                     sealed.found = decision::seam::form_of(view);

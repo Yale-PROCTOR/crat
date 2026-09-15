@@ -1731,6 +1731,7 @@ fn raw_boundary_expr(
     raw: &super::decision::seam::RawBoundaryGlue,
 ) -> Option<rustc_ast::ExprKind> {
     const ARG: &str = "__CRAT_RAW_BOUNDARY_ARG";
+    let argument = super::wave6r_shared_root::graft_argument(argument, raw);
     let rendered = if raw.force_explicit {
         raw.template.render_explicit(
             ARG,

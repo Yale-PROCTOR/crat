@@ -2885,6 +2885,13 @@ impl RawBoundaryDispositionIndex {
                     // Select its template before applying the R-B gate, so a
                     // shared projection cannot inherit the base's mutability.
                     let reference_view = outbound_reference_view(decision, site.source_shape);
+                    let reference_view = crate::bo_rewriter::wave6r_shared_root::disposition_view(
+                        emitability,
+                        site,
+                        node,
+                        decision,
+                        reference_view,
+                    );
                     if let Some(returned) = &returned_child {
                         let child = returned.child.as_ref().ok();
                         if let Some(sink) = child.and_then(|child| child.outward_sinks.first()) {

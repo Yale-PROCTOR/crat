@@ -368,6 +368,13 @@ fn current_alternative(
             return Err("callee-parameter-input-raw-boundary-held");
         }
     };
+    let found = crate::bo_rewriter::wave6r_shared_root::input_found(
+        table,
+        caller,
+        arg,
+        &site.target,
+        found,
+    );
     let source = seam::decision_for_safe_form(found)
         .ok_or("callee-parameter-input-source-form-unavailable")?;
     let child = raw.returned_child_evidence(key);
@@ -409,6 +416,7 @@ fn current_alternative(
         .source_map()
         .span_to_snippet(arg_span)
         .map_err(|_| "callee-parameter-input-operand-unplaceable")?;
+    let text = crate::bo_rewriter::wave6r_shared_root::input_text(text, arg, found);
     let unsafe_fn = tcx
         .fn_sig(caller.to_def_id())
         .skip_binder()
