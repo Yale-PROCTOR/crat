@@ -964,14 +964,20 @@ fn w6v_read_alias_holds_when_the_cursor_is_read_outside_the_counted_loop() {
         "    if sink(*csrc as i32) == -(1 as i32) { return -(1 as i32); }\n    return 0 as i32;",
     );
     assert_ne!(input, CSV_READ);
+    // R217-2(a) re-pin (wave-6v2 004 claim 3, R407-11): the LEAF holds; the
+    // wrapper's disposition is the forward-only rule's (held here, a `&[u8]`
+    // forwarded as `src.as_ptr().cast::<c_void>()` once that rule composes).
     let rows = super::emit_tests::decisions_of(&input);
     assert!(
         rows.iter()
-            .filter(|(n, p, _)| n == "src" && *p)
-            .all(|(_, _, r)| r != "<emitted>"),
-        "an unbounded read holds the parameter: {rows:?}"
+            .any(|(n, p, r)| n == "src" && *p && r == "held:void-pointee"),
+        "an unbounded read holds the leaf parameter: {rows:?}"
     );
     let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        compact(&source).contains("fncsv_fwrite2(mutsrc:*constcore::ffi::c_void,"),
+        "the leaf keeps its raw parameter: {source}"
+    );
     assert!(!source.contains("Option<&[u8]>"), "{source}");
     assert!(super::verify::type_checks_str(&source));
 }
@@ -984,12 +990,18 @@ fn w6v_read_alias_holds_when_the_alias_escapes() {
         "        csrc = csrc.offset(1);\n    }\n    let _keep = csrc as usize;",
     );
     assert_ne!(input, CSV_READ);
+    // R217-2(a) re-pin (wave-6v2 004 claim 3, R407-11): the LEAF holds; the
+    // wrapper's disposition is the forward-only rule's.
     let rows = super::emit_tests::decisions_of(&input);
     assert!(
         rows.iter()
-            .filter(|(n, p, _)| n == "src" && *p)
-            .all(|(_, _, r)| r != "<emitted>"),
-        "an escaping alias holds the parameter: {rows:?}"
+            .any(|(n, p, r)| n == "src" && *p && r == "held:void-pointee"),
+        "an escaping alias holds the leaf parameter: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        compact(&source).contains("fncsv_fwrite2(mutsrc:*constcore::ffi::c_void,"),
+        "the leaf keeps its raw parameter: {source}"
     );
 }
 
@@ -1255,7 +1267,12 @@ unsafe fn csv_write(mut dest: *mut core::ffi::c_void, mut dest_size: u64,
 /// The model kinds `csv_write2::dest` (a `*mut` cursor written and advanced)
 /// `Raw`; the forwarder `csv_write::dest` would otherwise prove a forward
 /// contract and take a view its raw callee cannot receive. Contracts are
-/// proven only against a non-`Raw` model kind, so the forwarder stays held.
+/// proven only against a non-`Raw` model kind: the callee keeps its raw
+/// parameter and no counted contract is inherited from it. (R217-2(a)
+/// re-pin, wave-6v2 004 / R407-11: the forwarder itself may deliver as the
+/// forward-only byte view `&mut [MaybeUninit<u8>]` bridged
+/// `dest.as_mut_ptr().cast::<c_void>()` at the raw seam once that rule
+/// composes; here it stays held.)
 #[test]
 fn w6v_forwarder_never_outruns_the_models_raw_callee() {
     let rows = super::emit_tests::decisions_of(CSV_WRITE);
@@ -1265,11 +1282,11 @@ fn w6v_forwarder_never_outruns_the_models_raw_callee() {
         dest.iter().any(|(_, _, r)| r == "kind-raw"),
         "the callee's dest is the model's Raw: {rows:?}"
     );
-    assert!(
-        dest.iter().all(|(_, _, r)| r != "<emitted>"),
-        "no forwarder takes a view into a raw callee: {rows:?}"
-    );
     let source = super::emit_tests::ast_emitted_source_of(CSV_WRITE).unwrap();
+    assert!(
+        compact(&source).contains("fncsv_write2(mutdest:*mutcore::ffi::c_void,"),
+        "the raw callee keeps its raw parameter: {source}"
+    );
     assert!(!source.contains("dest: Option<&mut ["), "{source}");
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
