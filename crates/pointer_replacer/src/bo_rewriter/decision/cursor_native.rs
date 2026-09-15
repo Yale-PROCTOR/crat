@@ -163,6 +163,7 @@ pub(crate) fn promote(
         })
         .collect::<Vec<_>>();
     let mut receipts = Vec::new();
+    let mut committed = Vec::new();
     for (index, proposed) in proposals {
         let (subject, decision) = &mut entries[index];
         receipts.push(CursorReceipt {
@@ -171,6 +172,9 @@ pub(crate) fn promote(
             local: subject.local,
             disposition: proposed.as_ref().map(|_| ()).map_err(|e| *e),
         });
+        if proposed.is_ok() {
+            committed.push((index, receipts.len() - 1, decision.clone()));
+        }
         if proposed == Err(CursorHold::BaseModelRaw)
             && let Decision::Degraded(record) = decision
         {
@@ -188,7 +192,137 @@ pub(crate) fn promote(
             };
         }
     }
+    compose_nested_uses(ctx, entries, &committed, &mut receipts);
     receipts
+}
+
+fn use_edits_mut(decision: &mut Decision) -> Option<&mut Vec<super::emitability::UseEdit>> {
+    match decision {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => Some(uses),
+        Decision::Cursor { plan, .. } => Some(&mut plan.uses),
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => None,
+    }
+}
+
+/// A cursor use nested inside another subject's use edit (`*f.offset(*w.offset(k)
+/// as isize)` with `w` the cursor) is composed the way the slice family composes
+/// two nested slices: the outer edit's replacement, rendered from source text,
+/// takes the cursor's rendered text in place of the inner's original text, and
+/// the inner edit is dropped. An inner whose text is not found exactly once in
+/// the outer keeps the subject's prior degraded decision.
+fn compose_nested_uses(
+    ctx: &Ctx<'_, '_>,
+    entries: &mut [(Subject, Decision)],
+    committed: &[(usize, usize, Decision)],
+    receipts: &mut [CursorReceipt],
+) {
+    let source_map = ctx.tcx.sess.source_map();
+    let contains = |outer: rustc_span::Span, inner: rustc_span::Span| {
+        let (outer, inner) = (outer.source_callsite(), inner.source_callsite());
+        outer.lo() <= inner.lo() && inner.hi() <= outer.hi() && outer != inner
+    };
+    for &(index, receipt, ref prior) in committed {
+        let owner = entries[index].0.fn_did;
+        let uses = match &entries[index].1 {
+            Decision::Cursor { plan, .. } => plan.uses.clone(),
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => continue,
+        };
+        // (inner use index, outer entry index, outer edit index, new outer text)
+        let mut splices = Vec::new();
+        let mut failed = false;
+        for (k, inner) in uses.iter().enumerate() {
+            let Some((j, o)) = entries
+                .iter()
+                .enumerate()
+                .find_map(|(j, (other, decision))| {
+                    if j == index || other.fn_did != owner {
+                        return None;
+                    }
+                    let outer = match decision {
+                        Decision::Slice { uses, .. }
+                        | Decision::NestedSlice { uses, .. }
+                        | Decision::Opt { uses, .. } => uses,
+                        Decision::Cursor { plan, .. } => &plan.uses,
+                        Decision::Ref { .. }
+                        | Decision::InferredRef { .. }
+                        | Decision::Box(_)
+                        | Decision::Degraded(_) => return None,
+                    };
+                    outer
+                        .iter()
+                        .position(|edit| contains(edit.span, inner.span))
+                        .map(|o| (j, o))
+                })
+            else {
+                continue;
+            };
+            let Ok(text) = source_map.span_to_snippet(inner.span) else {
+                failed = true;
+                break;
+            };
+            let replacement = match &entries[j].1 {
+                Decision::Slice { uses, .. }
+                | Decision::NestedSlice { uses, .. }
+                | Decision::Opt { uses, .. } => uses[o].replacement.clone(),
+                Decision::Cursor { plan, .. } => plan.uses[o].replacement.clone(),
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => unreachable!("outer edit came from a use list"),
+            };
+            if replacement.matches(text.as_str()).count() != 1 {
+                failed = true;
+                break;
+            }
+            splices.push((k, j, o, replacement.replacen(&text, &inner.replacement, 1)));
+        }
+        if failed {
+            entries[index].1 = prior.clone();
+            receipts[receipt].disposition = Err(CursorHold::UseUnbuilt);
+            continue;
+        }
+        if splices.is_empty() {
+            continue;
+        }
+        for &(_, j, o, ref text) in &splices {
+            if let Some(outer) = use_edits_mut(&mut entries[j].1) {
+                outer[o].replacement = text.clone();
+            }
+        }
+        let dropped = splices.iter().map(|s| s.0).collect::<Vec<_>>();
+        match &mut entries[index].1 {
+            Decision::Cursor { plan, .. } => {
+                let mut k = 0;
+                plan.uses.retain(|_| {
+                    k += 1;
+                    !dropped.contains(&(k - 1))
+                });
+                let mut k = 0;
+                plan.use_hirs.retain(|_| {
+                    k += 1;
+                    !dropped.contains(&(k - 1))
+                });
+            }
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => unreachable!("committed cursor entry"),
+        }
+    }
 }
 
 pub(crate) fn inspect_subject(

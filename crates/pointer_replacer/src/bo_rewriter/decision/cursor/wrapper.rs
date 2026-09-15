@@ -517,8 +517,12 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             }
             return;
         }
+        // Only a deref whose pointer chain is rooted at this subject is this
+        // subject's element; an enclosing deref of another pointer that merely
+        // carries the subject inside its offset operand is walked instead.
         if let hir::ExprKind::Unary(hir::UnOp::Deref, pointer) = e.kind
-            && contains(pointer, self.subject.hir_id)
+            && source_binding(self.ctx.tcx, self.subject.fn_did, pointer)
+                == Some(self.subject.hir_id)
         {
             match self.index(pointer) {
                 Ok(i) => self.push(e, format!("{}[{i}]", self.view()), "cursor-element"),

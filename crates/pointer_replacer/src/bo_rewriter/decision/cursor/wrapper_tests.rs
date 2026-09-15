@@ -498,3 +498,73 @@ fn slicecursor_written_table_element_with_escaping_table_is_held() {
     })
     .unwrap();
 }
+
+#[test]
+fn slicecursor_element_as_index_operand_of_another_pointer() {
+    // heman `edt`: the cursor's element `*w.offset(k)` is the index operand of
+    // another pointer's offset, `*f.offset(*w.offset(k) as isize)`; `k` walks
+    // both ways.
+    let input = r#"
+pub unsafe fn edt(f: *const f32, w: *mut u16, n: i32) -> f32 {
+    let mut k = 0i32;
+    let mut q = 1i32;
+    let mut s = 0f32;
+    *w.offset(0) = 0;
+    while q < n {
+        s = *f.offset(q as isize) - *f.offset(*w.offset(k as isize) as isize);
+        if s < 0. { k -= 1; }
+        k += 1;
+        *w.offset(k as isize) = q as u16;
+        q += 1;
+    }
+    s
+}
+"#;
+    let source = emitted(input);
+    save_fixture("element-as-index-operand", input, &source);
+    assert!(
+        source.contains("slice_cursor::SliceCursorMut"),
+        "wrapper absent: {source}"
+    );
+    assert!(
+        source.contains("f[(w[(0isize).wrapping_add((k as isize) as isize)]) as usize]"),
+        "element-as-index composition absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let f = [4., 1., 5., 2.]; let mut w = [9u16; 4]; let s = unsafe { edt(&f, &mut w, 4) }; assert_eq!(s, -3.); assert_eq!(w, [1, 3, 9, 9]); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_element_as_index_operand_backward_write() {
+    // bzip2 `fallbackSimpleSort`: `*eclass.offset(*fmap.offset(j) as isize)`
+    // beside `*fmap.offset(j - 4) = *fmap.offset(j)` writes.
+    let input = r#"
+pub unsafe fn sort(fmap: *mut u32, eclass: *const u32, lo: i32, hi: i32) {
+    let mut i = hi - 4;
+    while i >= lo {
+        let mut j = i + 4;
+        while j <= hi && *eclass.offset(*fmap.offset(j as isize) as isize) > 3 {
+            *fmap.offset((j - 4) as isize) = *fmap.offset(j as isize);
+            j += 4;
+        }
+        i -= 1;
+    }
+}
+"#;
+    let source = emitted(input);
+    save_fixture("element-as-index-operand-write", input, &source);
+    assert!(
+        source.contains("slice_cursor::SliceCursorMut"),
+        "wrapper absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let ec = [0u32, 9, 0, 9, 0]; let mut fm = [0u32, 1, 2, 3, 4, 3, 1]; unsafe { sort(&mut fm, &ec, 0, 6) }; assert_eq!(fm, [0, 3, 1, 3, 4, 3, 1]); }",
+        ),
+    );
+}
