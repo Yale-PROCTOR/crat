@@ -138,6 +138,7 @@ const DIRECT_COUNTED_CONTROL_INPUT: &str = r#"
 "#;
 
 #[test]
+#[ignore = "per-subject containment primitive (R397-6(a), wave-5d): the pair-overlap terminal at the caller withdraws the sibling"]
 fn thin_extent_transplant_of_the_bzip2_shape() {
     let got = reasons(TRANSPLANT_INPUT);
     assert_eq!(

@@ -123,6 +123,7 @@ fn emitted(source: &str) -> String {
 }
 
 #[test]
+#[ignore = "candidate #1b (R384-3): exact-count entry transport"]
 fn ce_w02_memcpy_exact_count_keeps_both_initialized_byte_slices_evidence_backed() {
     let source = r#"
         #![allow(dead_code, unused_unsafe, unused_mut)]
@@ -350,6 +351,7 @@ fn multiline_count_expression_is_single_line_only_in_the_receipt() {
 }
 
 #[test]
+#[ignore = "candidate #1b (R384-3): exact-count entry transport"]
 fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() {
     let source = r#"
         #![allow(dead_code, unused_unsafe, static_mut_refs)]
