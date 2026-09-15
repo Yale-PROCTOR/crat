@@ -459,6 +459,19 @@ pub(crate) fn symbol_key(
     }
 }
 
+/// wave-6f (W6F-2): the key of a call through a FUNCTION POINTER. No symbol
+/// and no path exist; the signature is the identity, so the HIR fact and the
+/// MIR terminator meet on the pointer type alone.
+pub(crate) fn indirect_symbol_key(sig: rustc_middle::ty::FnSig<'_>) -> ForeignSymbolKey {
+    ForeignSymbolKey {
+        symbol: "<indirect>".to_owned(),
+        path: "<indirect>".to_owned(),
+        abi: format!("{:?}", sig.abi),
+        signature: format!("{sig:?}"),
+        foreign: true,
+    }
+}
+
 fn operand_callee(func: &Operand<'_>) -> Option<DefId> {
     let constant = func.constant()?;
     let TyKind::FnDef(callee, _) = *constant.ty().kind() else {
@@ -484,8 +497,18 @@ fn mir_candidates(
                 TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
                 _ => return None,
             };
-            let callee = operand_callee(func)?;
-            let key = symbol_key(tcx, callee, functions);
+            let (key, callee) = match operand_callee(func) {
+                Some(callee) => (symbol_key(tcx, callee, functions), Some(callee)),
+                // wave-6f (W6F-2): a function-pointer operand — keyed by its
+                // pointer signature, no definition.
+                None => match func.ty(&body.local_decls, tcx).kind() {
+                    TyKind::FnPtr(sig_tys, header) => (
+                        indirect_symbol_key(sig_tys.with(*header).skip_binder()),
+                        None,
+                    ),
+                    _ => return None,
+                },
+            };
             let call_span = terminator.source_info.span.source_callsite();
             (key == *expected && call_span.contains(argument_span)).then_some(MirCallCandidate {
                 block: block.as_u32(),
@@ -707,7 +730,9 @@ pub(crate) struct MirCallCandidate {
     pub callee: ForeignSymbolKey,
     /// The resolved callee, kept so the carrier walk can read its signature.
     /// Selection still keys on `callee`; this never participates in matching.
-    pub did: DefId,
+    /// `None` for an INDIRECT call (a function-pointer operand): there is no
+    /// definition to read, and the carrier walk fails closed.
+    pub did: Option<DefId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3649,6 +3674,23 @@ impl RawBoundaryDispositionIndex {
                 })
     }
 
+    /// wave-6f (W6F-2): is THIS escape site handled by a raw-boundary bridge
+    /// (T1 / T2 with the target staying raw), whatever the node's other sites
+    /// do? An escape through a foreign or indirect call is discharged by the
+    /// receipted bridge at that call; the node's other sites (a raw expression
+    /// rooted at it, passed to a converting local callee) are the seam's, and
+    /// their own gates still apply.
+    pub(crate) fn opens_escape_site(&self, node: (LocalDefId, HirId), span: Span) -> bool {
+        let span = span.source_callsite();
+        self.site_lookup
+            .iter()
+            .any(|(candidate, site_span, _, key)| {
+                *candidate == node
+                    && (site_span.contains(span) || span.contains(*site_span))
+                    && self.handles_site(key)
+            })
+    }
+
     pub(crate) fn opens_argument(
         &self,
         node: (LocalDefId, HirId),
@@ -3710,7 +3752,7 @@ fn unique_candidate_did(
 ) -> Option<DefId> {
     let mut matching = candidates.iter().filter(|site| site.callee == *expected);
     let site = matching.next()?;
-    matching.next().is_none().then_some(site.did)
+    matching.next().is_none().then_some(site.did).flatten()
 }
 
 /// Zero and multiple matches stay typed rather than choosing by traversal
@@ -4404,7 +4446,7 @@ mod tests {
                 block: 7,
                 statement_index: 3,
                 callee: expected.clone(),
-                did: CRATE_DEF_ID.to_def_id(),
+                did: Some(CRATE_DEF_ID.to_def_id()),
             }],
         );
         assert_eq!(site, Ok((7, 3)));
@@ -4421,7 +4463,7 @@ mod tests {
             block: 1,
             statement_index: 0,
             callee: expected.clone(),
-            did: CRATE_DEF_ID.to_def_id(),
+            did: Some(CRATE_DEF_ID.to_def_id()),
         };
         assert_eq!(
             select_unique_site(&expected, &[one.clone(), one]),
@@ -4440,7 +4482,7 @@ mod tests {
                     block: 2,
                     statement_index: 1,
                     callee: local,
-                    did: CRATE_DEF_ID.to_def_id(),
+                    did: Some(CRATE_DEF_ID.to_def_id()),
                 }],
             ),
             Err(SiteMatchFailure::CalleeMismatch)

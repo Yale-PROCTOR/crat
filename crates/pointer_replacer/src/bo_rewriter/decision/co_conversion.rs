@@ -866,7 +866,10 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             continue;
         }
         if escape.kind == EscapeKind::ForeignArg
-            && raw_boundary.opens_span(escape.subject, escape.span)
+            && (raw_boundary.opens_span(escape.subject, escape.span)
+                // wave-6f (W6F-2): the escape's own site carries a receipted
+                // bridge; the node's other sites are the seam's.
+                || raw_boundary.opens_escape_site(escape.subject, escape.span))
         {
             continue;
         }

@@ -49,6 +49,23 @@ fn observe(source: &str) -> Observed {
         for blocked in &table.seams.blocked {
             println!("W6F-BLOCKED {blocked:?}");
         }
+        for site in &ctx.raw_boundary_sites.sites {
+            println!(
+                "W6F-SITE {} {:?} #{} {} shape={}",
+                site.key.caller,
+                site.key.callee.symbol,
+                site.key.argument_index,
+                site.source_site,
+                site.source_shape
+            );
+        }
+        for failure in &ctx.raw_boundary_sites.failures {
+            println!(
+                "W6F-SITE-FAIL {} {:?} #{} {:?}",
+                failure.caller, failure.callee.symbol, failure.argument_index, failure.reason
+            );
+        }
+        println!("W6F-DISPOSITIONS\n{}", ctx.raw_boundary.receipts_tsv());
         let fields = receipt
             .lines()
             .skip(1)
@@ -356,4 +373,33 @@ fn w6f_dependent_owner_revert_withdraws_the_transaction() {
         !source.contains("hti<'a>"),
         "the lifetime must withdraw:\n{source}"
     );
+}
+
+const QUADTREE: &str = include_str!("wave6f_fixture_quadtree.rs");
+
+/// Witness 7 (W6F-2, `escapes-via-foreign-arg`): a subject passed to a call
+/// through a FUNCTION POINTER (quadtree `quadtree_walk::root` → `descent(root)`
+/// / `ascent(root)`). The indirect call is a raw seam like an extern call —
+/// its argument sites are recorded, dispositioned T2 (`retention-open-boundary`,
+/// the callee unknown) under the named waiver — and the escape is discharged by
+/// its own receipted site, while the subject's recursive-call sites keep their
+/// arm-C reborrows.
+#[test]
+fn w6f_indirect_call_argument_bridges_under_t2() {
+    let observed = observe(QUADTREE);
+    assert_eq!(
+        decision_of(&observed, "quadtree_walk::root"),
+        "Ref { mutable: true }"
+    );
+    let outcome = emitted("quadtree", QUADTREE);
+    let (source, emitted_count, reverted_count) = emitted_source(&outcome);
+    assert_eq!(reverted_count, 0);
+    assert_eq!(emitted_count, 3);
+    for needle in [
+        "pub unsafe extern \"C\" fn quadtree_walk(mut root: &mut quadtree_node_t,",
+        ".expect(\"non-null function pointer\")(root);",
+        "quadtree_walk(&mut *(*root).nw, descent, ascent);",
+    ] {
+        assert!(source.contains(needle), "missing {needle:?} in\n{source}");
+    }
 }

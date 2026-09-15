@@ -855,6 +855,65 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
             // this one answers "what is supplied to it", and only the direct-call
             // shape has an answer at all.
             ExprKind::Call(callee, args) => {
+                // wave-6f (W6F-2): a call through a FUNCTION POINTER is a raw
+                // seam like an extern call — the callee is unknown, so its
+                // retention is unknown (the T2 tier), and every argument
+                // position is recorded exactly as a foreign argument is.
+                let direct = matches!(
+                    &callee.kind,
+                    ExprKind::Path(QPath::Resolved(_, path))
+                        if matches!(path.res, Res::Def(rustc_hir::def::DefKind::Fn, _))
+                );
+                if !direct
+                    && let rustc_middle::ty::TyKind::FnPtr(sig_tys, header) =
+                        self.tcx.typeck(self.fn_did).expr_ty(callee).kind()
+                {
+                    let sig = sig_tys.with(*header).skip_binder();
+                    let typeck = self.tcx.typeck(self.fn_did);
+                    let symbol = super::raw_boundary::indirect_symbol_key(sig);
+                    for (index, arg) in args.iter().enumerate() {
+                        let source_ty = typeck.expr_ty(arg);
+                        let Some(target) = sig
+                            .inputs()
+                            .get(index)
+                            .copied()
+                            .and_then(|ty| raw_target_type(self.tcx, ty))
+                        else {
+                            continue;
+                        };
+                        let shape = classify_arg(self.tcx, arg);
+                        let adapter_operand_span = match shape {
+                            ArgShape::AddrOfCast { inner, .. }
+                            | ArgShape::CastOfLocal { inner, .. } => inner,
+                            _ => arg.span,
+                        };
+                        let adapter_operand_mutability =
+                            match typeck.expr_ty(peel_casts(arg)).kind() {
+                                rustc_middle::ty::TyKind::RawPtr(_, mutability) => {
+                                    Some(if mutability.is_mut() {
+                                        super::raw_boundary::RawMutability::Mut
+                                    } else {
+                                        super::raw_boundary::RawMutability::Const
+                                    })
+                                }
+                                _ => None,
+                            };
+                        self.facts.foreign_call_args.push(ForeignCallArgFact {
+                            caller: self.fn_did,
+                            callee: symbol.clone(),
+                            call_span: expr.span,
+                            argument_index: index,
+                            argument_span: arg.span,
+                            root: shape.place_root(),
+                            shape: shape.key(),
+                            source_type: format!("{source_ty:?}"),
+                            target,
+                            direct_storage: direct_mutable_storage(arg),
+                            adapter_operand_span,
+                            adapter_operand_mutability,
+                        });
+                    }
+                }
                 if let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
                     && let Res::Def(rustc_hir::def::DefKind::Fn, def_id) = path.res
                 {
