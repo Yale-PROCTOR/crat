@@ -9,9 +9,17 @@ fn wave6s_strff_forward_parameter_pass_on() {
         source.contains("ptr: &[i8]"),
         "forward parameter must deliver: {source}"
     );
+    // The rendering is the arm that fires: the indexed forward parameter when
+    // the pass-on target stays a raw position (`strdup::input` on its
+    // `strlen` / `strcpy` C arms), the S3.2′-2b reslice (`ptr = &ptr[1..]`)
+    // when it is a slice. wave-4's contract extent (batch-7 probe P2) makes
+    // `strdup::input` a slice through its `strlen` contract, so THIS fixture
+    // may render either way (R217-2(a): the expectation moves where wave-4
+    // intentionally delivers); the index form stays pinned by the revert,
+    // incoming-extent and raw-local-caller witnesses below.
     assert!(
-        source.contains("let mut __crat_wave6s_pos_"),
-        "forward parameter needs its index: {source}"
+        source.contains("let mut __crat_wave6s_pos_") || source.contains("ptr = &ptr[1..];"),
+        "forward parameter renders by one of its two arms: {source}"
     );
 }
 
