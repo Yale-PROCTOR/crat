@@ -441,7 +441,10 @@ fn w5c_thin_count_first_element_reference_source_delivers_over_the_array_start()
     assert!(flat.contains("population: &[u32]"), "{emitted}");
     // On the call, not the file: slicecursor's verbatim prelude carries a
     // `slice::from_ref` helper once a cursor wrapper survives.
-    assert!(!flat.contains("BitsEntropy(core::slice::from_ref"), "{emitted}");
+    assert!(
+        !flat.contains("BitsEntropy(core::slice::from_ref"),
+        "{emitted}"
+    );
     assert!(
         flat.contains("BitsEntropy(core::slice::from_raw_parts(((*combined_histo.as_mut_ptr().offset(j as isize)).data_).as_mut_ptr(), ((*self_0).alphabet_size_) as usize), (*self_0).alphabet_size_)"),
         "{emitted}"
