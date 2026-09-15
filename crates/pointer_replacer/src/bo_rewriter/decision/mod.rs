@@ -87,6 +87,7 @@ pub(crate) mod raw_receiver;
 mod reader_chain_tests;
 pub(crate) mod receiver_input;
 pub(crate) mod return_alias;
+pub(crate) mod return_certificate;
 pub(crate) mod return_interface;
 pub(crate) mod return_receiver;
 pub(crate) mod returned_child;
@@ -982,6 +983,8 @@ pub(crate) struct DecisionTable {
     pub(crate) flexible_tails: flexible_tail::Transactions,
     /// wave-6a W6A-C1: Box-parameter chains (admitted / held).
     pub(crate) box_params: box_param::Chains,
+    /// wave-6a W6A-A1: allocation-return certificates (admitted / held).
+    pub(crate) return_certificates: return_certificate::Certificates,
     pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
     pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
@@ -1129,6 +1132,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     /// wave-6a W6A-T1: flexible-tail struct transactions (derived once).
     pub(crate) flexible_tails: &'a flexible_tail::Transactions,
     pub(crate) box_params: &'a box_param::Chains,
+    pub(crate) return_certificates: &'a return_certificate::Certificates,
     pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
@@ -1269,6 +1273,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         counted_void: ctx.counted_void.clone(),
         flexible_tails: ctx.flexible_tails.clone(),
         box_params: ctx.box_params.clone(),
+        return_certificates: ctx.return_certificates.clone(),
         nested_receipts: Vec::new(),
         cursor_receipts,
         sibling_overlap_inventory: Default::default(),
@@ -1759,6 +1764,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         counted_void: _,
         flexible_tails: _,
         box_params: _,
+        return_certificates: _,
         void_pointee,
         thin_extent,
         local_callee_extent,
@@ -1824,6 +1830,12 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let Some(slot_id) = universe.slot_for_local_depth(subject.local, 0) else {
         return degrade(subject, decl_site, DegradeReason::NoSlot);
     };
+
+    // wave-6a W6A-A1: a subject an allocation-return certificate plans is a
+    // Box on the certificate's evidence (relay wave-6a/005 §1).
+    if let Some(decision) = return_certificate::planned(ctx, subject) {
+        return decision;
+    }
 
     // BO's kind first: it is the authority on WHETHER a reference is sound.
     match model.get(&SlotRef::Local(subject.fn_did, slot_id)) {
@@ -2523,6 +2535,7 @@ mod self_consistency_tests {
             counted_void: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),
+            return_certificates: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

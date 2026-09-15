@@ -125,6 +125,8 @@ mod wave6a_allocation_tests;
 mod wave6a_box_param_tests;
 #[cfg(test)]
 mod wave6a_fixture_tulip;
+#[cfg(test)]
+mod wave6a_return_certificate_tests;
 mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;
 
@@ -377,6 +379,8 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) flexible_tail_receipts: String,
     /// wave-6a W6A-C1: Box-parameter chains (admitted / held).
     pub(crate) box_param_receipts: String,
+    /// wave-6a W6A-A1: allocation-return certificates (admitted / held).
+    pub(crate) return_certificate_receipts: String,
     /// R369 FIELD-CP observer, captured from the same frozen decision pass.
     pub(crate) ownership_native: String,
     pub(crate) shared_permissions: Vec<decision::overlapping_pairs::consumer::Permission>,
@@ -7034,6 +7038,16 @@ fn finish_decide<'tcx>(
         &slots,
         &model,
     );
+    // wave-6a W6A-A1: allocation-return certificates (relay wave-6a/005 §1).
+    let return_certificates = decision::return_certificate::derive(
+        tcx,
+        &program.functions,
+        &ctors,
+        &subjects,
+        &box_facts,
+        &slots,
+        &model,
+    );
     let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
     let mut predecessor: Option<additive::StageSnapshot> = None;
     let mut native_ownership_candidates = decision::ownership_fields_native::Candidates::default();
@@ -7146,6 +7160,7 @@ fn finish_decide<'tcx>(
                     counted_void: &counted_void,
                     flexible_tails: &flexible_tails,
                     box_params: &box_params,
+                    return_certificates: &return_certificates,
                     return_receivers,
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,
@@ -7687,6 +7702,8 @@ fn finish_decide<'tcx>(
         // wave-6a W6A-B1: explicit types on constructor-typed slice locals.
         decision::slice_local_construction::append_explicit_declarations(tcx, &mut table);
         decision::box_param::append_explicit_declarations(tcx, &mut table);
+        decision::return_certificate::append_explicit_declarations(tcx, &mut table);
+        decision::return_certificate::append_interface_dependencies(&mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
@@ -7875,6 +7892,7 @@ fn finish_decide<'tcx>(
         let raw_boundary_artifacts = RawBoundaryArtifacts {
             flexible_tail_receipts: table.flexible_tails.receipts_tsv(),
             box_param_receipts: table.box_params.receipts_tsv(),
+            return_certificate_receipts: table.return_certificates.receipts_tsv(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             shared_permissions: table.seams.shared_required.clone(),
             shared_pair_receipts: String::new(),

@@ -523,29 +523,9 @@ fn w6a_b1_annotated_slice_local_keeps_the_declaration_splice() {
     );
 }
 
-/// The frame read for shape (a): quadtree `quadtree_node_new` returns a
-/// fresh `malloc` (model Raw on its return and local), `test_node::node`
-/// receives it (model Ref); at this frame the receiver reports
-/// `return-not-adapted` and the callee local `kind-raw`. Pinned so the
-/// shape-(a) build starts from a recorded RED.
-#[test]
-fn w6a_a_quadtree_frame_read_receiver_is_return_not_adapted() {
-    let out = emitted("quadtree", QUADTREE_NODE_NEW);
-    assert_eq!(out.reverted, 0, "{}", out.source);
-    assert_eq!(
-        reason_of(&out.degradations, "test_node::node").as_deref(),
-        Some("return-not-adapted")
-    );
-    assert_eq!(
-        reason_of(&out.degradations, "quadtree_node_new::node").as_deref(),
-        Some("kind-raw")
-    );
-    assert!(
-        compact(&out.source).contains("quadtree_node_isleaf(&*node)"),
-        "{}",
-        out.source
-    );
-}
+// The quadtree frame-read witness (report 001, STOP 4) moved under W6A-A1:
+// `wave6a_return_certificate_tests::w6a_a1_quadtree_node_new_returns_a_box_and_the_receiver_owns_it`
+// asserts the delivery the certificate route was ruled to give (relay 005).
 
 /// **The rule's soundness control.** An unannotated copy of a parameter the
 /// model calls `Ref` (`let p = a;` then `p[1]`) stays exactly where the base

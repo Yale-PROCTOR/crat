@@ -143,17 +143,27 @@ impl MutVisitor for Apply<'_> {
                 self.placed_structs.insert(did);
             } else if let rustc_ast::ItemKind::Fn(function) = &mut item.kind {
                 if let Some(output) = self.returns.get(&did) {
-                    if !self.guard.claim(item.id, item.span, "flexible-tail:return") {
+                    // The output type's own node: a parameter pass may hold
+                    // the item, and the two edits do not overlap.
+                    let (claim_id, claim_span) = match &function.sig.decl.output {
+                        rustc_ast::FnRetTy::Ty(ty) => (ty.id, ty.span),
+                        rustc_ast::FnRetTy::Default(_) => (item.id, item.span),
+                    };
+                    if !self
+                        .guard
+                        .claim(claim_id, claim_span, "flexible-tail:return")
+                    {
                         self.failures.push(format!("return-claim-refused:{did:?}"));
                         return smallvec![item];
                     }
                     // The source's own pointee spelling, boxed — the same text
                     // the receivers' declarations carry.
                     let boxed = match &function.sig.decl.output {
-                        rustc_ast::FnRetTy::Ty(ty) => {
+                        rustc_ast::FnRetTy::Ty(ty) if !output.starts_with("Option<") => {
                             boxed_pointee(ty).unwrap_or_else(|| output.clone())
                         }
-                        rustc_ast::FnRetTy::Default(_) => output.clone(),
+                        // W6A-A1: the certificate's own text (`Option<Box<T>>`).
+                        _ => output.clone(),
                     };
                     function.sig.decl.output =
                         rustc_ast::FnRetTy::Ty(P(::utils::ast::parse_ty(boxed)));
@@ -175,7 +185,21 @@ pub(crate) fn apply(
     guard: &mut Composition,
 ) -> Result<(), String> {
     let active = active(table, reverts);
-    if active.is_empty() {
+    // wave-6a W6A-A1: certified allocation returns, active while none of the
+    // certificate's owners (the callee, its receivers' functions) reverted.
+    let certified: Vec<&super::decision::return_certificate::Certificate> = table
+        .return_certificates
+        .callees
+        .values()
+        .filter(|c| {
+            table
+                .return_certificates
+                .owners(c.callee)
+                .iter()
+                .all(|f| !reverts.fns.contains(f))
+        })
+        .collect();
+    if active.is_empty() && certified.is_empty() {
         return Ok(());
     }
     let mut structs = FxHashMap::default();
@@ -194,6 +218,9 @@ pub(crate) fn apply(
         for &function in &transaction.owning_returns {
             returns.insert(function, boxed.clone());
         }
+    }
+    for certificate in &certified {
+        returns.insert(certificate.callee, certificate.output_type.clone());
     }
     let _ = tcx;
     let mut apply = Apply {

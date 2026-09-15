@@ -148,7 +148,10 @@ pub(crate) fn append_explicit_declarations(tcx: TyCtxt<'_>, table: &mut Decision
             node: Some(node),
             span: Some(subject.binding_span),
             category: "local",
-            replacement: Some(format!("{name}: {emitted_type}")),
+            replacement: Some(format!(
+                "{}{name}: {emitted_type}",
+                if subject.mut_binding { "mut " } else { "" }
+            )),
             emitted_type,
             arm: "surface",
         });

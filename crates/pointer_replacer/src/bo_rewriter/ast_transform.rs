@@ -3092,7 +3092,11 @@ fn surface_wrapper_block_with_arguments(
                 // through `Box::from_raw` at the freeing callee's wrapper.
                 format!("Box::into_raw({call})")
             } else if ty.starts_with("Option<Box<") {
-                return Err("inbound-wrapper-unplaceable: owning return held by Arm B".to_owned());
+                // wave-6a W6A-A1: a nullable owning return crosses the C ABI as
+                // the raw allocation or null.
+                format!(
+                    "match {call} {{ Some(__crat_owned) => Box::into_raw(__crat_owned), None => core::ptr::null_mut() }}"
+                )
             } else {
                 call
             }

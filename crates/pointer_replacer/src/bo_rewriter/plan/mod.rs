@@ -3648,6 +3648,48 @@ pub(crate) fn plan(
             }),
         }
     }
+    // wave-6a W6A-A1: the span layer's copy of a certified callee's output type.
+    for certificate in table.return_certificates.callees.values() {
+        let owner_class = SignatureClassId::of(certificate.callee);
+        let kind = "return-certificate-output";
+        let span = certificate.output_span;
+        let bridge = BridgeSitePlan::local(
+            certificate.callee,
+            certificate.callee,
+            Arm::Surface.key(),
+            format!("{kind}:{}..{}", span.lo().0, span.hi().0),
+            kind,
+        );
+        match span_to_loc(span) {
+            Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
+                lo,
+                hi,
+                replacement: certificate.output_type.clone(),
+                justification: Justification::SeamAdapter {
+                    family: "safe",
+                    fabricated: false,
+                },
+                owner_class: Some(owner_class),
+                owner_path: certificate.callee_path.clone(),
+                bridge: Some(bridge),
+                atom_ids: Vec::new(),
+                subject_id: certificate.callee_path.clone(),
+                required_arms: owner_arms
+                    .get(&owner_class)
+                    .copied()
+                    .unwrap_or_default()
+                    .render(),
+                edit_kind: kind,
+            }),
+            Err(reason) => unplaceable.push(Unplaceable {
+                owner_class,
+                bridge,
+                reason,
+                detail: format!("{kind} for {}", certificate.callee_path),
+                subject: certificate.callee_path.clone(),
+            }),
+        }
+    }
     // wave-6a W6A-T1: the span layer's copy of the flexible-tail transaction —
     // item edits (field type, impls, owning signatures) and tail accesses —
     // charged to the transaction's owner class so a class revert takes them.
@@ -5488,6 +5530,7 @@ mod tests {
             counted_void: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),
+            return_certificates: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
@@ -5641,6 +5684,7 @@ mod tests {
             counted_void: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),
+            return_certificates: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
