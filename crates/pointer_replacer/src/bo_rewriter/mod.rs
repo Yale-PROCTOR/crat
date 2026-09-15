@@ -7155,7 +7155,7 @@ fn finish_decide<'tcx>(
     // index; an unavailable index attaches nothing.
     let a5_site_proofs = if a5_site_proofs.is_available() {
         a5_site_proofs.with_pair_certificates(
-            decision::pair_disjointness::PairDisjointnessIndex::derive(&program),
+            decision::pair_disjointness::PairDisjointnessIndex::derive(&program, &mut_facts),
         )
     } else {
         a5_site_proofs

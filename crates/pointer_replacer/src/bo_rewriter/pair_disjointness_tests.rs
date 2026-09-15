@@ -400,8 +400,11 @@ fn w6p_same_place_is_refused_before_any_rule() {
         // The analysis frame decides one side raw before any pair is consulted,
         // so the refusal is exercised on the index directly.
         let program = bo_rewriter::collect_program(tcx);
-        let index =
-            bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(&program);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts,
+        );
         let function = |name: &str| {
             *program
                 .functions
@@ -501,4 +504,65 @@ fn w6p_type_rule_union_sibling_stays_held() {
         assert!(ledger.iter().all(|row| row.outcome.is_err()), "{ledger:?}");
     })
     .expect("union-sibling fixture compilation");
+}
+
+/// wave-6k's READ/READ shape (brotli `ExtendLastCommand` →
+/// `CommandRestoreDistanceCode(last_command, &mut (*s).dist)`, both formals
+/// immutable): `Command` and `BrotliDistanceParams` would pass the type rule,
+/// but a READ/READ pair is the shared-read consumer's (charter (d)) — this lane
+/// leaves it untouched so that consumer's receipts stay identical.
+const READ_READ_PEERS: &str = r#"
+    #[repr(C)]
+    pub struct Command { pub insert_len_: u32, pub copy_len_: u32, pub dist_extra_: u32, pub cmd_prefix_: u16, pub dist_prefix_: u16 }
+    #[repr(C)]
+    pub struct BrotliDistanceParams { pub distance_postfix_bits: u32, pub num_direct_distance_codes: u32 }
+    #[repr(C)]
+    pub struct State { pub dist: BrotliDistanceParams }
+    pub unsafe fn CommandRestoreDistanceCode(self_0: *const Command, dist: *const BrotliDistanceParams) -> u32 {
+        if ((*self_0).dist_prefix_ as u32 & 0x3ff) < 16u32.wrapping_add((*dist).num_direct_distance_codes) {
+            (*self_0).dist_prefix_ as u32 & 0x3ff
+        } else { (*self_0).dist_extra_.wrapping_add((*dist).distance_postfix_bits) }
+    }
+    pub unsafe fn ExtendLastCommand(last_command: *mut Command, s: *mut State) -> u32 {
+        let distance_code = CommandRestoreDistanceCode(last_command, &mut (*s).dist);
+        (*last_command).dist_extra_ = distance_code;
+        distance_code
+    }
+"#;
+
+#[test]
+fn w6p_read_read_pair_is_left_to_the_shared_read_consumer() {
+    ::utils::compilation::run_compiler_on_str(READ_READ_PEERS, |tcx| {
+        let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
+            .expect("read/read fixture decision");
+        dump(tcx, &table);
+        let ledger = ctx
+            .a5_site_proofs
+            .pair_certificates()
+            .expect("certificates ride the attested index")
+            .ledger();
+        assert!(
+            ledger
+                .iter()
+                .any(|row| row.outcome == Err(Unproved::ReadReadPeers)),
+            "a READ/READ pair is refused to the shared-read consumer: {ledger:?}"
+        );
+        assert!(ledger.iter().all(|row| row.outcome.is_err()), "{ledger:?}");
+        let proof = table
+            .seams
+            .overlap_proofs
+            .iter()
+            .find(|proof| {
+                tcx.item_name(proof.callee.to_def_id()).as_str() == "CommandRestoreDistanceCode"
+                    && proof.index == 1
+            })
+            .expect("the shared-read receipt is still produced");
+        assert_eq!(proof.verdict, A5SiteProofVerdict::Overlapping);
+        assert!(
+            proof.reason.contains("native-shared-read-peers"),
+            "{}",
+            proof.reason
+        );
+    })
+    .expect("read/read fixture compilation");
 }

@@ -51,7 +51,7 @@ use rustc_hir::{
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeckResults};
 use rustc_span::Span;
 
-use crate::utils::rustc::RustProgram;
+use crate::{analyses::borrow_ownership::mutability_facts::MutFacts, utils::rustc::RustProgram};
 
 /// libc allocators whose result is a fresh block: disjoint from every object
 /// live at the call. `realloc` returns either a fresh block or the caller's own
@@ -90,6 +90,10 @@ pub(crate) enum Unproved {
     UnionSibling,
     TypeUnresolved,
     RootsUnknown,
+    /// Both formals carry a non-defaulted immutable fact: a READ/READ pair,
+    /// which is wave-6k's shared-read consumer's (charter (d)); this lane
+    /// leaves it untouched so that consumer's receipts stay identical.
+    ReadReadPeers,
 }
 
 impl Unproved {
@@ -108,6 +112,7 @@ impl Unproved {
             Self::UnionSibling => "pair-disjointness-unproved:union-sibling",
             Self::TypeUnresolved => "pair-disjointness-unproved:type-unresolved",
             Self::RootsUnknown => "pair-disjointness-unproved:roots-unknown",
+            Self::ReadReadPeers => "pair-disjointness-unproved:read-read-peers",
         }
     }
 }
@@ -211,11 +216,13 @@ pub(crate) struct PairDisjointnessIndex {
     sites: FxHashMap<(u32, u32), Vec<SiteRecord>>,
     /// `(callee, left, right)` with `left < right`, zero-based.
     type_rule: FxHashMap<(u32, usize, usize), PairTypeVerdict>,
+    /// `(callee, index)` formals with a non-defaulted immutable fact.
+    immutable_formals: FxHashSet<(u32, usize)>,
     ledger: RefCell<Vec<LedgerRow>>,
 }
 
 impl PairDisjointnessIndex {
-    pub(crate) fn derive(program: &RustProgram<'_>) -> Self {
+    pub(crate) fn derive(program: &RustProgram<'_>, mut_facts: &MutFacts) -> Self {
         let tcx = program.tcx;
         let local_functions: FxHashSet<LocalDefId> = program.functions.iter().copied().collect();
         let allocators = allocator_wrappers(tcx, &local_functions);
@@ -249,8 +256,15 @@ impl PairDisjointnessIndex {
         }
 
         let mut type_verdicts = FxHashMap::default();
+        let mut immutable_formals = FxHashSet::default();
         for &callee in &program.functions {
             let inputs = tcx.fn_sig(callee).skip_binder().skip_binder().inputs();
+            for index in 0..inputs.len() {
+                let local = rustc_middle::mir::Local::from_usize(index + 1);
+                if !mut_facts.is_defaulted(callee, local) && !mut_facts.is_mutable(callee, local) {
+                    immutable_formals.insert((callee.local_def_index.as_u32(), index));
+                }
+            }
             let pointees: Vec<Option<Ty<'_>>> = inputs
                 .iter()
                 .map(|ty| match ty.kind() {
@@ -275,6 +289,7 @@ impl PairDisjointnessIndex {
         Self {
             sites,
             type_rule: type_verdicts,
+            immutable_formals,
             ledger: RefCell::new(Vec::new()),
         }
     }
@@ -331,6 +346,11 @@ impl PairDisjointnessIndex {
         let (Some(a), Some(b)) = (arg(left, left_span), arg(right, right_span)) else {
             return Err(Unproved::SiteUnresolved);
         };
+        if self.immutable_formals.contains(&(callee, left))
+            && self.immutable_formals.contains(&(callee, right))
+        {
+            return Err(Unproved::ReadReadPeers);
+        }
         // The same syntactic place, however it is cast, is never disjoint from
         // itself; refused before any rule is consulted.
         if let (Some(pa), Some(pb)) = (&a.place, &b.place)
