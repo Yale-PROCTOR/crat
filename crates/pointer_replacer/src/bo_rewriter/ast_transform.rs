@@ -3717,9 +3717,12 @@ fn transform_with<'tcx>(
         let Some(node) = site.node else {
             return Err("declaration-explicit-type-local-missing-node".to_owned());
         };
-        if explicit_local_types
-            .insert(node, site.emitted_type.clone())
-            .is_some()
+        // R410-2(a): the same explicit type registered twice for one node is
+        // ONE declaration; a different type is the planner's
+        // `declaration-type-conflict` hold and never reaches this pass -- if
+        // it does, fail closed as before.
+        if let Some(previous) = explicit_local_types.insert(node, site.emitted_type.clone())
+            && previous != site.emitted_type
         {
             return Err(format!(
                 "declaration-explicit-type-duplicate:{}:{}",

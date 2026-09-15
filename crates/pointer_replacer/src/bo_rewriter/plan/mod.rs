@@ -4036,7 +4036,47 @@ pub(crate) fn plan(
                             && site.emitted_type == receiver.receiver_type()
                     })
             });
-        let (ty_file, declaration_edit) = if inferred_box || typed_pattern || typed_receiver {
+                let typed_field_load = typed_field_load(table, subject);
+        // R410-2(a): ONE explicit declaration per node. Several producers may
+        // register the same node (a null-init declaration, a cursor
+        // declaration, a field-load declaration, a construction-plan
+        // declaration, a Box declaration); the same type twice is one
+        // declaration, a DIFFERENT type is a conflict the planner names as a
+        // typed hold, never something the emitter discovers as a duplicate.
+        {
+            let declared = table
+                .seams
+                .explicit_declarations
+                .iter()
+                .filter(|site| {
+                    site.category == "local" && site.node == Some((subject.fn_did, subject.hir_id))
+                })
+                .map(|site| site.emitted_type.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if declared.len() > 1 {
+                unplaceable.push(Unplaceable {
+                    owner_class: SignatureClassId::of(subject.fn_did),
+                    bridge: surface_bridge(),
+                    reason: "declaration-type-conflict",
+                    detail: format!(
+                        "{}: {}",
+                        attribution(),
+                        declared.iter().copied().collect::<Vec<_>>().join(" | ")
+                    ),
+                    subject: identity(),
+                });
+                continue;
+            }
+        }
+        let planned_declaration = inferred_box || typed_pattern || typed_receiver;
+        
+let (ty_file, declaration_edit) = if inferred_box || typed_pattern || typed_receiver || planned_declaration || typed_field_load {
+||||||| parent of 6b057417 (Planner: one explicit declaration per node; a second type is the typed hold declaration-type-conflict (R410-2(a)))
+        // wave-6f: a local loaded from a converting field carries an explicit
+        // declaration planned by the field transaction; no type span to splice.
+        let typed_field_load = typed_field_load(table, subject);
+        let planned_declaration = inferred_box || typed_pattern || typed_receiver;
+        let (ty_file, declaration_edit) = if planned_declaration || typed_field_load {
             match span_to_loc(subject.binding_span) {
                 Ok((file, _, _)) => (file, None),
                 Err(reason) => {
@@ -5301,6 +5341,89 @@ mod tests {
             planned.unplaceable[0].detail.contains("p (param #0)"),
             "the record must name WHICH subject, in the artifact's own terms: {:?}",
             planned.unplaceable[0].detail
+        );
+    }
+
+    /// R410-2(a): two producers registering an explicit declaration for one
+    /// node with DIFFERENT types is a typed hold the planner names
+    /// (`declaration-type-conflict`), never a duplicate the emitter finds;
+    /// the same type twice is one declaration and plans normally.
+    ///
+    /// *Mutation-tested:* delete the guard and the first table plans the
+    /// binding (no `Unplaceable`), so the equality on `reason` fails.
+    #[test]
+    fn two_explicit_declarations_with_different_types_are_a_typed_conflict() {
+        use crate::bo_rewriter::decision::seam::ExplicitDeclarationSite;
+        let site = |emitted_type: &str| ExplicitDeclarationSite {
+            owner_class: SignatureClassId::of(rustc_hir::def_id::CRATE_DEF_ID),
+            caller: rustc_hir::def_id::CRATE_DEF_ID,
+            node: Some((rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID)),
+            span: None,
+            category: "local",
+            emitted_type: emitted_type.to_owned(),
+            replacement: None,
+            arm: "test",
+        };
+        let table = |declarations: Vec<ExplicitDeclarationSite>| DecisionTable {
+            counted_void: Default::default(),
+            forward_slice_parameters: Vec::new(),
+            void_region: Default::default(),
+            flexible_tails: Default::default(),
+            box_params: Default::default(),
+            nested_receipts: Vec::new(),
+            cursor_receipts: Vec::new(),
+            sibling_overlap_inventory: Default::default(),
+            declaration_pointees: Default::default(),
+            declaration_patterns: Default::default(),
+            input_interfaces: Default::default(),
+            arm_requirements: Default::default(),
+            exposure: None,
+            seams: crate::bo_rewriter::decision::seam::SeamPlan {
+                explicit_declarations: declarations,
+                ..Default::default()
+            },
+            c9_marks: Vec::new(),
+            lifetime_plan: Default::default(),
+            return_interfaces: Default::default(),
+            return_receivers: Default::default(),
+            depth2_npo_storages: Vec::new(),
+            slice_constructions: Vec::new(),
+            retired_slice_constructions: Vec::new(),
+            slice_use_receipts: Vec::new(),
+            option_receipts: Vec::new(),
+            option_value_initializers: Vec::new(),
+            option_mut_bindings: rustc_hash::FxHashSet::default(),
+            option_composed_uses: Vec::new(),
+            contract_extent_promotions: Default::default(),
+            field_transactions: Default::default(),
+            entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
+        };
+        let run = |table: &DecisionTable| {
+            plan(
+                table,
+                |_| Some("fn f(p: PtrAlias) {}".to_owned()),
+                |_: rustc_span::Span| -> Result<(FileKey, usize, usize), &'static str> {
+                    Ok((FileKey::Virtual("f.rs".to_owned()), 0, 0))
+                },
+                |_| "f".to_owned(),
+                &|_| false,
+            )
+        };
+        let conflict = run(&table(vec![site("&[u8]"), site("&mut [u8]")]));
+        assert_eq!(conflict.unplaceable.len(), 1, "{:?}", conflict.unplaceable);
+        assert_eq!(conflict.unplaceable[0].reason, "declaration-type-conflict");
+        assert!(
+            conflict.unplaceable[0].detail.contains("&[u8] | &mut [u8]"),
+            "the hold names both types: {:?}",
+            conflict.unplaceable[0].detail
+        );
+        let same = run(&table(vec![site("&[u8]"), site("&[u8]")]));
+        assert!(
+            same.unplaceable
+                .iter()
+                .all(|row| row.reason != "declaration-type-conflict"),
+            "one type registered twice is one declaration: {:?}",
+            same.unplaceable
         );
     }
 
