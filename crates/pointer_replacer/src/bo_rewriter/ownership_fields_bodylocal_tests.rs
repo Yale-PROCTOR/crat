@@ -188,6 +188,68 @@ pub unsafe extern "C" fn generate_gaussian_splat(mut target: *mut libc::c_float,
 }
 
 #[test]
+fn r395_heman_percentiles_real_shape_recursive_qselect_lend() {
+    // `heman_ops_percentiles::{vals, percentiles}` with the real `qselect`:
+    // a recursive raw callee that passes the formal (and an offset of it)
+    // back to itself; both owners keep their Box and drop at their C free.
+    let input = format!(
+        r#"{}
+unsafe extern "C" fn qselect(mut v: *mut libc::c_float, mut len: libc::c_int, mut k: libc::c_int) -> libc::c_float {{
+    let mut i: libc::c_int = 0;
+    let mut st: libc::c_int = 0;
+    while i < len - 1 as libc::c_int {{
+        if !(*v.offset(i as isize) > *v.offset((len - 1 as libc::c_int) as isize)) {{
+            let mut f = *v.offset(i as isize);
+            *v.offset(i as isize) = *v.offset(st as isize);
+            *v.offset(st as isize) = f;
+            st += 1;
+        }}
+        i += 1;
+    }}
+    let mut __0 = *v.offset((len - 1 as libc::c_int) as isize);
+    *v.offset((len - 1 as libc::c_int) as isize) = *v.offset(st as isize);
+    *v.offset(st as isize) = __0;
+    return if k == st {{ *v.offset(st as isize) }} else if st > k {{ qselect(v, st, k) }} else {{ qselect(v.offset(st as isize), len - st, k - st) }};
+}}
+pub unsafe extern "C" fn heman_ops_percentiles(mut src: *mut libc::c_float, mut size: libc::c_int, mut nsteps: libc::c_int) -> libc::c_float {{
+    let mut npixels = size;
+    let mut vals = malloc((::std::mem::size_of::<libc::c_float>() as libc::c_ulong).wrapping_mul(npixels as libc::c_ulong)) as *mut libc::c_float;
+    let mut i_0 = 0 as libc::c_int;
+    while i_0 < size {{
+        *vals.offset(i_0 as isize) = *src.offset(i_0 as isize);
+        i_0 += 1;
+    }}
+    let mut percentiles = malloc((::std::mem::size_of::<libc::c_float>() as libc::c_ulong).wrapping_mul(nsteps as libc::c_ulong)) as *mut libc::c_float;
+    let mut tier = 0 as libc::c_int;
+    while tier < nsteps {{
+        let mut height = qselect(vals, npixels, tier * npixels / nsteps);
+        *percentiles.offset(tier as isize) = height;
+        tier += 1;
+    }}
+    free(vals as *mut libc::c_void);
+    let mut e = *src;
+    let mut tier_0 = nsteps - 1 as libc::c_int;
+    while tier_0 >= 0 as libc::c_int {{
+        if e > *percentiles.offset(tier_0 as isize) {{
+            e = *percentiles.offset(tier_0 as isize);
+            break;
+        }} else {{ tier_0 -= 1; }}
+    }}
+    free(percentiles as *mut libc::c_void);
+    e
+}}"#,
+        c_declarations()
+    );
+    let s = verify(&input, "vals", BoxShape::Slice, false);
+    assert!(!s.contains("Box::into_raw"));
+    assert!(
+        s.contains("qselect(<[_]>::as_mut_ptr(&mut *(vals)), npixels, tier * npixels / nsteps)"),
+        "{s}"
+    );
+    verify(&input, "percentiles", BoxShape::Slice, false);
+}
+
+#[test]
 fn r395_heman_percentiles_real_shape_sizeof_first_wrapping_mul_count() {
     // `heman_ops_percentiles::vals#292`: sizeof-first operand order, an
     // index-written buffer read back in a loop, the C free at the end.
@@ -244,6 +306,38 @@ fn r395_scalar_returning_callee_keeps_caller_box() {
     );
     let s = verify(&input, "buffer", BoxShape::Slice, false);
     assert!(!s.contains("Box::into_raw"));
+}
+
+#[test]
+fn r395_scalar_arithmetic_call_arguments_are_pure_but_effectful_ones_hold() {
+    // heman `qselect(vals, npixels, tier * npixels / nsteps)`.
+    let input = format!(
+        "{} unsafe fn read(p:*mut u32, k:usize)->u32 {{ *p.offset(k as isize) }} pub unsafe fn prepare(n:usize)->u32 {{ let mut buffer=calloc(4,core::mem::size_of::<u32>()) as *mut u32; *buffer=9; let value=read(buffer, (n * 2 + 1) / 3 % 4); free(buffer as *mut core::ffi::c_void); value }}",
+        declarations()
+    );
+    let s = verify(&input, "buffer", BoxShape::Slice, false);
+    assert!(s.contains("read(<[_]>::as_mut_ptr(&mut *(buffer)), (n * 2 + 1) / 3 % 4)"));
+    let effectful = format!(
+        "{} static mut COUNTER: usize = 0; unsafe fn next()->usize {{ COUNTER+=1; COUNTER }} unsafe fn read(p:*mut u32, k:usize)->u32 {{ *p.offset(k as isize) }} pub unsafe fn prepare()->u32 {{ let mut buffer=calloc(4,core::mem::size_of::<u32>()) as *mut u32; *buffer=9; let value=read(buffer, next() * 2); free(buffer as *mut core::ffi::c_void); value }}",
+        declarations()
+    );
+    ::utils::compilation::run_compiler_on_str(&effectful, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, d) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("buffer"))
+            .unwrap();
+        assert!(matches!(d, Decision::Degraded(_)), "{d:?}");
+    })
+    .unwrap();
 }
 
 #[test]

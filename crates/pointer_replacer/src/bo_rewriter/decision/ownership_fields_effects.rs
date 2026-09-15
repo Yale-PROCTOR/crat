@@ -504,8 +504,13 @@ impl<'tcx> NativeEffects<'tcx> {
         if done.contains(&key) {
             return Ok(());
         }
+        // Recursion on the same (function, formals) key adds no site: every
+        // site the formal reaches in that body is inspected by the activation
+        // already on the stack, and a retiring, opaque or escaping site fails
+        // the whole trace from there. (The whole-closure proof keeps its
+        // cycle hold; this refinement is only consulted after it fails.)
         if !active.insert(key.clone()) {
-            return Err(Hold::Cycle(function));
+            return Ok(());
         }
         let facts = self
             .arguments
@@ -705,6 +710,10 @@ fn trace_parameter<'tcx>(
                     .iter()
                     .any(|argument| operand_tainted(tcx, body, &tainted, &argument.node)) =>
                 {
+                    // A scalar result cannot carry the pointer back.
+                    if is_scalar(destination.ty(body, tcx).ty) {
+                        continue;
+                    }
                     if destination
                         .projection
                         .iter()
@@ -1080,6 +1089,39 @@ mod native_tests {
                 "{body}: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn native_per_argument_recursion_on_the_same_formal_certifies() {
+        // heman `qselect`: the formal (or a pointer derived from it) is passed
+        // back to the same function; every site it reaches is inspected once.
+        let source = format!(
+            "{LIBC} pub unsafe fn qselect(v: *mut f32, len: i32, k: i32) -> f32 {{ if len <= 1 {{ return *v; }} let st = len / 2; if k < st {{ qselect(v, st, k) }} else {{ qselect(v.offset(st as isize), len - st, k - st) }} }}"
+        );
+        assert_eq!(verdict(&source, "qselect"), Ok((1, 2)));
+        assert_eq!(
+            no_retention(&source, "qselect"),
+            Ok("native-per-argument-no-retention")
+        );
+        // A recursive callee that frees the formal on one path still holds.
+        let freeing = source.replace(
+            "if len <= 1 { return *v; }",
+            "if len <= 1 { free(v as *mut core::ffi::c_void); return 0.0; }",
+        );
+        assert_ne!(freeing, source);
+        assert!(matches!(
+            verdict(&freeing, "qselect"),
+            Err(EffectsHold::Retirement(_))
+        ));
+        // The key is (function, reached formals): a swapped recursion moves
+        // the traced formal into a freed position and is not the same key.
+        let swapped = format!(
+            "{LIBC} pub unsafe fn swap(a: *mut i32, b: *mut i32, n: i32) {{ if n == 0 {{ free(b as *mut core::ffi::c_void); }} else {{ swap(b, a, n - 1); }} }}"
+        );
+        assert!(matches!(
+            verdict(&swapped, "swap"),
+            Err(EffectsHold::Retirement(_))
+        ));
     }
 
     #[test]

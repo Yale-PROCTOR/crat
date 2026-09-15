@@ -316,6 +316,35 @@ fn scalar_arguments(
             ExprKind::Lit(_) => true,
             ExprKind::Path(QPath::Resolved(_, path)) => matches!(path.res, Res::Local(_)),
             ExprKind::Cast(inner, _) => pure(inner, typeck),
+            // Scalar arithmetic over pure operands reads no memory and
+            // introduces no reference; an overflow or zero-divisor trap is
+            // the input's own UB in C (§28) and unwinds through the
+            // receipted cleanup drops.
+            ExprKind::Binary(operator, left, right) => {
+                use rustc_hir::BinOpKind::*;
+                matches!(
+                    operator.node,
+                    Add | Sub
+                        | Mul
+                        | Div
+                        | Rem
+                        | BitAnd
+                        | BitOr
+                        | BitXor
+                        | Shl
+                        | Shr
+                        | Eq
+                        | Ne
+                        | Lt
+                        | Le
+                        | Gt
+                        | Ge
+                ) && pure(left, typeck)
+                    && pure(right, typeck)
+            }
+            ExprKind::Unary(rustc_hir::UnOp::Neg | rustc_hir::UnOp::Not, inner) => {
+                pure(inner, typeck)
+            }
             _ => false,
         }
     }
