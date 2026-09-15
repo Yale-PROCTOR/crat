@@ -793,18 +793,13 @@ fn pair_local_statement_ordinals(
     let source_locals = labeled_simple_locals(source, source_path)?;
     let target_locals = labeled_simple_locals(target, target_path)?;
     let mut pairs = Vec::with_capacity(source_locals.len());
-    for (label, (source_ordinal, source_name)) in &source_locals {
-        let Some((target_ordinal, target_name)) = target_locals.get(label) else {
+    for (&(label, name), &source_ordinal) in &source_locals {
+        let Some(&target_ordinal) = target_locals.get(&(label, name)) else {
             return Err(correspondence_error(&format!(
-                "target has no simple local declaration for label {label}"
+                "target has no simple local declaration for label {label} and symbol `{name}`"
             )));
         };
-        if source_name != target_name {
-            return Err(correspondence_error(&format!(
-                "local declaration symbols differ at label {label}"
-            )));
-        }
-        pairs.push((*source_ordinal, *target_ordinal));
+        pairs.push((source_ordinal, target_ordinal));
     }
     Ok(pairs)
 }
@@ -812,19 +807,22 @@ fn pair_local_statement_ordinals(
 fn labeled_simple_locals(
     statements: &[LabeledStatement<'_>],
     path: &str,
-) -> Result<HashMap<u32, (usize, Symbol)>, ObservationError> {
+) -> Result<HashMap<(u32, Symbol), usize>, ObservationError> {
     let mut result = HashMap::new();
     for statement in statements {
         let StmtKind::Let(local) = &statement.statement.kind else { continue };
         let PatKind::Ident(_, ident, None) = local.pat.kind else { continue };
         let Some(label) = statement.label else { continue };
         if result
-            .insert(label, (statement.ordinal, ident.name))
+            .insert((label, ident.name), statement.ordinal)
             .is_some()
         {
             return Err(ObservationError {
                 code: "binding_correspondence",
-                message: format!("{path} has duplicate simple-local label {label}"),
+                message: format!(
+                    "{path} has duplicate simple-local declaration for label {label} and symbol `{}`",
+                    ident.name
+                ),
             });
         }
     }
@@ -6065,6 +6063,42 @@ unsafe fn target() -> i32 {
                 .observations
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn multi_statement_target_group_allows_distinct_generated_locals() {
+        let source = r#"
+unsafe fn source_copy(mut pointer: *mut i32) -> i32 {
+    #[proctor(0)] let mut alias: *mut i32 = pointer;
+    #[proctor(1)] *alias
+}
+unsafe fn target(mut pointer: &mut i32) -> i32 {
+    #[proctor(0)] let proctor_temp_var_0 = pointer;
+    #[proctor(0)] let proctor_temp_var_1 = proctor_temp_var_0;
+    #[proctor(0)] let mut alias: &mut i32 = proctor_temp_var_1;
+    #[proctor(1)] *alias
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0, 1]).unwrap();
+        assert_eq!(document.observations.len(), 1, "{document:?}");
+    }
+
+    #[test]
+    fn duplicate_local_symbol_within_target_group_is_ambiguous() {
+        let source = r#"
+unsafe fn source_copy(mut pointer: *mut i32) -> i32 {
+    #[proctor(0)] let mut alias: *mut i32 = pointer;
+    #[proctor(1)] *alias
+}
+unsafe fn target(mut pointer: &mut i32) -> i32 {
+    #[proctor(0)] let mut alias: &mut i32 = pointer;
+    #[proctor(0)] let mut alias: &mut i32 = alias;
+    #[proctor(1)] *alias
+}
+"#;
+        let error = extract_case(source, "source_copy", "target", vec![0, 1]).unwrap_err();
+        assert_eq!(error.code, "binding_correspondence");
+        assert!(error.message.contains("label 0 and symbol `alias`"));
     }
 
     #[test]
