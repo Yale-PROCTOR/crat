@@ -110,6 +110,7 @@ mod slice_input_root_tests;
 #[cfg(test)]
 mod slice_input_tests;
 pub(crate) mod slice_local_construction;
+pub(crate) mod slice_passon;
 pub(crate) mod slice_return_evidence;
 pub(crate) mod slice_scalar_return;
 pub(crate) mod slice_use;

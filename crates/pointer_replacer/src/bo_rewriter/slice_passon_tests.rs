@@ -375,3 +375,89 @@ fn wave6s2_pin_pass_on_into_a_fn_pointer_pinned_callee_goes_through_its_shim() {
     );
     assert!(joined(&source).contains("sink(buf, n)"), "{source}");
 }
+
+// ---------------------------------------------------------------------------
+// W6S2-2 — the C2Rust constant-reslice return (`decision/slice_passon.rs`).
+// ---------------------------------------------------------------------------
+
+/// **Witness (lodepng `lodepng_chunk_data` / `lodepng_chunk_data_const`,
+/// batch-6 rows, sole).** C2Rust spells the reslice return as
+/// `&mut *chunk.offset(8 as i32 as isize) as *mut u8`; the return family
+/// already delivers `return chunk.offset(8)` as the tied `&chunk[8..]`, and
+/// the spine is the same value. RED at `8e84dc6d` (`slice-cursor-use` on both
+/// parameters), GREEN with the recogniser.
+const LODEPNG_CHUNK_DATA: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn lodepng_chunk_data(mut chunk: *mut u8) -> *mut u8 { return &mut *chunk.offset(8 as i32 as isize) as *mut u8; }
+ pub unsafe fn lodepng_chunk_data_const(mut chunk: *const u8) -> *const u8 { return &*chunk.offset(8 as i32 as isize) as *const u8; }
+ pub unsafe fn use_it(mut chunk: *mut u8) -> u8 { let a = *chunk.offset(2); let d = lodepng_chunk_data(chunk); let c = lodepng_chunk_data_const(chunk); a.wrapping_add(*d.offset(1)).wrapping_add(*c.offset(2)) }
+"#;
+
+#[test]
+fn wave6s2_c2rust_constant_reslice_return_delivers_the_tied_suffix() {
+    let (source, _) = emit_with_receipts(LODEPNG_CHUNK_DATA);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let text = joined(&source);
+    assert!(
+        text.contains(
+            "fn lodepng_chunk_data<'a>(mut chunk: &'a [u8]) -> &'a [u8] { return &chunk[8..]; }"
+        ),
+        "{source}"
+    );
+    assert!(
+        text.contains("fn lodepng_chunk_data_const<'a>(mut chunk: &'a [u8]) -> &'a [u8] { return &chunk[8..]; }"),
+        "{source}"
+    );
+    assert!(
+        text.contains("let d: &[u8] = lodepng_chunk_data(chunk);"),
+        "{source}"
+    );
+    assert!(
+        text.contains("a.wrapping_add(d[1]).wrapping_add(c[2])"),
+        "{source}"
+    );
+}
+
+/// **Witness (the bare spelling is unchanged).** `return chunk.offset(8)`
+/// delivered before this rule and delivers identically with it.
+const BARE_RESLICE_RETURN: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn chunk_data(mut chunk: *mut u8) -> *mut u8 { return chunk.offset(8); }
+ pub unsafe fn use_it(mut chunk: *mut u8) -> u8 { let a = *chunk.offset(2); let d = chunk_data(chunk); a.wrapping_add(*d.offset(1)) }
+"#;
+
+#[test]
+fn wave6s2_pin_bare_constant_reslice_return_still_delivers() {
+    let (source, _) = emit_with_receipts(BARE_RESLICE_RETURN);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        joined(&source)
+            .contains("fn chunk_data<'a>(mut chunk: &'a [u8]) -> &'a [u8] { return &chunk[8..]; }"),
+        "{source}"
+    );
+}
+
+/// **Controls.** A cast that CHANGES the pointee (`… as *const u16` on a
+/// `*const u8` receiver) is a reinterpretation, not a reslice, and stays
+/// held; a NEGATIVE literal is the bidirectional family's (slicecursor) and
+/// stays held. Both functions keep their raw signatures.
+const RESLICE_RETURN_CONTROLS: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn reinterpret(mut chunk: *const u8) -> *const u16 { return &*chunk.offset(8 as i32 as isize) as *const u8 as *const u16; }
+ pub unsafe fn backward(mut chunk: *const u8) -> *const u8 { return &*chunk.offset(-8 as i32 as isize) as *const u8; }
+ pub unsafe fn use_it(mut chunk: *mut u8) -> u16 { let a = *chunk.offset(2); let d = reinterpret(chunk); let c = backward(chunk.offset(16)); (a as u16).wrapping_add(*d).wrapping_add(*c as u16) }
+"#;
+
+#[test]
+fn wave6s2_reslice_return_controls_stay_held() {
+    let (source, _) = emit_with_receipts(RESLICE_RETURN_CONTROLS);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("fn reinterpret(mut chunk: *const u8) -> *const u16"),
+        "a pointee-changing cast is not a reslice: {source}"
+    );
+    assert!(
+        source.contains("fn backward(mut chunk: *const u8) -> *const u8"),
+        "a negative literal is the bidirectional family's: {source}"
+    );
+}

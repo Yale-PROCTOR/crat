@@ -351,7 +351,10 @@ pub(crate) struct ReturnSiteFact {
     pub expression_shape: ReturnExprShape,
 }
 
-fn return_expression_shape(tcx: TyCtxt<'_>, expression: &Expr<'_>) -> ReturnExprShape {
+fn return_expression_shape<'tcx>(tcx: TyCtxt<'tcx>, expression: &Expr<'tcx>) -> ReturnExprShape {
+    if let Some(shape) = super::slice_passon::c2rust_constant_reslice_return(tcx, expression) {
+        return shape;
+    }
     let ExprKind::MethodCall(_, receiver, arguments, _) = expression.kind else {
         return ReturnExprShape::Other;
     };
@@ -753,7 +756,9 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                 hir_id: expr.hir_id,
                 owner: self.fn_did,
                 span: expr.span,
-                root: shape.place_root(),
+                root: shape
+                    .place_root()
+                    .or_else(|| super::slice_passon::c2rust_constant_reslice_root(self.tcx, expr)),
                 source_shape: shape.key(),
                 source_type,
                 expression_shape: return_expression_shape(self.tcx, expr),
