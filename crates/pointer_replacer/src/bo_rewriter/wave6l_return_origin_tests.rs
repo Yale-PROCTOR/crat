@@ -1074,3 +1074,90 @@ fn w6l_dead_return_needs_a_bare_parameter() {
     );
     assert!(observed.plans.is_empty(), "{:?}", observed.plans);
 }
+
+/// heman `heman_image_texel` with the receivers the raw-receiver twin does
+/// not serve: a cast initializer (`heman_lighting_apply`), an immediate
+/// deref read into a field (`heman_lighting_compute_normals`), a compound
+/// assignment through the call (`heman_ops_accumulate`), an assignment to an
+/// existing raw local (`heman_ops_warp_core`), and a walker that fixes the
+/// slice form. One unadaptable site drops the callee's class today.
+const HEMAN_EXPRESSION_RECEIVERS: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+pub struct heman_image { pub width: i32, pub height: i32, pub nbands: i32, pub data: *mut f32 }
+pub struct kmVec3 { pub x: f32, pub y: f32, pub z: f32 }
+#[no_mangle]
+pub unsafe extern "C" fn heman_image_texel(mut img: *mut heman_image, mut x: i32, mut y: i32) -> *mut f32 {
+    return ((*img).data).offset(((y * (*img).width * (*img).nbands) as isize) + ((x * (*img).nbands) as isize));
+}
+#[no_mangle]
+pub unsafe extern "C" fn heman_draw_points(mut target: *mut heman_image, mut i: i32, mut j: i32, val: f32) {
+    let mut texel = heman_image_texel(target, i, j);
+    let mut c = 0;
+    while c < (*target).nbands {
+        *texel = val;
+        texel = texel.offset(1);
+        c += 1;
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn heman_lighting_apply(mut normals: *mut heman_image, mut x: i32, mut y: i32) -> f32 {
+    let mut N = heman_image_texel(normals, x, y) as *mut kmVec3;
+    (*N).x + (*N).y
+}
+#[no_mangle]
+pub unsafe extern "C" fn heman_lighting_compute_normals(mut heightmap: *mut heman_image, mut x: i32, mut y: i32) -> f32 {
+    let mut p = kmVec3 { x: 0.0, y: 0.0, z: 0.0 };
+    p.z = *heman_image_texel(heightmap, x, y);
+    p.z
+}
+#[no_mangle]
+pub unsafe extern "C" fn heman_ops_accumulate(mut result: *mut heman_image, mut i: i32, mut j: i32, v: f32) {
+    *heman_image_texel(result, i, j) += v;
+}
+#[no_mangle]
+pub unsafe extern "C" fn heman_ops_warp_core(mut secondary: *mut heman_image, mut x: i32, mut y: i32) -> f32 {
+    let mut src = 0 as *mut f32;
+    src = heman_image_texel(secondary, x, y);
+    *src
+}
+"#;
+
+/// RED (wave 5, queued in report 005): every one of these callers keeps its
+/// delivery — the changed return interface is bridged at the cast
+/// initializer, the immediate derefs, the compound assignment and the
+/// assignment receiver — and the callee's class is placed.
+#[test]
+#[ignore = "wave-6l build queued: expression-position and cast receivers of a changed return interface (report 005)"]
+fn w6l_red_expression_position_receivers_keep_the_callee_class_placed() {
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        degradations,
+        ..
+    } = emitted(
+        "heman-expression-receivers",
+        HEMAN_EXPRESSION_RECEIVERS,
+        &[
+            "heman_draw_points",
+            "heman_image_texel",
+            "heman_lighting_apply",
+            "heman_lighting_compute_normals",
+            "heman_ops_accumulate",
+            "heman_ops_warp_core",
+        ],
+    )
+    else {
+        panic!("heman expression receivers emission degraded");
+    };
+    println!("W6L-EXPR-EMITTED\n{source}\nW6L-EXPR-END\n{degradations:?}");
+    assert_eq!(reverted_count, 0);
+    let text = compact(&source);
+    assert!(text.contains("->&'staticmut[f32]"), "{text}");
+    assert!(
+        !degradations
+            .iter()
+            .any(|d| format!("{:?}", d.reason).contains("raw-receiver-result-unavailable")),
+        "{degradations:?}"
+    );
+    assert!(text.contains("letmuttexel:&mut[f32]="), "{text}");
+}
