@@ -1267,10 +1267,14 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                         // pinned callee's parameters degrade
                         // `call-site-not-adapted` even under `LiftAdaptable`,
                         // so they are never `other_form` either.
-                        let reason = if via_borrow {
-                            BlockReason::BorrowedIntoRawParam
-                        } else if callee_subject.is_some_and(|k| other_form.contains(&k)) {
+                        // A target converting to another safe form is that
+                        // family's adapter question (W-C4), whether the
+                        // argument is the binding or a borrow through it; only
+                        // a target that STAYS raw makes a borrow a P1 hazard.
+                        let reason = if callee_subject.is_some_and(|k| other_form.contains(&k)) {
                             continue;
+                        } else if via_borrow {
+                            BlockReason::BorrowedIntoRawParam
                         } else if pinned {
                             BlockReason::FlowsIntoPinnedCallee
                         } else {

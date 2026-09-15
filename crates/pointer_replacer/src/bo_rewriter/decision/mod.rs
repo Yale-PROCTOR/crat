@@ -51,6 +51,9 @@ pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod local_callee_extent;
+pub(crate) mod mixed_boundary;
+#[cfg(test)]
+mod mixed_boundary_tests;
 pub(crate) mod nested_slice;
 pub(crate) mod option;
 mod option_ops;

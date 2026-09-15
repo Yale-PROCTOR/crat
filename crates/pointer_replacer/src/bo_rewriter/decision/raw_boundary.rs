@@ -3234,7 +3234,9 @@ impl RawBoundaryDispositionIndex {
                     _ => disposition.is_handled() && target_stays_raw,
                 };
                 open_nodes.entry(node).or_default().push(opens_arm_a);
-                handled_nodes.entry(node).or_default().push(handled);
+                if super::mixed_boundary::site_votes(target_stays_raw, &disposition) {
+                    handled_nodes.entry(node).or_default().push(handled);
+                }
                 out.site_lookup.push((
                     node,
                     site.source_span.source_callsite(),
