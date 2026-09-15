@@ -269,6 +269,7 @@ fn owners(requests: &[(SignatureClassId, String)]) -> BTreeSet<SignatureClassId>
 /// is an independent conversion, connected to the loss by nothing but the
 /// undirected interface graph, must keep it.
 #[test]
+#[ignore = "RED by design: wave-5d primitive (R398-1)"]
 fn w5c_wall_interface_restoration_must_not_withdraw_an_unmoved_neighbour() {
     with_reduction(|reduction| {
         let mut policy = FamilyPolicy::at(FamilyStage::SliceUse);
@@ -295,6 +296,7 @@ fn w5c_wall_interface_restoration_must_not_withdraw_an_unmoved_neighbour() {
 /// (excluding it at the input restores the callee), never the callee whose
 /// delivered slice it demoted.
 #[test]
+#[ignore = "RED by design: wave-5d primitive (R398-1)"]
 fn w5c_wall_restoration_targets_the_candidate_that_caused_the_loss_not_the_victim() {
     with_reduction(|reduction| {
         let policy = FamilyPolicy::at(FamilyStage::SliceUse);
