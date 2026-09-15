@@ -33,6 +33,15 @@ use crate::utils::rustc::RustProgram;
 
 pub(crate) const PROVENANCE: &str = "k18-callee-descendant-free";
 
+/// A `core` raw-pointer method that takes the pointer by value and hands
+/// nothing back: `is_null`. Every other `Rust`-ABI method on a tracked
+/// pointer stays an unknown call for the retention collector and refuses the
+/// descendant-free scan (`offset`, `add`, `cast`, … derive a new pointer the
+/// contract table cannot see).
+pub(crate) fn core_pointer_no_retain(tcx: TyCtxt<'_>, callee: DefId) -> bool {
+    tcx.crate_name(callee.krate).as_str() == "core" && tcx.item_name(callee).as_str() == "is_null"
+}
+
 fn pointer(ty: Ty<'_>) -> bool {
     matches!(ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
 }
@@ -179,7 +188,17 @@ fn descendant_free(
                 // an unknown or retaining contract; a known no-retain row that
                 // returns an alias was folded into the alias set above — unless
                 // its result lands somewhere other than a plain local, which
-                // hands the alias out directly.
+                // hands the alias out directly. A `Rust`-ABI method on an
+                // alias is outside the contract table: only `is_null` is known.
+                if callee
+                    .as_local()
+                    .is_none_or(|local| !functions.contains(&local))
+                    && !symbol_key(tcx, callee, functions).abi.starts_with('C')
+                    && args.iter().any(|argument| is_alias(&argument.node))
+                    && !core_pointer_no_retain(tcx, callee)
+                {
+                    return false;
+                }
                 if callee
                     .as_local()
                     .is_none_or(|local| !functions.contains(&local))

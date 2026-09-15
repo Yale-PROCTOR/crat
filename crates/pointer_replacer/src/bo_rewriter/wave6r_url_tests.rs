@@ -147,3 +147,18 @@ fn wave6r_scan_libc_returned_alias_stored_is_not_descendant_free() {
 fn wave6r_scan_local_callee_returning_alias_is_not_descendant_free() {
     assert!(!scan(SCAN, "returns_through_local", 0));
 }
+
+/// A `Rust`-ABI pointer method other than `is_null` (`offset`) derives a new
+/// pointer the scan cannot follow through a contract row: refuse.
+#[test]
+fn wave6r_scan_core_offset_result_stored_is_not_descendant_free() {
+    let input = SCAN.replace(
+        "pub unsafe fn fresh(",
+        "pub unsafe fn stores_offset(url: *mut Url) -> i32 { KEEP = url.offset(1) as *mut c_void; (*url).len }\npub unsafe fn null_tests(url: *mut Url) -> i32 { if url.is_null() { return 0; } (*url).len }\npub unsafe fn fresh(",
+    );
+    assert!(!scan(&input, "stores_offset", 0));
+    assert!(
+        scan(&input, "null_tests", 0),
+        "is_null keeps the position free"
+    );
+}

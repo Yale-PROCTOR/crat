@@ -1374,6 +1374,17 @@ fn collect_retention_facts<'tcx>(
                         format!("{} arg{index} {detail}", key.symbol),
                     ));
                 }
+                Err(_)
+                    if crate::bo_rewriter::wave6r_child_access::core_pointer_no_retain(
+                        tcx, callee,
+                    ) =>
+                {
+                    facts.steps.push(retention_step(
+                        location,
+                        RetentionEventKind::KnownNoRetainCall,
+                        format!("{} arg{index} core-no-retain", key.symbol),
+                    ));
+                }
                 Err(error) => {
                     let step = retention_step(
                         location,

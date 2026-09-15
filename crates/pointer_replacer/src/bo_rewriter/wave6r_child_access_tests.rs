@@ -115,3 +115,17 @@ fn wave6r_child_access_transitive_retaining_callee_keeps_hold() {
         "    *cache = (*s).num;\n    keep(s);\n",
     ).replace("pub struct H65", "pub static mut KEEP3: *mut H6 = core::ptr::null_mut();\npub unsafe fn keep(p: *mut H6) { KEEP3 = p; }\npub struct H65"));
 }
+
+/// Reduced from binn `binn_object_get_value`: the callee null-tests its
+/// parameter before reading it. `is_null` is a `Rust`-ABI core method, which
+/// the retention collector filed as an unknown call, so the position never
+/// earned NoRetain and the shared source stayed held.
+#[test]
+fn wave6r_child_access_null_test_in_callee_is_no_retain() {
+    let row = h6_arg0_disposition(&INPUT.replace(
+        "    *cache = (*s).num;\n",
+        "    if s.is_null() { return; }\n    *cache = (*s).num;\n",
+    ));
+    assert!(row.contains("\tshared-ref-to-mut-raw\t"), "{row}");
+    assert!(!row.contains("write-through-shared-view"), "{row}");
+}
