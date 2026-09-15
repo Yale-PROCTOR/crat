@@ -5858,6 +5858,11 @@ const E_ADAPT_PRE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused
 /// offset expression rather than a bare local: that is the corpus shape the
 /// existing argument classifier calls `Other`, so the witness is RED before
 /// wave 1 even though g25/g26 already cover the glue algebra in isolation.
+///
+/// wave-6s (report 007): a forward computed sub-view argument into a SLICE
+/// callee now delivers `base` itself as a slice and the suffix view carries
+/// the base's own extent (no fallback), so the raw expressions this pins are
+/// kept raw by a signed delta, which the forward view refuses (R394-2).
 #[test]
 fn e_adapt_w1_slice_uses_licensed_then_named_fallback_extent() {
     let src = format!(
@@ -5867,8 +5872,8 @@ fn e_adapt_w1_slice_uses_licensed_then_named_fallback_extent() {
          \x20   while i < n {{ out += *p.offset(i as isize); i += 1; }} out\n\
          }}\n\
          pub unsafe fn without_len(p: *const i32) -> i32 {{ *p.offset(0) + *p.offset(1) }}\n\
-         pub unsafe fn caller(base: *const i32, n: usize) -> i32 {{\n\
-         \x20   with_len(base.offset(0), n) + without_len(base.offset(1))\n\
+         pub unsafe fn caller(base: *const i32, n: usize, k: isize) -> i32 {{\n\
+         \x20   with_len(base.offset(k), n) + without_len(base.offset(k + 1))\n\
          }}\n"
     );
     let seams = e_adapt_seams(&src);
@@ -6018,12 +6023,15 @@ fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
 }
 
 /// E-ADAPT-N4 — fallback identity is inseparable from its receipt and name.
+///
+/// wave-6s (report 007): the raw expression is kept raw by a signed delta
+/// (R394-2); a forward one would deliver the suffix view with no fallback.
 #[test]
 fn e_adapt_n4_fallback_name_and_receipt_are_one_production_fact() {
     let src = format!(
         "{E_ADAPT_PRE}\
          pub unsafe fn sum(p: *const i32) -> i32 {{ *p.offset(0) + *p.offset(1) }}\n\
-         pub unsafe fn caller(p: *const i32) -> i32 {{ sum(p.offset(0)) }}\n"
+         pub unsafe fn caller(p: *const i32, k: isize) -> i32 {{ sum(p.offset(k)) }}\n"
     );
     let seams = e_adapt_seams(&src);
     let emitted = e_adapt_source(&src);

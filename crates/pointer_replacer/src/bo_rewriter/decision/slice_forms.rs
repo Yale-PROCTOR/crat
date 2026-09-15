@@ -359,24 +359,75 @@ pub(crate) fn computed_body_copy_view<'tcx>(
     ))
 }
 
-/// Forward-only: the delta, under its `as isize` casts, is a non-negative
-/// integer literal or an expression of unsigned type. A signed or negated
-/// delta is the bidirectional family's (R394-2) and stays with the cursor
-/// verdict. Conditional on a UB-free input, an unsigned C index added to a
-/// pointer never moves it backwards.
+/// Forward-only: the delta is a non-negative integer literal, an expression
+/// of unsigned type, or a `+` of two forward deltas (lodepng
+/// `chunk.offset((8 as isize) + (length as isize))`: each summand is
+/// non-negative, and a sum that left the object would already be the input's
+/// UB), seen through casts that PRESERVE non-negativity: to any unsigned
+/// type; to a signed type strictly wider than an unsigned source, or at least
+/// as wide as a non-negative signed source; or to a signed type of pointer
+/// width, since an index at or above 2^63 cannot address an object. A
+/// signed or negated delta, or one narrowed through a signed cast (`length
+/// as c_int as isize` with `length: u32`), is the bidirectional family's
+/// (R394-2) and stays with the cursor verdict. Conditional on a UB-free
+/// input, a non-negative C index added to a pointer never moves it backwards.
 fn forward_delta<'tcx>(tcx: TyCtxt<'tcx>, delta: &'tcx Expr<'tcx>) -> bool {
+    use rustc_middle::ty::{IntTy, TyKind, UintTy};
+    let owner = delta.hir_id.owner.def_id;
+    let typeck = tcx.typeck(owner);
+    let pointer_bits = tcx.data_layout.pointer_size.bits();
+    let width = |ty: rustc_middle::ty::Ty<'tcx>| -> Option<(bool, u64)> {
+        match ty.kind() {
+            TyKind::Uint(UintTy::Usize) => Some((false, pointer_bits)),
+            TyKind::Int(IntTy::Isize) => Some((true, pointer_bits)),
+            TyKind::Uint(u) => Some((false, u.bit_width()?)),
+            TyKind::Int(i) => Some((true, i.bit_width()?)),
+            _ => None,
+        }
+    };
+    // Innermost first: the chain of casts, outermost last.
+    let mut casts = Vec::new();
     let mut inner = delta;
     while let ExprKind::Cast(operand, _) = inner.kind {
+        casts.push(inner);
         inner = operand;
     }
-    if matches!(&inner.kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(..)))
+    let base_forward = if let ExprKind::Binary(op, left, right) = inner.kind
+        && op.node == rustc_hir::BinOpKind::Add
     {
-        return true;
+        forward_delta(tcx, left) && forward_delta(tcx, right)
+    } else if matches!(&inner.kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(..)))
+    {
+        true
+    } else {
+        typeck
+            .expr_ty_opt(inner)
+            .is_some_and(|ty| matches!(ty.kind(), TyKind::Uint(_)))
+    };
+    if !base_forward {
+        return false;
     }
-    let owner = inner.hir_id.owner.def_id;
-    tcx.typeck(owner)
-        .expr_ty_opt(inner)
-        .is_some_and(|ty| matches!(ty.kind(), rustc_middle::ty::TyKind::Uint(_)))
+    let mut source = inner;
+    for cast in casts.into_iter().rev() {
+        let (Some((source_signed, source_bits)), Some((target_signed, target_bits))) = (
+            typeck.expr_ty_opt(source).and_then(width),
+            typeck.expr_ty_opt(cast).and_then(width),
+        ) else {
+            return false;
+        };
+        let preserved = !target_signed
+            || target_bits >= pointer_bits
+            || if source_signed {
+                target_bits >= source_bits
+            } else {
+                target_bits > source_bits
+            };
+        if !preserved {
+            return false;
+        }
+        source = cast;
+    }
+    true
 }
 
 pub(crate) fn computed_argument_view<'tcx>(
@@ -683,10 +734,17 @@ fn lower_computed_argument_views(
                 && let Form::Slice {
                     mutable: expected_mutable,
                 } = edit.expected
-                && matches!(edit.spec.core, GlueCore::FromRefMut)
+                && matches!(
+                    edit.spec.core,
+                    GlueCore::FromRefMut | GlueCore::FromRawParts
+                )
             {
-                // A borrowed element widened into a converted SLICE parameter:
-                // the suffix is already that slice.
+                // A borrowed element widened into a converted SLICE parameter,
+                // or the bare arithmetic wrapped by `from_raw_parts` with a
+                // guessed length (lodepng `lodepng_set32bitInt(chunk.offset(8 +
+                // length), CRC)`, where the adjacency arm had licensed `CRC`
+                // as the length): the suffix is already that slice, with the
+                // base's own extent.
                 if expected_mutable && !mutable {
                     hold = Some(view.use_span);
                     break;

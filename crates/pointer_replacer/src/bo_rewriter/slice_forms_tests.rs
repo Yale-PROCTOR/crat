@@ -1492,3 +1492,140 @@ fn wave6s_computed_view_composes_into_option_value() {
         "{source}"
     );
 }
+
+/// **Sum of forward deltas (report 007 §5a).** lodepng
+/// `lodepng_chunk_generate_crc`: `chunk.offset((8 as isize) + (length as
+/// isize))` — the delta is a `+` of a non-negative literal and an unsigned
+/// value under casts. Conditional on a UB-free input each summand is
+/// non-negative and a sum leaving the object would already be the input's
+/// UB, so the sum is forward and the argument is the suffix view.
+#[test]
+fn wave6s_generate_crc_sum_of_forward_deltas() {
+    let (source, receipts) = emit_with_family_receipts(GENERATE_CRC_LENGTH_GIVEN);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("fnlodepng_chunk_generate_crc(mutchunk:&mut[libc::c_uchar]"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("lodepng_set32bitInt((&mut(chunk)[((8aslibc::c_intasisize)+(lengthasisize))asusize..]),CRC)"),
+        "{source}"
+    );
+}
+
+/// A `+` with a signed summand keeps the cursor verdict (R394-2).
+#[test]
+fn wave6s_sum_with_signed_summand_keeps_the_cursor_verdict() {
+    let signed = GENERATE_CRC_LENGTH_GIVEN.replace(
+        "(8 as libc::c_int as isize) + (length as isize)",
+        "(8 as libc::c_int as isize) + (length as libc::c_int as isize)",
+    );
+    assert_ne!(signed, GENERATE_CRC_LENGTH_GIVEN);
+    let rows = super::emit_tests::decisions_of(&signed);
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(n, p, _)| n == "chunk" && *p)
+        .map(|(_, _, r)| r.clone())
+        .expect("generate_crc::chunk");
+    assert_eq!(reason, "slice-cursor-use", "{rows:?}");
+}
+
+/// The faithful lodepng shape (`lodepng_chunk_generate_crc::chunk`,
+/// `slice-cursor-use` at `60f52cff`): with the sum forward and the bare
+/// `from_raw_parts` seam of a slice callee taking the suffix view, the
+/// subject delivers, its `lodepng_chunk_length(chunk)` pass-on through the
+/// existing thin-element carrier.
+#[test]
+fn wave6s_generate_crc_faithful_delivers() {
+    let (source, receipts) = emit_with_family_receipts(GENERATE_CRC);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("fnlodepng_chunk_generate_crc(mutchunk:&mut[libc::c_uchar])"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("lodepng_chunk_length(chunk.first().unwrap())"),
+        "{source}"
+    );
+    assert_eq!(receipts.trim(), "[]", "no family withdrawal: {receipts}");
+}
+
+const GENERATE_CRC: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ mod libc { pub type c_uchar = u8; pub type c_uint = u32; pub type c_int = i32; pub type c_ulong = u64; }
+ pub type size_t = libc::c_ulong;
+ static lodepng_crc32_table: [libc::c_uint; 256] = [0; 256];
+ unsafe extern "C" fn lodepng_read32bitInt(mut buffer: *const libc::c_uchar) -> libc::c_uint {
+    return (*buffer.offset(0 as libc::c_int as isize) as libc::c_uint) << 24 as libc::c_uint
+        | (*buffer.offset(1 as libc::c_int as isize) as libc::c_uint) << 16 as libc::c_uint
+        | (*buffer.offset(2 as libc::c_int as isize) as libc::c_uint) << 8 as libc::c_uint
+        | *buffer.offset(3 as libc::c_int as isize) as libc::c_uint;
+ }
+ unsafe extern "C" fn lodepng_set32bitInt(mut buffer: *mut libc::c_uchar, mut value: libc::c_uint) {
+    *buffer.offset(0 as libc::c_int as isize) = (value >> 24 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(1 as libc::c_int as isize) = (value >> 16 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(2 as libc::c_int as isize) = (value >> 8 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(3 as libc::c_int as isize) = (value & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+ }
+ pub unsafe extern "C" fn lodepng_chunk_length(mut chunk: *const libc::c_uchar) -> libc::c_uint {
+    return lodepng_read32bitInt(chunk);
+ }
+ pub unsafe extern "C" fn lodepng_crc32(mut data: *const libc::c_uchar, mut length: size_t) -> libc::c_uint {
+    let mut r = 0xffffffff as libc::c_uint;
+    let mut i: size_t = 0;
+    i = 0 as libc::c_int as size_t;
+    while i < length {
+        r = lodepng_crc32_table[((r ^ *data.offset(i as isize) as libc::c_uint) & 0xff as libc::c_uint) as usize] ^ r >> 8 as libc::c_uint;
+        i = i.wrapping_add(1);
+    }
+    return r ^ 0xffffffff as libc::c_uint;
+ }
+ pub unsafe extern "C" fn lodepng_chunk_generate_crc(mut chunk: *mut libc::c_uchar) {
+    let mut length = lodepng_chunk_length(chunk);
+    let mut CRC = lodepng_crc32(&mut *chunk.offset(4 as libc::c_int as isize), length.wrapping_add(4 as libc::c_int as libc::c_uint) as size_t);
+    lodepng_set32bitInt(chunk.offset((8 as libc::c_int as isize) + (length as isize)), CRC);
+ }
+"#;
+
+const GENERATE_CRC_LENGTH_GIVEN: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ mod libc { pub type c_uchar = u8; pub type c_uint = u32; pub type c_int = i32; pub type c_ulong = u64; }
+ pub type size_t = libc::c_ulong;
+ static lodepng_crc32_table: [libc::c_uint; 256] = [0; 256];
+ unsafe extern "C" fn lodepng_read32bitInt(mut buffer: *const libc::c_uchar) -> libc::c_uint {
+    return (*buffer.offset(0 as libc::c_int as isize) as libc::c_uint) << 24 as libc::c_uint
+        | (*buffer.offset(1 as libc::c_int as isize) as libc::c_uint) << 16 as libc::c_uint
+        | (*buffer.offset(2 as libc::c_int as isize) as libc::c_uint) << 8 as libc::c_uint
+        | *buffer.offset(3 as libc::c_int as isize) as libc::c_uint;
+ }
+ unsafe extern "C" fn lodepng_set32bitInt(mut buffer: *mut libc::c_uchar, mut value: libc::c_uint) {
+    *buffer.offset(0 as libc::c_int as isize) = (value >> 24 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(1 as libc::c_int as isize) = (value >> 16 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(2 as libc::c_int as isize) = (value >> 8 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(3 as libc::c_int as isize) = (value & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+ }
+ pub unsafe extern "C" fn lodepng_chunk_length(mut chunk: *const libc::c_uchar) -> libc::c_uint {
+    return lodepng_read32bitInt(chunk);
+ }
+ pub unsafe extern "C" fn lodepng_crc32(mut data: *const libc::c_uchar, mut length: size_t) -> libc::c_uint {
+    let mut r = 0xffffffff as libc::c_uint;
+    let mut i: size_t = 0;
+    i = 0 as libc::c_int as size_t;
+    while i < length {
+        r = lodepng_crc32_table[((r ^ *data.offset(i as isize) as libc::c_uint) & 0xff as libc::c_uint) as usize] ^ r >> 8 as libc::c_uint;
+        i = i.wrapping_add(1);
+    }
+    return r ^ 0xffffffff as libc::c_uint;
+ }
+ pub unsafe extern "C" fn lodepng_chunk_generate_crc(mut chunk: *mut libc::c_uchar, mut length: libc::c_uint) {
+    let mut CRC = lodepng_crc32(&mut *chunk.offset(4 as libc::c_int as isize), length.wrapping_add(4 as libc::c_int as libc::c_uint) as size_t);
+    lodepng_set32bitInt(chunk.offset((8 as libc::c_int as isize) + (length as isize)), CRC);
+ }
+"#;
