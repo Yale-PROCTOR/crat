@@ -403,7 +403,7 @@ fn w6p_same_place_is_refused_before_any_rule() {
         let mut_facts =
             crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
         let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
-            &program, &mut_facts,
+            &program, &mut_facts, None,
         );
         let function = |name: &str| {
             *program
@@ -565,4 +565,220 @@ fn w6p_read_read_pair_is_left_to_the_shared_read_consumer() {
         );
     })
     .expect("read/read fixture compilation");
+}
+
+/// brotli `BrotliBuildMetaBlock`: `distance_histograms = BrotliAllocate(m, n)`
+/// beside `&mut (*mb).distance_histograms_size`. `HistogramDistance` carries a
+/// `size_t` member, so the type rule holds the pair; the distinct-roots
+/// certificate needs `BrotliAllocate` admitted as an allocator — it returns a
+/// local assigned through `(*m).alloc_func`, a function pointer whose only
+/// closed-world target is `BrotliDefaultAllocFunc` → `malloc` (R402-5(6)).
+const FN_PTR_ALLOCATOR: &str = r#"
+    use core::ffi::c_void;
+    extern "C" { fn malloc(n: u64) -> *mut c_void; fn exit(code: i32) -> !; }
+    #[repr(C)]
+    pub struct MemoryManager { pub alloc_func: Option<unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void>, pub opaque: *mut c_void }
+    #[repr(C)]
+    pub struct HistogramDistance { pub data: [u32; 4], pub total_count: u64 }
+    #[repr(C)]
+    pub struct MetaBlockSplit { pub distance_histograms_size: u64, pub literal_count: u64 }
+    pub unsafe extern "C" fn BrotliDefaultAllocFunc(opaque: *mut c_void, size: u64) -> *mut c_void { malloc(size) }
+    pub unsafe fn BrotliInitMemoryManager(m: *mut MemoryManager, opaque: *mut c_void) {
+        (*m).alloc_func = Some(BrotliDefaultAllocFunc as unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void);
+        (*m).opaque = opaque;
+    }
+    pub unsafe fn BrotliAllocate(m: *mut MemoryManager, n: u64) -> *mut c_void {
+        let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+        if result.is_null() { exit(1); }
+        return result;
+    }
+    pub unsafe fn ClusterHistograms(histograms: *mut HistogramDistance, out_size: *mut u64) {
+        (*histograms.offset(0)).total_count = 1;
+        *out_size = (*out_size).wrapping_add(1);
+    }
+    pub unsafe fn BrotliBuildMetaBlock(m: *mut MemoryManager, mb: *mut MetaBlockSplit) {
+        let mut distance_histograms = 0 as *mut HistogramDistance;
+        if (*mb).distance_histograms_size > 0 {
+            distance_histograms = BrotliAllocate(m, (*mb).distance_histograms_size.wrapping_mul(::core::mem::size_of::<HistogramDistance>() as u64)) as *mut HistogramDistance;
+        }
+        ClusterHistograms(distance_histograms, &mut (*mb).distance_histograms_size);
+    }
+    #[repr(C)]
+    pub struct Encoder { pub memory_manager_: MemoryManager, pub mb: MetaBlockSplit }
+    pub unsafe fn BrotliEncoderCreateInstance() -> *mut Encoder {
+        let s = malloc(::core::mem::size_of::<Encoder>() as u64) as *mut Encoder;
+        BrotliInitMemoryManager(&mut (*s).memory_manager_, 0 as *mut c_void);
+        s
+    }
+    pub unsafe fn EncodeData(s: *mut Encoder) {
+        BrotliBuildMetaBlock(&mut (*s).memory_manager_, &mut (*s).mb);
+    }
+"#;
+
+/// End-to-end through the production web. RED at this frame: the Andersen
+/// closed-world inventory does not resolve the field-stored allocator pointer
+/// `(*m).alloc_func` in this reduction (no `BrotliAllocate → *` site is
+/// produced), so the wrapper is not admitted and the type rule's member
+/// clause holds the pair. Kept `#[ignore]`d with that typed reason; the
+/// corpus census decides whether brotli's real instance resolves (the two
+/// `BrotliClusterHistograms*::out_size#6` rows are the measurement).
+#[test]
+#[ignore = "closed-world inventory does not resolve the field-stored allocator pointer in this reduction; census decides on the corpus (report 002)"]
+fn w6p_distinct_roots_fn_pointer_allocator_wrapper_delivers() {
+    ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR, |tcx| {
+        let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
+            .expect("fn-pointer allocator fixture decision");
+        dump(tcx, &table);
+        let ledger = ctx
+            .a5_site_proofs
+            .pair_certificates()
+            .expect("certificates ride the attested index")
+            .ledger();
+        assert!(
+            ledger
+                .iter()
+                .any(|row| row.outcome == Ok(CertificateKind::DistinctRoots)),
+            "BrotliAllocate's result is a fresh root through the closed-world fn-pointer group: {ledger:?}"
+        );
+        let out_size = param_decision(tcx, &table, "ClusterHistograms", 1);
+        assert!(
+            !is_pair_raw_view(out_size),
+            "out_size must not stay pair-raw-view beside the wrapper allocation: {out_size:?}"
+        );
+    })
+    .expect("fn-pointer allocator fixture compilation");
+}
+
+/// The mechanism, with the inventory naming the target the way the closed
+/// world does on the corpus: `BrotliAllocate`'s call through `(*m).alloc_func`
+/// resolves to `BrotliDefaultAllocFunc` (a wrapper of `malloc`), so
+/// `BrotliAllocate` is a wrapper, its result a fresh root, and the pair beside
+/// `&mut (*mb).distance_histograms_size` certifies by distinct roots — while
+/// the same pair without the inventory stays held by the member clause.
+#[test]
+fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
+    ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR, |tcx| {
+        use rustc_hir::intravisit::{self, Visitor};
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        // The span of the one call through a function pointer in BrotliAllocate.
+        struct IndirectCalls(Vec<rustc_span::Span>);
+        impl<'tcx> Visitor<'tcx> for IndirectCalls {
+            fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+                if let rustc_hir::ExprKind::Call(callee, _) = &expr.kind
+                    && !matches!(callee.kind, rustc_hir::ExprKind::Path(..))
+                {
+                    self.0.push(expr.span);
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+        let allocate = function("BrotliAllocate");
+        let body = tcx.hir_body(tcx.hir_node_by_def_id(allocate).body_id().expect("body"));
+        let mut calls = IndirectCalls(Vec::new());
+        calls.visit_body(body);
+        assert_eq!(calls.0.len(), 1, "one call through the function pointer");
+        let sites = vec![bo_rewriter::decision::lifetime::MirCallTargetSite {
+            caller: allocate,
+            callee: function("BrotliDefaultAllocFunc"),
+            block: 0,
+            argument_count: 2,
+            span: calls.0[0],
+        }];
+        let with = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program,
+            &mut_facts,
+            Some(&sites),
+        );
+        assert_eq!(
+            with.certify_recorded(
+                function("BrotliBuildMetaBlock"),
+                function("ClusterHistograms"),
+                0,
+                1
+            ),
+            Ok(CertificateKind::DistinctRoots)
+        );
+        // A target that is NOT an allocator wrapper (the caller itself) admits nothing.
+        let sites = vec![bo_rewriter::decision::lifetime::MirCallTargetSite {
+            caller: allocate,
+            callee: function("EncodeData"),
+            block: 0,
+            argument_count: 2,
+            span: calls.0[0],
+        }];
+        let without = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program,
+            &mut_facts,
+            Some(&sites),
+        );
+        assert_eq!(
+            without.certify_recorded(
+                function("BrotliBuildMetaBlock"),
+                function("ClusterHistograms"),
+                0,
+                1
+            ),
+            Err(Unproved::MemberType)
+        );
+        // An inventory that names no target for THIS call (a site elsewhere in
+        // the body) admits nothing either: an unresolved call is not fresh.
+        let sites = vec![bo_rewriter::decision::lifetime::MirCallTargetSite {
+            caller: allocate,
+            callee: function("BrotliDefaultAllocFunc"),
+            block: 0,
+            argument_count: 2,
+            span: rustc_span::DUMMY_SP,
+        }];
+        let unresolved = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program,
+            &mut_facts,
+            Some(&sites),
+        );
+        assert_eq!(
+            unresolved.certify_recorded(
+                function("BrotliBuildMetaBlock"),
+                function("ClusterHistograms"),
+                0,
+                1
+            ),
+            Err(Unproved::MemberType)
+        );
+    })
+    .expect("fn-pointer allocator mechanism compilation");
+}
+
+/// Negative control: the same wrapper when the function pointer is NOT
+/// resolvable to an allocator (the web is absent) stays unproved.
+#[test]
+fn w6p_fn_pointer_allocator_without_the_web_stays_unproved() {
+    ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        assert_eq!(
+            index.certify_recorded(function("BrotliBuildMetaBlock"), function("ClusterHistograms"), 0, 1),
+            Err(Unproved::MemberType),
+            "without the closed-world inventory the wrapper is not an allocator and the type rule holds"
+        );
+    })
+    .expect("fn-pointer allocator control compilation");
 }

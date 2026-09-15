@@ -222,10 +222,17 @@ pub(crate) struct PairDisjointnessIndex {
 }
 
 impl PairDisjointnessIndex {
-    pub(crate) fn derive(program: &RustProgram<'_>, mut_facts: &MutFacts) -> Self {
+    /// `indirect_calls`: the closed-world resolution of every MIR call site
+    /// (the P-b fn-pointer web's inventory, attested only under the frozen
+    /// benchmark graph); `None` admits no call through a function pointer.
+    pub(crate) fn derive(
+        program: &RustProgram<'_>,
+        mut_facts: &MutFacts,
+        indirect_calls: Option<&[super::lifetime::MirCallTargetSite]>,
+    ) -> Self {
         let tcx = program.tcx;
         let local_functions: FxHashSet<LocalDefId> = program.functions.iter().copied().collect();
-        let allocators = allocator_wrappers(tcx, &local_functions);
+        let allocators = allocator_wrappers(tcx, &local_functions, indirect_calls);
         let unions = union_member_classes(tcx, program);
 
         let mut sites: FxHashMap<(u32, u32), Vec<SiteRecord>> = FxHashMap::default();
@@ -235,7 +242,7 @@ impl PairDisjointnessIndex {
             };
             let body = tcx.hir_body(body_id);
             let typeck = tcx.typeck(caller);
-            let classes = classify_locals(tcx, typeck, body, &allocators);
+            let classes = classify_locals(tcx, typeck, body, &allocators, caller);
             let mut collector = CallCollector {
                 tcx,
                 typeck,
@@ -651,33 +658,70 @@ fn is_null_literal(expr: &Expr<'_>) -> bool {
     }
 }
 
-/// Is `expr` (after casts) a call whose result is a fresh allocation?
-fn is_allocator_call(tcx: TyCtxt<'_>, expr: &Expr<'_>, allocators: &FxHashSet<DefId>) -> bool {
-    let ExprKind::Call(callee, _) = &peel_casts(expr).kind else {
-        return false;
-    };
-    let Some(did) = callee_def_id(callee) else {
-        return false;
-    };
-    if allocators.contains(&did) {
-        return true;
+/// What counts as an allocator: the libc allocators by name, the local
+/// wrappers found so far, and — through the closed-world fn-pointer web — a
+/// call through a function pointer every resolved target of which is one of
+/// those (R402-5(6): `BrotliAllocate`'s `(*m).alloc_func` resolves to
+/// `BrotliDefaultAllocFunc`, itself a wrapper of `malloc`).
+struct AllocatorOracle<'a> {
+    wrappers: FxHashSet<DefId>,
+    indirect_calls: Option<&'a [super::lifetime::MirCallTargetSite]>,
+}
+
+impl AllocatorOracle<'_> {
+    /// A libc allocator is a FOREIGN item (C2Rust declares it in an
+    /// `extern "C"` block inside the crate, so its `DefId` IS local — the test
+    /// is foreignness, not locality) with the allocator's name.
+    fn is_libc_allocator(tcx: TyCtxt<'_>, did: DefId) -> bool {
+        let name = tcx.item_name(did);
+        tcx.is_foreign_item(did) && LIBC_ALLOCATORS.contains(&name.as_str())
     }
-    // A foreign (extern "C") libc allocator has no local body; match by name
-    // exactly as the construction recognizer does.
-    let name = tcx.item_name(did);
-    did.as_local().is_none() && LIBC_ALLOCATORS.contains(&name.as_str())
+
+    /// Is `expr` (after casts) a call whose result is a fresh allocation, in
+    /// the body of `function`?
+    fn is_allocator_call(&self, tcx: TyCtxt<'_>, function: LocalDefId, expr: &Expr<'_>) -> bool {
+        let ExprKind::Call(callee, _) = &peel_casts(expr).kind else {
+            return false;
+        };
+        if let Some(did) = callee_def_id(callee) {
+            return self.wrappers.contains(&did) || Self::is_libc_allocator(tcx, did);
+        }
+        // A call through a function pointer: every closed-world target must be
+        // an allocator wrapper already admitted. Foreign targets (libc
+        // `malloc` stored in a static, as binn does) are not in the web's
+        // local inventory, so such a call has no resolved target and is NOT
+        // admitted — a typed residue, not a gap in the closed world.
+        let Some(sites) = self.indirect_calls else {
+            return false;
+        };
+        let span = expr.span.source_callsite();
+        let targets = sites
+            .iter()
+            .filter(|site| site.caller == function && site.span.source_callsite().contains(span))
+            .map(|site| site.callee.to_def_id())
+            .collect::<Vec<_>>();
+        !targets.is_empty() && targets.iter().all(|target| self.wrappers.contains(target))
+    }
 }
 
 /// Local functions that are allocator WRAPPERS: every value the function
-/// returns is (a cast of) an allocator call or a null literal. Iterated to a
-/// fixpoint so a wrapper of a wrapper qualifies. A return through a function
-/// pointer (`malloc_fn.expect(..)(n)`) never qualifies.
-fn allocator_wrappers(tcx: TyCtxt<'_>, functions: &FxHashSet<LocalDefId>) -> FxHashSet<DefId> {
-    let mut wrappers: FxHashSet<DefId> = FxHashSet::default();
+/// returns is (a cast of) an allocator call, a null literal, or a local that
+/// is itself a fresh-allocation binding of that body. Iterated to a fixpoint
+/// so a wrapper of a wrapper qualifies, and so a call through a function
+/// pointer qualifies once every target has (R402-5(6)).
+fn allocator_wrappers<'a>(
+    tcx: TyCtxt<'_>,
+    functions: &FxHashSet<LocalDefId>,
+    indirect_calls: Option<&'a [super::lifetime::MirCallTargetSite]>,
+) -> AllocatorOracle<'a> {
+    let mut oracle = AllocatorOracle {
+        wrappers: FxHashSet::default(),
+        indirect_calls,
+    };
     loop {
-        let before = wrappers.len();
+        let before = oracle.wrappers.len();
         for &function in functions {
-            if wrappers.contains(&function.to_def_id()) {
+            if oracle.wrappers.contains(&function.to_def_id()) {
                 continue;
             }
             let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
@@ -700,16 +744,21 @@ fn allocator_wrappers(tcx: TyCtxt<'_>, functions: &FxHashSet<LocalDefId>) -> FxH
             if returns.returns.is_empty() {
                 continue;
             }
-            let all_fresh = returns
-                .returns
-                .iter()
-                .all(|expr| is_null_literal(expr) || is_allocator_call(tcx, expr, &wrappers));
+            let typeck = tcx.typeck(function);
+            let classes = classify_locals(tcx, typeck, body, &oracle, function);
+            let all_fresh = returns.returns.iter().all(|expr| {
+                is_null_literal(expr)
+                    || oracle.is_allocator_call(tcx, function, expr)
+                    || resolved_local(peel_casts(expr)).is_some_and(|binding| {
+                        matches!(classes.get(&binding), Some(RootClass::FreshAlloc(_)))
+                    })
+            });
             if all_fresh {
-                wrappers.insert(function.to_def_id());
+                oracle.wrappers.insert(function.to_def_id());
             }
         }
-        if wrappers.len() == before {
-            return wrappers;
+        if oracle.wrappers.len() == before {
+            return oracle;
         }
     }
 }
@@ -748,7 +797,8 @@ fn classify_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
     typeck: &TypeckResults<'tcx>,
     body: &'tcx rustc_hir::Body<'tcx>,
-    allocators: &FxHashSet<DefId>,
+    allocators: &AllocatorOracle<'_>,
+    function: LocalDefId,
 ) -> FxHashMap<HirId, RootClass> {
     let mut facts: FxHashMap<HirId, LocalFacts> = FxHashMap::default();
     for param in body.params {
@@ -769,6 +819,7 @@ fn classify_locals<'tcx>(
         tcx,
         typeck,
         allocators,
+        function,
         facts: &mut facts,
     };
     collector.visit_body(body);
@@ -814,7 +865,8 @@ fn classify_locals<'tcx>(
 struct LocalCollector<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typeck: &'a TypeckResults<'tcx>,
-    allocators: &'a FxHashSet<DefId>,
+    allocators: &'a AllocatorOracle<'a>,
+    function: LocalDefId,
     facts: &'a mut FxHashMap<HirId, LocalFacts>,
 }
 
@@ -822,7 +874,10 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
     fn assign_kind(&self, rhs: &Expr<'_>) -> AssignKind {
         if is_null_literal(rhs) {
             AssignKind::Null
-        } else if is_allocator_call(self.tcx, rhs, self.allocators) {
+        } else if self
+            .allocators
+            .is_allocator_call(self.tcx, self.function, rhs)
+        {
             AssignKind::Allocator
         } else {
             AssignKind::Other

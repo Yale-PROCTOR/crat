@@ -7151,18 +7151,23 @@ fn finish_decide<'tcx>(
         analysis.a5_mode,
         analysis.attestation,
     );
+    let web_started = std::time::Instant::now();
+    let fnptr_web = decision::lifetime::derive_fn_ptr_web(&program, analysis.attestation);
+    let fnptr_web_wall_s = web_started.elapsed().as_secs_f64();
     // wave-6p (R400-4): pair-disjointness certificates ride the attested A5
-    // index; an unavailable index attaches nothing.
+    // index; an unavailable index attaches nothing. The closed-world call
+    // inventory admits allocator wrappers through function pointers (R402-5).
     let a5_site_proofs = if a5_site_proofs.is_available() {
         a5_site_proofs.with_pair_certificates(
-            decision::pair_disjointness::PairDisjointnessIndex::derive(&program, &mut_facts),
+            decision::pair_disjointness::PairDisjointnessIndex::derive(
+                &program,
+                &mut_facts,
+                fnptr_web.as_ref().ok().map(|web| web.mir_call_sites()),
+            ),
         )
     } else {
         a5_site_proofs
     };
-    let web_started = std::time::Instant::now();
-    let fnptr_web = decision::lifetime::derive_fn_ptr_web(&program, analysis.attestation);
-    let fnptr_web_wall_s = web_started.elapsed().as_secs_f64();
     let exposure_seed = decision::exposure::ExposureSeed::derive(
         &program,
         &run_config.configured_exposure,
