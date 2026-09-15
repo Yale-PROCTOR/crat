@@ -4944,7 +4944,7 @@ fn composed_by_slice_constructor(edits: &[plan::Edit], inner_index: usize) -> bo
             );
         // A wrapper cursor constructor composed over its outer table's element
         // rewrite; the AST pass applies only the constructor at that span.
-        let cursor = outer.edit_kind == "cursor-constructor"
+        let cursor = matches!(outer.edit_kind, "cursor-constructor" | "cursor-advance")
             && inner.edit_kind == "subject-use"
             && outer.owner_class == inner.owner_class;
         outer_index != inner_index

@@ -379,6 +379,83 @@ fn compose_nested_uses(
             receipts[receipt].disposition = Err(CursorHold::UseUnbuilt);
             continue;
         }
+        // The reverse nesting: a cursor edit (a constructor or an advance)
+        // that CONTAINS another subject's use edit takes that inner's rendered
+        // text in place of the inner's original text and records the inner
+        // span, which the AST pass then skips.
+        let mut contained = Vec::new();
+        {
+            let uses = match &entries[index].1 {
+                Decision::Cursor { plan, .. } => plan.uses.clone(),
+                Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => Vec::new(),
+            };
+            for (k, outer) in uses.iter().enumerate() {
+                if !matches!(outer.bridge_kind, "cursor-constructor" | "cursor-advance") {
+                    continue;
+                }
+                let mut text = outer.replacement.clone();
+                let mut spans = Vec::new();
+                for (j, (other, decision)) in entries.iter().enumerate() {
+                    if j == index || other.fn_did != owner {
+                        continue;
+                    }
+                    let inner_uses = match decision {
+                        Decision::Slice { uses, .. }
+                        | Decision::NestedSlice { uses, .. }
+                        | Decision::Opt { uses, .. } => uses,
+                        Decision::Cursor { .. }
+                        | Decision::Ref { .. }
+                        | Decision::InferredRef { .. }
+                        | Decision::Box(_)
+                        | Decision::Degraded(_) => continue,
+                    };
+                    for inner in inner_uses
+                        .iter()
+                        .filter(|inner| contains(outer.span, inner.span))
+                    {
+                        let Ok(original) = source_map.span_to_snippet(inner.span) else {
+                            failed = true;
+                            break;
+                        };
+                        if text.matches(original.as_str()).count() != 1 {
+                            failed = true;
+                            break;
+                        }
+                        text = text.replacen(&original, &inner.replacement, 1);
+                        spans.push(inner.span);
+                    }
+                }
+                if !spans.is_empty() {
+                    contained.push((k, text, spans));
+                }
+            }
+        }
+        if failed {
+            entries[index].1 = prior.clone();
+            receipts[receipt].disposition = Err(CursorHold::UseUnbuilt);
+            continue;
+        }
+        match &mut entries[index].1 {
+            Decision::Cursor { plan, .. } => {
+                for (k, text, spans) in contained {
+                    plan.uses[k].replacement = text;
+                    plan.composed_edit_spans.extend(spans);
+                }
+            }
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => unreachable!("committed cursor entry"),
+        }
         if splices.is_empty() {
             continue;
         }

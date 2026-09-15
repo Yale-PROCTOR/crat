@@ -5109,7 +5109,8 @@ pub(crate) fn filtered_inputs(
             if composed_slice_edits.contains(&key)
                 || (composed_option_edits.contains(&key)
                     && u.bridge_kind != "option-value-composed")
-                || (composed_cursor_edits.contains(&key) && u.bridge_kind != "cursor-constructor")
+                || (composed_cursor_edits.contains(&key)
+                    && !matches!(u.bridge_kind, "cursor-constructor" | "cursor-advance"))
             {
                 continue;
             }

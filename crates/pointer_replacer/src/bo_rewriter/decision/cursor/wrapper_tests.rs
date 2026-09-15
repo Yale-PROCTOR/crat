@@ -873,3 +873,50 @@ pub unsafe fn match_len(in_0: *const u8, insize: usize, pos: usize, back: usize)
         ),
     );
 }
+
+#[test]
+fn slicecursor_fragment_fast_core_loop() {
+    // brotli `BrotliCompressFragmentFastImpl`, the hash-match core: optional
+    // cursors over `input`, a derived end, a candidate looked up backward and
+    // from a table, compared, differenced and matched through a local callee.
+    let input = r#"
+pub unsafe fn is_match(p1: *const u8, p2: *const u8) -> i32 {
+    (*p1.offset(0) == *p2.offset(0) && *p1.offset(1) == *p2.offset(1)) as i32
+}
+pub unsafe fn fragment(input: *const u8, block_size: usize, table: *mut i32, last_distance: i32) -> i32 {
+    let mut ip_end = 0 as *const u8;
+    let mut ip = 0 as *const u8;
+    let mut candidate = 0 as *const u8;
+    let base_ip = input;
+    let mut matched = 0;
+    ip = input;
+    ip_end = input.offset(block_size as isize);
+    ip = ip.offset(1);
+    while ip < ip_end.offset(-2) {
+        let hash = (*ip as usize) & 7;
+        candidate = ip.offset(-(last_distance as isize));
+        if candidate < base_ip || is_match(ip, candidate) == 0 {
+            candidate = base_ip.offset(*table.offset(hash as isize) as isize);
+        }
+        *table.offset(hash as isize) = ip.offset_from(base_ip) as i32;
+        if candidate < ip && is_match(ip, candidate) != 0 {
+            matched += 1;
+        }
+        ip = ip.offset(1);
+    }
+    matched
+}
+"#;
+    let source = emitted(input);
+    save_fixture("fragment-fast-core-loop", input, &source);
+    assert!(
+        source.contains("Option<crate::slice_cursor::SliceCursor"),
+        "optional cursors absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let b = [1u8, 2, 1, 2, 1, 2, 9, 9]; let mut t = [0i32; 8]; assert_eq!(unsafe { fragment(&b, 8, &mut t, 2) }, 3); }",
+        ),
+    );
+}

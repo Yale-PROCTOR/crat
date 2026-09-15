@@ -361,11 +361,26 @@ fn base(
             return Err(CursorHold::ScheduleMissing);
         }
         let name = emission::binding_name(ctx.tcx, source)?;
-        let expression = match (source.mutable, s.mutable) {
-            (false, false) => name,
-            (true, true) => format!("{name}.as_deref_mut()"),
-            (true, false) => format!("{name}.as_deref_mut().as_deref()"),
-            (false, true) => return Err(CursorHold::ScheduleMissing),
+        // An optional parent lends its view through the checked accessor; a
+        // shared cursor copies out of it.
+        let parent_optional = source.null_init
+            || ctx
+                .facts
+                .raw_only_uses
+                .get(&(source.fn_did, source.hir_id))
+                .is_some_and(|uses| uses.iter().any(|(op, _)| op == "is_null"));
+        let expression = match (source.mutable, s.mutable, parent_optional) {
+            (false, false, false) => name,
+            (false, false, true) => format!("(*{name}.as_ref().expect(\"non-null cursor\"))"),
+            (true, true, false) => format!("{name}.as_deref_mut()"),
+            (true, true, true) => {
+                format!("{name}.as_mut().expect(\"non-null cursor\").as_deref_mut()")
+            }
+            (true, false, false) => format!("{name}.as_deref_mut().as_deref()"),
+            (true, false, true) => {
+                format!("{name}.as_mut().expect(\"non-null cursor\").as_deref_mut().as_deref()")
+            }
+            (false, true, _) => return Err(CursorHold::ScheduleMissing),
         };
         return Ok(Base {
             expression,
@@ -649,7 +664,6 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     | hir::BinOpKind::Eq
                     | hir::BinOpKind::Ne
             )
-            && !self.optional
             && [lhs, rhs].iter().any(|side| {
                 source_binding(self.ctx.tcx, self.subject.fn_did, side) == Some(self.subject.hir_id)
             })
@@ -678,16 +692,25 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     self.visit_expr(side);
                     continue;
                 }
-                match self.index(side) {
-                    Ok(d) if local(side) == Some(self.subject.hir_id) => {
-                        let _ = d;
-                        self.push(side, format!("{}.addr()", self.name), "cursor-address");
+                let address = |derived: &str| {
+                    if self.optional {
+                        format!(
+                            "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor{derived}.addr())",
+                            self.name
+                        )
+                    } else {
+                        format!("{}{derived}.addr()", self.name)
                     }
-                    Ok(d) => self.push(
-                        side,
-                        format!("{}.offset_by({d}).addr()", self.name),
-                        "cursor-address",
-                    ),
+                };
+                match self.index(side) {
+                    Ok(_) if local(side) == Some(self.subject.hir_id) => {
+                        let value = address("");
+                        self.push(side, value, "cursor-address");
+                    }
+                    Ok(d) => {
+                        let value = address(&format!(".offset_by({d})"));
+                        self.push(side, value, "cursor-address");
+                    }
                     Err(hold) => {
                         self.hold.get_or_insert(hold);
                     }
@@ -969,18 +992,20 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                         }) {
                             self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
                         }
-                    } else if !self.optional
-                        && target
-                            .and_then(|(_, d)| {
-                                slice_mutability(d).or_else(|| cursor_parameter_mutability(d))
-                            })
-                            .is_some()
+                    } else if target
+                        .and_then(|(_, d)| {
+                            slice_mutability(d).or_else(|| cursor_parameter_mutability(d))
+                        })
+                        .is_some()
                     {
+                        // An optional cursor handed to a non-optional slice
+                        // position: the C callee dereferences it, so `None` is
+                        // the C program's own null path (§28).
                         self.push(
                             arg,
                             format!(
                                 "{}.{}()",
-                                self.name,
+                                self.view(),
                                 if self.subject.mutable {
                                     "as_slice_mut"
                                 } else {

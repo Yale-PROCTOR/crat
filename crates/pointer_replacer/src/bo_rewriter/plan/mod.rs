@@ -498,8 +498,10 @@ fn nested_ast_composition(
         // A wrapper cursor constructor composed over its outer table's element
         // rewrite (`*table.offset(k)` → `table[k]`): the outer edit is part of
         // the constructor text and the AST pass applies only the constructor.
-        let cursor_constructor_over_element = outer.key.bridge_kind == "cursor-constructor"
-            && inner.key.bridge_kind == "subject-use"
+        let cursor_constructor_over_element = matches!(
+            outer.key.bridge_kind.as_str(),
+            "cursor-constructor" | "cursor-advance"
+        ) && inner.key.bridge_kind == "subject-use"
             && contains(outer, inner);
         // L07 (§39 addendum 272, R272-3). The five outer/inner kind pairs the
         // J'' frame measures as STRICT CONTAINMENTS, entering under exactly
