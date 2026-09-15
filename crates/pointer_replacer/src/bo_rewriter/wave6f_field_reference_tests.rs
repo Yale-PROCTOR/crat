@@ -712,3 +712,60 @@ fn w6f_block_encoder_two_fields_share_the_lifetime_and_walkers_take_slices() {
         assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
     }
 }
+
+const HOIST: &str = include_str!("wave6f_fixture_hoist.rs");
+
+/// era-5c's E5C-3 shape (relay 006 §1): the store's value is a call whose
+/// moving argument (`.take()` of the field) invalidates a view a LATER
+/// argument reads through (`(*temp).key`, `temp` a reference into the
+/// moved subtree). Frame: fields Owning; `removeMin::root` a `&mut` view,
+/// `removeMin::temp` a reference; `deleteNode` stays raw at this frame.
+fn hoist_frame() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-hoist-frame",
+        vec![
+            ("node".to_owned(), 1, SlotKind::Owning),
+            ("node".to_owned(), 2, SlotKind::Owning),
+        ],
+        vec![
+            ("deleteNode::root".to_owned(), SlotKind::Owning),
+            ("deleteNode::temp".to_owned(), SlotKind::Owning),
+            ("removeMin::root".to_owned(), SlotKind::Ref),
+            ("removeMin::temp".to_owned(), SlotKind::Ref),
+        ],
+    );
+}
+
+/// Witness 12 (E5C-3, relay 006 §1): the store's value is a call whose
+/// moving argument (`.take()` of the field) invalidates the view a LATER
+/// argument reads through; the pure `Copy` read is hoisted before the
+/// statement (`let __crat_hoist0 = (*temp).key;`), the same value as in
+/// place (a move relocates a pointer, it writes nothing the read observes),
+/// so the checker accepts what was E0502 without it.
+#[test]
+fn w6f_hoist_pure_read_before_a_moving_argument() {
+    hoist_frame();
+    let observed = observe(HOIST);
+    let outcome = emitted("hoist", HOIST);
+    super::test_model_override::clear();
+    for field in ["left", "right"] {
+        let row = field_row(&observed, "node", field);
+        assert_eq!(
+            (row.2.as_str(), row.3.as_str()),
+            ("applied", "opt-box"),
+            "{row:?}"
+        );
+    }
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    assert_eq!((emitted_count, reverted), (2, 0), "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "pub unsafe extern \"C\" fn removeMin(mut root: &mut node) { let mut temp: &crate::node = (*root).right.as_deref().unwrap(); (*root).key = (*temp).key; let __crat_hoist0 = (*temp).key; (*root).right = core::ptr::NonNull::new(deleteNode((*root).right.take().map_or(core::ptr::null_mut(), Box::into_raw), __crat_hoist0)).map(|__p| Box::from_raw(__p.as_ptr())); }",
+        // a bare local read (`key`) is not hoisted — nothing a move invalidates
+        "deleteNode((*root).left.take().map_or(core::ptr::null_mut(), Box::into_raw), key)",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+    assert_eq!(flat.matches("__crat_hoist").count(), 2, "{source}");
+}

@@ -3759,6 +3759,9 @@ fn transform_with<'tcx>(
     // wave-6f: struct items, their impls and the storing signatures, after the
     // declaration passes so a stored parameter's reference layer exists.
     super::field_reference_ast::apply(tcx, capture, table, reverts, &mut krate, &mut guard)?;
+    // E5C-3: hoist the pure reads a moving argument would invalidate, before
+    // the use grafts (a moved read keeps its spans).
+    super::field_reference_ast::apply_hoists(table, reverts, &mut krate, &mut guard)?;
 
     // **ARMS 2 AND 3 CONSUME THE SHARED BUILDER** (M-2). Their visitors carry no
     // site check, so their revert semantics live entirely in how these maps are

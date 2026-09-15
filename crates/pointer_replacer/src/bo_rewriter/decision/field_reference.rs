@@ -161,6 +161,10 @@ pub(crate) struct Site {
     pub raw_base: bool,
     /// `Store` only: the whole assignment expression.
     pub assign_span: Option<Span>,
+    /// `Store` only (E5C-3): later arguments of the stored call that are pure
+    /// `Copy` reads evaluated AFTER an earlier argument moves an owned field
+    /// out — hoisted before the statement so no view is read past the move.
+    pub hoists: Vec<Span>,
 }
 
 /// One function whose signature mentions the struct.
@@ -286,6 +290,8 @@ pub(crate) struct FieldTransaction {
     /// W6F-3: the rendered form of each owned call-argument site (its
     /// consumer's decided form), so the seam glues by identity.
     pub argument_forms: Vec<(Span, Form)>,
+    /// E5C-3: `(owner, the assignment, the read to hoist before it)`.
+    pub hoists: Vec<(LocalDefId, Span, Span)>,
     pub site_count: usize,
 }
 
@@ -563,6 +569,44 @@ impl<'tcx> Collector<'_, 'tcx> {
         (subject, raw)
     }
 
+    /// E5C-3: for a stored value that is a call, the later arguments that
+    /// are pure `Copy` reads once an EARLIER argument is an owned target
+    /// field handed to an owning parameter (a move out of the field). Every
+    /// argument between the move and the read must be pure too, so the
+    /// hoisted read sees the same values it saw in place (a move relocates
+    /// a pointer, it writes nothing the read can observe).
+    fn hoisted_reads(&self, value: &Expr<'tcx>) -> Vec<Span> {
+        let ExprKind::Call(callee, args) = value.kind else { return Vec::new() };
+        let typeck = self.tcx.typeck(self.owner);
+        let moving = args.iter().enumerate().position(|(index, arg)| {
+            self.field_key(arg)
+                .is_some_and(|key| self.owning.contains(&key))
+                && self
+                    .callee_parameter(callee, index)
+                    .is_some_and(|(_, kind)| kind == SlotKind::Owning)
+        });
+        let Some(moving) = moving else { return Vec::new() };
+        let mut out = Vec::new();
+        for arg in &args[moving + 1..] {
+            if !pure_read(arg) {
+                break;
+            }
+            // A bare local or literal reads through nothing a move could
+            // invalidate; only a read THROUGH a place is hoisted.
+            if !reads_through(arg) {
+                continue;
+            }
+            let ty = typeck.expr_ty(arg);
+            if self.tcx.type_is_copy_modulo_regions(
+                rustc_middle::ty::TypingEnv::post_analysis(self.tcx, self.owner),
+                ty,
+            ) {
+                out.push(arg.span);
+            }
+        }
+        out
+    }
+
     /// `let ref mut b = PLACE.f;` — `b`'s uses in the owner. The idiom is
     /// admitted only when the binding is used exactly once, as the place of a
     /// plain assignment `*b = v`; returns that assignment and `v`.
@@ -640,6 +684,7 @@ impl<'tcx> Collector<'_, 'tcx> {
             base,
             raw_base,
             assign_span: None,
+            hoists: Vec::new(),
         };
         let owning = self.owning.contains(&key);
         let Node::Expr(parent) = tcx.parent_hir_node(field.hir_id) else {
@@ -666,6 +711,7 @@ impl<'tcx> Collector<'_, 'tcx> {
                                     let mut store =
                                         site(SiteKind::Store, value.span, Some(rhs), None, None);
                                     store.assign_span = Some(assign.span);
+                                    store.hoists = self.hoisted_reads(value);
                                     self.push(key, store);
                                 }
                                 Err(cause) => self.hold(key, cause.to_owned()),
@@ -720,6 +766,7 @@ impl<'tcx> Collector<'_, 'tcx> {
                 Ok(value) => {
                     let mut store = site(SiteKind::Store, rhs.span, Some(value), None, None);
                     store.assign_span = Some(parent.span);
+                    store.hoists = self.hoisted_reads(rhs);
                     self.push(key, store);
                 }
                 Err(cause) => self.hold(key, cause.to_owned()),
@@ -850,6 +897,7 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
                                         base: None,
                                         raw_base: false,
                                         assign_span: None,
+                                        hoists: Vec::new(),
                                     },
                                 );
                             }
@@ -1331,6 +1379,32 @@ pub(crate) fn derive(
 /// call `G(.., p, ..)` where `G` ties that position and `p` is a bare
 /// parameter of `F` ties `p` in `F` too. Iterated to a fixpoint; each owner
 /// is walked once per round.
+/// A read with no call, no write and no address-taking: field projections,
+/// dereferences, locals, literals, casts and unary/binary arithmetic of the
+/// same.
+fn pure_read(expr: &Expr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::Lit(_) => true,
+        ExprKind::Path(QPath::Resolved(_, path)) => matches!(path.res, Res::Local(_)),
+        ExprKind::Field(base, _) => pure_read(base),
+        ExprKind::Unary(UnOp::Deref | UnOp::Neg | UnOp::Not, inner) => pure_read(inner),
+        ExprKind::Cast(inner, _) => pure_read(inner),
+        ExprKind::Binary(_, left, right) => pure_read(left) && pure_read(right),
+        _ => false,
+    }
+}
+
+/// Whether a pure read goes through a place (a field projection or a
+/// dereference) rather than naming a local or a literal.
+fn reads_through(expr: &Expr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::Field(..) | ExprKind::Unary(UnOp::Deref, _) => true,
+        ExprKind::Unary(_, inner) | ExprKind::Cast(inner, _) => reads_through(inner),
+        ExprKind::Binary(_, left, right) => reads_through(left) || reads_through(right),
+        _ => false,
+    }
+}
+
 fn forward_ties(
     tcx: TyCtxt<'_>,
     mentions: &[(LocalDefId, bool, bool)],
@@ -1752,6 +1826,16 @@ pub(crate) fn finalize(
             expression_edits: edits,
             load_locals,
             argument_forms,
+            hoists: candidate
+                .sites
+                .iter()
+                .filter(|site| candidate.owning && site.kind == SiteKind::Store)
+                .flat_map(|site| {
+                    site.hoists.iter().filter_map(move |read| {
+                        site.assign_span.map(|assign| (site.owner, assign, *read))
+                    })
+                })
+                .collect(),
             site_count: candidate.sites.len(),
         });
     }

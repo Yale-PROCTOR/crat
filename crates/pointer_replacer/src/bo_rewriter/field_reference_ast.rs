@@ -575,3 +575,147 @@ pub(crate) fn apply_wraps(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// E5C-3: hoisted reads
+// ---------------------------------------------------------------------------
+
+/// Takes the expression at `read` out of a statement, leaving a path to the
+/// hoisted binding in its place.
+struct TakeRead {
+    read: (u32, u32),
+    name: String,
+    taken: Option<rustc_ast::Expr>,
+}
+
+impl MutVisitor for TakeRead {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        if !e.span.is_dummy() && (e.span.lo().0, e.span.hi().0) == self.read && self.taken.is_none()
+        {
+            let path = super::ast_transform::graft_expr(&self.name)
+                .expect("a hoisted binding name parses as a path");
+            // The moved node keeps its id (the claim) and its spans (the
+            // edits nested in it); the path left behind is a fresh node.
+            let moved = e.clone();
+            e.id = rustc_ast::node_id::DUMMY_NODE_ID;
+            e.kind = path.kind;
+            e.span = rustc_span::DUMMY_SP;
+            self.taken = Some(moved);
+            return;
+        }
+        rustc_ast::mut_visit::walk_expr(self, e);
+    }
+}
+
+/// Inserts `let <name> = <read>;` before the statement holding the store
+/// whose value moves an owned field before that read is evaluated.
+struct Hoists<'a> {
+    /// assignment span → the reads to hoist, in argument order
+    plans: &'a FxHashMap<(u32, u32), Vec<(u32, u32)>>,
+    guard: &'a mut Composition,
+    placed: usize,
+    counter: usize,
+    failures: Vec<String>,
+}
+
+impl MutVisitor for Hoists<'_> {
+    fn flat_map_stmt(
+        &mut self,
+        mut statement: rustc_ast::Stmt,
+    ) -> smallvec::SmallVec<[rustc_ast::Stmt; 1]> {
+        let assignment = match &statement.kind {
+            rustc_ast::StmtKind::Expr(e) | rustc_ast::StmtKind::Semi(e) => {
+                Some((e.span.lo().0, e.span.hi().0))
+            }
+            _ => None,
+        };
+        let Some(reads) = assignment.and_then(|key| self.plans.get(&key)) else {
+            return rustc_ast::mut_visit::walk_flat_map_stmt(self, statement);
+        };
+        let mut out = smallvec::SmallVec::new();
+        for read in reads {
+            let name = format!("__crat_hoist{}", self.counter);
+            self.counter += 1;
+            let mut take = TakeRead {
+                read: *read,
+                name: name.clone(),
+                taken: None,
+            };
+            match &mut statement.kind {
+                rustc_ast::StmtKind::Expr(e) | rustc_ast::StmtKind::Semi(e) => take.visit_expr(e),
+                _ => {}
+            }
+            let Some(read_expr) = take.taken else {
+                self.failures.push(format!("hoist-read-unplaced:{read:?}"));
+                continue;
+            };
+            if !self
+                .guard
+                .claim(read_expr.id, read_expr.span, "field:hoist")
+            {
+                self.failures.push(format!("hoist-claim-refused:{read:?}"));
+                continue;
+            }
+            let mut binding = ::utils::ast::parse_stmt(format!("let {name} = 0;"));
+            let rustc_ast::StmtKind::Let(local) = &mut binding.kind else {
+                self.failures.push("hoist-binding-shape".to_owned());
+                continue;
+            };
+            let rustc_ast::LocalKind::Init(init) = &mut local.kind else {
+                self.failures.push("hoist-binding-init".to_owned());
+                continue;
+            };
+            **init = read_expr;
+            out.push(binding);
+            self.placed += 1;
+        }
+        out.extend(rustc_ast::mut_visit::walk_flat_map_stmt(self, statement));
+        out
+    }
+}
+
+/// Applies the E5C-3 hoists of every active owned-field transaction. Runs
+/// before the use-graft pass: a moved read keeps its spans, so the edits
+/// nested in it are grafted where it now stands.
+pub(crate) fn apply_hoists(
+    table: &DecisionTable,
+    reverts: &RevertSet,
+    krate: &mut rustc_ast::Crate,
+    guard: &mut Composition,
+) -> Result<(), String> {
+    let mut plans: FxHashMap<(u32, u32), Vec<(u32, u32)>> = FxHashMap::default();
+    let mut expected = 0;
+    for transaction in table.field_transactions.active(&reverts.fns) {
+        for (_, assignment, read) in &transaction.hoists {
+            plans
+                .entry((assignment.lo().0, assignment.hi().0))
+                .or_default()
+                .push((read.lo().0, read.hi().0));
+            expected += 1;
+        }
+    }
+    if plans.is_empty() {
+        return Ok(());
+    }
+    let mut hoists = Hoists {
+        plans: &plans,
+        guard,
+        placed: 0,
+        counter: 0,
+        failures: Vec::new(),
+    };
+    hoists.visit_crate(krate);
+    if !hoists.failures.is_empty() {
+        return Err(format!(
+            "field-transaction-hoist:{}",
+            hoists.failures.join(";")
+        ));
+    }
+    if hoists.placed != expected {
+        return Err(format!(
+            "field-transaction-hoist:unplaced {}/{expected}",
+            hoists.placed
+        ));
+    }
+    Ok(())
+}
