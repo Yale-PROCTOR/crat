@@ -3799,6 +3799,14 @@ fn transform_with<'tcx>(
             ));
         }
     }
+    super::wave5r_field_borrow::apply_before_a5(
+        tcx,
+        table,
+        reverts,
+        &mut krate,
+        &mut guard,
+        &a5_raw_calls.keys().copied().collect(),
+    )?;
     let mut a5_raw = A5RawGraftVisitor {
         calls: &a5_raw_calls,
         reverts,

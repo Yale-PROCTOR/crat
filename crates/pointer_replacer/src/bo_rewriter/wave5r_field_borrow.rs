@@ -50,17 +50,50 @@ pub(super) fn apply(
     krate: &mut rustc_ast::Crate,
     guard: &mut Composition,
 ) -> Result<(), String> {
+    apply_in(tcx, table, reverts, krate, guard, None)
+}
+
+/// The same repair, restricted to the calls an A5 raw-view graft is about to
+/// re-render from the current tree: the graft pretty-prints the call and
+/// re-parses it with fresh spans, so a repair that runs after it can no longer
+/// find the argument. Running it first, on the original node, lets the
+/// re-rendered call carry the shared borrow (wave-6r, batch-8 composition).
+pub(super) fn apply_before_a5(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    reverts: &RevertSet,
+    krate: &mut rustc_ast::Crate,
+    guard: &mut Composition,
+    a5_calls: &rustc_hash::FxHashSet<(u32, u32)>,
+) -> Result<(), String> {
+    apply_in(tcx, table, reverts, krate, guard, Some(a5_calls))
+}
+
+fn apply_in(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    reverts: &RevertSet,
+    krate: &mut rustc_ast::Crate,
+    guard: &mut Composition,
+    only_calls: Option<&rustc_hash::FxHashSet<(u32, u32)>>,
+) -> Result<(), String> {
     struct Calls<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         table: &'a DecisionTable,
         reverts: &'a RevertSet,
         owner: LocalDefId,
         sites: &'a mut rustc_hash::FxHashMap<Span, Span>,
+        only_calls: Option<&'a rustc_hash::FxHashSet<(u32, u32)>>,
     }
     impl<'tcx> Visitor<'tcx> for Calls<'_, 'tcx> {
         fn visit_expr(&mut self, call: &'tcx Expr<'tcx>) {
             intravisit::walk_expr(self, call);
             let ExprKind::Call(callee, args) = call.kind else { return };
+            if let Some(only) = self.only_calls
+                && !only.contains(&(call.span.lo().0, call.span.hi().0))
+            {
+                return;
+            }
             let ExprKind::Path(ref path) = callee.kind else { return };
             let Res::Def(_, did) = self.tcx.typeck(self.owner).qpath_res(path, callee.hir_id)
             else {
@@ -105,6 +138,7 @@ pub(super) fn apply(
                 reverts,
                 owner: subject.fn_did,
                 sites: &mut sites,
+                only_calls,
             }
             .visit_body(tcx.hir_body(body));
         }
@@ -127,6 +161,11 @@ pub(super) fn apply(
                 return;
             }
             if !self.guard.claim(expr.id, expr.span, "shared-field-borrow") {
+                // The early A5 pass already made this borrow shared; the
+                // late pass finds it claimed and leaves it.
+                if *permission == rustc_ast::Mutability::Not {
+                    return;
+                }
                 self.collision = true;
                 return;
             }
