@@ -2410,12 +2410,22 @@ pub(crate) fn reconcile_outbound_return_rows(
                     ));
                 };
                 let null = row.boundary_kind == "return-null-to-option";
+                // W6L-1: a return manufactured from raw storage is the T2
+                // pair (bridge tier + the named waiver + the T2 retention row);
+                // the bare-parameter return stays the T1 pair with no waiver.
+                let through_raw_field = bridge.retention == BridgeRetentionTier::T2
+                    && bridge.waiver_id.as_deref() == Some(RAW_BOUNDARY_T2_WAIVER_ID)
+                    && bridge.site.position.contains(":through_raw_field=")
+                    && row.retention
+                        == (MechanicalRetention::T2 {
+                            waiver_id: RAW_BOUNDARY_T2_WAIVER_ID.into(),
+                        });
                 if proof.owner != callee.local_def_index.as_u32()
                     || proof.lifetime.is_empty()
                     || proof.plan_digest.is_empty()
                     || associated.caller != callee
                     || row.retention_evidence.is_some()
-                    || bridge.waiver_id.is_some()
+                    || (bridge.waiver_id.is_some() && !through_raw_field)
                     || row.terminal_interface != row.target_form
                     || row.target_form.is_empty()
                     || row.target_form == "raw"
@@ -2450,8 +2460,9 @@ pub(crate) fn reconcile_outbound_return_rows(
                             "outbound-return native null evidence drift at {key}"
                         ));
                     }
-                } else if row.retention != MechanicalRetention::T1
-                    || bridge.retention != BridgeRetentionTier::T1
+                } else if (!through_raw_field
+                    && (row.retention != MechanicalRetention::T1
+                        || bridge.retention != BridgeRetentionTier::T1))
                     || !matches!(event.key.subject,
                         MechanicalSubjectKey::Local { owner, mir_local, slot_depth: 0 }
                             if owner == callee && mir_local > 0)

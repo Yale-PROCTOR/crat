@@ -103,7 +103,7 @@ impl FnSignatureSlot {
                 && self.deref_depth.saturating_add(self.depth) > 0
     }
 
-    fn receipt_key(self) -> String {
+    pub(crate) fn receipt_key(self) -> String {
         match self.root {
             FnSignatureRoot::Arg(index) => {
                 format!("arg{index}/deref{}/depth{}", self.deref_depth, self.depth)
@@ -125,6 +125,12 @@ pub(crate) enum LifetimeFailure {
     FnPtrWebHeld,
     AstUnplaceable,
     SeamIncompatible,
+    /// W6L-1: more than one input parameter feeds the return through raw
+    /// storage; no lifetime is guessed.
+    OriginAmbiguous,
+    /// W6L-1: a mutable returned view would sit beside another safe view of
+    /// the same pointee type in the caller.
+    ViewPairHeld,
 }
 
 /// The only token that may discharge one `escapes-via-return` row. Its
@@ -259,9 +265,21 @@ pub(crate) struct LifetimeEligibility {
     fnptr_web: Option<FnPtrWeb>,
     web_wall_s: f64,
     derive_wall_s: f64,
+    /// W6L-1: callees whose return permit collapsed a raw traversal onto one
+    /// parameter, with the derived summary overlay the planner reads for them.
+    through_raw_field: FxHashMap<LocalDefId, super::return_through_raw_field::ThroughRawFieldReuse>,
+    derived_summaries: FxHashMap<LocalDefId, OriginSummary>,
+    through_raw_field_failures: FxHashMap<LocalDefId, LifetimeFailure>,
 }
 
 impl LifetimeEligibility {
+    pub(crate) fn through_raw_field(
+        &self,
+        function: LocalDefId,
+    ) -> Option<&super::return_through_raw_field::ThroughRawFieldReuse> {
+        self.through_raw_field.get(&function)
+    }
+
     pub(crate) fn return_permit(&self, subject: NodeKey) -> Option<&ReturnLifetimePermit> {
         self.return_permits.get(&subject)
     }
@@ -382,6 +400,9 @@ impl LifetimeEligibility {
             fnptr_web: None,
             web_wall_s: 0.0,
             derive_wall_s: 0.0,
+            through_raw_field: FxHashMap::default(),
+            derived_summaries: FxHashMap::default(),
+            through_raw_field_failures: FxHashMap::default(),
         }
     }
 }
@@ -584,6 +605,68 @@ pub(crate) fn derive_return_eligibility(
         }
     }
 
+    // W6L-1: returns reached through raw storage of one parameter. Derived
+    // only for callees a `return-not-adapted` caller local actually names,
+    // keyed by the callee's parameter, and never where a bare-parameter
+    // return permit already exists.
+    if let Ok(web) = &web {
+        let mut callees =
+            super::return_through_raw_field::candidate_callees(subjects, &decisions, constructions)
+                .into_iter()
+                .collect::<Vec<_>>();
+        callees.sort_unstable_by_key(|did| did.local_def_index.as_u32());
+        for callee in callees {
+            if web.contains(callee)
+                && matches!(
+                    exposure.plan(callee),
+                    super::exposure::ExposureSurfacePlan::NotApplicable
+                )
+            {
+                result
+                    .through_raw_field_failures
+                    .insert(callee, LifetimeFailure::FnPtrWebHeld);
+                continue;
+            }
+            let permit = match super::return_through_raw_field::derive_callee(
+                program, callee, origins, slots, model, &decisions, subjects,
+            ) {
+                Ok(permit) => permit,
+                Err(failure) => {
+                    result.through_raw_field_failures.insert(callee, failure);
+                    continue;
+                }
+            };
+            if result.return_permits.contains_key(&permit.parameter_node) {
+                continue;
+            }
+            let required = [permit.parameter_origin, permit.return_origin];
+            let tie = ReturnTie {
+                sources: vec![permit.reuse.parameter],
+                target: FnSignatureSlot::RETURN,
+            };
+            if let Err(failure) = plan_function_with_return_ties(
+                &permit.overlay,
+                &required,
+                &BTreeSet::new(),
+                std::slice::from_ref(&tie),
+            ) {
+                result.through_raw_field_failures.insert(callee, failure);
+                continue;
+            }
+            result.return_permits.insert(
+                permit.parameter_node,
+                ReturnLifetimePermit::new(
+                    permit.parameter_node,
+                    callee,
+                    vec![(permit.reuse.parameter, permit.parameter_origin)],
+                    (FnSignatureSlot::RETURN, permit.return_origin),
+                ),
+            );
+            result.through_raw_field.insert(callee, permit.reuse);
+            result.derived_summaries.insert(callee, permit.overlay);
+        }
+    }
+
     if let (Ok(web), Some(origins)) = (&web, origins) {
         for (&function, summary) in origins.iter() {
             if web.contains(function) {
@@ -766,7 +849,45 @@ pub(crate) fn derive_return_eligibility(
             continue;
         }
         if !return_plan_functions.contains(&callee) {
-            result.failures.insert(key, LifetimeFailure::OriginAbsent);
+            result.failures.insert(
+                key,
+                result
+                    .through_raw_field_failures
+                    .get(&callee)
+                    .copied()
+                    .unwrap_or(LifetimeFailure::OriginAbsent),
+            );
+            continue;
+        }
+        // W6L-1: a mutable view manufactured from raw storage must be the only
+        // safe view of its pointee type in the caller.
+        if result.through_raw_field.contains_key(&callee)
+            && subject.mutable
+            && super::return_through_raw_field::mutable_view_pair_held(
+                program,
+                subject,
+                subjects,
+                &|sibling| {
+                    let sibling_key = (sibling.fn_did, sibling.hir_id);
+                    let sibling_decision = decisions.get(&sibling_key);
+                    super::return_through_raw_field::is_safe_view(sibling_decision)
+                        || result.inferred_permits.contains_key(&sibling_key)
+                        || result.annotated_receiver_permits.contains_key(&sibling_key)
+                        || (super::return_through_raw_field::is_return_residual(sibling_decision)
+                            && !sibling.mutable
+                            && matches!(sibling.ctor, Some(Construction::CallResult))
+                            && constructions
+                                .call_result_targets
+                                .get(&sibling_key)
+                                .is_some_and(|target| {
+                                    matches!(target,
+                                    CallResultTarget::DirectLocal(other)
+                                        if result.through_raw_field.contains_key(other))
+                                }))
+                },
+            )
+        {
+            result.failures.insert(key, LifetimeFailure::ViewPairHeld);
             continue;
         }
         // Both tokens require the same direct-callee, web, frozen model and
@@ -797,6 +918,8 @@ impl LifetimeFailure {
             Self::FnPtrWebHeld => "lifetime-fnptr-web-held",
             Self::AstUnplaceable => "lifetime-ast-unplaceable",
             Self::SeamIncompatible => "lifetime-seam-incompatible",
+            Self::OriginAmbiguous => "lifetime-origin-ambiguous",
+            Self::ViewPairHeld => "lifetime-view-pair-held",
         }
     }
 }
@@ -807,6 +930,8 @@ pub(crate) struct FunctionPlan {
     pub(crate) sccs: Vec<Vec<FnSignatureSlot>>,
     pub(crate) outlives: Vec<(String, String)>,
     return_reuses: Vec<ReturnLifetimeReuse>,
+    /// W6L-1: the raw traversal this plan's return tie collapsed, when any.
+    through_raw_field: Option<super::return_through_raw_field::ThroughRawFieldReuse>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1021,6 +1146,12 @@ impl FunctionPlan {
         self.lifetimes.get(&slot).map(String::as_str)
     }
 
+    pub(crate) fn through_raw_field(
+        &self,
+    ) -> Option<&super::return_through_raw_field::ThroughRawFieldReuse> {
+        self.through_raw_field.as_ref()
+    }
+
     pub(crate) fn receipt(&self) -> String {
         let mut rows = Vec::new();
         for (slot, lifetime) in &self.lifetimes {
@@ -1041,6 +1172,9 @@ impl FunctionPlan {
                 reuse.target.receipt_key(),
                 reuse.common_name,
             ));
+        }
+        if let Some(reuse) = &self.through_raw_field {
+            rows.push(reuse.receipt_key());
         }
         rows.join("\n")
     }
@@ -1137,19 +1271,23 @@ pub(crate) fn finalize(
     let mut owners = required.into_iter().collect::<Vec<_>>();
     owners.sort_by_key(|(did, _)| did.local_def_index.as_u32());
     for (did, slots) in owners {
-        let summary = origins.get(&did).ok_or_else(|| {
-            format!(
-                "lifetime-origin-absent: no summary for {}",
-                program.tcx.def_path_str(did.to_def_id())
-            )
-        })?;
+        let summary = eligibility
+            .derived_summaries
+            .get(&did)
+            .or_else(|| origins.get(&did))
+            .ok_or_else(|| {
+                format!(
+                    "lifetime-origin-absent: no summary for {}",
+                    program.tcx.def_path_str(did.to_def_id())
+                )
+            })?;
         let required = slots.into_iter().collect::<Vec<_>>();
         let ties = return_ties
             .remove(&did)
             .unwrap_or_default()
             .into_iter()
             .collect::<Vec<_>>();
-        let plan = plan_function_with_return_ties(
+        let mut plan = plan_function_with_return_ties(
             summary,
             &required,
             &existing_lifetime_names(program, did),
@@ -1162,6 +1300,7 @@ pub(crate) fn finalize(
                 program.tcx.def_path_str(did.to_def_id())
             )
         })?;
+        plan.through_raw_field = eligibility.through_raw_field.get(&did).cloned();
         functions.insert(did, plan);
     }
     Ok(LifetimePlan { functions })
@@ -1334,6 +1473,7 @@ fn plan_function_with_return_ties(
             .collect(),
         outlives: outlives.into_iter().collect(),
         return_reuses,
+        through_raw_field: None,
     })
 }
 

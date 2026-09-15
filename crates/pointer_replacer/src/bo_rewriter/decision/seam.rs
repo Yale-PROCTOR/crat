@@ -5812,6 +5812,10 @@ pub(crate) fn synthesize_with_raw_boundary(
             });
             continue;
         }
+        // W6L-1: a return reached through raw storage borrows the parameter's
+        // LIFETIME, not its pointee, so the returned view's mutability follows
+        // the raw return type rather than the parameter's own permission.
+        let through_raw_field = function_plan.through_raw_field();
         let final_mutable = decision_of.get(&node).is_some_and(|decision| {
             matches!(
                 decision,
@@ -5821,7 +5825,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     | Decision::Opt { mutable: true, .. }
             )
         });
-        if expected_mutable && !final_mutable {
+        if expected_mutable && !final_mutable && through_raw_field.is_none() {
             plan.blocked.push(BlockedSeam {
                 caller: site.owner,
                 callee: site.owner,
@@ -5945,6 +5949,17 @@ pub(crate) fn synthesize_with_raw_boundary(
             continue;
         };
         let digest = function_plan.digest();
+        // W6L-1: the reference is manufactured from raw storage; retention of
+        // raw aliases to the same memory is unknown, so the bridge rides the
+        // named T2 waiver and the receipt names the collapsed traversal.
+        let (retention, waiver_id, traversal) = match through_raw_field {
+            Some(reuse) => (
+                BridgeRetentionTier::T2,
+                Some(crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+                format!(":through_raw_field={}", reuse.traversal.join(",")),
+            ),
+            None => (BridgeRetentionTier::T1, None, String::new()),
+        };
         plan.edits.push(SeamEdit {
             raw_outbound: None,
             zero_syntax: same_borrowed_family && !wrap_borrowed_payload && suffix_offset.is_none(),
@@ -5957,7 +5972,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 callee: BridgeCalleeId::Local(site.owner),
                 arm: "glue".to_owned(),
                 position: format!(
-                    "return@{}..{}:target={}:lifetime_plan={digest}",
+                    "return@{}..{}:target={}:lifetime_plan={digest}{traversal}",
                     site.span.lo().0,
                     site.span.hi().0,
                     site.source_type.rendered,
@@ -5967,8 +5982,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                 found_form: found.key().to_owned(),
                 argument_kind: "return-seam".to_owned(),
                 extent: BridgeExtentKind::None,
-                retention: BridgeRetentionTier::T1,
-                waiver_id: None,
+                retention,
+                waiver_id,
                 unsafe_context: unsafe_context_for(tcx, site.owner, &spec),
             },
             owner_fn: tcx.def_path_str(site.owner.to_def_id()),

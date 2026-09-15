@@ -215,7 +215,7 @@ fn capture_one(
         || interface.form == Form::Raw
         || seam.call_span != site.span
         || seam.bridge.extent != BridgeExtentKind::None
-        || seam.bridge.waiver_id.is_some()
+        || seam.bridge.waiver_id.is_some() != lifetime.through_raw_field().is_some()
     {
         return Err("native-return:native-common-evidence-mismatch".into());
     }
@@ -232,8 +232,19 @@ fn capture_one(
         }
         MechanicalRetention::None
     } else {
+        // W6L-1: a return manufactured from raw storage carries the T2
+        // waiver its seam recorded; the bare-parameter return keeps T1.
+        let through_raw_field = lifetime.through_raw_field();
+        let expected_tier = if through_raw_field.is_some() {
+            BridgeRetentionTier::T2
+        } else {
+            BridgeRetentionTier::T1
+        };
         if seam.bridge.bridge_kind != "return-raw-to-ref"
-            || seam.bridge.retention != BridgeRetentionTier::T1
+            || seam.bridge.retention != expected_tier
+            || (through_raw_field.is_some()
+                && seam.bridge.waiver_id.as_deref()
+                    != Some(super::super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID))
         {
             return Err("native-return:return-permit-bridge-mismatch".into());
         }
@@ -286,7 +297,12 @@ fn capture_one(
         }
         // T1 is the existing native return permit's label, not a NoRetain
         // claim: returning a parameter is itself observable retention.
-        MechanicalRetention::T1
+        match through_raw_field {
+            Some(_) => MechanicalRetention::T2 {
+                waiver_id: super::super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
+            },
+            None => MechanicalRetention::T1,
+        }
     };
     let (file, lo, hi) = spans(site.span)?;
     let lo = u32::try_from(lo).map_err(|_| "native-return:span-offset-overflow")?;
