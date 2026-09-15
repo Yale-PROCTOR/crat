@@ -33,6 +33,7 @@ pub(crate) mod allocator_contract;
 pub(crate) mod array_start;
 #[cfg(test)]
 mod array_start_tests;
+pub(crate) mod binn_counted;
 pub(crate) mod box_facts;
 pub(crate) mod box_param;
 pub(crate) mod callee_parameter_input;

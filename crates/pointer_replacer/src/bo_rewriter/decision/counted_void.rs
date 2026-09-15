@@ -43,6 +43,10 @@ pub(crate) struct Contract {
     /// A `void *` handle to ONE struct: the declared pointee type's text. The
     /// form is a plain reference; no count, no use edits beyond null tests.
     pub(crate) handle: Option<String>,
+    /// wave-6v2: the byte count is a width the callee's own typed accesses
+    /// fix (a constant, or one width per literal of a sibling discriminant);
+    /// `count_index` is then the discriminant's index, or the parameter's own.
+    pub(crate) width: Option<super::binn_counted::WidthTable>,
     pub(crate) uses: Vec<UseEdit>,
 }
 fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
@@ -100,6 +104,7 @@ fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         },
         nullable: false,
         handle: None,
+        width: None,
         uses: vec![UseEdit {
             span: access.span,
             replacement,
@@ -122,6 +127,7 @@ pub(crate) fn collect(
             prove(tcx, s)
                 .or_else(|| super::counted_void_read::prove(tcx, s))
                 .or_else(|| super::counted_void_handle::prove(tcx, s))
+                .or_else(|| super::binn_counted::prove(tcx, s))
                 .map(|c| (s, c))
         })
         .collect();
@@ -283,6 +289,10 @@ fn prove_forward(
                     element: contract.element,
                     nullable: contract.nullable,
                     handle: None,
+                    width: contract
+                        .width
+                        .as_ref()
+                        .map(|width| width.rekey(count_index)),
                     uses: Vec::new(),
                 });
             }
@@ -645,7 +655,7 @@ impl CountForm<'_> {
 
 /// Where the bridged pointer's provenance comes from, read off the argument
 /// expression of the INPUT program.
-enum Root {
+pub(crate) enum Root {
     /// The value of this local: its referent is what the view covers.
     Value(HirId),
     /// This local's own storage is what the view covers.
@@ -653,7 +663,7 @@ enum Root {
     /// A loaded pointer, a call result, a literal: no subject's claim is at stake.
     Opaque,
 }
-fn value_root(e: &Expr<'_>) -> Root {
+pub(crate) fn value_root(e: &Expr<'_>) -> Root {
     match e.kind {
         ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => value_root(inner),
         ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
@@ -683,7 +693,7 @@ fn place_root(e: &Expr<'_>) -> Root {
 /// The place whose bytes the view starts at, for the fitting proof: the
 /// receiver of `as_mut_ptr`/`as_ptr`, the operand of `&`/`&mut`, or the
 /// pointee of a bare pointer local.
-fn viewed_type<'tcx>(
+pub(crate) fn viewed_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner: LocalDefId,
     e: &'tcx Expr<'tcx>,
@@ -703,7 +713,7 @@ fn viewed_type<'tcx>(
         _ => None,
     }
 }
-fn thin(decision: &super::Decision) -> bool {
+pub(crate) fn thin(decision: &super::Decision) -> bool {
     use super::Decision;
     match decision {
         Decision::Ref { .. } | Decision::InferredRef { .. } => true,
@@ -827,6 +837,15 @@ pub(crate) fn count_argument<'tcx>(
         }
         _ => return Err(SeamBlock::SiteOverlap),
     };
+    if let Some(width) = &c.width {
+        // wave-6v2: the count is the callee's own width (table), never an
+        // argument's value; the root rule reads the literal discriminant.
+        if route != Route::RawTwin {
+            let discriminant = width.discriminant.map(|k| args.get(k)).flatten();
+            super::binn_counted::root_rule(tcx, table, site.caller, argument, width, discriminant)?;
+        }
+        return Ok((width.render(), route));
+    }
     if route != Route::RawTwin {
         root_rule(tcx, table, site.caller, argument, &form)?;
     }
@@ -1116,6 +1135,10 @@ pub(crate) fn record_call<'tcx>(
         })
         .map(|count| count_form(tcx, site.caller, count).receipt())
         .unwrap_or_else(|| "bytes".to_owned());
+    let count_form = contract
+        .width
+        .as_ref()
+        .map_or(count_form, super::binn_counted::WidthTable::receipt);
     let key = (
         site.caller.local_def_index.as_u32(),
         site.span.lo().0,

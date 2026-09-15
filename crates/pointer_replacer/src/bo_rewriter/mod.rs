@@ -148,6 +148,8 @@ pub(crate) mod ast_bridge;
 /// composition guard built beside its first arm.
 pub(crate) mod ast_transform;
 #[cfg(test)]
+mod binn_counted_tests;
+#[cfg(test)]
 pub(crate) mod bridge_custody_export;
 #[cfg(test)]
 pub(crate) mod bridge_custody_match;
