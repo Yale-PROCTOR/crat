@@ -1081,7 +1081,7 @@ fn emit_with_family_receipts(input: &str) -> (String, String) {
     (output, receipts)
 }
 
-/// **Caller-bearing witness for wave-5d (R398-1), target behaviour — RED.**
+/// **Caller-bearing witness (report 004; R401-4 lands the fix).**
 /// The callee-only fixture delivers `ptr: &[i8]`; adding the real caller
 /// must not withdraw it. Today the caller's class is charged the C arm for
 /// its raw argument `hostname` while the adapter site is owned by the callee
@@ -1089,7 +1089,6 @@ fn emit_with_family_receipts(input: &str) -> (String, String) {
 /// `missing-required-arm:c`), its previously applied `url` is "lost", and the
 /// restoration walk withdraws `strff` through the interface graph.
 #[test]
-#[ignore = "RED for wave-5d's per-subject preservation / arm-C charge (report wave-6s/004)"]
 fn wave6s_strff_survives_its_raw_local_caller() {
     let (source, receipts) = emit_with_family_receipts(STRFF_WITH_URL_GET_PORT);
     println!("EMITTED {source}");
@@ -1103,27 +1102,6 @@ fn wave6s_strff_survives_its_raw_local_caller() {
     assert!(
         !receipts.contains("restore-family-interface-path"),
         "interface restoration withdrew a caller-side family: {receipts}"
-    );
-}
-
-/// The same fixture, asserting the withdrawal it reproduces today (report
-/// 002's urlparser path `[38, 58, 57, 55, 43]` reduced to `[11, 9]`). Flips
-/// when the target above turns GREEN; then it is retired with it.
-#[test]
-fn wave6s_strff_caller_withdrawal_reproduced() {
-    let (source, receipts) = emit_with_family_receipts(STRFF_WITH_URL_GET_PORT);
-    println!("EMITTED {source}");
-    println!("FAMILY RECEIPTS {receipts}");
-    assert!(super::verify::type_checks_str(&source), "{source}");
-    assert!(source.contains("ptr: *mut i8"), "{source}");
-    assert!(source.contains("url: &i8"), "{source}");
-    assert!(
-        receipts.contains("unwitnessed-family-refusal:blocked-subject:kind-raw"),
-        "{receipts}"
-    );
-    assert!(
-        receipts.contains("restore-family-interface-path:[11, 9]"),
-        "{receipts}"
     );
 }
 
@@ -1148,7 +1126,7 @@ const STOREH2_WITH_STORE_RANGE: &str = r#"
  }
 "#;
 
-/// **Second caller-bearing witness for wave-5d — RED, the `unrestored` form.**
+/// **Second caller-bearing witness (report 004; R401-4) — the `unrestored` form before the fix.**
 /// `StoreRangeH2` (caller) and `StoreH2` (callee) depend on each other in the
 /// class graph (`interface-call-zero-syntax` one way, the raw→slice adapter
 /// the other); when the caller's class holds for the mis-charged C arm, both
@@ -1157,7 +1135,6 @@ const STOREH2_WITH_STORE_RANGE: &str = r#"
 /// `additive-family-preservation-invariant:unrestored:[(9, 1), (10, 1)]` —
 /// wave-5d's binn `binn_get_bool` MAX-3 shape.
 #[test]
-#[ignore = "RED for wave-5d's per-subject preservation / arm-C charge (report wave-6s/004)"]
 fn wave6s_storeh2_survives_its_thin_raw_caller() {
     let (source, receipts) = emit_with_family_receipts(STOREH2_WITH_STORE_RANGE);
     println!("EMITTED {source}");
@@ -1172,26 +1149,6 @@ fn wave6s_storeh2_survives_its_thin_raw_caller() {
     assert!(
         source.contains("StoreH2(self_0, core::slice::from_raw_parts(data, "),
         "{source}"
-    );
-}
-
-#[test]
-fn wave6s_storeh2_caller_unrestored_reproduced() {
-    let error = ::utils::compilation::run_compiler_on_str(STOREH2_WITH_STORE_RANGE, |tcx| {
-        super::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                super::A5Mode::PreciseReplay,
-                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .err()
-    })
-    .expect("input type-checks")
-    .expect("the caller-bearing fixture fails the preservation invariant today");
-    assert_eq!(
-        error,
-        "additive-family-preservation-invariant:unrestored:[(9, 1), (10, 1)]"
     );
 }
 
@@ -1396,13 +1353,12 @@ const KM_VEC4_TRANSFORM_ARRAY: &str = r#"
  }
 "#;
 
-/// **Third caller-side witness for wave-5d — RED, same-function form.** The
+/// **Third caller-side witness (report 005; R401-4) — same-function form.** The
 /// derived local `out` (degraded `copy-source-coupled`) is the raw source of
 /// the converted `kmVec4Transform::pOut: &mut kmVec4`, so the arm-C charge
 /// lands on it and holds its own class (`blocked-subject:copy-source-coupled`)
 /// although `pV` / `pOut` both plan their suffix raw views.
 #[test]
-#[ignore = "RED for wave-5d's per-subject preservation / arm-C charge (report wave-6s/005)"]
 fn wave6s_km_vec4_transform_array_derived_pointers_bound_to_locals() {
     let (source, receipts) = emit_with_family_receipts(KM_VEC4_TRANSFORM_ARRAY);
     println!("EMITTED {source}");
@@ -1413,62 +1369,6 @@ fn wave6s_km_vec4_transform_array_derived_pointers_bound_to_locals() {
     assert!(
         source.contains("let mut in_0 = (&(pV)[(i.wrapping_mul(vStride)) as usize..]).as_ptr();"),
         "{source}"
-    );
-}
-
-/// The same fixture pinning today's hold: both bases plan the suffix raw view
-/// and the class holds on the derived local's arm-C charge.
-#[test]
-fn wave6s_km_vec4_transform_array_class_hold_reproduced() {
-    let decisions = ::utils::compilation::run_compiler_on_str(KM_VEC4_TRANSFORM_ARRAY, |tcx| {
-        let (table, ctx) = super::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                super::A5Mode::PreciseReplay,
-                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .expect("native corpus-mode decisions");
-        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
-            .expect("native emission plan");
-        let held = emission
-            .plan
-            .class_finalization
-            .classes
-            .values()
-            .filter(|class| !class.is_ready())
-            .flat_map(|class| class.hold_reasons().to_vec())
-            .collect::<Vec<_>>();
-        (
-            table
-                .entries
-                .iter()
-                .map(|(subject, decision)| format!("{} {decision:?}", subject.label))
-                .collect::<Vec<_>>(),
-            held,
-        )
-    })
-    .expect("input type-checks");
-    let (entries, held) = decisions;
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.starts_with("kmVec4TransformArray::pV Slice")
-                && entry.contains("(&(pV)[(i.wrapping_mul(vStride)) as usize..]).as_ptr()")),
-        "{entries:#?}"
-    );
-    assert!(
-        entries.iter().any(
-            |entry| entry.starts_with("kmVec4TransformArray::pOut Slice")
-                && entry
-                    .contains("(&mut (pOut)[(i.wrapping_mul(outStride)) as usize..]).as_mut_ptr()")
-        ),
-        "{entries:#?}"
-    );
-    assert!(
-        held.iter()
-            .any(|reason| reason == "blocked-subject:copy-source-coupled"),
-        "{held:?}"
     );
 }
 

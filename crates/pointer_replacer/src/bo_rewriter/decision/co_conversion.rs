@@ -514,7 +514,15 @@ impl CoConv {
             .filter(|edge| edge.source == key || edge.target == key)
         {
             match edge.route {
-                EdgeRoute::ArmC => arms.insert(Arm::C),
+                // R401-4 (wave-6s report 004/005): the C adapter is the seam
+                // edit owned by the CONVERTED callee's class, and it is applied
+                // whether or not the caller's class is ready; charging the raw
+                // source side too held every caller with a degraded argument
+                // (`blocked-subject:<reason>` + `missing-required-arm:c`) and
+                // withdrew the callee through restoration. Only the target
+                // requires the arm.
+                EdgeRoute::ArmC if edge.target == key => arms.insert(Arm::C),
+                EdgeRoute::ArmC => {}
                 EdgeRoute::Glue => arms.insert(Arm::Glue),
                 EdgeRoute::ZeroSyntax | EdgeRoute::ArmA => {}
             }
