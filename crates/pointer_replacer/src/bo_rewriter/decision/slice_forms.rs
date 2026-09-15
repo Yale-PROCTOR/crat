@@ -738,6 +738,7 @@ fn lower_computed_argument_views(
                     edit.spec.core,
                     GlueCore::FromRefMut | GlueCore::FromRawParts
                 )
+                && edit.spec.void_region.is_none()
             {
                 // A borrowed element widened into a converted SLICE parameter,
                 // or the bare arithmetic wrapped by `from_raw_parts` with a
