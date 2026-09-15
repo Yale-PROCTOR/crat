@@ -246,7 +246,7 @@ fn array_capacity(tcx: TyCtxt<'_>, owner: LocalDefId, e: &Expr<'_>) -> Option<u1
     }
     Some(n.try_to_target_usize(tcx)? as u128)
 }
-fn closed_calls<'a>(
+pub(super) fn closed_calls<'a>(
     tcx: TyCtxt<'_>,
     owner: LocalDefId,
     facts: &'a EmitabilityFacts,

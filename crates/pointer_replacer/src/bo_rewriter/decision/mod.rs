@@ -92,6 +92,9 @@ pub(crate) mod shared_read_pairs;
 pub(crate) mod sibling_overlap;
 pub(crate) mod slice_carrier;
 pub(crate) mod slice_construction_values;
+pub(crate) mod slice_input;
+#[cfg(test)]
+mod slice_input_tests;
 pub(crate) mod slice_use;
 pub(crate) mod surface_argument;
 pub(crate) mod thin_counted;
@@ -1932,7 +1935,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         };
     }
     let counted = thin_counted::enabled_proof(tcx, subject, facts, family_policy, exposure);
-    if counted.is_some() && matches!(form, Form::Plain | Form::Slice) {
+    let supplied = slice_input::enabled_proof(tcx, subject, facts, fat, family_policy);
+    if (counted.is_some() || supplied.is_some()) && matches!(form, Form::Plain | Form::Slice) {
         form = Form::Slice;
     }
     if let Some(receiver) = return_receivers
