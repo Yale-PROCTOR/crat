@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! let mut val = 0 as *mut T;      ->      let mut val: Option<&mut T> = None;
+//! let mut s = 0 as *const u8;     ->      let mut s: Option<&[u8]> = None;
 //! ```
 //!
 //! `decide_one` vetoes every emitting decision on a local without a declared
@@ -15,8 +16,8 @@
 //! Admitted only where the pointee is nameable from the owner, the pattern is
 //! a plain binding, the local is not a callee-return receiver (that carrier
 //! owns its own declaration) and the Declaration family is enabled for the
-//! owner. Optional slices are not admitted: their declaration carries an
-//! extent this module has no evidence for.
+//! owner. An optional slice's declaration names no extent; its value plan
+//! carries the extent (evidence-backed or the receipted fallback).
 
 use rustc_hir::{Node, PatKind};
 use rustc_middle::ty::{TyCtxt, TyKind};
@@ -30,10 +31,14 @@ use crate::bo_rewriter::{
     decision::seam::ExplicitDeclarationSite,
 };
 
-/// Only a THIN optional is admitted; every other disposition keeps the veto.
+/// An optional — thin, or a slice (relay 010: brotli's static-dictionary
+/// `let mut s = 0 as *const u8; … s = &*data.offset(l) as *const u8;`
+/// locals, whose form is `Option<&[u8]>`; the slice VALUE plan is the
+/// existing nullable-slice construction or wave-6s's view) — is admitted;
+/// every other disposition keeps the veto.
 fn thin_optional(decision: &Decision) -> bool {
     match decision {
-        Decision::Opt { slice, .. } => !*slice,
+        Decision::Opt { .. } => true,
         Decision::Ref { .. }
         | Decision::InferredRef { .. }
         | Decision::Slice { .. }

@@ -168,3 +168,43 @@ unsafe fn get_bracketpart(count: i32) -> *mut Binn {{
     let output = ast_emitted_source_of(&input).expect("hold emission");
     assert!(verify::type_checks_str(&output), "{output}");
 }
+
+/// Relay 010 — brotli `BrotliFindAllStaticDictionaryMatches::{s,s_0,s_1,s_2}`:
+/// an unannotated null-initialized local whose form is an optional SLICE
+/// (`s = &*data.offset(l) as *const u8; *s.offset(k)`) receives
+/// `Option<&[u8]>`. The VALUE is the existing nullable-slice plan (here, with
+/// `data` still raw in the reduction, the one-element `from_ref` carrier;
+/// with wave-6s's computed view, `Some(&data[l..])`).
+#[test]
+fn wave6o_unannotated_null_init_optional_slice_receives_its_type() {
+    let input = r#"
+#![allow(dead_code, unused_mut, non_snake_case)]
+unsafe fn FindAllStaticDictionaryMatches(data: *const u8, l: usize, k: usize, n: usize) -> u32 {
+    let mut s = 0 as *const u8;
+    let mut sum = 0u32;
+    if l < n {
+        s = &*data.offset(l as isize) as *const u8;
+        sum = sum.wrapping_add(*s.offset(k as isize) as u32);
+    }
+    return sum;
+}
+"#;
+    assert!(verify::type_checks_str(input));
+    let (decision, receipts) = decisions_and_receipts(input, "FindAllStaticDictionaryMatches", "s");
+    assert!(
+        matches!(decision, Decision::Opt { slice: true, .. }),
+        "the unannotated null-initialized optional slice must be admitted: {decision:?}"
+    );
+    assert!(
+        receipts
+            .iter()
+            .any(|(operation, state, _)| operation == "null-initialization" && state == "Applied"),
+        "{receipts:?}"
+    );
+    let output = ast_emitted_source_of(input).expect("native emission");
+    assert!(
+        output.contains("let mut s: Option<&[u8]> = None;"),
+        "{output}"
+    );
+    assert!(verify::type_checks_str(&output), "{output}");
+}
