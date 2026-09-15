@@ -829,6 +829,16 @@ fn wave6s_brotli_forward_word_and_byte_walk() {
         source.contains("let mut __crat_wave6s_pos_"),
         "forward byte parameter needs its index: {source}"
     );
+    // The computed sub-view argument of the word loop (report 004): `s1` is a
+    // sole-blocker row in all six corpus copies.
+    assert!(source.contains("s1: &[u8]"), "{source}");
+    let joined = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        joined.contains(
+            "BrotliUnalignedRead64((&(s1)[(matched) as usize..]).as_ptr().cast::<core::ffi::c_void>())"
+        ),
+        "the word read takes the suffix view: {source}"
+    );
 }
 
 const STRFF: &str = r#"
@@ -953,4 +963,358 @@ fn wave6s_strff_incoming_preserves_tail_extent() {
         source.contains("FALLBACK_SLICE_EXTENT"),
         "prefix count does not prove the NUL tail: {source}"
     );
+}
+
+/// urlparser `url_get_port` → `strff`, reduced with the real caller: the argument
+/// `hostname` is an analysis-Raw local (allocated by a local callee, freed
+/// here) and the caller already delivers `url`. Report 002's census recorded
+/// this owner withdrawn at `restore-family-interface-path:[38, 58, 57, 55, 43]`
+/// from `url_get_port`'s `unwitnessed-family-refusal:blocked-subject:kind-raw`.
+const STRFF_WITH_URL_GET_PORT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe extern "C" {
+    fn strlen(p: *const i8) -> usize;
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+    fn strcpy(out: *mut i8, input: *const i8) -> *mut i8;
+ }
+ unsafe extern "C" fn strdup(input: *const i8) -> *mut i8 {
+    let n = strlen(input) + 1;
+    let dup = malloc(n) as *mut i8;
+    if !dup.is_null() { strcpy(dup, input); }
+    return dup;
+ }
+ unsafe fn strff(mut ptr: *mut i8, n: i32) -> *mut i8 {
+  let mut y = 0; let mut i = 0;
+  while i < n { let fresh11 = *ptr; ptr = ptr.offset(1); y = fresh11 as i32; i += 1; }
+  strdup(ptr)
+ }
+ unsafe fn url_get_hostname() -> *mut i8 { malloc(64) as *mut i8 }
+ pub unsafe fn url_get_port(url: *mut i8, n: i32) -> *mut i8 {
+    let hostname = url_get_hostname();
+    let first = *url;
+    let tmp_hostname = strff(hostname, n);
+    free(hostname as *mut core::ffi::c_void);
+    tmp_hostname
+ }
+ "#;
+
+fn emit_with_family_receipts(input: &str) -> (String, String) {
+    let receipts = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = receipts.clone();
+    let output = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("capture original AST");
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native corpus-mode decisions");
+        for (subject, decision) in &table.entries {
+            println!(
+                "DECISION {} arms={:?} {decision:?}",
+                subject.label,
+                table.arm_requirements.get(&(subject.fn_did, subject.hir_id))
+            );
+        }
+        for edit in &table.seams.edits {
+            println!("SEAM owner={:?} src={:?} repl={} zero={} shape={} found={:?} expected={:?} spec={:?} outbound={}", edit.owner_class, edit.source_node, edit.replacement, edit.zero_syntax, edit.source_shape, edit.found, edit.expected, edit.spec, edit.raw_outbound.is_some());
+        }
+        for block in &table.seams.blocked {
+            println!("SEAM-BLOCK {block:?}");
+        }
+        *sink.lock().unwrap() = format!(
+            "{:#?}",
+            ctx.raw_boundary_artifacts.additive_family_receipts
+        );
+        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+            .expect("native emission plan");
+        for (id, class) in &emission.plan.class_finalization.classes {
+            println!(
+                "CLASS {} ready={} holds={:?}",
+                tcx.def_path_str(id.local_def_id().to_def_id()),
+                class.is_ready(),
+                class.hold_reasons()
+            );
+        }
+        let held = emission.plan.held_classes();
+        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+            &held,
+            &Default::default(),
+            &table,
+        )
+        .expect("planned held classes");
+        super::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_call_plans),
+        )
+        .expect("native AST emission")
+        .0
+        .into_values()
+        .next()
+        .expect("one source file")
+    })
+    .expect("input type-checks");
+    let receipts = receipts.lock().unwrap().clone();
+    println!(
+        "WAVE6S_RUNTIME {}",
+        serde_json::json!({"input": input, "output": output})
+    );
+    (output, receipts)
+}
+
+/// **Caller-bearing witness for wave-5d (R398-1), target behaviour — RED.**
+/// The callee-only fixture delivers `ptr: &[i8]`; adding the real caller
+/// must not withdraw it. Today the caller's class is charged the C arm for
+/// its raw argument `hostname` while the adapter site is owned by the callee
+/// class, so the caller holds (`blocked-subject:kind-raw`,
+/// `missing-required-arm:c`), its previously applied `url` is "lost", and the
+/// restoration walk withdraws `strff` through the interface graph.
+#[test]
+#[ignore = "RED for wave-5d's per-subject preservation / arm-C charge (report wave-6s/004)"]
+fn wave6s_strff_survives_its_raw_local_caller() {
+    let (source, receipts) = emit_with_family_receipts(STRFF_WITH_URL_GET_PORT);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("ptr: &[i8]"),
+        "the forward parameter is withdrawn by its caller: {receipts}\n{source}"
+    );
+    assert!(source.contains("url: &i8"), "{source}");
+    assert!(
+        !receipts.contains("restore-family-interface-path"),
+        "interface restoration withdrew a caller-side family: {receipts}"
+    );
+}
+
+/// The same fixture, asserting the withdrawal it reproduces today (report
+/// 002's urlparser path `[38, 58, 57, 55, 43]` reduced to `[11, 9]`). Flips
+/// when the target above turns GREEN; then it is retired with it.
+#[test]
+fn wave6s_strff_caller_withdrawal_reproduced() {
+    let (source, receipts) = emit_with_family_receipts(STRFF_WITH_URL_GET_PORT);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("ptr: *mut i8"), "{source}");
+    assert!(source.contains("url: &i8"), "{source}");
+    assert!(
+        receipts.contains("unwitnessed-family-refusal:blocked-subject:kind-raw"),
+        "{receipts}"
+    );
+    assert!(
+        receipts.contains("restore-family-interface-path:[11, 9]"),
+        "{receipts}"
+    );
+}
+
+/// brotli `StoreRangeH2` → `StoreH2` → `HashBytesH2`: the caller passes a thin
+/// raw `data` (held `local-callee-access-extent`), the callee now delivers.
+const STOREH2_WITH_STORE_RANGE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ #[repr(C)] pub struct H2 { pub buckets_: [u32; 65536] }
+ static kHashMul64: u64 = 0x1E35A7BD1E35A7BD;
+ unsafe fn BrotliUnalignedRead64(p: *const core::ffi::c_void) -> u64 { *(p as *const u64) }
+ unsafe fn HashBytesH2(mut data: *const u8) -> u32 {
+    let h = (BrotliUnalignedRead64(data as *const core::ffi::c_void) << (64 - 8 * 5)).wrapping_mul(kHashMul64);
+    return (h >> (64 - 16)) as u32;
+ }
+ pub unsafe fn StoreH2(mut self_0: *mut H2, mut data: *const u8, mask: usize, ix: usize) {
+    let key = HashBytesH2(&*data.offset((ix & mask) as isize));
+    (*self_0).buckets_[key as usize] = ix as u32;
+ }
+ pub unsafe fn StoreRangeH2(mut self_0: *mut H2, mut data: *const u8, mask: usize, ix_start: usize, ix_end: usize) {
+    let mut i = ix_start;
+    while i < ix_end { StoreH2(self_0, data, mask, i); i = i.wrapping_add(1); }
+ }
+"#;
+
+/// **Second caller-bearing witness for wave-5d — RED, the `unrestored` form.**
+/// `StoreRangeH2` (caller) and `StoreH2` (callee) depend on each other in the
+/// class graph (`interface-call-zero-syntax` one way, the raw→slice adapter
+/// the other); when the caller's class holds for the mis-charged C arm, both
+/// `self_0` deliveries are "lost", the restoration walk finds each owner held
+/// only through the other and requests nothing, and the pipeline fails with
+/// `additive-family-preservation-invariant:unrestored:[(9, 1), (10, 1)]` —
+/// wave-5d's binn `binn_get_bool` MAX-3 shape.
+#[test]
+#[ignore = "RED for wave-5d's per-subject preservation / arm-C charge (report wave-6s/004)"]
+fn wave6s_storeh2_survives_its_thin_raw_caller() {
+    let (source, receipts) = emit_with_family_receipts(STOREH2_WITH_STORE_RANGE);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("data: &[u8]"), "{source}");
+    assert!(source.contains("self_0: &mut H2"), "{source}");
+    assert!(source.contains("crate::FALLBACK_SLICE_EXTENT"), "{source}");
+}
+
+#[test]
+fn wave6s_storeh2_caller_unrestored_reproduced() {
+    let error = ::utils::compilation::run_compiler_on_str(STOREH2_WITH_STORE_RANGE, |tcx| {
+        super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .err()
+    })
+    .expect("input type-checks")
+    .expect("the caller-bearing fixture fails the preservation invariant today");
+    assert_eq!(
+        error,
+        "additive-family-preservation-invariant:unrestored:[(9, 1), (10, 1)]"
+    );
+}
+
+/// Negative controls: the arithmetic consumed by anything other than the
+/// call-argument spine is not a view and keeps the collector's verdict.
+#[test]
+fn wave6s_computed_view_refuses_non_argument_consumers() {
+    // A copy of the arithmetic.
+    let copied = STOREH2.replace(
+        "let key = HashBytesH2(&*data.offset((ix & mask) as isize));",
+        "let q = data.offset((ix & mask) as isize); let key = HashBytesH2(q);",
+    );
+    let source = emit(&copied);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("data: *const u8"), "{source}");
+    // A borrowed element bound to a local, not passed on.
+    let bound = STOREH2.replace(
+        "let key = HashBytesH2(&*data.offset((ix & mask) as isize));",
+        "let r = &*data.offset((ix & mask) as isize); let key = HashBytesH2(r);",
+    );
+    let source = emit(&bound);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("data: *const u8"), "{source}");
+}
+
+/// A signed delta is the bidirectional family's (R394-2): no view.
+#[test]
+fn wave6s_computed_view_refuses_signed_delta() {
+    let signed = STOREH2
+        .replace(
+            "mask: usize, ix: usize",
+            "mask: usize, ix: usize, back: i32",
+        )
+        .replace(
+            "&*data.offset((ix & mask) as isize)",
+            "&*data.offset(back as isize)",
+        );
+    let source = emit(&signed);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("data: *const u8"), "{source}");
+}
+
+const STOREH2: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ #[repr(C)] pub struct H2 { pub buckets_: [u32; 65536] }
+ static kHashMul64: u64 = 0x1E35A7BD1E35A7BD;
+ unsafe fn BrotliUnalignedRead64(p: *const core::ffi::c_void) -> u64 { *(p as *const u64) }
+ unsafe fn HashBytesH2(mut data: *const u8) -> u32 {
+    let h = (BrotliUnalignedRead64(data as *const core::ffi::c_void) << (64 - 8 * 5)).wrapping_mul(kHashMul64);
+    return (h >> (64 - 16)) as u32;
+ }
+ pub unsafe fn StoreH2(mut self_0: *mut H2, mut data: *const u8, mask: usize, ix: usize) {
+    let key = HashBytesH2(&*data.offset((ix & mask) as isize));
+    (*self_0).buckets_[key as usize] = ix as u32;
+ }
+"#;
+
+#[test]
+fn wave6s_storeh2_computed_subview_argument() {
+    let source = emit(STOREH2);
+    println!("EMITTED {source}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("data: &[u8]"), "{source}");
+    assert!(
+        source.contains("HashBytesH2((&(data)[(ix & mask)..]).as_ptr())"),
+        "the suffix view bridges at the raw callee: {source}"
+    );
+}
+
+/// brotli `ClearHistogramsLiteral` → `HistogramClearLiteral`: the arithmetic
+/// itself is the argument, no borrow.
+const CLEAR_HISTOGRAMS: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" { fn memset(s: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void; }
+ #[repr(C)] pub struct HistogramLiteral { pub data_: [u32; 256], pub total_count_: usize, pub bit_cost_: f64 }
+ unsafe fn HistogramClearLiteral(mut self_0: *mut HistogramLiteral) {
+    memset(((*self_0).data_).as_mut_ptr() as *mut core::ffi::c_void, 0, core::mem::size_of::<[u32; 256]>());
+    (*self_0).total_count_ = 0;
+    (*self_0).bit_cost_ = f64::INFINITY;
+ }
+ pub unsafe fn ClearHistogramsLiteral(mut array: *mut HistogramLiteral, mut length: usize) {
+    let mut i: usize = 0;
+    while i < length { HistogramClearLiteral(array.offset(i as isize)); i = i.wrapping_add(1); }
+ }
+"#;
+
+#[test]
+fn wave6s_clear_histograms_direct_offset_argument() {
+    let (source, receipts) = emit_with_family_receipts(CLEAR_HISTOGRAMS);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("array: &mut [HistogramLiteral]"),
+        "{source}"
+    );
+}
+
+/// brotli `BrotliCreateHuffmanTree` → `InitHuffmanTree`: a mutable computed
+/// sub-view argument.
+const CREATE_HUFFMAN_TREE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ #[repr(C)] #[derive(Clone, Copy)] pub struct HuffmanTree { pub total_count_: u32, pub index_left_: i16, pub index_right_or_value_: i16 }
+ unsafe fn InitHuffmanTree(mut self_0: *mut HuffmanTree, mut count: u32, mut left: i16, mut right: i16) {
+    (*self_0).total_count_ = count;
+    (*self_0).index_left_ = left;
+    (*self_0).index_right_or_value_ = right;
+ }
+ pub unsafe fn BrotliCreateHuffmanTree(mut data: *const u32, length: usize, mut tree: *mut HuffmanTree) {
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while i < length {
+        let count = *data.offset(i as isize);
+        if count != 0 {
+            let fresh1 = n;
+            n = n.wrapping_add(1);
+            InitHuffmanTree(&mut *tree.offset(fresh1 as isize), count, -1, -1);
+        }
+        i = i.wrapping_add(1);
+    }
+ }
+"#;
+
+#[test]
+fn wave6s_create_huffman_tree_mutable_subview_argument() {
+    let (source, receipts) = emit_with_family_receipts(CREATE_HUFFMAN_TREE);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("tree: &mut [HuffmanTree]"), "{source}");
+}
+
+/// The E-ADAPT-W4 shape with a forward delta: the base now delivers and the
+/// scalar-reference callee receives the checked element of the suffix.
+#[test]
+fn wave6s_forward_computed_view_delivers_the_scalar_reference_base() {
+    let source = emit(
+        "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+         pub unsafe fn scalar(p: *const i32) -> i32 { *p }\n\
+         pub unsafe fn caller(base: *const i32) -> i32 { scalar(base.offset(1)) }\n",
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("base: &[i32]"), "{source}");
+    assert!(source.contains("scalar(&(&(base)[1..])[0])"), "{source}");
 }

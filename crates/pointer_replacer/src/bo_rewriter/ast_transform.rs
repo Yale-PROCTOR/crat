@@ -1558,7 +1558,10 @@ pub(crate) struct SeamGraftStats {
 /// `Paren` between the cast and its operand shifts the node without shifting
 /// the span, so the search is by the coordinate the decision layer actually
 /// recorded.
-fn find_by_span<'a>(e: &'a rustc_ast::Expr, want: rustc_span::Span) -> Option<&'a rustc_ast::Expr> {
+pub(super) fn find_by_span<'a>(
+    e: &'a rustc_ast::Expr,
+    want: rustc_span::Span,
+) -> Option<&'a rustc_ast::Expr> {
     struct Find<'a> {
         want: rustc_span::Span,
         hit: Option<&'a rustc_ast::Expr>,

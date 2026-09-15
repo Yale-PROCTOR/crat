@@ -403,6 +403,29 @@ pub(crate) fn receipt_plans(
                                                 == boundary_span.source_callsite()
                                     })
                                     .collect::<Vec<_>>();
+                                // wave-6s: a borrowed computed sub-view
+                                // (`&mut *p.offset(e)`) coerces into a
+                                // converted THIN parameter with no seam of its
+                                // own; the subject's element use edit
+                                // `&mut p[e]` is its carrier.
+                                let thin_parameter = match parameters.as_slice() {
+                                    [(_, decision)] => match decision {
+                                        Decision::Ref { .. } => true,
+                                        Decision::InferredRef { .. }
+                                        | Decision::Slice { .. }
+                                        | Decision::Opt { .. }
+                                        | Decision::Box(_)
+                                        | Decision::NestedSlice { .. }
+                                        | Decision::Cursor { .. }
+                                        | Decision::Degraded(_) => false,
+                                    },
+                                    _ => false,
+                                };
+                                let element_view = carriers.is_empty()
+                                    && thin_parameter
+                                    && uses.computed_argument_views.iter().any(|view| {
+                                        view.use_span == observed.span && view.borrowed
+                                    });
                                 if !settled_safe {
                                     reason = Some(MechanicalTerminalReason::EvidenceMissing(
                                         format!(
@@ -410,6 +433,17 @@ pub(crate) fn receipt_plans(
                                             parameters.len()
                                         ),
                                     ));
+                                } else if element_view {
+                                    adapter = "computed-suffix-view-element".to_owned();
+                                    target_form_override = Some(
+                                        Form::Ref {
+                                            mutable: subject.mutable,
+                                        }
+                                        .key()
+                                        .to_owned(),
+                                    );
+                                    boundary_evidence =
+                                        "existing-c-thin-parameter:element-view".to_owned();
                                 } else if let [carrier] = carriers.as_slice() {
                                     adapter = "owned-existing-c-interface".to_owned();
                                     target_form_override = Some(carrier.expected.key().to_owned());

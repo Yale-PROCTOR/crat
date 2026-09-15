@@ -7840,7 +7840,13 @@ fn finish_decide<'tcx>(
             &raw_boundary,
         );
         let mut table = table;
-        decision::slice_forms::lower(tcx, &mut table, &advance_ok, &raw_boundary_sites)?;
+        decision::slice_forms::lower(
+            tcx,
+            &mut table,
+            &advance_ok,
+            &raw_boundary_sites,
+            &slice_uses,
+        )?;
 
         // Structural self-check: the table matches the subjects it was handed. NOT
         // the coverage gate — every comparison in it is against the collector's own

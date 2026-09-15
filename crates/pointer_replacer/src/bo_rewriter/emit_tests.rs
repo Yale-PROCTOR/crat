@@ -5994,12 +5994,17 @@ fn e_adapt_w3_nested_use_then_seam_composes_at_the_ast_choke_point() {
 }
 
 /// E-ADAPT-W4 — a non-bare raw expression into a scalar-reference target.
+///
+/// wave-6s (report 004): a forward computed sub-view argument
+/// (`base.offset(1)`) now delivers `base` itself as a slice, so the raw
+/// expression this pins is kept raw by a signed delta, which the forward
+/// view refuses (R394-2); the delivered form is `slice_forms_tests`'.
 #[test]
 fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
     let src = format!(
         "{E_ADAPT_PRE}\
          pub unsafe fn scalar(p: *const i32) -> i32 {{ *p }}\n\
-         pub unsafe fn caller(base: *const i32) -> i32 {{ scalar(base.offset(1)) }}\n"
+         pub unsafe fn caller(base: *const i32, k: isize) -> i32 {{ scalar(base.offset(k)) }}\n"
     );
     let seams = e_adapt_seams(&src);
     let emitted = e_adapt_source(&src);
@@ -6008,7 +6013,7 @@ fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
         "the raw-expression bridge must be typed as the scalar template:\n{seams}"
     );
     assert!(
-        emitted.contains("scalar(&*base.offset(1))"),
+        emitted.contains("scalar(&*base.offset(k))"),
         "the call-scoped shared reborrow must surround the whole expression:\n{emitted}"
     );
 }

@@ -187,6 +187,45 @@ fn fresh_return(program: &RustProgram<'_>, callee: LocalDefId) -> bool {
     )
 }
 
+/// Is this site's argument a computed sub-view of `binding` (wave-6s): the
+/// subject's arithmetic under the exact borrow/cast spine that ends at the
+/// argument? The callee then receives a suffix of the same base, and the
+/// returned value's independence is the same question as for a forward walk.
+fn computed_view_argument(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    binding: HirId,
+    argument: rustc_span::Span,
+) -> bool {
+    struct Walk<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        binding: HirId,
+        argument: rustc_span::Span,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Walk<'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx rustc_hir::Expr<'tcx>) {
+            if matches!(expression.kind, ExprKind::Path(QPath::Resolved(_, path)) if path.res == Res::Local(self.binding))
+                && self.argument.lo() <= expression.span.lo()
+                && expression.span.hi() <= self.argument.hi()
+                && super::slice_forms::computed_view_spine(self.tcx, expression)
+                    .is_some_and(|outer| outer.span == self.argument)
+            {
+                self.found = true;
+            }
+            intravisit::walk_expr(self, expression);
+        }
+    }
+    let mut walk = Walk {
+        tcx,
+        binding,
+        argument,
+        found: false,
+    };
+    walk.visit_body(tcx.hir_body_owned_by(owner));
+    walk.found
+}
+
 pub(crate) fn collect(
     program: &RustProgram<'_>,
     facts: &RawBoundarySiteFacts,
@@ -199,6 +238,7 @@ pub(crate) fn collect(
         if !*forward
             .entry((owner, binding))
             .or_insert_with(|| forward_parameter(program.tcx, owner, binding))
+            && !computed_view_argument(program.tcx, owner, binding, site.source_span)
         {
             continue;
         }

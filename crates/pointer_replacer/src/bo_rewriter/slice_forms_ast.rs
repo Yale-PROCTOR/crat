@@ -19,6 +19,12 @@ pub(super) fn argument(
     view: Option<&super::decision::slice_forms::ForwardView>,
 ) -> Option<rustc_ast::Expr> {
     let Some(view) = view else { return Some(original) };
+    // A computed sub-view keeps only the base binding's subtree; the
+    // arithmetic and borrow/cast spine around it are what the view replaces.
+    let original = match view.root {
+        Some(root) => super::ast_transform::find_by_span(&original, root)?.clone(),
+        None => original,
+    };
     const PLACEHOLDER: &str = "__CRAT_FORWARD_SLICE_ARGUMENT";
     let mut expression = graft_expr(&view.render(PLACEHOLDER)).ok()?;
     struct Replace {

@@ -2,93 +2,6 @@
 //! This changes presentation only after the normal use and boundary proofs.
 
 use rustc_ast::mut_visit::{self, MutVisitor};
-use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{
-    Expr, ExprKind, HirId, QPath,
-    def::Res,
-    def_id::LocalDefId,
-    intravisit::{self, Visitor},
-};
-use rustc_middle::ty::TyCtxt;
-use rustc_span::Span;
-
-use super::{
-    Decision, DecisionTable, Degradation, DegradeReason, SubjectKind,
-    emitability::{EmitabilityFacts, SliceRawUse, SliceUses, UseEdit, classify_arg, index_text},
-    raw_boundary::raw_target_type,
-};
-
-/// The receipt key a computed sub-view argument carries once its seam renders
-/// the suffix. Consumers that key on the original borrow/cast shapes fall to
-/// their terminal-source default, which is the view the callee now receives.
-pub(crate) const COMPUTED_SUFFIX_VIEW: &str = "computed-suffix-view";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ForwardParameter {
-    pub(crate) node: (LocalDefId, HirId),
-    pub(crate) body_span: Span,
-    pub(crate) index_name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ForwardView {
-    pub(crate) index_name: String,
-    pub(crate) mutable: bool,
-    /// wave-6s computed sub-view: the base binding's own path inside the
-    /// argument. `None` shifts the whole argument (a forward parameter's bare
-    /// use); `Some` shifts only that subtree and discards the arithmetic
-    /// around it, so the seam's `arg_span` and its revert twin stay whole.
-    pub(crate) root: Option<Span>,
-}
-
-impl ForwardView {
-    pub(crate) fn render(&self, argument: &str) -> String {
-        let borrow = if self.mutable { "&mut " } else { "&" };
-        format!("({borrow}({argument})[{}..])", self.index_name)
-    }
-}
-
-/// A computed sub-view of a delivered slice base that is itself a raw-boundary
-/// argument: `&*p.offset(e)`, `&mut *p.offset(e)`, `p.offset(e) as *const T`
-/// or a bare `p.offset(e)`. The boundary keeps its own disposition and
-/// receipts; the seam renders the checked suffix `&p[e..]` in place of the
-/// arithmetic, and the existing bridge adds `.as_ptr()` / `.as_mut_ptr()`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ComputedArgumentView {
-    /// The subject's own path expression inside the argument.
-    pub(crate) use_span: Span,
-    /// The whole boundary argument the seam replaces.
-    pub(crate) argument_span: Span,
-    /// The suffix start, already typed `usize`.
-    pub(crate) index: String,
-    /// The spine borrowed the element (`&*` / `&mut *`) rather than passing
-    /// the arithmetic itself.
-    pub(crate) borrowed: bool,
-    /// The `&*…` / `&mut *…` expression itself, when the spine borrows.
-    pub(crate) borrow_span: Option<Span>,
-    pub(crate) mutable: bool,
-    /// A call argument (rendered on its seam by `lower`) rather than a body
-    /// copy (rendered by the slice-use receipt planner).
-    pub(crate) argument: bool,
-}
-
-/// Recognise a computed sub-view argument rooted at `expr` (the subject's
-/// path). Only the exact borrow/cast spine between the arithmetic and a
-/// registered boundary argument is accepted; any other consumer of the
-/// arithmetic (a copy, a store, a comparison, a distance) is not a view and
-/// stays with the collector's ordinary verdict.
-/// The spine above the subject's arithmetic: `p.offset(e)` under any casts,
-/// optionally `&*` / `&mut *` borrowed once, then casts again. Returns the
-/// outermost expression of the spine, its borrow mutability and the delta.
-/// Every other consumer of the arithmetic is refused here.
-pub(crate) fn computed_view_spine<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    expr: &'tcx Expr<'tcx>,
-) -> Option<&'tcx Expr<'tcx>> {
-    spine(tcx, expr)
-        .filter(|(_, _, delta)| forward_delta(tcx, delta))
-        .map(|(outer, _, _)| outer)
-}
 
 /// Where a spine ends: the consumer of its outermost expression.
 enum SpineEnd {
@@ -99,15 +12,6 @@ enum SpineEnd {
         destination: HirId,
     },
     Other,
-}
-
-fn spine<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    expr: &'tcx Expr<'tcx>,
-) -> Option<(&'tcx Expr<'tcx>, Option<(bool, Span)>, &'tcx Expr<'tcx>)> {
-    spine_end(tcx, expr).and_then(|(operand, borrowed, delta, end)| {
-        matches!(end, SpineEnd::Argument).then_some((operand, borrowed, delta))
-    })
 }
 
 fn spine_end<'tcx>(
@@ -228,6 +132,145 @@ pub(crate) fn computed_body_copy_view<'tcx>(
         },
     ))
 }
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    Expr, ExprKind, HirId, QPath,
+    def::Res,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
+use rustc_middle::ty::TyCtxt;
+use rustc_span::Span;
+
+use super::{
+    Decision, DecisionTable, Degradation, DegradeReason, SubjectKind,
+    emitability::{EmitabilityFacts, SliceRawUse, SliceUses, UseEdit, classify_arg, index_text},
+    raw_boundary::raw_target_type,
+};
+
+/// The receipt key a computed sub-view argument carries once its seam renders
+/// the suffix. Consumers that key on the original borrow/cast shapes fall to
+/// their terminal-source default, which is the view the callee now receives.
+pub(crate) const COMPUTED_SUFFIX_VIEW: &str = "computed-suffix-view";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardParameter {
+    pub(crate) node: (LocalDefId, HirId),
+    pub(crate) body_span: Span,
+    pub(crate) index_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardView {
+    pub(crate) index_name: String,
+    pub(crate) mutable: bool,
+    /// wave-6s computed sub-view: the base binding's own path inside the
+    /// argument. `None` shifts the whole argument (a forward parameter's bare
+    /// use); `Some` shifts only that subtree and discards the arithmetic
+    /// around it, so the seam's `arg_span` and its revert twin stay whole.
+    pub(crate) root: Option<Span>,
+}
+
+impl ForwardView {
+    pub(crate) fn render(&self, argument: &str) -> String {
+        let borrow = if self.mutable { "&mut " } else { "&" };
+        format!("({borrow}({argument})[{}..])", self.index_name)
+    }
+}
+
+/// A computed sub-view of a delivered slice base that is itself a raw-boundary
+/// argument: `&*p.offset(e)`, `&mut *p.offset(e)`, `p.offset(e) as *const T`
+/// or a bare `p.offset(e)`. The boundary keeps its own disposition and
+/// receipts; the seam renders the checked suffix `&p[e..]` in place of the
+/// arithmetic, and the existing bridge adds `.as_ptr()` / `.as_mut_ptr()`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComputedArgumentView {
+    /// The subject's own path expression inside the argument.
+    pub(crate) use_span: Span,
+    /// The whole boundary argument the seam replaces.
+    pub(crate) argument_span: Span,
+    /// The suffix start, already typed `usize`.
+    pub(crate) index: String,
+    /// The spine borrowed the element (`&*` / `&mut *`) rather than passing
+    /// the arithmetic itself.
+    pub(crate) borrowed: bool,
+    pub(crate) mutable: bool,
+}
+
+/// Recognise a computed sub-view argument rooted at `expr` (the subject's
+/// path). Only the exact borrow/cast spine between the arithmetic and a
+/// registered boundary argument is accepted; any other consumer of the
+/// arithmetic (a copy, a store, a comparison, a distance) is not a view and
+/// stays with the collector's ordinary verdict.
+/// The spine above the subject's arithmetic: `p.offset(e)` under any casts,
+/// optionally `&*` / `&mut *` borrowed once, then casts again. Returns the
+/// outermost expression of the spine, its borrow mutability and the delta.
+/// Every other consumer of the arithmetic is refused here.
+pub(crate) fn computed_view_spine<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+) -> Option<&'tcx Expr<'tcx>> {
+    spine(tcx, expr)
+        .filter(|(_, _, delta)| forward_delta(tcx, delta))
+        .map(|(outer, _, _)| outer)
+}
+
+fn spine<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+) -> Option<(&'tcx Expr<'tcx>, Option<bool>, &'tcx Expr<'tcx>)> {
+    let owner = expr.hir_id.owner.def_id;
+    let rustc_hir::Node::Expr(call) = tcx.parent_hir_node(expr.hir_id) else {
+        return None;
+    };
+    let ExprKind::MethodCall(segment, receiver, [delta], _) = call.kind else {
+        return None;
+    };
+    if receiver.hir_id != expr.hir_id || !matches!(segment.ident.name.as_str(), "offset" | "add") {
+        return None;
+    }
+    let typeck = tcx.typeck(owner);
+    let callee = typeck.type_dependent_def_id(call.hir_id)?;
+    if tcx.crate_name(callee.krate).as_str() != "core" {
+        return None;
+    }
+    let mut operand = call;
+    let mut borrowed = None;
+    loop {
+        let rustc_hir::Node::Expr(parent) = tcx.parent_hir_node(operand.hir_id) else {
+            return None;
+        };
+        match parent.kind {
+            ExprKind::Cast(inner, _) if inner.hir_id == operand.hir_id => operand = parent,
+            ExprKind::Unary(rustc_hir::UnOp::Deref, inner)
+                if inner.hir_id == operand.hir_id && borrowed.is_none() =>
+            {
+                let rustc_hir::Node::Expr(borrow) = tcx.parent_hir_node(parent.hir_id) else {
+                    return None;
+                };
+                let ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, mutability, place) = borrow.kind
+                else {
+                    return None;
+                };
+                if place.hir_id != parent.hir_id {
+                    return None;
+                }
+                borrowed = Some(mutability == rustc_hir::Mutability::Mut);
+                operand = borrow;
+            }
+            // The spine ends at the call argument: the consumer must be a
+            // call, and this operand one of its arguments.
+            ExprKind::Call(_, arguments) | ExprKind::MethodCall(_, _, arguments, _)
+                if arguments
+                    .iter()
+                    .any(|argument| argument.hir_id == operand.hir_id) =>
+            {
+                return Some((operand, borrowed, delta));
+            }
+            _ => return None,
+        }
+    }
+}
 
 /// Forward-only: the delta, under its `as isize` casts, is a non-negative
 /// integer literal or an expression of unsigned type. A signed or negated
@@ -281,9 +324,7 @@ pub(crate) fn computed_argument_view<'tcx>(
             argument_span: operand.span,
             index,
             borrowed: borrowed.is_some(),
-            borrow_span: borrowed.map(|(_, span)| span),
-            mutable: borrowed.is_some_and(|(mutable, _)| mutable),
-            argument: true,
+            mutable: borrowed.unwrap_or(false),
         },
     ))
 }
@@ -430,12 +471,7 @@ fn lower_computed_argument_views(
         };
         let Some(views) = slice_uses
             .get(&node)
-            .map(|uses| {
-                uses.computed_argument_views
-                    .iter()
-                    .filter(|view| view.argument)
-                    .collect::<Vec<_>>()
-            })
+            .map(|uses| uses.computed_argument_views.as_slice())
             .filter(|views| !views.is_empty())
         else {
             continue;
@@ -566,26 +602,6 @@ fn lower_computed_argument_views(
                 edit.spec = spec;
                 edit.family = SeamFamily::Safe;
                 edit.bridge.bridge_kind = "computed-suffix-view".to_owned();
-            } else if edit.spec.raw_boundary.is_none()
-                && let Form::Slice {
-                    mutable: expected_mutable,
-                } = edit.expected
-                && let Some(region) = edit.spec.void_region.as_ref()
-                && region.reads_width()
-            {
-                // wave-6b: a width reader over the computed view — the
-                // reader's width as a checked prefix of the suffix.
-                if expected_mutable && !mutable {
-                    hold = Some(view.use_span);
-                    break;
-                }
-                let mut spec = GlueSpec::core(GlueCore::Bare, expected_mutable);
-                spec.forward_slice = Some(forward(expected_mutable));
-                spec.void_region = Some(region.as_prefix_of_view());
-                spec.len = edit.spec.len.clone();
-                edit.spec = spec;
-                edit.family = SeamFamily::Safe;
-                edit.bridge.bridge_kind = "computed-suffix-view-width-read".to_owned();
             } else {
                 hold = Some(view.use_span);
                 break;
@@ -724,310 +740,6 @@ fn lower_forward_parameters(
             index_name: index_name.clone(),
             mutable: false,
             root: None,
-        };
-        let mut replacements = Vec::new();
-        let mut complete = true;
-        for edit in uses {
-            if let Some(advance) = inventory.advances.iter().find(|a| a.rhs == edit.span) {
-                replacements.push(UseEdit {
-                    span: advance.assignment,
-                    replacement: format!(
-                        "{index_name} = {index_name}.checked_add(({}) as usize).expect(\"forward slice index overflow\")",
-                        advance.delta
-                    ),
-                    bridge_kind: "subject-use",
-                });
-            } else if let Some(edit) = shifted_use(edit, name, &view) {
-                replacements.push(edit);
-            } else {
-                complete = false;
-            }
-        }
-        if !complete {
-            continue;
-        }
-        let mut seams = Vec::new();
-        for index in seam_indices {
-            let mut edit = table.seams.edits[index].clone();
-            edit.spec.forward_slice = Some(view.clone());
-            let argument = tcx
-                .sess
-                .source_map()
-                .span_to_snippet(edit.arg_span)
-                .map_err(|_| "forward-slice:seam-source-unavailable")?;
-            edit.replacement = edit
-                .spec
-                .render_in_context(
-                    &argument,
-                    tcx.fn_sig(node.0)
-                        .skip_binder()
-                        .skip_binder()
-                        .safety
-                        .is_unsafe(),
-                )
-                .ok_or("forward-slice:seam-render-unavailable")?;
-            // A suffix is syntax even if the original safe argument required
-            // no wrapper. Keep the same boundary owner and permission receipt.
-            edit.zero_syntax = false;
-            seams.push((index, edit));
-        }
-        match &mut table.entries[entry].1 {
-            Decision::Slice { uses, .. } => *uses = replacements,
-            Decision::Ref { .. }
-            | Decision::InferredRef { .. }
-            | Decision::NestedSlice { .. }
-            | Decision::Opt { .. }
-            | Decision::Box(_)
-            | Decision::Cursor { .. }
-            | Decision::Degraded(_) => unreachable!("selected slice keeps its decision"),
-        }
-        for (index, edit) in seams {
-            table.seams.edits[index] = edit;
-        }
-        table.forward_slice_parameters.push(ForwardParameter {
-            node,
-            body_span: block.span,
-            index_name,
-        });
-    }
-    Ok(())
-}
-
-use rustc_ast::mut_visit::{self, MutVisitor};
-use rustc_hash::FxHashSet;
-use rustc_hir::{
-    Expr, ExprKind, HirId, QPath,
-    def::Res,
-    def_id::LocalDefId,
-    intravisit::{self, Visitor},
-};
-use rustc_middle::ty::TyCtxt;
-use rustc_span::Span;
-
-use super::{Decision, DecisionTable, SubjectKind, emitability::UseEdit};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ForwardParameter {
-    pub(crate) node: (LocalDefId, HirId),
-    pub(crate) body_span: Span,
-    pub(crate) index_name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ForwardView {
-    pub(crate) index_name: String,
-    pub(crate) mutable: bool,
-}
-
-impl ForwardView {
-    pub(crate) fn render(&self, argument: &str) -> String {
-        let borrow = if self.mutable { "&mut " } else { "&" };
-        format!("({borrow}({argument})[{}..])", self.index_name)
-    }
-}
-
-fn local(expression: &Expr<'_>) -> Option<HirId> {
-    match expression.kind {
-        ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
-            Res::Local(binding) => Some(binding),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-struct Advance {
-    assignment: Span,
-    rhs: Span,
-    delta: String,
-}
-
-struct Inventory<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    node: (LocalDefId, HirId),
-    name: String,
-    index_name: String,
-    advances: Vec<Advance>,
-    uses: Vec<Span>,
-    collision: bool,
-}
-
-impl<'tcx> Visitor<'tcx> for Inventory<'tcx> {
-    fn visit_pat(&mut self, pattern: &'tcx rustc_hir::Pat<'tcx>) {
-        if let rustc_hir::PatKind::Binding(_, binding, ident, _) = pattern.kind {
-            self.collision |= ident.name.as_str() == self.index_name
-                || (ident.name.as_str() == self.name && binding != self.node.1);
-        }
-        intravisit::walk_pat(self, pattern);
-    }
-
-    fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
-        if local(expression) == Some(self.node.1) {
-            self.uses.push(expression.span);
-        }
-        if let ExprKind::Assign(lhs, rhs, _) = expression.kind
-            && local(lhs) == Some(self.node.1)
-            && let ExprKind::MethodCall(segment, receiver, [delta], _) = rhs.kind
-            && local(receiver) == Some(self.node.1)
-            && matches!(segment.ident.name.as_str(), "offset" | "add")
-            && self
-                .tcx
-                .typeck(self.node.0)
-                .type_dependent_def_id(rhs.hir_id)
-                .is_some_and(|callee| self.tcx.crate_name(callee.krate).as_str() == "core")
-            && let Ok(delta) = self.tcx.sess.source_map().span_to_snippet(delta.span)
-        {
-            self.advances.push(Advance {
-                assignment: expression.span,
-                rhs: rhs.span,
-                delta,
-            });
-        }
-        intravisit::walk_expr(self, expression);
-    }
-}
-
-fn contains(outer: Span, inner: Span) -> bool {
-    outer.lo() <= inner.lo() && inner.hi() <= outer.hi()
-}
-
-fn shifted_use(edit: &UseEdit, name: &str, view: &ForwardView) -> Option<UseEdit> {
-    struct Shift<'a> {
-        name: &'a str,
-        replacement: rustc_ast::Expr,
-        hits: usize,
-    }
-    impl MutVisitor for Shift<'_> {
-        fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
-            if matches!(&expression.kind, rustc_ast::ExprKind::Path(None, path)
-                if path.segments.len() == 1 && path.segments[0].ident.name.as_str() == self.name)
-            {
-                expression.kind = self.replacement.kind.clone();
-                self.hits += 1;
-                return;
-            }
-            mut_visit::walk_expr(self, expression);
-        }
-    }
-    let (mut parsed, replacement) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (
-            ::utils::ast::parse_expr(edit.replacement.clone()),
-            ::utils::ast::parse_expr(view.render(name)),
-        )
-    }))
-    .ok()?;
-    let mut shift = Shift {
-        name,
-        replacement,
-        hits: 0,
-    };
-    shift.visit_expr(&mut parsed);
-    (shift.hits > 0).then(|| UseEdit {
-        span: edit.span,
-        replacement: rustc_ast_pretty::pprust::expr_to_string(&parsed),
-        bridge_kind: edit.bridge_kind,
-    })
-}
-
-/// Select only complete existing Slice presentations. An uncovered occurrence
-/// keeps the established reslice form; it never obtains new admission here.
-pub(crate) fn lower(
-    tcx: TyCtxt<'_>,
-    table: &mut DecisionTable,
-    advance_ok: &FxHashSet<(LocalDefId, HirId)>,
-    native: &super::raw_boundary::RawBoundarySiteFacts,
-) -> Result<(), String> {
-    for entry in 0..table.entries.len() {
-        let (subject, decision) = &table.entries[entry];
-        let node = (subject.fn_did, subject.hir_id);
-        let uses = match decision {
-            Decision::Slice {
-                mutable: false,
-                uses,
-            } => uses,
-            Decision::Slice { mutable: true, .. }
-            | Decision::Ref { .. }
-            | Decision::InferredRef { .. }
-            | Decision::NestedSlice { .. }
-            | Decision::Opt { .. }
-            | Decision::Box(_)
-            | Decision::Cursor { .. }
-            | Decision::Degraded(_) => continue,
-        };
-        // Keep existing reslice presentations stable. This first rule owns
-        // forward call-bearing subjects with newly proved result independence.
-        if !native.sites.iter().any(|site| {
-            site.node == Some(node) && native.forward_return_independent.contains_key(&site.key)
-        }) {
-            continue;
-        }
-        if !matches!(subject.kind, SubjectKind::Param { .. }) || !advance_ok.contains(&node) {
-            continue;
-        }
-        let Some(name) = subject.param_name.as_deref() else { continue };
-        let index_name = format!(
-            "__crat_wave6s_pos_{}_{}",
-            node.0.local_def_index.as_u32(),
-            node.1.local_id.as_u32()
-        );
-        let body = tcx.hir_body_owned_by(node.0);
-        let ExprKind::Block(block, _) = body.value.kind else { continue };
-        let mut inventory = Inventory {
-            tcx,
-            node,
-            name: name.to_owned(),
-            index_name: index_name.clone(),
-            advances: Vec::new(),
-            uses: Vec::new(),
-            collision: false,
-        };
-        inventory.visit_body(body);
-        if inventory.collision || inventory.advances.is_empty() {
-            continue;
-        }
-        // The existing source edit licenses each advancement. Reject nested
-        // edits and nested uses in its delta rather than embedding stale text.
-        if inventory.advances.iter().any(|advance| {
-            uses.iter().filter(|edit| edit.span == advance.rhs).count() != 1
-                || uses
-                    .iter()
-                    .any(|edit| edit.span != advance.rhs && contains(advance.assignment, edit.span))
-                || inventory
-                    .uses
-                    .iter()
-                    .filter(|&&span| contains(advance.assignment, span))
-                    .count()
-                    != 2
-        }) {
-            continue;
-        }
-        let seam_indices = table
-            .seams
-            .edits
-            .iter()
-            .enumerate()
-            .filter(|(_, edit)| {
-                edit.source_node == Some(node)
-                    && inventory.uses.contains(&edit.arg_span)
-                    && edit.spec.shared_address.is_none()
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if inventory.uses.iter().any(|&span| {
-            !inventory
-                .advances
-                .iter()
-                .any(|advance| contains(advance.assignment, span))
-                && !uses.iter().any(|edit| contains(edit.span, span))
-                && !seam_indices
-                    .iter()
-                    .any(|&index| table.seams.edits[index].arg_span == span)
-        }) {
-            continue;
-        }
-        let view = ForwardView {
-            index_name: index_name.clone(),
-            mutable: false,
         };
         let mut replacements = Vec::new();
         let mut complete = true;

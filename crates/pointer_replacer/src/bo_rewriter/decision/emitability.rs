@@ -1361,6 +1361,10 @@ pub(crate) struct SliceUses {
     /// rest is not a partial win — it is an ill-typed crate.
     pub unsupported: Option<Span>,
     pub unsupported_is_cursor: bool,
+    /// wave-6s: computed sub-views (`&*p.offset(e)`, `p.offset(e) as *const T`)
+    /// that are themselves a raw-boundary argument. The raw use above carries
+    /// the boundary; this carries the suffix the seam must render.
+    pub computed_argument_views: Vec<super::slice_forms::ComputedArgumentView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1418,7 +1422,7 @@ fn self_advance_lhs(expr: &Expr<'_>, key: (LocalDefId, HirId)) -> bool {
 /// **S3.2′-3: lifted out of the slice collector unchanged**, so the optional
 /// slice twin renders indices by the same rule rather than by a second copy of
 /// it. One canonicalizer, the standing rule.
-fn index_text(tcx: TyCtxt<'_>, arg: &Expr<'_>) -> Option<String> {
+pub(crate) fn index_text(tcx: TyCtxt<'_>, arg: &Expr<'_>) -> Option<String> {
     /// Is this expression already a `usize`?
     ///
     /// Asked of the type checker rather than of the syntax: `i`, `n as usize`
@@ -2113,6 +2117,23 @@ fn collect_slice_uses_with_family(
                     if let Some(edit) = edit {
                         entry.rewrites.push(edit);
                     }
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                // wave-6s: a computed sub-view that is itself a boundary
+                // argument keeps the boundary's own disposition; only the
+                // rendering changes, to the suffix view of the delivered base.
+                if self.expanded
+                    && let Some((site, view)) = super::slice_forms::computed_argument_view(
+                        self.tcx,
+                        expr,
+                        key,
+                        self.raw_boundary_arguments,
+                    )
+                {
+                    let entry = self.out.entry(key).or_default();
+                    entry.raw_uses.push(site);
+                    entry.computed_argument_views.push(view);
                     intravisit::walk_expr(self, expr);
                     return;
                 }
