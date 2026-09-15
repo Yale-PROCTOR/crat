@@ -96,6 +96,9 @@ pub(crate) mod plan;
 mod raw_place_values_tests;
 #[cfg(test)]
 mod raw_initializer_tests;
+pub(crate) mod revert_closure;
+#[cfg(test)]
+mod revert_closure_tests;
 mod shared_pair_ast;
 #[cfg(test)]
 mod shared_pair_tests;
@@ -6116,6 +6119,10 @@ fn prepare_plan_files<'tcx>(
                 .iter()
                 .map(move |dependency| (class.id, *dependency))
         })
+        .collect::<Vec<_>>();
+    let return_dependency_edges = return_dependency_edges
+        .into_iter()
+        .chain(planned.narrowed_dependency_edges.iter().copied())
         .collect::<Vec<_>>();
     planned.terminal_call_plans.return_origin_dependencies =
         decision::lifetime::ReturnOriginAtomDependencies::derive(table, &return_dependency_edges);

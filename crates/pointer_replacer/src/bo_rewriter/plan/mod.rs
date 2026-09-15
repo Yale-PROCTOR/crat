@@ -1262,12 +1262,13 @@ pub(crate) fn finalize_signature_classes(
         }
     }
 
-    let mut dependency_edges = table
+    let seam_adapter_edges = table
         .seams
         .edits
         .iter()
         .map(|edit| (SignatureClassId::of(edit.bridge.caller), edit.owner_class))
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    let mut dependency_edges = seam_adapter_edges.iter().copied().collect::<Vec<_>>();
     dependency_edges.extend(table.seams.interface_dependencies.iter().copied());
     dependency_edges.extend(table.seams.generated_item_dependencies.iter().copied());
     dependency_edges.extend(
@@ -1312,8 +1313,21 @@ pub(crate) fn finalize_signature_classes(
             SignatureClassId::of(receiver.callee),
         )
     }));
+    let narrowed = super::revert_closure::call_adapter_only_edges(
+        table,
+        dependency_edges
+            .iter()
+            .copied()
+            .filter(|edge| !seam_adapter_edges.contains(edge)),
+    );
     for (dependent, dependency) in dependency_edges {
         if dependent == dependency || !by_class.contains_key(&dependency) {
+            continue;
+        }
+        if narrowed.contains(&(dependent, dependency)) {
+            planned
+                .narrowed_dependency_edges
+                .insert((dependent, dependency));
             continue;
         }
         if let Some(class) = by_class.get_mut(&dependent) {
@@ -1539,6 +1553,9 @@ pub(crate) struct CursorReceiptPlan {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
+    /// wave-6k: call-adapter-only dependency edges the planning-time hold does
+    /// not propagate over (the atom closure still follows them).
+    pub(crate) narrowed_dependency_edges: BTreeSet<(SignatureClassId, SignatureClassId)>,
     pub native_return_plans: native_return::NativeReturnPlans,
     pub outbound_expression_plans: outbound_expression::OutboundExpressionReceiptPlans,
     pub outbound_expression_sites:
@@ -5245,6 +5262,7 @@ pub(crate) fn plan(
     );
 
     Plan {
+        narrowed_dependency_edges: BTreeSet::new(),
         native_return_plans,
         outbound_expression_plans,
         outbound_expression_sites,

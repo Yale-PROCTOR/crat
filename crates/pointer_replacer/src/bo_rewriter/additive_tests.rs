@@ -283,13 +283,24 @@ fn r220_unwitnessed_new_refusal_rolls_back_its_root_not_the_delivered_dependent(
             .unwrap()
             .block_reasons
             .push("blocked-subject:slice-cursor-use".to_owned());
+        // wave-6k narrowing (R217-2(a) migration): the caller's dependency on
+        // the callee is a bare call-adapter edge, which the planning-time hold
+        // no longer propagates over — the edge is recorded as narrowed and the
+        // delivered dependent stays READY while the root is held.
         let dependency = inputs
             .iter_mut()
             .find(|input| input.id == dependent)
             .unwrap();
         assert!(
-            dependency.depends_on.contains(&root),
-            "the delivered caller already depends on this callee"
+            !dependency.depends_on.contains(&root),
+            "a bare call-adapter edge is narrowed, not a dependency"
+        );
+        assert!(
+            prior
+                .plan
+                .narrowed_dependency_edges
+                .contains(&(dependent, root)),
+            "the narrowed edge is recorded"
         );
         let mut candidate = candidate(&prior, inputs);
         let (subject, decision) = candidate
@@ -304,7 +315,7 @@ fn r220_unwitnessed_new_refusal_rolls_back_its_root_not_the_delivered_dependent(
             reason: DegradeReason::SliceCursorUse,
         });
         assert!(!candidate.plan.class_finalization.classes[&root].is_ready());
-        assert!(!candidate.plan.class_finalization.classes[&dependent].is_ready());
+        assert!(candidate.plan.class_finalization.classes[&dependent].is_ready());
         assert_eq!(
             requested_owners(&prior, &candidate, FamilyStage::SliceUse, &[]),
             BTreeSet::from([root]),
