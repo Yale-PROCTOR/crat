@@ -984,3 +984,93 @@ fn w6l_pointer_value_read_from_a_pointer_array_field_is_held_origin_absent() {
     assert_eq!(reverted_count, 0);
     assert_eq!(emitted_count, 2, "the two `lil` parameters still deliver");
 }
+
+/// heman `kmAABB3Scale` (subject `kmAABB3Scale::pOut#1`, `escapes-via-return`):
+/// an unimplemented stub — `__assert_fail(..)` then `return pOut`.
+const KM_AABB3_SCALE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+pub struct kmAABB3 { pub min: [f32; 3], pub max: [f32; 3] }
+unsafe extern "C" { fn __assert_fail(assertion: *const u8, file: *const u8, line: u32, function: *const u8) -> !; }
+#[no_mangle]
+pub unsafe extern "C" fn kmAABB3Scale(mut pOut: *mut kmAABB3, mut pIn: *const kmAABB3, mut s: f32) -> *mut kmAABB3 {
+    {
+        __assert_fail(b"0 && \"Not implemented\"\0" as *const u8, b"../kazmath/aabb3.c\0" as *const u8, 81, b"kmAABB3Scale\0" as *const u8);
+    }
+    return pOut;
+}
+#[no_mangle]
+pub unsafe extern "C" fn use_scale(mut a: *mut kmAABB3, mut b: *const kmAABB3) -> f32 {
+    let mut r = kmAABB3Scale(a, b, 2.0);
+    (*r).min[0]
+}
+"#;
+
+/// Wave 4 — the dead return: `kmAABB3Scale` never reaches its `return pOut`
+/// (a diverging `__assert_fail` precedes it), so NB5-O carries no origin
+/// edge; the bare-parameter tie is granted on the derived overlay (vacuously
+/// sound) and the caller's local is inferred safe. What still holds the
+/// emission is the existing `seam-shared-to-mut` gate: `pOut` is decided
+/// SHARED (its only use is the dead return) while the `*mut` ABI asks for a
+/// mutable view — a typed class hold, no revert.
+#[test]
+fn w6l_dead_return_of_a_bare_parameter_ties_to_that_parameter() {
+    let observed = observe(KM_AABB3_SCALE);
+    let p_out = decision_of(&observed, "kmAABB3Scale::pOut");
+    assert!(
+        p_out.starts_with("Ref { mutable: false"),
+        "pOut={p_out}; failures={:?}",
+        observed.failures
+    );
+    let r = decision_of(&observed, "use_scale::r");
+    assert!(
+        r.starts_with("InferredRef {"),
+        "r={r}; failures={:?}",
+        observed.failures
+    );
+    let (_, plan) = observed
+        .plans
+        .iter()
+        .find(|(function, _)| function == "kmAABB3Scale")
+        .unwrap_or_else(|| panic!("scale plan; {:?}", observed.plans));
+    assert!(plan.contains("return_lifetime_reused=true"), "{plan}");
+    assert!(!plan.contains("through_raw_field"), "{plan}");
+    let RewriteOutcome::Emitted {
+        reverted_count,
+        degradations,
+        ..
+    } = emitted("km-scale", KM_AABB3_SCALE, &["kmAABB3Scale", "use_scale"])
+    else {
+        panic!("km scale emission degraded");
+    };
+    assert_eq!(reverted_count, 0);
+    let p_out = degradations
+        .iter()
+        .find(|degradation| degradation.subject == "kmAABB3Scale::pOut#1")
+        .expect("pOut class hold");
+    assert!(
+        format!("{:?}", p_out.reason).contains("seam-shared-to-mut"),
+        "{:?}",
+        p_out.reason
+    );
+}
+
+/// The dead-return control: a LIVE return of the same shape is the existing
+/// bare-parameter permit (no overlay), and a dead return that hands back
+/// something other than a bare parameter stays held.
+#[test]
+fn w6l_dead_return_needs_a_bare_parameter() {
+    let source = KM_AABB3_SCALE.replace(
+        "    return pOut;\n",
+        "    return (*pOut).min.as_mut_ptr() as *mut kmAABB3;\n",
+    );
+    let observed = observe(&source);
+    let r = decision_of(&observed, "use_scale::r");
+    assert!(r.contains("ReturnNotAdapted"), "{r}");
+    assert_eq!(
+        failure_of(&observed, "use_scale::r"),
+        Some(LifetimeFailure::OriginAbsent),
+        "{:?}",
+        observed.failures
+    );
+    assert!(observed.plans.is_empty(), "{:?}", observed.plans);
+}

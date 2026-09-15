@@ -634,8 +634,19 @@ pub(crate) fn derive_return_eligibility(
             let slice = callers.iter().any(|caller| {
                 super::return_through_raw_field::arithmetic_use(raw_only_uses, *caller)
             });
+            let dead_return = super::return_through_raw_field::dead_return_parameter(
+                program, callee, escapes, subjects,
+            );
             let permit = match super::return_through_raw_field::derive_callee(
-                program, callee, origins, slots, model, &decisions, subjects, slice,
+                program,
+                callee,
+                origins,
+                slots,
+                model,
+                &decisions,
+                subjects,
+                slice,
+                dead_return,
             ) {
                 Ok(permit) => permit,
                 Err(failure) => {
@@ -682,8 +693,10 @@ pub(crate) fn derive_return_eligibility(
                     (FnSignatureSlot::RETURN, permit.return_origin),
                 ),
             );
-            if let (Some(reuse), Some(overlay)) = (permit.reuse, permit.overlay) {
+            if let Some(reuse) = permit.reuse {
                 result.through_raw_field.insert(callee, reuse);
+            }
+            if let Some(overlay) = permit.overlay {
                 result.derived_summaries.insert(callee, overlay);
             }
         }

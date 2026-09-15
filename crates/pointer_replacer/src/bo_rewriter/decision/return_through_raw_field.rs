@@ -37,6 +37,13 @@
 //! the view-pair gate is active, and an untied view that the caller stores
 //! into a field or returns further is a typed hold.
 //!
+//! Wave 4 (addendum 403, family-to-zero): the **dead return** — a callee whose
+//! MIR never reaches an assignment to its return place (heman `kmAABB3Scale`:
+//! `__assert_fail(..)` then `return pOut`) has no origin edge in NB5-O because
+//! the return never executes. When the source returns a bare parameter, the
+//! parameter tie is granted on a derived overlay: it is vacuously sound (no
+//! value is ever returned) and it is the tie the live code would carry.
+//!
 //! Wave 2 adds two things. (1) The **pointee** class: a return derived from
 //! the parameter's OWN pointee through a non-bare expression (brotli
 //! `StartPosQueueAt`: `&*(*self_0).q_.as_ptr().offset(k) as *const PosData`,
@@ -133,6 +140,7 @@ pub(crate) fn derive_callee(
     decisions: &FxHashMap<NodeKey, &Decision>,
     subjects: &[Subject],
     slice: bool,
+    dead_return_parameter: Option<rustc_middle::mir::Local>,
 ) -> Result<CalleePermit, LifetimeFailure> {
     let summary = origins
         .and_then(|origins| origins.get(&callee))
@@ -176,7 +184,64 @@ pub(crate) fn derive_callee(
         })
         .collect::<Vec<_>>();
     if sources.is_empty() {
-        return Err(LifetimeFailure::OriginAbsent);
+        // The dead return: no reachable assignment to the return place, and
+        // the source's return expression is the bare parameter `root`. The
+        // derived overlay carries the tie NB5-O could not observe.
+        let Some(root) = dead_return_parameter else {
+            return Err(LifetimeFailure::OriginAbsent);
+        };
+        let parameter_origin = summary
+            .slots
+            .iter_enumerated()
+            .find(|(_, slot)| {
+                slot.place.root == SignatureRoot::Arg(root)
+                    && slot.place.field.is_none()
+                    && slot.place.deref_depth == 0
+                    && slot.depth == 0
+            })
+            .map(|(origin, _)| origin)
+            .ok_or(LifetimeFailure::OriginAbsent)?;
+        if model_kind(root, 0) != Some(SlotKind::Ref) {
+            return Err(LifetimeFailure::OriginConflict);
+        }
+        let parameter = subjects
+            .iter()
+            .find(|subject| {
+                subject.fn_did == callee
+                    && subject.ptr_depth == 1
+                    && matches!(subject.kind, SubjectKind::Param { hir_index }
+                        if hir_index.checked_add(1).and_then(|index| u32::try_from(index).ok())
+                            == Some(root.as_u32()))
+            })
+            .ok_or(LifetimeFailure::OriginConflict)?;
+        let parameter_node = (parameter.fn_did, parameter.hir_id);
+        // EXHAUSTIVE: the dead-return parameter is decided as it stands.
+        match decisions.get(&parameter_node) {
+            Some(Decision::Ref { .. }) => {}
+            Some(
+                Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. },
+            ) => {}
+            Some(Decision::Degraded(_)) | None => {
+                // The escaping parameter is itself degraded in the hypothetical
+                // (`escapes-via-return` blocks it); the permit is what lifts
+                // that, exactly as the bare-parameter permit does.
+            }
+        }
+        let mut overlay = summary.clone();
+        overlay.subset.insert(parameter_origin, return_origin);
+        return Ok(CalleePermit {
+            parameter_node,
+            parameter: FnSignatureSlot::arg(root.as_u32() as usize, 0, 0),
+            parameter_origin,
+            return_origin,
+            reuse: None,
+            overlay: Some(overlay),
+        });
     }
     let mut roots = sources
         .iter()
@@ -417,4 +482,56 @@ pub(crate) fn candidate_callees(
     }
     callers.retain(|callee, _| named.get(callee).copied().unwrap_or(false));
     callers
+}
+
+/// The dead-return parameter of a callee: the bare parameter its `return`
+/// hands back when no reachable MIR block assigns the return place (a
+/// diverging call precedes every return). `None` when the return place is
+/// reachable or the returned value is not a bare parameter.
+pub(crate) fn dead_return_parameter(
+    program: &RustProgram<'_>,
+    callee: LocalDefId,
+    escapes: &[super::co_conversion::Escape],
+    subjects: &[Subject],
+) -> Option<rustc_middle::mir::Local> {
+    use rustc_middle::mir::{RETURN_PLACE, StatementKind, TerminatorKind};
+    let body_ref = program
+        .tcx
+        .mir_drops_elaborated_and_const_checked(callee)
+        .borrow();
+    let reachable = rustc_middle::mir::traversal::reachable_as_bitset(&body_ref);
+    let assigns_return = body_ref
+        .basic_blocks
+        .iter_enumerated()
+        .filter(|(block, _)| reachable.contains(*block))
+        .any(|(_, data)| {
+            data.statements.iter().any(|statement| {
+                matches!(&statement.kind, StatementKind::Assign(assign) if assign.0.local == RETURN_PLACE)
+            }) || matches!(
+                &data.terminator().kind,
+                TerminatorKind::Call { destination, .. } if destination.local == RETURN_PLACE
+            )
+        });
+    if assigns_return {
+        return None;
+    }
+    let mut returned = escapes
+        .iter()
+        .filter(|escape| escape.subject.0 == callee)
+        .filter(|escape| matches!(escape.kind, super::co_conversion::EscapeKind::Return))
+        .filter_map(|escape| {
+            subjects.iter().find(|subject| {
+                (subject.fn_did, subject.hir_id) == escape.subject
+                    && subject.ptr_depth == 1
+                    && matches!(subject.kind, SubjectKind::Param { .. })
+            })
+        })
+        .map(|subject| subject.local)
+        .collect::<Vec<_>>();
+    returned.sort_unstable();
+    returned.dedup();
+    match returned.as_slice() {
+        [local] => Some(*local),
+        _ => None,
+    }
 }
