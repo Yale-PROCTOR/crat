@@ -29,6 +29,14 @@
 //! Multiple parameters feeding one return are a typed hold
 //! (`lifetime-origin-ambiguous`), per the charter: no guessed lifetime.
 //!
+//! Wave 3 (R401-8): when the parameter is an exclusive reference the view is
+//! UNTIED — `-> &'static mut T` / `&'static mut [T]` — the honest declaration
+//! that Rust tracks no borrow behind a raw field (an exclusive tie would be
+//! E0503 in every caller that reads the parameter while walking the view);
+//! it rides the same T2 waiver with the per-site receipt `untied-return-view`,
+//! the view-pair gate is active, and an untied view that the caller stores
+//! into a field or returns further is a typed hold.
+//!
 //! Wave 2 adds two things. (1) The **pointee** class: a return derived from
 //! the parameter's OWN pointee through a non-bare expression (brotli
 //! `StartPosQueueAt`: `&*(*self_0).q_.as_ptr().offset(k) as *const PosData`,
@@ -69,15 +77,24 @@ pub(crate) struct ThroughRawFieldReuse {
     /// The return is a slice (`&'a mut [T]` over the fallback extent) because
     /// at least one caller walks or indexes the result.
     pub(crate) slice: bool,
+    /// R401-8: the parameter is an exclusive reference, so the view is
+    /// UNTIED (`&'static`) — the honest declaration that Rust tracks no
+    /// borrow behind the raw field; receipted `untied-return-view`.
+    pub(crate) untied: bool,
 }
 
 impl ThroughRawFieldReuse {
     pub(crate) fn receipt_key(&self) -> String {
         format!(
-            "through_raw_field={}\tparameter={}\tform={}",
+            "through_raw_field={}\tparameter={}\tform={}\ttie={}",
             self.traversal.join(","),
             self.parameter.receipt_key(),
-            if self.slice { "slice" } else { "thin" }
+            if self.slice { "slice" } else { "thin" },
+            if self.untied {
+                "untied-return-view"
+            } else {
+                "parameter"
+            }
         )
     }
 }
@@ -236,12 +253,10 @@ pub(crate) fn derive_callee(
     // an EXCLUSIVE borrow of `*p` would forbid the caller every read of `*p`
     // while the view lives (heman's callers read `(*img).nbands` in the loop
     // that walks the view: E0503, a revert that takes the owner's other
-    // deliveries down). Only a shared parameter can lend its lifetime this
-    // way; the pointee class is exactly the case where the exclusive tie is
-    // right, so it is exempt.
-    if !pointee_class && parameter_mutable {
-        return Err(LifetimeFailure::ParameterBorrowHeld);
-    }
+    // deliveries down). A shared parameter lends its lifetime; an exclusive
+    // one yields an UNTIED view (R401-8) — the pointee class is exactly the
+    // case where the exclusive tie is right, so it is exempt.
+    let untied = !pointee_class && parameter_mutable;
 
     if pointee_class {
         return Ok(CalleePermit {
@@ -277,6 +292,7 @@ pub(crate) fn derive_callee(
             parameter,
             traversal,
             slice,
+            untied,
         }),
         overlay: Some(overlay),
     })

@@ -131,9 +131,9 @@ pub(crate) enum LifetimeFailure {
     /// W6L-1: a mutable returned view would sit beside another safe view of
     /// the same pointee type in the caller.
     ViewPairHeld,
-    /// W6L-1: the parameter that would lend its lifetime is an exclusive
-    /// reference, and the returned memory is not its pointee.
-    ParameterBorrowHeld,
+    /// W6L-1 (R401-8): an untied view escapes its caller (stored into a
+    /// field or returned further).
+    UntiedViewEscapes,
 }
 
 /// The only token that may discharge one `escapes-via-return` row. Its
@@ -661,12 +661,15 @@ pub(crate) fn derive_return_eligibility(
                     continue;
                 }
             };
-            if let Err(failure) = plan_function_with_return_ties(
-                summary,
-                &required,
-                &BTreeSet::new(),
-                std::slice::from_ref(&tie),
-            ) {
+            let untied = permit.reuse.as_ref().is_some_and(|reuse| reuse.untied);
+            if !untied
+                && let Err(failure) = plan_function_with_return_ties(
+                    summary,
+                    &required,
+                    &BTreeSet::new(),
+                    std::slice::from_ref(&tie),
+                )
+            {
                 result.through_raw_field_failures.insert(callee, failure);
                 continue;
             }
@@ -890,6 +893,24 @@ pub(crate) fn derive_return_eligibility(
                 .insert(key, LifetimeFailure::SeamIncompatible);
             continue;
         }
+        // R401-8 guard: an untied view may not leave its caller.
+        if result
+            .through_raw_field
+            .get(&callee)
+            .is_some_and(|reuse| reuse.untied)
+            && escapes.iter().any(|escape| {
+                escape.subject == key
+                    && matches!(
+                        escape.kind,
+                        EscapeKind::Return | EscapeKind::FieldStore | EscapeKind::StaticStore
+                    )
+            })
+        {
+            result
+                .failures
+                .insert(key, LifetimeFailure::UntiedViewEscapes);
+            continue;
+        }
         // W6L-1: a mutable view manufactured from raw storage must be the only
         // safe view of its pointee type in the caller.
         if result.through_raw_field.contains_key(&callee)
@@ -951,10 +972,13 @@ impl LifetimeFailure {
             Self::SeamIncompatible => "lifetime-seam-incompatible",
             Self::OriginAmbiguous => "lifetime-origin-ambiguous",
             Self::ViewPairHeld => "lifetime-view-pair-held",
-            Self::ParameterBorrowHeld => "lifetime-parameter-borrow-held",
+            Self::UntiedViewEscapes => "lifetime-untied-view-escapes",
         }
     }
 }
+
+/// R401-8: the lifetime name of an untied return view.
+pub(crate) const UNTIED_LIFETIME: &str = "static";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FunctionPlan {
@@ -1166,7 +1190,14 @@ impl LifetimePlan {
 }
 
 impl FunctionPlan {
+    /// The signature slots the return borrows from. An untied view (R401-8)
+    /// has no tie; its recorded origin is the collapsed parameter.
     pub(crate) fn return_sources(&self) -> BTreeSet<FnSignatureSlot> {
+        if let Some(reuse) = &self.through_raw_field
+            && reuse.untied
+        {
+            return BTreeSet::from([reuse.parameter]);
+        }
         self.return_reuses
             .iter()
             .filter(|reuse| reuse.target == FnSignatureSlot::RETURN)
@@ -1221,11 +1252,25 @@ impl FunctionPlan {
             .map(|(slot, lifetime)| (slot, lifetime.as_str()))
     }
 
+    /// R401-8: the untied view — the return carries `'static`, no generic
+    /// parameter, no tie, no outlives.
+    pub(crate) fn untied_return() -> Self {
+        Self {
+            lifetimes: BTreeMap::from([(FnSignatureSlot::RETURN, UNTIED_LIFETIME.to_owned())]),
+            sccs: Vec::new(),
+            outlives: Vec::new(),
+            return_reuses: Vec::new(),
+            through_raw_field: None,
+        }
+    }
+
+    /// The names that need a generic parameter: `'static` is not one.
     pub(crate) fn generated_names(&self) -> Vec<&str> {
         let mut names = self
             .lifetimes
             .values()
             .map(String::as_str)
+            .filter(|name| *name != UNTIED_LIFETIME)
             .collect::<Vec<_>>();
         names.sort_unstable();
         names.dedup();
@@ -1319,20 +1364,25 @@ pub(crate) fn finalize(
             .unwrap_or_default()
             .into_iter()
             .collect::<Vec<_>>();
-        let mut plan = plan_function_with_return_ties(
-            summary,
-            &required,
-            &existing_lifetime_names(program, did),
-            &ties,
-        )
-        .map_err(|failure| {
-            format!(
-                "{}: {}",
-                failure.key(),
-                program.tcx.def_path_str(did.to_def_id())
+        let marker = eligibility.through_raw_field.get(&did).cloned();
+        let mut plan = if marker.as_ref().is_some_and(|reuse| reuse.untied) {
+            FunctionPlan::untied_return()
+        } else {
+            plan_function_with_return_ties(
+                summary,
+                &required,
+                &existing_lifetime_names(program, did),
+                &ties,
             )
-        })?;
-        plan.through_raw_field = eligibility.through_raw_field.get(&did).cloned();
+            .map_err(|failure| {
+                format!(
+                    "{}: {}",
+                    failure.key(),
+                    program.tcx.def_path_str(did.to_def_id())
+                )
+            })?
+        };
+        plan.through_raw_field = marker;
         functions.insert(did, plan);
     }
     Ok(LifetimePlan { functions })

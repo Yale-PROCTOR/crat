@@ -5969,7 +5969,15 @@ pub(crate) fn synthesize_with_raw_boundary(
             Some(reuse) => (
                 BridgeRetentionTier::T2,
                 Some(crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
-                format!(":through_raw_field={}", reuse.traversal.join(",")),
+                format!(
+                    ":through_raw_field={}{}",
+                    reuse.traversal.join(","),
+                    if reuse.untied {
+                        ":untied-return-view"
+                    } else {
+                        ""
+                    }
+                ),
             ),
             None => (BridgeRetentionTier::T1, None, String::new()),
         };

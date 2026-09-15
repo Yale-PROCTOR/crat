@@ -261,58 +261,217 @@ fn w6l_heman_texel_shared_views_are_inferred_from_the_raw_field_origin() {
     assert!(plan.contains("form=thin"), "{plan}");
 }
 
-/// RED 2 — a write through the view makes the parameter mutable in the
-/// model; an exclusive tie is refused as a typed hold (never a compile-gate
-/// revert), for the single-view and the two-view callers alike.
+/// RED 2 (R401-8, the relay's RED on `copy_row`) — a write through the view
+/// makes the parameter mutable in the model; the view is then UNTIED
+/// (`&'static mut f32`): `srcp` (shared view) delivers, `dstp` (a mutable
+/// view beside another safe `f32` view) is view-pair-held; the emitted tree
+/// carries `'static` on the callee's return with no generic parameter, the
+/// receipt `untied-return-view`, and nothing reverts.
 #[test]
-fn w6l_mutable_parameter_is_held_typed() {
+fn w6l_mutable_parameter_yields_an_untied_view() {
     let observed = observe(HEMAN);
-    for label in ["copy_row::srcp", "copy_row::dstp"] {
-        let decision = decision_of(&observed, label);
-        assert!(decision.contains("ReturnNotAdapted"), "{label}={decision}");
-        assert_eq!(
-            failure_of(&observed, label),
-            Some(LifetimeFailure::ParameterBorrowHeld),
-            "{label}: {:?}",
-            observed.failures
-        );
-    }
+    let srcp = decision_of(&observed, "copy_row::srcp");
     assert!(
-        !observed
-            .plans
-            .iter()
-            .any(|(function, _)| function == "heman_image_texel"),
-        "{:?}",
-        observed.plans
+        srcp.starts_with("InferredRef { mutable: false"),
+        "srcp={srcp}; failures={:?}",
+        observed.failures
     );
-    let observed = observe(HEMAN_FILL);
+    let dstp = decision_of(&observed, "copy_row::dstp");
+    assert!(dstp.contains("ReturnNotAdapted"), "{dstp}");
     assert_eq!(
-        failure_of(&observed, "fill::t"),
-        Some(LifetimeFailure::ParameterBorrowHeld),
+        failure_of(&observed, "copy_row::dstp"),
+        Some(LifetimeFailure::ViewPairHeld),
         "{:?}",
+        observed.failures
+    );
+    let (_, plan) = observed
+        .plans
+        .iter()
+        .find(|(function, _)| function == "heman_image_texel")
+        .unwrap_or_else(|| panic!("texel plan; {:?}", observed.plans));
+    assert!(
+        plan.contains("slot\treturn/deref0/depth0\tstatic"),
+        "{plan}"
+    );
+    assert!(plan.contains("tie=untied-return-view"), "{plan}");
+    assert!(!plan.contains("return_tie"), "no tie: {plan}");
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        raw_boundary_artifacts,
+        ..
+    } = heman_emitted()
+    else {
+        panic!("heman emission degraded");
+    };
+    println!("W6L-UNTIED-EMITTED\n{source}\nW6L-UNTIED-END");
+    assert_eq!(*reverted_count, 0);
+    let text = compact(source);
+    assert!(
+        text.contains("fn__crat_safe_heman_image_texel(mutimg:&mutheman_image,mutx:i32,muty:i32)->&'staticmutf32"),
+        "{text}"
+    );
+    assert!(
+        text.contains("letmutsrcp:&f32=__crat_safe_heman_image_texel(src,x,y);"),
+        "{text}"
+    );
+    assert!(text.contains("*dstp=*srcp;"), "{text}");
+    let returns = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| {
+            event.site.bridge_kind == "return-raw-to-ref"
+                && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
+        })
+        .collect::<Vec<_>>();
+    let [event] = returns.as_slice() else {
+        panic!("one terminal return bridge: {returns:#?}");
+    };
+    assert_eq!(
+        event.retention,
+        super::bridge_receipt::BridgeRetentionTier::T2
+    );
+    assert_eq!(
+        event.waiver_id.as_deref(),
+        Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
+    );
+    assert!(
+        event.site.position.contains(":untied-return-view"),
+        "the per-site receipt: {}",
+        event.site.position
+    );
+    assert!(
+        raw_boundary_artifacts.outbound_return_error.is_none(),
+        "{:?}",
+        raw_boundary_artifacts.outbound_return_error
+    );
+}
+
+/// R401-8 — a single mutable untied view delivers (`fill`), and the untied
+/// SLICE form serves a writing walker: `&'static mut [f32]` over the fallback
+/// extent, the walk rewritten, `(*img).nbands` still readable in the loop.
+#[test]
+fn w6l_single_mutable_untied_view_and_untied_slice_deliver() {
+    let observed = observe(HEMAN_FILL);
+    let t = decision_of(&observed, "fill::t");
+    assert!(
+        t.starts_with("InferredRef { mutable: true"),
+        "t={t}; failures={:?}",
         observed.failures
     );
     let RewriteOutcome::Emitted {
         source,
         reverted_count,
         ..
-    } = heman_emitted()
+    } = emitted("heman-fill", HEMAN_FILL, &["fill", "heman_image_texel"])
     else {
-        panic!("heman emission degraded");
+        panic!("heman fill emission degraded");
     };
-    assert_eq!(*reverted_count, 0);
-    let text = compact(source);
+    assert_eq!(reverted_count, 0);
+    let text = compact(&source);
+    assert!(text.contains("->&'staticmutf32"), "{text}");
     assert!(
-        text.contains(
-            "fn__crat_safe_heman_image_texel(mutimg:&mutheman_image,mutx:i32,muty:i32)->*mutf32"
-        ),
+        text.contains("letmutt:&mutf32=__crat_safe_heman_image_texel(img,x,y);*t=v;"),
         "{text}"
     );
+
+    let observed = observe(HEMAN_WRITE_WALK);
+    let texel = decision_of(&observed, "heman_draw_points::texel");
     assert!(
-        text.contains("letmutsrcp=__crat_safe_heman_image_texel(src,x,y);"),
+        texel.starts_with("Slice { mutable: true"),
+        "texel={texel}; failures={:?}",
+        observed.failures
+    );
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        ..
+    } = emitted(
+        "heman-write-walk",
+        HEMAN_WRITE_WALK,
+        &["heman_draw_points", "heman_image_texel"],
+    )
+    else {
+        panic!("heman write-walk emission degraded");
+    };
+    println!("W6L-WRITE-WALK-EMITTED\n{source}\nW6L-WRITE-WALK-END");
+    assert_eq!(reverted_count, 0);
+    let text = compact(&source);
+    assert!(text.contains("->&'staticmut[f32]"), "{text}");
+    assert!(
+        text.contains("returncore::slice::from_raw_parts_mut("),
         "{text}"
     );
+    assert!(text.contains("whilec<(*target).nbands"), "{text}");
+    assert!(text.contains("texel[0]=val;"), "{text}");
 }
+
+/// R401-8 guard — an untied view that leaves its caller (returned further)
+/// is a typed hold, never a `'static` that outlives what Rust can see.
+#[test]
+fn w6l_untied_view_that_escapes_its_caller_is_held() {
+    let observed = observe(HEMAN_ESCAPE);
+    let t = decision_of(&observed, "first_texel::t");
+    assert!(!t.starts_with("InferredRef"), "t={t}");
+    assert!(
+        t.contains("Degraded"),
+        "the escaping view is not delivered: {t}; failures={:?}",
+        observed.failures
+    );
+    assert_eq!(
+        failure_of(&observed, "first_texel::t"),
+        Some(LifetimeFailure::UntiedViewEscapes),
+        "{:?}",
+        observed.failures
+    );
+    let RewriteOutcome::Emitted { reverted_count, .. } = emitted(
+        "heman-escape",
+        HEMAN_ESCAPE,
+        &["first_texel", "heman_image_texel"],
+    ) else {
+        panic!("heman escape emission degraded");
+    };
+    assert_eq!(reverted_count, 0);
+}
+
+/// heman `heman_draw_points`: a WRITING walker (`*texel = val; texel = texel.offset(1)`).
+const HEMAN_WRITE_WALK: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+pub struct heman_image { pub width: i32, pub height: i32, pub nbands: i32, pub data: *mut f32 }
+#[no_mangle]
+pub unsafe extern "C" fn heman_image_texel(mut img: *mut heman_image, mut x: i32, mut y: i32) -> *mut f32 {
+    return ((*img).data).offset(((y * (*img).width * (*img).nbands) as isize) + ((x * (*img).nbands) as isize));
+}
+#[no_mangle]
+pub unsafe extern "C" fn heman_draw_points(mut target: *mut heman_image, mut i: i32, mut j: i32, val: f32) {
+    if !(i < 0 || i >= (*target).width || j < 0 || j >= (*target).height) {
+        let mut texel = heman_image_texel(target, i, j);
+        let mut c = 0;
+        while c < (*target).nbands {
+            *texel = val;
+            let fresh0 = *texel;
+            texel = texel.offset(1);
+            c += 1;
+        }
+    }
+}
+"#;
+
+/// The escape control: the caller returns the view further.
+const HEMAN_ESCAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+pub struct heman_image { pub width: i32, pub height: i32, pub nbands: i32, pub data: *mut f32 }
+#[no_mangle]
+pub unsafe extern "C" fn heman_image_texel(mut img: *mut heman_image, mut x: i32, mut y: i32) -> *mut f32 {
+    return ((*img).data).offset(((y * (*img).width * (*img).nbands) as isize) + ((x * (*img).nbands) as isize));
+}
+#[no_mangle]
+pub unsafe extern "C" fn first_texel(mut img: *mut heman_image, v: f32) -> *mut f32 {
+    let mut t = heman_image_texel(img, 0, 0);
+    *t = v;
+    return t;
+}
+"#;
 
 /// RED 3 — the emitted tree: the safe variant returns `&'a mut f32` tied to
 /// the shared `img` (the view's mutability follows the raw return type, the
