@@ -699,6 +699,23 @@ pub unsafe extern "C" fn political_3(mut width: libc::c_int, mut ncolors: libc::
 }
 
 #[test]
+fn r402_annotated_binding_has_its_type_replaced_in_place() {
+    // bzip2 spells its owners `let mut v: *mut T = malloc(..)`: the
+    // declared type is replaced, the pattern kept.
+    let input = format!(
+        "{} pub unsafe fn prepare(n: usize) -> u32 {{ let mut buffer: *mut u32 = calloc(4, core::mem::size_of::<u32>()) as *mut u32; *buffer.offset(1) = 9; let value = *buffer.offset(1); free(buffer as *mut core::ffi::c_void); value }}",
+        declarations()
+    );
+    let s = verify(&input, "buffer", BoxShape::Slice, false);
+    assert!(
+        s.contains(
+            "let mut buffer: ::std::boxed::Box<[u32]> = ::std::vec![0u32; 4].into_boxed_slice();"
+        ),
+        "{s}"
+    );
+}
+
+#[test]
 fn r395_heman_percentiles_real_shape_sizeof_first_wrapping_mul_count() {
     // `heman_ops_percentiles::vals#292`: sizeof-first operand order, an
     // index-written buffer read back in a loop, the C free at the end.

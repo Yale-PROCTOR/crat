@@ -530,22 +530,30 @@ fn derive_bundle(
     // R402-2(a): every delivered declaration carries its explicit type. The
     // source binding is unannotated (`let mut p = malloc(..) as *mut T`), so
     // the pattern itself is respelled `p: Box<T>` / `p: Box<[T]>`.
-    let binding = tcx
-        .sess
-        .source_map()
-        .span_to_snippet(subject.binding_span)
-        .map_err(|_| NativeHold::Missing("native-binding-spelling"))?;
-    if subject.ty_span.is_some() {
-        return Err(NativeHold::Missing("native-annotated-binding"));
-    }
     let payload = match source.shape() {
         BoxShape::Sized => source.element_spelling().to_owned(),
         BoxShape::Slice => format!("[{}]", source.element_spelling()),
     };
-    edits.push(BoxExprEdit {
-        span: subject.binding_span,
-        replacement: format!("{binding}: ::std::boxed::Box<{payload}>"),
-        receipt: "native-box-declaration-type",
+    edits.push(match subject.ty_span {
+        // An annotated binding (`let v: *mut T = …`) keeps its pattern and
+        // has its type replaced in place.
+        Some(ty_span) => BoxExprEdit {
+            span: ty_span,
+            replacement: format!("::std::boxed::Box<{payload}>"),
+            receipt: "native-box-declaration-type",
+        },
+        None => {
+            let binding = tcx
+                .sess
+                .source_map()
+                .span_to_snippet(subject.binding_span)
+                .map_err(|_| NativeHold::Missing("native-binding-spelling"))?;
+            BoxExprEdit {
+                span: subject.binding_span,
+                replacement: format!("{binding}: ::std::boxed::Box<{payload}>"),
+                receipt: "native-box-declaration-type",
+            }
+        }
     });
     edits.extend_from_slice(source.scalar_edits());
     let mut receipts = vec![format!(
@@ -864,7 +872,10 @@ fn derive_bundle(
             receipts,
             fabricated_extent: false,
             pointee_override: None,
-            inferred_binding: subject.ty_span.is_none(),
+            // The plan's own declaration edit spells the Box type (annotated
+            // bindings have their declared type replaced in place), so the
+            // AST planner must place no declaration splice of its own.
+            inferred_binding: true,
             overwrite_spans: Vec::new(),
             retained_sink: true,
             implicit_scope_close: false,

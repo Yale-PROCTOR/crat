@@ -443,6 +443,12 @@ pub(crate) fn derive<'tcx>(
     let typeck = tcx.typeck(subject.fn_did);
     let constructor =
         super::ownership_fields_constructor::derive(tcx, subject.fn_did, init, *element)?;
+    // A depth-2 owner is admitted only as a pointer ARRAY (`Box<[*mut T]>`,
+    // the count from the allocation); a single boxed pointer cell stays
+    // outside the wave (BOX-N5).
+    if subject.ptr_depth == 2 && constructor.shape != BoxShape::Slice {
+        return Err(SourceHold::ConstructorShape);
+    }
     let allocation = constructor.allocation;
     let allocator = constructor.allocator;
     let Node::Pat(pattern) = tcx.hir_node(subject.hir_id) else { return Err(SourceHold::Identity) };
