@@ -859,6 +859,8 @@ pub(crate) struct RetentionSummaries {
     /// pinned contract row, kept apart so the row stays the authority wherever
     /// it exists.
     type_backed_children: FxHashMap<LocalDefId, Vec<ReturnedChildRecord>>,
+    /// W-C5: raw-pointer parameters whose pointee reaches no pointer.
+    pointer_free_parameters: FxHashSet<(LocalDefId, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1526,7 +1528,12 @@ impl RetentionSummaries {
         let mut facts = FxHashMap::default();
         let mut returned_children = FxHashMap::default();
         let mut type_backed_children = FxHashMap::default();
+        let mut pointer_free_parameters = FxHashSet::default();
         for &function in &program.functions {
+            pointer_free_parameters.extend(
+                super::returned_child_descent::pointer_free_parameters(program.tcx, function)
+                    .map(|index| (function, index)),
+            );
             let body = program
                 .tcx
                 .mir_drops_elaborated_and_const_checked(function)
@@ -1624,7 +1631,13 @@ impl RetentionSummaries {
             attested,
             returned_children,
             type_backed_children,
+            pointer_free_parameters,
         }
+    }
+
+    pub(crate) fn pointee_pointer_free(&self, function: LocalDefId, argument_index: usize) -> bool {
+        self.pointer_free_parameters
+            .contains(&(function, argument_index))
     }
 
     pub(crate) fn get(
@@ -3092,6 +3105,12 @@ impl RawBoundaryDispositionIndex {
                             && site.callee_may_yield_pointer
                             && contract.is_err()
                             && returned_child_permission(view, child_access).is_err()
+                            && !super::returned_child_descent::no_child_can_descend(
+                                &retention_verdict,
+                                site.callee_local.is_some_and(|callee| {
+                                    retention.pointee_pointer_free(callee, site.key.argument_index)
+                                }),
+                            )
                         {
                             // **R283-3 widened this arm to `*mut` positions.**
                             // It used to run only at `*const` targets, so a

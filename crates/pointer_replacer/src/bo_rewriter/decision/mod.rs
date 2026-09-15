@@ -81,6 +81,9 @@ pub(crate) mod return_alias;
 pub(crate) mod return_interface;
 pub(crate) mod return_receiver;
 pub(crate) mod returned_child;
+pub(crate) mod returned_child_descent;
+#[cfg(test)]
+mod returned_child_tests;
 pub(crate) mod seam;
 pub(crate) mod shared_read_pairs;
 pub(crate) mod sibling_overlap;
