@@ -474,17 +474,13 @@ fn w6v2_escaping_cast_stays_held_and_a_constant_width_forwards() {
 }
 
 /// binn.rs:2629 `binn_list_int32` → :2493 `binn_list_get` → :1561
-/// `binn_list_get_value` (reassigned from `binn_ptr`, held) → :1254 `binn_ptr`.
-/// The two forwarders pass their `void *` on unchanged; the leaf keeps its raw
-/// parameter, so every forward crosses an outbound raw seam. Under build 2b
-/// the byte-view bridge exists and the descendant question is discharged by
-/// the frame-confined out-param, but the retention verdict still holds the
-/// chain: `binn_list_get_value`'s `ptr` reaches `binn_ptr`, which RETURNS it,
-/// and the returned alias — not the parameter — is what the leaf stores into
-/// `*value`. A positive sink reached through a dependency's return is outside
-/// the stack-storage certificate (report 003, next shape), so every forward
-/// is withdrawn as a dropped class site and the parameters stay
-/// `held:void-pointee` — never an unbridged view.
+/// `binn_list_get_value` (reassigned from `binn_ptr`) → :1254 `binn_ptr`.
+/// R407-11: the two forwarders take the byte view and cross their raw seams
+/// by the byte-view bridge; `binn_ptr` only RETURNS its argument, so the
+/// returned-alias continuation makes `binn_list_get_value`'s own sinks the
+/// ones that count (T2 under the waiver here: `offset` and `is_null` are open
+/// calls in the walk). The leaf itself is reassigned (`ptr = binn_ptr(ptr)`)
+/// and stays held — build 3's shadow shape.
 const CHAIN: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
 #[repr(C)]
@@ -527,38 +523,161 @@ pub unsafe fn binn_list_int32(mut list: *mut core::ffi::c_void, mut pos: i32) ->
 "#;
 
 #[test]
-fn w6v2_forwards_into_a_returned_alias_chain_stay_held() {
+fn w6v2_forwarders_over_a_returned_alias_chain_deliver() {
     let rows = by_function(CHAIN);
-    assert!(
-        rows.contains(&(
-            "binn_get_ptr_type".to_owned(),
-            "ptr".to_owned(),
-            "<emitted>".to_owned()
-        )),
-        "the leaf read delivers: {rows:?}"
-    );
     for (function, parameter) in [
         ("binn_list_int32", "list"),
         ("binn_list_get", "ptr"),
-        ("binn_list_get_value", "ptr"),
-        ("binn_ptr", "ptr"),
+        ("binn_get_ptr_type", "ptr"),
     ] {
+        assert!(
+            rows.contains(&(
+                function.to_owned(),
+                parameter.to_owned(),
+                "<emitted>".to_owned()
+            )),
+            "{function}::{parameter} delivers: {rows:?}"
+        );
+    }
+    for (function, parameter) in [("binn_list_get_value", "ptr"), ("binn_ptr", "ptr")] {
         assert!(
             rows.contains(&(
                 function.to_owned(),
                 parameter.to_owned(),
                 "held:void-pointee".to_owned()
             )),
-            "{function}::{parameter} stays in the family: {rows:?}"
+            "{function}::{parameter} (reassigned / returned) stays held: {rows:?}"
         );
     }
     let source = super::emit_tests::ast_emitted_source_of(CHAIN).unwrap();
+    let c = compact(&source);
     assert!(
-        compact(&source)
-            .contains("fnbinn_list_int32(mutlist:*mutcore::ffi::c_void,mutpos:i32)->i32"),
-        "a withdrawn forward keeps its raw parameter: {source}"
+        c.contains("fnbinn_list_int32(mutlist:&[u8],mutpos:i32)->i32{letmutvalue:i32=0;binn_list_get(list,pos,0x61asi32,&mutvalue);"),
+        "the accessor forwards its view safe-to-safe: {source}"
+    );
+    assert!(
+        c.contains("fnbinn_list_get(mutptr:&[u8],")
+            && c.contains(
+                "binn_list_get_value(ptr.as_ptr().cast::<core::ffi::c_void>().cast_mut(),pos,"
+            ),
+        "the middle forwarder crosses the raw seam by the byte-view bridge: {source}"
     );
     assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe {
+        let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
+        println!("{} {}", binn_list_int32(buffer.as_mut_ptr().cast(), 2), binn_list_int32(buffer.as_mut_ptr().cast(), 1));
+    }}"#;
+    let emitted_main = r#"fn main() { unsafe {
+        let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
+        println!("{} {}", binn_list_int32(&buffer[..], 2), binn_list_int32(&buffer[..], 1));
+    }}"#;
+    let original = run_binary(&format!("{CHAIN}\n{main}"));
+    assert_eq!(original, b"9 3\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+}
+
+/// The full binn shape of the typed accessors (lib.rs:1389 `GetValue` storing
+/// into `(*value).ptr`; :2267 `copy_value` → :2116 `copy_raw_value` storing
+/// the source through `pdest`; :2493 `binn_list_get` reading `value.ptr` on
+/// and passing its own `pvalue`; :2629 `binn_list_int32` with an `i32` local,
+/// :2716 `binn_list_str` with a pointer local). The container pointer is
+/// stored through three levels of output storage: the walk transposes each
+/// level to the caller's own output parameter, follows the confined local's
+/// pointer-field read, and discharges at the accessor whose out-storage is an
+/// `i32` (never a pointer); `binn_list_str` returns its pointer local and
+/// holds. The middle `binn_list_get::ptr` reads `value.ptr` on, which the
+/// SITE-level descendant question (R283-3, K18' evidence — wave-6r's) does
+/// not discharge: it stays held, and the accessor bridges its view at it.
+const ACCESSORS: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+#[repr(C)]
+pub struct binn { pub header: i32, pub type_0: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
+unsafe fn GetValue(mut p: *mut u8, mut value: *mut binn) -> i32 {
+    if value.is_null() { return 0 as i32; }
+    (*value).type_0 = *p as i32;
+    (*value).ptr = p as *mut core::ffi::c_void;
+    return 1 as i32;
+}
+pub unsafe fn get_value(mut ptr: *mut core::ffi::c_void, mut pos: i32, mut value: *mut binn) -> i32 {
+    if ptr.is_null() || value.is_null() { return 0 as i32; }
+    let mut p = ptr as *mut u8;
+    return GetValue(p, value);
+}
+unsafe fn copy_raw_value(mut psource: *mut core::ffi::c_void, mut pdest: *mut core::ffi::c_void, mut data_store: i32) -> i32 {
+    match data_store {
+        96 => { *(pdest as *mut i32) = *(psource as *mut i32); }
+        160 => { *(pdest as *mut *mut i8) = psource as *mut i8; }
+        _ => return 0 as i32,
+    }
+    return 1 as i32;
+}
+unsafe fn copy_value(mut psource: *mut core::ffi::c_void, mut pdest: *mut core::ffi::c_void, mut data_store: i32) -> i32 {
+    return copy_raw_value(psource, pdest, data_store);
+}
+pub unsafe fn binn_list_get(mut ptr: *mut core::ffi::c_void, mut pos: i32, mut type_0: i32, mut pvalue: *mut core::ffi::c_void) -> i32 {
+    let mut value = binn { header: 0, type_0: 0, size: 0, ptr: 0 as *mut core::ffi::c_void };
+    if get_value(ptr, pos, &mut value) == 0 as i32 { return 0 as i32; }
+    if copy_value(value.ptr, pvalue, type_0) == 0 as i32 { return 0 as i32; }
+    return 1 as i32;
+}
+pub unsafe fn binn_list_int32(mut list: *mut core::ffi::c_void, mut pos: i32) -> i32 {
+    let mut value: i32 = 0;
+    binn_list_get(list, pos, 96 as i32, &mut value as *mut i32 as *mut core::ffi::c_void);
+    return value;
+}
+pub unsafe fn binn_list_str(mut list: *mut core::ffi::c_void, mut pos: i32) -> *mut i8 {
+    let mut value: *mut i8 = 0 as *mut i8;
+    binn_list_get(list, pos, 160 as i32, &mut value as *mut *mut i8 as *mut core::ffi::c_void);
+    return value;
+}
+"#;
+
+#[test]
+fn w6v2_typed_accessor_discharges_through_three_output_levels() {
+    let rows = by_function(ACCESSORS);
+    assert!(
+        rows.contains(&(
+            "binn_list_int32".to_owned(),
+            "list".to_owned(),
+            "<emitted>".to_owned()
+        )),
+        "the int accessor's container view delivers: {rows:?}"
+    );
+    for (function, parameter) in [("binn_list_str", "list"), ("binn_list_get", "ptr")] {
+        assert!(
+            rows.contains(&(
+                function.to_owned(),
+                parameter.to_owned(),
+                "held:void-pointee".to_owned()
+            )),
+            "{function}::{parameter} stays held: {rows:?}"
+        );
+    }
+    let source = super::emit_tests::ast_emitted_source_of(ACCESSORS).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fnbinn_list_int32(mutlist:&[u8],mutpos:i32)->i32")
+            && c.contains(
+                "binn_list_get(list.as_ptr().cast::<core::ffi::c_void>().cast_mut(),pos,96asi32,"
+            ),
+        "the accessor bridges its view at the held middle: {source}"
+    );
+    assert!(
+        c.contains("fnbinn_list_str(mutlist:*mutcore::ffi::c_void,mutpos:i32)->*muti8"),
+        "the string accessor stays raw: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe {
+        let mut buffer = [7u8, 0, 0, 0, 0, 0, 0, 0];
+        println!("{} {}", binn_list_int32(buffer.as_mut_ptr().cast(), 0), *binn_list_str(buffer.as_mut_ptr().cast(), 0));
+    }}"#;
+    let emitted_main = r#"fn main() { unsafe {
+        let mut buffer = [7u8, 0, 0, 0, 0, 0, 0, 0];
+        println!("{} {}", binn_list_int32(&buffer[..], 0), *binn_list_str(buffer.as_mut_ptr().cast(), 0));
+    }}"#;
+    let original = run_binary(&format!("{ACCESSORS}\n{main}"));
+    assert_eq!(original, b"7 7\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
 }
 
 /// R406-6 finding B, the direct shape: `get_value` stores the pointer it is
@@ -745,4 +864,26 @@ fn w6v2_byte_view_void_templates_render_the_bridge() {
         )
         .is_err()
     );
+}
+
+/// The returned-alias continuation's own line: the alias a returning callee
+/// hands back is THIS body's to account for — stored into a global, it holds.
+#[test]
+fn w6v2_returned_alias_stored_globally_keeps_the_hold() {
+    let input = CHAIN.replace(
+        "pub unsafe fn binn_list_get_value(mut ptr: *mut core::ffi::c_void, mut pos: i32, mut value: *mut binn) -> i32 {\n    ptr = binn_ptr(ptr);",
+        "static mut KEPT: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;\npub unsafe fn binn_list_get_value(mut ptr: *mut core::ffi::c_void, mut pos: i32, mut value: *mut binn) -> i32 {\n    let q = binn_ptr(ptr); KEPT = q; ptr = binn_ptr(ptr);",
+    );
+    assert_ne!(input, CHAIN);
+    let rows = by_function(&input);
+    for (function, parameter) in [("binn_list_int32", "list"), ("binn_list_get", "ptr")] {
+        assert!(
+            !rows.contains(&(
+                function.to_owned(),
+                parameter.to_owned(),
+                "<emitted>".to_owned()
+            )),
+            "{function}::{parameter} holds behind a globally stored returned alias: {rows:?}"
+        );
+    }
 }

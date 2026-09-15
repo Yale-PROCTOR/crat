@@ -942,6 +942,350 @@ struct RetentionDependency {
     callee: LocalDefId,
     argument_index: usize,
     step: RetentionStep,
+    /// wave-6v2 (R407-11): the callee's only positive sinks are stores
+    /// through its own output parameters and every such operand at this call
+    /// is a frame-confined local of this body — the dependency is discharged
+    /// at this call; only the callee's RESIDUAL (its unknowns and its other
+    /// dependencies) still travels.
+    discharged_by_stack_storage: bool,
+    /// wave-6v2 (R407-11): the callee only returns this argument and the
+    /// call's destination was made a reachable alias in this body (the
+    /// returned-alias continuation) — the callee's `return` sink is this
+    /// body's to account for; only the callee's residual travels.
+    continued_returned_alias: bool,
+}
+
+/// wave-6v2 (R407-11): what the previous derivation pass learned about every
+/// local callee, consumed by the next pass of [`collect_retention_facts`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RetentionPriorPass {
+    /// `(callee, argument)` whose only positive sinks are `return` of that
+    /// argument: a call's destination is then a reachable alias of the
+    /// argument in the caller, and the caller's own sinks are the ones that
+    /// count (the returned-alias continuation).
+    returning: FxHashSet<(LocalDefId, usize)>,
+    /// `(callee, argument)` whose only positive sinks are stores through the
+    /// callee's own output parameters, with those parameter indices.
+    output_storage_only: FxHashMap<(LocalDefId, usize), Vec<usize>>,
+}
+
+impl RetentionPriorPass {
+    fn of(facts: &FxHashMap<(LocalDefId, usize), RetentionBodyFacts>) -> Self {
+        let mut out = Self::default();
+        for (&key, fact) in facts {
+            if fact.retains.is_empty() {
+                continue;
+            }
+            if fact
+                .retains
+                .iter()
+                .all(|step| step.kind == RetentionEventKind::Return)
+            {
+                out.returning.insert(key);
+            }
+            if fact
+                .retains
+                .iter()
+                .all(|step| step.kind == RetentionEventKind::OutputStorage)
+                && let Some(outputs) = output_storage_positions(fact)
+            {
+                out.output_storage_only.insert(key, outputs);
+            }
+        }
+        out
+    }
+}
+
+/// What a call's output-storage operand denotes, through transparent copies
+/// and casts: this body's own raw-pointer parameter, or a borrow of a local.
+enum OutputOperand {
+    Parameter(Local),
+    /// The borrowed local and the location of the borrow itself.
+    Borrowed(Local, Location),
+}
+
+/// The storage a call operand carries the address of: the operand local was
+/// defined, before `call`, by exactly one `&mut _v` / `&raw mut _v` (through
+/// transparent copies and casts) — `_v` is the storage the callee's output
+/// parameter writes into — or it is (a transparent copy of) one of this
+/// body's raw-pointer parameters.
+fn output_operand<'tcx>(
+    body: &Body<'tcx>,
+    operand: Local,
+    call: Location,
+) -> Option<OutputOperand> {
+    let mut current = operand;
+    for _ in 0..8 {
+        if current.as_usize() > 0
+            && current.as_usize() <= body.arg_count
+            && matches!(body.local_decls[current].ty.kind(), TyKind::RawPtr(..))
+        {
+            return Some(OutputOperand::Parameter(current));
+        }
+        let mut definitions = body
+            .basic_blocks
+            .iter_enumerated()
+            .flat_map(|(block, data)| {
+                data.statements
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, statement)| {
+                        (
+                            Location {
+                                block,
+                                statement_index: index,
+                            },
+                            statement,
+                        )
+                    })
+            })
+            .filter_map(|(location, statement)| match &statement.kind {
+                StatementKind::Assign(box (lhs, rhs)) if lhs.as_local() == Some(current) => {
+                    Some((location, rhs))
+                }
+                _ => None,
+            });
+        let (location, rhs) = definitions.next()?;
+        if definitions.next().is_some() || !definition_before(body, location, call) {
+            return None;
+        }
+        match rhs {
+            Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                if let Some(local) = place.as_local() {
+                    return Some(OutputOperand::Borrowed(local, location));
+                }
+                // `&raw mut (*_r)`: a reborrow through the reference `_r`.
+                if place.projection.len() == 1
+                    && matches!(place.projection[0], ProjectionElem::Deref)
+                    && matches!(body.local_decls[place.local].ty.kind(), TyKind::Ref(..))
+                {
+                    current = place.local;
+                    continue;
+                }
+                return None;
+            }
+            Rvalue::Cast(_, operand, _) | Rvalue::Use(operand) => {
+                current = operand.place()?.as_local()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// wave-6v2 (R407-11): the ONE raw-pointer parameter this local is a
+/// transparent alias of (`_p -> .. -> local` through the body's alias edges),
+/// or `None` when it is rooted at no parameter or at more than one.
+fn parameter_alias_root(
+    body: &Body<'_>,
+    aliases: &[(Local, Local, RetentionStep)],
+    local: Local,
+) -> Option<Local> {
+    let mut roots = Vec::new();
+    for parameter in 1..=body.arg_count {
+        let parameter = Local::from_usize(parameter);
+        if !matches!(body.local_decls[parameter].ty.kind(), TyKind::RawPtr(..)) {
+            continue;
+        }
+        let mut reachable = FxHashSet::from_iter([parameter]);
+        loop {
+            let before = reachable.len();
+            for (source, destination, _) in aliases {
+                if reachable.contains(source) {
+                    reachable.insert(*destination);
+                }
+            }
+            if reachable.len() == before {
+                break;
+            }
+        }
+        if reachable.contains(&local) {
+            roots.push(parameter);
+        }
+    }
+    match roots.as_slice() {
+        [root] => Some(*root),
+        _ => None,
+    }
+}
+
+/// The output-parameter positions an `OutputStorage`-only fact stores through
+/// (`store _s through _p` → `p - 1`).
+fn output_storage_positions(facts: &RetentionBodyFacts) -> Option<Vec<usize>> {
+    let mut parameters = Vec::new();
+    for step in &facts.retains {
+        let local = step
+            .detail
+            .rsplit("through _")
+            .next()?
+            .parse::<usize>()
+            .ok()?;
+        parameters.push(local.checked_sub(1)?);
+    }
+    parameters.sort_unstable();
+    parameters.dedup();
+    Some(parameters)
+}
+
+/// wave-6v2 (R407-11): is this local of `body` FRAME-CONFINED at the MIR
+/// level — storage whose contents never leave the function except through
+/// reads the walk can follow? Its address may be taken only by the one borrow
+/// at `call` (the operand of the certified call); a read of it is either a
+/// projection whose type
+/// cannot carry a pointer (or of the whole local when the local's own type
+/// cannot), or a pointer-carrying FIELD copied into a local — returned, so
+/// the walk continues from that local; writes to it and its fields are free.
+/// `None` when any other use exists. The HIR twin,
+/// `binn_counted::frame_confined`, answers the site-level question.
+fn mir_frame_confined<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    local: Local,
+    call: Location,
+) -> Option<Vec<(Local, Location)>> {
+    use rustc_middle::mir::visit::{PlaceContext, Visitor};
+    struct Uses<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        body: &'a Body<'tcx>,
+        local: Local,
+        call: Location,
+        confined: bool,
+        field_reads: Vec<(Local, Location)>,
+        allowed_read: Option<Location>,
+    }
+    impl<'tcx> Visitor<'tcx> for Uses<'_, 'tcx> {
+        fn visit_assign(
+            &mut self,
+            place: &rustc_middle::mir::Place<'tcx>,
+            rvalue: &Rvalue<'tcx>,
+            location: Location,
+        ) {
+            if let Rvalue::Use(Operand::Copy(source) | Operand::Move(source)) = rvalue
+                && source.local == self.local
+                && !source.projection.is_empty()
+                && may_carry_pointer(
+                    self.tcx,
+                    source.ty(self.body, self.tcx).ty,
+                    CARRIER_WALK_DEPTH,
+                )
+                && let Some(destination) = place.as_local()
+            {
+                self.field_reads.push((destination, location));
+                self.allowed_read = Some(location);
+            }
+            self.super_assign(place, rvalue, location);
+            self.allowed_read = None;
+        }
+
+        fn visit_place(
+            &mut self,
+            place: &rustc_middle::mir::Place<'tcx>,
+            context: PlaceContext,
+            location: Location,
+        ) {
+            if place.local != self.local {
+                return;
+            }
+            use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext};
+            let confined = match context {
+                PlaceContext::NonUse(_) => true,
+                PlaceContext::MutatingUse(MutatingUseContext::Store) => true,
+                PlaceContext::MutatingUse(
+                    MutatingUseContext::Borrow | MutatingUseContext::RawBorrow,
+                )
+                | PlaceContext::NonMutatingUse(
+                    NonMutatingUseContext::SharedBorrow
+                    | NonMutatingUseContext::FakeBorrow
+                    | NonMutatingUseContext::RawBorrow,
+                ) => location == self.call,
+                // A fake read inspects nothing.
+                PlaceContext::NonMutatingUse(NonMutatingUseContext::Inspect) => true,
+                PlaceContext::NonMutatingUse(
+                    NonMutatingUseContext::Copy | NonMutatingUseContext::Move,
+                ) => {
+                    self.allowed_read == Some(location)
+                        || !may_carry_pointer(
+                            self.tcx,
+                            place.ty(self.body, self.tcx).ty,
+                            CARRIER_WALK_DEPTH,
+                        )
+                }
+                PlaceContext::MutatingUse(MutatingUseContext::Drop) => true,
+                _ => false,
+            };
+            self.confined &= confined;
+        }
+    }
+    let mut uses = Uses {
+        tcx,
+        body,
+        local,
+        call,
+        confined: true,
+        field_reads: Vec::new(),
+        allowed_read: None,
+    };
+    uses.visit_body(body);
+    uses.confined.then_some(uses.field_reads)
+}
+
+/// wave-6v2 (R407-11): how one call to an output-storage-only callee is
+/// discharged in the caller's own retention row, per output position: the
+/// operand borrows a frame-confined local of this body (its pointer-carrying
+/// field reads continue the walk), or the operand IS a raw-pointer parameter
+/// of this body (the sink transposes to `store _s through _p` of this body).
+#[derive(Clone, Debug, Default)]
+struct OutputDischarge {
+    ok: bool,
+    /// `(argument local, this body's output parameter local)` transposed sinks.
+    transposed: Vec<(Local, Local)>,
+    /// `(argument local, field-read destination, read location)` aliases.
+    field_reads: Vec<(Local, Local, Location)>,
+}
+
+fn output_discharge<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    args: &[rustc_middle::mir::Operand<'tcx>],
+    argument: Local,
+    outputs: &[usize],
+    call: Location,
+) -> OutputDischarge {
+    let mut out = OutputDischarge {
+        ok: true,
+        ..Default::default()
+    };
+    for &output in outputs {
+        let Some(operand) = args
+            .get(output)
+            .and_then(|operand| operand.place())
+            .and_then(|place| place.as_local())
+        else {
+            out.ok = false;
+            break;
+        };
+        match output_operand(body, operand, call) {
+            Some(OutputOperand::Parameter(parameter)) => {
+                out.transposed.push((argument, parameter));
+            }
+            Some(OutputOperand::Borrowed(referent, borrow)) => {
+                match mir_frame_confined(tcx, body, referent, borrow) {
+                    Some(reads) => out
+                        .field_reads
+                        .extend(reads.into_iter().map(|(dest, at)| (argument, dest, at))),
+                    None => {
+                        out.ok = false;
+                        break;
+                    }
+                }
+            }
+            None => {
+                out.ok = false;
+                break;
+            }
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1014,37 +1358,41 @@ fn plain_operand_local(operand: &Operand<'_>) -> Option<Local> {
     operand.place().and_then(|place| place.as_local())
 }
 
+/// Does `definition` precede `call` on every path (same block, or through
+/// predecessors)?
+fn definition_before(body: &Body<'_>, definition: Location, call: Location) -> bool {
+    if definition.block == call.block {
+        return definition.statement_index < call.statement_index;
+    }
+    let mut block = call.block;
+    let mut visited = FxHashSet::default();
+    while visited.insert(block) {
+        let predecessors = body
+            .basic_blocks
+            .iter_enumerated()
+            .filter_map(|(candidate, data)| {
+                data.terminator()
+                    .successors()
+                    .any(|successor| successor == block)
+                    .then_some(candidate)
+            })
+            .collect::<Vec<_>>();
+        let [predecessor] = predecessors.as_slice() else { return false };
+        if *predecessor == definition.block {
+            return true;
+        }
+        block = *predecessor;
+    }
+    false
+}
+
 fn returned_parent_is_raw_field_load<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     call: Location,
     mut parent: Local,
 ) -> bool {
-    fn before(body: &Body<'_>, definition: Location, call: Location) -> bool {
-        if definition.block == call.block {
-            return definition.statement_index < call.statement_index;
-        }
-        let mut block = call.block;
-        let mut visited = FxHashSet::default();
-        while visited.insert(block) {
-            let predecessors = body
-                .basic_blocks
-                .iter_enumerated()
-                .filter_map(|(candidate, data)| {
-                    data.terminator()
-                        .successors()
-                        .any(|successor| successor == block)
-                        .then_some(candidate)
-                })
-                .collect::<Vec<_>>();
-            let [predecessor] = predecessors.as_slice() else { return false };
-            if *predecessor == definition.block {
-                return true;
-            }
-            block = *predecessor;
-        }
-        false
-    }
+    let before = definition_before;
     let mut visited = FxHashSet::default();
     while visited.insert(parent) {
         if !matches!(body.local_decls[parent].ty.kind(), TyKind::RawPtr(..)) {
@@ -1105,11 +1453,92 @@ fn collect_retention_facts<'tcx>(
     argument_index: Option<usize>,
     body: &Body<'tcx>,
     children: &[ReturnedChildRecord],
+    prior: &RetentionPriorPass,
 ) -> RetentionBodyFacts {
     let tcx = program.tcx;
     let function_path = tcx.def_path_str(function.to_def_id());
     let mut definitions = vec![0usize; body.local_decls.len()];
     let mut aliases = Vec::<(Local, Local, RetentionStep)>::new();
+    // wave-6v2 (R407-11): a local callee that only RETURNS its argument makes
+    // the call's destination an alias of that argument in this body; a local
+    // callee that only stores its argument through output parameters supplied
+    // from this body's frame-confined locals (or this body's own output
+    // parameters) is discharged here, its confined field reads continuing the
+    // walk and its parameter stores transposing to this body's.
+    let mut discharges = FxHashMap::<(Location, usize), OutputDischarge>::default();
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &data.terminator().kind
+        else {
+            continue;
+        };
+        let call = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        let Some(callee) = operand_callee(func).and_then(|callee| callee.as_local()) else {
+            continue;
+        };
+        let operands = args
+            .iter()
+            .map(|argument| argument.node.clone())
+            .collect::<Vec<_>>();
+        for (index, argument) in args.iter().enumerate() {
+            let Some(source) = argument.node.place().and_then(|place| place.as_local()) else {
+                continue;
+            };
+            if !matches!(body.local_decls[source].ty.kind(), TyKind::RawPtr(..)) {
+                continue;
+            }
+            if let Some(outputs) = prior.output_storage_only.get(&(callee, index)) {
+                let discharge = output_discharge(tcx, body, &operands, source, outputs, call);
+                if discharge.ok {
+                    for &(argument, dest, at) in &discharge.field_reads {
+                        aliases.push((
+                            argument,
+                            dest,
+                            retention_step(
+                                at,
+                                RetentionEventKind::ReturnedAlias,
+                                format!(
+                                    "{} arg{index} confined-field-read _{}->_{}",
+                                    tcx.def_path_str(callee.to_def_id()),
+                                    argument.as_u32(),
+                                    dest.as_u32()
+                                ),
+                            ),
+                        ));
+                    }
+                }
+                discharges.insert((call, index), discharge);
+            }
+            if !prior.returning.contains(&(callee, index)) {
+                continue;
+            }
+            let Some(destination) = destination.as_local() else { continue };
+            if !matches!(body.local_decls[destination].ty.kind(), TyKind::RawPtr(..)) {
+                continue;
+            }
+            aliases.push((
+                source,
+                destination,
+                retention_step(
+                    call,
+                    RetentionEventKind::ReturnedAlias,
+                    format!(
+                        "{} arg{index} returns _{}->_{}",
+                        tcx.def_path_str(callee.to_def_id()),
+                        source.as_u32(),
+                        destination.as_u32()
+                    ),
+                ),
+            ));
+        }
+    }
 
     for (block, data) in body.basic_blocks.iter_enumerated() {
         for (statement_index, statement) in data.statements.iter().enumerate() {
@@ -1351,9 +1780,18 @@ fn collect_retention_facts<'tcx>(
                     format!("return _{}", source.as_u32()),
                 ));
             } else if !lhs.projection.is_empty() {
-                let output_storage = lhs.local.as_usize() > 0
-                    && lhs.local.as_usize() <= body.arg_count
+                // wave-6v2 (R407-11): a store through a transparent alias of
+                // an output parameter (`*(pdest as *mut *mut T) = ..`) is a
+                // store through that parameter.
+                let storage_root =
+                    if lhs.local.as_usize() > 0 && lhs.local.as_usize() <= body.arg_count {
+                        Some(lhs.local)
+                    } else {
+                        parameter_alias_root(body, &aliases, lhs.local)
+                    };
+                let output_storage = storage_root.is_some()
                     && matches!(lhs.projection.first(), Some(ProjectionElem::Deref));
+                let storage_root = storage_root.unwrap_or(lhs.local);
                 let (reason, kind) = if output_storage {
                     (
                         RetentionUnknownReason::OutputStorage,
@@ -1368,7 +1806,11 @@ fn collect_retention_facts<'tcx>(
                 let step = retention_step(
                     location,
                     kind,
-                    format!("store _{} through _{}", source.as_u32(), lhs.local.as_u32()),
+                    format!(
+                        "store _{} through _{}",
+                        source.as_u32(),
+                        storage_root.as_u32()
+                    ),
                 );
                 facts.retains.push(step.clone());
                 facts.unknowns.entry(reason).or_default().push(step);
@@ -1410,15 +1852,61 @@ fn collect_retention_facts<'tcx>(
                 .as_local()
                 .filter(|callee| program.functions.contains(callee))
             {
+                // wave-6v2 (R407-11): a callee that stores this argument only
+                // through its output parameters, each supplied here from a
+                // frame-confined local or this body's own output parameter,
+                // is discharged at this call; transposed sinks become this
+                // body's output-storage sinks.
+                let discharge = discharges.get(&(location, index));
+                let discharged_by_stack_storage = discharge.is_some_and(|d| d.ok);
+                if let Some(discharge) = discharge.filter(|d| d.ok) {
+                    for &(source, parameter) in &discharge.transposed {
+                        let step = retention_step(
+                            location,
+                            RetentionEventKind::OutputStorage,
+                            format!("store _{} through _{}", source.as_u32(), parameter.as_u32()),
+                        );
+                        facts.retains.push(step.clone());
+                        facts
+                            .unknowns
+                            .entry(RetentionUnknownReason::OutputStorage)
+                            .or_default()
+                            .push(step);
+                    }
+                }
+                let continued_returned_alias = prior.returning.contains(&(local_callee, index))
+                    && matches!(
+                        &terminator.kind,
+                        TerminatorKind::Call { destination, .. }
+                            if destination.as_local().is_some_and(|destination| {
+                                matches!(body.local_decls[destination].ty.kind(), TyKind::RawPtr(..))
+                            })
+                    );
                 let step = retention_step(
                     location,
-                    RetentionEventKind::LocalCall,
-                    format!("{} arg{index}", tcx.def_path_str(callee)),
+                    if discharged_by_stack_storage || continued_returned_alias {
+                        RetentionEventKind::KnownNoRetainCall
+                    } else {
+                        RetentionEventKind::LocalCall
+                    },
+                    format!(
+                        "{} arg{index}{}",
+                        tcx.def_path_str(callee),
+                        if discharged_by_stack_storage {
+                            " stack-storage-certificate"
+                        } else if continued_returned_alias {
+                            " returned-alias-continued"
+                        } else {
+                            ""
+                        }
+                    ),
                 );
                 facts.dependencies.push(RetentionDependency {
                     callee: local_callee,
                     argument_index: index,
                     step: step.clone(),
+                    discharged_by_stack_storage,
+                    continued_returned_alias,
                 });
                 facts.steps.push(step);
                 continue;
@@ -1535,6 +2023,77 @@ fn collect_retention_facts<'tcx>(
     facts
 }
 
+/// wave-6v2 (R407-11): the verdict a callee parameter carries once its
+/// output-storage sinks are discharged at a call — its unknowns and its own
+/// dependencies, nothing else.
+fn residual_after_discharge(
+    facts: &RetentionBodyFacts,
+    rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
+    attested: bool,
+) -> Option<RetentionVerdict> {
+    residual_after_discharge_in(facts, rows, None, attested, 0)
+}
+
+/// [`residual_after_discharge`] with the fact table, so a dependency that was
+/// itself discharged or continued contributes ITS residual rather than its row;
+/// the depth bound guards a cycle of discharged calls.
+fn residual_after_discharge_in(
+    facts: &RetentionBodyFacts,
+    rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
+    all_facts: Option<&FxHashMap<(LocalDefId, usize), RetentionBodyFacts>>,
+    attested: bool,
+    depth: usize,
+) -> Option<RetentionVerdict> {
+    if !attested {
+        return Some(RetentionVerdict::Unknown {
+            reason: RetentionUnknownReason::AttestationAbsent,
+            frontier: facts.steps.clone(),
+        });
+    }
+    if let Some((&reason, frontier)) = facts
+        .unknowns
+        .iter()
+        .find(|(reason, _)| **reason != RetentionUnknownReason::OutputStorage)
+    {
+        return Some(RetentionVerdict::Unknown {
+            reason,
+            frontier: frontier.clone(),
+        });
+    }
+    for dependency in &facts.dependencies {
+        let key = (dependency.callee, dependency.argument_index);
+        let verdict = if (dependency.discharged_by_stack_storage
+            || dependency.continued_returned_alias)
+            && depth < 8
+            && let Some(callee_facts) = all_facts.and_then(|all| all.get(&key))
+        {
+            residual_after_discharge_in(callee_facts, rows, all_facts, attested, depth + 1)
+        } else {
+            rows.get(&key).cloned()
+        };
+        match verdict {
+            Some(RetentionVerdict::NoRetain { .. }) => {}
+            Some(RetentionVerdict::Retains { sink, path }) => {
+                return Some(RetentionVerdict::Retains { sink, path });
+            }
+            _ => {
+                return Some(RetentionVerdict::Unknown {
+                    reason: RetentionUnknownReason::LocalSummaryUnknown,
+                    frontier: vec![dependency.step.clone()],
+                });
+            }
+        }
+    }
+    Some(RetentionVerdict::NoRetain {
+        certificate: RetentionCertificate {
+            function: facts.function_path.clone(),
+            argument_index: facts.argument_index?,
+            steps: facts.steps.clone(),
+            attestation: "stack-storage-certificate",
+        },
+    })
+}
+
 fn direct_verdict(facts: &RetentionBodyFacts, attested: bool) -> RetentionVerdict {
     if let Some(sink) = facts.retains.first().cloned() {
         return RetentionVerdict::Retains {
@@ -1585,14 +2144,25 @@ fn evaluate_retention(
         for key in &keys {
             let fact = &facts[key];
             let direct = direct_verdict(fact, attested);
+            // wave-6v2 (R407-11): a dependency discharged by the stack-storage
+            // certificate contributes only the callee's residual verdict.
+            let dependency_verdict = |dependency: &RetentionDependency| {
+                let row = previous.get(&(dependency.callee, dependency.argument_index));
+                if (dependency.discharged_by_stack_storage || dependency.continued_returned_alias)
+                    && let Some(callee_facts) =
+                        facts.get(&(dependency.callee, dependency.argument_index))
+                {
+                    residual_after_discharge_in(callee_facts, &previous, Some(facts), attested, 0)
+                } else {
+                    row.cloned()
+                }
+            };
             let next = if matches!(direct, RetentionVerdict::Retains { .. }) {
                 direct
             } else if let Some((dependency, sink)) =
                 fact.dependencies.iter().find_map(|dependency| {
-                    match previous.get(&(dependency.callee, dependency.argument_index)) {
-                        Some(RetentionVerdict::Retains { sink, .. }) => {
-                            Some((dependency, sink.clone()))
-                        }
+                    match dependency_verdict(dependency) {
+                        Some(RetentionVerdict::Retains { sink, .. }) => Some((dependency, sink)),
                         _ => None,
                     }
                 })
@@ -1605,7 +2175,7 @@ fn evaluate_retention(
                 direct
             } else if let Some(dependency) = fact.dependencies.iter().find(|dependency| {
                 !matches!(
-                    previous.get(&(dependency.callee, dependency.argument_index)),
+                    dependency_verdict(dependency),
                     Some(RetentionVerdict::NoRetain { .. })
                 )
             }) {
@@ -1672,11 +2242,22 @@ impl RetentionSummaries {
             .dependencies
             .iter()
             .map(|dependency| {
-                (
-                    dependency,
-                    self.rows
-                        .get(&(dependency.callee, dependency.argument_index)),
-                )
+                let key = (dependency.callee, dependency.argument_index);
+                let verdict = if (dependency.discharged_by_stack_storage
+                    || dependency.continued_returned_alias)
+                    && let Some(callee_facts) = self.facts.get(&key)
+                {
+                    residual_after_discharge_in(
+                        callee_facts,
+                        &self.rows,
+                        Some(&self.facts),
+                        self.attested,
+                        0,
+                    )
+                } else {
+                    self.rows.get(&key).cloned()
+                };
+                (dependency, verdict)
             })
             .collect::<Vec<_>>();
         if dependency_verdicts
@@ -1785,11 +2366,53 @@ impl RetentionSummaries {
                         Some(argument_index),
                         &body,
                         &children,
+                        &RetentionPriorPass::default(),
                     ),
                 );
             }
             returned_children.insert(function, children);
             type_backed_children.insert(function, type_backed);
+        }
+        // wave-6v2 (R407-11): the returned-alias continuation and the
+        // stack-storage discharge read the previous pass; iterate to a
+        // fixpoint (a chain of returning callees needs one pass per link).
+        let mut prior = RetentionPriorPass::of(&facts);
+        for _ in 0..program.functions.len() {
+            if prior == RetentionPriorPass::default() {
+                break;
+            }
+            let mut next = FxHashMap::default();
+            for &function in &program.functions {
+                let body = program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                let children = &returned_children[&function];
+                for argument_index in 0..body.arg_count {
+                    let local = Local::from_usize(argument_index + 1);
+                    if !matches!(body.local_decls[local].ty.kind(), TyKind::RawPtr(..)) {
+                        continue;
+                    }
+                    next.insert(
+                        (function, argument_index),
+                        collect_retention_facts(
+                            program,
+                            function,
+                            local,
+                            Some(argument_index),
+                            &body,
+                            children,
+                            &prior,
+                        ),
+                    );
+                }
+            }
+            let next_prior = RetentionPriorPass::of(&next);
+            facts = next;
+            if next_prior == prior {
+                break;
+            }
+            prior = next_prior;
         }
         let rows = if origins.is_none() {
             evaluate_retention(&facts, false)
@@ -1925,6 +2548,7 @@ impl RetentionSummaries {
             self.returned_children
                 .get(&function)
                 .map_or(&[], Vec::as_slice),
+            &RetentionPriorPass::default(),
         );
         let unknown_reason = if !self.attested {
             RetentionUnknownReason::AttestationAbsent
@@ -1973,6 +2597,7 @@ impl RetentionSummaries {
                     self.returned_children
                         .get(&dependency.callee)
                         .map_or(&[], Vec::as_slice),
+                    &RetentionPriorPass::default(),
                 );
                 let mut dependency_path = path.clone();
                 dependency_path.push(dependency.step.clone());

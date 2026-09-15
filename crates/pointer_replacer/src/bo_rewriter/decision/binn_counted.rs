@@ -379,21 +379,19 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
 }
 
 /// A forward-only `void *` parameter: its uses are null tests and pass-ons of
-/// the bare binding as an argument of a LOCAL call, and EVERY pass-on reaches a
-/// position that carries a typed-width contract. It takes the byte view and
-/// inherits the element and the width (re-keyed by the sibling the forwarder
-/// passes as the discriminant); its seams are safe-to-safe and a raw caller's
-/// count is the inherited width.
-///
-/// A pass-on that reaches a raw or held `void *` position is NOT taken: the
-/// parent lane's witnesses pin that a wrapper of a HELD counted pair holds with
-/// it (`csv_fwrite` over a held `csv_fwrite2`), and a byte view bridged into a
-/// raw void position would deliver that wrapper instead. The bridge itself
-/// exists (R406-6, `raw_boundary`'s byte-view void templates, a blocked site
-/// dropping the class) and serves every other safe form at a void position;
-/// the forwarder shape over it is the seat's call (report 003). Sibling-COUNT
-/// contracts (the parent lane's) are the parent's `prove_forward` and are not
-/// taken here.
+/// the bare binding as an argument of a LOCAL call. It takes the byte view.
+/// Where every pass-on reaches a position that carries a typed-width contract,
+/// the element and the width are inherited (re-keyed by the sibling the
+/// forwarder passes as the discriminant), its seams are safe-to-safe and a raw
+/// caller's count is the inherited width. Where a pass-on reaches a raw or
+/// held position (R407-11, admitted), the width is UNKNOWN — a raw caller of
+/// this forwarder holds at its seam — the element follows the parameter's own
+/// mutability, and the pass-on is the seam's outbound R130 bridge at that
+/// position (`raw_boundary`'s byte-view void templates: T1 where the callee's
+/// retention is attested no-retain, T2 under the named waiver where unknown,
+/// a positive retention drops the class — never an unbridged view).
+/// Sibling-COUNT contracts (the parent lane's) are the parent's
+/// `prove_forward` and are not taken here.
 pub(crate) fn prove_forward_only(
     tcx: TyCtxt<'_>,
     s: &Subject,
@@ -468,7 +466,7 @@ pub(crate) fn prove_forward_only(
                 });
                 let Some((_, contract)) = position else {
                     reaches_raw = true;
-                    return None;
+                    continue;
                 };
                 // A sibling-count contract is the parent's forward; a void
                 // position that already forwards an unknown width is a raw
@@ -506,10 +504,17 @@ pub(crate) fn prove_forward_only(
     }
     let (element, width) = match inherited {
         Some((element, width)) if !reaches_raw => (element, width),
-        // Unreachable while a raw position returns above; the typed shape a
-        // raw-position forward would take (no width travels).
+        // A raw position among the pass-ons: no width travels, and a
+        // delivered `u8` view is never widened to a writable one.
         Some((element, _)) => (element, WidthTable::unknown()),
-        None => return None,
+        None => (
+            if s.mutable {
+                ByteElement::Write
+            } else {
+                ByteElement::Read
+            },
+            WidthTable::unknown(),
+        ),
     };
     Some(Contract {
         count_index: width.discriminant.unwrap_or(own_index),

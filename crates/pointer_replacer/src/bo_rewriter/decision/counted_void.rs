@@ -142,11 +142,25 @@ pub(crate) fn collect(
             if known.contains_key(&(s.fn_did, s.hir_id)) || model_raw(s) {
                 continue;
             }
-            if let Some(contract) = prove_forward(tcx, s, subjects, &known)
-                .or_else(|| super::binn_counted::prove_forward_only(tcx, s, subjects, &known))
-            {
+            if let Some(contract) = prove_forward(tcx, s, subjects, &known) {
                 proven.push((s, contract));
                 added += 1;
+            }
+        }
+        // wave-6v2: the forward-only shape runs only once the sibling-count
+        // forwards have converged, so a wrapper of a counted pair takes the
+        // pair's contract, never the width-less view.
+        if added == 0 {
+            for s in subjects {
+                if known.contains_key(&(s.fn_did, s.hir_id)) {
+                    continue;
+                }
+                if let Some(contract) =
+                    super::binn_counted::prove_forward_only(tcx, s, subjects, &known)
+                {
+                    proven.push((s, contract));
+                    added += 1;
+                }
             }
         }
         if added == 0 {
