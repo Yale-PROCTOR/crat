@@ -1273,3 +1273,70 @@ fn w6v_forwarder_never_outruns_the_models_raw_callee() {
     assert!(!source.contains("dest: Option<&mut ["), "{source}");
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
+
+// ---- report 009/010: a converted callee called with ONE local at two positions ----
+
+/// rs-crown/heman `kmQuaternionSlerp` → `kmQuaternionScale(&mut diff, &mut diff, t)`
+/// at batch 6: `pOut` is delivered `&mut kmQuaternion`, `pIn` stays raw
+/// (`kind-raw`; here kept raw by a raw use), and one call passes the same
+/// local at both positions (an in-place scale, legal C). The `&mut diff` view
+/// beside a second `&mut diff` coerced to the raw position is batch 6's heman
+/// round-1 E0499 — unless the call is routed to the callee's raw twin.
+const KM_SCALE: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct kmQuaternion { pub x: f32, pub y: f32, pub z: f32, pub w: f32 }
+unsafe fn kmQuaternionScale(mut pOut: *mut kmQuaternion, mut pIn: *const kmQuaternion, mut s: f32) {
+    (*pOut).x = (*pIn).x * s;
+    (*pOut).y = (*pIn).y * s;
+    (*pOut).z = (*pIn).z * s;
+    (*pOut).w = (*pIn).w * s;
+    let _k = pIn.offset(0);
+}
+unsafe fn slerp(mut q1: *const kmQuaternion, mut t: f32) -> f32 {
+    let mut diff = kmQuaternion { x: 0., y: 0., z: 0., w: 0. };
+    kmQuaternionScale(&mut diff, q1, 2.0);
+    kmQuaternionScale(&mut diff, &mut diff, t);
+    diff.x + diff.w
+}
+"#;
+
+#[test]
+fn w6v_same_local_at_two_converted_positions_never_emits_two_views() {
+    let rows = super::emit_tests::decisions_of(KM_SCALE);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "pOut" && *p && r == "<emitted>"),
+        "the callee's destination keeps its delivery: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(KM_SCALE).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains(
+            "fnkmQuaternionScale(mutpOut:&mutkmQuaternion,mutpIn:*constkmQuaternion,muts:f32)"
+        ),
+        "{source}"
+    );
+    assert!(
+        c.contains("kmQuaternionScale(&mutdiff,q1,2.0);"),
+        "the disjoint call keeps the view: {source}"
+    );
+    assert!(
+        c.contains("__crat_raw_kmQuaternionScale(&mutdiff,&mutdiff,t);"),
+        "the aliased call takes the pristine raw twin: {source}"
+    );
+    assert!(
+        super::verify::type_checks_str(&source),
+        "the emitted crate must type-check (no two live views of `diff`): {source}"
+    );
+    let main = r#"fn main() { unsafe { let q = kmQuaternion { x: 1., y: 2., z: 3., w: 4. }; println!("{}", slerp(&q, 0.5)); } }"#;
+    let original = run_binary(&format!("{KM_SCALE}\n{main}"));
+    assert_eq!(original, b"5\n".to_vec());
+    let emitted_main = if compact(&source).contains("fnslerp(mutq1:&kmQuaternion") {
+        r#"fn main() { unsafe { let q = kmQuaternion { x: 1., y: 2., z: 3., w: 4. }; println!("{}", slerp(&q, 0.5)); } }"#
+    } else {
+        main
+    };
+    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+}

@@ -4302,6 +4302,25 @@ pub(crate) fn synthesize_with_raw_boundary(
             // only `glue` call. Building here is observational: no AST node is
             // claimed and no edit is emitted until pass 3.
             let enclosing_unsafe_fn = enclosing_function_is_unsafe(tcx, site.caller);
+            // A converted position whose storage root is also the root of a
+            // RAW argument of the same call takes the callee's pristine raw
+            // twin: no view is formed beside a raw alias (wave-6v, R408-7).
+            let aliased_twin = super::counted_void::aliased_storage_twin(
+                site,
+                &positions
+                    .iter()
+                    .map(|pos| (pos.index, pos.found))
+                    .collect::<Vec<_>>(),
+            );
+            if let Some(indices) = &aliased_twin {
+                super::counted_void::record_alias_twin(
+                    table,
+                    &mut counted_void_calls,
+                    site,
+                    *callee,
+                    indices,
+                );
+            }
             let return_tied = table
                 .lifetime_plan
                 .function(*callee)
@@ -4313,6 +4332,13 @@ pub(crate) fn synthesize_with_raw_boundary(
             let mut candidates = Vec::with_capacity(positions.len());
             let mut input_candidates = Vec::with_capacity(positions.len());
             for pos in &positions {
+                if aliased_twin.is_some() {
+                    // Zero syntax at every position: the twin takes the
+                    // original arguments.
+                    candidates.push(Ok(None));
+                    input_candidates.push(Ok(None));
+                    continue;
+                }
                 let Some(text) = pos.text.as_deref() else {
                     candidates.push(Err(SeamBlock::UnnameableOperand));
                     input_candidates.push(Err(SeamBlock::UnnameableOperand));

@@ -1092,6 +1092,89 @@ pub(crate) fn record_call<'tcx>(
         call.bridged.sort_by_key(|b| b.index);
     }
 }
+/// A call where a CONVERTED position's storage root (`&mut local`, a local
+/// pointer, a place rooted at a local) is also the root of an argument at a
+/// RAW callee position: the view would live beside a raw alias of the same
+/// storage for the whole call. When every converted position's argument
+/// coerces to the raw parameter (a raw expression, or a plain reference of the
+/// same pointee), the call takes the pristine raw twin. Returns the converted
+/// positions' indices.
+pub(crate) fn aliased_storage_twin(
+    site: &super::emitability::CallSite,
+    positions: &[(usize, super::seam::Form)],
+) -> Option<Vec<usize>> {
+    use super::seam::Form;
+    let converted: rustc_hash::FxHashSet<usize> = positions.iter().map(|(i, _)| *i).collect();
+    let root_of = |index: usize| {
+        site.args
+            .iter()
+            .find(|a| a.index == index)
+            .and_then(|a| a.shape.place_root())
+    };
+    let aliased = positions.iter().any(|(i, _)| {
+        let Some(root) = root_of(*i) else { return false };
+        site.args.iter().any(|other| {
+            !converted.contains(&other.index) && other.shape.place_root() == Some(root)
+        })
+    });
+    if !aliased {
+        return None;
+    }
+    let coercible = positions.iter().all(|(_, found)| match found {
+        Form::Raw | Form::Ref { .. } => true,
+        Form::Slice { .. } | Form::Opt { .. } | Form::Cursor { .. } | Form::NestedSlice { .. } => {
+            false
+        }
+    });
+    coercible.then(|| positions.iter().map(|(i, _)| *i).collect())
+}
+
+/// The plan row for an aliased-storage call: every converted position keeps
+/// its original argument and the call is renamed to the raw twin.
+pub(crate) fn record_alias_twin(
+    table: &super::DecisionTable,
+    calls: &mut std::collections::BTreeMap<(u32, u32, u32), CallPlan>,
+    site: &super::emitability::CallSite,
+    callee: LocalDefId,
+    indices: &[usize],
+) {
+    let bridged = indices
+        .iter()
+        .filter_map(|index| {
+            let param = table.entries.iter().find_map(|(s, _)| {
+                (s.fn_did == callee
+                    && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == *index))
+                .then_some(s.hir_id)
+            })?;
+            Some(BridgedArg {
+                index: *index,
+                param,
+                element: ByteElement::Read,
+                mutable: false,
+                bridge: String::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if bridged.is_empty() {
+        return;
+    }
+    let key = (
+        site.caller.local_def_index.as_u32(),
+        site.span.lo().0,
+        site.span.hi().0,
+    );
+    calls.entry(key).or_insert_with(|| CallPlan {
+        owner_class: crate::bo_rewriter::bridge_receipt::SignatureClassId::of(callee),
+        caller: site.caller,
+        callee,
+        call_span: site.span,
+        count_index: 0,
+        route: Route::RawTwin,
+        bridged,
+        count_form: "aliased-storage".to_owned(),
+    });
+}
+
 fn contract_at(
     table: &super::DecisionTable,
     callee: LocalDefId,
