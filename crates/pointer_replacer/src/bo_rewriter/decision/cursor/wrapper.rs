@@ -288,10 +288,10 @@ fn base(
         });
     }
     if let Some(binding) = local(e)
-        && let Some((source, _)) = entries
+        && let Some((source, source_decision)) = entries
             .iter()
             .find(|(source, _)| source.fn_did == s.fn_did && source.hir_id == binding)
-        && candidate_shape(ctx, source)
+        && candidate_shape(ctx, source, source_decision)
     {
         if s.mutable && !source.mutable {
             return Err(CursorHold::ScheduleMissing);
@@ -530,10 +530,10 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         // The derived binding owns its constructor edit; the parent lends its
         // full base only through the wrapper's checked Rust reborrow API.
         if self.index(e).is_ok()
-            && self.entries.iter().any(|(child, _)| {
+            && self.entries.iter().any(|(child, child_decision)| {
                 child.fn_did == self.subject.fn_did
                     && child.hir_id != self.subject.hir_id
-                    && candidate_shape(self.ctx, child)
+                    && candidate_shape(self.ctx, child, child_decision)
                     && self
                         .ctx
                         .constructions
@@ -695,13 +695,46 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         intravisit::walk_expr(self, e);
     }
 }
+/// The subject is an operand of a pointer ordering / difference observation:
+/// the cursor form carries those as address views, so a forward-only walk
+/// that is ordered against another pointer is this family's too (relay 008).
+pub(crate) fn ordering_participant(ctx: &Ctx<'_, '_>, s: &Subject) -> bool {
+    ctx.facts
+        .address_observations
+        .iter()
+        .filter(|observation| scalar_address_operation(observation.op))
+        .flat_map(|observation| &observation.operands)
+        .any(|operand| operand.node == (s.fn_did, s.hir_id))
+}
+/// Ordering participation selects a subject only where the other families
+/// DEGRADE it (`ptr-comparison` or a cursor reason): a subject they deliver —
+/// a thin reference compared, a slice differenced — keeps its delivered form.
+fn ordering_degraded(decision: &Decision) -> bool {
+    match decision {
+        Decision::Degraded(record) => {
+            matches!(record.reason, super::super::DegradeReason::PtrComparison)
+                || super::is_cursor_reason(&record.reason)
+        }
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Cursor { .. } => false,
+    }
+}
+fn selected(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
+    ctx.sign.may_be_negative(s.fn_did, s.local)
+        || (ordering_participant(ctx, s) && ordering_degraded(decision))
+}
 pub(super) fn plan(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     decision: &Decision,
     entries: &[(Subject, Decision)],
 ) -> Option<Result<CursorPlan, CursorHold>> {
-    if !ctx.sign.may_be_negative(subject.fn_did, subject.local) || subject.ptr_depth != 1 {
+    if !selected(ctx, subject, decision) || subject.ptr_depth != 1 {
         return None;
     }
     match decision {
@@ -734,7 +767,9 @@ pub(super) fn plan(
         found: false,
     };
     offsets.visit_body(ctx.tcx.hir_body_owned_by(subject.fn_did));
-    if !offsets.found {
+    // An end marker (`p < end`) may carry no arithmetic of its own; ordering
+    // participation admits it beside the walked cursor.
+    if !offsets.found && !ordering_participant(ctx, subject) {
         return None;
     }
     Some(build(ctx, subject, entries))
@@ -786,9 +821,6 @@ fn build(
             composed: vec![],
         }
     } else {
-        if subject.ty_span.is_none() {
-            return Err(CursorHold::DeclarationUnbuilt);
-        }
         base(
             ctx,
             subject,
@@ -797,6 +829,27 @@ fn build(
                 .expect_expr(),
             entries,
         )?
+    };
+    // An untyped local (`let mut q = p.offset(k)`) gets its cursor type as an
+    // explicit declaration (the custody instrument rejects inferred types); the
+    // pointee is the compiler's, rendered.
+    let explicit_declaration = if !parameter && subject.ty_span.is_none() {
+        let ty::RawPtr(pointee, _) = *ctx
+            .tcx
+            .typeck(subject.fn_did)
+            .node_type(subject.hir_id)
+            .kind()
+        else {
+            return Err(CursorHold::DeclarationUnbuilt);
+        };
+        Some(type_text(
+            subject.mutable,
+            optional,
+            &pointee.to_string(),
+            None,
+        ))
+    } else {
+        None
     };
     let mut v = Uses {
         ctx,
@@ -849,6 +902,7 @@ fn build(
         bridges: v.bridges,
         local_bridges: vec![],
         composed_edit_spans: b.composed,
+        explicit_declaration,
     })
 }
 
@@ -989,20 +1043,16 @@ fn table_origin(
     None
 }
 
-fn candidate_shape(ctx: &Ctx<'_, '_>, s: &Subject) -> bool {
+fn candidate_shape(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
+    let uses = ctx.facts.raw_only_uses.get(&(s.fn_did, s.hir_id));
     s.ptr_depth == 1
-        && s.ty_span.is_some()
         && !s.null_init
-        && ctx.sign.may_be_negative(s.fn_did, s.local)
-        && ctx
-            .facts
-            .raw_only_uses
-            .get(&(s.fn_did, s.hir_id))
-            .is_some_and(|uses| {
-                uses.iter()
-                    .any(|(op, _)| ["offset", "add", "sub"].contains(&op.as_str()))
-                    && uses.iter().all(|(op, _)| op != "is_null")
-            })
+        && selected(ctx, s, decision)
+        && (uses.is_some_and(|uses| {
+            uses.iter()
+                .any(|(op, _)| ["offset", "add", "sub"].contains(&op.as_str()))
+        }) || ordering_participant(ctx, s))
+        && uses.is_none_or(|uses| uses.iter().all(|(op, _)| op != "is_null"))
 }
 
 pub(crate) fn parent_available(

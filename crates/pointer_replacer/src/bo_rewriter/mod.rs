@@ -8738,6 +8738,10 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
     }
     table.seams.explicit_declarations.extend(declarations);
     table.seams.zero_bridges.extend(receives);
+    table
+        .seams
+        .explicit_declarations
+        .extend(decision::cursor_native::explicit_declarations(table));
 }
 
 /// wave-6f (W6F-3), TEST ONLY: slot-kind overrides by name, so a fixture can

@@ -4363,6 +4363,9 @@ pub(crate) fn plan(
         // wave-6b: a region receiver is declared by its explicit-type site.
         let typed_receiver = typed_receiver
             || super::decision::void_region::typed_receiver(table, subject, decision);
+        let cursor_explicit = cursor_plan.is_some_and(|plan| plan.explicit_declaration.is_some());
+        let planned_declaration =
+            inferred_box || typed_pattern || typed_receiver || cursor_explicit;
         let (ty_file, declaration_edit) = if planned_declaration || typed_field_load || inferred_box || typed_pattern || typed_receiver {
             match span_to_loc(subject.binding_span) {
                 Ok((file, _, _)) => (file, None),
@@ -5397,6 +5400,7 @@ mod tests {
             delivered_base: None,
             local_bridges: vec![],
             composed_edit_spans: vec![],
+            explicit_declaration: None,
             bridges: vec![CursorBridge {
                 call_hir: hir(2),
                 callee: subject.fn_did,

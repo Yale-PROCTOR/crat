@@ -41,6 +41,9 @@ pub(crate) struct CursorPlan {
     /// Outer-subject use edits composed into the constructor text; the AST
     /// pass applies the constructor at that span and skips these.
     pub(crate) composed_edit_spans: Vec<rustc_span::Span>,
+    /// The cursor type to declare on an untyped local (`let mut q = …`), emitted
+    /// through the explicit-declaration site.
+    pub(crate) explicit_declaration: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +233,40 @@ pub(crate) fn promote(
     }
     compose_nested_uses(ctx, entries, &committed, &mut receipts);
     receipts
+}
+
+/// Explicit declaration sites for untyped cursor locals (one hook in `mod.rs`).
+pub(crate) fn explicit_declarations(
+    table: &super::DecisionTable,
+) -> Vec<super::seam::ExplicitDeclarationSite> {
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+    table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| match decision {
+            Decision::Cursor { plan, .. } => {
+                plan.explicit_declaration.as_ref().map(|emitted_type| {
+                    super::seam::ExplicitDeclarationSite {
+                        owner_class: SignatureClassId::of(subject.fn_did),
+                        caller: subject.fn_did,
+                        node: Some((subject.fn_did, subject.hir_id)),
+                        span: Some(subject.binding_span),
+                        category: "local",
+                        emitted_type: emitted_type.clone(),
+                        replacement: None,
+                        arm: "surface",
+                    }
+                })
+            }
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => None,
+        })
+        .collect()
 }
 
 fn use_edits_mut(decision: &mut Decision) -> Option<&mut Vec<super::emitability::UseEdit>> {
@@ -526,7 +563,7 @@ pub(crate) fn observe(
     }
 }
 
-fn is_cursor_reason(reason: &DegradeReason) -> bool {
+pub(super) fn is_cursor_reason(reason: &DegradeReason) -> bool {
     matches!(
         reason,
         DegradeReason::SliceNegOrUnknownOffset

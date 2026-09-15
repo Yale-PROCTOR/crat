@@ -740,3 +740,67 @@ pub unsafe fn caller(t: *const *const f64) -> f64 { sma(4, t, 2) }
         ),
     );
 }
+
+#[test]
+fn slicecursor_ordering_walk_to_derived_end() {
+    // brotli `ShannonEntropy`: a forward walk of a parameter cursor compared
+    // against a derived, untyped end (`population < population_end`).
+    let input = r#"
+pub unsafe fn entropy(mut population: *const u32, size: usize) -> u64 {
+    let mut sum = 0u64;
+    let mut population_end = population.offset(size as isize);
+    while population < population_end {
+        sum += *population as u64;
+        population = population.offset(1);
+    }
+    sum
+}
+"#;
+    let source = emitted(input);
+    save_fixture("ordering-walk-to-derived-end", input, &source);
+    assert!(
+        source.contains("let mut population_end: crate::slice_cursor::SliceCursor<'_, u32> ="),
+        "derived end declaration absent: {source}"
+    );
+    assert!(
+        source.contains(".as_ptr() < ") || source.contains(".as_ptr()) < "),
+        "ordering address view absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let p = [1u32, 2, 3, 4]; assert_eq!(unsafe { entropy(&p, 4) }, 10); assert_eq!(unsafe { entropy(&p[1..], 2) }, 5); }",
+        ),
+    );
+}
+
+#[test]
+fn slicecursor_ordering_two_parameters_with_difference() {
+    // lodepng `lodepng_chunk_next` / binn `AdvanceDataPos`: two parameter
+    // cursors ordered against each other and their difference taken; neither
+    // walks backward. (Its E2-permitted raw return is the seam's, not tested here.)
+    let input = r#"
+pub unsafe fn chunk_len(chunk: *mut u8, end: *mut u8) -> usize {
+    let available = end.offset_from(chunk) as usize;
+    if chunk >= end || available < 4 { return 0; }
+    *chunk.offset(3) as usize + available
+}
+"#;
+    let source = emitted(input);
+    save_fixture("ordering-two-parameters", input, &source);
+    assert!(
+        source.contains("slice_cursor::SliceCursor::new(chunk)")
+            && source.contains("slice_cursor::SliceCursor::new(end)"),
+        "wrapper absent: {source}"
+    );
+    assert!(
+        source.contains(".as_ptr()") && source.contains("offset_from("),
+        "address views absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let b = [0u8, 0, 0, 2, 9, 9, 9, 9]; assert_eq!(unsafe { chunk_len(&b[..], &b[8..]) }, 10); let c = [9u8, 9]; assert_eq!(unsafe { chunk_len(&c[..], &c[2..]) }, 0); }",
+        ),
+    );
+}
