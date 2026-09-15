@@ -351,6 +351,13 @@ fn box2_w3_malloc_sized_uses_numeric_default_fill() {
 /// BOX2-N3/R1 — a fixed header plus a separately-sized trailing allocation is
 /// a representation question, not an initializer failure. Wave 2 must retain
 /// the exact positive layout evidence in its dedicated hold.
+///
+/// **Golden moved under R217-2(a) by wave-6a W6A-T1 (2026-09-15, R404-2):** a
+/// program-private struct hack now takes the split form — `values:
+/// Box<[f64]>`, `Box::new(crate::Tail { .. })` with the count from the byte
+/// expression, `drop(p)` at the C free site. The Box plan's own PRIOR (the
+/// `default_fill_candidates` evidence) still records the typed hold with its
+/// layout evidence: the transaction overrides the prior, it does not erase it.
 #[test]
 fn box2_n3_flexible_tail_is_a_typed_hold_with_layout_evidence() {
     let src = format!(
@@ -370,15 +377,17 @@ fn box2_n3_flexible_tail_is_a_typed_hold_with_layout_evidence() {
     else {
         panic!("BOX2-N3 fixture must complete conservatively");
     };
-    let row = degradations
-        .iter()
-        .find(|row| row.subject == "f::p")
-        .expect("flexible-tail subject has a typed row");
-    assert_eq!(row.reason.key(), "box-flexible-tail-held");
-    let detail = row.reason.detail();
-    assert!(detail.contains("root_site="), "{detail}");
-    assert!(detail.contains("size_of::<Tail>"), "{detail}");
-    assert!(!source.contains("Box<"), "{source}");
+    assert!(
+        degradations.iter().all(|row| row.subject != "f::p"),
+        "W6A-T1 delivers the private struct hack: {degradations:#?}"
+    );
+    let compact = source.split_whitespace().collect::<String>();
+    assert!(compact.contains("values:Box<[f64]>}"), "{source}");
+    assert!(
+        compact.contains("letp:Box<Tail>=Box::new(crate::Tail{len:0asi32,values:vec![0asf64;(((n-1))+1)asusize].into_boxed_slice(),});"),
+        "{source}"
+    );
+    assert!(compact.contains("drop(p);"), "{source}");
     let evidence = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
         super::box_plan_artifact(tcx)
             .expect("Box plan artifact")

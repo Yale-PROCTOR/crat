@@ -49,6 +49,7 @@ pub(crate) mod declaration_pattern;
 pub(crate) mod emitability;
 pub(crate) mod exposure;
 pub(crate) mod field_reference;
+pub(crate) mod flexible_tail;
 pub(crate) mod interface;
 pub(crate) mod io_domain;
 pub(crate) mod lifetime;
@@ -976,6 +977,8 @@ pub(crate) enum Decision {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
     pub(crate) counted_void: counted_void::Contracts,
+    /// wave-6a W6A-T1: the admitted flexible-tail struct transactions.
+    pub(crate) flexible_tails: flexible_tail::Transactions,
     pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
     pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
@@ -1120,6 +1123,8 @@ impl DecisionTable {
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) counted_void: &'a counted_void::Contracts,
+    /// wave-6a W6A-T1: flexible-tail struct transactions (derived once).
+    pub(crate) flexible_tails: &'a flexible_tail::Transactions,
     pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
@@ -1258,6 +1263,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         .collect();
     DecisionTable {
         counted_void: ctx.counted_void.clone(),
+        flexible_tails: ctx.flexible_tails.clone(),
         nested_receipts: Vec::new(),
         cursor_receipts,
         sibling_overlap_inventory: Default::default(),
@@ -1746,6 +1752,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         tcx,
         io_domain,
         counted_void: _,
+        flexible_tails: _,
         void_pointee,
         thin_extent,
         local_callee_extent,
@@ -1843,6 +1850,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 slots,
                 subjects,
             );
+            // wave-6a W6A-T1: a flexible-tail transaction supplies the plan.
+            let prior = flexible_tail::override_plan(ctx, subject, prior);
             return match ownership_fields_hook::plan(ctx, subject, owning_slot, prior) {
                 Ok(plan) => Decision::Box(plan),
                 Err(failure) => degrade(subject, decl_site, DegradeReason::BoxFailure { failure }),
@@ -2504,6 +2513,7 @@ mod self_consistency_tests {
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
             counted_void: Default::default(),
+            flexible_tails: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

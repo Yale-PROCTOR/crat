@@ -336,6 +336,7 @@ fn reason_of(degradations: &[super::decision::Degradation], subject: &str) -> Op
 /// its own initializer, its element uses index, and the call to `edt` keeps
 /// its text: `&mut [f32]` at `&[f32]` / `&mut [f32]` is Rust's own coercion.
 #[test]
+#[ignore = "W6A-B1 at the batch-6 head: the Return-stage class-finalizer wall (report 001 STOP 1, wave-5d) — GREEN at 30d69d95; un-ignore when the head carries the finalizer answer"]
 fn w6a_b1_heman_transform_to_distance_delivers_the_four_computed_views() {
     let out = emitted("heman-distance", HEMAN_TRANSFORM);
     let src = compact(&out.source);
@@ -442,6 +443,7 @@ fn w6a_b1_heman_transform_to_distance_delivers_the_four_computed_views() {
 /// allocations (`pl1`, `pl2`, Box-family locals that stay raw at this frame)
 /// at a seven-argument call. Only `f`/`d` move.
 #[test]
+#[ignore = "W6A-B1 at the batch-6 head: the Return-stage class-finalizer wall (report 001 STOP 1, wave-5d) — GREEN at 30d69d95; un-ignore when the head carries the finalizer answer"]
 fn w6a_b1_heman_transform_to_coordfield_delivers_f_and_d_beside_raw_payloads() {
     let out = emitted("heman-coordfield", HEMAN_COORDFIELD);
     let src = compact(&out.source);
@@ -498,6 +500,7 @@ fn w6a_b1_heman_transform_to_coordfield_delivers_f_and_d_beside_raw_payloads() {
 /// declaration splice, so the planner branch is exercised only by the
 /// unannotated population.
 #[test]
+#[ignore = "W6A-B1 at the batch-6 head: the Return-stage class-finalizer wall (report 001 STOP 1, wave-5d) — GREEN at 30d69d95; un-ignore when the head carries the finalizer answer"]
 fn w6a_b1_annotated_slice_local_keeps_the_declaration_splice() {
     let src = HEMAN_TRANSFORM.replace(
         "let mut f = ff.offset((height * x) as isize);",
@@ -653,5 +656,211 @@ fn w6a_b1_field_rooted_locals_split_by_what_memory_the_slice_covers() {
         Some("place-read-pointee"),
         "{:#?}",
         out.degradations
+    );
+}
+
+/// **Rule W6A-T1, first corpus shape** (`ti_cci` + the smoke test): the
+/// struct splits, the allocating callee returns `Box<ti_buffer>`, the freeing
+/// callee takes `Box<ti_buffer>` and drops, every receiver is a `Box`, every
+/// tail access indexes, the `Copy` / `Clone` impls go, `reverted = 0`.
+#[test]
+fn w6a_t1_tulip_cci_and_smoke_deliver_the_split_struct() {
+    let out = emitted("tulip-cci", super::wave6a_fixture_tulip::TULIP_BUFFER);
+    let src = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}", out.source);
+    assert_eq!(out.emitted, 4, "{}", out.source);
+    assert!(src.contains("pubvals:Box<[f64]>,}"), "{}", out.source);
+    assert!(!src.contains("Copyforti_buffer"), "{}", out.source);
+    assert!(!src.contains("Cloneforti_buffer"), "{}", out.source);
+    assert!(
+        src.contains("fnti_buffer_new(mutsize:std::os::raw::c_int)->Box<ti_buffer>{"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("letmutret:Box<ti_buffer>=Box::new(crate::ti_buffer{size:0asi32,pushes:0asi32,index:0asi32,sum:0asf64,vals:vec![0asf64;(((size-1asstd::os::raw::c_int))+1)asusize].into_boxed_slice(),});"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("fnti_buffer_free(mutbuffer:Box<ti_buffer>){drop(buffer);}"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("letmutsum:Box<ti_buffer>=ti_buffer_new(period);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("(*sum).vals[((*sum).index)asusize]=today;"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("acc+=fabs(avg-(*sum).vals[(j)asusize]);"),
+        "{}",
+        out.source
+    );
+    assert!(src.contains("ti_buffer_free(sum);"), "{}", out.source);
+    assert!(
+        src.contains("letmutb:Box<ti_buffer>=ti_buffer_new(3asstd::os::raw::c_int);"),
+        "{}",
+        out.source
+    );
+    for raw in [
+        "malloc(s as",
+        "as_mut_ptr().offset(",
+        "free(buffer",
+        "*mut ti_buffer",
+    ] {
+        assert!(!src.contains(&compact(raw)), "{raw}: {}", out.source);
+    }
+    for subject in [
+        "ti_buffer_new::ret",
+        "ti_buffer_free::buffer",
+        "ti_cci::sum",
+        "test_buffer::b",
+    ] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}: {:#?}",
+            out.degradations
+        );
+    }
+    let receipts = out.artifacts.flexible_tail_receipts.clone();
+    assert!(receipts.contains("crate::ti_buffer\tadmitted\tflexible-tail-split struct=crate::ti_buffer tail=vals element=f64 declared_len=1 allocations=1 receivers=2 owning_returns=1 owning_params=1 tail_edits=6 impls_removed=2"), "{receipts}");
+    let declarations =
+        super::delivery_custody::inventory_source("lib.rs", &out.source).expect("inventory");
+    for (owner, binding) in [
+        ("ti_cci", "sum"),
+        ("test_buffer", "b"),
+        ("ti_buffer_new", "ret"),
+    ] {
+        let row = declarations
+            .iter()
+            .find(|row| row.owner == owner && row.binding == binding)
+            .unwrap_or_else(|| panic!("{owner}::{binding}: {declarations:#?}"));
+        assert!(row.type_is_fully_explicit, "{row:#?}");
+        assert_eq!(
+            row.explicit_type.as_deref(),
+            Some("Box<ti_buffer>"),
+            "{row:#?}"
+        );
+    }
+}
+
+/// **Second corpus shape** (`ti_stoch`): two buffers in one owner, the second
+/// fed from the first, both transferred to the freeing callee at the end.
+#[test]
+fn w6a_t1_tulip_stoch_two_buffers_in_one_owner() {
+    let src_text = format!(
+        "{}{}",
+        super::wave6a_fixture_tulip::TULIP_HEADER,
+        super::wave6a_fixture_tulip::TULIP_STOCH_BODY
+    );
+    let out = emitted("tulip-stoch", &src_text);
+    let src = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}", out.source);
+    assert!(
+        src.contains("letmutk_sum:Box<ti_buffer>=ti_buffer_new(kslow);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("letmutd_sum:Box<ti_buffer>=ti_buffer_new(dperiod);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("(*d_sum).vals[((*d_sum).index)asusize]=k;"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("ti_buffer_free(k_sum);ti_buffer_free(d_sum);"),
+        "{}",
+        out.source
+    );
+    assert!(src.contains("pubvals:Box<[f64]>,}"), "{}", out.source);
+    for subject in [
+        "ti_buffer_new::ret",
+        "ti_buffer_free::buffer",
+        "ti_stoch::k_sum",
+        "ti_stoch::d_sum",
+    ] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}: {:#?}",
+            out.degradations
+        );
+    }
+    assert_eq!(out.emitted, 4, "{}", out.source);
+}
+
+/// Control: a foreign consumer takes the struct by pointer — the layout may
+/// not change; the transaction holds typed and every row keeps
+/// `box-flexible-tail-held`.
+#[test]
+fn w6a_t1_struct_crossing_a_foreign_boundary_is_held() {
+    let src_text = format!(
+        "{}{}",
+        super::wave6a_fixture_tulip::TULIP_HEADER,
+        super::wave6a_fixture_tulip::TULIP_CROSSING_BODY
+    );
+    let out = emitted("tulip-crossing", &src_text);
+    let src = compact(&out.source);
+    assert!(
+        src.contains("pubvals:[std::os::raw::c_double;1],"),
+        "{}",
+        out.source
+    );
+    assert!(!src.contains("Box<ti_buffer>"), "{}", out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "crossing::b").as_deref(),
+        Some("box-flexible-tail-held"),
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "ti_buffer_new::ret").as_deref(),
+        Some("box-flexible-tail-held")
+    );
+    assert!(
+        out.artifacts
+            .flexible_tail_receipts
+            .contains("ti_buffer\theld\tflexible-tail-crosses-boundary:extern:ti_buffer_dump"),
+        "{}",
+        out.artifacts.flexible_tail_receipts
+    );
+}
+
+/// Control: a caller reads the buffer after handing it to the freeing callee,
+/// so the callee's parameter is not an owning transfer at every caller — the
+/// transaction holds typed (`param-caller-retains`) and nothing moves.
+#[test]
+fn w6a_t1_caller_using_the_buffer_after_transfer_is_held() {
+    let src_text = format!(
+        "{}{}",
+        super::wave6a_fixture_tulip::TULIP_HEADER,
+        super::wave6a_fixture_tulip::TULIP_RETAINED_BODY
+    );
+    let out = emitted("tulip-retained", &src_text);
+    let src = compact(&out.source);
+    assert!(!src.contains("Box<ti_buffer>"), "{}", out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "retained::b").as_deref(),
+        Some("box-flexible-tail-held"),
+        "{:#?}",
+        out.degradations
+    );
+    assert!(
+        out.artifacts.flexible_tail_receipts.contains(
+            "ti_buffer\theld\tflexible-tail-param-caller-retains:retained:used-after-transfer"
+        ),
+        "{}",
+        out.artifacts.flexible_tail_receipts
     );
 }

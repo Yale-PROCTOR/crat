@@ -3648,6 +3648,55 @@ pub(crate) fn plan(
             }),
         }
     }
+    // wave-6a W6A-T1: the span layer's copy of the flexible-tail transaction —
+    // item edits (field type, impls, owning signatures) and tail accesses —
+    // charged to the transaction's owner class so a class revert takes them.
+    for transaction in table.flexible_tails.structs.values() {
+        let owner_class = SignatureClassId::of(transaction.owner_class_fn);
+        for (kind, edits) in [
+            ("flexible-tail-item", &transaction.item_edits),
+            ("flexible-tail-access", &transaction.tail_edits),
+        ] {
+            for (span, replacement) in edits {
+                let bridge = BridgeSitePlan::local(
+                    transaction.owner_class_fn,
+                    transaction.owner_class_fn,
+                    Arm::Surface.key(),
+                    format!("{kind}:{}..{}", span.lo().0, span.hi().0),
+                    kind,
+                );
+                match span_to_loc(*span) {
+                    Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
+                        lo,
+                        hi,
+                        replacement: replacement.clone(),
+                        justification: Justification::SeamAdapter {
+                            family: "safe",
+                            fabricated: false,
+                        },
+                        owner_class: Some(owner_class),
+                        owner_path: transaction.struct_path.clone(),
+                        bridge: Some(bridge),
+                        atom_ids: Vec::new(),
+                        subject_id: transaction.struct_path.clone(),
+                        required_arms: owner_arms
+                            .get(&owner_class)
+                            .copied()
+                            .unwrap_or_default()
+                            .render(),
+                        edit_kind: kind,
+                    }),
+                    Err(reason) => unplaceable.push(Unplaceable {
+                        owner_class,
+                        bridge,
+                        reason,
+                        detail: format!("{kind} for {}", transaction.struct_path),
+                        subject: transaction.struct_path.clone(),
+                    }),
+                }
+            }
+        }
+    }
     for storage in &table.depth2_npo_storages {
         let owner = SignatureClassId::of(storage.node.0);
         let subject_id = table
@@ -5437,6 +5486,7 @@ mod tests {
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
             counted_void: Default::default(),
+            flexible_tails: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
@@ -5588,6 +5638,7 @@ mod tests {
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
             counted_void: Default::default(),
+            flexible_tails: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

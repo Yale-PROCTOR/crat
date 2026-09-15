@@ -83,6 +83,7 @@ mod construction_values_tests;
 #[cfg(test)]
 mod exclusion_rederivation_tests;
 mod field_reference_ast;
+pub(crate) mod flexible_tail_ast;
 pub(crate) mod ownership_fields;
 #[cfg(test)]
 mod ownership_fields_bodylocal_tests;
@@ -120,6 +121,8 @@ mod wave6f_field_reference_tests;
 pub(crate) mod wave6r_child_access;
 #[cfg(test)]
 mod wave6a_allocation_tests;
+#[cfg(test)]
+mod wave6a_fixture_tulip;
 mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;
 
@@ -368,6 +371,8 @@ pub(crate) struct E2Timings {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RawBoundaryArtifacts {
+    /// wave-6a W6A-T1: flexible-tail struct transactions (admitted / held).
+    pub(crate) flexible_tail_receipts: String,
     /// R369 FIELD-CP observer, captured from the same frozen decision pass.
     pub(crate) ownership_native: String,
     pub(crate) shared_permissions: Vec<decision::overlapping_pairs::consumer::Permission>,
@@ -7010,6 +7015,10 @@ fn finish_decide<'tcx>(
     // task 2 only.** Production has passed `LiftAdaptable` since S3.6-1 and the
     // `BlockAll` variant was deleted at M-3 (X-3). Task 3 is where the verdict
     // reaches a gate.
+    // wave-6a W6A-T1: flexible-tail struct transactions, derived once from the
+    // construction facts and the subject universe (no model, no analysis).
+    let flexible_tails =
+        decision::flexible_tail::derive(tcx, &program.functions, &ctors, &subjects);
     let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
     let mut predecessor: Option<additive::StageSnapshot> = None;
     let mut native_ownership_candidates = decision::ownership_fields_native::Candidates::default();
@@ -7120,6 +7129,7 @@ fn finish_decide<'tcx>(
                 decision::Ctx {
                     tcx,
                     counted_void: &counted_void,
+                    flexible_tails: &flexible_tails,
                     return_receivers,
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,
@@ -7846,6 +7856,7 @@ fn finish_decide<'tcx>(
         };
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
+            flexible_tail_receipts: table.flexible_tails.receipts_tsv(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             shared_permissions: table.seams.shared_required.clone(),
             shared_pair_receipts: String::new(),

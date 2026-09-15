@@ -2943,6 +2943,14 @@ fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Resu
         super::mechanical_receipt::present_unsafe_text(format!("&mut *{name}"), enclosing_unsafe_fn)
     } else if matches!(form, Some(Form::Ref { mutable: false })) {
         super::mechanical_receipt::present_unsafe_text(format!("&*{name}"), enclosing_unsafe_fn)
+    } else if ty.starts_with("Box<") && !ty.starts_with("Box<[") {
+        // wave-6a W6A-T1: an owning parameter re-enters ownership from the raw
+        // allocation the C ABI carried (every in-crate producer is
+        // `Box::into_raw` at the allocating callee's wrapper).
+        super::mechanical_receipt::present_unsafe_text(
+            format!("Box::from_raw({name})"),
+            enclosing_unsafe_fn,
+        )
     } else if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
         return Err("inbound-wrapper-unplaceable: owning parameter held by Arm B".to_owned());
     } else {
@@ -3078,7 +3086,12 @@ fn surface_wrapper_block_with_arguments(
                 format!(
                     "{{ let __crat_result: {result_ty} = {call}; core::ptr::from_ref(__crat_result) }}"
                 )
-            } else if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
+            } else if ty.starts_with("Box<") {
+                // wave-6a W6A-T1: an owning return crosses the C ABI as the
+                // raw allocation it always was; the caller side owns it again
+                // through `Box::from_raw` at the freeing callee's wrapper.
+                format!("Box::into_raw({call})")
+            } else if ty.starts_with("Option<Box<") {
                 return Err("inbound-wrapper-unplaceable: owning return held by Arm B".to_owned());
             } else {
                 call
@@ -3775,6 +3788,9 @@ fn transform_with<'tcx>(
     // E5C-3: hoist the pure reads a moving argument would invalidate, before
     // the use grafts (a moved read keeps its spans).
     super::field_reference_ast::apply_hoists(table, reverts, &mut krate, &mut guard)?;
+
+    // wave-6a W6A-T1: flexible-tail struct items, impls and owning signatures.
+    super::flexible_tail_ast::apply(tcx, capture, table, reverts, &mut krate, &mut guard)?;
 
     // **ARMS 2 AND 3 CONSUME THE SHARED BUILDER** (M-2). Their visitors carry no
     // site check, so their revert semantics live entirely in how these maps are
@@ -4952,6 +4968,18 @@ pub(crate) fn filtered_inputs(
         .flatten()
         .map(|span| (span.lo().0, span.hi().0))
         .collect::<FxHashSet<_>>();
+    // wave-6a W6A-T1: a flexible-tail transaction's tail accesses, crate-wide,
+    // active only while none of its owners is reverted.
+    for transaction in super::flexible_tail_ast::active(table, reverts) {
+        for (span, replacement) in &transaction.tail_edits {
+            insert_counting(
+                &mut out.uses,
+                (span.lo().0, span.hi().0),
+                replacement.clone(),
+                &mut out.use_key_collisions,
+            );
+        }
+    }
     for (subject, decision) in &table.entries {
         let use_edits = match decision {
             super::decision::Decision::Cursor { plan, .. } => Some(&plan.uses),
