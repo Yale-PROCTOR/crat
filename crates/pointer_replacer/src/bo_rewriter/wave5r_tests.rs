@@ -10,7 +10,11 @@ pub unsafe fn inspect(info: *const Info) -> i32 {
 }
 "#;
 
-/// A cast repair cannot supply the multi-byte extent of fwrite's source.
+/// A cast repair cannot supply the multi-byte extent of fwrite's source; the
+/// contract can. Since wave-4 #1b's `fwrite` row (R386-3) the position is a
+/// counted contract, so the counted buffer takes the SLICE form with the
+/// exact count `buffersize` — never the one-byte reference this witness was
+/// written against — and the raw function is no longer retained.
 #[test]
 fn wave5r_e0606_counted_foreign_read_stays_raw_without_extent() {
     let input = r#"
@@ -25,8 +29,8 @@ fn wave5r_e0606_counted_foreign_read_stays_raw_without_extent() {
     "#;
     let attempted = ast_source_reverting(input, None);
     assert!(
-        !super::verify::type_checks_str(&attempted),
-        "the unlicensed one-byte form must not be made compilable: {attempted}"
+        !attempted.contains("buffer: &u8"),
+        "the unlicensed one-byte form is never attempted: {attempted}"
     );
     let outcome = super::rewrite_core_injected(
         ::utils::compilation::str_to_input(input),
@@ -56,13 +60,17 @@ fn wave5r_e0606_counted_foreign_read_stays_raw_without_extent() {
     println!("R5-HELD {source}");
     assert!(super::verify::type_checks_str(&source));
     assert!(
-        source.contains("buffer: *const u8"),
-        "one-byte reference must not replace the counted buffer: {source}"
+        source.contains("buffer: &[u8]")
+            && source.contains(
+                "fwrite(buffer.as_ptr().cast::<core::ffi::c_void>(), 1, buffersize, file)"
+            ),
+        "the counted buffer takes the slice form with its exact count: {source}"
     );
     assert!(
-        reverted_count > 0,
-        "existing verifier conservatively retains the raw function"
+        !source.contains("buffer: &u8"),
+        "one-byte reference must not replace the counted buffer: {source}"
     );
+    assert_eq!(reverted_count, 0, "nothing is retained raw: {source}");
 }
 
 #[test]

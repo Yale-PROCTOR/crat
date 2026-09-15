@@ -327,7 +327,18 @@ pub(crate) fn select(
             Requirement::ExactAccess(None) => LengthPlan::Fallback(FallbackReason::CountMissing),
             Requirement::UpperBound(_) => LengthPlan::Fallback(FallbackReason::UpperBound),
             Requirement::NulTerminated => LengthPlan::Fallback(FallbackReason::NulTerminated),
-            Requirement::ElementCount(_) => LengthPlan::Fallback(FallbackReason::ElementCount),
+            // #1b (R386-3): `size * nmemb` proved in elements is exact evidence.
+            Requirement::ElementCount(Some(count)) => match &count.elements {
+                Ok(elements) => LengthPlan::Evidence {
+                    elements: elements.clone(),
+                    source: LengthSource::ExactContract {
+                        site: count.site.clone(),
+                        argument_index: count.argument_index,
+                    },
+                },
+                Err(gap) => LengthPlan::Fallback(FallbackReason::CountGap(gap.clone())),
+            },
+            Requirement::ElementCount(None) => LengthPlan::Fallback(FallbackReason::ElementCount),
             Requirement::UnboundedWrite => LengthPlan::Fallback(FallbackReason::UnboundedWrite),
             Requirement::LocalAccess => LengthPlan::Fallback(FallbackReason::LocalAccess),
             Requirement::OneElement | Requirement::Lifecycle => unreachable!("filtered above"),

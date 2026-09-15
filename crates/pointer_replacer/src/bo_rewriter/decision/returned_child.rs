@@ -300,6 +300,7 @@ pub(crate) fn derive_type_backed<'tcx>(
                     extent: ArgumentExtent::Unclassified,
                     count_argument_index: None,
                     count_is_exact: false,
+                    size_argument_index: None,
                     returns_alias_of: Some(index),
                     provenance: "type-derived-return-carrier",
                 },

@@ -114,6 +114,10 @@ pub(crate) struct ArgumentContract {
     /// units, construction identity, and whether the count is exact or upper.
     pub count_argument_index: Option<usize>,
     pub count_is_exact: bool,
+    /// Wave-4 #1b (R386-3): the call argument carrying the element SIZE of an
+    /// `ElementCount` position (`fwrite(ptr, size, nmemb, stream)`), so the
+    /// byte extent is `size * nmemb`.
+    pub size_argument_index: Option<usize>,
     /// Function-level relation: a non-null returned view derives from this
     /// zero-based argument. Consumers must compare it with their own argument
     /// index; its presence does not make every argument the returned parent.
@@ -153,6 +157,7 @@ struct ContractRow {
     extent: ArgumentExtent,
     count_argument_index: Option<usize>,
     count_is_exact: bool,
+    size_argument_index: Option<usize>,
 }
 
 impl ContractRow {
@@ -170,6 +175,13 @@ impl ContractRow {
             ..self
         }
     }
+
+    const fn with_size(self, argument_index: usize) -> Self {
+        Self {
+            size_argument_index: Some(argument_index),
+            ..self
+        }
+    }
 }
 
 const fn row(symbol: &'static str, position: usize, access: PointeeAccess) -> ContractRow {
@@ -182,6 +194,7 @@ const fn row(symbol: &'static str, position: usize, access: PointeeAccess) -> Co
         extent: ArgumentExtent::Unclassified,
         count_argument_index: None,
         count_is_exact: false,
+        size_argument_index: None,
     }
 }
 
@@ -213,6 +226,17 @@ const TABLE: &[ContractRow] = &[
         .with_count(1, true),
     row("fopen", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("fopen", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    // Wave-4 #1b rider (R386-3): `size * nmemb` bytes at the pointer, read by
+    // `fwrite`, written by `fread` (the writable-destination premise applies).
+    // N1570 §7.21.8.1–2.
+    row("fread", 0, PointeeAccess::Write)
+        .with(ArgumentExtent::ElementCount)
+        .with_count(2, true)
+        .with_size(1),
+    row("fwrite", 0, PointeeAccess::Read)
+        .with(ArgumentExtent::ElementCount)
+        .with_count(2, true)
+        .with_size(1),
     row("fprintf", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("fputs", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("fscanf", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
@@ -278,6 +302,7 @@ const TABLE: &[ContractRow] = &[
         extent: ArgumentExtent::Lifecycle,
         count_argument_index: None,
         count_is_exact: false,
+        size_argument_index: None,
     },
     ContractRow {
         symbol: "free",
@@ -288,6 +313,7 @@ const TABLE: &[ContractRow] = &[
         extent: ArgumentExtent::Lifecycle,
         count_argument_index: None,
         count_is_exact: false,
+        size_argument_index: None,
     },
     ContractRow {
         symbol: "realloc",
@@ -298,6 +324,7 @@ const TABLE: &[ContractRow] = &[
         extent: ArgumentExtent::Lifecycle,
         count_argument_index: None,
         count_is_exact: false,
+        size_argument_index: None,
     },
 ];
 
@@ -394,6 +421,7 @@ fn family_contract(
         extent,
         count_argument_index: None,
         count_is_exact: false,
+        size_argument_index: None,
         returns_alias_of: function_return_alias(symbol),
         provenance,
     }))
@@ -434,6 +462,7 @@ pub(crate) fn classify_contract(
         extent: row.extent,
         count_argument_index: row.count_argument_index,
         count_is_exact: row.count_is_exact,
+        size_argument_index: row.size_argument_index,
         returns_alias_of: row.returns_alias_of,
         provenance: "pinned-libc-0.2.184",
     })
@@ -611,6 +640,7 @@ mod tests {
                 extent: ArgumentExtent::NulTerminated,
                 count_argument_index: None,
                 count_is_exact: false,
+                size_argument_index: None,
                 returns_alias_of: None,
                 provenance: "pinned-libc-0.2.184",
             })

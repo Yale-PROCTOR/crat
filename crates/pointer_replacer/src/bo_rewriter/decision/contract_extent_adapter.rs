@@ -1,6 +1,6 @@
 //! Compiler-fact adapter and terminal receipt helpers for contract extent.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{HirId, def_id::LocalDefId};
 
 use super::{
@@ -211,6 +211,18 @@ fn byte_pointee(pointee: &str) -> bool {
     matches!(pointee.trim(), "u8" | "i8")
 }
 
+/// The element type the count is measured against: the callee's pointee, or
+/// — at a `c_void` position such as `fwrite`'s — the ARGUMENT's own pointee,
+/// which is what the subject is a slice of.
+fn element_pointee(fact: &super::raw_boundary::ForeignCallArgFact) -> String {
+    let target = fact.target.pointee.trim();
+    if target == "c_void" || target.ends_with("::c_void") {
+        fact.operand_pointee.trim().to_owned()
+    } else {
+        target.to_owned()
+    }
+}
+
 fn initialized_write_source(
     subject: &Subject,
     constructions: &ConstructionFacts,
@@ -266,10 +278,11 @@ pub(crate) fn collect(
         else {
             continue;
         };
-        if contract.returns_alias_of == Some(fact.argument_index) {
-            // #1a does not yet carry the returned-child custody needed to
-            // replace the parent pointer. Exact-count memcpy destination
-            // ownership is the separately bounded #1b transaction.
+        if contract.returns_alias_of == Some(fact.argument_index) && !fact.return_unused {
+            // #1b: a returned alias of this argument (`memcpy` returns its
+            // destination) is admitted only where the caller discards the
+            // return, so nothing retains the alias while the slice lives; a
+            // used return stays with the returned-child custody it needs.
             continue;
         }
         if matches!(
@@ -301,7 +314,7 @@ pub(crate) fn collect(
             site: site_key.clone(),
             construction: construction.clone(),
             argument_index: count.argument_index,
-            elements: if byte_pointee(&fact.target.pointee) {
+            elements: if byte_pointee(&element_pointee(fact)) {
                 Ok(count.expression.clone())
             } else {
                 Err(CountGap::UnitsUnproved)
@@ -378,10 +391,119 @@ pub(crate) fn collect(
             }
         }
     }
+    // #1b — the reader chain (relay 005 §2 / R349-1, made native): a caller
+    // argument that DENOTES a caller subject and is handed to a local callee
+    // parameter that reaches a foreign multi-element position is itself read
+    // to that extent. The callee's requirement is propagated to the caller as
+    // a `via-local-callee` site, transitively, so the whole chain takes the
+    // slice form and no hop narrows to a thin reference. Exact counts do not
+    // transport (they belong to the callee's own call): a counted requirement
+    // arrives as its count-less twin and takes the fallback extent.
+    // Only a callee whose slice form would be DUE to the contract seeds the
+    // chain: a parameter that is a slice by its own arithmetic stays R365-2's
+    // census item, and its callers are not re-decided here.
+    let arithmetic_slice = |node: (LocalDefId, HirId)| -> bool {
+        subjects.get(&node).is_some_and(|subject| {
+            facts.raw_only_uses.get(&node).is_some_and(|uses| {
+                uses.iter()
+                    .any(|(op, _)| super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
+                    && fat.is_array(node.0, subject.local)
+            })
+        })
+    };
+    let mut worklist = by_subject
+        .iter()
+        .filter(|(node, candidate)| {
+            !arithmetic_slice(**node)
+                && candidate
+                    .sites
+                    .iter()
+                    .any(|site| !matches!(site.requirement, Requirement::LocalAccess))
+        })
+        .map(|(&node, _)| node)
+        .collect::<Vec<_>>();
+    let mut propagated_from = FxHashSet::<((LocalDefId, HirId), (LocalDefId, HirId))>::default();
+    while let Some(callee_node) = worklist.pop() {
+        let Some(callee_subject) = subjects.get(&callee_node).copied() else { continue };
+        let SubjectKind::Param { hir_index } = callee_subject.kind else { continue };
+        let Some(sites) = by_subject.get(&callee_node).map(|candidate| {
+            candidate
+                .sites
+                .iter()
+                .filter(|site| !matches!(site.requirement, Requirement::LocalAccess))
+                .cloned()
+                .collect::<Vec<_>>()
+        }) else {
+            continue;
+        };
+        let Some(calls) = facts.call_args.get(&callee_node.0) else { continue };
+        for call in calls {
+            for argument in call
+                .args
+                .iter()
+                .filter(|argument| argument.index == hir_index)
+            {
+                let root = match argument.shape {
+                    ArgShape::BareLocal(root) | ArgShape::CastOfLocal { binding: root, .. } => root,
+                    _ => continue,
+                };
+                let caller_node = (call.caller, root);
+                let Some(caller_subject) = subjects.get(&caller_node).copied() else { continue };
+                if caller_subject.ptr_depth != 1
+                    || arithmetic_slice(caller_node)
+                    || !propagated_from.insert((callee_node, caller_node))
+                {
+                    continue;
+                }
+                let key = subject_key(caller_subject);
+                let construction = construction_key(caller_subject, constructions);
+                let had_sites = by_subject.contains_key(&caller_node);
+                let candidate = by_subject.entry(caller_node).or_insert_with(|| Candidate {
+                    subject: key.clone(),
+                    construction: construction.clone(),
+                    sites: Vec::new(),
+                });
+                for site in &sites {
+                    candidate.sites.push(ContractSite {
+                        subject: key.clone(),
+                        site: format!(
+                            "owner={}:call={}..{}:callee=local:{}:arg={}:via={}",
+                            call.caller.local_def_index.as_u32(),
+                            call.span.lo().0,
+                            call.span.hi().0,
+                            callee_node.0.local_def_index.as_u32(),
+                            argument.index,
+                            site.site,
+                        ),
+                        contract: format!(
+                            "via-local-callee:{}:{}:{}",
+                            callee_node.0.local_def_index.as_u32(),
+                            hir_index,
+                            site.contract,
+                        ),
+                        requirement: match &site.requirement {
+                            Requirement::ExactAccess(_) => Requirement::ExactAccess(None),
+                            Requirement::UpperBound(_) => Requirement::UpperBound(None),
+                            Requirement::ElementCount(_) => Requirement::ElementCount(None),
+                            other => other.clone(),
+                        },
+                    });
+                }
+                if !had_sites {
+                    worklist.push(caller_node);
+                } else if !worklist.contains(&caller_node) {
+                    worklist.push(caller_node);
+                }
+            }
+        }
+    }
     for candidate in by_subject.values_mut() {
         candidate
             .sites
             .sort_by(|left, right| left.site.cmp(&right.site));
+        candidate
+            .sites
+            .dedup_by(|left, right| left.site == right.site);
     }
     // R397-6(b): the up-front decline, read from the candidate's own uses
     // before any selection. A declined candidate is never attempted, so no
@@ -401,26 +523,69 @@ pub(crate) fn collect(
     // widened into the promoted slice by `from_ref`. Counted per candidate
     // parameter over every call site; the callee is declined, never the caller
     // re-decided.
-    let would_be_thin = |caller: LocalDefId, root: HirId| -> bool {
-        let Some(subject) = subjects.get(&(caller, root)) else {
-            return false;
-        };
-        let model_ref = slots
-            .fn_local_slots
-            .get(&caller)
-            .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
-            .is_some_and(|slot| model.get(&SlotRef::Local(caller, slot)) == Some(&SlotKind::Ref));
-        let own_slice = facts
-            .raw_only_uses
-            .get(&(caller, root))
-            .is_some_and(|uses| {
+    let model_ref = |node: (LocalDefId, HirId)| -> bool {
+        subjects.get(&node).is_some_and(|subject| {
+            slots
+                .fn_local_slots
+                .get(&node.0)
+                .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                .is_some_and(|slot| {
+                    model.get(&SlotRef::Local(node.0, slot)) == Some(&SlotKind::Ref)
+                })
+        })
+    };
+    let own_slice = |node: (LocalDefId, HirId)| -> bool {
+        subjects.get(&node).is_some_and(|subject| {
+            facts.raw_only_uses.get(&node).is_some_and(|uses| {
                 uses.iter()
                     .any(|(op, _)| super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
-                    && fat.is_array(caller, subject.local)
-            });
-        model_ref && !own_slice
+                    && fat.is_array(node.0, subject.local)
+            })
+        })
     };
-    let thin_caller_arguments = |node: (LocalDefId, HirId)| -> usize {
+    // A candidate that would PROMOTE under the pure selector's own gates
+    // (BO `Ref`, depth 1, `Arr`, at least one multi-element site) and is not
+    // declined at this iteration. The chain is decided as a greatest fixpoint:
+    // every candidate starts promotable, a decline removes it, and a removal
+    // may decline the callee it fed (thin caller) or the caller it carried
+    // (local-callee boundary), until nothing moves.
+    let promotable = |node: (LocalDefId, HirId), declined: &FxHashMap<_, DeclineCause>| -> bool {
+        !declined.contains_key(&node)
+            && model_ref(node)
+            && subjects.get(&node).is_some_and(|subject| {
+                subject.ptr_depth == 1 && fat.is_array(node.0, subject.local)
+            })
+            && by_subject.get(&node).is_some_and(|candidate| {
+                candidate.sites.iter().any(|site| {
+                    !matches!(
+                        site.requirement,
+                        Requirement::LocalAccess | Requirement::OneElement | Requirement::Lifecycle
+                    )
+                })
+            })
+    };
+    // A caller subject with a raw-only use that is neither arithmetic nor a
+    // null test is decided raw by the ladder (`raw-pointer-operation`) and is
+    // bridged raw, never widened.
+    let own_raw_use = |node: (LocalDefId, HirId)| -> bool {
+        facts.raw_only_uses.get(&node).is_some_and(|uses| {
+            uses.iter().any(|(op, _)| {
+                !super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()) && op != "is_null"
+            })
+        })
+    };
+    let would_be_thin =
+        |caller: LocalDefId, root: HirId, declined: &FxHashMap<_, DeclineCause>| -> bool {
+            let node = (caller, root);
+            subjects.contains_key(&node)
+                && model_ref(node)
+                && !own_slice(node)
+                && !own_raw_use(node)
+                && !promotable(node, declined)
+        };
+    let thin_caller_arguments = |node: (LocalDefId, HirId),
+                                 declined: &FxHashMap<_, DeclineCause>|
+     -> usize {
         let Some(subject) = subjects.get(&node) else { return 0 };
         let SubjectKind::Param { hir_index } = subject.kind else { return 0 };
         facts
@@ -437,17 +602,55 @@ pub(crate) fn collect(
                 argument.index == hir_index
                     && match argument.shape {
                         ArgShape::BareLocal(root) | ArgShape::CastOfLocal { binding: root, .. } => {
-                            would_be_thin(*caller, root)
+                            would_be_thin(*caller, root, declined)
                         }
                         _ => false,
                     }
             })
             .count()
     };
+    // A raw use at a LOCAL callee argument whose parameter is a promotable
+    // candidate of the SAME slice form is carried by the zero-syntax interface
+    // carrier (`slice_use.rs`); every other local boundary use stays declined.
+    let local_boundary_uses = |node: (LocalDefId, HirId),
+                               declined: &FxHashMap<_, DeclineCause>|
+     -> usize {
+        let Some(uses) = slice_uses.get(&node) else { return 0 };
+        let Some(subject) = subjects.get(&node) else { return 0 };
+        uses.raw_uses
+            .iter()
+            .filter(|raw| {
+                let Some(span) = raw.boundary_span else { return false };
+                // Wave-5c's equal-slice carrier takes a bare-local argument
+                // into a parameter that promotes to the same form.
+                let carried = raw.source_shape == "bare-local"
+                    && facts.call_args.iter().any(|(callee, calls)| {
+                    calls.iter().any(|call| {
+                        call.caller == node.0
+                            && call.args.iter().any(|argument| {
+                                argument.span.lo() == span.lo()
+                                    && argument.span.hi() == span.hi()
+                                    && subjects.values().any(|parameter| {
+                                        parameter.fn_did == *callee
+                                            && matches!(parameter.kind, SubjectKind::Param { hir_index } if hir_index == argument.index)
+                                            && promotable((parameter.fn_did, parameter.hir_id), declined)
+                                            && (subject.mutable || !parameter.mutable)
+                                    })
+                            })
+                    })
+                });
+                local_boundaries.contains(&(node.0, span.lo().0, span.hi().0)) && !carried
+            })
+            .count()
+    };
     let declines_for = |nullable: bool| {
-        by_subject
-            .keys()
-            .filter_map(|&node| {
+        let mut declined = FxHashMap::<(LocalDefId, HirId), DeclineCause>::default();
+        loop {
+            let mut changed = false;
+            for &node in by_subject.keys() {
+                if declined.contains_key(&node) {
+                    continue;
+                }
                 let uses = slice_uses.get(&node);
                 let unsupported = if nullable {
                     opt_uses
@@ -457,10 +660,17 @@ pub(crate) fn collect(
                     uses.is_some_and(|uses| uses.unsupported.is_some())
                 };
                 let mut summary = use_summary(node.0, uses, unsupported, &local_boundaries);
-                summary.thin_caller_arguments = thin_caller_arguments(node);
-                decline(&summary).map(|cause| (node, cause))
-            })
-            .collect::<FxHashMap<_, _>>()
+                summary.local_callee_boundary_uses = local_boundary_uses(node, &declined);
+                summary.thin_caller_arguments = thin_caller_arguments(node, &declined);
+                if let Some(cause) = decline(&summary) {
+                    declined.insert(node, cause);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break declined;
+            }
+        }
     };
     let declines = declines_for(false);
     let nullable_declines = declines_for(true);

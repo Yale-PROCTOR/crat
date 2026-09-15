@@ -197,6 +197,10 @@ pub(crate) enum LenEvidence {
     /// from the call site**, so such a position can only ever be served by
     /// certified `approx-len` (U-2') or stay gated.
     None,
+    /// Wave-4 #1b: the callee parameter's contract-extent promotion names the
+    /// exact count argument (`memcpy(dest, src, n)`: `n` for BOTH pointers),
+    /// so the companion is that argument, not the adjacent one.
+    Contract,
 }
 
 impl LenEvidence {
@@ -206,6 +210,7 @@ impl LenEvidence {
             LenEvidence::Preceding => "len-preceding",
             LenEvidence::Elsewhere => "len-elsewhere",
             LenEvidence::None => "len-absent",
+            LenEvidence::Contract => "len-contract",
         }
     }
 }
@@ -4178,16 +4183,63 @@ pub(crate) fn synthesize_with_raw_boundary(
                 let (len_text, len_evidence) = if let Some(Ok(count)) = counted_len {
                     (Some(count), Some(LenEvidence::Elsewhere))
                 } else if wants_len {
-                    let arm = length_evidence(tcx, *callee, pos.index);
+                    // Wave-4 #1b: a contract-extent promotion with an exact
+                    // count names the companion argument itself. The count
+                    // is licensed only when its spelling contains no call
+                    // (`n`, `n as usize`, `2 * n`): a call would be evaluated
+                    // once per construction, so it takes the fabricated
+                    // extent instead and stays evaluated exactly once as the
+                    // surviving scalar argument.
+                    // The exact count is spelled inside the CALLEE (`n` at its
+                    // own foreign call); it names the caller's argument only
+                    // when it is one of the callee's parameters, by name.
+                    // A contract whose count is NOT one parameter (`(4) * (n)`)
+                    // still owns the arm: adjacency must not license the
+                    // wrong operand over it, so the construction fabricates.
+                    let contract_count = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| table.contract_extent_promotions.get(key))
+                        .and_then(|promotion| match &promotion.length {
+                            super::contract_extent::LengthPlan::Evidence {
+                                elements,
+                                source: super::contract_extent::LengthSource::ExactContract { .. },
+                            } => Some(elements.trim().to_owned()),
+                            _ => None,
+                        });
+                    let contract_companion = contract_count.as_deref().and_then(|elements| {
+                        tcx.fn_arg_idents(callee.to_def_id())
+                            .iter()
+                            .position(|ident| {
+                                ident.is_some_and(|ident| ident.name.as_str() == elements)
+                            })
+                    });
+                    let arm = if contract_count.is_some() {
+                        LenEvidence::Contract
+                    } else {
+                        length_evidence(tcx, *callee, pos.index)
+                    };
                     let companion = match arm {
                         LenEvidence::Following => Some(pos.index + 1),
                         LenEvidence::Preceding => pos.index.checked_sub(1),
+                        LenEvidence::Contract => contract_companion,
                         LenEvidence::Elsewhere | LenEvidence::None => None,
                     };
+                    // A CALL in the spelling (`f(`, `size_of::<T>(`) is the
+                    // hazard; grouping parentheses are not.
+                    let licensed_spelling =
+                        |text: &str| {
+                            arm != LenEvidence::Contract
+                                || !text.match_indices('(').any(|(at, _)| {
+                                    text[..at].trim_end().chars().next_back().is_some_and(|c| {
+                                        c.is_alphanumeric() || c == '_' || c == '>'
+                                    })
+                                })
+                        };
                     (
                         companion
                             .and_then(|i| site.args.iter().find(|argument| argument.index == i))
-                            .and_then(|argument| sm.span_to_snippet(argument.span).ok()),
+                            .and_then(|argument| sm.span_to_snippet(argument.span).ok())
+                            .filter(|text| licensed_spelling(text)),
                         Some(arm),
                     )
                 } else {

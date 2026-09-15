@@ -970,12 +970,33 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                             .and_then(|contract| {
                                 let count_index = contract.count_argument_index?;
                                 let count = args.get(count_index)?;
-                                let expression = self
+                                let mut expression = self
                                     .tcx
                                     .sess
                                     .source_map()
                                     .span_to_snippet(count.span)
                                     .ok()?;
+                                // Wave-4 #1b (R386-3): `fwrite` / `fread` state
+                                // `size * nmemb` bytes; a unit element size is
+                                // the count itself, anything else is composed
+                                // and stays a BYTE count for the units gate.
+                                if let Some(size_index) = contract.size_argument_index {
+                                    let size = args.get(size_index)?;
+                                    let size_text = self
+                                        .tcx
+                                        .sess
+                                        .source_map()
+                                        .span_to_snippet(size.span)
+                                        .ok()?;
+                                    let unit = size_text.trim() == "1"
+                                        || size_text.trim().strip_prefix('1').is_some_and(|rest| {
+                                            rest.trim_start().starts_with("as ")
+                                        });
+                                    if !unit {
+                                        expression =
+                                            format!("({}) * ({expression})", size_text.trim());
+                                    }
+                                }
                                 Some(super::raw_boundary::ContractCountOperandFact {
                                     argument_index: count_index,
                                     span: count.span,
@@ -983,6 +1004,21 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                     exact: contract.count_is_exact,
                                 })
                             });
+                            let return_unused = match self.tcx.parent_hir_node(expr.hir_id) {
+                                rustc_hir::Node::Stmt(stmt) => {
+                                    matches!(stmt.kind, rustc_hir::StmtKind::Semi(_))
+                                }
+                                rustc_hir::Node::LetStmt(local) => {
+                                    matches!(local.pat.kind, rustc_hir::PatKind::Wild)
+                                }
+                                _ => false,
+                            };
+                            let operand_pointee = match typeck.expr_ty(peel_casts(arg)).kind() {
+                                rustc_middle::ty::TyKind::RawPtr(pointee, _) => {
+                                    format!("{pointee:?}")
+                                }
+                                _ => String::new(),
+                            };
                             self.facts.foreign_call_args.push(ForeignCallArgFact {
                                 caller: self.fn_did,
                                 callee: symbol.clone(),
@@ -998,6 +1034,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 adapter_operand_span,
                                 adapter_operand_mutability,
                                 contract_count,
+                                return_unused,
+                                operand_pointee,
                             });
                         }
                     }

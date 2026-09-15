@@ -369,6 +369,13 @@ pub(crate) struct ForeignCallArgFact {
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<RawMutability>,
     pub contract_count: Option<ContractCountOperandFact>,
+    /// Wave-4 #1b: the call's return value is discarded at the call (a `;`
+    /// statement or `let _ =`), so a returned alias of an argument is never
+    /// retained by the caller.
+    pub return_unused: bool,
+    /// Wave-4 #1b: the pointee of the argument's OPERAND beneath its casts —
+    /// the element the subject is a slice of at a `c_void` position.
+    pub operand_pointee: String,
 }
 
 impl ForeignCallArgFact {

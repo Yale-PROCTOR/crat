@@ -247,6 +247,9 @@ fn zero_syntax_custody_explicit_to_zero_replacement_preserves_atom_dependency() 
 /// **R285-3's receipt, as a live witness.** The shape these fixtures used to
 /// take is held, not quietly absent: the returned-parent source degrades with
 /// `ThinExtent` before a seam exists, which is why the route above changed.
+/// Since wave-4 #1b (a returned alias whose return is discarded is admitted)
+/// the same source may instead be delivered as a SLICE with the NUL-terminated
+/// contract's extent; what it may never be is a thin reference.
 #[test]
 fn thin_extent_holds_the_returned_parent_zero_syntax_source() {
     let source = "#![allow(dead_code, unused_variables, unused_unsafe)]\n\
@@ -271,8 +274,8 @@ fn thin_extent_holds_the_returned_parent_zero_syntax_source() {
                 decision,
                 Decision::Degraded(degraded)
                     if degraded.reason == super::decision::DegradeReason::ThinExtent
-            ),
-            "the returned-parent NUL-terminated source must be held, not delivered thin: {decision:?}"
+            ) || matches!(decision, Decision::Slice { .. }),
+            "the returned-parent NUL-terminated source must be held or a slice, never delivered thin: {decision:?}"
         );
     })
     .expect("held-source fixture compiles");

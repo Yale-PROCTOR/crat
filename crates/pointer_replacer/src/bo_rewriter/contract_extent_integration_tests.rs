@@ -122,9 +122,55 @@ fn emitted(source: &str) -> String {
     source
 }
 
+/// The corpus configuration: precise A5 replay under the frozen-graph
+/// attestation, so a pair of distinct array-decay arguments is PROVEN disjoint
+/// by the analysis rather than left undeterminable (the fixture default).
+fn attested_promotions(source: &str) -> Vec<super::decision::contract_extent::Promotion> {
+    ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(source), |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )?;
+        Ok::<_, String>(table.contract_extent_promotions.into_values().collect())
+    })
+    .expect("attested contract-extent fixture compiles")
+    .expect("attested contract-extent decision table")
+}
+
+fn attested_emitted(source: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "crat-wave4-attested-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("attested fixture directory");
+    let root = dir.join("lib.rs");
+    std::fs::write(&root, source).expect("attested fixture file");
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &root,
+        super::A5Mode::PreciseReplay,
+        Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        &|_| {},
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let super::RewriteOutcome::Emitted { source, .. } = outcome else {
+        panic!("attested contract-extent fixture must emit")
+    };
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    source
+}
+
 #[test]
-#[ignore = "candidate #1b (R384-3): exact-count entry transport"]
 fn ce_w02_memcpy_exact_count_keeps_both_initialized_byte_slices_evidence_backed() {
+    // #1b: `memcpy` returns its destination, so the destination is admitted
+    // only where the caller discards the return (`memcpy(..);`); both
+    // array-decay arguments then take the exact count from the contract's own
+    // count argument (`n`, licensed because it spells no call), under the
+    // corpus's attested A5 mode which proves the two arrays disjoint.
     let source = r#"
         #![allow(dead_code, unused_unsafe, unused_mut)]
         extern "C" { fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8; }
@@ -138,14 +184,8 @@ fn ce_w02_memcpy_exact_count_keeps_both_initialized_byte_slices_evidence_backed(
             dest[0]
         }
     "#;
-    let plans = promotions(source);
-    assert_eq!(
-        plans.len(),
-        2,
-        "plans={plans:#?}\ndecisions={:#?}\nslice_uses={}",
-        super::emit_tests::decisions_of(source),
-        fact_debug(source),
-    );
+    let plans = attested_promotions(source);
+    assert_eq!(plans.len(), 2, "plans={plans:#?}");
     assert!(
         plans.iter().all(|plan| matches!(
             &plan.length,
@@ -159,13 +199,64 @@ fn ce_w02_memcpy_exact_count_keeps_both_initialized_byte_slices_evidence_backed(
         )),
         "{plans:#?}"
     );
-    let output = emitted(source);
+    let output = attested_emitted(source);
     assert!(output.contains("dest: &mut [u8]"), "{output}");
     assert!(output.contains("src: &[u8]"), "{output}");
     assert!(!output.contains("FALLBACK_SLICE_EXTENT"), "{output}");
     assert!(
-        output.contains("memcpy(dest_ptr.as_mut_ptr(), src_ptr.as_ptr(), n)"),
+        output.contains("memcpy(dest.as_mut_ptr(), src.as_ptr(), n)"),
         "{output}"
+    );
+    assert!(
+        output.contains("core::slice::from_raw_parts_mut(dest.as_mut_ptr(), (n) as usize)")
+            && output.contains("core::slice::from_raw_parts(src.as_ptr(), (n) as usize)"),
+        "both constructions carry the exact count from the contract's own argument:\n{output}"
+    );
+
+    // The companion is the callee's PARAMETER that spells the count, found by
+    // name, not the foreign call's own argument position.
+    let reordered = r#"
+        #![allow(dead_code, unused_unsafe, unused_mut)]
+        extern "C" { fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8; }
+        unsafe fn copy(count: usize, dest: *mut u8, src: *const u8) {
+            memcpy(dest, src, count);
+        }
+        pub unsafe fn caller(count: usize) -> u8 {
+            let mut dest = [0u8; 8];
+            let src = [1u8; 8];
+            copy(count, dest.as_mut_ptr(), src.as_ptr());
+            dest[0]
+        }
+    "#;
+    let output = attested_emitted(reordered);
+    assert!(
+        output.contains(
+            "copy(count, core::slice::from_raw_parts_mut(dest.as_mut_ptr(), (count) as usize),"
+        ) || output.contains("from_raw_parts_mut(dest.as_mut_ptr(), (count) as usize)"),
+        "{output}"
+    );
+    assert!(!output.contains("FALLBACK_SLICE_EXTENT"), "{output}");
+
+    // A USED return keeps the destination out (its returned alias needs the
+    // returned-child custody #1b does not carry); the source still promotes.
+    let used_return = r#"
+        #![allow(dead_code, unused_unsafe, unused_mut)]
+        extern "C" { fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8; }
+        unsafe fn copy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+            memcpy(dest, src, n)
+        }
+        pub unsafe fn caller(n: usize) -> u8 {
+            let mut dest = [0u8; 8];
+            let src = [1u8; 8];
+            copy(dest.as_mut_ptr(), src.as_ptr(), n);
+            dest[0]
+        }
+    "#;
+    let plans = attested_promotions(used_return);
+    assert_eq!(plans.len(), 1, "{plans:#?}");
+    assert!(
+        plans[0].subject.contains("binding=4"),
+        "the source, not the destination: {plans:#?}"
     );
 }
 
@@ -351,8 +442,11 @@ fn multiline_count_expression_is_single_line_only_in_the_receipt() {
 }
 
 #[test]
-#[ignore = "candidate #1b (R384-3): exact-count entry transport"]
 fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() {
+    // A count that spells a CALL is not licensed as the constructions' length
+    // (each construction would evaluate it again): both constructions take
+    // the fabricated extent under the waiver and the count stays the single,
+    // original scalar argument inside its conditional.
     let source = r#"
         #![allow(dead_code, unused_unsafe, static_mut_refs)]
         extern "C" { fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8; }
@@ -367,18 +461,22 @@ fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() 
             if run { copy(dest.as_mut_ptr(), src.as_ptr(), next_n()); }
         }
     "#;
-    let plans = promotions(source);
+    let plans = attested_promotions(source);
+    assert_eq!(plans.len(), 2, "plans={plans:#?}");
+    let output = attested_emitted(source);
     assert_eq!(
-        plans.len(),
+        output.matches("next_n()").count(),
         2,
-        "plans={plans:#?}\ndecisions={:#?}",
-        super::emit_tests::decisions_of(source)
+        "the declaration and the one call: {output}"
     );
-    let output = emitted(source);
-    assert_eq!(output.matches("next_n()").count(), 1, "{output}");
     let if_pos = output.find("if run").expect("conditional remains");
-    let count_pos = output.find("next_n()").expect("count remains");
+    let count_pos = output.rfind("next_n()").expect("count remains");
     assert!(count_pos > if_pos, "the count was hoisted: {output}");
+    assert_eq!(
+        output.matches("crate::FALLBACK_SLICE_EXTENT").count(),
+        2,
+        "both constructions take the waived extent rather than re-evaluating the count:\n{output}"
+    );
 }
 
 #[test]
@@ -503,14 +601,14 @@ fn ce_d01_local_callee_boundary_declines_the_candidate_up_front() {
 }
 
 /// The lil shape (third census, `lil_find_var::name#3` → `lil_find_local_var::
-/// name#3`): the callee's parameter would be promoted to a contract-extent
-/// slice because `strcmp` reads it to the NUL, and the caller's THIN `&i8`
-/// would then be widened into it with `core::slice::from_ref` — one element
-/// of provenance handed to a NUL-terminated read through `as_ptr()`. R395-2
-/// forbids exactly that widening. The candidate is declined up front
-/// (`thin-caller-argument`); the caller keeps its prior form untouched, so no
-/// family transaction opens on the caller's account (the fourth census's
-/// genann / lodepng / heman / binn withdrawals were the caller-side HOLD's).
+/// name#3`): the callee's parameter is promoted to a contract-extent slice
+/// because `strcmp` reads it to the NUL. Under #1a the caller's THIN `&i8` was
+/// widened into it with `core::slice::from_ref` — one element of provenance
+/// handed to a NUL-terminated read (R395-2). Under #1b the callee's requirement
+/// is propagated to the caller as a `via-local-callee` site (the reader chain
+/// of relay 005 §2): BOTH take the slice form, the call is the zero-syntax
+/// same-form carrier, and only the raw wrapper at the top of the chain takes
+/// the pointer's own provenance under the slice-extent waiver.
 const CE_D02_CALLER_THIN: &str = r#"
 #![allow(dead_code, unused_unsafe)]
 extern "C" {
@@ -525,25 +623,22 @@ pub unsafe fn find(name: *const i8) -> i32 {
 "#;
 
 #[test]
-fn ce_d02_a_thin_caller_argument_declines_the_candidate_instead_of_being_widened() {
+fn ce_d02_a_thin_caller_argument_takes_the_slice_form_with_its_callee() {
     let decisions = super::emit_tests::decisions_of(CE_D02_CALLER_THIN);
     let names = decisions
         .iter()
         .filter(|(subject, is_param, _)| subject == "name" && *is_param)
         .map(|(_, _, reason)| reason.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 2, "{decisions:#?}");
+    assert_eq!(names, ["<emitted>", "<emitted>"], "{decisions:#?}");
+    let plans = promotions(CE_D02_CALLER_THIN);
+    assert_eq!(plans.len(), 2, "callee and caller both promote: {plans:#?}");
     assert!(
-        names.contains(&"held:thin-extent"),
-        "the callee's candidate resumes the ladder at the thin-extent backstop: {decisions:#?}"
-    );
-    assert!(
-        !names.contains(&"held:local-callee-access-extent"),
-        "the caller is never re-decided on the callee's account: {decisions:#?}"
-    );
-    assert!(
-        promotions(CE_D02_CALLER_THIN).is_empty(),
-        "no contract promotion exists for a parameter fed by a thin caller"
+        plans.iter().any(|plan| plan
+            .sites
+            .iter()
+            .any(|site| site.contract.starts_with("via-local-callee:"))),
+        "the caller's site is the propagated requirement: {plans:#?}"
     );
     let super::RewriteOutcome::Emitted {
         raw_boundary_artifacts,
@@ -553,29 +648,36 @@ fn ce_d02_a_thin_caller_argument_declines_the_candidate_instead_of_being_widened
     else {
         panic!("CE-D02 must emit");
     };
-    let declines = &raw_boundary_artifacts.contract_candidate_declines;
-    let rows = declines.lines().skip(1).collect::<Vec<_>>();
     assert_eq!(
-        rows.len(),
-        2,
-        "one declined candidate under both forms: {declines}"
+        raw_boundary_artifacts
+            .contract_candidate_declines
+            .lines()
+            .count(),
+        1,
+        "no decline: {}",
+        raw_boundary_artifacts.contract_candidate_declines
     );
-    for (row, form) in rows.iter().zip(["nullable", "plain"]) {
-        assert!(
-            row.starts_with("find_local\tfind_local::name\t")
-                && row.contains(&format!(
-                    "\t{form}\tcontract-candidate-declined:thin-caller-argument\t"
-                )),
-            "the typed receipt names the subject, the form and the cause: {declines}"
-        );
-    }
     assert!(
         !source.contains("from_ref(") && !source.contains("from_mut("),
         "no thin reference is widened at the local callee:\n{source}"
     );
+    assert!(source.contains("fn find_local(name: &[i8])"), "{source}");
+    assert!(source.contains("find_local(name)"), "{source}");
     assert!(
-        source.contains("fn find_local(name: *const i8)"),
-        "the callee keeps its raw parameter:\n{source}"
+        source.contains("pub unsafe fn find(name: &[i8])"),
+        "{source}"
+    );
+    // The same-form call is wave-5c's equal-slice interface carrier (landed
+    // with batch 4); this lane adds no carrier of its own.
+    let carriers = raw_boundary_artifacts
+        .slice_use_rows
+        .iter()
+        .filter(|row| row.adapter == "owned-existing-c-same-slice")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        carriers.len(),
+        2,
+        "one plan and one terminal row: {carriers:#?}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
@@ -625,4 +727,230 @@ fn ce_d03_a_raw_caller_argument_keeps_the_promotion() {
         "the raw argument takes the waived fallback extent at the call, never a widened reference:\n{source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// Three hops: the requirement travels `strcmp` → `find_local::name` →
+/// `find::name`; the top caller hands a raw pointer, so exactly one fallback
+/// construction exists and every hop between is zero-syntax.
+const CE_D04_CHAIN: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+extern "C" {
+    fn strcmp(a: *const i8, b: *const i8) -> i32;
+}
+static KEY: [i8; 2] = [120, 0];
+unsafe fn find_local(name: *const i8) -> i32 {
+    strcmp(name, b"x\0".as_ptr() as *const i8)
+}
+unsafe fn find(name: *const i8) -> i32 {
+    find_local(name)
+}
+pub unsafe fn top() -> i32 {
+    find(KEY.as_ptr())
+}
+"#;
+
+#[test]
+fn ce_d04_the_requirement_propagates_along_the_whole_chain() {
+    let plans = promotions(CE_D04_CHAIN);
+    assert_eq!(plans.len(), 2, "{plans:#?}");
+    let source = emitted(CE_D04_CHAIN);
+    assert!(source.contains("fn find_local(name: &[i8])"), "{source}");
+    assert!(source.contains("fn find(name: &[i8])"), "{source}");
+    assert!(source.contains("find_local(name)"), "{source}");
+    assert_eq!(
+        source.matches("FALLBACK_SLICE_EXTENT").count(),
+        2,
+        "one construction at the top plus the constant's declaration:\n{source}"
+    );
+    assert!(!source.contains("from_ref("), "{source}");
+}
+
+/// A caller that CANNOT take the slice form stays thin, so its callee is
+/// declined (`thin-caller-argument`) rather than widened: here the caller
+/// also hands `name` to a retaining local callee, which declines its own
+/// candidate (`local-callee-boundary`) and so leaves it a thin `&i8`.
+const CE_D05_THIN_CALLER_STAYS: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+extern "C" {
+    fn strcmp(a: *const i8, b: *const i8) -> i32;
+}
+static mut SAVED: *const i8 = 0 as *const i8;
+unsafe fn keep(p: *const i8) {
+    SAVED = p;
+}
+unsafe fn find_local(name: *const i8) -> i32 {
+    strcmp(name, b"x\0".as_ptr() as *const i8)
+}
+pub unsafe fn find(name: *const i8) -> i32 {
+    keep(name);
+    find_local(name)
+}
+"#;
+
+#[test]
+fn ce_d05_a_caller_that_stays_thin_declines_its_callee() {
+    assert!(promotions(CE_D05_THIN_CALLER_STAYS).is_empty());
+    let super::RewriteOutcome::Emitted {
+        raw_boundary_artifacts,
+        source,
+        ..
+    } = super::rewrite_m1(CE_D05_THIN_CALLER_STAYS)
+    else {
+        panic!("CE-D05 must emit");
+    };
+    let declines = &raw_boundary_artifacts.contract_candidate_declines;
+    assert!(
+        declines.contains("find_local\tfind_local::name\t")
+            && declines.contains("\tplain\tcontract-candidate-declined:thin-caller-argument\t"),
+        "{declines}"
+    );
+    assert!(
+        declines.contains("find\tfind::name\t")
+            && declines.contains("\tplain\tcontract-candidate-declined:local-callee-boundary\t"),
+        "{declines}"
+    );
+    assert!(
+        source.contains("fn find_local(name: *const i8)"),
+        "{source}"
+    );
+    assert!(
+        !source.contains("from_ref(") && !source.contains("from_mut("),
+        "{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+// ---------------------------------------------------------------------------
+// #1b rider (R386-3): the counted-foreign contract for `fwrite` / `fread`.
+// ---------------------------------------------------------------------------
+
+/// The lodepng shape (wave-5r's finding): `fwrite(buffer as *const c_void, 1,
+/// buffersize, file)` with `buffer: &c_uchar` read `buffersize` bytes through
+/// a one-byte reference. With the row, the position is a counted contract
+/// (`size * nmemb` bytes; a unit size is the count itself): the subject is
+/// promoted to `&[u8]` with the EXACT count `buffersize`, and the local
+/// caller's construction takes that count from the callee's own parameter.
+const CE_F01_FWRITE_UNIT_SIZE: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+#[repr(C)]
+pub struct FILE {
+    pub handle: i32,
+}
+extern "C" {
+    fn fwrite(ptr: *const ::core::ffi::c_void, size: usize, nmemb: usize, stream: *mut FILE) -> usize;
+}
+pub static mut OUT: *mut FILE = 0 as *mut FILE;
+unsafe fn save(buffer: *const u8, buffersize: usize) -> usize {
+    fwrite(buffer as *const ::core::ffi::c_void, 1, buffersize, OUT)
+}
+pub unsafe fn caller(n: usize) -> usize {
+    let bytes = [7u8; 16];
+    save(bytes.as_ptr(), n)
+}
+"#;
+
+#[test]
+fn ce_f01_fwrite_unit_size_promotes_with_the_exact_element_count() {
+    let plans = attested_promotions(CE_F01_FWRITE_UNIT_SIZE);
+    assert_eq!(plans.len(), 1, "{plans:#?}");
+    assert!(
+        matches!(
+            &plans[0].length,
+            super::decision::contract_extent::LengthPlan::Evidence { elements, .. }
+                if elements.trim() == "buffersize"
+        ),
+        "{plans:#?}"
+    );
+    let output = attested_emitted(CE_F01_FWRITE_UNIT_SIZE);
+    assert!(output.contains("buffer: &[u8]"), "{output}");
+    assert!(
+        output.contains("fwrite(buffer.as_ptr().cast::<core::ffi::c_void>(), 1, buffersize, OUT)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("core::slice::from_raw_parts(bytes.as_ptr(), (n) as usize)"),
+        "the caller's construction takes the callee's own count parameter by name:\n{output}"
+    );
+    assert!(!output.contains("FALLBACK_SLICE_EXTENT"), "{output}");
+}
+
+/// A size that is NOT the element size (`fwrite(bytes, 4, n, f)` on a byte
+/// pointer) writes `4 * n` bytes: the count is composed, never `n` alone.
+/// This is R386-3's deliberate-fault shape made a witness — reading the count
+/// as the element count would fabricate a slice one quarter of what is read.
+const CE_F02_FWRITE_COMPOSED_SIZE: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+#[repr(C)]
+pub struct FILE {
+    pub handle: i32,
+}
+extern "C" {
+    fn fwrite(ptr: *const ::core::ffi::c_void, size: usize, nmemb: usize, stream: *mut FILE) -> usize;
+}
+pub static mut OUT: *mut FILE = 0 as *mut FILE;
+unsafe fn save(buffer: *const u8, n: usize) -> usize {
+    fwrite(buffer as *const ::core::ffi::c_void, 4, n, OUT)
+}
+pub unsafe fn caller(n: usize) -> usize {
+    let bytes = [7u8; 16];
+    save(bytes.as_ptr(), n)
+}
+"#;
+
+#[test]
+fn ce_f02_fwrite_composes_a_non_unit_size_into_the_count() {
+    let plans = attested_promotions(CE_F02_FWRITE_COMPOSED_SIZE);
+    assert_eq!(plans.len(), 1, "{plans:#?}");
+    assert!(
+        matches!(
+            &plans[0].length,
+            super::decision::contract_extent::LengthPlan::Evidence { elements, .. }
+                if elements.trim() == "(4) * (n)"
+        ),
+        "{plans:#?}"
+    );
+    // The composed spelling is not a single parameter, so no caller argument
+    // carries it: the caller's construction takes the fallback extent, and the
+    // callee's own bridge still reads `4 * n` bytes of a slice that is at least
+    // that long under the waiver.
+    let output = attested_emitted(CE_F02_FWRITE_COMPOSED_SIZE);
+    assert!(output.contains("buffer: &[u8]"), "{output}");
+    assert!(output.contains("crate::FALLBACK_SLICE_EXTENT"), "{output}");
+}
+
+/// A non-byte element (`fwrite(values, 8, n, f)` over `*const f64`) keeps
+/// the units unproved: the position is a contract, the subject promotes, and
+/// the length is the typed count-gap fallback, never `8 * n` elements.
+const CE_F03_FWRITE_NON_BYTE: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+#[repr(C)]
+pub struct FILE {
+    pub handle: i32,
+}
+extern "C" {
+    fn fwrite(ptr: *const ::core::ffi::c_void, size: usize, nmemb: usize, stream: *mut FILE) -> usize;
+}
+pub static mut OUT: *mut FILE = 0 as *mut FILE;
+unsafe fn save(values: *const f64, n: usize) -> usize {
+    fwrite(values as *const ::core::ffi::c_void, 8, n, OUT)
+}
+pub unsafe fn caller(n: usize) -> usize {
+    let values = [0.5f64; 4];
+    save(values.as_ptr(), n)
+}
+"#;
+
+#[test]
+fn ce_f03_fwrite_over_a_non_byte_element_keeps_the_units_gap() {
+    let plans = attested_promotions(CE_F03_FWRITE_NON_BYTE);
+    assert_eq!(plans.len(), 1, "{plans:#?}");
+    assert_eq!(
+        plans[0].length,
+        super::decision::contract_extent::LengthPlan::Fallback(
+            super::decision::contract_extent::FallbackReason::CountGap(
+                super::decision::contract_extent::CountGap::UnitsUnproved
+            )
+        ),
+        "{plans:#?}"
+    );
 }
