@@ -1443,3 +1443,44 @@ fn wave6s_cast_argument_bridge_already_exists() {
         "{source}"
     );
 }
+
+/// tulipindicators `smoke::get_array` (corpus regression of the partial
+/// census, report 006): the Option value composition snapshots the seam's
+/// text, so the computed-view rendering must be on the seam set before it —
+/// `strtok((&mut (line)[1..]).as_mut_ptr(), …)` composed into `.as_ref()`.
+#[test]
+fn wave6s_computed_view_composes_into_option_value() {
+    let src = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, static_mut_refs)]
+ unsafe extern "C" {
+    fn strtok(s: *mut i8, delim: *const i8) -> *mut i8;
+    fn atof(s: *const i8) -> f64;
+ }
+ static mut BUF: [i8; 64] = [0; 64];
+ unsafe fn next_line() -> *mut i8 { BUF.as_mut_ptr() }
+ pub unsafe fn get_array(mut s: *mut f64) -> i32 {
+    let mut line: *mut i8 = next_line();
+    if *line.offset(0 as i32 as isize) as i32 != '{' as i32 { return 0; }
+    let mut num: *mut i8 = strtok(line.offset(1 as i32 as isize), b",}\r\n\0" as *const u8 as *const i8);
+    if num.is_null() { return 0; }
+    let mut inp: *mut f64 = s;
+    loop {
+        *inp = atof(num);
+        inp = inp.offset(1);
+        num = strtok(0 as *mut i8, b",}\r\n\0" as *const u8 as *const i8);
+        if num.is_null() { break; }
+    }
+    return 1;
+ }
+"#;
+    let (source, receipts) = emit_with_family_receipts(src);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("line: &mut [i8]"), "{source}");
+    let joined = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        joined.contains("strtok((&mut (line)[(1 as i32) as usize..]).as_mut_ptr(),"),
+        "{source}"
+    );
+}

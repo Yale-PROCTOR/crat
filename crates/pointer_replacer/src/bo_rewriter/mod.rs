@@ -7667,6 +7667,16 @@ fn finish_decide<'tcx>(
         table
             .option_mut_bindings
             .extend(returned_child_mut_bindings);
+        // wave-6s: the forward-slice / computed-view renderings must be on the
+        // seam set BEFORE anything composes or snapshots a seam's text (the
+        // Option value composition below, the callee-parameter inputs).
+        decision::slice_forms::lower(
+            tcx,
+            &mut table,
+            &advance_ok,
+            &raw_boundary_sites,
+            &slice_uses,
+        )?;
 
         // Item 2 renders local raw-result constructors only after the terminal
         // seam set exists, so a contained raw-view/cast edit is composed into the
@@ -7840,13 +7850,6 @@ fn finish_decide<'tcx>(
             &raw_boundary,
         );
         let mut table = table;
-        decision::slice_forms::lower(
-            tcx,
-            &mut table,
-            &advance_ok,
-            &raw_boundary_sites,
-            &slice_uses,
-        )?;
 
         // Structural self-check: the table matches the subjects it was handed. NOT
         // the coverage gate — every comparison in it is against the collector's own
