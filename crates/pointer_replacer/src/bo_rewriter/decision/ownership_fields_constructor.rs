@@ -117,7 +117,8 @@ pub(crate) fn derive<'tcx>(
                 .source_map()
                 .span_to_snippet(bytes.span)
                 .map_err(|_| SourceHold::Missing("constructor-byte-spelling"))?;
-            let count = format!("((({original}) as usize) / ::core::mem::size_of::<{element}>())");
+            let count =
+                format!("((({original}) as usize) / ::core::mem::size_of::<{element_spelling}>())");
             let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
             return Ok(Constructor {
                 allocation,
@@ -166,7 +167,8 @@ pub(crate) fn derive<'tcx>(
                 .source_map()
                 .span_to_snippet(bytes.span)
                 .map_err(|_| SourceHold::Missing("constructor-byte-spelling"))?;
-            let count = format!("((({original}) as usize) / ::core::mem::size_of::<{element}>())");
+            let count =
+                format!("((({original}) as usize) / ::core::mem::size_of::<{element_spelling}>())");
             let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
             (BoxShape::Slice, count, replacement)
         };

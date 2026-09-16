@@ -306,6 +306,41 @@ impl Candidates {
     }
 }
 
+/// `span` lies inside the initializer of a `let` whose binding the table
+/// decided a slice-family form (a slice, cursor, nested slice or option) —
+/// the construction that family renders over the initializer's source text.
+fn under_slice_construction(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    table: &DecisionTable,
+    owner: LocalDefId,
+    span: rustc_span::Span,
+) -> bool {
+    table.entries.iter().any(|(subject, decision)| {
+        if subject.fn_did != owner {
+            return false;
+        }
+        let constructed = match decision {
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Opt { .. } => true,
+            Decision::Box(_)
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Degraded(_) => false,
+        };
+        if !constructed {
+            return false;
+        }
+        let rustc_hir::Node::LetStmt(local) = tcx.parent_hir_node(subject.hir_id) else {
+            return false;
+        };
+        local
+            .init
+            .is_some_and(|init| init.span.contains(span) && init.span != span)
+    })
+}
+
 fn outer_owning(
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
@@ -596,6 +631,22 @@ fn derive_bundle(
         BoxShape::Slice => format!("[{}]", source.element_spelling()),
     };
     edits.extend_from_slice(source.scalar_edits());
+    // R412-2: an owner access that is the BASE of another family's slice
+    // construction (`let mut src = ((**elevations.offset(i)).data).offset(…)`
+    // with `src` decided a slice or cursor) sits inside that family's
+    // initializer replacement, which is rendered from the source text — the
+    // access edit would be lost and `.offset` kept on the Box. Until the
+    // nested-edit composition applies the inner edit first (wave-6l's), the
+    // owner holds, typed.
+    if source
+        .scalar_edits()
+        .iter()
+        .any(|edit| under_slice_construction(tcx, table, subject.fn_did, edit.span))
+    {
+        return Err(NativeHold::Missing(
+            "native-access-under-slice-construction",
+        ));
+    }
     let mut receipts = vec![format!(
         "native-owning-source owner={} local={} generation=Missing source-root={:?}",
         subject.fn_did.local_def_index.as_u32(),
