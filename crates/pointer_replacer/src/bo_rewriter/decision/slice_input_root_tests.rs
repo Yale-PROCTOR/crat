@@ -180,6 +180,18 @@ fn w5c_slice_input_root_local_must_be_fresh() {
         super::slice_input_tests::proof_of(&proofs, "SplitByteVector::data"),
         &Err(Hold::CallerNotSupplied)
     );
+    // A root redefined from something else is not fresh past that point.
+    let reassigned = fixture()
+        .replace("    let literals = xalloc(n);", "    let mut literals = xalloc(n);")
+        .replace(
+            "    fill(literals, n);",
+            "    let mut arr = [0u8; 16];\n    fill(literals, n);\n    literals = arr.as_mut_ptr();",
+        );
+    let proofs = super::slice_input_tests::proofs(&reassigned);
+    assert_eq!(
+        super::slice_input_tests::proof_of(&proofs, "SplitByteVector::data"),
+        &Err(Hold::CallerNotSupplied)
+    );
     let tested = fixture().replace(
         "    fill(literals, n);",
         "    if literals.is_null() { return 0; }\n    fill(literals, n);",
