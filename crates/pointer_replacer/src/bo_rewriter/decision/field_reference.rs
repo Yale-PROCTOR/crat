@@ -176,6 +176,16 @@ pub(crate) struct Site {
     pub written: bool,
 }
 
+/// `f(.., data /* i */, .., size /* j */)` stores `data` into the fat field
+/// and `size` into the sibling that bounds the fat field's reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CountCompanion {
+    pub callee: LocalDefId,
+    pub stored: usize,
+    pub count: usize,
+    pub sibling: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CastSite {
     pub target: String,
@@ -321,6 +331,11 @@ pub(crate) struct FieldTransaction {
     /// scope exit the language drops — addendum 101's
     /// `waiver-drop(scope-exit)` for a libc-freed allocation, receipted.
     pub value_instances: usize,
+    /// R411 §2: the count companions of a fat field — the storing
+    /// function's parameter that fills the SIBLING field bounding the fat
+    /// field's element reads: `(callee, stored parameter index, count
+    /// parameter index, sibling field name)`.
+    pub count_companions: Vec<CountCompanion>,
     pub site_count: usize,
 }
 
@@ -352,6 +367,18 @@ impl FieldTransactions {
             .flat_map(|t| t.argument_forms.iter())
             .find(|(argument, _)| *argument == span)
             .map(|(_, form)| *form)
+    }
+
+    /// R411 §2: the parameter positions of `callee` that a field transaction
+    /// proves to be the COUNT of the fat parameter at `index` (the sibling
+    /// field the same store fills bounds the fat field's reads).
+    pub(crate) fn count_companions(&self, callee: LocalDefId, index: usize) -> Vec<usize> {
+        self.applied
+            .iter()
+            .flat_map(|t| t.count_companions.iter())
+            .filter(|c| c.callee == callee && c.stored == index)
+            .map(|c| c.count)
+            .collect()
     }
 
     pub(crate) fn owner_sets(&self) -> Vec<Vec<LocalDefId>> {
@@ -387,7 +414,7 @@ impl FieldTransactions {
                     .count()
             };
             out.push_str(&format!(
-                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={}\t-\n",
+                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\n",
                 t.struct_path,
                 t.field_name,
                 if t.owning {
@@ -417,6 +444,17 @@ impl FieldTransactions {
                 count(DEALLOC_TRANSFER) + count(DEALLOC_TRANSFER_CONTRACT),
                 count(DEALLOC_TRANSFER_CONTRACT),
                 t.value_instances,
+                t.count_companions
+                    .iter()
+                    .map(|c| format!(
+                        "{}:{}<-{}({})",
+                        tcx.def_path_str(c.callee.to_def_id()),
+                        c.stored,
+                        c.count,
+                        c.sibling
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("|"),
             ));
         }
         for (struct_path, field, cause) in &self.held {
@@ -1513,10 +1551,6 @@ pub(crate) fn derive(
     out
 }
 
-/// The transitive lifetime tie (E): for every mention `F` of the struct, a
-/// call `G(.., p, ..)` where `G` ties that position and `p` is a bare
-/// parameter of `F` ties `p` in `F` too. Iterated to a fixpoint; each owner
-/// is walked once per round.
 /// The later arguments of a call that are pure `Copy` reads through a place
 /// once the argument at `moving` moves an owned value; the scan stops at the
 /// first non-pure argument (an intervening call could write).
@@ -1666,6 +1700,10 @@ fn reads_through(expr: &Expr<'_>) -> bool {
     }
 }
 
+/// The transitive lifetime tie (E): for every mention `F` of the struct, a
+/// call `G(.., p, ..)` where `G` ties that position and `p` is a bare
+/// parameter of `F` ties `p` in `F` too. Iterated to a fixpoint; each owner
+/// is walked once per round.
 fn forward_ties(
     tcx: TyCtxt<'_>,
     mentions: &[(LocalDefId, bool, bool)],
@@ -1738,6 +1776,216 @@ fn forward_ties(
             break;
         }
     }
+}
+
+/// R411 §2 — the field-side count companion. For a FAT field stored from a
+/// parameter `p_i` of `G`, a sibling integer field `C` of the same struct
+/// stored in `G` from a parameter `p_j` is the fat field's count when some
+/// element read of the fat field is guarded by a comparison against `C`
+/// (a local loaded from `C`, or `C` read in place): the index's variables
+/// appear on one side, `C`'s value on the other. Evidence, not a guess;
+/// receipted per companion.
+fn count_companions(
+    tcx: TyCtxt<'_>,
+    candidate: &Candidate,
+    table: &DecisionTable,
+) -> Vec<CountCompanion> {
+    if !matches!(
+        candidate.form,
+        Form::Slice { .. } | Form::Opt { slice: true, .. }
+    ) {
+        return Vec::new();
+    }
+    // The element reads' index texts by owner.
+    let mut index_texts: FxHashMap<LocalDefId, Vec<String>> = FxHashMap::default();
+    for site in &candidate.sites {
+        if site.kind == SiteKind::Element
+            && let Some(index) = &site.index_text
+        {
+            index_texts
+                .entry(site.owner)
+                .or_default()
+                .push(index.clone());
+        }
+    }
+    if index_texts.is_empty() {
+        return Vec::new();
+    }
+    let words = |text: &str| -> Vec<String> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| {
+                !w.is_empty()
+                    && !w.chars().all(|c| c.is_ascii_digit())
+                    && *w != "as"
+                    && *w != "usize"
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut out = Vec::new();
+    for site in &candidate.sites {
+        if site.kind != SiteKind::Store {
+            continue;
+        }
+        let Some(Rhs::Subject(node)) = site.rhs else { continue };
+        let Some((subject, _)) = table
+            .entries
+            .iter()
+            .find(|(s, _)| (s.fn_did, s.hir_id) == node)
+        else {
+            continue;
+        };
+        let SubjectKind::Param { hir_index: stored } = subject.kind else { continue };
+        let callee = site.owner;
+        for (sibling, count) in sibling_parameter_stores(tcx, callee, candidate.key.struct_did) {
+            if sibling == candidate.field_name {
+                continue;
+            }
+            // The bound: a comparison in an element-reading owner between the
+            // sibling's value and the index's variables.
+            let bounded = index_texts.iter().any(|(owner, indices)| {
+                comparisons_against_field(tcx, *owner, &sibling)
+                    .iter()
+                    .any(|other| {
+                        let other_words = words(other);
+                        indices
+                            .iter()
+                            .any(|index| words(index).iter().any(|v| other_words.contains(v)))
+                    })
+            });
+            if bounded {
+                out.push(CountCompanion {
+                    callee,
+                    stored,
+                    count,
+                    sibling: sibling.clone(),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| (a.stored, a.count).cmp(&(b.stored, b.count)));
+    out.dedup();
+    out
+}
+
+/// `(*s).C = p_j` in `callee` for integer fields `C` of `struct_did` and
+/// parameters `p_j`: `(field name, parameter position)`.
+fn sibling_parameter_stores(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    struct_did: LocalDefId,
+) -> Vec<(String, usize)> {
+    struct Stores<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        owner: LocalDefId,
+        struct_did: LocalDefId,
+        params: FxHashMap<HirId, usize>,
+        out: Vec<(String, usize)>,
+    }
+    impl<'tcx> Visitor<'tcx> for Stores<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let ExprKind::Field(base, ident) = lhs.kind
+                && adt_local(self.tcx.typeck(self.owner).expr_ty_adjusted(base))
+                    == Some(self.struct_did)
+                && self.tcx.typeck(self.owner).expr_ty(rhs).is_integral()
+                && let ExprKind::Path(QPath::Resolved(_, path)) = rhs.kind
+                && let Res::Local(binding) = path.res
+                && let Some(&index) = self.params.get(&binding)
+            {
+                self.out.push((ident.to_string(), index));
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let Some(body_id) = tcx.hir_node_by_def_id(callee).body_id() else { return Vec::new() };
+    let body = tcx.hir_body(body_id);
+    let params: FxHashMap<HirId, usize> = body
+        .params
+        .iter()
+        .enumerate()
+        .filter_map(|(index, param)| match param.pat.kind {
+            rustc_hir::PatKind::Binding(_, binding, _, _) => Some((binding, index)),
+            _ => None,
+        })
+        .collect();
+    let mut stores = Stores {
+        tcx,
+        owner: callee,
+        struct_did,
+        params,
+        out: Vec::new(),
+    };
+    stores.visit_body(body);
+    stores.out
+}
+
+/// The texts on the OTHER side of every comparison in `owner` whose one side
+/// reads the field `sibling` (`(*s).C`) or a local initialised from it.
+fn comparisons_against_field(tcx: TyCtxt<'_>, owner: LocalDefId, sibling: &str) -> Vec<String> {
+    struct Cmp<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sibling: String,
+        loaded: FxHashSet<HirId>,
+        out: Vec<String>,
+    }
+    impl Cmp<'_> {
+        fn reads_sibling(&self, expr: &Expr<'_>) -> bool {
+            match expr.kind {
+                ExprKind::Field(_, ident) => ident.as_str() == self.sibling,
+                ExprKind::Path(QPath::Resolved(_, path)) => {
+                    matches!(path.res, Res::Local(b) if self.loaded.contains(&b))
+                }
+                _ => false,
+            }
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Cmp<'tcx> {
+        fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+            if let Some(init) = local.init
+                && let ExprKind::Field(_, ident) = init.kind
+                && ident.as_str() == self.sibling
+                && let rustc_hir::PatKind::Binding(_, binding, _, _) = local.pat.kind
+            {
+                self.loaded.insert(binding);
+            }
+            intravisit::walk_local(self, local);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Binary(op, left, right) = expr.kind
+                && matches!(
+                    op.node,
+                    rustc_hir::BinOpKind::Lt
+                        | rustc_hir::BinOpKind::Le
+                        | rustc_hir::BinOpKind::Gt
+                        | rustc_hir::BinOpKind::Ge
+                )
+            {
+                let sm = self.tcx.sess.source_map();
+                if self.reads_sibling(right)
+                    && let Ok(text) = sm.span_to_snippet(left.span)
+                {
+                    self.out.push(text);
+                }
+                if self.reads_sibling(left)
+                    && let Ok(text) = sm.span_to_snippet(right.span)
+                {
+                    self.out.push(text);
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let Some(body_id) = tcx.hir_node_by_def_id(owner).body_id() else { return Vec::new() };
+    let mut cmp = Cmp {
+        tcx,
+        sibling: sibling.to_owned(),
+        loaded: FxHashSet::default(),
+        out: Vec::new(),
+    };
+    cmp.visit_body(tcx.hir_body(body_id));
+    cmp.out
 }
 
 /// An A5 raw-view call snapshots its argument from PLAN-TIME TEXT
@@ -2183,6 +2431,7 @@ pub(crate) fn finalize(
             expression_edits: edits,
             load_locals,
             argument_forms,
+            count_companions: count_companions(tcx, candidate, table),
             value_instances: if candidate.owning {
                 candidate
                     .sites

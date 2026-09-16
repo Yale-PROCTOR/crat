@@ -320,14 +320,51 @@ fn w6f_lodepng_slice_field_with_size_delivers() {
     // carries the addendum-77 fabricated extent with its receipt. Either
     // way the field delivers; the length arm is the seam's, not this
     // transaction's.
+    // R411 §2: the count companion — `LodePNGBitReader_init(reader, data,
+    // size)` stores `size` into the sibling that bounds `data`'s reads
+    // (`start + 1 < size`), so parameter 2 is parameter 1's count; with the
+    // companion the raw caller's construction is the exact `insize` on every
+    // head (bare adjacency without R408-1, the companion under it).
     assert!(
-        source.contains("core::slice::from_raw_parts(in_0, (insize) as usize), insize);")
-            || source.contains("core::slice::from_raw_parts(in_0, crate::FALLBACK_SLICE_EXTENT),"),
+        observed
+            .bridges
+            .iter()
+            .any(|(_, field, receipt)| field == "data"
+                && receipt.contains("count-companion=LodePNGBitReader_init:1<-2(size)")),
+        "{:?}",
+        observed.bridges
+    );
+    assert!(
+        source.contains("core::slice::from_raw_parts(in_0, (insize) as usize), insize);"),
         "{source}"
     );
     assert!(
         !source.contains("data).offset("),
         "a raw offset survived on the field:\n{source}"
+    );
+    // Control: without the bound (`size` no longer compared against the
+    // reads' indices) the sibling store alone names no count.
+    let unbounded = LODEPNG
+        .replace(
+            "if start.wrapping_add(1 as u32 as u64) < size {",
+            "if start.wrapping_add(1 as u32 as u64) < 4096 {",
+        )
+        .replace(
+            "if start.wrapping_add(0 as i32 as u64) < size {",
+            "if start.wrapping_add(0 as i32 as u64) < 4096 {",
+        )
+        .replace(
+            "if bytepos.wrapping_add(4 as i32 as u64) >= size { return 52 as i32 as u32; }",
+            "if bytepos.wrapping_add(4 as i32 as u64) >= 4096 { return 52 as i32 as u32; }",
+        );
+    let control = observe(&unbounded);
+    assert!(
+        control
+            .bridges
+            .iter()
+            .any(|(_, field, receipt)| field == "data" && receipt.ends_with("count-companion=")),
+        "{:?}",
+        control.bridges
     );
     // The field's own store fabricates nothing: `Some(data)` carries the
     // parameter's slice as it arrived (pinned above); a fabricated extent, if
@@ -539,12 +576,12 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
             (
                 "node".to_owned(),
                 "left".to_owned(),
-                "raw-move=3;raw-view=1;raw-store=3;dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0".to_owned()
+                "raw-move=3;raw-view=1;raw-store=3;dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;count-companion=".to_owned()
             ),
             (
                 "node".to_owned(),
                 "right".to_owned(),
-                "raw-move=4;raw-view=1;raw-store=4;dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0".to_owned()
+                "raw-move=4;raw-view=1;raw-store=4;dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;count-companion=".to_owned()
             ),
         ]
     );
@@ -948,7 +985,7 @@ fn w6f_thin_owned_field_free_site_transfers_and_memcpy_takes_a_raw_view() {
         vec![(
             "Holder".to_owned(),
             "slot_".to_owned(),
-            "raw-move=0;raw-view=1;raw-store=2;dealloc-transfer=1;allocator-contract=0;waiver-drop-scope-exit=1".to_owned()
+            "raw-move=0;raw-view=1;raw-store=2;dealloc-transfer=1;allocator-contract=0;waiver-drop-scope-exit=1;count-companion=".to_owned()
         )]
     );
     let (source, emitted_count, reverted) = emitted_source(&outcome);
