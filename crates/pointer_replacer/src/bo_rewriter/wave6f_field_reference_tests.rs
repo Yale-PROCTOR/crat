@@ -908,9 +908,10 @@ fn ring_buffer_frame() {
     );
 }
 
-/// Witness 16 (relay 007, R409-3; the RingBuffer shape): a FAT owned field
-/// `Option<Box<[u8]>>` — at this frame the store from a raw thin local
-/// (`*fresh66 = new_data`, `new_data = malloc(..) as *mut u8`) carries no
+/// Witness 16 (relay 007, R409-3; the RingBuffer shape, spelled as the
+/// substrate of record spells it — `(*rb).data_ = new_data;`, R416-12): a FAT
+/// owned field `Option<Box<[u8]>>` — at this frame the store from a raw thin
+/// local (`new_data = malloc(..) as *mut u8`) carries no
 /// length, so the field holds typed; on a head where `new_data` delivers as
 /// a `Box<[u8]>` the store is the moved Option and the free site is the
 /// transfer.
@@ -936,7 +937,7 @@ fn w6f_ring_buffer_fat_owned_field_store_needs_a_length_or_a_boxed_source() {
             "pub data_: Option<Box<[u8]>>,",
             "free((*rb).data_.take().map_or(core::ptr::null_mut(), |__b| Box::into_raw(__b) as *mut ::std::ffi::c_void));",
             "(*rb).data_.as_deref().map_or(core::ptr::null(), |__s| __s.as_ptr()) as *const ::std::ffi::c_void",
-            "core::ptr::write(&raw mut *fresh67, (*rb).data_.as_deref_mut().map_or(core::ptr::null_mut(), |__s| __s.as_mut_ptr()).offset(2 as isize));",
+            "(*rb).buffer_ = (*rb).data_.as_deref_mut().map_or(core::ptr::null_mut(), |__s| __s.as_mut_ptr()).offset(2 as isize);",
             "return (*rb).data_.as_deref().unwrap()[(i) as usize];",
         ] {
             assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
