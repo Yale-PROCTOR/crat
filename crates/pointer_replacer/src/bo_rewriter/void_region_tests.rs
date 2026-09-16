@@ -566,8 +566,10 @@ pub unsafe extern "C" fn swap(mut a: u64_0) -> u64_0 {
 }
 "#;
 
-/// The byte view delivers: each local is a `size_of::<u64>()`-byte slice over
-/// its parameter's own storage; the byte reads and writes index it.
+/// The byte view delivers: each local is a byte slice over its parameter's
+/// own storage and the byte reads and writes index it. `copy_be64` indexes
+/// by a loop counter, so the body has not shown where the view ends: the
+/// extent is the addendum-77 fallback, receipted.
 #[test]
 fn w6b_be64_byte_view_of_a_scalar_parameter_delivers() {
     let rows = super::emit_tests::decisions_of(BE64);
@@ -581,8 +583,8 @@ fn w6b_be64_byte_view_of_a_scalar_parameter_delivers() {
     let flat = compact(&source);
     assert!(
         flat.contains("letmutsource:&[u8]=core::slice::from_raw_parts(")
-            && flat.contains("*mutlibc::c_uchar,core::mem::size_of::<u64>())"),
-        "the read view is a shared byte slice of exactly the scalar's bytes: {source}"
+            && flat.contains("*mutlibc::c_uchar,crate::FALLBACK_SLICE_EXTENT)"),
+        "the read view is a shared byte slice under the fallback extent: {source}"
     );
     assert!(
         flat.contains("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut("),
@@ -593,8 +595,8 @@ fn w6b_be64_byte_view_of_a_scalar_parameter_delivers() {
         "the byte accesses index the views: {source}"
     );
     assert!(
-        !source.contains("FALLBACK_SLICE_EXTENT"),
-        "the extent is the scalar's size, never fabricated: {source}"
+        !source.contains("size_of::<u64>()"),
+        "a loop-indexed view has no exact extent: {source}"
     );
     assert!(
         super::verify::type_checks_str(&source),
@@ -659,4 +661,83 @@ fn w6b_byte_view_needs_a_byte_target() {
         "slice-neg-or-unknown-offset",
         "{rows:?}"
     );
+}
+
+/// binn `copy_be16` (rs-crown/binn `lib.rs:190`): every index is a constant
+/// inside the scalar, so the view is exactly `size_of::<u16>()` bytes.
+pub(super) const BE16: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type u16_0 = u16;
+unsafe extern "C" fn copy_be16(mut pdest: *mut u16_0, mut psource: *mut u16_0) {
+    let mut source = psource as *mut libc::c_uchar;
+    let mut dest = pdest as *mut libc::c_uchar;
+    *dest.offset(0 as libc::c_int as isize) = *source.offset(1 as libc::c_int as isize);
+    *dest.offset(1 as libc::c_int as isize) = *source.offset(0 as libc::c_int as isize);
+}
+pub unsafe extern "C" fn swap16(mut a: u16_0) -> u16_0 {
+    let mut b: u16_0 = 0;
+    copy_be16(&mut b, &mut a);
+    return b;
+}
+"#;
+
+#[test]
+fn w6b_be16_constant_indices_make_the_view_exact() {
+    let rows = super::emit_tests::decisions_of(BE16);
+    for name in ["source", "dest"] {
+        assert_eq!(local_reason(&rows, name), "<emitted>", "{name}: {rows:?}");
+    }
+    let source = super::emit_tests::ast_emitted_source_of(BE16).expect("AST output");
+    let flat = compact(&source);
+    assert!(
+        flat.contains("letmutsource:&[u8]=core::slice::from_raw_parts(")
+            && flat.contains("*mutlibc::c_uchar,core::mem::size_of::<u16>())"),
+        "the read view is exactly the scalar's bytes: {source}"
+    );
+    assert!(
+        flat.contains("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut(")
+            && flat.contains("dest[(0aslibc::c_int)asusize]=source[(1aslibc::c_int)asusize]"),
+        "the written view indexes: {source}"
+    );
+    assert!(
+        !source.contains("FALLBACK_SLICE_EXTENT"),
+        "nothing is fabricated: {source}"
+    );
+    assert!(
+        super::verify::type_checks_str(&source),
+        "output compiles: {source}"
+    );
+}
+
+/// A constant index at or beyond the scalar's size is not evidence of one
+/// scalar: the extent falls back.
+#[test]
+fn w6b_byte_view_index_beyond_the_scalar_falls_back() {
+    let beyond = BE16.replace(
+        "*source.offset(1 as libc::c_int as isize);",
+        "*source.offset(2 as libc::c_int as isize);",
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&beyond).expect("AST output");
+    let flat = compact(&source);
+    assert!(
+        flat.contains("letmutsource:&[u8]=core::slice::from_raw_parts(")
+            && flat.contains("*mutlibc::c_uchar,crate::FALLBACK_SLICE_EXTENT)"),
+        "the over-indexed view falls back: {source}"
+    );
+    assert!(
+        flat.contains("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut(")
+            && flat.contains("*mutlibc::c_uchar,core::mem::size_of::<u16>())"),
+        "the other view stays exact: {source}"
+    );
+}
+
+/// A byte-to-byte recast (`*const c_char` as `*const c_uchar`) is a string
+/// re-signing, not a scalar's byte view: not in the class.
+#[test]
+fn w6b_byte_recast_of_a_char_pointer_is_not_in_the_class() {
+    let chars = BE16
+        .replace("pub type u16_0 = u16;", "pub type u16_0 = libc::c_char;")
+        .replace("let mut b: u16_0 = 0;", "let mut b: u16_0 = 0;");
+    let rows = super::emit_tests::decisions_of(&chars);
+    assert_ne!(local_reason(&rows, "source"), "<emitted>", "{rows:?}");
 }

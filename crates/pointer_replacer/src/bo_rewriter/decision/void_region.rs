@@ -305,20 +305,42 @@ struct ByteView {
     /// The scalar type as the parameter spells it, resolved.
     scalar: String,
     size: u64,
+    /// Every index of the view is a constant inside the scalar: the extent is
+    /// exactly `size_of::<T>()`. Otherwise the body has not shown where the
+    /// view ends, and the extent is the addendum-77 fallback with its receipt.
+    exact: bool,
     initializer: HirId,
     initializer_span: Span,
 }
 
-/// Count the body's path uses of one local binding.
-struct UseCounter {
+/// Count the body's path uses of one local binding, and check each `offset`
+/// of it against a constant bound.
+struct UseCounter<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
     local: HirId,
     count: usize,
+    /// Indices that are constants in `0..bound`, out of every `offset` seen.
+    bound: u64,
+    offsets: usize,
+    constant_in_bound: usize,
 }
 
-impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for UseCounter {
+impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for UseCounter<'tcx> {
     fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
         if is_param_path(expression, self.local) {
             self.count += 1;
+        }
+        if let ExprKind::MethodCall(segment, receiver, [index], _) = expression.kind
+            && segment.ident.name.as_str() == "offset"
+            && is_param_path(receiver, self.local)
+        {
+            self.offsets += 1;
+            if eval_const(self.tcx, self.owner, index)
+                .is_some_and(|k| k >= 0 && u64::try_from(k).is_ok_and(|k| k < self.bound))
+            {
+                self.constant_in_bound += 1;
+            }
         }
         rustc_hir::intravisit::walk_expr(self, expression);
     }
@@ -326,10 +348,11 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for UseCounter {
 
 /// Read one unannotated local's byte view: `let v = p as *mut u8` (any run of
 /// plain pointer casts, ending at `u8`) where `p` is a parameter of this
-/// function typed `*T` for a scalar `T`, and the cast is `p`'s ONLY use in
-/// the body — so the view is the only live path to the scalar while it
-/// lives, and a safe form of `p` is never used alongside it. `None` is "not
-/// in the class"; the ladder's own hold stays.
+/// function typed `*T` for a scalar `T` wider than a byte (a byte-to-byte
+/// recast is a string, not a view), and the cast is `p`'s ONLY use in the
+/// body — so the view is the only live path to the scalar while it lives,
+/// and a safe form of `p` is never used alongside it. `None` is "not in the
+/// class"; the ladder's own hold stays.
 fn read_byte_view<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<ByteView> {
     if subject.ptr_depth != 1 || subject.kind != SubjectKind::Local || subject.ty_span.is_some() {
         return None;
@@ -366,18 +389,37 @@ fn read_byte_view<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<ByteView
         return None;
     }
     let (size, _) = layout_of(tcx, subject.fn_did, *scalar_ty)?;
+    if size <= 1 {
+        return None;
+    }
     let mut counter = UseCounter {
+        tcx,
+        owner: subject.fn_did,
         local: parameter,
         count: 0,
+        bound: size,
+        offsets: 0,
+        constant_in_bound: 0,
     };
     rustc_hir::intravisit::Visitor::visit_expr(&mut counter, body.value);
     if counter.count != 1 {
         return None;
     }
+    let mut indices = UseCounter {
+        tcx,
+        owner: subject.fn_did,
+        local: subject.hir_id,
+        count: 0,
+        bound: size,
+        offsets: 0,
+        constant_in_bound: 0,
+    };
+    rustc_hir::intravisit::Visitor::visit_expr(&mut indices, body.value);
     Some(ByteView {
         parameter,
         scalar: super::declaration::pointee_source(tcx, *scalar_ty),
         size,
+        exact: indices.offsets > 0 && indices.constant_in_bound == indices.offsets,
         initializer: initializer.hir_id,
         initializer_span: initializer.span,
     })
@@ -652,7 +694,7 @@ pub(crate) fn collect(
             Region {
                 shape: Shape::ByteView,
                 offset_bytes: 0,
-                len_bytes: Some(view.size),
+                len_bytes: view.exact.then_some(view.size),
                 element: "u8".to_owned(),
                 element_size: 1,
                 mutable: subject.mutable,
@@ -1116,8 +1158,12 @@ pub(crate) fn receivers(
                 initializer_span: view.initializer_span,
                 element: "u8".to_owned(),
                 mutable: subject.mutable,
-                count_text: format!("core::mem::size_of::<{}>()", view.scalar),
-                fabricated: false,
+                count_text: if view.exact {
+                    format!("core::mem::size_of::<{}>()", view.scalar)
+                } else {
+                    super::seam::FABRICATED_LEN_PATH.to_owned()
+                },
+                fabricated: !view.exact,
                 enclosing_unsafe_fn: tcx
                     .fn_sig(subject.fn_did)
                     .skip_binder()

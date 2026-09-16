@@ -4146,6 +4146,13 @@ fn transform_with<'tcx>(
             unmatched_receiver_inputs.len()
         ));
     }
+    // wave-6b: a region receiver placed under the fallback extent names the
+    // crate-level const like any fabricated seam; counted here, past the
+    // placement (every input above was consumed or the pass failed).
+    seams.len_fabricated += receiver_inputs
+        .values()
+        .filter(|graft| matches!(graft, ReceiverGraft::Region(receiver) if receiver.fabricated))
+        .count();
 
     // Surface policy runs after every inner-body transform. The transformed
     // function becomes the safe inner; the pristine capture supplies the raw
