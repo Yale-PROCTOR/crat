@@ -1130,7 +1130,15 @@ fn w6f_array_of_references_local_delivers() {
         "let mut other_point: &crate::kmVec2 = if i == 3 as u32 || i == 0 as u32 { points[1 as usize].unwrap() } else { points[0 as usize].unwrap() };",
         "acc += kmVec2Dot(this_point, next_point) + (*this_point).x + (*other_point).y;",
     ] {
-        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+        // A composition may reborrow a thin Ref local's initializer
+        // (`= &*points[i as usize].unwrap()`, another family's rule): the same
+        // delivered form, one `&*` deeper. The pin is of the form, so a
+        // reborrow-free reading of both sides satisfies it too.
+        let reborrowless = flat.replace("&*", "");
+        assert!(
+            flat.contains(needle) || reborrowless.contains(&needle.replace("&*", "")),
+            "missing {needle:?} in\n{source}"
+        );
     }
 
     // Control: a raw-model source stored into the array.
