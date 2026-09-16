@@ -901,9 +901,13 @@ pub(crate) fn derive_return_eligibility(
             result.failures.insert(key, LifetimeFailure::OriginConflict);
             continue;
         }
-        // wave 6: a cast initializer types the local by the cast, not by the
-        // callee's return — the cast position is the expression carrier's.
-        if super::return_through_raw_field::initializer_is_cast(program, subject) {
+        // wave 6: a cast initializer types the local by the CAST's pointee —
+        // the reference is a typed reborrow of the view cast (the cast
+        // receiver of the expression carrier); a cast to anything but a raw
+        // pointer has no reference form.
+        if super::return_through_raw_field::initializer_is_cast(program, subject)
+            && !super::return_through_raw_field::initializer_casts_to_raw_pointer(program, subject)
+        {
             result
                 .failures
                 .insert(key, LifetimeFailure::SeamIncompatible);

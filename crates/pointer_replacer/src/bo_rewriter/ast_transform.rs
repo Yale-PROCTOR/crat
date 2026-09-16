@@ -2624,6 +2624,10 @@ impl MutVisitor for C9GraftVisitor<'_> {
 enum ReceiverGraft<'a> {
     Outbound(&'a super::decision::outbound_expression::OutboundExpressionPlan),
     Expression(&'a super::decision::native_result_expression::NativeResultExpressionPlan),
+    /// wave-6l: the cast a view sits in, reborrowed for its inferred-reference
+    /// receiver (`let n: &U = &*(… as *mut U)`); grafted at the CAST node
+    /// after its children, so the view is already in the text.
+    CastReceiver(&'a super::decision::native_result_expression::NativeResultExpressionPlan),
     Retired(&'a super::decision::receiver_input::ReceiverInputPlan),
     Raw(&'a super::decision::raw_receiver::RawReceiverPlan),
     SharedOption(&'a super::decision::return_receiver::ReceiverPlan),
@@ -2638,6 +2642,9 @@ impl ReceiverGraft<'_> {
             Self::Raw(input) => input.render(call),
             Self::Outbound(input) => input.render(call),
             Self::Expression(input) => input.render(call),
+            Self::CastReceiver(input) => input
+                .render_cast_receiver(call)
+                .expect("a cast-receiver graft is planned only with its receiver"),
             Self::SharedOption(input) => input.render_coercion(call),
             Self::Region(receiver) => receiver.render(call),
         }
@@ -2681,9 +2688,20 @@ impl MutVisitor for ReceiverInputGraftVisitor<'_> {
             ));
             return;
         }
-        if !matches!(expression.kind, rustc_ast::ExprKind::Call(..)) && !input.wraps_cast() {
+        let expected_call = !matches!(input, ReceiverGraft::CastReceiver(_));
+        if expected_call
+            && !matches!(expression.kind, rustc_ast::ExprKind::Call(..))
+            && !input.wraps_cast()
+        {
             self.failure = Some(format!(
                 "receiver-input-invariant:non-call:{}..{}",
+                key.0, key.1
+            ));
+            return;
+        }
+        if !expected_call && !matches!(expression.kind, rustc_ast::ExprKind::Cast(..)) {
+            self.failure = Some(format!(
+                "receiver-input-invariant:non-cast:{}..{}",
                 key.0, key.1
             ));
             return;
@@ -4216,6 +4234,21 @@ fn transform_with<'tcx>(
                 "native-result-expression-invariant:duplicate-plan:{}..{}",
                 key.0, key.1
             ));
+        }
+        if let Some(receiver) = input.cast_receiver
+            && let Some(cast) = input.covers_initializer
+            && reverts.keeps_subject(input.caller, receiver.binding)
+        {
+            let key = (cast.lo().0, cast.hi().0);
+            if receiver_inputs
+                .insert(key, ReceiverGraft::CastReceiver(input))
+                .is_some()
+            {
+                return Err(format!(
+                    "native-result-expression-invariant:duplicate-cast-receiver:{}..{}",
+                    key.0, key.1
+                ));
+            }
         }
     }
     for input in table

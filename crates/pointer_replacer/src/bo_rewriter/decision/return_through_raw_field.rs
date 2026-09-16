@@ -533,6 +533,31 @@ pub(crate) fn initializer_is_cast(program: &RustProgram<'_>, subject: &Subject) 
     }
 }
 
+/// The cast initializer's target is a raw pointer (`*mut U` / `*const U`),
+/// so the local can hold `&U` / `&mut U` through a typed reborrow.
+pub(crate) fn initializer_casts_to_raw_pointer(
+    program: &RustProgram<'_>,
+    subject: &Subject,
+) -> bool {
+    let tcx = program.tcx;
+    let mut node = subject.hir_id;
+    loop {
+        match tcx.parent_hir_node(node) {
+            rustc_hir::Node::Pat(pat) => node = pat.hir_id,
+            rustc_hir::Node::LetStmt(local) => {
+                return local.init.is_some_and(|init| {
+                    matches!(init.kind, rustc_hir::ExprKind::Cast(..))
+                        && matches!(
+                            tcx.typeck(subject.fn_did).expr_ty(init).kind(),
+                            TyKind::RawPtr(..)
+                        )
+                });
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// The dead-return parameter of a callee: the bare parameter its `return`
 /// hands back when no reachable MIR block assigns the return place (a
 /// diverging call precedes every return). `None` when the return place is

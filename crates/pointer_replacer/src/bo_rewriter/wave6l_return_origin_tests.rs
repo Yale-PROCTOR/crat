@@ -1229,7 +1229,7 @@ fn w6l_expression_position_receivers_keep_the_callee_class_placed() {
     // own T2 receipt; its field reads are untouched.
     assert!(
         text.contains(&format!(
-            "letmutN:&kmVec3=&*({}as*mutkmVec3);(*N).x+(*N).y",
+            "letmutN:&crate::kmVec3=&*({}as*mutkmVec3);(*N).x+(*N).y",
             view("__crat_native_result_14_10", "normals,x,y")
         )),
         "{text}"

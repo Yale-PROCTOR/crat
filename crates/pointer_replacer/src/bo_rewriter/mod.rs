@@ -8740,11 +8740,15 @@ fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision
             let TyKind::RawPtr(pointee, _) = *signature.output().kind() else { continue };
             (
                 *callee,
-                format!(
-                    "&{}{}",
-                    if *mutable { "mut " } else { "" },
-                    decision::declaration::pointee_source(tcx, pointee)
-                ),
+                // wave-6l: a cast receiver holds a reference of the CAST's pointee.
+                decision::native_result_expression::cast_receiver_type(tcx, subject, *mutable)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "&{}{}",
+                            if *mutable { "mut " } else { "" },
+                            decision::declaration::pointee_source(tcx, pointee)
+                        )
+                    }),
                 "ref",
             )
         };

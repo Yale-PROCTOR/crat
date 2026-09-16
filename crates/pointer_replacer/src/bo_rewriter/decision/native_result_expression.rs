@@ -112,6 +112,18 @@ pub(crate) struct NativeResultExpressionPlan {
     pub(crate) temporary: String,
     pub(crate) mutable_temporary: bool,
     view: String,
+    /// wave 6: the cast this view sits in initialises an inferred-reference
+    /// local (`let n = callee(..) as *mut U`): the whole cast is reborrowed
+    /// as `&{mut }*(cast)` so the local holds a reference of the CAST's
+    /// pointee, under this view's own receipt.
+    pub(crate) cast_receiver: Option<CastReceiver>,
+}
+
+/// The receiving local of a cast initializer this view delivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CastReceiver {
+    pub(crate) binding: HirId,
+    pub(crate) mutable: bool,
 }
 
 impl NativeResultExpressionPlan {
@@ -144,6 +156,16 @@ impl NativeResultExpressionPlan {
             waiver_id: Some(RAW_BOUNDARY_T2_WAIVER_ID.into()),
             unsafe_context: None,
         }
+    }
+
+    /// The cast receiver's initializer: the cast, already carrying this view,
+    /// reborrowed as a reference of its pointee.
+    pub(crate) fn render_cast_receiver(&self, adapted_cast: &str) -> Option<String> {
+        let receiver = self.cast_receiver?;
+        Some(format!(
+            "&{}*({adapted_cast})",
+            if receiver.mutable { "mut " } else { "" }
+        ))
     }
 
     /// The input is the call after its own argument adapters; binding it once
@@ -518,6 +540,25 @@ pub(crate) fn plan(
                 Form::Opt { mutable, .. } => mutable,
                 Form::Ref { .. } | Form::Slice { .. } => selected.mutable_binding_required,
             };
+            let cast_receiver = covers_initializer.and_then(|_| {
+                let binding = cast_receiver_binding(tcx, call)?;
+                let mutable = table.entries.iter().find_map(|(subject, decision)| {
+                    (subject.fn_did == caller && subject.hir_id == binding).then_some(decision)
+                })?;
+                match mutable {
+                    Decision::InferredRef { mutable, .. } => Some(CastReceiver {
+                        binding,
+                        mutable: *mutable,
+                    }),
+                    Decision::Ref { .. }
+                    | Decision::Slice { .. }
+                    | Decision::Opt { .. }
+                    | Decision::NestedSlice { .. }
+                    | Decision::Cursor { .. }
+                    | Decision::Box(_)
+                    | Decision::Degraded(_) => None,
+                }
+            });
             out.plans.insert(
                 key,
                 NativeResultExpressionPlan {
@@ -533,11 +574,67 @@ pub(crate) fn plan(
                     temporary,
                     mutable_temporary,
                     view,
+                    cast_receiver,
                 },
             );
         }
     }
     out
+}
+
+/// The binding `let n = callee(..) as *mut U` initialises, when the call's
+/// parent is a cast that is itself a `let` initializer.
+fn cast_receiver_binding(tcx: TyCtxt<'_>, call: &Expr<'_>) -> Option<HirId> {
+    let HirNode::Expr(cast) = tcx.parent_hir_node(call.hir_id) else {
+        return None;
+    };
+    let ExprKind::Cast(operand, _) = cast.kind else {
+        return None;
+    };
+    if operand.hir_id != call.hir_id {
+        return None;
+    }
+    let HirNode::LetStmt(local) = tcx.parent_hir_node(cast.hir_id) else {
+        return None;
+    };
+    if !local.init.is_some_and(|init| init.hir_id == cast.hir_id) {
+        return None;
+    }
+    match local.pat.kind {
+        rustc_hir::PatKind::Binding(_, binding, ..) => Some(binding),
+        _ => None,
+    }
+}
+
+/// The declared type of a cast receiver's inferred reference: the CAST's
+/// pointee (`let n = callee(..) as *mut U` → `&U` / `&mut U`), not the
+/// callee's. `None` for every other inferred local.
+pub(crate) fn cast_receiver_type(
+    tcx: TyCtxt<'_>,
+    subject: &super::Subject,
+    mutable: bool,
+) -> Option<String> {
+    let owner = subject.fn_did;
+    let mut node = subject.hir_id;
+    let local = loop {
+        match tcx.parent_hir_node(node) {
+            HirNode::Pat(pat) => node = pat.hir_id,
+            HirNode::LetStmt(local) => break local,
+            _ => return None,
+        }
+    };
+    let init = local.init?;
+    let ExprKind::Cast(..) = init.kind else {
+        return None;
+    };
+    let TyKind::RawPtr(pointee, _) = *tcx.typeck(owner).expr_ty(init).kind() else {
+        return None;
+    };
+    Some(format!(
+        "&{}{}",
+        if mutable { "mut " } else { "" },
+        super::declaration::pointee_source(tcx, pointee)
+    ))
 }
 
 /// Which subject kinds a call-result subject local can have — kept exhaustive
