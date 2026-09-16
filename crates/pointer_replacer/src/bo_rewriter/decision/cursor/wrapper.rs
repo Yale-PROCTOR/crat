@@ -794,9 +794,33 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             if peer_owned {
                 return;
             }
-            // Otherwise the idiom's chain is this cursor's derived address; the
-            // `&*` and the cast around it keep their raw meaning (a value another
-            // family may wrap — its edit composes over this inner one).
+            // Otherwise the idiom's chain is this cursor's derived address where
+            // the value is compared or differenced, or stored into a peer whose
+            // own edit composes over this inner one; the `&*` and the cast keep
+            // their raw meaning. A cast returned as-is stays off the raw-return
+            // bridge (the C-N2 control), so any other position holds.
+            let composes = match parent {
+                hir::Node::LetStmt(decl) => decl.init.is_some_and(|init| init.hir_id == e.hir_id),
+                hir::Node::Expr(parent) => match parent.kind {
+                    hir::ExprKind::Assign(_, rhs, _) => rhs.hir_id == e.hir_id,
+                    hir::ExprKind::Binary(..) => true,
+                    hir::ExprKind::MethodCall(_, _, [arg], _) => {
+                        arg.hir_id == e.hir_id
+                            && emission::method(
+                                self.ctx.tcx,
+                                self.subject.fn_did,
+                                parent,
+                                &["offset_from"],
+                            )
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !composes {
+                self.hold.get_or_insert(CursorHold::BorrowedElementUnbuilt);
+                return;
+            }
             let address = |derived: &str| {
                 if self.optional {
                     format!(
