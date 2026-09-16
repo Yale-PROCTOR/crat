@@ -4448,12 +4448,21 @@ impl RawBoundaryDispositionIndex {
                                 // returns the argument hands the alias to the
                                 // caller, whose own row accounts for it; the
                                 // site is T2 `ReturnedAliasUsed`. (A discarded
-                                // result is wave-6r's T1 arm, above.)
+                                // result is wave-6r's T1 arm, above.) A caller
+                                // that WRITES through the returned alias keeps
+                                // wave-6r's positive retention (their
+                                // `kept_by_caller` pin): the tier is for a
+                                // caller whose own row only reads through it.
                                 Some((_, RetentionVerdict::Retains { .. })) | None
                                     if site.callee_local.is_some_and(|callee| {
                                         retention
                                             .returns_argument_only(callee, site.key.argument_index)
-                                    }) =>
+                                    }) && match subject.kind {
+                                        super::SubjectKind::Param { hir_index } => {
+                                            retention.no_write_through(node.0, hir_index)
+                                        }
+                                        _ => false,
+                                    } =>
                                 {
                                     evidence = format!("{evidence};returned-alias-used");
                                     Ok(RawBoundaryDisposition::T2 {
