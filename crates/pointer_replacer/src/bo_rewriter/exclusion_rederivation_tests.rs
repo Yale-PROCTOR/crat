@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 #[path = "exclusion_rederivation_bzip2_fixture.rs"]
 mod bzip2_fixture;
+#[path = "exclusion_rederivation_quadtree_fixture.rs"]
+mod quadtree_fixture;
 
 use super::{A5Mode, WholeProgramAttestation, additive::FamilyFallbackReceipt, decision};
 
@@ -1043,6 +1045,16 @@ mod l07_rows_relay_017 {
         );
     }
 
+    /// Relay 025: quadtree's `find_(get_quadrant_(node, &mut test), x, y)` —
+    /// the MUTABLE reborrow of the raw-returning call over the weakening of
+    /// its argument; the twin of the shared row, measured as the three
+    /// `cross-class-interval-collision` rows `find_::node`,
+    /// `get_quadrant_::{root, point}` at census 1.
+    #[test]
+    fn c_raw_reborrow_mut_over_shared_weakening_composes() {
+        composes(Arm::C, "c-raw-reborrow-mut", Arm::Glue, "shared-weakening");
+    }
+
     #[test]
     fn typed_raw_temporary_over_box_expression_composes() {
         composes(
@@ -1219,4 +1231,63 @@ mod a5_wrapper_subsumes_a_selected_view_bridge {
             assert!(!f.collisions.is_empty());
         });
     }
+}
+
+/// Relay 025's three quadtree rows on the corpus-derived reduction: `find_`'s
+/// mutable reborrow of `get_quadrant_(node, &mut test)` over `get_quadrant_`'s
+/// weakening of `&mut test` (`c-raw-reborrow-mut` over `shared-weakening`).
+/// On the census-1 composition the pair held both classes and, through their
+/// dependents, seven subjects (`quadtree_node_isleaf::node`,
+/// `node_contains_::{outer, it}`, `get_quadrant_::{root, point}`,
+/// `find_::node`, `quadtree_search::tree`); under the row every one of them
+/// places in the corpus program (40 -> 33 degradations, 0 reverts) and the AST
+/// pass (wave-6l's `c3d9fc93`) renders
+/// `find_(&mut *get_quadrant_(node, &(test)), x, y)`.
+///
+/// **What this asserts is the COLLISION, not the placement** (relay 028): the
+/// reduction's own `insert_` leaves `get_quadrant_`'s return without a
+/// lifetime permit on a tree that has wave-6p's weakening (measured on the
+/// assembler's `batch-9-dry2` `4bc42b57`: `dropped-site:return-lifetime-permit-
+/// absent` on class 33, and `find_` then `dependency-class-held:33`), so
+/// whether the classes PLACE is a fact about other families, not about this
+/// row. What the row owns is that the pair no longer collides — on `4bc42b57`
+/// the program's collision table is EMPTY. On a base without a weakening
+/// producer (this one) the assertion is vacuously true and the shape is a
+/// regression guard, as the bzip2 witness above is; its substantive RED is the
+/// composition, where the same fixture collided before the row.
+#[test]
+fn quadtree_mutable_reborrow_over_weakened_argument_places() {
+    let input = quadtree_fixture::QUADTREE_FIND;
+    let outcome = super::rewrite_core_injected(
+        ::utils::compilation::str_to_input(input),
+        None,
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        false,
+        Some((
+            A5Mode::PreciseReplay,
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    );
+    let super::RewriteOutcome::Emitted {
+        degradations,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
+        panic!("quadtree reduction degraded: {outcome:?}")
+    };
+    assert!(
+        raw_boundary_artifacts.class_collisions.lines().count() <= 1,
+        "the pair must not collide:\n{}",
+        raw_boundary_artifacts.class_collisions
+    );
+    assert!(
+        !degradations
+            .iter()
+            .any(|d| format!("{d:?}").contains("cross-class-interval-collision")),
+        "{degradations:#?}"
+    );
 }

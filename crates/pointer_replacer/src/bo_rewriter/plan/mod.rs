@@ -530,6 +530,11 @@ fn nested_ast_composition(
                     // the one owner) instead of holding both classes here.
                     | ("c-raw-reborrow-shared", "shared-weakening")
                     | ("typed-raw-temporary", "box-expression")
+                    // Relay 025: the mutable twin — quadtree's `find_(
+                    // get_quadrant_(node, &mut test), x, y)`, the three
+                    // collision rows `find_::node`, `get_quadrant_::{root,
+                    // point}` at census 1.
+                    | ("c-raw-reborrow-mut", "shared-weakening")
             );
         let raw_receiver_over_argument = matches!(
             outer.key.bridge_kind.as_str(),
@@ -6109,8 +6114,8 @@ mod wave3_class_tests {
         // (seat addendum 411): the shared reborrow of a raw-returning call
         // over W-C5's argument adapter, and a call bridge over a Box owner's
         // access edit — the AST pass renders both nestings since wave-6l's
-        // `f8a2d5e6`.
-        const PAIRS: [(Arm, &str, Arm, &str); 7] = [
+        // `f8a2d5e6` — and relay 025's mutable twin of the reborrow row.
+        const PAIRS: [(Arm, &str, Arm, &str); 8] = [
             (Arm::Pair, "pair-t2-raw-view", Arm::C, "typed-raw-temporary"),
             (
                 Arm::Pair,
@@ -6133,6 +6138,7 @@ mod wave3_class_tests {
                 Arm::Surface,
                 "box-expression",
             ),
+            (Arm::C, "c-raw-reborrow-mut", Arm::Glue, "shared-weakening"),
         ];
         for (outer_arm, outer_kind, inner_arm, inner_kind) in PAIRS {
             with_classes(2, |ids| {
