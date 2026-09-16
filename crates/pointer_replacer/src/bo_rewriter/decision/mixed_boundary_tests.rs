@@ -180,11 +180,15 @@ fn w5c_mixed_boundary_output_state_delivers() {
     );
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
     let text = flat(&emitted);
-    // The owner's class is not applied in this reduction (its `available_out`
-    // sibling flows into `WriteRingBuffer`'s raw parameter), so the decided
-    // form shows at the bridged calls, not yet at the signature.
+    // Where the owner's class is NOT applied (this reduction alone: its
+    // `available_out` sibling flows into `WriteRingBuffer`'s raw parameter)
+    // the decided form shows at the bridged call, `&mut *s`; where the
+    // composition applies it (batch 9's frame: `s: &mut …` in the signature)
+    // the argument is already `&mut` and needs no bridge. Both are this
+    // rule's claim — `s` reaches the converting callee as a reference.
     assert!(
-        text.contains("BrotliEnsureRingBuffer(&mut *s) == 0"),
+        text.contains("BrotliEnsureRingBuffer(&mut *s) == 0")
+            || text.contains("BrotliEnsureRingBuffer(s) == 0"),
         "{emitted}"
     );
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));

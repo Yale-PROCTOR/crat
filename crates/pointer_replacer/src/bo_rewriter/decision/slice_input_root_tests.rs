@@ -90,6 +90,46 @@ fn fixture_no_companion() -> String {
         )
 }
 
+
+/// **The adapter's extent arm, in both frames.** Ruling item 4a licensed the
+/// adjacent integer by adjacency; R408-1 (wave-6f, batch 8) requires evidence
+/// that it is a COUNT — a pinned contract's count position, wave-5c's
+/// thin-count proof, or wave-6f's field transaction. These reductions carry
+/// none, so on the composed frame the same site takes the receipted
+/// `FALLBACK_SLICE_EXTENT` (addendum 77) where this lane's own line still
+/// spells `(n) as usize`. The witness pins the SHAPE of the adapter and
+/// accepts either extent; which one it is belongs to R408-1's evidence, not
+/// to this rule. (Report 020 §2 asks whether the chain proof of R418-1 is
+/// count evidence for that arm.)
+fn extent_arm(flat: &str, prefix: &str) -> String {
+    let at = flat
+        .find(prefix)
+        .unwrap_or_else(|| panic!("{prefix} not in {flat}"));
+    // The prefix ends inside the constructor's argument list, so the extent
+    // runs to the `)` that closes it — depth-aware, because the licensed
+    // spelling is itself parenthesised (`(n) as usize`).
+    let rest = &flat[at + prefix.len()..];
+    let mut depth = 1usize;
+    let mut end = rest.len();
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    rest[..end].trim().trim_end_matches(',').to_owned()
+}
+fn licensed_extent(extent: &str, companion: &str) -> bool {
+    extent == companion || extent == "crate::FALLBACK_SLICE_EXTENT"
+}
+
 /// `SplitByteVector::data` and `RefineEntropyCodes::data` are the corpus's
 /// thin forwarders; their root is the caller's allocation LOCAL, which W-C7
 /// refused (`caller-not-supplied`: a supplier had to be a parameter).
@@ -124,14 +164,13 @@ fn w5c_slice_input_root_local_forwarders_deliver() {
         );
     }
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
-    assert!(
-        emitted.contains("unsafe fn SplitByteVector(data: &[u8]"),
-        "{emitted}"
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("unsafe fn SplitByteVector(data: &[u8]"), "{flat}");
+    let extent = extent_arm(
+        &flat,
+        "SplitByteVector(core::slice::from_raw_parts(literals,",
     );
-    assert!(
-        emitted.contains("SplitByteVector(core::slice::from_raw_parts(literals, (n) as usize)"),
-        "{emitted}"
-    );
+    assert!(licensed_extent(&extent, "(n) as usize"), "{extent}: {flat}");
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
 }
 

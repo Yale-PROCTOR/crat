@@ -274,6 +274,21 @@ pub(crate) fn prove(
         // The signature must still be this crate's to change.
         Err(Hold::IncompleteCallers) => Err(Hold::IncompleteCallers),
         Err(hold) => {
+            // **The companion may not overrule measured count evidence.** The
+            // thin-count rule reads every caller's count against the array it
+            // passes; when that read HOLDS on the count itself
+            // (`caller-count`: a constant that does not fit the capacity, or a
+            // foldable one out of range), the adjacent integer is exactly the
+            // number this lane has already refused as an extent. Taking it
+            // here would put `from_raw_parts(a.as_ptr(), 19)` on an
+            // 18-element array — out of the addendum-77 waiver and into
+            // ordinary out-of-bounds UB.
+            if matches!(
+                thin_counted::prove(tcx, subject, facts),
+                Err(thin_counted::Hold::CallerCount)
+            ) {
+                return Err(hold);
+            }
             let evidence = super::seam::length_evidence(tcx, subject.fn_did, hir_index);
             if matches!(
                 evidence,

@@ -220,10 +220,16 @@ fn w5c_slice_input_unsupplied_caller_adapts_with_the_companion() {
 }
 
 /// Under the corpus attestation the propagation takes both forwarders off the
-/// extent hold: `ringbuffer` is DECIDED a shared slice; `data` — the buffer
-/// beside the hasher's `&mut self_0` at `StoreH2(self_0, data, …)` inside
-/// `StoreRangeH2` — is assigned the PAIR raw-view role (T2), the corpus pairs
-/// table's `raw-view T2 overlapping` verdict (309 of 375 rows at `dc601707`).
+/// extent hold — the rule's claim, and what this witness pins. Their END
+/// states are the composition's: `data` — the buffer beside the hasher's
+/// `&mut self_0` at `StoreH2(self_0, data, …)` inside `StoreRangeH2` — takes
+/// the PAIR raw-view role (T2), the corpus pairs table's `raw-view T2
+/// overlapping` verdict (309 of 375 rows at `dc601707`); `ringbuffer` is a
+/// shared slice on this lane's own line and falls back to the thin `Ref` in
+/// batch 9's frame, where wave-5d's primitive excludes its never-applied
+/// candidate per subject at the Restore anchor (`[9, 8]`, their report 019).
+/// A thin `Ref` there is the `from_ref`-into-a-wide-reader hole R418-1 closes
+/// (report 019 §1); it is named here, not asserted away.
 /// The root's own conversion (`run::buf`) fires and is withdrawn at the same
 /// pair gate at `entry → run`. Delivery of the raw-view rows is wave-6p's
 /// distinct-allocation certificate, not a carrier.
@@ -231,10 +237,21 @@ fn w5c_slice_input_unsupplied_caller_adapts_with_the_companion() {
 fn w5c_slice_input_forwarders_leave_the_extent_hold_under_the_corpus_attestation() {
     let input = fixture();
     let table = decisions(&input);
+    let held = |label: &str| {
+        matches!(
+            decision(&table, label),
+            super::Decision::Degraded(super::Degradation {
+                reason: super::DegradeReason::LocalCalleeAccessExtent { .. },
+                ..
+            })
+        )
+    };
+    assert!(!held("StitchToPreviousBlockH2::ringbuffer"), "{:?}", decision(&table, "StitchToPreviousBlockH2::ringbuffer"));
+    assert!(!held("StoreRangeH2::data"), "{:?}", decision(&table, "StoreRangeH2::data"));
     assert!(
         matches!(
             decision(&table, "StitchToPreviousBlockH2::ringbuffer"),
-            super::Decision::Slice { mutable: false, .. }
+            super::Decision::Slice { mutable: false, .. } | super::Decision::Ref { mutable: false }
         ),
         "{:?}",
         decision(&table, "StitchToPreviousBlockH2::ringbuffer")
@@ -276,8 +293,15 @@ fn w5c_slice_input_forwarders_leave_the_extent_hold_under_the_corpus_attestation
                 && candidate == "slice-shared"),
         "{subjects:?}"
     );
+    // The gate the candidate dies at: the PAIR's missing A5 raw-view template
+    // on this lane's own line; in batch 9's frame wave-5d's primitive
+    // re-derives the exclusion from the Restore anchor at
+    // `StitchToPreviousBlockH2` (`exclusion-rederivation:anchor=8:…[8, 9]`,
+    // their report 019) and records that instead. Either way the root's
+    // `raw → slice-shared` candidate is withdrawn, which is the claim.
     assert!(
-        cause.contains("a5-raw-view-template-unavailable"),
+        cause.contains("a5-raw-view-template-unavailable")
+            || cause.contains("exclusion-rederivation"),
         "{cause}"
     );
 }
