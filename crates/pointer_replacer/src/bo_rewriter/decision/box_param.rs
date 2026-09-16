@@ -336,8 +336,54 @@ fn slice_uses_of(
     Ok(rewrites)
 }
 
+/// The formals a chain COULD plan as consuming owners — syntactically: a
+/// depth-1 raw parameter freed exactly once whose other uses the slice-use
+/// collector rewrites, of a callee whose address is not taken. The
+/// allocation-return certificate (A1) asks this to admit a receiver's
+/// transfer into such a formal; the chain itself then confirms or not.
+pub(crate) fn consuming_formals<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
+    subjects: &[Subject],
+) -> FxHashSet<(DefId, usize)> {
+    let mut scans: FxHashMap<LocalDefId, Scan<'tcx>> = FxHashMap::default();
+    for &function in functions {
+        let mut scan = Scan {
+            tcx: Some(tcx),
+            ..Scan::default()
+        };
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else { continue };
+        scan.visit_body(tcx.hir_body(body_id));
+        scans.insert(function, scan);
+    }
+    let fn_values: FxHashSet<DefId> = scans
+        .values()
+        .flat_map(|s| s.fn_values.iter().copied())
+        .collect();
+    let mut out = FxHashSet::default();
+    for param in subjects {
+        let SubjectKind::Param { hir_index } = param.kind else { continue };
+        if param.ptr_depth != 1 || fn_values.contains(&param.fn_did.to_def_id()) {
+            continue;
+        }
+        let Some(scan) = scans.get(&param.fn_did) else { continue };
+        let frees: Vec<(Span, Span)> = scan
+            .frees
+            .iter()
+            .filter(|(hir, _, _)| *hir == param.hir_id)
+            .map(|(_, call, arg)| (*call, *arg))
+            .collect();
+        if frees.len() != 1 || slice_uses_of(tcx, param, &[frees[0].1]).is_err() {
+            continue;
+        }
+        out.insert((param.fn_did.to_def_id(), hir_index));
+    }
+    out
+}
+
 /// Derive every chain for the crate. Runs once, before the family stages; the
 /// model is read only to refuse a chain whose members are not all Owning.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn derive<'tcx>(
     tcx: TyCtxt<'tcx>,
     functions: &[LocalDefId],
@@ -346,6 +392,7 @@ pub(crate) fn derive<'tcx>(
     box_facts: &BoxOwnershipFacts,
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
+    certificates: &super::return_certificate::Certificates,
 ) -> Chains {
     let mut out = Chains::default();
     let mut scans: FxHashMap<LocalDefId, Scan<'tcx>> = FxHashMap::default();
@@ -459,6 +506,33 @@ pub(crate) fn derive<'tcx>(
                     ));
                     break 'callers;
                 };
+                // A1-c: a receiver an allocation-return certificate plans is
+                // an owner too — its plan is the certificate's (the transfer
+                // at this call is what that plan admitted as a sink).
+                if let Some(plan) = certificates.plans.get(&key) {
+                    if plan.optional {
+                        failure = Some(format!(
+                            "box-param-caller-retains:{caller_path}:optional-owner"
+                        ));
+                        break 'callers;
+                    }
+                    if caller_scan
+                        .local_uses
+                        .iter()
+                        .any(|(hir, span)| *hir == *arg && span.lo() > call_span.hi())
+                    {
+                        failure = Some(format!(
+                            "box-param-caller-retains:{caller_path}:used-after-transfer"
+                        ));
+                        break 'callers;
+                    }
+                    let mut plan = plan.clone();
+                    plan.receipts.push(format!(
+                        "box-param-transfer callee={callee_path} index={hir_index} source=return-certificate"
+                    ));
+                    member_plans.push((key, plan, local.label.clone(), Vec::new()));
+                    continue;
+                }
                 if !matches!(
                     constructions.by_binding.get(&key),
                     Some(Construction::Alloc { .. })
@@ -562,13 +636,20 @@ pub(crate) fn derive<'tcx>(
             continue;
         }
         let Some(param_slot) = slot_of(param) else { continue };
-        if model.get(&param_slot) != Some(&SlotKind::Owning) {
+        // The formal's kind: Owning admits; Raw admits when every caller
+        // transfers a CERTIFIED owner (A1-c) — the same licensing wall R410-5
+        // §1 named for the allocation local, superseded on the same source
+        // proof (the formal is freed once, its other uses are derefs, every
+        // caller moves an owner it never touches again); Ref never.
+        let formal_kind = model.get(&param_slot).copied();
+        let certified_callers = member_plans
+            .iter()
+            .all(|(k, _, _, _)| certificates.plans.contains_key(k));
+        if !(formal_kind == Some(SlotKind::Owning)
+            || (formal_kind == Some(SlotKind::Raw) && certified_callers))
+        {
             hold(
-                format!(
-                    "box-param-model:{}:{:?}",
-                    param.label,
-                    model.get(&param_slot)
-                ),
+                format!("box-param-model:{}:{formal_kind:?}", param.label),
                 &mut out,
             );
             continue;
@@ -659,7 +740,7 @@ pub(crate) fn derive<'tcx>(
             .map(|(_, _, label, _)| label.clone())
             .collect();
         out.receipts.push(format!(
-            "box-param-chain callee={callee_path} index={hir_index} pointee={pointee} shape={} callers={call_count} members={}",
+            "box-param-chain callee={callee_path} index={hir_index} pointee={pointee} shape={} callers={call_count} members={} formal_model={formal_kind:?}",
             if slice { "slice" } else { "sized" },
             members.join(",")
         ));

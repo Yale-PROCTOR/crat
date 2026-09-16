@@ -7029,6 +7029,21 @@ fn finish_decide<'tcx>(
         decision::flexible_tail::derive(tcx, &program.functions, &ctors, &subjects);
     // wave-6a W6A-C1: Box-parameter chains of consuming callees (the model is
     // read only to refuse a chain whose members are not all Owning).
+    // wave-6a W6A-A1: allocation-return certificates (relay wave-6a/005 §1),
+    // derived first: a receiver may move into a consuming formal (A1-c) —
+    // admitted on the formal's shape, confirmed once the chains derive.
+    let consuming_formals =
+        decision::box_param::consuming_formals(tcx, &program.functions, &subjects);
+    let mut return_certificates = decision::return_certificate::derive(
+        tcx,
+        &program.functions,
+        &ctors,
+        &subjects,
+        &box_facts,
+        &slots,
+        &model,
+        &consuming_formals,
+    );
     let box_params = decision::box_param::derive(
         tcx,
         &program.functions,
@@ -7037,16 +7052,21 @@ fn finish_decide<'tcx>(
         &box_facts,
         &slots,
         &model,
+        &return_certificates,
     );
-    // wave-6a W6A-A1: allocation-return certificates (relay wave-6a/005 §1).
-    let return_certificates = decision::return_certificate::derive(
+    decision::return_certificate::confirm_transfers(
+        &mut return_certificates,
         tcx,
-        &program.functions,
-        &ctors,
         &subjects,
-        &box_facts,
-        &slots,
-        &model,
+        &|did, index| {
+            did.as_local().is_some_and(|callee| {
+                subjects.iter().any(|s| {
+                    s.fn_did == callee
+                        && matches!(s.kind, decision::SubjectKind::Param { hir_index } if hir_index == index)
+                        && box_params.plans.contains_key(&(s.fn_did, s.hir_id))
+                })
+            })
+        },
     );
     let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
     let mut predecessor: Option<additive::StageSnapshot> = None;

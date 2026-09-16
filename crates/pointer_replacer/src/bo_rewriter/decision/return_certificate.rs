@@ -64,15 +64,28 @@ pub(crate) struct Certificate {
     pub(crate) output_type: String,
     /// The output type's span (the span layer's edit target).
     pub(crate) output_span: Span,
-    /// The returned local.
-    pub(crate) returned: (LocalDefId, HirId),
-    /// Receivers planned for this callee.
+    /// The returned local (`None` when every return is a call / null).
+    pub(crate) returned: Option<(LocalDefId, HirId)>,
+    /// Receivers planned for this callee (`let` and assignment receivers).
     pub(crate) receivers: Vec<(LocalDefId, HirId)>,
     /// Receivers returned by their own function: planned by THAT function's
     /// certificate, which must exist for this one to stand.
     pub(crate) returned_receivers: Vec<(LocalDefId, HirId)>,
-    /// The callee this one's returned local is a receiver of (a chain).
-    pub(crate) chained_from: Option<LocalDefId>,
+    /// Functions that `return callee(..)` directly: certified themselves or
+    /// this certificate withdraws.
+    pub(crate) returning_callers: Vec<LocalDefId>,
+    /// The callees this one's returns chain from (a receiver's source, a
+    /// returned call's target).
+    pub(crate) chained_from: Vec<LocalDefId>,
+    /// Edits outside any subject's plan: a call stored straight into a raw
+    /// place (`(*t).root = callee(..)` → `Box::into_raw(..)`), keyed by the
+    /// storing function (which then follows this certificate's class).
+    pub(crate) site_edits: Vec<(LocalDefId, BoxExprEdit)>,
+    /// A1-c: transfers of an owner into a consuming formal a Box-parameter
+    /// chain plans: (callee, index, the owner). Admitted on the formal's
+    /// syntactic shape; CONFIRMED against the chains after they derive — an
+    /// unconfirmed transfer withdraws this certificate (`confirm_transfers`).
+    pub(crate) transfers: Vec<(DefId, usize, (LocalDefId, HirId))>,
     pub(crate) receipts: Vec<String>,
 }
 
@@ -116,8 +129,100 @@ impl Certificates {
             owners.insert(c.callee);
             owners.extend(c.receivers.iter().map(|(f, _)| *f));
             owners.extend(c.returned_receivers.iter().map(|(f, _)| *f));
+            owners.extend(c.returning_callers.iter().copied());
+            owners.extend(c.site_edits.iter().map(|(f, _)| *f));
         }
         owners
+    }
+}
+
+/// A1-c, after the Box-parameter chains derive: a certificate whose owner
+/// was admitted to move into a consuming formal stands only if a chain plans
+/// that formal (`confirmed`); otherwise it withdraws — the transfer would
+/// have been a raw seam beside a raw free, the double-free path.
+pub(crate) fn confirm_transfers(
+    certificates: &mut Certificates,
+    tcx: TyCtxt<'_>,
+    subjects: &[Subject],
+    confirmed: &dyn Fn(DefId, usize) -> bool,
+) {
+    loop {
+        let withdraw: Vec<LocalDefId> = certificates
+            .callees
+            .values()
+            .filter(|c| c.transfers.iter().any(|(d, i, _)| !confirmed(*d, *i)))
+            .map(|c| c.callee)
+            .collect();
+        if withdraw.is_empty() {
+            break;
+        }
+        for callee in withdraw {
+            let Some(c) = certificates.callees.remove(&callee) else { continue };
+            if let Some(returned) = c.returned {
+                certificates.plans.remove(&returned);
+            }
+            for r in &c.receivers {
+                certificates.plans.remove(r);
+            }
+            let unconfirmed = c
+                .transfers
+                .iter()
+                .filter(|(d, i, _)| !confirmed(*d, *i))
+                .map(|(d, i, _)| format!("{}#{i}", tcx.def_path_str(*d)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let key = c.returned.unwrap_or((callee, rustc_hir::CRATE_HIR_ID));
+            let label = subjects
+                .iter()
+                .find(|s| s.fn_did == key.0 && s.hir_id == key.1)
+                .map(|s| s.label.clone())
+                .unwrap_or_else(|| c.callee_path.clone());
+            certificates.holds.insert(
+                key,
+                (
+                    label,
+                    format!(
+                        "return-certificate-transfer-unconfirmed:{}:{unconfirmed}",
+                        c.callee_path
+                    ),
+                ),
+            );
+        }
+        // A withdrawn callee may have been another's source or receiver
+        // owner: the ordinary withdrawal rule applies again.
+        let withdraw_dependents: Vec<LocalDefId> = certificates
+            .callees
+            .values()
+            .filter(|c| {
+                c.chained_from
+                    .iter()
+                    .any(|s| !certificates.callees.contains_key(s))
+                    || c.returned_receivers
+                        .iter()
+                        .any(|(f, _)| !certificates.callees.contains_key(f))
+                    || c.returning_callers
+                        .iter()
+                        .any(|f| !certificates.callees.contains_key(f))
+            })
+            .map(|c| c.callee)
+            .collect();
+        for callee in withdraw_dependents {
+            let Some(c) = certificates.callees.remove(&callee) else { continue };
+            if let Some(returned) = c.returned {
+                certificates.plans.remove(&returned);
+            }
+            for r in &c.receivers {
+                certificates.plans.remove(r);
+            }
+            let key = c.returned.unwrap_or((callee, rustc_hir::CRATE_HIR_ID));
+            certificates.holds.insert(
+                key,
+                (
+                    c.callee_path.clone(),
+                    format!("return-certificate-chain-open:{}:transfer", c.callee_path),
+                ),
+            );
+        }
     }
 }
 
@@ -193,15 +298,22 @@ pub(crate) fn append_interface_dependencies(table: &mut DecisionTable) {
     let mut edges = Vec::new();
     for c in table.return_certificates.callees.values() {
         let callee = SignatureClassId::of(c.callee);
-        for (f, _) in c.receivers.iter().chain(&c.returned_receivers) {
-            let receiver = SignatureClassId::of(*f);
-            if receiver != callee {
-                edges.push((callee, receiver));
-                edges.push((receiver, callee));
+        for f in c
+            .receivers
+            .iter()
+            .chain(&c.returned_receivers)
+            .map(|(f, _)| *f)
+            .chain(c.returning_callers.iter().copied())
+            .chain(c.site_edits.iter().map(|(f, _)| *f))
+        {
+            let other = SignatureClassId::of(f);
+            if other != callee {
+                edges.push((callee, other));
+                edges.push((other, callee));
             }
         }
-        if let Some(source) = c.chained_from {
-            let source = SignatureClassId::of(source);
+        for source in &c.chained_from {
+            let source = SignatureClassId::of(*source);
             if source != callee {
                 edges.push((callee, source));
                 edges.push((source, callee));
@@ -249,6 +361,8 @@ fn foreign_fn(tcx: TyCtxt<'_>, did: DefId) -> bool {
 
 enum Returned {
     Local(HirId, Span),
+    /// `return callee(..)` of a local callee (the call's span).
+    Call(DefId, Span),
     Null(Span),
     Other(Span),
 }
@@ -264,6 +378,22 @@ struct Scan<'tcx> {
     fn_values: FxHashSet<DefId>,
     /// Every direct call of a local function: (callee, call span).
     calls: Vec<(DefId, Span)>,
+    /// `x = callee(..)` with `x` a bare local: (local, callee, value span).
+    /// (local, callee, value span, statement span)
+    assign_calls: Vec<(HirId, DefId, Span, Span)>,
+    /// `<place> = callee(..)` with a non-local place: (callee, value span).
+    store_calls: Vec<(DefId, Span)>,
+    /// Every assignment to a bare local: (local, value span).
+    assigns: Vec<(HirId, Span)>,
+}
+
+fn local_callee(e: &Expr<'_>) -> Option<DefId> {
+    let ExprKind::Call(callee, _) = &peel_casts(e).kind else { return None };
+    let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else { return None };
+    match path.res {
+        Res::Def(DefKind::Fn, did) if did.is_local() => Some(did),
+        _ => None,
+    }
 }
 
 impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
@@ -276,13 +406,36 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
     fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
         match &e.kind {
             ExprKind::Ret(Some(value)) => {
+                let tcx = self.tcx.expect("scan tcx");
                 self.returns.push(if let Some(hir) = bare_local(value) {
                     Returned::Local(hir, value.span)
                 } else if null_literal(value) {
                     Returned::Null(value.span)
+                } else if let Some(did) = local_callee(value)
+                    && !foreign_fn(tcx, did)
+                {
+                    Returned::Call(did, value.span)
                 } else {
                     Returned::Other(value.span)
                 });
+            }
+            ExprKind::Assign(lhs, rhs, _) => {
+                let tcx = self.tcx.expect("scan tcx");
+                if let Some(hir) = bare_local(lhs) {
+                    self.assigns.push((hir, rhs.span));
+                }
+                let statement = match tcx.parent_hir_node(e.hir_id) {
+                    rustc_hir::Node::Stmt(stmt) => stmt.span,
+                    _ => e.span,
+                };
+                if let Some(did) = local_callee(rhs)
+                    && !foreign_fn(tcx, did)
+                {
+                    match bare_local(lhs) {
+                        Some(hir) => self.assign_calls.push((hir, did, rhs.span, statement)),
+                        None => self.store_calls.push((did, rhs.span)),
+                    }
+                }
             }
             ExprKind::Path(QPath::Resolved(_, path)) => {
                 if let Res::Def(DefKind::Fn, did) = path.res
@@ -317,6 +470,86 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
     }
 }
 
+/// A formal's uses in its own body: `ok` while every occurrence is a deref,
+/// an element access, a null test, or an argument onward to a local callee
+/// (recorded in `nested` for the caller to certify the same way).
+struct LendWalk<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    binding: HirId,
+    ok: bool,
+    nested: Vec<(DefId, usize)>,
+}
+
+impl<'tcx> Visitor<'tcx> for LendWalk<'tcx> {
+    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+        if let ExprKind::Path(QPath::Resolved(_, path)) = &e.kind
+            && let Res::Local(hir) = path.res
+            && hir == self.binding
+        {
+            // The nearest non-cast ancestor.
+            let mut child = e.hir_id;
+            let parent = loop {
+                match self.tcx.parent_hir_node(child) {
+                    rustc_hir::Node::Expr(parent) if matches!(parent.kind, ExprKind::Cast(..)) => {
+                        child = parent.hir_id;
+                    }
+                    rustc_hir::Node::Expr(parent) => break Some((parent, child)),
+                    _ => break None,
+                }
+            };
+            match parent {
+                Some((parent, child)) => match &parent.kind {
+                    ExprKind::Unary(rustc_hir::UnOp::Deref, _) => {}
+                    ExprKind::MethodCall(seg, recv, _, _) if recv.hir_id == child => {
+                        let name = seg.ident.name.as_str();
+                        let under_deref = matches!(
+                            self.tcx.parent_hir_node(parent.hir_id),
+                            rustc_hir::Node::Expr(g) if matches!(g.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                        );
+                        if !(name == "is_null"
+                            || (matches!(name, "offset" | "add" | "wrapping_add") && under_deref))
+                        {
+                            self.ok = false;
+                        }
+                    }
+                    ExprKind::Call(callee, args) if args.iter().any(|a| a.hir_id == child) => {
+                        let index = args
+                            .iter()
+                            .position(|a| a.hir_id == child)
+                            .expect("argument");
+                        match &callee.kind {
+                            ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                                // A local callee's formal (certified the same
+                                // way) or a foreign position (the contract
+                                // table) — both resolved by the caller.
+                                Res::Def(DefKind::Fn, did) => self.nested.push((did, index)),
+                                _ => self.ok = false,
+                            },
+                            _ => self.ok = false,
+                        }
+                    }
+                    _ => self.ok = false,
+                },
+                // A `let q = p` copy or a statement-level use.
+                None => {
+                    if let rustc_hir::Node::LetStmt(local) = self.tcx.parent_hir_node(e.hir_id)
+                        && local.init.is_some_and(|init| init.hir_id == e.hir_id)
+                    {
+                        self.ok = false;
+                    }
+                }
+            }
+        }
+        intravisit::walk_expr(self, e);
+    }
+}
+
 /// One owner's uses, classified by the parent of each bare occurrence.
 struct OwnerUses {
     edits: Vec<BoxExprEdit>,
@@ -326,6 +559,10 @@ struct OwnerUses {
     dead_guards: Vec<Span>,
     /// Null returns swallowed by a dead guard.
     dead_null_returns: Vec<Span>,
+    /// Stores of the owner into raw places (`Box::into_raw` transfers).
+    stores: Vec<Span>,
+    /// Transfers into consuming formals: (callee, index).
+    transfers: Vec<(DefId, usize)>,
 }
 
 struct UseWalk<'a, 'tcx> {
@@ -334,11 +571,15 @@ struct UseWalk<'a, 'tcx> {
     name: &'a str,
     shape: BoxShape,
     optional: bool,
-    /// The owner is the callee's own allocation (its null test is dead).
-    allocation: bool,
+    /// The owner can never be null (an allocation, or a receiver of a
+    /// non-optional certificate): its null guard is dead.
+    never_null: bool,
     frees: &'a [(Span, Span)],
     /// Is the callee's formal at this index a Ref-modeled local formal?
     lend_ok: &'a dyn Fn(DefId, usize) -> bool,
+    /// Is the callee's formal at this index a consuming formal a Box-parameter
+    /// chain could plan (the move IS the sink)?
+    transfer_ok: &'a dyn Fn(DefId, usize) -> bool,
     out: Result<OwnerUses, String>,
 }
 
@@ -385,7 +626,13 @@ impl<'tcx> UseWalk<'_, 'tcx> {
 
     fn classify(&mut self, e: &Expr<'_>) {
         let Some((parent, child)) = self.parent_of(e) else {
-            // A statement-level bare use (`p;`) — nothing to rewrite.
+            // `let q = p;` copies the owner — a second owner — refused; a
+            // statement-level bare use (`p;`) has nothing to rewrite.
+            if let rustc_hir::Node::LetStmt(local) = self.tcx.parent_hir_node(e.hir_id)
+                && local.init.is_some_and(|init| init.hir_id == e.hir_id)
+            {
+                self.refuse(format!("copied-into-let:{}", self.snippet(local.span)));
+            }
             return;
         };
         let name = self.name.to_owned();
@@ -405,7 +652,7 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                         {
                             cond_id = temps.hir_id;
                         }
-                        if self.allocation
+                        if self.never_null
                             && !negated
                             && let rustc_hir::Node::Expr(if_expr) =
                                 self.tcx.parent_hir_node(cond_id)
@@ -499,7 +746,9 @@ impl<'tcx> UseWalk<'_, 'tcx> {
             }
             ExprKind::Unary(rustc_hir::UnOp::Deref, _) => {
                 let replacement = match (self.shape, self.optional) {
-                    (BoxShape::Sized, false) => format!("(*{name})"),
+                    // `*b` on a `Box<T>` is the source's own text: no edit,
+                    // so no interval to collide with a bridge around it.
+                    (BoxShape::Sized, false) => return,
                     (BoxShape::Sized, true) => format!("(*{name}.as_deref_mut().unwrap())"),
                     (BoxShape::Slice, false) => format!("{name}[0]"),
                     (BoxShape::Slice, true) => {
@@ -511,6 +760,33 @@ impl<'tcx> UseWalk<'_, 'tcx> {
             }
             ExprKind::Ret(_) => {}
             ExprKind::Assign(lhs, _, _) if lhs.hir_id == child => {}
+            // The owner stored into a raw place: ownership moves into C's
+            // storage (`Box::into_raw`), exactly the batch-6 deallocator
+            // transfer with the store as the sink; the C free of that place
+            // stays a C free.
+            ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == child => {
+                if bare_local(lhs).is_some() {
+                    self.refuse(format!("copied-into-local:{}", self.snippet(parent.span)));
+                    return;
+                }
+                let lhs_ty = self.tcx.typeck(lhs.hir_id.owner.def_id).expr_ty(lhs);
+                if !matches!(lhs_ty.kind(), rustc_middle::ty::TyKind::RawPtr(..)) {
+                    self.refuse(format!(
+                        "stored-into-non-raw-place:{}",
+                        self.snippet(parent.span)
+                    ));
+                    return;
+                }
+                let replacement = if self.optional {
+                    format!("{name}.map_or(core::ptr::null_mut(), Box::into_raw)")
+                } else {
+                    format!("Box::into_raw({name})")
+                };
+                if let Ok(uses) = &mut self.out {
+                    uses.stores.push(rhs.span);
+                }
+                self.push(rhs.span, replacement, "return-certificate-store-transfer");
+            }
             ExprKind::Call(callee, args) if args.iter().any(|a| a.hir_id == child) => {
                 if self.frees.iter().any(|(call, _)| *call == parent.span) {
                     return; // the free: `drop` is planned by the caller
@@ -537,6 +813,16 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     },
                     _ => None,
                 };
+                if let Some(did) = callee_def
+                    && (self.transfer_ok)(did, index)
+                {
+                    // A1-c: moved into the consuming formal; the chain
+                    // confirms it (`confirm_transfers`) or this owner withdraws.
+                    if let Ok(uses) = &mut self.out {
+                        uses.transfers.push((did, index));
+                    }
+                    return;
+                }
                 if !callee_def.is_some_and(|did| (self.lend_ok)(did, index)) {
                     self.refuse(format!(
                         "call-argument-not-a-lend:{}",
@@ -573,9 +859,10 @@ fn owner_uses(
     subject: &Subject,
     shape: BoxShape,
     optional: bool,
-    allocation: bool,
+    never_null: bool,
     frees: &[(Span, Span)],
     lend_ok: &dyn Fn(DefId, usize) -> bool,
+    transfer_ok: &dyn Fn(DefId, usize) -> bool,
 ) -> Result<OwnerUses, String> {
     let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
     let Some(body_id) = tcx.hir_node_by_def_id(subject.fn_did).body_id() else {
@@ -587,13 +874,16 @@ fn owner_uses(
         name: &name,
         shape,
         optional,
-        allocation,
+        never_null,
         frees,
         lend_ok,
+        transfer_ok,
         out: Ok(OwnerUses {
             edits: Vec::new(),
             dead_guards: Vec::new(),
             dead_null_returns: Vec::new(),
+            stores: Vec::new(),
+            transfers: Vec::new(),
         }),
     };
     walk.visit_body(tcx.hir_body(body_id));
@@ -690,8 +980,11 @@ pub(crate) fn derive<'tcx>(
     box_facts: &BoxOwnershipFacts,
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
+    consuming_formals: &FxHashSet<(DefId, usize)>,
 ) -> Certificates {
     let mut out = Certificates::default();
+    let transfer_ok =
+        |did: DefId, index: usize| -> bool { consuming_formals.contains(&(did, index)) };
     let mut scans: FxHashMap<LocalDefId, Scan<'tcx>> = FxHashMap::default();
     for &function in functions {
         let mut scan = Scan {
@@ -727,22 +1020,124 @@ pub(crate) fn derive<'tcx>(
             .and_then(|u| u.slot_for_local_depth(s.local, 0))
             .map(|slot| SlotRef::Local(s.fn_did, slot))
     };
-    // A local callee's formal at `index` the model calls Ref.
+    // A local callee's formal at `index` the model calls Ref AND whose every
+    // use in the callee is a read through it (derefs, element accesses, null
+    // tests, lends onward to such formals): the model's Ref alone does not
+    // say the callee keeps nothing — a store of the formal through memory
+    // still emits as an escape later — so the callee's own body is read.
+    let lend_memo: std::cell::RefCell<FxHashMap<(DefId, usize), Option<bool>>> =
+        std::cell::RefCell::new(FxHashMap::default());
+    #[allow(clippy::too_many_arguments)]
+    fn lend_formal<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        functions: &[LocalDefId],
+        slots: &CrateSlots,
+        model: &FxHashMap<SlotRef, SlotKind>,
+        memo: &std::cell::RefCell<FxHashMap<(DefId, usize), Option<bool>>>,
+        foreign_lend: &dyn Fn(DefId, usize) -> bool,
+        did: DefId,
+        index: usize,
+    ) -> bool {
+        if foreign_fn(tcx, did) {
+            return foreign_lend(did, index);
+        }
+        match memo.borrow().get(&(did, index)) {
+            Some(Some(answer)) => return *answer,
+            Some(None) => return false, // in progress: a cycle is not a lend
+            None => {}
+        }
+        memo.borrow_mut().insert((did, index), None);
+        let answer =
+            (|| {
+                let callee = did.as_local()?;
+                if !functions.contains(&callee) {
+                    return Some(false);
+                }
+                let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+                if index >= body.arg_count {
+                    return Some(false);
+                }
+                let local = rustc_middle::mir::Local::from_usize(index + 1);
+                let is_ref = slots
+                    .fn_local_slots
+                    .get(&callee)
+                    .and_then(|u| u.slot_for_local_depth(local, 0))
+                    .is_some_and(|slot| {
+                        model.get(&SlotRef::Local(callee, slot)) == Some(&SlotKind::Ref)
+                    });
+                if !is_ref {
+                    return Some(false);
+                }
+                let hir_body = tcx.hir_body_owned_by(callee);
+                let param = hir_body.params.get(index)?;
+                let rustc_hir::PatKind::Binding(_, hir, _, None) = param.pat.kind else {
+                    return Some(false);
+                };
+                let mut walk = LendWalk {
+                    tcx,
+                    binding: hir,
+                    ok: true,
+                    nested: Vec::new(),
+                };
+                walk.visit_body(hir_body);
+                if !walk.ok {
+                    return Some(false);
+                }
+                Some(walk.nested.into_iter().all(|(d, i)| {
+                    lend_formal(tcx, functions, slots, model, memo, foreign_lend, d, i)
+                }))
+            })()
+            .unwrap_or(false);
+        memo.borrow_mut().insert((did, index), Some(answer));
+        answer
+    }
+    // A1-d: a FOREIGN position is a lend when the pinned libc contract table
+    // says the callee neither retains nor consumes it (`NoRetain` +
+    // `BorrowView`; `sscanf`, `strlen`, `strcmp`, `memcpy`, ..): the ordinary
+    // raw-boundary glue bridges the owner at the seam (`as_mut_ptr` / `&*`).
+    // A variadic tail position (`sscanf`'s `%[..]` target) is `UnboundedWrite`
+    // on a byte owner — the same extent the raw program gave it.
+    let foreign_lend = |did: DefId, index: usize| -> bool {
+        if !foreign_fn(tcx, did) {
+            return false;
+        }
+        let key = super::raw_boundary::symbol_key(tcx, did, functions);
+        let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+        let Some(input) = sig.inputs().get(index) else {
+            // A variadic position: no declared type; the table's family rows
+            // (the scanf / printf tails) decide, at a byte target.
+            let target = super::raw_boundary::RawTargetType {
+                rendered: "*mut u8".to_owned(),
+                pointee: "u8".to_owned(),
+                mutability: super::raw_boundary::RawMutability::Mut,
+                depth2: None,
+            };
+            return matches!(
+                super::raw_boundary_contracts::classify_contract(&key, index, &target),
+                Ok(c) if c.retention == super::raw_boundary_contracts::RetentionContract::NoRetain
+                    && c.ownership == super::raw_boundary_contracts::OwnershipContract::BorrowView
+            );
+        };
+        let Some(target) = super::raw_boundary::raw_target_type(tcx, *input) else {
+            return false;
+        };
+        matches!(
+            super::raw_boundary_contracts::classify_contract(&key, index, &target),
+            Ok(c) if c.retention == super::raw_boundary_contracts::RetentionContract::NoRetain
+                && c.ownership == super::raw_boundary_contracts::OwnershipContract::BorrowView
+        )
+    };
     let lend_ok = |did: DefId, index: usize| -> bool {
-        let Some(callee) = did.as_local() else { return false };
-        if !functions.contains(&callee) {
-            return false;
-        }
-        let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
-        if index >= body.arg_count {
-            return false;
-        }
-        let local = rustc_middle::mir::Local::from_usize(index + 1);
-        slots
-            .fn_local_slots
-            .get(&callee)
-            .and_then(|u| u.slot_for_local_depth(local, 0))
-            .is_some_and(|slot| model.get(&SlotRef::Local(callee, slot)) == Some(&SlotKind::Ref))
+        lend_formal(
+            tcx,
+            functions,
+            slots,
+            model,
+            &lend_memo,
+            &foreign_lend,
+            did,
+            index,
+        )
     };
     let subject_of = |f: LocalDefId, hir: HirId| {
         subjects
@@ -798,6 +1193,7 @@ pub(crate) fn derive<'tcx>(
                 &slot_of,
                 &subject_of,
                 &lend_ok,
+                &transfer_ok,
                 &out,
             ) {
                 Ok(Some((certificate, plans))) => {
@@ -813,10 +1209,10 @@ pub(crate) fn derive<'tcx>(
         }
         pending = next;
     }
-    // A certificate stands only if every receiver its callee hands to a
-    // returning function is planned by THAT function's certificate, and only
-    // if the callee its own returned local chains from stands: withdraw to a
-    // fixpoint, holding each withdrawn callee's returned local typed.
+    // A certificate stands only if every function it depends on — one
+    // returning a receiver of it, one returning a call of it, the callees its
+    // own returns chain from — is certified: withdraw to a fixpoint, holding
+    // each withdrawn callee typed (on its returned local where it has one).
     loop {
         let withdraw: Vec<LocalDefId> = out
             .callees
@@ -825,8 +1221,12 @@ pub(crate) fn derive<'tcx>(
                 c.returned_receivers
                     .iter()
                     .any(|(f, _)| !out.callees.contains_key(f))
+                    || c.returning_callers
+                        .iter()
+                        .any(|f| !out.callees.contains_key(f))
                     || c.chained_from
-                        .is_some_and(|source| !out.callees.contains_key(&source))
+                        .iter()
+                        .any(|source| !out.callees.contains_key(source))
             })
             .map(|c| c.callee)
             .collect();
@@ -835,15 +1235,20 @@ pub(crate) fn derive<'tcx>(
         }
         for callee in withdraw {
             let Some(c) = out.callees.remove(&callee) else { continue };
-            out.plans.remove(&c.returned);
+            if let Some(returned) = c.returned {
+                out.plans.remove(&returned);
+            }
             for r in &c.receivers {
                 out.plans.remove(r);
             }
-            let label = subject_of(c.returned.0, c.returned.1)
+            let key = c.returned.unwrap_or((callee, rustc_hir::CRATE_HIR_ID));
+            let label = c
+                .returned
+                .and_then(|(f, h)| subject_of(f, h))
                 .map(|s| s.label.clone())
                 .unwrap_or_else(|| c.callee_path.clone());
             out.holds.insert(
-                c.returned,
+                key,
                 (
                     label,
                     format!(
@@ -852,7 +1257,16 @@ pub(crate) fn derive<'tcx>(
                         c.returned_receivers
                             .iter()
                             .map(|(f, _)| tcx.def_path_str(f.to_def_id()))
-                            .chain(c.chained_from.map(|f| tcx.def_path_str(f.to_def_id())))
+                            .chain(
+                                c.returning_callers
+                                    .iter()
+                                    .map(|f| tcx.def_path_str(f.to_def_id()))
+                            )
+                            .chain(
+                                c.chained_from
+                                    .iter()
+                                    .map(|f| tcx.def_path_str(f.to_def_id()))
+                            )
                             .collect::<Vec<_>>()
                             .join(",")
                     ),
@@ -860,31 +1274,45 @@ pub(crate) fn derive<'tcx>(
             );
         }
     }
-    // Chains that never closed (a receiver of an uncertified callee returned).
+    // Chains that never closed (a return chained from an uncertified callee).
     for callee in pending {
-        if let Some(scan) = scans.get(&callee)
-            && let Some(Returned::Local(hir, _)) = scan
-                .returns
-                .iter()
-                .find(|r| matches!(r, Returned::Local(..)))
-            && let Some(s) = subject_of(callee, *hir)
-        {
-            out.holds.insert(
-                (callee, *hir),
-                (
-                    s.label.clone(),
-                    format!(
-                        "return-certificate-return-locals:{}:uncertified-source",
-                        tcx.def_path_str(callee.to_def_id())
-                    ),
+        let Some(scan) = scans.get(&callee) else { continue };
+        let key = scan
+            .returns
+            .iter()
+            .find_map(|r| match r {
+                Returned::Local(hir, _) => Some((callee, *hir)),
+                _ => None,
+            })
+            .unwrap_or((callee, rustc_hir::CRATE_HIR_ID));
+        let label = subject_of(key.0, key.1)
+            .map(|s| s.label.clone())
+            .unwrap_or_else(|| tcx.def_path_str(callee.to_def_id()));
+        out.holds.insert(
+            key,
+            (
+                label,
+                format!(
+                    "return-certificate-return-locals:{}:uncertified-source",
+                    tcx.def_path_str(callee.to_def_id())
                 ),
-            );
-        }
+            ),
+        );
     }
     out
 }
 
 type Hold = ((LocalDefId, HirId), String, String);
+
+/// What the callee's returns chain from: one owner local, calls to certified
+/// callees, nulls.
+struct Sources {
+    /// The one returned local, its return spans.
+    owner: Option<(HirId, Vec<Span>)>,
+    /// `return callee(..)` sites: (target, call span).
+    calls: Vec<(LocalDefId, Span)>,
+    nulls: Vec<Span>,
+}
 
 /// `Ok(Some(..))` certified, `Ok(None)` waiting on another certificate,
 /// `Err` refused with the typed hold.
@@ -903,429 +1331,625 @@ fn certify<'tcx, 's>(
     slot_of: &dyn Fn(&Subject) -> Option<SlotRef>,
     subject_of: &dyn Fn(LocalDefId, HirId) -> Option<&'s Subject>,
     lend_ok: &dyn Fn(DefId, usize) -> bool,
+    transfer_ok: &dyn Fn(DefId, usize) -> bool,
     done: &Certificates,
 ) -> Result<Option<(Certificate, Vec<((LocalDefId, HirId), BoxPlan)>)>, Hold> {
     let callee_path = tcx.def_path_str(callee.to_def_id());
     let scan = scans.get(&callee).expect("scanned");
-    let mut returned_locals: Vec<HirId> = Vec::new();
-    let mut null_returns: Vec<Span> = Vec::new();
-    let mut local_returns: Vec<Span> = Vec::new();
-    // (`null_returns` shrinks by the dead guards below.)
+    // 1. The returns.
+    let mut sources = Sources {
+        owner: None,
+        calls: Vec::new(),
+        nulls: Vec::new(),
+    };
+    let anon_key = (callee, rustc_hir::CRATE_HIR_ID);
     for r in &scan.returns {
         match r {
-            Returned::Local(hir, span) => {
-                if !returned_locals.contains(hir) {
-                    returned_locals.push(*hir);
+            Returned::Local(hir, span) => match &mut sources.owner {
+                Some((owner, spans)) if *owner == *hir => spans.push(*span),
+                Some((owner, _)) => {
+                    let key = (callee, *owner);
+                    let label = subject_of(callee, *owner)
+                        .map(|s| s.label.clone())
+                        .unwrap_or_else(|| callee_path.clone());
+                    return Err((
+                        key,
+                        label,
+                        format!("return-certificate-return-locals:{callee_path}:2"),
+                    ));
                 }
-                local_returns.push(*span);
+                None => sources.owner = Some((*hir, vec![*span])),
+            },
+            Returned::Call(target, span) => {
+                let Some(local) = target.as_local() else {
+                    return Err((
+                        anon_key,
+                        callee_path.clone(),
+                        format!("return-certificate-return-shape:{callee_path}:external-call"),
+                    ));
+                };
+                sources.calls.push((local, *span));
             }
-            Returned::Null(span) => null_returns.push(*span),
+            Returned::Null(span) => sources.nulls.push(*span),
             Returned::Other(span) => {
                 let text = tcx
                     .sess
                     .source_map()
                     .span_to_snippet(*span)
                     .unwrap_or_default();
-                let key = returned_locals
-                    .first()
-                    .and_then(|h| subject_of(callee, *h))
-                    .map(|s| (s.fn_did, s.hir_id));
-                let Some(key) = key else {
-                    // No returned local at all: nothing to hold a row on.
-                    return Err((
-                        (callee, rustc_hir::CRATE_HIR_ID),
-                        callee_path.clone(),
-                        format!("return-certificate-return-shape:{callee_path}:{text}"),
-                    ));
-                };
+                let key = sources
+                    .owner
+                    .as_ref()
+                    .map_or(anon_key, |(h, _)| (callee, *h));
+                let label = subject_of(key.0, key.1)
+                    .map(|s| s.label.clone())
+                    .unwrap_or_else(|| callee_path.clone());
                 return Err((
                     key,
-                    callee_path.clone(),
+                    label,
                     format!("return-certificate-return-shape:{callee_path}:{text}"),
                 ));
             }
         }
     }
-    let [returned] = returned_locals.as_slice() else {
-        let key = returned_locals
-            .first()
-            .map(|h| (callee, *h))
-            .unwrap_or((callee, rustc_hir::CRATE_HIR_ID));
-        return Err((
-            key,
-            callee_path.clone(),
-            format!(
-                "return-certificate-return-locals:{callee_path}:{}",
-                returned_locals.len()
-            ),
-        ));
+    let owner_subject = match &sources.owner {
+        Some((hir, _)) => match subject_of(callee, *hir) {
+            Some(s) => Some(s),
+            None => {
+                return Err((
+                    (callee, *hir),
+                    callee_path.clone(),
+                    format!("return-certificate-return-locals:{callee_path}:not-a-subject"),
+                ));
+            }
+        },
+        None => None,
     };
-    let Some(subject) = subject_of(callee, *returned) else {
+    if owner_subject.is_none() && sources.calls.is_empty() {
         return Err((
-            (callee, *returned),
+            anon_key,
             callee_path.clone(),
-            format!("return-certificate-return-locals:{callee_path}:not-a-subject"),
+            format!("return-certificate-return-shape:{callee_path}:no-source"),
         ));
-    };
-    let key = (callee, *returned);
-    let hold = |reason: String| -> Hold { (key, subject.label.clone(), reason) };
+    }
+    let key = owner_subject.map_or(anon_key, |s| (s.fn_did, s.hir_id));
+    let label = owner_subject.map_or_else(|| callee_path.clone(), |s| s.label.clone());
+    let hold = |reason: String| -> Hold { (key, label.clone(), reason) };
     if fn_values.contains(&callee.to_def_id()) {
         return Err(hold(format!(
             "return-certificate-indirect-callers:{callee_path}"
         )));
     }
-    let receivers = receivers_of.get(&callee).map(Vec::as_slice).unwrap_or(&[]);
-    if receivers.is_empty() {
-        return Err(hold(format!(
-            "return-certificate-no-receivers:{callee_path}"
-        )));
-    }
-    let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
-    let Some(slot) = slot_of(subject) else {
-        return Err(hold(format!(
-            "return-certificate-allocation:{callee_path}:no-slot"
-        )));
-    };
-    // The returned local's own plan: an allocation the ordinary arm plans
-    // (the return boundary lifted), a struct allocation this rule fills, or a
-    // receiver of a certified callee.
-    let construction = constructions.by_binding.get(&key);
-    let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
-    let return_slot = slots
-        .fn_local_slots
-        .get(&callee)
-        .and_then(|u| u.slot_for_local_depth(rustc_middle::mir::RETURN_PLACE, 0))
-        .map(|s| SlotRef::Local(callee, s));
-    let pointee_ty = match body.local_decls[subject.local].ty.kind() {
-        TyKind::RawPtr(p, _) => *p,
-        _ => {
-            return Err(hold(
-                "return-certificate-allocation:not-a-pointer".to_owned(),
-            ));
+    // Every returned call's target must be certified (pending otherwise).
+    let mut chained_from: Vec<LocalDefId> = Vec::new();
+    for (target, _) in &sources.calls {
+        if !done.callees.contains_key(target) {
+            return Ok(None);
         }
-    };
-    let pointee = pointee_source(tcx, pointee_ty);
-    let frees: Vec<(Span, Span)> = scan
-        .frees
-        .iter()
-        .filter(|(hir, _, _)| *hir == *returned)
-        .map(|(_, call, arg)| (*call, *arg))
-        .collect();
-    let (mut plan, source_receipt): (BoxPlan, String) = match construction {
-        Some(Construction::CallResult) => match constructions.call_result_targets.get(&key) {
-            Some(CallResultTarget::DirectLocal(source)) => match done.callees.get(source) {
-                Some(source_certificate) => {
-                    let plan = receiver_plan(
-                        tcx,
-                        subject,
-                        source_certificate,
-                        &frees,
-                        lend_ok,
-                        &format!(
-                            "return-certificate-chained source={}",
-                            source_certificate.callee_path
-                        ),
-                    )
-                    .map_err(|reason| hold(reason))?;
-                    (
-                        plan,
-                        format!("chained-from={}", source_certificate.callee_path),
-                    )
-                }
-                None => return Ok(None),
-            },
+        if !chained_from.contains(target) {
+            chained_from.push(*target);
+        }
+    }
+    // 2. The owner local's plan (an allocation, or a receiver of a certified
+    // callee), if there is one.
+    let mut plans: Vec<((LocalDefId, HirId), BoxPlan)> = Vec::new();
+    let mut transfers: Vec<(DefId, usize, (LocalDefId, HirId))> = Vec::new();
+    let mut owner_shape: Option<(BoxShape, bool)> = None;
+    let mut owner_plan_optional = false;
+    let mut source_receipt = String::from("calls");
+    let mut kind: Option<SlotKind> = None;
+    let mut dead_guard_receipts: Vec<String> = Vec::new();
+    let mut null_returns = sources.nulls.clone();
+    let mut pointee_ty: Option<rustc_middle::ty::Ty<'tcx>> = None;
+    if let Some(subject) = owner_subject {
+        let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
+        let Some(slot) = slot_of(subject) else {
+            return Err(hold(format!(
+                "return-certificate-allocation:{callee_path}:no-slot"
+            )));
+        };
+        kind = model.get(&slot).copied();
+        let construction = constructions.by_binding.get(&key);
+        let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+        let return_slot = slots
+            .fn_local_slots
+            .get(&callee)
+            .and_then(|u| u.slot_for_local_depth(rustc_middle::mir::RETURN_PLACE, 0))
+            .map(|s| SlotRef::Local(callee, s));
+        let ty = match body.local_decls[subject.local].ty.kind() {
+            TyKind::RawPtr(p, _) => *p,
             _ => {
-                return Err(hold(format!(
-                    "return-certificate-allocation:{callee_path}:call-result-not-local"
-                )));
+                return Err(hold(
+                    "return-certificate-allocation:not-a-pointer".to_owned(),
+                ));
             }
-        },
-        Some(Construction::Alloc { .. }) | Some(Construction::NullLit) => {
-            let facts = match return_slot {
-                Some(return_slot) => box_facts.without_boundary_hold(return_slot),
-                None => box_facts.clone(),
-            };
-            let ordinary =
-                facts.plan_for_subject(tcx, subject, slot, constructions, slots, subjects);
-            match ordinary {
-                Ok(plan) => (plan, "ordinary-plan".to_owned()),
-                Err(BoxPlanFailure::InitializerUnsupported) => {
-                    // A struct pointee: zero-fill the fields the C program then stores.
-                    let initializer = struct_initializer(tcx, pointee_ty)
-                        .map_err(|reason| hold(format!("return-certificate-{reason}")))?;
-                    let overwrites = constructions
-                        .owner_overwrites
-                        .get(&key)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
-                    let init_span = *constructions.init_spans.get(&key).ok_or_else(|| {
-                        hold("return-certificate-allocation:no-init-span".to_owned())
-                    })?;
-                    let mut expr_edits = Vec::new();
-                    let mut delete_statements = Vec::new();
-                    let optional;
-                    match (construction, overwrites) {
+        };
+        pointee_ty = Some(ty);
+        let pointee = pointee_source(tcx, ty);
+        let frees: Vec<(Span, Span)> = scan
+            .frees
+            .iter()
+            .filter(|(hir, _, _)| *hir == subject.hir_id)
+            .map(|(_, call, arg)| (*call, *arg))
+            .collect();
+        let (mut plan, receipt): (BoxPlan, String) = match construction {
+            Some(Construction::CallResult) => match constructions.call_result_targets.get(&key) {
+                Some(CallResultTarget::DirectLocal(source)) => match done.callees.get(source) {
+                    Some(source_certificate) => {
+                        if !chained_from.contains(source) {
+                            chained_from.push(*source);
+                        }
+                        let (plan, owner_transfers) = receiver_plan(
+                            tcx,
+                            subject,
+                            source_certificate,
+                            &frees,
+                            &[],
+                            None,
+                            lend_ok,
+                            transfer_ok,
+                            &format!(
+                                "return-certificate-chained source={}",
+                                source_certificate.callee_path
+                            ),
+                        )
+                        .map_err(|reason| hold(reason))?;
+                        transfers.extend(owner_transfers.into_iter().map(|(d, i)| (d, i, key)));
                         (
-                            Some(Construction::Alloc {
-                                callee: alloc,
-                                count: None,
-                                ..
-                            }),
-                            [],
-                        ) if alloc == "malloc" => {
-                            optional = false;
-                            expr_edits.push(BoxExprEdit {
-                                span: init_span,
-                                replacement: initializer.clone(),
-                                receipt: "return-certificate-struct-allocation",
-                            });
-                        }
-                        // `let mut a = 0 as *mut S; a = malloc(sizeof S) as *mut S;`
-                        // with no use between: the allocation IS the
-                        // initializer and the overwrite statement goes.
-                        (Some(Construction::NullLit), [overwrite])
-                            if matches!(
-                                &overwrite.construction,
-                                Construction::Alloc { callee, count: None, .. } if callee == "malloc"
-                            ) =>
-                        {
-                            if first_use_is(tcx, subject, overwrite.statement_span).is_none() {
-                                return Err(hold(format!(
-                                    "return-certificate-allocation:{callee_path}:null-init-used-before-allocation"
-                                )));
-                            }
-                            optional = false;
-                            expr_edits.push(BoxExprEdit {
-                                span: init_span,
-                                replacement: initializer.clone(),
-                                receipt: "return-certificate-struct-allocation",
-                            });
-                            delete_statements.push(overwrite.statement_span);
-                        }
-                        _ => {
-                            return Err(hold(format!(
-                                "return-certificate-allocation:{callee_path}:shape"
-                            )));
-                        }
+                            plan,
+                            format!("chained-from={}", source_certificate.callee_path),
+                        )
                     }
-                    (
-                        BoxPlan {
-                            shape: BoxShape::Sized,
-                            optional,
-                            expr_edits,
-                            delete_statements,
-                            receipts: vec![format!(
-                                "return-certificate-struct-fill pointee={pointee}"
-                            )],
-                            fabricated_extent: false,
-                            pointee_override: None,
-                            inferred_binding: subject.ty_span.is_none(),
-                            overwrite_spans: Vec::new(),
-                            retained_sink: true,
-                            implicit_scope_close: false,
-                        },
-                        "struct-fill".to_owned(),
-                    )
-                }
-                // The ordinary arm's endpoints come from the model, which
-                // calls a returned allocation Raw (its source endpoint is
-                // not Active): a direct allocator initializer is planned
-                // from source with ownership/fields' constructor rule (the
-                // same `vec![..].into_boxed_slice()` / `Box::new(..)` text).
-                Err(BoxPlanFailure::EndpointInactive)
-                    if matches!(construction, Some(Construction::Alloc { .. }))
-                        && constructions
-                            .owner_overwrites
-                            .get(&key)
-                            .is_none_or(Vec::is_empty) =>
-                {
-                    let init_hir = *constructions
-                        .init_hirs
-                        .get(&key)
-                        .ok_or_else(|| hold("return-certificate-allocation:no-init".to_owned()))?;
-                    let init = tcx.hir_node(init_hir).expect_expr();
-                    let constructor = super::ownership_fields_constructor::derive(
-                        tcx, callee, init, pointee_ty,
-                    )
-                    .map_err(|reason| {
-                        hold(format!(
-                            "return-certificate-allocation:{callee_path}:constructor:{reason:?}"
-                        ))
-                    })?;
-                    (
-                        BoxPlan {
-                            shape: constructor.shape,
-                            optional: false,
-                            expr_edits: vec![constructor.edit],
-                            delete_statements: Vec::new(),
-                            receipts: vec![format!(
-                                "return-certificate-constructor count={} shape={:?}",
-                                constructor.count, constructor.shape
-                            )],
-                            fabricated_extent: false,
-                            pointee_override: None,
-                            inferred_binding: subject.ty_span.is_none(),
-                            overwrite_spans: Vec::new(),
-                            retained_sink: true,
-                            implicit_scope_close: false,
-                        },
-                        "constructor".to_owned(),
-                    )
-                }
-                Err(failure) => {
+                    None => return Ok(None),
+                },
+                _ => {
                     return Err(hold(format!(
-                        "return-certificate-allocation:{callee_path}:{}",
-                        failure.key()
+                        "return-certificate-allocation:{callee_path}:call-result-not-local"
                     )));
                 }
+            },
+            Some(Construction::NullLit)
+                if scan
+                    .assign_calls
+                    .iter()
+                    .any(|(hir, _, _, _)| *hir == subject.hir_id) =>
+            {
+                // An assignment receiver returned by its own function:
+                // `let mut node = null; node = callee(..); ..; return node`.
+                let assignments: Vec<(LocalDefId, Span, Span)> = scan
+                    .assign_calls
+                    .iter()
+                    .filter(|(hir, _, _, _)| *hir == subject.hir_id)
+                    .filter_map(|(_, did, span, stmt)| did.as_local().map(|d| (d, *span, *stmt)))
+                    .collect();
+                let overwrites = scan
+                    .assigns
+                    .iter()
+                    .filter(|(hir, _)| *hir == subject.hir_id)
+                    .count();
+                if assignments.len() != overwrites || assignments.is_empty() {
+                    return Err(hold(format!(
+                        "return-certificate-allocation:{callee_path}:assignment-shape"
+                    )));
+                }
+                let source = assignments[0].0;
+                if assignments.iter().any(|(d, _, _)| *d != source) {
+                    return Err(hold(format!(
+                        "return-certificate-allocation:{callee_path}:assignment-sources"
+                    )));
+                }
+                let Some(source_certificate) = done.callees.get(&source) else {
+                    return Ok(None);
+                };
+                if !chained_from.contains(&source) {
+                    chained_from.push(source);
+                }
+                let (plan, owner_transfers) = receiver_plan(
+                    tcx,
+                    subject,
+                    source_certificate,
+                    &frees,
+                    &assignments
+                        .iter()
+                        .map(|(_, s, st)| (*s, *st))
+                        .collect::<Vec<_>>(),
+                    constructions.init_spans.get(&key).copied(),
+                    lend_ok,
+                    transfer_ok,
+                    &format!(
+                        "return-certificate-chained-assignment source={}",
+                        source_certificate.callee_path
+                    ),
+                )
+                .map_err(|reason| hold(reason))?;
+                transfers.extend(owner_transfers.into_iter().map(|(d, i)| (d, i, key)));
+                (
+                    plan,
+                    format!("assigned-from={}", source_certificate.callee_path),
+                )
             }
-        }
-        _ => {
+            Some(Construction::Alloc { .. }) | Some(Construction::NullLit) => {
+                let facts = match return_slot {
+                    Some(return_slot) => box_facts.without_boundary_hold(return_slot),
+                    None => box_facts.clone(),
+                };
+                let ordinary =
+                    facts.plan_for_subject(tcx, subject, slot, constructions, slots, subjects);
+                match ordinary {
+                    Ok(plan) => (plan, "ordinary-plan".to_owned()),
+                    Err(BoxPlanFailure::InitializerUnsupported) => {
+                        let initializer = struct_initializer(tcx, ty)
+                            .map_err(|reason| hold(format!("return-certificate-{reason}")))?;
+                        let overwrites = constructions
+                            .owner_overwrites
+                            .get(&key)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
+                        let init_span = *constructions.init_spans.get(&key).ok_or_else(|| {
+                            hold("return-certificate-allocation:no-init-span".to_owned())
+                        })?;
+                        let mut expr_edits = Vec::new();
+                        let mut delete_statements = Vec::new();
+                        match (construction, overwrites) {
+                            (
+                                Some(Construction::Alloc {
+                                    callee: alloc,
+                                    count: None,
+                                    ..
+                                }),
+                                [],
+                            ) if alloc == "malloc" => {
+                                expr_edits.push(BoxExprEdit {
+                                    span: init_span,
+                                    replacement: initializer.clone(),
+                                    receipt: "return-certificate-struct-allocation",
+                                });
+                            }
+                            // `let mut a = 0 as *mut S; a = malloc(sizeof S) as *mut S;`
+                            // with no use between: the allocation IS the
+                            // initializer and the overwrite statement goes.
+                            (Some(Construction::NullLit), [overwrite])
+                                if matches!(
+                                    &overwrite.construction,
+                                    Construction::Alloc { callee, count: None, .. } if callee == "malloc"
+                                ) =>
+                            {
+                                if first_use_is(tcx, subject, overwrite.statement_span).is_none() {
+                                    return Err(hold(format!(
+                                        "return-certificate-allocation:{callee_path}:null-init-used-before-allocation"
+                                    )));
+                                }
+                                expr_edits.push(BoxExprEdit {
+                                    span: init_span,
+                                    replacement: initializer.clone(),
+                                    receipt: "return-certificate-struct-allocation",
+                                });
+                                delete_statements.push(overwrite.statement_span);
+                            }
+                            _ => {
+                                return Err(hold(format!(
+                                    "return-certificate-allocation:{callee_path}:shape"
+                                )));
+                            }
+                        }
+                        (
+                            BoxPlan {
+                                shape: BoxShape::Sized,
+                                optional: false,
+                                expr_edits,
+                                delete_statements,
+                                receipts: vec![format!(
+                                    "return-certificate-struct-fill pointee={pointee}"
+                                )],
+                                fabricated_extent: false,
+                                pointee_override: None,
+                                inferred_binding: subject.ty_span.is_none(),
+                                overwrite_spans: Vec::new(),
+                                retained_sink: true,
+                                implicit_scope_close: false,
+                            },
+                            "struct-fill".to_owned(),
+                        )
+                    }
+                    // The ordinary arm's endpoints come from the model, which
+                    // calls a returned allocation Raw (its source endpoint is
+                    // not Active): a direct allocator initializer is planned
+                    // from source with ownership/fields' constructor rule.
+                    Err(BoxPlanFailure::EndpointInactive)
+                        if matches!(construction, Some(Construction::Alloc { .. }))
+                            && constructions
+                                .owner_overwrites
+                                .get(&key)
+                                .is_none_or(Vec::is_empty) =>
+                    {
+                        let init_hir = *constructions.init_hirs.get(&key).ok_or_else(|| {
+                            hold("return-certificate-allocation:no-init".to_owned())
+                        })?;
+                        let init = tcx.hir_node(init_hir).expect_expr();
+                        let constructor = super::ownership_fields_constructor::derive(
+                            tcx, callee, init, ty,
+                        )
+                        .map_err(|reason| {
+                            hold(format!(
+                                "return-certificate-allocation:{callee_path}:constructor:{reason:?}"
+                            ))
+                        })?;
+                        (
+                            BoxPlan {
+                                shape: constructor.shape,
+                                optional: false,
+                                expr_edits: vec![constructor.edit],
+                                delete_statements: Vec::new(),
+                                receipts: vec![format!(
+                                    "return-certificate-constructor count={} shape={:?}",
+                                    constructor.count, constructor.shape
+                                )],
+                                fabricated_extent: false,
+                                pointee_override: None,
+                                inferred_binding: subject.ty_span.is_none(),
+                                overwrite_spans: Vec::new(),
+                                retained_sink: true,
+                                implicit_scope_close: false,
+                            },
+                            "constructor".to_owned(),
+                        )
+                    }
+                    Err(failure) => {
+                        return Err(hold(format!(
+                            "return-certificate-allocation:{callee_path}:{}",
+                            failure.key()
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(hold(format!(
+                    "return-certificate-allocation:{callee_path}:construction"
+                )));
+            }
+        };
+        // The model: Owning admits; Raw admits under the source certificate
+        // (R410-5 §1); Ref never for an allocation (a borrowed local is not
+        // one) — a chained receiver's Ref is superseded like any receiver's.
+        if kind == Some(SlotKind::Ref)
+            && !matches!(
+                construction,
+                Some(Construction::CallResult | Construction::NullLit)
+            )
+        {
             return Err(hold(format!(
-                "return-certificate-allocation:{callee_path}:construction"
+                "return-certificate-allocation-model:{callee_path}:ref"
             )));
         }
-    };
-    // The model: Owning admits; Raw admits only under the source certificate
-    // (the frames of record call every returned allocation Raw; report 004
-    // STOP 1); Ref never (a borrowed local is not an allocation).
-    let kind = model.get(&slot).copied();
-    if kind == Some(SlotKind::Ref) && !matches!(construction, Some(Construction::CallResult)) {
-        return Err(hold(format!(
-            "return-certificate-allocation-model:{callee_path}:ref"
-        )));
-    }
-    if plan.pointee_override.is_some() {
-        return Err(hold(format!(
-            "return-certificate-allocation:{callee_path}:pointee-override"
-        )));
-    }
-    // The returned local's uses: derefs, element accesses, null tests (a
-    // `Box` cannot be null: the guard `if A.is_null() { return null; }` is
-    // dead and goes), the return(s), a free on a non-returning path.
-    let allocation = !matches!(construction, Some(Construction::CallResult));
-    let uses = owner_uses(
-        tcx,
-        subject,
-        plan.shape,
-        plan.optional,
-        allocation,
-        &frees,
-        lend_ok,
-    )
-    .map_err(|form| hold(format!("return-certificate-owner-use:{callee_path}:{form}")))?;
-    let dead_null_returns = uses.dead_null_returns.clone();
-    // R410-5 §2: each removed malloc guard is receipted (`dead-alloc-guard`,
-    // the resource-scope waiver beside addendum 101).
-    let dead_guard_receipts: Vec<String> = uses
-        .dead_guards
-        .iter()
-        .map(|span| {
-            format!(
-                "dead-alloc-guard site={}",
-                super::emitability::EmitabilityFacts::site(tcx, *span)
+        if plan.pointee_override.is_some() {
+            return Err(hold(format!(
+                "return-certificate-allocation:{callee_path}:pointee-override"
+            )));
+        }
+        let allocation = !matches!(
+            construction,
+            Some(Construction::CallResult | Construction::NullLit)
+        ) || matches!(
+            receipt.as_str(),
+            "struct-fill" | "constructor" | "ordinary-plan"
+        );
+        // The owner's uses (a receiver's were walked by `receiver_plan`).
+        if allocation {
+            let uses = owner_uses(
+                tcx,
+                subject,
+                plan.shape,
+                plan.optional,
+                !plan.optional,
+                &frees,
+                lend_ok,
+                transfer_ok,
             )
-        })
-        .collect();
-    let deleted = plan.delete_statements.clone();
-    let owner_edits: Vec<BoxExprEdit> = uses
-        .edits
-        .into_iter()
-        .filter(|e| !deleted.iter().any(|d| d.contains(e.span)))
-        .collect();
-    plan.expr_edits.retain(|e| {
-        !owner_edits
-            .iter()
-            .any(|o| o.span == e.span || o.span.contains(e.span))
-    });
-    plan.expr_edits.extend(owner_edits);
-    for (call, _) in &frees {
-        if !plan.expr_edits.iter().any(|e| e.span == *call) {
-            plan.expr_edits.push(BoxExprEdit {
-                span: *call,
-                replacement: format!("drop({name})"),
-                receipt: "return-certificate-c-free-site-drop",
+            .map_err(|form| hold(format!("return-certificate-owner-use:{callee_path}:{form}")))?;
+            transfers.extend(uses.transfers.iter().map(|(d, i)| (*d, *i, key)));
+            let deleted = plan.delete_statements.clone();
+            let owner_edits: Vec<BoxExprEdit> = uses
+                .edits
+                .into_iter()
+                .filter(|e| !deleted.iter().any(|d| d.contains(e.span)))
+                .collect();
+            plan.expr_edits.retain(|e| {
+                !owner_edits
+                    .iter()
+                    .any(|o| o.span == e.span || o.span.contains(e.span))
+            });
+            plan.expr_edits.extend(owner_edits);
+            for (call, _) in &frees {
+                if !plan.expr_edits.iter().any(|e| e.span == *call) {
+                    plan.expr_edits.push(BoxExprEdit {
+                        span: *call,
+                        replacement: format!("drop({name})"),
+                        receipt: "return-certificate-c-free-site-drop",
+                    });
+                }
+            }
+            null_returns.retain(|span| !uses.dead_null_returns.contains(span));
+            dead_guard_receipts.extend(uses.dead_guards.iter().map(|span| {
+                format!(
+                    "dead-alloc-guard site={}",
+                    super::emitability::EmitabilityFacts::site(tcx, *span)
+                )
+            }));
+        } else {
+            // A receiver-owner: its dead guards were folded by `receiver_plan`
+            // (receipts carried on the plan).
+            for receipt in &plan.receipts {
+                if let Some(site) = receipt.strip_prefix("dead-null-guard ") {
+                    dead_guard_receipts.push(format!("dead-alloc-guard {site}"));
+                }
+            }
+            null_returns.retain(|span| {
+                !plan
+                    .receipts
+                    .iter()
+                    .any(|r| r == &format!("dead-null-return {}", span.lo().0))
             });
         }
+        plan.receipts
+            .retain(|receipt| !receipt.starts_with("waiver-drop(scope-exit)"));
+        plan.retained_sink = true;
+        plan.implicit_scope_close = false;
+        owner_plan_optional = plan.optional;
+        owner_shape = Some((plan.shape, plan.optional));
+        source_receipt = receipt;
+        plans.push((key, plan));
     }
-    null_returns.retain(|span| !dead_null_returns.contains(span));
-    plan.receipts
-        .retain(|receipt| !receipt.starts_with("waiver-drop(scope-exit)"));
-    plan.retained_sink = true;
-    plan.implicit_scope_close = false;
-    let optional_output = plan.optional || !null_returns.is_empty();
-    // Return edits: null → None; a non-optional owner into an optional output → Some(..).
+    // 3. One shape across the sources.
+    let mut shapes: Vec<(BoxShape, bool)> = owner_shape.into_iter().collect();
+    for (target, _) in &sources.calls {
+        let c = &done.callees[target];
+        shapes.push((c.shape, c.optional));
+    }
+    let shape = shapes[0].0;
+    if shapes.iter().any(|(s, _)| *s != shape) {
+        return Err(hold(format!(
+            "return-certificate-shape:{callee_path}:sources-disagree"
+        )));
+    }
+    let optional_output = !null_returns.is_empty() || shapes.iter().any(|(_, o)| *o);
+    // Return edits: null → None; a non-optional source into an optional
+    // output → Some(..).
+    let mut return_edits: Vec<BoxExprEdit> = Vec::new();
     for span in &null_returns {
-        plan.expr_edits.push(BoxExprEdit {
+        return_edits.push(BoxExprEdit {
             span: *span,
             replacement: "None".to_owned(),
             receipt: "return-certificate-null-return",
         });
     }
-    if optional_output && !plan.optional {
-        for span in &local_returns {
-            plan.expr_edits.push(BoxExprEdit {
+    if optional_output
+        && !owner_plan_optional
+        && let Some((_, spans)) = &sources.owner
+        && let Some(subject) = owner_subject
+    {
+        let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
+        for span in spans {
+            return_edits.push(BoxExprEdit {
                 span: *span,
                 replacement: format!("Some({name})"),
                 receipt: "return-certificate-some-return",
             });
         }
     }
-    plan.receipts.push(format!(
-        "return-certificate-owner callee={callee_path} source={source_receipt} model={kind:?}"
-    ));
-    plan.receipts.extend(dead_guard_receipts.iter().cloned());
+    for (target, span) in &sources.calls {
+        if optional_output && !done.callees[target].optional {
+            let text = tcx
+                .sess
+                .source_map()
+                .span_to_snippet(*span)
+                .unwrap_or_default();
+            return_edits.push(BoxExprEdit {
+                span: *span,
+                replacement: format!("Some({text})"),
+                receipt: "return-certificate-some-return",
+            });
+        }
+    }
+    // Where the owner has a plan the return edits ride it; otherwise they
+    // are site edits of the callee itself.
+    let mut site_edits: Vec<(LocalDefId, BoxExprEdit)> = Vec::new();
+    if let Some((_, plan)) = plans.first_mut() {
+        plan.expr_edits.extend(return_edits);
+    } else {
+        site_edits.extend(return_edits.into_iter().map(|e| (callee, e)));
+    }
+    // 4. The output type, source-spelled.
     let Some(decl) = tcx.hir_node_by_def_id(callee).fn_decl() else {
         return Err(hold("return-certificate-allocation:no-decl".to_owned()));
     };
     let rustc_hir::FnRetTy::Return(output_ty) = decl.output else {
         return Err(hold("return-certificate-allocation:no-output".to_owned()));
     };
-    // The output spells the pointee as the source does (both layers agree).
-    let spelled = match output_ty.kind {
-        rustc_hir::TyKind::Ptr(p) => tcx
+    let pointee = match (output_ty.kind, pointee_ty) {
+        (rustc_hir::TyKind::Ptr(p), _) => tcx
             .sess
             .source_map()
             .span_to_snippet(p.ty.span)
-            .unwrap_or_else(|_| pointee.clone()),
-        _ => pointee.clone(),
+            .unwrap_or_else(|_| "_".to_owned()),
+        (_, Some(ty)) => pointee_source(tcx, ty),
+        _ => "_".to_owned(),
     };
-    let base = match plan.shape {
-        BoxShape::Sized => format!("Box<{spelled}>"),
-        BoxShape::Slice => format!("Box<[{spelled}]>"),
+    let base = match shape {
+        BoxShape::Sized => format!("Box<{pointee}>"),
+        BoxShape::Slice => format!("Box<[{pointee}]>"),
     };
     let output_type = if optional_output {
         format!("Option<{base}>")
     } else {
         base
     };
-    // Receivers.
-    let mut plans = vec![(key, plan.clone())];
+    // 5. Receivers: `let r = callee(..)` (the construction facts) and
+    // `r = callee(..)` assignment receivers (null-initialized locals whose
+    // every overwrite is a call of this callee).
     let mut planned_receivers = Vec::new();
     let mut returned_receivers = Vec::new();
     let mut receiver_labels: Vec<String> = Vec::new();
-    let chained_from = match construction {
-        Some(Construction::CallResult) => match constructions.call_result_targets.get(&key) {
-            Some(CallResultTarget::DirectLocal(source)) => Some(*source),
-            _ => None,
-        },
-        _ => None,
-    };
     let certificate_stub = Certificate {
         callee,
         callee_path: callee_path.clone(),
         pointee: pointee.clone(),
         optional: optional_output,
-        shape: plan.shape,
+        shape,
         output_type: output_type.clone(),
         output_span: output_ty.span,
-        returned: key,
+        returned: owner_subject.map(|s| (s.fn_did, s.hir_id)),
         receivers: Vec::new(),
         returned_receivers: Vec::new(),
-        chained_from,
+        returning_callers: Vec::new(),
+        chained_from: chained_from.clone(),
+        site_edits: Vec::new(),
+        transfers: Vec::new(),
         receipts: Vec::new(),
     };
-    for receiver in receivers {
+    let let_receivers = receivers_of.get(&callee).map(Vec::as_slice).unwrap_or(&[]);
+    let mut assignment_receivers: Vec<(&Subject, Vec<(Span, Span)>)> = Vec::new();
+    for s in subjects {
+        if s.kind != SubjectKind::Local {
+            continue;
+        }
+        let rkey = (s.fn_did, s.hir_id);
+        if !matches!(
+            constructions.by_binding.get(&rkey),
+            Some(Construction::NullLit)
+        ) {
+            continue;
+        }
+        let Some(rscan) = scans.get(&s.fn_did) else { continue };
+        let values: Vec<(Span, Span)> = rscan
+            .assign_calls
+            .iter()
+            .filter(|(hir, did, _, _)| *hir == s.hir_id && *did == callee.to_def_id())
+            .map(|(_, _, span, stmt)| (*span, *stmt))
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        let overwrites = rscan
+            .assigns
+            .iter()
+            .filter(|(hir, _)| *hir == s.hir_id)
+            .count();
+        if overwrites != values.len() {
+            return Err((
+                rkey,
+                s.label.clone(),
+                format!(
+                    "return-certificate-receiver-use:mixed-assignments:{}",
+                    s.label
+                ),
+            ));
+        }
+        assignment_receivers.push((s, values));
+    }
+    let mut all_receivers: Vec<(&Subject, Vec<(Span, Span)>)> =
+        let_receivers.iter().map(|s| (*s, Vec::new())).collect();
+    all_receivers.extend(assignment_receivers);
+    for (receiver, assignments) in &all_receivers {
         let rkey = (receiver.fn_did, receiver.hir_id);
         let rscan = scans.get(&receiver.fn_did).expect("scanned");
         let rfrees: Vec<(Span, Span)> = rscan
@@ -1334,12 +1958,7 @@ fn certify<'tcx, 's>(
             .filter(|(hir, _, _)| *hir == receiver.hir_id)
             .map(|(_, call, arg)| (*call, *arg))
             .collect();
-        // A receiver the model calls Ref or Raw is superseded (relay 005 and
-        // report 004 STOP 1); an Owning receiver is admitted as is.
         let rkind = slot_of(receiver).and_then(|s| model.get(&s).copied());
-        // A receiver returned by its own function chains: that function's
-        // certificate plans it (fixpoint); here it is only refused if that
-        // function's returns are not certifiable at all — left to the chain.
         let returned_here = rscan
             .returns
             .iter()
@@ -1348,33 +1967,79 @@ fn certify<'tcx, 's>(
             returned_receivers.push(rkey);
             continue;
         }
-        let rplan = receiver_plan(
+        let (rplan, rtransfers) = receiver_plan(
             tcx,
             receiver,
             &certificate_stub,
             &rfrees,
+            assignments,
+            constructions.init_spans.get(&rkey).copied(),
             lend_ok,
+            transfer_ok,
             &format!("return-certificate-receiver callee={callee_path} model={rkind:?}"),
         )
         .map_err(|reason| (rkey, receiver.label.clone(), reason))?;
+        transfers.extend(rtransfers.into_iter().map(|(d, i)| (d, i, rkey)));
         plans.push((rkey, rplan));
         planned_receivers.push(rkey);
         receiver_labels.push(receiver.label.clone());
     }
-    // Every call of the callee is one of the receivers' initializers: a call
-    // whose result goes anywhere else (a field store, an argument, a bare
-    // statement) would meet the new output type untyped.
-    let receiver_inits: Vec<Span> = planned_receivers
+    // 6. Every call of the callee is accounted for: a receiver's initializer
+    // or assignment, a `return callee(..)` in a function that certifies
+    // itself, or a store straight into a raw place (a site edit).
+    let mut admitted_calls: Vec<Span> = planned_receivers
         .iter()
         .chain(&returned_receivers)
         .filter_map(|rkey| constructions.init_spans.get(rkey).copied())
         .collect();
+    admitted_calls.extend(
+        all_receivers
+            .iter()
+            .flat_map(|(_, a)| a.iter().map(|(v, _)| *v)),
+    );
+    let mut returning_callers: Vec<LocalDefId> = Vec::new();
+    for (caller, caller_scan) in scans {
+        for r in &caller_scan.returns {
+            if let Returned::Call(target, span) = r
+                && *target == callee.to_def_id()
+            {
+                admitted_calls.push(*span);
+                if !returning_callers.contains(caller) {
+                    returning_callers.push(*caller);
+                }
+            }
+        }
+        for (target, span) in &caller_scan.store_calls {
+            if *target != callee.to_def_id() {
+                continue;
+            }
+            let text = tcx
+                .sess
+                .source_map()
+                .span_to_snippet(*span)
+                .unwrap_or_default();
+            let replacement = if optional_output {
+                format!("{text}.map_or(core::ptr::null_mut(), Box::into_raw)")
+            } else {
+                format!("Box::into_raw({text})")
+            };
+            site_edits.push((
+                *caller,
+                BoxExprEdit {
+                    span: *span,
+                    replacement,
+                    receipt: "return-certificate-store-transfer",
+                },
+            ));
+            admitted_calls.push(*span);
+        }
+    }
     for (caller, caller_scan) in scans {
         for (target, call_span) in &caller_scan.calls {
             if *target != callee.to_def_id() {
                 continue;
             }
-            if !receiver_inits.iter().any(|init| init.contains(*call_span)) {
+            if !admitted_calls.iter().any(|init| init.contains(*call_span)) {
                 return Err(hold(format!(
                     "return-certificate-call-site-not-a-receiver:{callee_path}:{}:{}",
                     tcx.def_path_str(caller.to_def_id()),
@@ -1386,42 +2051,76 @@ fn certify<'tcx, 's>(
             }
         }
     }
+    if planned_receivers.is_empty()
+        && returned_receivers.is_empty()
+        && returning_callers.is_empty()
+        && site_edits.iter().all(|(f, _)| *f == callee)
+    {
+        return Err(hold(format!(
+            "return-certificate-no-receivers:{callee_path}"
+        )));
+    }
     let mut certificate = certificate_stub;
     certificate.receivers = planned_receivers;
     certificate.returned_receivers = returned_receivers;
+    certificate.returning_callers = returning_callers;
+    certificate.site_edits = site_edits;
+    certificate.transfers = transfers;
     certificate.receipts.extend(dead_guard_receipts);
     certificate.receipts.push(format!(
-        "return-certificate callee={callee_path} output={output_type} source={source_receipt} model={kind:?} null_returns={} receivers={} [{}] returned_receivers={}",
+        "return-certificate callee={callee_path} output={output_type} source={source_receipt} model={kind:?} null_returns={} receivers={} [{}] returned_receivers={} returning_callers={} store_sites={}",
         null_returns.len(),
         certificate.receivers.len(),
         receiver_labels.join(","),
-        certificate.returned_receivers.len()
+        certificate.returned_receivers.len(),
+        certificate.returning_callers.len(),
+        certificate.site_edits.len()
     ));
     Ok(Some((certificate, plans)))
 }
 
 /// A receiver's plan: the callee's shape and optionality, its uses rewritten,
-/// its C free a `drop`.
+/// its C free a `drop`, a store a `Box::into_raw` transfer. An assignment
+/// receiver (`let r = null; r = callee(..)`) is `Option<Box<..>>` from `None`,
+/// each assignment wrapped `Some(..)` when the callee's output is not
+/// optional. A `let` receiver of a non-optional callee can never be null: its
+/// null guard is dead (folded like the allocation's, receipted).
 fn receiver_plan(
     tcx: TyCtxt<'_>,
     receiver: &Subject,
     certificate: &Certificate,
     frees: &[(Span, Span)],
+    assignments: &[(Span, Span)],
+    init_span: Option<Span>,
     lend_ok: &dyn Fn(DefId, usize) -> bool,
+    transfer_ok: &dyn Fn(DefId, usize) -> bool,
     receipt: &str,
-) -> Result<BoxPlan, String> {
+) -> Result<(BoxPlan, Vec<(DefId, usize)>), String> {
     let name = receiver
         .param_name
         .clone()
         .unwrap_or_else(|| "?".to_owned());
+    // An assignment receiver of a non-optional callee whose ONE assignment is
+    // the binding's first use folds: `let r: Box<T> = callee(..)` with the
+    // assignment statement gone (the null init is never read). Otherwise it
+    // is `Option<Box<T>>` from `None`.
+    let folded = match assignments {
+        [(_, statement)] if !certificate.optional => {
+            first_use_is(tcx, receiver, *statement).is_some()
+        }
+        _ => false,
+    };
+    let optional = certificate.optional || (!assignments.is_empty() && !folded);
+    let never_null = !optional;
     let uses = owner_uses(
         tcx,
         receiver,
         certificate.shape,
-        certificate.optional,
-        false,
+        optional,
+        never_null,
         frees,
         lend_ok,
+        transfer_ok,
     )
     .map_err(|form| format!("return-certificate-receiver-use:{form}"))?;
     let mut expr_edits = uses.edits;
@@ -1432,22 +2131,83 @@ fn receiver_plan(
             receipt: "return-certificate-c-free-site-drop",
         });
     }
-    let retained_sink = !frees.is_empty();
     let mut receipts = vec![receipt.to_owned()];
+    let mut delete_statements = Vec::new();
+    if folded {
+        let Some(init_span) = init_span else {
+            return Err("return-certificate-receiver-use:assignment-init".to_owned());
+        };
+        let (value, statement) = assignments[0];
+        let text = tcx
+            .sess
+            .source_map()
+            .span_to_snippet(value)
+            .unwrap_or_default();
+        expr_edits.push(BoxExprEdit {
+            span: init_span,
+            replacement: text,
+            receipt: "return-certificate-folded-assignment",
+        });
+        delete_statements.push(statement);
+        receipts.push("assignment-receiver folded".to_owned());
+    } else if !assignments.is_empty() {
+        let Some(init_span) = init_span else {
+            return Err("return-certificate-receiver-use:assignment-init".to_owned());
+        };
+        expr_edits.push(BoxExprEdit {
+            span: init_span,
+            replacement: "None".to_owned(),
+            receipt: "return-certificate-null-init",
+        });
+        if !certificate.optional {
+            for (span, _) in assignments {
+                let text = tcx
+                    .sess
+                    .source_map()
+                    .span_to_snippet(*span)
+                    .unwrap_or_default();
+                expr_edits.push(BoxExprEdit {
+                    span: *span,
+                    replacement: format!("Some({text})"),
+                    receipt: "return-certificate-some-assignment",
+                });
+            }
+        }
+        receipts.push(format!(
+            "assignment-receiver assignments={}",
+            assignments.len()
+        ));
+    }
+    for span in &uses.dead_guards {
+        receipts.push(format!(
+            "dead-null-guard site={}",
+            super::emitability::EmitabilityFacts::site(tcx, *span)
+        ));
+    }
+    for span in &uses.dead_null_returns {
+        receipts.push(format!("dead-null-return {}", span.lo().0));
+    }
+    let retained_sink = !frees.is_empty() || !uses.stores.is_empty() || !uses.transfers.is_empty();
     if !retained_sink {
         receipts.push("waiver-drop(scope-exit)".to_owned());
     }
-    Ok(BoxPlan {
-        shape: certificate.shape,
-        optional: certificate.optional,
-        expr_edits,
-        delete_statements: Vec::new(),
-        receipts,
-        fabricated_extent: false,
-        pointee_override: None,
-        inferred_binding: receiver.ty_span.is_none(),
-        overwrite_spans: Vec::new(),
-        retained_sink,
-        implicit_scope_close: !retained_sink,
-    })
+    // An edit inside a deleted statement goes with it.
+    expr_edits.retain(|e| !delete_statements.iter().any(|d| d.contains(e.span)));
+    let transfers = uses.transfers.clone();
+    Ok((
+        BoxPlan {
+            shape: certificate.shape,
+            optional,
+            expr_edits,
+            delete_statements,
+            receipts,
+            fabricated_extent: false,
+            pointee_override: None,
+            inferred_binding: receiver.ty_span.is_none(),
+            overwrite_spans: Vec::new(),
+            retained_sink,
+            implicit_scope_close: !retained_sink,
+        },
+        transfers,
+    ))
 }

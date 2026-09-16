@@ -1865,6 +1865,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if let Some(decision) = return_certificate::planned(ctx, subject) {
         return decision;
     }
+    // wave-6a W6A-C1 (A1-c): a consuming FORMAL a chain plans is a Box on the
+    // chain's evidence whatever the model says of it (R410-5 §1 extended to
+    // the formal every caller moves a certified owner into); a chain's
+    // LOCAL members keep the owning arm's path below.
+    if matches!(subject.kind, SubjectKind::Param { .. })
+        && let Some(plan) = ctx.box_params.plans.get(&(subject.fn_did, subject.hir_id))
+    {
+        return Decision::Box(plan.clone());
+    }
 
     // BO's kind first: it is the authority on WHETHER a reference is sound.
     match model.get(&SlotRef::Local(subject.fn_did, slot_id)) {

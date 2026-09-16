@@ -280,9 +280,11 @@ pub unsafe extern "C" fn register(mut r: *mut registry, mut id: i32) -> i32 {
 }
 "#;
 
-/// Control: the receiver is handed to a raw callee that frees it — a Box in
-/// the caller would drop it a second time at scope exit.
-const RECEIVER_CONSUMED_RAW: &str = r#"
+/// **A1-c** (the C1 composition): the receiver is handed to a callee that
+/// FREES its formal — a consuming formal the Box-parameter chain plans, so
+/// the transfer is a move (`item_release(it, 1)`), the formal `Box<item>`,
+/// its free `drop(it)`; nothing drops twice.
+const RECEIVER_CONSUMED: &str = r#"
 pub unsafe extern "C" fn item_new(mut id: i32) -> *mut item {
     let mut it = malloc(::std::mem::size_of::<item>()) as *mut item;
     if it.is_null() {
@@ -301,6 +303,30 @@ pub unsafe extern "C" fn use_item() -> i32 {
     let mut it = item_new(3 as i32);
     let mut id = (*it).id;
     item_release(it, 1 as i32);
+    return id;
+}
+"#;
+
+/// Control: the receiver is handed to a raw callee that KEEPS it (stores
+/// it through a raw slot) — not a lend, not a consuming formal: the owner
+/// holds.
+const RECEIVER_KEPT_RAW: &str = r#"
+pub unsafe extern "C" fn item_new(mut id: i32) -> *mut item {
+    let mut it = malloc(::std::mem::size_of::<item>()) as *mut item;
+    if it.is_null() {
+        return 0 as *mut item;
+    }
+    (*it).id = id;
+    (*it).next = 0 as *mut item;
+    return it;
+}
+pub unsafe extern "C" fn item_stash(mut it: *mut item, mut slot: *mut *mut item) {
+    *slot = it;
+}
+pub unsafe extern "C" fn use_item(mut slot: *mut *mut item) -> i32 {
+    let mut it = item_new(3 as i32);
+    let mut id = (*it).id;
+    item_stash(it, slot);
     return id;
 }
 "#;
@@ -347,16 +373,54 @@ fn w6a_a1_lil_add_func_is_not_an_owning_return() {
 }
 
 #[test]
-fn w6a_a1_receiver_handed_to_a_freeing_raw_callee_holds() {
+fn w6a_a1c_receiver_moved_into_a_consuming_formal_composes_with_the_chain() {
     let out = emitted(
         "cert-consumed",
-        &format!("{CONTROL_PRELUDE}{RECEIVER_CONSUMED_RAW}"),
+        &format!("{CONTROL_PRELUDE}{RECEIVER_CONSUMED}"),
+    );
+    record("item-consumed", &out.source);
+    let src = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}", out.source);
+    assert!(
+        src.contains("fnitem_release(mutit:Box<item>,mutflag:i32){ifflag!=0{drop(it);}}"),
+        "{}\n{}\n{}",
+        out.source,
+        out.artifacts.return_certificate_receipts,
+        out.artifacts.box_param_receipts
+    );
+    assert!(
+        src.contains("letmutit:Box<crate::item>=item_new(3asi32);letmutid=(*it).id;item_release(it,1asi32);returnid;}"),
+        "{}",
+        out.source
+    );
+    assert!(
+        out.artifacts.box_param_receipts.contains(
+            "box-param-chain callee=item_release index=0 pointee=item shape=sized callers=1 members=use_item::it formal_model=Some(Raw)"
+        ),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+    for subject in ["item_new::it", "use_item::it", "item_release::it"] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}: {:#?}",
+            out.degradations
+        );
+    }
+}
+
+#[test]
+fn w6a_a1_receiver_handed_to_a_keeping_raw_callee_holds() {
+    let out = emitted(
+        "cert-kept",
+        &format!("{CONTROL_PRELUDE}{RECEIVER_KEPT_RAW}"),
     );
     let src = compact(&out.source);
     assert!(!src.contains("Box<"), "{}", out.source);
     assert!(
         out.artifacts.return_certificate_receipts.contains(
-            "use_item::it\theld\treturn-certificate-receiver-use:call-argument-not-a-lend:item_release(it, 1 as i32)"
+            "use_item::it\theld\treturn-certificate-receiver-use:call-argument-not-a-lend:item_stash(it, slot)"
         ),
         "{}",
         out.artifacts.return_certificate_receipts
@@ -418,9 +482,12 @@ fn w6a_a1_sized_receiver_reads_and_frees() {
     );
 }
 
-/// urlparser `url_get_protocol`: the byte buffer is handed to `sscanf` — a
-/// foreign lend this build does not bridge (the raw-boundary retention
-/// certificate is the next step); the row holds typed.
+/// **A1-d** urlparser `url_get_protocol`: the byte buffer is handed to
+/// `sscanf` and, through `url_is_protocol`, to `strcmp` — foreign lends the
+/// pinned libc contract table calls `NoRetain` / `BorrowView`; the owner is
+/// bridged at those seams by the ordinary raw-boundary glue. (The corpus
+/// callers pass their own raw `url` parameter along, which the base holds
+/// `flows-into-raw-param` on the caller's class — kept out of this fixture.)
 const URLPARSER_PROTOCOL: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
 extern "C" {
@@ -432,19 +499,19 @@ extern "C" {
 pub unsafe extern "C" fn url_is_protocol(mut s: *mut std::os::raw::c_char) -> bool {
     return 0 as i32 == strcmp(b"http\0" as *const u8 as *const std::os::raw::c_char, s);
 }
-pub unsafe extern "C" fn url_get_protocol(mut url: *mut std::os::raw::c_char) -> *mut std::os::raw::c_char {
+pub unsafe extern "C" fn url_get_protocol() -> *mut std::os::raw::c_char {
     let mut protocol = malloc((16 as std::os::raw::c_ulong) * (::std::mem::size_of::<std::os::raw::c_char>() as std::os::raw::c_ulong)) as *mut std::os::raw::c_char;
     if protocol.is_null() {
         return 0 as *mut std::os::raw::c_char;
     }
-    sscanf(url, b"%[^://]\0" as *const u8 as *const std::os::raw::c_char, protocol);
+    sscanf(b"http://x\0" as *const u8 as *const std::os::raw::c_char, b"%[^://]\0" as *const u8 as *const std::os::raw::c_char, protocol);
     if url_is_protocol(protocol) {
         return protocol;
     }
     return 0 as *mut std::os::raw::c_char;
 }
-pub unsafe extern "C" fn url_get_auth(mut url: *mut std::os::raw::c_char) -> i32 {
-    let mut protocol = url_get_protocol(url);
+pub unsafe extern "C" fn url_get_auth() -> i32 {
+    let mut protocol = url_get_protocol();
     if protocol.is_null() {
         return 0 as i32;
     }
@@ -454,15 +521,20 @@ pub unsafe extern "C" fn url_get_auth(mut url: *mut std::os::raw::c_char) -> i32
 "#;
 
 #[test]
-fn w6a_a1_urlparser_protocol_buffer_lent_to_sscanf_holds_typed() {
+fn w6a_a1d_urlparser_protocol_buffer_lent_to_sscanf_delivers() {
     let out = emitted("cert-urlparser", URLPARSER_PROTOCOL);
+    record("urlparser-protocol", &out.source);
     let src = compact(&out.source);
-    assert!(!src.contains("Box<"), "{}", out.source);
+    assert_eq!(
+        out.reverted, 0,
+        "{}\n{:#?}\n{}",
+        out.source, out.degradations, out.artifacts.return_certificate_receipts
+    );
     assert!(
-        out.artifacts.return_certificate_receipts.contains(
-            "url_get_protocol::protocol\theld\treturn-certificate-owner-use:url_get_protocol:call-argument-not-a-lend:sscanf("
-        ),
-        "{}",
+        src.contains("Box<[std::os::raw::c_char]>"),
+        "{}\n{:#?}\n{}",
+        out.source,
+        out.degradations,
         out.artifacts.return_certificate_receipts
     );
 }
@@ -505,15 +577,15 @@ fn w6a_a1_receiver_returned_by_an_uncertified_function_holds_the_chain() {
     assert!(
         out.artifacts
             .return_certificate_receipts
-            .contains("pick\theld\treturn-certificate-return-locals:pick:2"),
+            .contains("pick::it\theld\treturn-certificate-return-locals:pick:2"),
         "{}",
         out.artifacts.return_certificate_receipts
     );
 }
 
-/// Control: a call whose result is stored straight into a field (quadtree's
-/// `(*root).nw = quadtree_node_with_bounds(..)` shape) is not a receiver —
-/// the callee holds rather than meet that store untyped.
+/// A1-b: a call whose result is stored straight into a raw field
+/// (quadtree's `(*root).nw = quadtree_node_with_bounds(..)` shape) is a
+/// transfer into C's storage: `Box::into_raw(callee(..))` at the store.
 const CALL_INTO_FIELD: &str = r#"
 pub unsafe extern "C" fn item_new(mut id: i32) -> *mut item {
     let mut it = malloc(::std::mem::size_of::<item>()) as *mut item;
@@ -529,22 +601,269 @@ pub unsafe extern "C" fn chain(mut head: *mut item) -> i32 {
     (*head).next = item_new(2 as i32);
     let mut id = (*it).id;
     free(it as *mut core::ffi::c_void);
+    let mut tail = item_new(3 as i32);
+    (*(*head).next).next = tail;
     return id;
 }
 "#;
 
 #[test]
-fn w6a_a1_call_result_stored_into_a_field_holds_the_callee() {
+fn w6a_a1_call_result_stored_into_a_raw_field_transfers_through_into_raw() {
     let out = emitted(
         "cert-field-store",
         &format!("{CONTROL_PRELUDE}{CALL_INTO_FIELD}"),
     );
     let src = compact(&out.source);
-    assert!(!src.contains("Box<"), "{}", out.source);
+    assert_eq!(out.reverted, 0, "{}", out.source);
     assert!(
-        out.artifacts.return_certificate_receipts.contains(
-            "item_new::it\theld\treturn-certificate-call-site-not-a-receiver:item_new:chain:item_new(2 as i32)"
+        src.contains("(*head).next=Box::into_raw(item_new(2asi32));"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("letmutit:Box<crate::item>=item_new(1asi32);"),
+        "{}",
+        out.source
+    );
+    // A non-optional OWNER stored into a raw field: `Box::into_raw(tail)`.
+    assert!(
+        src.contains(
+            "letmuttail:Box<crate::item>=item_new(3asi32);(*(*head).next).next=Box::into_raw(tail);"
         ),
+        "{}",
+        out.source
+    );
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("store_sites=1"),
+        "{}",
+        out.artifacts.return_certificate_receipts
+    );
+}
+
+/// **A1-b, the quadtree corpus chain reduced**: `quadtree_node_new` (the
+/// allocation) → `quadtree_node_with_bounds` (an ASSIGNMENT receiver
+/// `node = quadtree_node_new()` with its dead guard, a real null return on
+/// the bounds path, `return node`) → `split_node_` (four assignment receivers
+/// null-checked and STORED into the parent's fields) and `quadtree_new`
+/// (the call stored straight into `(*tree).root`).
+const QUADTREE_CHAIN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct quadtree_bounds { pub w: f64, pub h: f64 }
+#[repr(C)]
+pub struct quadtree_node {
+    pub ne: *mut quadtree_node,
+    pub nw: *mut quadtree_node,
+    pub bounds: *mut quadtree_bounds,
+    pub key: *mut core::ffi::c_void,
+}
+#[repr(C)]
+pub struct quadtree { pub root: *mut quadtree_node, pub length: u32 }
+pub unsafe extern "C" fn quadtree_bounds_new() -> *mut quadtree_bounds {
+    let mut b = malloc(::std::mem::size_of::<quadtree_bounds>()) as *mut quadtree_bounds;
+    if b.is_null() {
+        return 0 as *mut quadtree_bounds;
+    }
+    (*b).w = 0.0;
+    (*b).h = 0.0;
+    return b;
+}
+pub unsafe extern "C" fn quadtree_bounds_extend(mut b: *mut quadtree_bounds, mut x: f64, mut y: f64) {
+    (*b).w = if x > (*b).w { x } else { (*b).w };
+    (*b).h = if y > (*b).h { y } else { (*b).h };
+}
+pub unsafe extern "C" fn quadtree_node_new() -> *mut quadtree_node {
+    let mut node = 0 as *mut quadtree_node;
+    node = malloc(::std::mem::size_of::<quadtree_node>()) as *mut quadtree_node;
+    if node.is_null() {
+        return 0 as *mut quadtree_node;
+    }
+    (*node).ne = 0 as *mut quadtree_node;
+    (*node).nw = 0 as *mut quadtree_node;
+    (*node).bounds = 0 as *mut quadtree_bounds;
+    (*node).key = 0 as *mut core::ffi::c_void;
+    return node;
+}
+pub unsafe extern "C" fn quadtree_node_with_bounds(mut maxx: f64, mut maxy: f64) -> *mut quadtree_node {
+    let mut node = 0 as *mut quadtree_node;
+    node = quadtree_node_new();
+    if node.is_null() {
+        return 0 as *mut quadtree_node;
+    }
+    (*node).bounds = quadtree_bounds_new();
+    if ((*node).bounds).is_null() {
+        return 0 as *mut quadtree_node;
+    }
+    quadtree_bounds_extend((*node).bounds, maxx, maxy);
+    return node;
+}
+pub unsafe extern "C" fn split_node_(mut node: *mut quadtree_node) -> i32 {
+    let mut nw = 0 as *mut quadtree_node;
+    let mut ne = 0 as *mut quadtree_node;
+    let mut hw = (*(*node).bounds).w / 2 as i32 as f64;
+    nw = quadtree_node_with_bounds(hw, hw);
+    if nw.is_null() {
+        return 0 as i32;
+    }
+    ne = quadtree_node_with_bounds(hw * 2 as i32 as f64, hw);
+    if ne.is_null() {
+        return 0 as i32;
+    }
+    (*node).nw = nw;
+    (*node).ne = ne;
+    return 1 as i32;
+}
+pub unsafe extern "C" fn quadtree_new(mut maxx: f64, mut maxy: f64) -> *mut quadtree {
+    let mut tree = 0 as *mut quadtree;
+    tree = malloc(::std::mem::size_of::<quadtree>()) as *mut quadtree;
+    if tree.is_null() {
+        return 0 as *mut quadtree;
+    }
+    (*tree).root = quadtree_node_with_bounds(maxx, maxy);
+    if ((*tree).root).is_null() {
+        free(tree as *mut core::ffi::c_void);
+        return 0 as *mut quadtree;
+    }
+    (*tree).length = 0 as u32;
+    return tree;
+}
+pub unsafe extern "C" fn driver() -> i32 {
+    let mut tree = quadtree_new(8.0, 8.0);
+    if tree.is_null() {
+        return -(1 as i32);
+    }
+    return (*tree).length as i32;
+}
+"#;
+
+#[test]
+fn w6a_a1b_quadtree_assignment_receivers_stores_and_the_stored_call_deliver() {
+    let out = emitted("cert-quadtree-chain", QUADTREE_CHAIN);
+    record("quadtree-full-chain", &out.source);
+    let src = compact(&out.source);
+    assert_eq!(
+        out.reverted, 0,
+        "{}\n{:#?}\n{}",
+        out.source, out.degradations, out.artifacts.return_certificate_receipts
+    );
+    // The allocation: null-init folded, dead guard, `Box<quadtree_node>`.
+    assert!(
+        src.contains("fnquadtree_node_new()->Box<quadtree_node>{"),
+        "{}\n{:#?}\n{}\nCOLLISIONS\n{}",
+        out.source,
+        out.degradations,
+        out.artifacts.return_certificate_receipts,
+        out.artifacts.class_collisions
+    );
+    // The assignment receiver returned, FOLDED (its one assignment is the
+    // binding's first use): `let mut node: Box<..> = quadtree_node_new();`,
+    // the assignment statement gone, its guard dead, the bounds call stored
+    // through `Box::into_raw`, the real null return `None`, `return Some(node)`.
+    assert!(
+        src.contains("fnquadtree_node_with_bounds(mutmaxx:f64,mutmaxy:f64)->Option<Box<quadtree_node>>{letmutnode:Box<crate::quadtree_node>=quadtree_node_new();{}(*node).bounds=Box::into_raw(quadtree_bounds_new());"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("if((*node).bounds).is_null(){returnNone;}"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("quadtree_bounds_extend(&mut*(*node).bounds,maxx,maxy);returnSome(node);}"),
+        "{}",
+        out.source
+    );
+    // split_node_: two assignment receivers of an optional callee, null-tested,
+    // stored into the parent's raw fields.
+    assert!(
+        src.contains("letmutnw:Option<Box<crate::quadtree_node>>=None;"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("nw=quadtree_node_with_bounds(hw,hw);ifnw.is_none(){return0asi32;}"),
+        "{}",
+        out.source
+    );
+    assert!(src.contains("(*node).nw=nw.map_or(core::ptr::null_mut(),Box::into_raw);(*node).ne=ne.map_or(core::ptr::null_mut(),Box::into_raw);"), "{}", out.source);
+    // quadtree_new: the call stored straight into the raw field.
+    assert!(src.contains("(*tree).root=quadtree_node_with_bounds(maxx,maxy).map_or(core::ptr::null_mut(),Box::into_raw);"), "{}", out.source);
+    for subject in [
+        "quadtree_node_new::node",
+        "quadtree_node_with_bounds::node",
+        "split_node_::nw",
+        "split_node_::ne",
+    ] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}: {:#?}",
+            out.degradations
+        );
+    }
+}
+
+/// **A1-b, buffer's direct return**: `buffer_new() { return buffer_new_with_size(64) }`
+/// chains without a local; its receiver frees.
+const BUFFER_DIRECT_RETURN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct buffer_t { pub len: usize, pub data: *mut u8 }
+pub unsafe extern "C" fn buffer_new_with_size(mut n: usize) -> *mut buffer_t {
+    let mut self_0 = malloc(::std::mem::size_of::<buffer_t>()) as *mut buffer_t;
+    if self_0.is_null() {
+        return 0 as *mut buffer_t;
+    }
+    (*self_0).len = n;
+    (*self_0).data = 0 as *mut u8;
+    return self_0;
+}
+pub unsafe extern "C" fn buffer_new() -> *mut buffer_t {
+    return buffer_new_with_size(64 as usize);
+}
+pub unsafe extern "C" fn test_buffer_new() -> usize {
+    let mut buf = buffer_new();
+    let mut n = (*buf).len;
+    free(buf as *mut core::ffi::c_void);
+    return n;
+}
+"#;
+
+#[test]
+fn w6a_a1b_direct_return_of_a_certified_call_chains() {
+    let out = emitted("cert-direct-return", BUFFER_DIRECT_RETURN);
+    record("buffer-direct-return", &out.source);
+    let src = compact(&out.source);
+    assert_eq!(
+        out.reverted, 0,
+        "{}\n{:#?}\n{}",
+        out.source, out.degradations, out.artifacts.return_certificate_receipts
+    );
+    assert!(
+        src.contains("fnbuffer_new()->Box<buffer_t>{returnbuffer_new_with_size(64asusize);}"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("letmutbuf:Box<crate::buffer_t>=buffer_new();letmutn=(*buf).len;drop(buf);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("return-certificate callee=buffer_new output=Box<buffer_t> source=calls"),
         "{}",
         out.artifacts.return_certificate_receipts
     );

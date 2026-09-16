@@ -3648,46 +3648,58 @@ pub(crate) fn plan(
             }),
         }
     }
-    // wave-6a W6A-A1: the span layer's copy of a certified callee's output type.
+    // wave-6a W6A-A1: the span layer's copy of a certified callee's output type
+    // and of its site edits (each charged to the class of the function it
+    // sits in).
     for certificate in table.return_certificates.callees.values() {
-        let owner_class = SignatureClassId::of(certificate.callee);
-        let kind = "return-certificate-output";
-        let span = certificate.output_span;
-        let bridge = BridgeSitePlan::local(
+        let output = (
             certificate.callee,
-            certificate.callee,
-            Arm::Surface.key(),
-            format!("{kind}:{}..{}", span.lo().0, span.hi().0),
-            kind,
+            "return-certificate-output",
+            certificate.output_span,
+            certificate.output_type.clone(),
         );
-        match span_to_loc(span) {
-            Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
-                lo,
-                hi,
-                replacement: certificate.output_type.clone(),
-                justification: Justification::SeamAdapter {
-                    family: "safe",
-                    fabricated: false,
-                },
-                owner_class: Some(owner_class),
-                owner_path: certificate.callee_path.clone(),
-                bridge: Some(bridge),
-                atom_ids: Vec::new(),
-                subject_id: certificate.callee_path.clone(),
-                required_arms: owner_arms
-                    .get(&owner_class)
-                    .copied()
-                    .unwrap_or_default()
-                    .render(),
-                edit_kind: kind,
-            }),
-            Err(reason) => unplaceable.push(Unplaceable {
-                owner_class,
-                bridge,
-                reason,
-                detail: format!("{kind} for {}", certificate.callee_path),
-                subject: certificate.callee_path.clone(),
-            }),
+        let sites = certificate
+            .site_edits
+            .iter()
+            .map(|(owner, edit)| (*owner, edit.receipt, edit.span, edit.replacement.clone()));
+        for (owner_fn, kind, span, replacement) in std::iter::once(output).chain(sites) {
+            let owner_class = SignatureClassId::of(owner_fn);
+            let bridge = BridgeSitePlan::local(
+                owner_fn,
+                owner_fn,
+                Arm::Surface.key(),
+                format!("{kind}:{}..{}", span.lo().0, span.hi().0),
+                kind,
+            );
+            match span_to_loc(span) {
+                Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
+                    lo,
+                    hi,
+                    replacement,
+                    justification: Justification::SeamAdapter {
+                        family: "safe",
+                        fabricated: false,
+                    },
+                    owner_class: Some(owner_class),
+                    owner_path: certificate.callee_path.clone(),
+                    bridge: Some(bridge),
+                    atom_ids: Vec::new(),
+                    subject_id: certificate.callee_path.clone(),
+                    required_arms: owner_arms
+                        .get(&owner_class)
+                        .copied()
+                        .unwrap_or_default()
+                        .render(),
+                    edit_kind: kind,
+                }),
+                Err(reason) => unplaceable.push(Unplaceable {
+                    owner_class,
+                    bridge,
+                    reason,
+                    detail: format!("{kind} for {}", certificate.callee_path),
+                    subject: certificate.callee_path.clone(),
+                }),
+            }
         }
     }
     // wave-6a W6A-T1: the span layer's copy of the flexible-tail transaction —

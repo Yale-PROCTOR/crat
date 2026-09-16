@@ -4984,6 +4984,27 @@ pub(crate) fn filtered_inputs(
             );
         }
     }
+    // wave-6a W6A-A1: a certificate's site edits (a call stored into a raw
+    // place, a `Some(..)` return wrap in a callee without an owner local),
+    // active while none of the certificate's owners is reverted.
+    for certificate in table.return_certificates.callees.values() {
+        if table
+            .return_certificates
+            .owners(certificate.callee)
+            .iter()
+            .any(|f| reverts.fns.contains(f))
+        {
+            continue;
+        }
+        for (_, edit) in &certificate.site_edits {
+            insert_counting(
+                &mut out.uses,
+                (edit.span.lo().0, edit.span.hi().0),
+                edit.replacement.clone(),
+                &mut out.use_key_collisions,
+            );
+        }
+    }
     for (subject, decision) in &table.entries {
         let use_edits = match decision {
             super::decision::Decision::Cursor { plan, .. } => Some(&plan.uses),
