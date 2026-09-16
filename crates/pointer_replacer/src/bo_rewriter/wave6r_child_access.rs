@@ -197,9 +197,19 @@ fn descendant_free(
         .mir_drops_elaborated_and_const_checked(function)
         .borrow();
     let body: &Body<'_> = &body;
-    // Transparent alias closure: copies, pointer casts, and the results of
-    // libc calls whose contract row returns an alias of an alias.
-    let mut aliases = vec![parameter];
+    let aliases = alias_closure(tcx, functions, body, vec![parameter]);
+    scan(tcx, functions, body, &aliases, None, visited)
+}
+
+/// Transparent alias closure of `seeds`: copies, pointer casts, the results
+/// of alias-result core calls, and of libc calls whose contract row returns
+/// an alias of an alias.
+fn alias_closure<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
+    body: &Body<'tcx>,
+    mut aliases: Vec<Local>,
+) -> Vec<Local> {
     let mut changed = true;
     while changed {
         changed = false;
@@ -260,9 +270,38 @@ fn descendant_free(
             }
         }
     }
+    aliases
+}
+
+/// The body scan over an alias set: no alias may be handed out (stored
+/// anywhere but a plain local, returned, aggregated, address-taken, offset by
+/// a binary op, cast to a non-pointer, passed to an open callee) and every
+/// local callee receiving one must be descendant-free at that position.
+/// `output` names a parameter whose pointee is the CERTIFIED output storage
+/// (wave-6v2's frame-confined certificate): a store of an alias through it
+/// is that certificate's own sink, not a hand-out of this scan.
+fn scan<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
+    body: &Body<'tcx>,
+    aliases: &[Local],
+    output: Option<Local>,
+    visited: &mut FxHashSet<(LocalDefId, Local)>,
+) -> bool {
+    let outputs = output.map(|output| alias_closure(tcx, functions, body, vec![output]));
     let is_alias =
         |operand: &Operand<'_>| operand_local(operand).is_some_and(|l| aliases.contains(&l));
     let hands_out = |place: &rustc_middle::mir::Place<'_>| {
+        if let Some(outputs) = &outputs
+            && let Some((rustc_middle::mir::PlaceElem::Deref, rest)) =
+                place.projection.split_first()
+            && rest
+                .iter()
+                .all(|elem| matches!(elem, rustc_middle::mir::PlaceElem::Field(..)))
+            && outputs.contains(&place.local)
+        {
+            return false;
+        }
         place
             .as_local()
             .is_none_or(|local| local == rustc_middle::mir::RETURN_PLACE)
@@ -376,8 +415,8 @@ fn descendant_free(
     true
 }
 
-/// The body scan alone (no retention row), for the witnesses.
-#[cfg(test)]
+/// The body scan alone (no retention row): the parameter at `index` is only
+/// read through in this function and every local callee it reaches.
 pub(crate) fn position_is_descendant_free(
     tcx: TyCtxt<'_>,
     functions: &[LocalDefId],
@@ -389,6 +428,89 @@ pub(crate) fn position_is_descendant_free(
         functions,
         function,
         Local::from_usize(index + 1),
+        &mut FxHashSet::default(),
+    )
+}
+
+/// The scan for a callee position whose stores through the parameter at
+/// `output_index` are the certified output-storage sinks (relay wave-6r/013
+/// §2, wave-6v2's `frame_confined`): every other use is read-through only.
+pub(crate) fn position_is_descendant_free_modulo_output(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    function: LocalDefId,
+    index: usize,
+    output_index: usize,
+) -> bool {
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(function)
+        .borrow();
+    let body: &Body<'_> = &body;
+    let parameter = Local::from_usize(index + 1);
+    let aliases = alias_closure(tcx, functions, body, vec![parameter]);
+    let mut visited = FxHashSet::from_iter([(function, parameter)]);
+    scan(
+        tcx,
+        functions,
+        body,
+        &aliases,
+        Some(Local::from_usize(output_index + 1)),
+        &mut visited,
+    )
+}
+
+/// The reader side of the same certificate: every pointer LOADED from
+/// `field` through the parameter at `index` (`(*p).field`, `p` or any of
+/// its transparent aliases) is read through only in this function and every
+/// local callee it reaches — never stored, returned or handed to an open
+/// callee.
+pub(crate) fn loaded_field_is_descendant_free(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    function: LocalDefId,
+    index: usize,
+    field: rustc_abi::FieldIdx,
+) -> bool {
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(function)
+        .borrow();
+    let body: &Body<'_> = &body;
+    let bases = alias_closure(tcx, functions, body, vec![Local::from_usize(index + 1)]);
+    let mut loaded = Vec::new();
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let StatementKind::Assign(assignment) = &statement.kind else { continue };
+            let (lhs, rhs) = (&assignment.0, &assignment.1);
+            if let Rvalue::Use(operand) = rhs
+                && let Some(place) = operand.place()
+                && bases.contains(&place.local)
+                && let [
+                    rustc_middle::mir::PlaceElem::Deref,
+                    rustc_middle::mir::PlaceElem::Field(f, _),
+                ] = place.projection.as_slice()
+                && *f == field
+            {
+                // A load straight into the return place or through another
+                // pointer hands the loaded pointer out before any local holds it.
+                let Some(destination) = lhs
+                    .as_local()
+                    .filter(|local| *local != rustc_middle::mir::RETURN_PLACE)
+                else {
+                    return false;
+                };
+                if pointer(body.local_decls[destination].ty) && !loaded.contains(&destination) {
+                    loaded.push(destination);
+                }
+            }
+        }
+    }
+    let aliases = alias_closure(tcx, functions, body, loaded);
+    scan(
+        tcx,
+        functions,
+        body,
+        &aliases,
+        None,
         &mut FxHashSet::default(),
     )
 }
