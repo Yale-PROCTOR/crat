@@ -2096,7 +2096,12 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         None if region.is_some() => Form::Slice,
         None => Form::Plain,
     };
+    // R422-5 (wave-4 × wave-6v): a subject the counted-void route claims —
+    // a twin, a counted view, or a handled void call — is never a
+    // contract-extent candidate; the libc row is the lend oracle's evidence
+    // at typed positions, and one site has one owner.
     let contract_form = match form {
+        _ if counted.is_some() => None,
         Form::Plain => Some(contract_extent::CurrentForm::Ref {
             mutable: subject.mutable,
             nullable: false,
