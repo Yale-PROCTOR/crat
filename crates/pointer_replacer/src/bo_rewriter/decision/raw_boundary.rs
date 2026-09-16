@@ -3668,6 +3668,18 @@ impl BridgeTemplate {
                     "{argument}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_ptr().cast::<{pointee}>().cast_mut())"
                 )))
             }
+            Self::OptSliceMutToVoidMut => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_mut_ptr().cast::<{pointee}>())"
+                )))
+            }
+            Self::OptSliceToVoidConst => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                Ok(BridgeRender::Edit(format!(
+                    "{argument}.as_deref().map_or(core::ptr::null::<{pointee}>(), |slice| slice.as_ptr().cast::<{pointee}>())"
+                )))
+            }
             Self::BoxBorrowViewToRaw if box_slice => {
                 Ok(BridgeRender::Edit(match target_mutability {
                     RawMutability::Mut => format!("{argument}.as_mut_ptr()"),

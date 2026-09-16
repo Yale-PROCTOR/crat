@@ -190,3 +190,47 @@ unsafe fn peek(value: *const Binn) -> i32 {{
     assert!(!output.contains("cast_mut()"), "{output}");
     assert!(verify::type_checks_str(&output), "{output}");
 }
+
+/// binn `binn_read_pair::pkey` — an optional SLICE (`pkey.offset(len)` is
+/// written) reaching `memcpy`'s `*mut c_void` through a cast: the slice's
+/// raw view carries its whole extent (K19'), erased to `c_void` inside the
+/// `Some` arm; `None` stays null.
+#[test]
+fn wave6o_binn_read_pair_optional_slice_at_void_mut() {
+    let input = format!(
+        r#"{PRELUDE}
+unsafe extern "C" {{ fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void; }}
+unsafe fn binn_read_pair(pkey: *mut i8, key: *const i8, len: usize) -> i32 {{
+    if pkey.is_null() {{ return 0; }}
+    memcpy(pkey as *mut core::ffi::c_void, key as *const core::ffi::c_void, len);
+    *pkey.offset(len as isize) = 0;
+    return 1;
+}}
+"#
+    );
+    assert!(verify::type_checks_str(&input));
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let table = super::decide_table(tcx).expect("native decisions");
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.param_name.as_deref() == Some("pkey"))
+            .expect("corpus-derived subject");
+        assert!(
+            matches!(decision, Decision::Opt { slice: true, .. }),
+            "the void cast must keep pkey an optional slice: {decision:?}"
+        );
+    })
+    .expect("fixture compiler context");
+    let output = ast_emitted_source_of(&input).expect("native emission");
+    assert!(output.contains("pkey: Option<&mut [i8]>"), "{output}");
+    assert!(
+        output.split_whitespace().collect::<String>().contains(
+            &"memcpy(pkey.as_deref_mut().map_or(core::ptr::null_mut::<core::ffi::c_void>(), |slice| slice.as_mut_ptr().cast::<core::ffi::c_void>()),"
+                .split_whitespace().collect::<String>()
+        ),
+        "{output}"
+    );
+    eprintln!("WAVE6O_VOID_OUTPUT_BEGIN binn_read_pair\n{output}\nWAVE6O_VOID_OUTPUT_END");
+    assert!(verify::type_checks_str(&output), "{output}");
+}
