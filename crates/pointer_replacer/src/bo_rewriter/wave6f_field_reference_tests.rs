@@ -1104,6 +1104,7 @@ fn w6f_array_of_references_local_delivers() {
         "kmRay2IntersectBox::p4",
         "kmRay2IntersectBox::this_point",
         "kmRay2IntersectBox::next_point",
+        "kmRay2IntersectBox::other_point",
     ] {
         assert_eq!(
             decision_of(&observed, label),
@@ -1113,7 +1114,7 @@ fn w6f_array_of_references_local_delivers() {
     }
     let outcome = emitted("points", POINTS);
     let (source, emitted_count, reverted) = emitted_source(&outcome);
-    assert_eq!((emitted_count, reverted), (8, 0), "{source}");
+    assert_eq!((emitted_count, reverted), (9, 0), "{source}");
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
     for needle in [
         "fn kmRay2IntersectBox(mut p1: &kmVec2, mut p2: &kmVec2, mut p3: &kmVec2, mut p4: &kmVec2) -> f32 {",
@@ -1121,7 +1122,8 @@ fn w6f_array_of_references_local_delivers() {
         "points[0 as usize] = Some(p1);",
         "points[3 as usize] = Some(p4);",
         "let mut this_point: &crate::kmVec2 = points[i as usize].unwrap();",
-        "acc += kmVec2Dot(this_point, next_point) + (*this_point).x;",
+        "let mut other_point: &crate::kmVec2 = if i == 3 as u32 || i == 0 as u32 { points[1 as usize].unwrap() } else { points[0 as usize].unwrap() };",
+        "acc += kmVec2Dot(this_point, next_point) + (*this_point).x + (*other_point).y;",
     ] {
         assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
     }

@@ -1942,10 +1942,55 @@ fn array_local_candidates(
                                         None,
                                     ));
                                 }
-                                // `points[i]` as the arm of a conditional that a
-                                // `let` consumes: the load is the `if`'s.
                                 _ => self.hold("element-use-shape"),
                             },
+                            // `let x = if c { points[1] } else { points[0] };` —
+                            // the element is a block's tail under an `if` a
+                            // `let` consumes: a load of the `let`'s local.
+                            Node::Block(block)
+                                if block.expr.is_some_and(|e| e.hir_id == expr.hir_id) =>
+                            {
+                                let mut at = block.hir_id;
+                                let mut consumer = None;
+                                for _ in 0..4 {
+                                    match tcx.parent_hir_node(at) {
+                                        Node::Expr(e)
+                                            if matches!(
+                                                e.kind,
+                                                ExprKind::If(..) | ExprKind::Block(..)
+                                            ) =>
+                                        {
+                                            at = e.hir_id;
+                                        }
+                                        Node::LetStmt(local)
+                                            if local.init.is_some_and(|init| init.hir_id == at) =>
+                                        {
+                                            consumer = Some(local);
+                                            break;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                let Some(local) = consumer else {
+                                    self.hold("element-use-shape");
+                                    return;
+                                };
+                                let rustc_hir::PatKind::Binding(_, b, _, None) = local.pat.kind
+                                else {
+                                    self.hold("load-pattern");
+                                    return;
+                                };
+                                if local.ty.is_some() {
+                                    self.hold("load-annotated");
+                                    return;
+                                }
+                                let Some(node) = self.subjects.get(&b) else {
+                                    self.hold("load-consumer-not-a-subject");
+                                    return;
+                                };
+                                self.sites
+                                    .push(site(SiteKind::Load, expr.span, None, Some(*node)));
+                            }
                             Node::LetStmt(local)
                                 if local.init.is_some_and(|init| init.hir_id == expr.hir_id) =>
                             {
@@ -2646,7 +2691,10 @@ pub(crate) fn finalize(
                         cause.get_or_insert_with(|| "load-consumer-form-unrenderable".to_owned());
                         continue;
                     };
-                    load_locals.push((local, emitted));
+                    // Both arms of an `if` load the same local: one declaration.
+                    if !load_locals.iter().any(|(node, _)| *node == local) {
+                        load_locals.push((local, emitted));
+                    }
                 }
                 SiteKind::Deref => {
                     if matches!(field, Form::Opt { .. }) {

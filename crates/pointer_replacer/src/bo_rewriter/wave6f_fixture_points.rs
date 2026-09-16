@@ -24,7 +24,8 @@ pub unsafe extern "C" fn kmRay2IntersectBox(
     while i < 4 as u32 {
         let mut this_point = points[i as usize];
         let mut next_point = points[(if i == 3 as u32 { 0 as u32 } else { i.wrapping_add(1) }) as usize];
-        acc += kmVec2Dot(this_point, next_point) + (*this_point).x;
+        let mut other_point = if i == 3 as u32 || i == 0 as u32 { points[1 as usize] } else { points[0 as usize] };
+        acc += kmVec2Dot(this_point, next_point) + (*this_point).x + (*other_point).y;
         i = i.wrapping_add(1);
     }
     return acc;
