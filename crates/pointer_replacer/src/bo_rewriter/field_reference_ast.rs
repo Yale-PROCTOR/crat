@@ -301,7 +301,10 @@ pub(super) fn apply(
         let struct_did = transaction.key.struct_did;
         let form = if transaction.owning {
             DeclForm::Box {
-                slice: false,
+                slice: matches!(
+                    transaction.form,
+                    Form::Slice { .. } | Form::Opt { slice: true, .. }
+                ),
                 optional: true,
                 pointee_override: None,
             }
@@ -495,7 +498,53 @@ impl MutVisitor for Wraps<'_> {
                 std::mem::replace(&mut rhs.kind, rustc_ast::ExprKind::Dummy),
                 Some(std::mem::replace(&mut lhs.kind, rustc_ast::ExprKind::Dummy)),
             ),
-            ("owned-field-is-null" | "owned-field-raw-store", _) => {
+            // A cast site wraps the cast's OPERAND (the field), keeping the
+            // template's own `as <target>`.
+            (
+                "owned-field-dealloc-transfer" | "owned-field-dealloc-transfer-contract",
+                rustc_ast::ExprKind::Cast(operand, _),
+            ) => (
+                std::mem::replace(&mut operand.kind, rustc_ast::ExprKind::Dummy),
+                None,
+            ),
+            // A raw view of a cast site likewise; of an OFFSET the receiver
+            // (the field) is the inner and the offset operand the second slot.
+            ("owned-field-raw-view", rustc_ast::ExprKind::Cast(operand, _)) => (
+                std::mem::replace(&mut operand.kind, rustc_ast::ExprKind::Dummy),
+                None,
+            ),
+            ("owned-field-raw-view", rustc_ast::ExprKind::MethodCall(call)) => {
+                let Some(operand) = call.args.first_mut() else {
+                    self.failures.push(format!("wrap-shape:{kind}:{key:?}"));
+                    return;
+                };
+                (
+                    std::mem::replace(&mut call.receiver.kind, rustc_ast::ExprKind::Dummy),
+                    Some(std::mem::replace(
+                        &mut operand.kind,
+                        rustc_ast::ExprKind::Dummy,
+                    )),
+                )
+            }
+            // `*(f).offset(k)`: the field is the receiver under the deref.
+            ("owned-field-element", rustc_ast::ExprKind::Unary(rustc_ast::UnOp::Deref, under)) => {
+                let rustc_ast::ExprKind::MethodCall(call) = &mut under.kind else {
+                    self.failures.push(format!("wrap-shape:{kind}:{key:?}"));
+                    return;
+                };
+                (
+                    std::mem::replace(&mut call.receiver.kind, rustc_ast::ExprKind::Dummy),
+                    None,
+                )
+            }
+            (
+                "owned-field-is-null"
+                | "owned-field-raw-store"
+                | "owned-field-dealloc-transfer"
+                | "owned-field-dealloc-transfer-contract"
+                | "owned-field-element",
+                _,
+            ) => {
                 self.failures.push(format!("wrap-shape:{kind}:{key:?}"));
                 return;
             }

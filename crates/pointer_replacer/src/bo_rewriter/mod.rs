@@ -7017,6 +7017,28 @@ fn finish_decide<'tcx>(
     let mut a5_role_profile = None;
     // wave-6f: fields a finalization refused, with the cause; grows only, so
     // the re-derivation below terminates.
+    // The C free sites an owned field's allocation may leave through: libc
+    // `free` itself, a local deallocator proved from its source
+    // (`ownership_fields_deallocator`), or a user-named allocator contract
+    // (none in production yet; the test frame names one).
+    let field_deallocator = |callee: Option<rustc_hir::def_id::LocalDefId>,
+                             foreign: Option<&str>,
+                             argument: usize| {
+        if foreign == Some("free") && argument == 0 {
+            return Some(decision::field_reference::DEALLOC_TRANSFER);
+        }
+        #[cfg(test)]
+        if let Some(callee) = callee
+            && test_model_override::contract_deallocator(tcx, callee, argument)
+        {
+            return Some(decision::field_reference::DEALLOC_TRANSFER_CONTRACT);
+        }
+        callee
+            .filter(|callee| {
+                decision::ownership_fields_deallocator::derive(&program, *callee, argument).is_ok()
+            })
+            .map(|_| decision::field_reference::DEALLOC_TRANSFER)
+    };
     let mut withdrawn_fields: std::collections::BTreeMap<
         decision::field_reference::FieldKey,
         String,
@@ -7320,8 +7342,13 @@ fn finish_decide<'tcx>(
         // wave-6f: finalize every field transaction against the settled table;
         // a refused field is excluded at the candidate input and the stage is
         // re-derived, so its dependents reproduce their prior decisions.
-        let (field_transactions, refused_fields) =
-            decision::field_reference::finalize(tcx, &field_candidates, &table, &exposure);
+        let (field_transactions, refused_fields) = decision::field_reference::finalize(
+            tcx,
+            &field_candidates,
+            &table,
+            &exposure,
+            &field_deallocator,
+        );
         if !refused_fields.is_empty() {
             let before = withdrawn_fields.len();
             withdrawn_fields.extend(refused_fields);
@@ -8521,6 +8548,7 @@ pub(crate) mod test_model_override {
         String,
         Vec<(String, usize, SlotKind)>,
         Vec<(String, SlotKind)>,
+        Vec<(String, usize)>,
     );
     static OVERRIDE: Mutex<Option<Override>> = Mutex::new(None);
 
@@ -8529,7 +8557,38 @@ pub(crate) mod test_model_override {
         fields: Vec<(String, usize, SlotKind)>,
         locals: Vec<(String, SlotKind)>,
     ) {
-        *OVERRIDE.lock().unwrap() = Some((marker.to_owned(), fields, locals));
+        *OVERRIDE.lock().unwrap() = Some((marker.to_owned(), fields, locals, Vec::new()));
+    }
+
+    /// The frame's allocator contract: `(fn path, argument)` pairs that free
+    /// their argument exactly once through a custom deallocator.
+    pub(crate) fn set_with_contract(
+        marker: &str,
+        fields: Vec<(String, usize, SlotKind)>,
+        locals: Vec<(String, SlotKind)>,
+        deallocators: Vec<(String, usize)>,
+    ) {
+        *OVERRIDE.lock().unwrap() = Some((marker.to_owned(), fields, locals, deallocators));
+    }
+
+    pub(crate) fn contract_deallocator(
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        callee: rustc_hir::def_id::LocalDefId,
+        argument: usize,
+    ) -> bool {
+        let Some((marker, _, _, deallocators)) = OVERRIDE.lock().unwrap().clone() else {
+            return false;
+        };
+        let marked = tcx
+            .sess
+            .source_map()
+            .files()
+            .iter()
+            .any(|file| file.src.as_ref().is_some_and(|src| src.contains(&marker)));
+        marked
+            && deallocators.iter().any(|(path, index)| {
+                *index == argument && tcx.def_path_str(callee.to_def_id()) == *path
+            })
     }
 
     pub(crate) fn clear() {
@@ -8543,7 +8602,7 @@ pub(crate) mod test_model_override {
         subjects: &[super::decision::Subject],
         mut model: FxHashMap<SlotRef, SlotKind>,
     ) -> FxHashMap<SlotRef, SlotKind> {
-        let Some((marker, fields, locals)) = OVERRIDE.lock().unwrap().clone() else {
+        let Some((marker, fields, locals, _)) = OVERRIDE.lock().unwrap().clone() else {
             return model;
         };
         let marked = tcx

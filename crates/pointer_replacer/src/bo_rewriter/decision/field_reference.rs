@@ -136,6 +136,9 @@ pub(crate) enum SiteKind {
     /// `local = PLACE.f` — the field span; the local is an already-declared
     /// subject (owned fields only).
     Assignment,
+    /// `PLACE.f as *T` handed to a callee (owned fields only) — the cast
+    /// expression span; the callee decides transfer (a deallocator) or view.
+    Cast,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +168,21 @@ pub(crate) struct Site {
     /// `Copy` reads evaluated AFTER an earlier argument moves an owned field
     /// out — hoisted before the statement so no view is read past the move.
     pub hoists: Vec<Span>,
+    /// `Cast` only: the cast's target type text, its mutability, and the
+    /// callee the cast is an argument of (`None` for a foreign callee) with
+    /// the argument index, plus the foreign symbol when foreign.
+    pub cast: Option<CastSite>,
+    /// `Element` only: the read is the place of an assignment (a write).
+    pub written: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CastSite {
+    pub target: String,
+    pub mutable: bool,
+    pub callee: Option<LocalDefId>,
+    pub foreign: Option<String>,
+    pub index: usize,
 }
 
 /// One function whose signature mentions the struct.
@@ -254,8 +272,13 @@ pub(crate) struct ExpressionEdit {
 
 /// The placeholder an owned-field wrap template carries for the wrapped node.
 pub(crate) const WRAP_PLACEHOLDER: &str = "__crat_inner";
-/// The assigned place of a raw-base store (`owned-field-raw-store` edits).
+/// The assigned place of a raw-base store (`owned-field-raw-store` edits);
+/// the offset operand of an `owned-field-raw-view` offset.
 pub(crate) const WRAP_PLACE: &str = "__crat_place";
+/// Edit kinds of a C free site taking the owned allocation: through a `free`
+/// / source-proved deallocator, and through a user-named allocator contract.
+pub(crate) const DEALLOC_TRANSFER: &str = "owned-field-dealloc-transfer";
+pub(crate) const DEALLOC_TRANSFER_CONTRACT: &str = "owned-field-dealloc-transfer-contract";
 
 /// A function's signature plan: the generated lifetime, the parameters that
 /// carry it and whether the return type mentions the struct.
@@ -294,6 +317,10 @@ pub(crate) struct FieldTransaction {
     pub argument_forms: Vec<(Span, Form)>,
     /// E5C-3: `(owner, the assignment, the read to hoist before it)`.
     pub hoists: Vec<(LocalDefId, Span, Span)>,
+    /// Struct VALUE instances (literals) of an owning struct: each is a
+    /// scope exit the language drops — addendum 101's
+    /// `waiver-drop(scope-exit)` for a libc-freed allocation, receipted.
+    pub value_instances: usize,
     pub site_count: usize,
 }
 
@@ -360,10 +387,18 @@ impl FieldTransactions {
                     .count()
             };
             out.push_str(&format!(
-                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={}\t-\n",
+                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={}\t-\n",
                 t.struct_path,
                 t.field_name,
-                if t.owning { "opt-box" } else { t.form.key() },
+                if t.owning {
+                    if matches!(t.form, Form::Slice { .. } | Form::Opt { slice: true, .. }) {
+                        "opt-box-slice"
+                    } else {
+                        "opt-box"
+                    }
+                } else {
+                    t.form.key()
+                },
                 t.site_count,
                 t.owners
                     .iter()
@@ -379,6 +414,9 @@ impl FieldTransactions {
                 count("owned-field-raw-move"),
                 count("owned-field-raw-view"),
                 count("owned-field-raw-store"),
+                count(DEALLOC_TRANSFER) + count(DEALLOC_TRANSFER_CONTRACT),
+                count(DEALLOC_TRANSFER_CONTRACT),
+                t.value_instances,
             ));
         }
         for (struct_path, field, cause) in &self.held {
@@ -497,6 +535,14 @@ fn index_text(tcx: TyCtxt<'_>, owner: LocalDefId, operand: &Expr<'_>) -> Option<
         }
         ExprKind::Lit(lit) => match lit.node {
             rustc_ast::LitKind::Int(value, _) => Some(format!("{}usize", value.get())),
+            _ => None,
+        },
+        // `2 as isize`: a non-negative literal under the cast.
+        ExprKind::Cast(inner, _) => match inner.kind {
+            ExprKind::Lit(lit) => match lit.node {
+                rustc_ast::LitKind::Int(value, _) => Some(format!("{}usize", value.get())),
+                _ => None,
+            },
             _ => None,
         },
         _ => None,
@@ -672,6 +718,8 @@ impl<'tcx> Collector<'_, 'tcx> {
             raw_base,
             assign_span: None,
             hoists: Vec::new(),
+            cast: None,
+            written: false,
         };
         let owning = self.owning.contains(&key);
         let Node::Expr(parent) = tcx.parent_hir_node(field.hir_id) else {
@@ -759,7 +807,15 @@ impl<'tcx> Collector<'_, 'tcx> {
                 Err(cause) => self.hold(key, cause.to_owned()),
             },
             ExprKind::Unary(UnOp::Deref, _) => {
-                self.push(key, site(SiteKind::Deref, field.span, None, None, None));
+                let mut deref = site(SiteKind::Deref, field.span, None, None, None);
+                // `*PLACE.f = v` writes through the field; a read takes the
+                // shared view.
+                deref.written = matches!(
+                    tcx.parent_hir_node(parent.hir_id),
+                    Node::Expr(assign)
+                        if matches!(assign.kind, ExprKind::Assign(lhs, _, _) if lhs.hir_id == parent.hir_id)
+                );
+                self.push(key, deref);
             }
             ExprKind::MethodCall(segment, receiver, args, _) if receiver.hir_id == field.hir_id => {
                 let method = segment.ident.name.as_str().to_owned();
@@ -768,23 +824,41 @@ impl<'tcx> Collector<'_, 'tcx> {
                         self.push(key, site(SiteKind::IsNull, parent.span, None, None, None));
                     }
                     ("offset" | "add", [operand]) => {
-                        let Some(index) = index_text(tcx, owner, operand) else {
-                            self.hold(key, "field-offset-sign-unknown".to_owned());
-                            return;
-                        };
+                        let index = index_text(tcx, owner, operand);
                         match tcx.parent_hir_node(parent.hir_id) {
                             Node::Expr(grand)
                                 if matches!(grand.kind, ExprKind::Unary(UnOp::Deref, _)) =>
                             {
-                                self.push(
-                                    key,
-                                    site(SiteKind::Element, grand.span, None, None, Some(index)),
+                                let Some(index) = index else {
+                                    self.hold(key, "field-offset-sign-unknown".to_owned());
+                                    return;
+                                };
+                                let mut element =
+                                    site(SiteKind::Element, grand.span, None, None, Some(index));
+                                // `*(f).offset(k) = v` writes the element.
+                                element.written = matches!(
+                                    tcx.parent_hir_node(grand.hir_id),
+                                    Node::Expr(assign)
+                                        if matches!(assign.kind, ExprKind::Assign(lhs, _, _) if lhs.hir_id == grand.hir_id)
                                 );
+                                self.push(key, element);
                             }
-                            Node::Expr(grand) if matches!(grand.kind, ExprKind::Cast(..)) => {
+                            // The offset as a pointer VALUE: under a cast (a
+                            // reference field's slice view) or, for an owned
+                            // field, stored / passed as a raw cursor.
+                            Node::Expr(grand)
+                                if matches!(grand.kind, ExprKind::Cast(..)) || owning =>
+                            {
+                                // A reference field's slice view needs the
+                                // index as `usize`; an owned field's raw
+                                // cursor keeps the operand as written.
+                                if index.is_none() && !owning {
+                                    self.hold(key, "field-offset-sign-unknown".to_owned());
+                                    return;
+                                }
                                 self.push(
                                     key,
-                                    site(SiteKind::Offset, parent.span, None, None, Some(index)),
+                                    site(SiteKind::Offset, parent.span, None, None, index),
                                 );
                             }
                             _ => self.hold(key, "field-offset-consumer-unsupported".to_owned()),
@@ -840,6 +914,64 @@ impl<'tcx> Collector<'_, 'tcx> {
                 key,
                 "field-transaction-incomplete:address-of-field".to_owned(),
             ),
+            // An owned field cast to a raw pointer and handed to a callee: a
+            // deallocator takes the allocation (transfer), anything else a
+            // raw view; the callee is read at finalization.
+            ExprKind::Cast(_, target_ty) if owning => {
+                let typeck = tcx.typeck(owner);
+                let TyKind::RawPtr(_, mutability) = typeck.expr_ty(parent).kind() else {
+                    self.hold(key, "field-transaction-incomplete:cast-of-field".to_owned());
+                    return;
+                };
+                let Ok(target) = sm.span_to_snippet(target_ty.span) else {
+                    self.hold(key, "field-transaction-incomplete:cast-of-field".to_owned());
+                    return;
+                };
+                let Node::Expr(call) = tcx.parent_hir_node(parent.hir_id) else {
+                    self.hold(key, "field-transaction-incomplete:cast-of-field".to_owned());
+                    return;
+                };
+                let ExprKind::Call(callee, args) = call.kind else {
+                    self.hold(key, "field-transaction-incomplete:cast-of-field".to_owned());
+                    return;
+                };
+                let Some(index) = args.iter().position(|arg| arg.hir_id == parent.hir_id) else {
+                    self.hold(key, "field-transaction-incomplete:cast-of-field".to_owned());
+                    return;
+                };
+                let (local_callee, foreign) = match callee.kind {
+                    ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                        Res::Def(rustc_hir::def::DefKind::Fn, did) => (
+                            did.as_local().filter(|local| {
+                                !matches!(tcx.hir_node_by_def_id(*local), Node::ForeignItem(_))
+                            }),
+                            did.as_local()
+                                .filter(|local| {
+                                    matches!(tcx.hir_node_by_def_id(*local), Node::ForeignItem(_))
+                                })
+                                .map(|_| tcx.item_name(did).to_string()),
+                        ),
+                        _ => (None, None),
+                    },
+                    _ => (None, None),
+                };
+                if local_callee.is_none() && foreign.is_none() {
+                    self.hold(
+                        key,
+                        "field-transaction-incomplete:cast-of-field-callee".to_owned(),
+                    );
+                    return;
+                }
+                let mut cast_site = site(SiteKind::Cast, parent.span, None, None, None);
+                cast_site.cast = Some(CastSite {
+                    target,
+                    mutable: mutability.is_mut(),
+                    callee: local_callee,
+                    foreign,
+                    index,
+                });
+                self.push(key, cast_site);
+            }
             ExprKind::Cast(..) => {
                 self.hold(key, "field-transaction-incomplete:cast-of-field".to_owned())
             }
@@ -885,6 +1017,8 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
                                         raw_base: false,
                                         assign_span: None,
                                         hoists: Vec::new(),
+                                        cast: None,
+                                        written: false,
                                     },
                                 );
                             }
@@ -1033,6 +1167,12 @@ pub(crate) fn derive(
                         "field-transaction-incomplete:struct-copied-by-value".into(),
                     ));
                     continue;
+                }
+                if matches!(
+                    fatness.struct_field_fact(struct_did, field_index, 0),
+                    Some(Fatness::Arr)
+                ) {
+                    fat.insert(key);
                 }
                 owning_fields.insert(key);
                 targets.insert(key, field_index);
@@ -1221,8 +1361,11 @@ pub(crate) fn derive(
                 cause = Some(hold.clone());
             }
         }
-        if cause.is_none() && owning && wants_slice_of(&key_sites) {
-            cause = Some("field-transaction-incomplete:owned-slice".to_owned());
+        // An owned field walked by element / offset is `Option<Box<[T]>>`
+        // under Foster's `Arr` licence (the same corroboration as a slice
+        // field); unlicensed it holds.
+        if cause.is_none() && owning && wants_slice_of(&key_sites) && !fat.contains(&key) {
+            cause = Some("field-fat-unlicensed".to_owned());
         }
         // The field is fat when it is walked itself, or (E) when it is handed
         // to a callee that walks it — Foster's `Arr` fact is flow-insensitive
@@ -1706,11 +1849,18 @@ pub(crate) fn lift_store_walls(
 
 /// The finalization: every site's replacement from the FINAL decisions, or the
 /// field is refused with a typed cause.
+/// `deallocator(callee, foreign symbol, argument)` answers with the receipt
+/// key when the callee frees that argument exactly once (`free` itself, a
+/// source-proved local deallocator, or a user-named allocator contract).
+pub(crate) type DeallocatorPredicate<'p> =
+    dyn Fn(Option<LocalDefId>, Option<&str>, usize) -> Option<&'static str> + 'p;
+
 pub(crate) fn finalize(
     tcx: TyCtxt<'_>,
     candidates: &FieldCandidates,
     table: &DecisionTable,
     exposure: &super::exposure::ExposurePolicy,
+    deallocator: &DeallocatorPredicate<'_>,
 ) -> (FieldTransactions, BTreeMap<FieldKey, String>) {
     let mut out = FieldTransactions::default();
     out.local_move_hoists = candidates
@@ -1755,6 +1905,7 @@ pub(crate) fn finalize(
                 candidate,
                 table,
                 &decision_of,
+                deallocator,
                 &mut cause,
                 &mut edits,
                 &mut load_locals,
@@ -1931,6 +2082,13 @@ pub(crate) fn finalize(
                         "field-transaction-incomplete:assignment".to_owned()
                     });
                 }
+                // Never collected for a reference field (the collector holds
+                // `cast-of-field`); exhaustive rather than silent.
+                SiteKind::Cast => {
+                    cause.get_or_insert_with(|| {
+                        "field-transaction-incomplete:cast-of-field".to_owned()
+                    });
+                }
             }
         }
         // A stored parameter must itself be a delivered reference form so the
@@ -1943,6 +2101,23 @@ pub(crate) fn finalize(
                     });
                 }
             }
+        }
+        // R409-3: an allocation released through a user-named allocator
+        // contract must never meet a Rust drop. A struct VALUE instance
+        // (a struct literal: a local the language drops at scope exit) could
+        // drop the field while it still holds the allocation — a typed hold
+        // for contract allocations; for libc-`free` allocations the same
+        // exit is addendum 101's `waiver-drop(scope-exit)`, receipted per
+        // value instance.
+        if cause.is_none()
+            && candidate.owning
+            && edits.iter().any(|e| e.kind == DEALLOC_TRANSFER_CONTRACT)
+            && candidate
+                .sites
+                .iter()
+                .any(|site| site.kind == SiteKind::Literal)
+        {
+            cause = Some("contract-allocation:implicit-close".to_owned());
         }
         if let Some(cause) = cause {
             out.held.push((
@@ -2008,6 +2183,15 @@ pub(crate) fn finalize(
             expression_edits: edits,
             load_locals,
             argument_forms,
+            value_instances: if candidate.owning {
+                candidate
+                    .sites
+                    .iter()
+                    .filter(|site| site.kind == SiteKind::Literal)
+                    .count()
+            } else {
+                0
+            },
             hoists: candidate
                 .sites
                 .iter()
@@ -2100,6 +2284,7 @@ fn owned_sites<'t>(
     candidate: &Candidate,
     table: &'t DecisionTable,
     decision_of: &dyn Fn(NodeKey) -> Option<&'t Decision>,
+    deallocator: &DeallocatorPredicate<'_>,
     cause: &mut Option<String>,
     edits: &mut Vec<ExpressionEdit>,
     load_locals: &mut Vec<(NodeKey, String)>,
@@ -2107,18 +2292,31 @@ fn owned_sites<'t>(
 ) {
     let null_mut = "core::ptr::null_mut()";
     let null_const = "core::ptr::null()";
+    // A fat owned field is `Option<Box<[T]>>`: its raw views are the slice's
+    // pointers, its move hands the whole allocation over.
+    let fat = matches!(
+        candidate.form,
+        Form::Slice { .. } | Form::Opt { slice: true, .. }
+    );
     // Move the owned value out to a raw owning consumer.
     // Every owned template is rendered around the WRAP placeholder: the AST
     // wrap pass substitutes the node's current (inner-edited) expression.
     let inner = WRAP_PLACEHOLDER;
-    let move_to_raw = || format!("{inner}.take().map_or({null_mut}, Box::into_raw)");
-    // A raw VIEW of the owned value (the C alias), mutability by the target.
-    let view_to_raw = |mutable: bool| {
-        if mutable {
-            format!("{inner}.as_deref_mut().map_or({null_mut}, core::ptr::from_mut)")
+    let move_to_raw = || {
+        if fat {
+            format!("{inner}.take().map_or({null_mut}, |__b| Box::into_raw(__b) as *mut _)")
         } else {
-            format!("{inner}.as_deref().map_or({null_const}, core::ptr::from_ref)")
+            format!("{inner}.take().map_or({null_mut}, Box::into_raw)")
         }
+    };
+    // A raw VIEW of the owned value (the C alias), mutability by the target.
+    let view_to_raw = |mutable: bool| match (fat, mutable) {
+        (true, true) => {
+            format!("{inner}.as_deref_mut().map_or({null_mut}, |__s| __s.as_mut_ptr())")
+        }
+        (true, false) => format!("{inner}.as_deref().map_or({null_const}, |__s| __s.as_ptr())"),
+        (false, true) => format!("{inner}.as_deref_mut().map_or({null_mut}, core::ptr::from_mut)"),
+        (false, false) => format!("{inner}.as_deref().map_or({null_const}, core::ptr::from_ref)"),
     };
     let from_raw =
         || format!("core::ptr::NonNull::new({inner}).map(|__p| Box::from_raw(__p.as_ptr()))");
@@ -2194,11 +2392,28 @@ fn owned_sites<'t>(
                     Some(Rhs::Null) => "None".to_owned(),
                     Some(Rhs::Subject(node)) => match decision_of(node) {
                         Some(Decision::Box(plan)) => {
+                            // The source's shape must be the field's: a
+                            // sized Box cannot fill a slice field.
+                            let source_fat = plan.shape == super::box_facts::BoxShape::Slice;
+                            if source_fat != fat {
+                                cause.get_or_insert_with(|| {
+                                    "field-transaction-incomplete:owned-store-shape".to_owned()
+                                });
+                                continue;
+                            }
                             if plan.optional {
                                 inner.to_owned()
                             } else {
                                 format!("Some({inner})")
                             }
+                        }
+                        // A raw source reclaims the allocation; a fat field
+                        // needs its length, which a raw pointer does not carry.
+                        Some(Decision::Degraded(_)) | None if fat => {
+                            cause.get_or_insert_with(|| {
+                                "field-transaction-incomplete:owned-slice-store-length".to_owned()
+                            });
+                            continue;
                         }
                         Some(Decision::Degraded(_)) | None => from_raw(),
                         Some(other) => {
@@ -2212,6 +2427,12 @@ fn owned_sites<'t>(
                             continue;
                         }
                     },
+                    Some(Rhs::RawExpression) if fat => {
+                        cause.get_or_insert_with(|| {
+                            "field-transaction-incomplete:owned-slice-store-length".to_owned()
+                        });
+                        continue;
+                    }
                     Some(Rhs::RawExpression) => from_raw(),
                     None => {
                         cause.get_or_insert_with(|| "store-source-unknown".to_owned());
@@ -2309,7 +2530,11 @@ fn owned_sites<'t>(
             SiteKind::Deref => edits.push(ExpressionEdit {
                 owner: site.owner,
                 span: site.span,
-                replacement: format!("{inner}.as_deref_mut().unwrap()"),
+                replacement: if site.written {
+                    format!("{inner}.as_deref_mut().unwrap()")
+                } else {
+                    format!("{inner}.as_deref().unwrap()")
+                },
                 kind: "owned-field-deref",
                 wrap: true,
             }),
@@ -2320,8 +2545,66 @@ fn owned_sites<'t>(
                 kind: "owned-field-is-null",
                 wrap: true,
             }),
-            SiteKind::Element | SiteKind::Offset => {
-                cause.get_or_insert_with(|| "field-transaction-incomplete:owned-slice".to_owned());
+            // `*(f).offset(k)` on a fat owned field indexes the slice.
+            SiteKind::Element => {
+                let Some(index) = &site.index_text else { continue };
+                if !fat {
+                    cause.get_or_insert_with(|| "field-fat-unlicensed".to_owned());
+                    continue;
+                }
+                edits.push(ExpressionEdit {
+                    owner: site.owner,
+                    span: site.span,
+                    replacement: if site.written {
+                        format!("{inner}.as_deref_mut().unwrap()[{index}]")
+                    } else {
+                        format!("{inner}.as_deref().unwrap()[{index}]")
+                    },
+                    kind: "owned-field-element",
+                    wrap: true,
+                });
+            }
+            // `(f).offset(k)` as a pointer value: the raw view of the slice,
+            // offset as written (a C cursor into the owned buffer; receipted
+            // as a raw view).
+            SiteKind::Offset => {
+                if !fat {
+                    cause.get_or_insert_with(|| "field-fat-unlicensed".to_owned());
+                    continue;
+                }
+                edits.push(ExpressionEdit {
+                    owner: site.owner,
+                    span: site.span,
+                    replacement: format!("{}.offset({WRAP_PLACE})", view_to_raw(true)),
+                    kind: "owned-field-raw-view",
+                    wrap: true,
+                });
+            }
+            // `f as *T` at a callee: a deallocator takes the allocation
+            // (`take()` + `Box::into_raw`, the C free site kept as the call);
+            // any other callee gets the raw view.
+            SiteKind::Cast => {
+                let Some(cast) = &site.cast else { continue };
+                let null = if cast.mutable { null_mut } else { null_const };
+                match deallocator(cast.callee, cast.foreign.as_deref(), cast.index) {
+                    Some(receipt) => edits.push(ExpressionEdit {
+                        owner: site.owner,
+                        span: site.span,
+                        replacement: format!(
+                            "{inner}.take().map_or({null}, |__b| Box::into_raw(__b) as {})",
+                            cast.target
+                        ),
+                        kind: receipt,
+                        wrap: true,
+                    }),
+                    None => edits.push(ExpressionEdit {
+                        owner: site.owner,
+                        span: site.span,
+                        replacement: format!("{} as {}", view_to_raw(cast.mutable), cast.target),
+                        kind: "owned-field-raw-view",
+                        wrap: true,
+                    }),
+                }
             }
         }
     }

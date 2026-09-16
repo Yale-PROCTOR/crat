@@ -473,6 +473,13 @@ fn w6f_indirect_call_argument_bridges_under_t2() {
     }
 }
 
+/// The frame override is process-global; every test that sets it holds
+/// this lock for its whole run so a concurrent test cannot clear it.
+fn frame_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const BST: &str = include_str!("wave6f_fixture_bst.rs");
 
 /// era-5c's coming frame for bst (relay 003), stated as slot-kind overrides:
@@ -507,6 +514,7 @@ fn bst_frame() {
 /// bridge, and the C `free` untouched.
 #[test]
 fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
+    let _frame = frame_lock();
     // RED control: the landed model has no Owning field verdict here, so the
     // fields are not candidates at all and every stored subject degrades.
     let control = observe(BST);
@@ -531,12 +539,12 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
             (
                 "node".to_owned(),
                 "left".to_owned(),
-                "raw-move=3;raw-view=1;raw-store=3".to_owned()
+                "raw-move=3;raw-view=1;raw-store=3;dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0".to_owned()
             ),
             (
                 "node".to_owned(),
                 "right".to_owned(),
-                "raw-move=4;raw-view=1;raw-store=4".to_owned()
+                "raw-move=4;raw-view=1;raw-store=4;dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0".to_owned()
             ),
         ]
     );
@@ -782,6 +790,7 @@ fn hoist_frame() {
 /// so the checker accepts what was E0502 without it.
 #[test]
 fn w6f_hoist_pure_read_before_a_moving_argument() {
+    let _frame = frame_lock();
     hoist_frame();
     let observed = observe(HOIST);
     let outcome = emitted("hoist", HOIST);
@@ -819,6 +828,7 @@ const MOVE_LOCAL: &str = include_str!("wave6f_fixture_move_local.rs");
 /// hoisted — a raw local moves nothing the checker sees.
 #[test]
 fn w6f_hoist_pure_read_before_a_moving_owned_local() {
+    let _frame = frame_lock();
     use crate::analyses::borrow_ownership::SlotKind;
     super::test_model_override::set(
         "w6f-move-local-frame",
@@ -845,4 +855,177 @@ fn w6f_hoist_pure_read_before_a_moving_owned_local() {
         assert!(!flat.contains("__crat_hoist"), "{source}");
         assert!(flat.contains("return consume(p, *p);"), "{source}");
     }
+}
+
+const RING_BUFFER: &str = include_str!("wave6f_fixture_ring_buffer.rs");
+
+fn ring_buffer_frame() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-ring-buffer-frame",
+        vec![("RingBuffer".to_owned(), 1, SlotKind::Owning)],
+        vec![(
+            "RingBufferInitBuffer::new_data".to_owned(),
+            SlotKind::Owning,
+        )],
+    );
+}
+
+/// Witness 16 (relay 007, R409-3; the RingBuffer shape): a FAT owned field
+/// `Option<Box<[u8]>>` — at this frame the store from a raw thin local
+/// (`*fresh66 = new_data`, `new_data = malloc(..) as *mut u8`) carries no
+/// length, so the field holds typed; on a head where `new_data` delivers as
+/// a `Box<[u8]>` the store is the moved Option and the free site is the
+/// transfer.
+#[test]
+fn w6f_ring_buffer_fat_owned_field_store_needs_a_length_or_a_boxed_source() {
+    let _frame = frame_lock();
+    ring_buffer_frame();
+    let observed = observe(RING_BUFFER);
+    let outcome = emitted("ring-buffer", RING_BUFFER);
+    super::test_model_override::clear();
+    let row = field_row(&observed, "RingBuffer", "data_");
+    let source_boxed = decision_of(&observed, "RingBufferInitBuffer::new_data").starts_with("Box");
+    let (source, _, reverted) = emitted_source(&outcome);
+    assert_eq!(reverted, 0, "{source}");
+    if source_boxed {
+        assert_eq!(
+            (row.2.as_str(), row.3.as_str()),
+            ("applied", "opt-box-slice"),
+            "{row:?}"
+        );
+        let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "pub data_: Option<Box<[u8]>>,",
+            "free((*rb).data_.take().map_or(core::ptr::null_mut(), |__b| Box::into_raw(__b) as *mut ::std::ffi::c_void));",
+            "(*rb).data_.as_deref().map_or(core::ptr::null(), |__s| __s.as_ptr()) as *const ::std::ffi::c_void",
+            "core::ptr::write(&raw mut *fresh67, (*rb).data_.as_deref_mut().map_or(core::ptr::null_mut(), |__s| __s.as_mut_ptr()).offset(2 as isize));",
+            "return (*rb).data_.as_deref().unwrap()[(i) as usize];",
+        ] {
+            assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+        }
+    } else {
+        assert_eq!(
+            (row.2.as_str(), row.4.as_str()),
+            (
+                "held",
+                "field-transaction-incomplete:owned-slice-store-length"
+            ),
+            "{row:?}"
+        );
+        assert!(source.contains("pub data_: *mut u8,"), "{source}");
+    }
+}
+
+const SLOT: &str = include_str!("wave6f_fixture_slot.rs");
+
+/// Witness 14 (relay 007 / wave-6a 006 §2): a THIN owned field's C free
+/// site through libc `free` takes the allocation (`take()` + `Box::into_raw`,
+/// the call kept), a foreign `memcpy` gets the raw view, the deref read the
+/// shared view, the null test `is_none()`, and every store through the raw
+/// base is `ptr::write`; the by-value `Holder` in `drive` is a scope exit
+/// the language drops — addendum 101's `waiver-drop(scope-exit)`, receipted.
+#[test]
+fn w6f_thin_owned_field_free_site_transfers_and_memcpy_takes_a_raw_view() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-slot-frame",
+        vec![("Holder".to_owned(), 1, SlotKind::Owning)],
+        vec![("HolderFill::fresh".to_owned(), SlotKind::Owning)],
+    );
+    let observed = observe(SLOT);
+    let outcome = emitted("slot", SLOT);
+    super::test_model_override::clear();
+    let row = field_row(&observed, "Holder", "slot_");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "opt-box"),
+        "{row:?}"
+    );
+    assert_eq!(
+        observed.bridges,
+        vec![(
+            "Holder".to_owned(),
+            "slot_".to_owned(),
+            "raw-move=0;raw-view=1;raw-store=2;dealloc-transfer=1;allocator-contract=0;waiver-drop-scope-exit=1".to_owned()
+        )]
+    );
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    assert_eq!((emitted_count, reverted), (1, 0), "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "pub slot_: Option<Box<i32>>,",
+        "free((*h).slot_.take().map_or(core::ptr::null_mut(), |__b| Box::into_raw(__b) as *mut ::std::ffi::c_void));",
+        "core::ptr::write(&raw mut *fresh1, None);",
+        "if !((*h).slot_).is_none() {",
+        "(*h).slot_.as_deref().map_or(core::ptr::null(), core::ptr::from_ref) as *const ::std::ffi::c_void,",
+        "core::ptr::write(&raw mut *fresh2, core::ptr::NonNull::new(fresh).map(|__p| Box::from_raw(__p.as_ptr())));",
+        "return *(*h).slot_.as_deref().unwrap();",
+        "let mut h = Holder { count: 0, slot_: None };",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+}
+
+const SLOT_CONTRACT: &str = include_str!("wave6f_fixture_slot_contract.rs");
+
+/// Witness 15 (R409-3, the allocator contract): the free site through a
+/// contract deallocator (`CustomFree(m, p)`, freeing through the manager's
+/// `free_func` — not source-provable, named by the frame's contract) is the
+/// same transfer with the `allocator-contract` receipt; the container lives
+/// on the heap (freed raw), so no Rust drop can reach the field. Control:
+/// a by-value instance of the struct is a scope exit the language would
+/// drop — `contract-allocation:implicit-close`, a typed hold.
+#[test]
+fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    let frame = || {
+        super::test_model_override::set_with_contract(
+            "w6f-slot-contract-frame",
+            vec![("Holder".to_owned(), 1, SlotKind::Owning)],
+            vec![("HolderFill::fresh".to_owned(), SlotKind::Owning)],
+            vec![("CustomFree".to_owned(), 1)],
+        )
+    };
+    frame();
+    let observed = observe(SLOT_CONTRACT);
+    let outcome = emitted("slot-contract", SLOT_CONTRACT);
+    super::test_model_override::clear();
+    let row = field_row(&observed, "Holder", "slot_");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "opt-box"),
+        "{row:?}"
+    );
+    assert!(
+        observed.bridges[0]
+            .2
+            .contains("dealloc-transfer=1;allocator-contract=1;waiver-drop-scope-exit=0"),
+        "{:?}",
+        observed.bridges
+    );
+    let (source, _, reverted) = emitted_source(&outcome);
+    assert_eq!(reverted, 0, "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("CustomFree(m, (*h).slot_.take().map_or(core::ptr::null_mut(), |__b| Box::into_raw(__b) as *mut ::std::ffi::c_void));"),
+        "{source}"
+    );
+
+    // Control: a by-value instance.
+    let by_value = SLOT_CONTRACT.replace(
+        "    let mut h = HolderNew();",
+        "    let mut hv = Holder { count: 0, slot_: 0 as *mut i32 };\n    let mut h = HolderNew();",
+    );
+    frame();
+    let held = observe(&by_value);
+    super::test_model_override::clear();
+    let row = field_row(&held, "Holder", "slot_");
+    assert_eq!(
+        (row.2.as_str(), row.4.as_str()),
+        ("held", "contract-allocation:implicit-close"),
+        "{row:?}"
+    );
 }
