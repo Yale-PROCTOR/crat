@@ -628,6 +628,73 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
         });
     }
 
+    /// slicecursor's `fragment → is_match` shape on dry3 (relay 018 §1): the
+    /// caller's cursors need a `cursor → slice` C bridge at the callee; that
+    /// bridge does not exist, the callee's class holds `missing-required-arm:c`
+    /// and its prior slices are lost — and the missing bridge is the only edge
+    /// that would have joined the two classes. With no changed owner in the
+    /// root's component the search must fall back to the program-wide layer
+    /// instead of failing the whole program `unrestored`.
+    #[test]
+    fn an_unconnected_lost_root_falls_back_to_the_program_wide_layer() {
+        ::utils::compilation::run_compiler_on_str(CHAIN, |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).expect("prior");
+            let emission = crate::bo_rewriter::emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )
+            .expect("prior terminal plan");
+            // No dependency edges added: the chain's classes are unconnected
+            // (every parameter is `&i32`, no bridge, no seam edit).
+            let prior = StageSnapshot {
+                table,
+                plan: emission.plan,
+            };
+            let root = owner(&prior, "root_value");
+            let far = owner(&prior, "far_value");
+            let mut inputs = class_inputs(&prior);
+            inputs
+                .iter_mut()
+                .find(|input| input.id == root)
+                .unwrap()
+                .block_reasons
+                .push("missing-required-arm:c".to_owned());
+            let mut candidate = prior.clone();
+            candidate.plan.class_finalization = plan::finalize_class_inputs(inputs);
+            for (subject, decision) in &mut candidate.table.entries {
+                match subject.param_name.as_deref() {
+                    Some("root_value") => {
+                        *decision = Decision::Degraded(Degradation {
+                            subject: subject.identity_key("root"),
+                            site: "unconnected witness".to_owned(),
+                            reason: DegradeReason::SliceUseUnsupported,
+                        });
+                    }
+                    Some("far_value") => *decision = Decision::Ref { mutable: true },
+                    _ => {}
+                }
+            }
+            let mut policy = FamilyPolicy::at(FamilyStage::Return);
+            policy.withdrawn.insert((FamilyStage::Return, root));
+            let requests = additive::withdrawals(&prior, &candidate, &policy, &[]);
+            let [request] = requests.as_slice() else {
+                panic!("the program-wide layer yields the one changed owner: {requests:#?}")
+            };
+            assert_eq!(request.owner, far);
+            assert_eq!(
+                request.subjects,
+                vec![subject(&prior, "far_value").0.hir_id]
+            );
+            assert!(
+                request.cause.contains("restore-family-unconnected-root:"),
+                "{request:#?}"
+            );
+        })
+        .expect("chain compiler identities");
+    }
+
     /// The root loses its delivery with no transaction of its own to withdraw
     /// (it is already withdrawn at this stage), while `far` and `farthest`
     /// each carry a moved candidate (`&T` → `&mut T`) and `near` is unchanged.

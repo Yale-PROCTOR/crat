@@ -469,6 +469,7 @@ pub(crate) fn withdrawals(
             Anchor::Restore => {
                 let mut frontier = vec![(*anchor, vec![*anchor])];
                 let mut seen = BTreeSet::from([*anchor]);
+                let mut resolved = false;
                 while !frontier.is_empty() {
                     let mut next = Vec::new();
                     let mut layer = Vec::new();
@@ -499,9 +500,35 @@ pub(crate) fn withdrawals(
                                 request(owner, scoped_cause(*anchor, &cause), subjects);
                             }
                         }
+                        resolved = true;
                         break;
                     }
                     frontier = next;
+                }
+                // The component held no changed owner: the edge that would
+                // have joined the root to its cause is the very site that is
+                // missing (a cursor handed to a slice callee with no C bridge
+                // to render leaves the callee's class held and the two classes
+                // unconnected). The last resort before the whole program fails
+                // `unrestored` is the program-wide layer — every enabled
+                // changed owner yields, its moved candidates per subject.
+                if !resolved {
+                    for owner in candidate.plan.class_finalization.classes.keys() {
+                        if *owner == *anchor
+                            || !enabled(*owner)
+                            || !class_changed(prior, candidate, *owner)
+                        {
+                            continue;
+                        }
+                        let cause =
+                            format!("restore-family-unconnected-root:{}", anchor.order_key());
+                        let subjects = moved(prior, candidate, policy, *owner);
+                        if subjects.is_empty() {
+                            request(*owner, cause, Vec::new());
+                        } else {
+                            request(*owner, scoped_cause(*anchor, &cause), subjects);
+                        }
+                    }
                 }
             }
         }
