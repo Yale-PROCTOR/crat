@@ -1808,6 +1808,14 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // BO's kind first: it is the authority on WHETHER a reference is sound.
     match model.get(&SlotRef::Local(subject.fn_did, slot_id)) {
         Some(SlotKind::Ref) => {}
+        // wave-6f G: a local loaded from a transaction-controlled ARRAY of
+        // pointers reads a slot the model does not register (locals' arrays
+        // have no slots; the read is opaque provenance, not raw evidence) —
+        // its value is exactly the Ref-model subject the transaction stored.
+        Some(SlotKind::Raw)
+            if field_reference
+                .is_some_and(|fields| fields.array_load_lift((subject.fn_did, subject.hir_id))) => {
+        }
         Some(SlotKind::Raw) => return degrade(subject, decl_site, DegradeReason::KindRaw),
         Some(SlotKind::Owning) => {
             // Item 5 opens borrowed declaration forms. Owning alias emission

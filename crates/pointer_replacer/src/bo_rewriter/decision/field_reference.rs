@@ -217,6 +217,8 @@ pub(crate) struct Candidate {
     pub impls: Vec<LocalDefId>,
     /// Every function carrying a site or a mention, in definition order.
     pub owners: Vec<LocalDefId>,
+    /// G: the candidate is a local array of pointers, not a struct field.
+    pub array: Option<ArrayLocal>,
 }
 
 /// The candidate table handed to the ladder: which escapes are discharged and
@@ -244,6 +246,12 @@ impl FieldCandidates {
     /// The form a stored subject must take so the store is a zero-syntax or
     /// glued site: the field's own form, offered when the subject carries no
     /// contrary use of its own.
+    /// G: a load permit from an ARRAY local lifts the model's opaque-provenance
+    /// `Raw` on the loaded local (locals' arrays are not slot-registered).
+    pub(crate) fn array_load_lift(&self, local: NodeKey) -> bool {
+        self.load_permit(local).is_some_and(|c| c.array.is_some())
+    }
+
     pub(crate) fn required_store_form(&self, subject: NodeKey) -> Option<Form> {
         self.store_permits
             .iter()
@@ -308,6 +316,8 @@ pub(crate) struct FieldTransaction {
     /// W6F-3: an owned field (`Option<Box<T>>`); no lifetime, the struct's
     /// derived `Copy` / `Clone` impls become empty inherent impls.
     pub owning: bool,
+    /// G: a local array of pointers rather than a struct field.
+    pub array: Option<ArrayLocal>,
     pub form: Form,
     /// Every function carrying a site or a mention.
     pub owners: Vec<LocalDefId>,
@@ -423,6 +433,8 @@ impl FieldTransactions {
                     } else {
                         "opt-box"
                     }
+                } else if t.array.is_some() {
+                    "array-opt-ref-shared"
                 } else {
                     t.form.key()
                 },
@@ -1258,6 +1270,15 @@ pub(crate) fn derive(
         &parameters,
         &parameter_kinds,
     );
+    // G: local arrays of pointers, independent of the struct fields.
+    array_local_candidates(
+        tcx,
+        &program.functions,
+        &subject_by_binding,
+        &parameter_kinds,
+        withdrawn,
+        &mut out,
+    );
     if targets.is_empty() {
         return out;
     }
@@ -1545,6 +1566,7 @@ pub(crate) fn derive(
                 mentions,
                 impls: impls_of.remove(&key.struct_did).unwrap_or_default(),
                 owners,
+                array: None,
             },
         );
     }
@@ -1774,6 +1796,337 @@ fn forward_ties(
         }
         if !changed {
             break;
+        }
+    }
+}
+
+/// G — a LOCAL ARRAY OF POINTERS (`let mut points: [*const T; N] = [0 as
+/// *const T; N]; points[k] = p; let x = points[i];`) is a transaction of the
+/// same site vocabulary: the array is the container, its elements the one
+/// "field". Every store's source must be a subject the model decides `Ref`
+/// (the stored parameters of heman's `kmRay2IntersectBox`), every load a
+/// subject that takes its type from the element; the array's declared type
+/// becomes `[Option<&T>; N]` (null = `None`), the null repeat `[None; N]`,
+/// stores `Some(p)`, loads `points[i].unwrap()`. No lifetime is written: the
+/// elements' borrows unify at the local's scope. Anything else holds typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArrayLocal {
+    pub owner: LocalDefId,
+    /// The binding pattern of the local (the AST `Local.pat` maps to it).
+    pub binding: HirId,
+    pub name: String,
+    pub len: String,
+    pub pointee: String,
+}
+
+fn array_local_candidates(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    subjects: &FxHashMap<HirId, NodeKey>,
+    kinds: &FxHashMap<NodeKey, SlotKind>,
+    withdrawn: &BTreeMap<FieldKey, String>,
+    out: &mut FieldCandidates,
+) {
+    struct Arrays<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        owner: LocalDefId,
+        subjects: &'a FxHashMap<HirId, NodeKey>,
+        kinds: &'a FxHashMap<NodeKey, SlotKind>,
+        /// binding → (info, sites, hold)
+        found: Vec<(ArrayLocal, Vec<Site>, Option<String>)>,
+    }
+    impl<'tcx> Arrays<'_, 'tcx> {
+        fn classify(
+            &self,
+            info: &ArrayLocal,
+            body: &'tcx rustc_hir::Body<'tcx>,
+        ) -> (Vec<Site>, Option<String>) {
+            struct Uses<'a, 'tcx> {
+                tcx: TyCtxt<'tcx>,
+                owner: LocalDefId,
+                binding: HirId,
+                subjects: &'a FxHashMap<HirId, NodeKey>,
+                kinds: &'a FxHashMap<NodeKey, SlotKind>,
+                sites: Vec<Site>,
+                hold: Option<String>,
+            }
+            impl Uses<'_, '_> {
+                fn hold(&mut self, cause: &str) {
+                    if self.hold.is_none() {
+                        self.hold = Some(format!("array-local-incomplete:{cause}"));
+                    }
+                }
+            }
+            impl<'tcx> Visitor<'tcx> for Uses<'_, 'tcx> {
+                fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+                    let tcx = self.tcx;
+                    let is_array = |e: &Expr<'_>| matches!(e.kind, ExprKind::Path(QPath::Resolved(_, path)) if path.res == Res::Local(self.binding));
+                    // An indexed element `points[i]`.
+                    if let ExprKind::Index(base, _, _) = expr.kind
+                        && is_array(base)
+                    {
+                        let sm = tcx.sess.source_map();
+                        let Ok(text) = sm.span_to_snippet(expr.span) else {
+                            self.hold("element-text");
+                            return;
+                        };
+                        let owner = self.owner;
+                        let site = |kind, span, rhs, local| Site {
+                            owner,
+                            kind,
+                            span,
+                            field_text: text.clone(),
+                            rhs,
+                            local,
+                            index_text: None,
+                            consumer: None,
+                            base: None,
+                            raw_base: false,
+                            assign_span: None,
+                            hoists: Vec::new(),
+                            cast: None,
+                            written: false,
+                        };
+                        match tcx.parent_hir_node(expr.hir_id) {
+                            Node::Expr(parent) => match parent.kind {
+                                ExprKind::Assign(lhs, rhs, _) if lhs.hir_id == expr.hir_id => {
+                                    let value = if super::emitability::is_zero_literal(rhs) {
+                                        Some(Rhs::Null)
+                                    } else if let ExprKind::Path(QPath::Resolved(_, path)) =
+                                        rhs.kind
+                                        && let Res::Local(b) = path.res
+                                        && let Some(node) = self.subjects.get(&b)
+                                    {
+                                        (self.kinds.get(node) == Some(&SlotKind::Ref))
+                                            .then_some(Rhs::Subject(*node))
+                                    } else {
+                                        None
+                                    };
+                                    match value {
+                                        Some(rhs_value) => {
+                                            let mut store = site(
+                                                SiteKind::Store,
+                                                rhs.span,
+                                                Some(rhs_value),
+                                                None,
+                                            );
+                                            store.assign_span = Some(parent.span);
+                                            self.sites.push(store);
+                                        }
+                                        None => self.hold("store-source"),
+                                    }
+                                }
+                                ExprKind::Unary(UnOp::Deref, _) => {
+                                    self.sites
+                                        .push(site(SiteKind::Deref, expr.span, None, None));
+                                }
+                                ExprKind::MethodCall(segment, receiver, [], _)
+                                    if receiver.hir_id == expr.hir_id
+                                        && segment.ident.name.as_str() == "is_null" =>
+                                {
+                                    self.sites.push(site(
+                                        SiteKind::IsNull,
+                                        parent.span,
+                                        None,
+                                        None,
+                                    ));
+                                }
+                                ExprKind::Call(callee, args)
+                                    if args.iter().any(|a| a.hir_id == expr.hir_id)
+                                        && matches!(callee.kind, ExprKind::Path(QPath::Resolved(_, p)) if matches!(p.res, Res::Def(rustc_hir::def::DefKind::Fn, did) if did.is_local())) =>
+                                {
+                                    self.sites.push(site(
+                                        SiteKind::CallArgument,
+                                        expr.span,
+                                        None,
+                                        None,
+                                    ));
+                                }
+                                // `points[i]` as the arm of a conditional that a
+                                // `let` consumes: the load is the `if`'s.
+                                _ => self.hold("element-use-shape"),
+                            },
+                            Node::LetStmt(local)
+                                if local.init.is_some_and(|init| init.hir_id == expr.hir_id) =>
+                            {
+                                let rustc_hir::PatKind::Binding(_, b, _, None) = local.pat.kind
+                                else {
+                                    self.hold("load-pattern");
+                                    return;
+                                };
+                                if local.ty.is_some() {
+                                    self.hold("load-annotated");
+                                    return;
+                                }
+                                let Some(node) = self.subjects.get(&b) else {
+                                    self.hold("load-consumer-not-a-subject");
+                                    return;
+                                };
+                                self.sites
+                                    .push(site(SiteKind::Load, expr.span, None, Some(*node)));
+                            }
+                            _ => self.hold("element-use-shape"),
+                        }
+                        return;
+                    }
+                    // Any other use of the array itself (its address, a copy,
+                    // a call argument) holds.
+                    if is_array(expr) {
+                        let parent = tcx.parent_hir_node(expr.hir_id);
+                        let indexed = matches!(parent, Node::Expr(p) if matches!(p.kind, ExprKind::Index(base, _, _) if base.hir_id == expr.hir_id));
+                        if !indexed {
+                            self.hold("array-use-shape");
+                        }
+                        return;
+                    }
+                    intravisit::walk_expr(self, expr);
+                }
+            }
+            let mut uses = Uses {
+                tcx: self.tcx,
+                owner: self.owner,
+                binding: info.binding,
+                subjects: self.subjects,
+                kinds: self.kinds,
+                sites: Vec::new(),
+                hold: None,
+            };
+            uses.visit_body(body);
+            (uses.sites, uses.hold)
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Arrays<'_, 'tcx> {
+        fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+            let tcx = self.tcx;
+            if let Some(ty) = local.ty
+                && let rustc_hir::TyKind::Array(elem, len) = ty.kind
+                && let rustc_hir::TyKind::Ptr(mut_ty) = elem.kind
+                && let rustc_hir::PatKind::Binding(_, binding, name, None) = local.pat.kind
+            {
+                let sm = tcx.sess.source_map();
+                let (Ok(pointee), Ok(len)) = (
+                    sm.span_to_snippet(mut_ty.ty.span),
+                    sm.span_to_snippet(len.span()),
+                ) else {
+                    return;
+                };
+                let info = ArrayLocal {
+                    owner: self.owner,
+                    binding,
+                    name: name.to_string(),
+                    len,
+                    pointee,
+                };
+                // The initializer: a repeated null literal, or nothing.
+                let mut hold = None;
+                let mut sites = Vec::new();
+                match local.init {
+                    None => {}
+                    Some(init) => match init.kind {
+                        ExprKind::Repeat(elem, _) if super::emitability::is_zero_literal(elem) => {
+                            sites.push(Site {
+                                owner: self.owner,
+                                kind: SiteKind::Literal,
+                                span: init.span,
+                                field_text: info.name.clone(),
+                                rhs: Some(Rhs::Null),
+                                local: None,
+                                index_text: None,
+                                consumer: None,
+                                base: None,
+                                raw_base: false,
+                                assign_span: None,
+                                hoists: Vec::new(),
+                                cast: None,
+                                written: false,
+                            });
+                        }
+                        _ => hold = Some("array-local-incomplete:initializer".to_owned()),
+                    },
+                }
+                if mut_ty.mutbl.is_mut() {
+                    hold.get_or_insert_with(|| {
+                        "array-local-incomplete:mutable-elements".to_owned()
+                    });
+                }
+                let body = tcx.hir_body(
+                    tcx.hir_node_by_def_id(self.owner)
+                        .body_id()
+                        .expect("a function body"),
+                );
+                let (uses, use_hold) = self.classify(&info, body);
+                sites.extend(uses);
+                if hold.is_none() {
+                    hold = use_hold;
+                }
+                self.found.push((info, sites, hold));
+            }
+            intravisit::walk_local(self, local);
+        }
+    }
+    for &owner in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(owner).body_id() else { continue };
+        let mut arrays = Arrays {
+            tcx,
+            owner,
+            subjects,
+            kinds,
+            found: Vec::new(),
+        };
+        arrays.visit_body(tcx.hir_body(body_id));
+        for (info, sites, hold) in arrays.found {
+            let key = FieldKey {
+                struct_did: info.owner,
+                field_index: info.binding.local_id.as_usize(),
+            };
+            let struct_path = tcx.def_path_str(info.owner.to_def_id());
+            let field_name = info.name.clone();
+            let mut hold = hold;
+            if let Some(cause) = withdrawn.get(&key) {
+                hold = Some(cause.clone());
+            }
+            if hold.is_none() && !sites.iter().any(|s| s.kind == SiteKind::Store) {
+                hold = Some("array-local-incomplete:never-stored".to_owned());
+            }
+            if let Some(cause) = hold {
+                out.holds.push((key, struct_path, field_name, cause));
+                continue;
+            }
+            for site in &sites {
+                match site.kind {
+                    SiteKind::Store | SiteKind::Literal => {
+                        if let Some(Rhs::Subject(node)) = site.rhs {
+                            out.store_permits.insert((node, site.span));
+                        }
+                    }
+                    SiteKind::Load => {
+                        if let Some(local) = site.local {
+                            out.load_permits.insert(local, key);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let nullable = true; // initialised from a null repeat: `Option` always
+            let _ = nullable;
+            out.candidates.insert(
+                key,
+                Candidate {
+                    key,
+                    struct_path,
+                    field_name,
+                    owning: false,
+                    form: Form::Opt {
+                        mutable: false,
+                        slice: false,
+                    },
+                    sites,
+                    mentions: Vec::new(),
+                    impls: Vec::new(),
+                    owners: vec![info.owner],
+                    array: Some(info),
+                },
+            );
         }
     }
 }
@@ -2163,6 +2516,21 @@ pub(crate) fn finalize(
         for site in candidate.sites.iter().filter(|_| !candidate.owning) {
             let field = candidate.form;
             match site.kind {
+                // G: the array's null repeat is `[None; N]`.
+                SiteKind::Literal if candidate.array.is_some() => {
+                    let len = candidate
+                        .array
+                        .as_ref()
+                        .map(|a| a.len.clone())
+                        .unwrap_or_default();
+                    edits.push(ExpressionEdit {
+                        owner: site.owner,
+                        span: site.span,
+                        replacement: format!("[None; {len}]"),
+                        kind: "array-null-repeat",
+                        wrap: false,
+                    });
+                }
                 SiteKind::Literal | SiteKind::Store => match site.rhs {
                     Some(Rhs::Null) => edits.push(ExpressionEdit {
                         owner: site.owner,
@@ -2423,6 +2791,7 @@ pub(crate) fn finalize(
             struct_path: candidate.struct_path.clone(),
             field_name: candidate.field_name.clone(),
             owning: candidate.owning,
+            array: candidate.array.clone(),
             form: candidate.form,
             owners: candidate.owners.clone(),
             dependent_owners,

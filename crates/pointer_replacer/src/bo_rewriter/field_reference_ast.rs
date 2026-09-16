@@ -297,7 +297,44 @@ pub(super) fn apply(
     let mut structs: FxHashMap<LocalDefId, StructPlan> = FxHashMap::default();
     let mut impls: FxHashMap<LocalDefId, LocalDefId> = FxHashMap::default();
     let mut signatures: FxHashMap<LocalDefId, (LocalDefId, Vec<usize>)> = FxHashMap::default();
-    for transaction in &active {
+    // G: array locals retype their declaration; no struct, impl or signature.
+    let arrays: FxHashMap<(LocalDefId, rustc_hir::HirId), String> = active
+        .iter()
+        .filter_map(|t| {
+            t.array.as_ref().map(|a| {
+                (
+                    (a.owner, a.binding),
+                    format!("[Option<&{}>; {}]", a.pointee, a.len),
+                )
+            })
+        })
+        .collect();
+    if !arrays.is_empty() {
+        let mut retype = ArrayLocalRetype {
+            local_map: &capture.map.local_map,
+            global_map: &capture.map.global_map,
+            arrays: &arrays,
+            current_fn: None,
+            guard,
+            placed: 0,
+            failures: Vec::new(),
+        };
+        retype.visit_crate(krate);
+        if !retype.failures.is_empty() {
+            return Err(format!(
+                "field-transaction-ast:array-local:{}",
+                retype.failures.join(";")
+            ));
+        }
+        if retype.placed != arrays.len() {
+            return Err(format!(
+                "field-transaction-ast:array-local:unplaced {}/{}",
+                retype.placed,
+                arrays.len()
+            ));
+        }
+    }
+    for transaction in active.iter().filter(|t| t.array.is_none()) {
         let struct_did = transaction.key.struct_did;
         let form = if transaction.owning {
             DeclForm::Box {
@@ -816,4 +853,52 @@ pub(crate) fn apply_hoists(
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// G: array locals
+// ---------------------------------------------------------------------------
+
+/// `let mut points: [*const T; N] = ..` → `let mut points: [Option<&T>; N]`:
+/// the annotated type is replaced in place (the explicit-declaration visitor
+/// refuses annotated locals; this one exists for them).
+struct ArrayLocalRetype<'a> {
+    local_map: &'a rustc_ast::node_id::NodeMap<rustc_hir::HirId>,
+    global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    arrays: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), String>,
+    current_fn: Option<LocalDefId>,
+    guard: &'a mut Composition,
+    placed: usize,
+    failures: Vec<String>,
+}
+
+impl MutVisitor for ArrayLocalRetype<'_> {
+    fn visit_item(&mut self, item: &mut rustc_ast::Item) {
+        let saved = self.current_fn;
+        if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            self.current_fn = self.global_map.get(&item.id).copied();
+        }
+        rustc_ast::mut_visit::walk_item(self, item);
+        self.current_fn = saved;
+    }
+
+    fn visit_local(&mut self, local: &mut rustc_ast::Local) {
+        if let Some(fn_did) = self.current_fn
+            && let Some(&hir_id) = self.local_map.get(&local.pat.id)
+            && let Some(ty) = self.arrays.get(&(fn_did, hir_id))
+        {
+            if local.ty.is_none() {
+                self.failures.push(format!("array-local-unannotated:{ty}"));
+                return;
+            }
+            if !self.guard.claim(local.pat.id, local.pat.span, "array:decl") {
+                self.failures
+                    .push(format!("array-local-claim-refused:{ty}"));
+                return;
+            }
+            local.ty = Some(P(::utils::ast::parse_ty(ty.clone())));
+            self.placed += 1;
+        }
+        rustc_ast::mut_visit::walk_local(self, local);
+    }
 }

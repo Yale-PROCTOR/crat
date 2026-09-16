@@ -1067,3 +1067,81 @@ fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
         "{row:?}"
     );
 }
+
+const POINTS: &str = include_str!("wave6f_fixture_points.rs");
+
+/// Witness 17 (G, relay 002 / R416): heman's `kmRay2IntersectBox` — a LOCAL
+/// array of pointers is a transaction of the field vocabulary: the
+/// declaration `[Option<&kmVec2>; 4]`, the null repeat `[None; 4]`, the
+/// stores `Some(p1)`.., the loads `points[i].unwrap()` into explicitly typed
+/// locals; the stored parameters deliver (`escapes-via-field-store`
+/// discharged) and the loaded locals' opaque-provenance `Raw` is lifted (the
+/// model registers no slots for a local's array). Control: a store from a
+/// model-Raw local holds the whole array typed.
+#[test]
+fn w6f_array_of_references_local_delivers() {
+    let observed = observe(POINTS);
+    let row = field_row(&observed, "kmRay2IntersectBox", "points");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "array-opt-ref-shared"),
+        "{row:?}"
+    );
+    for label in [
+        "kmRay2IntersectBox::p1",
+        "kmRay2IntersectBox::p4",
+        "kmRay2IntersectBox::this_point",
+        "kmRay2IntersectBox::next_point",
+    ] {
+        assert_eq!(
+            decision_of(&observed, label),
+            "Ref { mutable: false }",
+            "{label}"
+        );
+    }
+    let outcome = emitted("points", POINTS);
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    assert_eq!((emitted_count, reverted), (8, 0), "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "fn kmRay2IntersectBox(mut p1: &kmVec2, mut p2: &kmVec2, mut p3: &kmVec2, mut p4: &kmVec2) -> f32 {",
+        "let mut points: [Option<&kmVec2>; 4] = [None; 4];",
+        "points[0 as usize] = Some(p1);",
+        "points[3 as usize] = Some(p4);",
+        "let mut this_point: &crate::kmVec2 = points[i as usize].unwrap();",
+        "acc += kmVec2Dot(this_point, next_point) + (*this_point).x;",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+
+    // Control: a raw-model source stored into the array.
+    let raw_source = POINTS.replace(
+        "    points[1 as usize] = p2;",
+        "    let mut q = (p2 as usize + 8 as usize) as *const kmVec2;\n    points[1 as usize] = q;",
+    );
+    // (`q` is model-Ref but decides `copy-source-coupled`: the store's source
+    // does not deliver, so the array holds at finalization.)
+    let held = observe(&raw_source);
+    let row = field_row(&held, "kmRay2IntersectBox", "points");
+    assert_eq!(row.2, "held", "{row:?}");
+    assert!(
+        row.4
+            .starts_with("store-source-degraded:kmRay2IntersectBox::q")
+            || row.4 == "array-local-incomplete:store-source",
+        "{row:?}"
+    );
+
+    // Control: the array used whole (copied) is a shape the transaction does
+    // not express — a typed hold, never a silent skip.
+    let copied = POINTS.replace(
+        "    let mut i = 0 as u32;",
+        "    let mut alias: [*const kmVec2; 4] = points;\n    let mut i = 0 as u32;",
+    );
+    let held = observe(&copied);
+    let row = field_row(&held, "kmRay2IntersectBox", "points");
+    assert_eq!(
+        (row.2.as_str(), row.4.as_str()),
+        ("held", "array-local-incomplete:array-use-shape"),
+        "{row:?}"
+    );
+}
