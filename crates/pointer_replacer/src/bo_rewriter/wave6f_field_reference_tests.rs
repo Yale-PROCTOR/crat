@@ -311,7 +311,12 @@ fn w6f_lodepng_slice_field_with_size_delivers() {
         "data: None,",
         "fn ensureBits9(mut reader: &mut LodePNGBitReader,",
     ] {
-        assert!(source.contains(needle), "missing {needle:?} in\n{source}");
+        // The pins are of the emitted FORM, not of its line breaks: a
+        // composition that nests the argument deeper (a counted-void twin, an
+        // A5 raw view) re-wraps the same text. Compare whitespace-flattened.
+        let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        let needle: String = needle.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(&needle), "missing {needle:?} in\n{source}");
     }
     // The store's slice at the raw caller `lodepng_inflatev`: ruling B's
     // adjacency licenses `insize` where the head takes the bare adjacency;
