@@ -963,3 +963,110 @@ unsafe fn tail(mut p: *const core::ffi::c_void) -> u64 {
     })
     .expect("compiles");
 }
+
+/// binn.rs:441 `binn_copy`: `old_ptr = binn_ptr(old)` — `binn_ptr` only RETURNS
+/// its argument and the caller USES the result (reads the header through
+/// it). R412-7: the site is T2 `ReturnedAliasUsed` under the named waiver —
+/// the tier a contract callee with `returns_alias_of` gets — and `old`
+/// takes the byte view; the alias's fate is the caller's own row (the
+/// returned-alias continuation), which here reads and copies only.
+const COPY_OLD: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+#[repr(C)]
+pub struct binn { pub header: i32, pub type_0: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
+unsafe fn binn_get_ptr_type(mut ptr: *mut core::ffi::c_void) -> i32 {
+    if ptr.is_null() { return 0 as i32; }
+    match *(ptr as *mut u32) {
+        522367263 => return 1 as i32,
+        _ => return 2 as i32,
+    };
+}
+pub unsafe fn binn_ptr(mut ptr: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let mut item = 0 as *mut binn;
+    match binn_get_ptr_type(ptr) {
+        1 => { item = ptr as *mut binn; return (*item).ptr; }
+        2 => return ptr,
+        _ => return 0 as *mut core::ffi::c_void,
+    };
+}
+pub unsafe fn binn_copy(mut old: *mut core::ffi::c_void) -> i32 {
+    let mut old_ptr = binn_ptr(old) as *mut u8;
+    if old_ptr.is_null() { return 0 as i32; }
+    return *old_ptr as i32 + *old_ptr.offset(1) as i32;
+}
+"#;
+
+#[test]
+fn w6v2_used_returned_alias_site_is_t2() {
+    let rows = by_function(COPY_OLD);
+    assert!(
+        rows.contains(&(
+            "binn_copy".to_owned(),
+            "old".to_owned(),
+            "<emitted>".to_owned()
+        )),
+        "the caller of a returning callee delivers its view: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(COPY_OLD).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fnbinn_copy(mutold:&[u8])->i32")
+            && c.contains("binn_ptr(old.as_ptr().cast::<core::ffi::c_void>().cast_mut())"),
+        "the bridge at the returning callee: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source));
+    let main = r#"fn main() { unsafe {
+        let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
+        println!("{}", binn_copy(buffer.as_mut_ptr().cast()));
+    }}"#;
+    let emitted_main = r#"fn main() { unsafe {
+        let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
+        println!("{}", binn_copy(&buffer[..]));
+    }}"#;
+    let original = run_binary(&format!("{COPY_OLD}\n{main}"));
+    assert_eq!(original, b"227\n".to_vec());
+    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+}
+
+/// The tier is for a callee that ONLY returns the argument: one that also
+/// stores it into a global keeps positive retention at the site.
+#[test]
+fn w6v2_returning_callee_that_also_stores_keeps_the_hold() {
+    let input = COPY_OLD.replace(
+        "        2 => return ptr,",
+        "        2 => { KEPT = ptr; return ptr; }",
+    ).replace("pub unsafe fn binn_ptr", "static mut KEPT: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;\npub unsafe fn binn_ptr");
+    assert_ne!(input, COPY_OLD);
+    let rows = by_function(&input);
+    assert!(
+        !rows.contains(&(
+            "binn_copy".to_owned(),
+            "old".to_owned(),
+            "<emitted>".to_owned()
+        )),
+        "a callee that stores the argument is not Return-only: {rows:?}"
+    );
+}
+
+/// The descendant question stays: a caller that WRITES through the returned
+/// alias of a shared view is the write-through-shared-view hazard and holds.
+#[test]
+fn w6v2_write_through_returned_alias_keeps_the_hold() {
+    let input = COPY_OLD.replace(
+        "    return *old_ptr as i32 + *old_ptr.offset(1) as i32;",
+        "    *old_ptr = 1;\n    return *old_ptr as i32;",
+    );
+    assert_ne!(input, COPY_OLD);
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let c = compact(&source);
+    // Either the view is held, or the analysis made it MUTABLE (the write
+    // through the alias is a write through the subject) — never a shared
+    // view with a write behind it.
+    assert!(
+        c.contains("fnbinn_copy(mutold:*mutcore::ffi::c_void)->i32")
+            || c.contains("fnbinn_copy(mutold:&mut[core::mem::MaybeUninit<u8>])->i32"),
+        "a write through the returned alias is never behind a shared view: {source}"
+    );
+    assert!(!c.contains("fnbinn_copy(mutold:&[u8])"), "{source}");
+    assert!(super::verify::type_checks_str(&source));
+}

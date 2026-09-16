@@ -2376,6 +2376,39 @@ fn evaluate_retention(
 }
 
 impl RetentionSummaries {
+    /// wave-6v2 (R412-7): does this callee only RETURN the argument — every
+    /// positive sink a `return` of it? The returned alias is then the caller's
+    /// to account for (its own row continues the walk), and the site is
+    /// retention-unknown under the named waiver, exactly as a contract callee
+    /// with `returns_alias_of`.
+    pub(crate) fn returns_argument_only(&self, callee: LocalDefId, argument_index: usize) -> bool {
+        self.facts
+            .get(&(callee, argument_index))
+            .is_some_and(|facts| {
+                !facts.retains.is_empty()
+                    && facts
+                        .retains
+                        .iter()
+                        .all(|step| step.kind == RetentionEventKind::Return)
+            })
+    }
+
+    /// wave-6v2 (R412-7): does this function's row for the parameter record
+    /// no write THROUGH the parameter or any alias the walk reached from it
+    /// (the walk's `access through` steps are the writes; reads are `read
+    /// through`)? A shared view's caller that never writes through the
+    /// returned alias cannot be the write-through-shared-view hazard.
+    pub(crate) fn no_write_through(&self, function: LocalDefId, argument_index: usize) -> bool {
+        self.facts
+            .get(&(function, argument_index))
+            .is_some_and(|facts| {
+                facts.steps.iter().all(|step| {
+                    !(step.kind == RetentionEventKind::DereferenceOnly
+                        && step.detail.starts_with("access through"))
+                })
+            })
+    }
+
     /// wave-6v2 (R410-3): does the callee's BODY store no pointer derived from
     /// this argument anywhere but the named confined output positions? Every
     /// positive sink is `store _s through _p` with `p` confined, the walk has
@@ -3973,7 +4006,7 @@ impl RawBoundaryDispositionIndex {
                             "depth-2 out-param storage is not a direct variable local".to_owned(),
                         ));
                     }
-                    let (_, decision) = decisions.get(&node).copied().ok_or_else(|| {
+                    let (subject, decision) = decisions.get(&node).copied().ok_or_else(|| {
                         (
                             RawBoundaryBlockReason::SubjectNotSafe,
                             "hypothetical has no safe subject decision".to_owned(),
@@ -4305,6 +4338,18 @@ impl RawBoundaryDispositionIndex {
                                         &site.frame_confined_outputs,
                                     )
                                 }))
+                            // wave-6v2 (R412-7): the descendant a Return-only
+                            // callee hands back is the caller's own alias; the
+                            // caller's row (continued) shows whether it ever
+                            // WRITES through the subject or any alias of it.
+                            && !(site.callee_local.is_some_and(|callee| {
+                                retention.returns_argument_only(callee, site.key.argument_index)
+                            }) && match subject.kind {
+                                super::SubjectKind::Param { hir_index } => {
+                                    retention.no_write_through(node.0, hir_index)
+                                }
+                                _ => false,
+                            })
                         {
                             // **R283-3 widened this arm to `*mut` positions.**
                             // It used to run only at `*const` targets, so a
@@ -4395,6 +4440,25 @@ impl RawBoundaryDispositionIndex {
                                     Ok(RawBoundaryDisposition::T2 {
                                         template,
                                         reason,
+                                        waiver_id: RAW_BOUNDARY_WAIVER_ID,
+                                        evidence,
+                                    })
+                                }
+                                // wave-6v2 (R412-7): a local callee that only
+                                // returns the argument hands the alias to the
+                                // caller, whose own row accounts for it; the
+                                // site is T2 `ReturnedAliasUsed`. (A discarded
+                                // result is wave-6r's T1 arm, above.)
+                                Some((_, RetentionVerdict::Retains { .. })) | None
+                                    if site.callee_local.is_some_and(|callee| {
+                                        retention
+                                            .returns_argument_only(callee, site.key.argument_index)
+                                    }) =>
+                                {
+                                    evidence = format!("{evidence};returned-alias-used");
+                                    Ok(RawBoundaryDisposition::T2 {
+                                        template,
+                                        reason: RetentionUnknownReason::ReturnedAliasUsed,
                                         waiver_id: RAW_BOUNDARY_WAIVER_ID,
                                         evidence,
                                     })
