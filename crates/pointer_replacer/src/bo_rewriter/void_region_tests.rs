@@ -733,12 +733,16 @@ fn w6b_byte_view_index_beyond_the_scalar_stays_exact() {
 }
 
 /// A byte-to-byte recast (`*const c_char` as `*const c_uchar`) is a string
-/// re-signing, not a scalar's byte view: not in the class.
+/// re-signing, not a scalar's byte view: not in the class. Scoped to THIS
+/// lane's form — another family may well type the local (on batch 9's
+/// composition one does, under its own fallback extent); what may not appear
+/// is a view whose extent is the scalar's own size, this rule's spelling.
 #[test]
 fn w6b_byte_recast_of_a_char_pointer_is_not_in_the_class() {
-    let chars = BE16
-        .replace("pub type u16_0 = u16;", "pub type u16_0 = libc::c_char;")
-        .replace("let mut b: u16_0 = 0;", "let mut b: u16_0 = 0;");
-    let rows = super::emit_tests::decisions_of(&chars);
-    assert_ne!(local_reason(&rows, "source"), "<emitted>", "{rows:?}");
+    let chars = BE16.replace("pub type u16_0 = u16;", "pub type u16_0 = libc::c_char;");
+    let source = super::emit_tests::ast_emitted_source_of(&chars).expect("AST output");
+    assert!(
+        !source.contains("size_of::<i8>()"),
+        "a byte-wide scalar has no byte view: {source}"
+    );
 }
