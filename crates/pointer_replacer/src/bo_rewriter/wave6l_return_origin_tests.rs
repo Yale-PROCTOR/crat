@@ -1243,8 +1243,15 @@ fn w6l_expression_position_receivers_keep_the_callee_class_placed() {
         "{text}"
     );
     assert!(text.contains("as*mutf32}+=v;"), "{text}");
-    // (c) the assignment into an existing raw local.
-    assert!(text.contains("src={let__crat_native_result_"), "{text}");
+    // (c) the assignment into an existing raw local — or, where another
+    // family delivers that null-initialised local as an optional view, its
+    // store composed OVER the view (the nested-edit composition, wave 6):
+    // `src = ({ let t: &mut [f32] = (call); (t.as_mut_ptr()) as *mut f32 } as *const f32).as_ref()`.
+    assert!(
+        text.contains("src={let__crat_native_result_")
+            || text.contains("src=({let__crat_native_result_17_19:&mut[f32]=(__crat_safe_heman_image_texel(secondary,x,y));(__crat_native_result_17_19.as_mut_ptr())as*mutf32}as*constf32).as_ref();"),
+        "{text}"
+    );
     let views = raw_boundary_artifacts
         .bridge_events
         .iter()
@@ -1416,22 +1423,15 @@ fn w6l_thin_expression_position_receivers_keep_the_callee_class_placed() {
                 && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
         })
         .collect::<Vec<_>>();
-    if text.contains("letmutsrc:Option<&f32>=None;") {
-        // R217-2(a) re-pin (batch-8 composition): another family delivers
-        // the null-initialised receiving local as an optional view and its
-        // construction takes the raw call; the carrier yields the position
-        // (`assigned_place`) and plans no view there.
-        assert!(
-            text.contains(
-                "src=(__crat_safe_heman_image_texel(secondary,x,y)as*constf32).as_ref();"
-            ),
-            "{text}"
-        );
-        assert!(views.is_empty(), "{views:#?}");
-        return;
-    }
+    // The raw-local assignment takes the view; where another family
+    // delivers that null-initialised local as an optional view (the batch-8
+    // composition), its store is composed OVER the view by the nested-edit
+    // composition (wave 6) and both deliver.
+    let view = "{let__crat_native_result_17_19:&mutf32=(__crat_safe_heman_image_texel(secondary,x,y));(core::ptr::from_mut(&mut*__crat_native_result_17_19))as*mutf32}";
     assert!(
-        text.contains("src={let__crat_native_result_17_19:&mutf32=(__crat_safe_heman_image_texel(secondary,x,y));(core::ptr::from_mut(&mut*__crat_native_result_17_19))as*mutf32};"),
+        text.contains(&format!("src={view};"))
+            || (text.contains("letmutsrc:Option<&f32>=None;")
+                && text.contains(&format!("src=({view}as*constf32).as_ref();"))),
         "{text}"
     );
     let [event] = views.as_slice() else {

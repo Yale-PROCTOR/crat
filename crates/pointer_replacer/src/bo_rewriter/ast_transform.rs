@@ -1285,6 +1285,9 @@ impl MutVisitor for ExplicitLocalDeclVisitor<'_> {
 #[derive(Default)]
 pub(crate) struct UseGraftStats {
     pub grafted: usize,
+    /// wave-6l: use grafts composed over a native-result view at the same
+    /// node (the outer store carries the re-rendered inner).
+    pub composed_over_inner: usize,
     /// Replacements [`graft_expr`] refused. **A checked corpus expectation of
     /// zero**, per R7.4 — a failure here names a template the enumeration
     /// missed, with its text attached.
@@ -1335,6 +1338,18 @@ pub(crate) struct UseGraftVisitor<'a> {
     /// identities** rather than a difference of two counts that could agree by
     /// coincidence.
     consumed: FxHashSet<(u32, u32)>,
+    /// wave-6l (nested-edit composition): native-result views planned at the
+    /// SAME node as a use graft (an optional store over a call whose callee
+    /// this lane adapts). The use text was rendered over the ORIGINAL call
+    /// text; the view is rendered over the node first and spliced into the
+    /// use text in the call's place, so the outer store carries the inner.
+    inner_views: FxHashMap<
+        (u32, u32),
+        &'a super::decision::native_result_expression::NativeResultExpressionPlan,
+    >,
+    /// Keys the composition consumed; the receiver-input pass skips them.
+    pub(crate) composed: FxHashSet<(u32, u32)>,
+    composition_failures: Vec<String>,
 }
 
 impl<'a> UseGraftVisitor<'a> {
@@ -1344,7 +1359,30 @@ impl<'a> UseGraftVisitor<'a> {
             guard,
             stats: UseGraftStats::default(),
             consumed: FxHashSet::default(),
+            inner_views: FxHashMap::default(),
+            composed: FxHashSet::default(),
+            composition_failures: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_inner_views(
+        mut self,
+        inner_views: FxHashMap<
+            (u32, u32),
+            &'a super::decision::native_result_expression::NativeResultExpressionPlan,
+        >,
+    ) -> Self {
+        self.inner_views = inner_views;
+        self
+    }
+
+    /// The use text with the node's original text replaced by the view
+    /// rendered over it. The use text came from the source file and the node
+    /// prints through `pprust`, so the match ignores whitespace and the
+    /// splice is done on the use text's own bytes.
+    fn compose_over_inner(text: &str, original: &str, inner: &str) -> Option<String> {
+        let (start, end) = find_ignoring_whitespace(text, original)?;
+        Some(format!("{}{inner}{}", &text[..start], &text[end..]))
     }
 
     /// Close the walk, deriving `unmatched` from what was never reached.
@@ -1356,6 +1394,43 @@ impl<'a> UseGraftVisitor<'a> {
             .count();
         self.stats
     }
+
+    /// Close the walk keeping the composed keys and any composition failure.
+    fn finish_composed(mut self) -> (UseGraftStats, FxHashSet<(u32, u32)>, Vec<String>) {
+        self.stats.unmatched = self
+            .uses
+            .keys()
+            .filter(|k| !self.consumed.contains(k))
+            .count();
+        let composed = std::mem::take(&mut self.composed);
+        let failures = std::mem::take(&mut self.composition_failures);
+        (self.stats, composed, failures)
+    }
+}
+
+/// `needle`'s occurrence in `hay` ignoring whitespace on both sides, as a
+/// byte range of `hay`. Used by the nested-edit composition to find a node's
+/// source text inside a use text rendered from the same source.
+fn find_ignoring_whitespace(hay: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle: Vec<char> = needle.chars().filter(|c| !c.is_whitespace()).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let hay_chars: Vec<(usize, char)> = hay
+        .char_indices()
+        .filter(|(_, c)| !c.is_whitespace())
+        .collect();
+    for start in 0..hay_chars.len() {
+        if hay_chars.len() - start < needle.len() {
+            break;
+        }
+        if (0..needle.len()).all(|i| hay_chars[start + i].1 == needle[i]) {
+            let (lo, _) = hay_chars[start];
+            let (last, c) = hay_chars[start + needle.len() - 1];
+            return Some((lo, last + c.len_utf8()));
+        }
+    }
+    None
 }
 
 impl MutVisitor for UseGraftVisitor<'_> {
@@ -1380,6 +1455,28 @@ impl MutVisitor for UseGraftVisitor<'_> {
                 self.stats.refused += 1;
                 return;
             }
+            let composed;
+            let text = if let Some(view) = self.inner_views.get(&key) {
+                let original = rustc_ast_pretty::pprust::expr_to_string(e);
+                let inner = view.render(&original);
+                match Self::compose_over_inner(text, &original, &inner) {
+                    Some(composed_text) => {
+                        composed = composed_text;
+                        self.composed.insert(key);
+                        self.stats.composed_over_inner += 1;
+                        composed.as_str()
+                    }
+                    None => {
+                        self.composition_failures.push(format!(
+                            "nested-composition:inner-text-not-found:{}..{}",
+                            key.0, key.1
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                text.as_str()
+            };
             match graft_expr(text) {
                 Ok(parsed) => {
                     // **Only `kind` is replaced.** The node keeps its own id and
@@ -1523,6 +1620,9 @@ pub(crate) struct SeamGraftStats {
     pub len_shapes: usize,
     /// Seam edits whose span matched no AST expression.
     pub unmatched: usize,
+    /// wave-6l: outer seams built over an already-grafted contained seam (an
+    /// L07 containment): the adapter's text carries the inner's.
+    pub composed_over_inner: usize,
     pub refused: usize,
     /// One seam key matched by MORE THAN ONE AST node — invisible to both the
     /// guard (which keys on `NodeId`) and to `unmatched` (a set membership),
@@ -1937,6 +2037,16 @@ impl<'a> SeamGraftVisitor<'a> {
         self.stats
     }
 
+    /// Does another seam target lie strictly inside this one's span?
+    fn contains_seam(&self, outer: (u32, u32)) -> bool {
+        self.seams.keys().any(|inner| {
+            *inner != outer
+                && outer.0 <= inner.0
+                && inner.1 <= outer.1
+                && (outer.0 < inner.0 || inner.1 < outer.1)
+        })
+    }
+
     /// Build the adapter around `e`'s own subtree, or decline with a typed row.
     fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
         use super::decision::seam::{GlueCore, NullArm};
@@ -2198,10 +2308,22 @@ impl MutVisitor for SeamGraftVisitor<'_> {
             // rows can exceed the placements. That is unreachable while
             // `refused` is zero, and a nonzero `refused` is STOP-class, so the
             // over-count can only appear on a path a human is already reading.
+            // wave-6l (nested-edit composition): a seam the plan admitted
+            // INSIDE this one (an L07 containment — the shared reborrow of a
+            // raw-returning call over the weakening of one of its arguments)
+            // is grafted first, so the adapter below is built over the
+            // argument-adapted subtree and its text carries the inner's.
+            // Without a contained seam the walk order is unchanged.
+            if self.contains_seam(key) {
+                rustc_ast::mut_visit::walk_expr(self, e);
+                self.stats.composed_over_inner += 1;
+            }
             let Some(kind) = self.build(e, target) else {
                 // Declined with a typed row; the node is left intact AND
                 // claimable, which is the invariant that matters.
-                rustc_ast::mut_visit::walk_expr(self, e);
+                if !self.contains_seam(key) {
+                    rustc_ast::mut_visit::walk_expr(self, e);
+                }
                 return;
             };
             let claimed = if target.exact_use_composition {
@@ -2547,6 +2669,12 @@ impl MutVisitor for ReceiverInputGraftVisitor<'_> {
             return;
         };
         if self.consumed.contains(&key) {
+            // wave-6l: a view the use pass already composed under its store
+            // at this node (the node is the store's product now).
+            if matches!(input, ReceiverGraft::Expression(_)) {
+                rustc_ast::mut_visit::walk_expr(self, expression);
+                return;
+            }
             self.failure = Some(format!(
                 "receiver-input-invariant:duplicate-ast:{}..{}",
                 key.0, key.1
@@ -3856,9 +3984,29 @@ fn transform_with<'tcx>(
     let uses = filtered.uses;
     let statement_deletes = filtered.statement_deletes;
     let use_key_collisions = use_key_collisions + filtered.use_key_collisions;
-    let mut g = UseGraftVisitor::new(&uses, &mut guard);
+    // wave-6l: native-result views at the same node as a use graft compose
+    // under it (the withheld set is the one the receiver-input pass uses).
+    let withheld_for_views: std::collections::BTreeSet<_> = reverts
+        .fns
+        .iter()
+        .copied()
+        .map(super::bridge_receipt::SignatureClassId::of)
+        .collect();
+    let inner_views = table
+        .seams
+        .native_result_expressions
+        .plans
+        .values()
+        .filter(|input| input.active(&withheld_for_views))
+        .map(|input| ((input.call_span.lo().0, input.call_span.hi().0), input))
+        .filter(|(key, _)| uses.contains_key(key))
+        .collect::<FxHashMap<_, _>>();
+    let mut g = UseGraftVisitor::new(&uses, &mut guard).with_inner_views(inner_views);
     g.visit_crate(&mut krate);
-    let mut grafts = g.finish();
+    let (mut grafts, composed_receiver_inputs, composition_failures) = g.finish_composed();
+    if let Some(why) = composition_failures.first() {
+        return Err(why.clone());
+    }
     // wave-6f (W6F-3): owned-field wraps, post-order over the grafted tree.
     // A wrapped node keeps its span, so a use edit nested INSIDE a wrap is
     // reached either way; running after the use pass makes the other nesting
@@ -4148,7 +4296,7 @@ fn transform_with<'tcx>(
     let mut receiver_grafts = ReceiverInputGraftVisitor {
         inputs: &receiver_inputs,
         guard: &mut guard,
-        consumed: FxHashSet::default(),
+        consumed: composed_receiver_inputs,
         failure: None,
     };
     receiver_grafts.visit_crate(&mut krate);

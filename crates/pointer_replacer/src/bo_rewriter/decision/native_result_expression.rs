@@ -211,7 +211,8 @@ enum AssignedPlace {
     /// Stays raw in the output (degraded or undecided): the carrier's.
     Raw,
     /// Another family constructs the place's form OVER the raw call (a
-    /// sealed slice, an optional receiver, a cursor): the call is theirs.
+    /// sealed slice, an optional receiver, a cursor): the construction is
+    /// rendered over this view.
     ConstructedElsewhere,
     /// A safe reference or box: assigning a raw view into it is unbuilt.
     Delivered,
@@ -301,8 +302,13 @@ fn consumer_of(tcx: TyCtxt<'_>, table: &DecisionTable, call: &Expr<'_>, form: Fo
                 // The place's OUTPUT form decides: a raw view may only be
                 // assigned into a place that stays raw.
                 match assigned_place(table, expr.hir_id.owner.def_id, lhs) {
-                    AssignedPlace::Raw => Consumer::Position(ResultPosition::Assign, None),
-                    AssignedPlace::ConstructedElsewhere => Consumer::Elsewhere,
+                    // A place another family constructs OVER the raw call
+                    // (an optional store) takes its construction over this
+                    // view: the AST pass composes the outer store over the
+                    // re-rendered call (`UseGraftVisitor`, wave-6l).
+                    AssignedPlace::Raw | AssignedPlace::ConstructedElsewhere => {
+                        Consumer::Position(ResultPosition::Assign, None)
+                    }
                     AssignedPlace::Delivered => Consumer::Unbuilt("assign-to-delivered-place"),
                 }
             }

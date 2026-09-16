@@ -138,6 +138,8 @@ mod wave6a_return_certificate_tests;
 #[cfg(test)]
 mod wave6l_local_box_exemption_tests;
 #[cfg(test)]
+mod wave6l_nested_composition_tests;
+#[cfg(test)]
 mod wave6l_return_origin_tests;
 mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;
@@ -1813,7 +1815,9 @@ fn verify_and_revert(
     let nested_seam_composition = !table.seams.pair_raw_calls.is_empty()
         || emission_plan.by_file.values().any(|edits| {
             edits.iter().enumerate().any(|(index, _)| {
-                nested_kind_under_seam(edits, index) || exact_kind_composed_by_seam(edits, index)
+                nested_kind_under_seam(edits, index)
+                    || exact_kind_composed_by_seam(edits, index)
+                    || nested_seam_under_seam(edits, index)
             })
         });
     let e1_edit_contexts = if census_once {
@@ -4914,6 +4918,7 @@ pub(crate) fn validate_plan(
                     ) || !exact_kind_composed_by_seam(kept, *inner_index))
                     && !nested_c9_over_seam(kept, *inner_index)
                     && !composed_by_slice_constructor(kept, *inner_index)
+                    && !nested_seam_under_seam(kept, *inner_index)
             })
             .map(|(_, edit)| edit.clone())
             .collect::<Vec<_>>();
@@ -4976,6 +4981,24 @@ fn nested_kind_under_seam(edits: &[plan::Edit], inner_index: usize) -> bool {
             && inner.hi <= outer.hi
             && (outer.lo < inner.lo || inner.hi < outer.hi)
     })
+}
+
+/// wave-6l: a seam adapter STRICTLY inside another seam adapter is an L07
+/// containment the plan admitted (a declined pair holds both classes before
+/// this projection sees their edits). The AST pass grafts the inner first
+/// and builds the outer over the adapted subtree (`SeamGraftVisitor`), so
+/// the byte projection omits the inner range exactly as it does for a use
+/// under a seam; both edits stay in the plan for attribution and reverts.
+fn nested_seam_under_seam(edits: &[plan::Edit], inner_index: usize) -> bool {
+    let inner = &edits[inner_index];
+    matches!(inner.justification, plan::Justification::SeamAdapter { .. })
+        && edits.iter().enumerate().any(|(outer_index, outer)| {
+            outer_index != inner_index
+                && matches!(outer.justification, plan::Justification::SeamAdapter { .. })
+                && outer.lo <= inner.lo
+                && inner.hi <= outer.hi
+                && (outer.lo < inner.lo || inner.hi < outer.hi)
+        })
 }
 
 /// The AST path has a typed use-to-seam handoff for one exact-span seam. This

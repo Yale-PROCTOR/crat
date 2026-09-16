@@ -9420,6 +9420,7 @@ mod run {
                 } = &st;
                 let crate::bo_rewriter::ast_transform::UseGraftStats {
                     grafted: _,
+                    composed_over_inner: _,
                     parse_failed: _,
                     parse_failures: _,
                     unmatched: _,

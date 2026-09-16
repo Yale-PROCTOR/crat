@@ -541,6 +541,7 @@ fn nested_ast_composition(
                     | ("pair-copy-snapshot", "typed-raw-temporary")
                     | ("pair-t2-raw-view", "raw-cast-const")
                     | ("c-raw-reborrow-shared", "raw-cast-const")
+                    | ("c-raw-reborrow-shared", "shared-weakening")
                     | ("pair-t2-raw-view", "subject-use")
                     // Relay 017 §2 (seat addendum 411): the two pairs wave-5c
                     // 015 §2 and ownership-fields 019 STOP 3 measured on the
