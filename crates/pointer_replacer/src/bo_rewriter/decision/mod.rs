@@ -1787,8 +1787,12 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         }
         // wave-6b: an accessor-result local receives its region as a typed
         // slice (declared explicitly, the raw result wrapped with the count).
-        Decision::Slice { mutable, .. }
-            if void_region::receives_region(ctx.void_region_receivers, receiver_node, mutable) =>
+        Decision::Slice { .. }
+            if void_region::receiver_form_matches(
+                ctx.void_region_receivers,
+                receiver_node,
+                &decision,
+            ) =>
         {
             decision
         }

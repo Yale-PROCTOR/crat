@@ -1171,3 +1171,23 @@ pub(crate) fn owns_span(table: &super::DecisionTable, owner: LocalDefId, span: S
                 .is_some_and(|region| region.replaced.contains(span))
     })
 }
+
+/// The veto's question in its decision-shaped form — asked by this lane's own
+/// arm and by any constructor-typing refusal that must let a receiver answer
+/// first: is this local a region receiver whose ladder decision is its slice?
+pub(crate) fn receiver_form_matches(
+    receivers: &Receivers,
+    node: Key,
+    decision: &super::Decision,
+) -> bool {
+    match decision {
+        super::Decision::Slice { mutable, .. } => receives_region(receivers, node, *mutable),
+        super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::NestedSlice { .. }
+        | super::Decision::Opt { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Cursor { .. }
+        | super::Decision::Degraded(_) => false,
+    }
+}
