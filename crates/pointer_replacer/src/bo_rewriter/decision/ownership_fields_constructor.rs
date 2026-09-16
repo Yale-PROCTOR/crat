@@ -509,9 +509,15 @@ fn zero_value<'tcx>(
                     rustc_middle::ty::TypingEnv::fully_monomorphized().as_query_input(element),
                 )
                 .map_err(|_| SourceHold::ConstructorShape)?;
+            // Every field is followed by a comma, the last one too: the AST
+            // emission grafts a replacement only if it round-trips through
+            // the pretty printer (whitespace aside), and the printer spells a
+            // struct literal with a trailing comma — without it the graft is
+            // silently refused and the initializer stays raw (R412-2, the
+            // heman probe's `E0308` at `img`).
             Ok((
                 format!(
-                    "crate::{} {{ {} }}",
+                    "crate::{} {{ {}, }}",
                     tcx.def_path_str(def.did()),
                     fields.join(", ")
                 ),
@@ -748,7 +754,7 @@ mod tests {
             ),
             Ok((
                 "1".into(),
-                "::std::boxed::Box::new(crate::Rec { width: 0i32, data: ::core::ptr::null_mut(), name: ::core::ptr::null(), inner: crate::Inner { v: [0.0f32; 2] } })".into(),
+                "::std::boxed::Box::new(crate::Rec { width: 0i32, data: ::core::ptr::null_mut(), name: ::core::ptr::null(), inner: crate::Inner { v: [0.0f32; 2], }, })".into(),
                 "native-malloc-zero-numeric"
             ))
         );

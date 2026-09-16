@@ -348,6 +348,35 @@ pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
         s.contains("return ::std::boxed::Box::into_raw(img);"),
         "{s}"
     );
+    // R412-2: every expression edit must round-trip through the AST
+    // emission's graft parser (the pretty printer's spelling, e.g. the
+    // trailing comma of a struct literal); a refused graft leaves the source
+    // node intact and the program does not compile.
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("img"))
+            .unwrap();
+        let Decision::Box(plan) = decision else { panic!("{decision:?}") };
+        for edit in &plan.expr_edits {
+            assert!(
+                super::ast_transform::graft_expr(&edit.replacement).is_ok(),
+                "{}: {}",
+                edit.receipt,
+                edit.replacement
+            );
+        }
+    })
+    .unwrap();
     // The census (AST) path must graft the struct-literal constructor too.
     let outcome = super::rewrite_core_injected(
         ::utils::compilation::str_to_input(&input),
@@ -374,7 +403,7 @@ pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
         census_source.contains("return ::std::boxed::Box::into_raw(img);"),
         "{census_source}"
     );
-    assert!(s.contains("let mut img: ::std::boxed::Box<crate::heman_image_s> = ::std::boxed::Box::new(crate::heman_image_s { width: 0i32, height: 0i32, nbands: 0i32, data: ::core::ptr::null_mut() });"), "{s}");
+    assert!(s.contains("let mut img: ::std::boxed::Box<crate::heman_image_s> = ::std::boxed::Box::new(crate::heman_image_s { width: 0i32, height: 0i32, nbands: 0i32, data: ::core::ptr::null_mut(), });"), "{s}");
 }
 
 #[test]
@@ -412,7 +441,7 @@ fn r399_aggregate_owner_with_an_unsupplied_field_holds() {
     let supplied = input.replace("(*p).x = n;", "(*p).x = n; (*p).y = n + 1;");
     let s = verify(&supplied, "p", BoxShape::Sized, false);
     assert!(
-        s.contains("::std::boxed::Box::new(crate::Pair { x: 0i32, y: 0i32 })"),
+        s.contains("::std::boxed::Box::new(crate::Pair { x: 0i32, y: 0i32, })"),
         "{s}"
     );
 }
