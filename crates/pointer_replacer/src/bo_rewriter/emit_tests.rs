@@ -12882,6 +12882,25 @@ fn slu_r220_assert_retired_use_cause(
     let (events, rows) = plan.materialize(false, false);
     super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
         .expect("retired slice-use common/specialized join");
+    // Every additive family that can withdraw a slice-use candidate renders
+    // the predecessor form under its own `prior-family-rendering:<stage>`
+    // adapter (`additive.rs`); the retired-partner rule must license each of
+    // them, or the family's first real withdrawal aborts the census worker
+    // (batch 8: heman, `prior-family-rendering:Ownership`).
+    for stage in [
+        super::additive::FamilyStage::SliceConstruction,
+        super::additive::FamilyStage::SliceUse,
+        super::additive::FamilyStage::Option,
+        super::additive::FamilyStage::Declaration,
+        super::additive::FamilyStage::Return,
+        super::additive::FamilyStage::Ownership,
+    ] {
+        let mut staged = plan.clone();
+        staged.adapter = format!("prior-family-rendering:{stage:?}");
+        let (events, rows) = staged.materialize(false, false);
+        super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
+            .unwrap_or_else(|err| panic!("{stage:?} is a licensed retired partner: {err}"));
+    }
     if plan.source_form != plan.candidate_form {
         let mut bad_events = events.clone();
         let mut bad_rows = rows.clone();

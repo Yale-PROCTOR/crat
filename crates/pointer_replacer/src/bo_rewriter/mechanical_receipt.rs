@@ -1624,7 +1624,8 @@ pub(crate) fn reconcile_slice_use_rows(
                         | "prior-family-rendering:SliceUse"
                         | "prior-family-rendering:Option"
                         | "prior-family-rendering:Declaration"
-                        | "prior-family-rendering:Return")
+                        | "prior-family-rendering:Return"
+                        | "prior-family-rendering:Ownership")
                     && matches!(row.candidate_form.as_str(),
                         "slice-shared" | "slice-mut" | "opt-slice-shared" | "opt-slice-mut")
             });
