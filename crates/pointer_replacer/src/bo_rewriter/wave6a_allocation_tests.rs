@@ -878,6 +878,55 @@ fn w6a_b1_receiver_of_a_local_callee_is_not_typed_by_its_constructor() {
 /// shared-interface clause of the refusal must not fire on `strlen(p)`, so
 /// the unannotated slice local keeps its constructor typing; an argument of
 /// a callee the crate owns (a body) is still refused.
+/// **The root is itself a delivered slice.** Over a formal another rule
+/// delivers fat (`a: &mut [i8]`), wave-6s's computed-suffix-copy already
+/// renders the initializer as the reslice (`&mut (a)[1..]`); the constructor
+/// planner takes that value bare — wrapping it in `from_raw_parts_mut` is
+/// E0308 and reverts the whole class, the root with it. The root delivers on
+/// the batch-8 composition only (on this branch `a` degrades
+/// `slice-cursor-use`, so the witness is load-bearing there: the reslice
+/// text and no class revert; here it pins the constructor form).
+#[test]
+fn w6a_b1_suffix_copy_of_a_delivered_root_is_the_reslice() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub unsafe fn measure(mut a: *mut std::os::raw::c_char, mut n: usize) -> usize {\n\
+                   let mut p = a.offset(1 as i32 as isize);\n\
+                   *p.offset(0 as i32 as isize) = 0 as std::os::raw::c_char;\n\
+                   return n;\n\
+               }\n";
+    let out = emitted("suffix-copy-root", src);
+    let text = compact(&out.source);
+    let root_delivered = text.contains("muta:&mut[std::os::raw::c_char]");
+    assert!(
+        if root_delivered {
+            text.contains("letmutp:&mut[i8]=&mut(a)[(1asi32)asusize..];")
+        } else {
+            text.contains("letmutp:&mut[i8]=core::slice::from_raw_parts_mut(a.offset(1asi32asisize),crate::FALLBACK_SLICE_EXTENT);")
+        },
+        "root_delivered={root_delivered}\n{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert!(
+        !text.contains("from_raw_parts_mut(&mut(a)"),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "measure::p"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert_ne!(
+        reason_of(&out.degradations, "measure::a").as_deref(),
+        Some("reverted-after-verify-failure"),
+        "{:#?}",
+        out.degradations
+    );
+}
+
 #[test]
 fn w6a_b1_libc_argument_is_not_a_shared_interface() {
     let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
@@ -895,9 +944,12 @@ fn w6a_b1_libc_argument_is_not_a_shared_interface() {
                }\n";
     let out = emitted("libc-argument", src);
     let text = compact(&out.source);
-    // The libc lend keeps the constructor typing.
+    // The libc lend keeps the constructor typing: over a raw root the
+    // fallback-extent view, over a root another rule delivers fat (the
+    // batch-8 composition) the reslice of it.
     assert!(
-        text.contains("letmutp:&mut[i8]=core::slice::from_raw_parts_mut(a.offset(1asi32asisize),crate::FALLBACK_SLICE_EXTENT);"),
+        text.contains("letmutp:&mut[i8]=core::slice::from_raw_parts_mut(a.offset(1asi32asisize),crate::FALLBACK_SLICE_EXTENT);")
+            || text.contains("letmutp:&mut[i8]=&mut(a)[(1asi32)asusize..];"),
         "{}\n{:#?}",
         out.source,
         out.degradations

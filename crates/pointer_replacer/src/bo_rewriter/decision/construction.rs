@@ -44,8 +44,8 @@ use rustc_span::Span;
 
 use super::{Decision, DecisionTable, Subject, SubjectKind};
 use crate::bo_rewriter::mechanical_receipt::{
-    FALLBACK_EXTENT_RECEIPT, MechanicalExtent, SLICE_EXTENT_WAIVER_ID, UnsafeContextPresentation,
-    present_unsafe_text,
+    CanonicalLocation, FALLBACK_EXTENT_RECEIPT, MechanicalExtent, SLICE_EXTENT_WAIVER_ID,
+    UnsafeContextPresentation, present_unsafe_text,
 };
 
 /// How a pointer binding got its value.
@@ -640,6 +640,59 @@ fn bind_allocation_arguments(
     ))
 }
 
+/// wave-6a (report 007): the composable edit that covers the WHOLE
+/// initializer is wave-6s's computed-suffix-copy of a delivered slice root
+/// (`a.offset(e)` → `&mut (a)[e..]`, the root's own `slice_use` receipt at a
+/// site inside this initializer). That value is already the local's complete
+/// slice; the planner takes it bare.
+fn suffix_copy_initializer(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    subject: &Subject,
+    init_hir: HirId,
+    init_span: Span,
+    edits: &[(Span, String)],
+) -> Option<String> {
+    let init = init_span.source_callsite();
+    let (_, replacement) = edits
+        .iter()
+        .find(|(span, _)| span.lo() == init.lo() && span.hi() == init.hi())?;
+    let inside_initializer = |location: &CanonicalLocation| {
+        let CanonicalLocation::Hir {
+            owner,
+            item_local_id,
+        } = location
+        else {
+            return false;
+        };
+        if *owner != subject.fn_did {
+            return false;
+        }
+        let mut hir = HirId {
+            owner: rustc_hir::OwnerId { def_id: *owner },
+            local_id: rustc_hir::ItemLocalId::from_u32(*item_local_id),
+        };
+        loop {
+            if hir == init_hir {
+                return true;
+            }
+            match tcx.parent_hir_node(hir) {
+                rustc_hir::Node::Expr(parent) => hir = parent.hir_id,
+                _ => return false,
+            }
+        }
+    };
+    table
+        .slice_use_receipts
+        .iter()
+        .any(|receipt| {
+            receipt.adapter == "computed-suffix-copy"
+                && receipt.use_site.owner == subject.fn_did
+                && inside_initializer(&receipt.use_site.location)
+        })
+        .then(|| replacement.clone())
+}
+
 pub(crate) fn collect_composable_edits(
     table: &DecisionTable,
     init_span: Span,
@@ -816,6 +869,54 @@ pub(crate) fn plan_slice_constructions(
             &known_lengths,
         );
         let composed_edits = collect_composable_edits(table, init_span);
+        if !nullable
+            && let Some(reslice) =
+                suffix_copy_initializer(tcx, table, subject, init_hir, init_span, &composed_edits)
+        {
+            // wave-6a (report 007): the root is itself a delivered slice and
+            // wave-6s's computed-suffix-copy already renders the initializer
+            // as the reslice (`&mut (a)[e..]`). Wrapping that in a raw-result
+            // constructor is E0308 and reverts the whole class, root included;
+            // the constructor IS the reslice, and it fabricates no extent.
+            let length = SliceLengthPlan {
+                expression: format!("({reslice}).len()"),
+                source: SliceLengthSource::SealedContract {
+                    contract: "computed-suffix-copy".to_owned(),
+                },
+                provenance: Vec::new(),
+            };
+            if let Some(name) = &subject.param_name {
+                known_lengths.insert(
+                    node,
+                    SliceLengthPlan {
+                        expression: format!("{name}.len()"),
+                        ..length.clone()
+                    },
+                );
+            }
+            plans.push(SliceConstructionPlan {
+                node,
+                init_hir,
+                init_span,
+                replacement: Some(reslice),
+                hold_reason: None,
+                element_type,
+                mutable,
+                nullable,
+                initializer_kind: facts
+                    .by_binding
+                    .get(&node)
+                    .map_or("unknown", Construction::key),
+                length,
+                composed_edit_spans: composed_edits.into_iter().map(|(span, _)| span).collect(),
+                unsafe_context: UnsafeContextPresentation {
+                    unsafe_fn: false,
+                    wrapper_inserted: false,
+                    edition: 2018,
+                },
+            });
+            continue;
+        }
         let enclosing_unsafe_fn = tcx
             .fn_sig(subject.fn_did)
             .skip_binder()
