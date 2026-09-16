@@ -1438,6 +1438,9 @@ unsafe extern "C" fn holder_free(mut h: *mut Holder) { free((*h).buf as *mut lib
             "(*h).buf = new_data; *new_data.offset(0 as isize) = 7 as u8;",
             "(*h).buf = new_data; free(new_data as *mut libc::c_void);",
             "let mut other = new_data; (*h).buf = other;",
+            // A read that FOLLOWS the store in control flow though it
+            // precedes it in the text (the second trip round the loop).
+            "let mut i = 0; loop { if i == 1 { let v = *new_data.offset(0 as isize); (*h).count = v as u32; return; } (*h).buf = new_data; i += 1; }",
         ] {
             ::utils::compilation::run_compiler_on_str(&store(body), |tcx| {
                 let (table, ctx) = bo::decide_table_with_ctx_config(
