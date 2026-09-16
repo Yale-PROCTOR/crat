@@ -1756,22 +1756,46 @@ fn verify_and_revert(
     raw_boundary_artifacts.class_collisions = render_class_collisions(&emission_plan);
     raw_boundary_artifacts.arm_outcomes = atomic_arm_outcomes_tsv(tcx, table, &emission_plan);
     let mut class_paths = std::collections::BTreeMap::new();
+    // **R430-1 — EVERY owner path of a class, not just its display path.** A
+    // signature class spans as many functions as its interface does;
+    // `class_paths` keeps ONE path per class for display, and the final-reverts
+    // artifact carried only that one. The census marks a subject reverted by
+    // its OWNER PATH, so the other owners of a withheld class kept `realized`
+    // rows while the tree left their text verbatim — heman's
+    // `kmRay2IntersectBox` (a class-mate of `kmRay2IntersectLineSegment`, the
+    // path that WAS rendered) and 24 more rows on batch 9's candidate.
+    let mut class_owner_paths: std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
     for edit in emission_plan.by_file.values().flatten() {
         if let Some(class) = edit.owner_class {
             class_paths
                 .entry(class)
                 .or_insert_with(|| edit.owner_path.clone());
+            class_owner_paths
+                .entry(class)
+                .or_default()
+                .insert(edit.owner_path.clone());
         }
     }
     for site in &emitted_sites {
         class_paths
             .entry(site.owner_class)
             .or_insert_with(|| site.fn_path.clone());
+        class_owner_paths
+            .entry(site.owner_class)
+            .or_default()
+            .insert(site.fn_path.clone());
     }
     for subject in &emitted_subjects {
         class_paths
             .entry(subject.owner_class)
             .or_insert_with(|| subject.owner_path.clone());
+        class_owner_paths
+            .entry(subject.owner_class)
+            .or_default()
+            .insert(subject.owner_path.clone());
     }
     let all_ready_classes = ready_classes(&emission_plan);
     // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
@@ -2309,6 +2333,7 @@ fn verify_and_revert(
                 &effective_reverted,
                 &reverted_atoms,
                 &class_paths,
+                &class_owner_paths,
                 &reverted,
                 Some(&emission_plan),
             );
@@ -2770,6 +2795,7 @@ fn verify_and_revert(
                 &final_reverted,
                 &reverted_atoms,
                 &class_paths,
+                &class_owner_paths,
                 &reverted,
                 Some(&emission_plan),
             );
@@ -3929,14 +3955,30 @@ fn render_raw_boundary_final_reverts(
     functions: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     atoms: &std::collections::BTreeSet<String>,
     display_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+    owner_paths: &std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
     verify_reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     emission_plan: Option<&plan::Plan>,
 ) -> String {
     let mut out = String::from("kind\tidentity\tclass_id\tattribution\n");
     for &function in functions {
-        let path = display_paths
+        // **R430-1 — one row per OWNER PATH of the withheld class.** The census
+        // marks a subject reverted by its owner path; a class-mate this
+        // artifact does not name keeps a `realized` row over verbatim text.
+        let owners = owner_paths
             .get(&function)
-            .map_or("<unknown-local-class>", String::as_str);
+            .filter(|paths| !paths.is_empty())
+            .map(|paths| paths.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_else(|| {
+                vec![
+                    display_paths
+                        .get(&function)
+                        .cloned()
+                        .unwrap_or_else(|| "<unknown-local-class>".to_owned()),
+                ]
+            });
         let attribution = if verify_reverted.contains(&function) {
             "verify-reverted".to_owned()
         } else if let Some(reason) = emission_plan.and_then(|plan| {
@@ -3949,10 +3991,12 @@ fn render_raw_boundary_final_reverts(
         } else {
             "closure:partition".to_owned()
         };
-        out.push_str(&format!(
-            "function\t{path}\tlocal-def-index:{}\t{attribution}\n",
-            function.order_key()
-        ));
+        for path in owners {
+            out.push_str(&format!(
+                "function\t{path}\tlocal-def-index:{}\t{attribution}\n",
+                function.order_key()
+            ));
+        }
     }
     for atom in atoms {
         out.push_str(&format!("atom\t{atom}\t-\tatom-reverted\n"));

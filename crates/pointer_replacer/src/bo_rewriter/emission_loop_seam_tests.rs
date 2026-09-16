@@ -327,3 +327,103 @@ fn r299_2_an_absent_render_is_stated_as_absent_not_reconstructed() {
     assert_eq!((call.lo, call.hi), (CALL_LO as usize, CALL_HI as usize));
     assert_eq!(call.edits.len(), 1);
 }
+
+/// **R430-1 — the final-reverts artifact names EVERY owner of a withheld
+/// class.** The census marks a subject reverted by its owner path, so a
+/// class-mate the artifact does not name keeps a `realized` row over text the
+/// tree left verbatim: on batch 9's candidate that was heman's
+/// `kmRay2IntersectBox` (class-mate of `kmRay2IntersectLineSegment`, the one
+/// path the artifact carried) and 24 more rows, which failed the program's
+/// delivery custody by themselves.
+#[test]
+fn r430_final_reverts_name_every_owner_of_a_withheld_class() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+
+    let class = SignatureClassId::of(rustc_hir::def_id::LocalDefId {
+        local_def_index: rustc_hir::def_id::DefIndex::from_u32(352),
+    });
+    let other = SignatureClassId::of(rustc_hir::def_id::LocalDefId {
+        local_def_index: rustc_hir::def_id::DefIndex::from_u32(410),
+    });
+    let withheld = BTreeSet::from([class]);
+    let display = BTreeMap::from([
+        (
+            class,
+            "src::kazmath::ray2::kmRay2IntersectLineSegment".to_owned(),
+        ),
+        (other, "src::kazmath::vec2::kmVec2Dot".to_owned()),
+    ]);
+    let owners = BTreeMap::from([
+        (
+            class,
+            BTreeSet::from([
+                "src::kazmath::ray2::kmRay2IntersectBox".to_owned(),
+                "src::kazmath::ray2::kmRay2IntersectLineSegment".to_owned(),
+            ]),
+        ),
+        (
+            other,
+            BTreeSet::from(["src::kazmath::vec2::kmVec2Dot".to_owned()]),
+        ),
+    ]);
+    let receipt = crate::bo_rewriter::render_raw_boundary_final_reverts(
+        &withheld,
+        &BTreeSet::new(),
+        &display,
+        &owners,
+        &withheld,
+        None,
+    );
+    let rows = receipt
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "{receipt}");
+    assert!(
+        rows.iter()
+            .any(|row| row[1] == "src::kazmath::ray2::kmRay2IntersectBox"),
+        "the class-mate the display path does not name must be a row: {receipt}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row[1] == "src::kazmath::ray2::kmRay2IntersectLineSegment"),
+        "{receipt}"
+    );
+    assert!(
+        rows.iter().all(|row| row[2] == "local-def-index:352"),
+        "both rows carry the withheld class's id: {receipt}"
+    );
+    // A class with no recorded owner keeps the display path, and an unnamed
+    // one still fails closed as before.
+    let bare = crate::bo_rewriter::render_raw_boundary_final_reverts(
+        &withheld,
+        &BTreeSet::new(),
+        &display,
+        &BTreeMap::new(),
+        &withheld,
+        None,
+    );
+    assert!(
+        bare.contains("src::kazmath::ray2::kmRay2IntersectLineSegment"),
+        "{bare}"
+    );
+    // This IS the defect's shape: the display-path-only rendering (the artifact
+    // before R430-1) names one owner of the class and the census therefore
+    // never learns that the other owner's text stayed verbatim.
+    assert!(
+        !bare.contains("src::kazmath::ray2::kmRay2IntersectBox"),
+        "the display path alone cannot name the class-mate: {bare}"
+    );
+    let unknown = crate::bo_rewriter::render_raw_boundary_final_reverts(
+        &withheld,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &withheld,
+        None,
+    );
+    assert!(unknown.contains("<unknown-local-class>"), "{unknown}");
+}

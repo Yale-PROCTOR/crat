@@ -577,6 +577,7 @@ mod tests {
                         &reverted,
                         &BTreeSet::new(),
                         &labels,
+                        &BTreeMap::new(),
                         &reverted,
                         None,
                     );

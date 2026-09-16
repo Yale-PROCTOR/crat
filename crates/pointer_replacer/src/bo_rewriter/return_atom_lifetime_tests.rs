@@ -222,7 +222,7 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
             let effective = emission.plan.effective_reverted_classes(&held, &atoms);
             let paths = emission.plan.class_finalization.classes.keys().map(|owner|
                 (*owner, tcx.def_path_str(owner.local_def_id().to_def_id()))).collect();
-            artifacts.final_reverts = super::render_raw_boundary_final_reverts(&effective, &atoms, &paths, &held, Some(&emission.plan));
+            artifacts.final_reverts = super::render_raw_boundary_final_reverts(&effective, &atoms, &paths, &std::collections::BTreeMap::new(), &held, Some(&emission.plan));
             let rows = artifacts.final_reverts.lines().skip(1)
                 .map(|line| line.split('\t').collect::<Vec<_>>()).collect::<Vec<_>>();
             let choose_name = tcx.def_path_str(subject.fn_did.to_def_id());
