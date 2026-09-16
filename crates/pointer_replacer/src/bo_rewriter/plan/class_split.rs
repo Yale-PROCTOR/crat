@@ -161,6 +161,16 @@ pub(crate) mod fixture {
     /// Returns the E1 subject receipt (with its `exclusion` column), the arm
     /// outcomes and the emitted root text.
     pub(crate) fn run(src: &str) -> Receipts {
+        run_injected(src, &|_| {})
+    }
+
+    /// The same drive with a hook on the decided table at the phase boundary
+    /// (the `decide_table_perturbed` precedent): hands the plan a form the
+    /// small crate's own decisions do not reach.
+    pub(crate) fn run_injected(
+        src: &str,
+        inject: &(dyn Fn(&mut crate::bo_rewriter::decision::DecisionTable) + Sync),
+    ) -> Receipts {
         let dir = std::env::temp_dir().join(format!(
             "crat-class-split-fixture-{}-{}",
             std::process::id(),
@@ -173,7 +183,7 @@ pub(crate) mod fixture {
             ::utils::compilation::path_to_input(&root),
             Some(&root),
             crate::bo_rewriter::MAX_REVERT_ROUNDS,
-            &|_| {},
+            inject,
             false,
             true,
             true,
@@ -228,7 +238,7 @@ pub(crate) mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{column, run};
+    use super::fixture::{column, run, run_injected};
 
     /// brotli `PrefixEncodeCopyDistance(…, code, extra_bits)` called from
     /// `InitCommand` with `&mut (*self_0).dist_prefix_, &mut
@@ -644,6 +654,68 @@ pub mod src {
             Some(Form::Ref { mutable: false })
         );
         assert_eq!(a5_argument_expression_form("cast", Form::Raw), None);
+    }
+
+    /// **Relay 009 STOP 1 — the nested-caller-edit guard.** lodepng
+    /// `lodepng_chunk_check_crc(chunk)` on batch 8's composition: `chunk` is
+    /// delivered as `&[u8]` by the slice family and the A5 raw view at
+    /// `lodepng_crc32(&*chunk.offset(4), …)` (its `data` position is a raw
+    /// view for another call's pair) re-emits the ORIGINAL argument text over
+    /// the delivered root — `from_ref(&*chunk.offset(4))`, `E0599`, the
+    /// callee's class reverts. The small crate cannot deliver `chunk` as a
+    /// slice through that use (`slice-cursor-use` at this base), so the
+    /// delivered root is INJECTED at the phase boundary (`check::chunk` →
+    /// `Slice`, the `force_a5_term_addr_of_forms` precedent) and the terminal
+    /// replay sees exactly the composition's state.
+    const NESTED_CALLER_EDIT_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+pub unsafe fn copy_bytes(dst: *mut u8, src: *const u8, n: usize) {
+    let mut i: usize = 0;
+    while i < n {
+        *dst.offset(i as isize) = *src.offset(i as isize);
+        i = i.wrapping_add(1);
+    }
+}
+pub unsafe fn pair_site(p: *mut u8, n: usize) {
+    copy_bytes(&mut *p.offset(0), &*p.offset(n as isize), n);
+}
+pub unsafe fn check(chunk: *const u8, out: *mut u8, n: usize) {
+    let first = *chunk.offset(0);
+    if first == 0 { return; }
+    copy_bytes(out, &*chunk.offset(4), n);
+}
+"#;
+
+    fn deliver_chunk_as_a_slice(table: &mut crate::bo_rewriter::decision::DecisionTable) {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("check::chunk") {
+                *decision = crate::bo_rewriter::decision::Decision::Slice {
+                    mutable: false,
+                    uses: Vec::new(),
+                };
+            }
+        }
+    }
+
+    /// With the guard: `copy_bytes`'s class holds, typed
+    /// `a5-fallback-unrenderable:nested-caller-edit`, and no `from_ref(&*chunk.offset`
+    /// text is emitted. Without it (fault F8): the stale text is emitted and
+    /// the class reverts on `E0599` (the composition's lodepng row).
+    #[test]
+    fn a_view_over_a_root_delivered_by_another_family_holds_typed() {
+        let got = run_injected(NESTED_CALLER_EDIT_SHAPE, &deliver_chunk_as_a_slice);
+        let text = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !text.contains("from_ref(&*chunk.offset"),
+            "the stale original text must not be emitted:\n{}",
+            got.emitted
+        );
+        let exclusion = column(&got.subjects, "copy_bytes::dst#1", "exclusion");
+        assert!(
+            exclusion.contains("a5-fallback-unrenderable:nested-caller-edit"),
+            "the callee's class holds on the typed reason, not a revert: {exclusion}\n{}",
+            got.subjects
+        );
     }
 
     /// binn `binn_is_valid_ex(ptr, ptype, …)`: `plimit = p.offset(size)` is

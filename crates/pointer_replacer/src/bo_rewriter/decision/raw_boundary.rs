@@ -386,6 +386,137 @@ pub(crate) fn a5_raw_expr_view_admits(source_shape: &str, argument: &str) -> boo
     true
 }
 
+/// **wave-5d2 (relay 009 STOP 1) — a raw view's argument text over a root
+/// another family delivered.** The A5 snapshot hoists the view's argument as
+/// the ORIGINAL text; the AST layer's transforms of that root inside the
+/// argument (a slice family's `chunk.offset(k)` rewrite, a cursor form) are
+/// not in that text, so `from_ref(&*chunk.offset(4))` is emitted over
+/// `chunk: &[u8]` (batch 8's composition, lodepng `lodepng_chunk_check_crc`).
+/// The stale case is decidable at the terminal replay from what it already
+/// knows — the root's PLACED form and the argument text:
+///
+/// - a root placed as a plain reference (`&T` / `&mut T`) keeps every use
+///   that dereferences it first (`&*p`, `(*p).field`: the field's own type
+///   whatever the root's form; wave-6f reconciles field edits separately);
+///   a use of the binding itself as the pointer operand (`p.offset(..)`,
+///   `p as ..`, `p[..]` — `*p.offset(k)` is `*(p.offset(k))`) is stale;
+/// - a root placed as a slice, an `Option`, a cursor or a nested slice has no
+///   use the original text renders: every mention is stale.
+///
+/// Such a view is held `nested-caller-edit`, typed, so the callee's class
+/// holds instead of emitting stale text and reverting.
+pub(crate) fn a5_view_argument_is_stale_over_root(
+    argument: &str,
+    root_name: &str,
+    root_form: super::seam::Form,
+) -> bool {
+    use super::seam::Form;
+    if root_name.is_empty() {
+        return false;
+    }
+    let requires_operand = match root_form {
+        Form::Raw => return false,
+        Form::Ref { .. } => true,
+        Form::Slice { .. } | Form::Opt { .. } | Form::Cursor { .. } | Form::NestedSlice { .. } => {
+            false
+        }
+    };
+    let mut from = 0usize;
+    while let Some(found) = argument[from..].find(root_name) {
+        let start = from + found;
+        let end = start + root_name.len();
+        let whole = !argument[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !argument[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if whole {
+            if !requires_operand {
+                return true;
+            }
+            let previous = argument[..start].trim_end().chars().next_back();
+            let rest = argument[end..].trim_start();
+            let binds_tighter = rest.starts_with('.') || rest.starts_with('[');
+            if previous != Some('*') || binds_tighter {
+                return true;
+            }
+        }
+        from = end;
+    }
+    false
+}
+
+#[cfg(test)]
+mod a5_nested_caller_edit_tests {
+    use super::{super::seam::Form, a5_view_argument_is_stale_over_root};
+
+    const REF: Form = Form::Ref { mutable: false };
+    const SLICE: Form = Form::Slice { mutable: false };
+
+    #[test]
+    fn a_reference_root_is_stale_only_as_the_pointer_operand() {
+        for text in [
+            "&*chunk.offset(4 as isize)",
+            "chunk.offset(k) as *const c_void",
+            "chunk as *const u8",
+            "&chunk[0]",
+        ] {
+            assert!(
+                a5_view_argument_is_stale_over_root(text, "chunk", REF),
+                "{text}"
+            );
+        }
+        for text in [
+            "&*chunk",
+            "&*(*chunk).start",
+            "((*reader).data).offset(bytepos as isize) as *const c_void",
+            "&mut (*self_0).dist_extra_",
+            "(*source).iccp_name",
+        ] {
+            for root in ["chunk", "reader", "self_0", "source"] {
+                assert!(
+                    !a5_view_argument_is_stale_over_root(text, root, REF),
+                    "{text} / {root}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_slice_or_option_root_is_stale_at_any_mention_and_a_raw_root_never() {
+        assert!(a5_view_argument_is_stale_over_root(
+            "&*chunk", "chunk", SLICE
+        ));
+        assert!(a5_view_argument_is_stale_over_root(
+            "&*chunk.offset(4)",
+            "chunk",
+            Form::Opt {
+                mutable: false,
+                slice: false
+            }
+        ));
+        assert!(!a5_view_argument_is_stale_over_root(
+            "&*chunk.offset(4)",
+            "chunk",
+            Form::Raw
+        ));
+        // Identifier boundaries: `chunk2` and `my_chunk` are not `chunk`.
+        assert!(!a5_view_argument_is_stale_over_root(
+            "chunk2.offset(1)",
+            "chunk",
+            SLICE
+        ));
+        assert!(!a5_view_argument_is_stale_over_root(
+            "my_chunk as *const u8",
+            "chunk",
+            SLICE
+        ));
+    }
+}
+
 #[cfg(test)]
 mod a5_raw_expr_view_tests {
     use super::a5_raw_expr_view_admits;

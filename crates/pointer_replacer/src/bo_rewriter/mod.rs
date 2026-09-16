@@ -6195,6 +6195,28 @@ fn prepare_plan_files<'tcx>(
             let terminal_source =
                 decision::seam::a5_argument_expression_form(view.argument_shape, terminal_subject)
                     .unwrap_or(terminal_subject);
+            // wave-5d2 (relay 009): the argument text is the ORIGINAL; a root
+            // delivered in a non-raw form whose uses inside the argument the AST
+            // layer rewrites would be re-emitted stale (`from_ref(&*chunk.offset(4))`
+            // over `chunk: &[u8]`). Typed hold instead.
+            if matches!(view.argument_shape, "addr-of" | "addr-of-mut" | "raw-expr")
+                && view.source_node.is_some_and(|(owner, hir)| {
+                    table.entries.iter().any(|(subject, _)| {
+                        subject.fn_did == owner
+                            && subject.hir_id == hir
+                            && subject.param_name.as_deref().is_some_and(|name| {
+                                decision::raw_boundary::a5_view_argument_is_stale_over_root(
+                                    &view.argument_expression,
+                                    name,
+                                    terminal_subject,
+                                )
+                            })
+                    })
+                })
+            {
+                terminal_hold = Some("a5-fallback-unrenderable:nested-caller-edit".into());
+                break;
+            }
             match decision::seam::replan_a5_raw_view(view, terminal_target, terminal_source) {
                 Ok(mut replanned) => {
                     if view.source_node.is_some() {
