@@ -223,6 +223,28 @@ fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
             {
                 self.found = true;
             }
+            // Clause (b) for the assignment form: `s = f(..)` with `f` a
+            // local callee is the receiver shape clause (b) refuses at a
+            // `let` — the return family reads `f`'s settled return, a
+            // constructor over it is E0308 (lil's `str = lil_to_string(..)`
+            // under the null-init nullable-slice assignment).
+            if let ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && matches!(&lhs.kind, ExprKind::Path(path)
+                    if self.typeck.qpath_res(path, lhs.hir_id) == Res::Local(self.binding))
+            {
+                let mut value = rhs;
+                while let ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) = value.kind {
+                    value = inner;
+                }
+                if let ExprKind::Call(callee, _) = value.kind
+                    && let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
+                    && let Res::Def(DefKind::Fn, def_id) = path.res
+                    && def_id.is_local()
+                    && self.tcx.is_mir_available(def_id)
+                {
+                    self.found = true;
+                }
+            }
             rustc_hir::intravisit::walk_expr(self, expr);
         }
     }

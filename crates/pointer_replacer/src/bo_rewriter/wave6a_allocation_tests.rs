@@ -927,6 +927,39 @@ fn w6a_b1_suffix_copy_of_a_delivered_root_is_the_reslice() {
     );
 }
 
+/// **Clause (b), the assignment form** (lil `fnc_charat::str`: null-init,
+/// then `str = lil_to_string(..)`, then `strlen(str)`): an unannotated local
+/// ASSIGNED from a local callee's call is the receiver shape clause (b)
+/// refuses at a `let` — the return family reads the callee's settled return,
+/// a nullable-slice constructor over the assignment is E0308 once it
+/// converts. Before the libc fix the `strlen` bug held it by accident.
+#[test]
+fn w6a_b1_assigned_call_of_a_local_callee_is_refused() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments)]\n\
+               extern \"C\" { fn strlen(s: *const std::os::raw::c_char) -> usize; }\n\
+               pub unsafe fn to_string(mut v: *mut std::os::raw::c_char) -> *const std::os::raw::c_char { return v; }\n\
+               pub unsafe fn charat(mut v: *mut std::os::raw::c_char, mut index: usize) -> std::os::raw::c_char {\n\
+                   let mut s = 0 as *const std::os::raw::c_char;\n\
+                   s = to_string(v);\n\
+                   if index >= strlen(s) { return 0; }\n\
+                   return *s.offset(index as isize);\n\
+               }\n";
+    let out = emitted("assigned-call", src);
+    let text = compact(&out.source);
+    assert!(
+        !text.contains("from_raw_parts("),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert!(
+        reason_of(&out.degradations, "charat::s").is_some(),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+}
+
 #[test]
 fn w6a_b1_libc_argument_is_not_a_shared_interface() {
     let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
