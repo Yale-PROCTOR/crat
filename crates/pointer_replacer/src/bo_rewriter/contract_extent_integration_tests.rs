@@ -1640,3 +1640,44 @@ fn ce_a03_a_contract_alone_candidate_at_a_pending_sibling_site_holds() {
     let source = emitted(CE_A03_CONTRACT_ALONE_PENDING);
     assert!(!source.contains("format: &[i8]"), "{source}");
 }
+
+/// The corpus spelling of CE-M04 (libtree `small_vec_u64_init`, a batch-8
+/// loss): the struct lives in nested modules, so the operand's pointee prints
+/// as `src::libtree::small_vec_u64_t` while the count's source text can only
+/// spell `size_of::<small_vec_u64_t>()`. The one-element refinement compares
+/// what the two forms have in common — the type's final path segment.
+const CE_M06_NESTED_POINTEE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+pub mod src {
+    pub mod libtree {
+        extern "C" {
+            fn memset(_: *mut core::ffi::c_void, _: i32, _: u64) -> *mut core::ffi::c_void;
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct small_vec_u64_t {
+            pub p: *mut u64,
+            pub n: u64,
+            pub buf: [u64; 16],
+        }
+        pub unsafe fn small_vec_u64_init(mut v: *mut small_vec_u64_t) {
+            memset(v as *mut core::ffi::c_void, 0 as i32,
+                ::std::mem::size_of::<small_vec_u64_t>() as u64);
+            (*v).p = ((*v).buf).as_mut_ptr();
+        }
+    }
+}
+"#;
+
+#[test]
+fn ce_m06_a_nested_pointee_still_reads_as_one_element() {
+    let decisions = super::emit_tests::decisions_of(CE_M06_NESTED_POINTEE);
+    let v = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "v" && *is_param)
+        .expect("CE-M06 v subject");
+    assert_eq!(v.2, "<emitted>", "{decisions:#?}");
+    let source = emitted(CE_M06_NESTED_POINTEE);
+    assert!(source.contains("v: &mut small_vec_u64_t"), "{source}");
+    assert!(!source.contains("[small_vec_u64_t]"), "{source}");
+}

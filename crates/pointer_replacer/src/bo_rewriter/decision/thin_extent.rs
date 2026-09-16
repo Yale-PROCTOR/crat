@@ -58,12 +58,21 @@ pub(crate) fn position_consumes_many_elements(
 /// casts, against the operand's own pointee (a `c_void` position types the
 /// argument, not the row). Anything else at a `ByteCount` position keeps the
 /// row's multi-element extent.
+///
+/// The two forms are compared on the type's FINAL PATH SEGMENT, which is all
+/// they can share: the pointee is a printed type, carrying the path from the
+/// crate root (`src::libtree::small_vec_u64_t`), while the count is the source
+/// text of `size_of::<..>()`, which names the type as the call's own module
+/// sees it (`small_vec_u64_t`). Measured at batch 8: with a whole-path
+/// comparison the refinement missed every corpus site and libtree's
+/// `small_vec_u64_init::v#1` lost its delivery.
 pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallArgFact) -> bool {
     let Some(count) = &fact.contract_count else { return false };
     let pointee = fact.operand_pointee.trim().trim_start_matches("::");
     if pointee.is_empty() || pointee == "c_void" || pointee.ends_with("::c_void") {
         return false;
     }
+    let pointee = pointee.rsplit("::").next().unwrap_or(pointee);
     let mut spelling = count.expression.split_whitespace().collect::<String>();
     // Peel the trailing `as <ty>` casts and grouping parentheses C2Rust
     // wraps a `size_of` in.
@@ -91,7 +100,10 @@ pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallA
         spelling
             .strip_prefix(prefix)
             .and_then(|rest| rest.strip_suffix(">()"))
-            .is_some_and(|argument| argument.trim_start_matches("::") == pointee)
+            .is_some_and(|argument| {
+                let argument = argument.trim_start_matches("::");
+                !argument.is_empty() && argument.rsplit("::").next().unwrap_or(argument) == pointee
+            })
     })
 }
 
