@@ -920,3 +920,56 @@ pub unsafe fn fragment(input: *const u8, block_size: usize, table: *mut i32, las
         ),
     );
 }
+
+#[test]
+fn slicecursor_encode_lz77_body() {
+    // lodepng `encodeLZ77`'s body around the match loop: the input parameter
+    // is read at computed offsets and roots the three null-initialised
+    // cursors through the reborrow idiom. (With `in_0` also handed whole to a
+    // local callee the tree hits the R398-1 restoration wall — that reduction
+    // is kept as a witness for wave-5d, not in the suite.)
+    let input = r#"
+pub unsafe fn lz77(in_0: *const u8, insize: usize, chain: *mut u16, maxsize: usize) -> u32 {
+    let mut pos = 0usize;
+    let mut total = 0u32;
+    let mut lastptr = 0 as *const u8;
+    let mut foreptr = 0 as *const u8;
+    let mut backptr = 0 as *const u8;
+    while pos < insize {
+        let hashval = if pos + 2 < insize { (*in_0.offset(pos as isize) as u32) ^ (*in_0.offset((pos + 1) as isize) as u32) } else { 0 };
+        let mut numzeros = 0u32;
+        if hashval == 0 && pos + 1 < insize && *in_0.offset((pos + 1) as isize) == 0 { numzeros = 1; }
+        let limit = if insize < pos + maxsize { insize } else { pos + maxsize };
+        lastptr = &*in_0.offset(limit as isize) as *const u8;
+        let cur = *chain.offset(pos as isize) as usize;
+        if cur > 0 && cur <= pos {
+            foreptr = &*in_0.offset(pos as isize) as *const u8;
+            backptr = &*in_0.offset((pos - cur) as isize) as *const u8;
+            if numzeros >= 1 {
+                backptr = backptr.offset(numzeros as isize);
+                foreptr = foreptr.offset(numzeros as isize);
+            }
+            while foreptr != lastptr && *backptr == *foreptr {
+                backptr = backptr.offset(1);
+                foreptr = foreptr.offset(1);
+            }
+            total += foreptr.offset_from(&*in_0.offset(pos as isize) as *const u8) as u32;
+        }
+        pos += 1;
+    }
+    total
+}
+"#;
+    let source = emitted(input);
+    save_fixture("encode-lz77-body", input, &source);
+    assert!(
+        source.contains("Option<crate::slice_cursor::SliceCursor"),
+        "optional cursors absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let b = [0u8, 0, 5, 6, 0, 0, 5, 6, 7]; let mut c = [0u16, 0, 0, 0, 4, 4, 4, 4, 4]; assert_eq!(unsafe { lz77(&b, 9, &mut c, 8) }, 10); }",
+        ),
+    );
+}
