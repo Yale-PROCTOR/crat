@@ -1443,6 +1443,46 @@ impl MutVisitor for UseGraftVisitor<'_> {
             rustc_ast::mut_visit::walk_expr(self, e);
             return;
         }
+        // **The BRACKET form** (relay wave-6a/020 (ii)): a producer that must
+        // not CLAIM a node's text — because another class edits inside it —
+        // names the node by two zero-width keys at its boundaries instead of
+        // one key over the whole span. The children are walked FIRST, so every
+        // inner edit is applied, and the node's own re-rendered text is then
+        // wrapped. This is the same composition the outer-over-inner arm makes
+        // for a replacement, expressed so that the outer claims no interval.
+        let bracket = (
+            self.uses.get(&(key.0, key.0)),
+            self.uses.get(&(key.1, key.1)),
+        );
+        if let (Some(open), Some(close)) = bracket
+            && key.0 != key.1
+        {
+            let (open, close) = (open.clone(), close.clone());
+            self.consumed.insert((key.0, key.0));
+            self.consumed.insert((key.1, key.1));
+            if !self.guard.claim(e.id, e.span, "use") {
+                self.stats.refused += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, e);
+            let inner = rustc_ast_pretty::pprust::expr_to_string(e);
+            match graft_expr(&format!("{open}{inner}{close}")) {
+                Ok(parsed) => {
+                    e.kind = parsed.kind;
+                    self.stats.grafted += 1;
+                    self.stats
+                        .rendered
+                        .push((key.0, rustc_ast_pretty::pprust::expr_to_string(e)));
+                }
+                Err(offending) => {
+                    self.stats.parse_failed += 1;
+                    if self.stats.parse_failures.len() < 10 {
+                        self.stats.parse_failures.push(offending);
+                    }
+                }
+            }
+            return;
+        }
         if let Some(text) = self.uses.get(&key) {
             // `insert` returns false when the key was already reached — a
             // SECOND AST node carrying the same span. Counted here because

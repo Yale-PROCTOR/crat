@@ -835,22 +835,41 @@ pub(crate) fn derive<'tcx>(
                 }
             }
             for (span, else_null, a) in &creations {
-                let call_text = snippet(*span);
-                let boxed = match (&a.shape, &a.count) {
-                    (BoxShape::Sized, _) => format!("Box::from_raw({call_text})"),
-                    (BoxShape::Slice, Some(count)) => format!(
-                        "Box::from_raw(core::ptr::slice_from_raw_parts_mut({call_text}, ({count}) as usize))"
+                // **The construction is TWO INSERTIONS, not a replacement**
+                // (relay wave-6a/020 (ii), R432-2). The allocator call text is
+                // left exactly where it is and the `Box` is spelled around it:
+                // a prefix at the allocation's opening boundary and a suffix at
+                // its closing one. A replacement of the whole allocation would
+                // CONTAIN every edit another class plans inside the call — at
+                // 26 brotli receivers that is the raw-boundary C arm bridging
+                // the contract's own manager argument (`BrotliAllocate(&mut *m,
+                // ..)`, one byte inside the initializer), and containment holds
+                // both classes (`cross-class-interval-collision`, report 014
+                // claim 4). Two zero-width insertions at the boundaries contain
+                // nothing: the bridge renders where it was planned, inside text
+                // this rule never claims.
+                let (open, close) = match (&a.shape, &a.count) {
+                    (BoxShape::Sized, _) => ("Box::from_raw(".to_owned(), ")".to_owned()),
+                    (BoxShape::Slice, Some(count)) => (
+                        "Box::from_raw(core::ptr::slice_from_raw_parts_mut(".to_owned(),
+                        format!(", ({count}) as usize))"),
                     ),
                     (BoxShape::Slice, None) => unreachable!("a slice shape carries its count"),
                 };
+                let (open, close) = if optional {
+                    (format!("Some({open}"), format!("{close})"))
+                } else {
+                    (open, close)
+                };
                 expr_edits.push(BoxExprEdit {
-                    span: *span,
-                    replacement: if optional {
-                        format!("Some({boxed})")
-                    } else {
-                        boxed
-                    },
+                    span: span.shrink_to_lo(),
+                    replacement: open,
                     receipt: "allocator-contract-construction",
+                });
+                expr_edits.push(BoxExprEdit {
+                    span: span.shrink_to_hi(),
+                    replacement: close,
+                    receipt: "allocator-contract-construction-close",
                 });
                 if let Some(null) = else_null {
                     expr_edits.push(BoxExprEdit {

@@ -519,3 +519,68 @@ pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n:
         out.source
     );
 }
+
+/// **The containment the batch-9 census measured** (report 014 claim 4,
+/// relay wave-6a/020 (ii)): when the manager the contract allocates through is
+/// RAW in the caller — brotli's shape at 26 receivers — the C arm bridges it
+/// AT THE ARGUMENT, `BrotliAllocate(&mut *m, ..)`, and that one-byte edit sits
+/// INSIDE the initializer this rule rewrites. A construction rendered as ONE
+/// replacement of the allocation CONTAINS it, and the signature-class layer
+/// holds both classes with `cross-class-interval-collision`. Rendered as two
+/// insertions at the allocation's boundaries, this rule claims no interval of
+/// the call at all: the bridge renders where it was planned and the collision
+/// term is gone from the hold.
+///
+/// The fixture sources its manager from a foreign call, which is the only
+/// shape that keeps a manager raw without arithmetic; that leaves this class
+/// with wave-6l's own `return-not-adapted` subject, so the assertion is the
+/// hold's TERMS, not the delivery. The idiom that delivers is the
+/// ensure-capacity witness above, whose bytes the insertions reproduce
+/// exactly.
+#[test]
+fn w6a_ac_the_construction_contains_no_edit_of_the_allocator_call() {
+    let src = format!(
+        "{PRELUDE}\
+extern \"C\" {{\n\
+    fn get_manager() -> *mut MemoryManager;\n\
+}}\n\
+pub unsafe extern \"C\" fn raw_manager(mut n: usize, mut split: *mut u32) {{\n\
+    let mut m = get_manager();\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 3 as u32;\n\
+    *split = *syms.offset(0 as isize);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("ac-raw-manager", &src);
+    let text = compact(&out.source);
+    // The C arm's bridge is planned inside the allocator call and renders.
+    assert!(
+        text.contains("BrotliAllocate(&mut*m,"),
+        "the C arm's bridge must render at the argument\n{}",
+        out.source
+    );
+    // The degradation of a class-held subject carries its MIR suffix, and the
+    // terms live in the reason's detail, so the hold is read whole.
+    let hold = out
+        .degradations
+        .iter()
+        .filter(|d| d.subject.starts_with("raw_manager::syms"))
+        .map(|d| format!("{:?}", d.reason))
+        .collect::<Vec<_>>()
+        .join(";");
+    assert!(
+        !hold.contains("cross-class-interval-collision"),
+        "this rule must claim no interval of the allocator call; hold = {hold}\n{}",
+        out.source
+    );
+    // The rule itself admitted the subject: the residue is other families'.
+    assert!(
+        out.artifacts
+            .allocator_contract_receipts
+            .contains("raw_manager::syms\tadmitted\t"),
+        "{}",
+        out.artifacts.allocator_contract_receipts
+    );
+}
