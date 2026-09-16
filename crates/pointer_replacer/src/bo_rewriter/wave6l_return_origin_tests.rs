@@ -1516,3 +1516,71 @@ fn w6l_thin_unserved_result_position_holds_the_callee_class_typed() {
         "{reason}"
     );
 }
+
+/// kazmath's `kmVec3Fill` shape (heman): a bare-parameter return whose
+/// result most callers DISCARD (`kmVec3Fill(&mut v, 1., 2., 3.);`) and one
+/// caller binds.
+const KM_VEC3_FILL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+pub struct kmVec3 { pub x: f32, pub y: f32, pub z: f32 }
+#[no_mangle]
+pub unsafe extern "C" fn kmVec3Fill(mut pOut: *mut kmVec3, x: f32, y: f32, z: f32) -> *mut kmVec3 {
+    (*pOut).x = x;
+    (*pOut).y = y;
+    (*pOut).z = z;
+    return pOut;
+}
+#[no_mangle]
+pub unsafe extern "C" fn fill_only(mut v: *mut kmVec3) {
+    kmVec3Fill(v, 1.0, 2.0, 3.0);
+}
+#[no_mangle]
+pub unsafe extern "C" fn fill_use(mut v: *mut kmVec3) -> f32 {
+    let mut p = kmVec3Fill(v, 1.0, 2.0, 3.0);
+    (*p).x
+}
+"#;
+
+/// Wave 6 — a DISCARDED native result needs no carrier: the call statement
+/// takes any return type. Before: `PositionUnbuilt("discarded-result")` held
+/// the callee's class (31 heman rows on batch 8's census — kazmath's
+/// `kmVec3Fill` / `Zero` / `Cross`, `kmMat4Rotation*`, `kmQuaternion*`).
+#[test]
+fn w6l_discarded_native_result_keeps_the_callee_class_placed() {
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        degradations,
+        ..
+    } = emitted(
+        "km-fill",
+        KM_VEC3_FILL,
+        &["kmVec3Fill", "fill_only", "fill_use"],
+    )
+    else {
+        panic!("km fill emission degraded");
+    };
+    println!("W6L-FILL-EMITTED\n{source}\nW6L-FILL-END\n{degradations:?}");
+    assert_eq!(reverted_count, 0);
+    assert!(
+        !degradations
+            .iter()
+            .any(|d| format!("{:?}", d.reason).contains("discarded-result")),
+        "{degradations:?}"
+    );
+    let text = compact(&source);
+    assert!(
+        text.contains(
+            "fn__crat_safe_kmVec3Fill<'a>(mutpOut:&'amutkmVec3,x:f32,y:f32,z:f32)->&'amutkmVec3"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("__crat_safe_kmVec3Fill(v,1.0,2.0,3.0);"),
+        "{text}"
+    );
+    assert!(
+        text.contains("letmutp:&mutkmVec3=__crat_safe_kmVec3Fill(v,1.0,2.0,3.0);"),
+        "{text}"
+    );
+}
