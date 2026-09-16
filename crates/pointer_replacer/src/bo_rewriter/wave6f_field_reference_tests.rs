@@ -1108,6 +1108,42 @@ fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
     );
 }
 
+const TULIP_ARRAYS: &str = include_str!("wave6f_fixture_tulip_arrays.rs");
+
+/// Witness 20 (relay 023 §3, build 1) — the census's eleven
+/// `array-local-incomplete:initializer` rows are tulip's element LISTS, the
+/// substrate's other spelling of the same array. A list whose elements are
+/// all the null literal is the repeat form written out: it is admitted and
+/// renders `[None; N]`, so the array reaches its next gate — here the whole
+/// array handed to a callee (`inputs.as_ptr()`), `array-use-shape`, which is
+/// the next build. A list with a VALUE element is a different family (each
+/// element is a store whose source must deliver) and holds under its own
+/// reason, `initializer-element-source`, instead of the blanket one.
+#[test]
+fn w6f_tulip_element_list_initializers_split_by_their_elements() {
+    let observed = observe(TULIP_ARRAYS);
+    let null_list = field_row(&observed, "stress", "inputs");
+    assert_eq!(
+        (null_list.2.as_str(), null_list.4.as_str()),
+        ("held", "array-local-incomplete:array-use-shape"),
+        "{null_list:?}"
+    );
+    let value_list = field_row(&observed, "main_0", "all_inputs");
+    assert_eq!(
+        (value_list.2.as_str(), value_list.4.as_str()),
+        ("held", "array-local-incomplete:initializer-element-source"),
+        "{value_list:?}"
+    );
+    // A zero-length array has no element to convert: `[]` is not the null
+    // initializer, it is nothing, and the transaction stays out of it.
+    let empty = field_row(&observed, "empty_0", "none_at_all");
+    assert_eq!(
+        (empty.2.as_str(), empty.4.as_str()),
+        ("held", "array-local-incomplete:initializer-element-source"),
+        "{empty:?}"
+    );
+}
+
 const AVL: &str = include_str!("wave6f_fixture_avl.rs");
 
 /// era-5c-shaped frame for avl (the rotation family, relay 003 §2): both

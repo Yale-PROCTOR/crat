@@ -2062,13 +2062,46 @@ fn array_local_candidates(
                     len,
                     pointee,
                 };
-                // The initializer: a repeated null literal, or nothing.
+                // The initializer: a repeated null literal, an element LIST
+                // of null literals (the substrate's other spelling of the
+                // same array — tulip writes `[0 as *const f64, 0 as ...]`),
+                // or nothing. A list with a VALUE element is a different
+                // family: each element is a store whose source must deliver,
+                // and it holds under its own reason until that arm is built.
                 let mut hold = None;
                 let mut sites = Vec::new();
+                let all_null = |elems: &[rustc_hir::Expr<'_>]| {
+                    !elems.is_empty() && elems.iter().all(super::emitability::is_zero_literal)
+                };
                 match local.init {
                     None => {}
                     Some(init) => match init.kind {
+                        ExprKind::Array(elems) if !all_null(elems) => {
+                            hold = Some(
+                                "array-local-incomplete:initializer-element-source".to_owned(),
+                            );
+                        }
                         ExprKind::Repeat(elem, _) if super::emitability::is_zero_literal(elem) => {
+                            sites.push(Site {
+                                owner: self.owner,
+                                kind: SiteKind::Literal,
+                                span: init.span,
+                                field_text: info.name.clone(),
+                                rhs: Some(Rhs::Null),
+                                local: None,
+                                index_text: None,
+                                consumer: None,
+                                base: None,
+                                raw_base: false,
+                                assign_span: None,
+                                hoists: Vec::new(),
+                                cast: None,
+                                written: false,
+                            });
+                        }
+                        ExprKind::Array(_) => {
+                            // Every element is the null literal: the same
+                            // array as the repeat form, spelled out.
                             sites.push(Site {
                                 owner: self.owner,
                                 kind: SiteKind::Literal,
