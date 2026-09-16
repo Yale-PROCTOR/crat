@@ -1457,7 +1457,7 @@ fn w6l_thin_expression_position_receivers_keep_the_callee_class_placed() {
 }
 
 /// Wave 5 (thin form) — the method-receiver position holds the callee's
-/// class typed on every head.
+/// class typed on every head where the callee is this rule's.
 #[test]
 fn w6l_thin_unserved_result_position_holds_the_callee_class_typed() {
     let fixture = heman_thin_expression_receivers().replace(
@@ -1473,6 +1473,31 @@ fn w6l_thin_unserved_result_position_holds_the_callee_class_typed() {
         panic!("heman thin unserved position emission degraded");
     };
     assert_eq!(reverted_count, 0);
+    if !observe(&fixture)
+        .plans
+        .iter()
+        .any(|(function, _)| function == "heman_image_texel")
+    {
+        // R217-2(a) re-pin (batch-8 composition, dry3): another family
+        // delivers the null-initialised receiving local (`src`) from the raw
+        // call at its own stage and, the callee's class being held at this
+        // rule's stage anyway, the callee yields to it (no plan, no class
+        // hold of this rule's); the other receivers are typed holds.
+        assert!(
+            !degradations
+                .iter()
+                .any(|d| d.subject == "heman_image_texel::img#1"),
+            "{degradations:?}"
+        );
+        assert!(
+            degradations
+                .iter()
+                .any(|d| d.subject == "heman_draw_points::texel"
+                    && format!("{:?}", d.reason) == "ReturnNotAdapted"),
+            "{degradations:?}"
+        );
+        return;
+    }
     let img = degradations
         .iter()
         .find(|d| d.subject == "heman_image_texel::img#1")

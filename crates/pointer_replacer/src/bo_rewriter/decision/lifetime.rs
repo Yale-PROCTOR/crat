@@ -615,8 +615,14 @@ pub(crate) fn derive_return_eligibility(
     // local actually names, keyed by the callee's parameter, and never where
     // a bare-parameter return permit already exists.
     if let Ok(web) = &web {
-        let callees =
-            super::return_through_raw_field::candidate_callees(subjects, &decisions, constructions);
+        let assigned_elsewhere =
+            super::return_through_raw_field::assigned_raw_call_constructions(program, &decisions);
+        let callees = super::return_through_raw_field::candidate_callees(
+            subjects,
+            &decisions,
+            constructions,
+            &assigned_elsewhere,
+        );
         let mut callees = callees.into_iter().collect::<Vec<_>>();
         callees.sort_unstable_by_key(|(did, _)| did.local_def_index.as_u32());
         for (callee, callers) in callees {

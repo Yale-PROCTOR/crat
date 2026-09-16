@@ -55,8 +55,11 @@
 //! and the addendum-77 fallback extent receipt; thin callers of such a callee
 //! are held `lifetime-seam-incompatible` rather than mis-typed.
 
-use rustc_hash::FxHashMap;
-use rustc_hir::def_id::LocalDefId;
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    def_id::LocalDefId,
+    intravisit::{Visitor, walk_expr},
+};
 use rustc_middle::{mir::RETURN_PLACE, ty::TyKind};
 
 use super::{
@@ -479,11 +482,15 @@ pub(crate) fn candidate_callees(
     subjects: &[Subject],
     decisions: &FxHashMap<NodeKey, &Decision>,
     constructions: &super::construction::ConstructionFacts,
+    assigned_elsewhere: &FxHashSet<LocalDefId>,
 ) -> FxHashMap<LocalDefId, Vec<NodeKey>> {
     use super::construction::{CallResultTarget, Construction};
     let mut callers = FxHashMap::<LocalDefId, Vec<NodeKey>>::default();
     let mut named = FxHashMap::<LocalDefId, bool>::default();
     let mut served_elsewhere = FxHashMap::<LocalDefId, bool>::default();
+    for callee in assigned_elsewhere {
+        served_elsewhere.insert(*callee, true);
+    }
     for subject in subjects
         .iter()
         .filter(|subject| matches!(subject.ctor, Some(Construction::CallResult)))
@@ -517,6 +524,54 @@ pub(crate) fn candidate_callees(
             (callee, if served { Vec::new() } else { nodes })
         })
         .collect()
+}
+
+/// Callees whose result is ASSIGNED (`place = callee(..)`, not an
+/// initializer) into a local another family delivers from the raw call — an
+/// optional receiver's `(callee(..) as *const T).as_ref()` store over a
+/// null-initialised local. Such a construction is rendered over the raw
+/// call text; changing the callee's interface would break it, so the callee
+/// is not this rule's (the same yield as `candidate_callees` applies to
+/// initialized call results).
+pub(crate) fn assigned_raw_call_constructions(
+    program: &RustProgram<'_>,
+    decisions: &FxHashMap<NodeKey, &Decision>,
+) -> FxHashSet<LocalDefId> {
+    struct Assigns<'a, 'tcx> {
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+        owner: LocalDefId,
+        decisions: &'a FxHashMap<NodeKey, &'a Decision>,
+        served: FxHashSet<LocalDefId>,
+    }
+    impl<'tcx> Visitor<'tcx> for Assigns<'_, 'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expression.kind
+                && let rustc_hir::ExprKind::Call(callee, _) = rhs.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = lhs.kind
+                && let rustc_hir::def::Res::Local(binding) = path.res
+                && is_raw_call_construction(self.decisions.get(&(self.owner, binding)))
+                && let TyKind::FnDef(definition, _) =
+                    *self.tcx.typeck(self.owner).expr_ty(callee).kind()
+                && let Some(local) = definition.as_local()
+            {
+                self.served.insert(local);
+            }
+            walk_expr(self, expression);
+        }
+    }
+    let tcx = program.tcx;
+    let mut served = FxHashSet::default();
+    for &owner in &program.functions {
+        let mut assigns = Assigns {
+            tcx,
+            owner,
+            decisions,
+            served: FxHashSet::default(),
+        };
+        assigns.visit_expr(tcx.hir_body_owned_by(owner).value);
+        served.extend(assigns.served);
+    }
+    served
 }
 
 /// The dead-return parameter of a callee: the bare parameter its `return`
