@@ -24503,9 +24503,15 @@ fn raw_boundary_wave2_corpus_census() {
     // R407-14 (contract-alone): 57 -> 49 — the 8 `thin-extent` rows whose
     // every use is a NUL-terminated read position now promote to the shared
     // slice; retired by rule, confirmed by the batch census.
+    // Batch 8 morning (2026-09-16, main): the landed subset carries wave-4's
+    // set minus the counted-literal pair and none of wave-6s / wave-5c, so the
+    // control is re-pinned identity-exact from census m6-1 (49 -> 42 rows:
+    // 12 `control-unused` rows whose subjects now deliver or hold elsewhere,
+    // 3 libtree rows re-classed `slice-use-unsupported`, 2 urlparser rows
+    // added; report main/040). The population pin follows the control.
     assert_eq!(
         controls.libc_hold_receipt.lines().count(),
-        50,
+        43,
         "libc contract hold receipt population drift"
     );
     assert_eq!(
