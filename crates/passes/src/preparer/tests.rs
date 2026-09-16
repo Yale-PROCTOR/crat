@@ -1770,6 +1770,94 @@ pub fn h() -> i32 { #[export_name = "wire_symbol"] static INTERNAL: i32 = 3; INT
 }
 
 #[test]
+fn removes_ignored_setlocale_calls_recursively_by_final_path_name() {
+    let result = transform_result(
+        r#"
+fn setlocale(_: i32) -> i32 { 0 }
+mod locale { pub fn setlocale(_: i32) -> i32 { 0 } }
+mod query { pub fn setlocale(_: i32, _: *const i8) -> *mut i8 { core::ptr::null_mut() } }
+macro_rules! configure { ($value:expr) => { setlocale($value); } }
+fn configure_all(mut effects: i32) {
+    setlocale({ effects += 1; effects });
+    (setlocale)(effects);
+    locale::setlocale(effects);
+    (locale::setlocale)(effects);
+    { configure!({ effects += 1; effects }); }
+    if effects == 0 { crate::locale::setlocale(effects); }
+    query::setlocale(0, core::ptr::null());
+}
+"#,
+    )
+    .unwrap();
+    assert!(!result.requires_proctor_libc);
+    let code = compact(&result.code);
+    assert_eq!(count(&code, "setlocale("), 4, "{code}");
+    assert!(!code.contains("locale::setlocale"), "{code}");
+    assert!(!code.contains("query::setlocale"), "{code}");
+    assert!(!code.contains("effects += 1"), "{code}");
+    utils::compilation::run_compiler_on_str(&result.code, utils::type_check).unwrap();
+}
+
+#[test]
+fn retains_value_used_aliased_and_indirect_setlocale_calls() {
+    let input = r#"
+fn setlocale(value: i32) -> i32 { value }
+fn consume(_: i32) {}
+fn initializer(value: i32) -> i32 { let result = setlocale(value); result }
+fn assignment(value: i32) -> i32 { let mut result = 0; result = setlocale(value); result }
+fn returned(value: i32) -> i32 { return setlocale(value); }
+fn tailed(value: i32) -> i32 { setlocale(value) }
+fn conditioned(value: i32) -> bool { if setlocale(value) == 0 { true } else { false } }
+fn nested(value: i32) { consume(setlocale(value)); }
+fn casted(value: i32) -> i64 { setlocale(value) as i64 }
+fn aliases(value: i32) {
+    use crate::setlocale as configure_locale;
+    configure_locale(value);
+    let indirect: fn(i32) -> i32 = setlocale;
+    indirect(value);
+}
+"#;
+    assert_prepares_to(input, input);
+}
+
+#[test]
+fn removed_setlocale_arguments_do_not_request_ctype_dependency() {
+    let result = transform_result(
+        r#"
+fn setlocale(_: i32) -> i32 { 0 }
+fn isalpha(value: i32) -> i32 { value }
+fn configure(value: i32) {
+    static LOCALE: i32 = 1;
+    setlocale(isalpha(value + LOCALE));
+}
+"#,
+    )
+    .unwrap();
+    assert!(!result.requires_proctor_libc);
+    let code = compact(&result.code);
+    assert_eq!(count(&code, "setlocale("), 1, "{code}");
+    assert!(!code.contains("::proctor_libc::isalpha"), "{code}");
+    assert!(code.contains("static LOCALE: i32 = 1;"), "{code}");
+}
+
+#[test]
+fn setlocale_removal_is_structurally_idempotent() {
+    let first = transform_and_compile(
+        r#"
+fn setlocale(_: i32) -> i32 { 0 }
+fn configure(value: i32) {
+    { (crate::setlocale)(value); }
+}
+"#,
+    );
+    let second = utils::compilation::run_compiler_on_str(&first, prepare)
+        .unwrap()
+        .unwrap();
+    assert!(!second.requires_proctor_libc);
+    assert_eq!(compact(&first), compact(&second.code));
+}
+
+#[test]
 fn rewrites_each_direct_ctype_call_by_textual_name() {
     for name in [
         "isalnum", "isalpha", "isblank", "iscntrl", "isdigit", "isgraph", "islower", "isprint",

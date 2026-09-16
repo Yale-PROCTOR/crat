@@ -979,6 +979,39 @@ struct InsertVisitor<'a> {
     extracted: HashMap<ast::NodeId, P<ast::Item>>,
 }
 
+fn peel_parentheses(mut expression: &ast::Expr) -> &ast::Expr {
+    while let ast::ExprKind::Paren(inner) = &expression.kind {
+        expression = inner;
+    }
+    expression
+}
+
+fn is_ignored_setlocale_statement(statement: &ast::Stmt) -> bool {
+    let ast::StmtKind::Semi(expression) = &statement.kind else {
+        return false;
+    };
+    let ast::ExprKind::Call(callee, _) = &peel_parentheses(expression).kind else {
+        return false;
+    };
+    let ast::ExprKind::Path(_, path) = &peel_parentheses(callee).kind else {
+        return false;
+    };
+    path.segments
+        .last()
+        .is_some_and(|segment| segment.ident.name.as_str() == "setlocale")
+}
+
+struct IgnoredSetlocaleRemover;
+
+impl MutVisitor for IgnoredSetlocaleRemover {
+    fn flat_map_stmt(&mut self, statement: ast::Stmt) -> smallvec::SmallVec<[ast::Stmt; 1]> {
+        if is_ignored_setlocale_statement(&statement) {
+            return smallvec::smallvec![];
+        }
+        mut_visit::walk_flat_map_stmt(self, statement)
+    }
+}
+
 #[derive(Default)]
 struct CtypeRewriteVisitor {
     rewrote: bool,
@@ -1215,6 +1248,8 @@ pub fn prepare(tcx: TyCtxt<'_>) -> Result<PreparationResult, PrepareError> {
     };
     inserter.visit_crate(&mut krate);
     debug_assert!(inserter.extracted.is_empty());
+
+    IgnoredSetlocaleRemover.visit_crate(&mut krate);
 
     let mut ctype_rewriter = CtypeRewriteVisitor::default();
     ctype_rewriter.visit_crate(&mut krate);
