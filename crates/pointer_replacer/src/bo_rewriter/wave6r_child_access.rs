@@ -55,7 +55,10 @@ pub(crate) fn core_pointer_call(tcx: TyCtxt<'_>, callee: DefId) -> Option<CorePo
         return None;
     }
     match tcx.item_name(callee).as_str() {
-        "is_null" => Some(CorePointerCall::NoRetain),
+        // `offset_from` yields a COUNT, not a pointer: like `is_null` it reads
+        // the receiver and retains nothing (lodepng `alloc_string::in_0#1`,
+        // report 018 claim 3 — relay 018 asked for the one line).
+        "is_null" | "offset_from" | "byte_offset_from" => Some(CorePointerCall::NoRetain),
         "offset" | "add" | "sub" | "cast" | "cast_mut" | "cast_const" => {
             Some(CorePointerCall::AliasResult)
         }

@@ -287,3 +287,46 @@ fn wave6r_urlparser_get_part_chain_is_descendant_free() {
         "the reduction's chain is not held by the child walk: {receipt}"
     );
 }
+
+/// lodepng `alloc_string::in_0#1` (report 018 claim 3, relay 018): the only
+/// open step on the position is `offset_from`, which yields a COUNT — it reads
+/// the receiver and retains nothing, exactly like `is_null`.
+const OFFSET_FROM: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+use core::ffi::c_void;
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut c_void;
+    fn memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void;
+}
+unsafe fn span(begin: *const u8, end: *const u8) -> usize {
+    end.offset_from(begin) as usize
+}
+pub unsafe fn alloc_string(in_0: *const u8, end: *const u8) -> *mut u8 {
+    let size = span(in_0, end);
+    let out = malloc(size + 1) as *mut u8;
+    memcpy(out as *mut c_void, in_0 as *const c_void, size);
+    out
+}
+"#;
+
+#[test]
+fn wave6r_offset_from_is_a_known_no_retain_read() {
+    let row = ::utils::compilation::run_compiler_on_str(OFFSET_FROM, |tcx| {
+        let (_, ctx) = super::super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::super::A5Mode::PreciseReplay,
+                Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        let rows = ctx.retention.to_tsv();
+        println!("RETENTION\n{rows}");
+        rows.lines()
+            .find(|line| line.starts_with("span\t") && line.contains("\t1\t"))
+            .expect("the span position has a row")
+            .to_owned()
+    })
+    .expect("input type-checks");
+    assert!(row.contains("\tno-retain\t"), "{row}");
+}
