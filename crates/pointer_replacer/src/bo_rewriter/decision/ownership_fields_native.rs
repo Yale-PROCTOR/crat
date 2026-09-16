@@ -802,6 +802,27 @@ fn derive_bundle(
         BoxShape::Sized => source.element_spelling().to_owned(),
         BoxShape::Slice => format!("[{}]", source.element_spelling()),
     };
+    // R423: a view alias the table decides for ANOTHER family (a slice or
+    // cursor over the same accesses) owns its own use edits; rendering mine
+    // too would claim one interval twice (`intra-class-interval-overlap`).
+    // The alias is only this producer's while no other family took it.
+    if source.view_aliases().iter().any(|alias| {
+        table.entries.iter().any(|(candidate, decision)| {
+            let decided = match decision {
+                Decision::Box(_)
+                | Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. }
+                | Decision::Opt { .. } => true,
+                Decision::Degraded(_) => false,
+            };
+            candidate.fn_did == subject.fn_did && candidate.hir_id == alias.hir_id && decided
+        })
+    }) {
+        return Err(NativeHold::Missing("native-view-alias-family-owned"));
+    }
     edits.extend_from_slice(source.scalar_edits());
     // R412-2: an owner access that is the BASE of another family's slice
     // construction (`let mut src = ((**elevations.offset(i)).data).offset(…)`
