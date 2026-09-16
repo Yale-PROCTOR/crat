@@ -555,12 +555,6 @@ pub unsafe extern \"C\" fn raw_manager(mut n: usize, mut split: *mut u32) {{\n\
     );
     let out = emitted("ac-raw-manager", &src);
     let text = compact(&out.source);
-    // The C arm's bridge is planned inside the allocator call and renders.
-    assert!(
-        text.contains("BrotliAllocate(&mut*m,"),
-        "the C arm's bridge must render at the argument\n{}",
-        out.source
-    );
     // The degradation of a class-held subject carries its MIR suffix, and the
     // terms live in the reason's detail, so the hold is read whole.
     let hold = out
@@ -575,6 +569,25 @@ pub unsafe extern \"C\" fn raw_manager(mut n: usize, mut split: *mut u32) {{\n\
         "this rule must claim no interval of the allocator call; hold = {hold}\n{}",
         out.source
     );
+    if hold.is_empty() {
+        // Wherever the class is otherwise clean, the construction is spelled
+        // AROUND the call and the call's own text is untouched.
+        assert!(
+            text.contains("Some(Box::from_raw(core::ptr::slice_from_raw_parts_mut(BrotliAllocate("),
+            "{}",
+            out.source
+        );
+    } else {
+        // On this lane's head the residue is wave-6l's `return-not-adapted`
+        // on the foreign call's receiver; the bridge the C arm planned inside
+        // the allocator call still renders, which is the half a containing
+        // replacement used to lose.
+        assert!(
+            text.contains("BrotliAllocate(&mut*m,"),
+            "the C arm's bridge must render at the argument; hold = {hold}\n{}",
+            out.source
+        );
+    }
     // The rule itself admitted the subject: the residue is other families'.
     assert!(
         out.artifacts
