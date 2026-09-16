@@ -1654,13 +1654,47 @@ fn w6l_lodepng_chunk_receiver_takes_the_delivered_form_or_the_return_holds() {
         text.contains("fn__crat_safe_inspect_chunk(mutin_0:&[u8],"),
         "{text}"
     );
-    assert!(text.contains("letmutdata:Option<&[u8]>=None;"), "{text}");
-    assert!(text.contains("data.unwrap()[i]"), "{text}");
+    // THE INVARIANT: a converted return never reaches a raw receiver. Three
+    // admitted readings, one per composed head (R217-2(a)):
+    //   (a) the receiver is delivered as an optional slice (wave-6o's store),
+    //       over the raw call or over this lane's raw-restoring view;
+    //   (b) the receiver stays RAW and the callee keeps its raw interface —
+    //       the store is the unconverted call (batch-9 dry2, where wave-6o's
+    //       line is absent: `data` is a typed `null-init` hold);
+    //   (c) the receiver is delivered thin (an inferred reference).
+    // Every reading places `in_0` and reverts nothing.
+    let optional = text.contains("letmutdata:Option<&[u8]>=None;");
+    let raw_receiver = text.contains("letmutdata=0as*constu8;");
     assert!(
-        text.contains("let__crat_slice_ptr_9:*const_=lodepng_chunk_data_const(chunk);")
-            || text.contains("let__crat_slice_ptr_9:*const_={let__crat_native_result_"),
+        optional || raw_receiver || text.contains("letmutdata:&[u8]="),
         "{text}"
     );
+    if optional {
+        assert!(text.contains("data.unwrap()[i]"), "{text}");
+        assert!(
+            text.contains("let__crat_slice_ptr_9:*const_=lodepng_chunk_data_const(chunk);")
+                || text.contains("let__crat_slice_ptr_9:*const_={let__crat_native_result_"),
+            "{text}"
+        );
+    }
+    if raw_receiver {
+        // The call into the raw receiver is the UNCONVERTED one; the callee's
+        // own subject is a typed hold, never a converted return at a raw site.
+        assert!(
+            text.contains("data=lodepng_chunk_data_const(chunk);"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("data=__crat_safe_lodepng_chunk_data_const("),
+            "{text}"
+        );
+        assert!(
+            degradations
+                .iter()
+                .any(|d| d.subject == "lodepng_chunk_data_const::chunk"),
+            "{degradations:?}"
+        );
+    }
     assert!(
         !degradations
             .iter()
