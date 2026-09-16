@@ -1249,7 +1249,14 @@ impl MutVisitor for ExplicitLocalDeclVisitor<'_> {
             rustc_ast::mut_visit::walk_local(self, local);
             return;
         };
-        if local.ty.is_some()
+        // R419-1/3: a Box-decided local keeps the source's own annotation
+        // (`let mut ret: *mut ti_buffer = …`) unless it is REPLACED here —
+        // the ledger then counts a delivery the declaration inventory has no
+        // row for (tulip `ti_buffer_new::ret#14`). The site's type IS the
+        // decision's; another producer's competing type is the planner's
+        // `declaration-type-conflict`, never this visitor's.
+        let replaces_annotation = local.ty.is_some() && ty.starts_with("::std::boxed::Box<");
+        if (local.ty.is_some() && !replaces_annotation)
             || !self
                 .guard
                 .claim(local.pat.id, local.pat.span, "decl:explicit")

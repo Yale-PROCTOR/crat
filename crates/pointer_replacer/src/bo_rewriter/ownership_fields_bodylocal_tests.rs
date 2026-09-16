@@ -883,38 +883,58 @@ pub unsafe extern "C" fn political_3(mut width: libc::c_int, mut ncolors: libc::
 }
 
 #[test]
-fn r402_annotated_binding_stays_held_without_an_ast_declaration_channel() {
-    // bzip2 spells its owners `let mut v: *mut T = malloc(..)`: the AST
-    // emission has no channel to replace a declared type by a Box type, so
-    // the owner is a typed hold (`native-annotated-binding`).
+fn r419_annotated_binding_is_retyped_on_both_emission_paths() {
+    // bzip2 spells its owners `let mut v: *mut T = malloc(..)`; tulip's
+    // `ti_buffer_new::ret` is the same shape under wave-6a's plan. The
+    // declaration channel replaces the source's annotation with the Box type
+    // on the text path and on the census (AST) path, so the declaration
+    // inventory has the row the ledger counts (R419-1/3).
     let input = format!(
         "{} pub unsafe fn prepare(n: usize) -> u32 {{ let mut buffer: *mut u32 = calloc(4, core::mem::size_of::<u32>()) as *mut u32; *buffer.offset(1) = 9; let value = *buffer.offset(1); free(buffer as *mut core::ffi::c_void); value }}",
         declarations()
     );
-    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
-        let (table, ctx) = super::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                super::A5Mode::PreciseReplay,
-                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .unwrap();
-        let (_, d) = table
-            .entries
-            .iter()
-            .find(|(s, _)| s.param_name.as_deref() == Some("buffer"))
-            .unwrap();
-        assert!(matches!(d, Decision::Degraded(_)), "{d:?}");
-        assert!(
-            ctx.raw_boundary_artifacts
-                .ownership_native
-                .contains("native-annotated-binding"),
-            "{}",
-            ctx.raw_boundary_artifacts.ownership_native
-        );
-    })
-    .unwrap();
+    let s = verify(&input, "buffer", BoxShape::Slice, false);
+    assert!(
+        s.contains(
+            "let mut buffer: ::std::boxed::Box<[u32]> = ::std::vec![0u32; 4].into_boxed_slice();"
+        ),
+        "{s}"
+    );
+    let outcome = super::rewrite_core_injected(
+        ::utils::compilation::str_to_input(&input),
+        None,
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
+        true,
+        Some((
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        first_diags,
+        ..
+    } = outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!((reverted_count, first_diags.len()), (0, 0), "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("let mut buffer: ::std::boxed::Box<[u32]> ="),
+        "{source}"
+    );
+    let rows =
+        super::delivery_custody::inventory_source("fixture.rs", &source).expect("custody parse");
+    let row = rows
+        .iter()
+        .find(|row| row.owner == "prepare" && row.binding == "buffer")
+        .unwrap_or_else(|| panic!("{rows:#?}"));
+    assert!(row.type_is_fully_explicit, "{row:#?}");
 }
 
 #[test]

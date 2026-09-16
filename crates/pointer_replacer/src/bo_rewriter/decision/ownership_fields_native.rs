@@ -636,11 +636,20 @@ pub(crate) fn complete_declarations(
         else {
             continue;
         };
-        if subject.ty_span.is_some() {
-            continue;
-        }
         let node = (subject.fn_did, subject.hir_id);
-        let mut declarations = vec![(node, subject.binding_span, emitted_type.to_owned())];
+        // A declaration's text edit: inserted after the pattern, or REPLACING
+        // the source's own annotation when the binding carries one.
+        let mut declarations = vec![(
+            node,
+            subject.ty_span.map_or(
+                (
+                    subject.binding_span.shrink_to_hi(),
+                    format!(": {emitted_type}"),
+                ),
+                |annotation| (annotation, emitted_type.to_owned()),
+            ),
+            emitted_type.to_owned(),
+        )];
         // The owner's view aliases: `let mut a = root.offset(e)` becomes
         // `let mut a: &mut [T] = &mut (*root)[(e) as usize..]`.
         for receipt in &box_plan.receipts {
@@ -653,9 +662,13 @@ pub(crate) fn complete_declarations(
                 local_id: rustc_hir::ItemLocalId::from_u32(local_id),
             };
             let span = tcx.hir_span(alias);
-            declarations.push(((subject.fn_did, alias), span, ty.to_owned()));
+            declarations.push((
+                (subject.fn_did, alias),
+                (span.shrink_to_hi(), format!(": {ty}")),
+                ty.to_owned(),
+            ));
         }
-        for (node, binding_span, emitted_type) in declarations {
+        for (node, (span, replacement), emitted_type) in declarations {
             if plan
                 .explicit_declarations
                 .iter()
@@ -670,9 +683,9 @@ pub(crate) fn complete_declarations(
                     ),
                     caller: subject.fn_did,
                     node: Some(node),
-                    span: Some(binding_span.shrink_to_hi()),
+                    span: Some(span),
                     category: "local",
-                    replacement: Some(format!(": {emitted_type}")),
+                    replacement: Some(replacement),
                     emitted_type,
                     arm: "surface",
                 });
@@ -782,12 +795,9 @@ fn derive_bundle(
     // R402-2(a): every delivered declaration carries its explicit type. The
     // type is registered as an explicit local declaration site (the same
     // channel wave-6k's construction values use), which the text path splices
-    // after the pattern and the AST path places as `local.ty`. An annotated
-    // binding (`let v: *mut T = …`) has no AST channel for a Box type yet and
-    // stays held.
-    if subject.ty_span.is_some() {
-        return Err(NativeHold::Missing("native-annotated-binding"));
-    }
+    // after the pattern — or over the source's own annotation (`let v: *mut T
+    // = …`, bzip2's spelling) — and the AST path places as `local.ty`,
+    // replacing an annotation (R419-1/3).
     let payload = match source.shape() {
         BoxShape::Sized => source.element_spelling().to_owned(),
         BoxShape::Slice => format!("[{}]", source.element_spelling()),
