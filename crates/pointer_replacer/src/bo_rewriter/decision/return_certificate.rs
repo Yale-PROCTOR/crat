@@ -1165,6 +1165,7 @@ pub(crate) fn derive<'tcx>(
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
     consuming_formals: &FxHashSet<(DefId, usize)>,
+    raw_surface: &dyn Fn(LocalDefId) -> bool,
 ) -> Certificates {
     let mut out = Certificates::default();
     let transfer_ok =
@@ -1261,6 +1262,7 @@ pub(crate) fn derive<'tcx>(
                 &subject_of,
                 &lend_ok,
                 &transfer_ok,
+                raw_surface,
                 &out,
             ) {
                 Ok(Some((certificate, plans))) => {
@@ -1399,6 +1401,7 @@ fn certify<'tcx, 's>(
     subject_of: &dyn Fn(LocalDefId, HirId) -> Option<&'s Subject>,
     lend_ok: &dyn Fn(DefId, usize) -> bool,
     transfer_ok: &dyn Fn(DefId, usize) -> bool,
+    raw_surface: &dyn Fn(LocalDefId) -> bool,
     done: &Certificates,
 ) -> Result<Option<(Certificate, Vec<((LocalDefId, HirId), BoxPlan)>)>, Hold> {
     let callee_path = tcx.def_path_str(callee.to_def_id());
@@ -1486,6 +1489,13 @@ fn certify<'tcx, 's>(
         return Err(hold(format!(
             "return-certificate-indirect-callers:{callee_path}"
         )));
+    }
+    // R419-3 (relay wave-6a/011): a fn-pointer-web member or positive seed
+    // keeps a raw outer surface (the exposure family's wrapper) that every
+    // in-crate receiver binds to — a `Box<T>` return behind it is E0308 at
+    // every receiver. The certificate holds whole.
+    if raw_surface(callee) {
+        return Err(hold(format!("chain-endpoint-raw:{callee_path}")));
     }
     // Every returned call's target must be certified (pending otherwise).
     let mut chained_from: Vec<LocalDefId> = Vec::new();

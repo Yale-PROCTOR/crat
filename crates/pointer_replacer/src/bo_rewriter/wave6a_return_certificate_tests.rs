@@ -444,6 +444,48 @@ fn w6a_a1_callee_with_its_address_taken_holds() {
     );
 }
 
+/// R419-3 (relay 011): `use_item` is a fn-pointer-web ROOT (its address sits
+/// in a static table), so `item_new` and `item_release` are web MEMBERS —
+/// each would get the exposure family's raw wrapper that every in-crate
+/// caller binds to; a `Box<item>` return / parameter behind it is E0308 at
+/// the receiver and at the transfer. The certificate and the chain hold
+/// typed (`chain-endpoint-raw`); nothing reverts; no `Box` in the crate.
+#[test]
+fn w6a_a1_web_member_callee_holds_the_certificate_and_the_chain_whole() {
+    const TABLE: &str = r#"
+pub static mut HOOKS: [Option<unsafe extern "C" fn() -> i32>; 1] = [Some(use_item as unsafe extern "C" fn() -> i32)];
+"#;
+    let out = emitted(
+        "cert-web",
+        &format!("{CONTROL_PRELUDE}{RECEIVER_CONSUMED}{TABLE}"),
+    );
+    let src = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(!src.contains("Box<"), "{}", out.source);
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("item_new::it\theld\tchain-endpoint-raw:item_new"),
+        "{}",
+        out.artifacts.return_certificate_receipts
+    );
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("\theld\tchain-endpoint-raw:item_release"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+    // The formal is model-Raw: it degrades `kind-raw` before the Box arm
+    // (the typed hold rides the receipts; only an Owning-modeled formal
+    // carries it as its reason).
+    assert!(
+        reason_of(&out.degradations, "item_release::it").is_some(),
+        "{:#?}",
+        out.degradations
+    );
+}
+
 /// The same `item_new` with a plain owner: the receiver reads a field and
 /// frees — the sized chain with the dead malloc guard.
 #[test]

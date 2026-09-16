@@ -7054,6 +7054,7 @@ fn finish_decide<'tcx>(
         &slots,
         &model,
         &consuming_formals,
+        &raw_surface,
     );
     // wave-6a: allocator-contract owners (relay wave-6a/006, R409-1/3).
     let allocator_contracts =
