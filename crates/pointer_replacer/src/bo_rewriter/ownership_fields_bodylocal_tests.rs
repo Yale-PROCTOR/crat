@@ -371,35 +371,6 @@ pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
         s.contains("return ::std::boxed::Box::into_raw(img);"),
         "{s}"
     );
-    // R412-2: every expression edit must round-trip through the AST
-    // emission's graft parser (the pretty printer's spelling, e.g. the
-    // trailing comma of a struct literal); a refused graft leaves the source
-    // node intact and the program does not compile.
-    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
-        let (table, _ctx) = super::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                super::A5Mode::PreciseReplay,
-                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .unwrap();
-        let (_, decision) = table
-            .entries
-            .iter()
-            .find(|(s, _)| s.param_name.as_deref() == Some("img"))
-            .unwrap();
-        let Decision::Box(plan) = decision else { panic!("{decision:?}") };
-        for edit in &plan.expr_edits {
-            assert!(
-                super::ast_transform::graft_expr(&edit.replacement).is_ok(),
-                "{}: {}",
-                edit.receipt,
-                edit.replacement
-            );
-        }
-    })
-    .unwrap();
     // A sized owner's `(*img)` reads through the Box unchanged: the plan
     // carries no access edit whose text equals the source (such an edit only
     // claimed the interval and collided with a call bridge composed over the
@@ -425,6 +396,18 @@ pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
             .filter(|e| e.receipt == "native-box-slice-access")
             .collect();
         assert!(access.is_empty(), "{access:?}");
+        // R412-2: every expression edit must round-trip through the AST
+        // emission's graft parser (the pretty printer's spelling, e.g. the
+        // trailing comma of a struct literal); a refused graft leaves the
+        // source node intact and the program does not compile.
+        for edit in &plan.expr_edits {
+            assert!(
+                super::ast_transform::graft_expr(&edit.replacement).is_ok(),
+                "{}: {}",
+                edit.receipt,
+                edit.replacement
+            );
+        }
     })
     .unwrap();
     // The census (AST) path must graft the struct-literal constructor too.
@@ -1155,146 +1138,6 @@ unsafe extern "C" fn _match(mut mask: *mut heman_image, mut mask_color: heman_co
     }
 }
 
-#[test]
-fn r412_real_political_3_elevations_verbatim_body() {
-    // The verbatim corpus `heman_generate_archipelago_political_3` up to the
-    // owner's free (`elevations#9`, rule K): the pointer array is filled from
-    // a producer, read through `(**elevations.offset(i)).data` as the BASE of
-    // a cursor `src` that another family turns into a slice, each element
-    // destroyed by a local callee, the array freed. main 037's heman probe
-    // failed to compile this row (R412-2): the count's element path was not
-    // crate-rooted, and the access under the cursor's initializer kept
-    // `.offset` on the Box.
-    let input = format!(
-        r#"{}
-#[repr(C)] #[derive(Copy, Clone)] pub struct heman_image_s {{ pub width: libc::c_int, pub height: libc::c_int, pub nbands: libc::c_int, pub data: *mut libc::c_float }}
-pub type heman_image = heman_image_s;
-#[repr(C)] #[derive(Copy, Clone)] pub struct heman_color_s {{ pub r: libc::c_int }}
-pub type heman_color = heman_color_s;
-extern "C" {{ fn heman_generate_archipelago_political_2(w: libc::c_int, h: libc::c_int, c: heman_color, seed: libc::c_int, political: *mut heman_image, invert: libc::c_int) -> *mut heman_image; fn heman_image_create(w: libc::c_int, h: libc::c_int, n: libc::c_int) -> *mut heman_image; fn heman_image_clear(img: *mut heman_image, v: libc::c_float); }}
-pub unsafe extern "C" fn heman_image_destroy(mut img: *mut heman_image) {{
-    free((*img).data as *mut libc::c_void);
-    free(img as *mut libc::c_void);
-}}
-{}"#,
-        c_declarations(),
-        POLITICAL_3_BODY
-    );
-    // Two admissible readings (R217-2(a)): on this base `src` stays raw and
-    // the owner DELIVERS (the count's element path crate-rooted — R412-2(i));
-    // on the batch-8 composition the slice family constructs `src` over the
-    // owner access and the owner HOLDS `native-access-under-slice-construction`
-    // (R412-2(ii)) instead of emitting `.offset` on the Box.
-    let held = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
-        let (table, ctx) = super::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                super::A5Mode::PreciseReplay,
-                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .unwrap();
-        let (_, decision) = table
-            .entries
-            .iter()
-            .find(|(s, _)| s.param_name.as_deref() == Some("elevations"))
-            .unwrap();
-        let row = ctx
-            .raw_boundary_artifacts
-            .ownership_native
-            .lines()
-            .find(|row| row.starts_with("heman_generate_archipelago_political_3::elevations#"))
-            .unwrap()
-            .to_owned();
-        match decision {
-            Decision::Box(plan) => {
-                assert_eq!(plan.shape, BoxShape::Slice);
-                false
-            }
-            Decision::Degraded(_) => {
-                assert!(
-                    row.contains("\theld\t")
-                        && row.contains("native-access-under-slice-construction"),
-                    "{row}"
-                );
-                true
-            }
-            Decision::Ref { .. }
-            | Decision::InferredRef { .. }
-            | Decision::Slice { .. }
-            | Decision::NestedSlice { .. }
-            | Decision::Cursor { .. }
-            | Decision::Opt { .. } => panic!("{decision:?}"),
-        }
-    })
-    .unwrap();
-    if held {
-        return;
-    }
-    let s = verify(&input, "elevations", BoxShape::Slice, false);
-    assert!(
-        s.contains("/ ::core::mem::size_of::<*mut crate::heman_image_s>())].into_boxed_slice();"),
-        "{s}"
-    );
-    assert!(!s.contains("elevations.offset("), "{s}");
-    assert!(
-        s.contains("heman_image_destroy(elevations[(cindex_0) as usize]);"),
-        "{s}"
-    );
-    assert!(s.contains("::std::mem::drop(elevations);"), "{s}");
-}
-
-const POLITICAL_3_BODY: &str = r#"pub unsafe extern "C" fn heman_generate_archipelago_political_3(
-    mut width: libc::c_int,
-    mut height: libc::c_int,
-    mut colors: *const heman_color,
-    mut ncolors: libc::c_int,
-    mut ocean: heman_color,
-    mut seed: libc::c_int,
-    mut political: *mut heman_image,
-) -> *mut heman_image {
-    let mut elevations = malloc(
-        (::std::mem::size_of::<*mut heman_image>() as libc::c_ulong)
-            .wrapping_mul(ncolors as libc::c_ulong),
-    ) as *mut *mut heman_image;
-    let mut cindex = 0 as libc::c_int;
-    while cindex < ncolors {
-        *elevations.offset(cindex as isize) = heman_generate_archipelago_political_2(
-            width,
-            height,
-            *colors.offset(cindex as isize),
-            seed,
-            political,
-            1 as libc::c_int,
-        );
-        cindex += 1;
-    }
-    let mut elevation = heman_image_create(width, height, 1 as libc::c_int);
-    heman_image_clear(elevation, 0 as libc::c_int as libc::c_float);
-    let mut cindex_0 = 0 as libc::c_int;
-    while cindex_0 < ncolors {
-        let mut y: libc::c_int = 0;
-        y = 0 as libc::c_int;
-        while y < height {
-            let mut dst = ((*elevation).data).offset((y * width) as isize);
-            let mut src = ((**elevations.offset(cindex_0 as isize)).data)
-                .offset((y * width) as isize);
-            let mut x = 0 as libc::c_int;
-            while x < width {
-                *dst = if *src > *dst { *src } else { *dst };
-                x += 1;
-                dst = dst.offset(1);
-                src = src.offset(1);
-            }
-            y += 1;
-        }
-        heman_image_destroy(*elevations.offset(cindex_0 as isize));
-        cindex_0 += 1;
-    }
-    free(elevations as *mut libc::c_void);
-    return elevation;
-}"#;
-
 const HEMAN_OPS_PERCENTILES_BODY: &str = r#"pub unsafe extern "C" fn heman_ops_percentiles(mut hmap:
         *mut heman_image, mut nsteps: libc::c_int,
     mut mask: *mut heman_image, mut mask_color: heman_color,
@@ -1699,7 +1542,7 @@ unsafe extern "C" fn compute_occlusion(mut thispt: kmVec3, mut horizonpt: kmVec3
     );
     let s = verify(&input, "hull_buffer", BoxShape::Slice, false);
     assert!(
-        s.contains("let mut hull_buffer: ::std::boxed::Box<[crate::kmVec3]> = ::std::vec![crate::kmVec3 { x: 0.0f32, y: 0.0f32, z: 0.0f32 };"),
+        s.contains("let mut hull_buffer: ::std::boxed::Box<[crate::kmVec3]> = ::std::vec![crate::kmVec3 { x: 0.0f32, y: 0.0f32, z: 0.0f32, };"),
         "{s}"
     );
     assert!(
@@ -1808,6 +1651,146 @@ const HORIZON_SCAN_BODY: &str = r#"unsafe extern "C" fn horizon_scan(mut heightm
         sweep += 1;
     }
     free(hull_buffer as *mut libc::c_void);
+}"#;
+
+#[test]
+fn r412_real_political_3_elevations_verbatim_body() {
+    // The verbatim corpus `heman_generate_archipelago_political_3` up to the
+    // owner's free (`elevations#9`, rule K): the pointer array is filled from
+    // a producer, read through `(**elevations.offset(i)).data` as the BASE of
+    // a cursor `src` that another family turns into a slice, each element
+    // destroyed by a local callee, the array freed. main 037's heman probe
+    // failed to compile this row (R412-2): the count's element path was not
+    // crate-rooted, and the access under the cursor's initializer kept
+    // `.offset` on the Box.
+    let input = format!(
+        r#"{}
+#[repr(C)] #[derive(Copy, Clone)] pub struct heman_image_s {{ pub width: libc::c_int, pub height: libc::c_int, pub nbands: libc::c_int, pub data: *mut libc::c_float }}
+pub type heman_image = heman_image_s;
+#[repr(C)] #[derive(Copy, Clone)] pub struct heman_color_s {{ pub r: libc::c_int }}
+pub type heman_color = heman_color_s;
+extern "C" {{ fn heman_generate_archipelago_political_2(w: libc::c_int, h: libc::c_int, c: heman_color, seed: libc::c_int, political: *mut heman_image, invert: libc::c_int) -> *mut heman_image; fn heman_image_create(w: libc::c_int, h: libc::c_int, n: libc::c_int) -> *mut heman_image; fn heman_image_clear(img: *mut heman_image, v: libc::c_float); }}
+pub unsafe extern "C" fn heman_image_destroy(mut img: *mut heman_image) {{
+    free((*img).data as *mut libc::c_void);
+    free(img as *mut libc::c_void);
+}}
+{}"#,
+        c_declarations(),
+        POLITICAL_3_BODY
+    );
+    // Two admissible readings (R217-2(a)): on this base `src` stays raw and
+    // the owner DELIVERS (the count's element path crate-rooted — R412-2(i));
+    // on the batch-8 composition the slice family constructs `src` over the
+    // owner access and the owner HOLDS `native-access-under-slice-construction`
+    // (R412-2(ii)) instead of emitting `.offset` on the Box.
+    let held = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("elevations"))
+            .unwrap();
+        let row = ctx
+            .raw_boundary_artifacts
+            .ownership_native
+            .lines()
+            .find(|row| row.starts_with("heman_generate_archipelago_political_3::elevations#"))
+            .unwrap()
+            .to_owned();
+        match decision {
+            Decision::Box(plan) => {
+                assert_eq!(plan.shape, BoxShape::Slice);
+                false
+            }
+            Decision::Degraded(_) => {
+                assert!(
+                    row.contains("\theld\t")
+                        && row.contains("native-access-under-slice-construction"),
+                    "{row}"
+                );
+                true
+            }
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Opt { .. } => panic!("{decision:?}"),
+        }
+    })
+    .unwrap();
+    if held {
+        return;
+    }
+    let s = verify(&input, "elevations", BoxShape::Slice, false);
+    assert!(
+        s.contains("/ ::core::mem::size_of::<*mut crate::heman_image_s>())].into_boxed_slice();"),
+        "{s}"
+    );
+    assert!(!s.contains("elevations.offset("), "{s}");
+    assert!(
+        s.contains("heman_image_destroy(elevations[(cindex_0) as usize]);"),
+        "{s}"
+    );
+    assert!(s.contains("::std::mem::drop(elevations);"), "{s}");
+}
+
+const POLITICAL_3_BODY: &str = r#"pub unsafe extern "C" fn heman_generate_archipelago_political_3(
+    mut width: libc::c_int,
+    mut height: libc::c_int,
+    mut colors: *const heman_color,
+    mut ncolors: libc::c_int,
+    mut ocean: heman_color,
+    mut seed: libc::c_int,
+    mut political: *mut heman_image,
+) -> *mut heman_image {
+    let mut elevations = malloc(
+        (::std::mem::size_of::<*mut heman_image>() as libc::c_ulong)
+            .wrapping_mul(ncolors as libc::c_ulong),
+    ) as *mut *mut heman_image;
+    let mut cindex = 0 as libc::c_int;
+    while cindex < ncolors {
+        *elevations.offset(cindex as isize) = heman_generate_archipelago_political_2(
+            width,
+            height,
+            *colors.offset(cindex as isize),
+            seed,
+            political,
+            1 as libc::c_int,
+        );
+        cindex += 1;
+    }
+    let mut elevation = heman_image_create(width, height, 1 as libc::c_int);
+    heman_image_clear(elevation, 0 as libc::c_int as libc::c_float);
+    let mut cindex_0 = 0 as libc::c_int;
+    while cindex_0 < ncolors {
+        let mut y: libc::c_int = 0;
+        y = 0 as libc::c_int;
+        while y < height {
+            let mut dst = ((*elevation).data).offset((y * width) as isize);
+            let mut src = ((**elevations.offset(cindex_0 as isize)).data)
+                .offset((y * width) as isize);
+            let mut x = 0 as libc::c_int;
+            while x < width {
+                *dst = if *src > *dst { *src } else { *dst };
+                x += 1;
+                dst = dst.offset(1);
+                src = src.offset(1);
+            }
+            y += 1;
+        }
+        heman_image_destroy(*elevations.offset(cindex_0 as isize));
+        cindex_0 += 1;
+    }
+    free(elevations as *mut libc::c_void);
+    return elevation;
 }"#;
 
 const TRANSFORM_TO_DISTANCE_BODY: &str = r#"unsafe extern "C" fn transform_to_distance(mut sdf:
