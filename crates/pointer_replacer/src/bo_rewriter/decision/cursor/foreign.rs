@@ -65,6 +65,10 @@ fn classify_contract(
             access: PointeeAccess::Read,
             ownership: OwnershipContract::BorrowView,
             extent: ArgumentExtent::NulTerminated,
+            // wave-4 count metadata (R384-3 / #1b): strdup states no count or size argument.
+            count_argument_index: None,
+            count_is_exact: false,
+            size_argument_index: None,
             returns_alias_of: None,
             provenance: "pinned-libc-0.2.184",
         });
@@ -105,6 +109,10 @@ mod tests {
                 access: PointeeAccess::Read,
                 ownership: OwnershipContract::BorrowView,
                 extent: ArgumentExtent::NulTerminated,
+                // wave-4 count metadata (R384-3 / #1b): strdup states no count or size argument.
+                count_argument_index: None,
+                count_is_exact: false,
+                size_argument_index: None,
                 returns_alias_of: None,
                 provenance: "pinned-libc-0.2.184",
             }),

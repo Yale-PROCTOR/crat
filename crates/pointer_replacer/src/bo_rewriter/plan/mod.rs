@@ -4036,7 +4036,6 @@ pub(crate) fn plan(
                             && site.emitted_type == receiver.receiver_type()
                     })
             });
-                let typed_field_load = typed_field_load(table, subject);
         // R410-2(a): ONE explicit declaration per node. Several producers may
         // register the same node (a null-init declaration, a cursor
         // declaration, a field-load declaration, a construction-plan
@@ -4069,14 +4068,7 @@ pub(crate) fn plan(
             }
         }
         let planned_declaration = inferred_box || typed_pattern || typed_receiver;
-        
-let (ty_file, declaration_edit) = if inferred_box || typed_pattern || typed_receiver || planned_declaration || typed_field_load {
-||||||| parent of 6b057417 (Planner: one explicit declaration per node; a second type is the typed hold declaration-type-conflict (R410-2(a)))
-        // wave-6f: a local loaded from a converting field carries an explicit
-        // declaration planned by the field transaction; no type span to splice.
-        let typed_field_load = typed_field_load(table, subject);
-        let planned_declaration = inferred_box || typed_pattern || typed_receiver;
-        let (ty_file, declaration_edit) = if planned_declaration || typed_field_load {
+        let (ty_file, declaration_edit) = if planned_declaration {
             match span_to_loc(subject.binding_span) {
                 Ok((file, _, _)) => (file, None),
                 Err(reason) => {
@@ -5366,10 +5358,6 @@ mod tests {
         };
         let table = |declarations: Vec<ExplicitDeclarationSite>| DecisionTable {
             counted_void: Default::default(),
-            forward_slice_parameters: Vec::new(),
-            void_region: Default::default(),
-            flexible_tails: Default::default(),
-            box_params: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),
@@ -5395,7 +5383,6 @@ mod tests {
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
-            field_transactions: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
         let run = |table: &DecisionTable| {
