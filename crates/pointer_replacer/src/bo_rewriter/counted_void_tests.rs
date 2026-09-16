@@ -1640,3 +1640,51 @@ fn w6v_raw_twin_is_not_grafted_for_a_withdrawn_callee() {
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
+
+/// wave-6f's lodepng reduction (`inflateNoCompression`): `lodepng_memcpy(out as
+/// *mut c_void, ((*reader).data).offset(bytepos) as *const c_void, LEN)`. The
+/// pair machinery resolves the dst/src pair (no disjointness certificate) by
+/// making `src` an A5 raw view hoisted before the call and `dst` the counted
+/// `&mut` view — a view beside a raw alias, which this lane refuses. At plan
+/// time the counted position at that PAIR-owned call holds `seam-site-overlap`
+/// (dst keeps its raw parameter); `src` then converts alone, and its single
+/// view beside the raw `out` is routed to the pristine twin (one raw access
+/// under a live view is as forbidden as two views). The round emits; nothing
+/// pays at the compile gate (R410-2(d); the graft's yield stays the last
+/// resort for a node another family replaced).
+#[test]
+fn w6v_counted_position_at_a_pair_owned_call_holds_at_plan_time() {
+    // The A5 raw view is placed only on the production path (precise replay
+    // over the frozen graph), which is the path wave-6f's witness takes.
+    let fixture = include_str!("wave6f_fixture_lodepng.rs");
+    let dir = std::env::temp_dir().join(format!("crat-w6v-pair-owned-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.join("lib.rs");
+    std::fs::write(&root, fixture).unwrap();
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &root,
+        super::A5Mode::PreciseReplay,
+        Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        &|_| {},
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    let source = match &outcome {
+        super::RewriteOutcome::Emitted { source, .. } => source.clone(),
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            panic!("the round emits: no counted-void plan meets the A5 wrapper: {reason}")
+        }
+    };
+    let c = compact(&source);
+    assert!(
+        !source.contains("__crat_cv_"),
+        "no counted snapshot forms a view at that call: {source}"
+    );
+    assert!(
+        c.contains("fnlodepng_memcpy(mutdst:*mut::std::ffi::c_void,"),
+        "dst holds typed instead of paying at the compile gate: {source}"
+    );
+    assert!(
+        c.contains("__crat_raw_lodepng_memcpy(outas*mut::std::ffi::c_void,"),
+        "the single view beside the raw `out` routes to the pristine twin: {source}"
+    );
+}

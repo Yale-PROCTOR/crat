@@ -831,7 +831,32 @@ pub(crate) fn count_argument<'tcx>(
         .map(|argument| argument.index)
         .collect::<Vec<_>>();
     let route = match bridged.as_slice() {
-        [_] => Route::Direct,
+        // One view beside a RAW pointer argument of the same call (a callee
+        // parameter that does not convert) is one raw access under a live
+        // view unless their roots are provably distinct allocations: the
+        // call takes the raw twin, or holds.
+        [only] => {
+            let typeck = tcx.typeck(site.caller);
+            let raw_sibling = site.args.iter().any(|other| {
+                other.index != *only
+                    && other.index != c.count_index
+                    && !bridged.contains(&other.index)
+                    && args.get(other.index).is_none_or(|right| {
+                        let ty = typeck.expr_ty_adjusted(right);
+                        (ty.is_raw_ptr() || ty.is_ref())
+                            && !disjoint_roots(tcx, site.caller, argument, right)
+                    })
+            });
+            if !raw_sibling {
+                Route::Direct
+            } else if only_counted_params_convert(table, callee)
+                && twin_is_a_leaf(tcx, table, callee)
+            {
+                Route::RawTwin
+            } else {
+                return Err(SeamBlock::SiteOverlap);
+            }
+        }
         // Two byte views at one call may cover overlapping bytes: a
         // program-defined byte loop (unlike libc `memcpy`) is defined on
         // overlap, so overlap is not the input's fault, and one raw access

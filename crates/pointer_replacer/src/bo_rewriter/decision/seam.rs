@@ -4457,6 +4457,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                 let counted = (pos.found == Form::Raw)
                     .then(|| super::counted_void::parameter(table, *callee, pos.index))
                     .flatten();
+                // A counted view (a snapshotted call) at a call a PAIR row owns
+                // would stand beside that row's raw view of storage no
+                // disjointness certificate separates: the position holds typed
+                // here (R410-2(d), the receipted form of the graft's yield).
+                if pair_owned_call && counted.is_some_and(|contract| contract.handle.is_none()) {
+                    candidates.push(Err(SeamBlock::SiteOverlap));
+                    input_candidates.push(Err(SeamBlock::SiteOverlap));
+                    continue;
+                }
                 let wants_len = matches!(
                     pos.expected,
                     Form::Slice { .. } | Form::Opt { slice: true, .. }
