@@ -566,10 +566,10 @@ pub unsafe extern "C" fn swap(mut a: u64_0) -> u64_0 {
 }
 "#;
 
-/// The byte view delivers: each local is a byte slice over its parameter's
-/// own storage and the byte reads and writes index it. `copy_be64` indexes
-/// by a loop counter, so the body has not shown where the view ends: the
-/// extent is the addendum-77 fallback, receipted.
+/// The byte view delivers: each local is a `size_of::<u64>()`-byte slice over
+/// its parameter's own storage and the byte reads and writes index it. The
+/// extent is exact although `copy_be64` indexes by a loop counter (R422-7):
+/// the view is one scalar's storage, so no UB-free input indexes past it.
 #[test]
 fn w6b_be64_byte_view_of_a_scalar_parameter_delivers() {
     let rows = super::emit_tests::decisions_of(BE64);
@@ -583,8 +583,8 @@ fn w6b_be64_byte_view_of_a_scalar_parameter_delivers() {
     let flat = compact(&source);
     assert!(
         flat.contains("letmutsource:&[u8]=core::slice::from_raw_parts(")
-            && flat.contains("*mutlibc::c_uchar,crate::FALLBACK_SLICE_EXTENT)"),
-        "the read view is a shared byte slice under the fallback extent: {source}"
+            && flat.contains("*mutlibc::c_uchar,core::mem::size_of::<u64>())"),
+        "the read view is a shared byte slice of exactly the scalar's bytes: {source}"
     );
     assert!(
         flat.contains("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut("),
@@ -595,8 +595,8 @@ fn w6b_be64_byte_view_of_a_scalar_parameter_delivers() {
         "the byte accesses index the views: {source}"
     );
     assert!(
-        !source.contains("size_of::<u64>()"),
-        "a loop-indexed view has no exact extent: {source}"
+        !source.contains("FALLBACK_SLICE_EXTENT"),
+        "the extent is the scalar's size, never fabricated: {source}"
     );
     assert!(
         super::verify::type_checks_str(&source),
@@ -709,10 +709,11 @@ fn w6b_be16_constant_indices_make_the_view_exact() {
     );
 }
 
-/// A constant index at or beyond the scalar's size is not evidence of one
-/// scalar: the extent falls back.
+/// A constant index at or beyond the scalar's size does not move the extent
+/// (R422-7): such a read was UB in the input; the view stays exact and the
+/// emitted program's bounds check names it.
 #[test]
-fn w6b_byte_view_index_beyond_the_scalar_falls_back() {
+fn w6b_byte_view_index_beyond_the_scalar_stays_exact() {
     let beyond = BE16.replace(
         "*source.offset(1 as libc::c_int as isize);",
         "*source.offset(2 as libc::c_int as isize);",
@@ -721,13 +722,13 @@ fn w6b_byte_view_index_beyond_the_scalar_falls_back() {
     let flat = compact(&source);
     assert!(
         flat.contains("letmutsource:&[u8]=core::slice::from_raw_parts(")
-            && flat.contains("*mutlibc::c_uchar,crate::FALLBACK_SLICE_EXTENT)"),
-        "the over-indexed view falls back: {source}"
-    );
-    assert!(
-        flat.contains("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut(")
-            && flat.contains("*mutlibc::c_uchar,core::mem::size_of::<u16>())"),
-        "the other view stays exact: {source}"
+            && flat.contains("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut(")
+            && flat
+                .matches("*mutlibc::c_uchar,core::mem::size_of::<u16>())")
+                .count()
+                == 2
+            && !source.contains("FALLBACK_SLICE_EXTENT"),
+        "both views stay exact: {source}"
     );
 }
 
@@ -740,19 +741,4 @@ fn w6b_byte_recast_of_a_char_pointer_is_not_in_the_class() {
         .replace("let mut b: u16_0 = 0;", "let mut b: u16_0 = 0;");
     let rows = super::emit_tests::decisions_of(&chars);
     assert_ne!(local_reason(&rows, "source"), "<emitted>", "{rows:?}");
-}
-
-/// A step on the view that is not `offset` by a constant (`wrapping_add`
-/// here) is not extent evidence: the view is not exact.
-#[test]
-fn w6b_byte_view_steps_are_offset_by_a_constant() {
-    let wrapping = BE16.replace(
-        "*source.offset(1 as libc::c_int as isize);",
-        "*source.wrapping_add(1 as libc::c_int as usize);",
-    );
-    let source = super::emit_tests::ast_emitted_source_of(&wrapping).expect("AST output");
-    assert!(
-        !compact(&source).contains("letmutsource:&[u8]=core::slice::from_raw_parts(core::ptr::from_ref(psource).cast_mut()as*mutlibc::c_uchar,core::mem::size_of::<u16>())"),
-        "an unrecognised step is not exactness evidence: {source}"
-    );
 }
