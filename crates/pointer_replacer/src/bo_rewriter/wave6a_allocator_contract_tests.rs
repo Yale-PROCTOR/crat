@@ -187,14 +187,18 @@ pub unsafe extern \"C\" fn plain(mut m: *mut MemoryManager, n: usize, mut split:
     assert!(text.contains("*split=syms[(0)asusize];"), "{}", out.source);
 }
 
-/// (i) `memset(x, 0, n)`: the pinned libc table has no `memset` row
-/// (wave-4 adds `memcpy` / `memmove`, relay 012 §2), so the lend is unproven
-/// — a typed hold, its class held. (ii) A SLICE owner lent to a local reader
-/// whose formal converts to `&[u32]` delivers through the seam's owner-view
-/// glue (R422-5): `ReindexSymbols(&*lent, n)` — no `from_raw_parts` over the
-/// Box, no fabricated extent at the call. (iii) The plain owner delivers.
+/// (i) `memset(x, 0, n)` follows the pinned libc table: without a `memset`
+/// row the lend is unproven and the owner is a typed hold; with one (wave-4's
+/// rows, relays 013 §4 / 014 — `batch-9-dry2` `4bc42b57`) the owner delivers
+/// and the CAST argument takes the view (`zeroed.as_mut_ptr() as *mut
+/// c_void`): the raw-boundary glue bridges a bare argument, not the operand
+/// of a cast. (ii) A SLICE owner lent to a local reader whose formal converts
+/// to `&[u32]` delivers through the seam's owner-view glue (R422-5):
+/// `ReindexSymbols(&*lent, n)` — no `from_raw_parts` over the Box, no
+/// fabricated extent at the call. (iii) The plain owner delivers. Each shape
+/// sits in its own function: a typed hold holds its class.
 #[test]
-fn w6a_ac_memset_holds_and_the_slice_lend_takes_the_owner_view() {
+fn w6a_ac_memset_lend_follows_the_libc_table_and_the_slice_lend_takes_the_owner_view() {
     let src = format!(
         "{PRELUDE}\
 pub unsafe extern \"C\" fn zeroing(mut m: *mut MemoryManager, n: usize) {{\n\
@@ -219,12 +223,33 @@ pub unsafe extern \"C\" fn keeping(mut m: *mut MemoryManager, n: usize, mut spli
     let out = emitted("ac-lends", &src);
     let text = compact(&out.source);
     let receipts = &out.artifacts.allocator_contract_receipts;
-    assert!(
-        receipts.contains(
-            "zeroing::zeroed\theld\tcontract-allocation:use:call-argument-not-a-lend:memset("
-        ),
-        "{receipts}"
-    );
+    // The libc table decides the `memset` lend; both outcomes are pinned.
+    if receipts.contains("zeroing::zeroed\tadmitted\t") {
+        assert!(
+            text.contains("memset(zeroed.as_mut_ptr()as*mutstd::os::raw::c_void,"),
+            "{}\n{receipts}",
+            out.source
+        );
+        assert_eq!(
+            reason_of(&out.degradations, "zeroing::zeroed"),
+            None,
+            "{:#?}",
+            out.degradations
+        );
+    } else {
+        assert!(
+            receipts.contains(
+                "zeroing::zeroed\theld\tcontract-allocation:use:call-argument-not-a-lend:memset("
+            ),
+            "{receipts}"
+        );
+        assert_eq!(
+            reason_of(&out.degradations, "zeroing::zeroed").as_deref(),
+            Some("contract-allocation:use"),
+            "{:#?}",
+            out.degradations
+        );
+    }
     assert!(receipts.contains("lending::lent\tadmitted\t"), "{receipts}");
     assert!(
         text.contains("*split=ReindexSymbols(&*lent,n);"),
@@ -253,12 +278,6 @@ pub unsafe extern \"C\" fn keeping(mut m: *mut MemoryManager, n: usize, mut spli
     assert_eq!(
         reason_of(&out.degradations, "keeping::kept"),
         None,
-        "{:#?}",
-        out.degradations
-    );
-    assert_eq!(
-        reason_of(&out.degradations, "zeroing::zeroed").as_deref(),
-        Some("contract-allocation:use"),
         "{:#?}",
         out.degradations
     );

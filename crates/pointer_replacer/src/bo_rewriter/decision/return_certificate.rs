@@ -859,33 +859,41 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                 if let Ok(uses) = &mut self.out {
                     uses.lends.push((did, index, parent.span));
                 }
-                // A non-optional owner is bridged at the seam by the ordinary
-                // raw-boundary glue, and a LOCAL callee's converted formal by
-                // the seam's owner-view glue (R422-5) whatever the owner's
-                // optionality. An optional owner at a FOREIGN position has no
-                // glue, so the lend is spelled here (the R130 void bridge of
-                // report 003): the view's raw pointer, or null when the owner
-                // is `None`, under the argument's own casts.
-                if self.optional && foreign_fn(self.tcx, did) {
-                    let casts = if child == e.hir_id {
-                        String::new()
-                    } else {
+                // A LOCAL callee's converted formal is the seam's owner-view
+                // glue (R422-5), and a BARE non-optional owner at a foreign
+                // position is the ordinary raw-boundary glue's
+                // (`x.as_mut_ptr()`). The two shapes with no glue are spelled
+                // here, under the argument's own casts: an OPTIONAL owner at a
+                // foreign position (the R130 void bridge of report 003 — the
+                // view's raw pointer, or null when the owner is `None`), and
+                // a CAST argument (`memset(x as *mut c_void, ..)`, brotli's
+                // zeroing shape), where the raw-boundary site's operand is the
+                // cast rather than the owner.
+                let cast_argument = child != e.hir_id;
+                if foreign_fn(self.tcx, did) && (self.optional || cast_argument) {
+                    let casts = if cast_argument {
                         let outer = self.snippet(args[index].span);
                         let inner = self.snippet(e.span);
                         outer.strip_prefix(&inner).unwrap_or_default().to_owned()
+                    } else {
+                        String::new()
                     };
-                    let view = match self.shape {
-                        BoxShape::Slice => format!(
+                    let view = match (self.shape, self.optional) {
+                        (BoxShape::Slice, true) => format!(
                             "{name}.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())"
                         ),
-                        BoxShape::Sized => format!(
+                        (BoxShape::Sized, true) => format!(
                             "{name}.as_deref_mut().map_or(core::ptr::null_mut(), |b| core::ptr::from_mut(b))"
                         ),
+                        (BoxShape::Slice, false) => format!("{name}.as_mut_ptr()"),
+                        (BoxShape::Sized, false) => {
+                            format!("core::ptr::from_mut(&mut *{name})")
+                        }
                     };
                     self.push(
                         args[index].span,
                         format!("{view}{casts}"),
-                        "return-certificate-optional-lend",
+                        "return-certificate-foreign-lend",
                     );
                 }
             }
