@@ -522,6 +522,14 @@ fn nested_ast_composition(
                     | ("pair-t2-raw-view", "raw-cast-const")
                     | ("c-raw-reborrow-shared", "raw-cast-const")
                     | ("pair-t2-raw-view", "subject-use")
+                    // Relay 017 §2 (seat addendum 411): the two pairs wave-5c
+                    // 015 §2 and ownership-fields 019 STOP 3 measured on the
+                    // composition. The AST pass renders the outer over the
+                    // re-rendered inner as wave-6l's build; until it lands
+                    // such a site holds at apply time (`apply-site-rollback`,
+                    // the one owner) instead of holding both classes here.
+                    | ("c-raw-reborrow-shared", "shared-weakening")
+                    | ("typed-raw-temporary", "box-expression")
             );
         let raw_receiver_over_argument = matches!(
             outer.key.bridge_kind.as_str(),

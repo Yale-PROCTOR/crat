@@ -967,3 +967,117 @@ mod a5_wrapper_over_unselected_argument {
         });
     }
 }
+
+/// Relay 017 §2: two containment pairs missing from L07 (wave-5c 015 §2 — the
+/// shared reborrow of a raw-returning call over W-C5's `shared-weakening`
+/// argument adapter, heman's `kmRay2Intersect*`; ownership-fields 019 STOP 3 —
+/// a `typed-raw-temporary` call bridge over a Box owner's `box-expression`
+/// access edit). The planner half: both pairs compose under L07's containment
+/// discipline (outer depends on inner). The AST half — rendering the outer
+/// over the re-rendered inner — is wave-6l's; until it lands such a site holds
+/// at apply time (`apply-site-rollback`, one class) instead of at plan time
+/// (both classes).
+mod l07_rows_relay_017 {
+    use crate::bo_rewriter::{
+        bridge_receipt::SignatureClassId,
+        decision::{Arm, RequiredArmSet},
+        plan::{self, ClassInput, ClassSite},
+    };
+
+    fn with_two(test: impl FnOnce(SignatureClassId, SignatureClassId) + Send) {
+        ::utils::compilation::run_compiler_on_str(
+            "pub unsafe fn callee(p: *const i32) -> i32 { *p }\npub unsafe fn caller(p: *const i32) -> i32 { callee(p) }",
+            |tcx| {
+                let owners = tcx
+                    .hir_body_owners()
+                    .filter(|d| tcx.def_kind(*d) == rustc_hir::def::DefKind::Fn)
+                    .collect::<Vec<_>>();
+                test(SignatureClassId::of(owners[0]), SignatureClassId::of(owners[1]));
+            },
+        )
+        .unwrap();
+    }
+
+    fn composes(outer_arm: Arm, outer_kind: &str, inner_arm: Arm, inner_kind: &str) {
+        with_two(|a, b| {
+            // Same caller (the L07 discipline), strict containment.
+            let outer = ClassInput::new(a, RequiredArmSet::default()).with_site(ClassSite::edit(
+                a,
+                b,
+                outer_arm,
+                "kazmath.rs",
+                1684,
+                1740,
+                outer_kind,
+            ));
+            let inner = ClassInput::new(b, RequiredArmSet::default()).with_site(ClassSite::edit(
+                b,
+                b,
+                inner_arm,
+                "kazmath.rs",
+                1690,
+                1698,
+                inner_kind,
+            ));
+            let f = plan::finalize_class_inputs(vec![outer, inner]);
+            assert!(
+                f.collisions.is_empty(),
+                "{outer_kind} over {inner_kind}: {:#?}",
+                f.collisions
+            );
+            assert!(f.classes[&a].is_ready() && f.classes[&b].is_ready());
+            assert!(
+                f.classes[&a].depends_on.contains(&b),
+                "outer depends on inner"
+            );
+        });
+    }
+
+    #[test]
+    fn c_raw_reborrow_shared_over_shared_weakening_composes() {
+        composes(
+            Arm::C,
+            "c-raw-reborrow-shared",
+            Arm::Glue,
+            "shared-weakening",
+        );
+    }
+
+    #[test]
+    fn typed_raw_temporary_over_box_expression_composes() {
+        composes(
+            Arm::C,
+            "typed-raw-temporary",
+            Arm::Surface,
+            "box-expression",
+        );
+    }
+
+    /// The allowlist stays an allowlist: an unlisted pair of the same arms
+    /// still collides.
+    #[test]
+    fn an_unlisted_pair_still_collides() {
+        with_two(|a, b| {
+            let outer = ClassInput::new(a, RequiredArmSet::default()).with_site(ClassSite::edit(
+                a,
+                b,
+                Arm::C,
+                "kazmath.rs",
+                1684,
+                1740,
+                "c-raw-reborrow-shared",
+            ));
+            let inner = ClassInput::new(b, RequiredArmSet::default()).with_site(ClassSite::edit(
+                b,
+                b,
+                Arm::Glue,
+                "kazmath.rs",
+                1690,
+                1698,
+                "some-unlisted-adapter",
+            ));
+            let f = plan::finalize_class_inputs(vec![outer, inner]);
+            assert_eq!(f.collisions.len(), 1, "{:#?}", f.collisions);
+        });
+    }
+}
