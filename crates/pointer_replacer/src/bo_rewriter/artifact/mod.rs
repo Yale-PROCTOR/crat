@@ -242,6 +242,7 @@ mod tests {
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
             field_transactions: Default::default(),
+            slice_input_companions: Default::default(),
         }
     }
 

@@ -5701,6 +5701,7 @@ mod tests {
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
             field_transactions: Default::default(),
+            slice_input_companions: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -5788,6 +5789,7 @@ mod tests {
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
+            slice_input_companions: Default::default(),
         };
         let run = |table: &DecisionTable| {
             plan(
@@ -5859,6 +5861,7 @@ mod tests {
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
             field_transactions: Default::default(),
+            slice_input_companions: Default::default(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

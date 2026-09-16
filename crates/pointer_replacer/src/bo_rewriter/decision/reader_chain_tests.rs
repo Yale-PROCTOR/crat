@@ -60,6 +60,68 @@ fn w5c_reader_chain_adler32_forwarder_takes_the_slice_with_its_companion() {
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
 }
 
+/// R425-3: the chain's companion is COUNT evidence, so the caller's adapter
+/// takes it (`(32) as usize` at `entry`'s array root, `(len) as usize` at a
+/// raw caller) instead of R408-1's receipted fallback — nothing fabricated
+/// enters through the chain.
+#[test]
+fn w5c_reader_chain_companion_is_count_evidence_at_the_caller() {
+    let input = fixture(ADLER);
+    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("adler32(core::slice::from_raw_parts(buf.as_ptr(), (32) as usize), 32)"),
+        "{flat}"
+    );
+    assert!(!flat.contains("FALLBACK_SLICE_EXTENT"), "{flat}");
+    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
+}
+
+/// R423-6: the FALSE companion — the accessing callee reaches its element
+/// through ANOTHER parameter (`bitstream[*bitpointer >> 3]`), so the integer
+/// beside the pointer counts bits read, not bytes held: the chain declines
+/// typed (`companion-not-the-index-bound`) and the caller stays raw.
+#[test]
+fn w5c_reader_chain_false_companion_declines() {
+    let input = fixture(
+        r###"
+unsafe fn readBitFromReversedStream(bitpointer: *mut usize, bitstream: *const u8) -> u8 {
+    let result = ((*bitstream.offset((*bitpointer >> 3) as isize) as usize >> (7 - (*bitpointer & 7))) & 1) as u8;
+    *bitpointer = (*bitpointer).wrapping_add(1);
+    result
+}
+unsafe fn readBitsFromReversedStream(bitpointer: *mut usize, bitstream: *const u8, nbits: usize) -> u32 {
+    let mut result = 0u32;
+    let mut i = 0usize;
+    while i < nbits {
+        result = (result << 1) + readBitFromReversedStream(bitpointer, bitstream) as u32;
+        i = i.wrapping_add(1);
+    }
+    result
+}
+pub unsafe fn entry() -> u32 {
+    let buf: [u8; 32] = [7; 32];
+    let mut bp = 0usize;
+    readBitsFromReversedStream(&mut bp, buf.as_ptr(), 8)
+}
+"###,
+    );
+    let proofs = super::slice_input_tests::proofs(&input);
+    assert_eq!(
+        super::slice_input_tests::proof_of(&proofs, "readBitsFromReversedStream::bitstream"),
+        &Err(super::slice_input::Hold::CompanionNotIndexBound)
+    );
+    let table = super::slice_input_tests::decisions(&input);
+    assert!(
+        !matches!(
+            super::slice_input_tests::decision(&table, "readBitsFromReversedStream::bitstream"),
+            super::Decision::Slice { .. }
+        ),
+        "{:?}",
+        super::slice_input_tests::decision(&table, "readBitsFromReversedStream::bitstream")
+    );
+}
+
 /// The control: a one-element reader keeps `from_ref`.
 #[test]
 fn w5c_reader_chain_one_element_reader_keeps_from_ref() {

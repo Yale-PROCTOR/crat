@@ -4600,6 +4600,18 @@ pub(crate) fn synthesize_with_raw_boundary(
                             companions.push(proof.count_parameter);
                             companions
                         });
+                    // R425-3: wave-5c's reader chain proves the same thing for
+                    // a parameter it decided `Slice` on its own companion —
+                    // the accessing callee's indexes are bounded by exactly
+                    // that integer (`slice_input::index_bound_by_companion`).
+                    let count_companions = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| table.slice_input_companions.get(key))
+                        .map_or(count_companions.clone(), |companion| {
+                            let mut companions = count_companions.clone();
+                            companions.push(*companion);
+                            companions
+                        });
                     let arm = if contract_count.is_some() {
                         LenEvidence::Contract
                     } else {

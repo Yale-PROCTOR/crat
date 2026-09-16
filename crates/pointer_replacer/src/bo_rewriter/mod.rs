@@ -7602,6 +7602,21 @@ fn finish_decide<'tcx>(
             continue;
         }
         table.field_transactions = field_transactions;
+        // R425-3: the reader chain's own companion, for the seam's count
+        // evidence (`count_companions`). Read from the settled table so the
+        // index the seam licenses is the one the chain proved.
+        table.slice_input_companions = table
+            .entries
+            .iter()
+            .filter_map(|(subject, _)| {
+                let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                    return None;
+                };
+                let proof = decision::slice_input::prove(tcx, subject, &facts, &fat).ok()?;
+                let companion = proof.extent.companion_index(hir_index)?;
+                Some(((subject.fn_did, subject.hir_id), companion))
+            })
+            .collect();
 
         // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by
         // `decide_one`, which is handed one subject at a time. Runs here, over the

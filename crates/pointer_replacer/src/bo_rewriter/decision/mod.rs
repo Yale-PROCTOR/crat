@@ -1050,6 +1050,14 @@ pub(crate) struct DecisionTable {
         FxHashMap<(LocalDefId, rustc_hir::HirId), contract_extent::Promotion>,
     /// wave-6f: the finalized struct-field reference transactions.
     pub field_transactions: field_reference::FieldTransactions,
+    /// **R425-3 (wave-5c).** For a parameter the reader chain decided `Slice`
+    /// on its OWN companion integer (`adler32(data, len)`), the index of that
+    /// companion. It is count evidence of the same class as the thin-count
+    /// proof — the accessing callee's indexes are bounded by exactly this
+    /// parameter — so R408-1's adjacency arm licenses it and the chain's
+    /// callers adapt with an evidence-backed extent instead of the fabricated
+    /// one.
+    pub(crate) slice_input_companions: FxHashMap<(LocalDefId, rustc_hir::HirId), usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1346,6 +1354,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         option_composed_uses: Vec::new(),
         contract_extent_promotions,
         field_transactions: Default::default(),
+        slice_input_companions: Default::default(),
     }
 }
 
@@ -2747,6 +2756,7 @@ mod self_consistency_tests {
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
             field_transactions: Default::default(),
+            slice_input_companions: Default::default(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

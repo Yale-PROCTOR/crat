@@ -13,7 +13,12 @@
 //! already hold slices, the callees index them with the ordinary bounds check,
 //! and a non-array caller anywhere in the closure refuses the whole chain
 //! (typed, the hold stays).
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::{
+    Expr, ExprKind, HirId,
+    def::Res,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
 use rustc_middle::{mir::Local, ty::TyCtxt};
 
 use super::{
@@ -44,6 +49,23 @@ pub(crate) enum Extent {
     Companion(super::seam::LenEvidence),
 }
 
+impl Extent {
+    /// **R425-3: the chain's companion IS count evidence** — the accessing
+    /// callee's indexes are bounded by exactly this parameter (checked by
+    /// [`index_bound_by_companion`]), which is the same class of evidence as
+    /// the thin-count proof's reader walk. The seam reads this index into its
+    /// `count_companions` so R408-1's arm licenses the adjacent integer and
+    /// nothing fabricated enters through the chain.
+    pub(crate) fn companion_index(self, parameter: usize) -> Option<usize> {
+        match self {
+            Self::Supplied => None,
+            Self::Companion(super::seam::LenEvidence::Following) => Some(parameter + 1),
+            Self::Companion(super::seam::LenEvidence::Preceding) => parameter.checked_sub(1),
+            Self::Companion(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Hold {
     OutsideScope,
@@ -57,6 +79,14 @@ pub(crate) enum Hold {
     CallerNullable,
     /// Not every caller is known, or one is a fn-pointer / exported entry.
     IncompleteCallers,
+    /// **R423-6.** An adjacent integer that does not bound the indexes: the
+    /// accessing callee reaches its element through ANOTHER parameter
+    /// (`bitstream[*bitpointer >> 3]`, the bit-stream readers of report 019
+    /// §1's FALSE-companion column), so the integer beside the pointer counts
+    /// something else — bits read, one output line — and a slice of that
+    /// length under-claims the buffer. Typed decline; the caller stays raw
+    /// and adapts under the addendum-77 receipt like every raw caller.
+    CompanionNotIndexBound,
 }
 
 fn param_index(tcx: TyCtxt<'_>, function: LocalDefId, binding: rustc_hir::HirId) -> Option<usize> {
@@ -76,6 +106,7 @@ fn forwards_into_fat(
     facts: &EmitabilityFacts,
     fat: &FatFacts,
     visited: &mut Vec<(LocalDefId, usize)>,
+    accessed: &mut Vec<(LocalDefId, usize)>,
 ) -> Result<(), Hold> {
     let mut forwarded = false;
     for (&callee, calls) in &facts.call_args {
@@ -88,6 +119,9 @@ fn forwards_into_fat(
                 forwarded = true;
                 let local = Local::from_usize(arg.index + 1);
                 if fat.is_array(callee, local) {
+                    if !accessed.contains(&(callee, arg.index)) {
+                        accessed.push((callee, arg.index));
+                    }
                     continue;
                 }
                 if visited.contains(&(callee, arg.index)) {
@@ -95,7 +129,7 @@ fn forwards_into_fat(
                 }
                 visited.push((callee, arg.index));
                 let param = tcx.hir_body_owned_by(callee).params[arg.index].pat.hir_id;
-                forwards_into_fat(tcx, callee, param, facts, fat, visited)?;
+                forwards_into_fat(tcx, callee, param, facts, fat, visited, accessed)?;
             }
         }
     }
@@ -257,6 +291,7 @@ pub(crate) fn prove(
     if subject.ptr_depth != 1 || !fat.is_array(subject.fn_did, subject.local) {
         return Err(Hold::OutsideScope);
     }
+    let mut accessed = Vec::new();
     forwards_into_fat(
         tcx,
         subject.fn_did,
@@ -264,6 +299,7 @@ pub(crate) fn prove(
         facts,
         fat,
         &mut vec![(subject.fn_did, hir_index)],
+        &mut accessed,
     )?;
     let mut members = Vec::new();
     match supplied(tcx, subject.fn_did, hir_index, facts, fat, &mut members) {
@@ -290,17 +326,25 @@ pub(crate) fn prove(
                 return Err(hold);
             }
             let evidence = super::seam::length_evidence(tcx, subject.fn_did, hir_index);
-            if matches!(
+            if !matches!(
                 evidence,
                 super::seam::LenEvidence::Following | super::seam::LenEvidence::Preceding
             ) {
-                Ok(Proof {
-                    members: vec![subject.fn_did],
-                    extent: Extent::Companion(evidence),
-                })
-            } else {
-                Err(hold)
+                return Err(hold);
             }
+            // R423-6 / R425-3: the companion is the extent only where it
+            // BOUNDS the accessing callee's indexes. Checked at every
+            // position the chain reaches, so the evidence the seam licenses
+            // (`Extent::companion_index`) is the evidence checked here.
+            for &(callee, parameter) in &accessed {
+                if !index_bound_by_companion(tcx, callee, parameter) {
+                    return Err(Hold::CompanionNotIndexBound);
+                }
+            }
+            Ok(Proof {
+                members: vec![subject.fn_did],
+                extent: Extent::Companion(evidence),
+            })
         }
     }
 }
@@ -320,6 +364,113 @@ pub(crate) fn enabled_proof(
         .then_some(proof)
 }
 
+/// **Does the accessing callee index this parameter under its OWN adjacent
+/// companion, and nothing else?**
+///
+/// `update_adler32(adler, data, len)` indexes `data` by a local `i` bounded by
+/// `len`: the companion is the bound. `readBitFromReversedStream(bitpointer,
+/// bitstream)` indexes `bitstream` by `*bitpointer >> 3`: the index is reached
+/// through ANOTHER parameter, so whatever integer sits beside the pointer
+/// counts something else. The test is structural and conservative — an index
+/// expression naming any parameter of the accessing function other than its
+/// own companion refuses; locals, fields and literals are fine (they are
+/// bounded by the callee's own loop, which the extent is what it is checked
+/// against).
+fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: usize) -> bool {
+    let body = tcx.hir_body_owned_by(function);
+    let Some(param) = body.params.get(parameter) else {
+        return false;
+    };
+    let binding = param.pat.hir_id;
+    let companion = match super::seam::length_evidence(tcx, function, parameter) {
+        super::seam::LenEvidence::Following => parameter.checked_add(1),
+        super::seam::LenEvidence::Preceding => parameter.checked_sub(1),
+        _ => None,
+    };
+    let companion = companion.and_then(|index| body.params.get(index).map(|p| p.pat.hir_id));
+    let Some(companion) = companion else {
+        return false;
+    };
+    let others: Vec<HirId> = body
+        .params
+        .iter()
+        .map(|p| p.pat.hir_id)
+        .filter(|id| *id != binding && *id != companion)
+        .collect();
+
+    struct Indexes<'a, 'tcx> {
+        binding: HirId,
+        others: &'a [HirId],
+        bound: bool,
+        _marker: std::marker::PhantomData<&'tcx ()>,
+    }
+    fn names(e: &Expr<'_>, others: &[HirId]) -> bool {
+        struct Names<'a> {
+            others: &'a [HirId],
+            found: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for Names<'_> {
+            fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+                if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = e.kind
+                    && let Res::Local(id) = path.res
+                    && self.others.contains(&id)
+                {
+                    self.found = true;
+                }
+                intravisit::walk_expr(self, e);
+            }
+        }
+        let mut visitor = Names {
+            others,
+            found: false,
+        };
+        visitor.visit_expr(e);
+        visitor.found
+    }
+    fn is_binding(e: &Expr<'_>, binding: HirId) -> bool {
+        let mut e = e;
+        loop {
+            match e.kind {
+                ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+                    return path.res == Res::Local(binding);
+                }
+                _ => return false,
+            }
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Indexes<'_, 'tcx> {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            match e.kind {
+                ExprKind::MethodCall(segment, receiver, [index], _)
+                    if super::emitability::SLICE_ARITHMETIC_OPS
+                        .contains(&segment.ident.name.as_str())
+                        && is_binding(receiver, self.binding) =>
+                {
+                    if names(index, self.others) {
+                        self.bound = false;
+                    }
+                }
+                ExprKind::Index(base, index, _) if is_binding(base, self.binding) => {
+                    if names(index, self.others) {
+                        self.bound = false;
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut visitor = Indexes {
+        binding,
+        others: &others,
+        bound: true,
+        _marker: std::marker::PhantomData,
+    };
+    visitor.visit_body(body);
+    visitor.bound
+}
+
 impl Hold {
     pub(crate) fn key(self) -> &'static str {
         match self {
@@ -328,6 +479,7 @@ impl Hold {
             Self::CallerNotSupplied => "caller-not-supplied",
             Self::CallerNullable => "caller-nullable",
             Self::IncompleteCallers => "incomplete-callers",
+            Self::CompanionNotIndexBound => "companion-not-the-index-bound",
         }
     }
 }
