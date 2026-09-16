@@ -179,22 +179,51 @@ fn w5c_returned_child_pointer_bearing_pointee_is_not_pointer_free() {
     assert_eq!(parameters(&fixture()), vec![0, 1, 2]);
 }
 
-/// A callee that hands the argument itself back retains it: the view stays
-/// refused whatever the pointee holds.
+/// A callee that hands the argument itself back retains it; the pointee-free
+/// scan never settles that (no T1). Composition re-pin (wave-6v2, R412-7,
+/// R217-2(a)): a Return-only local callee whose result the caller only READS
+/// through is the used-returned-alias tier — T2 under the named waiver,
+/// receipted `retention-returned-alias-used` — so the shared view delivers;
+/// a caller that writes through the returned alias keeps the refusal
+/// (`wave6r_returned_alias_kept_by_caller_keeps_hold`).
 #[test]
-fn w5c_returned_child_returned_argument_stays_refused() {
+fn w5c_returned_child_returned_argument_is_the_waived_tier() {
     let input = fixture().replace(
         "    (*pOut).y = (*pV1).y - (*pV2).y;\n    return pOut;",
         "    (*pOut).y = (*pV1).y - (*pV2).y;\n    return pV2 as *mut kmVec2;",
     );
     let table = decisions(&input);
     assert!(
-        !matches!(
+        matches!(
             decision(&table, "kmRay2IntersectTriangle::ray"),
-            super::Decision::Ref { .. }
+            super::Decision::Ref { mutable: false }
         ),
         "{:?}",
         decision(&table, "kmRay2IntersectTriangle::ray")
+    );
+    let site = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::A5Mode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        ctx.raw_boundary
+            .receipts_tsv()
+            .lines()
+            .filter(|l| {
+                l.contains("kmRay2IntersectTriangle::ray#1") && l.contains("kmVec2Subtract\t2")
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .unwrap();
+    assert!(
+        site.iter()
+            .any(|l| l.contains("\tT2\t") && l.contains("retention-returned-alias-used")),
+        "{site:?}"
     );
 }
 
