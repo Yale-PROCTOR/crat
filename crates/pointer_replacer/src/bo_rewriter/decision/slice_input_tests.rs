@@ -246,8 +246,16 @@ fn w5c_slice_input_forwarders_leave_the_extent_hold_under_the_corpus_attestation
             })
         )
     };
-    assert!(!held("StitchToPreviousBlockH2::ringbuffer"), "{:?}", decision(&table, "StitchToPreviousBlockH2::ringbuffer"));
-    assert!(!held("StoreRangeH2::data"), "{:?}", decision(&table, "StoreRangeH2::data"));
+    assert!(
+        !held("StitchToPreviousBlockH2::ringbuffer"),
+        "{:?}",
+        decision(&table, "StitchToPreviousBlockH2::ringbuffer")
+    );
+    assert!(
+        !held("StoreRangeH2::data"),
+        "{:?}",
+        decision(&table, "StoreRangeH2::data")
+    );
     assert!(
         matches!(
             decision(&table, "StitchToPreviousBlockH2::ringbuffer"),

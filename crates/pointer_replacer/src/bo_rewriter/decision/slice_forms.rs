@@ -2,17 +2,21 @@
 //! This changes presentation only after the normal use and boundary proofs.
 
 use rustc_ast::mut_visit::{self, MutVisitor};
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    Expr, ExprKind, HirId, QPath,
+    def::Res,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
+use rustc_middle::ty::TyCtxt;
+use rustc_span::Span;
 
-/// Where a spine ends: the consumer of its outermost expression.
-enum SpineEnd {
-    /// One argument of a call.
-    Argument,
-    /// The initializer of `let <binding> = …` or the value of `<binding> = …`.
-    Copy {
-        destination: HirId,
-    },
-    Other,
-}
+use super::{
+    Decision, DecisionTable, Degradation, DegradeReason, SubjectKind,
+    emitability::{EmitabilityFacts, SliceRawUse, SliceUses, UseEdit, classify_arg, index_text},
+    raw_boundary::raw_target_type,
+};
 
 fn spine_end<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -90,63 +94,6 @@ fn spine_end<'tcx>(
         }
     }
 }
-
-/// A computed sub-view copied into a LOCAL: `let q = &*p.offset(e) as *const T`
-/// / `q = p.offset(e)`. The copy is the collector's body-copy raw use with the
-/// view attached; the receipt planner renders it by the destination's form.
-pub(crate) fn computed_body_copy_view<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    expr: &'tcx Expr<'tcx>,
-    key: (LocalDefId, HirId),
-) -> Option<(SliceRawUse, ComputedArgumentView)> {
-    let (operand, borrowed, delta, end) = spine_end(tcx, expr)?;
-    let SpineEnd::Copy { destination } = end else {
-        return None;
-    };
-    // A self-advance (`p = p.offset(e)`) is the classifier's reslice, not a
-    // copy into another binding.
-    if destination == key.1 || !forward_delta(tcx, delta) {
-        return None;
-    }
-    let typeck = tcx.typeck(key.0);
-    let target = raw_target_type(tcx, typeck.expr_ty(operand))?;
-    Some((
-        SliceRawUse {
-            hir_id: expr.hir_id,
-            span: expr.span,
-            boundary_span: None,
-            source_shape: "body-copy",
-            target,
-            native_element: false,
-            destination: Some(destination),
-            contract: None,
-        },
-        ComputedArgumentView {
-            use_span: expr.span,
-            argument_span: operand.span,
-            index: index_text(tcx, delta)?,
-            borrowed: borrowed.is_some(),
-            borrow_span: borrowed.map(|(_, span)| span),
-            mutable: borrowed.is_some_and(|(mutable, _)| mutable),
-            argument: false,
-        },
-    ))
-}
-use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{
-    Expr, ExprKind, HirId, QPath,
-    def::Res,
-    def_id::LocalDefId,
-    intravisit::{self, Visitor},
-};
-use rustc_middle::ty::TyCtxt;
-use rustc_span::Span;
-
-use super::{
-    Decision, DecisionTable, Degradation, DegradeReason, SubjectKind,
-    emitability::{EmitabilityFacts, SliceRawUse, SliceUses, UseEdit, classify_arg, index_text},
-    raw_boundary::raw_target_type,
-};
 
 /// The receipt key a computed sub-view argument carries once its seam renders
 /// the suffix. Consumers that key on the original borrow/cast shapes fall to
@@ -238,83 +185,6 @@ fn spine<'tcx>(
     spine_end(tcx, expr).and_then(|(operand, borrowed, delta, end)| {
         matches!(end, SpineEnd::Argument).then_some((operand, borrowed, delta))
     })
-}
-
-fn spine_end<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    expr: &'tcx Expr<'tcx>,
-) -> Option<(
-    &'tcx Expr<'tcx>,
-    Option<(bool, Span)>,
-    &'tcx Expr<'tcx>,
-    SpineEnd,
-)> {
-    let owner = expr.hir_id.owner.def_id;
-    let rustc_hir::Node::Expr(call) = tcx.parent_hir_node(expr.hir_id) else {
-        return None;
-    };
-    let ExprKind::MethodCall(segment, receiver, [delta], _) = call.kind else {
-        return None;
-    };
-    if receiver.hir_id != expr.hir_id || !matches!(segment.ident.name.as_str(), "offset" | "add") {
-        return None;
-    }
-    let typeck = tcx.typeck(owner);
-    let callee = typeck.type_dependent_def_id(call.hir_id)?;
-    if tcx.crate_name(callee.krate).as_str() != "core" {
-        return None;
-    }
-    let mut operand = call;
-    let mut borrowed = None;
-    loop {
-        let parent = match tcx.parent_hir_node(operand.hir_id) {
-            rustc_hir::Node::Expr(parent) => parent,
-            rustc_hir::Node::LetStmt(local)
-                if local.init.is_some_and(|init| init.hir_id == operand.hir_id) =>
-            {
-                let rustc_hir::PatKind::Binding(_, destination, _, None) = local.pat.kind else {
-                    return None;
-                };
-                return Some((operand, borrowed, delta, SpineEnd::Copy { destination }));
-            }
-            _ => return None,
-        };
-        match parent.kind {
-            ExprKind::Cast(inner, _) if inner.hir_id == operand.hir_id => operand = parent,
-            ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == operand.hir_id => {
-                let Some(destination) = local(lhs) else {
-                    return Some((operand, borrowed, delta, SpineEnd::Other));
-                };
-                return Some((operand, borrowed, delta, SpineEnd::Copy { destination }));
-            }
-            ExprKind::Unary(rustc_hir::UnOp::Deref, inner)
-                if inner.hir_id == operand.hir_id && borrowed.is_none() =>
-            {
-                let rustc_hir::Node::Expr(borrow) = tcx.parent_hir_node(parent.hir_id) else {
-                    return None;
-                };
-                let ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, mutability, place) = borrow.kind
-                else {
-                    return None;
-                };
-                if place.hir_id != parent.hir_id {
-                    return None;
-                }
-                borrowed = Some((mutability == rustc_hir::Mutability::Mut, borrow.span));
-                operand = borrow;
-            }
-            // The spine ends at the call argument: the consumer must be a
-            // call, and this operand one of its arguments.
-            ExprKind::Call(_, arguments) | ExprKind::MethodCall(_, _, arguments, _)
-                if arguments
-                    .iter()
-                    .any(|argument| argument.hir_id == operand.hir_id) =>
-            {
-                return Some((operand, borrowed, delta, SpineEnd::Argument));
-            }
-            _ => return Some((operand, borrowed, delta, SpineEnd::Other)),
-        }
-    }
 }
 
 /// A computed sub-view copied into a LOCAL: `let q = &*p.offset(e) as *const T`

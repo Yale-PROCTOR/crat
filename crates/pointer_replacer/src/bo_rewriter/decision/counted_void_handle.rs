@@ -114,6 +114,8 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         count_index: usize::MAX,
         element: ByteElement::Read,
         nullable,
+        // wave-6v2 typed-width table (ec0e694a): not a width-fixed view.
+        width: None,
         handle: Some(text),
         uses: edits,
     })

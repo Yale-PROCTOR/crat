@@ -93,9 +93,9 @@ mod ownership_fields_cp2_tests;
 mod ownership_fields_native_tests;
 pub(crate) mod plan;
 #[cfg(test)]
-mod raw_place_values_tests;
-#[cfg(test)]
 mod raw_initializer_tests;
+#[cfg(test)]
+mod raw_place_values_tests;
 pub(crate) mod revert_closure;
 #[cfg(test)]
 mod revert_closure_tests;
@@ -123,9 +123,6 @@ mod wave5r_helper_path;
 #[cfg(test)]
 mod wave5r_tests;
 #[cfg(test)]
-mod wave6f_field_reference_tests;
-pub(crate) mod wave6r_child_access;
-#[cfg(test)]
 mod wave6a_allocation_tests;
 #[cfg(test)]
 mod wave6a_allocator_contract_tests;
@@ -136,11 +133,14 @@ mod wave6a_fixture_tulip;
 #[cfg(test)]
 mod wave6a_return_certificate_tests;
 #[cfg(test)]
+mod wave6f_field_reference_tests;
+#[cfg(test)]
 mod wave6l_local_box_exemption_tests;
 #[cfg(test)]
 mod wave6l_nested_composition_tests;
 #[cfg(test)]
 mod wave6l_return_origin_tests;
+pub(crate) mod wave6r_child_access;
 mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;
 

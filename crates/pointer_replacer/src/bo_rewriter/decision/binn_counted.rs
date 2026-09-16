@@ -413,6 +413,8 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         count_index: width.discriminant.unwrap_or(own_index),
         element: ByteElement::Read,
         nullable,
+        // wave-6v void-handle field (01195a79): a typed-width view is not a handle.
+        handle: None,
         width: Some(width),
         uses: edits,
     })
@@ -659,6 +661,8 @@ pub(crate) fn prove_forward_only(
         count_index: width.discriminant.unwrap_or(own_index),
         element,
         nullable,
+        // wave-6v void-handle field (01195a79): a typed-width view is not a handle.
+        handle: None,
         width: Some(width),
         uses: edits,
     })

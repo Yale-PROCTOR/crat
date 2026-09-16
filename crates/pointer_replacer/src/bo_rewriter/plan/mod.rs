@@ -1344,9 +1344,9 @@ pub(crate) fn finalize_signature_classes(
             SignatureClassId::of(receiver.callee),
         )
     }));
-    let dependency_edges = super::revert_closure::narrow(table, dependency_edges, planned);
     // wave-6b: a region receiver's caller class depends on its accessor's.
     dependency_edges.extend(super::decision::void_region::receiver_dependencies(table));
+    let dependency_edges = super::revert_closure::narrow(table, dependency_edges, planned);
     for (dependent, dependency) in dependency_edges {
         if dependent == dependency || !by_class.contains_key(&dependency) {
             continue;
@@ -4442,7 +4442,12 @@ pub(crate) fn plan(
         let cursor_explicit = cursor_plan.is_some_and(|plan| plan.explicit_declaration.is_some());
         let planned_declaration =
             inferred_box || typed_pattern || typed_receiver || cursor_explicit;
-        let (ty_file, declaration_edit) = if planned_declaration || typed_field_load || inferred_box || typed_pattern || typed_receiver {
+        let (ty_file, declaration_edit) = if planned_declaration
+            || typed_field_load
+            || inferred_box
+            || typed_pattern
+            || typed_receiver
+        {
             match span_to_loc(subject.binding_span) {
                 Ok((file, _, _)) => (file, None),
                 Err(reason) => {
@@ -5790,6 +5795,14 @@ mod tests {
             contract_extent_promotions: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
             slice_input_companions: Default::default(),
+            flexible_tails: Default::default(),
+            box_params: Default::default(),
+            return_certificates: Default::default(),
+            allocator_contracts: Default::default(),
+            void_region: Default::default(),
+            void_region_receivers: Default::default(),
+            forward_slice_parameters: Default::default(),
+            field_transactions: Default::default(),
         };
         let run = |table: &DecisionTable| {
             plan(

@@ -1214,13 +1214,15 @@ fn derive_bundle(
         // `Option<Box<T>>`) takes the moved Box as its store (`Some(owner)`,
         // rendered by that transaction from this Box decision); the raw
         // transfer is rendered only into a field that stays raw.
-        let owned_field = source.store_field().is_some_and(|(struct_did, field_index)| {
-            table.field_transactions.applied.iter().any(|transaction| {
-                transaction.owning
-                    && transaction.key.struct_did.to_def_id() == struct_did
-                    && transaction.key.field_index == field_index
-            })
-        });
+        let owned_field = source
+            .store_field()
+            .is_some_and(|(struct_did, field_index)| {
+                table.field_transactions.applied.iter().any(|transaction| {
+                    transaction.owning
+                        && transaction.key.struct_did.to_def_id() == struct_did
+                        && transaction.key.field_index == field_index
+                })
+            });
         if owned_field {
             receipts.push(format!("native-box-transfer-to-owning-field span={span:?} store=field-transaction(Some(owner)) nonempty={nonempty}"));
         } else {

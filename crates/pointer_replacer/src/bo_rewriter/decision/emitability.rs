@@ -911,6 +911,25 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 }
                                 _ => None,
                             };
+                        // Composition arm: the fields the direct foreign-call fact gained
+                        // in this batch (wave-4 #1b's contract count, wave-6r's unused
+                        // return, wave-6v2's operand pointee, the deref-rooting flag),
+                        // computed as the direct site computes them; an indirect callee
+                        // has no libc contract row, so its count is `None`.
+                        let root_through_deref = place_root(arg).1;
+                        let return_unused = match self.tcx.parent_hir_node(expr.hir_id) {
+                            rustc_hir::Node::Stmt(stmt) => {
+                                matches!(stmt.kind, rustc_hir::StmtKind::Semi(_))
+                            }
+                            rustc_hir::Node::LetStmt(local) => {
+                                matches!(local.pat.kind, rustc_hir::PatKind::Wild)
+                            }
+                            _ => false,
+                        };
+                        let operand_pointee = match typeck.expr_ty(peel_casts(arg)).kind() {
+                            rustc_middle::ty::TyKind::RawPtr(pointee, _) => format!("{pointee:?}"),
+                            _ => String::new(),
+                        };
                         self.facts.foreign_call_args.push(ForeignCallArgFact {
                             caller: self.fn_did,
                             callee: symbol.clone(),
@@ -918,12 +937,16 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                             argument_index: index,
                             argument_span: arg.span,
                             root: shape.place_root(),
+                            root_through_deref,
                             shape: shape.key(),
                             source_type: format!("{source_ty:?}"),
                             target,
                             direct_storage: direct_mutable_storage(arg),
                             adapter_operand_span,
                             adapter_operand_mutability,
+                            contract_count: None,
+                            return_unused,
+                            operand_pointee,
                         });
                     }
                 }

@@ -90,7 +90,6 @@ fn fixture_no_companion() -> String {
         )
 }
 
-
 /// **The adapter's extent arm, in both frames.** Ruling item 4a licensed the
 /// adjacent integer by adjacency; R408-1 (wave-6f, batch 8) requires evidence
 /// that it is a COUNT — a pinned contract's count position, wave-5c's
@@ -165,7 +164,10 @@ fn w5c_slice_input_root_local_forwarders_deliver() {
     }
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
     let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(flat.contains("unsafe fn SplitByteVector(data: &[u8]"), "{flat}");
+    assert!(
+        flat.contains("unsafe fn SplitByteVector(data: &[u8]"),
+        "{flat}"
+    );
     let extent = extent_arm(
         &flat,
         "SplitByteVector(core::slice::from_raw_parts(literals,",
