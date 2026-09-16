@@ -200,16 +200,22 @@ fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
         intravisit::Visitor,
     };
     struct Find<'tcx> {
+        tcx: TyCtxt<'tcx>,
         typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
         binding: HirId,
         found: bool,
     }
     impl<'tcx> Visitor<'tcx> for Find<'tcx> {
         fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            // A callee is LOCAL for this clause only when the crate owns its
+            // body: an `extern "C"` block item is a local `DefId` too, and
+            // `strlen(buf)` / `sscanf(.., buf)` are libc lends, not shared
+            // interfaces (relay wave-6a/009 §1; wave-4 026 C3).
             if let ExprKind::Call(callee, args) = expr.kind
                 && let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
                 && let Res::Def(DefKind::Fn, def_id) = path.res
                 && def_id.is_local()
+                && self.tcx.is_mir_available(def_id)
                 && args.iter().any(|arg| {
                     matches!(&arg.kind, ExprKind::Path(path)
                         if self.typeck.qpath_res(path, arg.hir_id) == Res::Local(self.binding))
@@ -221,6 +227,7 @@ fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
         }
     }
     let mut find = Find {
+        tcx,
         typeck: tcx.typeck(subject.fn_did),
         binding: subject.hir_id,
         found: false,

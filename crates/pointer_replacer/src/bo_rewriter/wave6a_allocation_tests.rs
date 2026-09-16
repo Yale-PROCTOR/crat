@@ -872,3 +872,46 @@ fn w6a_b1_receiver_of_a_local_callee_is_not_typed_by_its_constructor() {
         out.degradations
     );
 }
+
+/// **Relay 009 §1 (wave-4 026 C3).** A libc callee declared in the crate's
+/// own `extern "C"` block is a local `DefId` but not a local callee: the
+/// shared-interface clause of the refusal must not fire on `strlen(p)`, so
+/// the unannotated slice local keeps its constructor typing; an argument of
+/// a callee the crate owns (a body) is still refused.
+#[test]
+fn w6a_b1_libc_argument_is_not_a_shared_interface() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               extern \"C\" { fn strlen(s: *const std::os::raw::c_char) -> usize; }\n\
+               pub unsafe fn measure(mut a: *mut std::os::raw::c_char, mut n: usize) -> usize {\n\
+                   let mut p = a.offset(1 as i32 as isize);\n\
+                   *p.offset(0 as i32 as isize) = 0 as std::os::raw::c_char;\n\
+                   return strlen(p);\n\
+               }\n\
+               pub unsafe fn own_len(mut s: *const std::os::raw::c_char) -> usize { let mut i = 0 as usize; while *s.offset(i as isize) != 0 { i = i.wrapping_add(1); } return i; }\n\
+               pub unsafe fn measure_own(mut a: *mut std::os::raw::c_char, mut n: usize) -> usize {\n\
+                   let mut p = a.offset(1 as i32 as isize);\n\
+                   *p.offset(0 as i32 as isize) = 0 as std::os::raw::c_char;\n\
+                   return own_len(p);\n\
+               }\n";
+    let out = emitted("libc-argument", src);
+    let text = compact(&out.source);
+    // The libc lend keeps the constructor typing.
+    assert!(
+        text.contains("letmutp:&mut[i8]=core::slice::from_raw_parts_mut(a.offset(1asi32asisize),crate::FALLBACK_SLICE_EXTENT);"),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "measure::p"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    // The argument of a callee the crate owns is still refused (clause (b)).
+    assert!(
+        reason_of(&out.degradations, "measure_own::p").is_some(),
+        "{:#?}",
+        out.degradations
+    );
+}
