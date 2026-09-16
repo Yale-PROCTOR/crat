@@ -1005,6 +1005,7 @@ pub(crate) fn plan_slice_constructions(
                     unsafe_fn: false,
                     wrapper_inserted: false,
                     edition: 2018,
+                    requires_unsafe: false,
                 },
             });
             continue;
@@ -1019,6 +1020,7 @@ pub(crate) fn plan_slice_constructions(
             unsafe_fn: enclosing_unsafe_fn,
             wrapper_inserted: !enclosing_unsafe_fn,
             edition: 2018,
+            requires_unsafe: true,
         };
         let rendered =
             if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {

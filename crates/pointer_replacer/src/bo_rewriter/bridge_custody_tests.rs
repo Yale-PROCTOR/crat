@@ -1716,6 +1716,31 @@ fn r430_optional_delivery_spellings_correspond_to_their_original_views() {
         "src.as_deref().map_or(core::ptr::null::<core::ffi::c_void>(), |slice| slice.as_ptr().cast::<core::ffi::c_void>())",
         "src"
     ));
+    // **R431-2 — brotli's `memcpy` suffix view, cast to the callee's pointee.**
+    let suffix = |emitted: &str, binding: &str, method: &str, original: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || {
+                crate::bo_rewriter::bridge_custody_match::typed_view_slice_correspondence_for_test(
+                    emitted, binding, method, original,
+                )
+            },
+        )
+    };
+    assert!(suffix(
+        "(&(data)[(from_pos) as usize..]).as_ptr().cast::<core::ffi::c_void>()",
+        "data",
+        "offset",
+        "data.offset(from_pos as isize) as *const libc::c_void",
+    ));
+    assert!(!suffix(
+        "(&(other)[(from_pos) as usize..]).as_ptr().cast::<core::ffi::c_void>()",
+        "data",
+        "offset",
+        "data.offset(from_pos as isize) as *const libc::c_void",
+    ));
     // Strict: a different field, a different binding, a different mutability
     // and an access with arguments are all refusals.
     assert!(!under(

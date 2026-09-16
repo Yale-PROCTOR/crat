@@ -8640,6 +8640,7 @@ fn append_surface_declaration_plans(
             unsafe_fn,
             wrapper_inserted: !unsafe_fn,
             edition: 2018,
+            requires_unsafe: true,
         };
         let raw_signature = format!(
             "{:?}",

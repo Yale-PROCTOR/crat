@@ -856,6 +856,20 @@ pub(crate) fn slice_construction_corresponds_for_test(
     slice_construction_corresponds(original, emitted, emitted_type)
 }
 
+#[cfg(test)]
+pub(crate) fn typed_view_slice_correspondence_for_test(
+    emitted: &str,
+    binding: &str,
+    method: &str,
+    original: &str,
+) -> bool {
+    let (Ok(emitted), Ok(original)) = (expression_for_test(emitted), expression_for_test(original))
+    else {
+        return false;
+    };
+    typed_view_slice_correspondence(&emitted, binding, method, &original)
+}
+
 pub(crate) fn local_types_correspond_for_test(
     original: Option<&str>,
     emitted: Option<&str>,
@@ -1969,7 +1983,23 @@ fn typed_view_slice_correspondence(
     {
         return false;
     }
-    let emitted = unparen(peel_raw_pointer_casts(emitted));
+    // **R431-2 — the view may be cast to the callee's pointee**, by `as` or by
+    // the pointer method: brotli's `memcpy` takes
+    // `(&(data)[(from_pos) as usize..]).as_ptr().cast::<c_void>()` where the
+    // original wrote `data.offset(from_pos as isize) as *const c_void`. Only
+    // the zero-argument pointer casts are peeled, as everywhere else here.
+    let mut emitted = unparen(peel_raw_pointer_casts(emitted));
+    while let ast::ExprKind::MethodCall(cast) = &emitted.kind {
+        if !cast.args.is_empty()
+            || !matches!(
+                cast.seg.ident.name.as_str(),
+                "cast" | "cast_mut" | "cast_const"
+            )
+        {
+            break;
+        }
+        emitted = unparen(peel_raw_pointer_casts(&cast.receiver));
+    }
     let ast::ExprKind::MethodCall(view) = &emitted.kind else {
         return false;
     };

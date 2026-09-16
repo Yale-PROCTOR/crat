@@ -1479,6 +1479,7 @@ pub(crate) fn plan_depth2_npo_storages(
                     unsafe_fn: enclosing_unsafe_fn,
                     wrapper_inserted: !enclosing_unsafe_fn,
                     edition: 2018,
+                    requires_unsafe: true,
                 },
             ),
         });

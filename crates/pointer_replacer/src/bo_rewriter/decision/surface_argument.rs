@@ -144,6 +144,7 @@ pub(crate) fn plan(
                     unsafe_fn,
                     wrapper_inserted: !unsafe_fn,
                     edition: 2018,
+                    requires_unsafe: true,
                 });
                 let position = format!("generated-wrapper-arg{parameter_index}");
                 let bridge = BridgeSitePlan {

@@ -664,12 +664,21 @@ pub(crate) struct UnsafeContextPresentation {
     pub(crate) unsafe_fn: bool,
     pub(crate) wrapper_inserted: bool,
     pub(crate) edition: u16,
+    /// **R431-2 — does this site's own text perform an unsafe operation?**
+    /// The wrapper rule ("a safe function needs `unsafe { .. }`, an unsafe one
+    /// must not repeat it") is a statement about a site that DOES. wave-6a's
+    /// computed-suffix-copy constructor emits `&mut (a)[e..]` — safe Rust — so
+    /// it inserts no wrapper in a safe function, and recorded `false/false`,
+    /// which the rule read as a missing wrapper (brotli's two
+    /// `slice-local-construction` sites failed the census this way). A site
+    /// that needs no unsafe operation says so; every other site keeps the rule.
+    pub(crate) requires_unsafe: bool,
 }
 
 impl UnsafeContextPresentation {
     fn key(self) -> String {
         format!(
-            "unsafe_fn={}:wrapper={}:edition={}",
+            "unsafe_fn={}:wrapper={}:edition={}{}",
             u8::from(self.unsafe_fn),
             if self.wrapper_inserted {
                 "inserted"
@@ -677,6 +686,11 @@ impl UnsafeContextPresentation {
                 "omitted"
             },
             self.edition,
+            if self.requires_unsafe {
+                ""
+            } else {
+                ":safe-text"
+            },
         )
     }
 
@@ -687,8 +701,11 @@ impl UnsafeContextPresentation {
                 self.edition
             ));
         }
-        if self.unsafe_fn == self.wrapper_inserted {
+        if self.requires_unsafe && self.unsafe_fn == self.wrapper_inserted {
             return Err("unsafe-context wrapper does not match enclosing safety".to_owned());
+        }
+        if !self.requires_unsafe && self.wrapper_inserted {
+            return Err("unsafe wrapper over text that performs no unsafe operation".to_owned());
         }
         Ok(())
     }
@@ -3396,6 +3413,7 @@ mod tests {
             unsafe_fn: true,
             wrapper_inserted: false,
             edition: 2018,
+            requires_unsafe: true,
         };
         assert!(unsafe_context.validate().is_ok());
         assert!(

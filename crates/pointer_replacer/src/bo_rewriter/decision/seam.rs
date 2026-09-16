@@ -4157,6 +4157,7 @@ pub(crate) fn unsafe_context_for(
             unsafe_fn,
             wrapper_inserted: !unsafe_fn,
             edition: 2018,
+            requires_unsafe: true,
         }
     })
 }
