@@ -1584,3 +1584,87 @@ fn w6l_discarded_native_result_keeps_the_callee_class_placed() {
         "{text}"
     );
 }
+
+/// lodepng `lodepng_chunk_data_const` / `lodepng_inspect_chunk` (batch-8
+/// census-1 round 0, main 039 §5): a null-initialised local ASSIGNED the
+/// return of a local callee and walked afterwards, while the callee's
+/// parameter is a slice candidate and its return is tied to it.
+const LODEPNG_CHUNK: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[no_mangle]
+pub unsafe extern "C" fn lodepng_chunk_data_const(mut chunk: *const u8) -> *const u8 {
+    return &*chunk.offset(8 as i32 as isize) as *const u8;
+}
+#[no_mangle]
+pub unsafe extern "C" fn lodepng_chunk_length(mut chunk: *const u8) -> u32 {
+    ((*chunk.offset(0) as u32) << 24) | (*chunk.offset(3) as u32)
+}
+#[no_mangle]
+pub unsafe extern "C" fn inspect_chunk(mut in_0: *const u8, mut pos: usize, mut insize: usize) -> u32 {
+    let mut chunk = in_0.offset(pos as isize);
+    let mut chunk_length: u32 = 0;
+    let mut data = 0 as *const u8;
+    let mut error = 0 as u32;
+    if pos + 4 > insize {
+        return 30;
+    }
+    chunk_length = lodepng_chunk_length(chunk);
+    data = lodepng_chunk_data_const(chunk);
+    let mut i = 0usize;
+    while i < chunk_length as usize {
+        error = error.wrapping_add(*data.offset(i as isize) as u32);
+        i += 1;
+    }
+    error
+}
+"#;
+
+/// R419-1 (a): the receiver takes the delivered form or the return holds —
+/// never a converted return (`&[u8]`) into a raw receiver. On the batch-8
+/// candidate `3d28008a` this shape reverted three subjects (round 0: the
+/// optional slice store over the CONVERTED call — `Option<&[[u8]]>`; round
+/// 1: `&[u8]` into `*const u8`). On this line: 0 reverts; the receiver's
+/// store is rendered over the raw call (the callee holds its raw interface
+/// typed) or, where the return is delivered, over this lane's raw-restoring
+/// view (the nested-edit composition) — either way the receiver walks a
+/// delivered `Option<&[u8]>`.
+#[test]
+fn w6l_lodepng_chunk_receiver_takes_the_delivered_form_or_the_return_holds() {
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        degradations,
+        ..
+    } = emitted(
+        "lodepng-chunk",
+        LODEPNG_CHUNK,
+        &[
+            "lodepng_chunk_data_const",
+            "lodepng_chunk_length",
+            "inspect_chunk",
+        ],
+    )
+    else {
+        panic!("lodepng chunk emission degraded");
+    };
+    println!("W6L-LP-EMITTED reverted={reverted_count}\n{source}\nW6L-LP-END\n{degradations:?}");
+    assert_eq!(reverted_count, 0, "{degradations:?}");
+    let text = compact(&source);
+    assert!(
+        text.contains("fn__crat_safe_inspect_chunk(mutin_0:&[u8],"),
+        "{text}"
+    );
+    assert!(text.contains("letmutdata:Option<&[u8]>=None;"), "{text}");
+    assert!(text.contains("data.unwrap()[i]"), "{text}");
+    assert!(
+        text.contains("let__crat_slice_ptr_9:*const_=lodepng_chunk_data_const(chunk);")
+            || text.contains("let__crat_slice_ptr_9:*const_={let__crat_native_result_"),
+        "{text}"
+    );
+    assert!(
+        !degradations
+            .iter()
+            .any(|d| format!("{:?}", d.reason).contains("RevertedAfterVerifyFailure")),
+        "{degradations:?}"
+    );
+}
