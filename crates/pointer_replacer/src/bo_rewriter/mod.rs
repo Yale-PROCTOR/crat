@@ -7738,6 +7738,7 @@ fn finish_decide<'tcx>(
         decision::field_reference::reconcile_a5_raw_views(tcx, &mut table)?;
         // wave-6a W6A-B1: explicit types on constructor-typed slice locals.
         decision::slice_local_construction::append_explicit_declarations(tcx, &mut table);
+        decision::flexible_tail::append_explicit_declarations(tcx, &mut table);
         decision::box_param::append_explicit_declarations(tcx, &mut table);
         decision::return_certificate::append_explicit_declarations(tcx, &mut table);
         decision::allocator_contract::append_explicit_declarations(tcx, &mut table);

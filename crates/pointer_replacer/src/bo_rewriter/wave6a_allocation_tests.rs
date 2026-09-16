@@ -659,16 +659,18 @@ pub static mut ti_indicators: [ti_indicator_info; 1] = [ti_indicator_info {
 }];
 "#;
 
-/// **Relay 011 (R419-3): a chain is planned WHOLE or not at all.** With
+/// **Relays 011 / 013 (R419-3, R423-7): the wrapper bridges the sized owning
+/// positions, so the transaction rides its raw-surfaced endpoints.** With
 /// `ti_cci` in the indicator table, `ti_buffer_new` and `ti_buffer_free` are
-/// fn-pointer-web members: a converted signature of theirs gets a raw outer
-/// wrapper (the exposure family's), and in-crate callers bind to THAT — a
-/// `Box<ti_buffer>` return / parameter behind it is E0308 at every receiver
-/// and every free (census-1 on `3d28008a`: tulip's 216). The transaction and
-/// the chain hold typed (`chain-endpoint-raw`) and every local stays raw;
-/// nothing reverts. Without the table (the witness above) they deliver.
+/// fn-pointer-web members: a converted signature of theirs gets the exposure
+/// family's raw outer wrapper. The wrapper re-enters ownership at the owning
+/// FORMAL (`ti_buffer_free(buffer: *mut ti_buffer) {
+/// __crat_safe_ti_buffer_free(Box::from_raw(buffer)) }`) and hands the owning
+/// RETURN back as the raw allocation it always was; every in-crate caller
+/// binds to the safe inner name. Before the bridge this was tulip's 216 E0308
+/// on census-1 (`3d28008a`).
 #[test]
-fn w6a_t1_web_member_endpoints_hold_the_transaction_whole() {
+fn w6a_t1_web_member_endpoints_deliver_through_the_wrapper_bridges() {
     let out = emitted(
         "tulip-cci-web",
         &format!(
@@ -679,26 +681,42 @@ fn w6a_t1_web_member_endpoints_hold_the_transaction_whole() {
     );
     let src = compact(&out.source);
     assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
-    assert!(!src.contains("Box<ti_buffer>"), "{}", out.source);
+    assert!(src.contains("pubvals:Box<[f64]>,}"), "{}", out.source);
     assert!(
-        src.contains("pubvals:[std::os::raw::c_double;1],}"),
+        src.contains("fnti_buffer_free(mutbuffer:*mutti_buffer){__crat_safe_ti_buffer_free(Box::from_raw(buffer))}"),
         "{}",
         out.source
     );
     assert!(
-        src.contains("fnti_buffer_new(mutsize:std::os::raw::c_int)->*mutti_buffer{"),
+        src.contains("fn__crat_safe_ti_buffer_free(mutbuffer:Box<ti_buffer>){drop(buffer);}"),
         "{}",
         out.source
     );
-    let receipts = &out.artifacts.flexible_tail_receipts;
     assert!(
-        receipts.contains("\theld\tchain-endpoint-raw:"),
-        "{receipts}\n{}",
-        out.artifacts.box_param_receipts
+        src.contains("fnti_buffer_new(mutsize:std::os::raw::c_int)->Box<ti_buffer>{"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("letmutsum:Box<ti_buffer>=ti_buffer_new(period);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("__crat_safe_ti_buffer_free(sum);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        out.artifacts
+            .flexible_tail_receipts
+            .contains("wrapper-bridged-endpoint "),
+        "{}",
+        out.artifacts.flexible_tail_receipts
     );
     assert_eq!(
-        reason_of(&out.degradations, "ti_cci::sum").as_deref(),
-        Some("chain-endpoint-raw"),
+        reason_of(&out.degradations, "ti_cci::sum"),
+        None,
         "{:#?}",
         out.degradations
     );

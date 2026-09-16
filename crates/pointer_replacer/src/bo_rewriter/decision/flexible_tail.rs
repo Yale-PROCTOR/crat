@@ -33,6 +33,7 @@ use super::{
     box_facts::{BoxExprEdit, BoxPlan, BoxPlanFailure, BoxShape, scalar_initializer_supported},
     construction::{CallResultTarget, ConstructionFacts},
     declaration::pointee_source,
+    seam::ExplicitDeclarationSite,
 };
 use crate::bo_rewriter::bridge_receipt::SignatureClassId;
 
@@ -146,6 +147,69 @@ pub(crate) fn override_plan(
             },
         },
     }
+}
+
+/// After the decisions (relay wave-6a/013 §3): every local a transaction
+/// plans carries its `Box<S>` type as an explicit-declaration SITE, so the
+/// AST channel and the span product read ONE text rather than each deriving
+/// its own.
+///
+/// **ANNOTATED locals are not registered here yet.** ownership-fields'
+/// `4e8ed238` is what makes the channel REPLACE a source annotation (`let
+/// mut ret: *mut ti_buffer = …`, tulip's `ti_buffer_new::ret`), and it reads
+/// the site's type as `::std::boxed::Box<…>`; on a tree without it the
+/// channel refuses an annotated local and the emission fails
+/// (`declaration-explicit-type-unplaceable: planned=3 placed=0 refused=3` on
+/// this lane's base). The annotated arm is the one-line flip at re-anchor —
+/// `subject.ty_span.is_some()` registered with that spelling — once their
+/// commit is in the tree.
+pub(crate) fn append_explicit_declarations(tcx: TyCtxt<'_>, table: &mut DecisionTable) {
+    let mut sites = Vec::new();
+    for (subject, decision) in &table.entries {
+        let node = (subject.fn_did, subject.hir_id);
+        match decision {
+            super::Decision::Box(_) => {}
+            super::Decision::Ref { .. }
+            | super::Decision::InferredRef { .. }
+            | super::Decision::Slice { .. }
+            | super::Decision::NestedSlice { .. }
+            | super::Decision::Cursor { .. }
+            | super::Decision::Opt { .. }
+            | super::Decision::Degraded(_) => continue,
+        }
+        if !table.flexible_tails.plans.contains_key(&node)
+            || !matches!(subject.kind, SubjectKind::Local)
+            || subject.ty_span.is_some()
+        {
+            continue;
+        }
+        let Some(name) = subject.param_name.as_deref() else { continue };
+        if table
+            .seams
+            .explicit_declarations
+            .iter()
+            .any(|site| site.category == "local" && site.node == Some(node))
+        {
+            continue;
+        }
+        let binding_type = tcx.typeck(subject.fn_did).node_type(subject.hir_id);
+        let TyKind::RawPtr(pointee, _) = binding_type.kind() else { continue };
+        let emitted_type = format!("Box<{}>", pointee_source(tcx, *pointee));
+        sites.push(ExplicitDeclarationSite {
+            owner_class: SignatureClassId::of(subject.fn_did),
+            caller: subject.fn_did,
+            node: Some(node),
+            span: Some(subject.binding_span),
+            category: "local",
+            replacement: Some(format!(
+                "{}{name}: {emitted_type}",
+                if subject.mut_binding { "mut " } else { "" }
+            )),
+            emitted_type,
+            arm: "surface",
+        });
+    }
+    table.seams.explicit_declarations.extend(sites);
 }
 
 /// After the seams: a transaction reverts whole (R419-3) — the class that
@@ -993,28 +1057,25 @@ pub(crate) fn derive<'tcx>(
                 item_edits.push((ty.span, format!("Box<{}>", snippet(tcx, pointer.ty.span))));
             }
         }
-        // R419-3 (relay wave-6a/011): a chain is planned WHOLE or not at all.
-        // An owning endpoint that is a fn-pointer-web member or a positive
-        // seed keeps a RAW outer surface (the exposure family's wrapper, which
-        // every in-crate caller binds to): its `Box<S>` return / parameter
-        // would sit behind `*mut S` at every receiver and every free (tulip's
-        // 216 E0308 on census-1). The transaction holds typed and every local
-        // it would have planned stays raw.
+        // R419-3 / R423-7 (relays wave-6a/011, /013): a chain is planned WHOLE
+        // or not at all. An owning endpoint that is a fn-pointer-web member or
+        // a positive seed keeps a RAW outer surface (the exposure family's
+        // wrapper); the wrapper BRIDGES a sized owning position in both
+        // directions (`__crat_safe_f(Box::from_raw(p))` at a `Box<S>` formal,
+        // `Box::into_raw(__crat_safe_f(..))` at a `Box<S>` return) and every
+        // in-crate caller binds to the safe inner name, so a flexible-tail
+        // transaction — whose owning positions are always the sized `Box<S>`
+        // of the split struct — rides it. `raw_surface` stays a receipt.
         if let Some(endpoint) = owning_returns
             .iter()
             .copied()
             .chain(owning_params.iter().map(|(f, _)| *f))
             .find(|f| raw_surface(*f))
         {
-            let reason = format!(
-                "chain-endpoint-raw:{}",
+            receipts.push(format!(
+                "wrapper-bridged-endpoint {}",
                 tcx.def_path_str(endpoint.to_def_id())
-            );
-            for key in plans.keys() {
-                out.endpoint_holds.insert(*key, reason.clone());
-            }
-            hold(reason, &mut out);
-            continue;
+            ));
         }
         // Owning parameters are subjects of their own: their `Box<S>` declaration
         // is the Box decision's, in both layers.

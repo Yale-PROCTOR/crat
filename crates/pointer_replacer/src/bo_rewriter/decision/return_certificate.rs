@@ -1492,13 +1492,6 @@ fn certify<'tcx, 's>(
             "return-certificate-indirect-callers:{callee_path}"
         )));
     }
-    // R419-3 (relay wave-6a/011): a fn-pointer-web member or positive seed
-    // keeps a raw outer surface (the exposure family's wrapper) that every
-    // in-crate receiver binds to — a `Box<T>` return behind it is E0308 at
-    // every receiver. The certificate holds whole.
-    if raw_surface(callee) {
-        return Err(hold(format!("chain-endpoint-raw:{callee_path}")));
-    }
     // Every returned call's target must be certified (pending otherwise).
     let mut chained_from: Vec<LocalDefId> = Vec::new();
     for (target, _) in &sources.calls {
@@ -1885,6 +1878,16 @@ fn certify<'tcx, 's>(
         shapes.push((c.shape, c.optional));
     }
     let shape = shapes[0].0;
+    // R419-3 / R423-7 (relays wave-6a/011, /013): a fn-pointer-web member or
+    // positive seed keeps a raw outer surface (the exposure family's
+    // wrapper). The wrapper carries a SIZED owning return across the C ABI
+    // (`Box::into_raw(__crat_safe_f(..))`, and the `match` arm for the
+    // nullable twin) and every in-crate receiver binds to the safe inner
+    // name; a `Box<[T]>` return would lose its extent at the raw surface, so
+    // that certificate still holds whole.
+    if shape == BoxShape::Slice && raw_surface(callee) {
+        return Err(hold(format!("chain-endpoint-raw:{callee_path}:slice")));
+    }
     if shapes.iter().any(|(s, _)| *s != shape) {
         return Err(hold(format!(
             "return-certificate-shape:{callee_path}:sources-disagree"

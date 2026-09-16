@@ -2994,6 +2994,14 @@ fn surface_wrapper_block_with_arguments(
                 if let Some(expression) = arguments.get(&index) {
                     return Ok(expression.clone());
                 }
+                // wave-6a (relay wave-6a/013 §2, R423-7): an OWNING parameter
+                // has no borrowed-parameter plan (the surface-argument
+                // constructor plans `Form`s, and a Box has none); its
+                // ownership re-entry is the arm below.
+                let ty = rustc_ast_pretty::pprust::ty_to_string(&parameter.ty);
+                if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
+                    return surface_argument(parameter, enclosing_unsafe_fn);
+                }
                 let rustc_ast::PatKind::Ident(_, ident, None) = &parameter.pat.kind else {
                     return Err("inbound-wrapper-unplaceable: non-identifier parameter".into());
                 };

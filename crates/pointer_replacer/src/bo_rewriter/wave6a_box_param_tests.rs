@@ -386,3 +386,29 @@ fn w6a_c1_qselect_lend_is_not_a_box_parameter() {
         out.artifacts.box_param_receipts
     );
 }
+
+/// R423-7: the wrapper bridges a SIZED owning formal
+/// (`__crat_safe_f(Box::from_raw(p))`) but a `Box<[T]>` one has no extent at
+/// the raw surface, so a slice chain whose consuming callee is a
+/// fn-pointer-web member still holds whole (`chain-endpoint-raw:…:slice`);
+/// the callers' allocation locals stay raw and nothing reverts.
+#[test]
+fn w6a_c1_slice_chain_on_a_web_member_holds_whole() {
+    const TABLE: &str = r#"
+pub static mut HOOKS: [Option<unsafe extern "C" fn(i32) -> i32>; 1] = [Some(run as unsafe extern "C" fn(i32) -> i32)];
+"#;
+    let out = emitted(
+        "boxparam-slice-web",
+        &format!("{}{TABLE}", with_prelude(SLICE_CHAIN)),
+    );
+    let src = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(!src.contains("Box<[i32]>"), "{}", out.source);
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("\theld\tchain-endpoint-raw:sum_and_release:slice"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+}

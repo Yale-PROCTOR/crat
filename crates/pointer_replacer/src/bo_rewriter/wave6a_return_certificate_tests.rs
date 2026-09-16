@@ -444,14 +444,15 @@ fn w6a_a1_callee_with_its_address_taken_holds() {
     );
 }
 
-/// R419-3 (relay 011): `use_item` is a fn-pointer-web ROOT (its address sits
-/// in a static table), so `item_new` and `item_release` are web MEMBERS —
-/// each would get the exposure family's raw wrapper that every in-crate
-/// caller binds to; a `Box<item>` return / parameter behind it is E0308 at
-/// the receiver and at the transfer. The certificate and the chain hold
-/// typed (`chain-endpoint-raw`); nothing reverts; no `Box` in the crate.
+/// R419-3 / R423-7 (relays 011, 013): `use_item` is a fn-pointer-web ROOT
+/// (its address sits in a static table), so `item_new` and `item_release`
+/// are web MEMBERS — `item_release`'s converted signature gets the exposure
+/// family's raw wrapper, which re-enters ownership (`Box::from_raw(it)`)
+/// because the formal is SIZED; `item_new`'s owning return crosses as the
+/// raw allocation; every in-crate caller binds to the safe inner name. The
+/// certificate and the chain deliver whole.
 #[test]
-fn w6a_a1_web_member_callee_holds_the_certificate_and_the_chain_whole() {
+fn w6a_a1_web_member_callee_delivers_through_the_wrapper_bridge() {
     const TABLE: &str = r#"
 pub static mut HOOKS: [Option<unsafe extern "C" fn() -> i32>; 1] = [Some(use_item as unsafe extern "C" fn() -> i32)];
 "#;
@@ -461,28 +462,32 @@ pub static mut HOOKS: [Option<unsafe extern "C" fn() -> i32>; 1] = [Some(use_ite
     );
     let src = compact(&out.source);
     assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
-    assert!(!src.contains("Box<"), "{}", out.source);
     assert!(
-        out.artifacts
-            .return_certificate_receipts
-            .contains("item_new::it\theld\tchain-endpoint-raw:item_new"),
+        src.contains("fnitem_release(mutit:*mutitem,mutflag:i32){__crat_safe_item_release(Box::from_raw(it),flag)}"),
         "{}",
-        out.artifacts.return_certificate_receipts
+        out.source
     );
     assert!(
-        out.artifacts
-            .box_param_receipts
-            .contains("\theld\tchain-endpoint-raw:item_release"),
+        src.contains(
+            "fn__crat_safe_item_release(mutit:Box<item>,mutflag:i32){ifflag!=0{drop(it);}}"
+        ),
         "{}",
-        out.artifacts.box_param_receipts
+        out.source
     );
-    // The formal is model-Raw: it degrades `kind-raw` before the Box arm
-    // (the typed hold rides the receipts; only an Owning-modeled formal
-    // carries it as its reason).
     assert!(
-        reason_of(&out.degradations, "item_release::it").is_some(),
-        "{:#?}",
-        out.degradations
+        src.contains("fnitem_new(mutid:i32)->Box<item>{"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("letmutit:Box<crate::item>=item_new(3asi32);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("__crat_safe_item_release(it,1asi32);"),
+        "{}",
+        out.source
     );
 }
 

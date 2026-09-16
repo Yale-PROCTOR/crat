@@ -500,15 +500,7 @@ pub(crate) fn derive<'tcx>(
             );
             continue;
         }
-        // R419-3 (relay wave-6a/011): the consuming callee is a fn-pointer-web
-        // member or a positive seed — its converted signature would sit
-        // behind the exposure family's raw wrapper, which every in-crate
-        // caller binds to (`__crat_safe_f(p)` with `p` raw: E0308). The chain
-        // holds typed; the callers' locals stay raw.
-        if raw_surface(param.fn_did) {
-            hold(format!("chain-endpoint-raw:{callee_path}"), &mut out);
-            continue;
-        }
+
         // Every direct call site passes an allocation local, planned by the
         // ordinary Box arm with the transfer's boundary lifted, dead afterwards.
         let mut call_count = 0usize;
@@ -705,6 +697,17 @@ pub(crate) fn derive<'tcx>(
             continue;
         }
         let (slice, pointee_override) = shapes.into_iter().next().expect("one shape");
+        // R419-3 / R423-7 (relays wave-6a/011, /013): the consuming callee is
+        // a fn-pointer-web member or a positive seed, so its converted
+        // signature sits behind the exposure family's raw wrapper. The wrapper
+        // re-enters ownership for a SIZED formal
+        // (`__crat_safe_f(Box::from_raw(p))`) and every in-crate caller binds
+        // to the safe inner name; a `Box<[T]>` formal has no extent at the raw
+        // surface, so that chain still holds typed.
+        if slice && raw_surface(param.fn_did) {
+            hold(format!("chain-endpoint-raw:{callee_path}:slice"), &mut out);
+            continue;
+        }
         if pointee_override.is_some() {
             hold(
                 format!("box-param-shape:{callee_path}:pointee-override"),
