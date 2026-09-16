@@ -1380,8 +1380,9 @@ fn collect_retention_facts<'tcx>(
                     ));
                 }
                 Err(_)
-                    if crate::bo_rewriter::wave6r_child_access::core_pointer_call(tcx, callee)
-                        .is_some() =>
+                    if crate::bo_rewriter::wave6r_child_access::core_pointer_known_no_retain(
+                        tcx, body, data, callee,
+                    ) =>
                 {
                     facts.steps.push(retention_step(
                         location,

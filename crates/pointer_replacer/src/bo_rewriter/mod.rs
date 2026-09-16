@@ -8834,7 +8834,7 @@ pub(crate) struct DecideCtx {
     box_facts: decision::box_facts::BoxOwnershipFacts,
     constructions: decision::construction::ConstructionFacts,
     raw_boundary_sites: decision::raw_boundary::RawBoundarySiteFacts,
-    retention: decision::raw_boundary::RetentionSummaries,
+    pub(crate) retention: decision::raw_boundary::RetentionSummaries,
     pub(crate) raw_boundary: decision::raw_boundary::RawBoundaryDispositionIndex,
     exposure: decision::exposure::ExposurePolicy,
     raw_boundary_artifacts: RawBoundaryArtifacts,

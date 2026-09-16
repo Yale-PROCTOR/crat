@@ -63,6 +63,65 @@ pub(crate) fn core_pointer_call(tcx: TyCtxt<'_>, callee: DefId) -> Option<CorePo
     }
 }
 
+/// Whether `local` reaches the function's return place through transparent
+/// copies and pointer casts. A subject's own rebind that is RETURNED
+/// (`let q = p.offset(1); q`, wave-6s's re-ratified g18 form) keeps the
+/// pre-hook reading — an open call, retention unknown — rather than a
+/// positive retention of the parameter (main 036 / relay wave-6r/010).
+fn result_returned(body: &Body<'_>, local: Local) -> bool {
+    let mut aliases = vec![local];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(assignment) = &statement.kind else { continue };
+                let (lhs, rhs) = (&assignment.0, &assignment.1);
+                let source = match rhs {
+                    Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => operand_local(operand),
+                    _ => None,
+                };
+                let Some(source) = source.filter(|source| aliases.contains(source)) else {
+                    continue;
+                };
+                if lhs.as_local() == Some(rustc_middle::mir::RETURN_PLACE) {
+                    return true;
+                }
+                if let Some(destination) = lhs.as_local()
+                    && !aliases.contains(&destination)
+                {
+                    aliases.push(destination);
+                    changed = true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The collector's arm for a `Rust`-ABI callee: a known no-retain step when
+/// the call is a classified core pointer method whose alias result (if any)
+/// is not the function's own returned rebind.
+pub(crate) fn core_pointer_known_no_retain<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    data: &rustc_middle::mir::BasicBlockData<'tcx>,
+    callee: DefId,
+) -> bool {
+    match core_pointer_call(tcx, callee) {
+        None => false,
+        Some(CorePointerCall::NoRetain) => true,
+        Some(CorePointerCall::AliasResult) => {
+            let TerminatorKind::Call { destination, .. } = &data.terminator().kind else {
+                return false;
+            };
+            destination
+                .as_local()
+                .is_some_and(|result| !result_returned(body, result))
+        }
+    }
+}
+
 /// The retention collector's alias edge for a block whose terminator is an
 /// alias-result core call on a raw-pointer local: `receiver -> result`.
 pub(crate) fn core_pointer_alias_edge<'tcx>(
@@ -88,6 +147,7 @@ pub(crate) fn core_pointer_alias_edge<'tcx>(
     let result = destination.as_local()?;
     if !matches!(body.local_decls[receiver].ty.kind(), TyKind::RawPtr(..))
         || !matches!(body.local_decls[result].ty.kind(), TyKind::RawPtr(..))
+        || result_returned(body, result)
     {
         return None;
     }

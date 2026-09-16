@@ -195,3 +195,40 @@ fn wave6r_child_access_core_offset_result_into_unmodeled_foreign_is_retention_un
         "{row}"
     );
 }
+
+/// main 036 (R410 relay 010): wave-6s's re-ratified g18 rebind — the subject
+/// re-binds its own view (`let q = p.offset(1)`) and returns it. The pin of
+/// record is that the position emits; the offset-family alias edge must not
+/// turn the rebind into a positive retention of `p`. The pre-hook reading
+/// (an open call, retention unknown) is kept for a result that is returned.
+#[test]
+fn wave6r_offset_alias_returned_rebind_keeps_the_open_reading() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+pub unsafe fn f(mut p: *mut i32, n: usize) -> *mut i32 {
+    let q: *mut i32 = p.offset(1 as isize);
+    q
+}
+"#;
+    let row = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = super::super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::super::A5Mode::PreciseReplay,
+                Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        let rows = ctx.retention.to_tsv();
+        println!("RETENTION\n{rows}");
+        rows.lines()
+            .find(|line| line.starts_with("f\t") && line.contains("\t0\t"))
+            .expect("f's parameter row")
+            .to_owned()
+    })
+    .expect("input type-checks");
+    assert!(
+        !row.contains("\tretains\t") && !row.contains("\tno-retain\t"),
+        "a returned offset rebind keeps the open reading: {row}"
+    );
+}
