@@ -180,6 +180,9 @@ pub(crate) struct SourcePlan {
     /// (`(*rb).data_ = new_data`): the close is the transfer, the field's
     /// own C free stays where it is (R415, wave-6f 012 STOP 3).
     store_transfer: Option<Span>,
+    /// The field the store transfer fills: `(struct, field index)` — the
+    /// identity a field transaction (wave-6f) is keyed by.
+    store_field: Option<(DefId, usize)>,
     /// The MIR local that receives the allocator's result: the one source of
     /// every pointer into this fresh allocation while the root never escapes.
     allocation_local: u32,
@@ -201,6 +204,10 @@ impl SourcePlan {
 
     pub(crate) fn store_transfer(&self) -> Option<Span> {
         self.store_transfer
+    }
+
+    pub(crate) fn store_field(&self) -> Option<(DefId, usize)> {
+        self.store_field
     }
 
     pub(crate) fn allocation_local(&self) -> u32 {
@@ -448,6 +455,7 @@ fn plain_local(operand: &Operand<'_>) -> Option<Local> {
 // trap between the generated peer borrows. Count operands are a different
 // phase: they remain evaluated once at their original allocation site.
 fn scalar_arguments(
+    tcx: TyCtxt<'_>,
     expression: &Expr<'_>,
     typeck: &rustc_middle::ty::TypeckResults<'_>,
 ) -> Result<BTreeSet<usize>, SourceHold> {
@@ -457,7 +465,7 @@ fn scalar_arguments(
         if typeck.expr_ty(argument).is_raw_ptr() {
             continue;
         }
-        if !pure(argument, typeck) {
+        if !pure(tcx, argument, typeck) {
             return Err(SourceHold::UnsupportedOwnerUse);
         }
         scalars.insert(index);
@@ -466,7 +474,11 @@ fn scalar_arguments(
 }
 /// A side-effect-free scalar read: literals, locals, casts, arithmetic and
 /// comparisons over those.
-fn pure(expression: &Expr<'_>, typeck: &rustc_middle::ty::TypeckResults<'_>) -> bool {
+fn pure(
+    tcx: TyCtxt<'_>,
+    expression: &Expr<'_>,
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+) -> bool {
     {
         if !matches!(
             typeck.expr_ty(expression).kind(),
@@ -477,7 +489,31 @@ fn pure(expression: &Expr<'_>, typeck: &rustc_middle::ty::TypeckResults<'_>) -> 
         match expression.kind {
             ExprKind::Lit(_) => true,
             ExprKind::Path(QPath::Resolved(_, path)) => matches!(path.res, Res::Local(_)),
-            ExprKind::Cast(inner, _) => pure(inner, typeck),
+            ExprKind::Cast(inner, _) => pure(tcx, inner, typeck),
+            // A scalar FIELD of another object read through a PARAMETER's raw
+            // pointer (`(*rb).cur_size_`): a parameter cannot alias the
+            // fresh allocation, and a raw read is not a borrow, so the read
+            // commutes with the owner's lend (E5C-3: nothing to hoist).
+            ExprKind::Field(base, _) => {
+                let ExprKind::Unary(rustc_hir::UnOp::Deref, through) = base.kind else {
+                    return false;
+                };
+                let ExprKind::Path(QPath::Resolved(_, path)) = through.kind else {
+                    return false;
+                };
+                let Res::Local(local) = path.res else { return false };
+                typeck.expr_ty(through).is_raw_ptr()
+                    && matches!(tcx.parent_hir_node(local), Node::Param(_))
+            }
+            // A wrapping integer operation over pure operands: no memory, no
+            // trap (C's unsigned arithmetic as the substrate spells it).
+            ExprKind::MethodCall(segment, receiver, [argument], _) => {
+                matches!(
+                    segment.ident.name.as_str(),
+                    "wrapping_add" | "wrapping_sub" | "wrapping_mul"
+                ) && pure(tcx, receiver, typeck)
+                    && pure(tcx, argument, typeck)
+            }
             // Scalar arithmetic over pure operands reads no memory and
             // introduces no reference; an overflow or zero-divisor trap is
             // the input's own UB in C (§28) and unwinds through the
@@ -501,11 +537,11 @@ fn pure(expression: &Expr<'_>, typeck: &rustc_middle::ty::TypeckResults<'_>) -> 
                         | Le
                         | Gt
                         | Ge
-                ) && pure(left, typeck)
-                    && pure(right, typeck)
+                ) && pure(tcx, left, typeck)
+                    && pure(tcx, right, typeck)
             }
             ExprKind::Unary(rustc_hir::UnOp::Neg | rustc_hir::UnOp::Not, inner) => {
-                pure(inner, typeck)
+                pure(tcx, inner, typeck)
             }
             _ => false,
         }
@@ -662,6 +698,7 @@ pub(crate) fn derive<'tcx>(
     let mut boundary_arguments = FxHashSet::default();
     let mut returns = Vec::new();
     let mut stores = Vec::new();
+    let mut store_fields = Vec::new();
     for &expression in &expressions.0 {
         if let ExprKind::Ret(Some(returned)) = expression.kind
             && let Ok(operand) = peel(returned, typeck)
@@ -684,6 +721,9 @@ pub(crate) fn derive<'tcx>(
         {
             covered.insert(operand.hir_id.local_id.as_u32());
             stores.push(stored);
+            if let TyKind::Adt(def, _) = typeck.expr_ty(base).kind() {
+                store_fields.push((def.did(), typeck.field_index(lhs.hir_id).as_usize()));
+            }
         }
         if let ExprKind::Call(callee, arguments) = expression.kind {
             for (index, argument) in arguments.iter().enumerate() {
@@ -692,7 +732,22 @@ pub(crate) fn derive<'tcx>(
                     continue;
                 }
                 let did = definition(callee).ok_or(SourceHold::UnsupportedOwnerUse)?;
+                // A pointer-valued result could be an alias of the owner; a
+                // FOREIGN call whose value is DISCARDED (`memcpy(dst, …);` as
+                // a statement) returns it to no one. A local callee's returned
+                // alias is the native stage's to certify (rule C), so its
+                // permit-level refusal stands.
+                let discarded = matches!(
+                    tcx.parent_hir_node(expression.hir_id),
+                    Node::Stmt(rustc_hir::Stmt {
+                        kind: rustc_hir::StmtKind::Semi(_),
+                        ..
+                    })
+                ) && did.as_local().is_some_and(|local| {
+                    matches!(tcx.hir_node_by_def_id(local), Node::ForeignItem(_))
+                });
                 if !typeck.expr_ty(expression).is_unit()
+                    && !discarded
                     && !matches!(
                         typeck.expr_ty(expression).kind(),
                         TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool
@@ -738,7 +793,7 @@ pub(crate) fn derive<'tcx>(
                 || !typeck.expr_ty(init).is_raw_ptr()
                 || local.els.is_some()
                 || local.ty.is_some()
-                || !pure(start, typeck)
+                || !pure(tcx, start, typeck)
             {
                 continue;
             }
@@ -1156,7 +1211,7 @@ pub(crate) fn derive<'tcx>(
                 lent,
                 argument_span,
                 call_span: expression.span,
-                scalar_arguments: scalar_arguments(expression, typeck)?,
+                scalar_arguments: scalar_arguments(tcx, expression, typeck)?,
                 deallocator_events,
                 raw_argument_type: typeck
                     .expr_ty(match expression.kind {
@@ -1328,6 +1383,7 @@ pub(crate) fn derive<'tcx>(
         mir_aliases: aliases,
         return_transfer: returns.first().map(|r| r.span),
         store_transfer: stores.first().map(|s| s.span),
+        store_field: store_fields.first().copied(),
         allocation_local: allocator_destination.as_u32(),
         element_spelling: constructor.element_spelling,
         view_aliases,
@@ -1460,6 +1516,85 @@ unsafe extern "C" fn holder_free(mut h: *mut Holder) { free((*h).buf as *mut lib
                 assert!(
                     derive(&program, subject, &ctx.constructions).is_err(),
                     "{body}"
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    /// R416-12: brotli's `RingBufferInitBuffer` as the derived substrate
+    /// spells it — a byte-sized element's count is the byte count whatever
+    /// its spelling; a `memcpy` whose pointer result is DISCARDED returns no
+    /// alias; a scalar argument may read a field through a PARAMETER's raw
+    /// pointer and use wrapping arithmetic; the store is the transfer. The
+    /// permit admits the body; the foreign lend itself is the native stage's
+    /// (`native-lend-source-join` until `memcpy` has a contract row).
+    #[test]
+    fn r416_ring_buffer_substrate_body_passes_the_permit() {
+        let declarations = r#"#![allow(non_camel_case_types)] pub mod libc { pub use core::ffi::c_int; pub use core::ffi::c_ulong; pub use core::ffi::c_void; } extern "C" { fn malloc(n:libc::c_ulong)->*mut libc::c_void; fn free(p:*mut libc::c_void); fn memcpy(d: *mut libc::c_void, s: *const libc::c_void, n: libc::c_ulong) -> *mut libc::c_void; }
+#[repr(C)] #[derive(Copy, Clone)] pub struct RingBuffer { pub cur_size_: u32, pub data_: *mut u8, pub buffer_: *mut u8 }"#;
+        let body = |copy: &str| {
+            format!(
+                "{declarations}\nunsafe extern \"C\" fn RingBufferInitBuffer(buflen: u32, mut rb: *mut RingBuffer) {{ let mut new_data = malloc((2 as u32).wrapping_add(buflen) as libc::c_ulong) as *mut u8; if !((*rb).data_).is_null() {{ {copy} free((*rb).data_ as *mut libc::c_void); (*rb).data_ = 0 as *mut u8; }} (*rb).data_ = new_data; (*rb).cur_size_ = buflen; }}"
+            )
+        };
+        let admitted = body(
+            "memcpy(new_data as *mut libc::c_void, (*rb).data_ as *const libc::c_void, (2 as u32).wrapping_add((*rb).cur_size_) as libc::c_ulong);",
+        );
+        ::utils::compilation::run_compiler_on_str(&admitted, |tcx| {
+            let (table, ctx) = bo::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    bo::A5Mode::PreciseReplay,
+                    Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let program = bo::collect_program(tcx);
+            let (subject, _) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.param_name.as_deref() == Some("new_data"))
+                .unwrap();
+            let plan = derive(&program, subject, &ctx.constructions).unwrap();
+            assert_eq!(plan.constructor().receipt, "native-malloc-zero-byte-count");
+            assert_eq!(
+                plan.count(),
+                "(((2 as u32).wrapping_add(buflen) as libc::c_ulong) as usize)"
+            );
+            assert!(plan.store_transfer().is_some() && plan.store_field().is_some());
+            assert_eq!(
+                plan.calls().len(),
+                1,
+                "the memcpy lend is a call obligation"
+            );
+            assert_eq!(plan.calls()[0].scalar_arguments().len(), 1);
+        })
+        .unwrap();
+        // A KEPT pointer result may alias the owner; a field read through a
+        // LOCAL (not a parameter) is not known disjoint from the owner.
+        for copy in [
+            "let kept = memcpy(new_data as *mut libc::c_void, (*rb).data_ as *const libc::c_void, 2 as libc::c_ulong);",
+            "let mut other = rb; memcpy(new_data as *mut libc::c_void, (*rb).data_ as *const libc::c_void, (*other).cur_size_ as libc::c_ulong);",
+        ] {
+            ::utils::compilation::run_compiler_on_str(&body(copy), |tcx| {
+                let (table, ctx) = bo::decide_table_with_ctx_config(
+                    tcx,
+                    Some((
+                        bo::A5Mode::PreciseReplay,
+                        Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                    )),
+                )
+                .unwrap();
+                let program = bo::collect_program(tcx);
+                let (subject, _) = table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| subject.param_name.as_deref() == Some("new_data"))
+                    .unwrap();
+                assert!(
+                    derive(&program, subject, &ctx.constructions).is_err(),
+                    "{copy}"
                 );
             })
             .unwrap();

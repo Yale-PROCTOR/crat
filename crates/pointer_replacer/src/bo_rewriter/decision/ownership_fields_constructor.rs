@@ -134,6 +134,33 @@ pub(crate) fn derive<'tcx>(
                     receipt: "native-malloc-zero-numeric-wrapping-count",
                 },
             });
+        } else if element_bits == 8 {
+            // A byte-sized element: the byte count IS the element count
+            // (`malloc(n) as *mut u8`, brotli's ring buffer), whatever the
+            // spelling of `n` (the allocator received exactly that many
+            // bytes); the whole expression is kept and evaluated once, and a
+            // count that may be zero is not proved nonempty.
+            let original = tcx
+                .sess
+                .source_map()
+                .span_to_snippet(bytes.span)
+                .map_err(|_| SourceHold::Missing("constructor-byte-spelling"))?;
+            let count = format!("(({original}) as usize)");
+            let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
+            return Ok(Constructor {
+                allocation,
+                allocator,
+                element,
+                element_spelling: element_spelling.clone(),
+                count,
+                shape: BoxShape::Slice,
+                nonempty: false,
+                edit: BoxExprEdit {
+                    span: init.span,
+                    replacement,
+                    receipt: "native-malloc-zero-byte-count",
+                },
+            });
         } else {
             let Some(peeled) = peeled else { return Err(SourceHold::ConstructorShape) };
             let ExprKind::Binary(operator, left, right) = peeled.kind else {
