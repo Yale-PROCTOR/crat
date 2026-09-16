@@ -75,6 +75,21 @@ fn fixture() -> String {
     )
 }
 
+/// The same chain with no companion integer beside `SplitByteVector::data`
+/// (a pointer sits between it and `length`), so the fresh-root supply is
+/// what decides it (R418-1 gives a companion forwarder the slice on its own).
+fn fixture_no_companion() -> String {
+    fixture()
+        .replace(
+            "unsafe fn SplitByteVector(data: *const u8, length: usize,",
+            "unsafe fn SplitByteVector(data: *const u8, _tail: *const u8, length: usize,",
+        )
+        .replace(
+            "SplitByteVector(literals, n, 3, 2)",
+            "SplitByteVector(literals, literals, n, 3, 2)",
+        )
+}
+
 /// `SplitByteVector::data` and `RefineEntropyCodes::data` are the corpus's
 /// thin forwarders; their root is the caller's allocation LOCAL, which W-C7
 /// refused (`caller-not-supplied`: a supplier had to be a parameter).
@@ -161,7 +176,7 @@ pub unsafe fn entry() -> u32 { let one: u8 = 7; thin_entry(&one) }
 #[test]
 fn w5c_slice_input_root_local_must_be_fresh() {
     use super::slice_input::Hold;
-    let borrowed = fixture().replace(
+    let borrowed = fixture_no_companion().replace(
         "    let literals = xalloc(n);",
         "    let mut arr = [0u8; 16];\n    let literals: *mut u8 = &mut arr[0];",
     );
@@ -171,7 +186,7 @@ fn w5c_slice_input_root_local_must_be_fresh() {
         &Err(Hold::CallerNotSupplied)
     );
     // A call that takes a pointer may hand it back: not fresh.
-    let handed_back = fixture().replace(
+    let handed_back = fixture_no_companion().replace(
         "    let literals = xalloc(n);",
         "    let mut arr = [0u8; 16];\n    let literals = pass_through(arr.as_mut_ptr());",
     ) + "unsafe fn pass_through(p: *mut u8) -> *mut u8 { p }\n";
@@ -181,7 +196,7 @@ fn w5c_slice_input_root_local_must_be_fresh() {
         &Err(Hold::CallerNotSupplied)
     );
     // A root redefined from something else is not fresh past that point.
-    let reassigned = fixture()
+    let reassigned = fixture_no_companion()
         .replace("    let literals = xalloc(n);", "    let mut literals = xalloc(n);")
         .replace(
             "    fill(literals, n);",
@@ -192,7 +207,7 @@ fn w5c_slice_input_root_local_must_be_fresh() {
         super::slice_input_tests::proof_of(&proofs, "SplitByteVector::data"),
         &Err(Hold::CallerNotSupplied)
     );
-    let tested = fixture().replace(
+    let tested = fixture_no_companion().replace(
         "    fill(literals, n);",
         "    if literals.is_null() { return 0; }\n    fill(literals, n);",
     );

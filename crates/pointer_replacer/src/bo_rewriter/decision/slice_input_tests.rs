@@ -1,6 +1,7 @@
 //! W-C7 witnesses: the `StoreRangeH2 → StoreH2` shape (brotli's hash readers:
 //! a thin forwarder between a slice-holding caller and a reading callee),
 //! reduced with a delivered-slice root.
+use super::slice_input::Extent;
 
 const CHAIN: &str = r###"
 #[repr(C)]
@@ -101,6 +102,42 @@ pub(super) fn proofs(input: &str) -> Vec<(String, Result<usize, super::slice_inp
     })
     .unwrap()
 }
+pub(super) fn input_extents(
+    input: &str,
+) -> Vec<(String, Result<Extent, super::slice_input::Hold>)> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let table = crate::bo_rewriter::decide_table(tcx).unwrap();
+        let functions = tcx
+            .hir_body_owners()
+            .filter(|d| matches!(tcx.def_kind(*d), rustc_hir::def::DefKind::Fn))
+            .collect::<Vec<_>>();
+        let facts = super::emitability::collect(tcx, &functions);
+        let program = crate::bo_rewriter::collect_program(tcx);
+        let fat = crate::bo_rewriter::fat_facts::FatFacts::from_program(&program);
+        table
+            .entries
+            .iter()
+            .filter(|(s, _)| matches!(s.kind, super::SubjectKind::Param { .. }) && s.ptr_depth == 1)
+            .map(|(s, _)| {
+                (
+                    s.label.clone(),
+                    super::slice_input::prove(tcx, s, &facts, &fat).map(|p| p.extent),
+                )
+            })
+            .collect()
+    })
+    .unwrap()
+}
+pub(super) fn extent_of<'a>(
+    extents: &'a [(String, Result<Extent, super::slice_input::Hold>)],
+    label: &str,
+) -> &'a Result<Extent, super::slice_input::Hold> {
+    &extents
+        .iter()
+        .find(|(l, _)| l == label)
+        .unwrap_or_else(|| panic!("{label}"))
+        .1
+}
 pub(super) fn proof_of<'a>(
     proofs: &'a [(String, Result<usize, super::slice_input::Hold>)],
     label: &str,
@@ -125,28 +162,61 @@ fn w5c_slice_input_forwarders_are_supplied_from_the_slice_root() {
     // through `StitchToPreviousBlockH2::ringbuffer`, itself a supplied forwarder
     assert_eq!(proof_of(&proofs, "StoreRangeH2::data"), &Ok(2));
     assert_eq!(proof_of(&proofs, "StoreH2::data"), &Err(Hold::CalleeNotFat));
-    assert_eq!(proof_of(&proofs, "run::buf"), &Err(Hold::CallerNotSupplied));
+    // `run::buf` is a slice by its own arithmetic; as a forwarder it is not
+    // supplied (`entry` passes `buf.as_ptr()`) but carries its companion `n`
+    // (R418-1).
+    assert_eq!(proof_of(&proofs, "run::buf"), &Ok(1));
+    assert_eq!(
+        extent_of(&input_extents(&fixture()), "run::buf"),
+        &Ok(Extent::Companion(super::seam::LenEvidence::Following))
+    );
+    assert_eq!(
+        extent_of(&input_extents(&fixture()), "StoreRangeH2::data"),
+        &Ok(Extent::Supplied)
+    );
 }
 
-/// A caller that supplies no buffer refuses the chain: `run` passes a local
-/// pointer it made itself (not a parameter, not an array), so nothing supplies
-/// `ringbuffer` and the hold stays typed.
+/// A caller that supplies no buffer no longer refuses a forwarder that
+/// carries its own companion (R418-1): `run` passes a local pointer it made
+/// itself, `ringbuffer` takes the slice with `ringbuffer_mask` as its extent,
+/// and the call adapts raw with it. (The thin `p` itself is the decline's —
+/// `reader_chain_tests`.) Without a companion the chain still refuses.
 #[test]
-fn w5c_slice_input_unsupplied_caller_refuses_the_chain() {
+fn w5c_slice_input_unsupplied_caller_adapts_with_the_companion() {
     use super::slice_input::Hold;
     let input = fixture().replace(
         "    StitchToPreviousBlockH2(self_0, n, n, buf, 4095);",
         "    let x: u8 = acc as u8;\n    let p: *const u8 = &x;\n    StitchToPreviousBlockH2(self_0, n, n, p, 4095);",
     );
-    let proofs = proofs(&input);
+    assert_eq!(
+        extent_of(
+            &input_extents(&input),
+            "StitchToPreviousBlockH2::ringbuffer"
+        ),
+        &Ok(Extent::Companion(super::seam::LenEvidence::Following))
+    );
+    // …and `StoreRangeH2::data`, no longer supplied through `ringbuffer`,
+    // stands on its own companion `mask`.
+    assert_eq!(
+        extent_of(&input_extents(&input), "StoreRangeH2::data"),
+        &Ok(Extent::Companion(super::seam::LenEvidence::Following))
+    );
+    let no_companion = input
+        .replace(
+            "position: usize, ringbuffer: *const u8, ringbuffer_mask: usize)",
+            "position: usize, _head: *const u8, ringbuffer: *const u8, _tail: *const u8, ringbuffer_mask: usize)",
+        )
+        .replace(
+            "StitchToPreviousBlockH2(self_0, n, n, p, 4095);",
+            "StitchToPreviousBlockH2(self_0, n, n, p, p, p, 4095);",
+        );
+    let proofs = proofs(&no_companion);
     assert_eq!(
         proof_of(&proofs, "StitchToPreviousBlockH2::ringbuffer"),
         &Err(Hold::CallerNotSupplied)
     );
-    assert_eq!(
-        proof_of(&proofs, "StoreRangeH2::data"),
-        &Err(Hold::CallerNotSupplied)
-    );
+    // `StoreRangeH2::data` keeps its own companion `mask` either way.
+    assert_eq!(proof_of(&proofs, "StoreRangeH2::data"), &Ok(1));
 }
 
 /// Under the corpus attestation the propagation takes both forwarders off the

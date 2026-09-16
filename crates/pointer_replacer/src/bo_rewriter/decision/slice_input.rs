@@ -28,6 +28,20 @@ pub(crate) struct Proof {
     /// Every function whose parameter the slice travels through, this one
     /// first; each must keep its SliceUse family for the chain to stand.
     pub members: Vec<LocalDefId>,
+    /// Where the slice's extent comes from.
+    pub extent: Extent,
+}
+
+/// R418-1 (relay 024): the forwarder's extent is evidence-backed only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Extent {
+    /// Every caller supplies a slice (W-C7) or a fresh root (W-C9): the
+    /// extent travels down as the slice's length.
+    Supplied,
+    /// The forwarder's OWN companion integer beside the pointer
+    /// (`adler32(data, len)`): its callers adapt raw with it, or take the
+    /// slice form themselves, or decline typed (`thin-caller-argument`).
+    Companion(super::seam::LenEvidence),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,8 +266,28 @@ pub(crate) fn prove(
         &mut vec![(subject.fn_did, hir_index)],
     )?;
     let mut members = Vec::new();
-    supplied(tcx, subject.fn_did, hir_index, facts, fat, &mut members)?;
-    Ok(Proof { members })
+    match supplied(tcx, subject.fn_did, hir_index, facts, fat, &mut members) {
+        Ok(()) => Ok(Proof {
+            members,
+            extent: Extent::Supplied,
+        }),
+        // The signature must still be this crate's to change.
+        Err(Hold::IncompleteCallers) => Err(Hold::IncompleteCallers),
+        Err(hold) => {
+            let evidence = super::seam::length_evidence(tcx, subject.fn_did, hir_index);
+            if matches!(
+                evidence,
+                super::seam::LenEvidence::Following | super::seam::LenEvidence::Preceding
+            ) {
+                Ok(Proof {
+                    members: vec![subject.fn_did],
+                    extent: Extent::Companion(evidence),
+                })
+            } else {
+                Err(hold)
+            }
+        }
+    }
 }
 
 pub(crate) fn enabled_proof(
