@@ -463,6 +463,12 @@ pub(crate) struct RawBoundarySiteFact {
     /// view then needs no returned-child permission: there is no descendant
     /// the caller could write through.
     pub descendants_frame_confined: bool,
+    /// wave-6r 016 claim 7 / relay wave-6v2/011: the callee position is
+    /// read-through only MODULO its stores through one frame-confined output
+    /// (`wave6r_child_access::position_is_descendant_free_modulo_output`), so
+    /// the certificate's residual — the open steps beside the certified
+    /// store — is discharged by the body scan: T1, not the T2 waiver.
+    pub descendant_free_modulo_output: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -624,6 +630,7 @@ impl RawBoundarySiteFacts {
                         .is_none_or(|site| site.may_yield_pointer),
                     frame_confined_outputs: Vec::new(),
                     descendants_frame_confined: false,
+                    descendant_free_modulo_output: false,
                 }),
                 Err(reason) => out.failures.push(RawBoundarySiteFailure {
                     caller: tcx.def_path_str(fact.caller.to_def_id()),
@@ -662,12 +669,29 @@ impl RawBoundarySiteFacts {
                         .filter(|sibling| sibling.index != argument.index)
                         .filter(|sibling| {
                             sibling.direct_storage.is_some_and(|(local, _)| {
-                                super::binn_counted::frame_confined(
+                                match super::binn_counted::frame_confined(
                                     tcx,
+                                    &program.functions,
                                     call.caller,
                                     local,
                                     call.span,
-                                )
+                                ) {
+                                    Some(super::binn_counted::Confinement::Plain) => true,
+                                    // Integer fields are read out of the local:
+                                    // the callee may not write an integer image
+                                    // of the argument anywhere (wave-6r's scan
+                                    // refuses a cast to a non-pointer).
+                                    Some(super::binn_counted::Confinement::IntegerReads) => {
+                                        crate::bo_rewriter::wave6r_child_access::position_is_descendant_free_modulo_output(
+                                            tcx,
+                                            &program.functions,
+                                            callee,
+                                            argument.index,
+                                            sibling.index,
+                                        )
+                                    }
+                                    None => false,
+                                }
                             })
                         })
                         .map(|sibling| sibling.index)
@@ -712,6 +736,17 @@ impl RawBoundarySiteFacts {
                             callee_may_yield_pointer: unique_candidate(&callee_key, &candidates)
                                 .is_none_or(|site| site.may_yield_pointer),
                             frame_confined_outputs: frame_confined_outputs.clone(),
+                            descendant_free_modulo_output: frame_confined_outputs.iter().any(
+                                |output| {
+                                    crate::bo_rewriter::wave6r_child_access::position_is_descendant_free_modulo_output(
+                                        tcx,
+                                        &program.functions,
+                                        callee,
+                                        argument.index,
+                                        *output,
+                                    )
+                                },
+                            ),
                             descendants_frame_confined: {
                                 let signature = tcx.fn_sig(callee).skip_binder().skip_binder();
                                 !may_carry_pointer(tcx, signature.output(), CARRIER_WALK_DEPTH)
@@ -4430,6 +4465,14 @@ impl RawBoundaryDispositionIndex {
                                 Some((outputs, RetentionVerdict::NoRetain { .. })) => {
                                     evidence = format!(
                                         "{evidence};stack-storage-certificate:outputs={outputs:?}"
+                                    );
+                                    Ok(RawBoundaryDisposition::T1 { template, evidence })
+                                }
+                                Some((outputs, RetentionVerdict::Unknown { .. }))
+                                    if site.descendant_free_modulo_output =>
+                                {
+                                    evidence = format!(
+                                        "{evidence};stack-storage-certificate:outputs={outputs:?};descendant-free-modulo-output"
                                     );
                                     Ok(RawBoundaryDisposition::T1 { template, evidence })
                                 }

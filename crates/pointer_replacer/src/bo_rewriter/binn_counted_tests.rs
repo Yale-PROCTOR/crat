@@ -773,7 +773,9 @@ fn w6v2_stack_confined_out_param_retention_is_t1() {
 
 /// The certificate's own line: a caller local whose pointer-carrying field is
 /// read out (`value.ptr` handed on) is NOT frame-confined, and the forward
-/// stays held; so does one whose address is taken at a second call.
+/// stays held; so does one whose address is taken at a second call into a
+/// reader that hands the loaded pointer out (relay wave-6v2/011: a READ-ONLY
+/// reader at a second call is confined — `w6v2_iterator_*`).
 #[test]
 fn w6v2_escaping_out_param_storage_keeps_the_hold() {
     for input in [
@@ -784,7 +786,7 @@ fn w6v2_escaping_out_param_storage_keeps_the_hold() {
         CONFINED.replace(
             "return value.type_0;",
             "touch(&mut value); return value.type_0;",
-        ) + "\nunsafe fn touch(p: *mut binn) {}",
+        ) + "\nstatic mut KEPT2: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;\nunsafe fn touch(p: *mut binn) { KEPT2 = (*p).ptr; }",
         // The callee also hands the pointer to a callee that keeps it: the
         // confined out-param does not discharge a sink reached elsewhere.
         CONFINED.replace(
@@ -1106,4 +1108,148 @@ fn w6v2_write_through_returned_alias_keeps_the_hold() {
     );
     assert!(!c.contains("fnbinn_copy(mutold:&[u8])"), "{source}");
     assert!(super::verify::type_checks_str(&source));
+}
+
+/// brotli `InitBlockSplitIterator` / `BlockSplitIteratorNext` (wave-6r 016
+/// claim 7, relay 011): the callee stores the shared argument into the
+/// caller's frame-local iterator; the local's only other uses are a second
+/// `&mut` into a reader that LOADS the stored pointer and reads through it,
+/// and non-pointer field reads.
+const ITERATOR: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, static_mut_refs)]
+pub struct Split { types: *const u8, lengths: *const u32, num: usize }
+pub struct It { split_: *const Split, idx_: usize, type_: usize, length_: usize }
+pub static mut KEEP: *const Split = core::ptr::null();
+unsafe fn init(self_0: *mut It, split: *const Split) {
+    (*self_0).split_ = split;
+    (*self_0).idx_ = 0;
+    (*self_0).type_ = 0;
+    (*self_0).length_ = if !((*split).lengths).is_null() { *((*split).lengths).offset(0) } else { 0 } as usize;
+}
+unsafe fn next(self_0: *mut It) {
+    if (*self_0).length_ == 0 {
+        (*self_0).idx_ += 1;
+        (*self_0).type_ = *((*(*self_0).split_).types).offset((*self_0).idx_ as isize) as usize;
+        (*self_0).length_ = *((*(*self_0).split_).lengths).offset((*self_0).idx_ as isize) as usize;
+    }
+    (*self_0).length_ -= 1;
+}
+pub unsafe fn build(split: *const Split, n: usize) -> usize {
+    let mut it = It { split_: core::ptr::null(), idx_: 0, type_: 0, length_: 0 };
+    init(&mut it, split);
+    let mut acc = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        next(&mut it);
+        acc += it.type_;
+        i += 1;
+    }
+    acc
+}
+"#;
+
+fn iterator_site_rows(input: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        ctx.raw_boundary
+            .receipts_tsv()
+            .lines()
+            .filter(|l| l.starts_with("build\t") && l.contains("\tinit\t1\t"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .unwrap()
+}
+
+/// The `build → init` arg-1 site is T1: the store lands in `it`, which is
+/// stack-confined — its second `&mut` goes to `next`, whose loads of `split_`
+/// are read through only — and the callee is descendant-free modulo that
+/// certified output storage.
+#[test]
+fn w6v2_iterator_store_into_a_read_only_reader_local_is_t1() {
+    let rows = by_function(ITERATOR);
+    let site = iterator_site_rows(ITERATOR);
+    assert!(
+        site.iter().any(|l| l.contains("\tT1\t")),
+        "the init site is T1: {site:?}\n{rows:?}"
+    );
+    let decisions = super::emit_tests::decisions_of(ITERATOR);
+    assert!(
+        delivers(&decisions, "split"),
+        "build::split delivers: {decisions:?}"
+    );
+}
+
+/// The reader hands the loaded pointer out (a global store): the second
+/// `&mut it` is not confined and the site keeps its hold.
+#[test]
+fn w6v2_iterator_reader_that_keeps_the_loaded_field_holds() {
+    let input = ITERATOR.replace(
+        "    (*self_0).length_ -= 1;\n}\npub unsafe fn build",
+        "    (*self_0).length_ -= 1;\n    KEEP = (*self_0).split_;\n}\npub unsafe fn build",
+    );
+    assert_ne!(input, ITERATOR);
+    let site = iterator_site_rows(&input);
+    assert!(
+        !site.iter().any(|l| l.contains("\tT1\t")),
+        "a kept load is not confined: {site:?}"
+    );
+}
+
+/// The callee stores the argument beside the output storage (a global): the
+/// residual is not descendant-free modulo the output and the site holds.
+#[test]
+fn w6v2_iterator_callee_with_a_second_sink_holds() {
+    let input = ITERATOR.replace(
+        "    (*self_0).split_ = split;\n    (*self_0).idx_ = 0;",
+        "    (*self_0).split_ = split;\n    KEEP = split;\n    (*self_0).idx_ = 0;",
+    );
+    assert_ne!(input, ITERATOR);
+    let site = iterator_site_rows(&input);
+    assert!(
+        !site.iter().any(|l| l.contains("\tT1\t")),
+        "a second sink keeps the hold: {site:?}"
+    );
+}
+
+/// The caller reads an INTEGER field of the local (`it.type_`), so the callee
+/// may not write an integer image of the argument into it: wave-6r's scan
+/// modulo the output refuses the cast and the site holds.
+#[test]
+fn w6v2_iterator_callee_that_writes_an_integer_image_holds() {
+    let input = ITERATOR.replace(
+        "    (*self_0).type_ = 0;\n",
+        "    (*self_0).type_ = split as usize;\n",
+    );
+    assert_ne!(input, ITERATOR);
+    let site = iterator_site_rows(&input);
+    assert!(
+        !site.iter().any(|l| l.contains("\tT1\t")),
+        "an integer image in a read field keeps the hold: {site:?}"
+    );
+}
+
+/// The callee reads through a DERIVED alias of the argument (`split.offset(0)`,
+/// an open step for the certificate): the residual is unknown, and the body
+/// scan modulo the output discharges it — T1, not the T2 waiver.
+#[test]
+fn w6v2_iterator_callee_reading_through_a_derived_alias_is_t1() {
+    let input = ITERATOR.replace(
+        "    (*self_0).idx_ = 0;\n    (*self_0).type_ = 0;\n",
+        "    (*self_0).idx_ = 0;\n    let q = split.offset(0);\n    (*self_0).type_ = (*q).num;\n",
+    );
+    assert_ne!(input, ITERATOR);
+    let site = iterator_site_rows(&input);
+    assert!(
+        site.iter()
+            .any(|l| l.contains("\tT1\t") && l.contains("descendant-free-modulo-output")),
+        "the derived read is discharged by the scan: {site:?}"
+    );
 }

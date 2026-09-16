@@ -708,6 +708,41 @@ pub(crate) fn root_rule<'tcx>(
     }
 }
 
+/// wave-6r 016 claim 7 / relay wave-6v2/011: a second `&mut local` (or `&`)
+/// is confined when it is the argument of a LOCAL callee whose every pointer
+/// LOADED from a pointer-carrying field of the local is read through only, in
+/// that callee and every local callee it reaches
+/// (`wave6r_child_access::loaded_field_is_descendant_free`).
+fn read_only_reader<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    borrow: &Expr<'_>,
+) -> bool {
+    let Node::Expr(call) = tcx.parent_hir_node(borrow.hir_id) else { return false };
+    let ExprKind::Call(callee, args) = call.kind else { return false };
+    let Some(index) = args.iter().position(|a| a.hir_id == borrow.hir_id) else { return false };
+    let ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = callee.kind else { return false };
+    let Res::Def(rustc_hir::def::DefKind::Fn, did) = path.res else { return false };
+    let Some(callee) = did.as_local() else { return false };
+    let ExprKind::AddrOf(_, _, operand) = borrow.kind else { return false };
+    let TyKind::Adt(adt, generics) = typeck.expr_ty(operand).kind() else { return false };
+    if !adt.is_struct() {
+        return false;
+    }
+    adt.non_enum_variant()
+        .fields
+        .iter_enumerated()
+        .filter(|(_, field)| {
+            super::raw_boundary::may_carry_pointer(tcx, field.ty(tcx, generics), 4)
+        })
+        .all(|(field, _)| {
+            crate::bo_rewriter::wave6r_child_access::loaded_field_is_descendant_free(
+                tcx, functions, callee, index, field,
+            )
+        })
+}
+
 /// Is this caller local FRAME-CONFINED — storage whose contents never leave
 /// the caller (R406-6, finding B)? A callee that stores a pointer derived from
 /// a bridged view into such a local retains it only for the caller's frame,
@@ -720,13 +755,16 @@ pub(crate) fn root_rule<'tcx>(
 /// an assignment target (`local = ..`, `local.f = ..`). Anything else — an
 /// address taken at another site, a pointer-carrying field read, a move or
 /// copy of a pointer-carrying value, a return, a closure capture — is an
-/// escape or an unknown, and the local is not confined.
+/// escape or an unknown, and the local is not confined. (5) wave-6r 016
+/// claim 7 / relay wave-6v2/011: an address taken as the argument of a LOCAL
+/// callee that is a read-only READER of the local (`read_only_reader`).
 pub(crate) fn frame_confined<'tcx>(
     tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
     caller: LocalDefId,
     local: HirId,
     call_span: rustc_span::Span,
-) -> bool {
+) -> Option<Confinement> {
     let body = tcx.hir_body_owned_by(caller);
     let typeck = tcx.typeck(caller);
     let mut uses = Uses {
@@ -737,9 +775,16 @@ pub(crate) fn frame_confined<'tcx>(
     };
     uses.visit_expr(body.value);
     if uses.closures {
-        return false;
+        return None;
     }
     let carries = |ty: Ty<'tcx>| super::raw_boundary::may_carry_pointer(tcx, ty, 4);
+    // A pointer-width INTEGER read cannot yield the stored alias unless some
+    // body wrote an integer image of it into the local: the caller's own
+    // stores are checked here (a cast from a pointer refuses), the certified
+    // callee's and the readers' by wave-6r's scan, which the caller of this
+    // certificate must run when `Confinement::IntegerReads` comes back.
+    let integer = |ty: Ty<'tcx>| matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_));
+    let mut integer_reads = false;
     let assigned = |e: &Expr<'_>| match tcx.parent_hir_node(e.hir_id) {
         Node::Expr(parent) => matches!(parent.kind,
             ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) if lhs.hir_id == e.hir_id),
@@ -758,21 +803,76 @@ pub(crate) fn frame_confined<'tcx>(
         let confined = match parent {
             Node::Expr(parent) => match parent.kind {
                 ExprKind::AddrOf(_, _, operand) if operand.hir_id == place.hir_id => {
-                    place.hir_id == use_.hir_id && call_span.contains(parent.span)
+                    place.hir_id == use_.hir_id
+                        && (call_span.contains(parent.span)
+                            || read_only_reader(tcx, functions, typeck, parent))
                 }
-                ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _)
+                ExprKind::Assign(lhs, rhs, _) | ExprKind::AssignOp(_, lhs, rhs)
                     if lhs.hir_id == place.hir_id =>
                 {
-                    true
+                    !casts_from_a_pointer(tcx, typeck, rhs)
                 }
-                _ => !carries(typeck.expr_ty(place)),
+                _ => {
+                    !carries(typeck.expr_ty(place)) || {
+                        integer_reads |= integer(typeck.expr_ty(place));
+                        integer(typeck.expr_ty(place))
+                    }
+                }
             },
             Node::Stmt(_) | Node::LetStmt(_) | Node::Block(_) => !carries(typeck.expr_ty(place)),
             _ => false,
         };
         if !confined && !assigned(place) {
-            return false;
+            return None;
         }
     }
-    true
+    Some(if integer_reads {
+        Confinement::IntegerReads
+    } else {
+        Confinement::Plain
+    })
+}
+
+/// What `frame_confined` certified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Confinement {
+    /// No pointer-carrying value is ever read out of the local.
+    Plain,
+    /// Pointer-width INTEGER fields are read out of the local: sound only when
+    /// no certified body writes an integer image of an alias into it — the
+    /// caller must also pass wave-6r's scan on the callee (modulo the output)
+    /// and on every reader.
+    IntegerReads,
+}
+
+/// Does `e` contain a cast whose operand is a pointer (an integer image)?
+fn casts_from_a_pointer<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    e: &'tcx Expr<'tcx>,
+) -> bool {
+    struct Casts<'a, 'tcx> {
+        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Casts<'_, 'tcx> {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Cast(operand, _) = e.kind
+                && matches!(
+                    self.typeck.expr_ty(operand).kind(),
+                    TyKind::RawPtr(..) | TyKind::Ref(..) | TyKind::FnPtr(..)
+                )
+            {
+                self.found = true;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let _ = tcx;
+    let mut casts = Casts {
+        typeck,
+        found: false,
+    };
+    casts.visit_expr(e);
+    casts.found
 }
