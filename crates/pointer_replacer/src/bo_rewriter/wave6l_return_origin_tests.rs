@@ -1223,19 +1223,21 @@ fn w6l_expression_position_receivers_keep_the_callee_class_placed() {
         text.contains("texel[0]=val;texel=&muttexel[1..];"),
         "{text}"
     );
-    // (a) the cast initializer: the view inside the cast; the local a typed hold.
+    // (a) the cast receiver (wave 6): the local is an inferred reference of
+    // the CAST's pointee, initialised by a typed reborrow of the view cast —
+    // `let mut N: &kmVec3 = &*({view} as *mut kmVec3)` — under the view's
+    // own T2 receipt; its field reads are untouched.
     assert!(
         text.contains(&format!(
-            "letmutN={}as*mutkmVec3;",
+            "letmutN:&kmVec3=&*({}as*mutkmVec3);(*N).x+(*N).y",
             view("__crat_native_result_14_10", "normals,x,y")
         )),
         "{text}"
     );
     assert!(
-        degradations
+        !degradations
             .iter()
-            .any(|d| d.subject == "heman_lighting_apply::N"
-                && format!("{:?}", d.reason) == "ReturnNotAdapted"),
+            .any(|d| d.subject == "heman_lighting_apply::N"),
         "{degradations:?}"
     );
     // (b) the immediate deref read and the compound assignment, natively.
