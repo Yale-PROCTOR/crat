@@ -4741,9 +4741,27 @@ mod tests {
         }
     }
 
+    fn shared_slice(name: &str) -> TypeTree {
+        shared_reference(TypeTree::Slice {
+            element: Box::new(primitive(name)),
+        })
+    }
+
     fn binding(id: &str) -> Expression {
         Expression::Path {
             value: ValueIdentity::Binding { id: id.into() },
+        }
+    }
+
+    fn external_call(path: &[&str], arguments: Vec<Expression>) -> Expression {
+        Expression::Call {
+            callee: Box::new(Expression::Path {
+                value: ValueIdentity::External {
+                    crate_name: "proctor_libc".into(),
+                    path: path.iter().map(|part| (*part).into()).collect(),
+                },
+            }),
+            arguments,
         }
     }
 
@@ -5001,6 +5019,162 @@ unsafe fn read(a: i32, b: u32, c: f64) {
         );
         let document = extract(&wrong_count).unwrap();
         assert!(document.printf_observations.is_empty());
+    }
+
+    #[test]
+    fn every_printf_wrapper_family_extracts_from_accepted_targets() {
+        let cases = [
+            (
+                "%hhd",
+                "small: i8",
+                "small as i32",
+                "{}",
+                "signed",
+                "small as i8",
+            ),
+            ("%ld", "long: i64", "long", "{}", "signed", "long"),
+            ("%u", "u: u32", "u", "{}", "unsigned", "u"),
+            ("%#08.4x", "x: u32", "x", "{:#08.4x}", "unsigned", "x"),
+            ("%f", "f: f64", "f", "{:.6}", "fixed", "f"),
+            (
+                "%LF",
+                "wide: f128::f128",
+                "wide",
+                "{:.6}",
+                "fixed_upper",
+                "wide",
+            ),
+            ("%E", "e: f64", "e", "{:.6E}", "scientific", "e"),
+            (
+                "%Lg",
+                "wide: f128::f128",
+                "wide",
+                "{:.6}",
+                "general",
+                "wide",
+            ),
+            ("%G", "g: f64", "g", "{:.6}", "general_upper", "g"),
+            (
+                "%La",
+                "wide: f128::f128",
+                "wide",
+                "{:x}",
+                "hex_float",
+                "wide",
+            ),
+            ("%10.3s", "s: *const i8", "s", "{:10.3}", "byte_string", "s"),
+        ];
+        for (specifier, source_parameter, source_expression, rust_format, wrapper, argument) in
+            cases
+        {
+            let target_parameter = if wrapper == "byte_string" {
+                "s: &[i8]"
+            } else {
+                source_parameter
+            };
+            let source = format!(
+                r#"
+extern crate f128;
+unsafe extern "C" {{ fn printf(format: *const i8, ...) -> i32; }}
+unsafe fn __proctor_source_read({source_parameter}) {{
+    #[proctor(0)] printf(b"{specifier}\0" as *const u8 as *const i8, {source_expression});
+}}
+unsafe fn read({target_parameter}) {{
+    #[proctor(0)] ::std::print!("{rust_format}", ::proctor_libc::printf::{wrapper}({argument}));
+}}
+"#
+            );
+            let document = extract(&source)
+                .unwrap_or_else(|error| panic!("{specifier}: {}: {}", error.code, error.message));
+            let [observation] = document.printf_observations.as_slice() else {
+                panic!("{specifier}: {document:?}")
+            };
+            assert_eq!(observation.format_specifier, specifier);
+            let source_argument = if specifier == "%hhd" {
+                Expression::Cast {
+                    expression: Box::new(binding("<id0>")),
+                    ty: primitive("i32"),
+                }
+            } else {
+                binding("<id0>")
+            };
+            let target_argument = if specifier == "%hhd" {
+                Expression::Cast {
+                    expression: Box::new(binding("<id0>")),
+                    ty: primitive("i8"),
+                }
+            } else {
+                binding("<id0>")
+            };
+            assert_eq!(
+                observation.source_expression, source_argument,
+                "{specifier}"
+            );
+            assert_eq!(
+                observation.target_expression,
+                external_call(&["stdio", "printf", wrapper], vec![target_argument]),
+                "{specifier}"
+            );
+            let expected_anchors = if wrapper == "byte_string" {
+                vec![pointer_anchor(
+                    "<id0>",
+                    raw_pointer("i8", RawMutability::Const),
+                    shared_slice("i8"),
+                )]
+            } else {
+                vec![]
+            };
+            assert_eq!(observation.pointer_anchors, expected_anchors, "{specifier}");
+        }
+    }
+
+    #[test]
+    fn printf_space_sign_wrappers_extract_as_exact_method_targets() {
+        let cases = [
+            ("% d", "d: i32", "d", "{}", "signed"),
+            ("% f", "f: f64", "f", "{:.6}", "fixed"),
+            ("% E", "e: f64", "e", "{:.6E}", "scientific"),
+            ("% g", "g: f64", "g", "{:.6}", "general"),
+            ("% G", "g: f64", "g", "{:.6}", "general_upper"),
+            ("% a", "a: f64", "a", "{:x}", "hex_float"),
+            ("% A", "a: f64", "a", "{:X}", "hex_float"),
+        ];
+        for (specifier, parameter, argument, rust_format, wrapper) in cases {
+            let source = format!(
+                r#"
+unsafe extern "C" {{ fn printf(format: *const i8, ...) -> i32; }}
+unsafe fn __proctor_source_read({parameter}) {{
+    #[proctor(0)] printf(b"{specifier}\0" as *const u8 as *const i8, {argument});
+}}
+unsafe fn read({parameter}) {{
+    #[proctor(0)] ::std::print!("{rust_format}", ::proctor_libc::printf::{wrapper}({argument}).space_sign());
+}}
+"#
+            );
+            let document = extract(&source)
+                .unwrap_or_else(|error| panic!("{specifier}: {}: {}", error.code, error.message));
+            let [observation] = document.printf_observations.as_slice() else {
+                panic!("{specifier}: {document:?}")
+            };
+            assert_eq!(observation.format_specifier, specifier);
+            assert_eq!(observation.source_expression, binding("<id0>"));
+            assert_eq!(
+                observation.target_expression,
+                Expression::MethodCall {
+                    receiver: Box::new(external_call(
+                        &["stdio", "printf", wrapper],
+                        vec![binding("<id0>")],
+                    )),
+                    method: ValueIdentity::External {
+                        crate_name: "proctor_libc".into(),
+                        path: vec!["stdio".into(), "printf".into(), "space_sign".into()],
+                    },
+                    arguments: vec![],
+                },
+                "{specifier}"
+            );
+            assert!(observation.pointer_anchors.is_empty(), "{specifier}");
+        }
     }
 
     #[test]

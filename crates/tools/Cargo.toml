@@ -10,5 +10,8 @@ serde.workspace = true
 serde_json.workspace = true
 unicode-ident = "1"
 
+[dev-dependencies]
+passes = { path = "../passes" }
+
 [package.metadata.rust-analyzer]
 rustc_private = true

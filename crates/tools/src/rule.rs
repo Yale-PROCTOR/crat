@@ -4899,6 +4899,82 @@ mod tests {
     }
 
     #[test]
+    fn expanded_printf_specifiers_round_trip_in_version_one_documents() {
+        let specifiers = [
+            "%d", "%hhi", "%u", "%#08.4o", "%x", "%X", "%f", "%LF", "%e", "%E", "%g", "%G", "%a",
+            "%A", "%10.3s", "% d",
+        ];
+        let observations = ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: specifiers
+                .iter()
+                .map(|specifier| {
+                    printf_observation(
+                        specifier,
+                        concrete_binding("<id0>"),
+                        concrete_binding("<id0>"),
+                        vec![],
+                        primitive(),
+                        primitive(),
+                    )
+                })
+                .collect(),
+        };
+        let observation_json = observation_document_to_json(&observations).unwrap();
+        assert_eq!(
+            observation_document_to_json(
+                &observation_document_from_json(&observation_json).unwrap()
+            )
+            .unwrap(),
+            observation_json
+        );
+
+        let rules = RuleDocument {
+            schema_version: 1,
+            rules: vec![],
+            printf_rules: specifiers
+                .iter()
+                .map(|specifier| {
+                    let mut rule = printf_rule(binding_variable(0), binding_variable(0), vec![]);
+                    rule.format_specifier = (*specifier).to_owned();
+                    rule
+                })
+                .collect(),
+        };
+        let rule_json = rule_document_to_json(&rules).unwrap();
+        assert_eq!(
+            rule_document_to_json(&rule_document_from_json(&rule_json).unwrap()).unwrap(),
+            rule_json
+        );
+
+        for (invalid, expected) in [
+            ("%q", ".format_specifier is unsupported"),
+            (
+                "%d%d",
+                ".format_specifier must be exactly one consuming conversion",
+            ),
+        ] {
+            let mut document = observations.clone();
+            document.printf_observations[0].format_specifier = invalid.to_owned();
+            assert!(
+                observation_document_to_json(&document)
+                    .unwrap_err()
+                    .message
+                    .contains(expected)
+            );
+            let mut document = rules.clone();
+            document.printf_rules[0].format_specifier = invalid.to_owned();
+            assert!(
+                rule_document_to_json(&document)
+                    .unwrap_err()
+                    .message
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
     fn anchored_printf_wire_round_trips_and_rejects_every_closed_shape_violation() {
         let anchor = crate::PointerAnchor {
             id: "<id0>".into(),
@@ -5221,6 +5297,148 @@ mod tests {
         }])
         .unwrap();
         assert!(rejected.printf_rules.is_empty());
+    }
+
+    #[test]
+    fn expanded_printf_synthesis_keeps_exact_specifiers_and_wrapper_structure() {
+        let wrapper_target = |wrapper: &str, binding: &str| {
+            call(
+                concrete_external("proctor_libc", &["stdio", "printf", wrapper]),
+                vec![concrete_binding(binding)],
+            )
+        };
+        let expected_wrapper = |wrapper: &str| RuleExpression::Call {
+            callee: Box::new(RuleExpression::Path {
+                value: external_value("proctor_libc", &["stdio", "printf", wrapper]),
+            }),
+            arguments: vec![binding_variable(0)],
+        };
+        for (specifier, wrapper) in [
+            ("%d", "signed"),
+            ("%#08.4x", "unsigned"),
+            ("%f", "fixed"),
+            ("%F", "fixed_upper"),
+            ("%E", "scientific"),
+            ("%g", "general"),
+            ("%G", "general_upper"),
+            ("%A", "hex_float"),
+            ("%10.3s", "byte_string"),
+        ] {
+            let make = |binding: &str| {
+                printf_observation(
+                    specifier,
+                    concrete_binding(binding),
+                    wrapper_target(wrapper, binding),
+                    vec![],
+                    primitive(),
+                    primitive(),
+                )
+            };
+            let rules = synthesize_rules(&[ObservationDocument {
+                schema_version: 1,
+                observations: vec![],
+                printf_observations: vec![make("<id0>"), make("<id0>")],
+            }])
+            .unwrap();
+            let [rule] = rules.printf_rules.as_slice() else { panic!("{specifier}: {rules:?}") };
+            assert_eq!(rule.format_specifier, specifier);
+            assert_eq!(rule.target_pattern, expected_wrapper(wrapper));
+        }
+
+        let spaced_target = |binding: &str| {
+            concrete_method(
+                wrapper_target("signed", binding),
+                concrete_external("proctor_libc", &["stdio", "printf", "space_sign"]),
+                vec![],
+            )
+        };
+        let spaced = |binding: &str| {
+            printf_observation(
+                "% d",
+                concrete_binding(binding),
+                spaced_target(binding),
+                vec![],
+                primitive(),
+                primitive(),
+            )
+        };
+        let rules = synthesize_rules(&[ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: vec![spaced("<id0>"), spaced("<id0>")],
+        }])
+        .unwrap();
+        let [rule] = rules.printf_rules.as_slice() else { panic!("{rules:?}") };
+        assert_eq!(rule.format_specifier, "% d");
+        assert_eq!(
+            rule.target_pattern,
+            rule_method(
+                expected_wrapper("signed"),
+                external_value("proctor_libc", &["stdio", "printf", "space_sign"]),
+                vec![],
+            )
+        );
+
+        let near_misses = [
+            ("%#08.4x", ["%#8.4x", "%#08.5x", "%#08.4X", "%x", "%08.4x"]),
+            ("% d", ["%d", "%d", "%d", "%d", "%d"]),
+            ("%E", ["%e", "%e", "%e", "%e", "%e"]),
+            ("%Lg", ["%g", "%g", "%g", "%g", "%g"]),
+            ("%10.3s", ["%.3s", "%.3s", "%.3s", "%.3s", "%.3s"]),
+        ];
+        for (left_specifier, right_specifiers) in near_misses {
+            for right_specifier in right_specifiers {
+                let make = |specifier: &str, binding: &str| {
+                    printf_observation(
+                        specifier,
+                        concrete_binding(binding),
+                        wrapper_target("signed", binding),
+                        vec![],
+                        primitive(),
+                        primitive(),
+                    )
+                };
+                assert!(
+                    synthesize_rules(&[ObservationDocument {
+                        schema_version: 1,
+                        observations: vec![],
+                        printf_observations: vec![
+                            make(left_specifier, "<id0>"),
+                            make(right_specifier, "<id0>"),
+                        ],
+                    }])
+                    .unwrap()
+                    .printf_rules
+                    .is_empty(),
+                    "{left_specifier} versus {right_specifier}"
+                );
+            }
+        }
+
+        let incompatible = synthesize_rules(&[ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: vec![
+                printf_observation(
+                    "%d",
+                    concrete_binding("<id0>"),
+                    wrapper_target("signed", "<id0>"),
+                    vec![],
+                    primitive(),
+                    primitive(),
+                ),
+                printf_observation(
+                    "%d",
+                    concrete_binding("<id0>"),
+                    wrapper_target("unsigned", "<id0>"),
+                    vec![],
+                    primitive(),
+                    primitive(),
+                ),
+            ],
+        }])
+        .unwrap();
+        assert!(incompatible.printf_rules.is_empty());
     }
 
     #[test]

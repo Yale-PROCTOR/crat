@@ -21,6 +21,11 @@ pub(crate) enum PrintfConversionKind {
     UpperHex,
     String,
     FixedFloat,
+    FixedFloatUpper,
+    ScientificFloat,
+    GeneralFloat,
+    GeneralFloatUpper,
+    HexFloat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +397,7 @@ fn is_c_int(ty: ty::Ty<'_>, tcx: TyCtxt<'_>) -> bool {
 struct Flags {
     left: bool,
     plus: bool,
+    space: bool,
     zero: bool,
     alternate: bool,
 }
@@ -424,9 +430,10 @@ pub(crate) fn convert_printf_format(bytes: &[u8]) -> Option<ConvertedPrintfForma
                     match flag {
                         b'-' => flags.left = true,
                         b'+' => flags.plus = true,
+                        b' ' => flags.space = true,
                         b'0' => flags.zero = true,
                         b'#' => flags.alternate = true,
-                        b' ' | b'\'' => return None,
+                        b'\'' => return None,
                         _ => break,
                     }
                     cursor += 1;
@@ -444,12 +451,12 @@ pub(crate) fn convert_printf_format(bytes: &[u8]) -> Option<ConvertedPrintfForma
                     if bytes.get(cursor) == Some(&b'*') {
                         return None;
                     }
-                    let (value, next) = parse_required_number(bytes, cursor)?;
+                    let (value, next) = parse_number(bytes, cursor)?;
                     cursor = next;
                     if bytes.get(cursor) == Some(&b'$') {
                         return None;
                     }
-                    Some(value)
+                    Some(value.unwrap_or(0))
                 } else {
                     None
                 };
@@ -470,25 +477,30 @@ pub(crate) fn convert_printf_format(bytes: &[u8]) -> Option<ConvertedPrintfForma
                 };
                 let conversion = *bytes.get(cursor)?;
                 cursor += 1;
-                let source_specifier = text[start..cursor].to_owned();
+                let source_specifier = std::str::from_utf8(bytes.get(start..cursor)?)
+                    .ok()?
+                    .to_owned();
                 let mut field = String::from("{");
                 let kind = match conversion {
                     b'd' | b'i' => {
-                        if flags.alternate || precision.is_some() || !integer_length(length) {
+                        if flags.alternate || !integer_length(length) {
                             return None;
                         }
-                        write_format_prefix(&mut field, flags, width, true);
+                        write_format_prefix(&mut field, flags, width, true, false);
+                        write_precision(&mut field, precision)?;
                         PrintfConversionKind::SignedDecimal
                     }
                     b'u' | b'o' | b'x' | b'X' => {
+                        let alternate_allowed = matches!(conversion, b'o' | b'x' | b'X');
                         if flags.plus
-                            || flags.alternate
-                            || precision.is_some()
+                            || flags.space
+                            || (flags.alternate && !alternate_allowed)
                             || !integer_length(length)
                         {
                             return None;
                         }
-                        write_format_prefix(&mut field, flags, width, false);
+                        write_format_prefix(&mut field, flags, width, false, flags.alternate);
+                        write_precision(&mut field, precision)?;
                         match conversion {
                             b'u' => PrintfConversionKind::UnsignedDecimal,
                             b'o' => {
@@ -510,36 +522,85 @@ pub(crate) fn convert_printf_format(bytes: &[u8]) -> Option<ConvertedPrintfForma
                         }
                     }
                     b's' => {
-                        if flags.left
-                            || flags.plus
+                        if flags.plus
+                            || flags.space
                             || flags.zero
                             || flags.alternate
-                            || width.is_some()
-                            || precision.is_some()
                             || !length.is_empty()
                         {
                             return None;
                         }
+                        write_format_prefix(&mut field, flags, width, false, false);
+                        write_precision(&mut field, precision)?;
                         PrintfConversionKind::String
                     }
                     b'f' | b'F' => {
-                        if !matches!(length, "" | "l") {
+                        if !matches!(length, "" | "l" | "L") {
                             return None;
                         }
                         let precision = precision.unwrap_or(6);
-                        if flags.alternate && precision == 0 {
+                        write_format_prefix(
+                            &mut field,
+                            flags,
+                            width,
+                            true,
+                            flags.alternate && precision == 0,
+                        );
+                        write_precision(&mut field, Some(precision))?;
+                        if conversion == b'f' {
+                            PrintfConversionKind::FixedFloat
+                        } else {
+                            PrintfConversionKind::FixedFloatUpper
+                        }
+                    }
+                    b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
+                        if !matches!(length, "" | "l" | "L") {
                             return None;
                         }
-                        write_format_prefix(&mut field, flags, width, true);
-                        ensure_format_options(&mut field);
-                        write!(field, ".{precision}").ok()?;
-                        PrintfConversionKind::FixedFloat
+                        let effective_precision = if matches!(conversion, b'e' | b'E' | b'g' | b'G')
+                        {
+                            Some(precision.unwrap_or(6))
+                        } else {
+                            precision
+                        };
+                        let retain_alternate = flags.alternate
+                            && match conversion {
+                                b'g' | b'G' => true,
+                                b'e' | b'E' => effective_precision == Some(0),
+                                b'a' | b'A' => {
+                                    effective_precision.is_none() || effective_precision == Some(0)
+                                }
+                                _ => false,
+                            };
+                        write_format_prefix(&mut field, flags, width, true, retain_alternate);
+                        write_precision(&mut field, effective_precision)?;
+                        match conversion {
+                            b'e' => {
+                                ensure_format_options(&mut field);
+                                field.push('e');
+                                PrintfConversionKind::ScientificFloat
+                            }
+                            b'E' => {
+                                ensure_format_options(&mut field);
+                                field.push('E');
+                                PrintfConversionKind::ScientificFloat
+                            }
+                            b'g' => PrintfConversionKind::GeneralFloat,
+                            b'G' => PrintfConversionKind::GeneralFloatUpper,
+                            b'a' => {
+                                ensure_format_options(&mut field);
+                                field.push('x');
+                                PrintfConversionKind::HexFloat
+                            }
+                            b'A' => {
+                                ensure_format_options(&mut field);
+                                field.push('X');
+                                PrintfConversionKind::HexFloat
+                            }
+                            _ => unreachable!(),
+                        }
                     }
-                    // These are parsed deliberately, but standard Rust formatting does not
-                    // provide the exact C spelling required by the supported domain.
-                    b'e' | b'E' | b'g' | b'G' | b'a' | b'A' | b'c' | b'p' | b'n' | b'%' => {
-                        return None;
-                    }
+                    b'c' | b'p' | b'n' | b'%' => return None,
                     _ => return None,
                 };
                 field.push('}');
@@ -590,17 +651,26 @@ fn parse_required_number(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
     any.then_some((value, cursor))
 }
 
-fn write_format_prefix(output: &mut String, flags: Flags, width: Option<u32>, signed: bool) {
+fn write_format_prefix(
+    output: &mut String,
+    flags: Flags,
+    width: Option<u32>,
+    signed: bool,
+    alternate: bool,
+) {
     let left = flags.left && width.is_some();
     let zero = flags.zero && !flags.left && width.is_some();
     let plus = flags.plus && signed;
-    if left || zero || plus || width.is_some() {
+    if left || zero || plus || alternate || width.is_some() {
         output.push(':');
         if left {
             output.push('<');
         }
         if plus {
             output.push('+');
+        }
+        if alternate {
+            output.push('#');
         }
         if zero {
             output.push('0');
@@ -609,6 +679,14 @@ fn write_format_prefix(output: &mut String, flags: Flags, width: Option<u32>, si
             write!(output, "{width}").expect("writing to a string cannot fail");
         }
     }
+}
+
+fn write_precision(output: &mut String, precision: Option<u32>) -> Option<()> {
+    if let Some(precision) = precision {
+        ensure_format_options(output);
+        write!(output, ".{precision}").ok()?;
+    }
+    Some(())
 }
 
 fn ensure_format_options(output: &mut String) {
@@ -705,6 +783,112 @@ mod tests {
                 "{:<+8} {} {}",
                 vec!["%--++0008d", "%0d", "%-d"],
             ),
+            ("plain {text} %%", "plain {{text}} %", vec![]),
+            (
+                "%hhd %hd %ld %lld %jd %zd %td",
+                "{} {} {} {} {} {} {}",
+                vec!["%hhd", "%hd", "%ld", "%lld", "%jd", "%zd", "%td"],
+            ),
+            (
+                "%.5d %08.5d %-08.5u %.0u",
+                "{:.5} {:08.5} {:<8.5} {:.0}",
+                vec!["%.5d", "%08.5d", "%-08.5u", "%.0u"],
+            ),
+            ("% d %+ d", "{} {:+}", vec!["% d", "%+ d"]),
+            (
+                "%#o %#x %#X",
+                "{:#o} {:#x} {:#X}",
+                vec!["%#o", "%#x", "%#X"],
+            ),
+            (
+                "%#.0o %#08.4x",
+                "{:#.0o} {:#08.4x}",
+                vec!["%#.0o", "%#08.4x"],
+            ),
+            (
+                "%f %F %lf %lF %Lf %LF",
+                "{:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+                vec!["%f", "%F", "%lf", "%lF", "%Lf", "%LF"],
+            ),
+            (
+                "%#.0f %#08.0F %-#08.0f",
+                "{:#.0} {:#08.0} {:<#8.0}",
+                vec!["%#.0f", "%#08.0F", "%-#08.0f"],
+            ),
+            (
+                "%e %E %.2e %12.2E",
+                "{:.6e} {:.6E} {:.2e} {:12.2E}",
+                vec!["%e", "%E", "%.2e", "%12.2E"],
+            ),
+            (
+                "%Le %LE %+012.2e %-012.2E",
+                "{:.6e} {:.6E} {:+012.2e} {:<12.2E}",
+                vec!["%Le", "%LE", "%+012.2e", "%-012.2E"],
+            ),
+            (
+                "%g %G %.0g %#.6G",
+                "{:.6} {:.6} {:.0} {:#.6}",
+                vec!["%g", "%G", "%.0g", "%#.6G"],
+            ),
+            (
+                "%Lg %LG % 010.4g",
+                "{:.6} {:.6} {:010.4}",
+                vec!["%Lg", "%LG", "% 010.4g"],
+            ),
+            (
+                "%a %A %.3a %#.0A",
+                "{:x} {:X} {:.3x} {:#.0X}",
+                vec!["%a", "%A", "%.3a", "%#.0A"],
+            ),
+            (
+                "%La %LA %+012.2a %-012.2A",
+                "{:x} {:X} {:+012.2x} {:<12.2X}",
+                vec!["%La", "%LA", "%+012.2a", "%-012.2A"],
+            ),
+            (
+                "%s %10s %-10s %.3s %10.3s",
+                "{} {:10} {:<10} {:.3} {:10.3}",
+                vec!["%s", "%10s", "%-10s", "%.3s", "%10.3s"],
+            ),
+            (
+                "%.d %.u %.s %.f %.e %.g %.a",
+                "{:.0} {:.0} {:.0} {:.0} {:.0e} {:.0} {:.0x}",
+                vec!["%.d", "%.u", "%.s", "%.f", "%.e", "%.g", "%.a"],
+            ),
+            ("%--++ 0008.4f", "{:<+8.4}", vec!["%--++ 0008.4f"]),
+            (
+                "n=% d x=%#08.4x s=%.3s e=%E %%",
+                "n={} x={:#08.4x} s={:.3} e={:.6E} %",
+                vec!["% d", "%#08.4x", "%.3s", "%E"],
+            ),
+            ("é=%La", "é={:x}", vec!["%La"]),
+            (
+                "%-+017.4lld %0-+17.4td",
+                "{:<+17.4} {:<+17.4}",
+                vec!["%-+017.4lld", "%0-+17.4td"],
+            ),
+            (
+                "%017.4ju %#017.4zo %0-#17.4X",
+                "{:017.4} {:#017.4o} {:<#17.4X}",
+                vec!["%017.4ju", "%#017.4zo", "%0-#17.4X"],
+            ),
+            (
+                "%+#017.2Le %#Le",
+                "{:+017.2e} {:.6e}",
+                vec!["%+#017.2Le", "%#Le"],
+            ),
+            ("%#La %#17.2La", "{:#x} {:17.2x}", vec!["%#La", "%#17.2La"]),
+            (
+                "%-017.3LG %+#017.3LG",
+                "{:<17.3} {:+#017.3}",
+                vec!["%-017.3LG", "%+#017.3LG"],
+            ),
+            ("%-17.3s", "{:<17.3}", vec!["%-17.3s"]),
+            (
+                "%2147483647d %.2147483647s",
+                "{:2147483647} {:.2147483647}",
+                vec!["%2147483647d", "%.2147483647s"],
+            ),
         ];
         for (input, output, specs) in cases {
             assert_eq!(
@@ -724,51 +908,47 @@ mod tests {
             "%",
             "abc%",
             "%q",
+            "%v",
+            "%D",
             "%2$d",
+            "%1$s",
             "%*d",
             "%2$*3$d",
-            "%.*f",
-            "%2$.*3$f",
-            "% d",
-            "% f",
+            "%*.*f",
             "%'d",
             "%'f",
-            "%#o",
-            "%#x",
-            "%#X",
+            "%'s",
             "%+u",
-            "%+o",
+            "% u",
             "%+x",
-            "%+X",
-            "%.0d",
-            "%.3u",
-            "%08.3x",
-            "%-s",
-            "%10s",
-            "%.3s",
+            "%#d",
+            "%#i",
+            "%#u",
+            "%+s",
+            "% s",
+            "%#s",
+            "%0s",
             "%ls",
+            "%hs",
+            "%Ls",
             "%c",
             "%lc",
+            "%C",
             "%p",
             "%n",
-            "%e",
-            "%E",
-            "%g",
-            "%G",
-            "%a",
-            "%A",
-            "%#.0f",
+            "%hn",
             "%hf",
             "%llf",
-            "%jf",
-            "%zf",
-            "%tf",
-            "%Lf",
-            "%LF",
-            "%#.0F",
+            "%je",
+            "%zg",
+            "%ta",
             "%5%",
             "%-%%",
-            "%d %*d %d",
+            "%.0%",
+            "%999999999999999999999999s",
+            "ok=%d bad=%p",
+            "%10.3s %n",
+            "%e %*d",
         ] {
             assert_eq!(converted(input), None, "{input}");
         }
@@ -827,6 +1007,75 @@ mod tests {
             (0..=u8::MAX).cycle().take(10_000).collect(),
         ] {
             assert!(std::panic::catch_unwind(|| convert_printf_format(&corpus)).is_ok());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn malformed_and_multibyte_conversion_boundaries_are_total() {
+        let cases: &[(&[u8], Option<(&str, &[&str])>)] = &[
+            (b"%", None),
+            (b"%-", None),
+            (b"%.", None),
+            (b"%L", None),
+            (b"%hh", None),
+            (b"%999999999999d", None),
+            (&[0xff], None),
+            (&[0xc3, 0x28], None),
+            (&[b'%', 0xff, b'd'], None),
+            (&[b'a', 0xc3, 0x28], None),
+            ("%é".as_bytes(), None),
+            ("%é%d".as_bytes(), None),
+            ("%Lé".as_bytes(), None),
+            (&[0x00], Some(("\0", &[]))),
+            (b"a", Some(("a", &[]))),
+            (b"{}}{", Some(("{{}}}}{{", &[]))),
+            (b"%%%d", Some(("%{}", &["%d"]))),
+        ];
+        for (input, expected) in cases {
+            let actual = std::panic::catch_unwind(|| convert_printf_format(input));
+            assert!(actual.is_ok(), "{input:?}");
+            let actual = actual.unwrap();
+            match expected {
+                None => assert_eq!(actual, None, "{input:?}"),
+                Some((format, specifiers)) => {
+                    let actual = actual.unwrap();
+                    assert_eq!(actual.rust_format, *format, "{input:?}");
+                    assert_eq!(
+                        actual
+                            .conversions
+                            .iter()
+                            .map(|conversion| conversion.source_specifier.as_str())
+                            .collect::<Vec<_>>(),
+                        *specifiers,
+                        "{input:?}"
+                    );
+                }
+            }
+        }
+        let long = vec![b'9'; 10_000];
+        let actual = std::panic::catch_unwind(|| convert_printf_format(&long))
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.rust_format, "9".repeat(10_000));
+        assert!(actual.conversions.is_empty());
+
+        let mut state = 0x6d2b_79f5_u32;
+        for length in 3..=64 {
+            for _ in 0..256 {
+                let input = (0..length)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        state as u8
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    std::panic::catch_unwind(|| convert_printf_format(&input)).is_ok(),
+                    "{input:?}"
+                );
+            }
         }
     }
 
@@ -984,52 +1233,41 @@ mod tests {
 
     #[test]
     fn rejected_conversion_mutations_fail_the_complete_format() {
-        for conversion in ['d', 'i', 'u', 'o', 'x', 'X', 'f', 'F'] {
-            for forbidden in [' ', '\''] {
-                let mutated = format!("%{forbidden}{conversion}");
-                assert_eq!(converted(&mutated), None, "{mutated}");
-                assert_eq!(converted(&format!("%d {mutated} %u")), None, "{mutated}");
-            }
-            for unsupported in ['c', 'p', 'n', 'e', 'E', 'g', 'G', 'a', 'A', 'q'] {
-                let mutated = format!("%{unsupported}");
-                assert_eq!(converted(&mutated), None, "{mutated}");
-                assert_eq!(converted(&format!("%d {mutated} %u")), None, "{mutated}");
-            }
-            for dynamic in [
-                format!("%*{conversion}"),
-                format!("%2${conversion}"),
-                format!("%2$*3${conversion}"),
-            ] {
-                assert_eq!(converted(&dynamic), None, "{dynamic}");
-            }
-        }
-        for conversion in ['d', 'i', 'u', 'o', 'x', 'X'] {
-            for precision in ["0", "1", "2147483647"] {
-                let mutated = format!("%.{precision}{conversion}");
-                assert_eq!(converted(&mutated), None, "{mutated}");
-            }
-            for incompatible in ["L", "H"] {
-                let mutated = format!("%{incompatible}{conversion}");
-                assert_eq!(converted(&mutated), None, "{mutated}");
-            }
-        }
-        for conversion in ['u', 'o', 'x', 'X'] {
-            assert_eq!(converted(&format!("%+{conversion}")), None);
-        }
-        for conversion in ['d', 'i', 'u', 'o', 'x', 'X'] {
-            assert_eq!(converted(&format!("%#{conversion}")), None);
-        }
-        for conversion in ['f', 'F'] {
-            for length in ["hh", "h", "ll", "j", "z", "t", "L"] {
-                assert_eq!(converted(&format!("%{length}{conversion}")), None);
-            }
-            assert_eq!(converted(&format!("%#.0{conversion}")), None);
-            for dynamic in [format!("%.*{conversion}"), format!("%2$.*3${conversion}")] {
-                assert_eq!(converted(&dynamic), None);
-            }
-        }
-        for mutation in ["%-s", "%+s", "%0s", "%#s", "%1s", "%.1s", "%hs", "%ls"] {
+        for mutation in [
+            "%",
+            "%q",
+            "%2$d",
+            "%*d",
+            "%2$*3$d",
+            "%*.*f",
+            "%'d",
+            "%c",
+            "%p",
+            "%n",
+            "%ls",
+            "%hf",
+            "%llf",
+            "%je",
+            "%zg",
+            "%ta",
+            "%+u",
+            "% u",
+            "%+x",
+            "%#d",
+            "%#i",
+            "%#u",
+            "%+s",
+            "% s",
+            "%#s",
+            "%0s",
+            "%5%",
+            "%-%%",
+            "%.0%",
+            "%2147483648d",
+            "%.2147483648f",
+        ] {
             assert_eq!(converted(mutation), None, "{mutation}");
+            assert_eq!(converted(&format!("%d {mutation} %u")), None, "{mutation}");
         }
     }
 
