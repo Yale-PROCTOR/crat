@@ -1213,3 +1213,46 @@ pub unsafe fn create_commands(input: *const u8, block_size: usize, base_ip: *con
         ),
     );
 }
+
+#[test]
+fn slicecursor_mutable_pointer_address_view_against_a_raw_mut_operand() {
+    // binn `IsValidBinnHeader` (batch-8 census-1, 4 x E0308): `plimit`, a
+    // null-initialised `*mut u8` cursor, is ordered against the raw `*mut u8`
+    // `p` through an offset chain (`p.offset(3) > plimit`); the chain arm's
+    // address view rendered `*const u8` (`null()` / `addr()`), which Rust will
+    // not order against a `*mut`. The view keeps the binding's own pointer
+    // mutability, as the observed-address arm already did.
+    let input = r#"
+static mut SAVED: *mut u8 = 0 as *mut u8;
+pub unsafe fn keep(q: *mut u8) { SAVED = q; }
+pub unsafe fn header(buf: &mut [u8], p: *mut u8, n: isize) -> i32 {
+    let mut plimit = 0 as *mut u8;
+    if n > 0 { plimit = buf.as_mut_ptr().offset(n + (-1)); }
+    keep(p);
+    if !plimit.is_null() && p > plimit { return 0; }
+    if !plimit.is_null() && p.offset(3) > plimit { return 2; }
+    1
+}
+"#;
+    let source = emitted(input);
+    save_fixture("mutable-pointer-address-view", input, &source);
+    assert!(
+        source.contains("let mut plimit: Option<crate::slice_cursor::SliceCursor<'_, u8>> = None;")
+            && source.contains("fn header(buf: &mut [u8], p: *mut u8, n: isize)"),
+        "optional cursor beside the raw operand absent: {source}"
+    );
+    assert!(
+        source
+            .matches("|cursor| cursor.addr())).cast_mut()")
+            .count()
+            == 2
+            && !source.contains("cursor.addr()) {"),
+        "the *mut address view absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let mut b = [0u8; 8]; let p = b.as_mut_ptr(); assert_eq!(unsafe { header(&mut b[..], p, 8) }, 1); let mut c = [0u8; 8]; let q = unsafe { c.as_mut_ptr().add(3) }; assert_eq!(unsafe { header(&mut c[..], q, 5) }, 2); let mut d = [0u8; 8]; let r = unsafe { d.as_mut_ptr().add(6) }; assert_eq!(unsafe { header(&mut d[..], r, 2) }, 0); }",
+        ),
+    );
+}

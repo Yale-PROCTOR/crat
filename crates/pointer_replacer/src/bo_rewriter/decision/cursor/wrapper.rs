@@ -539,6 +539,34 @@ impl Uses<'_, '_> {
         }
     }
 
+    /// The cursor's address for an ordering or difference operand, in the
+    /// binding's own pointer mutability: a `*mut T` binding is ordered against
+    /// `*mut T` operands, and Rust will not order `*const` against `*mut`. The
+    /// value is consumed by the comparison/difference, never retained.
+    fn address_view(&self, derived: &str) -> String {
+        let value = if self.optional {
+            format!(
+                "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor{derived}.addr())",
+                self.name
+            )
+        } else {
+            format!("{}{derived}.addr()", self.name)
+        };
+        let mutable_pointer = matches!(
+            self.ctx
+                .tcx
+                .typeck(self.subject.fn_did)
+                .node_type(self.subject.hir_id)
+                .kind(),
+            ty::RawPtr(_, hir::Mutability::Mut)
+        );
+        if mutable_pointer {
+            format!("({value}).cast_mut()")
+        } else {
+            value
+        }
+    }
+
     fn push(&mut self, e: &hir::Expr<'_>, replacement: String, kind: &'static str) {
         self.edits.push(UseEdit {
             span: e.span,
@@ -698,16 +726,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     self.visit_expr(side);
                     continue;
                 }
-                let address = |derived: &str| {
-                    if self.optional {
-                        format!(
-                            "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor{derived}.addr())",
-                            self.name
-                        )
-                    } else {
-                        format!("{}{derived}.addr()", self.name)
-                    }
-                };
+                let address = |derived: &str| self.address_view(derived);
                 match self.index(side) {
                     Ok(_) if local(side) == Some(self.subject.hir_id) => {
                         let value = address("");
@@ -738,16 +757,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                 .iter()
                 .any(|observation| observation.span == e.span)
         {
-            let address = |derived: &str| {
-                if self.optional {
-                    format!(
-                        "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor{derived}.addr())",
-                        self.name
-                    )
-                } else {
-                    format!("{}{derived}.addr()", self.name)
-                }
-            };
+            let address = |derived: &str| self.address_view(derived);
             match self.index(receiver) {
                 Ok(_) if local(receiver) == Some(self.subject.hir_id) => {
                     let value = address("");
