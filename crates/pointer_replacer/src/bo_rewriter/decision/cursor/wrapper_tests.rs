@@ -1119,11 +1119,18 @@ pub unsafe fn fragment(input: *const u8, n: usize) -> i32 {
     );
     let source = emitted(input);
     save_fixture("repointed-child-withdraws-with-parent", input, &source);
+    // On the composed tree the forward slice family may deliver the freed
+    // parameter as a slice: the harness follows the emitted form.
+    let argument = if source.contains("fn fragment(input: *const u8") {
+        "b.as_ptr()"
+    } else {
+        "&b[..]"
+    };
     compile(
         &source,
-        Some(
-            "fn main() { let b = [1u8, 2, 3, 4, 5, 6]; assert_eq!(unsafe { fragment(b.as_ptr(), 5) }, 1 + 2 + 3 + 4 + 1 + 2); }",
-        ),
+        Some(&format!(
+            "fn main() {{ let b = [1u8, 2, 3, 4, 5, 6]; assert_eq!(unsafe {{ fragment({argument}, 5) }}, 1 + 2 + 3 + 4 + 1 + 2); }}"
+        )),
     );
 }
 
@@ -1206,11 +1213,28 @@ pub unsafe fn create_commands(input: *const u8, block_size: usize, base_ip: *con
     }
     let source = emitted(input);
     save_fixture("parent-withdraws-with-copies", input, &source);
+    // On the composed tree the forward slice family may deliver the freed
+    // parameters as slices: the harness follows the emitted forms.
+    let input_argument = if source.contains("fn create_commands(input: *const u8") {
+        "b.as_ptr()"
+    } else {
+        "&b[..]"
+    };
+    let base_argument = if source.contains("base_ip: *const u8") {
+        "b.as_ptr()"
+    } else {
+        "&b[..]"
+    };
+    let table_argument = if source.contains("table: *mut i32") {
+        "t.as_mut_ptr()"
+    } else {
+        "&mut t[..]"
+    };
     compile(
         &source,
-        Some(
-            "fn main() { let b = [1u8, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 9, 9, 9, 9, 9, 9, 9, 9]; let mut t = [0i32; 8]; let mut lit = [0u8; 64]; let mut lp = lit.as_mut_ptr(); let r = unsafe { create_commands(b.as_ptr(), 32, b.as_ptr(), t.as_mut_ptr(), &mut lp) }; assert_eq!(r, 11); }",
-        ),
+        Some(&format!(
+            "fn main() {{ let b = [1u8, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 9, 9, 9, 9, 9, 9, 9, 9]; let mut t = [0i32; 8]; let mut lit = [0u8; 64]; let mut lp = lit.as_mut_ptr(); let r = unsafe {{ create_commands({input_argument}, 32, {base_argument}, {table_argument}, &mut lp) }}; assert_eq!(r, 11); }}"
+        )),
     );
 }
 
