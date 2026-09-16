@@ -522,6 +522,7 @@ pub(super) fn plan(
         bridges: visitor.bridges,
         local_bridges: vec![],
         composed_edit_spans: vec![],
+        peer_bases: vec![],
         explicit_declaration: None,
     })
 }

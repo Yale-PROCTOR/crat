@@ -44,6 +44,10 @@ pub(crate) struct CursorPlan {
     /// The cursor type to declare on an untyped local (`let mut q = …`), emitted
     /// through the explicit-declaration site.
     pub(crate) explicit_declaration: Option<String>,
+    /// The bases this cursor is re-pointed to after initialisation (`p = q`,
+    /// `p = Some(q.offset(k))`): a parent cursor or another family's delivered
+    /// local. The cursor stands only while every one of them is admitted.
+    pub(crate) peer_bases: Vec<rustc_hir::HirId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,22 +245,32 @@ pub(crate) fn promote(
         let orphan = committed
             .iter()
             .position(|&(index, _, _)| match &entries[index].1 {
-                Decision::Cursor { plan, .. } => plan.parent_cursor.is_some_and(|parent| {
-                    !entries.iter().any(|(other, decision)| {
-                        other.fn_did == entries[index].0.fn_did
-                            && other.hir_id == parent
-                            && match decision {
-                                Decision::Cursor { plan, .. } => plan.wrapper,
-                                Decision::Slice { .. }
-                                | Decision::NestedSlice { .. }
-                                | Decision::Opt { .. }
-                                | Decision::Ref { .. }
-                                | Decision::InferredRef { .. }
-                                | Decision::Box(_)
-                                | Decision::Degraded(_) => false,
-                            }
-                    })
-                }),
+                Decision::Cursor { plan, .. } => {
+                    plan.parent_cursor
+                        .iter()
+                        .chain(&plan.peer_bases)
+                        .any(|&base| {
+                            // A base that is no subject at all (an original
+                            // safe binding) has nothing to withdraw.
+                            entries.iter().any(|(other, decision)| {
+                                other.fn_did == entries[index].0.fn_did
+                                    && other.hir_id == base
+                                    && !match decision {
+                                        Decision::Cursor { plan, .. } => plan.wrapper,
+                                        // A delivered peer another family owns
+                                        // (`data = start`): admitted as long as
+                                        // that family's decision stands.
+                                        Decision::Slice { .. }
+                                        | Decision::NestedSlice { .. }
+                                        | Decision::Opt { .. } => plan.peer_bases.contains(&base),
+                                        Decision::Ref { .. }
+                                        | Decision::InferredRef { .. }
+                                        | Decision::Box(_)
+                                        | Decision::Degraded(_) => false,
+                                    }
+                            })
+                        })
+                }
                 Decision::Slice { .. }
                 | Decision::NestedSlice { .. }
                 | Decision::Opt { .. }

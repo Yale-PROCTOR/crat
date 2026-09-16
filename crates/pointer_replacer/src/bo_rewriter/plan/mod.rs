@@ -5423,6 +5423,7 @@ mod tests {
             delivered_base: None,
             local_bridges: vec![],
             composed_edit_spans: vec![],
+            peer_bases: vec![],
             explicit_declaration: None,
             bridges: vec![CursorBridge {
                 call_hir: hir(2),

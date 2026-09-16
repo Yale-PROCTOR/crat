@@ -1,5 +1,32 @@
 use super::*;
 
+/// The cursor-family decisions of a program: each subject label with whether
+/// it settled as a wrapper cursor (the plan, not the emitted text — a held
+/// class reverts the text but the plan is the defect).
+pub(super) fn cursor_decisions(input: &str) -> Vec<(String, bool)> {
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        table
+            .entries
+            .iter()
+            .map(|(subject, decision)| {
+                let cursor = match decision {
+                    Decision::Cursor { plan, .. } => plan.wrapper,
+                    Decision::Slice { .. }
+                    | Decision::NestedSlice { .. }
+                    | Decision::Opt { .. }
+                    | Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Box(_)
+                    | Decision::Degraded(_) => false,
+                };
+                (subject.label.clone(), cursor)
+            })
+            .collect()
+    })
+    .expect("cursor decisions")
+}
+
 pub(super) fn emitted(input: &str) -> String {
     let source = utils::compilation::run_compiler_on_str(input, |tcx| {
         let capture = crate::bo_rewriter::ast_transform::capture_ast(tcx).unwrap();

@@ -837,6 +837,7 @@ fn build<'tcx>(
         bridges: uses.bridges,
         local_bridges,
         composed_edit_spans: vec![],
+        peer_bases: vec![],
         explicit_declaration: None,
     })
 }

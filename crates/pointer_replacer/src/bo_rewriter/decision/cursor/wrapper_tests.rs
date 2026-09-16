@@ -1,4 +1,4 @@
-use super::tests::{compile, emitted};
+use super::tests::{compile, cursor_decisions, emitted};
 
 #[test]
 fn slicecursor_strrwd_backward_walk() {
@@ -1085,5 +1085,44 @@ pub unsafe fn has_suffix(s: *const i8, suffix: *const i8, ns: isize, nx: isize) 
         Some(&format!(
             "fn main() {{ let s = *b\"abcdef\\0\"; let s = s.map(|b| b as i8); let d = *b\"def\\0\"; let d = d.map(|b| b as i8); let x = *b\"xyz\\0\"; let x = x.map(|b| b as i8); assert_eq!(unsafe {{ has_suffix(&s[..6], {good}, 6, 3) }}, 1); assert_eq!(unsafe {{ has_suffix(&s[..6], {bad}, 6, 3) }}, 0); assert_eq!(unsafe {{ has_suffix(&s[..6], {good}, 2, 3) }}, 0); }}"
         )),
+    );
+}
+
+#[test]
+fn slicecursor_repointed_child_withdraws_with_its_parent() {
+    // brotli `BrotliCompressFragmentFastImpl` (batch-8 census-1, 42 cursor
+    // errors): `ip_end`, a null-initialised cursor re-pointed from the
+    // parameter `input` (`ip_end = input.offset(n)`), was kept as a cursor
+    // after `input` itself withdrew (its copies into raw locals are holds), so
+    // the constructor called `offset_by` on a raw pointer. A re-pointed child
+    // stands only on a base that admitted, like an initialised one.
+    let input = r#"
+pub unsafe fn walk(p: *const u8, q: *const u8) -> i32 { (*p.offset(0) as i32) + (*q.offset(1) as i32) }
+pub unsafe fn fragment(input: *const u8, n: usize) -> i32 {
+    let mut ip_end = 0 as *const u8;
+    let mut copy = input;
+    let mut acc = 0;
+    ip_end = input.offset(n as isize);
+    let mut ip = input.offset(1);
+    while ip < ip_end {
+        acc += *ip.offset(-1) as i32;
+        ip = ip.offset(1);
+    }
+    acc + walk(copy, copy)
+}
+"#;
+    let decisions = cursor_decisions(input);
+    let cursor = |label: &str| decisions.iter().any(|(l, c)| l == label && *c);
+    assert!(
+        !cursor("fragment::ip_end") || cursor("fragment::input"),
+        "child cursor over a raw parent: {decisions:?}"
+    );
+    let source = emitted(input);
+    save_fixture("repointed-child-withdraws-with-parent", input, &source);
+    compile(
+        &source,
+        Some(
+            "fn main() { let b = [1u8, 2, 3, 4, 5, 6]; assert_eq!(unsafe { fragment(b.as_ptr(), 5) }, 1 + 2 + 3 + 4 + 1 + 2); }",
+        ),
     );
 }

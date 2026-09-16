@@ -464,6 +464,7 @@ struct Uses<'a, 'tcx> {
     edits: Vec<UseEdit>,
     hirs: Vec<hir::HirId>,
     hold: Option<CursorHold>,
+    peer_bases: Vec<hir::HirId>,
 }
 impl Uses<'_, '_> {
     /// A derived pointer leaving the function through its raw return: the tail
@@ -934,6 +935,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                                 if (b.delivered.is_some() || b.parent_cursor.is_some())
                                     && !b.fallback =>
                             {
+                                self.peer_bases.extend(peer_base(&b));
                                 self.push(
                                     e,
                                     format!("{} = {}", self.name, b.expression),
@@ -952,6 +954,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                                 if (b.delivered.is_some() || b.parent_cursor.is_some())
                                     && !b.fallback =>
                             {
+                                self.peer_bases.extend(peer_base(&b));
                                 self.push(
                                     e,
                                     format!("{} = Some({})", self.name, b.expression),
@@ -1458,6 +1461,7 @@ fn build(
         edits: vec![],
         hirs: vec![],
         hold: None,
+        peer_bases: vec![],
     };
     v.visit_body(ctx.tcx.hir_body_owned_by(subject.fn_did));
     if let Some(hold) = v.hold {
@@ -1490,6 +1494,19 @@ fn build(
         local_bridges: vec![],
         composed_edit_spans: b.composed,
         explicit_declaration,
+        peer_bases: v.peer_bases,
+    })
+}
+
+/// The subject a re-point constructor stands on: a parent cursor, or another
+/// family's delivered local — never an original safe binding, which no family
+/// can withdraw.
+fn peer_base(b: &Base) -> Option<hir::HirId> {
+    b.parent_cursor.or_else(|| {
+        b.delivered
+            .as_ref()
+            .filter(|d| !matches!(d.provider, DeliveredBaseProvider::OriginalSlice))
+            .and(b.binding)
     })
 }
 
