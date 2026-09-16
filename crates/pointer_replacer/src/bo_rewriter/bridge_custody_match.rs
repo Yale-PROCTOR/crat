@@ -1800,6 +1800,78 @@ fn pending_original_source(
     Ok((**binding).clone())
 }
 
+/// **R424-3 — the delivered slice's suffix view of a typed pointer view.**
+///
+/// The protected source reaches the pending site as `binding.offset(e)` in the
+/// ORIGINAL; once the subject is delivered as a slice the same value is spelled
+/// `(&[mut] (binding)[e..]).as_[mut_]ptr()` (wave-6s's computed suffix view).
+/// The correspondence is exact and narrow: the same binding, the offset-family
+/// method the descriptor recorded, and the SAME index expression modulo casts —
+/// a different binding, a different offset, a bounded range (`e..n`) or any
+/// other method is not this view and still refuses.
+fn typed_view_slice_correspondence(
+    emitted: &ast::Expr,
+    binding: &str,
+    method: &str,
+    original: &ast::Expr,
+) -> bool {
+    if !matches!(
+        method,
+        "offset"
+            | "add"
+            | "wrapping_offset"
+            | "wrapping_add"
+            | "byte_offset"
+            | "wrapping_byte_offset"
+    ) {
+        return false;
+    }
+    let ast::ExprKind::MethodCall(original_call) = &unparen(peel_raw_pointer_casts(original)).kind
+    else {
+        return false;
+    };
+    if original_call.seg.ident.name.as_str() != method
+        || original_call.args.len() != 1
+        || path(unparen(&original_call.receiver)).as_deref() != Some(binding)
+    {
+        return false;
+    }
+    let emitted = unparen(peel_raw_pointer_casts(emitted));
+    let ast::ExprKind::MethodCall(view) = &emitted.kind else {
+        return false;
+    };
+    if !view.args.is_empty() || !matches!(view.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr") {
+        return false;
+    }
+    let ast::ExprKind::AddrOf(ast::BorrowKind::Ref, _, place) = &unparen(&view.receiver).kind
+    else {
+        return false;
+    };
+    let ast::ExprKind::Index(base, index, _) = &unparen(place).kind else {
+        return false;
+    };
+    if path(unparen(base)).as_deref() != Some(binding) {
+        return false;
+    }
+    let ast::ExprKind::Range(Some(start), None, ast::RangeLimits::HalfOpen) = &unparen(index).kind
+    else {
+        return false;
+    };
+    expression_key(peel_casts(start)) == expression_key(peel_casts(&original_call.args[0]))
+}
+
+/// Every `as` cast, of any target type: the two sides spell the same index with
+/// different integer types (`(1 as c_int) as usize` vs `1 as c_int as isize`).
+fn peel_casts(mut expression: &ast::Expr) -> &ast::Expr {
+    loop {
+        expression = unparen(expression);
+        match &expression.kind {
+            ast::ExprKind::Cast(inner, _) => expression = inner,
+            _ => return expression,
+        }
+    }
+}
+
 fn pending_selected_argument(
     input: &BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -1848,7 +1920,24 @@ fn pending_selected_argument(
             .ok_or("pending-carrier-initializer-absent")?
     } else {
         let emitted_expression = expression(&argument.text)?;
-        if !raw_initializer_matches(&emitted_expression, &original_expression) {
+        let typed_view_method =
+            expected
+                .pending_source
+                .as_ref()
+                .and_then(|source| match &source.shape {
+                    PendingSourceShape::TypedPointerView { method } => Some(method.as_str()),
+                    _ => None,
+                });
+        if !raw_initializer_matches(&emitted_expression, &original_expression)
+            && !typed_view_method.is_some_and(|method| {
+                typed_view_slice_correspondence(
+                    &emitted_expression,
+                    name,
+                    method,
+                    &original_expression,
+                )
+            })
+        {
             return Err("pending-source-view-correspondence-unbuilt".into());
         }
         argument.span
