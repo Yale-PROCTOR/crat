@@ -1640,7 +1640,26 @@ pub(crate) fn reconcile_slice_use_rows(
             || row.terminal.state != event.state
             || row.terminal.reason != event.terminal_reason
         {
-            return Err(format!("slice-use specialized/common drift at {key}"));
+            return Err(format!(
+                "slice-use specialized/common drift at {key}: row{{use_site={:?} source_form={} candidate_form={} target_form={} adapter={} retention={:?} state={:?} reason={:?} extent={:?}}} event{{site={:?} found={} expected={} shape={} retention={:?} state={:?} reason={:?} extent={:?}}} retired={retired}",
+                row.use_site,
+                row.source_form,
+                row.candidate_form,
+                row.target_form,
+                row.adapter,
+                row.retention,
+                row.terminal.state,
+                row.terminal.reason,
+                row.contract_extent.as_ref().map(|p| p.mechanical_extent()),
+                event.key.site,
+                event.found_form,
+                event.expected_form,
+                event.source_shape,
+                event.evidence.retention,
+                event.state,
+                event.terminal_reason,
+                event.evidence.extent
+            ));
         }
         event.validate()?;
     }
