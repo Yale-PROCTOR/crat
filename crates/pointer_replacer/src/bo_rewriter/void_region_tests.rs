@@ -741,3 +741,18 @@ fn w6b_byte_recast_of_a_char_pointer_is_not_in_the_class() {
     let rows = super::emit_tests::decisions_of(&chars);
     assert_ne!(local_reason(&rows, "source"), "<emitted>", "{rows:?}");
 }
+
+/// A step on the view that is not `offset` by a constant (`wrapping_add`
+/// here) is not extent evidence: the view is not exact.
+#[test]
+fn w6b_byte_view_steps_are_offset_by_a_constant() {
+    let wrapping = BE16.replace(
+        "*source.offset(1 as libc::c_int as isize);",
+        "*source.wrapping_add(1 as libc::c_int as usize);",
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&wrapping).expect("AST output");
+    assert!(
+        !compact(&source).contains("letmutsource:&[u8]=core::slice::from_raw_parts(core::ptr::from_ref(psource).cast_mut()as*mutlibc::c_uchar,core::mem::size_of::<u16>())"),
+        "an unrecognised step is not exactness evidence: {source}"
+    );
+}

@@ -305,9 +305,10 @@ struct ByteView {
     /// The scalar type as the parameter spells it, resolved.
     scalar: String,
     size: u64,
-    /// Every index of the view is a constant inside the scalar: the extent is
-    /// exactly `size_of::<T>()`. Otherwise the body has not shown where the
-    /// view ends, and the extent is the addendum-77 fallback with its receipt.
+    /// Every pointer step on the view is `offset` by a constant inside
+    /// the scalar: the extent is exactly `size_of::<T>()`. Otherwise the body
+    /// has not shown where the view ends, and the extent is the addendum-77
+    /// fallback with its receipt.
     exact: bool,
     initializer: HirId,
     initializer_span: Span,
@@ -320,9 +321,10 @@ struct UseCounter<'tcx> {
     owner: LocalDefId,
     local: HirId,
     count: usize,
-    /// Indices that are constants in `0..bound`, out of every `offset` seen.
+    /// Method calls on the binding, and how many of them are `offset` by a
+    /// constant in `0..bound`. A bare `*v` is byte 0 and needs no call.
     bound: u64,
-    offsets: usize,
+    methods: usize,
     constant_in_bound: usize,
 }
 
@@ -331,13 +333,14 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for UseCounter<'tcx> {
         if is_param_path(expression, self.local) {
             self.count += 1;
         }
-        if let ExprKind::MethodCall(segment, receiver, [index], _) = expression.kind
-            && segment.ident.name.as_str() == "offset"
+        if let ExprKind::MethodCall(segment, receiver, args, _) = expression.kind
             && is_param_path(receiver, self.local)
         {
-            self.offsets += 1;
-            if eval_const(self.tcx, self.owner, index)
-                .is_some_and(|k| k >= 0 && u64::try_from(k).is_ok_and(|k| k < self.bound))
+            self.methods += 1;
+            if segment.ident.name.as_str() == "offset"
+                && let [index] = args
+                && eval_const(self.tcx, self.owner, index)
+                    .is_some_and(|k| k >= 0 && u64::try_from(k).is_ok_and(|k| k < self.bound))
             {
                 self.constant_in_bound += 1;
             }
@@ -398,7 +401,7 @@ fn read_byte_view<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<ByteView
         local: parameter,
         count: 0,
         bound: size,
-        offsets: 0,
+        methods: 0,
         constant_in_bound: 0,
     };
     rustc_hir::intravisit::Visitor::visit_expr(&mut counter, body.value);
@@ -411,7 +414,7 @@ fn read_byte_view<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<ByteView
         local: subject.hir_id,
         count: 0,
         bound: size,
-        offsets: 0,
+        methods: 0,
         constant_in_bound: 0,
     };
     rustc_hir::intravisit::Visitor::visit_expr(&mut indices, body.value);
@@ -419,7 +422,7 @@ fn read_byte_view<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<ByteView
         parameter,
         scalar: super::declaration::pointee_source(tcx, *scalar_ty),
         size,
-        exact: indices.offsets > 0 && indices.constant_in_bound == indices.offsets,
+        exact: indices.constant_in_bound == indices.methods,
         initializer: initializer.hir_id,
         initializer_span: initializer.span,
     })
