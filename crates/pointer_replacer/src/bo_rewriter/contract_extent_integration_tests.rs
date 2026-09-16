@@ -1421,21 +1421,23 @@ fn ce_m05_a_size_of_another_type_keeps_the_multi_element_extent() {
 /// copies) — libtree's `print_error`: a local initialized by a conditional of
 /// NUL-terminated byte-string literals and read only at NUL contract
 /// positions. It takes `&[i8]` with each literal's own byte length as the
-/// evidence and `.as_ptr()` at the foreign seam.
+/// evidence and `.as_ptr()` at the foreign seam. (The corpus shape also hands
+/// it to `strcpy(p, box_vertical)` beside a written sibling — that site is
+/// pending and holds it, CE-S04; here the reads have no sibling.)
 const CE_S01_CONDITIONAL_LITERAL: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut)]
 extern "C" {
     fn strlen(s: *const i8) -> usize;
-    fn strcpy(dest: *mut i8, src: *const i8) -> *mut i8;
+    fn strcmp(a: *const i8, b: *const i8) -> i32;
 }
-pub unsafe fn print_error(color: i32, p: *mut i8) -> usize {
+pub unsafe fn print_error(color: i32) -> usize {
     let mut box_vertical = (if color != 0 {
         b"    \x1B[0;31m|\x1B[0m\0" as *const u8 as *const i8
     } else {
         b"    |\0" as *const u8 as *const i8
     }) as *mut i8;
     let n = strlen(box_vertical);
-    strcpy(p, box_vertical);
+    if strcmp(box_vertical, b"    |\0" as *const u8 as *const i8) == 0 { return 0; }
     n
 }
 "#;
@@ -1459,10 +1461,7 @@ fn ce_s01_a_conditional_of_nul_literals_takes_the_slice_with_literal_lengths() {
         "{source}"
     );
     assert!(flat.contains("strlen(box_vertical.as_ptr())"), "{source}");
-    assert!(
-        flat.contains("strcpy(p, box_vertical.as_ptr())"),
-        "{source}"
-    );
+    assert!(flat.contains("strcmp(box_vertical.as_ptr(),"), "{source}");
     assert!(
         !flat.contains("as *mut i8;"),
         "the outer cast is gone:\n{source}"
@@ -1548,4 +1547,65 @@ pub unsafe fn g(src: *const i8) {
         "the written literal keeps its raw form:\n{source}"
     );
     assert!(!source.contains("d: &"), "{source}");
+}
+
+/// R419-3 / R304-2: a pending sibling-overlap site is a stated hold. urlparser's
+/// `url_get_path`: the literal `fmt` is `sprintf`'s format while `path` — a
+/// written sibling at the same call whose aliasing with the literal no proof
+/// clears — is its destination; the literal local keeps its raw form with the
+/// typed reason `pending-sibling-overlap` instead of a `&[i8]` whose type moves
+/// under the pending site. A literal whose only site has no risky sibling
+/// (`strlen`) still delivers.
+const CE_S04_PENDING_SIBLING: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" {
+    fn sprintf(s: *mut i8, format: *const i8, _: ...) -> i32;
+}
+pub unsafe fn url_get_path(path: *mut i8, tmp_path: *mut i8, is_ssh: bool) {
+    let mut fmt = (if is_ssh {
+        b"%s\0" as *const u8 as *const i8
+    } else {
+        b"/%s\0" as *const u8 as *const i8
+    }) as *mut i8;
+    sprintf(path, fmt, tmp_path);
+}
+"#;
+
+#[test]
+fn ce_s04_a_literal_at_a_pending_sibling_site_keeps_its_raw_form() {
+    let decisions = super::emit_tests::decisions_of(CE_S04_PENDING_SIBLING);
+    let fmt = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "fmt" && !*is_param)
+        .expect("CE-S04 fmt subject");
+    assert_eq!(fmt.2, "pending-sibling-overlap", "{decisions:#?}");
+    let source = emitted(CE_S04_PENDING_SIBLING);
+    assert!(!source.contains("fmt: &[i8]"), "{source}");
+    assert!(source.contains("sprintf(path, fmt,"), "{source}");
+
+    // libtree's `strcpy(p, box_vertical)`: the written destination `p` is the
+    // risky sibling of the literal source.
+    let strcpy_shape = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" {
+    fn strlen(s: *const i8) -> usize;
+    fn strcpy(dest: *mut i8, src: *const i8) -> *mut i8;
+}
+pub unsafe fn print_error(color: i32, p: *mut i8) -> usize {
+    let mut box_vertical = (if color != 0 {
+        b"    |\0" as *const u8 as *const i8
+    } else {
+        b"    \0" as *const u8 as *const i8
+    }) as *mut i8;
+    let n = strlen(box_vertical);
+    strcpy(p, box_vertical);
+    n
+}
+"#;
+    let decisions = super::emit_tests::decisions_of(strcpy_shape);
+    let local = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "box_vertical" && !*is_param)
+        .expect("CE-S04 box_vertical subject");
+    assert_eq!(local.2, "pending-sibling-overlap", "{decisions:#?}");
 }

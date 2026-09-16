@@ -80,6 +80,7 @@ pub(crate) mod ownership_fields_native;
 #[cfg(test)]
 mod ownership_fields_roles_tests;
 pub(crate) mod ownership_fields_source;
+pub(crate) mod pending_sibling;
 pub(crate) mod pinned_local;
 #[cfg(test)]
 mod pinned_local_tests;
@@ -712,6 +713,11 @@ pub(crate) enum DegradeReason {
     SliceCursorUse,
     CursorBaseModelRaw,
     CursorBaseUnavailable,
+    /// R419-3 / R304-2: the subject is the source of a foreign site the
+    /// sibling-overlap instrument would hold `pending` (a risky sibling at the
+    /// same call); a delivered borrowed form there is a delivered held
+    /// subject, so the family refuses up front (`pending_sibling`).
+    PendingSiblingOverlap,
     /// **S3.2′-5 — the offset may be negative, so no `&[T]` form may emit.**
     ///
     /// `*p.offset(e)` becomes `p[(e) as usize]`. Where `e` is negative at
@@ -870,6 +876,7 @@ impl DegradeReason {
             DegradeReason::IoDomainType => "held:io-domain:type",
             DegradeReason::VoidPointee => "held:void-pointee",
             DegradeReason::ThinExtent => "held:thin-extent",
+            DegradeReason::PendingSiblingOverlap => "pending-sibling-overlap",
             DegradeReason::LocalCalleeAccessExtent { .. } => "held:local-callee-access-extent",
             DegradeReason::NoSlot => "no-slot",
             DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
@@ -1727,7 +1734,17 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         ),
         // wave-4 R410-9 (b): a string-literal construction has no root to
         // widen and no local-callee result to receive; it types its own local.
-        Decision::Slice { mutable: false, .. } if literal_construction => decision,
+        Decision::Slice { mutable: false, .. } if literal_construction => {
+            if pending_sibling::pending_site(ctx.facts, receiver_node).is_some() {
+                degrade(
+                    subject,
+                    EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                    DegradeReason::PendingSiblingOverlap,
+                )
+            } else {
+                decision
+            }
+        }
         // wave-6a (relay 007 §3a, wave-6s2 006; R395-2): before any rule that
         // types an unannotated slice local by its constructor — a receiver of
         // a local callee is the return family's, a Ref-rooted construction
