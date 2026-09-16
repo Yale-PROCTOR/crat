@@ -1236,9 +1236,14 @@ fn w6v2_iterator_callee_that_writes_an_integer_image_holds() {
     );
 }
 
-/// The callee reads through a DERIVED alias of the argument (`split.offset(0)`,
-/// an open step for the certificate): the residual is unknown, and the body
-/// scan modulo the output discharges it — T1, not the T2 waiver.
+/// The callee reads through a DERIVED alias of the argument (`split.offset(0)`):
+/// T1, not the T2 waiver. Two admissible readings (R217-2(a)): where the core
+/// call is an open step for the certificate the residual is unknown and the
+/// body scan modulo the output discharges it (`descendant-free-modulo-output`);
+/// where wave-6r's landed hooks 3/4 call the same step a known no-retain
+/// (batch 8 `6f521bfc` / `32f42251`, restored on the composition by their
+/// core-method seam) the residual is no-retain and the stack-storage
+/// certificate discharges it one tier earlier.
 #[test]
 fn w6v2_iterator_callee_reading_through_a_derived_alias_is_t1() {
     let input = ITERATOR.replace(
@@ -1248,9 +1253,10 @@ fn w6v2_iterator_callee_reading_through_a_derived_alias_is_t1() {
     assert_ne!(input, ITERATOR);
     let site = iterator_site_rows(&input);
     assert!(
-        site.iter()
-            .any(|l| l.contains("\tT1\t") && l.contains("descendant-free-modulo-output")),
-        "the derived read is discharged by the scan: {site:?}"
+        site.iter().any(|l| l.contains("\tT1\t")
+            && (l.contains("descendant-free-modulo-output")
+                || l.contains("stack-storage-certificate"))),
+        "the derived read is discharged by the scan or the certificate: {site:?}"
     );
 }
 

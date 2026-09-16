@@ -2023,6 +2023,27 @@ fn collect_retention_facts<'tcx>(
                     step
                 };
                 let step = match method {
+                    // wave-6r × wave-6v2 seam: hooks 3/4 of the batch-8 line
+                    // (`6f521bfc`, `32f42251` narrowed by `070164b9`) prove
+                    // that a core `is_null`, or an offset-family call whose
+                    // result the function does not return, RETAINS NOTHING —
+                    // a known no-retain step, not an open boundary. Outside
+                    // that set (`wrapping_*`, `byte_*`, `read`, `addr`, ..)
+                    // the call stays the open step wave-6v2 models.
+                    CorePointerMethod::Derive | CorePointerMethod::Observe
+                        if crate::bo_rewriter::wave6r_child_access::core_pointer_known_no_retain(
+                            tcx, body, data, callee,
+                        ) =>
+                    {
+                        retention_step(
+                            location,
+                            RetentionEventKind::KnownNoRetainCall,
+                            format!(
+                                "{} arg{index} core-no-retain {CORE_POINTER_METHOD_TAG}",
+                                tcx.def_path_str(callee)
+                            ),
+                        )
+                    }
                     CorePointerMethod::Derive | CorePointerMethod::Observe => open(
                         format!(
                             "{} arg{index} {CORE_POINTER_METHOD_TAG}",
