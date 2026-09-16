@@ -534,8 +534,9 @@ const BST: &str = include_str!("wave6f_fixture_bst.rs");
 /// `inorder::_1` (`root`). `deleteNode::_37` (the traversal ARGUMENT
 /// `(*root).right`, Owning) is a field site, not a named subject — the
 /// `.take()` move; `minValueNode::_8` and `inorder::_5/_13` are unnamed
-/// temporaries. Re-pinned 2026-09-16 against 002; era-5c 003's corpus
-/// probe table re-pins it again if the corpus entry differs.
+/// temporaries. Re-pinned 2026-09-16 against 002; era-5c 003 (R425-2)
+/// confirms the corpus entry IS this shape (0 raw / 13 ref / 31 owning), so
+/// the frame stands as the corpus's own.
 fn bst_frame() {
     use crate::analyses::borrow_ownership::SlotKind;
     super::test_model_override::set(
@@ -632,12 +633,34 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
         "let mut temp = (*root).right.take().map_or(core::ptr::null_mut(), Box::into_raw);",
         // the C free site is untouched
         "free(root as *mut ::std::ffi::c_void); return temp;",
+        // R425-2: the recursive walker's two arguments are VIEWS of the
+        // children, not moves — the callee formal stays `ref`
+        "inorder((*root.unwrap()).right.as_deref());",
+        // R425-2: the `minValueNode` receiver is a raw view of the child
+        "minValueNode((*root).right.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut))",
         // E5C-3 (report 007): the two-children branch hoists the pure read
         // before the moving argument
         "let __crat_hoist0 = (*temp_1).key;",
     ] {
         assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
     }
+    // R425-2 (era-5c 003) — the E5C-3 emission contract's SECOND clause:
+    // the four Owning kinds at the traversal / recursive-call arguments
+    // (`deleteNode::_37`, `minValueNode::_8`, `inorder::_5/_13`) are token
+    // loads whose callee formals stay `ref`, so they license NO drop. bst's
+    // only deallocation sites are `deleteNode`'s two C `free`s, both
+    // RETAINED; a `Box` dropped at one of those argument sites would free a
+    // linked subtree. Emission side: no Rust drop anywhere, the two frees
+    // exactly as C wrote them (the bridges row's
+    // `waiver-drop-scope-exit=0` is the receipt side of the same clause).
+    assert_eq!(source.matches("drop(").count(), 0, "{source}");
+    assert_eq!(
+        source
+            .matches("free(root as *mut ::std::ffi::c_void);")
+            .count(),
+        2,
+        "{source}"
+    );
     // A struct owning a Box is not Copy: the derives are withdrawn.
     assert!(
         !source.contains("impl ::core::marker::Copy for node"),
