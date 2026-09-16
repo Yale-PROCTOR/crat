@@ -11951,50 +11951,18 @@ mod run {
             format!("{:x}", Sha256::digest(stamped_patch.as_bytes())),
         );
         let artifact = &capture.raw_boundary_artifacts;
-        let bridge_summary =
-            crate::bo_rewriter::bridge_receipt::reconcile_bridge_events(&artifact.bridge_events)
-                .expect("bridge receipt reconciliation");
+        // R416-4: a receipt drift is a typed per-program failure that keeps
+        // the emitted tree and the subject outcomes, never a worker abort.
+        let reconciliation = super::reconcile_receipt_families(artifact);
+        let bridge_summary = reconciliation.bridge;
         let bridge_receipts =
             crate::bo_rewriter::bridge_receipt::render_bridge_events(&artifact.bridge_events);
-        let unsafe_context_summary =
-            crate::bo_rewriter::mechanical_receipt::reconcile_unsafe_context_events(
-                &artifact.unsafe_context_events,
-            )
-            .expect("unsafe-context receipt reconciliation");
+        let unsafe_context_summary = reconciliation.unsafe_context;
         let unsafe_context_receipts =
             crate::bo_rewriter::mechanical_receipt::render_unsafe_context_events(
                 &artifact.unsafe_context_events,
             );
-        let mechanical_summary =
-            crate::bo_rewriter::mechanical_receipt::reconcile_mechanical_obligations(
-                &artifact.mechanical_events,
-            )
-            .expect("mechanical obligation reconciliation");
-        crate::bo_rewriter::mechanical_receipt::reconcile_a5_proof_site_fallback_rows(
-            &artifact.a5_proof_site_fallback_rows,
-            &artifact.mechanical_events,
-        )
-        .expect("A5 proof-site fallback reconciliation");
-        crate::bo_rewriter::mechanical_receipt::reconcile_slice_construction_rows(
-            &artifact.slice_construction_rows,
-            &artifact.mechanical_events,
-        )
-        .expect("slice-construction receipt reconciliation");
-        crate::bo_rewriter::mechanical_receipt::reconcile_slice_use_rows(
-            &artifact.slice_use_rows,
-            &artifact.mechanical_events,
-        )
-        .expect("slice-use receipt reconciliation");
-        crate::bo_rewriter::mechanical_receipt::reconcile_option_presentation_rows(
-            &artifact.option_rows,
-            &artifact.mechanical_events,
-        )
-        .expect("Option-presentation receipt reconciliation");
-        crate::bo_rewriter::mechanical_receipt::reconcile_declaration_shape_rows(
-            &artifact.declaration_rows,
-            &artifact.mechanical_events,
-        )
-        .expect("declaration-shape receipt reconciliation");
+        let mechanical_summary = reconciliation.mechanical;
         let outbound_return_issue = artifact.outbound_return_error.clone().or_else(|| {
             crate::bo_rewriter::mechanical_receipt::reconcile_outbound_return_rows(
                 &artifact.outbound_return_required,
@@ -12872,7 +12840,9 @@ mod run {
         row.set(raw_schema::DATA, data);
         row.set(
             raw_schema::DELIVERY,
-            if program_outcome == super::RawBoundaryProgramOutcome::Degraded {
+            if program_outcome == super::RawBoundaryProgramOutcome::Degraded
+                || reconciliation.drift.is_some()
+            {
                 super::RawBoundaryDelivery::Degraded.key()
             } else {
                 super::RawBoundaryDelivery::Clean.key()
@@ -13247,6 +13217,7 @@ mod run {
                 "ok"
             },
         );
+        super::apply_receipt_reconciliation_drift(&mut row, &reconciliation);
         row
     }
 
@@ -23022,6 +22993,220 @@ fn raw_boundary_worker_row(program: &str, outcome: &orchestrate::ChildOutcome) -
     row
 }
 
+/// R416-4 (wave-6l): the eight receipt-family reconciliations of a census
+/// program, run to completion; the FIRST drift is kept as a typed failure
+/// (`family`, the spelled message) instead of aborting the worker, and the
+/// summaries a drifting family could not produce are the empty ones.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReceiptReconciliation {
+    pub(crate) bridge: crate::bo_rewriter::bridge_receipt::BridgeReceiptSummary,
+    pub(crate) unsafe_context: crate::bo_rewriter::mechanical_receipt::UnsafeContextReceiptSummary,
+    pub(crate) mechanical: crate::bo_rewriter::mechanical_receipt::MechanicalObligationSummary,
+    /// `(family, message)` of the first drift: `bridge`, `unsafe-context`,
+    /// `mechanical`, `a5-proof-site-fallback`, `slice-construction`,
+    /// `slice-use`, `option-presentation`, `declaration-shape`.
+    pub(crate) drift: Option<(&'static str, String)>,
+}
+
+pub(crate) fn reconcile_receipt_families(
+    artifact: &crate::bo_rewriter::RawBoundaryArtifacts,
+) -> ReceiptReconciliation {
+    use crate::bo_rewriter::{bridge_receipt, mechanical_receipt};
+    let mut out = ReceiptReconciliation::default();
+    let mut note = |family: &'static str, result: Result<(), String>| {
+        if let Err(message) = result
+            && out.drift.is_none()
+        {
+            out.drift = Some((family, message));
+        }
+    };
+    match bridge_receipt::reconcile_bridge_events(&artifact.bridge_events) {
+        Ok(summary) => out.bridge = summary,
+        Err(message) => note("bridge", Err(message)),
+    }
+    match mechanical_receipt::reconcile_unsafe_context_events(&artifact.unsafe_context_events) {
+        Ok(summary) => out.unsafe_context = summary,
+        Err(message) => note("unsafe-context", Err(message)),
+    }
+    match mechanical_receipt::reconcile_mechanical_obligations(&artifact.mechanical_events) {
+        Ok(summary) => out.mechanical = summary,
+        Err(message) => note("mechanical", Err(message)),
+    }
+    note(
+        "a5-proof-site-fallback",
+        mechanical_receipt::reconcile_a5_proof_site_fallback_rows(
+            &artifact.a5_proof_site_fallback_rows,
+            &artifact.mechanical_events,
+        )
+        .map(|_| ()),
+    );
+    note(
+        "slice-construction",
+        mechanical_receipt::reconcile_slice_construction_rows(
+            &artifact.slice_construction_rows,
+            &artifact.mechanical_events,
+        )
+        .map(|_| ()),
+    );
+    note(
+        "slice-use",
+        mechanical_receipt::reconcile_slice_use_rows(
+            &artifact.slice_use_rows,
+            &artifact.mechanical_events,
+        )
+        .map(|_| ()),
+    );
+    note(
+        "option-presentation",
+        mechanical_receipt::reconcile_option_presentation_rows(
+            &artifact.option_rows,
+            &artifact.mechanical_events,
+        )
+        .map(|_| ()),
+    );
+    note(
+        "declaration-shape",
+        mechanical_receipt::reconcile_declaration_shape_rows(
+            &artifact.declaration_rows,
+            &artifact.mechanical_events,
+        )
+        .map(|_| ()),
+    );
+    out
+}
+
+/// The program row of a drifting census program: `status=reconciliation-
+/// drift:<family>`, `delivery=degraded`, `data=false`, the drifting row's
+/// identity in `detail`. The tree, the subject rows and every receipt file
+/// written before this point stay.
+pub(crate) fn apply_receipt_reconciliation_drift(
+    row: &mut report::Row,
+    reconciliation: &ReceiptReconciliation,
+) {
+    let Some((family, message)) = &reconciliation.drift else {
+        return;
+    };
+    row.set(raw_schema::STATUS, format!("reconciliation-drift:{family}"));
+    row.set(raw_schema::DELIVERY, RawBoundaryDelivery::Degraded.key());
+    row.set(raw_schema::DATA, "false");
+    row.set("detail", report::sanitize(message));
+}
+
+/// R416-4: a drifting slice-use row (no common event owns it) is a typed
+/// per-program failure — `status=reconciliation-drift:slice-use`,
+/// `delivery=degraded`, `data=false`, the row's identity in `detail` — and
+/// never a panic; the other seven families still reconcile and a clean
+/// artifact leaves the row untouched.
+#[test]
+fn r416_receipt_reconciliation_drift_is_a_typed_program_row() {
+    use crate::bo_rewriter::{
+        bridge_receipt::SignatureClassId,
+        mechanical_receipt::{
+            CanonicalLocation, CanonicalSiteKey, MechanicalFamily, MechanicalObligationKey,
+            MechanicalRetention, MechanicalStage, MechanicalState, MechanicalSubjectKey,
+            SliceUseAdapterReceiptRow, SpecializedReceiptTerminal,
+        },
+    };
+    let owner = rustc_hir::def_id::CRATE_DEF_ID;
+    let site = CanonicalSiteKey {
+        owner,
+        location: CanonicalLocation::Mir {
+            basic_block: 3,
+            statement_index: 1,
+            terminator: false,
+        },
+        callee: None,
+        argument_index: None,
+        slot_depth: 0,
+    };
+    let key = MechanicalObligationKey {
+        owner_class: SignatureClassId::of(owner),
+        subject: MechanicalSubjectKey::Local {
+            owner,
+            mir_local: 7,
+            slot_depth: 0,
+        },
+        site: site.clone(),
+        family: MechanicalFamily::SliceUseUnsupported,
+    };
+    let drifting = SliceUseAdapterReceiptRow {
+        terminal: SpecializedReceiptTerminal {
+            obligation_key: key.clone(),
+            stage: MechanicalStage::Plan,
+            state: MechanicalState::Planned,
+            reason: None,
+        },
+        use_site: site,
+        source_form: "raw".into(),
+        candidate_form: "slice-mut".into(),
+        target_form: "slice-mut".into(),
+        access_mutability: "write".into(),
+        adapter: "subject-use".into(),
+        boundary_site: "-".into(),
+        boundary_evidence: "-".into(),
+        retention: MechanicalRetention::None,
+        terminal_class_state: MechanicalState::Applied,
+        contract_extent: None,
+    };
+    let artifact = crate::bo_rewriter::RawBoundaryArtifacts {
+        slice_use_rows: vec![drifting],
+        ..Default::default()
+    };
+    let reconciliation = reconcile_receipt_families(&artifact);
+    let (family, message) = reconciliation
+        .drift
+        .clone()
+        .expect("the unowned slice-use row is a drift");
+    assert_eq!(family, "slice-use");
+    assert!(
+        message.contains("unowned slice-use row") && message.contains(&key.receipt_key()),
+        "{message}"
+    );
+    let mut row = report::Row::default();
+    row.set(raw_schema::DATA, "provisional");
+    row.set(raw_schema::DELIVERY, RawBoundaryDelivery::Clean.key());
+    row.set(raw_schema::STATUS, "ok");
+    apply_receipt_reconciliation_drift(&mut row, &reconciliation);
+    assert_eq!(
+        row.get(raw_schema::STATUS),
+        Some("reconciliation-drift:slice-use")
+    );
+    assert_eq!(
+        row.get(raw_schema::DELIVERY),
+        Some(RawBoundaryDelivery::Degraded.key())
+    );
+    assert_eq!(row.get(raw_schema::DATA), Some("false"));
+    // `detail` is sanitized as every error row's is (spaces to underscores);
+    // the row's identity survives it.
+    assert!(
+        row.get("detail")
+            .is_some_and(|detail| detail.contains("unowned_slice-use_row")
+                && detail.contains("subject_local:0:7:depth_0")),
+        "{row:?}"
+    );
+    assert!(!raw_boundary_rows_have_data(std::slice::from_ref(&row)));
+    assert!(raw_boundary_typed_failure(&row));
+    // The census-level read skips the typed row instead of asserting `ok`.
+    assert!(!raw_boundary_census_rows_have_data(
+        std::slice::from_ref(&row),
+        false,
+        "frozen_benchmark_graph"
+    ));
+
+    // Control: a clean artifact drifts nowhere and leaves the row as it was.
+    let clean = reconcile_receipt_families(&crate::bo_rewriter::RawBoundaryArtifacts::default());
+    assert_eq!(clean.drift, None);
+    let mut ok = report::Row::default();
+    ok.set(raw_schema::STATUS, "ok");
+    ok.set(raw_schema::DELIVERY, RawBoundaryDelivery::Clean.key());
+    apply_receipt_reconciliation_drift(&mut ok, &clean);
+    assert_eq!(ok.get(raw_schema::STATUS), Some("ok"));
+    assert_eq!(
+        ok.get(raw_schema::DELIVERY),
+        Some(RawBoundaryDelivery::Clean.key())
+    );
+}
+
 fn raw_boundary_capture_error_row(error: &str) -> report::Row {
     const PRE_COMPILE_PREFIX: &str = "E1 capture has no observed root: ";
     let mut row = report::Row::default();
@@ -23118,6 +23303,8 @@ fn raw_boundary_typed_failure(row: &report::Row) -> bool {
         status == "worker-abort"
             || status == "instrument-error"
             || status.starts_with("degraded-pre-compile:")
+            // R416-4: a receipt drift is a typed per-program failure.
+            || status.starts_with("reconciliation-drift:")
     })
 }
 
@@ -23135,7 +23322,10 @@ fn raw_boundary_census_rows_have_data(
             && (matches!(
                 row.get(raw_schema::STATUS),
                 Some("worker-abort" | "instrument-error")
-            ) || diagnostic_run)
+            ) || row
+                .get(raw_schema::STATUS)
+                .is_some_and(|status| status.starts_with("reconciliation-drift:"))
+                || diagnostic_run)
         {
             continue;
         }
