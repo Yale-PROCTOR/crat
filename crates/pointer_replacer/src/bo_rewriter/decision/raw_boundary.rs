@@ -1899,6 +1899,39 @@ fn collect_retention_facts<'tcx>(
                     }
                 }
             }
+            // R416-11: a cast of a reachable POINTER to a non-pointer type
+            // (`p as usize`) is an integer image of the alias — an exposed
+            // address the walk cannot follow, which a store elsewhere may keep
+            // and a later cast may revive. It is an open step (a hand-out) for
+            // every certificate; a cast that is itself stored or returned is
+            // the store or the return below, seen as before.
+            if let Rvalue::Cast(_, operand, target) = rhs
+                && let Some(source) = plain_operand_local(operand)
+                && is_reachable(source)
+                && matches!(body.local_decls[source].ty.kind(), TyKind::RawPtr(..))
+                && !matches!(
+                    target.kind(),
+                    TyKind::RawPtr(..) | TyKind::Ref(..) | TyKind::FnPtr(..)
+                )
+                && lhs.as_local().is_some_and(|local| local != RETURN_PLACE)
+            {
+                let step = retention_step(
+                    location,
+                    RetentionEventKind::Nontransparent,
+                    format!(
+                        "integer image _{}->_{}",
+                        source.as_u32(),
+                        lhs.local.as_u32()
+                    ),
+                );
+                facts
+                    .unknowns
+                    .entry(RetentionUnknownReason::NontransparentDef)
+                    .or_default()
+                    .push(step.clone());
+                facts.steps.push(step);
+                continue;
+            }
             let Some(source_place) = transparent_operand(rhs).and_then(Operand::place) else {
                 continue;
             };

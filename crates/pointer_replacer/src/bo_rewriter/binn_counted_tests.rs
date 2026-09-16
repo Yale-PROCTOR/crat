@@ -1253,3 +1253,59 @@ fn w6v2_iterator_callee_reading_through_a_derived_alias_is_t1() {
         "the derived read is discharged by the scan: {site:?}"
     );
 }
+
+/// R416-11: an integer IMAGE of a reachable pointer (`p as usize`) is a
+/// hand-out for the retention walk — an exposed address is an alias under the
+/// permissive provenance model — so a callee that stores it is never
+/// `no-retain`; a callee that only compares the image is not certified either
+/// (the walk cannot follow an integer).
+#[test]
+fn w6v2_integer_image_of_the_argument_is_an_open_step() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, static_mut_refs)]
+pub static mut KEPT: usize = 0;
+pub unsafe fn keep(p: *mut u8) { let image = p as usize; KEPT = image; }
+pub unsafe fn compare(p: *mut u8, q: *mut u8) -> bool { (p as usize) < (q as usize) }
+pub unsafe fn read(p: *mut u8) -> u8 { *p }
+"#;
+    let rows = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        ctx.retention.to_tsv()
+    })
+    .expect("input type-checks");
+    let row = |function: &str, index: &str| {
+        rows.lines()
+            .find(|l| {
+                l.starts_with(&format!("{function}\t")) && l.contains(&format!("\t{index}\t"))
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("{function} arg {index} row: {rows}"))
+    };
+    assert!(
+        !row("keep", "0").contains("\tno-retain\t") && row("keep", "0").contains("integer image"),
+        "{}",
+        row("keep", "0")
+    );
+    assert!(
+        !row("compare", "0").contains("\tno-retain\t"),
+        "{}",
+        row("compare", "0")
+    );
+    assert!(
+        !row("compare", "1").contains("\tno-retain\t"),
+        "{}",
+        row("compare", "1")
+    );
+    assert!(
+        row("read", "0").contains("\tno-retain\t"),
+        "{}",
+        row("read", "0")
+    );
+}
