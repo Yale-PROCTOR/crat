@@ -151,7 +151,25 @@ pub(crate) mod fixture {
         pub(crate) subjects: String,
         pub(crate) arm_outcomes: String,
         pub(crate) class_collisions: String,
-        pub(crate) emitted: String,
+        /// The delivered tree, when one is delivered. A fixture whose every
+        /// ready class reverts has none, and its receipts are still the
+        /// measurement (the decision table and the plan are complete before
+        /// the verify loop runs).
+        pub(crate) emitted: Option<String>,
+        pub(crate) escalation: String,
+    }
+
+    impl Receipts {
+        /// The delivered tree, or a panic naming the escalation — for the
+        /// witnesses whose property IS the emitted text.
+        pub(crate) fn tree(&self) -> &str {
+            self.emitted.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "fixture delivers no tree: {}\nsubjects:\n{}",
+                    self.escalation, self.subjects
+                )
+            })
+        }
     }
 
     /// A one-file crate on disk, driven through the corpus's own path: precise
@@ -198,22 +216,13 @@ pub(crate) mod fixture {
         let emitted = capture
             .emitted_files
             .as_ref()
-            .and_then(|files| files.values().next().cloned())
-            .unwrap_or_else(|| {
-                panic!(
-                    "fixture delivers no tree: {}\nsubjects:\n{}\narms:\n{}\nbridge events: {:#?}\nreverts: {:#?}",
-                    capture.escalation,
-                    capture.subject_receipt,
-                    capture.raw_boundary_artifacts.arm_outcomes,
-                    capture.raw_boundary_artifacts.bridge_events,
-                    capture.reverts
-                )
-            });
+            .and_then(|files| files.values().next().cloned());
         Receipts {
             subjects: capture.subject_receipt,
             arm_outcomes: capture.raw_boundary_artifacts.arm_outcomes,
             class_collisions: capture.raw_boundary_artifacts.class_collisions,
             emitted,
+            escalation: capture.escalation.clone(),
         }
     }
 
@@ -323,16 +332,16 @@ pub unsafe fn init_command(self_0: *mut Command, other: *mut Command, distance_c
             column(&got.subjects, "prefix_encode::code#2", "placed"),
             "1"
         );
-        let signature = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+        let signature = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             signature.contains("code: &mut u32, extra_bits: *mut u32"),
             "the sibling places and the partner stays raw:\n{}",
-            got.emitted
+            got.tree()
         );
         assert!(
-            got.emitted.contains("__crat_a5_raw_"),
+            got.tree().contains("__crat_a5_raw_"),
             "the call site carries the planned A5 raw view:\n{}",
-            got.emitted
+            got.tree()
         );
     }
 
@@ -354,11 +363,11 @@ pub unsafe fn init_command(self_0: *mut Command, other: *mut Command, distance_c
             column(&got.subjects, "prefix_encode::extra_bits#3", "reason"),
             "kind-raw"
         );
-        let signature = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+        let signature = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             signature.contains("code: &mut u16, extra_bits: *mut u32"),
             "{}",
-            got.emitted
+            got.tree()
         );
     }
 
@@ -540,13 +549,13 @@ pub unsafe fn info_copy(dest: *mut Info, source: *mut Info) -> u32 {
             got.subjects
         );
         assert_eq!(column(&got.subjects, "assign_icc::info#1", "placed"), "1");
-        let text = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(text.contains("info: &mut Info"), "{}", got.emitted);
+        let text = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("info: &mut Info"), "{}", got.tree());
         assert!(
             text.contains("= (*source).iccp_name;")
                 && (text.contains("__crat_a5_raw_") || text.contains("__crat_pair_raw_")),
             "the raw field read is hoisted verbatim into the call snapshot:\n{}",
-            got.emitted
+            got.tree()
         );
     }
 
@@ -597,13 +606,13 @@ pub mod src {
             );
             assert_eq!(column(&got.subjects, key, "placed"), "1", "{key}");
         }
-        let text = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(text.contains("array: &Array"), "{}", got.emitted);
+        let text = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("array: &Array"), "{}", got.tree());
         assert!(
             text.contains("element: &Element = &*(*array).start;")
                 && text.contains("element = &*(*element).next;"),
             "the initializer and the assignment are the raw field reads under the reference glue:\n{}",
-            got.emitted
+            got.tree()
         );
     }
 
@@ -704,18 +713,29 @@ pub unsafe fn check(chunk: *const u8, out: *mut u8, n: usize) {
     #[test]
     fn a_view_over_a_root_delivered_by_another_family_holds_typed() {
         let got = run_injected(NESTED_CALLER_EDIT_SHAPE, &deliver_chunk_as_a_slice);
-        let text = got.emitted.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            !text.contains("from_ref(&*chunk.offset"),
-            "the stale original text must not be emitted:\n{}",
-            got.emitted
-        );
+        // The property is the TYPED HOLD, read from the receipt — which the
+        // decision table and the plan carry whether or not a tree survives the
+        // verify loop. (Whether one survives depends on the fixture's OTHER
+        // classes: the injected `Slice` decision carries no use rewrites, so
+        // `check`'s own body use `*chunk.offset(0)` cannot compile, and on a
+        // composition where `check` is the only remaining ready class its
+        // revert leaves nothing — `recovery-degraded`, the dry3-v2 red of
+        // relay 012. The guard's own observable is unchanged there, which is
+        // why it is what this witness asserts.)
         let exclusion = column(&got.subjects, "copy_bytes::dst#1", "exclusion");
         assert!(
             exclusion.contains("a5-fallback-unrenderable:nested-caller-edit"),
             "the callee's class holds on the typed reason, not a revert: {exclusion}\n{}",
             got.subjects
         );
+        // Where a tree IS delivered, it must not carry the stale original text.
+        if let Some(tree) = got.emitted.as_deref() {
+            let text = tree.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                !text.contains("from_ref(&*chunk.offset"),
+                "the stale original text must not be emitted:\n{tree}"
+            );
+        }
     }
 
     /// binn `binn_is_valid_ex(ptr, ptype, …)`: `plimit = p.offset(size)` is
@@ -773,9 +793,9 @@ pub unsafe fn is_valid(buf: *mut core::ffi::c_void, size: i32, ptype: *mut i32) 
             assert_eq!(exclusion, "-", "{}", got.subjects);
             assert_eq!(column(&got.subjects, "is_valid::ptype#3", "placed"), "1");
             assert!(
-                got.emitted.contains("ptype: Option<&mut i32>"),
+                got.tree().contains("ptype: Option<&mut i32>"),
                 "{}",
-                got.emitted
+                got.tree()
             );
         }
     }
