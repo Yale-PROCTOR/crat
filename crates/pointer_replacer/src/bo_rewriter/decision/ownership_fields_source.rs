@@ -1601,6 +1601,121 @@ unsafe extern "C" fn holder_free(mut h: *mut Holder) { free((*h).buf as *mut lib
         }
     }
 
+    /// R425-2 (era-5c 003 claim 6): a traversal / recursive-call argument
+    /// that is a TOKEN LOAD (`temp = (*root).right`, `minValueNode(node)`)
+    /// licenses NO drop — the only deallocation sites of bst's entry are its
+    /// two C `free`s, and a `Box` dropped at such a local's scope exit would
+    /// free a subtree the input keeps linked. The owner permit cannot admit
+    /// one by construction: a subject with no fresh allocation of its own is
+    /// refused at the constructor, whatever the model kind, so no drop is
+    /// ever emitted for it.
+    #[test]
+    fn r425_token_loads_and_traversal_arguments_license_no_drop() {
+        let source = format!(
+            r#"{} #[repr(C)] pub struct node {{ pub key: libc::c_int, pub left: *mut node, pub right: *mut node }}
+unsafe extern "C" fn minValueNode(mut node_0: *mut node) -> *mut node {{
+    let mut current = node_0;
+    while !((*current).left).is_null() {{ current = (*current).left; }}
+    return current;
+}}
+unsafe extern "C" fn newNode(mut key: libc::c_int) -> *mut node {{
+    let mut temp = malloc(::std::mem::size_of::<node>() as libc::c_ulong) as *mut node;
+    (*temp).key = key;
+    (*temp).left = 0 as *mut node;
+    (*temp).right = 0 as *mut node;
+    return temp;
+}}
+pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: libc::c_int) -> *mut node {{
+    if root.is_null() {{ return root; }}
+    if key < (*root).key {{
+        (*root).left = deleteNode((*root).left, key);
+    }} else if key > (*root).key {{
+        (*root).right = deleteNode((*root).right, key);
+    }} else {{
+        if ((*root).left).is_null() {{
+            let mut temp = (*root).right;
+            free(root as *mut libc::c_void);
+            return temp;
+        }}
+        let mut temp_0 = minValueNode((*root).right);
+        (*root).key = (*temp_0).key;
+        (*root).right = deleteNode((*root).right, (*temp_0).key);
+    }}
+    return root;
+}}"#,
+            r#"#![allow(non_camel_case_types)] pub mod libc { pub use core::ffi::c_int; pub use core::ffi::c_ulong; pub use core::ffi::c_void; } extern "C" { fn malloc(n:libc::c_ulong)->*mut libc::c_void; fn free(p:*mut libc::c_void); }"#
+        );
+        ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+            let (table, ctx) = bo::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    bo::A5Mode::PreciseReplay,
+                    Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let program = bo::collect_program(tcx);
+            // Every token load of the traversal — whatever the model says —
+            // is refused by the permit: it owns no allocation of its own.
+            for (owner, name) in [
+                ("minValueNode", "current"),
+                ("deleteNode", "temp"),
+                ("deleteNode", "temp_0"),
+            ] {
+                let (subject, _) = table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| {
+                        subject.param_name.as_deref() == Some(name)
+                            && tcx.def_path_str(subject.fn_did.to_def_id()) == owner
+                    })
+                    .unwrap_or_else(|| panic!("{owner}::{name}"));
+                assert!(
+                    matches!(
+                        derive(&program, subject, &ctx.constructions),
+                        Err(SourceHold::ConstructorIdentity | SourceHold::ConstructorShape)
+                    ),
+                    "{owner}::{name} must own no allocation"
+                );
+            }
+            // `newNode`'s own allocation IS an owner — closed by its return
+            // transfer, never by a scope-exit drop.
+            let (subject, _) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| {
+                    subject.param_name.as_deref() == Some("temp")
+                        && tcx.def_path_str(subject.fn_did.to_def_id()) == "newNode"
+                })
+                .expect("newNode::temp");
+            let plan = derive(&program, subject, &ctx.constructions).expect("newNode::temp");
+            assert!(plan.frees().is_empty() && plan.return_transfer().is_some());
+        })
+        .unwrap();
+        // End to end: the emitted program drops nothing anywhere and keeps
+        // its C free exactly where it was (R395-2's free timing).
+        let outcome = bo::rewrite_core_injected(
+            ::utils::compilation::str_to_input(&source),
+            None,
+            bo::MAX_REVERT_ROUNDS,
+            &|_| {},
+            false,
+            true,
+            true,
+            Some((
+                bo::A5Mode::PreciseReplay,
+                Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        );
+        let bo::RewriteOutcome::Emitted { source, .. } = outcome else { panic!("{outcome:?}") };
+        assert!(!source.contains("::std::mem::drop("), "{source}");
+        assert_eq!(
+            source.matches("free(root as *mut libc::c_void);").count(),
+            1,
+            "{source}"
+        );
+    }
+
     #[test]
     fn source_two_buffer_constructor_free_and_unwind_inventory() {
         let source = bo::ownership_fields_native_tests::native_fixture_source(
