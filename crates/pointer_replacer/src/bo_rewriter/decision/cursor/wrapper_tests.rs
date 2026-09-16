@@ -1063,19 +1063,27 @@ pub unsafe fn has_suffix(s: *const i8, suffix: *const i8, ns: isize, nx: isize) 
 "#;
     let source = emitted(input);
     save_fixture("offset-chain-argument-at-raw-callee", input, &source);
+    // `suffix` is another family's (raw here; a slice where a libc contract
+    // extent delivers it on the composed tree): the harness follows its form.
     assert!(
-        source.contains("fn has_suffix(s: &[i8], suffix: *const i8, ns: isize, nx: isize)"),
+        source.contains("fn has_suffix(s: &[i8], suffix: "),
         "cursor parameter absent: {source}"
     );
     assert!(
         source.contains("strcmp(s.offset_by((0isize).wrapping_add((ns + (-nx)) as")
-            && source.contains("isize)).as_ptr(), suffix)"),
+            && source.contains("isize)).as_ptr(), suffix"),
         "raw view over the derived cursor absent: {source}"
     );
+    let raw_suffix = source.contains("fn has_suffix(s: &[i8], suffix: *const i8");
+    let (good, bad) = if raw_suffix {
+        ("d.as_ptr()", "x.as_ptr()")
+    } else {
+        ("&d[..]", "&x[..]")
+    };
     compile(
         &source,
-        Some(
-            "fn main() { let s = *b\"abcdef\\0\"; let s = s.map(|b| b as i8); let d = *b\"def\\0\"; let d = d.map(|b| b as i8); let x = *b\"xyz\\0\"; let x = x.map(|b| b as i8); assert_eq!(unsafe { has_suffix(&s[..6], d.as_ptr(), 6, 3) }, 1); assert_eq!(unsafe { has_suffix(&s[..6], x.as_ptr(), 6, 3) }, 0); assert_eq!(unsafe { has_suffix(&s[..6], d.as_ptr(), 2, 3) }, 0); }",
-        ),
+        Some(&format!(
+            "fn main() {{ let s = *b\"abcdef\\0\"; let s = s.map(|b| b as i8); let d = *b\"def\\0\"; let d = d.map(|b| b as i8); let x = *b\"xyz\\0\"; let x = x.map(|b| b as i8); assert_eq!(unsafe {{ has_suffix(&s[..6], {good}, 6, 3) }}, 1); assert_eq!(unsafe {{ has_suffix(&s[..6], {bad}, 6, 3) }}, 0); assert_eq!(unsafe {{ has_suffix(&s[..6], {good}, 2, 3) }}, 0); }}"
+        )),
     );
 }
