@@ -122,51 +122,6 @@ pub(crate) fn core_pointer_known_no_retain<'tcx>(
     }
 }
 
-/// The retention collector's alias edge for a block whose terminator is an
-/// alias-result core call on a raw-pointer local: `receiver -> result`.
-pub(crate) fn core_pointer_alias_edge<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-    block: rustc_middle::mir::BasicBlock,
-    data: &rustc_middle::mir::BasicBlockData<'tcx>,
-) -> Option<(Local, Local, super::decision::raw_boundary::RetentionStep)> {
-    let TerminatorKind::Call {
-        func,
-        args,
-        destination,
-        ..
-    } = &data.terminator().kind
-    else {
-        return None;
-    };
-    let callee = resolved(func)?;
-    if core_pointer_call(tcx, callee) != Some(CorePointerCall::AliasResult) {
-        return None;
-    }
-    let receiver = operand_local(&args.first()?.node)?;
-    let result = destination.as_local()?;
-    if !matches!(body.local_decls[receiver].ty.kind(), TyKind::RawPtr(..))
-        || !matches!(body.local_decls[result].ty.kind(), TyKind::RawPtr(..))
-        || result_returned(body, result)
-    {
-        return None;
-    }
-    Some((
-        receiver,
-        result,
-        super::decision::raw_boundary::RetentionStep {
-            location: format!("bb{}:s{}", block.as_u32(), data.statements.len()),
-            kind: super::decision::raw_boundary::RetentionEventKind::Transparent,
-            detail: format!(
-                "_{}->_{} core-{}",
-                receiver.as_u32(),
-                result.as_u32(),
-                tcx.item_name(callee).as_str()
-            ),
-        },
-    ))
-}
-
 fn pointer(ty: Ty<'_>) -> bool {
     matches!(ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
 }

@@ -1712,11 +1712,6 @@ fn collect_retention_facts<'tcx>(
         {
             definitions[destination.index()] += 1;
         }
-        aliases.extend(
-            crate::bo_rewriter::wave6r_child_access::core_pointer_alias_edge(
-                tcx, body, block, data,
-            ),
-        );
     }
     for record in children {
         let child = &record.evidence;
