@@ -244,7 +244,7 @@ fn w6a_c1_sized_chain_moves_the_allocation_into_the_freeing_callee() {
     }
     assert!(
         out.artifacts.box_param_receipts.contains(
-            "-\tadmitted\tbox-param-chain callee=consume index=0 pointee=i32 shape=sized callers=1 members=producer::p"
+            "-\tadmitted\tbox-param-chain callee=consume index=0 sink=free pointee=i32 shape=sized callers=1 members=producer::p"
         ),
         "{}",
         out.artifacts.box_param_receipts
@@ -295,7 +295,7 @@ fn w6a_c1_slice_chain_indexes_in_callee_and_callers() {
     }
     assert!(
         out.artifacts.box_param_receipts.contains(
-            "box-param-chain callee=sum_and_release index=0 pointee=i32 shape=slice callers=2 members=run::v,run_twice::w"
+            "box-param-chain callee=sum_and_release index=0 sink=free pointee=i32 shape=slice callers=2 members=run::v,run_twice::w"
         ),
         "{}",
         out.artifacts.box_param_receipts
@@ -382,6 +382,187 @@ fn w6a_c1_qselect_lend_is_not_a_box_parameter() {
         out.artifacts
             .box_param_receipts
             .contains("qselect::v\theld\tbox-param-callee-lends:qselect"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+}
+
+/// **W6A-C2, the store sink** (relay wave-6a/006 §4, charter §1(c)): the ht
+/// shape reduced — a callee that STORES its formal into the program's own
+/// raw storage instead of freeing it (`(*slots.offset(i)).key = key`) takes
+/// `Box<T>` and hands ownership over at the store
+/// (`Box::into_raw(key) as *mut i8`); the caller's allocation local moves at
+/// the call, exactly as at a freeing callee. The C free of that storage is
+/// someone else's subject and stays a C free.
+#[test]
+fn w6a_c2_store_sink_moves_the_allocation_into_the_programs_storage() {
+    const STORE_CHAIN: &str = r#"
+#[repr(C)]
+pub struct slot { pub key: *mut i8, pub value: i32 }
+unsafe extern "C" fn slot_set(mut slots: *mut slot, mut index: usize, mut key: *mut i8, mut value: i32) {
+    *key.offset(0 as isize) = 0 as i8;
+    (*slots.offset(index as isize)).value = value;
+    (*slots.offset(index as isize)).key = key;
+}
+pub unsafe extern "C" fn table_put(mut slots: *mut slot, mut index: usize) {
+    let mut key = calloc(8 as usize, ::std::mem::size_of::<i8>()) as *mut i8;
+    *key.offset(1 as isize) = 65 as i8;
+    slot_set(slots, index, key, 7 as i32);
+}
+"#;
+    let out = emitted("boxparam-store", &with_prelude(STORE_CHAIN));
+    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
+        std::fs::write(path, &out.source).expect("dump");
+    }
+    let src = compact(&out.source);
+    if std::env::var("W6A_DUMP").is_ok() {
+        panic!(
+            "{}\nRECEIPTS\n{}\nDEGRADATIONS {:#?}",
+            out.source, out.artifacts.box_param_receipts, out.degradations
+        );
+    }
+    assert_eq!(
+        out.reverted, 0,
+        "{}
+{:#?}",
+        out.source, out.degradations
+    );
+    assert!(src.contains("mutkey:Box<[i8]>,"), "{}", out.source);
+    assert!(
+        src.contains("slots[index].key=Box::into_raw(key)as*muti8;"),
+        "{}",
+        out.source
+    );
+    assert!(src.contains("key[0]=0asi8;"), "{}", out.source);
+    assert!(
+        src.contains(
+            "letmutkey:Box<[i8]>=::std::vec![0i8;((8asusize)asusize)].into_boxed_slice();"
+        ),
+        "{}",
+        out.source
+    );
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("box-param-chain callee=slot_set index=2 sink=store"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "table_put::key"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+}
+
+/// W6A-C2 controls, each the delivering fixture with exactly ONE violation
+/// so the refusal it measures is the gate under test: the store inside a loop
+/// (the move would run twice), the formal re-assigned before the store (what
+/// is stored is not the caller's allocation — ht's `key = strdup(key)`
+/// shape), a use of the formal after the store (a use after a MOVE, which C
+/// permits and Rust does not), and both a store and a free. None of them
+/// takes a store chain.
+#[test]
+fn w6a_c2_one_violation_each_keeps_the_typed_hold() {
+    const SHAPES: [(&str, &str); 4] = [
+        (
+            "loop",
+            r#"
+unsafe extern "C" fn slot_set(mut slots: *mut slot, mut n: usize, mut key: *mut i8) {
+    let mut i = 0 as usize;
+    while i < n {
+        (*slots.offset(i as isize)).key = key;
+        i = i.wrapping_add(1);
+    }
+}
+"#,
+        ),
+        (
+            "reassigned",
+            r#"
+unsafe extern "C" fn slot_set(mut slots: *mut slot, mut n: usize, mut key: *mut i8) {
+    key = calloc(4 as usize, ::std::mem::size_of::<i8>()) as *mut i8;
+    (*slots.offset(0 as isize)).key = key;
+}
+"#,
+        ),
+        (
+            "used-after-store",
+            r#"
+unsafe extern "C" fn slot_set(mut slots: *mut slot, mut n: usize, mut key: *mut i8) {
+    (*slots.offset(0 as isize)).key = key;
+    *key.offset(0 as isize) = 1 as i8;
+}
+"#,
+        ),
+        (
+            "stored-and-freed",
+            r#"
+unsafe extern "C" fn slot_set(mut slots: *mut slot, mut n: usize, mut key: *mut i8) {
+    (*slots.offset(0 as isize)).key = key;
+    free(key as *mut core::ffi::c_void);
+}
+"#,
+        ),
+    ];
+    for (name, callee) in SHAPES {
+        let source = format!(
+            "{}
+#[repr(C)]
+pub struct slot {{ pub key: *mut i8, pub value: i32 }}
+{callee}
+             pub unsafe extern \"C\" fn table_put(mut slots: *mut slot, mut n: usize) {{
+             let mut key = calloc(8 as usize, ::std::mem::size_of::<i8>()) as *mut i8;
+             slot_set(slots, n, key);
+}}
+",
+            PRELUDE
+        );
+        let out = emitted(&format!("boxparam-store-{name}"), &source);
+        let receipts = &out.artifacts.box_param_receipts;
+        assert!(
+            !receipts.contains("sink=store"),
+            "{name}: {receipts}\n{}",
+            out.source
+        );
+        assert!(
+            !compact(&out.source).contains("key:Box<"),
+            "{name}: {}",
+            out.source
+        );
+    }
+}
+
+/// **The leak-parity line of W6A-C2.** A store into a field the input's own C
+/// `free` releases would hand a Rust-allocated block to libc: refused with
+/// `box-param-store-c-free:<callee>:<field>` (the composition where that
+/// field is an owned `Box` field — wave-6f's W6F-3 — is where the store
+/// becomes a move and the drop is theirs).
+#[test]
+fn w6a_c2_store_into_a_c_freed_field_is_refused() {
+    const FREED: &str = r#"
+#[repr(C)]
+pub struct slot { pub key: *mut i8, pub value: i32 }
+unsafe extern "C" fn slot_set(mut slots: *mut slot, mut index: usize, mut key: *mut i8) {
+    (*slots.offset(index as isize)).key = key;
+}
+pub unsafe extern "C" fn table_put(mut slots: *mut slot, mut index: usize) {
+    let mut key = calloc(8 as usize, ::std::mem::size_of::<i8>()) as *mut i8;
+    slot_set(slots, index, key);
+}
+pub unsafe extern "C" fn table_clear(mut slots: *mut slot, mut index: usize) {
+    free((*slots.offset(index as isize)).key as *mut core::ffi::c_void);
+    (*slots.offset(index as isize)).key = 0 as *mut i8;
+}
+"#;
+    let out = emitted("boxparam-store-cfree", &with_prelude(FREED));
+    let src = compact(&out.source);
+    assert!(!src.contains("Box<[i8]>"), "{}", out.source);
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("slot_set::key\theld\tbox-param-store-c-free:slot_set:"),
         "{}",
         out.artifacts.box_param_receipts
     );

@@ -1964,6 +1964,17 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     {
         return Decision::Box(plan.clone());
     }
+    // wave-6a W6A-C2: a caller local of a STORE chain is a Box on the chain's
+    // source proof — the model calls an allocation handed to C storage Raw,
+    // which is the licensing wall R410-5 §1 names, not evidence against.
+    if ctx
+        .box_params
+        .store_members
+        .contains(&(subject.fn_did, subject.hir_id))
+        && let Some(plan) = ctx.box_params.plans.get(&(subject.fn_did, subject.hir_id))
+    {
+        return Decision::Box(plan.clone());
+    }
 
     // BO's kind first: it is the authority on WHETHER a reference is sound.
     match model.get(&SlotRef::Local(subject.fn_did, slot_id)) {

@@ -61,6 +61,12 @@ pub(crate) struct Chains {
     /// R419-3: every admitted chain's classes — the consuming callee and its
     /// callers — revert together.
     pub(crate) chains: Vec<(LocalDefId, Vec<LocalDefId>)>,
+    /// W6A-C2: the caller locals of a STORE chain. The model calls such an
+    /// allocation Raw (it never sees it freed), so the ladder would degrade
+    /// `kind-raw` before the Box arm; the chain's source proof supersedes it
+    /// exactly as the allocation-return certificate's does, applied at the
+    /// same pre-model hook.
+    pub(crate) store_members: FxHashSet<(LocalDefId, HirId)>,
 }
 
 /// After the seams: a chain reverts whole (R419-3) — the consuming callee's
@@ -216,6 +222,20 @@ fn bare_local(e: &Expr<'_>) -> Option<HirId> {
     }
 }
 
+/// The struct field a place expression projects (`(*x).f`, `(*x.offset(i)).f`,
+/// `x.f`), as its own `DefId`.
+fn field_of(tcx: TyCtxt<'_>, place: &Expr<'_>) -> Option<DefId> {
+    let ExprKind::Field(base, _) = peel_casts(place).kind else { return None };
+    let typeck = tcx.typeck(place.hir_id.owner.def_id);
+    let base_ty = typeck.expr_ty_adjusted(base);
+    let rustc_middle::ty::TyKind::Adt(adt, _) = base_ty.peel_refs().kind() else { return None };
+    let index = typeck.field_index(peel_casts(place).hir_id);
+    adt.non_enum_variant()
+        .fields
+        .get(index)
+        .map(|field| field.did)
+}
+
 fn foreign_fn(tcx: TyCtxt<'_>, did: DefId) -> bool {
     matches!(tcx.def_kind(did), DefKind::Fn)
         && did.as_local().is_some_and(|local| {
@@ -238,6 +258,16 @@ struct Scan<'tcx> {
     /// `free(x)` calls whose operand is a bare local: (local, call span,
     /// argument span).
     frees: Vec<(HirId, Span, Span)>,
+    /// W6A-C2: `<raw place> = x` with `x` a bare local (the cast peeled):
+    /// (local, the local's own span, the assignment's span). A store into a
+    /// bare local is a copy, not a sink, and is not recorded here.
+    stores: Vec<(HirId, Span, Span)>,
+    /// The store expressions' own ids, for the enclosing-loop test.
+    store_ids: Vec<(HirId, HirId)>,
+    /// The field each store targets: (local, the field's `DefId`).
+    store_fields: Vec<(HirId, DefId)>,
+    /// Every field a C `free` releases anywhere in this body.
+    freed_fields: FxHashSet<DefId>,
     /// Local functions whose address is taken (a value, not a callee).
     fn_values: FxHashSet<DefId>,
 }
@@ -258,6 +288,21 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
                 }
                 _ => {}
             },
+            ExprKind::Assign(lhs, rhs, _) => {
+                if bare_local(lhs).is_none()
+                    && let Some(hir) = bare_local(rhs)
+                {
+                    let tcx = self.tcx.expect("scan tcx");
+                    let typeck = tcx.typeck(lhs.hir_id.owner.def_id);
+                    if typeck.expr_ty(lhs).is_raw_ptr() {
+                        self.stores.push((hir, peel_casts(rhs).span, e.span));
+                        self.store_ids.push((hir, e.hir_id));
+                        if let Some(field) = field_of(tcx, lhs) {
+                            self.store_fields.push((hir, field));
+                        }
+                    }
+                }
+            }
             ExprKind::Call(callee, args) => {
                 let callee_def = match &callee.kind {
                     ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
@@ -270,9 +315,17 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
                     Some(did) if foreign_fn(self.tcx.expect("scan tcx"), did) => {
                         if self.tcx.expect("scan tcx").item_name(did).as_str() == "free"
                             && let [arg] = args
-                            && let Some(hir) = bare_local(arg)
                         {
-                            self.frees.push((hir, e.span, arg.span));
+                            if let Some(hir) = bare_local(arg) {
+                                self.frees.push((hir, e.span, arg.span));
+                            }
+                            // W6A-C2: which FIELD C releases here, so a store
+                            // into that field is never admitted as a move.
+                            if let Some(field) =
+                                field_of(self.tcx.expect("scan tcx"), peel_casts(arg))
+                            {
+                                self.freed_fields.insert(field);
+                            }
                         }
                     }
                     Some(did) if did.is_local() => {
@@ -396,12 +449,68 @@ pub(crate) fn consuming_formals<'tcx>(
             .filter(|(hir, _, _)| *hir == param.hir_id)
             .map(|(_, call, arg)| (*call, *arg))
             .collect();
-        if frees.len() != 1 || slice_uses_of(tcx, param, &[frees[0].1]).is_err() {
+        let sink = match (frees.as_slice(), store_sink(tcx, scan, param)) {
+            ([(_, argument)], None) => *argument,
+            ([], Some((value, _))) => value,
+            _ => continue,
+        };
+        if slice_uses_of(tcx, param, &[sink]).is_err() {
             continue;
         }
         out.insert((param.fn_did.to_def_id(), hir_index));
     }
     out
+}
+
+/// **W6A-C2: the store sink.** A formal the callee neither frees nor returns
+/// but STORES exactly once into a raw place it reaches (`(*t).f = p`,
+/// `(*entries.offset(i)).key = p`) hands its allocation to the program's own
+/// storage: the move ends at the store, which emits `Box::into_raw(p)` — the
+/// batch-6 deallocator-transfer discipline with the store as the sink (the C
+/// free of that place stays a C free, someone else's subject). Admitted only
+/// when the move is the formal's LAST act: no assignment to the formal
+/// the store outside every loop, and no use of the formal after it (a use
+/// after a move is not a use after a free — C keeps the pointer valid, so
+/// this is a refusal the input does not owe us). A formal RE-SEATED before
+/// the store (ht's `key = strdup(key)`) needs no clause of its own: the
+/// re-seating expression is itself a raw use of the formal, which the
+/// slice-use collector refuses (the "reassigned" control measures it).
+fn store_sink<'tcx>(tcx: TyCtxt<'tcx>, scan: &Scan<'tcx>, param: &Subject) -> Option<(Span, Span)> {
+    let stores: Vec<(Span, Span)> = scan
+        .stores
+        .iter()
+        .filter(|(hir, _, _)| *hir == param.hir_id)
+        .map(|(_, value, statement)| (*value, *statement))
+        .collect();
+    let [(value, statement)] = stores.as_slice() else { return None };
+    if scan
+        .local_uses
+        .iter()
+        .any(|(hir, span)| *hir == param.hir_id && span.lo() > statement.hi())
+    {
+        return None;
+    }
+    scan.store_ids
+        .iter()
+        .find(|(hir, id)| *hir == param.hir_id && !inside_loop(tcx, *id))
+        .map(|_| (*value, *statement))
+}
+
+/// The store sits inside a loop: the move would run twice.
+fn inside_loop(tcx: TyCtxt<'_>, mut hir: HirId) -> bool {
+    loop {
+        match tcx.parent_hir_node(hir) {
+            rustc_hir::Node::Expr(parent) => {
+                if matches!(parent.kind, ExprKind::Loop(..)) {
+                    return true;
+                }
+                hir = parent.hir_id;
+            }
+            rustc_hir::Node::Block(block) => hir = block.hir_id,
+            rustc_hir::Node::Stmt(statement) => hir = statement.hir_id,
+            _ => return false,
+        }
+    }
 }
 
 /// Derive every chain for the crate. Runs once, before the family stages; the
@@ -455,7 +564,11 @@ pub(crate) fn derive<'tcx>(
             .filter(|(hir, _, _)| *hir == param.hir_id)
             .map(|(_, call, arg)| (*call, *arg))
             .collect();
-        if frees.is_empty() {
+        // W6A-C2: a formal the callee stores into a raw place instead of
+        // freeing hands its allocation to the program's own storage; the
+        // store is the sink and the move ends there.
+        let store = store_sink(tcx, scan, param);
+        if frees.is_empty() && store.is_none() {
             // Not a consumer: a lend. Only reported for an Owning-modeled formal
             // (the rows the Box arm holds today); a Ref/Raw formal is not (c).
             if slot_of(param).is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Owning)) {
@@ -474,16 +587,63 @@ pub(crate) fn derive<'tcx>(
             out.holds
                 .insert((param.fn_did, param.hir_id), (param.label.clone(), reason));
         };
-        if frees.len() != 1 {
+        if frees.len() > 1 {
             hold(
                 format!("box-param-callee-use:{callee_path}:second-free"),
                 &mut out,
             );
             continue;
         }
+        if !frees.is_empty() && store.is_some() {
+            hold(
+                format!("box-param-callee-use:{callee_path}:freed-and-stored"),
+                &mut out,
+            );
+            continue;
+        }
+        // W6A-C2: the store hands the allocation to the program's own storage
+        // and emits NO drop — so it is admitted only where the input itself
+        // never releases that field (the leak-parity shape, addendum 101: the
+        // emitted program leaks exactly what the input leaks). A field some C
+        // `free` releases would take a Rust-allocated block to libc's
+        // `free`; that composition is wave-6f's owned FIELD (W6F-3), where the
+        // store is a move into an owned field and the drop is theirs.
+        if let Some((_, statement)) = store {
+            let _ = statement;
+            let field = scan
+                .store_fields
+                .iter()
+                .find(|(hir, _)| *hir == param.hir_id)
+                .map(|(_, field)| *field);
+            match field {
+                None => {
+                    hold(
+                        format!("box-param-store-destination:{callee_path}:not-a-field"),
+                        &mut out,
+                    );
+                    continue;
+                }
+                Some(field) if scans.values().any(|s| s.freed_fields.contains(&field)) => {
+                    hold(
+                        format!(
+                            "box-param-store-c-free:{callee_path}:{}",
+                            tcx.def_path_str(field)
+                        ),
+                        &mut out,
+                    );
+                    continue;
+                }
+                Some(_) => {}
+            }
+        }
+        let sink = match (frees.first(), store) {
+            (Some((_, argument)), None) => *argument,
+            (None, Some((value, _))) => value,
+            _ => unreachable!("exactly one sink reaches here"),
+        };
         // Every other use of the formal is a deref / element access the
-        // slice-use collector rewrites; the free is its one raw boundary.
-        let param_uses = match slice_uses_of(tcx, param, &[frees[0].1]) {
+        // slice-use collector rewrites; the sink is its one raw boundary.
+        let param_uses = match slice_uses_of(tcx, param, &[sink]) {
             Ok(uses) => uses,
             Err(form) => {
                 hold(
@@ -573,7 +733,22 @@ pub(crate) fn derive<'tcx>(
                     ));
                     break 'callers;
                 };
-                if model.get(&slot) != Some(&SlotKind::Owning) {
+                // The model's kind licenses a FREEING chain (C1): the free is
+                // what makes the local Owning at this frame. A STORE sink is
+                // the licensing wall itself — an allocation handed to the
+                // program's own storage reads Raw everywhere (report 004's
+                // STOP 1, R410-5 §1 / R413-3) — so the store chain rests on
+                // the same source proof the certificates do: the allocation
+                // is the ordinary Box arm's, the transfer is the local's only
+                // call position, nothing reads it afterwards, and the callee's
+                // one sink is the store. The model may not CONTRADICT it:
+                // `Ref` is a lend verdict and refuses.
+                let licensed = match model.get(&slot) {
+                    Some(SlotKind::Owning) => true,
+                    Some(SlotKind::Raw) => store.is_some(),
+                    Some(SlotKind::Ref) | None => false,
+                };
+                if !licensed {
                     failure = Some(format!(
                         "box-param-model:{}:{:?}",
                         local.label,
@@ -618,6 +793,52 @@ pub(crate) fn derive<'tcx>(
                     slots,
                     subjects,
                 );
+                // The ordinary arm's endpoints come from the model, which
+                // calls an allocation handed to C storage Raw (its source
+                // endpoint is not Active): a direct allocator initializer is
+                // planned from source with ownership/fields' constructor
+                // rule, exactly as the allocation-return certificate does.
+                let plan = match plan {
+                    Err(BoxPlanFailure::EndpointInactive) if store.is_some() => {
+                        let body = tcx
+                            .mir_drops_elaborated_and_const_checked(local.fn_did)
+                            .borrow();
+                        let element = match body.local_decls[local.local].ty.kind() {
+                            TyKind::RawPtr(pointee, _) => Some(*pointee),
+                            _ => None,
+                        };
+                        drop(body);
+                        match (constructions.init_hirs.get(&key), element) {
+                            (Some(&init_hir), Some(element)) => {
+                                super::ownership_fields_constructor::derive(
+                                    tcx,
+                                    local.fn_did,
+                                    tcx.hir_node(init_hir).expect_expr(),
+                                    element,
+                                )
+                                .map(|constructor| BoxPlan {
+                                    shape: constructor.shape,
+                                    optional: false,
+                                    expr_edits: vec![constructor.edit],
+                                    delete_statements: Vec::new(),
+                                    receipts: vec![format!(
+                                        "box-param-constructor count={} shape={:?}",
+                                        constructor.count, constructor.shape
+                                    )],
+                                    fabricated_extent: false,
+                                    pointee_override: None,
+                                    inferred_binding: local.ty_span.is_none(),
+                                    overwrite_spans: Vec::new(),
+                                    retained_sink: true,
+                                    implicit_scope_close: false,
+                                })
+                                .map_err(|_| BoxPlanFailure::EndpointInactive)
+                            }
+                            _ => Err(BoxPlanFailure::EndpointInactive),
+                        }
+                    }
+                    other => other,
+                };
                 match plan {
                     Ok(mut plan) => {
                         if plan.optional {
@@ -665,13 +886,18 @@ pub(crate) fn derive<'tcx>(
         // transfers a CERTIFIED owner (A1-c) — the same licensing wall R410-5
         // §1 named for the allocation local, superseded on the same source
         // proof (the formal is freed once, its other uses are derefs, every
-        // caller moves an owner it never touches again); Ref never.
+        // caller moves an owner it never touches again). A STORE sink
+        // (W6A-C2) supersedes Raw AND Ref on its own proof: the model reads a
+        // formal it never sees freed as a borrow, and the store through
+        // memory is exactly what refutes that reading — the same finding
+        // A1-d's lend walk made (`*slot = it` is not a lend, report 006).
         let formal_kind = model.get(&param_slot).copied();
         let certified_callers = member_plans
             .iter()
             .all(|(k, _, _, _)| certificates.plans.contains_key(k));
         if !(formal_kind == Some(SlotKind::Owning)
-            || (formal_kind == Some(SlotKind::Raw) && certified_callers))
+            || (formal_kind == Some(SlotKind::Raw) && certified_callers)
+            || (store.is_some() && matches!(formal_kind, Some(SlotKind::Raw | SlotKind::Ref))))
         {
             hold(
                 format!("box-param-model:{}:{formal_kind:?}", param.label),
@@ -715,11 +941,37 @@ pub(crate) fn derive<'tcx>(
             );
             continue;
         }
+        let pointee_text = {
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(param.fn_did)
+                .borrow();
+            match body.local_decls[param.local].ty.kind() {
+                TyKind::RawPtr(pointee, _) => format!("{pointee}"),
+                _ => String::new(),
+            }
+        };
         // The chain's element accesses: slice owners index, sized owners deref.
-        let mut expr_edits = vec![BoxExprEdit {
-            span: frees[0].0,
-            replacement: format!("drop({name})"),
-            receipt: "box-param-c-free-site-drop",
+        let mut expr_edits = vec![match (frees.first(), store) {
+            (Some((call, _)), _) => BoxExprEdit {
+                span: *call,
+                replacement: format!("drop({name})"),
+                receipt: "box-param-c-free-site-drop",
+            },
+            // W6A-C2: ownership leaves Rust's hands into C's storage exactly
+            // where the source stored it; the cast the source wrote around
+            // the value stays (the raw place keeps its own type).
+            (None, Some((value, _))) => BoxExprEdit {
+                span: value,
+                // A slice owner's `into_raw` is a fat pointer; the place keeps
+                // the thin type the source gave it.
+                replacement: if slice {
+                    format!("Box::into_raw({name}) as *mut {pointee_text}")
+                } else {
+                    format!("Box::into_raw({name})")
+                },
+                receipt: "box-param-store-transfer",
+            },
+            (None, None) => unreachable!("one sink"),
         }];
         let mut shape_failure = None;
         for (edit, owner) in param_uses.iter().map(|e| (e, &name)).chain(
@@ -776,11 +1028,16 @@ pub(crate) fn derive<'tcx>(
             .map(|(_, _, label, _)| label.clone())
             .collect();
         out.receipts.push(format!(
-            "box-param-chain callee={callee_path} index={hir_index} pointee={pointee} shape={} callers={call_count} members={} formal_model={formal_kind:?}",
+            "box-param-chain callee={callee_path} index={hir_index} sink={} pointee={pointee} shape={} callers={call_count} members={} formal_model={formal_kind:?}",
+            if store.is_some() { "store" } else { "free" },
             if slice { "slice" } else { "sized" },
             members.join(",")
         ));
         let mut chain_callers: Vec<LocalDefId> = Vec::new();
+        if store.is_some() {
+            out.store_members
+                .extend(member_plans.iter().map(|(key, _, _, _)| *key));
+        }
         for (key, mut plan, _, uses) in member_plans {
             plan.expr_edits.extend(member_edits.drain(..uses.len()));
             if !chain_callers.contains(&key.0) {

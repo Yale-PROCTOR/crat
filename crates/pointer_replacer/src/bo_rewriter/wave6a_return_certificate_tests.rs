@@ -395,7 +395,7 @@ fn w6a_a1c_receiver_moved_into_a_consuming_formal_composes_with_the_chain() {
     );
     assert!(
         out.artifacts.box_param_receipts.contains(
-            "box-param-chain callee=item_release index=0 pointee=item shape=sized callers=1 members=use_item::it formal_model=Some(Raw)"
+            "box-param-chain callee=item_release index=0 sink=free pointee=item shape=sized callers=1 members=use_item::it formal_model=Some(Raw)"
         ),
         "{}",
         out.artifacts.box_param_receipts
@@ -418,9 +418,14 @@ fn w6a_a1_receiver_handed_to_a_keeping_raw_callee_holds() {
     );
     let src = compact(&out.source);
     assert!(!src.contains("Box<"), "{}", out.source);
+    // W6A-C2 reads `item_stash`'s formal as a syntactic store sink, so the
+    // certificate admits the transfer and the CHAIN then refuses it (the
+    // destination is a field a C free releases / not an admitted store), and
+    // `confirm_transfers` withdraws the certificate: the same hold, reached
+    // through the A1-c confirmation rather than the lend refusal.
     assert!(
         out.artifacts.return_certificate_receipts.contains(
-            "use_item::it\theld\treturn-certificate-receiver-use:call-argument-not-a-lend:item_stash(it, slot)"
+            "item_new::it\theld\treturn-certificate-transfer-unconfirmed:item_new:item_stash#0"
         ),
         "{}",
         out.artifacts.return_certificate_receipts
