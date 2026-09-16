@@ -23602,10 +23602,13 @@ fn raw_boundary_wave2_corpus_census() {
                 ),
             );
             let row = raw_boundary_worker_row(program.name, &outcome);
-            if raw_boundary_typed_failure(&row) {
-                // R407-5: a failed worker's stderr is written at once, so the cause of
-                // an abort survives the parent stopping later on another program (the
-                // batch-7 attempt-2 brotli abort had no readable cause).
+            // R407-5: a failed worker's stderr is written at once, so the cause of
+            // an abort survives the parent stopping later on another program (the
+            // batch-7 attempt-2 brotli abort had no readable cause). A DIAGNOSTIC
+            // run (R407-2 probe) keeps every worker's stderr: the verify rounds'
+            // compiler messages are the only record of what a class revert was
+            // for, and the ledger carries their codes alone (wave-6l 015).
+            if raw_boundary_typed_failure(&row) || diagnostic_run {
                 fs::write(
                     artifact_dir.join(format!("{}.raw-boundary-census.err", program.name)),
                     &outcome.stderr,
