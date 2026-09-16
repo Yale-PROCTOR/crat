@@ -69,6 +69,12 @@ pub(crate) fn core_pointer_call(tcx: TyCtxt<'_>, callee: DefId) -> Option<CorePo
 /// pre-hook reading — an open call, retention unknown — rather than a
 /// positive retention of the parameter (main 036 / relay wave-6r/010).
 pub(crate) fn result_returned(body: &Body<'_>, local: Local) -> bool {
+    // Composition (relay wave-6v2/014): a result written STRAIGHT into the
+    // return place (`fn dup(q) -> *mut T { q.cast_mut() }`) is returned with no
+    // assignment to follow, so the scan must answer on the seed itself.
+    if local == rustc_middle::mir::RETURN_PLACE {
+        return true;
+    }
     let mut aliases = vec![local];
     let mut changed = true;
     while changed {

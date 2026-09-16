@@ -1315,3 +1315,47 @@ pub unsafe fn read(p: *mut u8) -> u8 { *p }
         row("read", "0")
     );
 }
+
+/// The tag `core-pointer-method` is what lets `descendant_free` accept an open
+/// core call: the derived pointer is an alias whose sinks the walk sees. That
+/// premise fails for a derivation the function RETURNS — wave-6r's `070164b9`
+/// gives it no alias edge, so its hand-out through the return is invisible —
+/// and the step must therefore drop the tag.
+#[test]
+fn w6v2_returned_derivation_is_an_untagged_open_step() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+pub unsafe fn dup(q: *const i32) -> *mut i32 { q.cast_mut() }
+pub unsafe fn read_only(q: *const i32) -> i32 { *q.offset(1) }
+"#;
+    let rows = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        ctx.retention.to_tsv()
+    })
+    .expect("input type-checks");
+    let row = |function: &str| {
+        rows.lines()
+            .find(|l| l.starts_with(&format!("{function}\t")))
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("{function} row: {rows}"))
+    };
+    assert!(
+        !row("dup").contains("core-pointer-method") && row("dup").contains("returned-derivation"),
+        "{}",
+        row("dup")
+    );
+    // The control: a derivation that is only read through keeps the tag (and,
+    // on this line, wave-6r's known-no-retain reading of the same call).
+    assert!(
+        row("read_only").contains("core-pointer-method"),
+        "{}",
+        row("read_only")
+    );
+}

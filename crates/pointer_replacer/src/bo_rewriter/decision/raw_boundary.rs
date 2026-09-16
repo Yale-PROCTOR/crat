@@ -463,12 +463,6 @@ pub(crate) struct RawBoundarySiteFact {
     /// view then needs no returned-child permission: there is no descendant
     /// the caller could write through.
     pub descendants_frame_confined: bool,
-    /// wave-6r 016 claim 7 / relay wave-6v2/011: the callee position is
-    /// read-through only MODULO its stores through one frame-confined output
-    /// (`wave6r_child_access::position_is_descendant_free_modulo_output`), so
-    /// the certificate's residual — the open steps beside the certified
-    /// store — is discharged by the body scan: T1, not the T2 waiver.
-    pub descendant_free_modulo_output: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -630,7 +624,6 @@ impl RawBoundarySiteFacts {
                         .is_none_or(|site| site.may_yield_pointer),
                     frame_confined_outputs: Vec::new(),
                     descendants_frame_confined: false,
-                    descendant_free_modulo_output: false,
                 }),
                 Err(reason) => out.failures.push(RawBoundarySiteFailure {
                     caller: tcx.def_path_str(fact.caller.to_def_id()),
@@ -736,17 +729,6 @@ impl RawBoundarySiteFacts {
                             callee_may_yield_pointer: unique_candidate(&callee_key, &candidates)
                                 .is_none_or(|site| site.may_yield_pointer),
                             frame_confined_outputs: frame_confined_outputs.clone(),
-                            descendant_free_modulo_output: frame_confined_outputs.iter().any(
-                                |output| {
-                                    crate::bo_rewriter::wave6r_child_access::position_is_descendant_free_modulo_output(
-                                        tcx,
-                                        &program.functions,
-                                        callee,
-                                        argument.index,
-                                        *output,
-                                    )
-                                },
-                            ),
                             descendants_frame_confined: {
                                 let signature = tcx.fn_sig(callee).skip_binder().skip_binder();
                                 !may_carry_pointer(tcx, signature.output(), CARRIER_WALK_DEPTH)
@@ -2042,6 +2024,32 @@ fn collect_retention_facts<'tcx>(
                                 "{} arg{index} core-no-retain {CORE_POINTER_METHOD_TAG}",
                                 tcx.def_path_str(callee)
                             ),
+                        )
+                    }
+                    // A derivation whose result the function RETURNS keeps the
+                    // open reading (wave-6r's `070164b9`) and gets NO alias
+                    // edge — so the descendant walk cannot see the hand-out
+                    // through the return. The step therefore drops the tag:
+                    // `descendant_free` accepts a tagged core step because its
+                    // derived pointer is an alias whose sinks are visible, and
+                    // that premise does not hold here.
+                    CorePointerMethod::Derive
+                        if matches!(
+                            &terminator.kind,
+                            TerminatorKind::Call { destination, .. }
+                                if destination.as_local().is_some_and(|result| {
+                                    crate::bo_rewriter::wave6r_child_access::result_returned(
+                                        body, result,
+                                    )
+                                })
+                        ) =>
+                    {
+                        open(
+                            format!(
+                                "{} arg{index} returned-derivation",
+                                tcx.def_path_str(callee)
+                            ),
+                            &mut facts,
                         )
                     }
                     CorePointerMethod::Derive | CorePointerMethod::Observe => open(
@@ -4514,14 +4522,6 @@ impl RawBoundaryDispositionIndex {
                                 Some((outputs, RetentionVerdict::NoRetain { .. })) => {
                                     evidence = format!(
                                         "{evidence};stack-storage-certificate:outputs={outputs:?}"
-                                    );
-                                    Ok(RawBoundaryDisposition::T1 { template, evidence })
-                                }
-                                Some((outputs, RetentionVerdict::Unknown { .. }))
-                                    if site.descendant_free_modulo_output =>
-                                {
-                                    evidence = format!(
-                                        "{evidence};stack-storage-certificate:outputs={outputs:?};descendant-free-modulo-output"
                                     );
                                     Ok(RawBoundaryDisposition::T1 { template, evidence })
                                 }
