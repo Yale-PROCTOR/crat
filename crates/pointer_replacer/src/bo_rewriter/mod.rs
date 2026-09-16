@@ -7264,6 +7264,12 @@ fn finish_decide<'tcx>(
     // admitted on the formal's shape, confirmed once the chains derive.
     let consuming_formals =
         decision::box_param::consuming_formals(tcx, &program.functions, &subjects);
+    // R427-4 (relay wave-6a/017): the pointees whose exported surface is
+    // closed — every function mentioning them is an exported producer or an
+    // exported consumer, and no struct field holds one. The certificates and
+    // the chains read it to admit a pair the crate itself never calls.
+    let exported_pairs =
+        decision::exported_pair::derive(tcx, &program.functions, &raw_surface, &consuming_formals);
     let mut return_certificates = decision::return_certificate::derive(
         tcx,
         &program.functions,
@@ -7274,6 +7280,7 @@ fn finish_decide<'tcx>(
         &model,
         &consuming_formals,
         &raw_surface,
+        &exported_pairs,
     );
     // wave-6a: allocator-contract owners (relay wave-6a/006, R409-1/3).
     let allocator_contracts =
@@ -7288,6 +7295,7 @@ fn finish_decide<'tcx>(
         &model,
         &return_certificates,
         &raw_surface,
+        &exported_pairs,
     );
     decision::return_certificate::confirm_transfers(
         &mut return_certificates,

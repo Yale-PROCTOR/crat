@@ -1176,6 +1176,7 @@ pub(crate) fn derive<'tcx>(
     model: &FxHashMap<SlotRef, SlotKind>,
     consuming_formals: &FxHashSet<(DefId, usize)>,
     raw_surface: &dyn Fn(LocalDefId) -> bool,
+    exported_pairs: &super::exported_pair::Closure,
 ) -> Certificates {
     let mut out = Certificates::default();
     let transfer_ok =
@@ -1273,6 +1274,7 @@ pub(crate) fn derive<'tcx>(
                 &lend_ok,
                 &transfer_ok,
                 raw_surface,
+                exported_pairs,
                 &out,
             ) {
                 Ok(Some((certificate, plans))) => {
@@ -1412,6 +1414,7 @@ fn certify<'tcx, 's>(
     lend_ok: &dyn Fn(DefId, usize) -> bool,
     transfer_ok: &dyn Fn(DefId, usize) -> bool,
     raw_surface: &dyn Fn(LocalDefId) -> bool,
+    exported_pairs: &super::exported_pair::Closure,
     done: &Certificates,
 ) -> Result<Option<(Certificate, Vec<((LocalDefId, HirId), BoxPlan)>)>, Hold> {
     let callee_path = tcx.def_path_str(callee.to_def_id());
@@ -1979,7 +1982,7 @@ fn certify<'tcx, 's>(
     let mut planned_receivers = Vec::new();
     let mut returned_receivers = Vec::new();
     let mut receiver_labels: Vec<String> = Vec::new();
-    let certificate_stub = Certificate {
+    let mut certificate_stub = Certificate {
         callee,
         callee_path: callee_path.clone(),
         pointee: pointee.clone(),
@@ -2146,9 +2149,26 @@ fn certify<'tcx, 's>(
         && returning_callers.is_empty()
         && site_edits.iter().all(|(f, _)| *f == callee)
     {
-        return Err(hold(format!(
-            "return-certificate-no-receivers:{callee_path}"
-        )));
+        // R427-4: an EXPORTED producer whose pointee's surface closes has a
+        // receiver — the exposure family's wrapper, which hands the owner out
+        // as `Box::into_raw(__crat_safe_f(..))` (report 010's arm). Every
+        // other pointee keeps the hold: without a receiver and without the
+        // closure the return would convert with nothing to receive it.
+        let output_pointee = tcx
+            .fn_sig(callee.to_def_id())
+            .skip_binder()
+            .skip_binder()
+            .output();
+        let closed = matches!(output_pointee.kind(), TyKind::RawPtr(pointee, _)
+            if exported_pairs.closes(tcx, *pointee));
+        if !closed {
+            return Err(hold(format!(
+                "return-certificate-no-receivers:{callee_path}"
+            )));
+        }
+        certificate_stub
+            .receipts
+            .push(format!("exported-pair-closure callee={callee_path}"));
     }
     let mut certificate = certificate_stub;
     certificate.receivers = planned_receivers;

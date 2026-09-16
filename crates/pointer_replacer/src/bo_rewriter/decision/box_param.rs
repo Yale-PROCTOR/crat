@@ -526,6 +526,7 @@ pub(crate) fn derive<'tcx>(
     model: &FxHashMap<SlotRef, SlotKind>,
     certificates: &super::return_certificate::Certificates,
     raw_surface: &dyn Fn(LocalDefId) -> bool,
+    exported_pairs: &super::exported_pair::Closure,
 ) -> Chains {
     let mut out = Chains::default();
     let mut scans: FxHashMap<LocalDefId, Scan<'tcx>> = FxHashMap::default();
@@ -877,7 +878,19 @@ pub(crate) fn derive<'tcx>(
             hold(reason, &mut out);
             continue;
         }
-        if call_count == 0 {
+        // R427-4: an EXPORTED consumer whose pointee's surface closes HAS a
+        // caller — the exposure family's wrapper, which re-enters ownership
+        // (`__crat_safe_f(Box::from_raw(p))`, report 010's arm) — so the
+        // chain is the formal alone. Every other no-caller formal keeps the
+        // hold.
+        let exported_pair = call_count == 0 && {
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(param.fn_did)
+                .borrow();
+            matches!(body.local_decls[param.local].ty.kind(),
+                    TyKind::RawPtr(pointee, _) if exported_pairs.closes(tcx, *pointee))
+        };
+        if call_count == 0 && !exported_pair {
             hold(format!("box-param-no-callers:{callee_path}"), &mut out);
             continue;
         }
@@ -915,14 +928,25 @@ pub(crate) fn derive<'tcx>(
                 )
             })
             .collect();
-        if shapes.len() != 1 {
+        if shapes.len() > 1 || (shapes.is_empty() && !exported_pair) {
             hold(
                 format!("box-param-shape:{callee_path}:callers-disagree"),
                 &mut out,
             );
             continue;
         }
-        let (slice, pointee_override) = shapes.into_iter().next().expect("one shape");
+        let (slice, pointee_override) = match shapes.into_iter().next() {
+            Some(shape) => shape,
+            // R427-4: the exported pair has no caller to read a shape from;
+            // the formal's own pointee decides, and only a SIZED one — a
+            // `Box<[T]>` formal would need an extent the surface does not
+            // carry.
+            None if exported_pair => (false, None),
+            None => {
+                hold(format!("box-param-shape:{callee_path}:no-shape"), &mut out);
+                continue;
+            }
+        };
         // R419-3 / R423-7 (relays wave-6a/011, /013): the consuming callee is
         // a fn-pointer-web member or a positive seed, so its converted
         // signature sits behind the exposure family's raw wrapper. The wrapper
@@ -1028,9 +1052,10 @@ pub(crate) fn derive<'tcx>(
             .map(|(_, _, label, _)| label.clone())
             .collect();
         out.receipts.push(format!(
-            "box-param-chain callee={callee_path} index={hir_index} sink={} pointee={pointee} shape={} callers={call_count} members={} formal_model={formal_kind:?}",
+            "box-param-chain callee={callee_path} index={hir_index} sink={} pointee={pointee} shape={} callers={call_count}{} members={} formal_model={formal_kind:?}",
             if store.is_some() { "store" } else { "free" },
             if slice { "slice" } else { "sized" },
+            if exported_pair { " exported-pair-closure" } else { "" },
             members.join(",")
         ));
         let mut chain_callers: Vec<LocalDefId> = Vec::new();

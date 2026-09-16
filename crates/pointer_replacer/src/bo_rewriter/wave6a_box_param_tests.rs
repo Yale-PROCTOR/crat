@@ -347,13 +347,19 @@ fn w6a_c1_allocation_lent_before_the_transfer_holds_typed() {
 
 #[test]
 fn w6a_c1_ht_destroy_without_callers_holds_typed() {
+    // The full ht shape: `ht` closes at the surface (R427-4 — `ht_create` and
+    // `ht_destroy` are its only signatures and no field holds one), so the
+    // chain is attempted with no in-crate caller and refuses LATER, on the
+    // body: the sized owner is indexed (`(*table).entries` walked by
+    // `.offset`), which this rule does not rewrite. A typed hold either way,
+    // and no `Box<ht>` formal.
     let out = emitted("boxparam-ht", &with_prelude(HT_DESTROY));
     let src = compact(&out.source);
-    assert!(!src.contains("Box<ht>"), "{}", out.source);
+    assert!(!src.contains("table:Box<ht>"), "{}", out.source);
     assert!(
         out.artifacts
             .box_param_receipts
-            .contains("ht_destroy::table\theld\tbox-param-no-callers:ht_destroy"),
+            .contains("ht_destroy::table\theld\tbox-param-shape:ht_destroy:sized-owner-indexed"),
         "{}",
         out.artifacts.box_param_receipts
     );
@@ -594,17 +600,15 @@ pub static mut HOOKS: [Option<unsafe extern "C" fn(i32) -> i32>; 1] = [Some(run 
     );
 }
 
-/// **The exported pair at the surface** (relay wave-6a/016, the user's
-/// priority): ht's `ht_create` / `ht_destroy` are `#[no_mangle]` exports with
-/// NO in-program caller, so the consuming formal holds `box-param-no-callers`
-/// and the producer's return has no receiver. Under R415-7 each crate is the
-/// whole program, so the only producer of that pointee IS the export: the
-/// pair can close at the surface — the producer's wrapper hands the raw
-/// pointer out (`Box::into_raw`) and the consumer's wrapper takes it back
-/// (`Box::from_raw`), so the block is allocated and released by one
-/// allocator. This witness reads what the frame does today.
+/// **The exported pair at the surface** (relay wave-6a/017 §1, R427-4; the
+/// user's Box-emission priority): ht's `ht_create` / `ht_destroy` are
+/// `#[no_mangle]` exports with NO in-program caller, so the consuming formal
+/// had `box-param-no-callers` and the producer's certificate
+/// `return-certificate-no-receivers`. Under R415-7 each crate is the whole
+/// program, so the only producer of that pointee IS the export and the pair
+/// closes at the surface.
 #[test]
-fn w6a_c1_exported_pair_without_in_program_callers() {
+fn w6a_c1_exported_pair_delivers_through_the_surface() {
     const PAIR: &str = r#"
 #[repr(C)]
 pub struct ht { pub length: usize, pub capacity: usize }
@@ -627,16 +631,118 @@ pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
         "{}\n{}",
         out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
     );
-    // Today both ends hold, each on the same fact: the program has no
-    // in-crate caller or receiver. The two typed holds ARE the pair-closure
-    // rule's premise (report 011 STOP 1); no Box is emitted.
+    // R427-4: the pair CLOSES — `ht` is mentioned by nothing but the exported
+    // producer and the exported consumer, and no struct field holds one — so
+    // the producer returns `Box<ht>` behind a wrapper that hands the raw
+    // pointer out and the consumer takes `Box<ht>` behind a wrapper that takes
+    // it back. The block is allocated and released by one allocator; it
+    // crosses C only as an opaque handle.
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    // Neither end is a fn-pointer-web member or a positive seed, so the
+    // exposure family gives them no wrapper (`NotApplicable`): the converted
+    // `#[no_mangle] extern "C"` signatures ARE the surface — admissible under
+    // R415-7 (relay 015 STOP 2) and ABI-identical to the raw pointer.
     assert!(
-        receipts.contains("ht_destroy::table\theld\tbox-param-no-callers:ht_destroy"),
+        src.contains("fnht_create()->Box<ht>{"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains(
+            "letmuttable:Box<crate::ht>=Box::new(crate::ht{length:0asusize,capacity:0asusize});"
+        ),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("fnht_destroy(muttable:Box<ht>){drop(table);}"),
+        "{}",
+        out.source
+    );
+    assert!(
+        receipts.contains("exported-pair-closure callee=ht_create"),
         "{receipts}"
     );
     assert!(
-        receipts.contains("ht_create::table\theld\treturn-certificate-no-receivers:ht_create"),
+        receipts.contains("callers=0 exported-pair-closure"),
         "{receipts}"
     );
-    assert!(!src.contains("Box<"), "{}", out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "ht_destroy::table"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+}
+
+/// R427-4's fail-closed gates, one violation each over the delivering pair:
+/// a THIRD signature mentioning the pointee (a lend the closure cannot
+/// account for), a struct FIELD holding one (it could be stored and released
+/// anywhere), an end that is not exported (an in-crate caller could still
+/// hand in a foreign block), and a producer with no consumer (the owner would
+/// cross the surface with nothing to release it). None of them converts.
+#[test]
+fn w6a_c1_exported_pair_gates_hold_one_violation_each() {
+    const CREATE: &str = r#"
+#[repr(C)]
+pub struct ht { pub length: usize, pub capacity: usize }
+#[no_mangle]
+pub unsafe extern "C" fn ht_create() -> *mut ht {
+    let mut table = malloc(::std::mem::size_of::<ht>()) as *mut ht;
+    if table.is_null() { return 0 as *mut ht; }
+    (*table).length = 0 as usize;
+    (*table).capacity = 16 as usize;
+    return table;
+}
+"#;
+    const DESTROY: &str = r#"
+#[no_mangle]
+pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
+    free(table as *mut core::ffi::c_void);
+}
+"#;
+    const SHAPES: [(&str, &str); 4] = [
+        (
+            "third-signature",
+            r#"
+#[no_mangle]
+pub unsafe extern "C" fn ht_length(mut table: *mut ht) -> usize { return (*table).length; }
+"#,
+        ),
+        (
+            "struct-field",
+            r#"
+#[repr(C)]
+pub struct registry { pub table: *mut ht }
+"#,
+        ),
+        ("not-exported", ""),
+        ("producer-only", ""),
+    ];
+    for (name, extra) in SHAPES {
+        let source = match name {
+            // The producer alone: an owner would cross the surface with
+            // nothing to release it.
+            "producer-only" => format!("{}{CREATE}", PRELUDE),
+            // The consumer is not `#[no_mangle]`: an in-crate caller could
+            // still hand it a block from anywhere.
+            "not-exported" => format!(
+                "{}{CREATE}{}",
+                PRELUDE,
+                DESTROY.replace("#[no_mangle]\n", "")
+            ),
+            _ => format!("{}{CREATE}{DESTROY}{extra}", PRELUDE),
+        };
+        let out = emitted(&format!("boxparam-pair-{name}"), &source);
+        let src = compact(&out.source);
+        let receipts = format!(
+            "{}\n{}",
+            out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
+        );
+        assert!(
+            !src.contains("->Box<ht>") && !src.contains("table:Box<ht>"),
+            "{name}: {}\n{receipts}",
+            out.source
+        );
+    }
 }

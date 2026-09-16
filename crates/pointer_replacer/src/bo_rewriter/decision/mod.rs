@@ -52,6 +52,7 @@ pub(crate) mod cursor_native;
 pub(crate) mod declaration;
 pub(crate) mod declaration_pattern;
 pub(crate) mod emitability;
+pub(crate) mod exported_pair;
 pub(crate) mod exposure;
 pub(crate) mod field_reference;
 pub(crate) mod flexible_tail;
