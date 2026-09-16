@@ -140,6 +140,12 @@ pub(super) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
         && construction::slice_constructor_available(ctx.constructions, node)
         && slice_form_evidence(ctx, subject)
         && !argument_of_local_callee(ctx.tcx, subject)
+        // relay 012 §1: the refusal every constructor-typing rule shares
+        // (wave-6a): a thin-Ref root the Slice arm would not deliver fat is
+        // never widened by a construction over it (R395-2 fix-2), a receiver
+        // of a local callee is the return family's, an argument of one is
+        // declined.
+        && !super::slice_local_construction::refuses(ctx, subject)
         && emitted_type(ctx.tcx, subject, subject.mutable).is_some()
 }
 

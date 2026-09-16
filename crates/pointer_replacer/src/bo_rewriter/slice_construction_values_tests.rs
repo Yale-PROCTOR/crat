@@ -283,3 +283,39 @@ fn wave6k_call_initialised_slice_local_yields_to_the_return_receiver() {
     assert!(text.contains("letd:&[u8]=chunk_data(chunk);"), "{source}");
     assert!(!text.contains("from_raw_parts(chunk_data("), "{source}");
 }
+
+/// R395-2 fix-2 (relay wave-6k/012 §1, wave-6a 005 claim 2(ii)): a copy of a
+/// THIN reference parameter must not become a slice constructed over it —
+/// `from_raw_parts(a, …)` with `a: &i32` widens a one-element claim.
+#[test]
+fn wave6k_thin_reference_root_is_never_widened() {
+    ::utils::compilation::run_compiler_on_str(
+        r#"
+        pub unsafe fn f(a: *const i32) -> i32 { let p = a; *p.offset(1) }
+    "#,
+        |tcx| {
+            let (table, _) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .expect("native decisions");
+            for (subject, decision) in &table.entries {
+                println!("DECISION {} {decision:?}", subject.label);
+            }
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .expect("subject");
+            assert!(
+                matches!(decision, Decision::Degraded(_)),
+                "{} must keep its hold, never a slice over a thin root: {decision:?}",
+                subject.label
+            );
+        },
+    )
+    .expect("input compiles");
+}
