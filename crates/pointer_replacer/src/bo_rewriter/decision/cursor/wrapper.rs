@@ -1005,6 +1005,42 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         }
         if let hir::ExprKind::Call(callee, args) = e.kind {
             for (index, arg) in args.iter().enumerate() {
+                // An offset chain rooted at this cursor handed to a raw formal
+                // (`strcmp(s.offset(k), ..)`): the chain is the derived cursor
+                // value at the argument, and the boundary's own Arm-A site
+                // renders its raw view over it (`s.offset_by(k).as_ptr()`) —
+                // the ruled same-span composition, use then seam.
+                if !self.optional
+                    && local(arg) != Some(self.subject.hir_id)
+                    && matches!(arg.kind, hir::ExprKind::MethodCall(..))
+                    && source_binding(self.ctx.tcx, self.subject.fn_did, arg)
+                        == Some(self.subject.hir_id)
+                    && let ty::FnDef(did, _) =
+                        *self.ctx.tcx.typeck(self.subject.fn_did).expr_ty(callee).kind()
+                    && did.as_local().and_then(|did| {
+                        self.entries.iter().find(|(s, _)| s.fn_did == did && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == index))
+                    }).is_none_or(|(_, d)| raw_decision(d))
+                {
+                    match self.index(arg) {
+                        Ok(d) if self.ctx.raw_boundary.is_none_or(|rb| {
+                            rb.opens_argument(
+                                (self.subject.fn_did, self.subject.hir_id),
+                                arg.span,
+                                index,
+                            )
+                        }) =>
+                        {
+                            self.push(arg, format!("{}.offset_by({d})", self.name), "cursor-advance");
+                        }
+                        Ok(_) => {
+                            self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
+                        }
+                        Err(hold) => {
+                            self.hold.get_or_insert(hold);
+                        }
+                    }
+                    continue;
+                }
                 if local(arg) == Some(self.subject.hir_id) {
                     let ty::FnDef(did, _) = *self
                         .ctx

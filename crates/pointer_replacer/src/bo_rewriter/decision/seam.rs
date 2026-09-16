@@ -5261,7 +5261,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         atoms.dedup_by(|left, right| left.id == right.id);
     }
     for (key, disposition, site) in raw_boundary.emission_sites() {
-        let Some(template) = disposition.template() else {
+        let Some(mut template) = disposition.template() else {
             // A delivered counted byte view (wave-6v2) converts after the
             // co-conversion gate ran, so a blocked outbound site on it is
             // registered here as a dropped class site — the class withdraws —
@@ -5306,10 +5306,10 @@ pub(crate) fn synthesize_with_raw_boundary(
         let argument_span = site
             .direct_storage_span
             .unwrap_or(site.adapter_operand_span);
-        let Ok(argument) = sm.span_to_snippet(argument_span) else {
+        let Ok(mut argument) = sm.span_to_snippet(argument_span) else {
             continue;
         };
-        let spec = GlueSpec::raw_boundary_target(template, &site.target, site.box_slice, false);
+        let mut spec = GlueSpec::raw_boundary_target(template, &site.target, site.box_slice, false);
         let exact_subject_use = site
             .node
             .and_then(|node| decision_of.get(&node).copied())
@@ -5327,11 +5327,23 @@ pub(crate) fn synthesize_with_raw_boundary(
             .filter(|edit| edit.span == site.span)
             .collect::<Vec<_>>();
         if exact_subject_use.len() == 1 {
-            plan.raw_boundary_edit_region_owned.push((
-                super::raw_boundary::site_atom_id(key),
-                "raw-boundary-edit-region-owned".to_owned(),
-            ));
-            continue;
+            // slicecursor (09-16): a cursor's derived value at the argument
+            // (`s.offset_by(k)`, an offset chain rooted at the cursor) is not
+            // the raw view; the bridge renders over the rewritten operand and
+            // the AST pass wraps the grafted subtree (use, then seam).
+            if exact_subject_use[0].bridge_kind == "cursor-advance"
+                && site.target.mutability == super::raw_boundary::RawMutability::Const
+            {
+                argument = exact_subject_use[0].replacement.clone();
+                template = super::raw_boundary::BridgeTemplate::SliceToRawConst;
+                spec = GlueSpec::raw_boundary_target(template, &site.target, site.box_slice, false);
+            } else {
+                plan.raw_boundary_edit_region_owned.push((
+                    super::raw_boundary::site_atom_id(key),
+                    "raw-boundary-edit-region-owned".to_owned(),
+                ));
+                continue;
+            }
         }
         let Some(replacement) = spec.render_in_context(
             &argument,

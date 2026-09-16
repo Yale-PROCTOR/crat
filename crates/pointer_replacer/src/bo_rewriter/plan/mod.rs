@@ -509,6 +509,16 @@ fn nested_ast_composition(
         let option_value_over_cursor_address = outer.key.bridge_kind == "option-value"
             && inner.key.bridge_kind == "cursor-address"
             && contains(outer, inner);
+        // The boundary's raw view over a cursor's derived value at the same
+        // argument span (`strcmp(s.offset_by(k).as_ptr(), ..)`): the AST pass
+        // applies the use, then the seam wraps the rewritten subtree.
+        let raw_view_over_cursor_advance = outer.key.arm == "c"
+            && matches!(
+                outer.key.bridge_kind.as_str(),
+                "slice-to-raw-const" | "slice-mut-to-raw-mut"
+            )
+            && inner.key.bridge_kind == "cursor-advance"
+            && contains(outer, inner);
         // L07 (§39 addendum 272, R272-3). The five outer/inner kind pairs the
         // J'' frame measures as STRICT CONTAINMENTS, entering under exactly
         // the dependency discipline `bridge_over_subject` already uses: the
@@ -577,6 +587,7 @@ fn nested_ast_composition(
             || option_value_over_inner
             || cursor_constructor_over_element
             || option_value_over_cursor_address
+            || raw_view_over_cursor_advance
             || raw_receiver_over_argument
     };
     if composable(left, right) {

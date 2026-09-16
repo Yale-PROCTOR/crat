@@ -1046,3 +1046,36 @@ pub unsafe fn fragment(input: *const u8, block_size: usize, table: *mut i32, las
         ),
     );
 }
+
+#[test]
+fn slicecursor_offset_chain_argument_at_a_raw_callee() {
+    // brotli `hasSuffix` (report 008's typed hold, attempt 3): an offset chain
+    // rooted at the cursor handed to a raw foreign formal. The chain is the
+    // cursor's derived value at the argument; the boundary's own site renders
+    // the cursor's raw view over it (`.as_ptr()`), the same span composed
+    // use-then-seam, under the boundary's own retention receipt.
+    let input = r#"
+unsafe extern "C" { fn strcmp(a: *const i8, b: *const i8) -> i32; }
+pub unsafe fn has_suffix(s: *const i8, suffix: *const i8, ns: isize, nx: isize) -> i32 {
+    if ns < nx { return 0; }
+    if strcmp(s.offset(ns + (-nx)), suffix) == 0 { 1 } else { 0 }
+}
+"#;
+    let source = emitted(input);
+    save_fixture("offset-chain-argument-at-raw-callee", input, &source);
+    assert!(
+        source.contains("fn has_suffix(s: &[i8], suffix: *const i8, ns: isize, nx: isize)"),
+        "cursor parameter absent: {source}"
+    );
+    assert!(
+        source.contains("strcmp(s.offset_by((0isize).wrapping_add((ns + (-nx)) as")
+            && source.contains("isize)).as_ptr(), suffix)"),
+        "raw view over the derived cursor absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let s = *b\"abcdef\\0\"; let s = s.map(|b| b as i8); let d = *b\"def\\0\"; let d = d.map(|b| b as i8); let x = *b\"xyz\\0\"; let x = x.map(|b| b as i8); assert_eq!(unsafe { has_suffix(&s[..6], d.as_ptr(), 6, 3) }, 1); assert_eq!(unsafe { has_suffix(&s[..6], x.as_ptr(), 6, 3) }, 0); assert_eq!(unsafe { has_suffix(&s[..6], d.as_ptr(), 2, 3) }, 0); }",
+        ),
+    );
+}
