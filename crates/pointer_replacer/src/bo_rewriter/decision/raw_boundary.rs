@@ -1634,6 +1634,35 @@ fn collect_retention_facts<'tcx>(
                         ),
                     ));
                 }
+                // wave-6v2 (R412-1): the address of a place UNDER a pointer
+                // (`&raw mut (*s).extra`, `&mut (*s).f`) is a pointer derived
+                // from that pointer's referent — an alias for every sink that
+                // follows (a global store of it retains the argument).
+                if let Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) = rhs
+                    && matches!(place.projection.first(), Some(ProjectionElem::Deref))
+                    && matches!(
+                        body.local_decls[place.local].ty.kind(),
+                        TyKind::RawPtr(..) | TyKind::Ref(..)
+                    )
+                    && matches!(
+                        body.local_decls[destination].ty.kind(),
+                        TyKind::RawPtr(..) | TyKind::Ref(..)
+                    )
+                {
+                    aliases.push((
+                        place.local,
+                        destination,
+                        retention_step(
+                            location,
+                            RetentionEventKind::ReturnedAlias,
+                            format!(
+                                "address-derivation _{}->_{}",
+                                place.local.as_u32(),
+                                destination.as_u32()
+                            ),
+                        ),
+                    ));
+                }
             }
         }
         if let TerminatorKind::Call { destination, .. } = &data.terminator().kind

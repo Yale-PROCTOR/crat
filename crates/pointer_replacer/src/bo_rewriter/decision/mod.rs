@@ -2462,7 +2462,13 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // authority, no parallel notion. `may_be_negative` folds a lookup miss to
     // the conservative side, so an unanalyzed local is refused rather than
     // emitted on absent evidence.
-    if counted.is_none() && sign.may_be_negative(subject.fn_did, subject.local) {
+    // Composition (wave-6v2): a lane hook may rebind `counted` above; the void
+    // contract is read again here so a counted byte view without arithmetic
+    // (no sign fact) is not refused on a lookup miss.
+    if counted.is_none()
+        && counted_void::active(ctx, subject).is_none()
+        && sign.may_be_negative(subject.fn_did, subject.local)
+    {
         return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
     }
     if let Some(site) = uses.return_handoffs.first()

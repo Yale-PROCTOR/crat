@@ -593,13 +593,12 @@ const ACCESSORS: &str = r#"
 #[repr(C)]
 pub struct binn { pub header: i32, pub type_0: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
 unsafe fn GetValue(mut p: *mut u8, mut value: *mut binn) -> i32 {
-    if value.is_null() { return 0 as i32; }
     (*value).type_0 = *p as i32;
     (*value).ptr = p as *mut core::ffi::c_void;
     return 1 as i32;
 }
 pub unsafe fn get_value(mut ptr: *mut core::ffi::c_void, mut pos: i32, mut value: *mut binn) -> i32 {
-    if ptr.is_null() || value.is_null() { return 0 as i32; }
+    if ptr.is_null() { return 0 as i32; }
     let mut p = ptr as *mut u8;
     return GetValue(p, value);
 }
@@ -948,11 +947,19 @@ unsafe fn tail(mut p: *const core::ffi::c_void) -> u64 {
     *(p as *const u32) as u64
 }
 "#;
-    let rows = super::emit_tests::decisions_of(input);
-    assert!(
-        rows.iter()
-            .filter(|(n, p, _)| n == "p" && *p)
-            .all(|(_, _, r)| r == "held:void-pointee"),
-        "the width readers are the region's: {rows:?}"
-    );
+    // The region (wave-6b) may deliver them on a composed line; what this
+    // lane asserts is that ITS rule minted no contract for either.
+    ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
+        let table = super::decide_table(tcx).expect("table");
+        let minted = table
+            .counted_void
+            .keys()
+            .map(|(f, _)| tcx.def_path_str(f.to_def_id()))
+            .collect::<Vec<_>>();
+        assert!(
+            minted.is_empty(),
+            "the width readers are the region's: {minted:?}"
+        );
+    })
+    .expect("compiles");
 }
