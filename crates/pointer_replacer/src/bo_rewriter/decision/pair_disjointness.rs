@@ -94,13 +94,6 @@ pub(crate) enum Unproved {
     /// which is wave-6k's shared-read consumer's (charter (d)); this lane
     /// leaves it untouched so that consumer's receipts stay identical.
     ReadReadPeers,
-    /// Two views under one NULLABLE pointer root (`is_null`-tested or
-    /// null-assigned, so it delivers as `Option<&mut T>`): each view is bridged
-    /// through `root.as_mut().unwrap()`, and two of them live in one call are
-    /// two `&mut` borrows of the Option — E0499, a compile revert (report 002,
-    /// binn `binn_load`). Refused until the per-call reborrow hoist exists
-    /// (R406-2: wave-6o's row).
-    OptionRootMultiView,
 }
 
 impl Unproved {
@@ -120,7 +113,6 @@ impl Unproved {
             Self::TypeUnresolved => "pair-disjointness-unproved:type-unresolved",
             Self::RootsUnknown => "pair-disjointness-unproved:roots-unknown",
             Self::ReadReadPeers => "pair-disjointness-unproved:read-read-peers",
-            Self::OptionRootMultiView => "pair-disjointness-unproved:option-root-multi-view",
         }
     }
 }
@@ -169,12 +161,6 @@ struct ArgRecord {
     span: Span,
     class: RootClass,
     place: Option<PlacePath>,
-    /// The innermost local binding the argument expression is built from
-    /// (through derefs, fields, indices, casts and method receivers), when
-    /// there is one. Used only to refuse two views under one nullable root.
-    syntactic_root: Option<HirId>,
-    /// That root is `is_null`-tested or null-assigned in the caller.
-    nullable_root: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -243,7 +229,6 @@ impl PairDisjointnessIndex {
         program: &RustProgram<'_>,
         mut_facts: &MutFacts,
         indirect_calls: Option<&[super::lifetime::MirCallTargetSite]>,
-        null_tested: &FxHashSet<HirId>,
     ) -> Self {
         let tcx = program.tcx;
         let local_functions: FxHashSet<LocalDefId> = program.functions.iter().copied().collect();
@@ -261,15 +246,12 @@ impl PairDisjointnessIndex {
             };
             let body = tcx.hir_body(body_id);
             let typeck = tcx.typeck(caller);
-            let (classes, null_assigned) =
-                classify_locals_with_nullability(tcx, typeck, body, &allocators, caller);
+            let classes = classify_locals(tcx, typeck, body, &allocators, caller);
             let mut collector = CallCollector {
                 tcx,
                 typeck,
                 locals: &local_functions,
                 classes: &classes,
-                null_tested,
-                null_assigned: &null_assigned,
                 calls: Vec::new(),
             };
             collector.visit_body(body);
@@ -379,12 +361,6 @@ impl PairDisjointnessIndex {
             && self.immutable_formals.contains(&(callee, right))
         {
             return Err(Unproved::ReadReadPeers);
-        }
-        if let (Some(ra), Some(rb)) = (a.syntactic_root, b.syntactic_root)
-            && ra == rb
-            && (a.nullable_root || b.nullable_root)
-        {
-            return Err(Unproved::OptionRootMultiView);
         }
         // The same syntactic place, however it is cast, is never disjoint from
         // itself; refused before any rule is consulted.
@@ -835,19 +811,6 @@ fn classify_locals<'tcx>(
     allocators: &AllocatorOracle<'_>,
     function: LocalDefId,
 ) -> FxHashMap<HirId, RootClass> {
-    classify_locals_with_nullability(tcx, typeck, body, allocators, function).0
-}
-
-/// [`classify_locals`] plus the bindings that are assigned a null literal
-/// anywhere in the body (the other half of the Option-form evidence; the
-/// `is_null` half comes from the emitability facts).
-fn classify_locals_with_nullability<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    typeck: &TypeckResults<'tcx>,
-    body: &'tcx rustc_hir::Body<'tcx>,
-    allocators: &AllocatorOracle<'_>,
-    function: LocalDefId,
-) -> (FxHashMap<HirId, RootClass>, FxHashSet<HirId>) {
     let mut facts: FxHashMap<HirId, LocalFacts> = FxHashMap::default();
     for param in body.params {
         if let PatKind::Binding(_, hir_id, ..) = param.pat.kind {
@@ -872,12 +835,7 @@ fn classify_locals_with_nullability<'tcx>(
     };
     collector.visit_body(body);
 
-    let null_assigned = facts
-        .iter()
-        .filter(|(_, fact)| fact.assignments.contains(&AssignKind::Null))
-        .map(|(hir_id, _)| *hir_id)
-        .collect::<FxHashSet<_>>();
-    let classes = facts
+    facts
         .into_iter()
         .map(|(hir_id, fact)| {
             let class = if fact.is_pointer {
@@ -912,8 +870,7 @@ fn classify_locals_with_nullability<'tcx>(
             };
             (hir_id, class)
         })
-        .collect();
-    (classes, null_assigned)
+        .collect()
 }
 
 struct LocalCollector<'a, 'tcx> {
@@ -1007,8 +964,6 @@ struct CallCollector<'a, 'tcx> {
     typeck: &'a TypeckResults<'tcx>,
     locals: &'a FxHashSet<LocalDefId>,
     classes: &'a FxHashMap<HirId, RootClass>,
-    null_tested: &'a FxHashSet<HirId>,
-    null_assigned: &'a FxHashSet<HirId>,
     calls: Vec<(LocalDefId, SiteRecord)>,
 }
 
@@ -1025,17 +980,11 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                 .map(|(index, arg)| {
                     let (class, place) =
                         argument_provenance(self.tcx, self.typeck, self.classes, arg);
-                    let syntactic_root = syntactic_root(arg);
-                    let nullable_root = syntactic_root.is_some_and(|root| {
-                        self.null_tested.contains(&root) || self.null_assigned.contains(&root)
-                    });
                     ArgRecord {
                         index,
                         span: arg.span,
                         class,
                         place,
-                        syntactic_root,
-                        nullable_root,
                     }
                 })
                 .collect();
@@ -1048,25 +997,6 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
             ));
         }
         intravisit::walk_expr(self, expr);
-    }
-}
-
-/// The innermost local binding an argument expression is built from, walking
-/// derefs, fields, indices, address-ofs, casts and method receivers (the
-/// emitability `place_root` walk).
-fn syntactic_root(expr: &Expr<'_>) -> Option<HirId> {
-    let mut cur = expr;
-    loop {
-        match &cur.kind {
-            ExprKind::Unary(UnOp::Deref, base)
-            | ExprKind::Field(base, _)
-            | ExprKind::Index(base, _, _)
-            | ExprKind::AddrOf(_, _, base)
-            | ExprKind::Cast(base, _)
-            | ExprKind::DropTemps(base) => cur = base,
-            ExprKind::MethodCall(_, receiver, _, _) => cur = receiver,
-            _ => return resolved_local(cur),
-        }
     }
 }
 

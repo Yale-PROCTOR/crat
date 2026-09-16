@@ -403,10 +403,7 @@ fn w6p_same_place_is_refused_before_any_rule() {
         let mut_facts =
             crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
         let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
-            &program,
-            &mut_facts,
-            None,
-            &Default::default(),
+            &program, &mut_facts, None,
         );
         let function = |name: &str| {
             *program
@@ -700,7 +697,6 @@ fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
             &program,
             &mut_facts,
             Some(&sites),
-            &Default::default(),
         );
         assert_eq!(
             with.certify_recorded(
@@ -723,7 +719,6 @@ fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
             &program,
             &mut_facts,
             Some(&sites),
-            &Default::default(),
         );
         assert_eq!(
             without.certify_recorded(
@@ -747,7 +742,6 @@ fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
             &program,
             &mut_facts,
             Some(&sites),
-            &Default::default(),
         );
         assert_eq!(
             unresolved.certify_recorded(
@@ -774,7 +768,6 @@ fn w6p_fn_pointer_allocator_without_the_web_stays_unproved() {
             &program,
             &mut_facts,
             None,
-            &Default::default(),
         );
         let function = |name: &str| {
             *program
@@ -930,12 +923,20 @@ fn path_emission(source: &str, tag: &str) -> (String, usize, Vec<String>) {
     }
 }
 
+/// R412-14: with wave-6o's per-call reborrow hoist (`258c6f29`) in the
+/// frame, the interim refusal of two certified views under one nullable root
+/// is dropped. binn `binn_load`'s three disjoint-field views under the
+/// `Option<&mut binn>` root certify by disjoint fields and the emission
+/// compiles: the call is wrapped as `({ let value = value.as_deref_mut()
+/// .unwrap(); binn_is_valid(.., &mut (*value).type_0, ..) })`, one reborrow
+/// of the Option for the whole call. RED on dry3 with the refusal in place
+/// (`red-dry3-binn-load-refusal-present.log`), GREEN once it is dropped.
 #[test]
-fn w6p_option_root_multi_view_is_refused_and_emits_without_a_revert() {
-    // The refusal, on the index.
+fn w6p_option_root_multi_view_certifies_and_emits_with_the_hoist() {
     ::utils::compilation::run_compiler_on_str(BINN_LOAD, |tcx| {
-        let (_table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
+        let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
             .expect("binn_load fixture decision");
+        dump(tcx, &table);
         let ledger = ctx
             .a5_site_proofs
             .pair_certificates()
@@ -944,25 +945,36 @@ fn w6p_option_root_multi_view_is_refused_and_emits_without_a_revert() {
         assert!(
             ledger
                 .iter()
-                .any(|row| row.outcome == Err(Unproved::OptionRootMultiView)),
-            "two views under the nullable root `value` are refused: {ledger:?}"
+                .any(|row| row.outcome == Ok(CertificateKind::DisjointFields)),
+            "the three views under the nullable root certify by disjoint fields: {ledger:?}"
         );
         assert!(
             ledger
                 .iter()
-                .all(|row| row.outcome != Ok(CertificateKind::DisjointFields)),
-            "{ledger:?}"
+                .all(|row| row.outcome != Err(Unproved::SiteUnresolved)
+                    && row.outcome != Err(Unproved::RootsUnknown)),
+            "no view under the nullable root is refused for its root: {ledger:?}"
         );
+        for index in 1..4 {
+            let decision = param_decision(tcx, &table, "binn_is_valid", index);
+            assert!(
+                !is_pair_raw_view(decision),
+                "binn_is_valid#{index} must not stay pair-raw-view: {decision:?}"
+            );
+        }
     })
     .expect("binn_load fixture compilation");
-    // The emission, through the census's path entry: no revert (RED before the
-    // refusal: two E0499 on `value`, `red-binn-load-option-root-e0499.log`).
     let (source, reverted, diags) = path_emission(BINN_LOAD, "binn-load");
     for diag in &diags {
         println!("W6P_BINN diag {diag}");
     }
     println!("W6P_BINN_SOURCE_BEGIN\n{source}\nW6P_BINN_SOURCE_END");
     assert_eq!(reverted, 0, "binn_load must not revert: {diags:?}");
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("letvalue=value.as_deref_mut().unwrap();"),
+        "the Option root is reborrowed once for the call (wave-6o's hoist):\n{source}"
+    );
 }
 
 /// The same three field views under a NON-nullable root (`value` never
@@ -1006,12 +1018,6 @@ fn w6p_plain_root_multi_view_keeps_the_certificate_and_emits() {
             ledger
                 .iter()
                 .any(|row| row.outcome == Ok(CertificateKind::DisjointFields)),
-            "{ledger:?}"
-        );
-        assert!(
-            ledger
-                .iter()
-                .all(|row| row.outcome != Err(Unproved::OptionRootMultiView)),
             "{ledger:?}"
         );
     })
