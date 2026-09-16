@@ -1,5 +1,9 @@
 //! Source-identified zeroed numeric Box and boxed-slice constructors.
-use rustc_hir::{Expr, ExprKind, Node, QPath, def::Res};
+use rustc_hir::{
+    Expr, ExprKind, HirId, Node, QPath,
+    def::Res,
+    intravisit::{self, Visitor},
+};
 use rustc_middle::ty::{FloatTy, IntTy, Ty, TyCtxt, TyKind, UintTy};
 use rustc_span::{
     Symbol,
@@ -13,6 +17,12 @@ use super::{
 
 pub(crate) struct Constructor<'tcx> {
     pub(crate) allocation: &'tcx Expr<'tcx>,
+    /// R431: the owner is acquired by MOVING it out of another object's
+    /// owning field (`let mut x = (*y).left;`), not by allocating it. The
+    /// initializer is then the FIELD family's to render (their `take()`);
+    /// this producer contributes no constructor edit, only the type, the
+    /// close and the receipts.
+    pub(crate) field_load: bool,
     pub(crate) allocator: DefId,
     pub(crate) element: Ty<'tcx>,
     /// The element type as it must be spelled at the binding (`i32`, or a
@@ -22,6 +32,84 @@ pub(crate) struct Constructor<'tcx> {
     pub(crate) shape: BoxShape,
     pub(crate) nonempty: bool,
     pub(crate) edit: BoxExprEdit,
+}
+
+/// The local a raw base spells directly (`y` in `(*y).left`).
+fn base_local(expr: &Expr<'_>) -> Option<HirId> {
+    match expr.kind {
+        ExprKind::Path(QPath::Resolved(None, path)) => match path.res {
+            Res::Local(id) => Some(id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Does a later statement of the load's own block overwrite the same field of
+/// the same object, with no exit in between? (R431's move-out evidence.)
+fn moved_out<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    init: &'tcx Expr<'tcx>,
+    root: HirId,
+    field: usize,
+) -> Result<bool, SourceHold> {
+    struct Blocks<'tcx>(Vec<&'tcx rustc_hir::Block<'tcx>>);
+    impl<'tcx> Visitor<'tcx> for Blocks<'tcx> {
+        fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
+            self.0.push(block);
+            intravisit::walk_block(self, block);
+        }
+    }
+    struct Exits(bool);
+    impl<'tcx> Visitor<'tcx> for Exits {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if matches!(
+                expr.kind,
+                ExprKind::Ret(..) | ExprKind::Break(..) | ExprKind::Continue(..)
+            ) {
+                self.0 = true;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let typeck = tcx.typeck(owner);
+    let body_id = tcx
+        .hir_node_by_def_id(owner)
+        .body_id()
+        .ok_or(SourceHold::Identity)?;
+    let mut blocks = Blocks(Vec::new());
+    blocks.visit_body(tcx.hir_body(body_id));
+    for block in blocks.0 {
+        let Some(index) = block.stmts.iter().position(|statement| {
+            matches!(statement.kind, rustc_hir::StmtKind::Let(local)
+                if local.init.is_some_and(|value| value.hir_id == init.hir_id))
+        }) else {
+            continue;
+        };
+        for statement in &block.stmts[index + 1..] {
+            let mut exits = Exits(false);
+            exits.visit_stmt(statement);
+            if exits.0 {
+                return Ok(false);
+            }
+            let (rustc_hir::StmtKind::Semi(expression) | rustc_hir::StmtKind::Expr(expression)) =
+                statement.kind
+            else {
+                continue;
+            };
+            if let ExprKind::Assign(destination, _, _) = expression.kind
+                && let ExprKind::Field(base, _) = destination.kind
+                && let ExprKind::Unary(rustc_hir::UnOp::Deref, through) = base.kind
+                && base_local(through) == Some(root)
+                && typeck.field_index(destination.hir_id).as_usize() == field
+            {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    Ok(false)
 }
 
 pub(crate) fn derive<'tcx>(
@@ -39,6 +127,45 @@ pub(crate) fn derive<'tcx>(
         return Err(SourceHold::ConstructorShape);
     }
     let pointer_bits = tcx.data_layout.pointer_size.bits();
+    // R431 (avl's rotations): `let mut x = (*y).left;` — the owner is MOVED
+    // out of another object's field. The field family owns that field and
+    // renders the move (`take()`); this producer only types the local and
+    // closes it. Nothing here is allocated, so no count, no zero literal and
+    // no constructor edit: the edit is a marker with the initializer's own
+    // text, never emitted (the native stage drops it).
+    if let ExprKind::Field(base, _) = init.kind
+        && let ExprKind::Unary(rustc_hir::UnOp::Deref, through) = base.kind
+        && typeck.expr_ty(through).is_raw_ptr()
+        && matches!(typeck.expr_ty(base).kind(), TyKind::Adt(def, _) if def.is_struct())
+    {
+        // R425-2 keeps a traversal TOKEN load out. A load acquires the owner
+        // only where the INPUT ITSELF moves it out: the same field of the same
+        // object is overwritten by a later statement of the SAME block, with
+        // no exit between (`let mut x = (*y).left; … (*y).left = T2;`). bst's
+        // `let mut temp = (*root).right;` leaves the field pointing at the
+        // node it loaded — it owns nothing, and no Box (hence no drop) may be
+        // planned for it.
+        let root = base_local(through).ok_or(SourceHold::ConstructorIdentity)?;
+        let field = typeck.field_index(init.hir_id).as_usize();
+        if !moved_out(tcx, owner, init, root, field)? {
+            return Err(SourceHold::ConstructorIdentity);
+        }
+        return Ok(Constructor {
+            allocation: init,
+            field_load: true,
+            allocator: owner.to_def_id(),
+            element,
+            element_spelling: spell_element(tcx, element),
+            count: "1".into(),
+            shape: BoxShape::Sized,
+            nonempty: true,
+            edit: BoxExprEdit {
+                span: init.span,
+                replacement: String::new(),
+                receipt: "native-owner-moved-out-of-a-field",
+            },
+        });
+    }
     let (zero, element_bits) = zero_value(tcx, element, pointer_bits)?;
     let element_spelling = spell_element(tcx, element);
     let mut allocation = init;
@@ -122,6 +249,7 @@ pub(crate) fn derive<'tcx>(
             let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
             return Ok(Constructor {
                 allocation,
+                field_load: false,
                 allocator,
                 element,
                 element_spelling: element_spelling.clone(),
@@ -149,6 +277,7 @@ pub(crate) fn derive<'tcx>(
             let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
             return Ok(Constructor {
                 allocation,
+                field_load: false,
                 allocator,
                 element,
                 element_spelling: element_spelling.clone(),
@@ -201,6 +330,7 @@ pub(crate) fn derive<'tcx>(
         };
         return Ok(Constructor {
             allocation,
+            field_load: false,
             allocator,
             element,
             element_spelling: element_spelling.clone(),
@@ -274,6 +404,7 @@ pub(crate) fn derive<'tcx>(
     };
     Ok(Constructor {
         allocation,
+        field_load: false,
         allocator,
         element,
         element_spelling,

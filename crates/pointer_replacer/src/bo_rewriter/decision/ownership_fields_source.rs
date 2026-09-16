@@ -183,6 +183,10 @@ pub(crate) struct SourcePlan {
     /// The field the store transfer fills: `(struct, field index)` — the
     /// identity a field transaction (wave-6f) is keyed by.
     store_field: Option<(DefId, usize)>,
+    /// R431: the field the owner was MOVED OUT OF (`let mut x = (*y).left;`),
+    /// keyed the same way. The move is the field family's to render; until a
+    /// field transaction owns that field the native stage holds.
+    load_field: Option<(DefId, usize)>,
     /// The MIR local that receives the allocator's result: the one source of
     /// every pointer into this fresh allocation while the root never escapes.
     allocation_local: u32,
@@ -208,6 +212,10 @@ impl SourcePlan {
 
     pub(crate) fn store_field(&self) -> Option<(DefId, usize)> {
         self.store_field
+    }
+
+    pub(crate) fn load_field(&self) -> Option<(DefId, usize)> {
+        self.load_field
     }
 
     pub(crate) fn allocation_local(&self) -> u32 {
@@ -427,6 +435,28 @@ fn copy_closure(body: &rustc_middle::mir::Body<'_>, seeds: BTreeSet<u32>) -> BTr
         }
     }
 }
+/// `_x = ((*_y).field)` in MIR: an alias local takes its value from a place
+/// PROJECTED out of another local — the move out of an owning field.
+fn is_field_load_acquisition(
+    statement: &rustc_middle::mir::Statement<'_>,
+    aliases: &BTreeSet<u32>,
+) -> bool {
+    let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else { return false };
+    let Some(destination) = destination.as_local() else { return false };
+    if !aliases.contains(&destination.as_u32()) {
+        return false;
+    }
+    match rvalue {
+        Rvalue::Use(operand) | Rvalue::Cast(CastKind::PtrToPtr, operand, _) => match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                !place.projection.is_empty() && !aliases.contains(&place.local.as_u32())
+            }
+            Operand::Constant(_) => false,
+        },
+        _ => false,
+    }
+}
+
 /// `(*base).field = <alias of the owner>` in MIR: the destination is a
 /// projected place whose base is not the owner, the value a plain alias
 /// local (a copy, a move, or a pointer-to-pointer cast of one).
@@ -618,6 +648,21 @@ pub(crate) fn derive<'tcx>(
     }
     let allocation = constructor.allocation;
     let allocator = constructor.allocator;
+    // R431: the field this owner was moved out of, for the native stage's
+    // fail-closed check against the field family's transactions.
+    let load_field = match constructor.allocation.kind {
+        ExprKind::Field(base, _) if constructor.field_load => match typeck.expr_ty(base).kind() {
+            TyKind::Adt(def, _) => Some((
+                def.did(),
+                typeck.field_index(constructor.allocation.hir_id).as_usize(),
+            )),
+            _ => return Err(SourceHold::ConstructorShape),
+        },
+        _ => None,
+    };
+    if constructor.field_load && load_field.is_none() {
+        return Err(SourceHold::ConstructorShape);
+    }
     let Node::Pat(pattern) = tcx.hir_node(subject.hir_id) else { return Err(SourceHold::Identity) };
     let rustc_hir::PatKind::Binding(_, binding, ident, None) = pattern.kind else {
         return Err(SourceHold::Identity);
@@ -641,7 +686,13 @@ pub(crate) fn derive<'tcx>(
     // spelled zero literal is then a placeholder the program overwrites. A
     // whole-element store (`*root = v`, `*root.offset(k) = v`, or the same
     // through a view alias of the root) supplies every field at once.
-    if let TyKind::Adt(def, _) = element.kind() {
+    // F04 exists because a `malloc`ed aggregate's fields are indeterminate
+    // and the spelled zero is a placeholder the program overwrites. An owner
+    // MOVED out of a field (R431) is a fully initialised object: there is no
+    // placeholder to supply.
+    if let TyKind::Adt(def, _) = element.kind()
+        && !constructor.field_load
+    {
         let mut supplied = BTreeSet::new();
         let mut whole = false;
         for e in &expressions.0 {
@@ -811,6 +862,22 @@ pub(crate) fn derive<'tcx>(
             alias_bindings.push((alias, init, start));
         }
     }
+    // A SIZED owner's field projections (`(*x).right = y`, `(*x).height`)
+    // need no rewriting at all: `*x` derefs the Box to the same struct, so
+    // the source text is already valid against the delivered type. They are
+    // covered uses with no edit (R431; the same shape `newNode`'s field
+    // stores already take through F04's supplied set).
+    let mut field_bases: BTreeSet<(u32, Span)> = BTreeSet::new();
+    if constructor.shape == BoxShape::Sized {
+        for e in &expressions.0 {
+            let ExprKind::Field(base, _) = e.kind else { continue };
+            let ExprKind::Unary(rustc_hir::UnOp::Deref, operand) = base.kind else { continue };
+            if root_path(operand, binding) {
+                covered.insert(operand.hir_id.local_id.as_u32());
+                field_bases.insert((operand.hir_id.local_id.as_u32(), operand.span));
+            }
+        }
+    }
     let names = FxHashMap::from_iter([(key, root_spelling.clone())]);
     let slice_uses = super::emitability::collect_slice_uses(
         tcx,
@@ -829,6 +896,10 @@ pub(crate) fn derive<'tcx>(
     // The walker reports the stored owner (`(*h).buf = new_data`) as a raw
     // use without a boundary; that use is the transfer accounted above.
     let is_store_operand = |span: Span| stores.iter().any(|stored| stored.span == span);
+    // A sized owner's own field projection (`(*x).right`, `(*x).height`):
+    // the source text stays as it is and no edit is owed, so the walker's
+    // boundary-less raw use is accounted (R431).
+    let is_field_base = |hir: u32, span: Span| field_bases.contains(&(hir, span));
     if uses.unsupported.is_some_and(|span| {
         !returns.iter().any(|r| r.span == span)
             && !is_store_operand(span)
@@ -843,7 +914,8 @@ pub(crate) fn derive<'tcx>(
             !covered.contains(&u.hir_id.local_id.as_u32())
                 || (u.boundary_span.is_none()
                     && !is_alias_receiver(u.hir_id.local_id.as_u32(), u.span)
-                    && !is_store_operand(u.span))
+                    && !is_store_operand(u.span)
+                    && !is_field_base(u.hir_id.local_id.as_u32(), u.span))
         })
     {
         return Err(SourceHold::UnsupportedOwnerUse);
@@ -1107,25 +1179,35 @@ pub(crate) fn derive<'tcx>(
             },
         );
     }
-    let allocations: Vec<_> = mir_calls
-        .values()
-        .filter(|c| c.expression.hir_id == allocation.hir_id && c.callee == allocator)
-        .collect();
-    let [allocation_call] = allocations.as_slice() else {
-        return Err(SourceHold::ConstructorIdentity);
-    };
-    let allocator_destination = allocation_call
-        .destination
-        .ok_or(SourceHold::ConstructorShape)?;
     let aliases = copy_closure(&body, BTreeSet::from([subject.local.as_u32()]));
-    if !aliases.contains(&allocator_destination.as_u32()) {
-        return Err(SourceHold::ConstructorIdentity);
-    }
+    // R431: an owner MOVED out of another object's field is acquired at the
+    // MIR statement that loads it, not at an allocation call.
+    let field_load_acquisition = constructor.field_load;
+    let allocation_call = if field_load_acquisition {
+        None
+    } else {
+        let allocations: Vec<_> = mir_calls
+            .values()
+            .filter(|c| c.expression.hir_id == allocation.hir_id && c.callee == allocator)
+            .collect();
+        let [call] = allocations.as_slice() else {
+            return Err(SourceHold::ConstructorIdentity);
+        };
+        let destination = call.destination.ok_or(SourceHold::ConstructorShape)?;
+        if !aliases.contains(&destination.as_u32()) {
+            return Err(SourceHold::ConstructorIdentity);
+        }
+        Some((call.key, destination))
+    };
+    let allocator_destination = match allocation_call {
+        Some((_, destination)) => destination,
+        None => subject.local,
+    };
     for call in mir_calls.values() {
         if call
             .destination
             .is_some_and(|local| aliases.contains(&local.as_u32()))
-            && call.key != allocation_call.key
+            && Some(call.key) != allocation_call.map(|(key, _)| key)
         {
             return Err(SourceHold::UnsupportedOwnerUse);
         }
@@ -1271,6 +1353,16 @@ pub(crate) fn derive<'tcx>(
             found: false,
         };
         for (statement_index, statement) in data.statements.iter().enumerate() {
+            // R431: the owner is acquired where it is MOVED out of the field
+            // (`_x = ((*_y).left)`): live from that statement on, and every
+            // later read is the owner's own.
+            if field_load_acquisition && is_field_load_acquisition(statement, &aliases) {
+                if state == State::Live {
+                    return Err(SourceHold::NormalExitCoverage);
+                }
+                state = State::Live;
+                continue;
+            }
             // The store transfer (`(*rb).data_ = new_data`) closes the owner
             // at this statement: it must be live here, and no later
             // statement or terminator of the path may read it.
@@ -1305,7 +1397,7 @@ pub(crate) fn derive<'tcx>(
             return Err(SourceHold::NormalExitCoverage);
         }
         if let Some(call) = mir_calls.get(&block) {
-            if call.key == allocation_call.key {
+            if Some(call.key) == allocation_call.map(|(key, _)| key) {
                 if state == State::Live {
                     return Err(SourceHold::NormalExitCoverage);
                 }
@@ -1384,6 +1476,7 @@ pub(crate) fn derive<'tcx>(
         return_transfer: returns.first().map(|r| r.span),
         store_transfer: stores.first().map(|s| s.span),
         store_field: store_fields.first().copied(),
+        load_field,
         allocation_local: allocator_destination.as_u32(),
         element_spelling: constructor.element_spelling,
         view_aliases,
@@ -1520,6 +1613,130 @@ unsafe extern "C" fn holder_free(mut h: *mut Holder) { free((*h).buf as *mut lib
             })
             .unwrap();
         }
+    }
+
+    /// R431 (relay 035 (a)): avl's rotations as wave-6f's fixture spells
+    /// them. A load out of another object's field (`let mut x = (*y).left;`)
+    /// acquires the owner where the INPUT ITSELF moves it out — the same
+    /// field of the same object is overwritten by a later statement of that
+    /// block — and the close is the rotation's own transfer: `x` is returned,
+    /// `T2` is stored into the other node's field. A load the input leaves in
+    /// place is a traversal TOKEN and owns nothing (R425-2). The permit is
+    /// exercised directly: on this base the model grants these locals `Raw`
+    /// (era-5c's frame grants them); the native stage's own fail-closed hold
+    /// is witnessed in the lane's body-local tests.
+    #[test]
+    fn r431_a_field_load_is_an_owner_only_where_the_input_moves_it_out() {
+        let avl = r#"#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" { fn malloc(_: u64) -> *mut std::ffi::c_void; fn free(_: *mut std::ffi::c_void); }
+#[repr(C)] pub struct Node { pub key: i32, pub left: *mut Node, pub right: *mut Node, pub height: i32 }
+#[automatically_derived] impl ::core::marker::Copy for Node {}
+#[automatically_derived] impl ::core::clone::Clone for Node { #[inline] fn clone(&self) -> Node { *self } }
+pub unsafe extern "C" fn height(mut N: *mut Node) -> i32 { if N.is_null() { return 0 as i32; } return (*N).height; }
+pub unsafe extern "C" fn max(mut a: i32, mut b: i32) -> i32 { return if a > b { a } else { b }; }
+pub unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>() as u64) as *mut Node;
+    (*node).key = key;
+    (*node).left = 0 as *mut Node;
+    (*node).right = 0 as *mut Node;
+    (*node).height = 1 as i32;
+    return node;
+}
+pub unsafe extern "C" fn rightRotate(mut y: *mut Node) -> *mut Node {
+    let mut x = (*y).left;
+    let mut T2 = (*x).right;
+    (*y).left = T2;
+    (*y).height = max(height((*y).left), height((*y).right)) + 1 as i32;
+    (*x).right = y;
+    (*x).height = max(height((*x).left), height((*x).right)) + 1 as i32;
+    return x;
+}
+pub unsafe extern "C" fn leftRotate(mut x: *mut Node) -> *mut Node {
+    let mut y = (*x).right;
+    let mut T2 = (*y).left;
+    (*x).right = T2;
+    (*x).height = max(height((*x).left), height((*x).right)) + 1 as i32;
+    (*y).left = x;
+    (*y).height = max(height((*y).left), height((*y).right)) + 1 as i32;
+    return y;
+}
+pub unsafe extern "C" fn minValueNode(mut node: *mut Node) -> *mut Node {
+    while !((*node).left).is_null() { node = (*node).left; }
+    return node;
+}
+pub unsafe extern "C" fn peek(mut y: *mut Node) -> *mut Node { let mut token = (*y).left; return token; }
+"#;
+        ::utils::compilation::run_compiler_on_str(avl, |tcx| {
+            let (table, ctx) = bo::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    bo::A5Mode::PreciseReplay,
+                    Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let program = bo::collect_program(tcx);
+            let plan_of = |owner: &str, name: &str| {
+                let (subject, _) = table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| {
+                        subject.param_name.as_deref() == Some(name)
+                            && tcx.def_path_str(subject.fn_did.to_def_id()) == owner
+                    })
+                    .unwrap_or_else(|| panic!("{owner}::{name}"));
+                derive(&program, subject, &ctx.constructions)
+            };
+            // `Node { key, left, right, height }`: the moved-out field and the
+            // field the sibling owner is stored into.
+            let (left, right) = (1, 2);
+            // The rotated owner: moved out of `(*y).left`, returned.
+            for (owner, name, field) in [("rightRotate", "x", left), ("leftRotate", "y", right)] {
+                let plan =
+                    plan_of(owner, name).unwrap_or_else(|hold| panic!("{owner}::{name} {hold:?}"));
+                assert_eq!(plan.shape(), BoxShape::Sized);
+                assert_eq!(plan.count(), "1");
+                assert_eq!(plan.load_field().map(|(_, index)| index), Some(field));
+                assert!(
+                    plan.frees().is_empty(),
+                    "{owner}::{name} frees nothing itself"
+                );
+                assert!(plan.scalar_edits().is_empty() && plan.calls().is_empty());
+                let span = plan.return_transfer().expect("the return is the close");
+                assert_eq!(tcx.sess.source_map().span_to_snippet(span).unwrap(), name);
+                assert!(plan.store_transfer().is_none());
+            }
+            // The subtree: moved out of one node's field, stored into the
+            // other's — the store is the close, keyed for wave-6f.
+            for (owner, name, loaded, stored) in [
+                ("rightRotate", "T2", right, left),
+                ("leftRotate", "T2", left, right),
+            ] {
+                let plan =
+                    plan_of(owner, name).unwrap_or_else(|hold| panic!("{owner}::{name} {hold:?}"));
+                assert_eq!(plan.shape(), BoxShape::Sized);
+                assert_eq!(plan.load_field().map(|(_, index)| index), Some(loaded));
+                assert_eq!(plan.store_field().map(|(_, index)| index), Some(stored));
+                let span = plan.store_transfer().expect("the store is the close");
+                assert_eq!(tcx.sess.source_map().span_to_snippet(span).unwrap(), name);
+                assert!(plan.return_transfer().is_none() && plan.frees().is_empty());
+            }
+            // `newNode`'s own allocation is unchanged by R431: a `malloc`
+            // owner closed by its return transfer.
+            let plan = plan_of("newNode", "node").expect("newNode::node");
+            assert!(plan.return_transfer().is_some() && plan.frees().is_empty());
+            assert!(plan.load_field().is_none());
+            // A load the input leaves in place owns nothing (R425-2): no Box,
+            // hence no drop, may be planned for a traversal token.
+            assert!(
+                matches!(
+                    plan_of("peek", "token"),
+                    Err(SourceHold::ConstructorIdentity)
+                ),
+                "a token load is not an acquisition"
+            );
+        })
+        .unwrap();
     }
 
     /// R416-12: brotli's `RingBufferInitBuffer` as the derived substrate

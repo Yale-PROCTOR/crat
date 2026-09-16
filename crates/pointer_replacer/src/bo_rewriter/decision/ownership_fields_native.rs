@@ -791,6 +791,16 @@ fn derive_bundle(
     };
     let tcx = inputs.program.tcx;
     let name = subject.param_name.as_ref().ok_or(NativeHold::Identity)?;
+    // R431: an owner MOVED OUT of another object's field (`let mut x =
+    // (*y).left;`) has no constructor of its own — the load is the FIELD
+    // family's to render (wave-6f's `take()` out of an owning field). Until a
+    // field transaction owns that field, typing this local `Box<T>` would
+    // leave the container's raw copy pointing into memory this Box closes:
+    // the shape holds fail-closed. (The composition lifts the hold for a
+    // field wave-6f's transaction owns; see the R431 predicate patch.)
+    if source.load_field().is_some() {
+        return Err(NativeHold::Missing("native-field-load-field-not-owned"));
+    }
     let mut edits = vec![source.constructor().clone()];
     // R402-2(a): every delivered declaration carries its explicit type. The
     // type is registered as an explicit local declaration site (the same

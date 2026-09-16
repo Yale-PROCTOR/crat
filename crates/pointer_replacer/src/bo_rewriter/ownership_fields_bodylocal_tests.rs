@@ -2197,3 +2197,84 @@ fn r395_custom_global_allocator_is_not_a_c_free_contract() {
     })
     .unwrap();
 }
+
+/// R431, the native half: a local MOVED OUT of another object's field is an
+/// owner only once a field transaction owns that field. Here the model DOES
+/// grant the moved-out local `Owning` (`b`, freed in the same body), and the
+/// native stage still holds it fail-closed — typing `b` a `Box<[u8]>` while
+/// `(*h).buf` stays raw would leave the container's copy pointing into memory
+/// this Box closes. The holder's own allocation (`h`) delivers beside it, so
+/// the hold is the field-load rule's and nothing else's.
+#[test]
+fn r431_a_moved_out_field_owner_holds_until_a_field_transaction_owns_the_field() {
+    let input = r#"#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" { fn malloc(_: u64) -> *mut std::ffi::c_void; fn free(_: *mut std::ffi::c_void); }
+#[repr(C)] pub struct Holder { pub buf: *mut u8, pub len: i32 }
+pub unsafe extern "C" fn run() {
+    let mut h = malloc(::std::mem::size_of::<Holder>() as u64) as *mut Holder;
+    (*h).buf = malloc(64 as u64) as *mut u8;
+    (*h).len = 64 as i32;
+    let mut b = (*h).buf;
+    (*h).buf = 0 as *mut u8;
+    free(b as *mut std::ffi::c_void);
+    free(h as *mut std::ffi::c_void);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let audit = &ctx.raw_boundary_artifacts.ownership_native;
+        println!("R431_NATIVE\n{audit}");
+        let row = |subject: &str| {
+            audit
+                .lines()
+                .find(|line| line.starts_with(subject))
+                .unwrap_or_else(|| panic!("{subject}: {audit}"))
+                .to_owned()
+        };
+        let moved_out = row("run::b#");
+        assert!(
+            moved_out.contains("\towning\t") && moved_out.contains("\ttrue\t"),
+            "the model grants it and the native stage considers it: {moved_out}"
+        );
+        assert!(
+            moved_out.contains("held") && moved_out.contains("native-field-load-field-not-owned"),
+            "{moved_out}"
+        );
+        assert!(
+            row("run::h#").contains("selected"),
+            "the holder still delivers"
+        );
+    })
+    .unwrap();
+    // End to end: `b` keeps its raw form and its C free, `h` delivers with
+    // its drop at the C free site — no second owner of the same allocation.
+    let outcome = super::rewrite_core_injected(
+        ::utils::compilation::str_to_input(input),
+        None,
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        false,
+        Some((
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = outcome else { panic!("{outcome:?}") };
+    println!("R431_EMITTED_BEGIN\n{source}\nR431_EMITTED_END");
+    assert!(source.contains("let mut b = (*h).buf;"), "{source}");
+    assert!(
+        source.contains("free(b as *mut std::ffi::c_void)")
+            || source.contains("free(b as *mut ::std::ffi::c_void)"),
+        "{source}"
+    );
+    assert_eq!(source.matches("::std::mem::drop(").count(), 1, "{source}");
+}
