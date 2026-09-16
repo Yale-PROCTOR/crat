@@ -1469,3 +1469,177 @@ mod r306_void_carrier {
         }
     }
 }
+
+/// **R424-3 — a pending sibling site whose protected source is a TYPED VIEW of
+/// the subject.** tulipindicators `smoke::get_array` passes `line.offset(1)` to
+/// `strtok` while `line` is the protected source of a pending T1 sibling row;
+/// the export's pending-source descriptor knew only the whole subject and the
+/// depth-1 projection, so the row failed closed as
+/// `pending-source-coverage-not-supported` and the whole program's custody
+/// comparison was refused (batch 8's morning: it cost wave-6s and, with it,
+/// wave-5c / wave-5d2 / wave-6f). The shape is a pointer-arithmetic view of the
+/// binding — `binding.offset(e)`, `.add`, `.cast()`, … — and it is describable
+/// exactly: the method name travels in the descriptor and the comparator
+/// re-reads the ORIGINAL argument for that exact method over that exact
+/// binding.
+mod r424_typed_view_pending_source {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::bo_rewriter::{
+        CensusOutcomeKind, bridge_custody_export as custody, decision::sibling_overlap,
+    };
+
+    /// The `PARAMETER_CASE` of `sibling_overlap_tests` with the typed view that
+    /// `sibling_r233_coverage_slice_offset_keeps_its_exact_view_identity` pins:
+    /// `src` stays the protected source of the pending row and reaches `update`
+    /// as `src.offset(0)`.
+    const TYPED_VIEW_CASE: &str = "#![allow(dead_code, unused_unsafe)]\n\
+        pub struct Holder { data: *mut i32 }\n\
+        pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
+        pub unsafe fn caller(holder: *const Holder, src: *const i32) {\n\
+            let _value = *src.offset(1); update((*holder).data, src.offset(0));\n\
+        }\n\
+        pub unsafe fn entry() {\n\
+            let mut value = 1;\n\
+            let holder = Holder { data: &mut value };\n\
+            caller(&holder, &value);\n\
+        }\n";
+
+    type Candidates = Vec<(String, Result<String, String>)>;
+
+    fn typed_view_custody() -> (custody::CheckpointReport, Vec<String>, bool, Candidates) {
+        ::utils::compilation::run_compiler_on_str(TYPED_VIEW_CASE, |tcx| {
+            let ast_capture = crate::bo_rewriter::ast_transform::capture_ast(tcx)
+                .expect("typed-view fixture AST capture");
+            let (table, context) = crate::bo_rewriter::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::bo_rewriter::A5Mode::PreciseReplay,
+                    Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .expect("typed-view fixture decisions");
+            // The fixture is only load-bearing while the inventory really does
+            // carry a PENDING potential whose coverage evidence is a typed view.
+            let typed_view = table
+                .sibling_overlap_inventory
+                .coverage
+                .iter()
+                .filter(|coverage| {
+                    matches!(
+                        coverage.evidence,
+                        sibling_overlap::SourceBridgeEvidence::TypedView { .. }
+                    )
+                })
+                .any(|coverage| {
+                    table
+                        .sibling_overlap_inventory
+                        .potentials
+                        .iter()
+                        .any(|potential| potential.site == coverage.potential.site)
+                });
+            let original_files = tcx
+                .sess
+                .source_map()
+                .files()
+                .iter()
+                .filter_map(|file| {
+                    let key = crate::bo_rewriter::file_key(&file.name)?;
+                    Some((key, file.src.as_ref()?.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let emission = crate::bo_rewriter::emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &context.retained_c9_plans,
+            )
+            .expect("typed-view fixture emission plan");
+            let held = emission.plan.held_classes();
+            let reverts = crate::bo_rewriter::ast_transform::revert_set_from_classes_and_atoms(
+                &held,
+                &BTreeSet::new(),
+                &table,
+            )
+            .expect("typed-view fixture reverts");
+            let (files, _, _, _) = crate::bo_rewriter::ast_transform::ast_emitted_files_from(
+                tcx,
+                &ast_capture,
+                &reverts,
+                emission.plan.root_file.as_ref(),
+                &table,
+                Some(&emission.plan.terminal_call_plans),
+            )
+            .expect("typed-view fixture AST emission");
+            let export =
+                custody::capture(tcx, &ast_capture, &table, &emission.plan, &original_files);
+            let issues = export.terminal_issues.clone();
+            let events = emission.plan.bridge_events(&BTreeSet::new());
+            let sources = files
+                .into_iter()
+                .map(|(file, source)| (custody::file_label(&file), source))
+                .collect::<BTreeMap<_, _>>();
+            let candidates = export
+                .pending_candidates
+                .iter()
+                .map(|(id, candidate)| {
+                    (
+                        id.clone(),
+                        candidate
+                            .as_ref()
+                            .map(|descriptor| {
+                                format!("{:?}", descriptor.expectation.pending_source)
+                            })
+                            .map_err(Clone::clone),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (export, events, sources, issues, typed_view, candidates)
+        })
+        .map(
+            |(export, events, sources, issues, typed_view, candidates)| {
+                // The comparator parses the ORIGINAL and EMITTED text with its own
+                // session, so it runs outside the compiler callback.
+                let report = custody::compare_capture(
+                    &export,
+                    &events,
+                    Some(&sources),
+                    CensusOutcomeKind::Emitted,
+                );
+                (report, issues, typed_view, candidates)
+            },
+        )
+        .expect("typed-view fixture compiler callback")
+    }
+
+    #[test]
+    fn r424_typed_view_pending_source_is_described_not_refused() {
+        let (report, issues, typed_view, candidates) = typed_view_custody();
+        assert!(
+            typed_view,
+            "the fixture must carry a pending potential whose coverage is a typed view"
+        );
+        // The export's own product: every pending candidate of this fixture is
+        // a describable source, and the typed view says so in its shape.
+        assert!(
+            candidates.iter().all(|(_, candidate)| candidate.is_ok()),
+            "a typed view of the protected source is a describable pending source: {candidates:#?}"
+        );
+        assert!(
+            candidates.iter().any(|(_, candidate)| candidate
+                .as_deref()
+                .is_ok_and(|shape| shape.contains("TypedPointerView")
+                    && shape.contains("offset")
+                    && shape.contains("src"))),
+            "the descriptor carries the binding and the exact view method: {candidates:#?}"
+        );
+        assert!(
+            !issues
+                .iter()
+                .chain(report.issues.iter())
+                .any(|issue| issue.contains("pending-source-coverage-not-supported")),
+            "{issues:#?}\n{report:#?}"
+        );
+        assert!(report.data, "{report:#?}");
+    }
+}

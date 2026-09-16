@@ -633,10 +633,24 @@ pub(crate) fn capture(
                         | SourceBridgeEvidence::ProjectedArrayView { .. } => {
                             PendingSourceShape::ProjectedReferent
                         }
-                        SourceBridgeEvidence::TypedView { .. }
-                        | SourceBridgeEvidence::NativeReturnExpression { .. }
-                        | SourceBridgeEvidence::RawFieldValue
-                        | SourceBridgeEvidence::BindingStorage
+                        // **R424-3 — the three remaining licensed shapes of a
+                        // declared source.** Each one is described exactly as
+                        // the decision layer licenses it, and the comparator
+                        // re-reads the ORIGINAL argument for that same shape
+                        // over that same binding (R402-2: no guard, no
+                        // widening — a shape that does not match is refused at
+                        // the comparison, not admitted here).
+                        SourceBridgeEvidence::TypedView { method, .. } => {
+                            PendingSourceShape::TypedPointerView {
+                                method: tcx.item_name(*method).to_string(),
+                            }
+                        }
+                        SourceBridgeEvidence::RawFieldValue => PendingSourceShape::RawFieldValue,
+                        SourceBridgeEvidence::BindingStorage => PendingSourceShape::BindingStorage,
+                        // A declared source never carries a native-return
+                        // carrier (that pairing has its own `SiblingSource`),
+                        // and an unruled shape stays refused.
+                        SourceBridgeEvidence::NativeReturnExpression { .. }
                         | SourceBridgeEvidence::UnknownShape(_) => {
                             return Err("pending-source-coverage-not-supported".into());
                         }

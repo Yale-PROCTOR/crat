@@ -58,6 +58,25 @@ pub(crate) enum PendingSourceShape {
         temporary: String,
         template: String,
     },
+    /// **R424-3 — a typed pointer view of the protected source.**
+    /// `binding.offset(e)` / `.add` / `.cast()` …: the decision layer licenses
+    /// exactly a core pointer method whose receiver IS the binding
+    /// (`sibling_overlap::SourceBridgeEvidence::TypedView`), so the descriptor
+    /// carries that method's name and the comparator re-reads the original
+    /// argument for that exact method over that exact binding — nothing wider.
+    TypedPointerView {
+        method: String,
+    },
+    /// **R424-3 — the raw pointer VALUE loaded out of the subject's field.**
+    /// `(*binding).field`: a load, not a borrow, so it has its own shape; the
+    /// comparator requires the same depth-one field walk over the same binding
+    /// that `ProjectedReferent` requires of a borrow — a load rooted anywhere
+    /// else is a mismatch, not a pass.
+    RawFieldValue,
+    /// **R424-3 — a borrow of the pointer binding's own STORAGE**, `&binding` /
+    /// `&mut binding`: depth zero, distinct from the depth-one projection of
+    /// its referent (`ProjectedReferent`).
+    BindingStorage,
     /// The same carrier placed at a call the argument CONTAINS rather than IS.
     /// Its own arm, so the shape above keeps its exact rule: there the edit
     /// interval and the argument are the same span, here the edit is strictly
@@ -1647,6 +1666,67 @@ fn projected_referent_uses(expression: &ast::Expr, binding: &str) -> bool {
     dereferences == 1 && path(place).as_deref() == Some(binding)
 }
 
+/// **R424-3.** The original argument is the typed view the descriptor names:
+/// the SAME core pointer method over the SAME binding, under pointer casts.
+/// Nothing else passes — a different method, a receiver that is not the
+/// binding, or a place walk of any depth is a mismatch.
+fn typed_pointer_view_uses(expression: &ast::Expr, binding: &str, method: &str) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, ty) = &view.kind {
+        if !matches!(ty.kind, ast::TyKind::Ptr(_)) {
+            return false;
+        }
+        view = unparen(inner);
+    }
+    let ast::ExprKind::MethodCall(call) = &view.kind else {
+        return false;
+    };
+    call.seg.ident.name.as_str() == method
+        && path(unparen(&call.receiver)).as_deref() == Some(binding)
+}
+
+/// **R424-3.** The original argument LOADS a raw pointer out of the subject's
+/// field: a field chain whose place walk reaches the binding at exactly the
+/// recorded dereference depth, with no surrounding borrow.
+fn raw_field_value_uses(expression: &ast::Expr, binding: &str) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    if !matches!(view.kind, ast::ExprKind::Field(..)) {
+        return false;
+    }
+    let mut place = view;
+    let mut depth = 0;
+    loop {
+        match &place.kind {
+            ast::ExprKind::Field(base, _) => place = unparen(base),
+            ast::ExprKind::Unary(ast::UnOp::Deref, base) => {
+                depth += 1;
+                place = unparen(base);
+            }
+            _ => break,
+        }
+    }
+    depth == 1 && path(place).as_deref() == Some(binding)
+}
+
+/// **R424-3.** The original argument borrows the binding's own storage:
+/// `&binding` or `&mut binding`, no projection, no dereference.
+fn binding_storage_uses(expression: &ast::Expr, binding: &str) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, ty) = &view.kind {
+        if !matches!(ty.kind, ast::TyKind::Ptr(_)) {
+            return false;
+        }
+        view = unparen(inner);
+    }
+    let ast::ExprKind::AddrOf(ast::BorrowKind::Ref, _, place) = &view.kind else {
+        return false;
+    };
+    path(unparen(place)).as_deref() == Some(binding)
+}
+
 fn pending_original_source(
     input: &BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -1695,6 +1775,11 @@ fn pending_original_source(
     let shape_matches = match &metadata.shape {
         PendingSourceShape::WholeSubject => whole_subject_uses(expression, name),
         PendingSourceShape::ProjectedReferent => projected_referent_uses(expression, name),
+        PendingSourceShape::TypedPointerView { method } => {
+            typed_pointer_view_uses(expression, name, method)
+        }
+        PendingSourceShape::RawFieldValue => raw_field_value_uses(expression, name),
+        PendingSourceShape::BindingStorage => binding_storage_uses(expression, name),
         PendingSourceShape::NativeReturnExpression { .. }
         | PendingSourceShape::NativeReturnExpressionNested { .. } => {
             return Err("pending-native-expression-carrier-unbuilt".into());
