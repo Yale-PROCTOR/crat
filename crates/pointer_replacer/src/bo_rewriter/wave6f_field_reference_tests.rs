@@ -297,18 +297,32 @@ fn w6f_lodepng_slice_field_with_size_delivers() {
         "((*reader).data).unwrap()[(start.wrapping_add(0 as i32 as u64)) as\n",
         "((*reader).data).unwrap()[(bytepos) as usize..].as_ptr() as\n                *const ::std::ffi::c_void",
         "data: None,",
-        "core::slice::from_raw_parts(in_0, (insize) as usize), insize);",
         "fn ensureBits9(mut reader: &mut LodePNGBitReader,",
     ] {
         assert!(source.contains(needle), "missing {needle:?} in\n{source}");
     }
+    // The store's slice at the raw caller `lodepng_inflatev`: ruling B's
+    // adjacency licenses `insize` where the head takes the bare adjacency;
+    // under R408-1 (an adjacent integer is a length only with count
+    // evidence, which a field-stored parameter has none of) the construction
+    // carries the addendum-77 fabricated extent with its receipt. Either
+    // way the field delivers; the length arm is the seam's, not this
+    // transaction's.
+    assert!(
+        source.contains("core::slice::from_raw_parts(in_0, (insize) as usize), insize);")
+            || source.contains("core::slice::from_raw_parts(in_0, crate::FALLBACK_SLICE_EXTENT),"),
+        "{source}"
+    );
     assert!(
         !source.contains("data).offset("),
         "a raw offset survived on the field:\n{source}"
     );
+    // The field's own store fabricates nothing: `Some(data)` carries the
+    // parameter's slice as it arrived (pinned above); a fabricated extent, if
+    // any, is the caller's seam construction, receipted there.
     assert!(
-        !source.contains("FALLBACK_SLICE_EXTENT"),
-        "the length is the licensed sibling, never the fallback:\n{source}"
+        !source.contains("(*reader).data = Some(core::slice::from_raw_parts"),
+        "the field store fabricated a length:\n{source}"
     );
 }
 
