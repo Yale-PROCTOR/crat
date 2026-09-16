@@ -151,15 +151,34 @@ fn descendant_free(
     parameter: Local,
     visited: &mut FxHashSet<(LocalDefId, Local)>,
 ) -> bool {
+    refusal(tcx, functions, function, parameter, visited).is_none()
+}
+
+/// The scan's verdict with its REASON: `None` is descendant-free, `Some(r)`
+/// names the conjunct that refused (`r` is a short kebab tag, a recursive
+/// refusal prefixed by the callee position that carried it). The reason is
+/// what the child-access receipt reports per site.
+fn refusal(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    function: LocalDefId,
+    parameter: Local,
+    visited: &mut FxHashSet<(LocalDefId, Local)>,
+) -> Option<String> {
+    // A position already on the walk is assumed free: every hand-out is a
+    // concrete statement in some body on the cycle, and every body on the
+    // cycle is scanned (greatest fixpoint). Re-visiting a SIBLING call of the
+    // same position must not refuse it either — brotli's `StoreH35` calls
+    // `StoreH3` twice with the same argument.
     if !visited.insert((function, parameter)) {
-        return false;
+        return None;
     }
     let body = tcx
         .mir_drops_elaborated_and_const_checked(function)
         .borrow();
     let body: &Body<'_> = &body;
-    let aliases = alias_closure(tcx, functions, body, vec![parameter]);
-    scan(tcx, functions, body, &aliases, None, visited)
+    let (aliases, derived) = alias_closure_parts(tcx, functions, body, vec![parameter]);
+    scan(tcx, functions, body, &aliases, &derived, None, visited)
 }
 
 /// Transparent alias closure of `seeds`: copies, pointer casts, the results
@@ -169,8 +188,22 @@ fn alias_closure<'tcx>(
     tcx: TyCtxt<'tcx>,
     functions: &[LocalDefId],
     body: &Body<'tcx>,
-    mut aliases: Vec<Local>,
+    aliases: Vec<Local>,
 ) -> Vec<Local> {
+    alias_closure_parts(tcx, functions, body, aliases).0
+}
+
+/// The closure split into (every alias, the ADDRESS-DERIVED subset). The
+/// retention walk of this frame does not track an address taken under a
+/// pointer, so a derived alias carries no row evidence: the scan must prove
+/// its uses itself and may not hand one to a callee it cannot read.
+fn alias_closure_parts<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
+    body: &Body<'tcx>,
+    mut aliases: Vec<Local>,
+) -> (Vec<Local>, Vec<Local>) {
+    let mut derived = Vec::<Local>::new();
     let mut changed = true;
     while changed {
         changed = false;
@@ -189,6 +222,28 @@ fn alias_closure<'tcx>(
                     && !aliases.contains(&destination)
                 {
                     aliases.push(destination);
+                    if derived.contains(&source) {
+                        derived.push(destination);
+                    }
+                    changed = true;
+                }
+                // An address taken UNDER an alias is a pointer into the same
+                // pointee (brotli's `HashBytesH*(&*data.offset(ix))`): it
+                // joins the closure, so the scan proves its uses too. The
+                // address OF the alias slot (no `Deref`) does not.
+                if let Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) = rhs
+                    && aliases.contains(&place.local)
+                    && matches!(
+                        place.projection.first(),
+                        Some(rustc_middle::mir::PlaceElem::Deref)
+                    )
+                    && let Some(destination) = lhs.as_local()
+                    && destination != rustc_middle::mir::RETURN_PLACE
+                    && pointer(body.local_decls[destination].ty)
+                    && !aliases.contains(&destination)
+                {
+                    aliases.push(destination);
+                    derived.push(destination);
                     changed = true;
                 }
             }
@@ -207,12 +262,15 @@ fn alias_closure<'tcx>(
                 && !aliases.contains(&result)
             {
                 if core_pointer_call(tcx, callee) == Some(CorePointerCall::AliasResult)
-                    && args
+                    && let Some(receiver) = args
                         .first()
                         .and_then(|argument| operand_local(&argument.node))
-                        .is_some_and(|receiver| aliases.contains(&receiver))
+                        .filter(|receiver| aliases.contains(receiver))
                 {
                     aliases.push(result);
+                    if derived.contains(&receiver) {
+                        derived.push(result);
+                    }
                     changed = true;
                     continue;
                 }
@@ -231,7 +289,7 @@ fn alias_closure<'tcx>(
             }
         }
     }
-    aliases
+    (aliases, derived)
 }
 
 /// The body scan over an alias set: no alias may be handed out (stored
@@ -246,9 +304,10 @@ fn scan<'tcx>(
     functions: &[LocalDefId],
     body: &Body<'tcx>,
     aliases: &[Local],
+    derived: &[Local],
     output: Option<Local>,
     visited: &mut FxHashSet<(LocalDefId, Local)>,
-) -> bool {
+) -> Option<String> {
     let outputs = output.map(|output| alias_closure(tcx, functions, body, vec![output]));
     let is_alias =
         |operand: &Operand<'_>| operand_local(operand).is_some_and(|l| aliases.contains(&l));
@@ -272,22 +331,42 @@ fn scan<'tcx>(
             let StatementKind::Assign(assignment) = &statement.kind else { continue };
             let (lhs, rhs) = (&assignment.0, &assignment.1);
             let derived = match rhs {
-                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
-                    aliases.contains(&place.local)
+                // An address taken UNDER an alias (`&*p`, `&raw mut (*p).f`)
+                // is itself a pointer into the same pointee: free while the
+                // closure tracks it and this scan proves its every use
+                // read-through (it is in `aliases`), refused when it lands
+                // anywhere the closure does not track — a projection, the
+                // return place, or a non-pointer destination. The address OF
+                // the alias slot (`&p`, no `Deref`) stays refused.
+                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => aliases
+                    .contains(&place.local)
+                    .then_some("address-of-alias")
+                    .filter(|_| !lhs.as_local().is_some_and(|dest| aliases.contains(&dest))),
+                Rvalue::BinaryOp(BinOp::Offset, operands) => {
+                    is_alias(&operands.0).then_some("offset-binop")
                 }
-                Rvalue::BinaryOp(BinOp::Offset, operands) => is_alias(&operands.0),
-                Rvalue::Aggregate(_, operands) => operands.iter().any(is_alias),
+                Rvalue::Aggregate(_, operands) => {
+                    operands.iter().any(is_alias).then_some("aggregate")
+                }
                 // A copy or pointer cast of an alias stored through any
                 // projection, or into the return place, hands it out; a cast
                 // to a non-pointer is an image the scan cannot follow.
-                Rvalue::Cast(_, operand, ty) => {
-                    is_alias(operand) && (!pointer(*ty) || hands_out(lhs))
+                Rvalue::Cast(_, operand, ty) => is_alias(operand)
+                    .then(|| {
+                        if pointer(*ty) {
+                            "cast-hands-out"
+                        } else {
+                            "non-pointer-cast"
+                        }
+                    })
+                    .filter(|_| !pointer(*ty) || hands_out(lhs)),
+                Rvalue::Use(operand) => {
+                    (is_alias(operand) && hands_out(lhs)).then_some("use-hands-out")
                 }
-                Rvalue::Use(operand) => is_alias(operand) && hands_out(lhs),
-                _ => false,
+                _ => None,
             };
-            if derived {
-                return false;
+            if let Some(reason) = derived {
+                return Some(reason.to_owned());
             }
         }
         match &data.terminator().kind {
@@ -295,19 +374,35 @@ fn scan<'tcx>(
             | TerminatorKind::TailCall { func, args, .. } => {
                 let Some(callee) = resolved(func) else {
                     if args.iter().any(|argument| is_alias(&argument.node)) {
-                        return false;
+                        return Some("unresolved-callee".to_owned());
                     }
                     continue;
                 };
                 if matches!(data.terminator().kind, TerminatorKind::TailCall { .. })
                     && args.iter().any(|argument| is_alias(&argument.node))
                 {
-                    return false;
+                    return Some("tail-call".to_owned());
+                }
+                // An ADDRESS-DERIVED alias carries no retention row (this
+                // frame's walk does not track `&*p`), so only a local callee
+                // this scan reads, or a classified core call, may receive one.
+                if callee
+                    .as_local()
+                    .is_none_or(|local| !functions.contains(&local))
+                    && core_pointer_call(tcx, callee).is_none()
+                    && args.iter().any(|argument| {
+                        operand_local(&argument.node).is_some_and(|l| derived.contains(&l))
+                    })
+                {
+                    return Some(format!(
+                        "derived-address-into-open-callee:{}",
+                        tcx.item_name(callee).as_str()
+                    ));
                 }
                 if let Some(local) = callee.as_local().filter(|local| functions.contains(local)) {
                     for (index, argument) in args.iter().enumerate() {
                         if is_alias(&argument.node)
-                            && !descendant_free(
+                            && let Some(inner) = refusal(
                                 tcx,
                                 functions,
                                 local,
@@ -315,7 +410,10 @@ fn scan<'tcx>(
                                 visited,
                             )
                         {
-                            return false;
+                            return Some(format!(
+                                "{}@{index}:{inner}",
+                                tcx.item_name(local.to_def_id()).as_str()
+                            ));
                         }
                     }
                 }
@@ -332,7 +430,10 @@ fn scan<'tcx>(
                     && args.iter().any(|argument| is_alias(&argument.node))
                     && core_pointer_call(tcx, callee).is_none()
                 {
-                    return false;
+                    return Some(format!(
+                        "non-c-abi-callee:{}",
+                        tcx.item_name(callee).as_str()
+                    ));
                 }
                 // An alias-result core call whose result lands outside a plain
                 // local (a static, a field, the return place) hands the alias
@@ -344,7 +445,7 @@ fn scan<'tcx>(
                     && let TerminatorKind::Call { destination, .. } = &data.terminator().kind
                     && hands_out(destination)
                 {
-                    return false;
+                    return Some("alias-result-outside-a-local".to_owned());
                 }
                 if callee
                     .as_local()
@@ -366,14 +467,14 @@ fn scan<'tcx>(
                             )
                     });
                     if returns_alias {
-                        return false;
+                        return Some("returned-alias-outside-a-local".to_owned());
                     }
                 }
             }
             _ => {}
         }
     }
-    true
+    None
 }
 
 /// The body scan alone (no retention row): the parameter at `index` is only
@@ -385,6 +486,23 @@ pub(crate) fn position_is_descendant_free(
     index: usize,
 ) -> bool {
     descendant_free(
+        tcx,
+        functions,
+        function,
+        Local::from_usize(index + 1),
+        &mut FxHashSet::default(),
+    )
+}
+
+/// The scan's refusal reason for a position, for the receipt and the
+/// witnesses: `None` where `position_is_descendant_free` is true.
+pub(crate) fn position_refusal(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    function: LocalDefId,
+    index: usize,
+) -> Option<String> {
+    refusal(
         tcx,
         functions,
         function,
@@ -408,16 +526,18 @@ pub(crate) fn position_is_descendant_free_modulo_output(
         .borrow();
     let body: &Body<'_> = &body;
     let parameter = Local::from_usize(index + 1);
-    let aliases = alias_closure(tcx, functions, body, vec![parameter]);
+    let (aliases, derived) = alias_closure_parts(tcx, functions, body, vec![parameter]);
     let mut visited = FxHashSet::from_iter([(function, parameter)]);
     scan(
         tcx,
         functions,
         body,
         &aliases,
+        &derived,
         Some(Local::from_usize(output_index + 1)),
         &mut visited,
     )
+    .is_none()
 }
 
 /// The reader side of the same certificate: every pointer LOADED from
@@ -465,15 +585,17 @@ pub(crate) fn loaded_field_is_descendant_free(
             }
         }
     }
-    let aliases = alias_closure(tcx, functions, body, loaded);
+    let (aliases, derived) = alias_closure_parts(tcx, functions, body, loaded);
     scan(
         tcx,
         functions,
         body,
         &aliases,
+        &derived,
         None,
         &mut FxHashSet::default(),
     )
+    .is_none()
 }
 
 /// The returned-alias continuation at ONE call site: a callee position whose
@@ -550,43 +672,89 @@ pub(crate) fn verify_certificate(
 /// Rewrite the type-backed records whose callee position is descendant-free.
 /// The retention rows are the same summaries the raw-boundary disposition
 /// consumes; nothing is re-derived.
+/// The child-access receipt header (relay wave-6r/017: one additive
+/// instrument-only artifact; main writes it beside the other census rows).
+pub(crate) const CHILD_ACCESS_HEADER: &str = "callee\targument_index\taccess\toutcome\treason\n";
+
 pub(crate) fn discharge<'a>(
     program: &RustProgram<'_>,
     rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
     records: impl Iterator<Item = &'a mut ReturnedChildEvidence>,
-) {
+) -> String {
     let tcx: TyCtxt<'_> = program.tcx;
-    let mut memo = FxHashMap::<(LocalDefId, usize), bool>::default();
+    let mut memo = FxHashMap::<(LocalDefId, usize), Option<String>>::default();
+    let mut receipt = FxHashMap::<(String, usize), (String, String, String)>::default();
     for record in records {
         if matches!(record.access, ChildAccess::Unused) {
             continue;
         }
-        let Some(callee) = record.key.callee.as_local() else { continue };
-        if !program.functions.contains(&callee) {
-            continue;
+        let access = match &record.access {
+            ChildAccess::Unused => "unused",
+            ChildAccess::ReadOnly { .. } => "read-only",
+            ChildAccess::Writes { .. } => "writes",
+            ChildAccess::Unknown { .. } => "unknown",
         }
+        .to_owned();
         let index = record.key.parent_argument_index;
-        if !matches!(
-            rows.get(&(callee, index)),
-            Some(RetentionVerdict::NoRetain { .. })
-        ) {
+        let name = tcx.def_path_str(record.key.callee);
+        let mut note = |outcome: &str, reason: &str| {
+            receipt.insert(
+                (name.clone(), index),
+                (access.clone(), outcome.to_owned(), reason.to_owned()),
+            );
+        };
+        let Some(callee) = record.key.callee.as_local() else {
+            note("held", "callee-not-local");
+            continue;
+        };
+        if !program.functions.contains(&callee) {
+            note("held", "callee-outside-the-program");
             continue;
         }
-        let free = *memo.entry((callee, index)).or_insert_with(|| {
-            let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
-            index < body.arg_count
-                && descendant_free(
+        match rows.get(&(callee, index)) {
+            Some(RetentionVerdict::NoRetain { .. }) => {}
+            Some(RetentionVerdict::Retains { .. }) => {
+                note("held", "callee-row-retains");
+                continue;
+            }
+            _ => {
+                note("held", "callee-row-unknown");
+                continue;
+            }
+        }
+        let refused = memo
+            .entry((callee, index))
+            .or_insert_with(|| {
+                let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+                if index >= body.arg_count {
+                    return Some("position-is-not-a-parameter".to_owned());
+                }
+                drop(body);
+                refusal(
                     tcx,
                     &program.functions,
                     callee,
                     Local::from_usize(index + 1),
                     &mut FxHashSet::default(),
                 )
-        });
-        if !free {
+            })
+            .clone();
+        if let Some(reason) = refused {
+            note("held", &reason);
             continue;
         }
+        note("discharged", "-");
         record.access = ChildAccess::Unused;
         record.contract_provenance = PROVENANCE;
     }
+    let mut rows = receipt
+        .into_iter()
+        .map(|((callee, index), (access, outcome, reason))| {
+            format!("{callee}\t{index}\t{access}\t{outcome}\t{reason}\n")
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    let mut out = String::from(CHILD_ACCESS_HEADER);
+    out.extend(rows);
+    out
 }

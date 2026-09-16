@@ -425,3 +425,6 @@ mod wave6r_static_dict_tests;
 
 #[path = "wave6r_iterator_tests.rs"]
 mod wave6r_iterator_tests;
+
+#[path = "wave6r_address_alias_tests.rs"]
+mod wave6r_address_alias_tests;

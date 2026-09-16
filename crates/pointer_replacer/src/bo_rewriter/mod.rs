@@ -428,6 +428,10 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) edit_keys: String,
     pub(crate) sites: String,
     pub(crate) retention: String,
+    /// wave-6r (relay 017): the K18' child-access receipt, one row per callee
+    /// position with its outcome and refusal reason. Instrument-only; main
+    /// writes it as `raw-boundary-child-access.tsv` beside the other rows.
+    pub(crate) child_access: String,
     pub(crate) dispositions: String,
     pub(crate) subjects: String,
     pub(crate) atoms: String,
@@ -8217,6 +8221,7 @@ fn finish_decide<'tcx>(
             edit_keys: String::from("edit_key\n"),
             sites: raw_boundary_sites.to_tsv(),
             retention: retention.to_tsv(),
+            child_access: retention.child_access.clone(),
             dispositions: raw_boundary.receipts_tsv(),
             subjects: raw_boundary_subjects_tsv(tcx, &hypothetical, &table, &coconv, &raw_boundary),
             atoms: raw_boundary.atoms_tsv(),

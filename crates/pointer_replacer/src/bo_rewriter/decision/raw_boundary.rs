@@ -1625,6 +1625,10 @@ pub(crate) struct RetentionSummaries {
     type_backed_children: FxHashMap<LocalDefId, Vec<ReturnedChildRecord>>,
     /// W-C5: raw-pointer parameters whose pointee reaches no pointer.
     pointer_free_parameters: FxHashSet<(LocalDefId, usize)>,
+    /// wave-6r (relay 017): the child-access receipt — one row per callee
+    /// position the K18' discharge looked at, with its outcome and, where it
+    /// held, the conjunct that refused. Instrument-only.
+    pub(crate) child_access: String,
 }
 
 #[derive(Clone, Debug)]
@@ -3087,7 +3091,7 @@ impl RetentionSummaries {
         } else {
             evaluate_retention(&facts, attested)
         };
-        crate::bo_rewriter::wave6r_child_access::discharge(
+        let child_access = crate::bo_rewriter::wave6r_child_access::discharge(
             program,
             &rows,
             type_backed_children
@@ -3100,6 +3104,7 @@ impl RetentionSummaries {
             facts,
             attested,
             returned_children,
+            child_access,
             type_backed_children,
             pointer_free_parameters,
         }
