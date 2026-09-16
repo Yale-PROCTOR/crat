@@ -4947,8 +4947,11 @@ fn composed_by_slice_constructor(edits: &[plan::Edit], inner_index: usize) -> bo
         let cursor = matches!(outer.edit_kind, "cursor-constructor" | "cursor-advance")
             && inner.edit_kind == "subject-use"
             && outer.owner_class == inner.owner_class;
+        let value_over_cursor_address = outer.edit_kind == "option-value"
+            && inner.edit_kind == "cursor-address"
+            && outer.owner_class == inner.owner_class;
         outer_index != inner_index
-            && (slice || option || cursor)
+            && (slice || option || cursor || value_over_cursor_address)
             && outer.lo <= inner.lo
             && inner.hi <= outer.hi
     })

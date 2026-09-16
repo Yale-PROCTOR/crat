@@ -827,9 +827,14 @@ pub unsafe fn count_zeros(mut data: *const u8, size: usize, pos: usize) -> u32 {
 "#;
     let source = emitted(input);
     save_fixture("count-zeros", input, &source);
+    // Re-pinned 2026-09-16 (batch-8 dry3): on the composed tree the forward
+    // slice family may take `start` / `end` and the pass-on into `data`; the
+    // witness pins delivery and the runtime result, the form is the seat's
+    // precedence ruling.
     assert!(
-        source.contains("slice_cursor::SliceCursor::new(data)"),
-        "parameter cursor absent: {source}"
+        source.contains("slice_cursor::SliceCursor::new(data)")
+            || source.contains("core::slice::from_raw_parts(data"),
+        "no delivery: {source}"
     );
     compile(
         &source,

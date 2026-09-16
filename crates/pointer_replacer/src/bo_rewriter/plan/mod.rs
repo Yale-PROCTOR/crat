@@ -503,6 +503,12 @@ fn nested_ast_composition(
             "cursor-constructor" | "cursor-advance"
         ) && inner.key.bridge_kind == "subject-use"
             && contains(outer, inner);
+        // Another family's value edit (`Some(&*in_0.offset(k))`) over a cursor's
+        // derived address inside it: the cursor's inner text is composed into
+        // the outer at promote time and the AST pass applies only the outer.
+        let option_value_over_cursor_address = outer.key.bridge_kind == "option-value"
+            && inner.key.bridge_kind == "cursor-address"
+            && contains(outer, inner);
         // L07 (§39 addendum 272, R272-3). The five outer/inner kind pairs the
         // J'' frame measures as STRICT CONTAINMENTS, entering under exactly
         // the dependency discipline `bridge_over_subject` already uses: the
@@ -570,6 +576,7 @@ fn nested_ast_composition(
             || slice_construction_over_inner
             || option_value_over_inner
             || cursor_constructor_over_element
+            || option_value_over_cursor_address
             || raw_receiver_over_argument
     };
     if composable(left, right) {
