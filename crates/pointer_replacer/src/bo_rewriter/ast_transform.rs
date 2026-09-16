@@ -875,6 +875,12 @@ impl Composition {
         true
     }
 
+    /// The transform that owns `node`, if any (R410-2(d): a family that finds
+    /// its target replaced asks who replaced it before yielding).
+    pub(crate) fn holder(&self, node: NodeId) -> Option<&'static str> {
+        self.claimed.get(&node).copied()
+    }
+
     /// The spans this transform actually edited. Empty means the transform
     /// changed nothing — and then nothing is reprinted, which is the correct
     /// answer, not a degenerate one.

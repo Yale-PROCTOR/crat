@@ -624,6 +624,7 @@ pub(crate) fn graft_calls(
         consumed: rustc_hash::FxHashSet::default(),
         failure: None,
         unsafe_fn: false,
+        yielded: Vec::new(),
     };
     rustc_ast::mut_visit::MutVisitor::visit_crate(&mut visitor, krate);
     if let Some(why) = visitor.failure {
@@ -646,6 +647,8 @@ struct CallGraft<'a> {
     consumed: rustc_hash::FxHashSet<(u32, u32)>,
     failure: Option<String>,
     unsafe_fn: bool,
+    /// Calls yielded to another family's replacement (R410-2(d)).
+    yielded: Vec<((u32, u32), rustc_span::Span)>,
 }
 
 impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
@@ -690,6 +693,16 @@ impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
             return;
         }
         let rustc_ast::ExprKind::Call(callee, args) = &mut e.kind else {
+            // R410-2(d): a call another family's edit already replaced (an
+            // A5 / PAIR raw-view snapshot wraps the call in a block) — the
+            // counted-void plan YIELDS the call: it is consumed, unplaced,
+            // and its class pays at the compile gate rather than the whole
+            // round failing. A node no family claimed is still an error.
+            if self.guard.holder(e.id).is_some() {
+                self.consumed.insert(key);
+                self.yielded.push((key, e.span));
+                return;
+            }
             self.failure = Some(format!(
                 "counted-void call at {}..{} resolved to a non-call AST node",
                 key.0, key.1
