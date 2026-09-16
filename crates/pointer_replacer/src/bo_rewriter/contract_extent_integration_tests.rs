@@ -1609,3 +1609,34 @@ pub unsafe fn print_error(color: i32, p: *mut i8) -> usize {
         .expect("CE-S04 box_vertical subject");
     assert_eq!(local.2, "pending-sibling-overlap", "{decisions:#?}");
 }
+
+/// R419-3 at the CONTRACT-ALONE arm: urlparser's `get_part::format#2` — the
+/// parameter's only use is `sscanf(fmt_url, format, tmp)` position 1, a
+/// NUL-terminated read, so R407-14 would promote it over `Ptr` fatness; but the
+/// scanf tail WRITES `tmp` at the same call, so the site is a pending
+/// sibling-overlap site and the promotion would deliver a held subject.
+const CE_A03_CONTRACT_ALONE_PENDING: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" {
+    fn sscanf(s: *const i8, format: *const i8, _: ...) -> i32;
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+pub unsafe fn get_part(url: *const i8, format: *const i8) -> i32 {
+    let tmp = malloc(16) as *mut i8;
+    sscanf(url, format, tmp)
+}
+"#;
+
+#[test]
+fn ce_a03_a_contract_alone_candidate_at_a_pending_sibling_site_holds() {
+    let decisions = super::emit_tests::decisions_of(CE_A03_CONTRACT_ALONE_PENDING);
+    let format = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "format" && *is_param)
+        .expect("CE-A03 format subject");
+    // The promotion is not taken; the ladder's own thin-extent gate holds the
+    // subject under the reason the pinned libc control carries for it.
+    assert_eq!(format.2, "held:thin-extent", "{decisions:#?}");
+    let source = emitted(CE_A03_CONTRACT_ALONE_PENDING);
+    assert!(!source.contains("format: &[i8]"), "{source}");
+}

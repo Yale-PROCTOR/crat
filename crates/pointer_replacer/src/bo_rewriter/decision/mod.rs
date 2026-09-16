@@ -2121,6 +2121,24 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if let Some(contract_form) = contract_form
         && let contract_extent::Selection::Promote(promotion) =
             contract_extent.select(subject, contract_form, Some(SlotKind::Ref), fat)
+        // R419-3 / R304-2 at this arm: a contract-alone promotion is the one
+        // contract delivery whose first census is still ahead, and urlparser's
+        // `get_part::format#2` sits at `sscanf(fmt_url, format, tmp)` — a
+        // NUL-terminated read whose scanf tail WRITES the sibling `tmp`, so the
+        // site is pending and the promotion would deliver a held subject. The
+        // promotion is simply not taken there; the ladder's own thin-extent
+        // gate then holds the subject under its existing reason, which is the
+        // class the pinned libc control carries for it.
+        //
+        // A LITERAL construction is left to the literal rule's own refusal in
+        // `decide_one` (the typed `pending-sibling-overlap`), so one subject
+        // never receives two refusals for one site.
+        && !(promotion.contract_alone
+            && !matches!(
+                constructions.by_binding.get(&(subject.fn_did, subject.hir_id)),
+                Some(construction::Construction::StringLiteral { .. })
+            )
+            && pending_sibling::pending_site(facts, (subject.fn_did, subject.hir_id)).is_some())
     {
         contract_alone = promotion.contract_alone;
         form = if matches!(
