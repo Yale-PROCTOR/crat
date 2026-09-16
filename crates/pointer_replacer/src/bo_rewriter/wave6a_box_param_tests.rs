@@ -593,3 +593,50 @@ pub static mut HOOKS: [Option<unsafe extern "C" fn(i32) -> i32>; 1] = [Some(run 
         out.artifacts.box_param_receipts
     );
 }
+
+/// **The exported pair at the surface** (relay wave-6a/016, the user's
+/// priority): ht's `ht_create` / `ht_destroy` are `#[no_mangle]` exports with
+/// NO in-program caller, so the consuming formal holds `box-param-no-callers`
+/// and the producer's return has no receiver. Under R415-7 each crate is the
+/// whole program, so the only producer of that pointee IS the export: the
+/// pair can close at the surface — the producer's wrapper hands the raw
+/// pointer out (`Box::into_raw`) and the consumer's wrapper takes it back
+/// (`Box::from_raw`), so the block is allocated and released by one
+/// allocator. This witness reads what the frame does today.
+#[test]
+fn w6a_c1_exported_pair_without_in_program_callers() {
+    const PAIR: &str = r#"
+#[repr(C)]
+pub struct ht { pub length: usize, pub capacity: usize }
+#[no_mangle]
+pub unsafe extern "C" fn ht_create() -> *mut ht {
+    let mut table = malloc(::std::mem::size_of::<ht>()) as *mut ht;
+    if table.is_null() { return 0 as *mut ht; }
+    (*table).length = 0 as usize;
+    (*table).capacity = 16 as usize;
+    return table;
+}
+#[no_mangle]
+pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
+    free(table as *mut core::ffi::c_void);
+}
+"#;
+    let out = emitted("boxparam-exported-pair", &with_prelude(PAIR));
+    let src = compact(&out.source);
+    let receipts = format!(
+        "{}\n{}",
+        out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
+    );
+    // Today both ends hold, each on the same fact: the program has no
+    // in-crate caller or receiver. The two typed holds ARE the pair-closure
+    // rule's premise (report 011 STOP 1); no Box is emitted.
+    assert!(
+        receipts.contains("ht_destroy::table\theld\tbox-param-no-callers:ht_destroy"),
+        "{receipts}"
+    );
+    assert!(
+        receipts.contains("ht_create::table\theld\treturn-certificate-no-receivers:ht_create"),
+        "{receipts}"
+    );
+    assert!(!src.contains("Box<"), "{}", out.source);
+}
