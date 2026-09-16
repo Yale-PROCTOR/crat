@@ -109,6 +109,14 @@ fn reason(rows: &[(String, bool, String)], name: &str) -> String {
         .clone()
 }
 
+fn local_reason(rows: &[(String, bool, String)], name: &str) -> String {
+    rows.iter()
+        .find(|(n, p, _)| n == name && !*p)
+        .unwrap_or_else(|| panic!("no local subject {name}: {rows:?}"))
+        .2
+        .clone()
+}
+
 /// Every accessor parameter of the chain delivers, the chain is emitted as
 /// disjoint byte regions at the caller, and the tree type-checks.
 #[test]
@@ -533,4 +541,101 @@ fn w6b_h40_caller_locals_receive_region_slices() {
         "no raw arithmetic remains on the delivered locals: {source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// binn `copy_be64` (rs-crown/binn `lib.rs:212`): a `*mut u64` parameter
+/// cast to `*mut c_uchar` and read byte by byte at `7 - i` — an 8-byte view
+/// of one scalar, the byte-view-of-typed-storage shape (relay 009 / R416-7).
+pub(super) const BE64: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type u64_0 = u64;
+unsafe extern "C" fn copy_be64(mut pdest: *mut u64_0, mut psource: *mut u64_0) {
+    let mut source = psource as *mut libc::c_uchar;
+    let mut dest = pdest as *mut libc::c_uchar;
+    let mut i: libc::c_int = 0;
+    i = 0 as libc::c_int;
+    while i < 8 as libc::c_int {
+        *dest.offset(i as isize) = *source.offset((7 as libc::c_int - i) as isize);
+        i += 1;
+    }
+}
+pub unsafe extern "C" fn swap(mut a: u64_0) -> u64_0 {
+    let mut b: u64_0 = 0;
+    copy_be64(&mut b, &mut a);
+    return b;
+}
+"#;
+
+/// The byte view delivers: each local is a `size_of::<u64>()`-byte slice over
+/// its parameter's own storage; the byte reads and writes index it.
+#[test]
+fn w6b_be64_byte_view_of_a_scalar_parameter_delivers() {
+    let rows = super::emit_tests::decisions_of(BE64);
+    for name in ["pdest", "psource"] {
+        assert_eq!(reason(&rows, name), "<emitted>", "{name}: {rows:?}");
+    }
+    for name in ["source", "dest"] {
+        assert_eq!(local_reason(&rows, name), "<emitted>", "{name}: {rows:?}");
+    }
+    let source = super::emit_tests::ast_emitted_source_of(BE64).expect("AST output");
+    let flat = compact(&source);
+    assert!(
+        flat.contains("letmutsource:&[u8]=core::slice::from_raw_parts(")
+            && flat.contains("*mutlibc::c_uchar,core::mem::size_of::<u64>())"),
+        "the read view is a shared byte slice of exactly the scalar's bytes: {source}"
+    );
+    assert!(
+        flat.contains("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut("),
+        "the written view is a mutable byte slice: {source}"
+    );
+    assert!(
+        flat.contains("dest[(i)asusize]=source[((7aslibc::c_int-i))asusize]"),
+        "the byte accesses index the views: {source}"
+    );
+    assert!(
+        !source.contains("FALLBACK_SLICE_EXTENT"),
+        "the extent is the scalar's size, never fabricated: {source}"
+    );
+    assert!(
+        super::verify::type_checks_str(&source),
+        "output compiles: {source}"
+    );
+}
+
+/// The parameter used anywhere but the cast is not in the class: a safe form
+/// of it alongside the view would be a second live path to the scalar.
+#[test]
+fn w6b_byte_view_holds_when_the_parameter_is_reused() {
+    let reused = BE64.replace(
+        "let mut i: libc::c_int = 0;",
+        "let mut again: u64_0 = *psource;\n    let mut i: libc::c_int = 0;",
+    );
+    let rows = super::emit_tests::decisions_of(&reused);
+    assert_eq!(
+        local_reason(&rows, "source"),
+        "slice-neg-or-unknown-offset",
+        "the ladder's own hold stays: {rows:?}"
+    );
+    assert_eq!(local_reason(&rows, "dest"), "<emitted>", "{rows:?}");
+}
+
+/// A pointer to a struct viewed as bytes is not in the class: the rule reads
+/// one scalar's bytes.
+#[test]
+fn w6b_byte_view_of_a_struct_pointer_is_not_in_the_class() {
+    let structured = BE64
+        .replace(
+            "pub type u64_0 = u64;",
+            "#[repr(C)] #[derive(Copy, Clone)] pub struct u64_0 { pub lo: u32, pub hi: u32 }",
+        )
+        .replace(
+            "let mut b: u64_0 = 0;",
+            "let mut b: u64_0 = u64_0 { lo: 0, hi: 0 };",
+        );
+    let rows = super::emit_tests::decisions_of(&structured);
+    assert_eq!(
+        local_reason(&rows, "source"),
+        "slice-neg-or-unknown-offset",
+        "{rows:?}"
+    );
 }

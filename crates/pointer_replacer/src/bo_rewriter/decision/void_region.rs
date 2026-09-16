@@ -71,6 +71,11 @@ pub(crate) enum Shape {
     Accessor,
     /// `return *(p as *const T)` — one value of `T` read at offset 0.
     WidthRead,
+    /// A LOCAL `let v = p as *mut u8` over a typed scalar parameter `p: *mut T`:
+    /// the `size_of::<T>()` bytes of one scalar, viewed byte by byte (relay
+    /// 009 / R416-7; binn `copy_be64::source`). The local is the subject; the
+    /// parameter keeps its own form.
+    ByteView,
 }
 
 impl Shape {
@@ -78,6 +83,7 @@ impl Shape {
         match self {
             Self::Accessor => "accessor",
             Self::WidthRead => "width-read",
+            Self::ByteView => "byte-view",
         }
     }
 }
@@ -293,6 +299,90 @@ fn strip_plain_casts<'tcx>(expr: &'tcx Expr<'tcx>) -> (&'tcx Expr<'tcx>, usize) 
     (current, count)
 }
 
+/// What one local proves about itself: a byte view of one scalar parameter.
+struct ByteView {
+    parameter: HirId,
+    /// The scalar type as the parameter spells it, resolved.
+    scalar: String,
+    size: u64,
+    initializer: HirId,
+    initializer_span: Span,
+}
+
+/// Count the body's path uses of one local binding.
+struct UseCounter {
+    local: HirId,
+    count: usize,
+}
+
+impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for UseCounter {
+    fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
+        if is_param_path(expression, self.local) {
+            self.count += 1;
+        }
+        rustc_hir::intravisit::walk_expr(self, expression);
+    }
+}
+
+/// Read one unannotated local's byte view: `let v = p as *mut u8` (any run of
+/// plain pointer casts, ending at `u8`) where `p` is a parameter of this
+/// function typed `*T` for a scalar `T`, and the cast is `p`'s ONLY use in
+/// the body — so the view is the only live path to the scalar while it
+/// lives, and a safe form of `p` is never used alongside it. `None` is "not
+/// in the class"; the ladder's own hold stays.
+fn read_byte_view<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<ByteView> {
+    if subject.ptr_depth != 1 || subject.kind != SubjectKind::Local || subject.ty_span.is_some() {
+        return None;
+    }
+    let Node::LetStmt(let_stmt) = tcx.parent_hir_node(subject.hir_id) else { return None };
+    if let_stmt.ty.is_some() || let_stmt.pat.hir_id != subject.hir_id {
+        return None;
+    }
+    let initializer = let_stmt.init?;
+    if initializer.span.from_expansion() || !matches!(initializer.kind, ExprKind::Cast(..)) {
+        return None;
+    }
+    let typeck = tcx.typeck(subject.fn_did);
+    let TyKind::RawPtr(viewed, _) = typeck.expr_ty(initializer).kind() else { return None };
+    if *viewed != tcx.types.u8 {
+        return None;
+    }
+    let (base, _) = strip_plain_casts(initializer);
+    let ExprKind::Path(QPath::Resolved(_, path)) = &base.kind else { return None };
+    let Res::Local(parameter) = path.res else { return None };
+    let body = tcx.hir_body_owned_by(subject.fn_did);
+    if !body
+        .params
+        .iter()
+        .any(|param| param.pat.hir_id == parameter)
+    {
+        return None;
+    }
+    let TyKind::RawPtr(scalar_ty, _) = typeck.expr_ty(base).kind() else { return None };
+    if !matches!(
+        scalar_ty.kind(),
+        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+    ) {
+        return None;
+    }
+    let (size, _) = layout_of(tcx, subject.fn_did, *scalar_ty)?;
+    let mut counter = UseCounter {
+        local: parameter,
+        count: 0,
+    };
+    rustc_hir::intravisit::Visitor::visit_expr(&mut counter, body.value);
+    if counter.count != 1 {
+        return None;
+    }
+    Some(ByteView {
+        parameter,
+        scalar: super::declaration::pointee_source(tcx, *scalar_ty),
+        size,
+        initializer: initializer.hir_id,
+        initializer_span: initializer.span,
+    })
+}
+
 /// Read one body's chain. `None` is "not in the class", never a hold on its
 /// own — the void hold stays in force.
 fn read_chain<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<Chain> {
@@ -487,6 +577,8 @@ pub(crate) fn collect(
             continue;
         }
         let len_bytes = match chain.shape {
+            // A chain is read from a parameter's body; a byte view is a local's.
+            Shape::ByteView => unreachable!("a chain never reads as a byte view"),
             Shape::WidthRead => Some(chain.element_size),
             Shape::Accessor => absolute
                 .iter()
@@ -499,6 +591,7 @@ pub(crate) fn collect(
         let name = &chain.param_name;
         let element = &chain.element;
         let replacement = match chain.shape {
+            Shape::ByteView => unreachable!("a chain never reads as a byte view"),
             Shape::WidthRead => {
                 let bytes = (0..chain.element_size)
                     .map(|i| format!("{name}[{i}]"))
@@ -550,13 +643,35 @@ pub(crate) fn collect(
         );
         out.insert(*key, region);
     }
+    // Byte views: the local's uses stay the slice-use walk's own (indexing of
+    // a `size_of::<T>()`-byte slice); the contract carries the extent.
+    for subject in subjects {
+        let Some(view) = read_byte_view(tcx, subject) else { continue };
+        out.insert(
+            (subject.fn_did, subject.hir_id),
+            Region {
+                shape: Shape::ByteView,
+                offset_bytes: 0,
+                len_bytes: Some(view.size),
+                element: "u8".to_owned(),
+                element_size: 1,
+                mutable: subject.mutable,
+                uses: Vec::new(),
+                replaced: view.initializer_span,
+            },
+        );
+    }
     out
 }
 
 /// The body rewrites, installed over whatever the slice-use walk recorded for
-/// the parameter: the returned expression is the parameter's only use.
+/// the parameter: the returned expression is the parameter's only use. A byte
+/// view keeps the walk's rewrites: its uses are ordinary indexing.
 pub(crate) fn install(contracts: &Contracts, uses: &mut FxHashMap<Key, SliceUses>) {
     for (key, region) in contracts {
+        if region.shape == Shape::ByteView {
+            continue;
+        }
         uses.insert(
             *key,
             SliceUses {
@@ -713,7 +828,8 @@ pub(crate) fn retention(
 ) {
     use crate::bo_rewriter::bridge_receipt::BridgeRetentionTier;
     match region.shape {
-        Shape::WidthRead => (BridgeRetentionTier::T1, None),
+        // A byte view is a local's own reborrow; nothing is called.
+        Shape::WidthRead | Shape::ByteView => (BridgeRetentionTier::T1, None),
         Shape::Accessor => (
             BridgeRetentionTier::T2,
             Some(crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
@@ -870,6 +986,9 @@ pub(crate) struct Receiver {
     pub(crate) fabricated: bool,
     /// The caller is an `unsafe fn`: no redundant inner `unsafe` block.
     pub(crate) enclosing_unsafe_fn: bool,
+    /// A byte view: the scalar parameter viewed, in the same function
+    /// (`callee` is then the function itself and carries no dependency).
+    pub(crate) parameter: Option<HirId>,
 }
 
 pub(crate) type Receivers = FxHashMap<Key, Receiver>;
@@ -976,6 +1095,36 @@ pub(crate) fn receivers(
                     .skip_binder()
                     .safety
                     .is_unsafe(),
+                parameter: None,
+            },
+        );
+    }
+    // Byte views: the local's initializer (the cast of the parameter) is
+    // wrapped as a slice of exactly the scalar's bytes.
+    for subject in subjects {
+        let Some(view) = read_byte_view(tcx, subject) else { continue };
+        let node = (subject.fn_did, subject.hir_id);
+        if !contracts.contains_key(&node) {
+            continue;
+        }
+        out.insert(
+            node,
+            Receiver {
+                node,
+                callee: subject.fn_did,
+                initializer_hir: view.initializer,
+                initializer_span: view.initializer_span,
+                element: "u8".to_owned(),
+                mutable: subject.mutable,
+                count_text: format!("core::mem::size_of::<{}>()", view.scalar),
+                fabricated: false,
+                enclosing_unsafe_fn: tcx
+                    .fn_sig(subject.fn_did)
+                    .skip_binder()
+                    .skip_binder()
+                    .safety
+                    .is_unsafe(),
+                parameter: Some(view.parameter),
             },
         );
     }
@@ -1009,7 +1158,7 @@ pub(crate) fn append_receiver_declarations(table: &mut super::DecisionTable) {
             | super::Decision::Cursor { .. }
             | super::Decision::Degraded(_) => false,
         };
-        if !admitted || !accessor_delivered(table, receiver.callee) {
+        if !admitted || !source_delivered(table, receiver) {
             continue;
         }
         let Some(name) = subject.param_name.as_deref() else { continue };
@@ -1043,11 +1192,23 @@ pub(crate) fn append_receiver_declarations(table: &mut super::DecisionTable) {
             bridge_kind: "void-region-receiver",
             expected_form: receiver.declared_form(),
             found_form: "raw",
-            argument_kind: "return-call-result",
-            retention: BridgeRetentionTier::T2,
-            waiver_id: Some(
-                crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
-            ),
+            argument_kind: if receiver.parameter.is_some() {
+                "byte-view-of-scalar"
+            } else {
+                "return-call-result"
+            },
+            // A byte view is a reborrow of the parameter's own storage in the
+            // same body — nothing is called, nothing can retain it (T1). An
+            // accessor's raw result is return-carried (T2, the waiver).
+            retention: if receiver.parameter.is_some() {
+                BridgeRetentionTier::T1
+            } else {
+                BridgeRetentionTier::T2
+            },
+            waiver_id: receiver
+                .parameter
+                .is_none()
+                .then(|| crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
             unsafe_context: None,
         });
     }
@@ -1088,7 +1249,7 @@ pub(crate) fn delivered_receivers<'a>(
                 | super::Decision::Degraded(_) => false,
             };
             (delivered
-                && accessor_delivered(table, receiver.callee)
+                && source_delivered(table, receiver)
                 && reverts.keeps(SignatureClassId::of(receiver.callee))
                 && reverts.keeps(SignatureClassId::of(subject.fn_did))
                 && reverts.keeps_subject(subject.fn_did, subject.hir_id))
@@ -1126,7 +1287,7 @@ pub(crate) fn typed_receiver(
         | super::Decision::Degraded(_) => false,
     };
     delivered
-        && accessor_delivered(table, receiver.callee)
+        && source_delivered(table, receiver)
         && table.seams.explicit_declarations.iter().any(|site| {
             site.category == "local"
                 && site.node == Some(node)
@@ -1137,13 +1298,31 @@ pub(crate) fn typed_receiver(
 
 /// Is the accessor's own region parameter decided as the byte slice in this
 /// table? A receiver over an accessor that fell back to its raw parameter is
-/// not emitted: the two must move together.
-fn accessor_delivered(table: &super::DecisionTable, callee: LocalDefId) -> bool {
-    table.entries.iter().any(|(s, d)| {
-        s.fn_did == callee
-            && table.void_region.contains_key(&(s.fn_did, s.hir_id))
-            && decided_slice(d)
-    })
+/// not emitted: the two must move together. A byte view has no accessor: it
+/// is emitted unless it writes through a parameter decided as a SHARED safe
+/// form (the seam would bridge `from_ref(p).cast_mut()`, and a write through
+/// that is UB).
+fn source_delivered(table: &super::DecisionTable, receiver: &Receiver) -> bool {
+    match receiver.parameter {
+        Some(parameter) => {
+            !receiver.mutable
+                || table.entries.iter().any(|(s, d)| {
+                    s.fn_did == receiver.callee
+                        && s.hir_id == parameter
+                        && !matches!(
+                            super::seam::form_of(d),
+                            super::seam::Form::Ref { mutable: false }
+                                | super::seam::Form::Opt { mutable: false, .. }
+                                | super::seam::Form::Slice { mutable: false }
+                        )
+                })
+        }
+        None => table.entries.iter().any(|(s, d)| {
+            s.fn_did == receiver.callee
+                && table.void_region.contains_key(&(s.fn_did, s.hir_id))
+                && decided_slice(d)
+        }),
+    }
 }
 
 /// The class dependency each delivered region receiver introduces: the
@@ -1164,6 +1343,9 @@ pub(crate) fn receiver_dependencies(
             let receiver = table
                 .void_region_receivers
                 .get(&(subject.fn_did, subject.hir_id))?;
+            if receiver.parameter.is_some() {
+                return None;
+            }
             Some((
                 SignatureClassId::of(subject.fn_did),
                 SignatureClassId::of(receiver.callee),

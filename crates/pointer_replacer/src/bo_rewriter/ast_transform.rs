@@ -2518,6 +2518,12 @@ impl ReceiverGraft<'_> {
             Self::Region(receiver) => receiver.render(call),
         }
     }
+
+    /// wave-6b: a byte view wraps the local's CAST initializer (`p as *mut u8`),
+    /// not a call — the one graft whose carrier is not a call.
+    fn wraps_cast(self) -> bool {
+        matches!(self, Self::Region(receiver) if receiver.parameter.is_some())
+    }
 }
 
 struct ReceiverInputGraftVisitor<'a> {
@@ -2545,7 +2551,7 @@ impl MutVisitor for ReceiverInputGraftVisitor<'_> {
             ));
             return;
         }
-        if !matches!(expression.kind, rustc_ast::ExprKind::Call(..)) {
+        if !matches!(expression.kind, rustc_ast::ExprKind::Call(..)) && !input.wraps_cast() {
             self.failure = Some(format!(
                 "receiver-input-invariant:non-call:{}..{}",
                 key.0, key.1
