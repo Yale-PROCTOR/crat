@@ -1643,3 +1643,48 @@ mod r424_typed_view_pending_source {
         assert!(report.data, "{report:#?}");
     }
 }
+
+/// **R424-3 — the slice form of a raw local's own initializer**, the arm
+/// tulipindicators' `line` needs (`*mut c_char = next_line(fp)` vs
+/// `&mut [c_char] = core::slice::from_raw_parts_mut(next_line(fp), FALLBACK)`).
+#[test]
+fn r424_slice_construction_initializer_corresponds_exactly() {
+    use crate::bo_rewriter::bridge_custody_match::slice_construction_corresponds_for_test;
+    // The predicate parses both sides, so it runs under session globals like
+    // every other parse-based seam in this file.
+    let corresponds = |original: &str, emitted: &str, ty: Option<&str>| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || slice_construction_corresponds_for_test(original, emitted, ty),
+        )
+    };
+    assert!(corresponds(
+        "next_line(fp)",
+        "core::slice::from_raw_parts_mut(next_line(fp),\n            crate::FALLBACK_SLICE_EXTENT)",
+        Some("&mut [std::os::raw::c_char]")
+    ));
+    assert!(corresponds(
+        "next_line(fp)",
+        "core::slice::from_raw_parts(next_line(fp), len)",
+        Some("&[i8]")
+    ));
+    // A different value, a different constructor, and a non-slice declaration
+    // are all refusals.
+    assert!(!corresponds(
+        "next_line(fp)",
+        "core::slice::from_raw_parts_mut(other_line(fp), 3)",
+        Some("&mut [i8]")
+    ));
+    assert!(!corresponds(
+        "next_line(fp)",
+        "core::slice::from_ref(next_line(fp))",
+        Some("&mut [i8]")
+    ));
+    assert!(!corresponds(
+        "next_line(fp)",
+        "core::slice::from_raw_parts_mut(next_line(fp), 3)",
+        Some("*mut i8")
+    ));
+}
