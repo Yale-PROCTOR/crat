@@ -1614,14 +1614,22 @@ pub(crate) fn reconcile_slice_use_rows(
             .ok_or_else(|| format!("unowned slice-use row {key}"))?;
         // R220 keeps the attempted slice candidate separately from the restored
         // predecessor form. Only an exact retired terminal partner licenses
-        // that distinction; an ordinary applied row must still agree.
+        // that distinction; an ordinary applied row must still agree. A
+        // partner the program's degradation dropped (`RewriteOutcome::
+        // degraded` rewrites every terminal to `ProgramDegradedUnmodifiedInput`)
+        // was never applied either: it licenses the same distinction (wave-6s
+        // report 012 — the drift that aborted batch 8's lodepng and brotli
+        // workers after their revert loops exhausted).
         let retired = common
             .get(&format!("{}:terminal", event.key.receipt_key()))
             .is_some_and(|terminal| {
-                terminal.state == MechanicalState::Reclassified
+                (terminal.state == MechanicalState::Reclassified
                     && matches!(&terminal.terminal_reason,
                         Some(MechanicalTerminalReason::EvidenceMissing(reason))
                             if reason.starts_with("additive-family-fallback:slice-use-unsupported;site-cause="))
+                    || terminal.state == MechanicalState::Dropped
+                        && terminal.terminal_reason
+                            == Some(MechanicalTerminalReason::ProgramDegradedUnmodifiedInput))
                     && matches!(row.adapter.as_str(),
                         "prior-family-rendering:SliceConstruction"
                         | "prior-family-rendering:SliceUse"

@@ -1724,3 +1724,107 @@ const MAKE_UNCOMPRESSED_STREAM: &str = r#"
     return result;
  }
 "#;
+
+/// **Relay 013 — the slice-use receipt drift that aborted batch 8's census
+/// (lodepng class 563, brotli class 1276).** A slice-use candidate retired by
+/// R220 keeps its candidate form beside the restored source form
+/// (`source_form=raw`, `candidate_form=opt-slice-mut`, adapter
+/// `prior-family-rendering:<stage>`), licensed at reconciliation by its
+/// terminal partner (`Reclassified`, `additive-family-fallback:…`). When the
+/// whole program then degrades (`RewriteOutcome::degraded`: lodepng's and
+/// brotli's revert loops exhausted on wave-6v's missing raw twins), every
+/// terminal is rewritten to `Dropped` / `ProgramDegradedUnmodifiedInput` — the
+/// license vanishes while the row still carries both forms, and the census
+/// worker aborts on `slice-use specialized/common drift … :plan`. The retired
+/// identity is the row's, not the partner's state: a degraded partner
+/// licenses it too.
+#[test]
+fn wave6s_retired_slice_use_row_survives_program_degradation() {
+    use super::mechanical_receipt::{MechanicalStage, MechanicalState, MechanicalTerminalReason};
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        pub unsafe fn target(p: *const i32) -> i32 {\n\
+            let q: *const i32 = p; *p.offset(1) + *q\n\
+        }\n";
+    let table = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        super::decide_table(tcx).expect("retired-candidate table")
+    })
+    .expect("fixture compiles");
+    let retired = table
+        .slice_use_receipts
+        .iter()
+        .find(|plan| plan.obligation.intended_terminal_state == MechanicalState::Reclassified)
+        .expect("an R220-retired slice-use candidate");
+    assert_ne!(retired.source_form, retired.candidate_form, "{retired:?}");
+    let (mut events, mut rows) = retired.materialize(false, false);
+    super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
+        .expect("the retired partner licenses the row");
+    // `RewriteOutcome::degraded` (bo_rewriter/mod.rs): every terminal event
+    // and row drops with the program.
+    for event in &mut events {
+        if event.stage == MechanicalStage::Terminal {
+            event.state = MechanicalState::Dropped;
+            event.terminal_reason = Some(MechanicalTerminalReason::ProgramDegradedUnmodifiedInput);
+        }
+    }
+    for row in &mut rows {
+        row.terminal_class_state = MechanicalState::Dropped;
+        if row.terminal.stage == MechanicalStage::Terminal {
+            row.terminal.state = MechanicalState::Dropped;
+            row.terminal.reason = Some(MechanicalTerminalReason::ProgramDegradedUnmodifiedInput);
+        }
+    }
+    super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
+        .expect("a degraded partner still licenses the retired row");
+}
+
+/// The lodepng shape verbatim (`addChunk_IHDR` with `lodepng_chunk_init`,
+/// `ucvector_resize`/`reserve`, `lodepng_memcpy`, `lodepng_set32bitInt`,
+/// `lodepng_chunk_generate_crc`; `benchmarks/rs-crown-derived/lodepng`):
+/// `data = chunk.offset(8)` then `lodepng_set32bitInt(data.offset(0), w)` —
+/// the census's `class=563:subject=local:563:9:…:callee=def-id:0:329:arg=0`
+/// is this reduction's `subject=local:9 … arg=0` (the HIR item-local id 114
+/// coincides). The program degrades in the reduction as in the corpus, and
+/// the census's reconciliation must then hold rather than abort the worker.
+#[test]
+fn wave6s_lodepng_addchunk_ihdr_reduction_reconciles_after_degradation() {
+    let input = include_str!("testdata/wave6s-drift/lodepng-addchunk-ihdr.rs");
+    let outcome = super::rewrite_core_injected(
+        ::utils::compilation::str_to_input(input),
+        None,
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
+        true,
+        Some((
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    );
+    let artifacts = match &outcome {
+        super::RewriteOutcome::Emitted {
+            raw_boundary_artifacts,
+            ..
+        }
+        | super::RewriteOutcome::Degraded {
+            raw_boundary_artifacts,
+            ..
+        } => raw_boundary_artifacts,
+    };
+    let retired_after_degradation = artifacts.slice_use_rows.iter().any(|row| {
+        row.adapter.starts_with("prior-family-rendering:")
+            && row.source_form != row.candidate_form
+            && row.terminal.reason
+                == Some(super::mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput)
+    });
+    assert!(
+        retired_after_degradation,
+        "the reduction must carry a retired row of a degraded program: {:?}",
+        artifacts.slice_use_rows
+    );
+    super::mechanical_receipt::reconcile_slice_use_rows(
+        &artifacts.slice_use_rows,
+        &artifacts.mechanical_events,
+    )
+    .expect("slice-use receipt reconciliation");
+}
