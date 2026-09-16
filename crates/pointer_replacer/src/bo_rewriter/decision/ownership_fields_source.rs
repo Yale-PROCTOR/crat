@@ -176,6 +176,10 @@ pub(crate) struct SourcePlan {
     /// The owner handed to the caller raw at a `return`: the close is the
     /// transfer, the caller's C free stays where it is.
     return_transfer: Option<Span>,
+    /// The owner stored raw into a field of another object
+    /// (`(*rb).data_ = new_data`): the close is the transfer, the field's
+    /// own C free stays where it is (R415, wave-6f 012 STOP 3).
+    store_transfer: Option<Span>,
     /// The MIR local that receives the allocator's result: the one source of
     /// every pointer into this fresh allocation while the root never escapes.
     allocation_local: u32,
@@ -193,6 +197,10 @@ impl SourcePlan {
 
     pub(crate) fn return_transfer(&self) -> Option<Span> {
         self.return_transfer
+    }
+
+    pub(crate) fn store_transfer(&self) -> Option<Span> {
+        self.store_transfer
     }
 
     pub(crate) fn allocation_local(&self) -> u32 {
@@ -410,6 +418,24 @@ fn copy_closure(body: &rustc_middle::mir::Body<'_>, seeds: BTreeSet<u32>) -> BTr
         if before == aliases.len() {
             return aliases;
         }
+    }
+}
+/// `(*base).field = <alias of the owner>` in MIR: the destination is a
+/// projected place whose base is not the owner, the value a plain alias
+/// local (a copy, a move, or a pointer-to-pointer cast of one).
+fn is_store_transfer(
+    statement: &rustc_middle::mir::Statement<'_>,
+    aliases: &BTreeSet<u32>,
+) -> bool {
+    let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else { return false };
+    if destination.projection.is_empty() || aliases.contains(&destination.local.as_u32()) {
+        return false;
+    }
+    match rvalue {
+        Rvalue::Use(operand) | Rvalue::Cast(CastKind::PtrToPtr, operand, _) => {
+            plain_local(operand).is_some_and(|local| aliases.contains(&local.as_u32()))
+        }
+        _ => false,
     }
 }
 fn plain_local(operand: &Operand<'_>) -> Option<Local> {
@@ -635,6 +661,7 @@ pub(crate) fn derive<'tcx>(
     let mut root_calls = Vec::new();
     let mut boundary_arguments = FxHashSet::default();
     let mut returns = Vec::new();
+    let mut stores = Vec::new();
     for &expression in &expressions.0 {
         if let ExprKind::Ret(Some(returned)) = expression.kind
             && let Ok(operand) = peel(returned, typeck)
@@ -642,6 +669,21 @@ pub(crate) fn derive<'tcx>(
         {
             covered.insert(operand.hir_id.local_id.as_u32());
             returns.push(returned);
+        }
+        // A store into a FIELD of another object through a raw base
+        // (`(*rb).data_ = new_data`): ownership leaves as a raw pointer,
+        // exactly as at a return. The destination is never the owner's own
+        // storage (the owner is a plain binding, never a field).
+        if let ExprKind::Assign(lhs, stored, _) = expression.kind
+            && let Ok(operand) = peel(stored, typeck)
+            && root_path(operand, binding)
+            && let ExprKind::Field(base, _) = lhs.kind
+            && let ExprKind::Unary(rustc_hir::UnOp::Deref, through) = base.kind
+            && typeck.expr_ty(through).is_raw_ptr()
+            && !root_path(through, binding)
+        {
+            covered.insert(operand.hir_id.local_id.as_u32());
+            stores.push(stored);
         }
         if let ExprKind::Call(callee, arguments) = expression.kind {
             for (index, argument) in arguments.iter().enumerate() {
@@ -729,8 +771,12 @@ pub(crate) fn derive<'tcx>(
     // The walker reports a view alias's initializer as a cursor use of the
     // root; that use is accounted by the alias's own permit above.
     let is_alias_receiver = |hir: u32, span: Span| alias_receivers.contains(&(hir, span));
+    // The walker reports the stored owner (`(*h).buf = new_data`) as a raw
+    // use without a boundary; that use is the transfer accounted above.
+    let is_store_operand = |span: Span| stores.iter().any(|stored| stored.span == span);
     if uses.unsupported.is_some_and(|span| {
         !returns.iter().any(|r| r.span == span)
+            && !is_store_operand(span)
             && !alias_receivers
                 .iter()
                 .any(|(_, receiver)| *receiver == span)
@@ -741,7 +787,8 @@ pub(crate) fn derive<'tcx>(
         || uses.raw_uses.iter().any(|u| {
             !covered.contains(&u.hir_id.local_id.as_u32())
                 || (u.boundary_span.is_none()
-                    && !is_alias_receiver(u.hir_id.local_id.as_u32(), u.span))
+                    && !is_alias_receiver(u.hir_id.local_id.as_u32(), u.span)
+                    && !is_store_operand(u.span))
         })
     {
         return Err(SourceHold::UnsupportedOwnerUse);
@@ -1124,13 +1171,15 @@ pub(crate) fn derive<'tcx>(
         .iter()
         .filter(|c| c.deallocator_events.is_some())
         .collect();
-    if frees.len() + transfers.len() + returns.len() != 1 {
+    if frees.len() + transfers.len() + returns.len() + stores.len() != 1 {
         return Err(SourceHold::FreeIdentity);
     }
     let (close_key, close_span) = if let Some(free) = frees.first() {
         (Some(free.key), free.span)
     } else if let Some(transfer) = transfers.first() {
         (Some(transfer.key), transfer.call_span)
+    } else if let Some(store) = stores.first() {
+        (None, store.span)
     } else {
         (None, returns[0].span)
     };
@@ -1167,6 +1216,17 @@ pub(crate) fn derive<'tcx>(
             found: false,
         };
         for (statement_index, statement) in data.statements.iter().enumerate() {
+            // The store transfer (`(*rb).data_ = new_data`) closes the owner
+            // at this statement: it must be live here, and no later
+            // statement or terminator of the path may read it.
+            if !stores.is_empty() && is_store_transfer(statement, &aliases) {
+                if state != State::Live {
+                    return Err(SourceHold::NormalExitCoverage);
+                }
+                state = State::Freed;
+                continue;
+            }
+            reads.found = false;
             reads.visit_statement(
                 statement,
                 Location {
@@ -1174,7 +1234,11 @@ pub(crate) fn derive<'tcx>(
                     statement_index,
                 },
             );
+            if reads.found && state != State::Live {
+                return Err(SourceHold::NormalExitCoverage);
+            }
         }
+        reads.found = false;
         reads.visit_terminator(
             data.terminator(),
             Location {
@@ -1263,6 +1327,7 @@ pub(crate) fn derive<'tcx>(
         unwind_obligations: unwind_obligations.into_iter().collect(),
         mir_aliases: aliases,
         return_transfer: returns.first().map(|r| r.span),
+        store_transfer: stores.first().map(|s| s.span),
         allocation_local: allocator_destination.as_u32(),
         element_spelling: constructor.element_spelling,
         view_aliases,
@@ -1320,6 +1385,82 @@ mod tests {
             ))
         })
         .expect("native source fixture compiles")
+    }
+
+    /// R415 (wave-6f 012 STOP 3): a `malloc`ed local stored into a FIELD of
+    /// another object through its raw base (`(*h).buf = new_data`, the
+    /// derived substrate's spelling of brotli's `RingBufferInitBuffer`) is a
+    /// transfer — the close of the owner, exactly as a return transfer; the
+    /// field's own C free stays where it is. The permit is exercised directly
+    /// (on this base the model does not grant the local Owning; wave-6f's
+    /// frame does on the composition, where the emission is witnessed).
+    #[test]
+    fn r415_store_into_a_field_through_a_raw_base_is_the_transfer() {
+        let declarations = r#"#![allow(non_camel_case_types)] pub mod libc { pub use core::ffi::c_int; pub use core::ffi::c_ulong; pub use core::ffi::c_void; } extern "C" { fn malloc(n:libc::c_ulong)->*mut libc::c_void; fn free(p:*mut libc::c_void); }
+#[repr(C)] #[derive(Copy, Clone)] pub struct Holder { pub count: u32, pub buf: *mut u8 }
+unsafe extern "C" fn holder_free(mut h: *mut Holder) { free((*h).buf as *mut libc::c_void); (*h).buf = 0 as *mut u8; }"#;
+        let store = |body: &str| {
+            format!(
+                "{declarations}\nunsafe extern \"C\" fn holder_init(mut h: *mut Holder, n: u32) {{ let mut new_data = malloc((n as libc::c_ulong).wrapping_mul(::std::mem::size_of::<u8>() as libc::c_ulong)) as *mut u8; {body} }}"
+            )
+        };
+        let admitted =
+            store("*new_data.offset(0 as isize) = 7 as u8; (*h).buf = new_data; (*h).count = n;");
+        ::utils::compilation::run_compiler_on_str(&admitted, |tcx| {
+            let (table, ctx) = bo::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    bo::A5Mode::PreciseReplay,
+                    Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let program = bo::collect_program(tcx);
+            let (subject, _) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.param_name.as_deref() == Some("new_data"))
+                .unwrap();
+            let plan = derive(&program, subject, &ctx.constructions).unwrap();
+            let span = plan.store_transfer().expect("the store is the transfer");
+            assert_eq!(
+                tcx.sess.source_map().span_to_snippet(span).unwrap(),
+                "new_data"
+            );
+            assert!(plan.frees().is_empty() && plan.return_transfer().is_none());
+            assert_eq!(plan.scalar_edits().len(), 1);
+        })
+        .unwrap();
+        // A use of the owner AFTER the store (the allocation is no longer
+        // this function's) and a store into the owner's own storage are
+        // refused; a second close (the store and a free) is not one close.
+        for body in [
+            "(*h).buf = new_data; *new_data.offset(0 as isize) = 7 as u8;",
+            "(*h).buf = new_data; free(new_data as *mut libc::c_void);",
+            "let mut other = new_data; (*h).buf = other;",
+        ] {
+            ::utils::compilation::run_compiler_on_str(&store(body), |tcx| {
+                let (table, ctx) = bo::decide_table_with_ctx_config(
+                    tcx,
+                    Some((
+                        bo::A5Mode::PreciseReplay,
+                        Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                    )),
+                )
+                .unwrap();
+                let program = bo::collect_program(tcx);
+                let (subject, _) = table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| subject.param_name.as_deref() == Some("new_data"))
+                    .unwrap();
+                assert!(
+                    derive(&program, subject, &ctx.constructions).is_err(),
+                    "{body}"
+                );
+            })
+            .unwrap();
+        }
     }
 
     #[test]

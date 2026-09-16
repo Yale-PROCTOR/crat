@@ -226,6 +226,11 @@ impl Candidates {
                 super::DegradeReason::BoxFailure {
                     failure: BoxPlanFailure::PointerDepth,
                 } => {}
+                // The prior path knows no active endpoint (R415: a local
+                // stored into another object's field is one — the transfer).
+                super::DegradeReason::BoxFailure {
+                    failure: BoxPlanFailure::EndpointInactive,
+                } => {}
                 _ => continue,
             }
             let Some(slot) = inputs
@@ -1142,6 +1147,43 @@ fn derive_bundle(
             span,
             replacement: format!("::std::boxed::Box::into_raw({name})"),
             receipt: "native-box-transfer-at-return",
+        });
+    }
+    if let Some(span) = source.store_transfer() {
+        // The owner leaves into another object's field as a raw pointer,
+        // exactly as at a return transfer: that object's C free is untouched,
+        // so the allocation must be C-free compatible. A slice's count that
+        // is not proved nonempty is guarded: an empty boxed slice hands the
+        // field a null pointer — one of `malloc(0)`'s legal results, which
+        // the C free accepts — never a dangling sentinel.
+        if !c_free_allocator_compatible(tcx) {
+            return Err(NativeHold::Missing("native-transfer-allocator-contract"));
+        }
+        let raw = match source.shape() {
+            BoxShape::Sized => format!("::std::boxed::Box::into_raw({name})"),
+            BoxShape::Slice => format!(
+                "(::std::boxed::Box::into_raw({name}) as *mut {})",
+                source.element_spelling()
+            ),
+        };
+        let (replacement, nonempty) = if source.nonempty() {
+            (raw, "numeric-layout")
+        } else {
+            // The Box is consumed on every path (no drop anywhere); the
+            // empty case reads the raw slice pointer's length.
+            (
+                format!(
+                    "({{ let __crat_raw = ::std::boxed::Box::into_raw({name}); if __crat_raw.len() == 0 {{ ::core::ptr::null_mut() }} else {{ __crat_raw as *mut {} }} }})",
+                    source.element_spelling()
+                ),
+                "guarded-null-for-empty",
+            )
+        };
+        receipts.push(format!("native-box-transfer-at-store span={span:?} allocator=linux-System;global-allocators=none;nonempty={nonempty} field-free=unchanged"));
+        edits.push(BoxExprEdit {
+            span,
+            replacement,
+            receipt: "native-box-transfer-at-store",
         });
     }
     let required: BTreeSet<_> = source.frees().iter().map(|site| site.key()).collect();
