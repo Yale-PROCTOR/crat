@@ -3140,6 +3140,9 @@ pub(crate) struct SeamPlan {
     pub interface_required_sites: BTreeSet<InterfaceInventoryKey>,
     /// A zero-syntax safe/safe site relies on the caller class remaining live.
     /// The callee therefore depends on that caller and follows its reversion.
+    /// An optional argument at an optional formal also relies on the CALLEE
+    /// converting (no coercion to its raw formal), so that caller depends on
+    /// the callee too (wave-6o, relay 015).
     pub interface_dependencies: Vec<(SignatureClassId, SignatureClassId)>,
     /// A surfaced caller body names the callee's generated safe inner. The
     /// caller is therefore Ready only while the defining callee class is Ready.
@@ -5237,6 +5240,22 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 unsafe_context: None,
                             });
                         }
+                        // Wave-6o (relay 015): an optional argument at an
+                        // optional formal is zero-syntax, but `Option<&T>`
+                        // does not coerce to the raw formal a HELD callee
+                        // keeps — so the caller depends on the callee's
+                        // class from the Core stage on. A reference argument
+                        // coerces at the call and records no edge.
+                        if matches!(pos.found, Form::Opt { .. })
+                            && matches!(pos.expected, Form::Opt { .. })
+                            && pos.root.is_some()
+                            && site.caller != *callee
+                        {
+                            plan.interface_dependencies.push((
+                                SignatureClassId::of(site.caller),
+                                SignatureClassId::of(*callee),
+                            ));
+                        }
                         if let (Some(source), Some(input @ SeamInputRendering::Adapter { .. })) =
                             (pos.root, input_rendering)
                         {
@@ -6401,6 +6420,9 @@ pub(crate) fn synthesize_with_raw_boundary(
         &param_key,
         &mut plan,
     );
+    // The inventory dedups only when the fn-pointer web is available.
+    plan.interface_dependencies.sort();
+    plan.interface_dependencies.dedup();
     plan
 }
 
