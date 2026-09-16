@@ -519,9 +519,18 @@ fn frame_lock() -> std::sync::MutexGuard<'static, ()> {
 
 const BST: &str = include_str!("wave6f_fixture_bst.rs");
 
-/// era-5c's coming frame for bst (relay 003), stated as slot-kind overrides:
-/// the two `node` fields `Owning`, the owning parameters / locals `Owning`,
-/// the walkers `Ref`.
+/// era-5c's bst frame (report era-5c/002 §5, the full solve under E5C-3:
+/// 0 raw / 13 ref / 31 owning), stated as slot-kind overrides by subject
+/// name. The MIR locals of that report map to these subjects: both `node`
+/// fields (`field1@d0` / `field2@d0`) Owning; `insert::_1` (`node`),
+/// `newNode::_0` (`temp`), `deleteNode::_1` (`root`) and its `temp` /
+/// `temp_0` Owning; the Ref list `minValueNode::_1` (`node`),
+/// `deleteNode::_36` (`temp_1`, the `minValueNode` receiver) and
+/// `inorder::_1` (`root`). `deleteNode::_37` (the traversal ARGUMENT
+/// `(*root).right`, Owning) is a field site, not a named subject — the
+/// `.take()` move; `minValueNode::_8` and `inorder::_5/_13` are unnamed
+/// temporaries. Re-pinned 2026-09-16 against 002; era-5c 003's corpus
+/// probe table re-pins it again if the corpus entry differs.
 fn bst_frame() {
     use crate::analyses::borrow_ownership::SlotKind;
     super::test_model_override::set(
@@ -618,6 +627,9 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
         "let mut temp = (*root).right.take().map_or(core::ptr::null_mut(), Box::into_raw);",
         // the C free site is untouched
         "free(root as *mut ::std::ffi::c_void); return temp;",
+        // E5C-3 (report 007): the two-children branch hoists the pure read
+        // before the moving argument
+        "let __crat_hoist0 = (*temp_1).key;",
     ] {
         assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
     }
