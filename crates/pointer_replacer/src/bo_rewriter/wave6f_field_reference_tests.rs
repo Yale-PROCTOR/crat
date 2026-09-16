@@ -1108,6 +1108,100 @@ fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
     );
 }
 
+const AVL: &str = include_str!("wave6f_fixture_avl.rs");
+
+/// era-5c-shaped frame for avl (the rotation family, relay 003 §2): both
+/// `Node` pointer fields Owning, the rotation's owners Owning, the readers
+/// Ref.
+fn avl_frame() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-avl-frame",
+        vec![
+            ("Node".to_owned(), 1, SlotKind::Owning),
+            ("Node".to_owned(), 2, SlotKind::Owning),
+        ],
+        vec![
+            ("newNode::node".to_owned(), SlotKind::Owning),
+            ("rightRotate::y".to_owned(), SlotKind::Owning),
+            ("rightRotate::x".to_owned(), SlotKind::Owning),
+            ("rightRotate::T2".to_owned(), SlotKind::Owning),
+            ("leftRotate::x".to_owned(), SlotKind::Owning),
+            ("leftRotate::y".to_owned(), SlotKind::Owning),
+            ("leftRotate::T2".to_owned(), SlotKind::Owning),
+            ("insert::node".to_owned(), SlotKind::Owning),
+            ("height::N".to_owned(), SlotKind::Ref),
+            ("getBalance::N".to_owned(), SlotKind::Ref),
+            ("minValueNode::node".to_owned(), SlotKind::Ref),
+            ("preOrder::root".to_owned(), SlotKind::Ref),
+        ],
+    );
+}
+
+/// Witness 19 (relay 003 §2 / R426-2, the Box-first market) — avl's
+/// rotations, the substrate's own text. Under an era-5c-shaped frame the
+/// two `Node` pointer fields DERIVE and the transaction is `applied` as
+/// `opt-box`: the field side of the `TerminalRoleC` shape (a child moved
+/// out, the parent stored into it, the rotated owner returned) needs
+/// nothing new from this lane.
+///
+/// What blocks the delivery is the OWNING LOCALS' side, held by the native
+/// Box family: `newNode::node`, `rightRotate::x` / `T2`, `leftRotate::y` /
+/// `T2` hold `box-initializer-unsupported` (a Box local initialized from an
+/// owning field's load — `let mut x = (*y).left;`), and `rightRotate::y`,
+/// `leftRotate::x`, `insert::node` hold `box-param-caller-unknown` (a Box
+/// PARAMETER whose callers' hand-over is not evidenced; `insert` is itself
+/// held, so the two are one fixpoint). Those holds degrade the parameters,
+/// their signature classes are withheld, and — exactly as witness 18 shows
+/// for heman — the field transaction is then inactive at AST time, so the
+/// struct keeps `*mut Node`.
+///
+/// The pin is a TRIPWIRE for the Box-first route: when ownership-fields
+/// admit either prior key, avl's rotation family delivers and this witness
+/// fails, at which point the emitted forms are pinned here instead.
+#[test]
+fn w6f_avl_rotation_fields_derive_and_the_box_locals_hold() {
+    let _frame = frame_lock();
+    avl_frame();
+    let observed = observe(AVL);
+    let outcome = emitted("avl", AVL);
+    super::test_model_override::clear();
+    for field in ["left", "right"] {
+        let row = field_row(&observed, "Node", field);
+        assert_eq!(
+            (row.2.as_str(), row.3.as_str()),
+            ("applied", "opt-box"),
+            "{row:?}"
+        );
+    }
+    for (label, prior) in [
+        ("newNode::node", "box-initializer-unsupported"),
+        ("rightRotate::x", "box-initializer-unsupported"),
+        ("rightRotate::T2", "box-initializer-unsupported"),
+        ("leftRotate::y", "box-initializer-unsupported"),
+        ("leftRotate::T2", "box-initializer-unsupported"),
+        ("rightRotate::y", "box-param-caller-unknown"),
+        ("leftRotate::x", "box-param-caller-unknown"),
+        ("insert::node", "box-param-caller-unknown"),
+    ] {
+        let decision = decision_of(&observed, label);
+        assert!(
+            decision.contains("BoxFailure") && decision.contains(prior),
+            "{label}: {decision}"
+        );
+    }
+    let (source, _, _) = emitted_source(&outcome);
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The withheld owners keep the raw field declarations …
+    assert!(flat.contains("pub left: *mut Node,"), "{source}");
+    assert!(!flat.contains("Option<Box<Node>>"), "{source}");
+    // … while the readers this lane does not own still deliver.
+    assert!(
+        flat.contains("fn height(mut N: Option<&Node>) -> i32 {"),
+        "{source}"
+    );
+}
+
 const HEMAN_RAY2: &str = include_str!("wave6f_fixture_heman_ray2.rs");
 
 /// Witness 18 (relay 020 / R427-3) — heman's OWN `kmRay2IntersectBox`, the
