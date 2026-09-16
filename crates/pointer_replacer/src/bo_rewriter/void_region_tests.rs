@@ -639,3 +639,24 @@ fn w6b_byte_view_of_a_struct_pointer_is_not_in_the_class() {
         "{rows:?}"
     );
 }
+
+/// The view must be BYTES: a cast of the scalar pointer to any wider element
+/// is not in the class (its indices are not byte indices).
+#[test]
+fn w6b_byte_view_needs_a_byte_target() {
+    let wide = BE64
+        .replace(
+            "let mut source = psource as *mut libc::c_uchar;",
+            "let mut source = psource as *mut u16;",
+        )
+        .replace(
+            "*source.offset((7 as libc::c_int - i) as isize);",
+            "*source.offset((3 as libc::c_int - i / 2) as isize) as u8;",
+        );
+    let rows = super::emit_tests::decisions_of(&wide);
+    assert_eq!(
+        local_reason(&rows, "source"),
+        "slice-neg-or-unknown-offset",
+        "{rows:?}"
+    );
+}
