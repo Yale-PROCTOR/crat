@@ -1210,12 +1210,27 @@ fn derive_bundle(
                 "guarded-null-for-empty",
             )
         };
-        receipts.push(format!("native-box-transfer-at-store span={span:?} allocator=linux-System;global-allocators=none;nonempty={nonempty} field-free=unchanged"));
-        edits.push(BoxExprEdit {
-            span,
-            replacement,
-            receipt: "native-box-transfer-at-store",
+        // R416-12: a field a field transaction OWNS (wave-6f's
+        // `Option<Box<T>>`) takes the moved Box as its store (`Some(owner)`,
+        // rendered by that transaction from this Box decision); the raw
+        // transfer is rendered only into a field that stays raw.
+        let owned_field = source.store_field().is_some_and(|(struct_did, field_index)| {
+            table.field_transactions.applied.iter().any(|transaction| {
+                transaction.owning
+                    && transaction.key.struct_did.to_def_id() == struct_did
+                    && transaction.key.field_index == field_index
+            })
         });
+        if owned_field {
+            receipts.push(format!("native-box-transfer-to-owning-field span={span:?} store=field-transaction(Some(owner)) nonempty={nonempty}"));
+        } else {
+            receipts.push(format!("native-box-transfer-at-store span={span:?} allocator=linux-System;global-allocators=none;nonempty={nonempty} field-free=unchanged"));
+            edits.push(BoxExprEdit {
+                span,
+                replacement,
+                receipt: "native-box-transfer-at-store",
+            });
+        }
     }
     let required: BTreeSet<_> = source.frees().iter().map(|site| site.key()).collect();
     let frees = plan_frees(&required, source.frees()).map_err(NativeHold::Source)?;
