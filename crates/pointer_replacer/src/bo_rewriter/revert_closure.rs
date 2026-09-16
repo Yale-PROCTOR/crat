@@ -30,7 +30,19 @@ pub(crate) fn call_adapter_only_edges(
         }
     }
     let mut structural = BTreeSet::new();
-    structural.extend(table.seams.interface_dependencies.iter().copied());
+    // wave-5d2's class split decides which interface dependencies bind at all
+    // (`plan::class_split::keeps_interface_dependency`); an edge it drops is
+    // not a structural explanation here either, or a pair that is BOTH an
+    // adapter edge and a dropped interface edge would keep a hold neither
+    // rule intends (relay 015: the composed seam at `445f55be`).
+    structural.extend(
+        table
+            .seams
+            .interface_dependencies
+            .iter()
+            .copied()
+            .filter(|&edge| super::plan::class_split::keeps_interface_dependency(table, edge)),
+    );
     structural.extend(table.seams.generated_item_dependencies.iter().copied());
     for (subject, decision) in &table.entries {
         match decision {

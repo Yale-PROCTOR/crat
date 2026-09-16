@@ -105,17 +105,25 @@ fn reason_of(degradations: &[super::decision::Degradation], subject: &str) -> Op
         .map(|d| format!("{:?}", d.reason))
 }
 
-/// A held callee (`blocked-subject:return-not-adapted`) must not close over its
-/// callers: the caller's adapter leaves with the callee's class and the
-/// caller's argument renders in its own form against the raw signature.
+/// **Re-pin (R217-2(a), relay 015).** The end-to-end seed of this witness is
+/// gone at the composed frame: wave-5d2's class split discharges a Pair-only
+/// hold, so `CLOSURE`'s callee class is no longer held (`callee::p` delivers)
+/// and the fixture cannot produce the closure it was written to catch. Two
+/// probed alternatives (an address-taken degraded local; a `slice-use-
+/// unsupported` parameter) hold no class either. The MECHANISM is therefore
+/// pinned where it lives — a held class beside an adapter-only edge, in
+/// `additive_tests::r220_unwitnessed_new_refusal_rolls_back_its_root_not_the_delivered_dependent`
+/// — and this end-to-end test keeps the composed OUTCOME: every function of
+/// the chain delivers, nothing reverts, and the argument at the seam is
+/// rendered against the callee's settled form.
 #[test]
-fn wave6k_held_callee_does_not_close_over_adapted_callers() {
+fn wave6k_adapted_callers_of_a_raw_callee_deliver() {
     let (source, degradations, final_reverts, reverted_count, _) = outcome(CLOSURE);
     assert_eq!(reverted_count, 0, "no verify-loop revert: {final_reverts}");
-    assert!(
-        reason_of(&degradations, "callee::p#1")
-            .is_some_and(|r| r.contains("blocked-subject:return-not-adapted")),
-        "{degradations:?}"
+    assert_eq!(
+        final_reverts.lines().count().saturating_sub(1),
+        0,
+        "nothing withheld: {final_reverts}"
     );
     assert!(
         reason_of(&degradations, "caller::p#1").is_none(),
@@ -125,20 +133,11 @@ fn wave6k_held_callee_does_not_close_over_adapted_callers() {
         reason_of(&degradations, "grand::s#1").is_none(),
         "{degradations:?}"
     );
-    assert_eq!(
-        final_reverts.lines().count(),
-        2,
-        "only the callee: {final_reverts}"
-    );
     assert!(
         source.contains("fn caller(mut p: Option<&mut S>)"),
         "{source}"
     );
     assert!(source.contains("fn grand(s: &mut S)"), "{source}");
-    assert!(
-        source.contains("callee(p.as_deref_mut().map_or(core::ptr::null_mut::<crate::S>()"),
-        "{source}"
-    );
 }
 
 /// Control of the classification: on the closure fixture the caller→callee
