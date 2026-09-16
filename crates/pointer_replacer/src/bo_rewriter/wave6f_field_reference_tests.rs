@@ -281,11 +281,23 @@ fn w6f_lodepng_slice_field_with_size_delivers() {
     );
 
     let (source, emitted_count, reverted_count) = emitted_source(lodepng_emitted());
-    assert_eq!(reverted_count, 0);
-    // The field's own seven subjects (10 on this stack: the yield refinement
-    // lets `inflatev`'s three parameters reach `custom_inflate`, pinned by
-    // the needle below); other lanes' rules add rows of their own in this
-    // fixture, so the crate total is not this transaction's pin.
+    // Nothing of the field's reverts. On the batch-8 composition the one
+    // revert is `lodepng_memcpy::dst` — wave-6v's counted-void view of the
+    // memcpy call YIELDS (R410-2(d)) where an A5 raw-view snapshot already
+    // replaced that call for `src` (`38f836cb`), and the dst class pays at
+    // the compile gate; the field's sites in that call are untouched.
+    let reverted_names: Vec<&str> = match lodepng_emitted() {
+        RewriteOutcome::Emitted { degradations, .. } => degradations
+            .iter()
+            .filter(|d| format!("{:?}", d.reason).contains("RevertedAfterVerifyFailure"))
+            .map(|d| d.subject.as_str())
+            .collect(),
+        RewriteOutcome::Degraded { .. } => Vec::new(),
+    };
+    assert!(
+        reverted_count == 0 || (reverted_count == 1 && reverted_names == ["lodepng_memcpy::dst#1"]),
+        "{reverted_count} reverted {reverted_names:?}\n{source}"
+    );
     assert!(emitted_count >= 10, "{emitted_count}\n{source}");
     for needle in [
         "fn inflatev(mut out: &mut u8, mut in_0: &u8,",

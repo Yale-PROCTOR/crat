@@ -7628,6 +7628,7 @@ fn finish_decide<'tcx>(
         append_inferred_local_declaration_plans(tcx, &mut table);
         decision::slice_construction_values::append_declarations(tcx, &mut table);
         append_field_load_declaration_plans(&mut table)?;
+        decision::field_reference::reconcile_a5_raw_views(tcx, &mut table)?;
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =

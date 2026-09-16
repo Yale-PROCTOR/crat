@@ -1597,6 +1597,65 @@ fn forward_ties(
     }
 }
 
+/// An A5 raw-view call snapshots its argument from PLAN-TIME TEXT
+/// (`A5RawViewTemp::raw_expression`), so a field edit nested in that
+/// argument would be lost when the snapshot is grafted (`((*reader).data)
+/// .offset(..)` on a field that is now `Option<&[u8]>`). The field
+/// transaction owns the field's text: its non-wrapping edits are applied to
+/// the view's texts here, after the seam plan. A wrapping (owned) edit
+/// inside a raw view cannot be composed as text and is an error.
+pub(crate) fn reconcile_a5_raw_views(
+    tcx: TyCtxt<'_>,
+    table: &mut DecisionTable,
+) -> Result<(), String> {
+    let sm = tcx.sess.source_map();
+    let edits: Vec<(LocalDefId, Span, String, String, bool)> = table
+        .field_transactions
+        .applied
+        .iter()
+        .flat_map(|t| t.expression_edits.iter())
+        .filter_map(|e| {
+            sm.span_to_snippet(e.span)
+                .ok()
+                .map(|original| (e.owner, e.span, original, e.replacement.clone(), e.wrap))
+        })
+        .collect();
+    if edits.is_empty() {
+        return Ok(());
+    }
+    for call in &mut table.seams.a5_raw_calls {
+        for (owner, span, original, replacement, wrap) in &edits {
+            if *owner != call.caller || !call.call_span.contains(*span) {
+                continue;
+            }
+            for view in &mut call.views {
+                let mut texts: Vec<&mut String> = vec![
+                    &mut view.raw_expression,
+                    &mut view.adapted_expression,
+                    &mut view.argument_expression,
+                ];
+                if let Some(rendering) = view.input_rendering.as_mut() {
+                    texts.push(&mut rendering.raw_expression);
+                    texts.push(&mut rendering.adapted_expression);
+                }
+                for text in texts {
+                    if !text.contains(original.as_str()) {
+                        continue;
+                    }
+                    if *wrap {
+                        return Err(format!(
+                            "field-transaction-a5-raw-view:owned-edit-inside-view:{}",
+                            sm.span_to_diagnostic_string(*span)
+                        ));
+                    }
+                    *text = text.replace(original.as_str(), replacement);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Lift the slice-use wall of a stored subject whose EVERY use is a store
 /// into a converting field: the store is the field transaction's site, and a
 /// subject with no other use has no other use that could be unsupported.
