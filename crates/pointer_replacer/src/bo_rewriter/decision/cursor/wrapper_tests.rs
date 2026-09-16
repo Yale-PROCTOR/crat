@@ -985,3 +985,64 @@ pub unsafe fn lz77(in_0: *const u8, insize: usize, chain: *mut u16, maxsize: usi
         ),
     );
 }
+
+#[test]
+fn slicecursor_fragment_fast_core_loop_with_local_callee() {
+    // The R398-1 wall reduction (reports 011/012, relay 013 §1): the same
+    // core loop with the candidates also handed whole to a local callee whose
+    // parameters the slice family delivers. The callee's class was premised
+    // on the raw source (arm C); the cursor's own view at the argument
+    // (`.as_slice()`) is that C adaptation, receipted under the arm — so the
+    // class is not lost and the program is not restored to raw.
+    let input = r#"#![allow(unused_unsafe,unsafe_op_in_unsafe_fn,unused_mut,unused_assignments)]
+pub unsafe fn is_match(p1: *const u8, p2: *const u8) -> i32 {
+    (*p1.offset(0) == *p2.offset(0) && *p1.offset(1) == *p2.offset(1)) as i32
+}
+pub unsafe fn fragment(input: *const u8, block_size: usize, table: *mut i32, last_distance: i32) -> i32 {
+    let mut ip_end = 0 as *const u8;
+    let mut ip = 0 as *const u8;
+    let mut candidate = 0 as *const u8;
+    let base_ip = input;
+    let mut matched = 0;
+    ip = input;
+    ip_end = input.offset(block_size as isize);
+    ip = ip.offset(1);
+    while ip < ip_end.offset(-2) {
+        let hash = (*ip as usize) & 7;
+        candidate = ip.offset(-(last_distance as isize));
+        if candidate < base_ip || is_match(ip, candidate) == 0 {
+            candidate = base_ip.offset(*table.offset(hash as isize) as isize);
+        }
+        *table.offset(hash as isize) = ip.offset_from(base_ip) as i32;
+        if candidate < ip && is_match(ip, candidate) != 0 {
+            matched += 1;
+        }
+        ip = ip.offset(1);
+    }
+    matched
+}
+"#;
+    let source = emitted(input);
+    save_fixture("fragment-fast-with-local-callee", input, &source);
+    assert!(
+        source.contains("fn fragment(input: &[u8], block_size: usize, table: &mut [i32]"),
+        "cursor parameter absent: {source}"
+    );
+    assert!(
+        source.contains("is_match(ip.as_ref().expect(\"non-null cursor\").as_slice(),")
+            && source.contains("candidate.as_ref().expect(\"non-null cursor\").as_slice()) =="),
+        "cursor view at the delivered slice formal absent: {source}"
+    );
+    assert!(
+        !source.contains("restore-family")
+            && source
+                .contains("let mut ip: Option<crate::slice_cursor::SliceCursor<'_, u8>> = None;"),
+        "optional cursors absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let b = [1u8, 2, 1, 2, 1, 2, 9, 9]; let mut t = [0i32; 8]; assert_eq!(unsafe { fragment(&b, 8, &mut t, 2) }, 3); }",
+        ),
+    );
+}

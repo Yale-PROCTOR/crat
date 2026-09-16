@@ -5081,6 +5081,32 @@ pub(crate) fn synthesize_with_raw_boundary(
                 };
                 match &candidates[idx] {
                     Ok(None) => {
+                        // slicecursor (09-16): a cursor argument at a delivered
+                        // slice formal is the cursor's own view (`as_slice()`),
+                        // rendered by its use edit. Where the callee's class was
+                        // premised on the raw source (arm C: the candidate was
+                        // raw hypothetically, admitted as a cursor since), that
+                        // view is the C adaptation and is receipted under it.
+                        if matches!(pos.found, Form::Cursor { .. })
+                            && param_key.get(&(*callee, pos.index)).is_some_and(|node| {
+                                coconv.required_arms(*node).contains(super::Arm::C)
+                            })
+                        {
+                            plan.zero_bridges.push(ZeroBridgeSite {
+                                owner_class: SignatureClassId::of(*callee),
+                                caller: site.caller,
+                                span: Some(pos.span),
+                                arm: "c",
+                                position: format!("arg{}", pos.index),
+                                bridge_kind: "interface-call-cursor-view",
+                                expected_form: pos.expected.key(),
+                                found_form: pos.found.key(),
+                                argument_kind: pos.source_shape,
+                                retention: BridgeRetentionTier::None,
+                                waiver_id: None,
+                                unsafe_context: None,
+                            });
+                        }
                         if let (Some(source), Some(input @ SeamInputRendering::Adapter { .. })) =
                             (pos.root, input_rendering)
                         {
