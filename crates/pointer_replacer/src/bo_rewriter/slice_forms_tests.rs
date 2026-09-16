@@ -1828,3 +1828,37 @@ fn wave6s_lodepng_addchunk_ihdr_reduction_reconciles_after_degradation() {
     )
     .expect("slice-use receipt reconciliation");
 }
+
+/// **Relay 013 §3 — tulipindicators `ti_trima::inputs` → `ti_sma::inputs`.**
+/// The bare pass-on of a depth-2 parameter's OUTER slot (`inputs: &[*const
+/// f64]`, same form on both sides, raw element on both sides) had no carrier
+/// (`slice-use-existing-c-interface-carrier-unmapped:candidates=0`): the
+/// same-slice carrier (wave-5c W-C1) looked for the source and the parameter
+/// at `ptr_depth == 1` only, the site dropped `slice-use-evidence-held`, and
+/// the exclusion re-derivation withdrew `ti_sma`'s family with it (its
+/// cursor `input` among the losses — slicecursor 015). The carrier now reads
+/// the plan's own slot depth and requires every deeper slot to agree. Verbatim
+/// `ti_sma` / `ti_trima` (+ their `_start`) from `benchmarks/rs-crown-derived/
+/// tulipindicators`.
+#[test]
+fn wave6s_ti_trima_outer_slot_pass_on_delivers_and_returns_ti_sma_s_cursor() {
+    let input = include_str!("testdata/wave6s-drift/tulip-trima-sma.rs");
+    let (source, receipts) = emit_with_family_receipts(input);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("fnti_trima(mutsize:std::os::raw::c_int,mutinputs:&[*conststd::os::raw::c_double],mutoptions:&[std::os::raw::c_double],"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("fnti_sma(mutsize:std::os::raw::c_int,mutinputs:&[*conststd::os::raw::c_double],mutoptions:&[std::os::raw::c_double],"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("returnti_sma(size,inputs,options,outputs)"),
+        "{source}"
+    );
+    assert_eq!(receipts.trim(), "[]", "no family withdrawal: {receipts}");
+}

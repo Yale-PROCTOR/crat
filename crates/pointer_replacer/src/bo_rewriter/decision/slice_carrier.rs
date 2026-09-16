@@ -35,11 +35,17 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
     let MechanicalSubjectKey::Local {
         owner,
         mir_local,
-        slot_depth: 0,
+        slot_depth,
     } = event.key.subject
     else {
         return Err(Hold::Source);
     };
+    // wave-6s (relay 013 §3, tulipindicators `ti_trima` → `ti_sma`): the
+    // same-form pass-on of an OUTER slot (`inputs: &[*const f64]` at
+    // `slot_depth` 1) is the same zero-syntax position as a thin slice's,
+    // provided every deeper slot of the binding agrees with the parameter's —
+    // the element types must be the same type for the pass-on to coerce.
+    let depth = u8::try_from(slot_depth).map_err(|_| Hold::Source)? + 1;
     let CanonicalLocation::Hir {
         owner: hir_owner,
         item_local_id,
@@ -85,7 +91,7 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
         .filter(|(s, _)| {
             s.fn_did == owner
                 && s.local.as_u32() == mir_local
-                && s.ptr_depth == 1
+                && s.ptr_depth == depth
                 && s.hir_id == binding
         })
         .collect::<Vec<_>>();
@@ -114,12 +120,39 @@ fn prove(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &SliceUseReceiptPlan) -> 
         .iter()
         .filter(|(s, _)| {
             s.fn_did == callee
-                && s.ptr_depth == 1
+                && s.ptr_depth == depth
                 && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == index)
         })
         .collect::<Vec<_>>();
     let [(_, parameter)] = parameters.as_slice() else { return Err(Hold::Form) };
     let required = super::seam::form_of(parameter);
+    // Every deeper slot of the binding must be the parameter's form at that
+    // depth (or absent on both sides): `&[*const f64]` passes only into
+    // `&[*const f64]`, never into `&[&f64]`.
+    for deeper in (depth + 1)..=8 {
+        let slot = |fn_did: rustc_span::def_id::LocalDefId,
+                    pick: &dyn Fn(&super::Subject) -> bool| {
+            table
+                .entries
+                .iter()
+                .filter(|(s, _)| s.fn_did == fn_did && s.ptr_depth == deeper && pick(s))
+                .map(|(_, decision)| super::seam::form_of(decision))
+                .collect::<Vec<_>>()
+        };
+        let source_slots = slot(owner, &|s| {
+            s.local.as_u32() == mir_local && s.hir_id == binding
+        });
+        let parameter_slots = slot(
+            callee,
+            &|s| matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == index),
+        );
+        if source_slots != parameter_slots {
+            return Err(Hold::Form);
+        }
+        if source_slots.is_empty() {
+            break;
+        }
+    }
     // wave-6s (report 006, R401-4 landing): a MUTABLE slice source into a
     // SHARED slice parameter is the same zero-syntax position — `&mut [T]`
     // coerces to `&[T]` at the call, the existing input twin is the shared
