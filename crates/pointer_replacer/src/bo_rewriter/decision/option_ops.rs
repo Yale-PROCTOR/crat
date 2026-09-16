@@ -31,9 +31,7 @@ pub(super) fn collect_raw_return(
     uses: &mut FxHashMap<(LocalDefId, HirId), OptUses>,
 ) -> bool {
     if !matches!(tcx.parent_hir_node(node.1), Node::LetStmt(_))
-        || !matches!(tcx.parent_hir_node(expression.hir_id),
-            Node::Expr(parent) if matches!(parent.kind,
-                ExprKind::Ret(Some(value)) if value.hir_id == expression.hir_id))
+        || returned_value_route(tcx, expression).is_none()
         || !matches!(
             tcx.fn_sig(node.0)
                 .skip_binder()
@@ -53,6 +51,44 @@ pub(super) fn collect_raw_return(
         operation: "return-raw",
     });
     true
+}
+
+/// Is this expression the value an explicit `return` hands out — bare
+/// (`return r`) or as the tail of an `if` / `else if` arm
+/// (`return if !r.is_null() { r } else { .. }`, lil `lil_find_var::r`)?
+/// A returned CAST of the local (`return pvalue as *mut c_void`, binn
+/// `compress_int::pvalue`) is the address arm's `ptr-cast` observation
+/// instead, deferred by [`collect_address_observation`].
+fn returned_value_route(tcx: TyCtxt<'_>, expression: &Expr<'_>) -> Option<()> {
+    let mut current = expression.hir_id;
+    loop {
+        let parent = match tcx.parent_hir_node(current) {
+            Node::Expr(parent) => parent,
+            // A block's tail expression: its parent node is the `Block` itself,
+            // whose own parent is the `ExprKind::Block` expression.
+            Node::Block(block) if block.expr.is_some_and(|tail| tail.hir_id == current) => {
+                current = block.hir_id;
+                continue;
+            }
+            _ => return None,
+        };
+        match parent.kind {
+            ExprKind::Ret(Some(value)) if value.hir_id == current => return Some(()),
+            // A cast of the local is the address arm's observation (`ptr-cast`),
+            // deferred by `collect_address_observation`; the cast stays and
+            // converts the bridged value.
+            ExprKind::Cast(inner, _) if inner.hir_id == current => return None,
+            ExprKind::Block(block, _)
+                if block.hir_id == current
+                    || block.expr.is_some_and(|tail| tail.hir_id == current) => {}
+            ExprKind::If(_, then, otherwise)
+                if then.hir_id == current
+                    || otherwise.is_some_and(|otherwise| otherwise.hir_id == current) => {}
+            ExprKind::DropTemps(inner) if inner.hir_id == current => {}
+            _ => return None,
+        }
+        current = parent.hir_id;
+    }
 }
 
 pub(super) fn plan_raw_returns(
@@ -174,6 +210,30 @@ pub(super) fn collect_address_observation(
     node: (LocalDefId, HirId),
     uses: &mut FxHashMap<(LocalDefId, HirId), OptUses>,
 ) -> bool {
+    // A RETURNED pointer-to-pointer or pointer-to-integer cast of the local
+    // (`return pvalue as *mut c_void`) is the address arm's `ptr-cast` /
+    // `ptr-to-int` observation (the same predicate as the emitability
+    // collector's); a cast in any other position keeps its own owner (a call
+    // argument is a boundary site, a method receiver a slice-use carrier).
+    if let Node::Expr(cast) = tcx.parent_hir_node(expression.hir_id)
+        && let ExprKind::Cast(inner, _) = cast.kind
+        && inner.hir_id == expression.hir_id
+        && matches!(
+            tcx.typeck(node.0).expr_ty(cast).kind(),
+            TyKind::RawPtr(..) | TyKind::Int(_) | TyKind::Uint(_)
+        )
+        && !cast_owned_by_call_argument(tcx, cast)
+        && returned_value_route(tcx, cast).is_some()
+    {
+        let entry = uses.entry(node).or_default();
+        entry.non_test_uses += 1;
+        entry.sites.push(OptUseSite {
+            hir_id: expression.hir_id,
+            span: expression.span,
+            operation: "address-observation",
+        });
+        return true;
+    }
     let mut operand = expression;
     while let Node::Expr(parent) = tcx.parent_hir_node(operand.hir_id)
         && matches!(parent.kind, ExprKind::Cast(inner, _) if inner.hir_id == operand.hir_id)
@@ -231,7 +291,24 @@ pub(super) fn plan_address_observations(
                 && edit.bridge.caller == subject.fn_did
                 && edit.span.source_callsite() == site.span.source_callsite()
         });
+        // A pointer-to-pointer cast of a SHARED optional to a `*mut` target
+        // is not an observation of the address: the cast value can be written
+        // through by whoever receives it (a return, a store), and a view of a
+        // shared reference must never become writable (`&T -> &mut T`, R395-2).
+        let shared_to_mut_cast = matches!(source, Form::Opt { mutable: false, .. })
+            && matches!(tcx.parent_hir_node(site.hir_id),
+            Node::Expr(cast) if matches!(cast.kind, ExprKind::Cast(inner, _) if inner.hir_id == site.hir_id)
+                && matches!(
+                    tcx.typeck(subject.fn_did).expr_ty(cast).kind(),
+                    TyKind::RawPtr(_, rustc_ast::Mutability::Mut)
+                ));
         let (adapter, reason) = match view {
+            _ if shared_to_mut_cast => (
+                String::new(),
+                Some(MechanicalTerminalReason::EvidenceMissing(
+                    "option-address-view:shared-to-mut-cast".to_owned(),
+                )),
+            ),
             Some(view) => (view.spec.template_key().to_owned(), None),
             None => (
                 String::new(),
@@ -449,4 +526,20 @@ pub(super) fn address_of_raw_dereference(
     let ExprKind::AddrOf(_, _, place) = expr.kind else { return false };
     let ExprKind::Unary(rustc_hir::UnOp::Deref, base) = place.kind else { return false };
     matches!(tcx.typeck(owner).expr_ty(base).kind(), TyKind::RawPtr(..))
+}
+
+/// The emitability collector's `owned_by_call_argument`, for a cast: a cast
+/// that is (through `DropTemps`) a call argument is a boundary site, not an
+/// address observation.
+fn cast_owned_by_call_argument(tcx: TyCtxt<'_>, cast: &Expr<'_>) -> bool {
+    let mut child = cast.hir_id;
+    for _ in 0..4 {
+        let Node::Expr(parent) = tcx.parent_hir_node(child) else { return false };
+        match &parent.kind {
+            ExprKind::Call(_, args) if args.iter().any(|arg| arg.hir_id == child) => return true,
+            ExprKind::DropTemps(inner) if inner.hir_id == child => child = parent.hir_id,
+            _ => return false,
+        }
+    }
+    false
 }
