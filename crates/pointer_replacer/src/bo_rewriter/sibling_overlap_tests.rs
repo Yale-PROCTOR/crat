@@ -811,6 +811,76 @@ fn r304_an_unruled_source_shape_is_still_an_unresolved_gap() {
     }
 }
 
+/// bzip2's shape, reduced (R412-4): C2Rust spells `&s->limit[t][0]` as a
+/// reborrow of an address reached from the subject's referent by a field
+/// projection and raw-pointer adjustments. It is a view INTO the referent —
+/// named as its own shape and HELD under the seat's disposition, so the
+/// custody record is complete rather than an unresolved gap.
+const PROJECTED_ADDRESS_CASE: &str = "#![allow(dead_code, unused_unsafe, non_snake_case)]\n\
+    #[repr(C)] pub struct State { pub limit: [[i32; 4]; 2], pub len: i32 }\n\
+    extern \"C\" { fn tables(limit: *mut i32, base: *mut i32, n: i32) -> i32; }\n\
+    pub unsafe fn decompress(s: *mut State, t: i32) -> i32 {\n\
+        (*s).len = t;\n\
+        tables(&mut *(*(*s).limit.as_mut_ptr().offset(t as isize)).as_mut_ptr().offset(0),\n\
+            &mut *(*(*s).limit.as_mut_ptr().offset(0)).as_mut_ptr().offset(0), (*s).len)\n\
+    }\n\
+    pub unsafe fn entry() -> i32 { let mut st = State { limit: [[0; 4]; 2], len: 0 }; decompress(&mut st, 1) }\n";
+
+#[test]
+fn r412_a_reborrowed_projected_address_is_its_own_shape_and_held() {
+    let inventory = inventory(PROJECTED_ADDRESS_CASE, "decompress::s");
+    let record = covered(&inventory, "decompress::s", "tables", 0);
+    assert!(
+        matches!(
+            record.evidence,
+            SourceBridgeEvidence::UnknownShape("unsealed:addr-of-projected-through-the-subject")
+        ),
+        "the reborrow of an address projected through the subject is named: {:?}",
+        record.evidence
+    );
+    let receipts =
+        sibling_overlap::select_coverage_gaps(std::slice::from_ref(record), raw_terminal);
+    let [receipt] = receipts.as_slice() else { panic!("one receipt: {receipts:?}") };
+    assert!(receipt.held, "the ruled shape is held: {receipt:?}");
+    assert_eq!(
+        receipt.reason,
+        sibling_overlap::HELD_SOURCE_IS_PROJECTED_ADDRESS
+    );
+}
+
+/// Fault: the same reborrow rooted at ANOTHER parameter is not the subject's
+/// view: `s` owns no coverage record at that argument at all, and the record
+/// belongs to `o` — under whose own name the shape is (correctly) the same.
+#[test]
+fn r412_a_reborrowed_address_rooted_elsewhere_is_not_the_subjects_view() {
+    let input = PROJECTED_ADDRESS_CASE.replace(
+        "&mut *(*(*s).limit.as_mut_ptr().offset(0)).as_mut_ptr().offset(0), (*s).len)",
+        "&mut *(*(*o).limit.as_mut_ptr().offset(0)).as_mut_ptr().offset(0), (*s).len)",
+    ).replace("pub unsafe fn decompress(s: *mut State, t: i32) -> i32 {", "pub unsafe fn decompress(s: *mut State, t: i32, o: *mut State) -> i32 {")
+    .replace("decompress(&mut st, 1) }", "let mut other = State { limit: [[0; 4]; 2], len: 0 }; decompress(&mut st, 1, &mut other) }");
+    assert_ne!(input, PROJECTED_ADDRESS_CASE);
+    let inventory = inventory(&input, "decompress::s");
+    let for_s_at_1 = inventory
+        .coverage
+        .iter()
+        .filter(|record| {
+            record.potential.source.label() == "decompress::s"
+                && record.potential.site.callee.symbol == "tables"
+                && record.potential.site.argument_index == 1
+        })
+        .count();
+    assert_eq!(for_s_at_1, 0, "an address rooted at `o` is no view of `s`");
+    let record = covered(&inventory, "decompress::s", "tables", 0);
+    assert!(
+        matches!(
+            record.evidence,
+            SourceBridgeEvidence::UnknownShape("unsealed:addr-of-projected-through-the-subject")
+        ),
+        "{:?}",
+        record.evidence
+    );
+}
+
 /// heman's shape, reduced: a depth-1 projection of the referent viewed as a
 /// pointer by an array method. The projection is the one `ProjectedReferent`
 /// licenses; the array view is the only reason it used to fall through.

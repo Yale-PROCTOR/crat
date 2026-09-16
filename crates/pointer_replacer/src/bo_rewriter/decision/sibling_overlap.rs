@@ -234,6 +234,12 @@ pub(crate) struct CoverageGapReceipt {
 /// name rather than reported as an unresolved shape.
 pub(crate) const HELD_SOURCE_IS_LOAD: &str = "held:bridge-source-is-load";
 
+/// R412-4: an address reached from the subject's referent by projections and
+/// raw-pointer adjustments, reborrowed at the call — a view INTO the referent,
+/// not a source bridge of the subject; the site is held under this name and
+/// the custody record is complete.
+pub(crate) const HELD_SOURCE_IS_PROJECTED_ADDRESS: &str = "held:bridge-source-is-projected-address";
+
 /// The seat's disposition for an unsealed shape, or `None` where it has none
 /// and the site stays an unresolved gap. Fail-closed by construction: a new
 /// shape is unresolved until it is ruled on.
@@ -241,11 +247,11 @@ pub(crate) fn held_disposition(shape: &str) -> Option<&'static str> {
     // Both shapes are the same fact: the pointer handed to the callee was
     // LOADED through the subject. One spells the load `*p.offset(i)`, the
     // other projects a raw pointer field and adjusts it, `((*t).arr).offset(i)`.
-    matches!(
-        shape,
-        "unsealed:deref" | "unsealed:method-on-a-loaded-pointer"
-    )
-    .then_some(HELD_SOURCE_IS_LOAD)
+    match shape {
+        "unsealed:deref" | "unsealed:method-on-a-loaded-pointer" => Some(HELD_SOURCE_IS_LOAD),
+        "unsealed:addr-of-projected-through-the-subject" => Some(HELD_SOURCE_IS_PROJECTED_ADDRESS),
+        _ => None,
+    }
 }
 
 pub(crate) fn select_coverage_gaps(
@@ -800,6 +806,40 @@ fn source_bridge_evidence(
     SourceBridgeEvidence::UnknownShape(unsealed_shape(tcx, typeck, expression, source))
 }
 
+/// R412-4: the operand of an address-of, walked through dereferences,
+/// raw-pointer method receivers (`as_mut_ptr`, `offset`, ..), field and index
+/// projections and temporaries, roots at the SUBJECT itself.
+fn projected_through(
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    operand: &Expr<'_>,
+    source: &Subject,
+) -> bool {
+    let mut place = operand;
+    let mut dereferences = 0usize;
+    loop {
+        match place.kind {
+            ExprKind::Field(base, _) | ExprKind::DropTemps(base) => place = base,
+            ExprKind::Index(base, _, _) if typeck.type_dependent_def_id(place.hir_id).is_none() => {
+                place = base
+            }
+            ExprKind::Unary(rustc_hir::UnOp::Deref, base) => {
+                dereferences += 1;
+                place = base;
+            }
+            ExprKind::MethodCall(_, receiver, _, _)
+                if matches!(typeck.expr_ty(receiver).kind(), TyKind::RawPtr(..))
+                    || matches!(typeck.expr_ty(place).kind(), TyKind::RawPtr(..)) =>
+            {
+                place = receiver
+            }
+            _ => break,
+        }
+    }
+    dereferences >= 1
+        && matches!(place.kind, ExprKind::Path(QPath::Resolved(_, path))
+            if path.res == Res::Local(source.hir_id))
+}
+
 /// **R291-1 — what the source expression IS, when it is none of the sealed
 /// shapes.**
 ///
@@ -838,9 +878,17 @@ fn unsealed_shape(
         ExprKind::Unary(rustc_hir::UnOp::Deref, _) => "unsealed:deref",
         ExprKind::Unary(..) => "unsealed:unary",
         ExprKind::Binary(..) => "unsealed:binary",
-        ExprKind::AddrOf(..) => {
+        ExprKind::AddrOf(_, _, operand) => {
             if rooted_elsewhere(expression) {
                 "unsealed:addr-of-other-root"
+            } else if projected_through(typeck, operand, source) {
+                // **R412-4 (bzip2 `BZ2_hbCreateDecodeTables`).** C2Rust spells
+                // `&s->limit[t][0]` as `&mut *(*(*s).limit.as_mut_ptr()
+                // .offset(t)).as_mut_ptr().offset(0)`: a reborrow of an
+                // address reached from the subject's own referent by field
+                // projections and raw-pointer adjustments. It is a view INTO
+                // the referent, named so the seat's disposition can hold it.
+                "unsealed:addr-of-projected-through-the-subject"
             } else {
                 "unsealed:addr-of-non-place"
             }
