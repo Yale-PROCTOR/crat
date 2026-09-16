@@ -54,6 +54,10 @@ pub(crate) enum ResultPosition {
     Cast,
     /// `x = callee(..)` into an existing raw place.
     Assign,
+    /// `let x = callee(..)` where `x` is typed by a sealed constructor over
+    /// the raw call (a walking caller of a thin return): the constructor is
+    /// composed over this view (the initializer-channel composition).
+    Initializer,
 }
 
 impl ResultPosition {
@@ -62,7 +66,33 @@ impl ResultPosition {
             Self::Deref => "deref",
             Self::Cast => "cast",
             Self::Assign => "assign",
+            Self::Initializer => "initializer",
         }
+    }
+}
+
+/// Decide-time (wave 6): the subject is a call-result local of a LOCAL callee
+/// whose return this lane delivers THIN, so a sealed slice constructor over
+/// the call is rendered over this lane's raw-restoring view of it — the
+/// constructor-typing refusal's premise (a constructor over a converted
+/// return is ill-typed) does not hold.
+pub(crate) fn bridges_local_callee_result(
+    ctx: &super::Ctx<'_, '_>,
+    subject: &super::Subject,
+) -> bool {
+    use super::construction::{CallResultTarget, Construction};
+    let node = (subject.fn_did, subject.hir_id);
+    matches!(
+        ctx.constructions.by_binding.get(&node),
+        Some(Construction::CallResult)
+    ) && match ctx.constructions.call_result_targets.get(&node) {
+        Some(CallResultTarget::DirectLocal(callee)) => ctx
+            .lifetime_eligibility
+            .is_some_and(|eligibility| eligibility.thin_return_permit(*callee)),
+        Some(
+            CallResultTarget::Indirect | CallResultTarget::Foreign | CallResultTarget::Unresolved,
+        )
+        | None => false,
     }
 }
 
@@ -225,6 +255,10 @@ fn assigned_place(table: &DecisionTable, owner: LocalDefId, lhs: &Expr<'_>) -> A
     let rustc_hir::def::Res::Local(binding) = path.res else {
         return AssignedPlace::Raw;
     };
+    assigned_place_of(table, owner, binding)
+}
+
+fn assigned_place_of(table: &DecisionTable, owner: LocalDefId, binding: HirId) -> AssignedPlace {
     let decision = table
         .entries
         .iter()
@@ -329,7 +363,23 @@ fn consumer_of(tcx: TyCtxt<'_>, table: &DecisionTable, call: &Expr<'_>, form: Fo
             ExprKind::If(..) | ExprKind::Match(..) => Consumer::Unbuilt("condition-or-scrutinee"),
             _ => Consumer::Unbuilt("other-expression"),
         },
-        HirNode::LetStmt(_) => Consumer::Elsewhere,
+        // The receiving local's own twin types a thin or optional result;
+        // a local a sealed constructor types over the RAW call takes this
+        // view under the constructor (the initializer-channel composition)
+        // when the return is thin — a slice or optional return reaches its
+        // receiving local through the return receiver.
+        HirNode::LetStmt(local) => match (local.pat.kind, form) {
+            (rustc_hir::PatKind::Binding(_, binding, ..), Form::Ref { .. })
+                if matches!(
+                    assigned_place_of(table, call.hir_id.owner.def_id, binding),
+                    AssignedPlace::ConstructedElsewhere
+                ) =>
+            {
+                Consumer::Position(ResultPosition::Initializer, None)
+            }
+            (_, Form::Ref { .. } | Form::Slice { .. } | Form::Opt { .. }) => Consumer::Elsewhere,
+            (_, Form::NestedSlice { .. } | Form::Cursor { .. } | Form::Raw) => Consumer::Elsewhere,
+        },
         HirNode::Stmt(_) => Consumer::Unbuilt("discarded-result"),
         _ => Consumer::Elsewhere,
     }

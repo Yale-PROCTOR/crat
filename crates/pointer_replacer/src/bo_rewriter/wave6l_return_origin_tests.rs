@@ -809,7 +809,7 @@ pub unsafe extern "C" fn row_sum(mut src: *mut heman_image, mut dst: *mut heman_
 "#;
 
 #[test]
-fn w6l_mixed_callers_take_one_form_and_the_thin_caller_is_held_typed() {
+fn w6l_mixed_callers_deliver_thin_and_the_walker_is_constructed_over_the_view() {
     let observed = observe(HEMAN_MIXED);
     let data = decision_of(&observed, "heman_image_sample::data");
     assert!(
@@ -817,23 +817,10 @@ fn w6l_mixed_callers_take_one_form_and_the_thin_caller_is_held_typed() {
         "data={data}; failures={:?}",
         observed.failures
     );
-    let mine = observed
-        .plans
-        .iter()
-        .any(|(function, _)| function == "heman_image_texel");
-    for label in ["row_sum::srcp", "row_sum::dstp"] {
-        let decision = decision_of(&observed, label);
-        assert!(decision.contains("ReturnNotAdapted"), "{label}={decision}");
-        assert_eq!(
-            failure_of(&observed, label),
-            Some(LifetimeFailure::SeamIncompatible),
-            "{label}: {:?}",
-            observed.failures
-        );
-    }
     let RewriteOutcome::Emitted {
         source,
         reverted_count,
+        degradations,
         ..
     } = emitted(
         "heman-mixed",
@@ -843,25 +830,33 @@ fn w6l_mixed_callers_take_one_form_and_the_thin_caller_is_held_typed() {
     else {
         panic!("heman mixed emission degraded");
     };
-    println!("W6L-MIXED-EMITTED\n{source}\nW6L-MIXED-END");
+    println!("W6L-MIXED-EMITTED\n{source}\nW6L-MIXED-END\n{degradations:?}");
     assert_eq!(reverted_count, 0);
     let text = compact(&source);
-    assert!(
-        text.contains("sum+=*dstp+*srcp;"),
-        "the held thin callers keep their raw reads: {text}"
-    );
-    if mine {
-        assert!(text.contains("->&'amut[f32]"), "{text}");
-        assert!(
-            text.contains("letmutdata:&[f32]=__crat_safe_heman_image_texel(img,x,y);"),
-            "{text}"
-        );
-    } else {
-        // R217-2(a) re-pin (batch-8 composition): wave-6a's sealed slice
-        // constructor delivered the walker FROM THE RAW CALL and this rule
-        // yielded the callee, which keeps its raw interface.
-        assert!(text.contains("->*mutf32"), "{text}");
+    // Wave 6 (the initializer-channel composition): one thin caller makes
+    // the return THIN and the thin callers deliver as inferred references;
+    // the walking caller is typed by its sealed slice constructor rendered
+    // over this lane's view of the adapted call — both deliver, nothing is
+    // held on the form any more.
+    for label in ["row_sum::srcp", "row_sum::dstp"] {
+        let decision = decision_of(&observed, label);
+        assert!(decision.contains("InferredRef"), "{label}={decision}");
     }
+    assert!(text.contains("->&'amutf32"), "{text}");
+    assert!(
+        text.contains("letmutsrcp:&f32=__crat_safe_heman_image_texel(src,x,y);"),
+        "{text}"
+    );
+    assert!(text.contains("sum+=*dstp+*srcp;"), "{text}");
+    assert!(
+        text.contains("letmutdata:&[f32]=core::slice::from_raw_parts({let__crat_native_result_9_11:&mutf32=(__crat_safe_heman_image_texel(img,x,y));(core::ptr::from_mut(&mut*__crat_native_result_9_11))as*mutf32},crate::FALLBACK_SLICE_EXTENT);"),
+        "{text}"
+    );
+    assert!(
+        text.contains("letfresh1=data[0];data=&data[1..];"),
+        "{text}"
+    );
+    assert!(degradations.is_empty(), "{degradations:?}");
 }
 
 /// brotli `StartPosQueueAt` / `UpdateNodes` (subjects `UpdateNodes::posdata#54`,
@@ -1206,50 +1201,59 @@ fn w6l_expression_position_receivers_keep_the_callee_class_placed() {
             .any(|d| format!("{:?}", d.reason).contains("raw-receiver-result-unavailable")),
         "{degradations:?}"
     );
-    if !observe(HEMAN_EXPRESSION_RECEIVERS)
-        .plans
-        .iter()
-        .any(|(function, _)| function == "heman_image_texel")
-    {
-        // R217-2(a) re-pin (batch-8 composition): wave-6a's sealed slice
-        // constructor delivers the walker FROM THE RAW CALL, this rule
-        // yields the callee (raw interface kept, class placed), and the
-        // cast receiver is a typed `return-not-adapted` hold. The thin
-        // variant below keeps the wave-5 carriers witnessed on every head.
-        assert!(text.contains("->*mutf32"), "{text}");
-        assert!(
-            text.contains("letmuttexel:&mut[f32]=core::slice::from_raw_parts_mut(__crat_safe_heman_image_texel(target,"),
-            "{text}"
-        );
-        assert!(
-            degradations
-                .iter()
-                .any(|d| d.subject == "heman_lighting_apply::N"
-                    && format!("{:?}", d.reason) == "ReturnNotAdapted"),
-            "{degradations:?}"
-        );
-        return;
-    }
-    assert!(text.contains("->&'staticmut[f32]"), "{text}");
-    assert!(text.contains("letmuttexel:&mut[f32]="), "{text}");
-    // (a) the cast initializer: the twin inside the cast.
+    // Wave 6 (the initializer-channel composition): a walker beside thin
+    // receivers makes the return THIN; the walker is typed by its sealed
+    // slice constructor rendered over this lane's view of the adapted call,
+    // the cast and the store take their views, the immediate derefs read the
+    // reference natively — every receiver of one callee delivers.
+    let view = |temporary: &str, args: &str| {
+        format!(
+            "{{let{temporary}:&mutf32=(__crat_safe_heman_image_texel({args}));(core::ptr::from_mut(&mut*{temporary}))as*mutf32}}"
+        )
+    };
+    assert!(text.contains("->&'staticmutf32"), "{text}");
     assert!(
-        text.contains("letmutN={let__crat_native_result_14_10:&mut[f32]=(__crat_safe_heman_image_texel(normals,x,y));(__crat_native_result_14_10.as_mut_ptr())as*mutf32}as*mutkmVec3;"),
+        text.contains(&format!(
+            "letmuttexel:&mut[f32]=core::slice::from_raw_parts_mut({},crate::FALLBACK_SLICE_EXTENT);",
+            view("__crat_native_result_13_11", "target,i,j")
+        )),
         "{text}"
     );
-    // (b) the immediate deref read and the compound assignment.
     assert!(
-        text.contains("p.z=*{let__crat_native_result_15_24:&mut[f32]="),
+        text.contains("texel[0]=val;texel=&muttexel[1..];"),
         "{text}"
     );
-    assert!(text.contains("as*mutf32}+=v;"), "{text}");
-    // (c) the assignment into an existing raw local — or, where another
-    // family delivers that null-initialised local as an optional view, its
-    // store composed OVER the view (the nested-edit composition, wave 6):
-    // `src = ({ let t: &mut [f32] = (call); (t.as_mut_ptr()) as *mut f32 } as *const f32).as_ref()`.
+    // (a) the cast initializer: the view inside the cast; the local a typed hold.
     assert!(
-        text.contains("src={let__crat_native_result_")
-            || text.contains("src=({let__crat_native_result_17_19:&mut[f32]=(__crat_safe_heman_image_texel(secondary,x,y));(__crat_native_result_17_19.as_mut_ptr())as*mutf32}as*constf32).as_ref();"),
+        text.contains(&format!(
+            "letmutN={}as*mutkmVec3;",
+            view("__crat_native_result_14_10", "normals,x,y")
+        )),
+        "{text}"
+    );
+    assert!(
+        degradations
+            .iter()
+            .any(|d| d.subject == "heman_lighting_apply::N"
+                && format!("{:?}", d.reason) == "ReturnNotAdapted"),
+        "{degradations:?}"
+    );
+    // (b) the immediate deref read and the compound assignment, natively.
+    assert!(
+        text.contains("p.z=*__crat_safe_heman_image_texel(heightmap,x,y);"),
+        "{text}"
+    );
+    assert!(
+        text.contains("*__crat_safe_heman_image_texel(result,i,j)+=v;"),
+        "{text}"
+    );
+    // (c) the store into the null-initialised local: the raw view, or the
+    // optional store composed OVER it where another family delivers `src`.
+    let store = view("__crat_native_result_17_19", "secondary,x,y");
+    assert!(
+        text.contains(&format!("src={store};"))
+            || (text.contains("letmutsrc:Option<&f32>=None;")
+                && text.contains(&format!("src=({store}as*constf32).as_ref();"))),
         "{text}"
     );
     let views = raw_boundary_artifacts
@@ -1260,7 +1264,7 @@ fn w6l_expression_position_receivers_keep_the_callee_class_placed() {
                 && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
         })
         .collect::<Vec<_>>();
-    assert_eq!(views.len(), 4, "{views:#?}");
+    assert_eq!(views.len(), 3, "{views:#?}");
     for event in &views {
         assert_eq!(
             event.state,

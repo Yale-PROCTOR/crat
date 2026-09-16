@@ -451,8 +451,9 @@ pub(crate) fn is_safe_view(decision: Option<&&Decision>) -> bool {
 }
 
 /// EXHAUSTIVE: a call-result local delivered by a construction OVER the raw
-/// call (a sealed slice constructor, an optional or cursor form) — another
-/// family's delivery that consumes the callee's raw interface.
+/// call (a sealed slice constructor, an optional or cursor form) — a
+/// delivery the initializer-channel composition renders over this lane's
+/// view, so it names the callee exactly as a residual caller does.
 pub(crate) fn is_raw_call_construction(decision: Option<&&Decision>) -> bool {
     match decision {
         Some(
@@ -483,7 +484,6 @@ pub(crate) fn candidate_callees(
     use super::construction::{CallResultTarget, Construction};
     let mut callers = FxHashMap::<LocalDefId, Vec<NodeKey>>::default();
     let mut named = FxHashMap::<LocalDefId, bool>::default();
-    let mut served_elsewhere = FxHashMap::<LocalDefId, bool>::default();
     for subject in subjects
         .iter()
         .filter(|subject| matches!(subject.ctor, Some(Construction::CallResult)))
@@ -497,12 +497,12 @@ pub(crate) fn candidate_callees(
                 callers.entry(*callee).or_default().push(node);
                 let decision = decisions.get(&node);
                 *named.entry(*callee).or_default() |= is_return_residual(decision);
-                // A call-result local another family already delivers from
-                // the RAW call (a sealed slice constructor over the result,
-                // an optional receiver) consumes the callee's raw interface;
-                // changing that interface would break it. Such a callee is
-                // not this rule's.
-                *served_elsewhere.entry(*callee).or_default() |= is_raw_call_construction(decision);
+                // A call-result local another family delivers from the raw
+                // call (a sealed slice constructor over the result) keeps
+                // that delivery: the constructor is composed over this lane's
+                // view of the adapted call (the initializer-channel
+                // composition, wave 6), so the callee stays this rule's.
+                *named.entry(*callee).or_default() |= is_raw_call_construction(decision);
             }
             CallResultTarget::Indirect
             | CallResultTarget::Foreign
@@ -511,12 +511,26 @@ pub(crate) fn candidate_callees(
     }
     callers.retain(|callee, _| named.get(callee).copied().unwrap_or(false));
     callers
-        .into_iter()
-        .map(|(callee, nodes)| {
-            let served = served_elsewhere.get(&callee).copied().unwrap_or(false);
-            (callee, if served { Vec::new() } else { nodes })
-        })
-        .collect()
+}
+
+/// The local's initializer CASTS the call (`let n = callee(..) as *mut U`):
+/// the binding's type is the cast's target, never the callee's borrowed
+/// return, so no inferred reference may type it (the cast position is the
+/// native-result expression carrier's, with a typed hold on the local).
+pub(crate) fn initializer_is_cast(program: &RustProgram<'_>, subject: &Subject) -> bool {
+    let tcx = program.tcx;
+    let mut node = subject.hir_id;
+    loop {
+        match tcx.parent_hir_node(node) {
+            rustc_hir::Node::Pat(pat) => node = pat.hir_id,
+            rustc_hir::Node::LetStmt(local) => {
+                return local
+                    .init
+                    .is_some_and(|init| matches!(init.kind, rustc_hir::ExprKind::Cast(..)));
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// The dead-return parameter of a callee: the bare parameter its `return`

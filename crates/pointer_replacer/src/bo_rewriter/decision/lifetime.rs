@@ -296,6 +296,19 @@ impl LifetimeEligibility {
         self.return_permits.remove(&subject).is_some()
     }
 
+    /// wave-6l: the callee's return is a THIN reference under a permit of
+    /// this lane (a bare-parameter, dead-return or through-raw-field tie
+    /// whose form is not the slice).
+    pub(crate) fn thin_return_permit(&self, callee: LocalDefId) -> bool {
+        self.return_permits
+            .values()
+            .any(|permit| permit.function == callee)
+            && !self
+                .through_raw_field
+                .get(&callee)
+                .is_some_and(|reuse| reuse.slice)
+    }
+
     pub(crate) fn inferred_permit(&self, subject: NodeKey) -> Option<InferredLifetimePermit> {
         self.inferred_permits.get(&subject).copied()
     }
@@ -620,14 +633,6 @@ pub(crate) fn derive_return_eligibility(
         let mut callees = callees.into_iter().collect::<Vec<_>>();
         callees.sort_unstable_by_key(|(did, _)| did.local_def_index.as_u32());
         for (callee, callers) in callees {
-            // An empty caller list names a callee whose raw interface another
-            // family's delivery already consumes (see `candidate_callees`).
-            if callers.is_empty() {
-                result
-                    .through_raw_field_failures
-                    .insert(callee, LifetimeFailure::SeamIncompatible);
-                continue;
-            }
             if web.contains(callee)
                 && matches!(
                     exposure.plan(callee),
@@ -639,7 +644,12 @@ pub(crate) fn derive_return_eligibility(
                     .insert(callee, LifetimeFailure::FnPtrWebHeld);
                 continue;
             }
-            let slice = callers.iter().any(|caller| {
+            // The slice form serves callers that ALL walk the result; one
+            // thin caller makes the return thin, and a walking caller of a
+            // thin return is typed by its sealed slice constructor over this
+            // lane's view of the call (the initializer-channel composition,
+            // wave 6) — both deliver.
+            let slice = callers.iter().all(|caller| {
                 super::return_through_raw_field::arithmetic_use(raw_only_uses, *caller)
             });
             let dead_return = super::return_through_raw_field::dead_return_parameter(
@@ -889,6 +899,14 @@ pub(crate) fn derive_return_eligibility(
         };
         if model.get(&SlotRef::Local(subject.fn_did, slot)) != Some(&SlotKind::Ref) {
             result.failures.insert(key, LifetimeFailure::OriginConflict);
+            continue;
+        }
+        // wave 6: a cast initializer types the local by the cast, not by the
+        // callee's return — the cast position is the expression carrier's.
+        if super::return_through_raw_field::initializer_is_cast(program, subject) {
+            result
+                .failures
+                .insert(key, LifetimeFailure::SeamIncompatible);
             continue;
         }
         if !return_plan_functions.contains(&callee) {

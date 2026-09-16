@@ -271,7 +271,8 @@ fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
 pub(crate) fn refuses(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
     matches!(subject.kind, SubjectKind::Local)
         && subject.ty_span.is_none()
-        && (call_result_of_local_callee(ctx.constructions, subject)
+        && ((call_result_of_local_callee(ctx.constructions, subject)
+            && !super::native_result_expression::bridges_local_callee_result(ctx, subject))
             || argument_of_local_callee(ctx.tcx, subject)
             || root_is_a_reference_candidate(ctx, subject))
 }
