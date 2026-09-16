@@ -10309,6 +10309,158 @@ mod run {
             .replace(['\t', '\r', '\n'], " ")
     }
 
+    /// R423-5 (wave-6l): the program's compiler-diagnostics table — the
+    /// attributed reverts, then the FIRST verify's own novel diagnostics that
+    /// no revert row already carries.
+    ///
+    /// The second half exists because the first is not the record it reads
+    /// like: `capture.reverts` holds only what span attribution could own, so
+    /// an emitted outcome whose classes were taken back by the recovery
+    /// bisect writes an EMPTY table while its messages — the only statement of
+    /// what the reverts were for — are dropped (heman's 17 at batch 8:
+    /// `heman_ops_merge_political` E0308 ×5, `heman_image_extract_rgb` ×3, the
+    /// kazmath inverses, `stitch_vertical` / `warp_core` E0599, 4 × E0499; the
+    /// diagnostic ledger keeps their codes and functions and nothing else).
+    /// A first-verify row carries `<first-verify>` as its function and
+    /// `first-verify` as its attribution, so the two halves never merge.
+    fn raw_boundary_diagnostics_table(
+        reverts: &[crate::bo_rewriter::E1RevertDiagnostic],
+        first_diags: &[crate::bo_rewriter::verify::Diag],
+        observed_root: &std::path::Path,
+    ) -> String {
+        let row = |function: &str,
+                   diagnostic: &crate::bo_rewriter::verify::Diag,
+                   attribution: &str| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                tsv_field(function, 300),
+                e1_code(diagnostic.code.as_deref()),
+                tsv_field(&diagnostic.message, 300),
+                full_tsv_field(&diagnostic.message),
+                tsv_field(
+                    &crate::bo_rewriter::verify::crate_relative(&diagnostic.file, observed_root),
+                    400,
+                ),
+                diagnostic.line,
+                diagnostic.column,
+                diagnostic.end_line,
+                diagnostic.end_column,
+                attribution,
+            )
+        };
+        let mut diagnostics = String::from(RAW_BOUNDARY_DIAGNOSTIC_HEADER);
+        for diagnostic in reverts {
+            diagnostics.push_str(&row(
+                &diagnostic.function,
+                &diagnostic.diagnostic,
+                &diagnostic.attribution,
+            ));
+        }
+        let owned = reverts
+            .iter()
+            .map(|revert| {
+                (
+                    revert.diagnostic.file.clone(),
+                    revert.diagnostic.line,
+                    revert.diagnostic.column,
+                    revert.diagnostic.code.clone(),
+                    revert.diagnostic.message.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for diagnostic in first_diags {
+            let identity = (
+                diagnostic.file.clone(),
+                diagnostic.line,
+                diagnostic.column,
+                diagnostic.code.clone(),
+                diagnostic.message.clone(),
+            );
+            if owned.contains(&identity) {
+                continue;
+            }
+            diagnostics.push_str(&row("<first-verify>", diagnostic, "first-verify"));
+        }
+        diagnostics
+    }
+
+    /// *Mutation-tested:* drop the `first_diags` half and the table is its
+    /// header alone for the emitted-with-recovery-reverts shape.
+    #[test]
+    fn r423_first_verify_diagnostics_are_written_beside_the_attributed_reverts() {
+        use crate::bo_rewriter::verify::{Diag, Direction};
+        let root = std::path::PathBuf::from("/tmp/crat-verify-0-0");
+        let diag = |line: usize, message: &str, code: &str| Diag {
+            file: "/tmp/crat-verify-0-0/lib.rs".to_owned(),
+            line,
+            column: 9,
+            end_line: line,
+            end_column: 20,
+            message: message.to_owned(),
+            direction: Direction::Other,
+            code: Some(code.to_owned()),
+            related: Vec::new(),
+        };
+        // An emitted outcome whose classes the recovery bisect took back:
+        // no attributed revert row, four first-verify diagnostics.
+        let table = raw_boundary_diagnostics_table(
+            &[],
+            &[
+                diag(4181, "mismatched types", "ErrCode(308)"),
+                diag(
+                    4200,
+                    "cannot borrow `*q` as mutable more than once",
+                    "ErrCode(499)",
+                ),
+            ],
+            &root,
+        );
+        let rows = table.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{table}");
+        assert!(
+            rows.iter().all(|row| row.starts_with("<first-verify>\t")
+                && row.ends_with("\tfirst-verify")
+                && row.contains("\tlib.rs\t")),
+            "{table}"
+        );
+        assert!(
+            rows[0].contains("mismatched types") && rows[0].contains("E0308"),
+            "{table}"
+        );
+        assert!(rows[1].contains("E0499"), "{table}");
+
+        // A diagnostic an attributed revert already owns is not repeated.
+        let owned = crate::bo_rewriter::E1RevertDiagnostic {
+            function: "src::kazmath::mat3::kmMat3Inverse".to_owned(),
+            diagnostic: diag(4181, "mismatched types", "ErrCode(308)"),
+            site_kind: crate::bo_rewriter::E1DiagnosticSite::Other,
+            attribution: "exact-edit".to_owned(),
+            edits: Vec::new(),
+        };
+        let table = raw_boundary_diagnostics_table(
+            std::slice::from_ref(&owned),
+            &[
+                diag(4181, "mismatched types", "ErrCode(308)"),
+                diag(
+                    4200,
+                    "cannot borrow `*q` as mutable more than once",
+                    "ErrCode(499)",
+                ),
+            ],
+            &root,
+        );
+        let rows = table.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{table}");
+        assert!(
+            rows[0].starts_with("src::kazmath::mat3::kmMat3Inverse\t"),
+            "{table}"
+        );
+        assert!(
+            rows[1].starts_with("<first-verify>\t") && rows[1].contains("E0499"),
+            "{table}"
+        );
+    }
+
     #[test]
     fn d12_w2_raw_diagnostic_schema_keeps_the_full_primary_message() {
         assert!(
@@ -12092,28 +12244,11 @@ mod run {
             stamp(&outbound_return_receipts),
         )
         .expect("write outbound-return receipts");
-        let mut diagnostics = String::from(RAW_BOUNDARY_DIAGNOSTIC_HEADER);
-        for diagnostic in &capture.reverts {
-            diagnostics.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                tsv_field(&diagnostic.function, 300),
-                e1_code(diagnostic.diagnostic.code.as_deref()),
-                tsv_field(&diagnostic.diagnostic.message, 300),
-                full_tsv_field(&diagnostic.diagnostic.message),
-                tsv_field(
-                    &crate::bo_rewriter::verify::crate_relative(
-                        &diagnostic.diagnostic.file,
-                        &capture.observed_root,
-                    ),
-                    400,
-                ),
-                diagnostic.diagnostic.line,
-                diagnostic.diagnostic.column,
-                diagnostic.diagnostic.end_line,
-                diagnostic.diagnostic.end_column,
-                diagnostic.attribution,
-            ));
-        }
+        let diagnostics = raw_boundary_diagnostics_table(
+            &capture.reverts,
+            &capture.first_diags,
+            &capture.observed_root,
+        );
         let diagnostics_path =
             directory.join(format!("{name}.raw-boundary-compiler-diagnostics.tsv"));
         std::fs::write(&diagnostics_path, stamp(&diagnostics))

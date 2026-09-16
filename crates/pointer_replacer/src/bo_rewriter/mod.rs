@@ -274,6 +274,11 @@ pub(crate) struct E1RevertDiagnostic {
 pub(crate) struct E1Capture {
     pub(crate) observed_root: std::path::PathBuf,
     pub(crate) reverts: Vec<E1RevertDiagnostic>,
+    /// The FIRST verify's novel diagnostics (R423-5). `reverts` carries only
+    /// what span attribution could own; an emitted outcome whose classes were
+    /// taken back by the recovery bisect leaves `reverts` empty while these
+    /// messages are the whole record of what the reverts were for.
+    pub(crate) first_diags: Vec<verify::Diag>,
     /// Exact call-adapter rows rendered from the SAME `DecisionTable` consumed
     /// by the one E1 emission iteration.
     pub(crate) adapter_receipt: String,
@@ -3425,6 +3430,7 @@ impl RewriteOutcome {
     fn into_e1_capture(self) -> Result<E1Capture, String> {
         let (
             observed_root,
+            first_diags,
             e1_reverts,
             e1_adapter_receipt,
             e1_subject_receipt,
@@ -3451,6 +3457,7 @@ impl RewriteOutcome {
             RewriteOutcome::Emitted {
                 files,
                 observed_root,
+                first_diags,
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
@@ -3473,6 +3480,7 @@ impl RewriteOutcome {
                 ..
             } => (
                 observed_root,
+                first_diags,
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
@@ -3499,6 +3507,7 @@ impl RewriteOutcome {
             RewriteOutcome::Degraded {
                 reason,
                 observed_root,
+                first_diags,
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
@@ -3520,6 +3529,7 @@ impl RewriteOutcome {
                 ..
             } => (
                 observed_root,
+                first_diags,
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
@@ -3548,6 +3558,7 @@ impl RewriteOutcome {
             observed_root: observed_root
                 .ok_or_else(|| format!("E1 capture has no observed root: {outcome_reason}"))?,
             reverts: e1_reverts,
+            first_diags,
             adapter_receipt: e1_adapter_receipt,
             subject_receipt: e1_subject_receipt,
             e2_artifacts,
