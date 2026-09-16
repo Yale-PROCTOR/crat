@@ -794,25 +794,32 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             if peer_owned {
                 return;
             }
-            let raw_operand = matches!(parent, hir::Node::Expr(parent) if matches!(parent.kind,
-                hir::ExprKind::Binary(..))
-                || matches!(parent.kind, hir::ExprKind::MethodCall(_, _, [arg], _)
-                    if arg.hir_id == e.hir_id
-                        && emission::method(self.ctx.tcx, self.subject.fn_did, parent, &["offset_from"])));
-            if raw_operand && !self.optional {
-                match self.index(chain) {
-                    Ok(d) => self.push(
-                        e,
-                        format!("{}.offset_by({d}).addr()", self.name),
-                        "cursor-address",
-                    ),
-                    Err(hold) => {
-                        self.hold.get_or_insert(hold);
-                    }
+            // Otherwise the idiom's chain is this cursor's derived address; the
+            // `&*` and the cast around it keep their raw meaning (a value another
+            // family may wrap — its edit composes over this inner one).
+            let address = |derived: &str| {
+                if self.optional {
+                    format!(
+                        "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor{derived}.addr())",
+                        self.name
+                    )
+                } else {
+                    format!("{}{derived}.addr()", self.name)
                 }
-                return;
+            };
+            match self.index(chain) {
+                Ok(_) if local(chain) == Some(self.subject.hir_id) => {
+                    let value = address("");
+                    self.push(chain, value, "cursor-address");
+                }
+                Ok(d) => {
+                    let value = address(&format!(".offset_by({d})"));
+                    self.push(chain, value, "cursor-address");
+                }
+                Err(hold) => {
+                    self.hold.get_or_insert(hold);
+                }
             }
-            self.hold.get_or_insert(CursorHold::BorrowedElementUnbuilt);
             return;
         }
         if matches!(e.kind, hir::ExprKind::AddrOf(..)) && contains(e, self.subject.hir_id) {
@@ -894,6 +901,27 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     );
                 }
                 Err(hold) => {
+                    // A shared cursor re-pointed to a delivered base another
+                    // family owns (a slice peer, `data = start`) or to a parent
+                    // cursor: the base's own constructor, never a fallback.
+                    if !self.optional && !self.subject.mutable {
+                        match base(self.ctx, self.subject, rhs, self.entries) {
+                            Ok(b)
+                                if (b.delivered.is_some() || b.parent_cursor.is_some())
+                                    && !b.fallback =>
+                            {
+                                self.push(
+                                    e,
+                                    format!("{} = {}", self.name, b.expression),
+                                    "cursor-constructor",
+                                );
+                            }
+                            _ => {
+                                self.hold.get_or_insert(hold);
+                            }
+                        }
+                        return;
+                    }
                     if self.optional && !self.subject.mutable {
                         match base(self.ctx, self.subject, rhs, self.entries) {
                             Ok(b)

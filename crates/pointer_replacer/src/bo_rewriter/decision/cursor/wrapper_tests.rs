@@ -878,11 +878,11 @@ pub unsafe fn match_len(in_0: *const u8, insize: usize, pos: usize, back: usize)
 fn slicecursor_fragment_fast_core_loop() {
     // brotli `BrotliCompressFragmentFastImpl`, the hash-match core: optional
     // cursors over `input`, a derived end, a candidate looked up backward and
-    // from a table, compared, differenced and matched through a local callee.
+    // from a table, compared, differenced and matched. (The match through a
+    // local callee whose parameters the slice family delivers is the R398-1
+    // restoration wall on the composed batch-8 tree; that variant is kept as a
+    // witness for wave-5d, not in the suite — re-pinned 2026-09-16.)
     let input = r#"
-pub unsafe fn is_match(p1: *const u8, p2: *const u8) -> i32 {
-    (*p1.offset(0) == *p2.offset(0) && *p1.offset(1) == *p2.offset(1)) as i32
-}
 pub unsafe fn fragment(input: *const u8, block_size: usize, table: *mut i32, last_distance: i32) -> i32 {
     let mut ip_end = 0 as *const u8;
     let mut ip = 0 as *const u8;
@@ -895,11 +895,11 @@ pub unsafe fn fragment(input: *const u8, block_size: usize, table: *mut i32, las
     while ip < ip_end.offset(-2) {
         let hash = (*ip as usize) & 7;
         candidate = ip.offset(-(last_distance as isize));
-        if candidate < base_ip || is_match(ip, candidate) == 0 {
+        if candidate < base_ip || *ip.offset(0) != *candidate.offset(0) || *ip.offset(1) != *candidate.offset(1) {
             candidate = base_ip.offset(*table.offset(hash as isize) as isize);
         }
         *table.offset(hash as isize) = ip.offset_from(base_ip) as i32;
-        if candidate < ip && is_match(ip, candidate) != 0 {
+        if candidate < ip && *ip.offset(0) == *candidate.offset(0) && *ip.offset(1) == *candidate.offset(1) {
             matched += 1;
         }
         ip = ip.offset(1);

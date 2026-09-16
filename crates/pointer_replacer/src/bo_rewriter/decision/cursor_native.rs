@@ -234,6 +234,42 @@ pub(crate) fn promote(
             break;
         }
     }
+    // A derived cursor stands only on a parent that admitted: withdraw any
+    // committed cursor whose parent is not itself a committed cursor, to a
+    // fixpoint, so the family never emits a child over a raw parent.
+    loop {
+        let orphan = committed
+            .iter()
+            .position(|&(index, _, _)| match &entries[index].1 {
+                Decision::Cursor { plan, .. } => plan.parent_cursor.is_some_and(|parent| {
+                    !entries.iter().any(|(other, decision)| {
+                        other.fn_did == entries[index].0.fn_did
+                            && other.hir_id == parent
+                            && match decision {
+                                Decision::Cursor { plan, .. } => plan.wrapper,
+                                Decision::Slice { .. }
+                                | Decision::NestedSlice { .. }
+                                | Decision::Opt { .. }
+                                | Decision::Ref { .. }
+                                | Decision::InferredRef { .. }
+                                | Decision::Box(_)
+                                | Decision::Degraded(_) => false,
+                            }
+                    })
+                }),
+                Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => false,
+            });
+        let Some(slot) = orphan else { break };
+        let (index, receipt, prior) = committed.remove(slot);
+        entries[index].1 = prior;
+        receipts[receipt].disposition = Err(CursorHold::UseUnbuilt);
+    }
     compose_nested_uses(ctx, entries, &committed, &mut receipts);
     receipts
 }
