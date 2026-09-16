@@ -4291,7 +4291,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                         LenEvidence::Elsewhere | LenEvidence::None => None,
                     }
                     .filter(|index| {
-                        arm == LenEvidence::Contract || count_companions.contains(index)
+                        arm == LenEvidence::Contract
+                            || count_companions.contains(index)
+                            // wave-6f (R411 §2): the fat field the parameter
+                            // is stored into names its own count — the
+                            // sibling field the same store fills.
+                            || table
+                                .field_transactions
+                                .count_companions(*callee, pos.index)
+                                .contains(index)
                     });
                     // A CALL in the spelling (`f(`, `size_of::<T>(`) is the
                     // hazard; grouping parentheses are not.
