@@ -2089,7 +2089,15 @@ fn pending_selected_argument(
                 .emitted_source
                 .get(source_span.lo as usize..source_span.hi as usize)
                 .ok_or("pending-nullable-source-span-invalid")?;
-            optional_raw_view_matches(&*expression(source_text)?, &original_expression)
+            let emitted_source_expression = expression(source_text)?;
+            // **R430-2 — a PROJECTED borrow of an optional source's referent.**
+            // The nullable view (`as_deref().map_or(null(), ..)`) is one
+            // spelling; binn's `binn_is_valid(data, &mut (*value).type_0, ..)`
+            // over `value: Option<&mut binn>` is the other — the argument
+            // borrows the same place through the optional's access. The place
+            // keys must be equal (R430-2's arm), so nothing wider passes.
+            optional_raw_view_matches(&emitted_source_expression, &original_expression)
+                || borrows_the_same_place(&emitted_source_expression, &original_expression)
         }
         PointerType::Raw(_) | PointerType::Other => false,
     };
