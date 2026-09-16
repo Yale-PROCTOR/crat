@@ -6105,7 +6105,12 @@ mod wave3_class_tests {
     #[test]
     fn l07_five_kind_pairs_compose_and_revert_inner_first() {
         use crate::bo_rewriter::decision::Arm;
-        const PAIRS: [(Arm, &str, Arm, &str); 5] = [
+        // Five L07 pairs (addendum 272) plus the two of relay wave-5d/017
+        // (seat addendum 411): the shared reborrow of a raw-returning call
+        // over W-C5's argument adapter, and a call bridge over a Box owner's
+        // access edit — the AST pass renders both nestings since wave-6l's
+        // `f8a2d5e6`.
+        const PAIRS: [(Arm, &str, Arm, &str); 7] = [
             (Arm::Pair, "pair-t2-raw-view", Arm::C, "typed-raw-temporary"),
             (
                 Arm::Pair,
@@ -6116,6 +6121,18 @@ mod wave3_class_tests {
             (Arm::Pair, "pair-t2-raw-view", Arm::C, "raw-cast-const"),
             (Arm::C, "c-raw-reborrow-shared", Arm::C, "raw-cast-const"),
             (Arm::Pair, "pair-t2-raw-view", Arm::Surface, "subject-use"),
+            (
+                Arm::C,
+                "c-raw-reborrow-shared",
+                Arm::Glue,
+                "shared-weakening",
+            ),
+            (
+                Arm::C,
+                "typed-raw-temporary",
+                Arm::Surface,
+                "box-expression",
+            ),
         ];
         for (outer_arm, outer_kind, inner_arm, inner_kind) in PAIRS {
             with_classes(2, |ids| {
