@@ -118,8 +118,11 @@ fn wave6k_ht_next_raw_field_read_is_a_declared_reborrow() {
     assert!(compact_source.contains("*(*it)._table"), "{source}");
 }
 
-/// A static literal is not a raw-place value: its consumer reads to the NUL
-/// and the ladder's thin-extent gate holds the thin reference (R272-1).
+/// A static literal is not a raw-place value. Its consumer reads to the NUL,
+/// so the thin reference is held (R272-1) — and wave-4 R410-9 (b) (report
+/// 025; ratified R217-2(a), addendum 411) then delivers it as the
+/// counted-literal slice: `&[i8]` with each literal's own byte length,
+/// `.as_ptr()` at `sprintf`.
 #[test]
 fn wave6k_urlparser_static_literal_format_keeps_its_thin_extent_hold() {
     ::utils::compilation::run_compiler_on_str(URL_FMT, |tcx| {
@@ -137,8 +140,8 @@ fn wave6k_urlparser_static_literal_format_keeps_its_thin_extent_hold() {
             .find(|(s, _)| s.param_name.as_deref() == Some("fmt"))
             .expect("subject");
         assert!(
-            matches!(decision, Decision::Degraded(_)),
-            "{} must keep a typed hold: {decision:?}",
+            matches!(decision, Decision::Slice { mutable: false, .. }),
+            "{} takes the counted-literal slice, never a thin reference: {decision:?}",
             subject.label
         );
         assert!(
@@ -147,6 +150,18 @@ fn wave6k_urlparser_static_literal_format_keeps_its_thin_extent_hold() {
         );
     })
     .expect("input compiles");
+    let (source, _) = emitted(URL_FMT, "fmt");
+    let compact_source = compact(&source);
+    assert!(compact_source.contains("fmt:&[i8]="), "{source}");
+    assert!(
+        compact_source
+            .contains(r#"core::slice::from_raw_parts(b"%s\0"as*constu8as*consti8,3usize)"#),
+        "{source}"
+    );
+    assert!(
+        compact_source.contains("sprintf(path,fmt.as_ptr(),"),
+        "{source}"
+    );
 }
 
 /// Owner withdrawal restores the untyped raw read.
