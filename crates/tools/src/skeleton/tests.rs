@@ -166,6 +166,7 @@ pub unsafe fn message() { printf(b"hello %%\n\0" as *const u8 as *const i8); }
 "#;
     let records = generate(no_arguments);
     let record = function(&records, "message");
+    assert!(record.printf_format_specifiers.is_empty());
     assert_eq!(record.baseline.skeleton, record.applied.skeleton);
     assert!(
         record
@@ -217,6 +218,7 @@ pub unsafe fn value(x: i32) { printf(b"%d\0" as *const u8 as *const i8, x); }
     run_compiler_on_str(one_argument, |tcx| {
         let records = make_skeletons_with_rules(one_argument, Some(&rules), tcx).unwrap();
         let record = function(&records, "value");
+        assert_eq!(record.printf_format_specifiers, ["%d"]);
         assert!(
             record
                 .baseline
@@ -253,6 +255,207 @@ pub unsafe fn value(x: i32) { printf(b"%d\0" as *const u8 as *const i8, x); }
         );
     })
     .unwrap();
+}
+
+#[test]
+fn printf_specifier_summary_is_sorted_deduplicated_and_complete() {
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn render(d: i32, x: u32, f: f64, s: *const i8) {
+    printf(b"%s\0" as *const u8 as *const i8, s);
+    printf(b"% d %#08.4x %E %10.3s\0" as *const u8 as *const i8, d, x, f, s);
+    printf(b"%s\0" as *const u8 as *const i8, s);
+    printf(b"literal %%\0" as *const u8 as *const i8);
+    printf(b"%p\0" as *const u8 as *const i8, s);
+}
+"#;
+    let records = generate(source);
+    let record = function(&records, "render");
+    assert_eq!(
+        record.printf_format_specifiers,
+        ["% d", "%#08.4x", "%10.3s", "%E", "%s"]
+    );
+}
+
+#[test]
+fn prepared_ctype_and_printf_metadata_compose_through_library_seams() {
+    let source = r#"
+extern crate proctor_libc;
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+fn isalpha(c: i32) -> i32 { c }
+pub unsafe fn render(d: i32, x: u32, f: f64, s: *const i8) -> i32 {
+    let class = isalpha(d);
+    printf(
+        b"% d %#08.4x %E %10.3s\n\0" as *const u8 as *const i8,
+        d, x, f, s,
+    );
+    class
+}
+"#;
+    let prepared = utils::compilation::run_compiler_on_str(source, passes::preparer::prepare)
+        .unwrap()
+        .unwrap();
+    assert!(prepared.requires_proctor_libc);
+    assert!(prepared.code.contains("::proctor_libc::isalpha(d)"));
+
+    let records = utils::compilation::run_compiler_on_str(&prepared.code, |tcx| {
+        make_skeletons(&prepared.code, tcx)
+    })
+    .unwrap()
+    .unwrap();
+    let record = function(&records, "render");
+    assert_eq!(
+        record.printf_format_specifiers,
+        ["% d", "%#08.4x", "%10.3s", "%E"]
+    );
+    assert!(
+        !record
+            .foreign_function_names
+            .iter()
+            .any(|name| name == "isalpha"),
+        "{:?}",
+        record.foreign_function_names
+    );
+    let template = record
+        .baseline
+        .statement_pair_metadata
+        .iter()
+        .find_map(|metadata| metadata.printf_template.as_ref())
+        .unwrap();
+    assert_eq!(
+        template,
+        &crate::PrintfTemplateMetadata {
+            rust_format: "{} {:#08.4x} {:.6E} {:10.3}\n".into(),
+            argument_count: 4,
+        }
+    );
+}
+
+#[test]
+fn nested_printf_summary_and_serialization_are_byte_deterministic() {
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn summarize(s: *const i8, d: i32, p: *const i8, ready: bool) {
+    printf(b"%s\0" as *const u8 as *const i8, s);
+    printf(b"%d\0" as *const u8 as *const i8, d);
+    printf(b"%s\0" as *const u8 as *const i8, s);
+    printf(b"literal\0" as *const u8 as *const i8);
+    printf(b"%%\0" as *const u8 as *const i8);
+    printf(b"%p\0" as *const u8 as *const i8, p);
+    if ready {
+        printf(b"%d\0" as *const u8 as *const i8, d);
+    }
+}
+"#;
+    let first = generate(source);
+    let second = generate(source);
+    assert_eq!(
+        skeletons_to_json(&first).unwrap(),
+        skeletons_to_json(&second).unwrap()
+    );
+    let record = function(&first, "summarize");
+    assert_eq!(record.printf_format_specifiers, ["%d", "%s"]);
+    let nested = record
+        .baseline
+        .statement_dispositions
+        .iter()
+        .find(|node| node.disposition == crate::StatementDispositionKind::PreserveShell)
+        .unwrap();
+    assert_eq!(nested.children.len(), 1);
+    assert_eq!(
+        nested.children[0].disposition,
+        crate::StatementDispositionKind::Transform
+    );
+}
+
+#[test]
+fn expanded_printf_format_builds_one_exact_trusted_template() {
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn show(d: i32, x: u32, f: f64, s: *const i8) {
+    printf(
+        b"d=% d x=%#08.4x f=%E s=%10.3s\n\0" as *const u8 as *const i8,
+        d, x, f, s,
+    );
+}
+"#;
+    let records = generate(source);
+    let record = function(&records, "show");
+    assert_eq!(
+        record.printf_format_specifiers,
+        ["% d", "%#08.4x", "%10.3s", "%E"]
+    );
+    assert_eq!(
+        record.baseline.statement_pair_metadata[0].printf_template,
+        Some(crate::PrintfTemplateMetadata {
+            rust_format: "d={} x={:#08.4x} f={:.6E} s={:10.3}\n".into(),
+            argument_count: 4,
+        })
+    );
+    assert_eq!(record.baseline.skeleton.matches("todo!()").count(), 4);
+    assert!(
+        record
+            .baseline
+            .skeleton
+            .contains("::std::print!(\"d={} x={:#08.4x} f={:.6E} s={:10.3}\\n\"")
+    );
+}
+
+#[test]
+fn every_supported_printf_family_keeps_one_statement_boundary() {
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn all(
+    d: i32, i: i32, u: u32, o: u32, x: u32, upper_x: u32,
+    f: f64, upper_f: f64, e: f64, upper_e: f64,
+    g: f64, upper_g: f64, a: f64, upper_a: f64, s: *const i8,
+) {
+    printf(
+        b"%d %i %u %o %x %X %f %F %e %E %g %G %a %A %s\n\0" as *const u8 as *const i8,
+        d, i, u, o, x, upper_x, f, upper_f, e, upper_e, g, upper_g, a, upper_a, s,
+    );
+}
+"#;
+    let records = generate(source);
+    let record = function(&records, "all");
+    assert_eq!(record.baseline.statement_dispositions.len(), 1);
+    assert_eq!(
+        record.baseline.statement_dispositions[0].disposition,
+        crate::StatementDispositionKind::Transform
+    );
+    assert_eq!(
+        record.baseline.statement_pair_metadata[0].printf_template,
+        Some(crate::PrintfTemplateMetadata {
+            rust_format:
+                "{} {} {} {:o} {:x} {:X} {:.6} {:.6} {:.6e} {:.6E} {:.6} {:.6} {:x} {:X} {}\n"
+                    .into(),
+            argument_count: 15,
+        })
+    );
+    assert_eq!(record.baseline.skeleton.matches("todo!()").count(), 15);
+    assert_eq!(
+        record.printf_format_specifiers,
+        [
+            "%A", "%E", "%F", "%G", "%X", "%a", "%d", "%e", "%f", "%g", "%i", "%o", "%s", "%u",
+            "%x"
+        ]
+    );
+}
+
+#[test]
+fn prepared_ctype_calls_have_no_foreign_body_metadata() {
+    let source = r#"
+unsafe extern "C" {
+    fn isalpha(c: i32) -> i32;
+    fn __ctype_b_loc() -> *mut *const u16;
+}
+pub unsafe fn direct(c: i32) -> i32 { ::proctor_libc::isalpha(c) }
+pub unsafe fn table(c: i32) -> i32 { ::proctor_libc::isspace(c) }
+"#;
+    let records = generate(source);
+    for name in ["direct", "table"] {
+        assert!(function(&records, name).foreign_function_names.is_empty());
+    }
 }
 
 #[test]
@@ -768,6 +971,243 @@ pub unsafe fn third(small: i8) {
 }
 
 #[test]
+fn expanded_printf_wrapper_rules_materialize_and_type_check() {
+    let binding = crate::Expression::Path {
+        value: crate::ValueIdentity::Binding { id: "<id0>".into() },
+    };
+    let wrapper = |name: &str, argument: crate::Expression| crate::Expression::Call {
+        callee: Box::new(crate::Expression::Path {
+            value: crate::ValueIdentity::External {
+                crate_name: "proctor_libc".into(),
+                path: vec!["stdio".into(), "printf".into(), name.into()],
+            },
+        }),
+        arguments: vec![argument],
+    };
+    for (specifier, parameter, wrapper_name, rust_format) in [
+        ("%d", "x: i32", "signed", "{}"),
+        ("%#08.4x", "x: u32", "unsigned", "{:#08.4x}"),
+        ("%f", "x: f64", "fixed", "{:.6}"),
+        ("%F", "x: f64", "fixed_upper", "{:.6}"),
+        ("%E", "x: f64", "scientific", "{:.6E}"),
+        ("%g", "x: f64", "general", "{:.6}"),
+        ("%G", "x: f64", "general_upper", "{:.6}"),
+        ("%A", "x: f64", "hex_float", "{:X}"),
+    ] {
+        let ty = if parameter.ends_with("i32") {
+            crate::TypeTree::Primitive { name: "i32".into() }
+        } else if parameter.ends_with("u32") {
+            crate::TypeTree::Primitive { name: "u32".into() }
+        } else {
+            crate::TypeTree::Primitive { name: "f64".into() }
+        };
+        let rules = synthesized_printf_rules(
+            specifier,
+            binding.clone(),
+            wrapper(wrapper_name, binding.clone()),
+            vec![],
+            ty,
+        );
+        assert_eq!(rules.printf_rules.len(), 1, "{specifier}");
+        let source = format!(
+            r#"
+unsafe extern "C" {{ fn printf(format: *const i8, ...) -> i32; }}
+extern crate proctor_libc;
+pub unsafe fn third({parameter}) {{
+    printf(b"{specifier}\0" as *const u8 as *const i8, x);
+}}
+"#
+        );
+        run_compiler_on_str(&source, |tcx| {
+            let records = make_skeletons_with_rules(&source, Some(&rules), tcx).unwrap();
+            let record = function(&records, "third");
+            assert_eq!(
+                record.applied.statement_dispositions[0].disposition,
+                crate::StatementDispositionKind::RuleApplied,
+                "{specifier}: {}",
+                record.applied.skeleton
+            );
+            assert!(
+                record.applied.skeleton.contains(&format!(
+                    r#"::std::print!("{rust_format}", ::proctor_libc::printf::{wrapper_name}(x));"#
+                )),
+                "{specifier}: {}",
+                record.applied.skeleton
+            );
+            assert!(
+                installed_candidate_type_checks(&record.applied.skeleton),
+                "{specifier}: {}",
+                record.applied.skeleton
+            );
+        })
+        .unwrap();
+    }
+
+    let spaced_target = crate::Expression::MethodCall {
+        receiver: Box::new(wrapper("signed", binding.clone())),
+        method: crate::ValueIdentity::External {
+            crate_name: "proctor_libc".into(),
+            path: vec!["stdio".into(), "printf".into(), "space_sign".into()],
+        },
+        arguments: vec![],
+    };
+    let rules = synthesized_printf_rules(
+        "% d",
+        binding.clone(),
+        spaced_target,
+        vec![],
+        crate::TypeTree::Primitive { name: "i32".into() },
+    );
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+extern crate proctor_libc;
+pub unsafe fn third(x: i32) { printf(b"% d\0" as *const u8 as *const i8, x); }
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let candidate = &function(&records, "third").applied.skeleton;
+        assert!(
+            candidate.contains("::proctor_libc::printf::signed(x)).space_sign()"),
+            "{candidate}"
+        );
+        assert!(installed_candidate_type_checks(candidate));
+    })
+    .unwrap();
+
+    let source_pointer = crate::TypeTree::RawPointer {
+        mutability: crate::RawMutability::Const,
+        pointee: Box::new(crate::TypeTree::Primitive { name: "i8".into() }),
+    };
+    let target_slice = crate::TypeTree::Reference {
+        mutability: crate::RefMutability::Shared,
+        pointee: Box::new(crate::TypeTree::Slice {
+            element: Box::new(crate::TypeTree::Primitive { name: "i8".into() }),
+        }),
+    };
+    let rules = synthesized_printf_rules(
+        "%10.3s",
+        binding.clone(),
+        wrapper("byte_string", binding),
+        vec![crate::PointerAnchor {
+            id: "<id0>".into(),
+            source_type: source_pointer.clone(),
+            target_type: target_slice.clone(),
+        }],
+        source_pointer,
+    );
+    let candidate = apply_printf_rules_to_third(
+        r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+extern crate proctor_libc;
+pub unsafe fn third(s: *const i8) { printf(b"%10.3s\0" as *const u8 as *const i8, s); }
+"#,
+        r#"pub unsafe fn third(s: &[i8]) { #[proctor(0)] todo!(); }"#,
+        &rules,
+        Some(("s", target_slice)),
+    );
+    assert!(
+        candidate.contains("::std::print!(\"{:10.3}\", ::proctor_libc::printf::byte_string(s));")
+    );
+    assert!(installed_candidate_type_checks(&candidate));
+}
+
+#[test]
+fn nested_printf_views_keep_rule_transform_and_mechanical_metadata_aligned() {
+    let binding = crate::Expression::Path {
+        value: crate::ValueIdentity::Binding { id: "<id0>".into() },
+    };
+    let target = crate::Expression::Call {
+        callee: Box::new(crate::Expression::Path {
+            value: crate::ValueIdentity::External {
+                crate_name: "proctor_libc".into(),
+                path: vec!["stdio".into(), "printf".into(), "unsigned".into()],
+            },
+        }),
+        arguments: vec![binding.clone()],
+    };
+    let rules = synthesized_printf_rules(
+        "%#x",
+        binding,
+        target,
+        vec![],
+        crate::TypeTree::Primitive { name: "u32".into() },
+    );
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+extern crate proctor_libc;
+pub unsafe fn nested(x: u32, s: *const i8, ready: bool) {
+    printf(b"%#x\0" as *const u8 as *const i8, x);
+    if ready {
+        printf(b"%10.3s\0" as *const u8 as *const i8, s);
+    }
+    printf(b"done\0" as *const u8 as *const i8);
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let record = function(&records, "nested");
+        assert_eq!(record.printf_format_specifiers, ["%#x", "%10.3s"]);
+        assert_eq!(record.baseline.statement_dispositions.len(), 3);
+        assert_eq!(record.applied.statement_dispositions.len(), 3);
+        assert_eq!(
+            record.baseline.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::Transform
+        );
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::RuleApplied
+        );
+        for view in [&record.baseline, &record.applied] {
+            assert_eq!(
+                view.statement_dispositions[1].disposition,
+                crate::StatementDispositionKind::PreserveShell
+            );
+            assert_eq!(view.statement_dispositions[1].children.len(), 1);
+            assert_eq!(
+                view.statement_dispositions[1].children[0].disposition,
+                crate::StatementDispositionKind::Transform
+            );
+            assert_eq!(
+                view.statement_dispositions[2].disposition,
+                crate::StatementDispositionKind::Mechanical
+            );
+        }
+        let baseline_labels = record
+            .baseline
+            .statement_pair_metadata
+            .iter()
+            .map(|metadata| metadata.label)
+            .collect::<Vec<_>>();
+        let applied_labels = record
+            .applied
+            .statement_pair_metadata
+            .iter()
+            .map(|metadata| metadata.label)
+            .collect::<Vec<_>>();
+        assert_eq!(baseline_labels, [0, 2, 3]);
+        assert_eq!(applied_labels, [2, 3]);
+        let baseline_nested = record
+            .baseline
+            .statement_pair_metadata
+            .iter()
+            .find(|metadata| metadata.label == 2)
+            .unwrap();
+        let applied_nested = record
+            .applied
+            .statement_pair_metadata
+            .iter()
+            .find(|metadata| metadata.label == 2)
+            .unwrap();
+        assert_eq!(baseline_nested, applied_nested);
+        assert_eq!(
+            record.baseline.statement_pair_metadata[2],
+            record.applied.statement_pair_metadata[1]
+        );
+    })
+    .unwrap();
+}
+
+#[test]
 fn materialized_array_printf_argument_is_rejected_by_rust_type_checking() {
     let binding = crate::Expression::Path {
         value: crate::ValueIdentity::Binding { id: "<id0>".into() },
@@ -807,6 +1247,69 @@ pub unsafe fn third(x: i32) {
         !installed_candidate_type_checks(&candidate),
         "the generated array argument must fail Display type checking"
     );
+}
+
+#[test]
+fn structurally_applied_printf_wrappers_leave_type_errors_to_rust() {
+    let binding = crate::Expression::Path {
+        value: crate::ValueIdentity::Binding { id: "<id0>".into() },
+    };
+    let integer = |value: &str| crate::Expression::Literal {
+        value: crate::Literal::Integer {
+            value: value.into(),
+            ty: "i32".into(),
+        },
+    };
+    let wrapper = |name: &str, argument: crate::Expression| crate::Expression::Call {
+        callee: Box::new(crate::Expression::Path {
+            value: crate::ValueIdentity::External {
+                crate_name: "proctor_libc".into(),
+                path: vec!["stdio".into(), "printf".into(), name.into()],
+            },
+        }),
+        arguments: vec![argument],
+    };
+    for (specifier, wrapper_name, argument, expected) in [
+        (
+            "%d",
+            "signed",
+            crate::Expression::Array {
+                elements: vec![integer("1"), integer("2")],
+            },
+            "signed([1i32, 2i32])",
+        ),
+        ("%s", "byte_string", integer("17"), "byte_string(17i32)"),
+    ] {
+        let rules = synthesized_printf_rules(
+            specifier,
+            binding.clone(),
+            wrapper(wrapper_name, argument),
+            vec![],
+            crate::TypeTree::Primitive { name: "i32".into() },
+        );
+        let source = format!(
+            r#"
+extern crate proctor_libc;
+unsafe extern "C" {{ fn printf(format: *const i8, ...) -> i32; }}
+pub unsafe fn third(x: i32) {{ printf(b"{specifier}\0" as *const u8 as *const i8, x); }}
+"#
+        );
+        run_compiler_on_str(&source, |tcx| {
+            let records = make_skeletons_with_rules(&source, Some(&rules), tcx).unwrap();
+            let record = function(&records, "third");
+            assert_eq!(
+                record.applied.statement_dispositions[0].disposition,
+                crate::StatementDispositionKind::RuleApplied
+            );
+            assert!(
+                record.applied.skeleton.contains(expected),
+                "{}",
+                record.applied.skeleton
+            );
+            assert!(!installed_candidate_type_checks(&record.applied.skeleton));
+        })
+        .unwrap();
+    }
 }
 
 #[test]
@@ -2703,6 +3206,7 @@ fn record_variants_serialize_only_their_defined_fields() {
             "applied",
             "source_signature",
             "target_signature",
+            "printf_format_specifiers",
             "foreign_function_names",
             "foreign_static_names",
             "signature_dependencies",

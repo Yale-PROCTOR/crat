@@ -28,6 +28,7 @@ pub mod bit_set;
 pub mod bytemuck;
 pub mod c_lib;
 pub mod compilation;
+pub mod dependency;
 pub mod disjoint_set;
 pub mod equiv_classes;
 pub mod file;

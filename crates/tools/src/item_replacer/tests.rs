@@ -369,6 +369,103 @@ fn print_template_invariants_are_defended_without_validator() {
 }
 
 #[test]
+fn expanded_printf_templates_restore_exact_literals() {
+    let cases = [
+        (
+            "precision_zero",
+            "value: i32",
+            "{:.0}",
+            "::proctor_libc::printf::signed(value)",
+        ),
+        (
+            "lower_hex",
+            "value: u32",
+            "{:#08.4x}",
+            "::proctor_libc::printf::unsigned(value)",
+        ),
+        (
+            "lower_exp",
+            "value: f64",
+            "{:12.2e}",
+            "::proctor_libc::printf::scientific(value)",
+        ),
+        (
+            "upper_exp",
+            "value: f64",
+            "{:.6E}",
+            "::proctor_libc::printf::scientific(value)",
+        ),
+        (
+            "alternate_general",
+            "value: f64",
+            "{:#.6}",
+            "::proctor_libc::printf::general(value)",
+        ),
+        (
+            "lower_hex_float",
+            "value: f64",
+            "{:.3x}",
+            "::proctor_libc::printf::hex_float(value)",
+        ),
+        (
+            "upper_hex_float",
+            "value: f64",
+            "{:#.0X}",
+            "::proctor_libc::printf::hex_float(value)",
+        ),
+        (
+            "bounded_bytes",
+            "value: &[i8]",
+            "{:10.3}",
+            "::proctor_libc::printf::byte_string(value)",
+        ),
+        (
+            "literal_mix",
+            "value: i32",
+            "{{}} % {:.0}",
+            "::proctor_libc::printf::signed(value)",
+        ),
+    ];
+    for (name, parameter, format, argument) in cases {
+        let source = format!("unsafe fn {name}({parameter}) {{}}");
+        let skeleton = format!(
+            r#"unsafe fn {name}({parameter}) {{ #[proctor(0)] ::std::print!("{format}", todo!()); }}"#
+        );
+        let transformation = format!(
+            r#"unsafe fn {name}({parameter}) {{ #[proctor(0)] ::std::print!("{format}", {argument}); }}"#
+        );
+        let request = ReplacementRequest {
+            schema_version: 1,
+            items: vec![preservation_item(7, name, name, &skeleton, vec![0])],
+            transformation,
+            accepted_correspondence: vec![],
+        };
+        let output = replace(&source, &request).unwrap();
+        assert!(output.contains(&format!(r#"::std::print!("{format}", {argument})"#)));
+        assert!(!output.contains("printf_template"));
+        assert!(!output.contains("printf_format_specifiers"));
+    }
+}
+
+#[test]
+fn replacer_rechecks_expanded_printf_literal_without_validator() {
+    let skeleton =
+        r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4x}", todo!()); }"#;
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(7, "lower_hex", "lower_hex", skeleton, vec![0])],
+        transformation: r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4X}", ::proctor_libc::printf::unsigned(value)); }"#.to_owned(),
+        accepted_correspondence: vec![],
+    };
+    let error = replace("unsafe fn lower_hex(value: u32) {}", &request).unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
+    assert_eq!(
+        error.message,
+        "printf_format_literal: print format literal differs from the expected converted format"
+    );
+}
+
+#[test]
 fn aliased_printf_metadata_makes_corrupt_replacement_template_invalid_request() {
     let skeleton = r#"unsafe fn f() { #[proctor(0)] ::std::println!("{}"); }"#;
     let mut item = preservation_item(7, "f", "f", skeleton, vec![0]);

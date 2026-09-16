@@ -206,9 +206,9 @@ dependencies = [
 
 [[package]]
 name = "proctor-libc"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c48bfb4fab68a3da697aaf0927bed6ded40c6495480c72bb49a38e1e8e6efc91"
+checksum = "c8507878bec5bbd6e22b3d2e08b94f97f35aeeefe9436ff7b4df5ad0065e4860"
 dependencies = [
  "bytemuck",
  "f128",

@@ -67,6 +67,7 @@ pub struct FunctionRecord {
     pub applied: SkeletonView,
     pub source_signature: String,
     pub target_signature: String,
+    pub printf_format_specifiers: Vec<String>,
     pub foreign_function_names: Vec<String>,
     pub foreign_static_names: Vec<String>,
     pub signature_dependencies: Vec<u64>,
@@ -460,6 +461,12 @@ fn make_function_record<'tcx>(
         tcx,
     )?;
     let printf_templates = collect_printf_templates(&source, ast_to_hir, tcx);
+    let printf_format_specifiers = printf_templates
+        .values()
+        .flat_map(|template| template.source_specifiers.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let mechanical_statements = printf_templates
         .iter()
         .filter_map(|(label, template)| template.argument_count.eq(&0).then_some(*label))
@@ -651,6 +658,7 @@ fn make_function_record<'tcx>(
         applied,
         source_signature,
         target_signature,
+        printf_format_specifiers,
         foreign_function_names,
         foreign_static_names,
         signature_dependencies,
@@ -662,6 +670,7 @@ fn make_function_record<'tcx>(
 struct PrintfTemplate {
     rust_format: String,
     argument_count: usize,
+    source_specifiers: Vec<String>,
 }
 
 fn collect_printf_templates(
@@ -684,6 +693,12 @@ fn collect_printf_templates(
                     PrintfTemplate {
                         rust_format: call.format.rust_format,
                         argument_count: call.arguments.len(),
+                        source_specifiers: call
+                            .format
+                            .conversions
+                            .into_iter()
+                            .map(|conversion| conversion.source_specifier)
+                            .collect(),
                     },
                 );
             }

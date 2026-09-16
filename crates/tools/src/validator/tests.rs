@@ -164,6 +164,15 @@ fn assert_valid(skeleton: &str, transformation: &str) {
     assert_eq!(response, ValidationResponse::Valid, "{response:?}");
 }
 
+fn assert_valid_named(name: &str, skeleton: &str, transformation: &str) {
+    let response = validate(&ValidationRequest {
+        schema_version: 1,
+        expected_functions: vec![expected_function(7, name, skeleton)],
+        transformation: transformation.to_owned(),
+    });
+    assert_eq!(response, ValidationResponse::Valid, "{response:?}");
+}
+
 fn assert_code(skeleton: &str, transformation: &str, code: &str) {
     let response = validate(&request(skeleton, transformation));
     assert!(
@@ -341,6 +350,202 @@ fn print_template_attack_matrix_is_rejected_precisely() {
             "{transformation}: {response:?}"
         );
     }
+}
+
+#[test]
+fn expanded_printf_fields_are_trusted_exactly() {
+    let pairs = [
+        (
+            "precision_zero",
+            r#"unsafe fn precision_zero(value: i32) { #[proctor(0)] ::std::print!("{:.0}", todo!()); }"#,
+            r#"unsafe fn precision_zero(value: i32) { #[proctor(0)] ::std::print!("{:.0}", ::proctor_libc::printf::signed(value)); }"#,
+        ),
+        (
+            "lower_hex",
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4x}", todo!()); }"#,
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4x}", ::proctor_libc::printf::unsigned(value)); }"#,
+        ),
+        (
+            "lower_exp",
+            r#"unsafe fn lower_exp(value: f64) { #[proctor(0)] ::std::print!("{:12.2e}", todo!()); }"#,
+            r#"unsafe fn lower_exp(value: f64) { #[proctor(0)] ::std::print!("{:12.2e}", ::proctor_libc::printf::scientific(value)); }"#,
+        ),
+        (
+            "upper_exp",
+            r#"unsafe fn upper_exp(value: f64) { #[proctor(0)] ::std::print!("{:.6E}", todo!()); }"#,
+            r#"unsafe fn upper_exp(value: f64) { #[proctor(0)] ::std::print!("{:.6E}", ::proctor_libc::printf::scientific(value)); }"#,
+        ),
+        (
+            "alternate_general",
+            r#"unsafe fn alternate_general(value: f64) { #[proctor(0)] ::std::print!("{:#.6}", todo!()); }"#,
+            r#"unsafe fn alternate_general(value: f64) { #[proctor(0)] ::std::print!("{:#.6}", ::proctor_libc::printf::general(value)); }"#,
+        ),
+        (
+            "lower_hex_float",
+            r#"unsafe fn lower_hex_float(value: f64) { #[proctor(0)] ::std::print!("{:.3x}", todo!()); }"#,
+            r#"unsafe fn lower_hex_float(value: f64) { #[proctor(0)] ::std::print!("{:.3x}", ::proctor_libc::printf::hex_float(value)); }"#,
+        ),
+        (
+            "upper_hex_float",
+            r#"unsafe fn upper_hex_float(value: f64) { #[proctor(0)] ::std::print!("{:#.0X}", todo!()); }"#,
+            r#"unsafe fn upper_hex_float(value: f64) { #[proctor(0)] ::std::print!("{:#.0X}", ::proctor_libc::printf::hex_float(value)); }"#,
+        ),
+        (
+            "bounded_bytes",
+            r#"unsafe fn bounded_bytes(value: &[i8]) { #[proctor(0)] ::std::print!("{:10.3}", todo!()); }"#,
+            r#"unsafe fn bounded_bytes(value: &[i8]) { #[proctor(0)] ::std::print!("{:10.3}", ::proctor_libc::printf::byte_string(value)); }"#,
+        ),
+        (
+            "literal_mix",
+            r#"unsafe fn literal_mix(value: i32) { #[proctor(0)] ::std::print!("{{}} % {:.0}", todo!()); }"#,
+            r#"unsafe fn literal_mix(value: i32) { #[proctor(0)] ::std::print!("{{}} % {:.0}", ::proctor_libc::printf::signed(value)); }"#,
+        ),
+    ];
+    for (name, skeleton, transformation) in pairs {
+        assert_valid_named(name, skeleton, transformation);
+    }
+}
+
+#[test]
+fn expanded_printf_template_mutations_are_rejected_exactly() {
+    let lower_hex =
+        r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4x}", todo!()); }"#;
+    let lower_exp =
+        r#"unsafe fn lower_exp(value: f64) { #[proctor(0)] ::std::print!("{:12.2e}", todo!()); }"#;
+    let alternate_general = r#"unsafe fn alternate_general(value: f64) { #[proctor(0)] ::std::print!("{:#.6}", todo!()); }"#;
+    let literal_mix = r#"unsafe fn literal_mix(value: i32) { #[proctor(0)] ::std::print!("{{}} % {:.0}", todo!()); }"#;
+    let cases = [
+        (
+            lower_hex,
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4X}", ::proctor_libc::printf::unsigned(value)); }"#,
+            "printf_format_literal",
+        ),
+        (
+            lower_exp,
+            r#"unsafe fn lower_exp(value: f64) { #[proctor(0)] ::std::print!("{:12.3e}", ::proctor_libc::printf::scientific(value)); }"#,
+            "printf_format_literal",
+        ),
+        (
+            lower_exp,
+            r#"unsafe fn lower_exp(value: f64) { #[proctor(0)] ::std::print!("{:13.2e}", ::proctor_libc::printf::scientific(value)); }"#,
+            "printf_format_literal",
+        ),
+        (
+            alternate_general,
+            r#"unsafe fn alternate_general(value: f64) { #[proctor(0)] ::std::print!("{:.6}", ::proctor_libc::printf::general(value)); }"#,
+            "printf_format_literal",
+        ),
+        (
+            literal_mix,
+            r#"unsafe fn literal_mix(value: i32) { #[proctor(0)] ::std::print!("changed {:.0}", ::proctor_libc::printf::signed(value)); }"#,
+            "printf_format_literal",
+        ),
+        (
+            literal_mix,
+            r#"unsafe fn literal_mix(value: i32) { #[proctor(0)] ::std::print!("{{x}} % {:.0}", ::proctor_libc::printf::signed(value)); }"#,
+            "printf_format_literal",
+        ),
+        (
+            literal_mix,
+            r#"unsafe fn literal_mix(value: i32) { #[proctor(0)] ::std::print!("{{}} %% {:.0}", ::proctor_libc::printf::signed(value)); }"#,
+            "printf_format_literal",
+        ),
+        (
+            lower_hex,
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] std::print!("{:#08.4x}", ::proctor_libc::printf::unsigned(value)); }"#,
+            "printf_macro_path",
+        ),
+        (
+            lower_hex,
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!["{:#08.4x}", ::proctor_libc::printf::unsigned(value)]; }"#,
+            "printf_macro_delimiter",
+        ),
+        (
+            lower_hex,
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{0:#08.4x}", ::proctor_libc::printf::unsigned(value)); }"#,
+            "printf_format_references",
+        ),
+        (
+            lower_hex,
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!(::std::string::String::from("{:#08.4x}"), ::proctor_libc::printf::unsigned(value)); }"#,
+            "printf_format_literal",
+        ),
+        (
+            lower_hex,
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!(concat!("{:#08", ".4x}"), ::proctor_libc::printf::unsigned(value)); }"#,
+            "printf_format_literal",
+        ),
+        (
+            lower_hex,
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4x}"); }"#,
+            "printf_argument_count",
+        ),
+        (
+            lower_hex,
+            r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4x}", ::proctor_libc::printf::unsigned(value), value); }"#,
+            "printf_argument_count",
+        ),
+    ];
+    for (skeleton, transformation, code) in cases {
+        let name = skeleton
+            .strip_prefix("unsafe fn ")
+            .unwrap()
+            .split('(')
+            .next()
+            .unwrap();
+        let response = validate(&ValidationRequest {
+            schema_version: 1,
+            expected_functions: vec![expected_function(7, name, skeleton)],
+            transformation: transformation.to_owned(),
+        });
+        assert_eq!(codes(&response), [code], "{response:?}");
+    }
+}
+
+#[test]
+fn printf_argument_semantics_remain_outside_structural_validation() {
+    let cases = [
+        ("x: i32", "{}", "::proctor_libc::printf::signed(x)", "x"),
+        (
+            "x: i32",
+            "{}",
+            "::proctor_libc::printf::signed(x).space_sign()",
+            "x",
+        ),
+        (
+            "x: u32",
+            "{:#x}",
+            "::proctor_libc::printf::unsigned(x)",
+            "x",
+        ),
+        (
+            "x: f64",
+            "{:.6e}",
+            "::proctor_libc::printf::scientific(x)",
+            "x",
+        ),
+        (
+            "bytes: &[i8]",
+            "{:.3}",
+            "::proctor_libc::printf::byte_string(bytes)",
+            "::std::str::from_utf8(::bytemuck::cast_slice(bytes)).unwrap()",
+        ),
+    ];
+    for (parameter, format, wrapper, alternate) in cases {
+        let skeleton = format!(
+            r#"unsafe fn f({parameter}) {{ #[proctor(0)] ::std::print!("{format}", todo!()); }}"#
+        );
+        for argument in [wrapper, alternate] {
+            let transformation = format!(
+                r#"unsafe fn f({parameter}) {{ #[proctor(0)] ::std::print!("{format}", {argument}); }}"#
+            );
+            assert_valid(&skeleton, &transformation);
+        }
+    }
+    assert_valid(
+        r#"unsafe fn f(first: i32, second: i32) { #[proctor(0)] ::std::print!("{} {}", todo!(), todo!()); }"#,
+        r#"unsafe fn f(first: i32, second: i32) { #[proctor(0)] ::std::print!("{} {}", ::proctor_libc::printf::signed(second), ::proctor_libc::printf::signed(first)); }"#,
+    );
 }
 
 #[test]

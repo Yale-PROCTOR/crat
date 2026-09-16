@@ -11,6 +11,13 @@ fn source(code: &str) -> String {
 
 fn transform(code: &str) -> Result<String, PrepareError> {
     let code = source(code);
+    utils::compilation::run_compiler_on_str(&code, prepare)
+        .unwrap()
+        .map(|result| result.code)
+}
+
+fn transform_result(code: &str) -> Result<PreparationResult, PrepareError> {
+    let code = source(code);
     utils::compilation::run_compiler_on_str(&code, prepare).unwrap()
 }
 
@@ -37,6 +44,145 @@ fn assert_prepares_to(input: &str, expected: &str) {
 
 fn compact(code: &str) -> String {
     code.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn preparation_result_publishes_in_dependency_order() {
+    let events = std::cell::RefCell::new(vec![]);
+    let source = std::path::Path::new("/work/project/lib.rs");
+    let manifest = std::path::Path::new("/work/project/Cargo.toml");
+    PreparationResult {
+        code: "prepared".to_owned(),
+        requires_proctor_libc: false,
+    }
+    .publish_with(
+        source,
+        manifest,
+        |_, _, _| {
+            events.borrow_mut().push("dependency");
+            Ok(())
+        },
+        |path, code| {
+            events.borrow_mut().push("write");
+            assert_eq!(path, source);
+            assert_eq!(code, "prepared");
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(*events.borrow(), ["write"]);
+
+    events.borrow_mut().clear();
+    PreparationResult {
+        code: "prepared".to_owned(),
+        requires_proctor_libc: true,
+    }
+    .publish_with(
+        source,
+        manifest,
+        |path, name, minimum| {
+            events.borrow_mut().push("dependency");
+            assert_eq!(path, manifest);
+            assert_eq!(name, "proctor-libc");
+            assert_eq!(minimum, "0.3.0");
+            Ok(())
+        },
+        |path, code| {
+            events.borrow_mut().push("write");
+            assert_eq!(path, source);
+            assert_eq!(code, "prepared");
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(*events.borrow(), ["dependency", "write"]);
+}
+
+#[test]
+fn preparation_result_stops_before_or_after_write_at_the_failing_boundary() {
+    let events = std::cell::RefCell::new(vec![]);
+    let source = std::path::Path::new("/work/project/lib.rs");
+    let manifest = std::path::Path::new("/work/project/Cargo.toml");
+    let error = PreparationResult {
+        code: "prepared".to_owned(),
+        requires_proctor_libc: true,
+    }
+    .publish_with(
+        source,
+        manifest,
+        |path, name, minimum| {
+            events.borrow_mut().push("dependency");
+            assert_eq!(path, manifest);
+            assert_eq!(name, "proctor-libc");
+            assert_eq!(minimum, "0.3.0");
+            Err("dependency failed".to_owned())
+        },
+        |_, _| {
+            events.borrow_mut().push("write");
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PreparationPublishError::Dependency {
+            manifest: path,
+            cause,
+        } if path == manifest && cause == "dependency failed"
+    ));
+    assert_eq!(*events.borrow(), ["dependency"]);
+
+    events.borrow_mut().clear();
+    let error = PreparationResult {
+        code: "prepared".to_owned(),
+        requires_proctor_libc: true,
+    }
+    .publish_with(
+        source,
+        manifest,
+        |path, name, minimum| {
+            events.borrow_mut().push("dependency");
+            assert_eq!(path, manifest);
+            assert_eq!(name, "proctor-libc");
+            assert_eq!(minimum, "0.3.0");
+            Ok(())
+        },
+        |path, code| {
+            events.borrow_mut().push("write");
+            assert_eq!(path, source);
+            assert_eq!(code, "prepared");
+            Err("write failed".to_owned())
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PreparationPublishError::Source {
+            source: path,
+            cause,
+        } if path == source && cause == "write failed"
+    ));
+    assert_eq!(*events.borrow(), ["dependency", "write"]);
+}
+
+#[test]
+fn preparation_publication_errors_include_the_affected_path() {
+    assert_eq!(
+        PreparationPublishError::Dependency {
+            manifest: "/work/project/Cargo.toml".into(),
+            cause: "Cargo [dependencies] must be a table".to_owned(),
+        }
+        .to_string(),
+        "failed to ensure proctor-libc dependency in /work/project/Cargo.toml: Cargo [dependencies] must be a table"
+    );
+    assert_eq!(
+        PreparationPublishError::Source {
+            source: "/work/project/lib.rs".into(),
+            cause: "denied".to_owned(),
+        }
+        .to_string(),
+        "failed to write prepared source /work/project/lib.rs: denied"
+    );
 }
 
 fn count(code: &str, needle: &str) -> usize {
@@ -1273,8 +1419,9 @@ fn compiler_rejection_remains_distinct_from_prepare_rejection() {
 fn missing_definition_and_use_mappings_are_structured_errors() {
     let code = source(
         r#"
+fn isalpha(c: i32) -> i32 { c }
 fn reserve(CELL: i32) { let _ = CELL; }
-fn f() -> i32 { static CELL: i32 = 1; CELL }
+fn f(c: i32) -> i32 { static CELL: i32 = 1; match c { 0 => isalpha(c) + CELL, _ => c } }
 "#,
     );
     utils::compilation::run_compiler_on_str(&code, |tcx| {
@@ -1344,6 +1491,102 @@ fn f() -> i32 { static CELL: i32 = 1; CELL }
 }
 
 #[test]
+fn preparation_errors_return_no_partially_rewritten_result() {
+    let scoped = r#"
+fn isalpha(c: i32) -> i32 { c }
+fn combined(c: i32) -> usize {
+    const N: usize = 2;
+    static DATA: [u8; N] = [0; N];
+    match c { 0 => (isalpha(c) as usize) + DATA.len(), _ => DATA.len() }
+}
+"#;
+    assert!(matches!(
+        transform_result(scoped),
+        Err(PrepareError::ScopedDependency { .. })
+    ));
+
+    let direct_async = r#"
+fn isalpha(c: i32) -> i32 { c }
+fn combined(c: i32) -> i32 {
+    static CELL: i32 = 1;
+    match c { 0 => isalpha(c) + CELL, _ => c }
+}
+async fn unsupported() {}
+"#;
+    assert!(matches!(
+        transform_result(direct_async),
+        Err(PrepareError::UnsupportedAsyncFunction { .. })
+    ));
+
+    let unsupported_prelude = r#"
+#![no_implicit_prelude]
+fn isalpha(c: i32) -> i32 { c }
+fn combined(c: i32) -> i32 {
+    static CELL: i32 = 1;
+    match c { 0 => isalpha(c) + CELL, _ => c }
+}
+"#;
+    let result = utils::compilation::run_compiler_on_str(unsupported_prelude, prepare).unwrap();
+    assert!(matches!(
+        result,
+        Err(PrepareError::UnsupportedPrelude { .. })
+    ));
+}
+
+#[test]
+fn missing_mapping_precedes_all_combined_preparation_rewrites() {
+    let code = source(
+        r#"
+fn isalpha(c: i32) -> i32 { c }
+fn reserve(CELL: i32) { let _ = CELL; }
+fn combined(c: i32) -> i32 {
+    static CELL: i32 = 1;
+    match c { 0 => isalpha(c) + CELL, _ => c }
+}
+"#,
+    );
+    utils::compilation::run_compiler_on_str(&code, |tcx| {
+        let mut krate = utils::ast::expanded_ast(tcx);
+        let mut ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+        let mut discovery = Discovery::new(tcx, &ast_to_hir);
+        discovery.discover_crate(&krate);
+        assert!(discovery.error.is_none());
+        let lifts = discovery.lifts.clone();
+        let static_id = lifts[0].def_id;
+        drop(discovery);
+
+        let before = pprust::crate_to_string_for_macros(&krate);
+        let use_span = ast_to_hir
+            .path_span_to_res
+            .iter()
+            .find_map(|(span, resolution)| {
+                matches!(
+                    resolution,
+                    Res::Def(DefKind::Static { .. }, definition)
+                        if definition.as_local() == Some(static_id)
+                )
+                .then_some(*span)
+            })
+            .unwrap();
+        ast_to_hir.path_span_to_res.remove(&use_span);
+
+        assert_eq!(
+            validate_use_mappings(&krate, &lifts, &ast_to_hir, tcx),
+            Err(PrepareError::MissingMapping {
+                construct: "use of local static `CELL`".to_owned(),
+            })
+        );
+        let after = pprust::crate_to_string_for_macros(&krate);
+        assert_eq!(after, before);
+        assert!(after.contains("static CELL"));
+        assert!(after.contains("isalpha(c)"));
+        assert!(!after.contains("::proctor_libc::isalpha"));
+        assert!(!after.contains("0 => {"));
+    })
+    .unwrap();
+}
+
+#[test]
 fn preserves_export_attributes_across_renaming() {
     assert_prepares_to(
         r#"
@@ -1390,8 +1633,9 @@ fn f(x: i32) -> i32 {
     let second = utils::compilation::run_compiler_on_str(&first, prepare)
         .unwrap()
         .unwrap();
-    utils::compilation::run_compiler_on_str(&second, utils::type_check).unwrap();
-    assert_eq!(compact(&first), compact(&second));
+    assert!(!second.requires_proctor_libc);
+    utils::compilation::run_compiler_on_str(&second.code, utils::type_check).unwrap();
+    assert_eq!(compact(&first), compact(&second.code));
 }
 
 #[test]
@@ -1407,8 +1651,9 @@ fn f() -> i32 { CELL }
     let second = utils::compilation::run_compiler_on_str(&first, prepare)
         .unwrap()
         .unwrap();
-    utils::compilation::run_compiler_on_str(&second, utils::type_check).unwrap();
-    assert_eq!(compact(&first), compact(&second));
+    assert!(!second.requires_proctor_libc);
+    utils::compilation::run_compiler_on_str(&second.code, utils::type_check).unwrap();
+    assert_eq!(compact(&first), compact(&second.code));
 }
 
 #[test]
@@ -1432,7 +1677,8 @@ unsafe fn classify(x: Kind) -> i32 {
         .unwrap()
         .unwrap();
     let simplified =
-        utils::compilation::run_compiler_on_str(&prepared, crate::simplifier::simplify).unwrap();
+        utils::compilation::run_compiler_on_str(&prepared.code, crate::simplifier::simplify)
+            .unwrap();
     utils::compilation::run_compiler_on_str(&simplified, utils::type_check).unwrap();
     let simplified = compact(&simplified);
     assert_eq!(count(&simplified, "static CALLS"), 1);
@@ -1521,4 +1767,344 @@ pub fn h() -> i32 { #[export_name = "wire_symbol"] static INTERNAL: i32 = 3; INT
     assert!(!output.contains("export_name = \"UNCHANGED\""));
     assert_eq!(count(&output, "export_name = \"RENAMED\""), 1);
     assert_eq!(count(&output, "export_name = \"wire_symbol\""), 1);
+}
+
+#[test]
+fn rewrites_each_direct_ctype_call_by_textual_name() {
+    for name in [
+        "isalnum", "isalpha", "isblank", "iscntrl", "isdigit", "isgraph", "islower", "isprint",
+        "ispunct", "isspace", "isupper", "isxdigit", "tolower", "toupper",
+    ] {
+        let input = format!(
+            "fn {name}(c: i32) -> i32 {{ c + 100 }}\nfn use_it(c: i32) -> i32 {{ {name}(c) }}"
+        );
+        let result = transform_result(&input).unwrap();
+        assert!(result.requires_proctor_libc, "{name}");
+        assert!(
+            compact(&result.code).contains(&format!("::proctor_libc::{name}(c)")),
+            "{name}: {}",
+            result.code
+        );
+        utils::compilation::run_compiler_on_str(&result.code, utils::type_check).unwrap();
+    }
+}
+
+#[test]
+fn direct_ctype_calls_preserve_arguments_and_reject_near_misses() {
+    let result = transform_result(
+        r#"
+fn isalpha(c: i32) -> i32 { c }
+fn isdigit(c: i32) -> i32 { c }
+fn iscntrl(c: i32) -> i32 { c }
+fn isspace(c: i32) -> i32 { c }
+fn tolower(c: i32) -> i32 { c }
+fn toupper(c: i32) -> i32 { c }
+fn nested(mut n: i32) -> i32 { isalpha({ n += 1; isdigit(n) }) }
+mod helpers { pub fn isalpha(c: i32) -> i32 { c } }
+fn unchanged(c: i32) -> i32 { helpers::isalpha(c) }
+"#,
+    )
+    .unwrap();
+    assert!(result.requires_proctor_libc);
+    let code = compact(&result.code);
+    assert!(code.contains("::proctor_libc::isalpha({ n += 1; ::proctor_libc::isdigit(n) })"));
+    assert!(code.contains("helpers::isalpha(c)"));
+    utils::compilation::run_compiler_on_str(&result.code, utils::type_check).unwrap();
+
+    for input in [
+        "fn isalpha() -> i32 { 7 } fn f() -> i32 { isalpha() }",
+        "fn isalpha(a: i32, b: i32) -> i32 { a + b } fn f(c: i32) -> i32 { isalpha(c, c) }",
+        "fn c_isalpha(c: i32) -> i32 { c } fn f(c: i32) -> i32 { c_isalpha(c) }",
+        "fn isalpha_extra(c: i32) -> i32 { c } fn f(c: i32) -> i32 { isalpha_extra(c) }",
+        "struct Helper; impl Helper { fn isalpha(&self, c: i32) -> i32 { c } } fn f(helper: Helper, c: i32) -> i32 { helper.isalpha(c) }",
+        "fn isalpha_fn(c: i32) -> i32 { c } fn f(c: i32) -> i32 { let classify: fn(i32) -> i32 = isalpha_fn; classify(c) }",
+        "macro_rules! isalpha { ($c:expr) => { $c } } fn f(c: i32) -> i32 { isalpha!(c) }",
+    ] {
+        let result = transform_result(input).unwrap();
+        assert!(!result.requires_proctor_libc);
+    }
+}
+
+#[test]
+fn direct_ctype_calls_cover_effects_nesting_and_defined_inputs() {
+    for name in [
+        "isalnum", "isalpha", "isblank", "iscntrl", "isdigit", "isgraph", "islower", "isprint",
+        "ispunct", "isspace", "isupper", "isxdigit", "tolower", "toupper",
+    ] {
+        let input = format!(
+            "unsafe extern \"C\" {{ fn {name}(c: i32) -> i32; }}\npub unsafe fn classify(mut n: i32) -> i32 {{ {name}({{ n += 1; n }}) }}"
+        );
+        let result = transform_result(&input).unwrap();
+        assert!(result.requires_proctor_libc, "{name}");
+        let code = compact(&result.code);
+        assert!(
+            code.contains(&format!("::proctor_libc::{name}({{ n += 1; n }} )"))
+                || code.contains(&format!("::proctor_libc::{name}({{ n += 1; n }})")),
+            "{name}: {code}"
+        );
+        assert_eq!(count(&code, "n += 1"), 1, "{name}: {code}");
+        utils::compilation::run_compiler_on_str(&result.code, utils::type_check).unwrap();
+    }
+
+    let result = transform_result(
+        r#"
+fn isalpha(c: i32) -> i32 { c }
+fn isdigit(c: i32) -> i32 { c }
+fn iscntrl(c: i32) -> i32 { c }
+fn isspace(c: i32) -> i32 { c }
+fn tolower(c: i32) -> i32 { c }
+fn toupper(c: i32) -> i32 { c }
+fn nested(n: i32) -> i32 { isalpha(isdigit(n)) }
+fn compared(n: i32) -> i32 { if isalpha(n) != 0 { 1 } else { 0 } }
+fn returned(n: i32) -> i32 { return isalpha(n); }
+fn matched(n: i32) -> i32 { match n { 0 => isalpha(n), _ => 0 } }
+fn defined_inputs() -> i32 {
+    isalpha(-1) + isalpha(65) + iscntrl(31) + isspace(9) + isdigit(48)
+        + tolower(-1) + tolower(65) + toupper(-1) + toupper(97)
+}
+"#,
+    )
+    .unwrap();
+    assert!(result.requires_proctor_libc);
+    let code = compact(&result.code);
+    assert!(code.contains("::proctor_libc::isalpha(::proctor_libc::isdigit(n))"));
+    assert_eq!(count(&code, "::proctor_libc::isalpha"), 6);
+    utils::compilation::run_compiler_on_str(&result.code, utils::type_check).unwrap();
+}
+
+fn ctype_table_prelude() -> &'static str {
+    r#"
+unsafe extern "C" {
+    fn __ctype_b_loc() -> *mut *const u16;
+    fn __ctype_tolower_loc() -> *mut *const i32;
+    fn __ctype_toupper_loc() -> *mut *const i32;
+}
+const _ISupper: u32 = 256; const _ISlower: u32 = 512;
+const _ISalpha: u32 = 1024; const _ISdigit: u32 = 2048;
+const _ISxdigit: u32 = 4096; const _ISspace: u32 = 8192;
+const _ISprint: u32 = 16384; const _ISgraph: u32 = 32768;
+const _ISblank: u32 = 1; const _IScntrl: u32 = 2;
+const _ISpunct: u32 = 4; const _ISalnum: u32 = 8;
+"#
+}
+
+#[test]
+fn rewrites_each_supported_ctype_mask_and_preserves_the_index() {
+    for (mask, function) in [
+        ("_ISupper", "isupper"),
+        ("_ISlower", "islower"),
+        ("_ISalpha", "isalpha"),
+        ("_ISdigit", "isdigit"),
+        ("_ISxdigit", "isxdigit"),
+        ("_ISspace", "isspace"),
+        ("_ISprint", "isprint"),
+        ("_ISgraph", "isgraph"),
+        ("_ISblank", "isblank"),
+        ("_IScntrl", "iscntrl"),
+        ("_ISpunct", "ispunct"),
+        ("_ISalnum", "isalnum"),
+    ] {
+        let input = format!(
+            "{}\npub unsafe fn classify(c: i32) -> i32 {{ *(*__ctype_b_loc()).offset(c as i32 as isize) as i32 & {mask} as i32 as u16 as i32 }}",
+            ctype_table_prelude()
+        );
+        let result = transform_result(&input).unwrap();
+        assert!(result.requires_proctor_libc, "{mask}");
+        assert!(
+            compact(&result.code).contains(&format!("::proctor_libc::{function}(c as i32)")),
+            "{mask}: {}",
+            result.code
+        );
+        utils::compilation::run_compiler_on_str(&result.code, utils::type_check).unwrap();
+    }
+}
+
+#[test]
+fn rewrites_case_tables_and_requires_the_terminal_isize_cast() {
+    let input = format!(
+        "{}\npub unsafe fn classify(mut c: i32) -> i32 {{ *(*__ctype_tolower_loc()).offset(({{ c += 1; c }}) as isize) + *(*__ctype_toupper_loc()).offset(c as i32 as isize) }}",
+        ctype_table_prelude()
+    );
+    let first = transform_result(&input).unwrap();
+    assert!(first.requires_proctor_libc);
+    let code = compact(&first.code);
+    assert!(code.contains("::proctor_libc::tolower("));
+    assert!(code.contains("c += 1; c"));
+    assert!(code.contains("::proctor_libc::toupper(c as i32)"));
+    utils::compilation::run_compiler_on_str(&first.code, utils::type_check).unwrap();
+    let second = utils::compilation::run_compiler_on_str(&first.code, prepare)
+        .unwrap()
+        .unwrap();
+    assert!(!second.requires_proctor_libc);
+    assert_eq!(compact(&first.code), compact(&second.code));
+
+    let near_miss = format!(
+        "{}\npub unsafe fn classify(c: isize) -> i32 {{ *(*__ctype_tolower_loc()).offset(c) }}",
+        ctype_table_prelude()
+    );
+    let result = transform_result(&near_miss).unwrap();
+    assert!(!result.requires_proctor_libc);
+}
+
+#[test]
+fn ctype_table_rewrites_preserve_outer_contexts_and_inner_casts() {
+    let input = format!(
+        "{}\npub unsafe fn classify(c: i32) -> (i32, bool, bool, bool, bool, i32) {{\nlet bare = *(*__ctype_b_loc()).offset(c as i32 as isize) as i32 & _ISalpha as i32 as u16 as i32;\nlet a = (*(*__ctype_b_loc()).offset(c as i32 as isize) as i32 & _ISalpha as i32) != 0;\nlet b = 0 != (*(*__ctype_b_loc()).offset(c as i32 as isize) as i32 & _ISalpha as i32);\nlet d = (*(*__ctype_b_loc()).offset(c as i32 as isize) as i32 & _ISalpha as i32) == 0;\nlet e = 0 == (*(*__ctype_b_loc()).offset(c as i32 as isize) as i32 & _ISalpha as i32);\nlet casted = *(*__ctype_b_loc()).offset(c as u8 as i32 as isize) as i32 & _ISalpha as i32;\n(bare, a, b, d, e, casted)\n}}",
+        ctype_table_prelude()
+    );
+    let result = transform_result(&input).unwrap();
+    assert!(result.requires_proctor_libc);
+    let code = compact(&result.code);
+    assert_eq!(count(&code, "::proctor_libc::isalpha(c as i32)"), 5);
+    assert_eq!(count(&code, "::proctor_libc::isalpha(c as u8 as i32)"), 1);
+    assert_eq!(count(&code, " != "), 2, "{code}");
+    assert_eq!(count(&code, " == "), 2, "{code}");
+    utils::compilation::run_compiler_on_str(&result.code, utils::type_check).unwrap();
+}
+
+#[test]
+fn ctype_table_rewrites_nested_ctype_in_retained_indices() {
+    let input = format!(
+        "{}\nfn isalpha(c: i32) -> i32 {{ c }}\nfn tolower(c: i32) -> i32 {{ c }}\npub unsafe fn classify(c: i32) -> i32 {{\n(*(*__ctype_b_loc()).offset(isalpha(c) as isize) as i32 & _ISspace as i32)\n+ *(*__ctype_toupper_loc()).offset(tolower(c) as isize)\n}}",
+        ctype_table_prelude()
+    );
+    let first = transform_result(&input).unwrap();
+    assert!(first.requires_proctor_libc);
+    let code = compact(&first.code);
+    assert_eq!(
+        count(&code, "::proctor_libc::isspace(::proctor_libc::isalpha(c))"),
+        1,
+        "{code}"
+    );
+    assert_eq!(
+        count(&code, "::proctor_libc::toupper(::proctor_libc::tolower(c))"),
+        1,
+        "{code}"
+    );
+    utils::compilation::run_compiler_on_str(&first.code, utils::type_check).unwrap();
+
+    let second = utils::compilation::run_compiler_on_str(&first.code, prepare)
+        .unwrap()
+        .unwrap();
+    assert!(!second.requires_proctor_libc);
+    assert_eq!(compact(&first.code), compact(&second.code));
+}
+
+#[test]
+fn ctype_table_recognition_is_syntax_only_and_rejects_near_misses() {
+    let local = r#"
+fn __ctype_b_loc() -> *mut *const u16 { ::std::ptr::null_mut() }
+const _ISalpha: u32 = 7;
+unsafe fn classify(c: i32) -> i32 {
+    *(*__ctype_b_loc()).offset(c as isize) as i32 & _ISalpha as i32
+}
+"#;
+    let result = transform_result(local).unwrap();
+    assert!(result.requires_proctor_libc);
+    assert!(compact(&result.code).contains("::proctor_libc::isalpha(c)"));
+    utils::compilation::run_compiler_on_str(&result.code, utils::type_check).unwrap();
+
+    let misses = [
+        format!("{}\npub unsafe fn f() -> *const u16 {{ *__ctype_b_loc() }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ _ISalpha as i32 & (*(*__ctype_b_loc()).offset(c as isize) as i32) }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ (*(*__ctype_b_loc()).offset(c as isize) as i32) & (_ISalpha | _ISdigit) as i32 }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize, mask: i32) -> i32 {{ (*(*__ctype_b_loc()).offset(c as isize) as i32) & mask }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ (*(*crate::__ctype_b_loc()).offset(c as isize) as i32) & _ISalpha as i32 }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ (*(*__ctype_b_loc()).offset(c as isize) as i32) & crate::_ISalpha as i32 }}", ctype_table_prelude()),
+        "unsafe extern \"C\" { fn __ctype_b_loc(_: i32) -> *mut *const u16; } const _ISalpha: u32 = 1; pub unsafe fn f(c: isize) -> i32 { (*(*__ctype_b_loc(0)).offset(c as isize) as i32) & _ISalpha as i32 }".to_owned(),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ (*(*__ctype_b_loc()).offset(c) as i32) & _ISalpha as i32 }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: usize) -> u16 {{ *(*__ctype_b_loc()).add(c) }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ *(*__ctype_tolower_loc()).offset(c) }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ *(*__ctype_toupper_loc()).offset(c) }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: usize) -> i32 {{ *(*__ctype_tolower_loc()).add(c) }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ *(*crate::__ctype_toupper_loc()).offset(c as isize) }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ (*(*__ctype_b_loc()).offset(c as isize) & _ISalpha as u16) as i32 }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ (**__ctype_b_loc().offset(c as isize) as i32) & _ISalpha as i32 }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ (*(__ctype_b_loc()).offset(c as isize) as i32) & _ISalpha as i32 }}", ctype_table_prelude()),
+        format!("{}\npub unsafe fn f(c: isize) -> i32 {{ ((*__ctype_b_loc()).offset(c as isize) as i32) & _ISalpha as i32 }}", ctype_table_prelude()),
+    ];
+    for input in misses {
+        let result = transform_result(&input).unwrap();
+        assert!(!result.requires_proctor_libc, "{}", compact(&result.code));
+        utils::compilation::run_compiler_on_str(&result.code, utils::type_check).unwrap();
+    }
+}
+
+#[test]
+fn ctype_prepare_is_structurally_idempotent() {
+    let input = format!(
+        "{}\nfn isalpha(c: i32) -> i32 {{ c }}\npub unsafe fn combined(c: i32) -> i32 {{\nstatic CALLS: i32 = 1;\nmatch c {{\n0 => isalpha(c) + CALLS,\n_ => (*(*__ctype_b_loc()).offset(c as isize) as i32 & _ISspace as i32) + *(*__ctype_tolower_loc()).offset(c as isize),\n}}\n}}",
+        ctype_table_prelude()
+    );
+    let first = transform_result(&input).unwrap();
+    assert!(first.requires_proctor_libc);
+    let code = compact(&first.code);
+    assert_eq!(count(&code, "::proctor_libc::isalpha(c)"), 1);
+    assert_eq!(count(&code, "::proctor_libc::isspace(c)"), 1);
+    assert_eq!(count(&code, "::proctor_libc::tolower(c)"), 1);
+    utils::compilation::run_compiler_on_str(&first.code, utils::type_check).unwrap();
+    let second = utils::compilation::run_compiler_on_str(&first.code, prepare)
+        .unwrap()
+        .unwrap();
+    assert!(!second.requires_proctor_libc);
+    assert_eq!(compact(&first.code), compact(&second.code));
+}
+
+#[test]
+fn neighboring_passes_preserve_prepared_ctype_calls() {
+    let prepared = source(
+        r#"
+pub unsafe fn direct(c: i32) -> i32 {
+    if ::proctor_libc::isalpha(c) != 0 { 1 } else { 0 }
+}
+pub unsafe fn table(c: i32) -> i32 {
+    ::proctor_libc::isspace(c)
+}
+"#,
+    );
+    let unsafe_config = crate::unsafe_resolver::Config {
+        remove_unused: true,
+        remove_no_mangle: true,
+        remove_extern_c: true,
+        replace_pub: true,
+        c_exposed_fns: ["direct", "table"].into_iter().map(str::to_owned).collect(),
+    };
+    let outputs = [
+        utils::compilation::run_compiler_on_str(&prepared, crate::simplifier::simplify).unwrap(),
+        utils::compilation::run_compiler_on_str(&prepared, |tcx| {
+            crate::unsafe_resolver::resolve_unsafe(&unsafe_config, tcx)
+        })
+        .unwrap(),
+        utils::compilation::run_compiler_on_str(&prepared, |tcx| {
+            crate::unexpander::unexpand(crate::unexpander::Config { use_print: true }, tcx)
+        })
+        .unwrap(),
+    ];
+    for output in outputs {
+        utils::compilation::run_compiler_on_str(&output, utils::type_check).unwrap();
+        let output = compact(&output);
+        assert_eq!(count(&output, "::proctor_libc::isalpha(c)"), 1, "{output}");
+        assert_eq!(count(&output, "::proctor_libc::isspace(c)"), 1, "{output}");
+        assert!(!output.contains("__ctype_b_loc"));
+    }
+
+    let with_unused_declarations = source(
+        r#"
+unsafe extern "C" {
+    fn isalpha(c: i32) -> i32;
+    fn __ctype_b_loc() -> *mut *const u16;
+}
+pub unsafe fn direct(c: i32) -> i32 { ::proctor_libc::isalpha(c) }
+pub unsafe fn table(c: i32) -> i32 { ::proctor_libc::isspace(c) }
+"#,
+    );
+    let cleaned = utils::compilation::run_compiler_on_str(&with_unused_declarations, |tcx| {
+        crate::unsafe_resolver::resolve_unsafe(&unsafe_config, tcx)
+    })
+    .unwrap();
+    utils::compilation::run_compiler_on_str(&cleaned, utils::type_check).unwrap();
+    let cleaned = compact(&cleaned);
+    assert!(!cleaned.contains("extern \"C\""));
+    assert!(cleaned.contains("fn direct"));
+    assert!(cleaned.contains("fn table"));
 }

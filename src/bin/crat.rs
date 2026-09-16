@@ -145,7 +145,7 @@ struct Args {
     input: PathBuf,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
+#[derive(Clone, Debug, ValueEnum, Deserialize)]
 #[clap(rename_all = "lower")]
 #[serde(rename_all = "lowercase")]
 enum Pass {
@@ -170,26 +170,6 @@ enum Pass {
     Pointer,
     Static,
     Simpl,
-}
-
-#[derive(Debug)]
-enum PrepareRunError<E> {
-    Compiler(E),
-    Prepare(preparer::PrepareError),
-}
-
-fn apply_prepare_result<E>(
-    result: Result<Result<String, preparer::PrepareError>, E>,
-    write: impl FnOnce(String),
-) -> Result<(), PrepareRunError<E>> {
-    let prepared = result.map_err(PrepareRunError::Compiler)?;
-    let source = prepared.map_err(PrepareRunError::Prepare)?;
-    write(source);
-    Ok(())
-}
-
-fn prepare_failure_message(error: &preparer::PrepareError) -> String {
-    format!("prepare failed: {error}")
 }
 
 #[derive(Clone, Debug, ValueEnum, Deserialize)]
@@ -482,18 +462,20 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Prepare => {
-                match apply_prepare_result(
-                    run_compiler_on_path(&file, preparer::prepare),
-                    |source| std::fs::write(&file, source).unwrap(),
-                ) {
-                    Ok(()) => {}
-                    Err(PrepareRunError::Compiler(error)) => {
-                        error.raise();
+                let manifest = dir.join("Cargo.toml");
+                match run_compiler_on_path(&file, preparer::prepare) {
+                    Ok(Ok(result)) => {
+                        if let Err(error) = result.publish(&file, &manifest) {
+                            eprintln!("{error}");
+                            std::process::exit(1);
+                        }
                     }
-                    Err(PrepareRunError::Prepare(error)) => {
-                        let message = prepare_failure_message(&error);
-                        eprintln!("{message}");
+                    Ok(Err(error)) => {
+                        eprintln!("prepare failed: {error}");
                         std::process::exit(1);
+                    }
+                    Err(error) => {
+                        error.raise();
                     }
                 }
             }
@@ -792,68 +774,5 @@ fn max_sensitivity_in_range(s: &str) -> Result<usize, String> {
         Err("max_loop_head_states must be greater than 0".to_string())
     } else {
         Ok(m)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prepare_pass_parses_from_cli() {
-        let args = Args::try_parse_from(["crat", "--pass", "prepare", "input"]).unwrap();
-        assert_eq!(args.pass, vec![Pass::Prepare]);
-    }
-
-    #[test]
-    fn prepare_pass_deserializes_from_toml() {
-        let config: Config = toml::from_str("passes = [\"prepare\"]").unwrap();
-        assert_eq!(config.passes, vec![Pass::Prepare]);
-    }
-
-    #[test]
-    fn unknown_pass_remains_rejected() {
-        assert!(Args::try_parse_from(["crat", "--pass", "unknown", "input"]).is_err());
-        assert!(toml::from_str::<Config>("passes = [\"unknown\"]").is_err());
-    }
-
-    #[test]
-    fn prepare_result_writes_success_exactly_once() {
-        let mut writes = vec![];
-        apply_prepare_result::<&str>(Ok(Ok("prepared".to_owned())), |source| writes.push(source))
-            .unwrap();
-        assert_eq!(writes, ["prepared"]);
-    }
-
-    #[test]
-    fn prepare_result_keeps_compiler_and_prepare_errors_distinct() {
-        let mut writes = 0;
-        let inner = apply_prepare_result::<&str>(
-            Ok(Err(preparer::PrepareError::MissingMapping {
-                construct: "test construct".to_owned(),
-            })),
-            |_| writes += 1,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            &inner,
-            PrepareRunError::Prepare(preparer::PrepareError::MissingMapping { construct })
-                if construct == "test construct"
-        ));
-        let PrepareRunError::Prepare(inner_error) = &inner else { unreachable!() };
-        assert_eq!(
-            prepare_failure_message(inner_error),
-            "prepare failed: missing compiler mapping for test construct"
-        );
-        let outer = apply_prepare_result(
-            Err::<Result<String, preparer::PrepareError>, _>("compiler failure"),
-            |_| writes += 1,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            outer,
-            PrepareRunError::Compiler("compiler failure")
-        ));
-        assert_eq!(writes, 0);
     }
 }

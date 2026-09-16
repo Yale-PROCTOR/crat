@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::HashMap,
+    fmt, fs,
+    path::{Path, PathBuf},
+};
 
 use rustc_ast::{
     self as ast,
@@ -69,6 +73,69 @@ impl fmt::Display for PrepareError {
 }
 
 impl std::error::Error for PrepareError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparationResult {
+    pub code: String,
+    pub requires_proctor_libc: bool,
+}
+
+#[derive(Debug)]
+pub enum PreparationPublishError {
+    Dependency { manifest: PathBuf, cause: String },
+    Source { source: PathBuf, cause: String },
+}
+
+impl fmt::Display for PreparationPublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dependency { manifest, cause } => write!(
+                formatter,
+                "failed to ensure proctor-libc dependency in {}: {cause}",
+                manifest.display()
+            ),
+            Self::Source { source, cause } => write!(
+                formatter,
+                "failed to write prepared source {}: {cause}",
+                source.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PreparationPublishError {}
+
+impl PreparationResult {
+    pub fn publish(self, source: &Path, manifest: &Path) -> Result<(), PreparationPublishError> {
+        self.publish_with(
+            source,
+            manifest,
+            utils::dependency::ensure_crates_io_dependency,
+            |source, code| fs::write(source, code).map_err(|error| error.to_string()),
+        )
+    }
+
+    fn publish_with(
+        self,
+        source: &Path,
+        manifest: &Path,
+        ensure_dependency: impl FnOnce(&Path, &str, &str) -> Result<(), String>,
+        write: impl FnOnce(&Path, String) -> Result<(), String>,
+    ) -> Result<(), PreparationPublishError> {
+        if self.requires_proctor_libc {
+            ensure_dependency(manifest, "proctor-libc", "0.3.0").map_err(|cause| {
+                PreparationPublishError::Dependency {
+                    manifest: manifest.to_owned(),
+                    cause,
+                }
+            })?;
+        }
+        write(source, self.code).map_err(|cause| PreparationPublishError::Source {
+            source: source.to_owned(),
+            cause,
+        })
+    }
+}
 
 fn validate_supported_input(krate: &ast::Crate) -> Result<(), PrepareError> {
     struct SupportedInputVisitor {
@@ -912,6 +979,173 @@ struct InsertVisitor<'a> {
     extracted: HashMap<ast::NodeId, P<ast::Item>>,
 }
 
+#[derive(Default)]
+struct CtypeRewriteVisitor {
+    rewrote: bool,
+}
+
+impl MutVisitor for CtypeRewriteVisitor {
+    fn visit_expr(&mut self, expression: &mut ast::Expr) {
+        if let Some((function, argument)) =
+            ctype_mask_call(expression).or_else(|| ctype_table_call(expression))
+        {
+            let mut argument = argument.clone();
+            self.visit_expr(&mut argument);
+            *expression = ctype_call(function, &argument);
+            self.rewrote = true;
+            return;
+        }
+
+        mut_visit::walk_expr(self, expression);
+
+        let ast::ExprKind::Call(callee, arguments) = &expression.kind else {
+            return;
+        };
+        let ast::ExprKind::Path(None, path) = &callee.kind else {
+            return;
+        };
+        let [segment] = path.segments.as_slice() else {
+            return;
+        };
+        let [argument] = arguments.as_slice() else {
+            return;
+        };
+        let name = segment.ident.as_str();
+        if direct_ctype_name(name).is_none() {
+            return;
+        }
+        *expression = ctype_call(name, argument);
+        self.rewrote = true;
+    }
+}
+
+fn direct_ctype_name(name: &str) -> Option<&str> {
+    matches!(
+        name,
+        "isalnum"
+            | "isalpha"
+            | "isblank"
+            | "iscntrl"
+            | "isdigit"
+            | "isgraph"
+            | "islower"
+            | "isprint"
+            | "ispunct"
+            | "isspace"
+            | "isupper"
+            | "isxdigit"
+            | "tolower"
+            | "toupper"
+    )
+    .then_some(name)
+}
+
+fn ctype_call(function: &str, argument: &ast::Expr) -> ast::Expr {
+    let argument = pprust::expr_to_string(argument);
+    utils::expr!("::proctor_libc::{function}({argument})")
+}
+
+fn peel_casts(mut expression: &ast::Expr) -> &ast::Expr {
+    while let ast::ExprKind::Cast(inner, _) = &expression.kind {
+        expression = inner;
+    }
+    expression
+}
+
+fn terminal_isize_cast(expression: &ast::Expr) -> Option<&ast::Expr> {
+    let ast::ExprKind::Cast(inner, ty) = &expression.kind else {
+        return None;
+    };
+    (pprust::ty_to_string(ty) == "isize").then_some(inner)
+}
+
+fn ctype_accessor_index<'a>(expression: &'a ast::Expr, accessor: &str) -> Option<&'a ast::Expr> {
+    let ast::ExprKind::Unary(ast::UnOp::Deref, load) = &expression.kind else {
+        return None;
+    };
+    let ast::ExprKind::MethodCall(box ast::MethodCall {
+        seg,
+        receiver,
+        args,
+        ..
+    }) = &load.kind
+    else {
+        return None;
+    };
+    if seg.ident.as_str() != "offset" {
+        return None;
+    }
+    let [index] = args.as_slice() else {
+        return None;
+    };
+    let ast::ExprKind::Paren(receiver) = &receiver.kind else {
+        return None;
+    };
+    let ast::ExprKind::Unary(ast::UnOp::Deref, receiver) = &receiver.kind else {
+        return None;
+    };
+    let ast::ExprKind::Call(callee, call_arguments) = &receiver.kind else {
+        return None;
+    };
+    if !call_arguments.is_empty() {
+        return None;
+    }
+    let ast::ExprKind::Path(None, path) = &callee.kind else {
+        return None;
+    };
+    let [segment] = path.segments.as_slice() else {
+        return None;
+    };
+    if segment.ident.as_str() != accessor {
+        return None;
+    }
+    terminal_isize_cast(index)
+}
+
+fn ctype_mask_call(expression: &ast::Expr) -> Option<(&'static str, &ast::Expr)> {
+    let ast::ExprKind::Binary(operator, left, right) = &expression.kind else {
+        return None;
+    };
+    if operator.node != ast::BinOpKind::BitAnd {
+        return None;
+    }
+    let ast::ExprKind::Cast(load, _) = &left.kind else {
+        return None;
+    };
+    let argument = ctype_accessor_index(load, "__ctype_b_loc")?;
+    let ast::ExprKind::Path(None, path) = &peel_casts(right).kind else {
+        return None;
+    };
+    let [segment] = path.segments.as_slice() else {
+        return None;
+    };
+    let function = match segment.ident.as_str() {
+        "_ISupper" => "isupper",
+        "_ISlower" => "islower",
+        "_ISalpha" => "isalpha",
+        "_ISdigit" => "isdigit",
+        "_ISxdigit" => "isxdigit",
+        "_ISspace" => "isspace",
+        "_ISprint" => "isprint",
+        "_ISgraph" => "isgraph",
+        "_ISblank" => "isblank",
+        "_IScntrl" => "iscntrl",
+        "_ISpunct" => "ispunct",
+        "_ISalnum" => "isalnum",
+        _ => return None,
+    };
+    Some((function, argument))
+}
+
+fn ctype_table_call(expression: &ast::Expr) -> Option<(&'static str, &ast::Expr)> {
+    ctype_accessor_index(expression, "__ctype_tolower_loc")
+        .map(|argument| ("tolower", argument))
+        .or_else(|| {
+            ctype_accessor_index(expression, "__ctype_toupper_loc")
+                .map(|argument| ("toupper", argument))
+        })
+}
+
 impl MutVisitor for InsertVisitor<'_> {
     fn flat_map_item(&mut self, item: P<ast::Item>) -> smallvec::SmallVec<[P<ast::Item>; 1]> {
         let anchor = item.id;
@@ -930,7 +1164,7 @@ impl MutVisitor for InsertVisitor<'_> {
     }
 }
 
-pub fn prepare(tcx: TyCtxt<'_>) -> Result<String, PrepareError> {
+pub fn prepare(tcx: TyCtxt<'_>) -> Result<PreparationResult, PrepareError> {
     let mut krate = utils::ast::expanded_ast(tcx);
     validate_supported_input(&krate)?;
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
@@ -982,5 +1216,11 @@ pub fn prepare(tcx: TyCtxt<'_>) -> Result<String, PrepareError> {
     inserter.visit_crate(&mut krate);
     debug_assert!(inserter.extracted.is_empty());
 
-    Ok(pprust::crate_to_string_for_macros(&krate))
+    let mut ctype_rewriter = CtypeRewriteVisitor::default();
+    ctype_rewriter.visit_crate(&mut krate);
+
+    Ok(PreparationResult {
+        code: pprust::crate_to_string_for_macros(&krate),
+        requires_proctor_libc: ctype_rewriter.rewrote,
+    })
 }
