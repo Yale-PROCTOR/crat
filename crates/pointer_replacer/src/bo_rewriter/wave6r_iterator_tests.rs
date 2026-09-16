@@ -160,3 +160,75 @@ fn wave6r_iterator_readers_hand_out_or_forward_the_loaded_field() {
         "stored through another pointer"
     );
 }
+
+/// End-to-end on the composition (relay wave-6r/016): with wave-6v2's
+/// `frame_confined` consumer wired to the two scan entries above, the caller's
+/// `init(&mut it, split)` site — brotli's `BrotliBuildHistogramsWithContext →
+/// InitBlockSplitIterator` shape, held `write-through-shared-view` at the
+/// batch-8 frame (`08b9035e`, census `family-held-sites.tsv`: the three
+/// `*_split#3/4/5` rows, callee `retains / OutputStorage store _3 through _1`)
+/// — delivers T1. GREEN only where that consumer exists.
+fn build_init_site(input: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = super::super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::super::A5Mode::PreciseReplay,
+                Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        let rows = ctx.raw_boundary.receipts_tsv();
+        println!("DISPOSITIONS\n{rows}");
+        println!("RETENTION\n{}", ctx.retention.to_tsv());
+        rows.lines()
+            .filter(|line| line.starts_with("build\t") && line.contains("\tinit\t1\t"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .expect("input type-checks")
+}
+
+#[test]
+fn wave6r_iterator_frame_confined_site_delivers_end_to_end() {
+    let site = build_init_site(ITERATOR);
+    assert!(!site.is_empty(), "the init site is inventoried");
+    assert!(
+        site.iter().any(|row| row.contains("\tT1\t")
+            && (row.contains("stack-storage-certificate")
+                || row.contains("descendant-free-modulo-output"))),
+        "the confined iterator site delivers: {site:?}"
+    );
+}
+
+/// The same caller, with the callee keeping a second copy of the argument in a
+/// global: the certificate must not fire and the site stays held.
+#[test]
+fn wave6r_iterator_frame_confined_site_holds_when_the_callee_keeps_a_copy() {
+    let input = ITERATOR.replace(
+        "    init(&mut it, split);\n",
+        "    init_and_keep(&mut it, split);\n",
+    );
+    assert_ne!(input, ITERATOR);
+    let site = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (_, ctx) = super::super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::super::A5Mode::PreciseReplay,
+                Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        ctx.raw_boundary
+            .receipts_tsv()
+            .lines()
+            .filter(|line| line.starts_with("build\t") && line.contains("\tinit_and_keep\t1\t"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .expect("input type-checks");
+    assert!(
+        !site.iter().any(|row| row.contains("\tT1\t")),
+        "a global copy in the callee keeps the hold: {site:?}"
+    );
+}
