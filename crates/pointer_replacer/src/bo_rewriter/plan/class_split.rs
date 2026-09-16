@@ -748,21 +748,35 @@ pub unsafe fn is_valid(buf: *mut core::ffi::c_void, size: i32, ptype: *mut i32) 
 
     /// The C-charged coupling is NOT this module's: it is released by R401-4
     /// (wave-6s `bc46254e`, "charge the C adapter arm to the converted target
-    /// only"), measured GREEN on this fixture composed over that hook
-    /// (batch-8 composition) and RED at the batch-6 base, where the partner
-    /// owes `c` as a raw source and the class reports `missing-required-arm:c`
-    /// (report 001's packet carries that log). Ignored until the hook is on
-    /// the landed head; un-ignore then — one test-only commit.
+    /// only"). Which side of that release a head is on is READ from the head
+    /// itself — the partner's own required arms — rather than assumed, so the
+    /// witness holds wherever it is composed (before `bc46254e`: the partner
+    /// owes `c` as a raw source and the class reports `missing-required-arm:c`;
+    /// after it: the source end owes nothing and `ptype` places). Measured
+    /// both ways: at the batch-6 base and on the batch-8 evening base
+    /// `08b9035e` it takes the first arm, on wave-6s's branch and the batch-9
+    /// composition the second.
     #[test]
-    #[ignore = "RED by design: released by wave-6s bc46254e (R401-4), not by the class split"]
-    fn c_charged_raw_source_partner_is_released_by_the_target_only_charge() {
+    fn the_c_charge_on_a_raw_source_decides_whether_the_class_places() {
         let got = run(BINN_C_SOURCE_SHAPE);
-        assert_eq!(column(&got.subjects, "is_valid::ptype#3", "exclusion"), "-");
-        assert_eq!(column(&got.subjects, "is_valid::ptype#3", "placed"), "1");
-        assert!(
-            got.emitted.contains("ptype: Option<&mut i32>"),
-            "{}",
-            got.emitted
-        );
+        let partner_arms = column(&got.arm_outcomes, "is_valid::plimit#6", "required_arms");
+        let exclusion = column(&got.subjects, "is_valid::ptype#3", "exclusion");
+        if partner_arms.split('+').any(|arm| arm == "c") {
+            assert!(
+                exclusion.starts_with("terminal-not-applied:blocked-subject:")
+                    && exclusion.contains("missing-required-arm:c"),
+                "the raw source still owes the C arm, so its class holds: {exclusion}\n{}",
+                got.subjects
+            );
+            assert_eq!(column(&got.subjects, "is_valid::ptype#3", "placed"), "0");
+        } else {
+            assert_eq!(exclusion, "-", "{}", got.subjects);
+            assert_eq!(column(&got.subjects, "is_valid::ptype#3", "placed"), "1");
+            assert!(
+                got.emitted.contains("ptype: Option<&mut i32>"),
+                "{}",
+                got.emitted
+            );
+        }
     }
 }
