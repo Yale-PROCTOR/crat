@@ -623,17 +623,27 @@ impl MutVisitor for Hoists<'_> {
         &mut self,
         mut statement: rustc_ast::Stmt,
     ) -> smallvec::SmallVec<[rustc_ast::Stmt; 1]> {
+        // A field-store plan is keyed by the assignment expression, a
+        // local-move plan by the statement itself.
         let assignment = match &statement.kind {
             rustc_ast::StmtKind::Expr(e) | rustc_ast::StmtKind::Semi(e) => {
                 Some((e.span.lo().0, e.span.hi().0))
             }
             _ => None,
         };
-        let Some(reads) = assignment.and_then(|key| self.plans.get(&key)) else {
+        let by_statement = (statement.span.lo().0, statement.span.hi().0);
+        let reads: Vec<(u32, u32)> = assignment
+            .and_then(|key| self.plans.get(&key))
+            .into_iter()
+            .chain(self.plans.get(&by_statement))
+            .flatten()
+            .copied()
+            .collect();
+        if reads.is_empty() {
             return rustc_ast::mut_visit::walk_flat_map_stmt(self, statement);
-        };
+        }
         let mut out = smallvec::SmallVec::new();
-        for read in reads {
+        for read in &reads {
             let name = format!("__crat_hoist{}", self.counter);
             self.counter += 1;
             let mut take = TakeRead {
@@ -643,6 +653,13 @@ impl MutVisitor for Hoists<'_> {
             };
             match &mut statement.kind {
                 rustc_ast::StmtKind::Expr(e) | rustc_ast::StmtKind::Semi(e) => take.visit_expr(e),
+                rustc_ast::StmtKind::Let(local) => {
+                    if let rustc_ast::LocalKind::Init(init)
+                    | rustc_ast::LocalKind::InitElse(init, _) = &mut local.kind
+                    {
+                        take.visit_expr(init);
+                    }
+                }
                 _ => {}
             }
             let Some(read_expr) = take.taken else {
@@ -674,6 +691,21 @@ impl MutVisitor for Hoists<'_> {
     }
 }
 
+/// EXHAUSTIVE: only a delivered `Box` moves at a call.
+fn delivers_box(decision: &super::decision::Decision) -> bool {
+    use super::decision::Decision;
+    match decision {
+        Decision::Box(_) => true,
+        Decision::Cursor { .. }
+        | Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Degraded(_) => false,
+    }
+}
+
 /// Applies the E5C-3 hoists of every active owned-field transaction. Runs
 /// before the use-graft pass: a moved read keeps its spans, so the edits
 /// nested in it are grafted where it now stands.
@@ -693,6 +725,23 @@ pub(crate) fn apply_hoists(
                 .push((read.lo().0, read.hi().0));
             expected += 1;
         }
+    }
+    // A moving owned local: active while the local delivers as a Box (a raw
+    // local moves nothing the checker sees) and is not reverted.
+    for (_, local, statement, read) in &table.field_transactions.local_move_hoists {
+        let delivered = table
+            .entries
+            .iter()
+            .find(|(s, _)| (s.fn_did, s.hir_id) == *local)
+            .is_some_and(|(_, decision)| delivers_box(decision));
+        if !delivered || !reverts.keeps_subject(local.0, local.1) {
+            continue;
+        }
+        plans
+            .entry((statement.lo().0, statement.hi().0))
+            .or_default()
+            .push((read.lo().0, read.hi().0));
+        expected += 1;
     }
     if plans.is_empty() {
         return Ok(());

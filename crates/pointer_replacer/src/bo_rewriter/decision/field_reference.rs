@@ -202,6 +202,8 @@ pub(crate) struct FieldCandidates {
     load_permits: FxHashMap<NodeKey, FieldKey>,
     /// Fields that were candidates by the model but are held, with the cause.
     pub holds: Vec<(FieldKey, String, String, String)>,
+    /// E5C-3 over moving owned locals (independent of any field).
+    pub local_move_hoists: Vec<LocalMoveHoist>,
 }
 
 impl FieldCandidates {
@@ -300,6 +302,8 @@ pub(crate) struct FieldTransactions {
     pub applied: Vec<FieldTransaction>,
     /// `(struct path, field, cause)` per held field, model-Ref or withdrawn.
     pub held: Vec<(String, String, String)>,
+    /// E5C-3 over moving owned locals: `(owner, local, statement, read)`.
+    pub local_move_hoists: Vec<(LocalDefId, NodeKey, Span, Span)>,
 }
 
 impl FieldTransactions {
@@ -586,25 +590,8 @@ impl<'tcx> Collector<'_, 'tcx> {
                     .is_some_and(|(_, kind)| kind == SlotKind::Owning)
         });
         let Some(moving) = moving else { return Vec::new() };
-        let mut out = Vec::new();
-        for arg in &args[moving + 1..] {
-            if !pure_read(arg) {
-                break;
-            }
-            // A bare local or literal reads through nothing a move could
-            // invalidate; only a read THROUGH a place is hoisted.
-            if !reads_through(arg) {
-                continue;
-            }
-            let ty = typeck.expr_ty(arg);
-            if self.tcx.type_is_copy_modulo_regions(
-                rustc_middle::ty::TypingEnv::post_analysis(self.tcx, self.owner),
-                ty,
-            ) {
-                out.push(arg.span);
-            }
-        }
-        out
+        let _ = typeck;
+        reads_after_move(self.tcx, self.owner, args, moving)
     }
 
     /// `let ref mut b = PLACE.f;` — `b`'s uses in the owner. The idiom is
@@ -1081,15 +1068,23 @@ pub(crate) fn derive(
             targets.insert(key, field_index);
         }
     }
+    // E5C-3 for moving owned locals — independent of the field candidates.
+    let subject_by_binding: FxHashMap<HirId, NodeKey> = subjects
+        .iter()
+        .map(|s| (s.hir_id, (s.fn_did, s.hir_id)))
+        .collect();
+    out.local_move_hoists = local_move_hoists(
+        tcx,
+        &program.functions,
+        &subject_by_binding,
+        &parameters,
+        &parameter_kinds,
+    );
     if targets.is_empty() {
         return out;
     }
 
     // 2. Every site, over every program function.
-    let subject_by_binding: FxHashMap<HirId, NodeKey> = subjects
-        .iter()
-        .map(|s| (s.hir_id, (s.fn_did, s.hir_id)))
-        .collect();
     let mut sites: FxHashMap<FieldKey, Vec<Site>> = FxHashMap::default();
     let mut holds: FxHashMap<FieldKey, String> = FxHashMap::default();
     for &owner in &program.functions {
@@ -1379,6 +1374,129 @@ pub(crate) fn derive(
 /// call `G(.., p, ..)` where `G` ties that position and `p` is a bare
 /// parameter of `F` ties `p` in `F` too. Iterated to a fixpoint; each owner
 /// is walked once per round.
+/// The later arguments of a call that are pure `Copy` reads through a place
+/// once the argument at `moving` moves an owned value; the scan stops at the
+/// first non-pure argument (an intervening call could write).
+fn reads_after_move<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    args: &[Expr<'tcx>],
+    moving: usize,
+) -> Vec<Span> {
+    let typeck = tcx.typeck(owner);
+    let mut out = Vec::new();
+    for arg in &args[moving + 1..] {
+        if !pure_read(arg) {
+            break;
+        }
+        // A bare local or literal reads through nothing a move could
+        // invalidate; only a read THROUGH a place is hoisted.
+        if !reads_through(arg) {
+            continue;
+        }
+        let ty = typeck.expr_ty(arg);
+        if tcx
+            .type_is_copy_modulo_regions(rustc_middle::ty::TypingEnv::post_analysis(tcx, owner), ty)
+        {
+            out.push(arg.span);
+        }
+    }
+    out
+}
+
+/// E5C-3 for a moving owned LOCAL (R410 STOP 1): a call whose argument is a
+/// bare local subject the model decides Owning, handed to a parameter the
+/// model decides Owning, moves the local; the later pure reads through a
+/// place are planned for hoisting before the call's statement. Planned on
+/// the model; applied only while the local DELIVERS as a `Box` (a raw local
+/// moves nothing the checker sees).
+#[derive(Clone, Debug)]
+pub(crate) struct LocalMoveHoist {
+    pub owner: LocalDefId,
+    pub local: NodeKey,
+    /// The statement holding the call.
+    pub statement: Span,
+    pub read: Span,
+}
+
+fn local_move_hoists<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
+    subjects: &FxHashMap<HirId, NodeKey>,
+    parameters: &FxHashMap<(LocalDefId, usize), NodeKey>,
+    kinds: &FxHashMap<NodeKey, SlotKind>,
+) -> Vec<LocalMoveHoist> {
+    struct Calls<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        owner: LocalDefId,
+        subjects: &'a FxHashMap<HirId, NodeKey>,
+        parameters: &'a FxHashMap<(LocalDefId, usize), NodeKey>,
+        kinds: &'a FxHashMap<NodeKey, SlotKind>,
+        out: Vec<LocalMoveHoist>,
+    }
+    impl<'tcx> Visitor<'tcx> for Calls<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Call(callee, args) = expr.kind
+                && let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind
+                && let Res::Def(rustc_hir::def::DefKind::Fn, did) = path.res
+                && let Some(callee) = did.as_local()
+            {
+                let moving = args.iter().enumerate().find_map(|(index, arg)| {
+                    let ExprKind::Path(QPath::Resolved(_, path)) = arg.kind else { return None };
+                    let Res::Local(binding) = path.res else { return None };
+                    let local = *self.subjects.get(&binding)?;
+                    let target = *self.parameters.get(&(callee, index))?;
+                    (self.kinds.get(&local) == Some(&SlotKind::Owning)
+                        && self.kinds.get(&target) == Some(&SlotKind::Owning))
+                    .then_some((index, local))
+                });
+                if let Some((index, local)) = moving {
+                    let reads = reads_after_move(self.tcx, self.owner, args, index);
+                    if !reads.is_empty()
+                        && let Some(statement) = enclosing_statement(self.tcx, expr.hir_id)
+                    {
+                        for read in reads {
+                            self.out.push(LocalMoveHoist {
+                                owner: self.owner,
+                                local,
+                                statement,
+                                read,
+                            });
+                        }
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut out = Vec::new();
+    for &owner in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(owner).body_id() else { continue };
+        let mut calls = Calls {
+            tcx,
+            owner,
+            subjects,
+            parameters,
+            kinds,
+            out: Vec::new(),
+        };
+        calls.visit_body(tcx.hir_body(body_id));
+        out.extend(calls.out);
+    }
+    out
+}
+
+/// The span of the statement an expression belongs to.
+fn enclosing_statement(tcx: TyCtxt<'_>, mut hir_id: HirId) -> Option<Span> {
+    loop {
+        match tcx.parent_hir_node(hir_id) {
+            Node::Stmt(stmt) => return Some(stmt.span),
+            Node::Expr(expr) => hir_id = expr.hir_id,
+            _ => return None,
+        }
+    }
+}
+
 /// A read with no call, no write and no address-taking: field projections,
 /// dereferences, locals, literals, casts and unary/binary arithmetic of the
 /// same.
@@ -1536,6 +1654,11 @@ pub(crate) fn finalize(
     exposure: &super::exposure::ExposurePolicy,
 ) -> (FieldTransactions, BTreeMap<FieldKey, String>) {
     let mut out = FieldTransactions::default();
+    out.local_move_hoists = candidates
+        .local_move_hoists
+        .iter()
+        .map(|h| (h.owner, h.local, h.statement, h.read))
+        .collect();
     let mut refused = BTreeMap::new();
     for (key, _, field, cause) in &candidates.holds {
         let struct_path = tcx.def_path_str(key.struct_did.to_def_id());

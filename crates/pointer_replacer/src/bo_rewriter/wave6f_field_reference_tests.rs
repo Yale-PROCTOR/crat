@@ -31,6 +31,8 @@ struct Observed {
     bridges: Vec<(String, String, String)>,
     /// `(caller, replacement)` per planned seam edit.
     seam_edits: Vec<(String, String)>,
+    /// E5C-3 local-move hoist plans (on the model).
+    local_move_hoists: usize,
 }
 
 fn observe(source: &str) -> Observed {
@@ -108,6 +110,7 @@ fn observe(source: &str) -> Observed {
             fields,
             bridges,
             seam_edits,
+            local_move_hoists: table.field_transactions.local_move_hoists.len(),
         }
     })
     .unwrap()
@@ -776,4 +779,44 @@ fn w6f_hoist_pure_read_before_a_moving_argument() {
         assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
     }
     assert_eq!(flat.matches("__crat_hoist").count(), 2, "{source}");
+}
+
+const MOVE_LOCAL: &str = include_str!("wave6f_fixture_move_local.rs");
+
+/// Witness 13 (relay 008 §2, R410 STOP 1 = YES): E5C-3 over a moving owned
+/// LOCAL — C1's `consume(p, *p)`. The plan is made on the model (`producer::p`
+/// Owning at `consume::p` Owning; the later argument `*p` a pure `Copy` read
+/// through the moved local); the hoist is EMITTED only while `producer::p`
+/// delivers as a `Box`: on a head with wave-6a's C1 Box-parameter chain the
+/// tree is `let __crat_hoist0 = *p; return consume(p, __crat_hoist0);`
+/// (E0382 without it); on a head where the local stays raw nothing is
+/// hoisted — a raw local moves nothing the checker sees.
+#[test]
+fn w6f_hoist_pure_read_before_a_moving_owned_local() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-move-local-frame",
+        vec![],
+        vec![
+            ("producer::p".to_owned(), SlotKind::Owning),
+            ("consume::p".to_owned(), SlotKind::Owning),
+        ],
+    );
+    let observed = observe(MOVE_LOCAL);
+    let outcome = emitted("move-local", MOVE_LOCAL);
+    super::test_model_override::clear();
+    assert_eq!(observed.local_move_hoists, 1, "{:?}", observed.decisions);
+    let (source, _, reverted) = emitted_source(&outcome);
+    assert_eq!(reverted, 0, "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    println!("W6F-MOVE-LOCAL-SOURCE\n{source}");
+    if decision_of(&observed, "producer::p").starts_with("Box") {
+        assert!(
+            flat.contains("let __crat_hoist0 = *p; return consume(p, __crat_hoist0);"),
+            "{source}"
+        );
+    } else {
+        assert!(!flat.contains("__crat_hoist"), "{source}");
+        assert!(flat.contains("return consume(p, *p);"), "{source}");
+    }
 }
