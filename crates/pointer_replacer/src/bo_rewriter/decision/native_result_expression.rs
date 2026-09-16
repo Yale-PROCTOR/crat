@@ -402,7 +402,9 @@ fn consumer_of(tcx: TyCtxt<'_>, table: &DecisionTable, call: &Expr<'_>, form: Fo
             (_, Form::Ref { .. } | Form::Slice { .. } | Form::Opt { .. }) => Consumer::Elsewhere,
             (_, Form::NestedSlice { .. } | Form::Cursor { .. } | Form::Raw) => Consumer::Elsewhere,
         },
-        HirNode::Stmt(_) => Consumer::Unbuilt("discarded-result"),
+        // A discarded result (`callee(..);` as a statement) takes any return
+        // type: nothing is consumed, nothing needs restoring.
+        HirNode::Stmt(_) => Consumer::Elsewhere,
         _ => Consumer::Elsewhere,
     }
 }

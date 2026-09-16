@@ -1580,7 +1580,7 @@ fn w6l_discarded_native_result_keeps_the_callee_class_placed() {
         "{text}"
     );
     assert!(
-        text.contains("letmutp:&mutkmVec3=__crat_safe_kmVec3Fill(v,1.0,2.0,3.0);"),
+        text.contains("letmutp:&crate::kmVec3=__crat_safe_kmVec3Fill(v,1.0,2.0,3.0);"),
         "{text}"
     );
 }
