@@ -1081,3 +1081,142 @@ mod l07_rows_relay_017 {
         });
     }
 }
+
+/// The other 100 of the 119 collision rows at the hook frame: the inner edit
+/// is the caller's own bridge on a SELECTED view argument, at exactly the
+/// view's interval, converting the same source form to the same raw target
+/// (brotli 60 — 48 `raw-cast-const` where the argument stays raw and only its
+/// mutability is cast, 8 `option-to-raw-null-map`, 2 `slice-mut-to-raw-mut`,
+/// 2 `returned-child-ref-mut-to-raw-const`; heman 34; lodepng 2; binn 2). The
+/// wrapper renders that argument ITSELF from the source form
+/// (`pair_raw_view_expression`: `Slice → .as_ptr()`, `Opt → .as_deref()…`,
+/// `Ref → from_ref`, raw → passthrough into `let t: <target> = <arg>`, whose
+/// `*mut T → *const T` coercion is exactly the cast the inner did), so the
+/// inner bridge is a duplicate the wrapper overwrites with an equivalent
+/// rendering. The planner composes it when the intervals are equal, the forms
+/// are equal, and the view is renderable (`EditReady`).
+mod a5_wrapper_subsumes_a_selected_view_bridge {
+    use crate::bo_rewriter::{
+        bridge_receipt::SignatureClassId,
+        decision::{Arm, RequiredArmSet},
+        plan::{self, ClassInput, ClassSite, ClassSiteState},
+    };
+
+    const CALL: (u32, u32) = (7_503_003, 7_503_119);
+    const ARG1: (u32, u32) = (7_503_028, 7_503_047);
+    const ARG2: (u32, u32) = (7_503_050, 7_503_055); // `nodes`, a selected view here
+
+    fn wrapper(
+        owner: SignatureClassId,
+        caller: SignatureClassId,
+        found: &str,
+        view_state: ClassSiteState,
+    ) -> ClassInput {
+        let mut whole = ClassSite::edit(
+            owner,
+            caller,
+            Arm::Pair,
+            "lib.rs",
+            CALL.0,
+            CALL.1,
+            "a5-site-proof-t2-fallback",
+        );
+        whole.key.position = "args=arg=1,arg=2".to_owned();
+        let mut input = ClassInput::new(owner, RequiredArmSet::default());
+        for (position, (lo, hi), f) in [("arg1", ARG1, "raw"), ("arg2", ARG2, found)] {
+            let mut site = ClassSite::edit(
+                owner,
+                caller,
+                Arm::Pair,
+                "lib.rs",
+                lo,
+                hi,
+                "a5-site-proof-t2-fallback",
+            );
+            site.key.position = position.to_owned();
+            site.edit_key.clone_from(&whole.edit_key);
+            site.expected_form = "raw".to_owned();
+            site.found_form = f.to_owned();
+            if position == "arg2" {
+                site.state = view_state.clone();
+            }
+            input.sites.push(site);
+        }
+        input.sites.push(whole);
+        input
+    }
+
+    fn inner(owner: SignatureClassId, kind: &str, found: &str, (lo, hi): (u32, u32)) -> ClassInput {
+        let mut site = ClassSite::edit(owner, owner, Arm::C, "lib.rs", lo, hi, kind);
+        site.expected_form = "raw".to_owned();
+        site.found_form = found.to_owned();
+        ClassInput::new(owner, RequiredArmSet::default()).with_site(site)
+    }
+
+    fn with_two(test: impl FnOnce(SignatureClassId, SignatureClassId) + Send) {
+        ::utils::compilation::run_compiler_on_str(
+            "pub unsafe fn callee(p: *const i32) -> i32 { *p }\npub unsafe fn caller(p: *const i32) -> i32 { callee(p) }",
+            |tcx| {
+                let owners = tcx
+                    .hir_body_owners()
+                    .filter(|d| tcx.def_kind(*d) == rustc_hir::def::DefKind::Fn)
+                    .collect::<Vec<_>>();
+                test(SignatureClassId::of(owners[0]), SignatureClassId::of(owners[1]));
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_same_form_bridge_at_the_view_interval_is_subsumed() {
+        for (kind, found) in [
+            ("raw-cast-const", "raw"),
+            ("option-to-raw-null-map", "opt-ref-mut"),
+            ("slice-mut-to-raw-mut", "slice-mut"),
+        ] {
+            with_two(|callee, caller| {
+                let f = plan::finalize_class_inputs(vec![
+                    wrapper(callee, caller, found, ClassSiteState::EditReady),
+                    inner(caller, kind, found, ARG2),
+                ]);
+                assert!(f.collisions.is_empty(), "{kind}: {:#?}", f.collisions);
+                assert!(
+                    f.classes[&callee].is_ready() && f.classes[&caller].is_ready(),
+                    "{kind}"
+                );
+                assert!(f.classes[&callee].depends_on.contains(&caller), "{kind}");
+            });
+        }
+    }
+
+    /// A different source form at the same interval is not the same conversion.
+    #[test]
+    fn a_different_form_still_collides() {
+        with_two(|callee, caller| {
+            let f = plan::finalize_class_inputs(vec![
+                wrapper(callee, caller, "raw", ClassSiteState::EditReady),
+                inner(caller, "slice-mut-to-raw-mut", "slice-mut", ARG2),
+            ]);
+            assert!(!f.collisions.is_empty());
+        });
+    }
+
+    /// A view the wrapper cannot render (no template for that form) subsumes
+    /// nothing: the inner bridge is the only rendering and it collides as
+    /// before (bzip2's `shared-ref-to-mut-raw` rows).
+    #[test]
+    fn an_unrenderable_view_still_collides() {
+        with_two(|callee, caller| {
+            let f = plan::finalize_class_inputs(vec![
+                wrapper(
+                    callee,
+                    caller,
+                    "ref-shared",
+                    ClassSiteState::Dropped("a5-raw-view-template-unavailable".into()),
+                ),
+                inner(caller, "shared-ref-to-mut-raw", "ref-shared", ARG2),
+            ]);
+            assert!(!f.collisions.is_empty());
+        });
+    }
+}
