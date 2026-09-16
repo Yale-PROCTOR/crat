@@ -314,6 +314,39 @@ impl PendingSiblingReceipt {
     }
 }
 
+/// **Wave-6o (relay 018 §1).** The inputs the potential derivation reads,
+/// borrowed — so the same derivation can run BEFORE the final decision pass
+/// (every input exists once the raw-boundary sites are derived) and the
+/// null-init family can consult the pending sibling market before delivering.
+/// The finished [`DecideCtx`](super::super::DecideCtx) converts into it.
+pub(crate) struct SiblingInputs<'a> {
+    pub slots: &'a crate::analyses::borrow_ownership::crate_slots::CrateSlots,
+    pub model: &'a FxHashMap<super::super::SlotRef, super::super::SlotKind>,
+    pub mut_facts: &'a crate::analyses::borrow_ownership::mutability_facts::MutFacts,
+    pub facts: &'a super::emitability::EmitabilityFacts,
+    pub subjects: &'a [Subject],
+    pub a5_site_proofs: &'a super::a5_site_proof::A5SeamProofIndex,
+    pub raw_boundary_sites: &'a super::raw_boundary::RawBoundarySiteFacts,
+    pub retention: &'a super::raw_boundary::RetentionSummaries,
+    pub origins: Option<&'a crate::analyses::borrow_ownership::origin_summary::OriginSummaries>,
+}
+
+impl<'a> From<&'a super::super::DecideCtx> for SiblingInputs<'a> {
+    fn from(ctx: &'a super::super::DecideCtx) -> Self {
+        Self {
+            slots: &ctx.slots,
+            model: &ctx.model,
+            mut_facts: &ctx.mut_facts,
+            facts: &ctx.facts,
+            subjects: &ctx.subjects,
+            a5_site_proofs: &ctx.a5_site_proofs,
+            raw_boundary_sites: &ctx.raw_boundary_sites,
+            retention: &ctx.retention,
+            origins: ctx.analysis.origins.as_ref(),
+        }
+    }
+}
+
 pub(crate) fn collect(tcx: TyCtxt<'_>, ctx: &super::super::DecideCtx) -> Vec<SiblingPotential> {
     collect_inventory(tcx, ctx).potentials
 }
@@ -328,6 +361,15 @@ pub(crate) fn collect_inventory(
 pub(crate) fn collect_inventory_with_expressions(
     tcx: TyCtxt<'_>,
     ctx: &super::super::DecideCtx,
+    outbound_expressions: &OutboundExpressionPlans,
+) -> SiblingInventory {
+    collect_inventory_from(tcx, &SiblingInputs::from(ctx), outbound_expressions)
+}
+
+/// The derivation itself, over borrowed inputs.
+pub(crate) fn collect_inventory_from(
+    tcx: TyCtxt<'_>,
+    ctx: &SiblingInputs<'_>,
     outbound_expressions: &OutboundExpressionPlans,
 ) -> SiblingInventory {
     let mut potentials = Vec::new();
@@ -1053,7 +1095,7 @@ fn call_exit_liveness<'tcx>(
 /// remote parameter is never substituted for this caller-side starting local.
 fn local_evidence<'tcx>(
     tcx: TyCtxt<'tcx>,
-    ctx: &super::super::DecideCtx,
+    ctx: &SiblingInputs<'_>,
     caller: LocalDefId,
     source_local: Local,
     ptr_depth: u8,
@@ -1065,9 +1107,7 @@ fn local_evidence<'tcx>(
         return LocalPostCallEvidence::Unknown("local-proof-depth-not-one");
     }
     let Some(flow) = ctx
-        .analysis
         .origins
-        .as_ref()
         .and_then(|origins| origins.try_native_flows())
         .and_then(|flows| flows.get(&caller))
         .map(|flow| &flow.body)

@@ -4289,6 +4289,10 @@ pub(crate) struct RawBoundaryDispositionIndex {
     /// K18'/OAP-CHILD-ACCESS, carried per site so the terminal emission asks
     /// the same question the disposition asked.
     type_backed_child_access: BTreeMap<RawBoundarySiteKey, super::returned_child::ChildAccess>,
+    /// **Wave-6o (relay 018 §1, R304-2).** Null-init-family locals whose
+    /// boundary site would be a PENDING sibling-overlap row if delivered — a
+    /// stated hold the family consults before delivering.
+    pending_sibling_sources: FxHashSet<(LocalDefId, HirId)>,
 }
 
 impl RawBoundaryDispositionIndex {
@@ -4297,6 +4301,18 @@ impl RawBoundaryDispositionIndex {
         key: &RawBoundarySiteKey,
     ) -> Option<&super::slice_return_evidence::ReturnIndependence> {
         self.return_independent.get(key)
+    }
+
+    pub(crate) fn with_pending_sibling_sources(
+        mut self,
+        sources: FxHashSet<(LocalDefId, HirId)>,
+    ) -> Self {
+        self.pending_sibling_sources = sources;
+        self
+    }
+
+    pub(crate) fn pending_sibling_source(&self, node: (LocalDefId, HirId)) -> bool {
+        self.pending_sibling_sources.contains(&node)
     }
 
     /// Fails closed: a site with no recorded answer is treated as able to

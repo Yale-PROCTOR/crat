@@ -215,6 +215,8 @@ mod option_null_arg_tests;
 #[cfg(test)]
 mod option_ops_tests;
 #[cfg(test)]
+mod option_pending_sibling_tests;
+#[cfg(test)]
 mod option_projection_tests;
 #[cfg(test)]
 mod option_reborrow_tests;
@@ -7612,6 +7614,25 @@ fn finish_decide<'tcx>(
             &facts,
             &mut_facts,
         );
+        // Wave-6o (relay 018 §1): the pending sibling-overlap market the
+        // null-init family consults before delivering, from the same inputs
+        // the terminal inventory reads.
+        let pending_sibling_sources = decision::null_init_declaration::pending_sibling_sources(
+            tcx,
+            &decision::sibling_overlap::SiblingInputs {
+                slots: &slots,
+                model: &model,
+                mut_facts: &mut_facts,
+                facts: &facts,
+                subjects: &subjects,
+                a5_site_proofs: &a5_site_proofs,
+                raw_boundary_sites: &raw_boundary_sites,
+                retention: &retention,
+                origins: analysis.origins.as_ref(),
+            },
+            &raw_boundary,
+        );
+        let raw_boundary = raw_boundary.with_pending_sibling_sources(pending_sibling_sources);
         let raw_boundary_decision_wall_s = raw_boundary_decision_started.elapsed().as_secs_f64();
         let coconv =
             decision::co_conversion::build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_roles(

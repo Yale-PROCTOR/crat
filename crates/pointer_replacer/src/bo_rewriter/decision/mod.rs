@@ -619,6 +619,11 @@ pub(crate) enum DegradeReason {
     /// than one — read to a NUL, to a stated count, or to a source-determined
     /// length. The extent column of the pinned contract table decides.
     ThinExtent,
+    /// R419-3 / R304-2: the subject is the source of a site the
+    /// sibling-overlap instrument would hold `pending` (a risky sibling at the
+    /// same call); a delivered borrowed form there is a delivered held
+    /// subject, so the family refuses up front.
+    PendingSiblingOverlap,
     /// R364-2 / R365-1. A thin reference carries provenance for one element,
     /// and this subject is handed to a LOCAL callee parameter whose body
     /// accesses past one — a `c_void` pointee cast away to a real width, or
@@ -1837,7 +1842,17 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         {
             decision
         }
-        // Wave-6o: an unannotated null-initialized local receives its type.
+        // Wave-6o: an unannotated null-initialized local receives its type —
+        // unless its site is a pending sibling-overlap row (relay 018 §1).
+        Decision::Opt { .. }
+            if null_init_declaration::pending_sibling_hold(ctx, subject, &decision) =>
+        {
+            degrade(
+                subject,
+                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                DegradeReason::PendingSiblingOverlap,
+            )
+        }
         Decision::Opt { .. } if null_init_declaration::admits(ctx, subject, &decision) => decision,
         Decision::Slice { mutable, .. }
             if receiver.is_some_and(|receiver| {
