@@ -1108,6 +1108,84 @@ fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
     );
 }
 
+const HEMAN_RAY2: &str = include_str!("wave6f_fixture_heman_ray2.rs");
+
+/// Witness 18 (relay 020 / R427-3) — heman's OWN `kmRay2IntersectBox`, the
+/// substrate's text. G's transaction is derived and `applied` on the
+/// decision side, and the three element loads decide `Ref` — but the
+/// function's signature class is WITHHELD (its `ray` parameter degrades
+/// `SilentCoercion { via: BorrowedIntoRawParam }`, and the callee
+/// `kmRay2IntersectLineSegment::intersection` degrades `KindRaw`), so the
+/// AST application is inactive for both owners and the two functions keep
+/// their input text — no retype, no element wraps, no load declarations.
+/// The other five functions of the reduction deliver.
+///
+/// This is why the candidate's custody comparator reads
+/// `delivery-custody:inferred-type` on `this_point/next_point/other_point`:
+/// the subjects are decided and counted, their owner is withheld, and the
+/// tree therefore carries the input's inferred `let mut this_point = …`.
+/// The pin is a TRIPWIRE: when the withholding lifts (another family
+/// converts `ray`, or this lane bridges the loads at a withheld consumer),
+/// this witness fails and the array's delivery is re-read here.
+#[test]
+fn w6f_heman_ray2_withheld_class_keeps_the_array_transaction_inactive() {
+    let observed = observe(HEMAN_RAY2);
+    let row = field_row(&observed, "kmRay2IntersectBox", "points");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "array-opt-ref-shared"),
+        "{row:?}"
+    );
+    for label in [
+        "kmRay2IntersectBox::this_point",
+        "kmRay2IntersectBox::next_point",
+        "kmRay2IntersectBox::other_point",
+    ] {
+        assert_eq!(
+            decision_of(&observed, label),
+            "Ref { mutable: false }",
+            "{label}"
+        );
+    }
+    assert!(
+        decision_of(&observed, "kmRay2IntersectBox::ray").contains("BorrowedIntoRawParam"),
+        "{:?}",
+        decision_of(&observed, "kmRay2IntersectBox::ray")
+    );
+    let outcome = emitted("heman_ray2", HEMAN_RAY2);
+    let (source, _, reverted) = emitted_source(&outcome);
+    assert_eq!(reverted, 0, "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for input_text in [
+        // the withheld owner keeps every line of its input
+        "let mut points: [*const kmVec2; 4] = [0 as *const kmVec2; 4];",
+        "points[0 as i32 as usize] = p1;",
+        "let mut this_point = points[i as usize];",
+        // and its signature
+        "fn kmRay2IntersectBox(mut ray: *const kmRay2, mut p1: *const kmVec2,",
+    ] {
+        assert!(
+            flat.contains(input_text),
+            "missing {input_text:?} in\n{source}"
+        );
+    }
+    assert!(
+        !flat.contains("[Option<&kmVec2>; 4]"),
+        "the withheld class must carry no retype\n{source}"
+    );
+    // The five functions whose classes are not withheld DO deliver.
+    for delivered in [
+        "fn kmVec2Dot(mut pV1: &kmVec2, mut pV2: &kmVec2)",
+        "fn kmVec2Length(mut pIn: &kmVec2) -> f32 {",
+        "fn calculate_line_normal(mut p1: kmVec2, mut p2: kmVec2, mut other_point: kmVec2, mut normal_out: &mut kmVec2)",
+    ] {
+        assert!(
+            flat.contains(delivered),
+            "missing {delivered:?} in\n{source}"
+        );
+    }
+}
+
 const POINTS: &str = include_str!("wave6f_fixture_points.rs");
 
 /// Witness 17 (G, relay 002 / R416): heman's `kmRay2IntersectBox` — a LOCAL
