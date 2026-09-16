@@ -755,6 +755,26 @@ fn lower_computed_argument_views(
                 edit.spec = spec;
                 edit.family = SeamFamily::Safe;
                 edit.bridge.bridge_kind = "computed-suffix-view".to_owned();
+            } else if edit.spec.raw_boundary.is_none()
+                && let Form::Slice {
+                    mutable: expected_mutable,
+                } = edit.expected
+                && let Some(region) = edit.spec.void_region.as_ref()
+                && region.reads_width()
+            {
+                // wave-6b: a width reader over the computed view — the
+                // reader's width as a checked prefix of the suffix.
+                if expected_mutable && !mutable {
+                    hold = Some(view.use_span);
+                    break;
+                }
+                let mut spec = GlueSpec::core(GlueCore::Bare, expected_mutable);
+                spec.forward_slice = Some(forward(expected_mutable));
+                spec.void_region = Some(region.as_prefix_of_view());
+                spec.len = edit.spec.len.clone();
+                edit.spec = spec;
+                edit.family = SeamFamily::Safe;
+                edit.bridge.bridge_kind = "computed-suffix-view-width-read".to_owned();
             } else {
                 hold = Some(view.use_span);
                 break;
