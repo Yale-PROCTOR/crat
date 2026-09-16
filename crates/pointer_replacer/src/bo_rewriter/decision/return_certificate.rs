@@ -585,6 +585,11 @@ struct UseWalk<'a, 'tcx> {
     /// Is the callee's formal at this index a consuming formal a Box-parameter
     /// chain could plan (the move IS the sink)?
     transfer_ok: &'a dyn Fn(DefId, usize) -> bool,
+    /// Does an assignment into this LOCAL take the owner's generation (the
+    /// allocator-contract consumer's re-seat, `all_histograms = new_array`)?
+    /// A certificate's receiver says no: a copy into a local is a second
+    /// owner.
+    move_ok: &'a dyn Fn(HirId) -> bool,
     out: Result<OwnerUses, String>,
 }
 
@@ -798,8 +803,13 @@ impl<'tcx> UseWalk<'_, 'tcx> {
             // transfer with the store as the sink; the C free of that place
             // stays a C free.
             ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == child => {
-                if bare_local(lhs).is_some() {
-                    self.refuse(format!("copied-into-local:{}", self.snippet(parent.span)));
+                if let Some(destination) = bare_local(lhs) {
+                    // The generation MOVES into another owner (build 2's
+                    // re-seat) — no edit, the `Option<Box<..>>` value itself
+                    // is assigned; anything else is a second owner.
+                    if !(self.move_ok)(destination) {
+                        self.refuse(format!("copied-into-local:{}", self.snippet(parent.span)));
+                    }
                     return;
                 }
                 let lhs_ty = self.tcx.typeck(lhs.hir_id.owner.def_id).expr_ty(lhs);
@@ -931,6 +941,7 @@ pub(crate) fn owner_uses(
     frees: &[(Span, Span)],
     lend_ok: &dyn Fn(DefId, usize) -> bool,
     transfer_ok: &dyn Fn(DefId, usize) -> bool,
+    move_ok: &dyn Fn(HirId) -> bool,
 ) -> Result<OwnerUses, String> {
     let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
     let Some(body_id) = tcx.hir_node_by_def_id(subject.fn_did).body_id() else {
@@ -946,6 +957,7 @@ pub(crate) fn owner_uses(
         frees,
         lend_ok,
         transfer_ok,
+        move_ok,
         out: Ok(OwnerUses {
             edits: Vec::new(),
             dead_guards: Vec::new(),
@@ -1827,6 +1839,7 @@ fn certify<'tcx, 's>(
                 &frees,
                 lend_ok,
                 transfer_ok,
+                &|_| false,
             )
             .map_err(|form| hold(format!("return-certificate-owner-use:{callee_path}:{form}")))?;
             transfers.extend(uses.transfers.iter().map(|(d, i)| (*d, *i, key)));
@@ -2231,6 +2244,7 @@ fn receiver_plan(
         frees,
         lend_ok,
         transfer_ok,
+        &|_| false,
     )
     .map_err(|form| format!("return-certificate-receiver-use:{form}"))?;
     let mut expr_edits = uses.edits;

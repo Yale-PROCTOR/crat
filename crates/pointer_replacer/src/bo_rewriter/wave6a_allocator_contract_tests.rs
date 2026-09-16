@@ -327,3 +327,195 @@ pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut spl
         out.degradations
     );
 }
+
+/// **Build 2 (relay wave-6a/018): the assignment receiver and the re-seated
+/// owner** — brotli's `BROTLI_ENSURE_CAPACITY` idiom, the 55 rows of report
+/// 008's market. The receiver is declared empty and allocated into further
+/// down (`let mut new_array = 0 as *mut T; new_array = if n > 0 {
+/// BrotliAllocate(..) } else { null };`), the owner it replaces is freed,
+/// nulled and RE-SEATED from it (`all_histograms = new_array`), and the
+/// re-seated generation is freed again at the end. The owner's generations
+/// are simulated (Dead → create → Live → release → Dead) with every block it
+/// touches balanced, so the moves need no edit at all and each free is the
+/// contract transfer.
+#[test]
+fn w6a_ac_ensure_capacity_receiver_and_reseat_deliver() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn cluster(mut m: *mut MemoryManager, mut n: usize, mut split: *mut u32) {{\n\
+    let mut all_histograms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    let mut capacity = n;\n\
+    if capacity < n.wrapping_add(4 as usize) {{\n\
+        let mut new_size = capacity.wrapping_add(4 as usize);\n\
+        let mut new_array = 0 as *mut u32;\n\
+        new_array = if new_size > 0 as usize {{ BrotliAllocate(m, new_size.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+        BrotliFree(m, all_histograms as *mut std::os::raw::c_void);\n\
+        all_histograms = 0 as *mut u32;\n\
+        all_histograms = new_array;\n\
+        capacity = new_size;\n\
+    }}\n\
+    *all_histograms.offset(0 as isize) = 3 as u32;\n\
+    *split = *all_histograms.offset(0 as isize);\n\
+    BrotliFree(m, all_histograms as *mut std::os::raw::c_void);\n\
+    all_histograms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("ac-ensure-capacity", &src);
+    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
+        std::fs::write(path, &out.source).expect("dump");
+    }
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    for expected in [
+        "letmutall_histograms:Option<Box<[u32]>>=ifn>0asusize{Some(Box::from_raw(",
+        "letmutnew_array:Option<Box<[u32]>>=None;",
+        "new_array=ifnew_size>0asusize{Some(Box::from_raw(",
+        "BrotliFree(m,all_histograms.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutstd::os::raw::c_void));",
+        "all_histograms=None;",
+        "all_histograms=new_array;",
+        "all_histograms.as_deref_mut().unwrap()[(0)asusize]=3asu32;",
+        "*split=all_histograms.as_deref().unwrap()[(0)asusize];",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}`\n{}\n{receipts}",
+            out.source
+        );
+    }
+    assert!(
+        receipts.contains("generations=1 moves_in=1 frees=2"),
+        "{receipts}"
+    );
+    assert!(
+        receipts.contains("cluster::new_array\tadmitted\t"),
+        "{receipts}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "cluster::all_histograms"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "cluster::new_array"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+}
+
+/// **Build 2's generation state machine, one control per gate.** Each shape
+/// sits in its own function and names the exact receipt, so exactly one hold
+/// answers for exactly one gate: (1) a generation still live at the body's
+/// end, (2) a block that does not leave the owner as it found it — here the
+/// conditional allocation assigned inside the branch, (3) a read of the
+/// owner after its release, (4) a second allocation over a live generation
+/// (the first would be dropped by Rust, and C leaks it), (5) a release
+/// before any generation exists, (6) the owner copied into a local that is
+/// not itself a contract owner — a second owner this rule cannot follow.
+/// (5) and (6) are UB-free-input shapes only in the trivial sense; they hold
+/// fail-closed either way.
+#[test]
+fn w6a_ac_generation_gates_each_hold_their_own_class() {
+    let alloc = "BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32";
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn live_at_exit(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = {alloc};\n\
+    *syms.offset(0 as isize) = 1 as u32;\n\
+    *split = *syms.offset(0 as isize);\n\
+}}\n\
+pub unsafe extern \"C\" fn unbalanced(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = 0 as *mut u32;\n\
+    if n > 4 as usize {{ syms = {alloc}; }}\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n\
+pub unsafe extern \"C\" fn read_after_release(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = {alloc};\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    *split = *syms.offset(0 as isize);\n\
+}}\n\
+pub unsafe extern \"C\" fn reseat_over_live(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = {alloc};\n\
+    syms = {alloc};\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n\
+pub unsafe extern \"C\" fn release_first(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = 0 as *mut u32;\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = {alloc};\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n\
+pub unsafe extern \"C\" fn plain_alias(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut copy = 0 as *mut u32;\n\
+    copy = split;\n\
+    *copy.offset(0 as isize) = 5 as u32;\n\
+}}\n\
+pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = {alloc};\n\
+    let mut alias = 0 as *mut u32;\n\
+    alias = syms;\n\
+    *split = *alias.offset(0 as isize);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n"
+    );
+    let out = emitted("ac-generation-gates", &src);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    for (subject, detail) in [
+        (
+            "live_at_exit::syms",
+            "contract-allocation:implicit-close:live-at-exit",
+        ),
+        (
+            "unbalanced::syms",
+            "contract-allocation:implicit-close:block-unbalanced",
+        ),
+        (
+            "read_after_release::syms",
+            "contract-allocation:use:read-while-empty",
+        ),
+        (
+            "reseat_over_live::syms",
+            "contract-allocation:overwrite:re-seat-over-live",
+        ),
+        (
+            "release_first::syms",
+            "contract-allocation:implicit-close:release-without-generation",
+        ),
+        (
+            "copied_into_plain_local::syms",
+            "contract-allocation:use:copied-into-local",
+        ),
+    ] {
+        assert!(
+            receipts.contains(&format!("{subject}\theld\t{detail}")),
+            "missing `{subject} held {detail}`\n{receipts}"
+        );
+        assert!(
+            reason_of(&out.degradations, subject).is_some(),
+            "{subject} not degraded\n{:#?}",
+            out.degradations
+        );
+    }
+    // (7) A local assigned from something that is not a contract owner is
+    // not a generation at all: the rule leaves it alone — no receipt, no
+    // degradation. Every program with a contract in it holds locals like
+    // this one, and the shared Option/alias families emit them.
+    assert!(
+        !receipts.contains("plain_alias::copy"),
+        "the plain alias is not the contract's\n{receipts}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "plain_alias::copy")
+            .filter(|r| r.starts_with("contract-allocation")),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert!(
+        !compact(&out.source).contains("Box<[u32]>"),
+        "{}",
+        out.source
+    );
+}

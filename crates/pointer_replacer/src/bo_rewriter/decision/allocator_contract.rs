@@ -47,7 +47,7 @@
 //!
 //! Receipt `allocator-contract` per site (the receipts table).
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     Expr, ExprKind, HirId, QPath,
     def::{DefKind, Res},
@@ -329,16 +329,38 @@ fn allocation<'h>(tcx: TyCtxt<'_>, e: &'h Expr<'h>) -> Option<Result<Allocation,
 }
 
 /// A statement of a block that concerns a contract owner.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
     /// `let x = <allocation>` / `let x = if c { <allocation> } else { null }`.
     Let,
+    /// `x = <allocation>` — build 2's assignment receiver (brotli's
+    /// ensure-capacity idiom allocates into a null-initialized local).
+    Alloc,
+    /// `x = y` with `y` another contract owner — the generation MOVES in.
+    MoveIn,
+    /// `y = x` with `y` another contract owner — it moves out.
+    MoveOut,
     /// `<Free>(m, x as *mut c_void);`
     Free,
     /// `x = <null>;`
     NullStore,
+    /// `let x = <null>;` — build 2: the ensure-capacity idiom declares the
+    /// receiver empty and allocates into it further down.
+    NullInit,
     /// Any other assignment to the binding.
     Store,
+}
+
+impl Role {
+    /// The owner's generation after this statement, or `None` when the role
+    /// does not change it.
+    fn creates(self) -> bool {
+        matches!(self, Role::Let | Role::Alloc | Role::MoveIn)
+    }
+
+    fn releases(self) -> bool {
+        matches!(self, Role::Free | Role::MoveOut)
+    }
 }
 
 #[derive(Default)]
@@ -351,6 +373,12 @@ struct Scan {
     frees: Vec<(HirId, Span, Span)>,
     /// Every assignment to a bare local: (binding, value span).
     assigns: Vec<(HirId, Span)>,
+    /// build 2: `x = <allocation>` — (binding, the value's span, its id).
+    alloc_assigns: Vec<(HirId, Span, HirId)>,
+    /// build 2: `x = y` with `y` a bare local — (binding, source, value span).
+    moves: Vec<(HirId, HirId, Span)>,
+    /// build 2: `let x = <null>;` — (binding, the initializer's span).
+    null_inits: Vec<(HirId, Span)>,
 }
 
 struct ScanWalk<'tcx> {
@@ -379,7 +407,14 @@ impl<'tcx> Visitor<'tcx> for ScanWalk<'tcx> {
                         },
                         _ => init,
                     };
-                    allocation(self.tcx, value).map(|_| (hir, Role::Let))
+                    if allocation(self.tcx, value).is_some() {
+                        return Some((hir, Role::Let));
+                    }
+                    if null_literal(init) {
+                        self.out.null_inits.push((hir, init.span));
+                        return Some((hir, Role::NullInit));
+                    }
+                    None
                 }),
                 rustc_hir::StmtKind::Semi(e) | rustc_hir::StmtKind::Expr(e) => match &e.kind {
                     ExprKind::Call(_, args) => callee_of(e)
@@ -395,14 +430,30 @@ impl<'tcx> Visitor<'tcx> for ScanWalk<'tcx> {
                         .filter(|_| matches!(lhs.kind, ExprKind::Path(_)))
                         .map(|hir| {
                             self.out.assigns.push((hir, rhs.span));
-                            (
-                                hir,
-                                if null_literal(rhs) {
-                                    Role::NullStore
-                                } else {
-                                    Role::Store
+                            // build 2 (relay wave-6a/018): the ensure-capacity
+                            // idiom allocates into a null-initialized local
+                            // (`new_array = if n > 0 { BrotliAllocate(..) }
+                            // else { null }`) and RE-SEATS the owner it
+                            // replaces (`all_histograms = new_array`).
+                            let value = match &rhs.kind {
+                                ExprKind::If(_, then, Some(_)) => match then.kind {
+                                    ExprKind::Block(b, _) => b.expr.unwrap_or(rhs),
+                                    _ => then,
                                 },
-                            )
+                                _ => rhs,
+                            };
+                            let role = if null_literal(rhs) {
+                                Role::NullStore
+                            } else if allocation(self.tcx, value).is_some() {
+                                self.out.alloc_assigns.push((hir, rhs.span, rhs.hir_id));
+                                Role::Alloc
+                            } else if let Some(source) = bare_local(rhs) {
+                                self.out.moves.push((hir, source, rhs.span));
+                                Role::MoveIn
+                            } else {
+                                Role::Store
+                            };
+                            (hir, role)
                         }),
                     _ => None,
                 },
@@ -465,88 +516,184 @@ pub(crate) fn derive<'tcx>(
         };
         walk.visit_body(tcx.hir_body(body_id));
         let scan = walk.out;
+        // build 2: the function's contract-owner candidates — a local the
+        // contract allocates into itself. The receiver walk consults the set
+        // so a RE-SEAT of one contract owner from another reads as a move of
+        // the generation; a copy into any other local is a second owner this
+        // rule cannot follow, and holds.
+        let candidates: FxHashSet<HirId> = scan
+            .statements
+            .iter()
+            .filter(|(_, _, _, role, _)| matches!(role, Role::Let | Role::Alloc))
+            .map(|(hir, _, _, _, _)| *hir)
+            .collect();
+        let move_ok = |destination: HirId| candidates.contains(&destination);
         for subject in subjects
             .iter()
             .filter(|s| s.fn_did == function && s.kind == SubjectKind::Local)
         {
             let node = (subject.fn_did, subject.hir_id);
-            let Some(&(_, block, let_index, _, let_span)) = scan
-                .statements
-                .iter()
-                .find(|(hir, _, _, role, _)| *hir == subject.hir_id && matches!(role, Role::Let))
-            else {
-                continue;
-            };
             let label = subject.label.clone();
+            let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
             let hold = |out: &mut Plans, reason: String| {
                 out.holds.insert(node, (label.clone(), reason));
             };
-            // The initializer: the allocation, or the conditional allocation.
-            let Some(local) = tcx.hir_node(subject.hir_id).parent_hir_node_let(tcx) else {
-                continue;
-            };
-            let Some(init) = local.init else { continue };
-            let (value, else_null) = match &init.kind {
-                ExprKind::If(_, then, Some(otherwise)) => {
-                    let value = match then.kind {
-                        ExprKind::Block(b, _) => b.expr.unwrap_or(then),
-                        _ => then,
+            // **The owner's generations** (build 2, relay wave-6a/018). Every
+            // event on the binding, in source order: a CREATION (the `let`'s
+            // allocation, an assignment of one — brotli's ensure-capacity
+            // idiom allocates into a null-initialized local — or a move in
+            // from another owner), a RELEASE (the contract free, or a move
+            // out into another owner), the `BROTLI_FREE` null store, and the
+            // uses. The simulation below proves the owner is never read while
+            // it holds nothing, never re-seated over a live generation, and
+            // never live at a `return` or at the body's end — the C free of a
+            // Rust block is UB and this rule adds no drop.
+            #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+            enum Event {
+                Create,
+                Release,
+                NullStore,
+                Use,
+                Store,
+            }
+            let mut events: Vec<(Span, HirId, Event, Role)> = Vec::new();
+            for (hir, block, _, role, span) in &scan.statements {
+                if *hir == subject.hir_id {
+                    // A move in from a local that is not itself a contract
+                    // owner carries no generation — the value came from
+                    // somewhere this rule does not follow, so it reads as an
+                    // opaque store (and a local no contract touches keeps
+                    // every event it has: none).
+                    let role = &if *role == Role::MoveIn
+                        && !scan.moves.iter().any(|(dest, source, value)| {
+                            dest == hir && span.contains(*value) && candidates.contains(source)
+                        }) {
+                        Role::Store
+                    } else {
+                        *role
                     };
-                    let null = match otherwise.kind {
-                        ExprKind::Block(b, _) => b.expr.filter(|e| null_literal(e)),
-                        _ => None,
+                    let event = match role {
+                        Role::Let | Role::Alloc | Role::MoveIn => Event::Create,
+                        Role::Free | Role::MoveOut => Event::Release,
+                        Role::NullStore | Role::NullInit => Event::NullStore,
+                        Role::Store => Event::Store,
                     };
-                    let Some(null) = null else {
-                        hold(
-                            &mut out,
-                            format!("{USE}:conditional-else:{}", snippet(otherwise.span)),
-                        );
-                        continue;
-                    };
-                    (value, Some(null.span))
+                    events.push((*span, *block, event, *role));
+                } else if *role == Role::MoveIn
+                    && scan
+                        .moves
+                        .iter()
+                        .any(|(dest, source, _)| dest == hir && *source == subject.hir_id)
+                {
+                    events.push((*span, *block, Event::Release, Role::MoveOut));
                 }
-                _ => (init, None),
-            };
-            let allocation = match allocation(tcx, value) {
-                Some(Ok(a)) => a,
-                Some(Err(reason)) => {
-                    hold(&mut out, reason);
+            }
+            if events.is_empty() {
+                continue;
+            }
+            // The creations decide the shape, the optionality and the text.
+            let mut creations: Vec<(Span, Option<Span>, Allocation)> = Vec::new();
+            let mut creation_error: Option<String> = None;
+            let mut moved_in = 0usize;
+            for (span, _, event, role) in &events {
+                if *event != Event::Create {
                     continue;
                 }
-                None => continue,
-            };
-            let optional = else_null.is_some();
-            let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
-            // The statements of the allocating block that concern the owner,
-            // in order.
-            let mut rows: Vec<(usize, Role, Span)> = scan
-                .statements
-                .iter()
-                .filter(|(hir, b, _, _, _)| *hir == subject.hir_id && *b == block)
-                .map(|(_, _, i, role, span)| (*i, *role, *span))
-                .collect();
-            rows.sort_by_key(|(i, _, _)| *i);
+                if *role == Role::MoveIn {
+                    moved_in += 1;
+                    continue;
+                }
+                let value_expr = match role {
+                    Role::Let => tcx
+                        .hir_node(subject.hir_id)
+                        .parent_hir_node_let(tcx)
+                        .and_then(|local| local.init),
+                    _ => scan
+                        .alloc_assigns
+                        .iter()
+                        .find(|(hir, value, _)| *hir == subject.hir_id && span.contains(*value))
+                        .map(|(_, _, id)| tcx.hir_node(*id).expect_expr()),
+                };
+                let Some(init) = value_expr else {
+                    creation_error = Some(format!("{USE}:creation-unreadable"));
+                    break;
+                };
+                let (value, else_null) = match &init.kind {
+                    ExprKind::If(_, then, Some(otherwise)) => {
+                        let value = match then.kind {
+                            ExprKind::Block(b, _) => b.expr.unwrap_or(then),
+                            _ => then,
+                        };
+                        let null = match otherwise.kind {
+                            ExprKind::Block(b, _) => b.expr.filter(|e| null_literal(e)),
+                            _ => None,
+                        };
+                        let Some(null) = null else {
+                            creation_error = Some(format!(
+                                "{USE}:conditional-else:{}",
+                                snippet(otherwise.span)
+                            ));
+                            break;
+                        };
+                        (value, Some(null.span))
+                    }
+                    _ => (init, None),
+                };
+                match allocation(tcx, value) {
+                    Some(Ok(a)) => creations.push((a.span, else_null, a)),
+                    Some(Err(reason)) => {
+                        creation_error = Some(reason);
+                        break;
+                    }
+                    None => {
+                        creation_error = Some(format!("{USE}:creation-not-an-allocation"));
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = creation_error {
+                hold(&mut out, reason);
+                continue;
+            }
+            if creations.is_empty() {
+                // Every generation of this local came from another owner; the
+                // source owns the contract and this one is its receiver — not
+                // a shape this build plans.
+                if moved_in > 0 {
+                    hold(&mut out, format!("{USE}:moved-in-only"));
+                }
+                continue;
+            }
+            let shape = creations[0].2.shape;
+            let contract = creations[0].2.contract;
+            if creations.iter().any(|(_, _, a)| a.shape != shape) {
+                hold(&mut out, format!("{USE}:shapes-disagree"));
+                continue;
+            }
+            // One generation created unconditionally and released once is the
+            // non-optional owner; anything else (a conditional allocation, a
+            // null-initialized local, several generations) carries `None`.
+            let optional = creations.len() + moved_in > 1
+                || creations
+                    .iter()
+                    .any(|(_, else_null, _)| else_null.is_some())
+                || events[0].2 != Event::Create;
             let frees: Vec<(Span, Span)> = scan
                 .frees
                 .iter()
                 .filter(|(hir, _, _)| *hir == subject.hir_id)
                 .map(|(_, call, arg)| (*call, *arg))
                 .collect();
-            let block_frees: Vec<(usize, Span)> = rows
-                .iter()
-                .filter(|(_, role, _)| matches!(role, Role::Free))
-                .map(|(i, _, span)| (*i, *span))
-                .collect();
-            // The uses (the certificate's receiver walk).
             let uses = match owner_uses(
                 tcx,
                 subject,
-                allocation.shape,
+                shape,
                 optional,
                 !optional,
                 &frees,
                 &lend_ok,
                 &transfer_ok,
+                &move_ok,
             ) {
                 Ok(uses) => uses,
                 Err(form) => {
@@ -558,120 +705,160 @@ pub(crate) fn derive<'tcx>(
                 hold(&mut out, format!("{RETURNED}:{}", snippet(*span)));
                 continue;
             }
-            // The sinks: the block's own free (exactly one, after the `let`,
-            // with no `return` between), or a store into a raw place.
-            let sink_free = match block_frees.as_slice() {
-                [(index, span)] if *index > let_index => Some((*index, *span)),
-                [] => None,
-                _ => {
-                    hold(
-                        &mut out,
-                        format!("{IMPLICIT_CLOSE}:frees={}", block_frees.len()),
-                    );
-                    continue;
+            for edit in &uses.edits {
+                if !events
+                    .iter()
+                    .any(|(span, _, _, _)| span.contains(edit.span))
+                {
+                    events.push((edit.span, events[0].1, Event::Use, Role::Store));
                 }
-            };
-            if frees.len() != block_frees.len() {
-                // A free inside a branch of the allocating block: the other
-                // arm keeps a live owner.
-                hold(&mut out, format!("{IMPLICIT_CLOSE}:free-in-branch"));
+            }
+            for store in &uses.stores {
+                if !events.iter().any(|(span, _, _, _)| span.contains(*store)) {
+                    events.push((*store, events[0].1, Event::Release, Role::MoveOut));
+                }
+            }
+            events.sort_by_key(|(span, _, _, _)| (span.lo(), span.hi()));
+            // The simulation: Dead → Create → Live → Release → Dead.
+            let mut live = false;
+            let mut block_state: FxHashMap<HirId, (bool, bool)> = FxHashMap::default();
+            let mut sequence_error = None;
+            for (span, block, event, role) in &events {
+                let entry = block_state.entry(*block).or_insert((live, live));
+                match event {
+                    Event::Create if live => {
+                        sequence_error =
+                            Some(format!("{OVERWRITE}:re-seat-over-live:{}", snippet(*span)));
+                    }
+                    Event::Create => live = true,
+                    Event::Release if !live => {
+                        sequence_error = Some(format!(
+                            "{IMPLICIT_CLOSE}:release-without-generation:{}",
+                            snippet(*span)
+                        ));
+                    }
+                    Event::Release => live = false,
+                    Event::Use if !live => {
+                        sequence_error = Some(format!("{USE}:read-while-empty:{}", snippet(*span)));
+                    }
+                    Event::Use | Event::NullStore => {}
+                    Event::Store => {
+                        sequence_error = Some(format!("{OVERWRITE}:{}", snippet(*span)));
+                    }
+                }
+                let _ = role;
+                entry.1 = live;
+                if sequence_error.is_some() {
+                    break;
+                }
+            }
+            if let Some(reason) = sequence_error {
+                hold(&mut out, reason);
                 continue;
             }
-            let live_end = match (sink_free, uses.stores.first()) {
-                (Some((_, span)), _) => span,
-                (None, Some(store)) => *store,
-                (None, None) => {
-                    hold(&mut out, format!("{IMPLICIT_CLOSE}:no-sink"));
-                    continue;
+            if live {
+                hold(&mut out, format!("{IMPLICIT_CLOSE}:live-at-exit"));
+                continue;
+            }
+            // Every block the owner touches must leave it as it found it: a
+            // branch that frees a generation must re-seat one (brotli's
+            // ensure-capacity), and one that creates must release.
+            if let Some((_, (entry, exit))) = block_state.iter().find(|(_, (a, b))| a != b) {
+                hold(
+                    &mut out,
+                    format!("{IMPLICIT_CLOSE}:block-unbalanced:{entry}->{exit}"),
+                );
+                continue;
+            }
+            // A `return` while a generation is live would drop it in Rust.
+            let live_spans: Vec<(Span, Span)> = {
+                let mut spans = Vec::new();
+                let mut open: Option<Span> = None;
+                for (span, _, event, _) in &events {
+                    match event {
+                        Event::Create => open = Some(*span),
+                        Event::Release => {
+                            if let Some(start) = open.take() {
+                                spans.push((start, *span));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
+                spans
             };
-            if let Some(ret) = scan
-                .returns
-                .iter()
-                .find(|r| r.lo() > let_span.lo() && r.lo() < live_end.lo())
-            {
+            if let Some(ret) = scan.returns.iter().find(|r| {
+                live_spans
+                    .iter()
+                    .any(|(start, end)| r.lo() > start.hi() && r.lo() < end.lo())
+            }) {
                 hold(
                     &mut out,
                     format!("{IMPLICIT_CLOSE}:return:{}", snippet(*ret)),
                 );
                 continue;
             }
-            // Assignments: only the `BROTLI_FREE` null store right after the
-            // free (the owner is moved by then); anything else overwrites a
-            // live owner or re-seats a dead one.
+            // The edits: one construction per generation, `None` on every
+            // else arm and every null store, `Box::into_raw` at every free.
             let mut expr_edits = uses.edits;
             let mut delete_statements = Vec::new();
-            let mut overwrite = None;
-            for (i, role, span) in &rows {
-                match role {
-                    Role::Let | Role::Free => {}
-                    Role::NullStore
-                        if sink_free.is_some_and(|(free_index, _)| *i == free_index + 1) =>
-                    {
-                        if optional {
-                            let (_, value) = scan
-                                .assigns
-                                .iter()
-                                .find(|(hir, v)| *hir == subject.hir_id && span.contains(*v))
-                                .expect("the null store's value");
-                            expr_edits.push(BoxExprEdit {
-                                span: *value,
-                                replacement: "None".to_owned(),
-                                receipt: "allocator-contract-null-store",
-                            });
-                        } else {
-                            delete_statements.push(*span);
-                        }
-                    }
-                    Role::NullStore | Role::Store => {
-                        overwrite = Some(*span);
-                    }
+            for (span, _, event, role) in &events {
+                if *event != Event::NullStore {
+                    continue;
+                }
+                if *role == Role::NullInit {
+                    let (_, init) = scan
+                        .null_inits
+                        .iter()
+                        .find(|(hir, _)| *hir == subject.hir_id)
+                        .expect("the null initializer");
+                    expr_edits.push(BoxExprEdit {
+                        span: *init,
+                        replacement: "None".to_owned(),
+                        receipt: "allocator-contract-null-init",
+                    });
+                    continue;
+                }
+                if optional {
+                    let (_, value) = scan
+                        .assigns
+                        .iter()
+                        .find(|(hir, v)| *hir == subject.hir_id && span.contains(*v))
+                        .expect("the null store's value");
+                    expr_edits.push(BoxExprEdit {
+                        span: *value,
+                        replacement: "None".to_owned(),
+                        receipt: "allocator-contract-null-store",
+                    });
+                } else {
+                    delete_statements.push(*span);
                 }
             }
-            let block_assigns = rows
-                .iter()
-                .filter(|(_, role, _)| matches!(role, Role::NullStore | Role::Store))
-                .count();
-            let all_assigns = scan
-                .assigns
-                .iter()
-                .filter(|(hir, _)| *hir == subject.hir_id)
-                .count();
-            if overwrite.is_none() && all_assigns != block_assigns {
-                overwrite = scan
-                    .assigns
-                    .iter()
-                    .find(|(hir, _)| *hir == subject.hir_id)
-                    .map(|(_, v)| *v);
-            }
-            if let Some(span) = overwrite {
-                hold(&mut out, format!("{OVERWRITE}:{}", snippet(span)));
-                continue;
-            }
-            // The construction and the sink.
-            let call_text = snippet(allocation.span);
-            let boxed = match (&allocation.shape, &allocation.count) {
-                (BoxShape::Sized, _) => format!("Box::from_raw({call_text})"),
-                (BoxShape::Slice, Some(count)) => format!(
-                    "Box::from_raw(core::ptr::slice_from_raw_parts_mut({call_text}, ({count}) as usize))"
-                ),
-                (BoxShape::Slice, None) => unreachable!("a slice shape carries its count"),
-            };
-            expr_edits.push(BoxExprEdit {
-                span: allocation.span,
-                replacement: if optional {
-                    format!("Some({boxed})")
-                } else {
-                    boxed
-                },
-                receipt: "allocator-contract-construction",
-            });
-            if let Some(null) = else_null {
+            for (span, else_null, a) in &creations {
+                let call_text = snippet(*span);
+                let boxed = match (&a.shape, &a.count) {
+                    (BoxShape::Sized, _) => format!("Box::from_raw({call_text})"),
+                    (BoxShape::Slice, Some(count)) => format!(
+                        "Box::from_raw(core::ptr::slice_from_raw_parts_mut({call_text}, ({count}) as usize))"
+                    ),
+                    (BoxShape::Slice, None) => unreachable!("a slice shape carries its count"),
+                };
                 expr_edits.push(BoxExprEdit {
-                    span: null,
-                    replacement: "None".to_owned(),
-                    receipt: "allocator-contract-none-arm",
+                    span: *span,
+                    replacement: if optional {
+                        format!("Some({boxed})")
+                    } else {
+                        boxed
+                    },
+                    receipt: "allocator-contract-construction",
                 });
+                if let Some(null) = else_null {
+                    expr_edits.push(BoxExprEdit {
+                        span: *null,
+                        replacement: "None".to_owned(),
+                        receipt: "allocator-contract-none-arm",
+                    });
+                }
             }
             for (_, arg) in &frees {
                 let arg_text = snippet(*arg);
@@ -692,14 +879,15 @@ pub(crate) fn derive<'tcx>(
             expr_edits.sort_by_key(|e| (e.span.lo(), e.span.hi()));
             expr_edits.retain(|e| !delete_statements.iter().any(|d| d.contains(e.span)));
             let mut receipts = vec![
-                format!("allocator-contract {}", allocation.contract.id),
+                format!("allocator-contract {}", contract.id),
                 format!(
-                    "shape={} optional={optional} sink={}",
-                    match allocation.shape {
+                    "shape={} optional={optional} generations={} moves_in={moved_in} frees={}",
+                    match shape {
                         BoxShape::Sized => "sized",
                         BoxShape::Slice => "slice",
                     },
-                    if sink_free.is_some() { "free" } else { "store" }
+                    creations.len(),
+                    frees.len()
                 ),
             ];
             for (call, _) in &frees {
@@ -714,7 +902,7 @@ pub(crate) fn derive<'tcx>(
             out.plans.insert(
                 node,
                 BoxPlan {
-                    shape: allocation.shape,
+                    shape,
                     optional,
                     expr_edits,
                     delete_statements,
