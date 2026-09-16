@@ -1155,9 +1155,19 @@ pub(crate) fn aliased_storage_twin(
     table: &super::DecisionTable,
     site: &super::emitability::CallSite,
     callee: LocalDefId,
-    positions: &[(usize, super::seam::Form)],
+    positions: &[(usize, super::seam::Form, super::seam::Form)],
 ) -> Option<Result<Vec<usize>, super::seam::SeamBlock>> {
     use super::seam::Form;
+    // A position whose callee parameter stays raw is not a view: only a
+    // safe expected form forms one beside the alias.
+    let positions = positions
+        .iter()
+        .filter(|(_, expected, _)| *expected != Form::Raw)
+        .map(|(i, _, found)| (*i, *found))
+        .collect::<Vec<_>>();
+    if positions.is_empty() {
+        return None;
+    }
     let converted: rustc_hash::FxHashSet<usize> = positions.iter().map(|(i, _)| *i).collect();
     let root_of = |index: usize| {
         site.args
@@ -1417,6 +1427,15 @@ pub(crate) fn graft_calls(
         if kept.is_empty() {
             continue;
         }
+        // The twin and its callers are ONE unit: a callee whose emitted
+        // signature is the input's (its class withheld by any route) keeps
+        // its original calls — the twin would not be printed beside an
+        // unedited item, and the renamed calls would dangle (E0425).
+        if call.route == Route::RawTwin
+            && !signature_converted(krate, pristine, global_map, call.callee)
+        {
+            continue;
+        }
         let key = (call.call_span.lo().0, call.call_span.hi().0);
         if by_span.insert(key, (call, kept)).is_some() {
             return Err(format!(
@@ -1457,6 +1476,60 @@ pub(crate) fn graft_calls(
 
 /// Clone the callee's PRISTINE item (the input's body, before any edit), rename
 /// it to the raw twin, and place it right after the converted item.
+/// Does the callee's item in the emitted crate carry a signature other than
+/// the pristine one? (`pprust` of the `fn` signature, both trees.)
+fn signature_converted(
+    krate: &rustc_ast::Crate,
+    pristine: &rustc_ast::Crate,
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    callee: LocalDefId,
+) -> bool {
+    fn find<'a>(
+        items: &'a [rustc_ast::ptr::P<rustc_ast::Item>],
+        global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+        callee: LocalDefId,
+    ) -> Option<&'a rustc_ast::Item> {
+        for item in items {
+            if global_map.get(&item.id) == Some(&callee)
+                && matches!(item.kind, rustc_ast::ItemKind::Fn(_))
+            {
+                return Some(item);
+            }
+            if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, ..)) =
+                &item.kind
+                && let Some(found) = find(inner, global_map, callee)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let sig = |item: &rustc_ast::Item| match &item.kind {
+        rustc_ast::ItemKind::Fn(function) => {
+            let decl = &function.sig.decl;
+            let inputs = decl
+                .inputs
+                .iter()
+                .map(|param| rustc_ast_pretty::pprust::ty_to_string(&param.ty))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let output = match &decl.output {
+                rustc_ast::FnRetTy::Default(_) => String::new(),
+                rustc_ast::FnRetTy::Ty(ty) => rustc_ast_pretty::pprust::ty_to_string(ty),
+            };
+            Some(format!("({inputs}) -> {output}"))
+        }
+        _ => None,
+    };
+    match (
+        find(&krate.items, global_map, callee).and_then(sig),
+        find(&pristine.items, global_map, callee).and_then(sig),
+    ) {
+        (Some(emitted), Some(original)) => emitted != original,
+        _ => false,
+    }
+}
+
 fn insert_raw_twin(
     krate: &mut rustc_ast::Crate,
     pristine: &rustc_ast::Crate,

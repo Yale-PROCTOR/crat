@@ -1508,3 +1508,135 @@ fn w6v_raw_twin_is_refused_when_the_callee_body_calls_a_converted_local() {
     assert_eq!(original, b"3\n".to_vec());
     assert_eq!(run_binary(&format!("{source}\n{main}")), original);
 }
+
+// ---- relay 015 / 016: the raw twin and the callee's revert unit ----
+
+/// Two callers route to `__crat_raw_lodepng_memcpy` (in-buffer copies), and a
+/// third caller makes the callee's class fail at the compile gate (an
+/// array-local address at the counted position takes the thin-reference glue
+/// `core::slice::from_mut(&mut buf)`, E0308). The verify loop then reverts
+/// `lodepng_memcpy`'s class — and the twin with it, since it is printed within
+/// the callee's span — while the two callers' renamed calls survive: E0425 in
+/// every later round, no attribution, the program degrades (batch 8's lodepng
+/// and brotli). The twin and its callers are ONE unit.
+const TWIN_UNIT: &str = r#"
+#![allow(dead_code, unused_mut, non_upper_case_globals, non_snake_case, unused_assignments, unused_variables)]
+extern "C" { fn malloc(n: usize) -> *mut core::ffi::c_void; fn free(p: *mut core::ffi::c_void); }
+unsafe fn lodepng_memcpy(mut dst: *mut core::ffi::c_void,
+    mut src: *const core::ffi::c_void, mut size: u64) {
+    let mut i: u64 = 0;
+    i = 0;
+    while i < size {
+        *(dst as *mut i8).offset(i as isize) = *(src as *const i8).offset(i as isize);
+        i = i.wrapping_add(1);
+    }
+}
+#[repr(C)]
+pub struct ucvector { pub data: *mut u8, pub size: u64, pub allocsize: u64 }
+pub unsafe fn inflateHuffmanBlock(mut out: *mut ucvector, mut start: u64, mut backward: u64, mut length: u64) {
+    lodepng_memcpy(((*out).data).offset(start as isize) as *mut core::ffi::c_void,
+        ((*out).data).offset(backward as isize) as *const core::ffi::c_void, length);
+}
+pub unsafe fn inflateNoCompression(mut out: *mut ucvector, mut start: u64, mut backward: u64, mut length: u64) {
+    lodepng_memcpy(((*out).data).offset(start as isize) as *mut core::ffi::c_void,
+        ((*out).data).offset(backward as isize) as *const core::ffi::c_void, length);
+}
+pub unsafe fn writeSignature(mut src: *const core::ffi::c_void) -> i64 {
+    let mut buf: [i8; 4] = [0; 4];
+    lodepng_memcpy(&mut buf as *mut [i8; 4] as *mut core::ffi::c_void, src, 4);
+    buf[0] as i64 + buf[3] as i64
+}
+"#;
+
+fn production_outcome(name: &str, fixture: &str) -> super::RewriteOutcome {
+    production_outcome_injected(name, fixture, &|_| {})
+}
+
+fn production_outcome_injected(
+    name: &str,
+    fixture: &str,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> super::RewriteOutcome {
+    let dir = std::env::temp_dir().join(format!("crat-w6v-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.join("lib.rs");
+    std::fs::write(&root, fixture).unwrap();
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &root,
+        super::A5Mode::PreciseReplay,
+        Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        inject,
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    outcome
+}
+
+#[test]
+fn w6v_raw_twin_reverts_with_its_callees_class() {
+    let outcome = production_outcome("twin-unit", TWIN_UNIT);
+    let source = match &outcome {
+        super::RewriteOutcome::Emitted { source, .. } => source.clone(),
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            panic!("the program must emit, not degrade on a missing twin: {reason}")
+        }
+    };
+    let c = compact(&source);
+    let twin_defined = c.contains("fn__crat_raw_lodepng_memcpy(");
+    let twin_called = c.contains("__crat_raw_lodepng_memcpy(");
+    assert!(
+        twin_defined == twin_called,
+        "the twin's definition and its call sites are one unit (defined={twin_defined}, called={twin_called}): {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// The forced revert: the split fixture's two in-buffer callers route to the
+/// twin (plans recorded), then the callee's `dst` / `src` are withdrawn AFTER
+/// planning (as a class revert or any later withdrawal leaves them). The
+/// callee's emitted signature is the input's, so no call is renamed and no
+/// twin is printed: the twin's definition and its call sites are one unit.
+#[test]
+fn w6v_raw_twin_is_not_grafted_for_a_withdrawn_callee() {
+    let fixture = format!(
+        "{COPY64}{INFLATE_BACKREF}\n\
+         pub unsafe fn inflateNoCompression(mut out: *mut ucvector, mut start: u64, mut backward: u64, mut length: u64) {{\n\
+             lodepng_memcpy(((*out).data).offset(start as isize) as *mut core::ffi::c_void,\n\
+                 ((*out).data).offset(backward as isize) as *const core::ffi::c_void, length);\n\
+         }}\n"
+    );
+    let delivered = super::emit_tests::ast_emitted_source_of(&fixture).unwrap();
+    assert!(
+        compact(&delivered).contains("__crat_raw_lodepng_memcpy(")
+            && compact(&delivered).contains("fn__crat_raw_lodepng_memcpy("),
+        "the plans exist and deliver before the withdrawal: {delivered}"
+    );
+    let outcome = production_outcome_injected("twin-withdrawn", &fixture, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("lodepng_memcpy::dst")
+                || subject.label.ends_with("lodepng_memcpy::src")
+            {
+                *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                    subject: subject.label.clone(),
+                    site: "<w6v-injected-withdrawal>".to_owned(),
+                    reason: super::decision::DegradeReason::CallSiteNotAdapted,
+                });
+            }
+        }
+    });
+    let source = match &outcome {
+        super::RewriteOutcome::Emitted { source, .. } => source.clone(),
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            panic!("the program must emit with the callee withdrawn: {reason}")
+        }
+    };
+    let c = compact(&source);
+    assert!(
+        !c.contains("__crat_raw_lodepng_memcpy(") && !c.contains("fn__crat_raw_lodepng_memcpy("),
+        "no call is renamed to a twin that is not printed: {source}"
+    );
+    assert!(
+        c.contains("fnlodepng_memcpy(mutdst:*mutcore::ffi::c_void,"),
+        "the withdrawn callee keeps its signature: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}

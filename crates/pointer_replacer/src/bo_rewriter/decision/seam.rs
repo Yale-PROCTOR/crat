@@ -4325,7 +4325,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                         *callee,
                         &positions
                             .iter()
-                            .map(|pos| (pos.index, pos.found))
+                            .map(|pos| (pos.index, pos.expected, pos.found))
                             .collect::<Vec<_>>(),
                     )
                 })
