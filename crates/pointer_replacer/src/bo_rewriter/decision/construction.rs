@@ -706,11 +706,13 @@ pub(crate) fn collect_composable_edits(
     for (_, decision) in &table.entries {
         let uses = match decision {
             Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => Some(uses),
+            // A cursor's use (a derived address under `&*…`) inside another
+            // family's initializer composes the same way (slicecursor, 09-16).
+            Decision::Cursor { plan, .. } => Some(&plan.uses),
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::Box(_)
             | Decision::NestedSlice { .. }
-            | Decision::Cursor { .. }
             | Decision::Degraded(_) => None,
         };
         edits.extend(
