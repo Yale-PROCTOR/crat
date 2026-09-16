@@ -7029,8 +7029,15 @@ fn finish_decide<'tcx>(
     // reaches a gate.
     // wave-6a W6A-T1: flexible-tail struct transactions, derived once from the
     // construction facts and the subject universe (no model, no analysis).
+    // R419-3 (relay wave-6a/011): an owning endpoint that is a fn-pointer-web
+    // member or a positive seed keeps a raw outer surface (the exposure
+    // family's wrapper, which every in-crate caller binds to) — the
+    // allocation forms hold such chains whole rather than split them.
+    let raw_surface = |did: rustc_hir::def_id::LocalDefId| {
+        exposure_seed.contains(did) || fnptr_web.as_ref().is_ok_and(|web| web.contains(did))
+    };
     let flexible_tails =
-        decision::flexible_tail::derive(tcx, &program.functions, &ctors, &subjects);
+        decision::flexible_tail::derive(tcx, &program.functions, &ctors, &subjects, &raw_surface);
     // wave-6a W6A-C1: Box-parameter chains of consuming callees (the model is
     // read only to refuse a chain whose members are not all Owning).
     // wave-6a W6A-A1: allocation-return certificates (relay wave-6a/005 §1),
@@ -7060,6 +7067,7 @@ fn finish_decide<'tcx>(
         &slots,
         &model,
         &return_certificates,
+        &raw_surface,
     );
     decision::return_certificate::confirm_transfers(
         &mut return_certificates,
@@ -7733,6 +7741,8 @@ fn finish_decide<'tcx>(
         decision::return_certificate::append_explicit_declarations(tcx, &mut table);
         decision::allocator_contract::append_explicit_declarations(tcx, &mut table);
         decision::return_certificate::append_interface_dependencies(&mut table);
+        decision::flexible_tail::append_interface_dependencies(&mut table);
+        decision::box_param::append_interface_dependencies(&mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =

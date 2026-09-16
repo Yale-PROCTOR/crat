@@ -58,6 +58,28 @@ pub(crate) struct Chains {
     pub(crate) holds: FxHashMap<(LocalDefId, HirId), (String, String)>,
     /// One receipt line per admitted chain.
     pub(crate) receipts: Vec<String>,
+    /// R419-3: every admitted chain's classes — the consuming callee and its
+    /// callers — revert together.
+    pub(crate) chains: Vec<(LocalDefId, Vec<LocalDefId>)>,
+}
+
+/// After the seams: a chain reverts whole (R419-3) — the consuming callee's
+/// class and every caller's class depend on each other both ways.
+pub(crate) fn append_interface_dependencies(table: &mut DecisionTable) {
+    let mut edges = Vec::new();
+    for (callee, callers) in &table.box_params.chains {
+        let callee_class = SignatureClassId::of(*callee);
+        for caller in callers {
+            let caller_class = SignatureClassId::of(*caller);
+            if caller_class != callee_class {
+                edges.push((callee_class, caller_class));
+                edges.push((caller_class, callee_class));
+            }
+        }
+    }
+    table.seams.interface_dependencies.extend(edges);
+    table.seams.interface_dependencies.sort();
+    table.seams.interface_dependencies.dedup();
 }
 
 impl Chains {
@@ -161,7 +183,8 @@ pub(crate) fn append_explicit_declarations(tcx: TyCtxt<'_>, table: &mut Decision
 
 /// The hold's family as a stable reason key (the receipt keeps the detail).
 fn typed_key(hold: &str) -> &'static str {
-    const KEYS: [&str; 7] = [
+    const KEYS: [&str; 8] = [
+        "chain-endpoint-raw",
         "box-param-callee-lends",
         "box-param-no-callers",
         "box-param-indirect-callers",
@@ -393,6 +416,7 @@ pub(crate) fn derive<'tcx>(
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
     certificates: &super::return_certificate::Certificates,
+    raw_surface: &dyn Fn(LocalDefId) -> bool,
 ) -> Chains {
     let mut out = Chains::default();
     let mut scans: FxHashMap<LocalDefId, Scan<'tcx>> = FxHashMap::default();
@@ -474,6 +498,15 @@ pub(crate) fn derive<'tcx>(
                 format!("box-param-indirect-callers:{callee_path}"),
                 &mut out,
             );
+            continue;
+        }
+        // R419-3 (relay wave-6a/011): the consuming callee is a fn-pointer-web
+        // member or a positive seed — its converted signature would sit
+        // behind the exposure family's raw wrapper, which every in-crate
+        // caller binds to (`__crat_safe_f(p)` with `p` raw: E0308). The chain
+        // holds typed; the callers' locals stay raw.
+        if raw_surface(param.fn_did) {
+            hold(format!("chain-endpoint-raw:{callee_path}"), &mut out);
             continue;
         }
         // Every direct call site passes an allocation local, planned by the
@@ -744,10 +777,15 @@ pub(crate) fn derive<'tcx>(
             if slice { "slice" } else { "sized" },
             members.join(",")
         ));
+        let mut chain_callers: Vec<LocalDefId> = Vec::new();
         for (key, mut plan, _, uses) in member_plans {
             plan.expr_edits.extend(member_edits.drain(..uses.len()));
+            if !chain_callers.contains(&key.0) {
+                chain_callers.push(key.0);
+            }
             out.plans.insert(key, plan);
         }
+        out.chains.push((param.fn_did, chain_callers));
         out.plans.insert(
             (param.fn_did, param.hir_id),
             BoxPlan {

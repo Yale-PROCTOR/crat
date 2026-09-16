@@ -642,6 +642,68 @@ fn w6a_b1_field_rooted_locals_split_by_what_memory_the_slice_covers() {
     );
 }
 
+/// The tulip indicator table: `ti_cci` is a fn-pointer web ROOT, so
+/// `ti_buffer_new` / `ti_buffer_free` (called from it) are web MEMBERS and
+/// the exposure family gives each a raw outer wrapper when its signature
+/// converts (`ti_buffer_free(buffer: *mut)` → `__crat_safe_ti_buffer_free(buffer)`).
+pub(super) const TULIP_INDICATOR_TABLE: &str = r#"
+#[repr(C)]
+pub struct ti_indicator_info {
+    pub name: *const std::os::raw::c_char,
+    pub indicator: Option<unsafe extern "C" fn(std::os::raw::c_int, *const *const std::os::raw::c_double, std::os::raw::c_int, *const *mut std::os::raw::c_double) -> std::os::raw::c_int>,
+}
+#[no_mangle]
+pub static mut ti_indicators: [ti_indicator_info; 1] = [ti_indicator_info {
+    name: b"cci\0" as *const u8 as *const std::os::raw::c_char,
+    indicator: Some(ti_cci as unsafe extern "C" fn(std::os::raw::c_int, *const *const std::os::raw::c_double, std::os::raw::c_int, *const *mut std::os::raw::c_double) -> std::os::raw::c_int),
+}];
+"#;
+
+/// **Relay 011 (R419-3): a chain is planned WHOLE or not at all.** With
+/// `ti_cci` in the indicator table, `ti_buffer_new` and `ti_buffer_free` are
+/// fn-pointer-web members: a converted signature of theirs gets a raw outer
+/// wrapper (the exposure family's), and in-crate callers bind to THAT — a
+/// `Box<ti_buffer>` return / parameter behind it is E0308 at every receiver
+/// and every free (census-1 on `3d28008a`: tulip's 216). The transaction and
+/// the chain hold typed (`chain-endpoint-raw`) and every local stays raw;
+/// nothing reverts. Without the table (the witness above) they deliver.
+#[test]
+fn w6a_t1_web_member_endpoints_hold_the_transaction_whole() {
+    let out = emitted(
+        "tulip-cci-web",
+        &format!(
+            "{}{}",
+            super::wave6a_fixture_tulip::TULIP_BUFFER,
+            TULIP_INDICATOR_TABLE
+        ),
+    );
+    let src = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(!src.contains("Box<ti_buffer>"), "{}", out.source);
+    assert!(
+        src.contains("pubvals:[std::os::raw::c_double;1],}"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("fnti_buffer_new(mutsize:std::os::raw::c_int)->*mutti_buffer{"),
+        "{}",
+        out.source
+    );
+    let receipts = &out.artifacts.flexible_tail_receipts;
+    assert!(
+        receipts.contains("\theld\tchain-endpoint-raw:"),
+        "{receipts}\n{}",
+        out.artifacts.box_param_receipts
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "ti_cci::sum").as_deref(),
+        Some("chain-endpoint-raw"),
+        "{:#?}",
+        out.degradations
+    );
+}
+
 /// **Rule W6A-T1, first corpus shape** (`ti_cci` + the smoke test): the
 /// struct splits, the allocating callee returns `Box<ti_buffer>`, the freeing
 /// callee takes `Box<ti_buffer>` and drops, every receiver is a `Box`, every

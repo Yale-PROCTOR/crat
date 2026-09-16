@@ -29,11 +29,12 @@ use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 use rustc_span::Span;
 
 use super::{
-    Ctx, Subject, SubjectKind,
+    Ctx, DecisionTable, Subject, SubjectKind,
     box_facts::{BoxExprEdit, BoxPlan, BoxPlanFailure, BoxShape, scalar_initializer_supported},
     construction::{CallResultTarget, ConstructionFacts},
     declaration::pointee_source,
 };
+use crate::bo_rewriter::bridge_receipt::SignatureClassId;
 
 /// One admitted struct transaction.
 #[derive(Clone, Debug)]
@@ -71,6 +72,10 @@ pub(crate) struct Transactions {
     pub(crate) plans: FxHashMap<(LocalDefId, HirId), BoxPlan>,
     /// Structs examined and refused, with the typed reason.
     pub(crate) holds: Vec<(String, String)>,
+    /// R419-3: the subjects a transaction WOULD have planned, held typed
+    /// because an owning endpoint keeps a raw outer surface
+    /// (`chain-endpoint-raw:<function>`).
+    pub(crate) endpoint_holds: FxHashMap<(LocalDefId, HirId), String>,
 }
 
 impl Transactions {
@@ -126,9 +131,48 @@ pub(crate) fn override_plan(
             .get(&(subject.fn_did, subject.hir_id))
         {
             Some(plan) => Ok(plan.clone()),
-            None => Err(failure),
+            None => match ctx
+                .flexible_tails
+                .endpoint_holds
+                .get(&(subject.fn_did, subject.hir_id))
+            {
+                // R419-3: the transaction holds whole — its would-be members
+                // carry the typed hold rather than their prior failure.
+                Some(hold) => Err(BoxPlanFailure::NativeEvidenceHeld {
+                    prior_key: "chain-endpoint-raw",
+                    detail: hold.clone(),
+                }),
+                None => Err(failure),
+            },
         },
     }
+}
+
+/// After the seams: a transaction reverts whole (R419-3) — the class that
+/// carries the struct's item edits (the owning signatures) and every class
+/// that receives or frees a `Box<S>` depend on each other both ways, exactly
+/// as the allocation-return certificates register their receivers.
+pub(crate) fn append_interface_dependencies(table: &mut DecisionTable) {
+    let mut edges = Vec::new();
+    for transaction in table.flexible_tails.structs.values() {
+        let owner = SignatureClassId::of(transaction.owner_class_fn);
+        let members = transaction
+            .owning_returns
+            .iter()
+            .copied()
+            .chain(transaction.owning_params.iter().map(|(f, _)| *f))
+            .chain(table.flexible_tails.plans.keys().map(|(f, _)| *f));
+        for f in members {
+            let other = SignatureClassId::of(f);
+            if other != owner {
+                edges.push((owner, other));
+                edges.push((other, owner));
+            }
+        }
+    }
+    table.seams.interface_dependencies.extend(edges);
+    table.seams.interface_dependencies.sort();
+    table.seams.interface_dependencies.dedup();
 }
 
 fn struct_of_pointer<'tcx>(ty: Ty<'tcx>) -> Option<DefId> {
@@ -418,6 +462,7 @@ pub(crate) fn derive<'tcx>(
     functions: &[LocalDefId],
     constructions: &ConstructionFacts,
     subjects: &[Subject],
+    raw_surface: &dyn Fn(LocalDefId) -> bool,
 ) -> Transactions {
     let mut out = Transactions::default();
     // 1. Candidate structs from the flexible-tail allocation sites.
@@ -947,6 +992,29 @@ pub(crate) fn derive<'tcx>(
             {
                 item_edits.push((ty.span, format!("Box<{}>", snippet(tcx, pointer.ty.span))));
             }
+        }
+        // R419-3 (relay wave-6a/011): a chain is planned WHOLE or not at all.
+        // An owning endpoint that is a fn-pointer-web member or a positive
+        // seed keeps a RAW outer surface (the exposure family's wrapper, which
+        // every in-crate caller binds to): its `Box<S>` return / parameter
+        // would sit behind `*mut S` at every receiver and every free (tulip's
+        // 216 E0308 on census-1). The transaction holds typed and every local
+        // it would have planned stays raw.
+        if let Some(endpoint) = owning_returns
+            .iter()
+            .copied()
+            .chain(owning_params.iter().map(|(f, _)| *f))
+            .find(|f| raw_surface(*f))
+        {
+            let reason = format!(
+                "chain-endpoint-raw:{}",
+                tcx.def_path_str(endpoint.to_def_id())
+            );
+            for key in plans.keys() {
+                out.endpoint_holds.insert(*key, reason.clone());
+            }
+            hold(reason, &mut out);
+            continue;
         }
         // Owning parameters are subjects of their own: their `Box<S>` declaration
         // is the Box decision's, in both layers.
