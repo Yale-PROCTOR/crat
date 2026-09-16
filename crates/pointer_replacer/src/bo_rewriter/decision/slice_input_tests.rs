@@ -48,7 +48,7 @@ fn fixture() -> String {
     )
 }
 
-fn decisions(input: &str) -> Vec<(String, super::Decision)> {
+pub(super) fn decisions(input: &str) -> Vec<(String, super::Decision)> {
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
         crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
@@ -66,7 +66,10 @@ fn decisions(input: &str) -> Vec<(String, super::Decision)> {
     })
     .unwrap()
 }
-fn decision<'a>(table: &'a [(String, super::Decision)], label: &str) -> &'a super::Decision {
+pub(super) fn decision<'a>(
+    table: &'a [(String, super::Decision)],
+    label: &str,
+) -> &'a super::Decision {
     &table
         .iter()
         .find(|(l, _)| l == label)
@@ -74,7 +77,7 @@ fn decision<'a>(table: &'a [(String, super::Decision)], label: &str) -> &'a supe
         .1
 }
 
-fn proofs(input: &str) -> Vec<(String, Result<usize, super::slice_input::Hold>)> {
+pub(super) fn proofs(input: &str) -> Vec<(String, Result<usize, super::slice_input::Hold>)> {
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let table = crate::bo_rewriter::decide_table(tcx).unwrap();
         let functions = tcx
@@ -98,7 +101,7 @@ fn proofs(input: &str) -> Vec<(String, Result<usize, super::slice_input::Hold>)>
     })
     .unwrap()
 }
-fn proof_of<'a>(
+pub(super) fn proof_of<'a>(
     proofs: &'a [(String, Result<usize, super::slice_input::Hold>)],
     label: &str,
 ) -> &'a Result<usize, super::slice_input::Hold> {

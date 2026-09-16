@@ -35,8 +35,12 @@ pub(crate) enum Hold {
     OutsideScope,
     /// The subject reaches a callee parameter that is not a buffer.
     CalleeNotFat,
-    /// A caller passes something other than a buffer at this position.
+    /// A caller passes something other than a binding at this position (a
+    /// computed pointer, an address, a cast).
     CallerNotSupplied,
+    /// A caller's binding at this position is null-tested: its own form is
+    /// the thin Option, which the extent hold does not reach.
+    CallerNullable,
     /// Not every caller is known, or one is a fn-pointer / exported entry.
     IncompleteCallers,
 }
@@ -112,28 +116,121 @@ fn supplied(
         let ArgShape::BareLocal(binding) = arg.shape else {
             return Err(Hold::CallerNotSupplied);
         };
-        let Some(index) = param_index(tcx, call.caller, binding) else {
-            return Err(Hold::CallerNotSupplied);
-        };
-        // A supplier is a parameter with array evidence of its OWN — arithmetic
-        // uses in its function (the form rule decides it a slice there) — or a
-        // forwarder that is itself supplied. The flow-insensitive array verdict
-        // alone is not enough: a forwarder carries it from its callees.
-        if fat.is_array(call.caller, Local::from_usize(index + 1))
-            && facts
-                .raw_only_uses
-                .get(&(call.caller, binding))
-                .is_some_and(|uses| {
+        let uses = facts.raw_only_uses.get(&(call.caller, binding));
+        let has = |op: &str| uses.is_some_and(|uses| uses.iter().any(|(use_op, _)| use_op == op));
+        if let Some(index) = param_index(tcx, call.caller, binding) {
+            // A supplier is a parameter with array evidence of its OWN —
+            // arithmetic uses in its function (the form rule decides it a
+            // slice there) — or a forwarder that is itself supplied. The
+            // flow-insensitive array verdict alone is not enough: a forwarder
+            // carries it from its callees.
+            if fat.is_array(call.caller, Local::from_usize(index + 1))
+                && uses.is_some_and(|uses| {
                     uses.iter().any(|(op, _)| {
                         super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
                     })
                 })
-        {
-            continue;
+            {
+                continue;
+            }
+            let reached = members.len();
+            match supplied(tcx, call.caller, index, facts, fat, members) {
+                Ok(()) => continue,
+                Err(Hold::IncompleteCallers | Hold::CallerNotSupplied | Hold::CallerNullable) => {
+                    members.truncate(reached);
+                }
+                Err(hold) => return Err(hold),
+            }
         }
-        supplied(tcx, call.caller, index, facts, fat, members)?;
+        // **W-C9 — a fresh root supplies the chain.** The caller's own
+        // allocation local (`BrotliSplitBlock::literals`): a binding whose
+        // every definition is a call that takes no pointer — so its value is
+        // a fresh allocation, never a borrow of anything thinner — or the
+        // null literal. Such a binding never takes the thin form (a fresh
+        // pointer has no referent to be a one-element claim on); it is
+        // either owning or stays raw, and the call then takes the
+        // companion-length adapter — the seam every raw caller of a slice
+        // parameter already takes. A null-TESTED root is the thin Option,
+        // which no extent hold reaches, so it refuses; anything else that
+        // is not a fresh root (a parameter whose own callers refused, a
+        // pointer read out of a field) refuses as before.
+        if has("is_null") {
+            return Err(Hold::CallerNullable);
+        }
+        if param_index(tcx, call.caller, binding).is_some()
+            || !fresh_root(tcx, call.caller, binding)
+        {
+            return Err(Hold::CallerNotSupplied);
+        }
     }
     Ok(())
+}
+
+/// A call whose arguments carry no pointer: what it returns was made by the
+/// callee, not borrowed from the caller (`xalloc(n)`, `malloc(n)`). Brotli's
+/// `BrotliAllocate(m, n)` takes its memory manager and is NOT this shape;
+/// it is the allocator contract's (R409-1, wave-6a's consumer).
+fn fresh_call(tcx: TyCtxt<'_>, owner: LocalDefId, e: &rustc_hir::Expr<'_>) -> bool {
+    use rustc_hir::ExprKind;
+    let types = tcx.typeck(owner);
+    match e.kind {
+        ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => fresh_call(tcx, owner, inner),
+        ExprKind::Block(block, _) => match (block.stmts, block.expr) {
+            ([], Some(tail)) => fresh_call(tcx, owner, tail),
+            _ => false,
+        },
+        ExprKind::If(_, then, Some(otherwise)) => {
+            // `if n > 0 { alloc(n) } else { null }`: one arm allocates, the
+            // other may be the null literal; two null arms allocate nothing.
+            let then_fresh = fresh_call(tcx, owner, then);
+            let otherwise_fresh = fresh_call(tcx, owner, otherwise);
+            (then_fresh || otherwise_fresh)
+                && (then_fresh || super::emitability::is_zero_literal(then))
+                && (otherwise_fresh || super::emitability::is_zero_literal(otherwise))
+        }
+        ExprKind::Call(_, args) => args.iter().all(|arg| !types.expr_ty(arg).is_any_ptr()),
+        _ => false,
+    }
+}
+
+fn fresh_root(tcx: TyCtxt<'_>, owner: LocalDefId, binding: rustc_hir::HirId) -> bool {
+    use rustc_hir::{
+        ExprKind, Node,
+        def::Res,
+        intravisit::{self, Visitor},
+    };
+    let Node::LetStmt(stmt) = tcx.parent_hir_node(binding) else { return false };
+    let Some(init) = stmt.init else { return false };
+    if !fresh_call(tcx, owner, init) {
+        return false;
+    }
+    struct Assigned<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        owner: LocalDefId,
+        binding: rustc_hir::HirId,
+        refused: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Assigned<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if let ExprKind::Assign(lhs, rhs, _) = e.kind
+                && let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = lhs.kind
+                && path.res == Res::Local(self.binding)
+                && !(fresh_call(self.tcx, self.owner, rhs)
+                    || super::emitability::is_zero_literal(rhs))
+            {
+                self.refused = true;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut assigned = Assigned {
+        tcx,
+        owner,
+        binding,
+        refused: false,
+    };
+    assigned.visit_body(tcx.hir_body_owned_by(owner));
+    !assigned.refused
 }
 
 pub(crate) fn prove(
@@ -180,6 +277,7 @@ impl Hold {
             Self::OutsideScope => "outside-scope",
             Self::CalleeNotFat => "callee-not-fat",
             Self::CallerNotSupplied => "caller-not-supplied",
+            Self::CallerNullable => "caller-nullable",
             Self::IncompleteCallers => "incomplete-callers",
         }
     }

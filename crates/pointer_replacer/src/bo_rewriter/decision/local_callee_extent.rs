@@ -86,6 +86,12 @@ pub(crate) enum AccessReason {
     VoidPointee { cast_to: String },
     /// The body offsets or indexes the parameter.
     PointerArithmetic { op: String },
+    /// The parameter accesses nothing itself and hands the pointer, bare, to
+    /// a callee parameter that does (W-C9, fix-2 one call deeper: a thin
+    /// caller bridged into the forwarder reads wide through a one-element
+    /// claim exactly as it would at the accessing callee). Carries that
+    /// parameter's own detail.
+    Forwarded { into: String },
 }
 
 impl AccessReason {
@@ -93,6 +99,7 @@ impl AccessReason {
         match self {
             Self::VoidPointee { cast_to } => format!("void-pointee-cast-to:{cast_to}"),
             Self::PointerArithmetic { op } => format!("pointer-arithmetic:{op}"),
+            Self::Forwarded { into } => format!("forwarded-into:{into}"),
         }
     }
 }
@@ -144,6 +151,8 @@ fn parameter_access(
     param: &Subject,
     facts: &EmitabilityFacts,
     slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
+    parameters: &FxHashMap<(LocalDefId, usize), &Subject>,
+    visited: &mut Vec<(LocalDefId, HirId)>,
 ) -> Option<LocalCalleeAccess> {
     let Node::Pat(pattern) = tcx.hir_node(param.hir_id) else {
         return None;
@@ -155,7 +164,9 @@ fn parameter_access(
     // is that every one of those becomes a CHECKED index on a form carrying its
     // own extent. What stays open for them is how the slice was CONSTRUCTED,
     // which is the `FALLBACK_SLICE_EXTENT` waiver, receipted per site and
-    // ruled a census item rather than a hold.
+    // ruled a census item rather than a hold. (W-C9 report 017 sizes the
+    // THIN-caller side of this exclusion — `from_ref` into a wide reader —
+    // for the seat; it is not moved here.)
     if slice_uses
         .get(&(param.fn_did, param.hir_id))
         .is_some_and(|uses| uses.unsupported.is_none() && !uses.rewrites.is_empty())
@@ -164,24 +175,44 @@ fn parameter_access(
     }
     let ty = tcx.typeck(param.fn_did).pat_ty(pattern);
     let key = (param.fn_did, param.hir_id);
-    // A `c_void` parameter is held on its own account by R271-1; what puts the
-    // CALLER in this class is the cast that follows, which is the evidence that
-    // the opaque address is accessed at some real width. A `c_void` parameter
-    // that is only passed on or compared accesses nothing and is not in scope.
     let reason = if has_void_pointee(tcx, ty, VOID_POINTEE_DEPTH) {
+        // A `c_void` parameter is held on its own account by R271-1; what puts
+        // the CALLER in this class is the cast that follows, which is the
+        // evidence that the opaque address is accessed at some real width. A
+        // `c_void` parameter that is only passed on or compared accesses
+        // nothing and is not in scope.
         let cast = facts.address_observations.iter().find(|fact| {
             fact.op == "ptr-cast" && fact.operands.iter().any(|operand| operand.node == key)
         })?;
         AccessReason::VoidPointee {
             cast_to: cast.target_type.clone(),
         }
-    } else {
-        let (op, _) = facts
-            .raw_only_uses
-            .get(&key)?
-            .iter()
-            .find(|(op, _)| EXTENT_LEAVING_OPS.contains(&op.as_str()))?;
+    } else if let Some((op, _)) = facts.raw_only_uses.get(&key).and_then(|uses| {
+        uses.iter()
+            .find(|(op, _)| EXTENT_LEAVING_OPS.contains(&op.as_str()))
+    }) {
         AccessReason::PointerArithmetic { op: op.clone() }
+    } else {
+        // No access of its own: the first callee parameter it is handed to,
+        // bare, that accesses wide (a cycle accesses nothing).
+        if visited.contains(&key) {
+            return None;
+        }
+        visited.push(key);
+        let into = facts
+            .call_args
+            .iter()
+            .flat_map(|(callee, sites)| sites.iter().map(move |site| (*callee, site)))
+            .filter(|(_, site)| site.caller == param.fn_did)
+            .flat_map(|(callee, site)| site.args.iter().map(move |arg| (callee, arg)))
+            .filter(|(_, arg)| matches!(arg.shape, ArgShape::BareLocal(binding) if binding == param.hir_id))
+            .find_map(|(callee, arg)| {
+                let target = parameters.get(&(callee, arg.index))?;
+                parameter_access(tcx, target, facts, slice_uses, parameters, visited)
+            })?;
+        AccessReason::Forwarded {
+            into: into.detail(),
+        }
     };
     let access = match ty.kind() {
         TyKind::RawPtr(_, Mutability::Mut) | TyKind::Ref(_, _, Mutability::Mut) => "write",
@@ -231,9 +262,9 @@ pub(crate) fn collect(
                 let Some(parameter) = parameters.get(&(*callee, arg.index)) else {
                     continue;
                 };
-                let access = classified
-                    .entry((*callee, arg.index))
-                    .or_insert_with(|| parameter_access(tcx, parameter, facts, slice_uses));
+                let access = classified.entry((*callee, arg.index)).or_insert_with(|| {
+                    parameter_access(tcx, parameter, facts, slice_uses, &parameters, &mut vec![])
+                });
                 if let Some(access) = access {
                     out.entry((site.caller, root))
                         .or_insert_with(|| access.clone());

@@ -94,6 +94,8 @@ pub(crate) mod slice_carrier;
 pub(crate) mod slice_construction_values;
 pub(crate) mod slice_input;
 #[cfg(test)]
+mod slice_input_root_tests;
+#[cfg(test)]
 mod slice_input_tests;
 pub(crate) mod slice_use;
 pub(crate) mod surface_argument;
