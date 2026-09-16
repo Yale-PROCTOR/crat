@@ -39,9 +39,11 @@
 //! callee's body and to libc positions the contract table calls `NoRetain`
 //! + `BorrowView` (`memset`, `memcpy`, ..) — the optional owner's lend is
 //! the R130 void bridge `x.as_deref_mut().map_or(null_mut(), |s|
-//! s.as_mut_ptr())`. A `return x` of the owner holds
-//! (`contract-allocation:returned`: the return interface is A1's, and a
-//! contract allocation must not be closed by a receiver's drop).
+//! s.as_mut_ptr())`; a lend to a LOCAL callee whose formal converts is the
+//! seam's owner-view glue (`&*x` at a slice formal, R422-5). A `return x`
+//! of the owner holds (`contract-allocation:returned`: the return interface
+//! is A1's, and a contract allocation must not be closed by a receiver's
+//! drop).
 //!
 //! Receipt `allocator-contract` per site (the receipts table).
 
@@ -91,11 +93,10 @@ const IMPLICIT_CLOSE: &str = "contract-allocation:implicit-close";
 const OVERWRITE: &str = "contract-allocation:overwrite";
 const RETURNED: &str = "contract-allocation:returned";
 const COUNT: &str = "contract-allocation:count";
-const LEND_GLUE: &str = "contract-allocation:lend-glue";
 const USE: &str = "contract-allocation:use";
 
 fn typed_key(hold: &str) -> &'static str {
-    [IMPLICIT_CLOSE, OVERWRITE, RETURNED, COUNT, LEND_GLUE, USE]
+    [IMPLICIT_CLOSE, OVERWRITE, RETURNED, COUNT, USE]
         .into_iter()
         .find(|key| hold.starts_with(key))
         .unwrap_or(USE)
@@ -555,25 +556,6 @@ pub(crate) fn derive<'tcx>(
             };
             if let Some(span) = uses.returns.first() {
                 hold(&mut out, format!("{RETURNED}:{}", snippet(*span)));
-                continue;
-            }
-            // A SLICE owner lent to a local callee: the seam's interface glue
-            // reads a Box argument as raw (`form_of(Box) = Raw`) and wraps it
-            // `from_raw_parts(x, n)` at a slice-converted formal — E0308 for
-            // a `Box<[T]>` — and `&*x` at a thin formal is `&[T]`, not `&T`;
-            // the owner-view glue (`&mut *x` / `x.as_deref_mut().unwrap()`)
-            // is a seam arm the vocabulary does not have (STOP, report 008).
-            // A sized owner rides A1's `&*x` at a thin formal.
-            if allocation.shape == BoxShape::Slice
-                && let Some((did, _, span)) = uses
-                    .lends
-                    .iter()
-                    .find(|(did, _, _)| !super::return_certificate::foreign_fn(tcx, *did))
-            {
-                hold(
-                    &mut out,
-                    format!("{LEND_GLUE}:{}:{}", tcx.item_name(*did), snippet(*span)),
-                );
                 continue;
             }
             // The sinks: the block's own free (exactly one, after the `let`,

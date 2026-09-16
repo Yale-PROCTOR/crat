@@ -860,11 +860,13 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     uses.lends.push((did, index, parent.span));
                 }
                 // A non-optional owner is bridged at the seam by the ordinary
-                // raw-boundary glue; an optional one has no such glue, so the
-                // lend is spelled here (the R130 void bridge of report 003):
-                // the view's raw pointer, or null when the owner is `None`,
-                // under the argument's own casts.
-                if self.optional {
+                // raw-boundary glue, and a LOCAL callee's converted formal by
+                // the seam's owner-view glue (R422-5) whatever the owner's
+                // optionality. An optional owner at a FOREIGN position has no
+                // glue, so the lend is spelled here (the R130 void bridge of
+                // report 003): the view's raw pointer, or null when the owner
+                // is `None`, under the argument's own casts.
+                if self.optional && foreign_fn(self.tcx, did) {
                     let casts = if child == e.hir_id {
                         String::new()
                     } else {

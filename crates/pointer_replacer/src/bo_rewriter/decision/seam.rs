@@ -3240,6 +3240,70 @@ fn shared_candidate(
     }))
 }
 
+/// wave-6a (relay wave-6a/012 §3, R422-5): **the owner-view glue** — an
+/// argument whose root the ladder decided `Box` (a `Box<[T]>` /
+/// `Option<Box<..>>` owner: an allocation-return receiver, a contract
+/// allocation, a chain member) at a CONVERTED formal. `form_of(Box)` is
+/// `Raw`, so the type-level matrix would write `from_raw_parts(x, n)` at a
+/// slice formal (E0308 for a `Box<[T]>`) or `&*x` at a thin one (`&[T]`, not
+/// `&T`). The owner's own view is the argument instead, spelled in the seam
+/// algebra the AST layer renders: `&mut *x` / `&*x` at a slice formal (a
+/// `Box<[T]>` reborrow IS `&mut [T]`); `&mut x[0]` / `&x[0]` at a thin one;
+/// an optional owner through `x.as_mut().unwrap()` first (`&*x.as_mut()
+/// .unwrap()` is `&Box<[T]>`, which deref-coerces to `&[T]` at the call);
+/// `Some(..)` at an optional formal from a non-optional owner. An optional
+/// owner at an optional formal has no panic-free spelling in the algebra
+/// (`as_deref`) and declines. No raw boundary is crossed, so no retention
+/// tier. A non-optional SIZED owner keeps the matrix's `&*x` (A1's receivers).
+/// Keyed on the argument's decision, not a new `Form` variant.
+fn owner_view_candidate(
+    decision: Option<&Decision>,
+    expected: Form,
+    text: &str,
+) -> Option<Candidate> {
+    let Some(Decision::Box(plan)) = decision else { return None };
+    let slice = plan.shape == super::box_facts::BoxShape::Slice;
+    if !slice && !plan.optional {
+        return None;
+    }
+    let (mutable, core, wrapped) = match expected {
+        Form::Slice { mutable } if slice => (mutable, GlueCore::Reborrow, false),
+        Form::Ref { mutable } if slice => (mutable, GlueCore::Index0, false),
+        Form::Ref { mutable } => (mutable, GlueCore::Reborrow, false),
+        Form::Opt {
+            mutable,
+            slice: true,
+        } if slice && !plan.optional => (mutable, GlueCore::Reborrow, true),
+        Form::Opt {
+            mutable,
+            slice: false,
+        } if slice && !plan.optional => (mutable, GlueCore::Index0, true),
+        Form::Slice { .. }
+        | Form::Opt { .. }
+        | Form::Raw
+        | Form::NestedSlice { .. }
+        | Form::Cursor { .. } => return None,
+    };
+    let mut spec = GlueSpec::core(core, mutable);
+    if plan.optional {
+        // `.as_mut().unwrap()`: a shared `.unwrap()` would MOVE the owner
+        // out of its `Option`.
+        spec = spec.with_unwrap(true);
+    }
+    if wrapped {
+        spec = spec.wrapped();
+    }
+    let replacement = spec.render(text)?;
+    Some(Candidate {
+        spec,
+        family: SeamFamily::Safe,
+        replacement,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_candidate(
     expected: Form,
@@ -4197,6 +4261,21 @@ pub(crate) fn synthesize_with_raw_boundary(
                     ));
                     continue;
                 };
+                // wave-6a (R422-5): a Box-decided argument the owner-view glue
+                // renders IS the expected form at the call (`&*x`,
+                // `x.as_deref().unwrap()`, ..): the position is a glue-arm
+                // seam of the callee's, not a C-arm crossing.
+                let found = if arg
+                    .shape
+                    .place_root()
+                    .and_then(|root| decision_of.get(&(site.caller, root)).copied())
+                    .and_then(|decision| owner_view_candidate(Some(decision), expected, "x"))
+                    .is_some()
+                {
+                    expected
+                } else {
+                    found
+                };
                 positions.push(Pos {
                     span: arg.span,
                     index: arg.index,
@@ -4359,12 +4438,18 @@ pub(crate) fn synthesize_with_raw_boundary(
                 } else {
                     (None, None)
                 };
+                let owner_view = pos
+                    .root
+                    .and_then(|root| decision_of.get(&(site.caller, root)).copied())
+                    .and_then(|decision| owner_view_candidate(Some(decision), pos.expected, text));
                 candidates.push(
                     if let Some(address) = shared_pairs
                         .at(*callee, site)
                         .and_then(|call| call.addresses.get(&pos.index))
                     {
                         shared_candidate(address, text)
+                    } else if let Some(candidate) = owner_view {
+                        Ok(Some(candidate))
                     } else {
                         build_candidate(
                             pos.expected,

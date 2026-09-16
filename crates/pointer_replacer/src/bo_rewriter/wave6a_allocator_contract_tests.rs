@@ -187,16 +187,14 @@ pub unsafe extern \"C\" fn plain(mut m: *mut MemoryManager, n: usize, mut split:
     assert!(text.contains("*split=syms[(0)asusize];"), "{}", out.source);
 }
 
-/// The two corpus shapes this build holds, each a typed hold and a named
-/// STOP of report 008: (i) `memset(x, 0, n)` — the pinned libc table has no
-/// `memset` / `memcpy` rows, so the lend is unproven; (ii) a SLICE owner lent
-/// to a local reader — the seam's interface glue reads a Box argument as raw
-/// (`from_raw_parts(x, n)` at the slice-converted formal, E0308), so the
-/// owner-view glue is owed before the row can deliver. A typed hold holds
-/// its class (the finalizer's `blocked-subject`), so each shape sits in its
-/// own function; the third function's owner delivers.
+/// (i) `memset(x, 0, n)`: the pinned libc table has no `memset` row
+/// (wave-4 adds `memcpy` / `memmove`, relay 012 §2), so the lend is unproven
+/// — a typed hold, its class held. (ii) A SLICE owner lent to a local reader
+/// whose formal converts to `&[u32]` delivers through the seam's owner-view
+/// glue (R422-5): `ReindexSymbols(&*lent, n)` — no `from_raw_parts` over the
+/// Box, no fabricated extent at the call. (iii) The plain owner delivers.
 #[test]
-fn w6a_ac_memset_and_slice_lends_are_typed_holds() {
+fn w6a_ac_memset_holds_and_the_slice_lend_takes_the_owner_view() {
     let src = format!(
         "{PRELUDE}\
 pub unsafe extern \"C\" fn zeroing(mut m: *mut MemoryManager, n: usize) {{\n\
@@ -227,9 +225,18 @@ pub unsafe extern \"C\" fn keeping(mut m: *mut MemoryManager, n: usize, mut spli
         ),
         "{receipts}"
     );
+    assert!(receipts.contains("lending::lent\tadmitted\t"), "{receipts}");
     assert!(
-        receipts.contains("lending::lent\theld\tcontract-allocation:lend-glue:ReindexSymbols:"),
-        "{receipts}"
+        text.contains("*split=ReindexSymbols(&*lent,n);"),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert!(
+        text.contains("letmutlent:Box<[u32]>=Box::from_raw("),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
     );
     assert!(receipts.contains("keeping::kept\tadmitted\t"), "{receipts}");
     assert!(
@@ -256,8 +263,47 @@ pub unsafe extern \"C\" fn keeping(mut m: *mut MemoryManager, n: usize, mut spli
         out.degradations
     );
     assert_eq!(
-        reason_of(&out.degradations, "lending::lent").as_deref(),
-        Some("contract-allocation:lend-glue"),
+        reason_of(&out.degradations, "lending::lent"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+}
+
+/// An OPTIONAL owner (`Option<Box<[u32]>>`) lent to the local reader: the
+/// owner view unwraps first — `&*syms.as_mut().unwrap()` is `&Box<[u32]>`,
+/// which deref-coerces to the `&[u32]` formal at the call (R422-5). A
+/// shared `.unwrap()` would move the owner out of its `Option`.
+#[test]
+fn w6a_ac_optional_owner_lent_takes_the_owner_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 7 as u32;\n\
+    *split = ReindexSymbols(syms, n);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("ac-optional-lend", &src);
+    let text = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        text.contains("*split=ReindexSymbols(&*syms.as_mut().unwrap(),n);"),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert!(
+        text.contains("letmutsyms:Option<Box<[u32]>>="),
+        "{}",
+        out.source
+    );
+    assert!(text.contains("syms=None;"), "{}", out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "optional::syms"),
+        None,
         "{:#?}",
         out.degradations
     );
