@@ -465,6 +465,11 @@ struct Uses<'a, 'tcx> {
     hirs: Vec<hir::HirId>,
     hold: Option<CursorHold>,
     peer_bases: Vec<hir::HirId>,
+    /// Peer cursor candidates this cursor's admission leans on: a use of this
+    /// subject left to the peer's own edit (its initialiser or re-point from
+    /// this cursor, this cursor re-pointed from it). Both are cursors of this
+    /// family or neither is emitted.
+    peer_cursors: Vec<hir::HirId>,
 }
 impl Uses<'_, '_> {
     /// A derived pointer leaving the function through its raw return: the tail
@@ -546,11 +551,11 @@ impl Uses<'_, '_> {
     /// The bare subject, possibly under an offset chain, is the right-hand side
     /// of an assignment into a shared peer cursor of this family; the peer owns
     /// that edit (`data = start`, `end = data.offset(k)`).
-    fn assigned_to_shared_peer(&self, e: &hir::Expr<'_>) -> bool {
+    fn assigned_to_shared_peer(&self, e: &hir::Expr<'_>) -> Option<hir::HirId> {
         let mut node = e.hir_id;
         loop {
             let hir::Node::Expr(parent) = self.ctx.tcx.parent_hir_node(node) else {
-                return false;
+                return None;
             };
             match parent.kind {
                 hir::ExprKind::MethodCall(_, receiver, [_], _)
@@ -565,7 +570,7 @@ impl Uses<'_, '_> {
                     node = parent.hir_id;
                 }
                 hir::ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == node => {
-                    return local(lhs).is_some_and(|peer| {
+                    return local(lhs).filter(|&peer| {
                         peer != self.subject.hir_id
                             && self.entries.iter().any(|(other, decision)| {
                                 other.fn_did == self.subject.fn_did
@@ -575,7 +580,7 @@ impl Uses<'_, '_> {
                             })
                     });
                 }
-                _ => return false,
+                _ => return None,
             }
         }
     }
@@ -771,28 +776,29 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         {
             let parent = self.ctx.tcx.parent_hir_node(e.hir_id);
             let peer_owned = match parent {
-                hir::Node::LetStmt(decl) => {
+                hir::Node::LetStmt(decl) => Some(decl.pat.hir_id).filter(|&peer| {
                     decl.init.is_some_and(|init| init.hir_id == e.hir_id)
                         && self.entries.iter().any(|(other, decision)| {
                             other.fn_did == self.subject.fn_did
-                                && other.hir_id == decl.pat.hir_id
+                                && other.hir_id == peer
                                 && candidate_shape(self.ctx, other, decision)
                         })
-                }
+                }),
                 hir::Node::Expr(parent) => match parent.kind {
                     hir::ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == e.hir_id => local(lhs)
-                        .is_some_and(|peer| {
+                        .filter(|&peer| {
                             self.entries.iter().any(|(other, decision)| {
                                 other.fn_did == self.subject.fn_did
                                     && other.hir_id == peer
                                     && candidate_shape(self.ctx, other, decision)
                             })
                         }),
-                    _ => false,
+                    _ => None,
                 },
-                _ => false,
+                _ => None,
             };
-            if peer_owned {
+            if let Some(peer) = peer_owned {
+                self.peer_cursors.push(peer);
                 return;
             }
             // Otherwise the idiom's chain is this cursor's derived address where
@@ -854,7 +860,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         // The derived binding owns its constructor edit; the parent lends its
         // full base only through the wrapper's checked Rust reborrow API.
         if self.index(e).is_ok()
-            && self.entries.iter().any(|(child, child_decision)| {
+            && let Some((child, _)) = self.entries.iter().find(|(child, child_decision)| {
                 child.fn_did == self.subject.fn_did
                     && child.hir_id != self.subject.hir_id
                     && candidate_shape(self.ctx, child, child_decision)
@@ -866,6 +872,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                         == Some(&e.hir_id)
             })
         {
+            self.peer_cursors.push(child.hir_id);
             return;
         }
         if let hir::ExprKind::Assign(lhs, rhs, _) = e.kind
@@ -886,6 +893,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                         && candidate_shape(self.ctx, other, decision)
                 })
             {
+                self.peer_cursors.push(peer);
                 if local(rhs) != Some(peer)
                     && let Ok(d) = self.peer_index(rhs, peer)
                 {
@@ -1118,9 +1126,16 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         if local(e) == Some(self.subject.hir_id) {
             // The bare subject as the right-hand side of an assignment into a
             // shared peer cursor (`data = start`) is the peer's edit or no edit.
-            let assigned_to_peer = !self.subject.mutable && self.assigned_to_shared_peer(e);
-            if !assigned_to_peer {
-                self.hold.get_or_insert(CursorHold::UseUnbuilt);
+            let assigned_to_peer = if self.subject.mutable {
+                None
+            } else {
+                self.assigned_to_shared_peer(e)
+            };
+            match assigned_to_peer {
+                Some(peer) => self.peer_cursors.push(peer),
+                None => {
+                    self.hold.get_or_insert(CursorHold::UseUnbuilt);
+                }
             }
         }
         if self.exclusive_base && self.base == local(e) && self.base.is_some() {
@@ -1462,6 +1477,7 @@ fn build(
         hirs: vec![],
         hold: None,
         peer_bases: vec![],
+        peer_cursors: vec![],
     };
     v.visit_body(ctx.tcx.hir_body_owned_by(subject.fn_did));
     if let Some(hold) = v.hold {
@@ -1495,6 +1511,7 @@ fn build(
         composed_edit_spans: b.composed,
         explicit_declaration,
         peer_bases: v.peer_bases,
+        peer_cursors: v.peer_cursors,
     })
 }
 

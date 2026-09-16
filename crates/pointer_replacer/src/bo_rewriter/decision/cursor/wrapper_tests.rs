@@ -1126,3 +1126,90 @@ pub unsafe fn fragment(input: *const u8, n: usize) -> i32 {
         ),
     );
 }
+
+#[test]
+fn slicecursor_parent_withdraws_with_the_copies_it_lent() {
+    // brotli `CreateCommands` (batch-8 census-1, 42 cursor errors): the
+    // parameter `input` was admitted with its copies (`let mut ip = input;`,
+    // `next_emit = input`) left to the copies' own cursor candidacy; the
+    // copies then withdrew (raw callee positions), `input` stayed a cursor,
+    // and every copy became a `SliceCursor` by inference with raw uses. A use
+    // left to a peer cursor stands only while that peer is a cursor too.
+    let input = r#"
+pub unsafe fn is_match(p1: *const u8, p2: *const u8) -> i32 { (*p1.offset(0) == *p2.offset(0) && *p1.offset(4) == *p2.offset(4)) as i32 }
+pub unsafe fn match_len(s1: *const u8, s2: *const u8, limit: usize) -> usize { let mut m = 0usize; while m < limit && *s1.offset(m as isize) == *s2.offset(m as isize) { m += 1; } m }
+unsafe extern "C" { fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8; }
+pub unsafe fn create_commands(input: *const u8, block_size: usize, base_ip: *const u8, table: *mut i32, literals: *mut *mut u8) -> i32 {
+    let mut ip = input;
+    let mut ip_end = input.offset(block_size as isize);
+    let mut next_emit = input;
+    let mut last_distance = -1i32;
+    let mut acc = 0;
+    if block_size >= 16 {
+        let mut ip_limit = input.offset((block_size - 16) as isize);
+        ip = ip.offset(1);
+        loop {
+            let mut next_ip = ip;
+            let mut candidate = 0 as *const u8;
+            let mut skip = 32u32;
+            let mut stop = false;
+            loop {
+                let hash = (*ip as usize) & 7;
+                let fresh = skip; skip += 1;
+                ip = next_ip;
+                next_ip = ip.offset((fresh >> 5) as isize);
+                if next_ip > ip_limit { stop = true; break; }
+                candidate = ip.offset(-(last_distance as isize));
+                if is_match(ip, candidate) != 0 && candidate < ip {
+                    *table.offset(hash as isize) = ip.offset_from(base_ip) as i32;
+                } else {
+                    candidate = base_ip.offset(*table.offset(hash as isize) as isize);
+                    *table.offset(hash as isize) = ip.offset_from(base_ip) as i32;
+                    if is_match(ip, candidate) == 0 { continue; }
+                }
+                if !(ip.offset_from(candidate) > 1000) { break; }
+            }
+            if stop { break; }
+            let base = ip;
+            let matched = 5 + match_len(candidate.offset(5), ip.offset(5), (ip_end.offset_from(ip) as usize) - 5);
+            let distance = base.offset_from(candidate) as i32;
+            let insert = base.offset_from(next_emit) as usize;
+            ip = ip.offset(matched as isize);
+            memcpy(*literals, next_emit, insert);
+            *literals = (*literals).offset(insert as isize);
+            acc += distance;
+            last_distance = distance;
+            next_emit = ip;
+            if ip >= ip_limit { break; }
+        }
+    }
+    if next_emit < ip_end {
+        let insert = ip_end.offset_from(next_emit) as usize;
+        memcpy(*literals, next_emit, insert);
+        *literals = (*literals).offset(insert as isize);
+        acc += insert as i32;
+    }
+    acc
+}
+"#;
+    let decisions = cursor_decisions(input);
+    let cursor = |label: &str| decisions.iter().any(|(l, c)| l == label && *c);
+    for (parent, copy) in [
+        ("create_commands::input", "create_commands::ip"),
+        ("create_commands::input", "create_commands::next_emit"),
+        ("create_commands::base_ip", "create_commands::candidate"),
+    ] {
+        assert!(
+            !cursor(parent) || cursor(copy),
+            "{parent} is a cursor while its copy {copy} is raw: {decisions:?}"
+        );
+    }
+    let source = emitted(input);
+    save_fixture("parent-withdraws-with-copies", input, &source);
+    compile(
+        &source,
+        Some(
+            "fn main() { let b = [1u8, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 9, 9, 9, 9, 9, 9, 9, 9]; let mut t = [0i32; 8]; let mut lit = [0u8; 64]; let mut lp = lit.as_mut_ptr(); let r = unsafe { create_commands(b.as_ptr(), 32, b.as_ptr(), t.as_mut_ptr(), &mut lp) }; assert_eq!(r, 11); }",
+        ),
+    );
+}

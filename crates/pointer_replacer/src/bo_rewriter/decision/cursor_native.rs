@@ -48,6 +48,10 @@ pub(crate) struct CursorPlan {
     /// `p = Some(q.offset(k))`): a parent cursor or another family's delivered
     /// local. The cursor stands only while every one of them is admitted.
     pub(crate) peer_bases: Vec<rustc_hir::HirId>,
+    /// Peer cursor candidates a use of this cursor was left to (the peer's
+    /// initialiser or re-point owns the edit): both are cursors of this family
+    /// or neither is emitted.
+    pub(crate) peer_cursors: Vec<rustc_hir::HirId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,6 +253,7 @@ pub(crate) fn promote(
                     plan.parent_cursor
                         .iter()
                         .chain(&plan.peer_bases)
+                        .chain(&plan.peer_cursors)
                         .any(|&base| {
                             // A base that is no subject at all (an original
                             // safe binding) has nothing to withdraw.
@@ -262,7 +267,10 @@ pub(crate) fn promote(
                                         // that family's decision stands.
                                         Decision::Slice { .. }
                                         | Decision::NestedSlice { .. }
-                                        | Decision::Opt { .. } => plan.peer_bases.contains(&base),
+                                        | Decision::Opt { .. } => {
+                                            plan.peer_bases.contains(&base)
+                                                && !plan.peer_cursors.contains(&base)
+                                        }
                                         Decision::Ref { .. }
                                         | Decision::InferredRef { .. }
                                         | Decision::Box(_)
