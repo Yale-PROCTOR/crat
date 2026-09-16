@@ -1688,3 +1688,60 @@ fn w6v_counted_position_at_a_pair_owned_call_holds_at_plan_time() {
         "the single view beside the raw `out` routes to the pristine twin: {source}"
     );
 }
+
+/// A counted `dst` view beside a raw pointer sibling (`ctx`, an untyped `void *`
+/// the callee never uses) at a raw caller that passes its parameter `p` for the
+/// view and its OWN local `t` (`&mut t as *mut _`) for the sibling: the local's
+/// storage is allocated in this frame, so the never-reassigned parameter's
+/// pointee cannot alias it — the roots are disjoint and the single view is
+/// formed (no twin). binn's `copy_int_value(psource, &mut out as *mut _, ..)` is
+/// this proof.
+const FILL_INTO_LOCAL: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, unused_variables)]
+unsafe fn fill_ctx(mut dst: *mut core::ffi::c_void, mut value: i32, mut num: usize, mut ctx: *mut core::ffi::c_void) {
+    let mut i: usize = 0;
+    i = 0;
+    while i < num {
+        *(dst as *mut i8).offset(i as isize) = value as i8;
+        i = i.wrapping_add(1);
+    }
+}
+pub unsafe fn stash(mut p: *mut core::ffi::c_void) -> i64 {
+    let mut t: i32 = 9;
+    fill_ctx(p, 7, 4, &mut t as *mut i32 as *mut core::ffi::c_void);
+    *(p as *mut i8) as i64 + *(p as *mut i8).offset(3) as i64 + t as i64
+}
+"#;
+
+#[test]
+fn w6v_view_beside_the_callers_own_local_storage_is_disjoint() {
+    let rows = super::emit_tests::decisions_of(FILL_INTO_LOCAL);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "dst" && *p && r == "<emitted>"),
+        "the counted destination delivers: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "ctx" && *p && r != "<emitted>"),
+        "the untyped context stays raw: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(FILL_INTO_LOCAL).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains(
+            "fnfill_ctx(mutdst:&mut[core::mem::MaybeUninit<u8>],mutvalue:i32,mutnum:usize,mutctx:*mutcore::ffi::c_void)"
+        ),
+        "the view beside the raw context: {source}"
+    );
+    assert!(
+        !source.contains("__crat_raw_")
+            && c.contains("(|__crat_cv_0,__crat_cv_1,__crat_cv_2,__crat_cv_3|"),
+        "the raw `ctx` (this frame's own `t`) cannot alias `p`'s pointee: the view is formed, no twin: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let main = "fn main() { unsafe { let mut b = [0i8; 4]; println!(\"{}\", stash(b.as_mut_ptr().cast())); } }";
+    let original = run_binary(&format!("{FILL_INTO_LOCAL}\n{main}"));
+    assert_eq!(original, b"23\n".to_vec());
+    assert_eq!(run_binary(&format!("{source}\n{main}")), original);
+}

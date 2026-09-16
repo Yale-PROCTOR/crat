@@ -841,6 +841,7 @@ pub(crate) fn count_argument<'tcx>(
                 other.index != *only
                     && other.index != c.count_index
                     && !bridged.contains(&other.index)
+                    && !parameter_converts(table, callee, other.index)
                     && args.get(other.index).is_none_or(|right| {
                         let ty = typeck.expr_ty_adjusted(right);
                         (ty.is_raw_ptr() || ty.is_ref())
@@ -897,6 +898,26 @@ pub(crate) fn count_argument<'tcx>(
         root_rule(tcx, table, site.caller, argument, &form)?;
     }
     Ok((placeholder(c.count_index), route))
+}
+
+/// Whether the callee's parameter at `index` is emitted in a safe form (a
+/// converted sibling is the seam's own overlap question, not a raw access).
+fn parameter_converts(table: &super::DecisionTable, callee: LocalDefId, index: usize) -> bool {
+    use super::Decision;
+    table.entries.iter().any(|(s, d)| {
+        s.fn_did == callee
+            && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == index)
+            && match d {
+                Decision::Degraded(_) => false,
+                Decision::Cursor { .. }
+                | Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_) => true,
+            }
+    })
 }
 
 /// The raw twin is the callee's pristine body under a new name: it calls every
@@ -984,19 +1005,39 @@ fn disjoint_roots<'tcx>(
     left: &'tcx Expr<'tcx>,
     right: &'tcx Expr<'tcx>,
 ) -> bool {
-    let (Root::Value(a), Root::Value(b)) = (value_root(left), value_root(right)) else {
-        return false;
-    };
-    if a == b {
-        return false;
-    }
     let facts = LocalFacts::collect(tcx, caller);
-    matches!(
-        (facts.class(tcx, caller, a), facts.class(tcx, caller, b)),
-        (RootClass::Fresh, RootClass::Fresh)
-            | (RootClass::Fresh, RootClass::Parameter)
-            | (RootClass::Parameter, RootClass::Fresh)
-    )
+    let is_param = |id: HirId| {
+        tcx.hir_body_owned_by(caller)
+            .params
+            .iter()
+            .any(|p| matches!(p.pat.kind, PatKind::Binding(_, pid, _, _) if pid == id))
+    };
+    match (value_root(left), value_root(right)) {
+        (Root::Value(a), Root::Value(b)) => {
+            a != b
+                && matches!(
+                    (facts.class(tcx, caller, a), facts.class(tcx, caller, b)),
+                    (RootClass::Fresh, RootClass::Fresh)
+                        | (RootClass::Fresh, RootClass::Parameter)
+                        | (RootClass::Parameter, RootClass::Fresh)
+                )
+        }
+        // A local's OWN storage (`&mut out as *mut _`) is allocated in this
+        // frame: a never-reassigned parameter's pointee and a fresh
+        // allocation both predate it.
+        (Root::Storage(s), Root::Value(v)) | (Root::Value(v), Root::Storage(s)) => {
+            s != v
+                && !is_param(s)
+                && !facts.closures
+                && matches!(
+                    facts.class(tcx, caller, v),
+                    RootClass::Fresh | RootClass::Parameter
+                )
+        }
+        // Two distinct locals' own storage.
+        (Root::Storage(a), Root::Storage(b)) => a != b && !facts.closures,
+        _ => false,
+    }
 }
 
 /// Per-local facts of one body: every value written to the local (its `let`
