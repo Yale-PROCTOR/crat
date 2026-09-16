@@ -383,9 +383,69 @@ fn same_view_operand(expression: &ast::Expr, original: &ast::Expr) -> bool {
         == expression_key(view_operand(peel_raw_pointer_casts(original)))
 }
 
+/// **R430-2 — the place key of a borrow, with a delivered `Option`'s access
+/// peeled.** A protected source delivered as `Option<&mut T>` spells the same
+/// projected referent as `&mut (**value.as_mut().unwrap()).f` where the
+/// original wrote `&mut (*value).f`: `*<opt>.as_mut().unwrap()` IS `<opt>`.
+/// Only that exact chain is peeled — an access with arguments, a different
+/// method, or any other receiver keeps its own key and still refuses.
+fn optional_place_key(expression: &ast::Expr) -> Option<String> {
+    let expression = unparen(expression);
+    match &expression.kind {
+        ast::ExprKind::Path(..) => path(expression),
+        ast::ExprKind::Field(base, field) => {
+            Some(format!("{}.{}", optional_place_key(base)?, field.name))
+        }
+        ast::ExprKind::Cast(inner, _) => optional_place_key(inner),
+        ast::ExprKind::Index(base, index, _) => Some(format!(
+            "{}[{}]",
+            optional_place_key(base)?,
+            expression_key(index)
+        )),
+        ast::ExprKind::Unary(ast::UnOp::Deref, inner) => {
+            if let ast::ExprKind::MethodCall(unwrap) = &unparen(inner).kind
+                && matches!(unwrap.seg.ident.name.as_str(), "unwrap" | "expect")
+                && let ast::ExprKind::MethodCall(access) = &unparen(&unwrap.receiver).kind
+                && access.args.is_empty()
+                && matches!(
+                    access.seg.ident.name.as_str(),
+                    "as_mut" | "as_ref" | "as_deref" | "as_deref_mut"
+                )
+            {
+                return optional_place_key(&access.receiver);
+            }
+            Some(format!("*{}", optional_place_key(inner)?))
+        }
+        _ => None,
+    }
+}
+
+fn borrows_the_same_place(initializer: &ast::Expr, original: &ast::Expr) -> bool {
+    let (
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, emitted_mutability, emitted_place),
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, original_mutability, original_place),
+    ) = (&unparen(initializer).kind, &unparen(original).kind)
+    else {
+        return false;
+    };
+    if emitted_mutability != original_mutability {
+        return false;
+    }
+    match (
+        optional_place_key(emitted_place),
+        optional_place_key(original_place),
+    ) {
+        (Some(emitted), Some(original)) => emitted == original,
+        _ => false,
+    }
+}
+
 fn raw_initializer_matches(initializer: &ast::Expr, original: &ast::Expr) -> bool {
     let initializer = unparen(initializer);
     if expression_key(initializer) == expression_key(original) {
+        return true;
+    }
+    if borrows_the_same_place(initializer, original) {
         return true;
     }
     match &initializer.kind {
@@ -463,7 +523,23 @@ fn raw_initializer_matches(initializer: &ast::Expr, original: &ast::Expr) -> boo
                     let ast::PatKind::Ident(_, name, None) = &parameter.pat.kind else {
                         return false;
                     };
-                    let ast::ExprKind::MethodCall(project) = &unparen(&closure.body).kind else {
+                    // **R430-2 — the view may be cast to the callee's pointee.**
+                    // `|slice| slice.as_ptr().cast::<c_void>()` is the same view
+                    // as `|slice| slice.as_ptr()`; only the zero-argument
+                    // pointer casts are peeled, exactly as elsewhere here.
+                    let mut body = unparen(&closure.body);
+                    while let ast::ExprKind::MethodCall(cast) = &body.kind {
+                        if !cast.args.is_empty()
+                            || !matches!(
+                                cast.seg.ident.name.as_str(),
+                                "cast" | "cast_mut" | "cast_const"
+                            )
+                        {
+                            break;
+                        }
+                        body = unparen(&cast.receiver);
+                    }
+                    let ast::ExprKind::MethodCall(project) = &body.kind else {
                         return false;
                     };
                     project.args.is_empty()

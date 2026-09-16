@@ -1688,3 +1688,50 @@ fn r424_slice_construction_initializer_corresponds_exactly() {
         Some("*mut i8")
     ));
 }
+
+/// **R430-2 — the two spellings a DELIVERED OPTIONAL gives a pending source.**
+/// binn's `binn_is_valid(data, &mut (*value).type_0, …)` and
+/// `memcpy(dest, src, size)`: with `value: Option<&mut binn>` and
+/// `src: Option<&[u8]>` the same values are spelled
+/// `&mut (**value.as_mut().unwrap()).type_0` and
+/// `src.as_deref().map_or(null(), |slice| slice.as_ptr().cast::<c_void>())`.
+/// Both are the original's own view; neither was a correspondence the
+/// comparator knew, and four rows failed binn's custody on batch 9's candidate.
+#[test]
+fn r430_optional_delivery_spellings_correspond_to_their_original_views() {
+    use crate::bo_rewriter::bridge_custody_match::raw_initializer_matches_for_test as matches;
+    let under = |emitted: &str, original: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || matches(emitted, original),
+        )
+    };
+    assert!(under(
+        "&mut (**value.as_mut().unwrap()).type_0",
+        "&mut (*value).type_0"
+    ));
+    assert!(under(
+        "src.as_deref().map_or(core::ptr::null::<core::ffi::c_void>(), |slice| slice.as_ptr().cast::<core::ffi::c_void>())",
+        "src"
+    ));
+    // Strict: a different field, a different binding, a different mutability
+    // and an access with arguments are all refusals.
+    assert!(!under(
+        "&mut (**value.as_mut().unwrap()).count",
+        "&mut (*value).type_0"
+    ));
+    assert!(!under(
+        "&mut (**other.as_mut().unwrap()).type_0",
+        "&mut (*value).type_0"
+    ));
+    assert!(!under(
+        "&(**value.as_ref().unwrap()).type_0",
+        "&mut (*value).type_0"
+    ));
+    assert!(!under(
+        "other.as_deref().map_or(core::ptr::null::<core::ffi::c_void>(), |slice| slice.as_ptr().cast::<core::ffi::c_void>())",
+        "src"
+    ));
+}
