@@ -68,7 +68,7 @@ pub(crate) fn core_pointer_call(tcx: TyCtxt<'_>, callee: DefId) -> Option<CorePo
 /// (`let q = p.offset(1); q`, wave-6s's re-ratified g18 form) keeps the
 /// pre-hook reading — an open call, retention unknown — rather than a
 /// positive retention of the parameter (main 036 / relay wave-6r/010).
-fn result_returned(body: &Body<'_>, local: Local) -> bool {
+pub(crate) fn result_returned(body: &Body<'_>, local: Local) -> bool {
     let mut aliases = vec![local];
     let mut changed = true;
     while changed {

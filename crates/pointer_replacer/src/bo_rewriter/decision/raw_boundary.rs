@@ -1533,6 +1533,10 @@ fn collect_retention_facts<'tcx>(
             && matches!(body.local_decls[source].ty.kind(), TyKind::RawPtr(..))
             && let Some(destination) = destination.as_local()
             && matches!(body.local_decls[destination].ty.kind(), TyKind::RawPtr(..))
+            // Composition with wave-6r (`070164b9`, main 036 claim 1): a derived
+            // result the function RETURNS keeps the open reading — no alias edge,
+            // so the rebind is not a positive retention of the parameter.
+            && !crate::bo_rewriter::wave6r_child_access::result_returned(body, destination)
         {
             aliases.push((
                 source,
