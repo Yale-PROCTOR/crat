@@ -50,12 +50,19 @@ fn fixture() -> String {
 
 fn decisions(input: &str) -> Vec<(String, super::Decision)> {
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
-        crate::bo_rewriter::decide_table(tcx)
-            .unwrap()
-            .entries
-            .iter()
-            .map(|(s, d)| (s.label.clone(), d.clone()))
-            .collect()
+        crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::A5Mode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap()
+        .0
+        .entries
+        .iter()
+        .map(|(s, d)| (s.label.clone(), d.clone()))
+        .collect()
     })
     .unwrap()
 }
@@ -139,45 +146,73 @@ fn w5c_slice_input_unsupplied_caller_refuses_the_chain() {
     );
 }
 
-/// The candidates fire at `SliceUse` (both forwarders `raw → slice-shared`)
-/// and are withdrawn on exactly one cause: the same-slice carrier twin
-/// (W-C1's `revert_found_form_edits`) does not exist for a subject that
-/// converts at the stage — the next hook.
+/// Under the corpus attestation the propagation takes both forwarders off the
+/// extent hold: `ringbuffer` is DECIDED a shared slice; `data` — the buffer
+/// beside the hasher's `&mut self_0` at `StoreH2(self_0, data, …)` inside
+/// `StoreRangeH2` — is assigned the PAIR raw-view role (T2), the corpus pairs
+/// table's `raw-view T2 overlapping` verdict (309 of 375 rows at `dc601707`).
+/// The root's own conversion (`run::buf`) fires and is withdrawn at the same
+/// pair gate at `entry → run`. Delivery of the raw-view rows is wave-6p's
+/// distinct-allocation certificate, not a carrier.
 #[test]
-fn w5c_slice_input_candidates_fire_and_name_the_carrier_twin() {
+fn w5c_slice_input_forwarders_leave_the_extent_hold_under_the_corpus_attestation() {
     let input = fixture();
+    let table = decisions(&input);
+    assert!(
+        matches!(
+            decision(&table, "StitchToPreviousBlockH2::ringbuffer"),
+            super::Decision::Slice { mutable: false, .. }
+        ),
+        "{:?}",
+        decision(&table, "StitchToPreviousBlockH2::ringbuffer")
+    );
+    assert!(
+        matches!(
+            decision(&table, "StoreRangeH2::data"),
+            super::Decision::Degraded(super::Degradation {
+                reason: super::DegradeReason::PairRawView,
+                ..
+            })
+        ),
+        "{:?}",
+        decision(&table, "StoreRangeH2::data")
+    );
     let receipts = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
-        let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::A5Mode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
         ctx.raw_boundary_artifacts
             .additive_family_receipts
             .iter()
-            .filter(|r| r.family == "SliceUse")
-            .map(|r| (r.owner_path.clone(), r.cause.clone(), r.subjects.clone()))
+            .filter(|r| r.family == "SliceUse" && r.owner_path == "run")
+            .map(|r| (r.cause.clone(), r.subjects.clone()))
             .collect::<Vec<_>>()
     })
     .unwrap();
-    for owner in ["StoreRangeH2", "StitchToPreviousBlockH2"] {
-        let (_, cause, subjects) = receipts
+    let (cause, subjects) = receipts.first().unwrap_or_else(|| panic!("{receipts:?}"));
+    assert!(
+        subjects
             .iter()
-            .find(|(o, _, _)| o == owner)
-            .unwrap_or_else(|| panic!("{owner}: {receipts:?}"));
-        assert!(
-            subjects
-                .iter()
-                .any(|(_, prior, candidate)| prior == "ref-shared" && candidate == "slice-shared"),
-            "{owner}: {subjects:?}"
-        );
-        assert!(
-            cause.contains("slice-use-adapter:Dropped(\"slice-use-evidence-held\")"),
-            "{owner}: {cause}"
-        );
-    }
+            .any(|(s, prior, candidate)| s == "run::buf#2"
+                && prior == "raw"
+                && candidate == "slice-shared"),
+        "{subjects:?}"
+    );
+    assert!(
+        cause.contains("a5-raw-view-template-unavailable"),
+        "{cause}"
+    );
 }
 
-/// The delivery itself: RED until the carrier twin exists for a stage-converted
-/// subject (report 014 §2).
+/// The delivery itself: RED until the pair beside the hasher is certified
+/// disjoint (report 016 §2).
 #[test]
-#[ignore = "W-C7 RED: same-slice carrier twin for a stage-converted subject (report 014)"]
+#[ignore = "W-C7 RED: the PAIR raw-view role beside the hasher's &mut self_0 (wave-6p's distinct-allocation certificate; report 016)"]
 fn w5c_slice_input_forwarders_deliver() {
     let input = fixture();
     let table = decisions(&input);
