@@ -1868,7 +1868,7 @@ impl SeamTarget {
         })
     }
 
-    fn of_body(edit: &super::decision::seam::BodyEdit) -> Self {
+    fn of_body(edit: &super::decision::seam::BodyEdit, exact_use_composition: bool) -> Self {
         use super::decision::seam::SeamFamily;
         Self {
             spec: edit.spec.clone(),
@@ -1877,7 +1877,7 @@ impl SeamTarget {
                 SeamFamily::Reborrow => true,
                 SeamFamily::Safe => false,
             },
-            exact_use_composition: false,
+            exact_use_composition,
         }
     }
 }
@@ -5169,10 +5169,17 @@ pub(crate) fn filtered_inputs(
         {
             continue;
         }
+        let key = (edit.span.lo().0, edit.span.hi().0);
+        // The raw-initializer reborrow (relay wave-5d/026 §2) is built over
+        // the use the pass before it grafted at the same node; wave 2's body
+        // adapters keep their plain claim.
+        let exact_use_composition = edit.bridge.bridge_kind
+            == super::decision::raw_initializer::BRIDGE_KIND
+            && out.uses.contains_key(&key);
         insert_counting(
             &mut out.seams,
-            (edit.span.lo().0, edit.span.hi().0),
-            SeamTarget::of_body(edit),
+            key,
+            SeamTarget::of_body(edit, exact_use_composition),
             &mut out.seam_key_collisions,
         );
     }

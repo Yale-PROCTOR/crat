@@ -713,7 +713,13 @@ fn every_golden_outcome_is_attributed() {
     // emission while its owning-local class stays held. The golden remains one
     // of the standing RED six, but it no longer exercises program-level
     // Degraded; g18 continues to do so.
-    const EXPECTED_DEGRADED: &[&str] = &["g18_reslice_rebind"];
+    //
+    // Relay wave-5d/026 §2: the raw-initializer reborrow bridges g18's
+    // `let q: *const i32 = p.offset(1)` to `let q: &i32 = &*(p.offset(1))`,
+    // so the program EMITS a thin reference where it degraded; the golden
+    // (the reslice family's `&p[1..]`) still differs, and g18 stays in the
+    // standing set as a text mismatch, no longer as a program-level Degraded.
+    const EXPECTED_DEGRADED: &[&str] = &[];
     assert_eq!(
         degraded.iter().copied().collect::<Vec<_>>(),
         EXPECTED_DEGRADED,

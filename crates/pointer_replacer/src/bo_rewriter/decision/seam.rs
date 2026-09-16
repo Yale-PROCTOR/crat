@@ -5810,6 +5810,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     super::wave5r::complete_casts(tcx, table, &mut plan);
     super::construction_values::complete(tcx, table, &mut plan);
     super::raw_place_values::complete(tcx, table, &mut plan);
+    super::raw_initializer::complete(tcx, table, &mut plan);
     complete_interface_inventory(
         facts,
         table,

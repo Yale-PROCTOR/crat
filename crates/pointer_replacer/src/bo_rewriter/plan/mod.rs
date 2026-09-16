@@ -545,8 +545,24 @@ fn nested_ast_composition(
             && outer.key.caller == inner.key.caller
             && matches!(inner.key.arm.as_str(), "c" | "glue")
             && strictly_contains(outer, inner);
+        // Relay wave-5d/026 §2: a `c`/`glue` bridge at EXACTLY a subject use's
+        // interval — the reborrow of a raw-valued initializer over the
+        // element read `inputs[k]` it wraps, or a callee's `c` reborrow over
+        // the caller's use in its argument. The AST pass has the typed
+        // use-to-seam handoff for one exact-span seam
+        // (`claim_seam_after_exact_use`) and the byte projection omits the
+        // use (`exact_kind_composed_by_seam`); the plan records the outer's
+        // dependency on the inner as for the strict nesting above.
+        let exact_use_handoff = matches!(outer.key.arm.as_str(), "c" | "glue")
+            && inner.key.bridge_kind == "subject-use"
+            && outer.key.caller == inner.key.caller
+            && outer.key.file == inner.key.file
+            && outer.key.lo == inner.key.lo
+            && outer.key.hi == inner.key.hi
+            && outer.key.lo < outer.key.hi;
         ((bridge_over_subject || pair_over_c || a5_over_inner || l07_containment)
             && strictly_contains(outer, inner))
+            || exact_use_handoff
             || slice_construction_over_inner
             || option_value_over_inner
             || cursor_constructor_over_element

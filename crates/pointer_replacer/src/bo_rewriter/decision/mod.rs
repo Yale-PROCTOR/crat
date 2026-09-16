@@ -77,6 +77,7 @@ pub(crate) mod pinned_local;
 mod pinned_local_tests;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
+pub(crate) mod raw_initializer;
 pub(crate) mod raw_place_values;
 pub(crate) mod raw_receiver;
 #[cfg(test)]

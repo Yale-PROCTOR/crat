@@ -92,6 +92,8 @@ mod ownership_fields_native_tests;
 pub(crate) mod plan;
 #[cfg(test)]
 mod raw_place_values_tests;
+#[cfg(test)]
+mod raw_initializer_tests;
 mod shared_pair_ast;
 #[cfg(test)]
 mod shared_pair_tests;
@@ -1756,10 +1758,9 @@ fn verify_and_revert(
     let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
     let nested_seam_composition = !table.seams.pair_raw_calls.is_empty()
         || emission_plan.by_file.values().any(|edits| {
-            edits
-                .iter()
-                .enumerate()
-                .any(|(index, _)| nested_kind_under_seam(edits, index))
+            edits.iter().enumerate().any(|(index, _)| {
+                nested_kind_under_seam(edits, index) || exact_kind_composed_by_seam(edits, index)
+            })
         });
     let e1_edit_contexts = if census_once {
         e1_edit_contexts(&emission_plan, &emission_texts)
@@ -4905,7 +4906,12 @@ fn exact_kind_composed_by_seam(edits: &[plan::Edit], kind_index: usize) -> bool 
             .filter(|(seam_index, seam)| {
                 *seam_index != kind_index
                     && matches!(seam.justification, plan::Justification::SeamAdapter { .. })
-                    && seam.edit_kind != "body-adapter"
+                    // wave 2's body adapters have no handoff; the raw-initializer
+                    // reborrow (relay wave-5d/026 §2) is built over the grafted use.
+                    && (seam.edit_kind != "body-adapter"
+                        || seam.bridge.as_ref().is_some_and(|bridge| {
+                            bridge.bridge_kind == decision::raw_initializer::BRIDGE_KIND
+                        }))
                     && seam.lo == kind.lo
                     && seam.hi == kind.hi
             })
