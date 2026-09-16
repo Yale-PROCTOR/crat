@@ -68,6 +68,7 @@ pub struct FunctionRecord {
     pub source_signature: String,
     pub target_signature: String,
     pub printf_format_specifiers: Vec<String>,
+    pub proctor_libc_function_paths: Vec<String>,
     pub foreign_function_names: Vec<String>,
     pub foreign_static_names: Vec<String>,
     pub signature_dependencies: Vec<u64>,
@@ -432,6 +433,7 @@ fn make_function_record<'tcx>(
     let signature_dependencies = collect_signature_dependencies(hitem, item_ids, tcx);
     let dependencies = collect_dependencies(hitem, item_ids, tcx);
     let (foreign_function_names, foreign_static_names) = collect_foreign_names(hitem, tcx);
+    let proctor_libc_function_paths = collect_proctor_libc_function_paths(hitem, tcx);
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
     validate_function_body(&source, &surface.path)?;
@@ -659,6 +661,7 @@ fn make_function_record<'tcx>(
         source_signature,
         target_signature,
         printf_format_specifiers,
+        proctor_libc_function_paths,
         foreign_function_names,
         foreign_static_names,
         signature_dependencies,
@@ -4966,6 +4969,49 @@ fn collect_foreign_names<'tcx>(
         visitor.function_names.into_iter().collect(),
         visitor.static_names.into_iter().collect(),
     )
+}
+
+fn collect_proctor_libc_function_paths<'tcx>(
+    item: &'tcx hir::Item<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Vec<String> {
+    struct Collector<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        paths: BTreeSet<String>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for Collector<'tcx> {
+        type NestedFilter = nested_filter::OnlyBodies;
+
+        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+            self.tcx
+        }
+
+        fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
+            if let hir::ExprKind::Call(callee, _) = expression.kind {
+                let callee_type = self.tcx.typeck(callee.hir_id.owner).expr_ty(callee);
+                if let ty::TyKind::FnDef(def_id, _) = callee_type.kind()
+                    && !def_id.is_local()
+                    && self.tcx.crate_name(def_id.krate).as_str() == "proctor_libc"
+                    && self.tcx.def_kind(*def_id) == DefKind::Fn
+                {
+                    let path = self.tcx.def_path_str(*def_id);
+                    if !path.contains("{impl#") {
+                        self.paths.insert(path);
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expression);
+        }
+    }
+
+    let hir::ItemKind::Fn { body, .. } = item.kind else { unreachable!() };
+    let mut collector = Collector {
+        tcx,
+        paths: BTreeSet::new(),
+    };
+    collector.visit_body(tcx.hir_body(body));
+    collector.paths.into_iter().collect()
 }
 
 #[cfg(test)]

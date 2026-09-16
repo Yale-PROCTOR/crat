@@ -308,6 +308,10 @@ pub unsafe fn render(d: i32, x: u32, f: f64, s: *const i8) -> i32 {
         record.printf_format_specifiers,
         ["% d", "%#08.4x", "%10.3s", "%E"]
     );
+    assert_eq!(
+        record.proctor_libc_function_paths,
+        ["proctor_libc::isalpha"]
+    );
     assert!(
         !record
             .foreign_function_names
@@ -456,6 +460,105 @@ pub unsafe fn table(c: i32) -> i32 { ::proctor_libc::isspace(c) }
     for name in ["direct", "table"] {
         assert!(function(&records, name).foreign_function_names.is_empty());
     }
+    assert_eq!(
+        function(&records, "direct").proctor_libc_function_paths,
+        ["proctor_libc::isalpha"]
+    );
+    assert_eq!(
+        function(&records, "table").proctor_libc_function_paths,
+        ["proctor_libc::isspace"]
+    );
+}
+
+#[test]
+fn proctor_libc_call_paths_use_resolved_external_identity() {
+    let source = r#"
+extern crate proctor_libc;
+use proctor_libc::isalpha as classify;
+mod facade { pub use proctor_libc::isdigit as digit; }
+macro_rules! upper { ($value:expr) => { ::proctor_libc::toupper($value) } }
+
+pub fn calls(value: i32) {
+    classify(value);
+    facade::digit(classify(value));
+    upper!(value);
+    ::proctor_libc::printf::signed::<i32>(value);
+}
+pub fn references_only(value: i32) {
+    let _item = ::proctor_libc::isalpha;
+    let pointer: fn(i32) -> i32 = ::proctor_libc::isalpha;
+    pointer(value);
+}
+"#;
+    let records = generate(source);
+    assert_eq!(
+        function(&records, "calls").proctor_libc_function_paths,
+        [
+            "proctor_libc::isalpha",
+            "proctor_libc::isdigit",
+            "proctor_libc::printf::signed",
+            "proctor_libc::toupper",
+        ]
+    );
+    assert!(
+        function(&records, "references_only")
+            .proctor_libc_function_paths
+            .is_empty()
+    );
+    assert_eq!(
+        skeletons_to_json(&records).unwrap(),
+        skeletons_to_json(&records).unwrap()
+    );
+
+    let local = generate(
+        "mod proctor_libc { pub fn isalpha(value: i32) -> i32 { value } } \
+         pub fn local_only(value: i32) { proctor_libc::isalpha(value); }",
+    );
+    assert!(
+        function(&local, "local_only")
+            .proctor_libc_function_paths
+            .is_empty()
+    );
+}
+
+fn resolved_proctor_libc_calls(source: &str, function: &str) -> Vec<String> {
+    run_compiler_on_str(source, |tcx| {
+        let definition = local_def(function, tcx);
+        let item = tcx.hir_node_by_def_id(definition).expect_item();
+        collect_proctor_libc_function_paths(item, tcx)
+    })
+    .unwrap()
+}
+
+#[test]
+fn proctor_libc_calls_in_nested_hir_owners_use_their_own_typeck_results() {
+    let source = r#"
+extern crate proctor_libc;
+pub fn nested(value: i32) -> i32 {
+    let classify = || ::proctor_libc::isalpha(value);
+    classify()
+}
+"#;
+    assert_eq!(
+        resolved_proctor_libc_calls(source, "nested"),
+        ["proctor_libc::isalpha"]
+    );
+}
+
+#[test]
+fn proctor_libc_ufcs_impl_paths_are_hidden_but_nested_free_calls_remain() {
+    let source = r#"
+extern crate proctor_libc;
+pub fn adapt(value: i32) {
+    let _ = ::proctor_libc::printf::Signed::space_sign(
+        ::proctor_libc::printf::signed(value),
+    );
+}
+"#;
+    assert_eq!(
+        resolved_proctor_libc_calls(source, "adapt"),
+        ["proctor_libc::printf::signed"]
+    );
 }
 
 #[test]
@@ -1933,6 +2036,8 @@ fn assert_function_record_json_key_order(record: &ItemRecord) {
         "\"applied\"",
         "\"source_signature\"",
         "\"target_signature\"",
+        "\"printf_format_specifiers\"",
+        "\"proctor_libc_function_paths\"",
         "\"foreign_function_names\"",
         "\"foreign_static_names\"",
         "\"signature_dependencies\"",
@@ -3207,6 +3312,7 @@ fn record_variants_serialize_only_their_defined_fields() {
             "source_signature",
             "target_signature",
             "printf_format_specifiers",
+            "proctor_libc_function_paths",
             "foreign_function_names",
             "foreign_static_names",
             "signature_dependencies",
@@ -3234,6 +3340,22 @@ fn record_variants_serialize_only_their_defined_fields() {
             .into_iter()
             .collect()
     );
+    assert_eq!(
+        objects[0]["proctor_libc_function_paths"],
+        serde_json::json!([])
+    );
+    assert!(
+        objects[0]["baseline"]
+            .get("proctor_libc_function_paths")
+            .is_none()
+    );
+    assert!(
+        objects[0]["applied"]
+            .get("proctor_libc_function_paths")
+            .is_none()
+    );
+    assert!(objects[1].get("proctor_libc_function_paths").is_none());
+    assert!(objects[2].get("proctor_libc_function_paths").is_none());
     assert!(!objects.iter().any(|value| {
         value
             .as_object()
@@ -6892,6 +7014,7 @@ fn metadata_labels_exactly_match_transformation_dispositions() {
     let positions = [
         "\"statement_dispositions\"",
         "\"statement_pair_metadata\"",
+        "\"proctor_libc_function_paths\"",
         "\"foreign_function_names\"",
         "\"foreign_static_names\"",
     ]
