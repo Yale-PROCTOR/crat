@@ -597,6 +597,55 @@ pub mod src {
         );
     }
 
+    /// **(b), the terminal replay** (wave-6f 011 on batch 8's composition):
+    /// `lodepng_memcpy(out as *mut c_void, ((*reader).data).offset(bytepos)
+    /// as *const c_void, n)` — `src`'s position takes the A5 raw view and its
+    /// raw expression is rooted at `reader`, a CONVERTING subject. The
+    /// terminal replay derived the argument's form from the root's placed
+    /// form (`&Reader` → `ref-shared`) and chose the reference arm
+    /// (`core::ptr::from_ref(<already raw>).cast()` — `E0308`, the callee's
+    /// class reverted). A raw-pointer expression's form is Raw whatever its
+    /// root's form is: `a5_argument_expression_form` says so, at plan time
+    /// and at the terminal replay alike, so the view is the passthrough.
+    ///
+    /// Witnessed at the form derivation (the one function both paths share):
+    /// a one-file reproduction cannot reach the terminal replay on this
+    /// branch — the converting root's own edits inside the call collide with
+    /// the callee-owned snapshot (`cross-class-interval-collision`, wave-5d's
+    /// composition), which is exactly what wave-6f's `474418c7` reconciles
+    /// on the composition. The end-to-end measurement is on that branch
+    /// (report 008).
+    #[test]
+    fn a_raw_expression_argument_is_raw_whatever_its_root_form() {
+        use crate::bo_rewriter::decision::seam::{Form, a5_argument_expression_form};
+        for root in [
+            Form::Raw,
+            Form::Ref { mutable: false },
+            Form::Ref { mutable: true },
+            Form::Slice { mutable: false },
+            Form::Opt {
+                mutable: false,
+                slice: false,
+            },
+        ] {
+            assert_eq!(
+                a5_argument_expression_form("raw-expr", root),
+                Some(Form::Raw),
+                "{root:?}"
+            );
+        }
+        // The other shapes are unchanged.
+        assert_eq!(
+            a5_argument_expression_form("bare-local", Form::Ref { mutable: true }),
+            Some(Form::Ref { mutable: true })
+        );
+        assert_eq!(
+            a5_argument_expression_form("addr-of", Form::Raw),
+            Some(Form::Ref { mutable: false })
+        );
+        assert_eq!(a5_argument_expression_form("cast", Form::Raw), None);
+    }
+
     /// binn `binn_is_valid_ex(ptr, ptype, …)`: `plimit = p.offset(size)` is
     /// passed raw into `AdvanceDataPos(p, plimit)` whose `plimit` is
     /// hypothetically `ref`, so the edge routes `arm-c` and the raw SOURCE is

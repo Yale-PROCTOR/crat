@@ -3463,6 +3463,11 @@ pub(crate) fn a5_argument_expression_form(
         "bare-local" | "cast-of-local" => Some(terminal_subject_form),
         "addr-of" | "addr-of-cast" => Some(Form::Ref { mutable: false }),
         "addr-of-mut" | "addr-of-mut-cast" => Some(Form::Ref { mutable: true }),
+        // wave-5d2 (b): a raw-pointer EXPRESSION is a raw value whatever form
+        // its root subject takes — `p.offset(k) as *const T` stays a raw
+        // pointer when `p`'s owner converts. The view is the passthrough,
+        // never the reference arm over an already-raw operand.
+        "raw-expr" => Some(Form::Raw),
         _ => None,
     }
 }
@@ -3586,6 +3591,8 @@ pub(crate) fn build_a5_raw_view(
         input_rendering: None,
     };
     // Discovery requests Raw; role feedback settles that endpoint before planning.
+    // A raw-pointer expression's own form is Raw (see `a5_argument_expression_form`).
+    let found = a5_argument_expression_form(source_shape, found).unwrap_or(found);
     replan_a5_raw_view(&seed, Form::Raw, found)
 }
 
