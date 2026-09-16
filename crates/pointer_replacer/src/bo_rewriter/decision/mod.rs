@@ -1714,6 +1714,12 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         Decision::Slice { .. } | Decision::Opt { slice: true, .. }
             if !receiver
                 .is_some_and(|receiver| receiver.receiver_form == seam::form_of(&decision))
+                // wave-6b × wave-6a: a region receiver is a receiver arm too.
+                && !void_region::receiver_form_matches(
+                    ctx.void_region_receivers,
+                    receiver_node,
+                    &decision,
+                )
                 && slice_local_construction::refuses(ctx, subject) =>
         {
             degrade(
