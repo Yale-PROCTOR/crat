@@ -964,6 +964,7 @@ fn same_source_binding_inner(
         (Some(left), Some(right), Some(left_span), Some(right_span)) => {
             (same_expression(left, right).unwrap_or(false)
                 || null_initializer_corresponds(left, right, emitted.type_text.as_deref())
+                || slice_construction_corresponds(left, right, emitted.type_text.as_deref())
                 || initializer_adapter_correspondence(left, right))
                 && span_bindings_correspond(
                     input,
@@ -1009,6 +1010,52 @@ fn null_initializer_corresponds(original: &str, emitted: &str, emitted_type: Opt
     }
     matches!(&view.kind, ast::ExprKind::Lit(literal)
         if literal.kind == ast::token::LitKind::Integer && literal.symbol.as_str() == "0")
+}
+
+/// **R424-3 — the slice form of a raw local's own initializer.** A delivered
+/// slice local is declared `&[T]` / `&mut [T]` and initialized
+/// `core::slice::from_raw_parts[_mut](<the original initializer>, <extent>)`:
+/// the same value, viewed as a slice. The arm is exact — the emitted type must
+/// really be a slice reference, the call must really be that constructor, and
+/// its pointer operand must correspond to the original initializer by the rules
+/// already in force. The extent is the slice family's own receipt (evidence or
+/// the named fallback of addendum 77) and is not a source-correspondence fact.
+fn slice_construction_corresponds(
+    original: &str,
+    emitted: &str,
+    emitted_type: Option<&str>,
+) -> bool {
+    let is_slice_reference = emitted_type
+        .and_then(|text| parsed_type(text).ok())
+        .is_some_and(|ty| match &ty.kind {
+            ast::TyKind::Ref(_, reference) => matches!(reference.ty.kind, ast::TyKind::Slice(_)),
+            _ => false,
+        });
+    if !is_slice_reference {
+        return false;
+    }
+    let (Ok(original), Ok(emitted)) = (expression(original), expression(emitted)) else {
+        return false;
+    };
+    let ast::ExprKind::Call(callee, arguments) = &unparen(&emitted).kind else {
+        return false;
+    };
+    if arguments.len() != 2
+        || !matches!(
+            path(callee).as_deref(),
+            Some(
+                "core::slice::from_raw_parts"
+                    | "core::slice::from_raw_parts_mut"
+                    | "std::slice::from_raw_parts"
+                    | "std::slice::from_raw_parts_mut"
+            )
+        )
+    {
+        return false;
+    }
+    let pointer = &arguments[0];
+    expression_key(unparen(pointer)) == expression_key(unparen(&original))
+        || initializer_matches_modulo_adapters(&original, pointer)
 }
 
 /// **R295-3, applied to a predicate rather than an arm.** `same_source_binding`
@@ -1060,6 +1107,7 @@ fn source_binding_divergence(
         (Some(left), Some(right), Some(_), Some(_)) => {
             if !same_expression(left, right).unwrap_or(false)
                 && !null_initializer_corresponds(left, right, emitted.type_text.as_deref())
+                && !slice_construction_corresponds(left, right, emitted.type_text.as_deref())
             {
                 format!("initializer:{left}!={right}")
             } else {
