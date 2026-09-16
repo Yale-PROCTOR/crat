@@ -1685,7 +1685,19 @@ fn candidate_shape_in(
     entries: &[(Subject, Decision)],
 ) -> bool {
     let uses = ctx.facts.raw_only_uses.get(&(s.fn_did, s.hir_id));
-    s.ptr_depth == 1
+    // Another family's delivery (a thin optional reference, a slice) is not a
+    // cursor candidate whatever its sign: a child cannot derive its window
+    // from it, and a peer cannot lean on it (binn `plimit` over `p`).
+    let open = match decision {
+        Decision::Degraded(_) | Decision::Cursor { .. } => true,
+        Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Box(_) => false,
+    };
+    open && s.ptr_depth == 1
         && (selected(ctx, s, decision)
             || derives_cursor(ctx, s, decision, entries)
             || (s.null_init && optional_degraded(decision)))
