@@ -128,6 +128,7 @@ pub(crate) fn collect(
                 .or_else(|| super::counted_void_read::prove(tcx, s))
                 .or_else(|| super::counted_void_handle::prove(tcx, s))
                 .or_else(|| super::binn_counted::prove(tcx, s))
+                .or_else(|| super::binn_counted::prove_foreign_copy(tcx, s))
                 .map(|c| (s, c))
         })
         .collect();

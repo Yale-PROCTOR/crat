@@ -329,7 +329,6 @@ pub unsafe fn dup_bytes(mut p: *mut core::ffi::c_void, mut n: i32) -> *mut core:
 "#;
 
 #[test]
-#[ignore = "build queued (wave-6v2 build 2): the foreign memcpy position is unmodeled in the pinned contract table; wave-4 #1b's contract rows land in batch 7"]
 fn w6v2_foreign_copy_source_counted_by_a_sibling_delivers() {
     let rows = super::emit_tests::decisions_of(MEMDUP);
     assert!(
@@ -357,6 +356,44 @@ fn w6v2_foreign_copy_source_counted_by_a_sibling_delivers() {
     let original = run_binary(&format!("{MEMDUP}\n{main}"));
     assert_eq!(original, b"[98, 105, 110, 110] true true\n".to_vec());
     assert_eq!(original, run_binary(&format!("{source}\n{main}")));
+}
+
+/// A WRITE position of the row (`memcpy`'s destination) is not a read view:
+/// the parameter stays held (the destination is the allocation's, not this
+/// rule's).
+#[test]
+fn w6v2_foreign_copy_destination_position_stays_held() {
+    let input = MEMDUP
+        .replace(
+            "memcpy(dest, src, size as u64);",
+            "memcpy(src, dest, size as u64);",
+        )
+        .replace(
+            "let mut dest = 0 as *mut core::ffi::c_void;",
+            "let mut dest = 0 as *mut core::ffi::c_void; let _ = &mut dest;",
+        );
+    let rows = super::emit_tests::decisions_of(&input);
+    assert!(
+        !delivers(&rows, "src"),
+        "a written position holds: {rows:?}"
+    );
+    assert!(
+        reason(&rows, "src").starts_with("held:void-pointee"),
+        "the hold keeps its family: {rows:?}"
+    );
+}
+
+/// The emitted copy site: the shared byte view reaches `memcpy`'s source
+/// position through the row's bridge, and nothing is fabricated.
+#[test]
+fn w6v2_foreign_copy_site_is_bridged_by_the_row() {
+    let source = super::emit_tests::ast_emitted_source_of(MEMDUP).unwrap();
+    assert!(!source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
+    let c = compact(&source);
+    assert!(
+        c.contains("memcpy(dest,src.as_deref().map_or(core::ptr::null::<core::ffi::c_void>(),|slice|slice.as_ptr().cast::<core::ffi::c_void>()),sizeasu64)"),
+        "the row bridges the source position: {source}"
+    );
 }
 
 /// The copy's count must be the sibling parameter itself, unchanged: a count

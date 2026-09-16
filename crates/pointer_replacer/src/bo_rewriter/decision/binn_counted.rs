@@ -418,6 +418,105 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
     })
 }
 
+/// BC-2 (wave-6v2, R410-9 rows): a `void *` parameter whose uses are null
+/// tests and pass-ons of the bare binding into a FOREIGN position that a
+/// pinned contract row reads for exactly `n` bytes (`memcpy` / `memmove`
+/// source), where `n` is an UNCHANGED sibling parameter itself. The sibling is
+/// the count (the parent's sibling-count contract: a raw caller's count is the
+/// snapshot of the sibling); the pass-on is the seam's outbound bridge at the
+/// row's position. A count the callee re-derives, a write through the
+/// pointee, or an unmodeled position keeps the hold.
+pub(crate) fn prove_foreign_copy(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
+    if s.ptr_depth != 1 || !matches!(s.kind, SubjectKind::Param { .. }) {
+        return None;
+    }
+    let Node::Pat(pat) = tcx.hir_node(s.hir_id) else { return None };
+    let typeck = tcx.typeck(s.fn_did);
+    if !super::void_pointee::has_void_pointee(tcx, typeck.pat_ty(pat), 1) {
+        return None;
+    }
+    let body = tcx.hir_body_owned_by(s.fn_did);
+    let params = body
+        .params
+        .iter()
+        .map(|p| match p.pat.kind {
+            PatKind::Binding(_, id, _, None) => Some(id),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let own_index = params.iter().position(|p| *p == s.hir_id)?;
+    let mut uses = Uses {
+        target: s.hir_id,
+        found: Vec::new(),
+        writes: FxHashMap::default(),
+        closures: false,
+    };
+    uses.visit_expr(body.value);
+    if uses.closures || uses.writes.contains_key(&s.hir_id) {
+        return None;
+    }
+    let name = s.param_name.as_ref()?;
+    let mut nullable = false;
+    let mut edits = Vec::new();
+    let mut count_index = None;
+    for use_ in uses.found {
+        let Node::Expr(parent) = tcx.parent_hir_node(use_.hir_id) else { return None };
+        match parent.kind {
+            ExprKind::MethodCall(segment, receiver, [], _)
+                if receiver.hir_id == use_.hir_id && segment.ident.name.as_str() == "is_null" =>
+            {
+                nullable = true;
+                edits.push(UseEdit {
+                    span: parent.span,
+                    replacement: format!("{name}.is_none()"),
+                    bridge_kind: "binn-counted-null-test",
+                });
+            }
+            ExprKind::Call(callee, args) => {
+                let index = args.iter().position(|a| a.hir_id == use_.hir_id)?;
+                let ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = callee.kind else {
+                    return None;
+                };
+                let Res::Def(rustc_hir::def::DefKind::Fn, did) = path.res else { return None };
+                if !tcx.is_foreign_item(did) {
+                    return None;
+                }
+                let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+                let target = super::raw_boundary::raw_target_type(tcx, *sig.inputs().get(index)?)?;
+                let symbol = super::raw_boundary::symbol_key(tcx, did, &[]);
+                let contract =
+                    super::raw_boundary_contracts::classify_contract(&symbol, index, &target)
+                        .ok()?;
+                if contract.access != super::raw_boundary_contracts::PointeeAccess::Read
+                    || contract.extent != super::raw_boundary_contracts::ArgumentExtent::ByteCount
+                    || !contract.count_is_exact
+                    || contract.returns_alias_of == Some(index)
+                {
+                    return None;
+                }
+                let count = strip_casts(args.get(contract.count_argument_index?)?);
+                let sibling = params.iter().position(|p| Some(*p) == local_of(count))?;
+                if sibling == own_index
+                    || uses.writes.contains_key(&params[sibling])
+                    || count_index.is_some_and(|k| k != sibling)
+                {
+                    return None;
+                }
+                count_index = Some(sibling);
+            }
+            _ => return None,
+        }
+    }
+    Some(Contract {
+        count_index: count_index?,
+        element: ByteElement::Read,
+        nullable,
+        handle: None,
+        width: None,
+        uses: edits,
+    })
+}
+
 /// A forward-only `void *` parameter: its uses are null tests and pass-ons of
 /// the bare binding as an argument of a LOCAL call. It takes the byte view.
 /// Where every pass-on reaches a position that carries a typed-width contract,
