@@ -29,6 +29,7 @@ use crate::analyses::borrow_ownership::{
 };
 
 pub(crate) mod a5_site_proof;
+pub(crate) mod allocator_contract;
 pub(crate) mod array_start;
 #[cfg(test)]
 mod array_start_tests;
@@ -985,6 +986,8 @@ pub(crate) struct DecisionTable {
     pub(crate) box_params: box_param::Chains,
     /// wave-6a W6A-A1: allocation-return certificates (admitted / held).
     pub(crate) return_certificates: return_certificate::Certificates,
+    /// wave-6a: allocator-contract owners (admitted / held).
+    pub(crate) allocator_contracts: allocator_contract::Plans,
     pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
     pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
@@ -1133,6 +1136,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) flexible_tails: &'a flexible_tail::Transactions,
     pub(crate) box_params: &'a box_param::Chains,
     pub(crate) return_certificates: &'a return_certificate::Certificates,
+    pub(crate) allocator_contracts: &'a allocator_contract::Plans,
     pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
@@ -1274,6 +1278,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         flexible_tails: ctx.flexible_tails.clone(),
         box_params: ctx.box_params.clone(),
         return_certificates: ctx.return_certificates.clone(),
+        allocator_contracts: ctx.allocator_contracts.clone(),
         nested_receipts: Vec::new(),
         cursor_receipts,
         sibling_overlap_inventory: Default::default(),
@@ -1794,6 +1799,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         flexible_tails: _,
         box_params: _,
         return_certificates: _,
+        allocator_contracts: _,
         void_pointee,
         thin_extent,
         local_callee_extent,
@@ -1863,6 +1869,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // wave-6a W6A-A1: a subject an allocation-return certificate plans is a
     // Box on the certificate's evidence (relay wave-6a/005 §1).
     if let Some(decision) = return_certificate::planned(ctx, subject) {
+        return decision;
+    }
+    // wave-6a: a contract-rooted allocation local is a Box on the pinned
+    // allocator contract's evidence (R409-1/3), or its typed hold.
+    if let Some(decision) = allocator_contract::planned(ctx, subject, &decl_site) {
         return decision;
     }
     // wave-6a W6A-C1 (A1-c): a consuming FORMAL a chain plans is a Box on the
@@ -2574,6 +2585,7 @@ mod self_consistency_tests {
             flexible_tails: Default::default(),
             box_params: Default::default(),
             return_certificates: Default::default(),
+            allocator_contracts: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
             sibling_overlap_inventory: Default::default(),

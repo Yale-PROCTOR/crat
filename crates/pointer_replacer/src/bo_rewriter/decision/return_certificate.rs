@@ -349,7 +349,7 @@ fn null_literal(e: &Expr<'_>) -> bool {
     )
 }
 
-fn foreign_fn(tcx: TyCtxt<'_>, did: DefId) -> bool {
+pub(crate) fn foreign_fn(tcx: TyCtxt<'_>, did: DefId) -> bool {
     matches!(tcx.def_kind(did), DefKind::Fn)
         && did.as_local().is_some_and(|local| {
             matches!(
@@ -551,18 +551,23 @@ impl<'tcx> Visitor<'tcx> for LendWalk<'tcx> {
 }
 
 /// One owner's uses, classified by the parent of each bare occurrence.
-struct OwnerUses {
-    edits: Vec<BoxExprEdit>,
+pub(crate) struct OwnerUses {
+    pub(crate) edits: Vec<BoxExprEdit>,
     /// `if A.is_null() { return null; }` guards of an allocation that cannot
     /// fail as a `Box`: the whole `if` becomes an empty block, and the null
     /// return inside it no longer counts.
-    dead_guards: Vec<Span>,
+    pub(crate) dead_guards: Vec<Span>,
     /// Null returns swallowed by a dead guard.
-    dead_null_returns: Vec<Span>,
+    pub(crate) dead_null_returns: Vec<Span>,
     /// Stores of the owner into raw places (`Box::into_raw` transfers).
-    stores: Vec<Span>,
+    pub(crate) stores: Vec<Span>,
     /// Transfers into consuming formals: (callee, index).
-    transfers: Vec<(DefId, usize)>,
+    pub(crate) transfers: Vec<(DefId, usize)>,
+    /// `return x` of the owner (the certificate chains it; a contract
+    /// allocation holds on it).
+    pub(crate) returns: Vec<Span>,
+    /// Lends admitted: (callee, index, the call).
+    pub(crate) lends: Vec<(DefId, usize, Span)>,
 }
 
 struct UseWalk<'a, 'tcx> {
@@ -605,6 +610,21 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                 replacement,
                 receipt,
             });
+        }
+    }
+
+    /// The deref expression is written: the place of an assignment or a
+    /// compound assignment, or borrowed mutably.
+    fn written(&self, deref: &Expr<'_>) -> bool {
+        match self.tcx.parent_hir_node(deref.hir_id) {
+            rustc_hir::Node::Expr(parent) => match parent.kind {
+                ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) => {
+                    lhs.hir_id == deref.hir_id
+                }
+                ExprKind::AddrOf(_, rustc_hir::Mutability::Mut, _) => true,
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -720,7 +740,6 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                         };
                         if !matches!(grand.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
                             || self.shape != BoxShape::Slice
-                            || self.optional
                         {
                             self.refuse(format!(
                                 "pointer-arithmetic:{}",
@@ -735,9 +754,19 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                             index = inner;
                         }
                         let index_text = self.snippet(index.span);
+                        // An optional slice owner (the contract consumer's
+                        // conditional allocation) is read through
+                        // `as_deref()` and written through `as_deref_mut()`.
+                        let owner = if !self.optional {
+                            name.clone()
+                        } else if self.written(grand) {
+                            format!("{name}.as_deref_mut().unwrap()")
+                        } else {
+                            format!("{name}.as_deref().unwrap()")
+                        };
                         self.push(
                             grand.span,
-                            format!("{name}[({index_text}) as usize]"),
+                            format!("{owner}[({index_text}) as usize]"),
                             "return-certificate-element-access",
                         );
                     }
@@ -758,7 +787,11 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                 };
                 self.push(parent.span, replacement, "return-certificate-deref");
             }
-            ExprKind::Ret(_) => {}
+            ExprKind::Ret(_) => {
+                if let Ok(uses) = &mut self.out {
+                    uses.returns.push(parent.span);
+                }
+            }
             ExprKind::Assign(lhs, _, _) if lhs.hir_id == child => {}
             // The owner stored into a raw place: ownership moves into C's
             // storage (`Box::into_raw`), exactly the batch-6 deallocator
@@ -791,13 +824,6 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                 if self.frees.iter().any(|(call, _)| *call == parent.span) {
                     return; // the free: `drop` is planned by the caller
                 }
-                if self.optional {
-                    self.refuse(format!(
-                        "optional-owner-call-argument:{}",
-                        self.snippet(parent.span)
-                    ));
-                    return;
-                }
                 // A lend to a local callee whose formal the model calls Ref
                 // (a Ref formal is never freed or kept: the freed-slot gate
                 // and the null ruling) is a seam the ordinary bridge settles;
@@ -823,11 +849,42 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     }
                     return;
                 }
-                if !callee_def.is_some_and(|did| (self.lend_ok)(did, index)) {
+                let Some(did) = callee_def.filter(|did| (self.lend_ok)(*did, index)) else {
                     self.refuse(format!(
                         "call-argument-not-a-lend:{}",
                         self.snippet(parent.span)
                     ));
+                    return;
+                };
+                if let Ok(uses) = &mut self.out {
+                    uses.lends.push((did, index, parent.span));
+                }
+                // A non-optional owner is bridged at the seam by the ordinary
+                // raw-boundary glue; an optional one has no such glue, so the
+                // lend is spelled here (the R130 void bridge of report 003):
+                // the view's raw pointer, or null when the owner is `None`,
+                // under the argument's own casts.
+                if self.optional {
+                    let casts = if child == e.hir_id {
+                        String::new()
+                    } else {
+                        let outer = self.snippet(args[index].span);
+                        let inner = self.snippet(e.span);
+                        outer.strip_prefix(&inner).unwrap_or_default().to_owned()
+                    };
+                    let view = match self.shape {
+                        BoxShape::Slice => format!(
+                            "{name}.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())"
+                        ),
+                        BoxShape::Sized => format!(
+                            "{name}.as_deref_mut().map_or(core::ptr::null_mut(), |b| core::ptr::from_mut(b))"
+                        ),
+                    };
+                    self.push(
+                        args[index].span,
+                        format!("{view}{casts}"),
+                        "return-certificate-optional-lend",
+                    );
                 }
             }
             _ => self.refuse(format!("use:{}", self.snippet(parent.span))),
@@ -854,7 +911,8 @@ impl<'tcx> Visitor<'tcx> for UseWalk<'_, 'tcx> {
 }
 
 /// The owner's uses as rewrites, or the refused form.
-fn owner_uses(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn owner_uses(
     tcx: TyCtxt<'_>,
     subject: &Subject,
     shape: BoxShape,
@@ -884,6 +942,8 @@ fn owner_uses(
             dead_null_returns: Vec::new(),
             stores: Vec::new(),
             transfers: Vec::new(),
+            returns: Vec::new(),
+            lends: Vec::new(),
         }),
     };
     walk.visit_body(tcx.hir_body(body_id));
@@ -970,6 +1030,130 @@ fn struct_initializer<'tcx>(
     ))
 }
 
+/// Is the callee's formal at `index` a LEND — a position that neither keeps
+/// nor consumes the pointer? A local callee's formal the model calls Ref AND
+/// whose every use in the callee is a read through it (derefs, element
+/// accesses, null tests, lends onward to such formals): the model's Ref
+/// alone does not say the callee keeps nothing — a store of the formal
+/// through memory still emits as an escape later — so the callee's own body
+/// is read (memoized; a cycle is not a lend). A FOREIGN position is a lend
+/// when the pinned libc contract table says the callee neither retains nor
+/// consumes it (`NoRetain` + `BorrowView`; `sscanf`, `strlen`, `strcmp`,
+/// `memcpy`, ..): the ordinary raw-boundary glue bridges the owner at the
+/// seam. A variadic tail position (`sscanf`'s `%[..]` target) is
+/// `UnboundedWrite` on a byte owner — the same extent the raw program gave it.
+/// Shared by the certificates (A1-d) and the allocator-contract consumer.
+pub(crate) struct LendOracle<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    functions: &'a [LocalDefId],
+    slots: &'a CrateSlots,
+    model: &'a FxHashMap<SlotRef, SlotKind>,
+    memo: std::cell::RefCell<FxHashMap<(DefId, usize), Option<bool>>>,
+}
+
+impl<'a, 'tcx> LendOracle<'a, 'tcx> {
+    pub(crate) fn new(
+        tcx: TyCtxt<'tcx>,
+        functions: &'a [LocalDefId],
+        slots: &'a CrateSlots,
+        model: &'a FxHashMap<SlotRef, SlotKind>,
+    ) -> Self {
+        Self {
+            tcx,
+            functions,
+            slots,
+            model,
+            memo: std::cell::RefCell::new(FxHashMap::default()),
+        }
+    }
+
+    fn foreign_lend(&self, did: DefId, index: usize) -> bool {
+        let tcx = self.tcx;
+        if !foreign_fn(tcx, did) {
+            return false;
+        }
+        let key = super::raw_boundary::symbol_key(tcx, did, self.functions);
+        let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+        let Some(input) = sig.inputs().get(index) else {
+            // A variadic position: no declared type; the table's family rows
+            // (the scanf / printf tails) decide, at a byte target.
+            let target = super::raw_boundary::RawTargetType {
+                rendered: "*mut u8".to_owned(),
+                pointee: "u8".to_owned(),
+                mutability: super::raw_boundary::RawMutability::Mut,
+                depth2: None,
+            };
+            return matches!(
+                super::raw_boundary_contracts::classify_contract(&key, index, &target),
+                Ok(c) if c.retention == super::raw_boundary_contracts::RetentionContract::NoRetain
+                    && c.ownership == super::raw_boundary_contracts::OwnershipContract::BorrowView
+            );
+        };
+        let Some(target) = super::raw_boundary::raw_target_type(tcx, *input) else {
+            return false;
+        };
+        matches!(
+            super::raw_boundary_contracts::classify_contract(&key, index, &target),
+            Ok(c) if c.retention == super::raw_boundary_contracts::RetentionContract::NoRetain
+                && c.ownership == super::raw_boundary_contracts::OwnershipContract::BorrowView
+        )
+    }
+
+    pub(crate) fn lend(&self, did: DefId, index: usize) -> bool {
+        let tcx = self.tcx;
+        if foreign_fn(tcx, did) {
+            return self.foreign_lend(did, index);
+        }
+        match self.memo.borrow().get(&(did, index)) {
+            Some(Some(answer)) => return *answer,
+            Some(None) => return false, // in progress: a cycle is not a lend
+            None => {}
+        }
+        self.memo.borrow_mut().insert((did, index), None);
+        let answer = (|| {
+            let callee = did.as_local()?;
+            if !self.functions.contains(&callee) {
+                return Some(false);
+            }
+            let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+            if index >= body.arg_count {
+                return Some(false);
+            }
+            let local = rustc_middle::mir::Local::from_usize(index + 1);
+            let is_ref = self
+                .slots
+                .fn_local_slots
+                .get(&callee)
+                .and_then(|u| u.slot_for_local_depth(local, 0))
+                .is_some_and(|slot| {
+                    self.model.get(&SlotRef::Local(callee, slot)) == Some(&SlotKind::Ref)
+                });
+            if !is_ref {
+                return Some(false);
+            }
+            let hir_body = tcx.hir_body_owned_by(callee);
+            let param = hir_body.params.get(index)?;
+            let rustc_hir::PatKind::Binding(_, hir, _, None) = param.pat.kind else {
+                return Some(false);
+            };
+            let mut walk = LendWalk {
+                tcx,
+                binding: hir,
+                ok: true,
+                nested: Vec::new(),
+            };
+            walk.visit_body(hir_body);
+            if !walk.ok {
+                return Some(false);
+            }
+            Some(walk.nested.into_iter().all(|(d, i)| self.lend(d, i)))
+        })()
+        .unwrap_or(false);
+        self.memo.borrow_mut().insert((did, index), Some(answer));
+        answer
+    }
+}
+
 /// Derive every certificate for the crate (fixpoint over chained returns).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn derive<'tcx>(
@@ -1020,125 +1204,8 @@ pub(crate) fn derive<'tcx>(
             .and_then(|u| u.slot_for_local_depth(s.local, 0))
             .map(|slot| SlotRef::Local(s.fn_did, slot))
     };
-    // A local callee's formal at `index` the model calls Ref AND whose every
-    // use in the callee is a read through it (derefs, element accesses, null
-    // tests, lends onward to such formals): the model's Ref alone does not
-    // say the callee keeps nothing — a store of the formal through memory
-    // still emits as an escape later — so the callee's own body is read.
-    let lend_memo: std::cell::RefCell<FxHashMap<(DefId, usize), Option<bool>>> =
-        std::cell::RefCell::new(FxHashMap::default());
-    #[allow(clippy::too_many_arguments)]
-    fn lend_formal<'tcx>(
-        tcx: TyCtxt<'tcx>,
-        functions: &[LocalDefId],
-        slots: &CrateSlots,
-        model: &FxHashMap<SlotRef, SlotKind>,
-        memo: &std::cell::RefCell<FxHashMap<(DefId, usize), Option<bool>>>,
-        foreign_lend: &dyn Fn(DefId, usize) -> bool,
-        did: DefId,
-        index: usize,
-    ) -> bool {
-        if foreign_fn(tcx, did) {
-            return foreign_lend(did, index);
-        }
-        match memo.borrow().get(&(did, index)) {
-            Some(Some(answer)) => return *answer,
-            Some(None) => return false, // in progress: a cycle is not a lend
-            None => {}
-        }
-        memo.borrow_mut().insert((did, index), None);
-        let answer =
-            (|| {
-                let callee = did.as_local()?;
-                if !functions.contains(&callee) {
-                    return Some(false);
-                }
-                let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
-                if index >= body.arg_count {
-                    return Some(false);
-                }
-                let local = rustc_middle::mir::Local::from_usize(index + 1);
-                let is_ref = slots
-                    .fn_local_slots
-                    .get(&callee)
-                    .and_then(|u| u.slot_for_local_depth(local, 0))
-                    .is_some_and(|slot| {
-                        model.get(&SlotRef::Local(callee, slot)) == Some(&SlotKind::Ref)
-                    });
-                if !is_ref {
-                    return Some(false);
-                }
-                let hir_body = tcx.hir_body_owned_by(callee);
-                let param = hir_body.params.get(index)?;
-                let rustc_hir::PatKind::Binding(_, hir, _, None) = param.pat.kind else {
-                    return Some(false);
-                };
-                let mut walk = LendWalk {
-                    tcx,
-                    binding: hir,
-                    ok: true,
-                    nested: Vec::new(),
-                };
-                walk.visit_body(hir_body);
-                if !walk.ok {
-                    return Some(false);
-                }
-                Some(walk.nested.into_iter().all(|(d, i)| {
-                    lend_formal(tcx, functions, slots, model, memo, foreign_lend, d, i)
-                }))
-            })()
-            .unwrap_or(false);
-        memo.borrow_mut().insert((did, index), Some(answer));
-        answer
-    }
-    // A1-d: a FOREIGN position is a lend when the pinned libc contract table
-    // says the callee neither retains nor consumes it (`NoRetain` +
-    // `BorrowView`; `sscanf`, `strlen`, `strcmp`, `memcpy`, ..): the ordinary
-    // raw-boundary glue bridges the owner at the seam (`as_mut_ptr` / `&*`).
-    // A variadic tail position (`sscanf`'s `%[..]` target) is `UnboundedWrite`
-    // on a byte owner — the same extent the raw program gave it.
-    let foreign_lend = |did: DefId, index: usize| -> bool {
-        if !foreign_fn(tcx, did) {
-            return false;
-        }
-        let key = super::raw_boundary::symbol_key(tcx, did, functions);
-        let sig = tcx.fn_sig(did).skip_binder().skip_binder();
-        let Some(input) = sig.inputs().get(index) else {
-            // A variadic position: no declared type; the table's family rows
-            // (the scanf / printf tails) decide, at a byte target.
-            let target = super::raw_boundary::RawTargetType {
-                rendered: "*mut u8".to_owned(),
-                pointee: "u8".to_owned(),
-                mutability: super::raw_boundary::RawMutability::Mut,
-                depth2: None,
-            };
-            return matches!(
-                super::raw_boundary_contracts::classify_contract(&key, index, &target),
-                Ok(c) if c.retention == super::raw_boundary_contracts::RetentionContract::NoRetain
-                    && c.ownership == super::raw_boundary_contracts::OwnershipContract::BorrowView
-            );
-        };
-        let Some(target) = super::raw_boundary::raw_target_type(tcx, *input) else {
-            return false;
-        };
-        matches!(
-            super::raw_boundary_contracts::classify_contract(&key, index, &target),
-            Ok(c) if c.retention == super::raw_boundary_contracts::RetentionContract::NoRetain
-                && c.ownership == super::raw_boundary_contracts::OwnershipContract::BorrowView
-        )
-    };
-    let lend_ok = |did: DefId, index: usize| -> bool {
-        lend_formal(
-            tcx,
-            functions,
-            slots,
-            model,
-            &lend_memo,
-            &foreign_lend,
-            did,
-            index,
-        )
-    };
+    let lend_oracle = LendOracle::new(tcx, functions, slots, model);
+    let lend_ok = |did: DefId, index: usize| -> bool { lend_oracle.lend(did, index) };
     let subject_of = |f: LocalDefId, hir: HirId| {
         subjects
             .iter()

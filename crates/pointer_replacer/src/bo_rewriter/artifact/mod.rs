@@ -214,6 +214,7 @@ mod tests {
             flexible_tails: Default::default(),
             box_params: Default::default(),
             return_certificates: Default::default(),
+            allocator_contracts: Default::default(),
             sibling_overlap_inventory: Default::default(),
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),

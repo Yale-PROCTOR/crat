@@ -122,6 +122,8 @@ pub(crate) mod wave6r_child_access;
 #[cfg(test)]
 mod wave6a_allocation_tests;
 #[cfg(test)]
+mod wave6a_allocator_contract_tests;
+#[cfg(test)]
 mod wave6a_box_param_tests;
 #[cfg(test)]
 mod wave6a_fixture_tulip;
@@ -381,6 +383,8 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) box_param_receipts: String,
     /// wave-6a W6A-A1: allocation-return certificates (admitted / held).
     pub(crate) return_certificate_receipts: String,
+    /// wave-6a: allocator-contract owners (admitted / held).
+    pub(crate) allocator_contract_receipts: String,
     /// R369 FIELD-CP observer, captured from the same frozen decision pass.
     pub(crate) ownership_native: String,
     pub(crate) shared_permissions: Vec<decision::overlapping_pairs::consumer::Permission>,
@@ -7044,6 +7048,9 @@ fn finish_decide<'tcx>(
         &model,
         &consuming_formals,
     );
+    // wave-6a: allocator-contract owners (relay wave-6a/006, R409-1/3).
+    let allocator_contracts =
+        decision::allocator_contract::derive(tcx, &program.functions, &subjects, &slots, &model);
     let box_params = decision::box_param::derive(
         tcx,
         &program.functions,
@@ -7181,6 +7188,7 @@ fn finish_decide<'tcx>(
                     flexible_tails: &flexible_tails,
                     box_params: &box_params,
                     return_certificates: &return_certificates,
+                    allocator_contracts: &allocator_contracts,
                     return_receivers,
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,
@@ -7723,6 +7731,7 @@ fn finish_decide<'tcx>(
         decision::slice_local_construction::append_explicit_declarations(tcx, &mut table);
         decision::box_param::append_explicit_declarations(tcx, &mut table);
         decision::return_certificate::append_explicit_declarations(tcx, &mut table);
+        decision::allocator_contract::append_explicit_declarations(tcx, &mut table);
         decision::return_certificate::append_interface_dependencies(&mut table);
         table.c9_marks = retained_c9_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
@@ -7913,6 +7922,7 @@ fn finish_decide<'tcx>(
             flexible_tail_receipts: table.flexible_tails.receipts_tsv(),
             box_param_receipts: table.box_params.receipts_tsv(),
             return_certificate_receipts: table.return_certificates.receipts_tsv(),
+            allocator_contract_receipts: table.allocator_contracts.receipts_tsv(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             shared_permissions: table.seams.shared_required.clone(),
             shared_pair_receipts: String::new(),
