@@ -836,11 +836,18 @@ pub unsafe fn count_zeros(mut data: *const u8, size: usize, pos: usize) -> u32 {
             || source.contains("core::slice::from_raw_parts(data"),
         "no delivery: {source}"
     );
+    // The harness follows the emitted parameter form: a cursor parameter is
+    // a slice at the safe body; the composed tree may keep `data` raw.
+    let argument = if source.contains("fn count_zeros(mut data: *const u8") {
+        "b.as_ptr()"
+    } else {
+        "&b"
+    };
     compile(
         &source,
-        Some(
-            "fn main() { let b = [0u8, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0]; assert_eq!(unsafe { count_zeros(&b, 12, 1) }, 3); assert_eq!(unsafe { count_zeros(&b, 12, 5) }, 6); assert_eq!(unsafe { count_zeros(&b, 12, 9) }, 3); }",
-        ),
+        Some(&format!(
+            "fn main() {{ let b = [0u8, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0]; assert_eq!(unsafe {{ count_zeros({argument}, 12, 1) }}, 3); assert_eq!(unsafe {{ count_zeros({argument}, 12, 5) }}, 6); assert_eq!(unsafe {{ count_zeros({argument}, 12, 9) }}, 3); }}"
+        )),
     );
 }
 
