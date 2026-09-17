@@ -846,3 +846,76 @@ fn w6a_ac_an_overwrite_of_a_live_owner_takes_the_leak_parity_waiver() {
     );
     assert!(receipts.contains("generations=2"), "{receipts}");
 }
+
+/// **The optional owner lent at a LOCAL callee's raw formal** (relay
+/// wave-6a/029, R451-3): brotli's `BrotliHistogramCombine{Literal,Distance,
+/// Command}` shape. The callee keeps a raw formal, so the seam's owner-view
+/// glue (which converts) does not apply and the ordinary raw bridge renders
+/// `x.as_mut_ptr()` — on an `Option`, 27 of batch 10's 44 reverts. The owner's
+/// own view is spelled here instead, keyed on its decision FORM:
+/// `.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())`, under
+/// the argument's own casts (the `*mut u8` vs `*mut c_void` spelling, 18 more).
+const LOCAL_RAW_FORMAL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn memset(s: *mut std::os::raw::c_void, c: i32, n: usize) -> *mut std::os::raw::c_void;
+    fn exit(code: i32) -> !;
+}
+#[repr(C)]
+pub struct MemoryManager {
+    pub alloc_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, usize) -> *mut std::os::raw::c_void>,
+    pub free_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void)>,
+    pub opaque: *mut std::os::raw::c_void,
+}
+pub unsafe extern "C" fn BrotliAllocate(mut m: *mut MemoryManager, mut n: usize) -> *mut std::os::raw::c_void {
+    let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+    if result.is_null() { exit(1 as i32); }
+    return result;
+}
+pub unsafe extern "C" fn BrotliFree(mut m: *mut MemoryManager, mut p: *mut std::os::raw::c_void) {
+    ((*m).free_func).expect("non-null function pointer")((*m).opaque, p);
+}
+pub unsafe extern "C" fn combine_void(mut region: *mut std::os::raw::c_void, mut n: usize) -> u32 {
+    let mut words = region as *mut u32;
+    let mut i = 0 as usize;
+    let mut acc = 0 as u32;
+    while i < n {
+        acc = acc.wrapping_add(*words.offset(i as isize));
+        i = i.wrapping_add(1);
+    }
+    return acc;
+}
+pub unsafe extern "C" fn cluster_combine(mut m: *mut MemoryManager, mut n: usize, mut split: *mut u32) {
+    let mut syms = if n > 0 as usize { BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 } else { 0 as *mut u32 };
+    *syms.offset(0 as isize) = 3 as u32;
+    *split = combine_void(syms as *mut std::os::raw::c_void, n);
+    BrotliFree(m, syms as *mut std::os::raw::c_void);
+    syms = 0 as *mut u32;
+}
+"#;
+
+#[test]
+fn w6a_ac_an_optional_owner_lent_at_a_local_raw_formal_takes_its_own_view() {
+    let out = emitted("ac-local-raw-formal", LOCAL_RAW_FORMAL);
+    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
+        std::fs::write(path, &out.source).expect("dump");
+    }
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(
+        out.reverted, 0,
+        "{}\n{:#?}\n{receipts}",
+        out.source, out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "cluster_combine::syms"),
+        None,
+        "{:#?}\n{receipts}",
+        out.degradations
+    );
+    assert!(
+        text.contains("combine_void(syms.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr())as*mutstd::os::raw::c_void,n)"),
+        "the owner's own raw view, under the argument's cast\n{}",
+        out.source
+    );
+}

@@ -901,8 +901,26 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                 // a CAST argument (`memset(x as *mut c_void, ..)`, brotli's
                 // zeroing shape), where the raw-boundary site's operand is the
                 // cast rather than the owner.
+                // A LOCAL callee's CONVERTED formal is the seam's owner-view
+                // glue (R422-5). Every other lend position keeps a raw formal —
+                // a foreign callee's always, a local callee's when the model
+                // leaves it raw — and there the owner's own view is spelled
+                // here, because the ordinary raw bridge would render a bare
+                // `as_mut_ptr()` on an `Option` (R451-3; report 023 measured 27
+                // of brotli's 44 reverts as exactly that).
                 let cast_argument = child != e.hir_id;
-                if foreign_fn(self.tcx, did) && (self.optional || cast_argument) {
+                // Two positions the seam's owner-view glue cannot reach, and
+                // one it can. It edits the BARE argument of a CONVERTED formal
+                // (R422-5), so: a CAST argument is spelled here whatever the
+                // formal does (`memset(x as *mut c_void, ..)`, and the same
+                // shape at a local callee — 18 of batch 10's brotli reverts),
+                // and an OPTIONAL owner at a formal that stays RAW is spelled
+                // here because the ordinary raw bridge would render a bare
+                // `as_mut_ptr()` on an `Option` (27 more). A bare, non-optional
+                // owner at a raw formal is exactly what that bridge renders
+                // correctly, and spelling it again would be two edits on one
+                // argument.
+                if cast_argument || (foreign_fn(self.tcx, did) && self.optional) {
                     let casts = if cast_argument {
                         let outer = self.snippet(args[index].span);
                         let inner = self.snippet(e.span);
