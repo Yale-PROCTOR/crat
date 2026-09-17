@@ -27,9 +27,15 @@ use utils::{
     ir::{AstToHir, is_option, mir_ty_to_string},
 };
 
+#[cfg(test)]
+use super::cursor_resolution::CursorResolution;
 use super::{
     Analysis, BytemuckDependency, Config,
     collector::{CollectedDiffs, collect_diffs, collect_diffs_with_diagnostics},
+    cursor_resolution::{
+        CursorDemotion, CursorDemotionValidationError, CursorOwner, FinalCursorDecisionView,
+        resolve_late_cursors, validate_cursor_demotions,
+    },
     decision::{PtrKind, SigDecision, SigDecisions},
     diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
@@ -69,6 +75,8 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     bytemuck_classifier: RefCell<BytemuckTypeClassifier<'tcx>>,
     pub slice_cursor: Cell<bool>,
     diagnostics: DecisionDiagnostics,
+    #[cfg(test)]
+    cursor_resolution: CursorResolution,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1874,20 +1882,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 &ptr_kinds,
                 &demoted_fields,
             );
-        let mut sig_changed = false;
         for hir_id in &demoted_field_source_bindings {
-            if force_signature_input_raw_for_binding(rust_program.tcx, &mut sig_decs, *hir_id) {
-                sig_changed = true;
-                if let Some((did, idx)) = param_index_for_binding(rust_program.tcx, *hir_id) {
-                    record_signature_input_event(
-                        &mut diagnostics,
-                        rust_program.tcx,
-                        &sig_decs,
-                        did,
-                        idx,
-                        DecisionReason::DemotedFieldSource,
-                    );
-                }
+            if force_signature_input_raw_for_binding(rust_program.tcx, &mut sig_decs, *hir_id)
+                && let Some((did, idx)) = param_index_for_binding(rust_program.tcx, *hir_id)
+            {
+                record_signature_input_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    did,
+                    idx,
+                    DecisionReason::DemotedFieldSource,
+                );
             }
         }
         record_binding_events_excluding(
@@ -1900,7 +1906,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         );
         for callee_did in raw_field_source_callees {
             if force_signature_output_raw(rust_program.tcx, &mut sig_decs, callee_did) {
-                sig_changed = true;
                 record_signature_output_event(
                     &mut diagnostics,
                     rust_program.tcx,
@@ -1911,9 +1916,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
         }
         forced_raw_bindings.extend(demoted_field_source_bindings);
-        if sig_changed {
-            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups).ptr_kinds;
-        }
+        let final_diffs = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+        let mut ptr_kinds = final_diffs.ptr_kinds;
+        let cursor_field_offset_alias_bindings = final_diffs.cursor_field_offset_alias_bindings;
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         normalize_owning_call_result_bindings(
             rust_program.tcx,
@@ -1921,6 +1926,26 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             &mut ptr_kinds,
             &forced_raw_bindings,
         );
+        let resolution = {
+            let view = FinalCursorDecisionView::new(
+                rust_program,
+                analysis,
+                &sig_decs,
+                &ptr_kinds,
+                &forced_raw_bindings,
+                &cursor_field_offset_alias_bindings,
+                &fn_ptr_groups,
+            );
+            resolve_late_cursors(&analysis.offset_sign_result.cursor_constraints, &view)
+        };
+        apply_cursor_demotions(
+            rust_program.tcx,
+            &mut sig_decs,
+            &mut ptr_kinds,
+            resolution.demotions(),
+            &mut diagnostics,
+        )
+        .expect("late cursor resolution snapshot must remain valid");
         apply_field_storage_input_lifetimes(
             rust_program.tcx,
             analysis,
@@ -1964,6 +1989,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             bytemuck_classifier: RefCell::new(BytemuckTypeClassifier::new(rust_program.tcx)),
             slice_cursor: Cell::new(false),
             diagnostics,
+            #[cfg(test)]
+            cursor_resolution: resolution,
         };
         visitor.record_field_decisions();
         visitor
@@ -10156,6 +10183,72 @@ fn record_signature_output_event(
     );
 }
 
+pub(crate) fn apply_cursor_demotions(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &mut FxHashMap<HirId, PtrKind>,
+    demotions: &[CursorDemotion],
+    diagnostics: &mut DecisionDiagnostics,
+) -> Result<(), CursorDemotionValidationError> {
+    validate_cursor_demotions(sig_decs, ptr_kinds, demotions)?;
+    // Resolve subjects even when diagnostics are off, so failure cannot follow a write.
+    let subjects = demotions
+        .iter()
+        .map(|demotion| match demotion.owner {
+            CursorOwner::Param {
+                did,
+                index,
+                binding,
+            } => Ok(DecisionSubject::Param {
+                did,
+                index,
+                hir_id: binding,
+                local: rustc_middle::mir::Local::from_usize(index + 1),
+            }),
+            CursorOwner::Binding { did, hir_id } => {
+                let mapping = utils::ir::map_thir_to_mir(did, false, tcx);
+                let local = mapping.binding_to_local.get(&hir_id).copied().ok_or(
+                    CursorDemotionValidationError::UnsupportedOwner(demotion.owner),
+                )?;
+                Ok(DecisionSubject::Local { did, hir_id, local })
+            }
+            CursorOwner::Return(_) | CursorOwner::Field(_) => unreachable!(),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for demotion in demotions {
+        let binding = match demotion.owner {
+            CursorOwner::Param {
+                did,
+                index,
+                binding,
+            } => {
+                assert!(
+                    sig_decs
+                        .data
+                        .get_mut(&did)
+                        .unwrap()
+                        .demote_cursor_input(index)
+                );
+                binding
+            }
+            CursorOwner::Binding { hir_id, .. } => hir_id,
+            CursorOwner::Return(_) | CursorOwner::Field(_) => unreachable!(),
+        };
+        *ptr_kinds.get_mut(&binding).unwrap() = demotion.replacement_kind;
+    }
+    for (demotion, subject) in demotions.iter().zip(subjects) {
+        diagnostics.record(
+            subject,
+            DecisionStage::LateCursorResolution,
+            Some(demotion.expected_old_kind),
+            Some(demotion.replacement_kind),
+            DecisionReason::NoReachableCursorDemandAfterNormalization,
+            None,
+        );
+    }
+    Ok(())
+}
+
 fn subject_for_binding(tcx: TyCtxt<'_>, hir_id: HirId) -> Option<DecisionSubject> {
     if let Some((did, index)) = param_index_for_binding(tcx, hir_id) {
         return Some(DecisionSubject::Param {
@@ -16352,9 +16445,564 @@ mod tests {
     use super::*;
     use crate::{
         analyses::{self, mir_variable_grouping::SourceVarGroups},
-        rewriter::{Config, replace_local_borrows},
+        rewriter::{Config, diagnostics::DiagnosticsMode, replace_local_borrows},
         utils::rustc::RustProgram,
     };
+
+    fn with_cursor_demotion_fixture(
+        check: impl FnOnce(TyCtxt<'_>, SigDecisions, FxHashMap<HirId, PtrKind>, [CursorDemotion; 4])
+        + Send,
+    ) {
+        utils::compilation::run_compiler_on_str(
+            "pub unsafe fn f(p: *const i32, q: *mut i32) -> *const i32 {
+                let a = p; let b = q; let _ = (*a, *b); p
+            }
+            pub fn other() {}",
+            |tcx| {
+                let did = crate::rewriter::collect_input(tcx).functions[0];
+                let mapping = utils::ir::map_thir_to_mir(did, false, tcx);
+                let binding = |name: &str| {
+                    *mapping
+                        .binding_to_local
+                        .keys()
+                        .find(|&&id| tcx.hir_name(id).as_str() == name)
+                        .unwrap()
+                };
+                let ids = [binding("p"), binding("q"), binding("a"), binding("b")];
+                let sigs = SigDecisions {
+                    data: FxHashMap::from_iter([(
+                        did,
+                        SigDecision {
+                            input_decs: vec![
+                                Some(PtrKind::SliceCursor(false)),
+                                Some(PtrKind::SliceCursor(true)),
+                            ],
+                            input_lifetimes: vec![
+                                Some(Symbol::intern("'p")),
+                                Some(Symbol::intern("'q")),
+                            ],
+                            output_dec: Some(PtrKind::SliceCursor(false)),
+                            output_lifetime: Some(Symbol::intern("'p")),
+                            signature_locked: false,
+                        },
+                    )]),
+                };
+                let kinds = ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, id)| (id, PtrKind::SliceCursor(i % 2 != 0)))
+                    .collect();
+                let demotions = std::array::from_fn(|i| CursorDemotion {
+                    owner: if i < 2 {
+                        CursorOwner::Param {
+                            did,
+                            index: i,
+                            binding: ids[i],
+                        }
+                    } else {
+                        CursorOwner::Binding {
+                            did,
+                            hir_id: ids[i],
+                        }
+                    },
+                    expected_old_kind: PtrKind::SliceCursor(i % 2 != 0),
+                    replacement_kind: PtrKind::Slice(i % 2 != 0),
+                });
+                check(tcx, sigs, kinds, demotions);
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_demotions_accepts_exact_binding_and_parameter_snapshots() {
+        with_cursor_demotion_fixture(|_, sigs, kinds, demotions| {
+            assert_eq!(validate_cursor_demotions(&sigs, &kinds, &demotions), Ok(()));
+            assert_eq!(validate_cursor_demotions(&sigs, &kinds, &[]), Ok(()));
+        });
+    }
+
+    #[test]
+    fn validate_demotions_rejects_wrong_mutability() {
+        with_cursor_demotion_fixture(|_, sigs, kinds, demotions| {
+            for (old, replacement) in [
+                (PtrKind::SliceCursor(false), PtrKind::Slice(true)),
+                (PtrKind::SliceCursor(true), PtrKind::Slice(false)),
+                (PtrKind::Slice(false), PtrKind::Slice(false)),
+                (PtrKind::Raw(false), PtrKind::Slice(false)),
+                (PtrKind::SliceCursor(false), PtrKind::Raw(false)),
+            ] {
+                let mut invalid = demotions[0].clone();
+                invalid.expected_old_kind = old;
+                invalid.replacement_kind = replacement;
+                assert_eq!(
+                    validate_cursor_demotions(&sigs, &kinds, &[invalid.clone()]),
+                    Err(CursorDemotionValidationError::InvalidTransition(
+                        invalid.owner,
+                        old,
+                        replacement
+                    ))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn validate_demotions_rejects_duplicate_owner() {
+        with_cursor_demotion_fixture(|_, sigs, kinds, demotions| {
+            for demotion in &demotions {
+                assert_eq!(
+                    validate_cursor_demotions(&sigs, &kinds, &[demotion.clone(), demotion.clone()]),
+                    Err(CursorDemotionValidationError::DuplicateOwner(
+                        demotion.owner
+                    ))
+                );
+            }
+            let CursorOwner::Param { did, binding, .. } = demotions[0].owner else {
+                unreachable!()
+            };
+            let mut alias = demotions[0].clone();
+            alias.owner = CursorOwner::Binding {
+                did,
+                hir_id: binding,
+            };
+            assert_eq!(
+                validate_cursor_demotions(&sigs, &kinds, &[demotions[0].clone(), alias.clone()]),
+                Err(CursorDemotionValidationError::UnsupportedOwner(alias.owner))
+            );
+            let CursorOwner::Binding { hir_id, .. } = demotions[2].owner else { unreachable!() };
+            alias.owner = CursorOwner::Param {
+                did,
+                index: 0,
+                binding: hir_id,
+            };
+            assert_eq!(
+                validate_cursor_demotions(&sigs, &kinds, &[demotions[0].clone(), alias.clone()]),
+                Err(CursorDemotionValidationError::UnsupportedOwner(alias.owner))
+            );
+            alias.owner = CursorOwner::Param {
+                did,
+                index: 1,
+                binding,
+            };
+            assert_eq!(
+                validate_cursor_demotions(&sigs, &kinds, &[demotions[0].clone(), alias.clone()]),
+                Err(CursorDemotionValidationError::UnsupportedOwner(alias.owner))
+            );
+        });
+    }
+
+    #[test]
+    fn validate_demotions_rejects_return_and_field() {
+        with_cursor_demotion_fixture(|tcx, sigs, kinds, demotions| {
+            let CursorOwner::Param { did, binding, .. } = demotions[0].owner else {
+                unreachable!()
+            };
+            let other_did = crate::rewriter::collect_input(tcx).functions[1];
+            assert_ne!(did, other_did);
+            for owner in [
+                CursorOwner::Return(did),
+                CursorOwner::Field(StructFieldSlot {
+                    struct_did: did,
+                    field_index: 0,
+                }),
+                CursorOwner::Param {
+                    did: other_did,
+                    index: 0,
+                    binding,
+                },
+                CursorOwner::Binding {
+                    did: other_did,
+                    hir_id: binding,
+                },
+            ] {
+                let mut invalid = demotions[0].clone();
+                invalid.owner = owner;
+                assert_eq!(
+                    validate_cursor_demotions(&sigs, &kinds, &[invalid]),
+                    Err(CursorDemotionValidationError::UnsupportedOwner(owner))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn apply_demotions_validates_full_delta_before_writing() {
+        with_cursor_demotion_fixture(|tcx, sigs, kinds, demotions| {
+            let CursorOwner::Param { did, binding, .. } = demotions[1].owner else {
+                unreachable!()
+            };
+            let CursorOwner::Binding { hir_id: local, .. } = demotions[3].owner else {
+                unreachable!()
+            };
+            for (case, mode) in (0..9).flat_map(|case| {
+                [DiagnosticsMode::Full, DiagnosticsMode::Off].map(|mode| (case, mode))
+            }) {
+                let mut sigs = sigs.clone();
+                let mut kinds = kinds.clone();
+                let mut invalid = demotions[1].clone();
+                let expected = match case {
+                    0 => {
+                        kinds.insert(binding, PtrKind::Slice(true));
+                        CursorDemotionValidationError::BindingMismatch(
+                            invalid.owner,
+                            Some(PtrKind::Slice(true)),
+                        )
+                    }
+                    1 => {
+                        sigs.data.get_mut(&did).unwrap().input_decs[1] = Some(PtrKind::Slice(true));
+                        CursorDemotionValidationError::SignatureMismatch(
+                            invalid.owner,
+                            Some(PtrKind::Slice(true)),
+                        )
+                    }
+                    2 => {
+                        kinds.remove(&binding);
+                        CursorDemotionValidationError::BindingMismatch(invalid.owner, None)
+                    }
+                    3 => {
+                        invalid = demotions[3].clone();
+                        kinds.remove(&local);
+                        CursorDemotionValidationError::BindingMismatch(invalid.owner, None)
+                    }
+                    4 => {
+                        invalid = demotions[3].clone();
+                        kinds.insert(local, PtrKind::Raw(true));
+                        CursorDemotionValidationError::BindingMismatch(
+                            invalid.owner,
+                            Some(PtrKind::Raw(true)),
+                        )
+                    }
+                    5 => {
+                        sigs.data.remove(&did);
+                        CursorDemotionValidationError::MissingSignature(did)
+                    }
+                    6 => {
+                        invalid.owner = CursorOwner::Param {
+                            did,
+                            index: 2,
+                            binding,
+                        };
+                        CursorDemotionValidationError::SignatureMismatch(invalid.owner, None)
+                    }
+                    7 => {
+                        sigs.data.get_mut(&did).unwrap().input_decs[1] = None;
+                        CursorDemotionValidationError::SignatureMismatch(invalid.owner, None)
+                    }
+                    _ => {
+                        let hir_id = tcx.hir_body_owned_by(did).value.hir_id;
+                        assert!(
+                            !utils::ir::map_thir_to_mir(did, false, tcx)
+                                .binding_to_local
+                                .contains_key(&hir_id)
+                        );
+                        kinds.insert(hir_id, PtrKind::SliceCursor(true));
+                        invalid.owner = CursorOwner::Binding { did, hir_id };
+                        CursorDemotionValidationError::UnsupportedOwner(invalid.owner)
+                    }
+                };
+                // The missing-signature case needs a valid local; all other cases start
+                // with a parameter so a partial commit would change both stores.
+                let first = if case == 5 { 2 } else { 0 };
+                let delta = [demotions[first].clone(), invalid];
+                let before_sigs = sigs.clone();
+                let before_kinds = kinds.clone();
+                let mut diagnostics = DecisionDiagnostics::for_test(mode);
+                assert_eq!(
+                    apply_cursor_demotions(tcx, &mut sigs, &mut kinds, &delta, &mut diagnostics),
+                    Err(expected),
+                    "case {case}"
+                );
+                assert_eq!(sigs, before_sigs, "case {case}");
+                assert_eq!(kinds, before_kinds, "case {case}");
+                assert!(diagnostics.events().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn apply_demotions_updates_parameter_and_binding_together() {
+        with_cursor_demotion_fixture(|tcx, mut sigs, mut kinds, demotions| {
+            let CursorOwner::Param { did, binding, .. } = demotions[0].owner else {
+                unreachable!()
+            };
+            let mut expected_sigs = sigs.clone();
+            expected_sigs.data.get_mut(&did).unwrap().input_decs[0] = Some(PtrKind::Slice(false));
+            let mut expected_kinds = kinds.clone();
+            expected_kinds.insert(binding, PtrKind::Slice(false));
+            apply_cursor_demotions(
+                tcx,
+                &mut sigs,
+                &mut kinds,
+                &demotions[..1],
+                &mut DecisionDiagnostics::disabled(),
+            )
+            .unwrap();
+            assert_eq!(sigs, expected_sigs);
+            assert_eq!(kinds, expected_kinds);
+        });
+    }
+
+    #[test]
+    fn apply_demotions_updates_local_only() {
+        with_cursor_demotion_fixture(|tcx, mut sigs, mut kinds, mut demotions| {
+            let CursorOwner::Param { did, binding, .. } = demotions[0].owner else {
+                unreachable!()
+            };
+            // Binding identity, even for a parameter HIR id, must not update the signature
+            // or be silently reclassified as a Param diagnostic subject.
+            demotions[0].owner = CursorOwner::Binding {
+                did,
+                hir_id: binding,
+            };
+            let before_sigs = sigs.clone();
+            let mut expected_kinds = kinds.clone();
+            expected_kinds.insert(binding, PtrKind::Slice(false));
+            let CursorOwner::Binding { hir_id, .. } = demotions[2].owner else { unreachable!() };
+            expected_kinds.insert(hir_id, PtrKind::Slice(false));
+            let mut diagnostics = DecisionDiagnostics::for_test(DiagnosticsMode::Full);
+            apply_cursor_demotions(
+                tcx,
+                &mut sigs,
+                &mut kinds,
+                &[demotions[0].clone(), demotions[2].clone()],
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert_eq!(sigs, before_sigs);
+            assert_eq!(kinds, expected_kinds);
+            assert_eq!(
+                diagnostics.events()[0].subject,
+                DecisionSubject::Local {
+                    did,
+                    hir_id: binding,
+                    local: rustc_middle::mir::Local::from_usize(1),
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn apply_demotions_preserves_lifetime_mutability_and_non_cursor_decisions() {
+        with_cursor_demotion_fixture(|tcx, sigs, kinds, demotions| {
+            let CursorOwner::Param {
+                did, binding: p, ..
+            } = demotions[0].owner
+            else {
+                unreachable!()
+            };
+            let CursorOwner::Param { binding: q, .. } = demotions[1].owner else { unreachable!() };
+            let CursorOwner::Binding { hir_id: a, .. } = demotions[2].owner else { unreachable!() };
+            let CursorOwner::Binding { hir_id: b, .. } = demotions[3].owner else { unreachable!() };
+            for unaffected in [
+                PtrKind::Raw(false),
+                PtrKind::Raw(true),
+                PtrKind::Ref(false),
+                PtrKind::Ref(true),
+                PtrKind::OptRef(false),
+                PtrKind::OptRef(true),
+                PtrKind::Box,
+                PtrKind::OptBox,
+                PtrKind::BoxedSlice,
+                PtrKind::OptBoxedSlice,
+                PtrKind::Slice(false),
+                PtrKind::Slice(true),
+            ] {
+                let mut sigs = sigs.clone();
+                sigs.data.get_mut(&did).unwrap().output_dec = Some(unaffected);
+                let mut kinds = kinds.clone();
+                kinds.insert(a, unaffected);
+                kinds.insert(b, PtrKind::Raw(true));
+                let mut expected_sigs = sigs.clone();
+                expected_sigs.data.get_mut(&did).unwrap().input_decs =
+                    vec![Some(PtrKind::Slice(false)), Some(PtrKind::Slice(true))];
+                let mut expected_kinds = kinds.clone();
+                expected_kinds.insert(p, PtrKind::Slice(false));
+                expected_kinds.insert(q, PtrKind::Slice(true));
+                apply_cursor_demotions(
+                    tcx,
+                    &mut sigs,
+                    &mut kinds,
+                    &demotions[..2],
+                    &mut DecisionDiagnostics::disabled(),
+                )
+                .unwrap();
+                assert_eq!(sigs, expected_sigs);
+                assert_eq!(kinds, expected_kinds);
+            }
+        });
+    }
+
+    #[test]
+    fn late_cursor_demotion_records_one_change_event() {
+        with_cursor_demotion_fixture(|tcx, sigs, kinds, demotions| {
+            let mut enabled_sigs = sigs.clone();
+            let mut enabled_kinds = kinds.clone();
+            let mut diagnostics = DecisionDiagnostics::for_test(DiagnosticsMode::Full);
+            apply_cursor_demotions(
+                tcx,
+                &mut enabled_sigs,
+                &mut enabled_kinds,
+                &demotions,
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert_eq!(diagnostics.events().len(), 4);
+            let CursorOwner::Param {
+                did, binding: p, ..
+            } = demotions[0].owner
+            else {
+                unreachable!()
+            };
+            let CursorOwner::Param { binding: q, .. } = demotions[1].owner else { unreachable!() };
+            let CursorOwner::Binding { hir_id: a, .. } = demotions[2].owner else { unreachable!() };
+            let CursorOwner::Binding { hir_id: b, .. } = demotions[3].owner else { unreachable!() };
+            let mapping = utils::ir::map_thir_to_mir(did, false, tcx);
+            let expected_subjects = [
+                DecisionSubject::Param {
+                    did,
+                    index: 0,
+                    hir_id: p,
+                    local: rustc_middle::mir::Local::from_usize(1),
+                },
+                DecisionSubject::Param {
+                    did,
+                    index: 1,
+                    hir_id: q,
+                    local: rustc_middle::mir::Local::from_usize(2),
+                },
+                DecisionSubject::Local {
+                    did,
+                    hir_id: a,
+                    local: mapping.binding_to_local[&a],
+                },
+                DecisionSubject::Local {
+                    did,
+                    hir_id: b,
+                    local: mapping.binding_to_local[&b],
+                },
+            ];
+            for (index, event) in diagnostics.events().iter().enumerate() {
+                assert_eq!(event.subject, expected_subjects[index]);
+                assert_eq!(event.stage, DecisionStage::LateCursorResolution);
+                assert_eq!(event.before, Some(PtrKind::SliceCursor(index % 2 != 0)));
+                assert_eq!(event.after, Some(PtrKind::Slice(index % 2 != 0)));
+                assert_eq!(
+                    event.reason,
+                    DecisionReason::NoReachableCursorDemandAfterNormalization
+                );
+                assert_eq!(event.detail, None);
+            }
+            let mut disabled_sigs = sigs;
+            let mut disabled_kinds = kinds;
+            let mut diagnostics = DecisionDiagnostics::disabled();
+            apply_cursor_demotions(
+                tcx,
+                &mut disabled_sigs,
+                &mut disabled_kinds,
+                &demotions,
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert_eq!(disabled_sigs, enabled_sigs);
+            assert_eq!(disabled_kinds, enabled_kinds);
+            assert!(diagnostics.events().is_empty());
+        });
+    }
+
+    #[test]
+    fn retained_cursor_records_no_change_event() {
+        utils::compilation::run_compiler_on_str(
+            "pub unsafe fn f(p: *const i32) -> i32 { *p.offset(-1) }",
+            |tcx| {
+                let mut krate = utils::ast::expanded_ast(tcx);
+                let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+                let (input, analysis) = build_analysis(tcx);
+                let did = input.functions[0];
+                let binding = tcx.hir_body_owned_by(did).params[0].pat.hir_id;
+                let visitor = TransformVisitor::new(
+                    &Config::default(),
+                    &input,
+                    &analysis,
+                    ast_to_hir,
+                    FnPtrGroups::default(),
+                    FnPtrRewriteDecision::default(),
+                    DecisionDiagnostics::for_test(DiagnosticsMode::Full),
+                );
+                assert_eq!(
+                    visitor.sig_decs.data[&did].input_decs[0],
+                    Some(PtrKind::SliceCursor(false))
+                );
+                assert_eq!(visitor.ptr_kinds[&binding], PtrKind::SliceCursor(false));
+                assert!(visitor.cursor_resolution.demotions().is_empty());
+                assert_eq!(visitor.cursor_resolution.stats().required, 1);
+                assert!(
+                    !visitor
+                        .diagnostics
+                        .events()
+                        .iter()
+                        .any(|event| event.stage == DecisionStage::LateCursorResolution)
+                );
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn late_cursor_resolution_applies_final_snapshot() {
+        utils::compilation::run_compiler_on_str(
+            "pub unsafe fn f(p: *const i32) -> i32 { *p.offset(-1) }",
+            |tcx| {
+                let mut krate = utils::ast::expanded_ast(tcx);
+                let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+                let (input, mut analysis) = build_analysis(tcx);
+                let did = input.functions[0];
+                let binding = tcx.hir_body_owned_by(did).params[0].pat.hir_id;
+                // Keep legacy sign provenance while removing late demand to isolate wiring.
+                assert!(
+                    analysis.offset_sign_result.access_signs[&did]
+                        .contains(rustc_middle::mir::Local::from_usize(1))
+                );
+                analysis.offset_sign_result.cursor_constraints = Default::default();
+                let visitor = TransformVisitor::new(
+                    &Config::default(),
+                    &input,
+                    &analysis,
+                    ast_to_hir,
+                    FnPtrGroups::default(),
+                    FnPtrRewriteDecision::default(),
+                    DecisionDiagnostics::for_test(DiagnosticsMode::Full),
+                );
+                assert_eq!(
+                    visitor.sig_decs.data[&did].input_decs[0],
+                    Some(PtrKind::Slice(false))
+                );
+                assert_eq!(visitor.ptr_kinds[&binding], PtrKind::Slice(false));
+                assert_eq!(visitor.cursor_resolution.stats().demoted, 1);
+                assert_eq!(
+                    visitor.cursor_resolution.demotions()[0].expected_old_kind,
+                    PtrKind::SliceCursor(false)
+                );
+                let events: Vec<_> = visitor
+                    .diagnostics
+                    .events()
+                    .iter()
+                    .filter(|event| event.stage == DecisionStage::LateCursorResolution)
+                    .collect();
+                assert_eq!(events.len(), 1);
+                assert_eq!(
+                    events[0].subject,
+                    DecisionSubject::Param {
+                        did,
+                        index: 0,
+                        hir_id: binding,
+                        local: rustc_middle::mir::Local::from_usize(1),
+                    }
+                );
+            },
+        )
+        .unwrap();
+    }
 
     fn with_simplified_cursor_projection(source: &str, check: impl FnOnce(&Expr) + Send) {
         utils::compilation::run_compiler_on_str("fn f() {}", move |_| {

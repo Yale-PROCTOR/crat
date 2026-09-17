@@ -325,6 +325,70 @@ pub(crate) struct CursorDemotion {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CursorDemotionValidationError {
+    InvalidTransition(CursorOwner, PtrKind, PtrKind),
+    DuplicateOwner(CursorOwner),
+    MissingSignature(LocalDefId),
+    SignatureMismatch(CursorOwner, Option<PtrKind>),
+    BindingMismatch(CursorOwner, Option<PtrKind>),
+    UnsupportedOwner(CursorOwner),
+}
+
+pub(crate) fn validate_cursor_demotions(
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    demotions: &[CursorDemotion],
+) -> Result<(), CursorDemotionValidationError> {
+    use CursorDemotionValidationError::*;
+
+    let mut owners = FxHashSet::default();
+    let mut bindings = FxHashSet::default();
+    let mut inputs = FxHashSet::default();
+    for demotion in demotions {
+        let owner = demotion.owner;
+        if !owners.insert(owner) {
+            return Err(DuplicateOwner(owner));
+        }
+        if !matches!(
+            (demotion.expected_old_kind, demotion.replacement_kind),
+            (PtrKind::SliceCursor(old), PtrKind::Slice(new)) if old == new
+        ) {
+            return Err(InvalidTransition(
+                owner,
+                demotion.expected_old_kind,
+                demotion.replacement_kind,
+            ));
+        }
+        let (did, binding) = match owner {
+            CursorOwner::Param { did, binding, .. } => (did, binding),
+            CursorOwner::Binding { did, hir_id } => (did, hir_id),
+            CursorOwner::Return(_) | CursorOwner::Field(_) => {
+                return Err(UnsupportedOwner(owner));
+            }
+        };
+        // Distinct owners must not alias either physical write target.
+        if did != binding.owner.def_id || !bindings.insert(binding) {
+            return Err(UnsupportedOwner(owner));
+        }
+        if let CursorOwner::Param { index, .. } = owner {
+            if !inputs.insert((did, index)) {
+                return Err(UnsupportedOwner(owner));
+            }
+            let signature = sig_decs.data.get(&did).ok_or(MissingSignature(did))?;
+            let actual = signature.input_decs.get(index).copied().flatten();
+            if actual != Some(demotion.expected_old_kind) {
+                return Err(SignatureMismatch(owner, actual));
+            }
+        }
+        let actual = ptr_kinds.get(&binding).copied();
+        if actual != Some(demotion.expected_old_kind) {
+            return Err(BindingMismatch(owner, actual));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CursorRetention {
     Required { witness: Vec<CursorLocalNode> },
     Protected { reasons: Vec<FreezeReason> },
