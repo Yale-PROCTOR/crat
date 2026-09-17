@@ -225,6 +225,7 @@ fn shared_to_mut(template: raw_boundary::BridgeTemplate) -> bool {
         | BridgeTemplate::OptSliceToVoidConst
         | BridgeTemplate::OptSliceToRaw
         | BridgeTemplate::BoxBorrowViewToRaw
+        | BridgeTemplate::OptionalBoxBorrowViewToRaw
         | BridgeTemplate::CursorSharedToRawConst
         | BridgeTemplate::CursorMutToRawMut
         | BridgeTemplate::CursorMutToRawConst

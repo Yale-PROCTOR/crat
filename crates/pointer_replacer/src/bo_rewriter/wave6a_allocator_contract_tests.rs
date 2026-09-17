@@ -919,3 +919,103 @@ fn w6a_ac_an_optional_owner_lent_at_a_local_raw_formal_takes_its_own_view() {
         out.source
     );
 }
+
+/// **The four Box cells of the raw-view vocabulary** (R452-3(3)). One template
+/// used to render every owner — `core::ptr::from_mut(X.as_mut())` — which is
+/// right for exactly one of the four shapes. A fat owner's raw view is the
+/// SLICE's (the whole allocation, not a pointer to the `Box`), and an OPTIONAL
+/// owner must be opened before it is viewed, with `None` as the null pointer.
+/// Batch 10 measured the cost of the missing cells: 27 brotli reverts reading
+/// `no method named as_mut_ptr found for enum Option`, and wave-6f's three
+/// `verify-reverted` roots (their report 031 §6).
+#[test]
+fn w6a_glue_each_box_shape_renders_its_own_raw_view() {
+    use super::decision::{
+        Decision,
+        box_facts::{BoxPlan, BoxShape},
+        raw_boundary::{BridgeRender, BridgeTemplate, RawMutability, RawTargetType, template_for},
+    };
+
+    let plan = |shape: BoxShape, optional: bool| {
+        Decision::Box(BoxPlan {
+            shape,
+            optional,
+            expr_edits: Vec::new(),
+            delete_statements: Vec::new(),
+            receipts: Vec::new(),
+            fabricated_extent: false,
+            pointee_override: None,
+            inferred_binding: false,
+            overwrite_spans: Vec::new(),
+            retained_sink: false,
+            implicit_scope_close: false,
+        })
+    };
+    let target = |mutability: RawMutability| RawTargetType {
+        rendered: format!(
+            "*{} u32",
+            if mutability == RawMutability::Mut {
+                "mut"
+            } else {
+                "const"
+            }
+        ),
+        pointee: "u32".to_owned(),
+        mutability,
+        depth2: None,
+    };
+    let render = |shape: BoxShape, optional: bool, mutability: RawMutability| {
+        let decision = plan(shape, optional);
+        let template = template_for(&decision, &target(mutability), None, false)
+            .expect("a Box owner has a raw view");
+        let slice = shape == BoxShape::Slice;
+        match template
+            .render("x", mutability, slice, Some("u32"))
+            .expect("the cell renders")
+        {
+            BridgeRender::Edit(text) => (template, text),
+            other => panic!("{other:?}"),
+        }
+    };
+
+    // The selection is by the owner's FORM, and the census receipts name it.
+    let (t, text) = render(BoxShape::Sized, false, RawMutability::Mut);
+    assert_eq!(t, BridgeTemplate::BoxBorrowViewToRaw);
+    assert_eq!(text, "core::ptr::from_mut(x.as_mut())");
+
+    let (t, text) = render(BoxShape::Slice, false, RawMutability::Mut);
+    assert_eq!(t, BridgeTemplate::BoxBorrowViewToRaw);
+    assert_eq!(text, "x.as_mut_ptr()");
+
+    let (t, text) = render(BoxShape::Sized, true, RawMutability::Mut);
+    assert_eq!(t, BridgeTemplate::OptionalBoxBorrowViewToRaw);
+    assert_eq!(
+        text,
+        "x.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut)"
+    );
+
+    let (t, text) = render(BoxShape::Slice, true, RawMutability::Mut);
+    assert_eq!(t, BridgeTemplate::OptionalBoxBorrowViewToRaw);
+    assert_eq!(
+        text,
+        "x.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())"
+    );
+
+    // …and the four shared twins.
+    assert_eq!(
+        render(BoxShape::Sized, false, RawMutability::Const).1,
+        "core::ptr::from_ref(x.as_ref())"
+    );
+    assert_eq!(
+        render(BoxShape::Slice, false, RawMutability::Const).1,
+        "x.as_ptr()"
+    );
+    assert_eq!(
+        render(BoxShape::Sized, true, RawMutability::Const).1,
+        "x.as_deref().map_or(core::ptr::null(), core::ptr::from_ref)"
+    );
+    assert_eq!(
+        render(BoxShape::Slice, true, RawMutability::Const).1,
+        "x.as_deref().map_or(core::ptr::null(), |s| s.as_ptr())"
+    );
+}

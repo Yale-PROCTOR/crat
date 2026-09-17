@@ -3444,6 +3444,12 @@ pub(crate) enum BridgeTemplate {
     OptSliceToVoidConst,
     OptSliceToVoidMut,
     BoxBorrowViewToRaw,
+    /// R452-3(3). The same borrow view when the owner is OPTIONAL: the option
+    /// is opened first and `None` is the null pointer, so `Option<Box<T>>` and
+    /// `Option<Box<[T]>>` reach a raw position without the bare
+    /// `as_mut_ptr()` that does not exist on an `Option` (batch 10: 27 brotli
+    /// reverts and wave-6f's three `verify-reverted` roots).
+    OptionalBoxBorrowViewToRaw,
     KnownFreeDrop,
 }
 
@@ -3486,6 +3492,7 @@ impl BridgeTemplate {
                 "returned-child-option-mut-to-raw-const"
             }
             Self::BoxBorrowViewToRaw => "box-borrow-view-to-raw",
+            Self::OptionalBoxBorrowViewToRaw => "optional-box-borrow-view-to-raw",
             Self::KnownFreeDrop => "known-free-drop",
         }
     }
@@ -3737,6 +3744,22 @@ impl BridgeTemplate {
                 RawMutability::Mut => format!("core::ptr::from_mut({argument}.as_mut())"),
                 RawMutability::Const => format!("core::ptr::from_ref({argument}.as_ref())"),
             })),
+            Self::OptionalBoxBorrowViewToRaw => {
+                Ok(BridgeRender::Edit(match (box_slice, target_mutability) {
+                    (true, RawMutability::Mut) => format!(
+                        "{argument}.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())"
+                    ),
+                    (true, RawMutability::Const) => {
+                        format!("{argument}.as_deref().map_or(core::ptr::null(), |s| s.as_ptr())")
+                    }
+                    (false, RawMutability::Mut) => format!(
+                        "{argument}.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut)"
+                    ),
+                    (false, RawMutability::Const) => format!(
+                        "{argument}.as_deref().map_or(core::ptr::null(), core::ptr::from_ref)"
+                    ),
+                }))
+            }
             Self::KnownFreeDrop => Ok(BridgeRender::Lifecycle),
         }
     }
@@ -4256,10 +4279,13 @@ pub(crate) fn template_for(
         Decision::Box(plan) => {
             if ownership == Some(OwnershipContract::Consume) {
                 Ok(BridgeTemplate::KnownFreeDrop)
-            } else if plan.shape == BoxShape::Sized || plan.shape == BoxShape::Slice {
-                Ok(BridgeTemplate::BoxBorrowViewToRaw)
+            } else if plan.optional {
+                // The owner is opened before it is viewed (R452-3(3)); which
+                // view it is — the slice's or the value's — the renderer reads
+                // from the shape it is handed.
+                Ok(BridgeTemplate::OptionalBoxBorrowViewToRaw)
             } else {
-                Err(RawBoundaryBlockReason::TemplateUnavailable)
+                Ok(BridgeTemplate::BoxBorrowViewToRaw)
             }
         }
         Decision::NestedSlice { .. } => Err(RawBoundaryBlockReason::TemplateUnavailable),
