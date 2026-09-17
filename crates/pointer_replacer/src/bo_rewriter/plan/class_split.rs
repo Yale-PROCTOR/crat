@@ -853,12 +853,12 @@ pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
 "#;
 
     #[test]
-    #[ignore = "RED for a measured reason, not a missing query (wave-5d2 report 019): the base's \
-                candidate is never PRODUCED — the native source scan holds `ff` at \
-                Source::UnsupportedOwnerUse because the derived local's own initializer is an \
-                uncovered raw use of the root. Selection was never the blocker. The companion \
-                tripwire below pins that hold; when it goes RED the candidate exists and this \
-                witness is the one to finish."]
+    #[ignore = "RED for a measured reason (wave-5d2 report 021, re-measured on batch-10-dry6): the \
+                `covered` wall is gone — the source scan admits the receiver — but the base is now \
+                held at `Missing(native-view-alias-family-owned)`, R423's arbitration: another \
+                family already decided the alias, at a FABRICATED extent. Rule B's form delivers \
+                the Box and an exact extent instead, and needs that arbitration to recognize the \
+                alias as the owner's own view."]
     fn a_derived_local_is_typed_by_its_base_candidate() {
         let got = run(HEMAN_DERIVED_SHAPE);
         eprintln!(
@@ -867,40 +867,61 @@ pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
             got.ownership_native,
             got.emitted.as_deref().unwrap_or("(no tree)")
         );
-        assert_ne!(
-            column(&got.subjects, "transform_to_coordfield::f#17", "reason"),
-            "copy-source-coupled",
-            "the derived local is typed by its base's candidate:\n{}",
+        // The property is BOTH rows, and the extent. A derived local typed at
+        // a fabricated 1024 while its base stays raw is what this frame
+        // already does; it is not what this rule is for.
+        assert_eq!(
+            column(&got.subjects, "transform_to_coordfield::ff#6", "decision"),
+            "box",
+            "the base delivers a Box:\n{}",
             got.subjects
         );
-    }
-
-    /// The control for the tripwire: the same body without the derived local.
-    /// Its base is not held by the source scan, which is what makes the
-    /// tripwire's hold attributable to `let f = ff.offset(k)` and not to the
-    /// allocation, the free, or the loop.
-    #[test]
-    fn without_the_derived_local_the_base_is_not_source_held() {
-        let got = run(HEMAN_INLINED_SHAPE);
-        eprintln!("INLINED\n{}\n{}", got.subjects, got.ownership_native);
-        assert_ne!(
-            column(
-                &got.ownership_native,
-                "transform_to_coordfield::ff#6",
-                "native_hold_kind"
-            ),
-            "Source::UnsupportedOwnerUse",
-            "without the derived local the source scan does not hold the base:\n{}",
-            got.ownership_native
+        let tree = got.tree();
+        assert!(
+            tree.contains("&mut ff[(height * x) as usize..]"),
+            "the derived local is the base's exact suffix view:\n{tree}"
+        );
+        assert!(
+            !tree.contains("FALLBACK_SLICE_EXTENT"),
+            "and no extent is fabricated for it:\n{tree}"
         );
     }
 
     // wave-5d2's `the_derived_locals_base_is_held_before_any_candidate_exists`
-    // is WITHDRAWN on the composition (seat relay assembler/018, R442-5; their
-    // relay 021): it pins a stale copy of ownership-fields' file — on this tree
-    // `transform_to_coordfield::ff#6` is still held, but by the native alias
-    // family (`Missing("native-view-alias-family-owned")`) before the source
-    // scan is reached. The lane re-states the tripwire on the composed frame.
+    // was WITHDRAWN on the composition (seat relay assembler/018, R442-5) and
+    // the lane RE-STATES the measurement here (`bf60f5caf`): on this tree
+    // `transform_to_coordfield::ff#6` is held by the native alias family
+    // before the source scan is reached, so the counterfactual below prices
+    // the derived local instead of pinning which producer answers first.
+
+    /// The counterfactual that prices the derived local: the same body with it
+    /// inlined delivers the base as a Box. Everything else about the function
+    /// — the allocation, the free, the loop — is identical, so the difference
+    /// is attributable to `let f = ff.offset(k)` alone.
+    #[test]
+    fn without_the_derived_local_the_base_delivers_box() {
+        let got = run(HEMAN_INLINED_SHAPE);
+        eprintln!("INLINED\n{}\n{}", got.subjects, got.ownership_native);
+        let row = "transform_to_coordfield::ff#6";
+        assert_eq!(
+            column(&got.subjects, row, "decision"),
+            "box",
+            "the inlined base delivers a Box:\n{}",
+            got.subjects
+        );
+        assert_eq!(
+            column(&got.subjects, row, "placed"),
+            "1",
+            "and it is placed:\n{}",
+            got.subjects
+        );
+        assert_eq!(
+            column(&got.ownership_native, row, "native_status"),
+            "selected",
+            "through a selected native candidate:\n{}",
+            got.ownership_native
+        );
+    }
 
     #[test]
     fn a_static_literal_local_is_typed_by_its_own_initializer() {
