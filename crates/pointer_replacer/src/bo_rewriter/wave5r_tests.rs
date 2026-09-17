@@ -428,3 +428,6 @@ mod wave6r_iterator_tests;
 
 #[path = "wave6r_address_alias_tests.rs"]
 mod wave6r_address_alias_tests;
+
+#[path = "wave6r_consumed_result_tests.rs"]
+mod wave6r_consumed_result_tests;

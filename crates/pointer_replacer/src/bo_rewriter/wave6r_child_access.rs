@@ -601,6 +601,213 @@ pub(crate) fn loaded_field_is_descendant_free(
     .is_none()
 }
 
+/// Every call site whose returned alias the caller consumes where it is
+/// produced: the callee position is a Return-only `Retains` (the alias IS the
+/// argument) and the caller's result local is read through only. Derived once
+/// with the rows, so the site query is a lookup.
+pub(crate) fn consumed_results(
+    program: &RustProgram<'_>,
+    rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
+) -> FxHashSet<(LocalDefId, u32, u32)> {
+    use super::decision::raw_boundary::RetentionEventKind;
+    let tcx: TyCtxt<'_> = program.tcx;
+    let return_only = |callee: LocalDefId| {
+        (0..8).any(|index| {
+            matches!(
+                rows.get(&(callee, index)),
+                Some(RetentionVerdict::Retains { sink, path })
+                    if sink.kind == RetentionEventKind::Return
+                        && path.iter().all(|step| step.kind == RetentionEventKind::Return)
+            )
+        })
+    };
+    let mut out = FxHashSet::default();
+    for &function in &program.functions {
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(function)
+            .borrow();
+        let body: &Body<'_> = &body;
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            let TerminatorKind::Call {
+                func, destination, ..
+            } = &data.terminator().kind
+            else {
+                continue;
+            };
+            let Some(callee) = resolved(func)
+                .and_then(|callee| callee.as_local())
+                .filter(|callee| program.functions.contains(callee) && return_only(*callee))
+            else {
+                continue;
+            };
+            let _ = callee;
+            let Some(result) = destination.as_local() else { continue };
+            if result_consumed_in_place(tcx, &program.functions, body, result) {
+                out.insert((function, block.as_u32(), data.statements.len() as u32));
+            }
+        }
+    }
+    out
+}
+
+/// The caller side of the returned-alias continuation: the alias the call
+/// returned is CONSUMED where it is produced — the caller never uses it
+/// itself (no deref, no store, no return) and passes it on only to local
+/// callees that are descendant-free at that position. heman's
+/// `kmVec2Length(kmVec2Subtract(&mut tmp, a, b))` is the shape.
+///
+/// This is deliberately stricter than the descendant scan: a caller that
+/// KEEPS the returned alias and reads or writes through it later holds a live
+/// raw alias of the subject beside the safe view the site emits, which is the
+/// R395-2 channel (`wave6r_returned_alias_kept_by_caller_keeps_hold`).
+fn result_consumed_in_place<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
+    body: &Body<'tcx>,
+    result: Local,
+) -> bool {
+    if !pointer(body.local_decls[result].ty) {
+        return true;
+    }
+    let mut aliases = vec![result];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(assignment) = &statement.kind else { continue };
+                let (lhs, rhs) = (&assignment.0, &assignment.1);
+                if let Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) = rhs
+                    && let Some(source) = operand_local(operand)
+                    && aliases.contains(&source)
+                    && let Some(destination) = lhs.as_local()
+                    && destination != rustc_middle::mir::RETURN_PLACE
+                    && pointer(body.local_decls[destination].ty)
+                    && !aliases.contains(&destination)
+                {
+                    aliases.push(destination);
+                    changed = true;
+                }
+            }
+        }
+    }
+    let touches = |place: &rustc_middle::mir::Place<'_>| {
+        aliases.contains(&place.local) && !place.projection.is_empty()
+    };
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let StatementKind::Assign(assignment) = &statement.kind else { continue };
+            let (lhs, rhs) = (&assignment.0, &assignment.1);
+            // A use THROUGH the alias (`(*r).x = ..`, `let y = (*r).x`) is the
+            // caller holding a live raw view of the subject: not consumed.
+            if touches(lhs) {
+                return false;
+            }
+            let operand_place = |operand: &Operand<'tcx>| operand.place();
+            let used_through = match rhs {
+                Rvalue::Use(operand)
+                | Rvalue::Cast(_, operand, _)
+                | Rvalue::Repeat(operand, _)
+                | Rvalue::UnaryOp(_, operand)
+                | Rvalue::ShallowInitBox(operand, _) => {
+                    operand_place(operand).as_ref().is_some_and(touches)
+                }
+                Rvalue::BinaryOp(_, operands) => {
+                    operand_place(&operands.0).as_ref().is_some_and(touches)
+                        || operand_place(&operands.1).as_ref().is_some_and(touches)
+                }
+                Rvalue::Aggregate(_, operands) => operands
+                    .iter()
+                    .any(|operand| operand_place(operand).as_ref().is_some_and(touches)),
+                Rvalue::Ref(_, _, place)
+                | Rvalue::RawPtr(_, place)
+                | Rvalue::Discriminant(place)
+                | Rvalue::CopyForDeref(place)
+                | Rvalue::Len(place) => touches(place),
+                _ => false,
+            };
+            if used_through {
+                return false;
+            }
+            match rhs {
+                Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
+                    if operand_local(operand).is_some_and(|local| aliases.contains(&local))
+                        && lhs
+                            .as_local()
+                            .is_none_or(|destination| !aliases.contains(&destination))
+                    {
+                        return false;
+                    }
+                }
+                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                    if aliases.contains(&place.local) {
+                        return false;
+                    }
+                }
+                Rvalue::BinaryOp(_, operands) => {
+                    if operand_local(&operands.0)
+                        .into_iter()
+                        .chain(operand_local(&operands.1))
+                        .any(|local| aliases.contains(&local))
+                    {
+                        return false;
+                    }
+                }
+                Rvalue::Aggregate(_, operands) => {
+                    if operands
+                        .iter()
+                        .any(|operand| operand_local(operand).is_some_and(|l| aliases.contains(&l)))
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (func, args) = match &data.terminator().kind {
+            TerminatorKind::Call { func, args, .. } => (func, args),
+            TerminatorKind::TailCall { func, args, .. } => (func, args),
+            _ => continue,
+        };
+        let passed = args
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| {
+                operand_local(&argument.node).is_some_and(|local| aliases.contains(&local))
+                    || argument.node.place().is_some_and(|place| touches(&place))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if passed.is_empty() {
+            continue;
+        }
+        if matches!(data.terminator().kind, TerminatorKind::TailCall { .. }) {
+            return false;
+        }
+        // Only a local callee this scan can read may receive the alias.
+        let Some(callee) = resolved(func)
+            .and_then(|callee| callee.as_local())
+            .filter(|callee| functions.contains(callee))
+        else {
+            return false;
+        };
+        let mut visited = FxHashSet::default();
+        if passed.iter().any(|index| {
+            refusal(
+                tcx,
+                functions,
+                callee,
+                Local::from_usize(index + 1),
+                &mut visited,
+            )
+            .is_some()
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
 /// The returned-alias continuation at ONE call site: a callee position whose
 /// only retention is returning the parameter retains nothing beyond a call
 /// whose result the caller discards. The retention row itself is untouched
@@ -624,8 +831,8 @@ pub(crate) fn site_retention(
     if !return_only {
         return Some(base.clone());
     }
-    match retention.type_backed_child_access(caller, key) {
-        Some(ChildAccess::Unused) => Some(RetentionVerdict::NoRetain {
+    let certificate = |detail: &str| {
+        Some(RetentionVerdict::NoRetain {
             certificate: RetentionCertificate {
                 function: key.callee.path.clone(),
                 argument_index: key.argument_index,
@@ -634,17 +841,31 @@ pub(crate) fn site_retention(
                     RetentionStep {
                         location: format!("bb{}:s{}", key.block, key.statement_index),
                         kind: RetentionEventKind::KnownNoRetainCall,
-                        detail: RETURNED_ALIAS_DISCARDED.to_owned(),
+                        detail: detail.to_owned(),
                     },
                 ],
                 attestation: "closed_world_frozen_graph",
             },
-        }),
-        _ => Some(base.clone()),
+        })
+    };
+    if let Some(ChildAccess::Unused) = retention.type_backed_child_access(caller, key) {
+        return certificate(RETURNED_ALIAS_DISCARDED);
     }
+    // The caller consumes the returned alias where it is produced: the result
+    // is only read through in the caller's body, so no alias of the argument
+    // outlives the call (report 021, wave-5d2 014's `kmVec2Subtract` row).
+    if retention.result_consumed_at(caller, key.block, key.statement_index) {
+        return certificate(RETURNED_ALIAS_CONSUMED);
+    }
+    Some(base.clone())
 }
 
 pub(crate) const RETURNED_ALIAS_DISCARDED: &str = "returned-alias-discarded";
+
+/// The same continuation where the caller CONSUMES the returned alias in the
+/// statement that produced it (heman `kmVec2Length(kmVec2Subtract(..))`)
+/// instead of discarding it: nothing keeps the alias past the call.
+pub(crate) const RETURNED_ALIAS_CONSUMED: &str = "returned-alias-consumed";
 
 /// Certificate replay for a site: a site certificate (its last step is the
 /// discarded-return marker) is re-derived from the callee's row and the
@@ -657,11 +878,9 @@ pub(crate) fn verify_certificate(
     callee: LocalDefId,
     certificate: &super::decision::raw_boundary::RetentionCertificate,
 ) -> Result<(), &'static str> {
-    if certificate
-        .steps
-        .last()
-        .is_some_and(|step| step.detail == RETURNED_ALIAS_DISCARDED)
-    {
+    if certificate.steps.last().is_some_and(|step| {
+        step.detail == RETURNED_ALIAS_DISCARDED || step.detail == RETURNED_ALIAS_CONSUMED
+    }) {
         return match site_retention(retention, caller, key, callee) {
             Some(RetentionVerdict::NoRetain {
                 certificate: expected,

@@ -1629,6 +1629,10 @@ pub(crate) struct RetentionSummaries {
     /// position the K18' discharge looked at, with its outcome and, where it
     /// held, the conjunct that refused. Instrument-only.
     pub(crate) child_access: String,
+    /// wave-6r (relay 019): the call sites whose returned alias the caller
+    /// CONSUMES where it is produced — the result is only read through in the
+    /// caller's body. Keyed by (caller, block, statement index of the call).
+    consumed_results: FxHashSet<(LocalDefId, u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -3099,12 +3103,15 @@ impl RetentionSummaries {
                 .flatten()
                 .map(|record| &mut record.evidence),
         );
+        let consumed_results =
+            crate::bo_rewriter::wave6r_child_access::consumed_results(program, &rows);
         Self {
             rows,
             facts,
             attested,
             returned_children,
             child_access,
+            consumed_results,
             type_backed_children,
             pointer_free_parameters,
         }
@@ -3161,6 +3168,17 @@ impl RetentionSummaries {
     /// callee may hand back, for callees with no pinned contract row. `None`
     /// means the walk produced no unique evidence, and the caller must keep
     /// treating the child's access as unknown.
+    /// wave-6r (relay 019): does the caller consume the alias returned by the
+    /// call at this site where it is produced?
+    pub(crate) fn result_consumed_at(
+        &self,
+        caller: LocalDefId,
+        block: u32,
+        statement: u32,
+    ) -> bool {
+        self.consumed_results.contains(&(caller, block, statement))
+    }
+
     pub(crate) fn type_backed_child_access(
         &self,
         caller: LocalDefId,
