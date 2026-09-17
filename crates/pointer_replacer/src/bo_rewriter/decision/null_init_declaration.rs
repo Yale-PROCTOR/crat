@@ -19,17 +19,12 @@
 //! owner. An optional slice's declaration names no extent; its value plan
 //! carries the extent (evidence-backed or the receipted fallback).
 
-use rustc_hash::FxHashSet;
-use rustc_hir::{HirId, Node, PatKind, def_id::LocalDefId};
+use rustc_hir::{Node, PatKind};
 use rustc_middle::ty::{TyCtxt, TyKind};
 
 use super::{
     Ctx, Decision, DecisionTable, Subject, SubjectKind,
     declaration::{emitted_type, pointee_is_nameable, pointee_source},
-    outbound_expression::OutboundExpressionPlans,
-    raw_boundary::RawBoundaryDispositionIndex,
-    seam::Form,
-    sibling_overlap,
 };
 use crate::bo_rewriter::{
     additive::FamilyStage, bridge_receipt::SignatureClassId,
@@ -75,63 +70,6 @@ pub(crate) fn pending_sibling_hold(
 fn pending_sibling(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
     ctx.raw_boundary
         .is_some_and(|index| index.pending_sibling_source((subject.fn_did, subject.hir_id)))
-}
-
-/// **Relay 018 §1.** The null-init-family locals whose boundary site would be
-/// a PENDING sibling-overlap row once delivered — the same predicate the
-/// terminal receipt applies (`select_pending`: a borrowed source at a RAW
-/// target, a risky sibling, the local not dead-unprotected after the call),
-/// asked before the final decision pass with the optional form as the source
-/// and the boundary index's open T1/T2 site as "the target is raw". Computed
-/// once, carried on the index the final pass already consults.
-pub(crate) fn pending_sibling_sources(
-    tcx: TyCtxt<'_>,
-    inputs: &sibling_overlap::SiblingInputs<'_>,
-    raw_boundary: &RawBoundaryDispositionIndex,
-) -> FxHashSet<(LocalDefId, HirId)> {
-    let mut out = FxHashSet::default();
-    // Nothing to consult where the family has no candidate: the inventory walks
-    // every boundary site's MIR body, so it is not derived for its own sake.
-    if !inputs.subjects.iter().any(|subject| {
-        subject.ty_span.is_none() && matches!(subject.kind, SubjectKind::Local) && subject.null_init
-    }) {
-        return out;
-    }
-    let potentials =
-        sibling_overlap::collect_inventory_from(tcx, inputs, &OutboundExpressionPlans::default())
-            .potentials;
-    for potential in &potentials {
-        let Some(source) = potential.source.declared() else { continue };
-        if source.ty_span.is_some()
-            || !matches!(source.kind, SubjectKind::Local)
-            || !source.null_init
-        {
-            continue;
-        }
-        let raw_target = raw_boundary.tracks_call_argument(
-            potential.caller,
-            &potential.site.callee.path,
-            potential.argument_span,
-            potential.site.argument_index,
-        );
-        let state = sibling_overlap::TerminalSiteState {
-            // The predicate asks only whether the source is a borrowed form.
-            source_form: Form::Opt {
-                mutable: true,
-                slice: false,
-            },
-            target_form: if raw_target {
-                Form::Raw
-            } else {
-                Form::Ref { mutable: false }
-            },
-            source_delivered: true,
-        };
-        if !sibling_overlap::select_pending(std::slice::from_ref(potential), |_| state).is_empty() {
-            out.insert((source.fn_did, source.hir_id));
-        }
-    }
-    out
 }
 
 fn admissible(ctx: &Ctx<'_, '_>, subject: &Subject, decision: &Decision) -> bool {

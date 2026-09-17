@@ -7617,7 +7617,7 @@ fn finish_decide<'tcx>(
         // Wave-6o (relay 018 §1): the pending sibling-overlap market the
         // null-init family consults before delivering, from the same inputs
         // the terminal inventory reads.
-        let pending_sibling_sources = decision::null_init_declaration::pending_sibling_sources(
+        let pending_sibling_sources = decision::pending_sibling::pending_sibling_sources(
             tcx,
             &decision::sibling_overlap::SiblingInputs {
                 slots: &slots,
