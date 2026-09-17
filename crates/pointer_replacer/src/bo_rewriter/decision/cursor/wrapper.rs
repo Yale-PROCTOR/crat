@@ -112,11 +112,15 @@ fn table_element_base(
         .iter()
         .find(|(source, _)| source.fn_did == s.fn_did && source.hir_id == root)
         .ok_or(CursorHold::BaseMissing)?;
-    let uses = match decision {
-        Decision::Slice { uses, .. } => uses,
+    // A table that delivers its inner level (nested's N1) hands the element as
+    // a slice, not a pointer: the constructor is then `new(t[k])`, which takes
+    // NO length, so this base fabricates nothing and is evidence-backed by
+    // construction (`fallback = false`, 027 (b)).
+    let (uses, delivered_inner) = match decision {
+        Decision::Slice { uses, .. } => (uses, false),
+        Decision::NestedSlice { uses, .. } => (uses, true),
         Decision::Ref { .. }
         | Decision::InferredRef { .. }
-        | Decision::NestedSlice { .. }
         | Decision::Opt { .. }
         | Decision::Box(_)
         | Decision::Cursor { .. }
@@ -128,12 +132,16 @@ fn table_element_base(
         .ok_or(CursorHold::BaseMissing)?;
     Ok(Base {
         parent_cursor: None,
-        expression: format!(
-            "unsafe {{ {}::from_raw_parts{}({}, crate::FALLBACK_SLICE_EXTENT) }}",
-            constructor(s.mutable),
-            if s.mutable { "_mut" } else { "" },
-            element.replacement
-        ),
+        expression: if delivered_inner {
+            format!("{}::new({})", constructor(s.mutable), element.replacement)
+        } else {
+            format!(
+                "unsafe {{ {}::from_raw_parts{}({}, crate::FALLBACK_SLICE_EXTENT) }}",
+                constructor(s.mutable),
+                if s.mutable { "_mut" } else { "" },
+                element.replacement
+            )
+        },
         binding: None,
         local: s.local,
         delivered: Some(DeliveredBase {
@@ -142,7 +150,7 @@ fn table_element_base(
             initializer: ctx.constructions.init_hirs.get(&(s.fn_did, root)).copied(),
             provider: DeliveredBaseProvider::TableElement,
         }),
-        fallback: true,
+        fallback: !delivered_inner,
         composed: vec![element.span],
     })
 }
