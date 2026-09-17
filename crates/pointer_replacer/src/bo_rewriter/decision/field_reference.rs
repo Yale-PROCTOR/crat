@@ -370,7 +370,10 @@ impl FieldTransaction {
                 "array-opt-ref-shared"
             }
         } else if self.owning {
-            if matches!(self.form, Form::Slice { .. } | Form::Opt { slice: true, .. }) {
+            if matches!(
+                self.form,
+                Form::Slice { .. } | Form::Opt { slice: true, .. }
+            ) {
                 "opt-box-slice"
             } else {
                 "opt-box"
