@@ -134,9 +134,11 @@ pub(super) fn settle(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) {
             if subject.ty_span.is_some() || plain_reference(decision).is_none() {
                 return None;
             }
-            // wave-5d2: a local this lane does not type may still be typed by
-            // its own initializer's value (`source_typed_local`); it is not a
-            // refusal of THIS rule.
+            // wave-5d2: defensive — a local typed by its own literal initializer
+            // (`source_typed_local`) is not a refusal of THIS rule. Today the two
+            // recognizers are disjoint (path initializer vs literal initializer),
+            // so this guard changes no outcome; it holds if `copy_value` widens.
+            // (Confirmed by this file's owner, wave-6k report 020.)
             if super::source_typed_local::permits(ctx, subject) {
                 return None;
             }
