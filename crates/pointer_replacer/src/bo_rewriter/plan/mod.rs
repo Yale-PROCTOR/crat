@@ -515,9 +515,15 @@ fn nested_ast_composition(
         let raw_view_over_cursor_advance = outer.key.arm == "c"
             && matches!(
                 outer.key.bridge_kind.as_str(),
-                "slice-to-raw-const" | "slice-mut-to-raw-mut"
+                // `void-cursor-view` is wave-6b's opaque-formal cell (R450-7(b)):
+                // it renders ZERO syntax over this family's own view inside the
+                // source's cast, so the two sites share one argument interval.
+                "slice-to-raw-const" | "slice-mut-to-raw-mut" | "void-cursor-view"
             )
-            && inner.key.bridge_kind == "cursor-advance"
+            && matches!(
+                inner.key.bridge_kind.as_str(),
+                "cursor-advance" | "raw-op-cursor-t1"
+            )
             && contains(outer, inner);
         // L07 (§39 addendum 272, R272-3). The five outer/inner kind pairs the
         // J'' frame measures as STRICT CONTAINMENTS, entering under exactly

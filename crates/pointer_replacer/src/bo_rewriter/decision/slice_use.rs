@@ -195,7 +195,8 @@ fn shared_to_mut(template: raw_boundary::BridgeTemplate) -> bool {
         | BridgeTemplate::VoidFromSliceCastMut
         | BridgeTemplate::OptSliceToVoidMut
         | BridgeTemplate::OptSliceToRawMut => true,
-        BridgeTemplate::Depth2NpoConst
+        BridgeTemplate::VoidFromCursorView
+        | BridgeTemplate::Depth2NpoConst
         | BridgeTemplate::Depth2NpoMut
         | BridgeTemplate::VoidFromMut
         | BridgeTemplate::VoidFromRef

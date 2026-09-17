@@ -110,11 +110,35 @@ fn cursor_raw_rejects_unlicensed_target_and_ownership_forms() {
         template_for(&cursor(false), &target(RawMutability::Mut), None, true),
         Err(RawBoundaryBlockReason::SharedToMut)
     );
+    // wave-6b (relay 016): the opaque formal IS licensed for a cursor now —
+    // the cursor family renders the argument (its raw view inside the source's
+    // own cast) and the boundary's part is the receipt, so the template is the
+    // zero-syntax one. A `*mut` void target from a SHARED cursor stays refused
+    // with every other shared-to-mut cell.
     let mut void = target(RawMutability::Const);
     void.pointee = "core::ffi::c_void".into();
     assert_eq!(
         template_for(&cursor(false), &void, None, false),
-        Err(RawBoundaryBlockReason::TemplateUnavailable)
+        Ok(BridgeTemplate::VoidFromCursorView)
+    );
+    let mut void_mut = target(RawMutability::Mut);
+    void_mut.pointee = "core::ffi::c_void".into();
+    assert_eq!(
+        template_for(&cursor(false), &void_mut, None, false),
+        Err(RawBoundaryBlockReason::SharedToMut)
+    );
+    assert_eq!(
+        template_for(&cursor(true), &void_mut, None, false),
+        Ok(BridgeTemplate::VoidFromCursorView)
+    );
+    assert_eq!(
+        BridgeTemplate::VoidFromCursorView.render(
+            "p",
+            RawMutability::Const,
+            false,
+            Some("core::ffi::c_void")
+        ),
+        Ok(crate::bo_rewriter::decision::raw_boundary::BridgeRender::ZeroSyntax)
     );
     let mut depth2 = target(RawMutability::Mut);
     depth2.depth2 = Some(Depth2Target {

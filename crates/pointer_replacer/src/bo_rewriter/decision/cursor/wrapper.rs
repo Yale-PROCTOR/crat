@@ -1091,31 +1091,30 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     } else {
                         "as_ptr"
                     };
-                    let opens = self.ctx.raw_boundary.is_none_or(|rb| {
-                        rb.opens_argument(
-                            (self.subject.fn_did, self.subject.hir_id),
-                            arg.span,
-                            index,
-                        )
-                    });
+                    // R450-7(b): the boundary's cell for an opaque formal renders
+                    // ZERO SYNTAX over this family's own view, so the receipt
+                    // arrives with the site rather than gating it — the family
+                    // no longer holds on `opens_argument` for this shape.
+                    // The T1 receipt for this view is the site's own bridge row;
+                    // a callee outside this crate carries no site, so it holds.
+                    let Some(callee_did) = did.as_local() else {
+                        self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
+                        continue;
+                    };
                     match self.index(operand) {
-                        Ok(_) if !opens => {
-                            self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
-                        }
-                        Ok(d) if local(operand) == Some(self.subject.hir_id) => {
-                            self.push(
-                                operand,
-                                format!("{}.{view}()", self.view()),
-                                "raw-op-cursor-t1",
-                            );
-                            let _ = d;
-                        }
                         Ok(d) => {
-                            self.push(
-                                operand,
-                                format!("{}.offset_by({d}).{view}()", self.view()),
-                                "raw-op-cursor-t1",
-                            );
+                            let text = if local(operand) == Some(self.subject.hir_id) {
+                                format!("{}.{view}()", self.view())
+                            } else {
+                                format!("{}.offset_by({d}).{view}()", self.view())
+                            };
+                            self.push(operand, text, "raw-op-cursor-t1");
+                            self.bridges.push(super::CursorBridge {
+                                call_hir: e.hir_id,
+                                callee: callee_did,
+                                argument_span: operand.span,
+                                argument_index: index,
+                            });
                         }
                         Err(hold) => {
                             self.hold.get_or_insert(hold);

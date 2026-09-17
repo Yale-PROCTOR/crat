@@ -1282,7 +1282,7 @@ pub unsafe fn header(buf: &mut [u8], p: *mut u8, n: isize) -> i32 {
 }
 
 #[test]
-fn slicecursor_cursor_cast_to_a_void_formal_reaches_the_boundary_gate() {
+fn slicecursor_cursor_cast_to_a_void_formal_takes_its_raw_view() {
     // brotli `CreateCommands` / the fragment compressors (census #6's archive:
     // `ip` and `next_ip` hold `RawBoundaryUnbuilt`, and the 14 forwarders'
     // `DeclarationUnbuilt` sit behind them): a cursor CAST to an opaque pointer
@@ -1297,8 +1297,8 @@ fn slicecursor_cursor_cast_to_a_void_formal_reaches_the_boundary_gate() {
     let input = r#"
 use std::os::raw::c_void;
 unsafe extern "C" { fn sink(p: *const c_void) -> u64; }
-pub unsafe fn emit(input: *const u8, n: usize) -> u64 {
-    let mut ip = input.offset(1);
+pub unsafe fn emit(input: &[u8], n: usize) -> u64 {
+    let mut ip = input.as_ptr().offset(1);
     let mut acc = 0u64;
     let mut i = 0usize;
     while i < n {
@@ -1320,14 +1320,14 @@ pub unsafe fn emit(input: *const u8, n: usize) -> u64 {
     };
     assert_eq!(
         of("emit::ip"),
-        "Err(RawBoundaryUnbuilt)",
-        "the cast operand's view is not built, or the gate moved: {dispositions:?}"
+        "Ok(())",
+        "the cast operand's view is not delivered: {dispositions:?}"
     );
     let source = emitted(input);
     save_fixture("cursor-cast-to-void-formal", input, &source);
     assert!(
-        source.contains("sink(ip.offset(-1) as *const c_void)"),
-        "the held subject must keep the original text: {source}"
+        source.contains(".as_ptr() as *const c_void)"),
+        "the cursor's raw view inside the cast is absent: {source}"
     );
 }
 

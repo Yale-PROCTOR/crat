@@ -3400,6 +3400,9 @@ pub(crate) enum BridgeTemplate {
     /// of the edge R271-1 opened.
     VoidFromSlice,
     VoidFromSliceMut,
+    /// wave-6b: the cursor family's own argument at an opaque formal — the
+    /// boundary's receipt over syntax the cursor emits (relay 016).
+    VoidFromCursorView,
     RawCastMut,
     RawCastConst,
     TypedRawTemporary,
@@ -3450,6 +3453,7 @@ impl BridgeTemplate {
             Self::Depth2NpoConst | Self::Depth2NpoMut => "depth2-npo-bridge",
             Self::VoidFromMut | Self::VoidFromRef | Self::VoidFromMutAsConst => "void-generic-raw",
             Self::VoidFromSlice | Self::VoidFromSliceMut => "void-generic-raw-slice",
+            Self::VoidFromCursorView => "void-cursor-view",
             Self::VoidFromSliceCastMut => "shared-slice-to-mut-void",
             Self::VoidFromRefCastMut => "shared-ref-to-mut-raw",
             Self::RawCastMut => "raw-cast-mut",
@@ -3554,6 +3558,9 @@ impl BridgeTemplate {
                 };
                 Ok(BridgeRender::Edit(format!("{source}.cast::<{pointee}>()")))
             }
+            // The cursor family renders this argument itself (relay 016): the
+            // boundary's part is the receipt, so the bridge is zero syntax.
+            Self::VoidFromCursorView => Ok(BridgeRender::ZeroSyntax),
             Self::RawCastMut => Ok(BridgeRender::Edit(format!("{argument}.cast_mut()"))),
             Self::RawCastConst => Ok(BridgeRender::Edit(format!("{argument}.cast_const()"))),
             Self::TypedRawTemporary => {
@@ -4184,10 +4191,26 @@ pub(crate) fn template_for(
                 ..
             } if has_negative_write_evidence => Ok(BridgeTemplate::OptSliceToVoidMut),
             Decision::Opt { slice: true, .. } => Err(RawBoundaryBlockReason::SharedToMut),
-            Decision::Box(_)
-            | Decision::NestedSlice { .. }
-            | Decision::Cursor { .. }
-            | Decision::Degraded(_) => Err(RawBoundaryBlockReason::TemplateUnavailable),
+            // wave-6b (relay 016, R448-5): a CURSOR at an opaque formal. The
+            // cursor family renders the whole argument itself — its raw view
+            // goes inside the source's own cast (`ip.offset_by(k).as_ptr() as
+            // *const c_void`, slicecursor's `b8f6071f2`) — so the boundary owes
+            // this site a RECEIPT, not syntax: the bridge is the identity over
+            // an expression that is already a raw pointer of the target's
+            // mutability, and the cast to the opaque type is the source's.
+            //
+            // A mutable target from a shared cursor is refused with its
+            // siblings: the cursor's view cannot widen a shared borrow.
+            Decision::Cursor { mutable: true, .. } => Ok(BridgeTemplate::VoidFromCursorView),
+            Decision::Cursor { mutable: false, .. }
+                if target.mutability == RawMutability::Const =>
+            {
+                Ok(BridgeTemplate::VoidFromCursorView)
+            }
+            Decision::Cursor { mutable: false, .. } => Err(RawBoundaryBlockReason::SharedToMut),
+            Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Degraded(_) => {
+                Err(RawBoundaryBlockReason::TemplateUnavailable)
+            }
         };
     }
     match decision {
