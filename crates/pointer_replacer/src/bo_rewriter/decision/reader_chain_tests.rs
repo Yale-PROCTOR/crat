@@ -196,3 +196,48 @@ fn w5c_reader_chain_thin_caller_declines_with_the_companion_adapter() {
     assert!(!flat.contains("from_ref("), "{flat}");
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
 }
+
+/// R427-7 / relay 027 §3: the `distance_cache` family's chain root is a
+/// struct FIELD array (`s->dist_cache_: [c_int; 16]`), not a companion and
+/// not a supplied slice — brotli's `PrepareDistanceCacheH40(privat,
+/// dist_cache) → PrepareDistanceCache(distance_cache, num_distances)` with
+/// `((*s).dist_cache_).as_mut_ptr()` at the root. The field's declared length
+/// is a static, evidence-backed extent; the chain should read it from the
+/// root's type. RED: `supplied` sees a `RawExpr` argument, not a binding, and
+/// refuses (`caller-not-supplied`), so the forwarders stay held.
+#[test]
+#[ignore = "R427-7 RED: the field-array root is not yet a supplier — the chain refuses `caller-not-supplied`, and the seam has no static-array extent source (report 022 §3)"]
+fn w5c_reader_chain_field_array_root_supplies_the_chain() {
+    let input = fixture(
+        r###"
+#[repr(C)]
+pub struct H40 { pub dist_cache_: [i32; 16], pub num_: u32 }
+unsafe fn PrepareDistanceCache(distance_cache: *mut i32, num_distances: i32) {
+    if num_distances > 4 {
+        let last = *distance_cache.offset(0);
+        *distance_cache.offset(4) = last - 1;
+        *distance_cache.offset(5) = last + 1;
+    }
+}
+unsafe fn PrepareDistanceCacheH40(self_0: *mut H40, distance_cache: *mut i32) {
+    PrepareDistanceCache(distance_cache, (*self_0).num_ as i32);
+}
+pub unsafe fn entry(s: *mut H40) {
+    PrepareDistanceCacheH40(s, ((*s).dist_cache_).as_mut_ptr());
+}
+"###,
+    );
+    let proofs = super::slice_input_tests::proofs(&input);
+    assert_eq!(
+        super::slice_input_tests::proof_of(&proofs, "PrepareDistanceCacheH40::distance_cache"),
+        &Ok(1)
+    );
+    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("PrepareDistanceCacheH40(s, core::slice::from_raw_parts_mut(((*s).dist_cache_).as_mut_ptr(), 16))"),
+        "{flat}"
+    );
+    assert!(!flat.contains("FALLBACK_SLICE_EXTENT"), "{flat}");
+    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
+}
