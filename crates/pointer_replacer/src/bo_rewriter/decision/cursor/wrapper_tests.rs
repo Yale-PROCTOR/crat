@@ -1332,7 +1332,7 @@ pub unsafe fn emit(input: *const u8, n: usize) -> u64 {
 }
 
 #[test]
-fn slicecursor_reborrow_idiom_at_a_slice_callee_is_a_class_level_wall() {
+fn slicecursor_reborrow_idiom_at_a_slice_callee_takes_the_tail_view() {
     // brotli `BrotliTransformDictionaryWord` (census #6: `dst` is the archive's
     // single `BorrowedElementUnbuilt`; `uppercase` / `shift` withdraw with it).
     // The c2rust idiom handed DIRECTLY to a local callee whose parameter the
@@ -1379,13 +1379,20 @@ pub unsafe fn transform(dst: *mut u8, idx: i32, mut len: i32, t: i32, param: u8)
     };
     assert_eq!(
         (of("transform::dst"), of("transform::uppercase")),
-        ("Err(BorrowedElementUnbuilt)", "Err(UseUnbuilt)"),
-        "the corpus shape's typed hold moved: {dispositions:?}"
+        ("Ok(())", "Ok(())"),
+        "the idiom at a slice callee is not the tail view: {dispositions:?}"
     );
     let source = emitted(input);
     save_fixture("reborrow-idiom-at-a-slice-callee", input, &source);
     assert!(
-        !source.contains("SliceCursorMut::new(dst)"),
-        "the family delivered without the interface dependency: {source}"
+        source.contains("fn transform(dst: &mut [u8], idx: i32, mut len: i32, t: i32,")
+            && source.matches(".as_slice_mut()").count() >= 3,
+        "the tail views are absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let mut b = *b\"abcd\"; unsafe { transform(&mut b[..], 4, 2, 1, 0) }; assert_eq!(&b, b\"abCd\"); let mut c = *b\"abcd\"; unsafe { transform(&mut c[..], 4, 2, 2, 0) }; assert_eq!(&c, b\"abCD\"); let mut d = *b\"abcd\"; unsafe { transform(&mut d[..], 4, 2, 3, 1) }; assert_eq!(&d, b\"abde\"); }",
+        ),
     );
 }

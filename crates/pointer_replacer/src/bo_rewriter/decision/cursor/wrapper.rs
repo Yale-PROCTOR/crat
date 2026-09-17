@@ -811,6 +811,42 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                 self.peer_cursors.push(peer);
                 return;
             }
+            // The idiom handed DIRECTLY to a local callee whose parameter another
+            // family delivers as a slice (`ToUpperCase(&mut *dst.offset(k))`,
+            // brotli's dictionary-word transform): the callee walks from that
+            // address, so the argument is this cursor's tail view at the index —
+            // the same view a whole-cursor argument takes, and the seam receipts
+            // it under the callee's own arm.
+            if let hir::Node::Expr(call) = parent
+                && let hir::ExprKind::Call(callee, args) = call.kind
+                && let Some(index) = args.iter().position(|arg| arg.hir_id == e.hir_id)
+                && let ty::FnDef(did, _) =
+                    *self.ctx.tcx.typeck(self.subject.fn_did).expr_ty(callee).kind()
+                && let Some(local_callee) = did.as_local()
+                && let Some(want) = self
+                    .entries
+                    .iter()
+                    .find(|(s, _)| s.fn_did == local_callee && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == index))
+                    .and_then(|(_, decision)| {
+                        slice_mutability(decision).or_else(|| cursor_parameter_mutability(decision))
+                    })
+                && (self.subject.mutable || !want)
+            {
+                match self.index(chain) {
+                    Ok(d) => {
+                        let view = if want { "as_slice_mut" } else { "as_slice" };
+                        self.push(
+                            e,
+                            format!("{}.offset_by({d}).{view}()", self.view()),
+                            "cursor-element",
+                        );
+                    }
+                    Err(hold) => {
+                        self.hold.get_or_insert(hold);
+                    }
+                }
+                return;
+            }
             // Otherwise the idiom's chain is this cursor's derived address where
             // the value is compared or differenced, or stored into a peer whose
             // own edit composes over this inner one; the `&*` and the cast keep

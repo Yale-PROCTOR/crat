@@ -4021,10 +4021,30 @@ fn complete_interface_inventory(
                         waiver_id: None,
                         unsafe_context: None,
                     });
-                    if matches!(
+                    // R217-2(a) (slicecursor 027, wave-6s reviews): a borrowed
+                    // ELEMENT of a cursor — the c2rust idiom handed straight to a
+                    // local callee, `ToUpperCase(&mut *dst.offset(k))` — carries
+                    // the same dependency as a bare local. The caller renders the
+                    // cursor's tail view there, so the callee's delivered-slice
+                    // parameter and the caller's cursor must stand or fall
+                    // together; without the edge the interface path restores the
+                    // caller's family and the view is lost. Guarded to a CURSOR
+                    // found form through a deref: every other borrowed place keeps
+                    // the standing reading (no edge, the borrow coerces).
+                    let cursor_element_view = matches!(found, Form::Cursor { .. })
+                        && matches!(
+                            argument.shape,
+                            ArgShape::AddrOf {
+                                base: Some(_),
+                                through_deref: true,
+                                ..
+                            }
+                        );
+                    if (matches!(
                         argument.shape,
                         ArgShape::BareLocal(_) | ArgShape::CastOfLocal { .. }
-                    ) && found != Form::Raw
+                    ) || cursor_element_view)
+                        && found != Form::Raw
                         && mir_site.caller != mir_site.callee
                     {
                         plan.interface_dependencies.push((
@@ -5213,6 +5233,48 @@ pub(crate) fn synthesize_with_raw_boundary(
                         continue;
                     }
                 };
+                // R217-2(a) (slicecursor report 027, wave-6s reviews): a borrowed
+                // ELEMENT of a CURSOR at a delivered-slice formal — the c2rust
+                // idiom handed straight to a local callee,
+                // `ToUpperCase(&mut *dst.offset(k))`. The position reads
+                // `found = Ref` (an `&mut` place) and the seam would render its
+                // own `from_mut(..)` over the same interval the cursor family has
+                // already rewritten to that cursor's tail view, so the two edits
+                // collide and the class withdraws the caller's family. The
+                // cursor's edit is the rendering; the seam receipts the site
+                // under the callee's C arm and registers the dependency, so the
+                // two classes stand or fall together. Guarded to a position whose
+                // ROOT is a cursor carrying an edit at exactly this span.
+                if let Some(root) = pos.root
+                    && let Some(Decision::Cursor { plan: cursor, .. }) =
+                        decision_of.get(&(site.caller, root)).copied()
+                    && cursor
+                        .uses
+                        .iter()
+                        .any(|edit| edit.span == pos.span && edit.bridge_kind == "cursor-element")
+                {
+                    plan.zero_bridges.push(ZeroBridgeSite {
+                        owner_class: SignatureClassId::of(*callee),
+                        caller: site.caller,
+                        span: Some(pos.span),
+                        arm: "c",
+                        position: format!("arg{}", pos.index),
+                        bridge_kind: "interface-call-cursor-element-view",
+                        expected_form: pos.expected.key(),
+                        found_form: "cursor-element",
+                        argument_kind: pos.source_shape,
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                        unsafe_context: None,
+                    });
+                    if site.caller != *callee {
+                        plan.interface_dependencies.push((
+                            SignatureClassId::of(*callee),
+                            SignatureClassId::of(site.caller),
+                        ));
+                    }
+                    continue;
+                }
                 match &candidates[idx] {
                     Ok(None) => {
                         // slicecursor (09-16): a cursor argument at a delivered
