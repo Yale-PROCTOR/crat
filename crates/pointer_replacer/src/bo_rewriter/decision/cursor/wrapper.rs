@@ -133,7 +133,14 @@ fn table_element_base(
     Ok(Base {
         parent_cursor: None,
         expression: if delivered_inner {
-            format!("{}::new({})", constructor(s.mutable), element.replacement)
+            // Indexing a `&mut [&mut [T]]` yields a place that cannot be moved
+            // out of, so an exclusive element is reborrowed.
+            format!(
+                "{}::new({}{})",
+                constructor(s.mutable),
+                if s.mutable { "&mut *" } else { "" },
+                element.replacement
+            )
         } else {
             format!(
                 "unsafe {{ {}::from_raw_parts{}({}, crate::FALLBACK_SLICE_EXTENT) }}",

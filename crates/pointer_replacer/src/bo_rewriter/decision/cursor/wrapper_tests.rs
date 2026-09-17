@@ -1,4 +1,5 @@
 use super::tests::{compile, cursor_decisions, cursor_dispositions, emitted};
+use crate::bo_rewriter::decision::Decision;
 
 #[test]
 fn slicecursor_strrwd_backward_walk() {
@@ -1394,5 +1395,112 @@ pub unsafe fn transform(dst: *mut u8, idx: i32, mut len: i32, t: i32, param: u8)
         Some(
             "fn main() { let mut b = *b\"abcd\"; unsafe { transform(&mut b[..], 4, 2, 1, 0) }; assert_eq!(&b, b\"abCd\"); let mut c = *b\"abcd\"; unsafe { transform(&mut c[..], 4, 2, 2, 0) }; assert_eq!(&c, b\"abCD\"); let mut d = *b\"abcd\"; unsafe { transform(&mut d[..], 4, 2, 3, 1) }; assert_eq!(&d, b\"abde\"); }",
         ),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// **The N2 seam** (nested's relay 034 §2 / R453-6). Their fixture and their RED
+// witness, transplanted into this family's files because the change is this
+// family's: `table_element_base` builds `new(t[k])` over a table that delivers
+// its inner level. Both are copied from
+// `docs/agents/artifacts/2026-09-17-nested-n2-handover/`; the witness is
+// unmodified except for the harness helpers below, which are this file's.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code, unused_assignments, unused_mut)]
+#[path = "nested_seam_fixture.rs"]
+mod nested_seam_original;
+
+const NESTED_SEAM_SOURCE: &str = include_str!("nested_seam_fixture.rs");
+const CURSOR: &str = "indicators::sma_cursor::ti_sma_cursor";
+
+/// The emitted tree of the N2 seam fixture, through the corpus's own path
+/// (A5 replay over the frozen benchmark graph) so the exposure plan is the
+/// `PositiveSeedShim` the registration entry asks for.
+fn nested_seam_emitted() -> &'static str {
+    static SOURCE_AFTER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SOURCE_AFTER.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("crat-slicecursor-n2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("lib.rs");
+        std::fs::write(&root, NESTED_SEAM_SOURCE).unwrap();
+        let outcome = crate::bo_rewriter::rewrite_m1_path_a5_injected(
+            &root,
+            crate::bo_rewriter::A5Mode::PreciseReplay,
+            Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            &|_| {},
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let crate::bo_rewriter::RewriteOutcome::Emitted { source, .. } = outcome else {
+            panic!("N2 seam emission unavailable; compiler diagnostics precede this assertion");
+        };
+        println!("N2-SEAM-EMITTED\n{source}\nN2-SEAM-END");
+        source
+    })
+}
+
+fn region<'a>(source: &'a str, owner: &str) -> &'a str {
+    source
+        .split(&format!("pub unsafe extern \"C\" fn {owner}("))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{owner} in the emitted tree"))
+        .split("pub mod ")
+        .next()
+        .expect("owner region")
+}
+
+/// The decision of one named parameter of one owner, at the final table.
+fn table_decision(name: &str, parameter: &str) -> Decision {
+    utils::compilation::run_compiler_on_str(NESTED_SEAM_SOURCE, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::A5Mode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        table
+            .entries
+            .iter()
+            .find(|(s, _)| {
+                tcx.def_path_str(s.fn_did.to_def_id()) == name
+                    && s.param_name.as_deref() == Some(parameter)
+            })
+            .map(|(_, decision)| decision.clone())
+            .unwrap_or_else(|| panic!("{name}::{parameter} subject"))
+    })
+    .expect("nested seam decisions")
+}
+
+/// **W-N2-CURSOR** — the seam (relay 002 §2). The input row is the cursor
+/// family's subject; its table still delivers its inner level, and the cursor's
+/// constructor becomes `SliceCursor::new(t[k])` — which takes NO length, so the
+/// seam fabricates nothing and the row's one fabricated extent is the one this
+/// arm relocated to the wrapper.
+#[test]
+fn n2_seams_a_cursor_row_onto_the_delivered_inner_slice() {
+    let inputs = table_decision(CURSOR, "inputs");
+    assert!(
+        matches!(inputs, Decision::NestedSlice { .. }),
+        "the table of a cursor row still delivers: {inputs:?}"
+    );
+    let source = nested_seam_emitted();
+    let body = region(source, "ti_sma_cursor");
+    assert!(
+        body.contains("inputs: &[&[std::os::raw::c_double]]"),
+        "the nested input table:\n{body}"
+    );
+    assert!(
+        body.contains("crate::slice_cursor::SliceCursor::new(inputs[0])"),
+        "the cursor takes the delivered inner slice, with no length:\n{body}"
+    );
+    assert!(
+        !body.contains("SliceCursor::from_raw_parts"),
+        "no raw cursor construction survives on the seamed row:\n{body}"
+    );
+    assert!(
+        !body.contains("from_raw_parts(inputs,"),
+        "the delivered table's own fabricated outer extent is gone:\n{body}"
     );
 }
