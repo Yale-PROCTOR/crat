@@ -62,6 +62,12 @@ const LIBC_ALLOCATORS: &[&str] = &["malloc", "calloc", "realloc"];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CertificateKind {
     DistinctRoots,
+    /// (a) again, but the freshness of one root rests on R409-1's allocator
+    /// contract rather than on a resolved allocator: the program stores a
+    /// caller-supplied function pointer into the allocator field, and the
+    /// contract is what says a conforming allocator returns a fresh block.
+    /// A separate kind so the receipt is countable wherever it is consumed.
+    DistinctRootsUnderContract,
     TypeRule,
     DisjointFields,
 }
@@ -70,6 +76,7 @@ impl CertificateKind {
     pub(crate) fn key(self) -> &'static str {
         match self {
             Self::DistinctRoots => "pair-disjoint:distinct-roots",
+            Self::DistinctRootsUnderContract => "pair-disjoint:distinct-roots:allocator-contract",
             Self::TypeRule => "pair-disjoint:type-rule",
             Self::DisjointFields => "pair-disjoint:disjoint-fields",
         }
@@ -117,12 +124,35 @@ impl Unproved {
     }
 }
 
+/// Where the freshness of an allocation comes from: a resolved allocator, or
+/// R409-1's allocator contract (the program stores a caller-supplied function
+/// pointer into the allocator field, so the closed world cannot name the
+/// callee and the CONTRACT is what says a conforming allocator returns a fresh
+/// block). Every certificate that rests on the second carries a receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Freshness {
+    Proven,
+    Contract,
+}
+
+impl Freshness {
+    /// The weaker of the two: a chain is contract-backed as soon as one link
+    /// is.
+    fn join(self, other: Self) -> Self {
+        if self == Self::Contract || other == Self::Contract {
+            Self::Contract
+        } else {
+            Self::Proven
+        }
+    }
+}
+
 /// The provenance class of one call argument, read in the caller's body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RootClass {
     /// A pointer local whose every assignment is an allocator result (or
     /// null) and whose own address is never taken: it names one fresh block.
-    FreshAlloc(HirId),
+    FreshAlloc(HirId, Freshness),
     /// A view into a stack object of the caller — an array / struct / scalar
     /// `let` local, or a parameter's own slot (`&mut param`).
     StackObject(HirId),
@@ -133,13 +163,21 @@ enum RootClass {
 }
 
 impl RootClass {
+    /// The contract receipt this root carries, if its freshness rests on one.
+    fn freshness(self) -> Freshness {
+        match self {
+            Self::FreshAlloc(_, freshness) => freshness,
+            _ => Freshness::Proven,
+        }
+    }
+
     fn is_fresh_object(self) -> bool {
-        matches!(self, Self::FreshAlloc(_) | Self::StackObject(_))
+        matches!(self, Self::FreshAlloc(..) | Self::StackObject(_))
     }
 
     fn object_id(self) -> Option<HirId> {
         match self {
-            Self::FreshAlloc(id) | Self::StackObject(id) | Self::EntryStorage(id) => Some(id),
+            Self::FreshAlloc(id, _) | Self::StackObject(id) | Self::EntryStorage(id) => Some(id),
             Self::Unknown => None,
         }
     }
@@ -480,8 +518,13 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
     };
     match other {
         RootClass::Unknown => None,
-        RootClass::FreshAlloc(_) | RootClass::StackObject(_) | RootClass::EntryStorage(_) => {
-            (fresh.object_id() != other.object_id()).then_some(CertificateKind::DistinctRoots)
+        RootClass::FreshAlloc(..) | RootClass::StackObject(_) | RootClass::EntryStorage(_) => {
+            (fresh.object_id() != other.object_id()).then(|| {
+                match fresh.freshness().join(other.freshness()) {
+                    Freshness::Proven => CertificateKind::DistinctRoots,
+                    Freshness::Contract => CertificateKind::DistinctRootsUnderContract,
+                }
+            })
         }
     }
 }
@@ -675,11 +718,11 @@ fn is_null_literal(expr: &Expr<'_>) -> bool {
 /// those (R402-5(6): `BrotliAllocate`'s `(*m).alloc_func` resolves to
 /// `BrotliDefaultAllocFunc`, itself a wrapper of `malloc`).
 struct AllocatorOracle<'a> {
-    wrappers: FxHashSet<DefId>,
+    wrappers: FxHashMap<DefId, Freshness>,
     /// Function-pointer FIELDS every assignment to which, program-wide, stores
     /// a known allocator (R433-6(2)). Keyed by the struct's `DefId` and the
     /// field's name.
-    allocator_fields: FxHashSet<(DefId, Symbol)>,
+    allocator_fields: FxHashMap<(DefId, Symbol), Freshness>,
     indirect_calls: Option<&'a [super::lifetime::MirCallTargetSite]>,
 }
 
@@ -694,21 +737,29 @@ impl AllocatorOracle<'_> {
 
     /// Is `expr` (after casts) a call whose result is a fresh allocation, in
     /// the body of `function`?
-    fn is_allocator_call(&self, tcx: TyCtxt<'_>, function: LocalDefId, expr: &Expr<'_>) -> bool {
+    fn is_allocator_call(
+        &self,
+        tcx: TyCtxt<'_>,
+        function: LocalDefId,
+        expr: &Expr<'_>,
+    ) -> Option<Freshness> {
         let ExprKind::Call(callee, _) = &peel_casts(expr).kind else {
-            return false;
+            return None;
         };
         if let Some(did) = callee_def_id(callee) {
-            return self.wrappers.contains(&did) || Self::is_libc_allocator(tcx, did);
+            if let Some(freshness) = self.wrappers.get(&did) {
+                return Some(*freshness);
+            }
+            return Self::is_libc_allocator(tcx, did).then_some(Freshness::Proven);
         }
         // A call through a FUNCTION-POINTER FIELD: admitted when every
         // assignment to that field in the program stores a known allocator
         // (R433-6(2)). brotli's `((*m).alloc_func).expect(..)(..)` is the
         // shape; the field is written once, by `BrotliInitMemoryManager`.
         if let Some(key) = fn_pointer_field_key(tcx, function, callee)
-            && self.allocator_fields.contains(&key)
+            && let Some(freshness) = self.allocator_fields.get(&key)
         {
-            return true;
+            return Some(*freshness);
         }
         // A call through a function pointer: every closed-world target must be
         // an allocator wrapper already admitted. Foreign targets (libc
@@ -716,7 +767,7 @@ impl AllocatorOracle<'_> {
         // local inventory, so such a call has no resolved target and is NOT
         // admitted — a typed residue, not a gap in the closed world.
         let Some(sites) = self.indirect_calls else {
-            return false;
+            return None;
         };
         let span = expr.span.source_callsite();
         let targets = sites
@@ -724,7 +775,13 @@ impl AllocatorOracle<'_> {
             .filter(|site| site.caller == function && site.span.source_callsite().contains(span))
             .map(|site| site.callee.to_def_id())
             .collect::<Vec<_>>();
-        !targets.is_empty() && targets.iter().all(|target| self.wrappers.contains(target))
+        if targets.is_empty() {
+            return None;
+        }
+        targets
+            .iter()
+            .map(|target| self.wrappers.get(target).copied())
+            .try_fold(Freshness::Proven, |acc, target| Some(acc.join(target?)))
     }
 }
 
@@ -739,15 +796,15 @@ fn allocator_wrappers<'a>(
     indirect_calls: Option<&'a [super::lifetime::MirCallTargetSite]>,
 ) -> AllocatorOracle<'a> {
     let mut oracle = AllocatorOracle {
-        wrappers: FxHashSet::default(),
-        allocator_fields: FxHashSet::default(),
+        wrappers: FxHashMap::default(),
+        allocator_fields: FxHashMap::default(),
         indirect_calls,
     };
     loop {
         let before = (oracle.wrappers.len(), oracle.allocator_fields.len());
         oracle.allocator_fields = allocator_fn_pointer_fields(tcx, functions, &oracle);
         for &function in functions {
-            if oracle.wrappers.contains(&function.to_def_id()) {
+            if oracle.wrappers.contains_key(&function.to_def_id()) {
                 continue;
             }
             let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
@@ -772,15 +829,35 @@ fn allocator_wrappers<'a>(
             }
             let typeck = tcx.typeck(function);
             let classes = classify_locals(tcx, typeck, body, &oracle, function);
-            let all_fresh = returns.returns.iter().all(|expr| {
-                is_null_literal(expr)
-                    || oracle.is_allocator_call(tcx, function, expr)
-                    || resolved_local(peel_casts(expr)).is_some_and(|binding| {
-                        matches!(classes.get(&binding), Some(RootClass::FreshAlloc(_)))
-                    })
-            });
-            if all_fresh {
-                oracle.wrappers.insert(function.to_def_id());
+            // Every returned value must be fresh; the wrapper is only as
+            // strong as its weakest return, so one contract-backed return
+            // makes the wrapper contract-backed.
+            let mut freshness = Some(Freshness::Proven);
+            for expr in &returns.returns {
+                if is_null_literal(expr) {
+                    continue;
+                }
+                let value =
+                    oracle
+                        .is_allocator_call(tcx, function, expr)
+                        .or_else(|| {
+                            match resolved_local(peel_casts(expr))
+                                .map(|binding| classes.get(&binding))
+                            {
+                                Some(Some(RootClass::FreshAlloc(_, value))) => Some(*value),
+                                _ => None,
+                            }
+                        });
+                freshness = match (freshness, value) {
+                    (Some(acc), Some(value)) => Some(acc.join(value)),
+                    _ => None,
+                };
+                if freshness.is_none() {
+                    break;
+                }
+            }
+            if let Some(freshness) = freshness {
+                oracle.wrappers.insert(function.to_def_id(), freshness);
             }
         }
         if (oracle.wrappers.len(), oracle.allocator_fields.len()) == before {
@@ -801,8 +878,8 @@ fn allocator_fn_pointer_fields(
     tcx: TyCtxt<'_>,
     functions: &FxHashSet<LocalDefId>,
     oracle: &AllocatorOracle<'_>,
-) -> FxHashSet<(DefId, Symbol)> {
-    let mut assignments: FxHashMap<(DefId, Symbol), Vec<bool>> = FxHashMap::default();
+) -> FxHashMap<(DefId, Symbol), Freshness> {
+    let mut assignments: FxHashMap<(DefId, Symbol), Vec<FieldStore>> = FxHashMap::default();
     for &function in functions {
         let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
             continue;
@@ -815,11 +892,52 @@ fn allocator_fn_pointer_fields(
         };
         collector.visit_body(tcx.hir_body(body_id));
     }
+    // R434-4(5). Resolved allocator stores only  -> the field is an allocator,
+    // proven. At least one resolved allocator plus stores this read cannot
+    // resolve (a caller-supplied pointer, as brotli's `alloc_func` is) -> the
+    // field is an allocator UNDER R409-1's contract, and every certificate
+    // that rests on it says so. A store that resolves to a function which is
+    // NOT an allocator refuses the field outright — the contract speaks for
+    // conforming allocators, not for whatever else a program may store.
     assignments
         .into_iter()
-        .filter(|(_, stores)| !stores.is_empty() && stores.iter().all(|allocator| *allocator))
-        .map(|(key, _)| key)
+        .filter_map(|(key, stores)| {
+            if stores
+                .iter()
+                .any(|store| *store == FieldStore::NotAnAllocator)
+            {
+                return None;
+            }
+            let strongest = stores
+                .iter()
+                .filter_map(|store| match store {
+                    FieldStore::Allocator(freshness) => Some(*freshness),
+                    FieldStore::Unresolved | FieldStore::NotAnAllocator => None,
+                })
+                .reduce(Freshness::join)?;
+            let unresolved = stores.iter().any(|store| *store == FieldStore::Unresolved);
+            Some((
+                key,
+                if unresolved {
+                    Freshness::Contract
+                } else {
+                    strongest
+                },
+            ))
+        })
         .collect()
+}
+
+/// One store into a function-pointer field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FieldStore {
+    /// A known allocator: a libc allocator or an admitted wrapper.
+    Allocator(Freshness),
+    /// A function item that is not an allocator. Refuses the field.
+    NotAnAllocator,
+    /// Not resolvable to a function item at all — a parameter, another field,
+    /// an unknown cast. Admitted only under the contract.
+    Unresolved,
 }
 
 /// `(*m).alloc_func` (or `m.alloc_func`), possibly behind `.expect(..)` /
@@ -886,12 +1004,12 @@ struct FieldStoreCollector<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
     oracle: &'a AllocatorOracle<'a>,
-    assignments: &'a mut FxHashMap<(DefId, Symbol), Vec<bool>>,
+    assignments: &'a mut FxHashMap<(DefId, Symbol), Vec<FieldStore>>,
 }
 
 impl<'tcx> FieldStoreCollector<'_, 'tcx> {
-    /// Is `value` (a cast, or `Some(..)` of one) a known allocator function?
-    fn stores_allocator(&self, value: &Expr<'_>) -> bool {
+    /// What `value` (a cast, or `Some(..)` of one) stores into the field.
+    fn stores_allocator(&self, value: &Expr<'_>) -> FieldStore {
         let value = peel_casts(value);
         if let ExprKind::Call(callee, args) = &value.kind
             && args.len() == 1
@@ -900,13 +1018,23 @@ impl<'tcx> FieldStoreCollector<'_, 'tcx> {
         {
             return self.stores_allocator(&args[0]);
         }
+        if is_null_literal(value) {
+            // `None` / a null function pointer is never called.
+            return FieldStore::Allocator(Freshness::Proven);
+        }
         let ExprKind::Path(QPath::Resolved(_, path)) = &peel_casts(value).kind else {
-            return false;
+            return FieldStore::Unresolved;
         };
         let Res::Def(DefKind::Fn, did) = path.res else {
-            return false;
+            return FieldStore::Unresolved;
         };
-        self.oracle.wrappers.contains(&did) || AllocatorOracle::is_libc_allocator(self.tcx, did)
+        if let Some(freshness) = self.oracle.wrappers.get(&did) {
+            FieldStore::Allocator(*freshness)
+        } else if AllocatorOracle::is_libc_allocator(self.tcx, did) {
+            FieldStore::Allocator(Freshness::Proven)
+        } else {
+            FieldStore::NotAnAllocator
+        }
     }
 
     fn record(&mut self, place: &Expr<'_>, value: &Expr<'_>) {
@@ -916,8 +1044,8 @@ impl<'tcx> FieldStoreCollector<'_, 'tcx> {
         let Some(key) = adt_field_key(self.tcx, self.typeck, base, field.name) else {
             return;
         };
-        let allocator = self.stores_allocator(value);
-        self.assignments.entry(key).or_default().push(allocator);
+        let store = self.stores_allocator(value);
+        self.assignments.entry(key).or_default().push(store);
     }
 }
 
@@ -938,11 +1066,11 @@ impl<'tcx> Visitor<'tcx> for FieldStoreCollector<'_, 'tcx> {
                             .map(|candidate| candidate.ty(self.tcx, args))
                             && is_fn_pointer(declared)
                         {
-                            let allocator = self.stores_allocator(field.expr);
+                            let store = self.stores_allocator(field.expr);
                             self.assignments
                                 .entry((def.did(), field.ident.name))
                                 .or_default()
-                                .push(allocator);
+                                .push(store);
                         }
                     }
                 }
@@ -979,7 +1107,7 @@ struct LocalFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AssignKind {
     Null,
-    Allocator,
+    Allocator(Freshness),
     Other,
 }
 
@@ -1027,18 +1155,21 @@ fn classify_locals<'tcx>(
                         RootClass::Unknown
                     }
                 } else {
-                    let fresh = fact
+                    let all_fresh = fact
                         .assignments
                         .iter()
-                        .all(|kind| matches!(kind, AssignKind::Null | AssignKind::Allocator))
-                        && fact
-                            .assignments
-                            .iter()
-                            .any(|kind| matches!(kind, AssignKind::Allocator));
-                    if fresh {
-                        RootClass::FreshAlloc(hir_id)
-                    } else {
-                        RootClass::Unknown
+                        .all(|kind| matches!(kind, AssignKind::Null | AssignKind::Allocator(_)));
+                    let freshness = fact
+                        .assignments
+                        .iter()
+                        .filter_map(|kind| match kind {
+                            AssignKind::Allocator(freshness) => Some(*freshness),
+                            _ => None,
+                        })
+                        .reduce(Freshness::join);
+                    match (all_fresh, freshness) {
+                        (true, Some(freshness)) => RootClass::FreshAlloc(hir_id, freshness),
+                        _ => RootClass::Unknown,
                     }
                 }
             } else {
@@ -1064,11 +1195,11 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
     fn assign_kind(&self, rhs: &Expr<'_>) -> AssignKind {
         if is_null_literal(rhs) {
             AssignKind::Null
-        } else if self
-            .allocators
-            .is_allocator_call(self.tcx, self.function, rhs)
+        } else if let Some(freshness) =
+            self.allocators
+                .is_allocator_call(self.tcx, self.function, rhs)
         {
-            AssignKind::Allocator
+            AssignKind::Allocator(freshness)
         } else {
             AssignKind::Other
         }
@@ -1338,8 +1469,27 @@ mod tests {
             local_id: rustc_hir::hir_id::ItemLocalId::from_u32(1),
         };
         assert_eq!(
-            certify_roots(RootClass::FreshAlloc(a), RootClass::EntryStorage(b)),
+            certify_roots(
+                RootClass::FreshAlloc(a, Freshness::Proven),
+                RootClass::EntryStorage(b)
+            ),
             Some(CertificateKind::DistinctRoots)
+        );
+        assert_eq!(
+            certify_roots(
+                RootClass::FreshAlloc(a, Freshness::Contract),
+                RootClass::EntryStorage(b)
+            ),
+            Some(CertificateKind::DistinctRootsUnderContract),
+            "a contract-backed root is receipted as such"
+        );
+        assert_eq!(
+            certify_roots(
+                RootClass::FreshAlloc(a, Freshness::Contract),
+                RootClass::FreshAlloc(b, Freshness::Proven)
+            ),
+            Some(CertificateKind::DistinctRootsUnderContract),
+            "one contract-backed side is enough to receipt the pair"
         );
         assert_eq!(
             certify_roots(RootClass::StackObject(a), RootClass::StackObject(b)),
@@ -1355,7 +1505,10 @@ mod tests {
             "two entry pointers may alias each other"
         );
         assert_eq!(
-            certify_roots(RootClass::FreshAlloc(a), RootClass::Unknown),
+            certify_roots(
+                RootClass::FreshAlloc(a, Freshness::Proven),
+                RootClass::Unknown
+            ),
             None
         );
     }

@@ -658,6 +658,83 @@ const FN_PTR_ALLOCATOR_FOREIGN_STORE: &str = r#"
     }
 "#;
 
+/// brotli `SplitByteVectorCommand` → `FindBlocksCommand`, mirrored: three
+/// separate `BrotliAllocate` locals handed to one call. `cost` and
+/// `insert_cost` are both `*mut f64` (same type), `switch_signal` is `*mut u8`
+/// (a wildcard) and `histograms` carries an `f64` member — so no type-rule
+/// route exists and rule (a) is the only one, which needs `BrotliAllocate`
+/// admitted through `(*m).alloc_func`. The field carries a caller-supplied
+/// store, so only R409-1's allocator contract admits it: these are the nine
+/// `FindBlocks{Command,Distance,Literal}` rows of report 007.
+const CONTRACT_FIND_BLOCKS: &str = r#"
+    use core::ffi::c_void;
+    extern "C" { fn malloc(n: u64) -> *mut c_void; fn exit(code: i32) -> !; }
+    #[repr(C)]
+    pub struct MemoryManager { pub alloc_func: Option<unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void>, pub opaque: *mut c_void }
+    #[repr(C)]
+    pub struct HistogramCommand { pub data_: [u32; 8], pub total_count_: u64, pub bit_cost_: f64 }
+    pub unsafe extern "C" fn BrotliDefaultAllocFunc(opaque: *mut c_void, size: u64) -> *mut c_void { malloc(size) }
+    pub unsafe extern "C" fn BrotliInitMemoryManager(m: *mut MemoryManager, alloc_func: Option<unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void>, opaque: *mut c_void) {
+        if alloc_func.is_none() {
+            (*m).alloc_func = Some(BrotliDefaultAllocFunc as unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void);
+            (*m).opaque = 0 as *mut c_void;
+        } else {
+            (*m).alloc_func = alloc_func;
+            (*m).opaque = opaque;
+        };
+    }
+    pub unsafe fn BrotliAllocate(m: *mut MemoryManager, n: u64) -> *mut c_void {
+        let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+        if result.is_null() { exit(1); }
+        return result;
+    }
+    pub unsafe fn FindBlocksCommand(data: *const u16, length: u64, histograms: *const HistogramCommand, insert_cost: *mut f64, cost: *mut f64, switch_signal: *mut u8) {
+        *insert_cost = 0f64;
+        *cost = *insert_cost + 1f64;
+        *switch_signal = 1;
+    }
+    pub unsafe fn SplitByteVectorCommand(m: *mut MemoryManager, data: *const u16, length: u64, histograms: *const HistogramCommand, num_histograms: u64) {
+        let mut insert_cost = BrotliAllocate(m, num_histograms.wrapping_mul(8)) as *mut f64;
+        let mut cost = BrotliAllocate(m, num_histograms.wrapping_mul(8)) as *mut f64;
+        let mut switch_signal = BrotliAllocate(m, length) as *mut u8;
+        FindBlocksCommand(data, length, histograms, insert_cost, cost, switch_signal);
+    }
+"#;
+
+/// The nine rows: two allocations of one contract-backed allocator are
+/// distinct roots, and the certificate says so — `DistinctRootsUnderContract`,
+/// the auditable receipt R434-4(5) asks for.
+#[test]
+fn w6p_find_blocks_pairs_certify_under_the_allocator_contract() {
+    ::utils::compilation::run_compiler_on_str(CONTRACT_FIND_BLOCKS, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        let (caller, callee) = (
+            function("SplitByteVectorCommand"),
+            function("FindBlocksCommand"),
+        );
+        for (left, right) in [(3usize, 4usize), (3, 5), (4, 5)] {
+            assert_eq!(
+                index.certify_recorded(caller, callee, left, right),
+                Ok(CertificateKind::DistinctRootsUnderContract),
+                "FindBlocksCommand#{left} beside #{right}"
+            );
+        }
+    })
+    .expect("FindBlocks contract fixture compilation");
+}
+
 /// brotli's REAL init, mirrored: `BrotliInitMemoryManager` stores
 /// `BrotliDefaultAllocFunc` when the caller passes `None` and the caller's own
 /// function pointer otherwise (`lib.rs:488888` and `:488898`; the decoder's
@@ -704,11 +781,12 @@ const FN_PTR_ALLOCATOR_PARAMETER_STORE: &str = r#"
     }
 "#;
 
-/// The corpus's own shape is refused: a store from a parameter is not a store
-/// of a known allocator. THIS is why the build moves brotli by zero — report
-/// 008 §2.
+/// The corpus's own shape, admitted under the contract (R434-4(5)): the store
+/// from a parameter is what report 008 measured, and R409-1 is the user's
+/// decision that brotli's `alloc_func` is malloc-like. The certificate says
+/// which premise it rests on.
 #[test]
-fn w6p_parameter_supplied_allocator_field_stays_unproved() {
+fn w6p_parameter_supplied_allocator_field_certifies_under_the_contract() {
     ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR_PARAMETER_STORE, |tcx| {
         let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
             .expect("parameter-store fixture decision");
@@ -721,14 +799,14 @@ fn w6p_parameter_supplied_allocator_field_stays_unproved() {
         assert!(
             ledger
                 .iter()
-                .all(|row| row.outcome != Ok(CertificateKind::DistinctRoots)),
-            "a field one of whose stores is a parameter is not an allocator field: {ledger:?}"
+                .any(|row| row.outcome == Ok(CertificateKind::DistinctRootsUnderContract)),
+            "the contract admits the caller-supplied allocator, with its receipt: {ledger:?}"
         );
         assert!(
             ledger
                 .iter()
-                .any(|row| row.outcome == Err(Unproved::MemberType)),
-            "the pair stays held by the member clause: {ledger:?}"
+                .all(|row| row.outcome != Ok(CertificateKind::DistinctRoots)),
+            "and never as a PROVEN root — the receipt is the point: {ledger:?}"
         );
     })
     .expect("parameter-store fixture compilation");
