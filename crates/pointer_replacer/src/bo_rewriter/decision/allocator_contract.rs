@@ -69,25 +69,77 @@ use crate::{
     bo_rewriter::bridge_receipt::SignatureClassId,
 };
 
-/// One pinned allocator contract.
+/// How one allocator of a contract states the extent of the block it returns.
+pub(crate) enum Extent {
+    /// The argument at this index is a BYTE count: `malloc(n * size_of::<T>())`
+    /// is `n` elements, `malloc(size_of::<T>())` is one.
+    SizeArgument(usize),
+    /// `calloc(n, size_of::<T>())`: the count is the first argument, and the
+    /// second must be the pointee's own size.
+    ElementCount {
+        count_index: usize,
+        size_index: usize,
+    },
+    /// `strdup(s)`: the block is the NUL-terminated copy of `s`, so its extent
+    /// is a POSTCONDITION of the contract — `strlen + 1` — and is read off the
+    /// RESULT, never off the argument (R434-4 §1). Reading the result keeps
+    /// the count independent of whatever form another family gives `s`.
+    NulTerminatedCopy,
+}
+
+/// One pinned allocator of a contract.
+pub(crate) struct Allocator {
+    pub(crate) name: &'static str,
+    pub(crate) extent: Extent,
+}
+
+/// One pinned allocator contract: a set of allocators and the ONE deallocator
+/// that releases what they return.
 pub(crate) struct Contract {
     pub(crate) id: &'static str,
-    /// The allocator's item name and the index of its size argument.
-    pub(crate) allocate: &'static str,
-    pub(crate) size_index: usize,
+    pub(crate) allocators: &'static [Allocator],
     /// The deallocator's item name and the index of its pointer argument.
     pub(crate) free: &'static str,
     pub(crate) pointer_index: usize,
 }
 
-/// The contract table (USER DECISION, seat addendum 409).
-pub(crate) const CONTRACTS: &[Contract] = &[Contract {
-    id: "allocator-contract:brotli-memory-manager/v1@2026-09-15",
-    allocate: "BrotliAllocate",
-    size_index: 1,
-    free: "BrotliFree",
-    pointer_index: 1,
-}];
+/// The contract table (USER DECISION, seat addendum 409; the libc row is
+/// R434-4 §3). `realloc` is deliberately ABSENT: it releases one generation
+/// and creates another in one call, which is neither of this table's two
+/// events, so a local it touches keeps its typed hold.
+pub(crate) const CONTRACTS: &[Contract] = &[
+    Contract {
+        id: "allocator-contract:brotli-memory-manager/v1@2026-09-15",
+        allocators: &[Allocator {
+            name: "BrotliAllocate",
+            extent: Extent::SizeArgument(1),
+        }],
+        free: "BrotliFree",
+        pointer_index: 1,
+    },
+    Contract {
+        id: "allocator-contract:libc/v1@2026-09-17",
+        allocators: &[
+            Allocator {
+                name: "malloc",
+                extent: Extent::SizeArgument(0),
+            },
+            Allocator {
+                name: "calloc",
+                extent: Extent::ElementCount {
+                    count_index: 0,
+                    size_index: 1,
+                },
+            },
+            Allocator {
+                name: "strdup",
+                extent: Extent::NulTerminatedCopy,
+            },
+        ],
+        free: "free",
+        pointer_index: 0,
+    },
+];
 
 const IMPLICIT_CLOSE: &str = "contract-allocation:implicit-close";
 const OVERWRITE: &str = "contract-allocation:overwrite";
@@ -106,8 +158,13 @@ fn typed_key(hold: &str) -> &'static str {
 pub(crate) struct Plans {
     /// Every subject the consumer plans: (function, binding) → plan.
     pub(crate) plans: FxHashMap<(LocalDefId, HirId), BoxPlan>,
-    /// Refusals: binding → (label, typed reason).
+    /// Refusals: binding → (label, typed reason). These DEGRADE the subject,
+    /// so only a contract that owns its subjects records them.
     pub(crate) holds: FxHashMap<(LocalDefId, HirId), (String, String)>,
+    /// The libc row's refusals. libc's allocators are the whole corpus's, not
+    /// this rule's alone: a local it cannot claim belongs to whichever family
+    /// does claim it, so the refusal is a RECEIPT and never a decision.
+    pub(crate) yields: Vec<(String, String)>,
     /// Admitted rows: (label, receipt).
     pub(crate) admitted: Vec<(String, String)>,
 }
@@ -115,6 +172,11 @@ pub(crate) struct Plans {
 impl Plans {
     pub(crate) fn receipts_tsv(&self) -> String {
         let mut out = String::from("subject\tkind\tdetail\n");
+        let mut yielded = self.yields.clone();
+        yielded.sort();
+        for (label, reason) in yielded {
+            out.push_str(&format!("{label}\tyielded\t{reason}\n"));
+        }
         let mut admitted = self.admitted.clone();
         admitted.sort();
         for (label, receipt) in admitted {
@@ -241,13 +303,16 @@ fn callee_of(e: &Expr<'_>) -> Option<DefId> {
 }
 
 /// The contract a callee belongs to, by item name (the pinned symbol).
-fn contract_of(tcx: TyCtxt<'_>, did: DefId) -> Option<(&'static Contract, bool)> {
+fn contract_of(
+    tcx: TyCtxt<'_>,
+    did: DefId,
+) -> Option<(&'static Contract, Option<&'static Allocator>)> {
     let name = tcx.item_name(did);
     CONTRACTS.iter().find_map(|c| {
-        if name.as_str() == c.allocate {
-            Some((c, true))
+        if let Some(allocator) = c.allocators.iter().find(|a| name.as_str() == a.name) {
+            Some((c, Some(allocator)))
         } else if name.as_str() == c.free {
-            Some((c, false))
+            Some((c, None))
         } else {
             None
         }
@@ -257,17 +322,19 @@ fn contract_of(tcx: TyCtxt<'_>, did: DefId) -> Option<(&'static Contract, bool)>
 /// The count of a contract allocation from its size argument: `n *
 /// size_of::<T>()` (either order, through casts) → `Slice` with count `n`;
 /// `size_of::<T>()` alone → `Sized`.
+fn size_of_call(e: &Expr<'_>) -> bool {
+    let e = peel_casts(e);
+    let ExprKind::Call(callee, args) = &e.kind else { return false };
+    args.is_empty()
+        && matches!(
+            &callee.kind,
+            ExprKind::Path(QPath::Resolved(_, path))
+                if path.segments.last().is_some_and(|s| s.ident.name.as_str() == "size_of")
+        )
+}
+
 fn shape_of(tcx: TyCtxt<'_>, size: &Expr<'_>) -> Result<(BoxShape, Option<String>), String> {
-    fn is_size_of(e: &Expr<'_>) -> bool {
-        let e = peel_casts(e);
-        let ExprKind::Call(callee, args) = &e.kind else { return false };
-        args.is_empty()
-            && matches!(
-                &callee.kind,
-                ExprKind::Path(QPath::Resolved(_, path))
-                    if path.segments.last().is_some_and(|s| s.ident.name.as_str() == "size_of")
-            )
-    }
+    let is_size_of = size_of_call;
     let snippet = |span: Span| {
         tcx.sess
             .source_map()
@@ -309,22 +376,55 @@ struct Allocation {
     span: Span,
     shape: BoxShape,
     count: Option<String>,
+    /// The extent is the contract's own postcondition on the RESULT — a
+    /// NUL-terminated copy — so the construction binds the block and measures
+    /// it, instead of spelling a count over the allocator's arguments.
+    nul_terminated: bool,
+}
+
+fn allocation_contract(tcx: TyCtxt<'_>, e: &Expr<'_>) -> Option<&'static Contract> {
+    let did = callee_of(peel_casts(e))?;
+    let (contract, allocator) = contract_of(tcx, did)?;
+    allocator.map(|_| contract)
 }
 
 fn allocation<'h>(tcx: TyCtxt<'_>, e: &'h Expr<'h>) -> Option<Result<Allocation, String>> {
     let call = peel_casts(e);
     let did = callee_of(call)?;
-    let (contract, is_alloc) = contract_of(tcx, did)?;
-    if !is_alloc {
-        return None;
-    }
+    let (contract, allocator) = contract_of(tcx, did)?;
+    let allocator = allocator?;
     let ExprKind::Call(_, args) = &call.kind else { return None };
-    let size = args.get(contract.size_index)?;
-    Some(shape_of(tcx, size).map(|(shape, count)| Allocation {
+    let snippet = |span: Span| {
+        tcx.sess
+            .source_map()
+            .span_to_snippet(span)
+            .unwrap_or_default()
+    };
+    let read = match &allocator.extent {
+        Extent::SizeArgument(index) => shape_of(tcx, args.get(*index)?),
+        Extent::ElementCount {
+            count_index,
+            size_index,
+        } => {
+            let size = args.get(*size_index)?;
+            if size_of_call(size) {
+                Ok((BoxShape::Slice, Some(snippet(args.get(*count_index)?.span))))
+            } else {
+                Err(format!("{COUNT}:element-size:{}", snippet(size.span)))
+            }
+        }
+        // The postcondition, read off the RESULT: the block is a NUL-terminated
+        // copy, so its extent is its own `CStr` length plus the terminator.
+        // Nothing here depends on the argument's emitted form.
+        Extent::NulTerminatedCopy => Ok((BoxShape::Slice, None)),
+    };
+    let nul_terminated = matches!(allocator.extent, Extent::NulTerminatedCopy);
+    Some(read.map(|(shape, count)| Allocation {
         contract,
         span: e.span,
         shape,
         count,
+        nul_terminated,
     }))
 }
 
@@ -379,6 +479,11 @@ struct Scan {
     moves: Vec<(HirId, HirId, Span)>,
     /// build 2: `let x = <null>;` — (binding, the initializer's span).
     null_inits: Vec<(HirId, Span)>,
+    /// Every CAST of a bare local — (binding, the cast's span). The owner walk
+    /// must have spelled each one: a cast this rule leaves alone is a use of
+    /// the owner in another pointee's shape, which the emitted `Box` cannot
+    /// satisfy (lodepng's `mem as *const c_void`, the counted-void family's).
+    casts: Vec<(HirId, Span)>,
 }
 
 struct ScanWalk<'tcx> {
@@ -419,7 +524,7 @@ impl<'tcx> Visitor<'tcx> for ScanWalk<'tcx> {
                 rustc_hir::StmtKind::Semi(e) | rustc_hir::StmtKind::Expr(e) => match &e.kind {
                     ExprKind::Call(_, args) => callee_of(e)
                         .and_then(|did| contract_of(self.tcx, did))
-                        .filter(|(_, is_alloc)| !is_alloc)
+                        .filter(|(_, allocator)| allocator.is_none())
                         .and_then(|(c, _)| {
                             let arg = args.get(c.pointer_index)?;
                             let hir = bare_local(arg)?;
@@ -469,6 +574,12 @@ impl<'tcx> Visitor<'tcx> for ScanWalk<'tcx> {
     }
 
     fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+        if let ExprKind::Cast(inner, _) = &e.kind
+            && let ExprKind::Path(QPath::Resolved(_, path)) = &inner.kind
+            && let Res::Local(hir) = path.res
+        {
+            self.out.casts.push((hir, e.span));
+        }
         match &e.kind {
             ExprKind::Ret(_) => self.out.returns.push(e.span),
             // An assignment outside statement position (`(x = ..)` as a
@@ -535,8 +646,44 @@ pub(crate) fn derive<'tcx>(
             let node = (subject.fn_did, subject.hir_id);
             let label = subject.label.clone();
             let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
+            // Which contract's subject this is, known BEFORE any refusal: the
+            // libc row's refusals are receipts, every other contract's are
+            // decisions (`Plans::yields` says why).
+            let subject_contract = scan
+                .statements
+                .iter()
+                .filter(|(hir, _, _, role, _)| {
+                    *hir == subject.hir_id && matches!(role, Role::Let | Role::Alloc)
+                })
+                .find_map(|(hir, _, _, role, span)| {
+                    let init = match role {
+                        Role::Let => tcx
+                            .hir_node(*hir)
+                            .parent_hir_node_let(tcx)
+                            .and_then(|local| local.init),
+                        _ => scan
+                            .alloc_assigns
+                            .iter()
+                            .find(|(h, value, _)| h == hir && span.contains(*value))
+                            .map(|(_, _, id)| tcx.hir_node(*id).expect_expr()),
+                    }?;
+                    let value = match &init.kind {
+                        ExprKind::If(_, then, Some(_)) => match then.kind {
+                            ExprKind::Block(b, _) => b.expr.unwrap_or(init),
+                            _ => then,
+                        },
+                        _ => init,
+                    };
+                    allocation_contract(tcx, value)
+                });
+            let yields =
+                subject_contract.is_some_and(|c| c.id.starts_with("allocator-contract:libc"));
             let hold = |out: &mut Plans, reason: String| {
-                out.holds.insert(node, (label.clone(), reason));
+                if yields {
+                    out.yields.push((label.clone(), reason));
+                } else {
+                    out.holds.insert(node, (label.clone(), reason));
+                }
             };
             // **The owner's generations** (build 2, relay wave-6a/018). Every
             // event on the binding, in source order: a CREATION (the `let`'s
@@ -666,6 +813,32 @@ pub(crate) fn derive<'tcx>(
             }
             let shape = creations[0].2.shape;
             let contract = creations[0].2.contract;
+            // **The libc row yields to the fields family on a model-OWNING
+            // local.** The licensing-wall supersession this rule applies is for
+            // subjects the model calls Raw or Ref — report 017's 82. A local
+            // the model already calls Owning is ownership-fields' body-local
+            // population (their `box_w1` / `box_w2` / `box2_*` witnesses), and
+            // two families planning one binding is an ill-typed function, not
+            // an arbitration.
+            if contract.id.starts_with("allocator-contract:libc")
+                && slots
+                    .fn_local_slots
+                    .get(&subject.fn_did)
+                    .and_then(|u| u.slot_for_local_depth(subject.local, 0))
+                    .is_some_and(|slot| {
+                        model.get(&SlotRef::Local(subject.fn_did, slot)) == Some(&SlotKind::Owning)
+                    })
+            {
+                hold(&mut out, format!("{USE}:model-owning-is-the-fields-family"));
+                continue;
+            }
+            // **The libc row yields to the fields family on a model-OWNING
+            // local** (R434-4 §3). The licensing-wall supersession this rule
+            // applies is for subjects the model calls Raw or Ref — report 017's
+            // 82. A local the model already calls Owning is ownership-fields'
+            // body-local population, and two families planning one subject is
+            // exactly what the class layer would have to arbitrate.
+
             if creations.iter().any(|(_, _, a)| a.shape != shape) {
                 hold(&mut out, format!("{USE}:shapes-disagree"));
                 continue;
@@ -705,6 +878,24 @@ pub(crate) fn derive<'tcx>(
                 hold(&mut out, format!("{RETURNED}:{}", snippet(*span)));
                 continue;
             }
+            // Every CAST of the owner must be one this rule spelled: an edit
+            // covers it, or it is the free's own argument. A cast left alone
+            // is the owner used in another pointee's shape — the counted-void
+            // family's `mem as *const c_void` — which the emitted `Box` cannot
+            // satisfy, so the subject is not this rule's.
+            if let Some((_, cast)) = scan.casts.iter().find(|(hir, span)| {
+                *hir == subject.hir_id
+                    && !uses
+                        .edits
+                        .iter()
+                        .any(|e| e.span == *span || e.span.contains(*span))
+                    && !frees.iter().any(|(_, arg)| arg.contains(*span))
+                    && !creations.iter().any(|(c, _, _)| c.contains(*span))
+            }) {
+                hold(&mut out, format!("{USE}:unbridged-cast:{}", snippet(*cast)));
+                continue;
+            }
+
             for edit in &uses.edits {
                 if !events
                     .iter()
@@ -787,10 +978,16 @@ pub(crate) fn derive<'tcx>(
                 }
                 spans
             };
+            // A return inside a DEAD null guard is not a path of the emitted
+            // program: the guard tests a `Box`, which cannot be null, and the
+            // owner walk already replaces the whole `if` with `{}`. libc's
+            // allocators are the reason this matters — brotli's exits on a
+            // null result, so no fixture of this rule had a guard before.
             if let Some(ret) = scan.returns.iter().find(|r| {
-                live_spans
-                    .iter()
-                    .any(|(start, end)| r.lo() > start.hi() && r.lo() < end.lo())
+                !uses.dead_guards.iter().any(|guard| guard.contains(**r))
+                    && live_spans
+                        .iter()
+                        .any(|(start, end)| r.lo() > start.hi() && r.lo() < end.lo())
             }) {
                 hold(
                     &mut out,
@@ -848,13 +1045,25 @@ pub(crate) fn derive<'tcx>(
                 // claim 4). Two zero-width insertions at the boundaries contain
                 // nothing: the bridge renders where it was planned, inside text
                 // this rule never claims.
-                let (open, close) = match (&a.shape, &a.count) {
-                    (BoxShape::Sized, _) => ("Box::from_raw(".to_owned(), ")".to_owned()),
-                    (BoxShape::Slice, Some(count)) => (
+                let (open, close) = match (&a.shape, &a.count, a.nul_terminated) {
+                    (BoxShape::Sized, _, _) => ("Box::from_raw(".to_owned(), ")".to_owned()),
+                    // The contract's postcondition: bind the block the
+                    // allocator returned and measure IT. The count never
+                    // mentions the allocator's arguments, so no other family's
+                    // rendering of them can make it stale.
+                    (BoxShape::Slice, _, true) => (
+                        "{ let __crat_alloc = ".to_owned(),
+                        "; Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_alloc, \
+                         core::ffi::CStr::from_ptr(__crat_alloc).to_bytes().len().wrapping_add(1))) }"
+                            .to_owned(),
+                    ),
+                    (BoxShape::Slice, Some(count), false) => (
                         "Box::from_raw(core::ptr::slice_from_raw_parts_mut(".to_owned(),
                         format!(", ({count}) as usize))"),
                     ),
-                    (BoxShape::Slice, None) => unreachable!("a slice shape carries its count"),
+                    (BoxShape::Slice, None, false) => {
+                        unreachable!("a counted slice shape carries its count")
+                    }
                 };
                 let (open, close) = if optional {
                     (format!("Some({open}"), format!("{close})"))

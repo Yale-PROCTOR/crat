@@ -597,3 +597,133 @@ pub unsafe extern \"C\" fn raw_manager(mut n: usize, mut split: *mut u32) {{\n\
         out.artifacts.allocator_contract_receipts
     );
 }
+
+/// **The libc row** (R434-4 §3, report 017's market): libc's own allocator
+/// contract — `malloc` / `calloc` / `strdup` released by `free` — read by the
+/// same generation machine as brotli's. `realloc` is deliberately absent from
+/// the table: it releases one generation and creates another in one call.
+///
+/// `strdup`'s extent is the contract's POSTCONDITION (§1): the block is a
+/// NUL-terminated copy, so the construction binds it and measures IT — the
+/// count never mentions the allocator's argument, so no other family's
+/// rendering of that argument can make it stale, and no length is fabricated.
+const LIBC_OWNERS: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn calloc(n: std::os::raw::c_ulong, size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn strdup(s: *const std::os::raw::c_char) -> *mut std::os::raw::c_char;
+    fn free(ptr: *mut core::ffi::c_void);
+    fn strcmp(a: *const std::os::raw::c_char, b: *const std::os::raw::c_char) -> i32;
+}
+pub unsafe extern "C" fn counted(mut n: usize, mut out: *mut u32) -> i32 {
+    let mut buf = malloc((n as std::os::raw::c_ulong).wrapping_mul(::std::mem::size_of::<u32>() as std::os::raw::c_ulong)) as *mut u32;
+    if buf.is_null() {
+        return 0 as i32;
+    }
+    *buf.offset(0 as isize) = 7 as u32;
+    *out = *buf.offset(0 as isize);
+    free(buf as *mut core::ffi::c_void);
+    return 1 as i32;
+}
+pub unsafe extern "C" fn zeroed(mut n: usize, mut out: *mut u32) -> i32 {
+    let mut grid = calloc(n as std::os::raw::c_ulong, ::std::mem::size_of::<u32>() as std::os::raw::c_ulong) as *mut u32;
+    if grid.is_null() {
+        return 0 as i32;
+    }
+    *out = *grid.offset(0 as isize);
+    free(grid as *mut core::ffi::c_void);
+    return 1 as i32;
+}
+pub unsafe extern "C" fn region(mut n: usize) -> usize {
+    let mut mem = malloc((n as std::os::raw::c_ulong).wrapping_mul(::std::mem::size_of::<u32>() as std::os::raw::c_ulong)) as *mut u32;
+    if mem.is_null() {
+        return 0 as usize;
+    }
+    let mut seen = span_of(mem as *const core::ffi::c_void, n);
+    free(mem as *mut core::ffi::c_void);
+    return seen;
+}
+pub unsafe extern "C" fn span_of(mut p: *const core::ffi::c_void, mut n: usize) -> usize {
+    return (p as usize).wrapping_add(n);
+}
+pub unsafe extern "C" fn copied(mut src: *const std::os::raw::c_char) -> i32 {
+    let mut dup = strdup(src);
+    if dup.is_null() {
+        return 0 as i32;
+    }
+    let mut same = strcmp(dup, src);
+    free(dup as *mut core::ffi::c_void);
+    return same;
+}
+"#;
+
+#[test]
+fn w6a_ac_the_libc_row_owns_malloc_calloc_and_strdup_locals() {
+    let out = emitted("ac-libc", LIBC_OWNERS);
+    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
+        std::fs::write(path, &out.source).expect("dump");
+    }
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(
+        out.reverted, 0,
+        "{}\n{:#?}\n{receipts}",
+        out.source, out.degradations
+    );
+    for expected in [
+        // malloc: the byte count is `n * size_of::<T>()`, so the count is `n`.
+        "letmutbuf:Box<[u32]>=Box::from_raw(core::ptr::slice_from_raw_parts_mut(malloc(",
+        "buf[(0)asusize]=7asu32;",
+        "free(Box::into_raw(buf)as*mutcore::ffi::c_void);",
+        // calloc: the count is the element argument, the size the pointee's.
+        "letmutgrid:Box<[u32]>=Box::from_raw(core::ptr::slice_from_raw_parts_mut(calloc(nasstd::os::raw::c_ulong,",
+        "free(Box::into_raw(grid)as*mutcore::ffi::c_void);",
+        // strdup: the contract's postcondition, measured on the block itself —
+        // the count never mentions `src`.
+        "letmutdup:Box<[i8]>={let__crat_alloc=strdup(src);Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_alloc,core::ffi::CStr::from_ptr(__crat_alloc).to_bytes().len().wrapping_add(1)))};",
+        "free(Box::into_raw(dup)as*mutcore::ffi::c_void);",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}`\n{}\n{:#?}\n{receipts}",
+            out.source,
+            out.degradations
+        );
+    }
+    for subject in ["counted::buf", "zeroed::grid", "copied::dup"] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}\n{:#?}",
+            out.degradations
+        );
+        assert!(
+            receipts.contains(&format!("{subject}\tadmitted\t")),
+            "{receipts}"
+        );
+    }
+    assert!(
+        receipts.contains("allocator-contract:libc/v1@2026-09-17"),
+        "{receipts}"
+    );
+    // CONTROL: **a refusal of the libc row is a RECEIPT, never a decision.**
+    // `region::mem` is handed to a local callee this rule cannot prove a lend
+    // of, so the row yields — and because it yields rather than holding, the
+    // subject stays available to whichever family does claim it, which is what
+    // kept seven witnesses of this lane and two of wave-6v's green when the
+    // row arrived.
+    assert!(
+        receipts.contains("region::mem\tyielded\tcontract-allocation:use:"),
+        "{receipts}"
+    );
+    assert!(
+        !receipts.contains("region::mem\theld\t"),
+        "a libc refusal must not degrade the subject\n{receipts}"
+    );
+    assert!(
+        !compact(&out.source).contains("letmutmem:Box<"),
+        "{}",
+        out.source
+    );
+}
