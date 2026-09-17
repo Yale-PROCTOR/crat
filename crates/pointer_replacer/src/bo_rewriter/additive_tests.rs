@@ -550,3 +550,76 @@ fn r220_later_carrier_retries_and_restores_the_exact_predecessor_profile() {
         );
     });
 }
+
+/// **Relay 043 (wave-6o 016 STOP 1, R397-6(a)) — the retirement arm.**
+///
+/// wave-6s2's `computed-suffix-raw-view` carries the evidence
+/// `body-local-raw-alias-schedule-unproved`, premised on the destination
+/// staying RAW. When the Option family takes that destination the receipt
+/// layer drops the adapter as `slice-use-evidence-held`, and the exclusion
+/// re-derivation used to read that drop as a family site that failed — which
+/// falls the WHOLE owner back to the predecessor's mechanics, one stage before
+/// wave-6o's own arm runs (their report 016 claims 3–5, five rows).
+///
+/// The site is SUPERSEDED, not unsatisfied. Pinned both ways on one input: with
+/// the destination moving to the Option family nothing is requested; without
+/// that move the same drop still requests, so the exception cannot widen into
+/// "a dropped slice-use adapter never counts".
+#[test]
+fn r397_6a_a_superseded_slice_use_adapter_is_not_an_unsatisfied_family_site() {
+    with_baseline(|prior| {
+        let owner = owner(&prior, "slice_values");
+        let dropped = |from: &StageSnapshot| {
+            let mut inputs = class_inputs(from);
+            inputs
+                .iter_mut()
+                .find(|input| input.id == owner)
+                .unwrap()
+                .sites
+                .push(ClassSite::dropped(
+                    owner,
+                    owner,
+                    Arm::Surface,
+                    "slice-use-adapter",
+                    "slice-use-evidence-held",
+                ));
+            candidate(from, inputs)
+        };
+
+        // (1) The destination does not move: the drop is an unsatisfied family
+        //     site and the owner falls back, exactly as before this arm.
+        assert_eq!(
+            requested_owners(&prior, &dropped(&prior), FamilyStage::Option, &[]),
+            BTreeSet::from([owner]),
+            "without the destination move the drop must still request"
+        );
+
+        // (2) The destination moves to the Option family — wave-6o's shape,
+        //     where it was `degraded:null-init` in the predecessor and becomes
+        //     `Option<&[u8]>` here. The adapter is superseded, not failed.
+        let mut before = prior.clone();
+        for (subject, decided) in &mut before.table.entries {
+            if SignatureClassId::of(subject.fn_did) == owner {
+                *decided = Decision::Degraded(Degradation {
+                    subject: subject.label.clone(),
+                    site: "<the destination, still raw>".to_owned(),
+                    reason: DegradeReason::KindRaw,
+                });
+            }
+        }
+        let mut composed = dropped(&before);
+        for (subject, decided) in &mut composed.table.entries {
+            if SignatureClassId::of(subject.fn_did) == owner {
+                *decided = Decision::Opt {
+                    mutable: false,
+                    slice: true,
+                    uses: Vec::new(),
+                };
+            }
+        }
+        assert!(
+            requested_owners(&before, &composed, FamilyStage::Option, &[]).is_empty(),
+            "a superseded adapter must not fall the owner back"
+        );
+    });
+}

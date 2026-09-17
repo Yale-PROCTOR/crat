@@ -410,6 +410,73 @@ fn named_by(
     Vec::new()
 }
 
+/// **Relay 043 (wave-6o 016 STOP 1, R397-6(a)).** Is this dropped site
+/// SUPERSEDED rather than unsatisfied?
+///
+/// wave-6s2's source-side raw view (`computed-suffix-raw-view`) carries the
+/// evidence `body-local-raw-alias-schedule-unproved`, which is premised on the
+/// **destination staying raw**. When the Option family then takes that
+/// destination, the adapter is not a family site that failed — it is one the
+/// newer family replaced, and the receipt layer drops it as
+/// `slice-use-evidence-held`. Reading that drop as an unsatisfied family site
+/// falls the WHOLE owner back to the predecessor's mechanics, which is how
+/// wave-6o's five rows die one stage before their own arm runs (their report
+/// 016 claims 3–5).
+///
+/// The invariant this restores is R397-6(a)'s own: a request means *a
+/// candidate of mine failed and must be excluded*, never *a site of mine was
+/// replaced by a later family*. Nothing here decides a form; it only stops one
+/// class of drop from being counted as a failure.
+///
+/// The supersession predicate is the one wave-6s2's relay 010 names — **the
+/// destination is typed by the Option family** — read here as: a subject of
+/// this owner carries an `Opt` decision in the candidate that it did not carry
+/// in the predecessor. A drop with no such move is untouched and still
+/// requests, which is what keeps this an exception rather than a loosening.
+fn superseded_by_an_option_destination(
+    site: &plan::ClassSite,
+    owner: SignatureClassId,
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+) -> bool {
+    if site.key.bridge_kind != "slice-use-adapter" {
+        return false;
+    }
+    if !matches!(
+        &site.state,
+        plan::ClassSiteState::Dropped(reason) if reason == "slice-use-evidence-held"
+    ) {
+        return false;
+    }
+    let optional = |snapshot: &StageSnapshot| -> BTreeSet<String> {
+        snapshot
+            .table
+            .entries
+            .iter()
+            .filter(|(subject, decided)| {
+                // Exhaustive by the import-denylist rule: a new `Decision`
+                // variant is classified here, never swept into a wildcard.
+                let optional = match decided {
+                    decision::Decision::Opt { .. } => true,
+                    decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Cursor { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::Degraded(_) => false,
+                };
+                optional && SignatureClassId::of(subject.fn_did) == owner
+            })
+            .map(|(subject, _)| subject.label.clone())
+            .collect()
+    };
+    optional(candidate)
+        .difference(&optional(prior))
+        .next()
+        .is_some()
+}
+
 pub(crate) fn withdrawals(
     prior: &StageSnapshot,
     candidate: &StageSnapshot,
@@ -629,6 +696,7 @@ fn anchors(
                 matches!(site.state, plan::ClassSiteState::Dropped(_))
                     && !old.is_some_and(|old| old.sites.contains(site))
                     && site.key.bridge_kind != "missing-required-site"
+                    && !superseded_by_an_option_destination(site, *owner, prior, candidate)
             })
             .collect::<Vec<_>>();
         if let Some(site) = new_dropped.first() {
@@ -644,9 +712,26 @@ fn anchors(
             });
             continue;
         }
+        // Relay 043: the same supersession, on the hold the finalizer derives
+        // from that site (`plan::finalize_class_inputs` spells it
+        // `dropped-site:<kind>:<reason>`). Filtering only the site list would
+        // leave the refusal branch requesting for the very drop the arm has
+        // just ruled superseded.
+        let superseded: BTreeSet<String> = class
+            .sites
+            .iter()
+            .filter(|site| superseded_by_an_option_destination(site, *owner, prior, candidate))
+            .filter_map(|site| match &site.state {
+                plan::ClassSiteState::Dropped(reason) => {
+                    Some(format!("dropped-site:{}:{}", site.key.bridge_kind, reason))
+                }
+                _ => None,
+            })
+            .collect();
         let new_refusal = class.hold_reasons().iter().find(|reason| {
             !reason.starts_with("dependency-class-held:")
                 && *reason != "cross-class-interval-collision"
+                && !superseded.contains(*reason)
                 && !old.is_some_and(|old| old.hold_reasons().contains(reason))
         });
         if let Some(reason) = new_refusal {
