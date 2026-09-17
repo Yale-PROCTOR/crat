@@ -19,12 +19,18 @@ use crate::{
     analyses::borrow::StructFieldSlot, rewriter::decision::DecisionMaker, utils::rustc::RustProgram,
 };
 
+pub(crate) struct CollectedDiffs {
+    pub(crate) ptr_kinds: FxHashMap<HirId, PtrKind>,
+    #[allow(dead_code)]
+    pub(crate) cursor_field_offset_alias_bindings: FxHashSet<HirId>,
+}
+
 pub fn collect_diffs<'tcx>(
     rust_program: &RustProgram<'tcx>,
     analysis: &Analysis,
     sig_decs: &SigDecisions,
     fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
-) -> FxHashMap<HirId, PtrKind> {
+) -> CollectedDiffs {
     collect_diffs_with_diagnostics(rust_program, analysis, sig_decs, fn_ptr_groups, None)
 }
 
@@ -34,8 +40,9 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
     sig_decs: &SigDecisions,
     fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
     mut diagnostics: Option<&mut DecisionDiagnostics>,
-) -> FxHashMap<HirId, PtrKind> {
+) -> CollectedDiffs {
     let mut ptr_kinds = FxHashMap::default();
+    let mut cursor_field_offset_alias_bindings = FxHashSet::default();
     let non_outermost_owning_locals = collect_non_outermost_owning_hir_locals(rust_program);
 
     let fn_ptrs = collect_fn_ptrs(rust_program);
@@ -167,6 +174,9 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                         &ptr_kinds,
                         ptr_kind,
                     ) {
+                        if alias_kind != ptr_kind {
+                            cursor_field_offset_alias_bindings.insert(*hir_id);
+                        }
                         record_local_collection_event(
                             diagnostics.as_deref_mut(),
                             *did,
@@ -233,7 +243,10 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
         }
     }
 
-    ptr_kinds
+    CollectedDiffs {
+        ptr_kinds,
+        cursor_field_offset_alias_bindings,
+    }
 }
 
 fn record_decision_info(

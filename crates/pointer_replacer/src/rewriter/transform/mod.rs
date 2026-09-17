@@ -29,7 +29,7 @@ use utils::{
 
 use super::{
     Analysis, BytemuckDependency, Config,
-    collector::{collect_diffs, collect_diffs_with_diagnostics},
+    collector::{CollectedDiffs, collect_diffs, collect_diffs_with_diagnostics},
     decision::{PtrKind, SigDecision, SigDecisions},
     diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
@@ -1523,7 +1523,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             Some(&mut diagnostics),
         );
         let initial_sig_decs = sig_decs.clone();
-        let mut ptr_kinds = collect_diffs_with_diagnostics(
+        let CollectedDiffs { mut ptr_kinds, .. } = collect_diffs_with_diagnostics(
             rust_program,
             analysis,
             &sig_decs,
@@ -1848,7 +1848,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if !changed {
                 break;
             }
-            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups).ptr_kinds;
             normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
             normalize_owning_call_result_bindings(
                 rust_program.tcx,
@@ -1912,7 +1912,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
         forced_raw_bindings.extend(demoted_field_source_bindings);
         if sig_changed {
-            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups).ptr_kinds;
         }
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         normalize_owning_call_result_bindings(
@@ -17840,7 +17840,8 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
         let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
         let fn_ptr_groups = FnPtrGroups::default();
         let sig_decs = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
-        let initial_ptr_kinds = collect_diffs(&input, &analysis, &sig_decs, &fn_ptr_groups);
+        let initial_ptr_kinds =
+            collect_diffs(&input, &analysis, &sig_decs, &fn_ptr_groups).ptr_kinds;
         let (_sig_decs, final_ptr_kinds, _reason_map, _usage_subreason_map) =
             simulate_transform_reasons(tcx, &input, &analysis);
 
@@ -18011,7 +18012,7 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
         let lifetime_plans = super::super::lifetimes::LifetimePlans::new(input, analysis);
         let fn_ptr_groups = FnPtrGroups::default();
         let mut sig_decs = SigDecisions::new(input, analysis, &lifetime_plans, &fn_ptr_groups);
-        let mut ptr_kinds = collect_diffs(input, analysis, &sig_decs, &fn_ptr_groups);
+        let mut ptr_kinds = collect_diffs(input, analysis, &sig_decs, &fn_ptr_groups).ptr_kinds;
         let free_like_wrappers = collect_local_free_wrappers(tcx);
         let local_raw_free_summaries = collect_local_raw_free_summaries(tcx, &free_like_wrappers);
         let local_raw_param_summaries =
@@ -18362,6 +18363,94 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
                 })
             })
             .expect("expected matching param hir id")
+    }
+
+    fn find_local_binding(
+        tcx: TyCtxt<'_>,
+        fn_name: &str,
+        binding_name: &str,
+    ) -> (LocalDefId, HirId, rustc_middle::mir::Local) {
+        let did = find_fn_did(tcx, fn_name);
+        let hir_to_mir = utils::ir::map_thir_to_mir(did, false, tcx);
+        let (hir_id, local) = hir_to_mir
+            .binding_to_local
+            .iter()
+            .find(|(hir_id, _)| {
+                let hir::Node::Pat(pat) = tcx.hir_node(**hir_id) else {
+                    return false;
+                };
+                let hir::PatKind::Binding(_, _, ident, _) = pat.kind else {
+                    return false;
+                };
+                ident.name.as_str() == binding_name
+            })
+            .expect("expected matching local binding");
+        (did, *hir_id, *local)
+    }
+
+    #[test]
+    fn collect_diffs_tracks_cursor_field_offset_alias_without_local_sign() {
+        let code = r#"
+#[repr(C)]
+pub struct Buffer {
+    pub data: *const u8,
+    pub position: i32,
+}
+
+pub unsafe fn read(buffer: *const Buffer) -> u8 {
+    let mut cursor: *const u8 = ((*buffer).data).offset((*buffer).position as isize);
+    let first = *cursor;
+    cursor = cursor.offset(1);
+    first + *cursor
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let (input, analysis) = build_analysis(tcx);
+            let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
+            let fn_ptr_groups = FnPtrGroups::default();
+            let sig_decs = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
+            let collected = collect_diffs(&input, &analysis, &sig_decs, &fn_ptr_groups);
+            let (did, binding, local) = find_local_binding(tcx, "read", "cursor");
+
+            assert_eq!(
+                collected.ptr_kinds.get(&binding),
+                Some(&PtrKind::SliceCursor(false))
+            );
+            assert!(
+                collected
+                    .cursor_field_offset_alias_bindings
+                    .contains(&binding)
+            );
+            assert!(!analysis.offset_sign_result.access_signs[&did].contains(local));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ordinary_sign_cursor_has_no_cursor_field_alias_provenance() {
+        let code = r#"
+pub unsafe fn read(values: [u8; 4]) -> u8 {
+    let cursor: *const u8 = values.as_ptr();
+    *cursor.offset(-1)
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let (input, analysis) = build_analysis(tcx);
+            let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
+            let fn_ptr_groups = FnPtrGroups::default();
+            let sig_decs = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
+            let collected = collect_diffs(&input, &analysis, &sig_decs, &fn_ptr_groups);
+            let (_, binding, _) = find_local_binding(tcx, "read", "cursor");
+
+            assert_eq!(
+                collected.ptr_kinds.get(&binding),
+                Some(&PtrKind::SliceCursor(false))
+            );
+            assert!(collected.cursor_field_offset_alias_bindings.is_empty());
+        })
+        .unwrap();
     }
 
     #[test]
