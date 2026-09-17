@@ -12165,6 +12165,10 @@ mod run {
             ("edit-keys", artifact.edit_keys.as_str()),
             ("adapters", capture.adapter_receipt.as_str()),
             ("sites", artifact.sites.as_str()),
+            (
+                "counted-void-calls",
+                artifact.counted_void_call_receipts.as_str(),
+            ),
             ("retention", artifact.retention.as_str()),
             ("dispositions", artifact.dispositions.as_str()),
             ("subject-index", artifact.subjects.as_str()),

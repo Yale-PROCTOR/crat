@@ -1470,6 +1470,11 @@ pub unsafe extern "C" fn binn_get_int32(mut value: *mut binn, mut pint: *mut i32
     return copy_int_value((*value).ptr, pint as *mut core::ffi::c_void, (*value).type_0, 0x61);
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn binn_get_int64(mut value: *mut binn, mut pint: *mut i64) -> i32 {
+    if value.is_null() || pint.is_null() { return 0; }
+    return copy_int_value((*value).ptr, pint as *mut core::ffi::c_void, (*value).type_0, 0x81);
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn binn_get_double(mut value: *mut binn, mut pfloat: *mut f64) -> i32 {
     let mut vint: i64 = 0;
     if value.is_null() || pfloat.is_null() { return 0; }
@@ -1480,6 +1485,54 @@ pub unsafe extern "C" fn binn_get_double(mut value: *mut binn, mut pfloat: *mut 
     1
 }
 "#;
+
+/// The COLLISION the corpus shows (report 015, handed to wave-5d): the A5
+/// proof site for argument 1 (`pint as *mut c_void`, a cast of a delivered
+/// `Option<&mut T>` local — `cast-of-local` / `opt-ref-mut` / verdict
+/// `overlapping` / T2) renders a raw view over the WHOLE call, while the
+/// counted-void seam has planned an argument adapter for argument 0 inside
+/// that same call. Whoever renders last wins, and in the corpus the adapter
+/// is the one discarded.
+#[test]
+fn w6v2_counted_call_under_an_a5_raw_view_is_the_collision() {
+    let (proofs, calls) = ::utils::compilation::run_compiler_on_str(COPY_INT, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        let proofs = ctx
+            .raw_boundary_artifacts
+            .a5_proof_site_fallback_rows
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        let calls = table
+            .seams
+            .counted_void_calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "{}->{} {:?} {:?}",
+                    tcx.def_path_str(call.caller.to_def_id()),
+                    tcx.def_path_str(call.callee.to_def_id()),
+                    call.route,
+                    call.call_span
+                )
+            })
+            .collect::<Vec<_>>();
+        (proofs, calls)
+    })
+    .expect("input type-checks");
+    println!("A5PROOFS {proofs:#?}\nCOUNTEDCALLS {calls:#?}");
+    assert!(
+        !calls.is_empty(),
+        "the counted-void seam plans a call adapter: {calls:?}"
+    );
+}
 
 #[test]
 fn w6v2_delivered_callee_routes_every_raw_caller_site() {

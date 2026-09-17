@@ -417,6 +417,14 @@ pub(crate) struct E2Timings {
 pub(crate) struct RawBoundaryArtifacts {
     /// wave-6a W6A-T1: flexible-tail struct transactions (admitted / held).
     pub(crate) flexible_tail_receipts: String,
+    /// wave-6v2 (R442-4): one row per counted-void CALL plan, with the whole-call
+    /// replacements that cover it. An A5 proof-site raw view, a PAIR raw view or a
+    /// C-9 mark replaces the entire call expression, so an argument adapter planned
+    /// inside it is discarded and a delivered callee is left with a raw argument
+    /// (binn's `copy_int_value`: two such sites, two `E0308`, a verify-revert and a
+    /// 50-function closure partition). `eprintln` is not an observable channel in the
+    /// census worker, so the collision is reported as a receipt row instead.
+    pub(crate) counted_void_call_receipts: String,
     /// wave-6a W6A-C1: Box-parameter chains (admitted / held).
     pub(crate) box_param_receipts: String,
     /// wave-6a W6A-A1: allocation-return certificates (admitted / held).
@@ -8248,6 +8256,7 @@ fn finish_decide<'tcx>(
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
             flexible_tail_receipts: table.flexible_tails.receipts_tsv(),
+            counted_void_call_receipts: counted_void_call_receipts(tcx, &table),
             box_param_receipts: table.box_params.receipts_tsv(),
             return_certificate_receipts: table.return_certificates.receipts_tsv(),
             allocator_contract_receipts: table.allocator_contracts.receipts_tsv(),
@@ -8672,6 +8681,48 @@ fn restore_a5_role_obligations(
             table.seams.overlap_proofs.push(proof);
         }
     }
+}
+
+/// wave-6v2 (R442-4): the counted-void call plans, each with the whole-call
+/// replacements that cover it. Read after the A5 fallback resolution, so the
+/// `a5_raw_view` column is final.
+fn counted_void_call_receipts(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
+    let mut out = String::from(
+        "caller\tcallee\troute\tcount_index\tcall_span\ta5_raw_view\tpair_raw_view\tc9_mark\n",
+    );
+    for call in &table.seams.counted_void_calls {
+        let span = call.call_span.source_callsite();
+        let covered = |hit: bool| if hit { "yes" } else { "no" };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\n",
+            tcx.def_path_str(call.caller.to_def_id()),
+            tcx.def_path_str(call.callee.to_def_id()),
+            call.route.key(),
+            call.count_index,
+            span,
+            covered(
+                table
+                    .seams
+                    .a5_raw_calls
+                    .iter()
+                    .any(|other| other.call_span.source_callsite() == span)
+            ),
+            covered(
+                table
+                    .seams
+                    .pair_raw_calls
+                    .iter()
+                    .any(|other| other.call_span.source_callsite() == span)
+            ),
+            covered(
+                table
+                    .c9_marks
+                    .iter()
+                    .any(|mark| mark.call_span.source_callsite() == span)
+            ),
+        ));
+    }
+    out
 }
 
 fn append_surface_declaration_plans(
