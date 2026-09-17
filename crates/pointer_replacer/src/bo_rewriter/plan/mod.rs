@@ -6516,7 +6516,7 @@ mod wave3_class_tests {
         // over W-C5's argument adapter, and a call bridge over a Box owner's
         // access edit — the AST pass renders both nestings since wave-6l's
         // `f8a2d5e6` — and relay 025's mutable twin of the reborrow row.
-        const PAIRS: [(Arm, &str, Arm, &str); 10] = [
+        const PAIRS: [(Arm, &str, Arm, &str); 11] = [
             (Arm::Pair, "pair-t2-raw-view", Arm::C, "typed-raw-temporary"),
             (
                 Arm::Pair,
@@ -6546,6 +6546,14 @@ mod wave3_class_tests {
             (
                 Arm::C,
                 "box-borrow-view-to-raw",
+                Arm::Surface,
+                "box-expression",
+            ),
+            // Relay 045: the Option glue's unwrap over the same (the three rows
+            // that survived batch 10).
+            (
+                Arm::Glue,
+                "nullable-required-unwrap",
                 Arm::Surface,
                 "box-expression",
             ),
@@ -6616,41 +6624,44 @@ mod wave3_class_tests {
     #[test]
     fn l07_box_borrow_view_over_its_own_box_expression_is_intra_class_composed() {
         use crate::bo_rewriter::decision::Arm;
-        with_classes(1, |ids| {
-            let class = ClassInput::new(ids[0], arms(&[Arm::C, Arm::Surface]))
-                .with_site(ClassSite::edit(
-                    ids[0],
-                    ids[0],
-                    Arm::C,
-                    "j.rs",
-                    11456136,
-                    11456181,
-                    "box-borrow-view-to-raw",
-                ))
-                .with_site(ClassSite::edit(
-                    ids[0],
-                    ids[0],
-                    Arm::Surface,
-                    "j.rs",
-                    11456141,
-                    11456181,
-                    "box-expression",
-                ));
-            let finalized = finalize_class_inputs(vec![class]);
-            assert!(
-                finalized.classes[&ids[0]].is_ready(),
-                "the class held: {:?}",
-                finalized.classes[&ids[0]].hold_reasons()
-            );
-            assert!(
-                !finalized.classes[&ids[0]]
-                    .hold_reasons()
-                    .iter()
-                    .any(|r| r == "intra-class-interval-overlap"),
-                "the containment was read as an overlap"
-            );
-            assert!(finalized.collisions.is_empty(), "a cross-class collision");
-        });
+        // Relay 045: the Option glue's unwrap carries the same geometry on two
+        // of the three rows that survived batch 10 (brotli 2714x2764 is
+        // 26834330..26834418 over 26834335..26834418), so both outers are
+        // pinned on one shape.
+        for (arm, kind) in [
+            (Arm::C, "box-borrow-view-to-raw"),
+            (Arm::Glue, "nullable-required-unwrap"),
+        ] {
+            with_classes(1, |ids| {
+                let class = ClassInput::new(ids[0], arms(&[arm, Arm::Surface]))
+                    .with_site(ClassSite::edit(
+                        ids[0], ids[0], arm, "j.rs", 11456136, 11456181, kind,
+                    ))
+                    .with_site(ClassSite::edit(
+                        ids[0],
+                        ids[0],
+                        Arm::Surface,
+                        "j.rs",
+                        11456141,
+                        11456181,
+                        "box-expression",
+                    ));
+                let finalized = finalize_class_inputs(vec![class]);
+                assert!(
+                    finalized.classes[&ids[0]].is_ready(),
+                    "the class held: {:?}",
+                    finalized.classes[&ids[0]].hold_reasons()
+                );
+                assert!(
+                    !finalized.classes[&ids[0]]
+                        .hold_reasons()
+                        .iter()
+                        .any(|r| r == "intra-class-interval-overlap"),
+                    "the containment was read as an overlap"
+                );
+                assert!(finalized.collisions.is_empty(), "a cross-class collision");
+            });
+        }
     }
 
     /// The allowlist stays an allowlist. An outer/inner kind combination that
