@@ -813,6 +813,29 @@ pub(crate) fn derive<'tcx>(
             }
             let shape = creations[0].2.shape;
             let contract = creations[0].2.contract;
+            // **The one shape the System declaration does not cover** (R443-1):
+            // libc's allocators guarantee alignment for any fundamental type
+            // (16 bytes here), and `System`'s `dealloc` of an over-aligned
+            // layout is not `free`. A pointee that asks for more keeps a typed
+            // hold rather than a Box whose release would not match its
+            // allocation.
+            let binding_type = tcx.typeck(subject.fn_did).node_type(subject.hir_id);
+            if let TyKind::RawPtr(pointee, _) = binding_type.kind()
+                && let Ok(layout) = tcx.layout_of(
+                    rustc_middle::ty::TypingEnv::post_analysis(tcx, subject.fn_did)
+                        .as_query_input(*pointee),
+                )
+                && layout.align.abi.bytes() > 16
+            {
+                hold(
+                    &mut out,
+                    format!(
+                        "{USE}:box-over-aligned-pointee:{}",
+                        layout.align.abi.bytes()
+                    ),
+                );
+                continue;
+            }
             // **The libc row yields to the fields family on a model-OWNING
             // local.** The licensing-wall supersession this rule applies is for
             // subjects the model calls Raw or Ref — report 017's 82. A local
@@ -918,21 +941,23 @@ pub(crate) fn derive<'tcx>(
             for (span, block, event, role) in &events {
                 let entry = block_state.entry(*block).or_insert((live, live));
                 match event {
-                    // **The overwrite of a live owner stays REFUSED** — R434-4
-                    // §2 admitted it, and Miri refutes the premise it was
-                    // admitted on (report 019 §3). An implicit close here
-                    // drops a `Box` whose block came from the CONTRACT's
-                    // allocator, and `Box`'s drop is Rust's deallocation, not
-                    // the contract's: Miri reports "deallocating … C heap
-                    // memory using Rust heap deallocation operation" — UB by
-                    // the language, whatever glibc does with the layout. The
-                    // admission returns when the release at the overwrite is
-                    // spelled with the contract's OWN free, which is a build,
-                    // not a waiver.
-                    Event::Create if live => {
-                        sequence_error =
-                            Some(format!("{OVERWRITE}:re-seat-over-live:{}", snippet(*span)));
-                    }
+                    // **The overwrite of a live unique owner** (R434-4 §2,
+                    // re-admitted under R443-1). The input leaks the generation
+                    // this assignment replaces; the emitted program closes it
+                    // with Rust's ordinary overwrite drop. Report 019 measured
+                    // that close as UB — `deallocating … C heap memory using
+                    // Rust heap deallocation operation` — and report 020's
+                    // probe measured the fix: with the emitted crate declaring
+                    // `#[global_allocator] … System`, Rust's deallocation IS
+                    // the contract's `free`, Miri accepts the drop, and the
+                    // emitted program leaks 0 where the input leaks 1. The one
+                    // shape the declaration does not cover is an over-aligned
+                    // pointee, which the gate below holds.
+                    //
+                    // Uniqueness is not assumed: a copy into another local, an
+                    // unproven lend or an unbridged cast each refuse the
+                    // subject before the simulation runs.
+                    Event::Create if live => overwrites.push(*span),
                     Event::Create => live = true,
                     Event::Release if !live => {
                         sequence_error = Some(format!(

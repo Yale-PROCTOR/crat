@@ -495,14 +495,17 @@ pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n:
             out.degradations
         );
     }
-    // (4) The re-seat over a live generation: R434-4 §2 admitted it and this
-    // lane WITHDREW the admission — an implicit close drops a block the
-    // CONTRACT's allocator owns, which Miri reports as UB (report 019 §3). The
-    // hold stands until the release is spelled with the contract's own free.
+    // (4) The re-seat over a live generation: ADMITTED (R434-4 §2 under
+    // R443-1), whose implicit close is well-defined because the emitted crate
+    // declares the System allocator — report 020's probe measured the same
+    // fixture UB without the declaration and clean with it. The control keeps
+    // the shape and asserts the waiver's receipt.
     assert!(
-        receipts.contains(
-            "reseat_over_live::syms\theld\tcontract-allocation:overwrite:re-seat-over-live"
-        ),
+        receipts.contains("reseat_over_live::syms\tadmitted\twaiver-drop(overwrite) site="),
+        "{receipts}"
+    );
+    assert!(
+        !receipts.contains("reseat_over_live::syms\theld\t"),
         "{receipts}"
     );
     // (7) A local assigned from something that is not a contract owner is
@@ -523,8 +526,9 @@ pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n:
     // Exactly ONE function of this fixture delivers: `reseat_over_live`, under
     // §2's waiver. Every other gate's owner keeps its typed hold, which the
     // per-subject assertions above already name.
-    assert!(
-        !compact(&out.source).contains("Box<[u32]>"),
+    assert_eq!(
+        compact(&out.source).matches("Box<[u32]>").count(),
+        1,
         "{}",
         out.source
     );
@@ -645,6 +649,21 @@ pub unsafe extern "C" fn zeroed(mut n: usize, mut out: *mut u32) -> i32 {
     free(grid as *mut core::ffi::c_void);
     return 1 as i32;
 }
+#[repr(C, align(32))]
+pub struct Wide {
+    pub a: u64,
+    pub b: u64,
+}
+pub unsafe extern "C" fn over_aligned(mut n: usize) -> u64 {
+    let mut w = malloc(::std::mem::size_of::<Wide>() as std::os::raw::c_ulong) as *mut Wide;
+    if w.is_null() {
+        return 0 as u64;
+    }
+    (*w).a = n as u64;
+    let mut seen = (*w).a;
+    free(w as *mut core::ffi::c_void);
+    return seen;
+}
 pub unsafe extern "C" fn region(mut n: usize) -> usize {
     let mut mem = malloc((n as std::os::raw::c_ulong).wrapping_mul(::std::mem::size_of::<u32>() as std::os::raw::c_ulong)) as *mut u32;
     if mem.is_null() {
@@ -717,6 +736,22 @@ fn w6a_ac_the_libc_row_owns_malloc_calloc_and_strdup_locals() {
         receipts.contains("allocator-contract:libc/v1@2026-09-17"),
         "{receipts}"
     );
+    // CONTROL (R443-1): the one shape the System declaration does not cover.
+    // libc guarantees alignment for any fundamental type; `System`'s dealloc of
+    // an over-aligned layout is not `free`, so an over-aligned pointee keeps a
+    // typed hold rather than a Box whose release would not match its
+    // allocation.
+    assert!(
+        receipts.contains(
+            "over_aligned::w\tyielded\tcontract-allocation:use:box-over-aligned-pointee:32"
+        ),
+        "{receipts}"
+    );
+    assert!(
+        !compact(&out.source).contains("letmutw:Box<"),
+        "{}",
+        out.source
+    );
     // CONTROL: **a refusal of the libc row is a RECEIPT, never a decision.**
     // `region::mem` is handed to a local callee this rule cannot prove a lend
     // of, so the row yields — and because it yields rather than holding, the
@@ -738,18 +773,18 @@ fn w6a_ac_the_libc_row_owns_malloc_calloc_and_strdup_locals() {
     );
 }
 
-/// **The overwrite of a live owner: admitted by R434-4 §2, WITHDRAWN here.**
-/// `dup = strdup(src)` over a generation the owner still holds. §2 licensed
-/// the implicit close under the leak-parity waiver, on the premise that the
-/// drop "frees through the System allocator, which ignores the layout". Miri
-/// refutes the premise, not the layout reasoning: dropping a `Box` whose block
-/// came from the CONTRACT's allocator is *deallocating C heap memory using
-/// Rust heap deallocation operation* — UB by the language, whatever glibc
-/// does (report 019 §3, `miri-overwrite-emitted-UB.log`).
+/// **The overwrite of a live unique owner** (R434-4 §2, withdrawn on Miri's
+/// evidence in report 019 and RE-ADMITTED under R443-1): `dup = strdup(src)`
+/// over a generation the owner still holds. The input LEAKS the first block;
+/// the emitted program closes it with Rust's ordinary overwrite drop, which
+/// is what the leak-parity waiver licenses (addendum 101) — and which is
+/// well-defined because the emitted crate declares the System allocator, so
+/// Rust's deallocation IS the contract's `free` (report 020's probe: the same
+/// fixture is UB without the declaration and `ok r=0` with it, leaking 0 where
+/// the input leaks 1). The site carries `waiver-drop(overwrite)`.
 ///
-/// So the shape keeps its typed hold. The admission returns when the release
-/// at the overwrite is spelled with the contract's OWN free, which is a build
-/// rather than a waiver — this witness is its RED.
+/// Uniqueness is not assumed: a copy into another local, an unproven lend or
+/// an unbridged cast each refuse the subject before the simulation runs.
 const OVERWRITTEN_OWNER: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types)]
 extern "C" {
@@ -772,24 +807,42 @@ pub unsafe extern "C" fn twice(mut src: *const std::os::raw::c_char) -> i32 {
 "#;
 
 #[test]
-fn w6a_ac_an_overwrite_of_a_live_owner_keeps_its_hold_until_the_release_is_spelled() {
+fn w6a_ac_an_overwrite_of_a_live_owner_takes_the_leak_parity_waiver() {
     let out = emitted("ac-overwrite", OVERWRITTEN_OWNER);
+    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
+        std::fs::write(path, &out.source).expect("dump");
+    }
+    let text = compact(&out.source);
     let receipts = &out.artifacts.allocator_contract_receipts;
-    // The row REACHES the shape — the owner is model-Raw, two generations of
-    // one libc contract — and refuses it at the simulation.
-    assert!(
-        receipts.contains("twice::dup\tyielded\tcontract-allocation:overwrite:re-seat-over-live"),
+    assert_eq!(
+        out.reverted, 0,
+        "{}\n{:#?}\n{receipts}",
+        out.source, out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "twice::dup"),
+        None,
+        "{:#?}\n{receipts}",
+        out.degradations
+    );
+    for expected in [
+        "letmutdup:Option<Box<[i8]>>=Some({let__crat_alloc=strdup(src);",
+        "ifdup.is_none(){return0asi32;}",
+        // The overwrite itself: a new generation assigned over a live one.
+        "dup=Some({let__crat_alloc=strdup(src);",
+        "free(dup.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutcore::ffi::c_void));",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}`\n{}\n{receipts}",
+            out.source
+        );
+    }
+    // One overwritten generation, one waiver receipt.
+    assert_eq!(
+        receipts.matches("waiver-drop(overwrite) site=").count(),
+        1,
         "{receipts}"
     );
-    // Nothing is emitted for it, and nothing else in the program is claimed by
-    // a half-plan: the refusal is a receipt, so the subject stays whole.
-    assert!(
-        !compact(&out.source).contains("Box<[i8]>"),
-        "{}",
-        out.source
-    );
-    assert!(
-        !receipts.contains("waiver-drop(overwrite)"),
-        "the waiver is withdrawn until the release is the contract's own free\n{receipts}"
-    );
+    assert!(receipts.contains("generations=2"), "{receipts}");
 }
