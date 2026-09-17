@@ -1979,6 +1979,74 @@ fn known_borrow_only_foreign_buffer_args_are_not_unmodeled() {
 }
 
 #[test]
+fn cross_crate_foreign_buffer_boundaries_use_definition_identity() {
+    ::utils::compilation::run_compiler_on_str(
+        r#"
+        #![feature(rustc_private)]
+        extern crate libc;
+        extern crate compiler_builtins;
+        use libc::memcpy as copy_bytes;
+
+        pub unsafe fn foreign_call(d: *mut libc::c_void, s: *const libc::c_void, n: usize) -> *mut libc::c_void {
+            libc::memcpy(d, s, n)
+        }
+        pub unsafe fn rust_body(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
+            compiler_builtins::mem::memcpy(d, s, n)
+        }
+        pub unsafe fn renamed_foreign(d: *mut libc::c_void, s: *const libc::c_void, n: usize) -> *mut libc::c_void {
+            copy_bytes(d, s, n)
+        }
+        pub unsafe fn renamed_unknown(d: *mut libc::c_void, s: *const libc::c_void, n: usize) -> *mut libc::c_void {
+            use libc::memccpy as memcpy;
+            memcpy(d, s, 0, n)
+        }
+        "#,
+        |tcx| {
+            let rust_program = build_rust_program(tcx);
+            let result = offset_sign_analysis(&rust_program);
+            let boundaries = &result.cursor_constraints.unmodeled_call_nodes;
+            let mut protected = Vec::new();
+            for (name, foreign, canonical_name) in [
+                ("foreign_call", true, "memcpy"),
+                ("rust_body", false, "memcpy"),
+                ("renamed_foreign", true, "memcpy"),
+                ("renamed_unknown", true, "memccpy"),
+            ] {
+                let caller = function_id(&rust_program, name);
+                let calls = call_snapshots(tcx, caller);
+                assert_eq!(calls.len(), 1);
+                let call = &calls[0];
+                let def_id = call.target_def_id.unwrap();
+                assert!(!def_id.is_local());
+                assert_eq!(tcx.is_foreign_item(def_id), foreign);
+                assert_eq!(tcx.item_name(def_id).as_str(), canonical_name);
+                assert_eq!(call.function_root, None);
+                assert!(call.argument_roots[0].1);
+                assert!(call.argument_roots[1].1);
+                assert!(call.destination_is_raw);
+                assert!(!call.destination_contains_deref);
+                protected.push([
+                    boundaries.contains(&(caller, call.argument_roots[0].0)),
+                    boundaries.contains(&(caller, call.argument_roots[1].0)),
+                    boundaries.contains(&(caller, call.destination_root)),
+                ]);
+            }
+            assert_eq!(
+                protected,
+                [
+                    [false, false, true],
+                    [true, true, true],
+                    [false, false, true],
+                    [true, true, true],
+                ],
+                "buffer arguments and pointer result: libc, Rust body, renamed libc, renamed unknown"
+            );
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn pointer_offset_call_is_seed_not_unmodeled() {
     ::utils::compilation::run_compiler_on_str(
         "

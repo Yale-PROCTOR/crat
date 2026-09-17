@@ -217,8 +217,11 @@ modeled direct local `FnDef` is recorded in `unmodeled_call_nodes`, except a
 recognized buffer argument of a resolved direct foreign call whose existing HIR
 adapter policy treats that argument as borrow-only and non-escaping. The shared
 name/argument-position policy covers the buffer arguments of `memcpy`, `memmove`,
-`memchr`, `memset`, and `strncpy`. Pointer-valued destinations, unknown foreign
-calls, and indirect calls remain unmodeled boundaries.
+`memchr`, `memset`, and `strncpy`. Both MIR and HIR require an actual foreign
+item, including across crate metadata, and use its canonical definition name
+rather than its import spelling. External Rust bodies are not foreign items.
+Pointer-valued destinations, unknown foreign calls, and indirect calls remain
+unmodeled boundaries.
 
 The existing edge direction is preserved. An edge `A -> B` means:
 

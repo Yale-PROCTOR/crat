@@ -342,6 +342,10 @@ Use one shared name/argument-position classifier for MIR collection and the
 existing HIR adapter policy. Each caller retains its own resolved-direct-call
 guard: never name-match an indirect call, and do not exempt a modeled local
 function with the same name.
+Require `tcx.is_foreign_item(def_id)` in both guards, including for external
+definitions, and use `tcx.item_name(def_id)` for the shared position policy.
+Renamed imports must retain their canonical policy; external Rust bodies remain
+unmodeled even when their names match.
 
 For private legacy graphs, preserve the existing constant-local-`FnDef` insertion behavior.
 

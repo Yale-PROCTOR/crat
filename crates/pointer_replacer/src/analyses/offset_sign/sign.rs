@@ -63,12 +63,7 @@ fn is_direct_borrow_only_foreign_buffer_arg(
     let Some(def_id) = fn_def_id else {
         return false;
     };
-    if def_id.as_local().is_some_and(|local_def_id| {
-        !matches!(
-            tcx.hir_node_by_def_id(local_def_id),
-            rustc_hir::Node::ForeignItem(_)
-        )
-    }) {
+    if !tcx.is_foreign_item(def_id) {
         return false;
     }
     is_borrow_only_foreign_buffer_arg(tcx.item_name(def_id).as_str(), arg_index)

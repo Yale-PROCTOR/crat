@@ -11463,17 +11463,10 @@ fn hir_is_borrow_only_foreign_buffer_arg(
     let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res else {
         return false;
     };
-    if def_id.as_local().is_some_and(|local_def_id| {
-        !matches!(
-            tcx.hir_node_by_def_id(local_def_id),
-            hir::Node::ForeignItem(_)
-        )
-    }) {
+    if !tcx.is_foreign_item(def_id) {
         return false;
     }
-    path.segments.last().is_some_and(|segment| {
-        is_borrow_only_foreign_buffer_arg(segment.ident.name.as_str(), arg_index)
-    })
+    is_borrow_only_foreign_buffer_arg(tcx.item_name(def_id).as_str(), arg_index)
 }
 
 fn hir_free_like_arg_local_id<'tcx>(
@@ -16572,6 +16565,83 @@ mod tests {
                 };
                 visitor.visit_body(tcx.hir_body_owned_by(caller));
                 assert_eq!(visitor.borrow_only, [false]);
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cross_crate_foreign_buffer_classifier_uses_definition_identity() {
+        utils::compilation::run_compiler_on_str(
+            r#"
+            #![feature(rustc_private)]
+            extern crate libc;
+            extern crate compiler_builtins;
+            use libc::memcpy as copy_bytes;
+
+            pub unsafe fn foreign_call(d: *mut libc::c_void, s: *const libc::c_void, n: usize) -> *mut libc::c_void {
+                libc::memcpy(d, s, n)
+            }
+            pub unsafe fn rust_body(d: *mut u8, s: *const u8, n: usize) -> *mut u8 {
+                compiler_builtins::mem::memcpy(d, s, n)
+            }
+            pub unsafe fn renamed_foreign(d: *mut libc::c_void, s: *const libc::c_void, n: usize) -> *mut libc::c_void {
+                copy_bytes(d, s, n)
+            }
+            pub unsafe fn renamed_unknown(d: *mut libc::c_void, s: *const libc::c_void, n: usize) -> *mut libc::c_void {
+                use libc::memccpy as memcpy;
+                memcpy(d, s, 0, n)
+            }
+            "#,
+            |tcx| {
+                struct CallVisitor<'tcx> {
+                    tcx: TyCtxt<'tcx>,
+                    borrow_only: Vec<Vec<bool>>,
+                }
+
+                impl<'tcx> hir::intravisit::Visitor<'tcx> for CallVisitor<'tcx> {
+                    type NestedFilter = OnlyBodies;
+
+                    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+                        self.tcx
+                    }
+
+                    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                        if let hir::ExprKind::Call(_, args) = expr.kind {
+                            self.borrow_only.push(
+                                (0..args.len())
+                                    .map(|i| {
+                                        hir_is_borrow_only_foreign_buffer_arg(self.tcx, expr, i)
+                                    })
+                                    .collect(),
+                            );
+                        }
+                        hir::intravisit::walk_expr(self, expr);
+                    }
+                }
+
+                let functions = crate::rewriter::collect_input(tcx).functions;
+                let mut visitor = CallVisitor {
+                    tcx,
+                    borrow_only: Vec::new(),
+                };
+                for name in ["foreign_call", "rust_body", "renamed_foreign", "renamed_unknown"] {
+                    let caller = functions
+                        .iter()
+                        .find(|def_id| tcx.item_name(def_id.to_def_id()).as_str() == name)
+                        .unwrap();
+                    visitor.visit_body(tcx.hir_body_owned_by(*caller));
+                }
+                assert_eq!(
+                    visitor.borrow_only,
+                    [
+                        vec![true, true, false],
+                        vec![false, false, false],
+                        vec![true, true, false],
+                        vec![false, false, false, false],
+                    ],
+                    "argument policy: libc, Rust body, renamed libc, renamed unknown"
+                );
             },
         )
         .unwrap();
