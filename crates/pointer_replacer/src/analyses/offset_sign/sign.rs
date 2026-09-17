@@ -1286,7 +1286,14 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                 if let Some(local_def_id) = def_id.as_local()
                     && self.modeled_functions.contains(&local_def_id)
                 {
-                    for (idx, arg) in args.iter().enumerate() {
+                    let fixed_arg_count = self
+                        .tcx
+                        .fn_sig(*def_id)
+                        .skip_binder()
+                        .inputs()
+                        .skip_binder()
+                        .len();
+                    for (idx, arg) in args.iter().take(fixed_arg_count).enumerate() {
                         if let Operand::Copy(place) | Operand::Move(place) = &arg.node {
                             let caller_arg = (self.def_id, place.local);
                             let param = Local::from_usize(idx + 1);

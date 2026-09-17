@@ -1,6 +1,9 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, ItemKind, OwnerNode, PatKind, intravisit};
-use rustc_middle::{mir::Local, ty::TyCtxt};
+use rustc_middle::{
+    mir::{Local, Operand, Rvalue, StatementKind, TerminatorKind},
+    ty::{self, TyCtxt},
+};
 use rustc_span::def_id::LocalDefId;
 
 use super::sign::{CursorFieldNode, CursorLocalNode, offset_sign_analysis};
@@ -77,36 +80,36 @@ struct ConstraintSnapshot {
     closed: FxHashMap<(String, String), bool>,
     local_edges: FxHashSet<((String, usize), (String, usize))>,
     return_slot_closed: bool,
+    caller_operand: usize,
 }
 
 fn run_constraint_analysis(code: &str) -> ConstraintSnapshot {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let rust_program = build_rust_program(tcx);
+        let caller = function_id(&rust_program, "caller");
+        let callee = function_id(&rust_program, "callee");
+        let caller_operand = call_operand_local(tcx, caller, callee, 0).index();
         let result = offset_sign_analysis(&rust_program);
-        let mut local_edges = FxHashSet::default();
-        for (&from, tos) in &result.cursor_constraints.local_edges {
-            let mut worklist = tos.iter().copied().collect::<Vec<_>>();
-            let mut reachable = FxHashSet::default();
-            while let Some(to) = worklist.pop() {
-                if !reachable.insert(to) {
-                    continue;
-                }
-                if let Some(next) = result.cursor_constraints.local_edges.get(&to) {
-                    worklist.extend(next);
-                }
-            }
-
-            let from = (
-                tcx.item_name(from.0.to_def_id()).to_string(),
-                from.1.index(),
-            );
-            local_edges.extend(reachable.into_iter().map(|to| {
-                (
-                    from.clone(),
-                    (tcx.item_name(to.0.to_def_id()).to_string(), to.1.index()),
-                )
-            }));
-        }
+        let local_edges = result
+            .cursor_constraints
+            .local_edges
+            .iter()
+            .flat_map(|(&(from_did, from_local), tos)| {
+                let from = (
+                    tcx.item_name(from_did.to_def_id()).to_string(),
+                    from_local.index(),
+                );
+                tos.iter().map(move |&(to_did, to_local)| {
+                    (
+                        from.clone(),
+                        (
+                            tcx.item_name(to_did.to_def_id()).to_string(),
+                            to_local.index(),
+                        ),
+                    )
+                })
+            })
+            .collect();
 
         let return_slot_closed = result
             .access_signs
@@ -133,9 +136,30 @@ fn run_constraint_analysis(code: &str) -> ConstraintSnapshot {
             closed,
             local_edges,
             return_slot_closed,
+            caller_operand,
         }
     })
     .unwrap()
+}
+
+fn assert_direct_argument_edges(snapshot: &ConstraintSnapshot) {
+    let callee_to_operand = (
+        ("callee".into(), 1),
+        ("caller".into(), snapshot.caller_operand),
+    );
+    let operand_to_source = (
+        ("caller".into(), snapshot.caller_operand),
+        ("caller".into(), 1),
+    );
+    assert!(snapshot.local_edges.contains(&callee_to_operand));
+    assert!(snapshot.local_edges.contains(&operand_to_source));
+    if snapshot.caller_operand != 1 {
+        assert!(
+            !snapshot
+                .local_edges
+                .contains(&(("callee".into(), 1), ("caller".into(), 1)))
+        );
+    }
 }
 
 fn function_id(rust_program: &RustProgram<'_>, name: &str) -> LocalDefId {
@@ -145,6 +169,34 @@ fn function_id(rust_program: &RustProgram<'_>, name: &str) -> LocalDefId {
         .copied()
         .find(|&did| rust_program.tcx.item_name(did.to_def_id()).as_str() == name)
         .unwrap()
+}
+
+fn call_operand_local(
+    tcx: TyCtxt<'_>,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    arg_index: usize,
+) -> Local {
+    let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+    for block in body.basic_blocks.iter() {
+        let TerminatorKind::Call { func, args, .. } = &block.terminator().kind else {
+            continue;
+        };
+        let Operand::Constant(box constant) = func else {
+            continue;
+        };
+        let ty::TyKind::FnDef(def_id, _) = constant.const_.ty().kind() else {
+            continue;
+        };
+        if def_id.as_local() != Some(callee) {
+            continue;
+        }
+        return match &args[arg_index].node {
+            Operand::Copy(place) | Operand::Move(place) => place.local,
+            Operand::Constant(_) => panic!("call argument {arg_index} is constant"),
+        };
+    }
+    panic!("call not found")
 }
 
 fn binding_local(tcx: TyCtxt<'_>, did: LocalDefId, name: &str) -> Local {
@@ -159,46 +211,60 @@ fn binding_local(tcx: TyCtxt<'_>, did: LocalDefId, name: &str) -> Local {
         .unwrap()
 }
 
-fn local_reaches(
+fn copied_operand_local(rvalue: &Rvalue<'_>) -> Option<Local> {
+    match rvalue {
+        Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+        | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => Some(place.local),
+        _ => None,
+    }
+}
+
+fn assignment_source_local(tcx: TyCtxt<'_>, did: LocalDefId, destination: Local) -> Local {
+    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+    body.basic_blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match &statement.kind {
+            StatementKind::Assign(box (place, rvalue))
+                if place.local == destination && place.projection.is_empty() =>
+            {
+                copied_operand_local(rvalue)
+            }
+            _ => None,
+        })
+        .unwrap()
+}
+
+fn field_assignment_source_local(tcx: TyCtxt<'_>, did: LocalDefId, aggregate: Local) -> Local {
+    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+    body.basic_blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match &statement.kind {
+            StatementKind::Assign(box (place, rvalue))
+                if place.local == aggregate && !place.projection.is_empty() =>
+            {
+                copied_operand_local(rvalue)
+            }
+            _ => None,
+        })
+        .unwrap()
+}
+
+fn local_edge_exists(
     edges: &FxHashMap<CursorLocalNode, FxHashSet<CursorLocalNode>>,
     from: CursorLocalNode,
     to: CursorLocalNode,
 ) -> bool {
-    let mut worklist = vec![from];
-    let mut reached = FxHashSet::default();
-    while let Some(node) = worklist.pop() {
-        if !reached.insert(node) {
-            continue;
-        }
-        if node == to {
-            return true;
-        }
-        if let Some(next) = edges.get(&node) {
-            worklist.extend(next);
-        }
-    }
-    false
+    edges.get(&from).is_some_and(|next| next.contains(&to))
 }
 
-fn field_reaches(
+fn field_edge_exists(
     edges: &FxHashMap<CursorFieldNode, FxHashSet<CursorFieldNode>>,
     from: CursorFieldNode,
     to: CursorFieldNode,
 ) -> bool {
-    let mut worklist = vec![from];
-    let mut reached = FxHashSet::default();
-    while let Some(node) = worklist.pop() {
-        if !reached.insert(node) {
-            continue;
-        }
-        if node == to {
-            return true;
-        }
-        if let Some(next) = edges.get(&node) {
-            worklist.extend(next);
-        }
-    }
-    false
+    edges.get(&from).is_some_and(|next| next.contains(&to))
 }
 
 fn run_field_analysis(code: &str) -> FxHashMap<(String, String), bool> {
@@ -1227,18 +1293,8 @@ fn complete_argument_edges_preserve_legacy_order_behavior() {
         needs_cursor(&callee_first.closed, "caller", "p"),
         Some(true)
     );
-    assert!(
-        caller_first
-            .local_edges
-            .contains(&(("callee".into(), 1), ("caller".into(), 1))),
-        "{:?}",
-        caller_first.local_edges
-    );
-    assert!(
-        callee_first
-            .local_edges
-            .contains(&(("callee".into(), 1), ("caller".into(), 1)))
-    );
+    assert_direct_argument_edges(&caller_first);
+    assert_direct_argument_edges(&callee_first);
 }
 
 #[test]
@@ -1261,11 +1317,10 @@ fn legacy_results_remain_characterized_with_retained_constraints() {
         needs_cursor(&callee_first.closed, "caller", "p"),
         Some(true)
     );
-    let argument_edge = (("callee".into(), 1), ("caller".into(), 1));
     assert!(!caller_first.return_slot_closed);
     assert!(!callee_first.return_slot_closed);
-    assert!(caller_first.local_edges.contains(&argument_edge));
-    assert!(callee_first.local_edges.contains(&argument_edge));
+    assert_direct_argument_edges(&caller_first);
+    assert_direct_argument_edges(&callee_first);
 }
 
 #[test]
@@ -1294,21 +1349,37 @@ fn retained_constraints_cover_assignment_cast_recursion_and_fields() {
             let p = binding_local(tcx, recurse, "p");
             let q = binding_local(tcx, recurse, "q");
             let r = binding_local(tcx, recurse, "r");
+            let pair = binding_local(tcx, recurse, "pair");
             let from_field = binding_local(tcx, recurse, "from_field");
+            let cast_operand = assignment_source_local(tcx, recurse, r);
+            assert_eq!(assignment_source_local(tcx, recurse, cast_operand), q);
+            let field_operand = field_assignment_source_local(tcx, recurse, pair);
+            assert_eq!(assignment_source_local(tcx, recurse, field_operand), r);
+            let recursive_operand = call_operand_local(tcx, recurse, recurse, 0);
 
-            assert!(local_reaches(
+            assert!(local_edge_exists(
                 &constraints.local_edges,
                 (recurse, q),
                 (recurse, p)
             ));
-            assert!(local_reaches(
+            assert!(local_edge_exists(
                 &constraints.local_edges,
                 (recurse, r),
-                (recurse, q)
+                (recurse, cast_operand),
             ));
-            assert!(local_reaches(
+            assert!(local_edge_exists(
+                &constraints.local_edges,
+                (recurse, cast_operand),
+                (recurse, q),
+            ));
+            assert!(local_edge_exists(
                 &constraints.local_edges,
                 (recurse, p),
+                (recurse, recursive_operand),
+            ));
+            assert!(local_edge_exists(
+                &constraints.local_edges,
+                (recurse, recursive_operand),
                 (recurse, from_field),
             ));
 
@@ -1325,12 +1396,17 @@ fn retained_constraints_cover_assignment_cast_recursion_and_fields() {
                     _ => None,
                 })
                 .unwrap();
-            assert!(field_reaches(
+            assert!(field_edge_exists(
                 &constraints.field_edges,
                 field,
+                CursorFieldNode::Local(recurse, field_operand),
+            ));
+            assert!(field_edge_exists(
+                &constraints.field_edges,
+                CursorFieldNode::Local(recurse, field_operand),
                 CursorFieldNode::Local(recurse, r),
             ));
-            assert!(field_reaches(
+            assert!(field_edge_exists(
                 &constraints.field_edges,
                 CursorFieldNode::Local(recurse, from_field),
                 field,
@@ -1381,6 +1457,7 @@ fn check_return_constraints(code: &str) {
         let caller_destination = (caller, binding_local(tcx, caller, "q"));
         let caller_argument = (caller, binding_local(tcx, caller, "p"));
         let callee_parameter = (passthrough, binding_local(tcx, passthrough, "p"));
+        let caller_operand = (caller, call_operand_local(tcx, caller, passthrough, 0));
         let callee_return = (passthrough, Local::from_usize(0));
         let integer_return = (number, Local::from_usize(0));
 
@@ -1398,18 +1475,28 @@ fn check_return_constraints(code: &str) {
                 .all(|targets| !targets.contains(&integer_return))
         );
 
-        assert!(local_reaches(
+        assert!(local_edge_exists(
             &constraints.local_edges,
             callee_parameter,
+            caller_operand,
+        ));
+        assert!(local_edge_exists(
+            &constraints.local_edges,
+            caller_operand,
             caller_argument,
         ));
-        assert!(local_reaches(
+        assert!(local_edge_exists(
             &constraints.local_edges,
             callee_return,
             callee_parameter,
         ));
+        assert!(!local_edge_exists(
+            &constraints.local_edges,
+            caller_destination,
+            callee_return,
+        ));
         assert!(!return_edges.contains_key(&callee_parameter));
-        assert!(field_reaches(
+        assert!(field_edge_exists(
             &constraints.field_edges,
             CursorFieldNode::Local(caller_destination.0, caller_destination.1),
             CursorFieldNode::Local(callee_return.0, callee_return.1),
@@ -1442,4 +1529,78 @@ fn return_edges_are_complete_and_return_only_in_both_orders() {
         }
         ",
     );
+}
+
+#[test]
+fn complete_variadic_call_edges_stop_at_fixed_formals() {
+    ::utils::compilation::run_compiler_on_str(
+        r#"
+        #![feature(c_variadic)]
+
+        pub unsafe extern "C" fn callee(p: *const i32, ...) {
+            let _ = p;
+        }
+
+        pub unsafe fn caller(p: *const i32, q: *const i32) {
+            callee(p, 1_i32, q);
+        }
+        "#,
+        |tcx| {
+            let rust_program = build_rust_program(tcx);
+            let caller = function_id(&rust_program, "caller");
+            let callee = function_id(&rust_program, "callee");
+            let fixed_operand = call_operand_local(tcx, caller, callee, 0);
+            let variadic_pointer_operand = call_operand_local(tcx, caller, callee, 2);
+            let result = offset_sign_analysis(&rust_program);
+            let constraints = &result.cursor_constraints;
+            let callee_local_count = tcx
+                .mir_drops_elaborated_and_const_checked(callee)
+                .borrow()
+                .local_decls
+                .len();
+
+            assert!(
+                constraints
+                    .local_edges
+                    .iter()
+                    .all(|(&(did, local), targets)| {
+                        (did != callee || local.index() < callee_local_count)
+                            && targets.iter().all(|&(did, local)| {
+                                did != callee || local.index() < callee_local_count
+                            })
+                    })
+            );
+            assert!(constraints.field_edges.iter().all(|(node, targets)| {
+                let valid = |node: &CursorFieldNode| {
+                    !matches!(
+                        node,
+                        CursorFieldNode::Local(did, local)
+                            if *did == callee && local.index() >= callee_local_count
+                    )
+                };
+                valid(node) && targets.iter().all(valid)
+            }));
+
+            let fixed_formal = (callee, Local::from_usize(1));
+            assert!(local_edge_exists(
+                &constraints.local_edges,
+                fixed_formal,
+                (caller, fixed_operand),
+            ));
+            assert!(field_edge_exists(
+                &constraints.field_edges,
+                CursorFieldNode::Local(fixed_formal.0, fixed_formal.1),
+                CursorFieldNode::Local(caller, fixed_operand),
+            ));
+
+            assert!(!constraints.local_edges.iter().any(|(&(did, _), targets)| {
+                did == callee && targets.contains(&(caller, variadic_pointer_operand))
+            }));
+            assert!(!constraints.field_edges.iter().any(|(node, targets)| {
+                matches!(node, CursorFieldNode::Local(did, _) if *did == callee)
+                    && targets.contains(&CursorFieldNode::Local(caller, variadic_pointer_operand))
+            }));
+        },
+    )
+    .unwrap();
 }
