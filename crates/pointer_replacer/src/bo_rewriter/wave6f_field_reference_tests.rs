@@ -1737,11 +1737,24 @@ fn w6f_the_seam_query_is_closed_on_every_form_it_does_not_own() {
 
 const INLINE_ARRAY: &str = include_str!("wave6f_fixture_inline_array.rs");
 
-/// Witness 26 (relay 034 / R451-4, **W6F-5**) — the inline array field taken
-/// as a pointer. RED at `8a777fa63`: every one of the six locals degrades,
-/// the two market shapes on `place-read-pointee` (the residue reason:
-/// `Construction::ArrayDecay`, "the type lives in a pointee or struct field",
-/// owed forward since 2026-08-12).
+/// Witness 26 (relay 034 / R451-4, **W6F-5**; restated for the composed
+/// frame under R217-2(a), relay 036 §1) — the inline array field taken as a
+/// pointer.
+///
+/// **The guards are absolute and hold on every frame.** Five shapes must
+/// never become a view, and none of them is a neighbour's to deliver either:
+/// two `&mut` views of one array live at once are Stacked-Borrows UB even
+/// with correct provenance and the true length (wave-6k 022's
+/// counterfactuals, relay 036 §3).
+///
+/// **The delivery is a DICHOTOMY**, because a neighbour's arm decides it.
+/// wave-6a's `slice_local_construction::refuses` clause
+/// `root_is_a_reference_candidate` refuses every construction whose root the
+/// model settles `Ref` — and its own doc names this market's shape with
+/// brotli's own length, `from_raw_parts_mut((*s).arr.as_mut_ptr(), 704)`. On
+/// this lane's frame W6F-5 delivers; on a composition carrying that refusal
+/// the subject holds and the INPUT text is kept, whole. Half a delivery
+/// would be the defect, so the pin is that the two move together.
 #[test]
 fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
     let observed = observe(INLINE_ARRAY);
@@ -1750,41 +1763,113 @@ fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
     assert_eq!(reverted, 0, "{source}");
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    // The market: both mutabilities, the extent the array type's own length.
-    for (label, needle) in [
+    // The guards, on every frame.
+    for (label, why) in [
+        (
+            "second_touch::last_entropy",
+            "the field place is read again",
+        ),
+        (
+            "whole_overwrite::last_entropy",
+            "the struct is overwritten whole",
+        ),
+        ("widen::w", "a shared decay cast to `*mut` would widen `&T`"),
+        (
+            "escape_after::last_entropy",
+            "the root escapes while the view lives",
+        ),
+        (
+            "decay_in_a_loop::last_entropy",
+            "inside a loop there is no order between the escape and the decay",
+        ),
+    ] {
+        assert!(
+            decision_of(&observed, label).starts_with("Degraded"),
+            "{label} must stay out ({why}): {}",
+            decision_of(&observed, label)
+        );
+    }
+    // …and the input text of each is kept, not half-rewritten.
+    for needle in [
+        "(*self_0).last_entropy_[1 as usize] = 2.0f64;",
+        "let mut w = ((*ro).last_entropy_).as_ptr() as *mut f64;",
+        "observe_splitter(self_0);",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+
+    // The market, and the ordered half of the escape rule beside it.
+    let market = [
         (
             "finish_block::last_entropy",
             "let mut last_entropy: &mut [f64] = core::slice::from_raw_parts_mut(((*self_0).last_entropy_).as_mut_ptr(), 2usize);",
+            "let mut last_entropy = ((*self_0).last_entropy_).as_mut_ptr();",
         ),
         (
             "trace3::m",
             "let mut m: &[f32] = core::slice::from_raw_parts(((*pIn).mat).as_ptr(), 9usize);",
+            "let mut m = ((*pIn).mat).as_ptr();",
         ),
-    ] {
+        (
+            // brotli's `StartPosQueuePush` shape: the root is handed to a
+            // callee BEFORE the view is taken, so the view is still sound.
+            "escape_before::last_entropy",
+            "let mut last_entropy: &mut [f64] = core::slice::from_raw_parts_mut(((*self_0).last_entropy_).as_mut_ptr(), 2usize);",
+            "let mut last_entropy = ((*self_0).last_entropy_).as_mut_ptr();",
+        ),
+    ];
+    let delivered: Vec<&str> = market
+        .iter()
+        .filter(|(label, _, _)| decision_of(&observed, label).starts_with("Slice"))
+        .map(|(label, _, _)| *label)
+        .collect();
+    if delivered.len() == market.len() {
+        for (_, emitted_form, _) in market {
+            assert!(
+                flat.contains(emitted_form),
+                "missing {emitted_form:?} in\n{source}"
+            );
+        }
+        // Every extent is the array type's own length.
+        for fabricated in [
+            "((*self_0).last_entropy_).as_mut_ptr(), crate::FALLBACK_SLICE_EXTENT",
+            "((*pIn).mat).as_ptr(), crate::FALLBACK_SLICE_EXTENT",
+        ] {
+            assert!(
+                !flat.contains(fabricated),
+                "the length is in the array's own type; nothing may be fabricated\n{source}"
+            );
+        }
+    } else {
+        // A neighbour's refusal governs: then NOTHING of this market moves,
+        // and each subject keeps the text it came with.
         assert!(
-            decision_of(&observed, label).starts_with("Slice"),
-            "{label}: {}",
-            decision_of(&observed, label)
+            delivered.is_empty(),
+            "half a market is a defect, not a frame: {delivered:?}\n{source}"
         );
-        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
-    }
-    assert!(
-        !flat.contains("FALLBACK_SLICE_EXTENT"),
-        "the length is in the array's own type; nothing may be fabricated\n{source}"
-    );
-
-    // The four controls, each for its own reason.
-    for label in [
-        "scratch_sum::p",                // a POINTER field: no length in its type
-        "local_array::p",                // a LOCAL array: wave-6s2's twin
-        "second_touch::last_entropy",    // the field place is touched again
-        "whole_overwrite::last_entropy", // the struct is overwritten whole
-        "widen::w",                      // a shared decay cast to `*mut` and written
-    ] {
-        assert!(
-            decision_of(&observed, label).starts_with("Degraded"),
-            "{label} must stay out: {}",
-            decision_of(&observed, label)
-        );
+        for (_, _, input_form) in market {
+            assert!(
+                flat.contains(input_form),
+                "held, so the input text must be kept: missing {input_form:?} in\n{source}"
+            );
+        }
+        // …and the hold is a NEIGHBOUR'S refusal, not a defect in this rule.
+        // The two are distinguishable by the rewriter's own degrade reason,
+        // and this is the one place the dichotomy must discriminate: an
+        // earlier refusal reaches the residue (`place-read-pointee`), while a
+        // broken declaration channel leaves the surface placement unplaceable
+        // and walks the SliceConstruction family back to `Core`, which
+        // reports `slice-local-construction`. Reading the reason here is
+        // deliberate — it is this crate's own vocabulary, not another lane's
+        // hold text, and without it the held branch would pass for a defect
+        // of this rule's own making.
+        for (label, _, _) in market {
+            let held = decision_of(&observed, label);
+            assert!(
+                !held.contains("SliceLocalConstruction"),
+                "{label} is held because THIS rule's declaration channel \
+                 failed, not because a neighbour refused: {held}\n{source}"
+            );
+        }
     }
 }

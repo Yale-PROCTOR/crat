@@ -1209,8 +1209,15 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
 /// - **one mention**: the field place is named exactly once in the body, at
 ///   the decay itself, so nothing reads or writes `(*s).arr` through the raw
 ///   base while the view is live;
-/// - **no whole-struct write**: `*s = …` would write the view's own bytes
-///   through another path.
+/// - **the root does not escape after the decay** (R453): a use of the root
+///   that is not a projection of it — a call argument above all, but a store
+///   or a whole-struct write `*s = …` equally — hands the whole struct on,
+///   and with it the field the view owns. Uses that PRECEDE the decay are
+///   harmless, so the refusal is ordered; inside a loop there is no order, so
+///   the decay is refused outright. This guard is wave-6a's
+///   `root_is_a_reference_candidate` objection answered in this rule's own
+///   terms, and it subsumes the whole-struct-write guard the first version
+///   carried (`*s = v` is a non-projection use of `s`).
 ///
 /// Other FIELDS of the same struct stay reachable through the raw base, and
 /// that is not an alias: they are disjoint locations, which both Stacked and
@@ -1231,10 +1238,14 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
         // Every `(base local, field name)` place named in the body, and every
         // local whose pointee is assigned as a whole.
         let mut mentions: FxHashMap<(HirId, String), usize> = FxHashMap::default();
-        let mut whole_writes: FxHashSet<HirId> = FxHashSet::default();
+        // R453 (wave-6a's `root_is_a_reference_candidate`, answered): every
+        // use of a local that is NOT a field projection of it — a call
+        // argument above all, which hands the callee the whole struct and
+        // with it the very field the view owns.
+        let mut escapes: Vec<(HirId, Span)> = Vec::new();
         struct Places<'a> {
             mentions: &'a mut FxHashMap<(HirId, String), usize>,
-            whole_writes: &'a mut FxHashSet<HirId>,
+            escapes: &'a mut Vec<(HirId, Span)>,
         }
         impl<'v> Visitor<'v> for Places<'_> {
             fn visit_expr(&mut self, expr: &'v Expr<'v>) {
@@ -1245,13 +1256,17 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
                                 .mentions
                                 .entry((local, ident.name.to_string()))
                                 .or_insert(0) += 1;
+                            // The projection consumes this use of the base:
+                            // `deref_of_local` succeeded, so the base is
+                            // exactly `*local` or `local` and holds nothing
+                            // else to visit. Not walking it is what keeps a
+                            // field read out of the escape list.
+                            return;
                         }
                     }
-                    ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) => {
-                        if let ExprKind::Unary(UnOp::Deref, inner) = lhs.kind
-                            && let Some(local) = path_local(inner)
-                        {
-                            self.whole_writes.insert(local);
+                    ExprKind::Path(_) => {
+                        if let Some(local) = path_local(expr) {
+                            self.escapes.push((local, expr.span));
                         }
                     }
                     _ => {}
@@ -1261,7 +1276,7 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
         }
         Places {
             mentions: &mut mentions,
-            whole_writes: &mut whole_writes,
+            escapes: &mut escapes,
         }
         .visit_body(body);
 
@@ -1270,10 +1285,21 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
             typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
             owner: LocalDefId,
             mentions: &'a FxHashMap<(HirId, String), usize>,
-            whole_writes: &'a FxHashSet<HirId>,
+            escapes: &'a [(HirId, Span)],
+            in_loop: usize,
             out: &'a mut FxHashMap<NodeKey, bool>,
         }
         impl<'v> Visitor<'v> for Decays<'_, '_> {
+            fn visit_expr(&mut self, expr: &'v Expr<'v>) {
+                if matches!(expr.kind, ExprKind::Loop(..)) {
+                    self.in_loop += 1;
+                    intravisit::walk_expr(self, expr);
+                    self.in_loop -= 1;
+                    return;
+                }
+                intravisit::walk_expr(self, expr);
+            }
+
             fn visit_stmt(&mut self, stmt: &'v rustc_hir::Stmt<'v>) {
                 if let rustc_hir::StmtKind::Let(let_stmt) = stmt.kind
                     && let_stmt.ty.is_none()
@@ -1308,7 +1334,20 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
                             .get(&(base_local, ident.name.to_string()))
                             .copied()
                             == Some(1)
-                        && !self.whole_writes.contains(&base_local)
+                        // R453: the root must not escape while the view is
+                        // live. A use of the root that is NOT a projection —
+                        // a call argument, a store — hands the whole struct
+                        // on, and with it the field the view owns; a callee
+                        // writing it is an alias no guard here can see and no
+                        // borrow relation the compiler checks. Uses that
+                        // precede the decay are harmless (the view does not
+                        // exist yet), so the refusal is ordered — and inside
+                        // a loop there is no order, so the decay is refused
+                        // outright.
+                        && self.in_loop == 0
+                        && !self.escapes.iter().any(|(local, span)| {
+                            *local == base_local && span.lo() >= stmt.span.lo()
+                        })
                     {
                         let _ = self.tcx;
                         self.out.insert((self.owner, binding), mutable);
@@ -1322,7 +1361,8 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
             typeck,
             owner,
             mentions: &mentions,
-            whole_writes: &whole_writes,
+            escapes: &escapes,
+            in_loop: 0,
             out: &mut out,
         }
         .visit_body(body);

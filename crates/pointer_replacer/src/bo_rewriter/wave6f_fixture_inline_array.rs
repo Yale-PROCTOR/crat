@@ -91,3 +91,45 @@ pub unsafe extern "C" fn widen(mut ro: *const Splitter) {
     let mut w = ((*ro).last_entropy_).as_ptr() as *mut f64;
     *w.offset(0 as isize) = 1.0f64;
 }
+
+// Control 6 (R453) — the ROOT is handed to a callee AFTER the view is taken.
+// The callee reaches the very field the view owns, which is an alias no guard
+// in this body can see and no borrow relation the compiler checks — exactly
+// what wave-6a's `root_is_a_reference_candidate` refusal is about. Held.
+#[no_mangle]
+pub unsafe extern "C" fn escape_after(mut self_0: *mut Splitter) {
+    let mut last_entropy = ((*self_0).last_entropy_).as_mut_ptr();
+    *last_entropy.offset(0 as isize) = 1.0f64;
+    observe_splitter(self_0);
+}
+#[no_mangle]
+pub unsafe extern "C" fn observe_splitter(mut s: *mut Splitter) -> u64 {
+    return (*s).num_blocks_;
+}
+
+// Control 7 (R453) — the root is handed to a callee BEFORE the view is taken
+// (brotli's `StartPosQueuePush` shape: `StartPosQueueSize(self_0)` precedes
+// `((*self_0).q_).as_mut_ptr()`). The view does not exist yet, so the
+// refusal is ordered and this one still delivers.
+#[no_mangle]
+pub unsafe extern "C" fn escape_before(mut self_0: *mut Splitter) -> f64 {
+    let mut n = observe_splitter(self_0);
+    let mut last_entropy = ((*self_0).last_entropy_).as_mut_ptr();
+    *last_entropy.offset(0 as isize) = n as f64;
+    return *last_entropy.offset(1 as isize);
+}
+
+// Control 8 (R453) — the decay is INSIDE a loop, and the root is handed to a
+// callee earlier in the same body. Textual order is not execution order
+// there: the call runs again after the view was taken on the previous
+// iteration. No order, no ordered refusal — held.
+#[no_mangle]
+pub unsafe extern "C" fn decay_in_a_loop(mut self_0: *mut Splitter, mut n: u64) {
+    let mut i = 0 as u64;
+    while i < n {
+        observe_splitter(self_0);
+        let mut last_entropy = ((*self_0).last_entropy_).as_mut_ptr();
+        *last_entropy.offset(0 as isize) = i as f64;
+        i = i.wrapping_add(1);
+    }
+}
