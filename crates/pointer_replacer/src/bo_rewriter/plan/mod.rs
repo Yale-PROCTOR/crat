@@ -1392,8 +1392,8 @@ pub(crate) fn finalize_signature_classes(
     // wave-6b: a region receiver's caller class depends on its accessor's, and
     // a chain's two links are one unit in both directions (R447-4).
     dependency_edges.extend(super::decision::void_region::receiver_dependencies(table));
-    let dependency_edges = super::revert_closure::narrow(table, dependency_edges, planned);
     dependency_edges.extend(super::decision::void_region::chain_dependencies(table));
+    let dependency_edges = super::revert_closure::narrow(table, dependency_edges, planned);
     for (dependent, dependency) in dependency_edges {
         if dependent == dependency || !by_class.contains_key(&dependency) {
             continue;
