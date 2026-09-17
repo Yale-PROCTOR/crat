@@ -565,6 +565,20 @@ fn nested_ast_composition(
                     // `c3d9fc93` renders — the twin of the
                     // `("c-raw-reborrow-shared", "raw-cast-const")` row above.
                     | ("c-raw-slice-shared", "raw-cast-const")
+                    // Relay 042 (report 028 §4, STOP 1 granted): brotli's
+                    // `BrotliCompressBufferQuality10`, class 2440 — the C
+                    // arm's borrow view of a Box owner strictly contains that
+                    // owner's own `box-expression` edit, and the outer exceeds
+                    // the inner by exactly the five bytes of `&mut `
+                    // (11456136..11456181 over 11456141..11456181 at the
+                    // batch-9 census). The two are a parent `AddrOf` node and
+                    // its operand — different AST nodes — and the seam pass
+                    // builds its adapter AROUND the node it finds
+                    // (`SeamGraftVisitor::build`), after the use pass has
+                    // grafted the operand. So the containment is a
+                    // composition the AST already renders, and holding the
+                    // class for it was the interval layer alone.
+                    | ("box-borrow-view-to-raw", "box-expression")
             );
         let raw_receiver_over_argument = matches!(
             outer.key.bridge_kind.as_str(),
@@ -6464,7 +6478,7 @@ mod wave3_class_tests {
         // over W-C5's argument adapter, and a call bridge over a Box owner's
         // access edit — the AST pass renders both nestings since wave-6l's
         // `f8a2d5e6` — and relay 025's mutable twin of the reborrow row.
-        const PAIRS: [(Arm, &str, Arm, &str); 9] = [
+        const PAIRS: [(Arm, &str, Arm, &str); 10] = [
             (Arm::Pair, "pair-t2-raw-view", Arm::C, "typed-raw-temporary"),
             (
                 Arm::Pair,
@@ -6489,6 +6503,14 @@ mod wave3_class_tests {
             ),
             (Arm::C, "c-raw-reborrow-mut", Arm::Glue, "shared-weakening"),
             (Arm::C, "c-raw-slice-shared", Arm::C, "raw-cast-const"),
+            // Relay 042: the C arm's borrow view of a Box owner over that
+            // owner's own expression edit (brotli class 2440).
+            (
+                Arm::C,
+                "box-borrow-view-to-raw",
+                Arm::Surface,
+                "box-expression",
+            ),
         ];
         for (outer_arm, outer_kind, inner_arm, inner_kind) in PAIRS {
             with_classes(2, |ids| {
@@ -6537,6 +6559,60 @@ mod wave3_class_tests {
                 );
             });
         }
+    }
+
+    /// **Relay 042 / report 028 §4 — the class-2440 shape, INTRA-class.**
+    ///
+    /// brotli's `BrotliCompressBufferQuality10` plans the C arm's borrow view
+    /// of a Box owner at `11456136..11456181` and that owner's own
+    /// `box-expression` at `11456141..11456181` — the same class, the outer
+    /// exceeding the inner by exactly the five bytes of `&mut `. Two sites over
+    /// one interval in one class is `intra-class-interval-overlap` unless the
+    /// containment is a named composition; it is one, because the pair is a
+    /// parent `AddrOf` node and its operand, and the seam pass builds its
+    /// adapter AROUND the node it finds, after the use pass grafted the
+    /// operand.
+    ///
+    /// Pinned on the census's own byte intervals so the witness fails if either
+    /// the allowlist row or the intra-class path stops reaching it.
+    #[test]
+    fn l07_box_borrow_view_over_its_own_box_expression_is_intra_class_composed() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(1, |ids| {
+            let class = ClassInput::new(ids[0], arms(&[Arm::C, Arm::Surface]))
+                .with_site(ClassSite::edit(
+                    ids[0],
+                    ids[0],
+                    Arm::C,
+                    "j.rs",
+                    11456136,
+                    11456181,
+                    "box-borrow-view-to-raw",
+                ))
+                .with_site(ClassSite::edit(
+                    ids[0],
+                    ids[0],
+                    Arm::Surface,
+                    "j.rs",
+                    11456141,
+                    11456181,
+                    "box-expression",
+                ));
+            let finalized = finalize_class_inputs(vec![class]);
+            assert!(
+                finalized.classes[&ids[0]].is_ready(),
+                "the class held: {:?}",
+                finalized.classes[&ids[0]].hold_reasons()
+            );
+            assert!(
+                !finalized.classes[&ids[0]]
+                    .hold_reasons()
+                    .iter()
+                    .any(|r| r == "intra-class-interval-overlap"),
+                "the containment was read as an overlap"
+            );
+            assert!(finalized.collisions.is_empty(), "a cross-class collision");
+        });
     }
 
     /// The allowlist stays an allowlist. An outer/inner kind combination that

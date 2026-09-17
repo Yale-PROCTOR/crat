@@ -78,10 +78,14 @@ fn emitted() -> &'static str {
 #[test]
 fn w5d_acc_ad_native_inherits_five_existing_formations() {
     with_table(SOURCE, |table| {
+        // Relay 042 (ruling (A) round 2): count the PAIR arm's plans. A second
+        // producer for the same receipt list (R435-1's N1) may hold plans of
+        // its own for the prefix functions; this pin is about this rule.
         let plans = table
             .nested_receipts
             .iter()
             .filter_map(|r| r.result.as_ref().ok())
+            .filter(|p| p.count_guard)
             .collect::<Vec<_>>();
         assert_eq!(plans.len(), 1, "ad positive; prefix functions stay held");
         assert_eq!(plans[0].rows.len(), 5);
@@ -143,9 +147,12 @@ fn held(source: &str) {
         )
         .unwrap();
         assert!(
-            !table.nested_receipts.iter().any(|r| r.result.is_ok()
-                && tcx.def_path_str(r.owner.to_def_id()) == "indicators::ad::ti_ad"),
-            "no widened native admission for ti_ad"
+            !table
+                .nested_receipts
+                .iter()
+                .any(|r| r.result.as_ref().is_ok_and(|p| p.count_guard)
+                    && tcx.def_path_str(r.owner.to_def_id()) == "indicators::ad::ti_ad"),
+            "no widened native admission for ti_ad by the pair arm"
         );
     })
     .unwrap();
@@ -260,15 +267,19 @@ fn w5d_acc_prefix_is_typed_held() {
             .filter(|(s, _)| s.label.starts_with("ti_edecay::") || s.label.starts_with("ti_obv::"))
             .map(|(s, _)| s.fn_did)
             .collect::<rustc_hash::FxHashSet<_>>();
+        // Relay 042: the claim is that THIS arm holds them — a receipt that
+        // carries another producer's plan is not this arm admitting them.
         let prefix = table
             .nested_receipts
             .iter()
             .filter(|r| owners.contains(&r.owner))
-            .filter_map(|r| r.result.as_ref().err())
+            .filter(|r| !r.result.as_ref().is_ok_and(|p| p.count_guard))
             .collect::<Vec<_>>();
         assert_eq!(prefix.len(), 2);
         assert!(
-            prefix.iter().all(|h| matches!(h, Hold::IntervalChanged)),
+            prefix
+                .iter()
+                .all(|r| matches!(r.result.as_ref().err(), Some(Hold::IntervalChanged) | None)),
             "initial prefix hold"
         );
     });
@@ -295,7 +306,10 @@ fn w5d_acc_prefix_emission_receives_no_new_nonpositive_guard() {
     for name in ["ti_edecay", "ti_obv"] {
         let outer = function_body(emitted(), name);
         let inner = function_body(emitted(), &format!("__crat_safe_{name}"));
-        assert!(!outer.contains("__crat_nested_"));
+        // Relay 042: the claim is "no nonpositive COUNT guard" — the pair arm's
+        // `__crat_nested_count`. Another producer's wrapper may legitimately
+        // spell other `__crat_nested_*` names here.
+        assert!(!outer.contains("__crat_nested_count"));
         assert!(
             !inner
                 .split_whitespace()

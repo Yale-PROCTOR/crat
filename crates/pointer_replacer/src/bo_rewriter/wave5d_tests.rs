@@ -109,9 +109,12 @@ fn held_native(source: &str) {
             .find(|r| tcx.def_path_str(r.owner.to_def_id()) == "indicators::abs::ti_abs")
             .expect("typed nested outcome");
         println!("W5D-HELD {:?}", receipt.result);
+        // Relay 042 (ruling (A) round 2): the claim is that the PAIR arm does
+        // not admit `ti_abs`. A receipt carrying another producer's plan
+        // (R435-1's N1, `count_guard == false`) is not this arm admitting it.
         assert!(
-            receipt.result.is_err(),
-            "must not admit: {:?}",
+            receipt.result.as_ref().map_or(true, |p| !p.count_guard),
+            "the pair arm must not admit: {:?}",
             receipt.result
         );
         // **Relay 041 ruling (A).** Scoped to `ti_abs`'s own subjects. While the

@@ -62,6 +62,13 @@ pub(crate) struct Parameter {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Plan {
+    /// **The arm discriminator** (relay 042, R447-3). `true` for THIS rule —
+    /// the pair arm (R384), which binds one positive count
+    /// (`__crat_nested_count`) and guards the whole wrapper with it. R435-1
+    /// chartered a second producer for the same receipt list, and a control
+    /// that means "the pair arm did not admit" must ask for the arm rather
+    /// than for the list being empty.
+    pub(crate) count_guard: bool,
     pub(crate) owner: LocalDefId,
     pub(crate) count: HirId,
     pub(crate) count_name: String,
@@ -597,6 +604,7 @@ fn inspect<'tcx>(
         return Err(Hold::RawBoundaryUnbuilt);
     }
     Ok(Plan {
+        count_guard: true,
         owner,
         count,
         count_name,
