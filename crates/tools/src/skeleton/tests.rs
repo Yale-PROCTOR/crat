@@ -7902,6 +7902,66 @@ pub unsafe fn f() -> i32 { rust_ping(1) }
 }
 
 #[test]
+fn explicit_generic_arguments_fail_closed_during_rule_application() {
+    let source = r#"
+unsafe extern "C" { fn read_buffer(buffer: *mut i8, size: usize) -> i32; }
+pub unsafe fn f(mut buffer: [i8; 100]) -> i32 {
+    read_buffer(
+        buffer.as_mut_ptr(),
+        core::mem::size_of::<[i8; 100]>(),
+    )
+}
+"#;
+    let rules = catch_all_i32_rule_document();
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let record = function(&records, "f");
+        assert_eq!(record.applied, record.baseline);
+        assert_eq!(record.applied.transform_labels(), [0]);
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::Transform
+        );
+    })
+    .unwrap();
+
+    let supported = r#"
+unsafe extern "C" { fn read_buffer(buffer: *mut i8, size: usize) -> i32; }
+pub unsafe fn f(mut buffer: [i8; 100]) -> i32 {
+    read_buffer(buffer.as_mut_ptr(), core::mem::size_of_val(&buffer))
+}
+"#;
+    run_compiler_on_str(supported, |tcx| {
+        let records = make_skeletons_with_rules(supported, Some(&rules), tcx).unwrap();
+        let record = function(&records, "f");
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::RuleApplied
+        );
+        assert!(record.applied.skeleton.contains("7i32"));
+    })
+    .unwrap();
+}
+
+#[test]
+fn qualified_self_type_generics_fail_closed_during_rule_application() {
+    let source = r#"
+unsafe extern "C" { fn consume(count: usize) -> i32; }
+pub unsafe fn f() -> i32 {
+    consume(<[i8; 100] as IntoIterator>::into_iter([0; 100]).count())
+}
+"#;
+    let rules = catch_all_i32_rule_document();
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let record = function(&records, "f");
+        assert_eq!(record.applied, record.baseline);
+        assert_eq!(record.applied.transform_labels(), [0]);
+    })
+    .unwrap();
+}
+
+#[test]
 fn target_only_foreign_identity_uses_one_accessible_local_declaration() {
     let source = r#"
 mod ffi {
@@ -8044,6 +8104,27 @@ fn fixed_integer_rule(value: &str) -> crate::RuleExpression {
             value: crate::RuleIntegerMagnitude::Fixed(value.into()),
             ty: "i32".into(),
         },
+    }
+}
+
+fn catch_all_i32_rule_document() -> crate::RuleDocument {
+    let i32_type = crate::RuleTypeTree::Primitive { name: "i32".into() };
+    crate::RuleDocument {
+        schema_version: crate::RULE_SCHEMA_VERSION,
+        printf_rules: vec![],
+        rules: vec![crate::Rule {
+            source_pattern: crate::RuleExpression::Variable {
+                sort: crate::VariableSort::Expression,
+                index: 0,
+            },
+            target_pattern: fixed_integer_rule("7"),
+            pointer_anchors: vec![],
+            lhs: false,
+            source_type: i32_type.clone(),
+            source_adjusted_type: i32_type.clone(),
+            target_type: i32_type.clone(),
+            target_adjusted_type: i32_type,
+        }],
     }
 }
 
