@@ -892,14 +892,22 @@ fn derive_bundle(
     // the shape holds fail-closed. (The composition lifts the hold for a
     // field wave-6f's transaction owns; see the R431 predicate patch.)
     // R431 on the composition: the load is an acquisition only where a field
-    // transaction OWNS the field it came out of; their transaction renders the
-    // move (`take()`), this producer types the local and closes it.
+    // transaction OWNS the field it came out of and delivers it as a PLAIN
+    // owning box. R436: an optional owning field (wave-6f's `opt-box`,
+    // `Option<Box<T>>`) renders the load as a `take()`, whose value is not this
+    // producer's `Box<T>` — measured on `batch-10-dry2` `c97e6162e`, where
+    // lifting the hold there emitted `let mut b: Box<u8> = (*h).buf;` and the
+    // program degraded. That shape needs the `Option<Box<T>>` contract, not
+    // this lift.
     let field_load = source.load_field();
     if let Some((struct_did, field_index)) = field_load
         && !table.field_transactions.applied.iter().any(|transaction| {
             transaction.owning
                 && transaction.key.struct_did.to_def_id() == struct_did
                 && transaction.key.field_index == field_index
+                && !format!("{:?}", transaction.form)
+                    .to_lowercase()
+                    .contains("opt")
         })
     {
         return Err(NativeHold::Missing("native-field-load-field-not-owned"));
