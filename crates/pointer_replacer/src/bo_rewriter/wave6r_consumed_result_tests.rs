@@ -16,6 +16,27 @@ unsafe fn vec2_subtract(pOut: *mut Vec2, pV1: *const Vec2, pV2: *const Vec2) -> 
 unsafe fn vec2_length(pIn: *const Vec2) -> f32 {
     ((*pIn).x * (*pIn).x + (*pIn).y * (*pIn).y).sqrt()
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vec2_normalize(pOut: *mut Vec2, pIn: *const Vec2) -> *mut Vec2 {
+    let l = ((*pIn).x * (*pIn).x + (*pIn).y * (*pIn).y).sqrt();
+    (*pOut).x = (*pIn).x / l;
+    (*pOut).y = (*pIn).y / l;
+    pOut
+}
+/// heman's `kmVec3Normalize(pOut, pOut)` / `kmMat3GetUpVec3` shape: ONE root
+/// at two positions of a callee whose row retains by returning `pOut`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn overlapped(pOut: *mut Vec2) {
+    vec2_normalize(pOut, pOut);
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn overlapped_kept(pOut: *mut Vec2, slot: *mut *mut Vec2) {
+    let p = vec2_normalize(pOut, pOut);
+    *slot = p;
+}
+pub unsafe fn discarded(out: *mut Vec2, a: *const Vec2, b: *const Vec2) {
+    vec2_subtract(out, a, b);
+}
 pub unsafe fn consumed(out: *mut Vec2, a: *const Vec2, b: *const Vec2) -> f32 {
     vec2_length(vec2_subtract(out, a, b))
 }

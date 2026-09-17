@@ -1633,6 +1633,11 @@ pub(crate) struct RetentionSummaries {
     /// CONSUMES where it is produced — the result is only read through in the
     /// caller's body. Keyed by (caller, block, statement index of the call).
     consumed_results: FxHashSet<(LocalDefId, u32, u32)>,
+    /// wave-6r (relay 021): the (caller, callee, argument) positions whose
+    /// Return-only retention is settled at EVERY call in that caller — the
+    /// returned alias is discarded or consumed there. The seam reads the
+    /// callee row, which cannot see this.
+    settled_returned_aliases: FxHashSet<(LocalDefId, LocalDefId, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -3105,6 +3110,8 @@ impl RetentionSummaries {
         );
         let consumed_results =
             crate::bo_rewriter::wave6r_child_access::consumed_results(program, &rows);
+        let settled_returned_aliases =
+            crate::bo_rewriter::wave6r_child_access::settled_returned_aliases(program, &rows);
         Self {
             rows,
             facts,
@@ -3112,6 +3119,7 @@ impl RetentionSummaries {
             returned_children,
             child_access,
             consumed_results,
+            settled_returned_aliases,
             type_backed_children,
             pointer_free_parameters,
         }
@@ -3168,6 +3176,20 @@ impl RetentionSummaries {
     /// callee may hand back, for callees with no pinned contract row. `None`
     /// means the walk produced no unique evidence, and the caller must keep
     /// treating the child's access as unknown.
+    /// wave-6r (relay 021): is this callee position's Return-only retention
+    /// settled at every call of it inside `caller` — the returned alias
+    /// discarded or consumed where it is produced? The callee ROW still says
+    /// `retains`; this says the caller keeps nothing.
+    pub(crate) fn returned_alias_settled(
+        &self,
+        caller: LocalDefId,
+        callee: LocalDefId,
+        argument_index: usize,
+    ) -> bool {
+        self.settled_returned_aliases
+            .contains(&(caller, callee, argument_index))
+    }
+
     /// wave-6r (relay 019): does the caller consume the alias returned by the
     /// call at this site where it is produced?
     pub(crate) fn result_consumed_at(

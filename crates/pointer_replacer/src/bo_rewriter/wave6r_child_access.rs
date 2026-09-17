@@ -601,6 +601,137 @@ pub(crate) fn loaded_field_is_descendant_free(
     .is_none()
 }
 
+/// Every (caller, callee, argument) position whose Return-only retention is
+/// SETTLED at every call of that callee in that caller: the returned alias is
+/// discarded (no use at all), or consumed where it is produced. The seam
+/// consults the callee ROW, which says `retains` for the whole kazmath family
+/// (`kmVec3Normalize(pOut, pOut)` returns its own out-parameter), so a caller
+/// that never keeps the alias was dropped `seam-positive-retention` anyway
+/// (wave-5d 029's root table: 4 of heman's 10 roots, 3 of binn's 10).
+/// All-sites, so one unsettled call in the caller withholds the position.
+pub(crate) fn settled_returned_aliases(
+    program: &RustProgram<'_>,
+    rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
+) -> FxHashSet<(LocalDefId, LocalDefId, usize)> {
+    use super::decision::raw_boundary::RetentionEventKind;
+    let tcx: TyCtxt<'_> = program.tcx;
+    let return_only = |callee: LocalDefId, index: usize| {
+        matches!(
+            rows.get(&(callee, index)),
+            Some(RetentionVerdict::Retains { sink, path })
+                if sink.kind == RetentionEventKind::Return
+                    && path.iter().all(|step| step.kind == RetentionEventKind::Return)
+        )
+    };
+    let mut settled = FxHashSet::default();
+    let mut unsettled = FxHashSet::default();
+    for &caller in &program.functions {
+        let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+        let body: &Body<'_> = &body;
+        for data in body.basic_blocks.iter() {
+            let TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } = &data.terminator().kind
+            else {
+                continue;
+            };
+            let Some(callee) = resolved(func)
+                .and_then(|callee| callee.as_local())
+                .filter(|callee| program.functions.contains(callee))
+            else {
+                continue;
+            };
+            let ok = destination.as_local().is_some_and(|result| {
+                result_discarded(body, result)
+                    || result_consumed_in_place(tcx, &program.functions, body, result)
+            });
+            for index in 0..args.len() {
+                if !return_only(callee, index) {
+                    continue;
+                }
+                if ok {
+                    settled.insert((caller, callee, index));
+                } else {
+                    unsettled.insert((caller, callee, index));
+                }
+            }
+        }
+    }
+    settled.retain(|position| !unsettled.contains(position));
+    settled
+}
+
+/// The result of the call is never read at all (the statement form
+/// `kmVec3Normalize(pOut, pOut);`): no alias of it survives the call.
+fn result_discarded(body: &Body<'_>, result: Local) -> bool {
+    if !pointer(body.local_decls[result].ty) {
+        return true;
+    }
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let used = match &statement.kind {
+                StatementKind::Assign(assignment) => {
+                    assignment.0.local == result || rvalue_mentions(&assignment.1, result)
+                }
+                _ => false,
+            };
+            if used {
+                return false;
+            }
+        }
+        match &data.terminator().kind {
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => {
+                if args.iter().any(|argument| {
+                    argument
+                        .node
+                        .place()
+                        .is_some_and(|place| place.local == result)
+                }) || func.place().is_some_and(|place| place.local == result)
+                {
+                    return false;
+                }
+            }
+            TerminatorKind::Return => {}
+            terminator => {
+                let mut mentioned = false;
+                if let TerminatorKind::SwitchInt { discr, .. } = terminator
+                    && discr.place().is_some_and(|place| place.local == result)
+                {
+                    mentioned = true;
+                }
+                if mentioned {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn rvalue_mentions(rvalue: &Rvalue<'_>, local: Local) -> bool {
+    let mentions =
+        |operand: &Operand<'_>| operand.place().is_some_and(|place| place.local == local);
+    match rvalue {
+        Rvalue::Use(operand)
+        | Rvalue::Cast(_, operand, _)
+        | Rvalue::Repeat(operand, _)
+        | Rvalue::UnaryOp(_, operand)
+        | Rvalue::ShallowInitBox(operand, _) => mentions(operand),
+        Rvalue::BinaryOp(_, operands) => mentions(&operands.0) || mentions(&operands.1),
+        Rvalue::Aggregate(_, operands) => operands.iter().any(mentions),
+        Rvalue::Ref(_, _, place)
+        | Rvalue::RawPtr(_, place)
+        | Rvalue::Discriminant(place)
+        | Rvalue::CopyForDeref(place)
+        | Rvalue::Len(place) => place.local == local,
+        _ => false,
+    }
+}
+
 /// Every call site whose returned alias the caller consumes where it is
 /// produced: the callee position is a Return-only `Retains` (the alias IS the
 /// argument) and the caller's result local is read through only. Derived once
