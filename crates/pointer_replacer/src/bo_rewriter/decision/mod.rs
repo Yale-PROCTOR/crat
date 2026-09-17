@@ -1537,14 +1537,7 @@ pub(crate) fn refuse_nested_use_edits(tcx: TyCtxt<'_>, table: &mut DecisionTable
         // (entry index, edit span) for every entry still emitting use-edits.
         let mut edits: Vec<(usize, Span)> = Vec::new();
         for (i, (_, decision)) in table.entries.iter().enumerate() {
-            let uses = match decision {
-                Decision::Slice { uses, .. }
-                | Decision::NestedSlice { uses, .. }
-                | Decision::Opt { uses, .. } => uses.as_slice(),
-                Decision::Box(_) => &[],
-                _ => &[],
-            };
-            edits.extend(uses.iter().map(|u| (i, u.span)));
+            edits.extend(use_edit_spans(decision).into_iter().map(|span| (i, span)));
         }
         // Outermost first at equal starts, so the container is seen before what
         // it contains.
@@ -1601,52 +1594,109 @@ fn compose_nested_use_edit(
     let Ok(inner_source) = tcx.sess.source_map().span_to_snippet(inner_span) else {
         return false;
     };
-    let uses_of = |decision: &Decision| -> Option<Vec<emitability::UseEdit>> {
-        match decision {
-            Decision::Slice { uses, .. }
-            | Decision::NestedSlice { uses, .. }
-            | Decision::Opt { uses, .. } => Some(uses.clone()),
-            _ => None,
-        }
-    };
-    let Some(inner_uses) = uses_of(&table.entries[inner_entry].1) else { return false };
-    let Some(inner_edit) = inner_uses.iter().find(|u| u.span == inner_span).cloned() else {
+    let Some(inner_replacement) = use_edit_replacement(&table.entries[inner_entry].1, inner_span)
+    else {
         return false;
     };
-    let Some(outer_uses) = uses_of(&table.entries[outer_entry].1) else { return false };
-    let Some(outer_position) = outer_uses.iter().position(|u| u.span == outer_span) else {
+    let Some(outer_replacement) = use_edit_replacement(&table.entries[outer_entry].1, outer_span)
+    else {
         return false;
     };
     // Exactly one occurrence, or the splice could land on a use that was never
     // this inner subject's.
-    if outer_uses[outer_position]
-        .replacement
-        .matches(inner_source.as_str())
-        .count()
-        != 1
-    {
+    if outer_replacement.matches(inner_source.as_str()).count() != 1 {
         return false;
     }
-    let composed = outer_uses[outer_position]
-        .replacement
-        .replace(inner_source.as_str(), &inner_edit.replacement);
-    match &mut table.entries[outer_entry].1 {
+    let composed = outer_replacement.replace(inner_source.as_str(), &inner_replacement);
+    if !set_use_edit_replacement(&mut table.entries[outer_entry].1, outer_span, composed) {
+        return false;
+    }
+    drop_use_edit(&mut table.entries[inner_entry].1, inner_span)
+}
+
+/// The spans a decision's own use edits claim.
+///
+/// **Relay 037.** A `Box` decision's `expr_edits` are use edits too — the
+/// owner's element accesses, its initializer and its free-site drops — and the
+/// scan used to skip them (`Decision::Box(_) => &[]`). brotli's
+/// `BrotliHistogramReindex*` writes
+/// `*new_index.offset(*symbols.offset(i as isize) as isize)`, whose container
+/// is exactly such an owner access; with the container invisible, the two edits
+/// reached the class layer as two sites over one interval and the class held
+/// `intra-class-interval-overlap` (12 rows of the batch-9 census, 4 in each of
+/// the three Reindex classes). Making a Box container visible is the whole of
+/// the change: K21's composition then applies verbatim, because the owner's
+/// replacement carries the inner span's ORIGINAL text for the same reason a
+/// Slice one does — the element-access rendering re-spells only the parts that
+/// belong to ITS subject and copies the index expression from the source.
+fn use_edit_spans(decision: &Decision) -> Vec<Span> {
+    match decision {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => uses.iter().map(|u| u.span).collect(),
+        Decision::Box(plan) => plan.expr_edits.iter().map(|e| e.span).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The replacement a decision plans at `span`, if it plans one there.
+fn use_edit_replacement(decision: &Decision, span: Span) -> Option<String> {
+    match decision {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => uses
+            .iter()
+            .find(|u| u.span == span)
+            .map(|u| u.replacement.clone()),
+        Decision::Box(plan) => plan
+            .expr_edits
+            .iter()
+            .find(|e| e.span == span)
+            .map(|e| e.replacement.clone()),
+        _ => None,
+    }
+}
+
+/// Re-spell the edit at `span`; false when the decision plans none there.
+fn set_use_edit_replacement(decision: &mut Decision, span: Span, text: String) -> bool {
+    let target = match decision {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => uses
+            .iter_mut()
+            .find(|u| u.span == span)
+            .map(|u| &mut u.replacement),
+        Decision::Box(plan) => plan
+            .expr_edits
+            .iter_mut()
+            .find(|e| e.span == span)
+            .map(|e| &mut e.replacement),
+        _ => None,
+    };
+    match target {
+        Some(slot) => {
+            *slot = text;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Drop the edit at `span` — its work now lives inside its container.
+fn drop_use_edit(decision: &mut Decision, span: Span) -> bool {
+    match decision {
         Decision::Slice { uses, .. }
         | Decision::NestedSlice { uses, .. }
         | Decision::Opt { uses, .. } => {
-            uses[outer_position].replacement = composed;
+            uses.retain(|u| u.span != span);
+            true
         }
-        _ => return false,
-    }
-    match &mut table.entries[inner_entry].1 {
-        Decision::Slice { uses, .. }
-        | Decision::NestedSlice { uses, .. }
-        | Decision::Opt { uses, .. } => {
-            uses.retain(|u| u.span != inner_span);
+        Decision::Box(plan) => {
+            plan.expr_edits.retain(|e| e.span != span);
+            true
         }
-        _ => return false,
+        _ => false,
     }
-    true
 }
 
 fn degrade(subject: &Subject, site: String, reason: DegradeReason) -> Decision {
