@@ -238,7 +238,28 @@ fn connect(graph: &mut SafetyGraph, from: SafetyVertex, to: SafetyVertex) {
     graph.entry(to).or_default().insert(from);
 }
 
-fn safety_graph(constraints: &CursorConstraints, view: &FinalCursorDecisionView) -> SafetyGraph {
+fn merged_owner_members(
+    view: &FinalCursorDecisionView,
+) -> FxHashMap<CursorOwner, Vec<CursorLocalNode>> {
+    let mut owner_members = view.owner_members.clone();
+    // A sparse member list must not discard ownership already known by a flow.
+    for (&node, &flow) in &view.flows {
+        if let CursorFlow::Cursor(owner) = flow {
+            owner_members.entry(owner).or_default().push(node);
+        }
+    }
+    for members in owner_members.values_mut() {
+        members.sort_unstable_by_key(|&node| node_key(node));
+        members.dedup();
+    }
+    owner_members
+}
+
+fn safety_graph(
+    constraints: &CursorConstraints,
+    view: &FinalCursorDecisionView,
+    owner_members: &FxHashMap<CursorOwner, Vec<CursorLocalNode>>,
+) -> SafetyGraph {
     let mut graph = SafetyGraph::default();
     for edges in [&constraints.local_edges, &constraints.return_edges] {
         for (&from, successors) in edges {
@@ -269,7 +290,7 @@ fn safety_graph(constraints: &CursorConstraints, view: &FinalCursorDecisionView)
     for &node in &constraints.field_seeds {
         graph.entry(node.into()).or_default();
     }
-    for (&owner, members) in &view.owner_members {
+    for (&owner, members) in owner_members {
         graph.entry(SafetyVertex::Owner(owner)).or_default();
         for &member in members {
             connect(
@@ -317,7 +338,8 @@ pub(crate) fn resolve_late_cursors(
     constraints: &CursorConstraints,
     view: &FinalCursorDecisionView,
 ) -> CursorResolution {
-    let graph = safety_graph(constraints, view);
+    let owner_members = merged_owner_members(view);
+    let graph = safety_graph(constraints, view, &owner_members);
     let mut vertices: Vec<_> = graph.keys().copied().collect();
     vertices.sort_unstable_by_key(|v| v.key());
     let mut component = FxHashMap::default();
@@ -369,6 +391,9 @@ pub(crate) fn resolve_late_cursors(
     seeds.sort_unstable_by_key(|&node| node_key(node));
     let mut predecessor: FxHashMap<_, Option<CursorLocalNode>> =
         seeds.iter().map(|&n| (n, None)).collect();
+    // Equality witnesses do not schedule a member's flow for classification.
+    // Only seeds and actual directed successors enter this set and the queue.
+    let mut scheduled: FxHashSet<_> = seeds.iter().copied().collect();
     let mut queue = VecDeque::from(seeds);
     let mut required = FxHashMap::default();
     let mut poisoned = FxHashMap::<usize, CursorLocalNode>::default();
@@ -382,15 +407,14 @@ pub(crate) fn resolve_late_cursors(
         {
             CursorFlow::Transparent => vec![node],
             CursorFlow::Cursor(owner) => {
-                if required.contains_key(&owner) {
-                    continue;
+                if let Entry::Vacant(entry) = required.entry(owner) {
+                    entry.insert(node);
+                    owner_members[&owner].clone()
+                } else {
+                    // Even after owner fan-out, every reached cursor node must
+                    // forward its own directed demand.
+                    vec![node]
                 }
-                required.insert(owner, node);
-                let mut members = view.owner_members.get(&owner).cloned().unwrap_or_default();
-                members.push(node);
-                members.sort_unstable_by_key(|&n| node_key(n));
-                members.dedup();
-                members
             }
             CursorFlow::RawBarrier => {
                 reached_raw_barriers.insert(node);
@@ -414,8 +438,8 @@ pub(crate) fn resolve_late_cursors(
             // of one source owner, followed by a directed supplier edge.
             predecessor.entry(member).or_insert(Some(node));
             for next in successors(constraints, member) {
-                if let Entry::Vacant(entry) = predecessor.entry(next) {
-                    entry.insert(Some(member));
+                if scheduled.insert(next) {
+                    predecessor.entry(next).or_insert(Some(member));
                     queue.push_back(next);
                 }
             }
@@ -999,7 +1023,7 @@ mod tests {
             assert_eq!(resolution.stats().protected, 4);
             assert_eq!(resolution.stats().reached_raw_barriers, 1);
             assert!(resolution.demotions().is_empty());
-            let graph = safety_graph(&constraints, &view);
+            let graph = safety_graph(&constraints, &view, &merged_owner_members(&view));
             for i in 1..=8 {
                 assert!(graph.contains_key(&SafetyVertex::Local(node(did, i))));
             }
@@ -1345,6 +1369,131 @@ mod tests {
                 resolution.retention(b),
                 Some(&CursorRetention::Poisoned {
                     boundary: node(did, 3)
+                })
+            );
+            assert!(resolution.demotions().is_empty());
+        });
+    }
+
+    fn check_directed_boundary_after_fanout(flow: Option<CursorFlow>) {
+        with_ids(move |did, ids| {
+            let mut constraints = CursorConstraints::default();
+            let mut view = FinalCursorDecisionView::default();
+            let a = candidate(&mut view, did, ids[0], 1, true);
+            let c = candidate(&mut view, did, ids[3], 4, true);
+            view.owner_members.get_mut(&a).unwrap().push(node(did, 2));
+            if let Some(flow) = flow {
+                view.flows.insert(node(did, 2), flow);
+            }
+            view.flows.insert(node(did, 3), CursorFlow::Transparent);
+            constraints.local_seeds.extend([node(did, 1), node(did, 3)]);
+            edge(&mut constraints, node(did, 3), node(did, 2));
+            edge(&mut constraints, node(did, 4), node(did, 2));
+            let resolution = resolve_late_cursors(&constraints, &view);
+            assert_eq!(
+                resolution.retention(a),
+                Some(&CursorRetention::Required {
+                    witness: vec![node(did, 1)]
+                })
+            );
+            if flow == Some(CursorFlow::RawBarrier) {
+                assert_eq!(
+                    resolution.reached_raw_barriers,
+                    FxHashSet::from_iter([node(did, 2)])
+                );
+                assert_eq!(resolution.stats().reached_raw_barriers, 1);
+                assert_eq!(
+                    resolution
+                        .demotions()
+                        .iter()
+                        .map(|delta| delta.owner)
+                        .collect::<Vec<_>>(),
+                    vec![c]
+                );
+            } else {
+                assert_eq!(
+                    resolution.retention(c),
+                    Some(&CursorRetention::Poisoned {
+                        boundary: node(did, 2)
+                    })
+                );
+                assert!(resolution.demotions().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn directed_missing_flow_after_fanout_poisons_component() {
+        check_directed_boundary_after_fanout(None);
+    }
+
+    #[test]
+    fn directed_unsupported_flow_after_fanout_poisons_component() {
+        check_directed_boundary_after_fanout(Some(CursorFlow::UnsupportedBoundary));
+    }
+
+    #[test]
+    fn directed_raw_flow_after_fanout_records_barrier() {
+        check_directed_boundary_after_fanout(Some(CursorFlow::RawBarrier));
+    }
+
+    #[test]
+    fn sparse_membership_propagates_owner_protection() {
+        with_ids(|did, ids| {
+            let mut constraints = CursorConstraints::default();
+            let mut view = FinalCursorDecisionView::default();
+            let a = candidate(&mut view, did, ids[0], 1, true);
+            let c = candidate(&mut view, did, ids[3], 4, true);
+            view.flows.insert(node(did, 2), CursorFlow::Cursor(a));
+            view.protections
+                .push((ProtectionSite::Owner(a), FreezeReason::MissingMirMembers));
+            edge(&mut constraints, node(did, 4), node(did, 2));
+            let resolution = resolve_late_cursors(&constraints, &view);
+            for owner in [a, c] {
+                assert_eq!(
+                    resolution.retention(owner),
+                    Some(&CursorRetention::Protected {
+                        reasons: vec![FreezeReason::MissingMirMembers]
+                    })
+                );
+            }
+            assert!(resolution.demotions().is_empty());
+        });
+    }
+
+    #[test]
+    fn sparse_membership_seed_propagates_after_owner_is_required() {
+        with_ids(|did, ids| {
+            let mut constraints = CursorConstraints::default();
+            let mut view = FinalCursorDecisionView::default();
+            let a = candidate(&mut view, did, ids[0], 1, true);
+            let c = candidate(&mut view, did, ids[3], 4, true);
+            view.flows.insert(node(did, 2), CursorFlow::Cursor(a));
+            constraints.local_seeds.extend([node(did, 1), node(did, 2)]);
+            edge(&mut constraints, node(did, 2), node(did, 4));
+            let resolution = resolve_late_cursors(&constraints, &view);
+            assert_eq!(
+                resolution.retention(a),
+                Some(&CursorRetention::Required {
+                    witness: vec![node(did, 1)]
+                })
+            );
+            assert_eq!(
+                resolution.retention(c),
+                Some(&CursorRetention::Required {
+                    witness: vec![node(did, 2), node(did, 4)]
+                })
+            );
+            assert!(resolution.demotions().is_empty());
+
+            // Known flow membership must also participate in owner fan-out
+            // when the omitted member has no independent seed.
+            constraints.local_seeds.remove(&node(did, 2));
+            let resolution = resolve_late_cursors(&constraints, &view);
+            assert_eq!(
+                resolution.retention(c),
+                Some(&CursorRetention::Required {
+                    witness: vec![node(did, 1), node(did, 2), node(did, 4)],
                 })
             );
             assert!(resolution.demotions().is_empty());
