@@ -1753,9 +1753,13 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             DegradeReason::SliceCursorUse,
         ),
         // wave-4 R410-9 (b): a string-literal construction has no root to
-        // widen and no local-callee result to receive; it types its own local.
+        // widen and no local-callee result to receive; it types its own local
+        // — unless its foreign site is a pending sibling-overlap hold
+        // (R419-3 / R304-2), where a delivered borrowed form is a delivered
+        // held subject.
         Decision::Slice { mutable: false, .. } if literal_construction => {
-            if pending_sibling::pending_site(ctx.facts, receiver_node).is_some() {
+            // A string literal's referent is static: no frame binding is it.
+            if pending_sibling::pending_site(ctx.facts, receiver_node, true).is_some() {
                 degrade(
                     subject,
                     EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
@@ -2184,7 +2188,12 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 constructions.by_binding.get(&(subject.fn_did, subject.hir_id)),
                 Some(construction::Construction::StringLiteral { .. })
             )
-            && pending_sibling::pending_site(facts, (subject.fn_did, subject.hir_id)).is_some())
+            && pending_sibling::pending_site(
+                facts,
+                (subject.fn_did, subject.hir_id),
+                matches!(subject.kind, SubjectKind::Param { .. }),
+            )
+            .is_some())
     {
         contract_alone = promotion.contract_alone;
         form = if matches!(

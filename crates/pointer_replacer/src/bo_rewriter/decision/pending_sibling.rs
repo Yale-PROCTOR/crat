@@ -17,55 +17,6 @@
 //! exactly `risky_sibling` for the population it is consulted for, and
 //! conservative for any other.
 
-use rustc_hir::{HirId, def_id::LocalDefId};
-
-use super::{
-    emitability::EmitabilityFacts,
-    raw_boundary_contracts::{PointeeAccess, classify_contract},
-};
-
-/// The first foreign site at which `node` is the source and a sibling argument
-/// is risky: `(callee path, node's argument index, the sibling's index)`.
-pub(crate) fn pending_site(
-    facts: &EmitabilityFacts,
-    node: (LocalDefId, HirId),
-) -> Option<(String, usize, usize)> {
-    facts
-        .foreign_call_args
-        .iter()
-        .filter(|fact| fact.caller == node.0 && fact.direct_subject_root() == Some(node.1))
-        .find_map(|fact| {
-            facts
-                .foreign_call_args
-                .iter()
-                .filter(|sibling| {
-                    sibling.caller == fact.caller
-                        && sibling.call_span == fact.call_span
-                        && sibling.argument_index != fact.argument_index
-                })
-                .find(|sibling| {
-                    match classify_contract(
-                        &sibling.callee,
-                        sibling.argument_index,
-                        &sibling.target,
-                    ) {
-                        Ok(contract) => matches!(
-                            contract.access,
-                            PointeeAccess::Write | PointeeAccess::Lifecycle
-                        ),
-                        Err(_) => true,
-                    }
-                })
-                .map(|sibling| {
-                    (
-                        fact.callee.path.clone(),
-                        fact.argument_index,
-                        sibling.argument_index,
-                    )
-                })
-        })
-}
-
 use rustc_hash::FxHashSet;
 use rustc_hir::{HirId, def_id::LocalDefId};
 use rustc_middle::ty::TyCtxt;
@@ -80,11 +31,34 @@ use super::{
     sibling_overlap,
 };
 
+/// Is this sibling argument the address of a place rooted in a binding of the
+/// CALLER's own frame (`&mut statBuf`), rather than a pointer value or a borrow
+/// through a dereference (`&mut (*p).field`)?
+///
+/// Such storage did not exist when the frame began, so nothing the frame
+/// RECEIVED — a parameter's referent, a string literal's static — can point
+/// into it: under the UB-free-input scope the two cannot alias, which is the
+/// separation the A5 proof reports as `Clear` and the sibling-overlap
+/// instrument reads before holding a site pending. Measured at the batch-9
+/// re-census: without this term the three bzip2 `lstat` / `stat` rows
+/// (`countHardLinks::name#1`, `notAStandardFile::name#1`,
+/// `saveInputFileMetaInfo::srcName#1`) lost the deliveries R407-14 gave them.
+fn addresses_a_frame_binding(fact: &super::raw_boundary::ForeignCallArgFact) -> bool {
+    matches!(fact.shape, "addr-of" | "addr-of-mut")
+        && !fact.root_through_deref
+        && fact.root.is_some()
+}
+
 /// The first foreign site at which `node` is the source and a sibling argument
 /// is risky: `(callee path, node's argument index, the sibling's index)`.
+///
+/// `frame_external_referent` states that the subject's referent lives outside
+/// the caller's frame (a parameter's referent, a string literal's static) — the
+/// premise [`addresses_a_frame_binding`] needs.
 pub(crate) fn pending_site(
     facts: &EmitabilityFacts,
     node: (LocalDefId, HirId),
+    frame_external_referent: bool,
 ) -> Option<(String, usize, usize)> {
     facts
         .foreign_call_args
@@ -100,6 +74,9 @@ pub(crate) fn pending_site(
                         && sibling.argument_index != fact.argument_index
                 })
                 .find(|sibling| {
+                    if frame_external_referent && addresses_a_frame_binding(sibling) {
+                        return false;
+                    }
                     match classify_contract(
                         &sibling.callee,
                         sibling.argument_index,

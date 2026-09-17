@@ -1681,3 +1681,90 @@ fn ce_m06_a_nested_pointee_still_reads_as_one_element() {
     assert!(source.contains("v: &mut small_vec_u64_t"), "{source}");
     assert!(!source.contains("[small_vec_u64_t]"), "{source}");
 }
+
+/// R433-2 (c): bzip2's `countHardLinks` — the contract-alone parameter's only
+/// use is `lstat(name, &mut statBuf)` position 0, a NUL-terminated read. The
+/// sibling at position 1 WRITES, but it is the address of a LOCAL of this very
+/// frame: no pointer to it existed when the frame began, so it cannot alias the
+/// parameter's referent and the site is not a pending sibling-overlap hold.
+const CE_A04_ADDR_OF_LOCAL_SIBLING: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+pub mod bzip2 {
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct stat {
+        pub st_dev: u64,
+        pub st_nlink: u64,
+    }
+    extern "C" {
+        fn lstat(path: *const i8, buf: *mut stat) -> i32;
+    }
+    pub unsafe fn countHardLinks(mut name: *mut i8) -> i32 {
+        let mut statBuf: stat = stat { st_dev: 0, st_nlink: 0 };
+        let i = lstat(name, &mut statBuf);
+        if i != 0 {
+            return 0;
+        }
+        statBuf.st_nlink as i32 - 1
+    }
+}
+"#;
+
+#[test]
+fn ce_a04_an_addr_of_local_sibling_is_not_a_pending_site() {
+    let decisions = super::emit_tests::decisions_of(CE_A04_ADDR_OF_LOCAL_SIBLING);
+    let name = decisions
+        .iter()
+        .find(|(n, is_param, _)| n == "name" && *is_param)
+        .expect("CE-A04 name subject");
+    assert_eq!(name.2, "<emitted>", "{decisions:#?}");
+    let source = emitted(CE_A04_ADDR_OF_LOCAL_SIBLING);
+    assert!(source.contains("name: &[i8]"), "{source}");
+    assert!(
+        source.contains("lstat(name.as_ptr(), &mut statBuf)"),
+        "{source}"
+    );
+}
+
+/// The negative half of CE-A04: a written sibling borrowed THROUGH a
+/// dereference (`&mut (*holder).st`) addresses storage the frame did not
+/// create, so it may alias the parameter's referent — the site stays a pending
+/// sibling-overlap hold and the contract-alone promotion is not taken.
+const CE_A05_ADDR_THROUGH_DEREF_SIBLING: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+pub mod bzip2 {
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct stat {
+        pub st_dev: u64,
+        pub st_nlink: u64,
+    }
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub struct holder {
+        pub st: stat,
+    }
+    extern "C" {
+        fn lstat(path: *const i8, buf: *mut stat) -> i32;
+    }
+    pub unsafe fn countHardLinks(mut name: *mut i8, mut h: *mut holder) -> i32 {
+        let i = lstat(name, &mut (*h).st);
+        if i != 0 {
+            return 0;
+        }
+        (*h).st.st_nlink as i32 - 1
+    }
+}
+"#;
+
+#[test]
+fn ce_a05_a_sibling_borrowed_through_a_deref_keeps_the_pending_hold() {
+    let decisions = super::emit_tests::decisions_of(CE_A05_ADDR_THROUGH_DEREF_SIBLING);
+    let name = decisions
+        .iter()
+        .find(|(n, is_param, _)| n == "name" && *is_param)
+        .expect("CE-A05 name subject");
+    assert_eq!(name.2, "held:thin-extent", "{decisions:#?}");
+    let source = emitted(CE_A05_ADDR_THROUGH_DEREF_SIBLING);
+    assert!(!source.contains("name: &[i8]"), "{source}");
+}
