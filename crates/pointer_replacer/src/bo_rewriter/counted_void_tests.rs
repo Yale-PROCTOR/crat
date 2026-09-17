@@ -441,18 +441,44 @@ fn withdrawals_of(input: &str) -> Vec<String> {
 
 /// The copy shape at a real call: `mem` is a fresh `malloc` local and `leaves`
 /// a parameter that is never reassigned, so the two roots are distinct
-/// allocations and the call is split (both views, closure snapshot).
+/// allocations and NEITHER position needs the twin.
+///
+/// **R217-2(a) re-pin (relay 020, wave-6a's half A `741482f9`).** Which family
+/// owns `src` is frame-dependent and not this lane's to fix: without half A the
+/// fresh local is a counted source and the call SPLITS (both views, one
+/// snapshot); with it the same local delivers as an owner (`Box<[BPMNode]>`)
+/// and is lent through a cast at the raw `src`, so the call keeps ONE counted
+/// view (`direct`). The property this witness pins on BOTH frames is the
+/// lane's own line: at this call there is exactly one counted view per bridged
+/// position, never a twin and never a withdrawal — and the emitted program
+/// agrees with the original at runtime (`w6v_bpm_sort_runtime_matches_original`).
 #[test]
 fn w6v_bpm_sort_direct_malloc_local_vs_parameter_splits() {
     let input = format!("{COPY64}{BPM_SORT}");
-    let source = check(&input, &["dst", "src"]);
+    let source = check(&input, &["dst"]);
+    let rows = super::emit_tests::decisions_of(&input);
     let routes = routes_of(&input);
-    assert!(
-        routes
-            .iter()
-            .any(|(c, r)| c.ends_with("bpmnode_sort") && r == "split"),
-        "fresh local vs parameter is split: {routes:?}"
-    );
+    let split = routes
+        .iter()
+        .any(|(c, r)| c.ends_with("bpmnode_sort") && r == "split");
+    if split {
+        assert!(
+            rows.iter()
+                .any(|(n, p, r)| n == "src" && *p && r == "<emitted>"),
+            "the split delivers both positions: {rows:?}"
+        );
+    } else {
+        assert!(
+            routes
+                .iter()
+                .any(|(c, r)| c.ends_with("bpmnode_sort") && r == "direct"),
+            "one bridged position is the only alternative to the split: {routes:?}"
+        );
+        assert!(
+            compact(&source).contains("mem.as_mut_ptr()as*constcore::ffi::c_void"),
+            "the unbridged position is the owner's own pointer, lent at the raw formal: {source}"
+        );
+    }
     assert!(
         !source.contains("__crat_raw_lodepng_memcpy"),
         "no twin needed: {source}"
