@@ -710,3 +710,47 @@ fn wave6s2_backward_assignment_destination_stays_out_of_scope() {
         "a backward assignment keeps the use wall: {receipts}"
     );
 }
+
+/// **The delivery witness (report 010).** The same destination shape with a
+/// TYPED (non-null) initialiser: both ends deliver and the assignment is the
+/// checked suffix — so W6S2-5 is a delivery rule, and the corpus rows whose
+/// declaration is null-initialised (brotli `static_dict::s*`, lodepng
+/// `addChunk_IHDR::data`) wait on exactly one thing: wave-6o's Option
+/// declaration for that local. Measured without composing the two lines.
+const ASSIGN_DESTINATION_NON_NULL_INIT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe fn FindMatches(mut data: *const u8, max_length: usize, mut out: *mut u32) -> i32 {
+    let mut s: *const u8 = data;
+    let mut l: usize = 0;
+    let mut found = 0;
+    while l < max_length {
+        if *data.offset(l as isize) as i32 == ' ' as i32 { l = l.wrapping_add(1); continue; }
+        s = &*data.offset(l as isize) as *const u8;
+        if *s.offset(0 as isize) as i32 == 'a' as i32 { *out.offset(found as isize) = l as u32; found += 1; }
+        if *s.offset(1 as isize) as i32 == 'b' as i32 { found += 1; }
+        l = l.wrapping_add(1);
+    }
+    found
+ }
+"#;
+
+#[test]
+fn wave6s2_assignment_destination_delivers_once_its_declaration_is_typed() {
+    let (source, receipts) = emit_with_receipts(ASSIGN_DESTINATION_NON_NULL_INIT);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        receipts.contains("DECISION-KV FindMatches::s slice-shared"),
+        "the destination carries the view: {receipts}"
+    );
+    let text = joined(&source);
+    assert!(text.contains("let mut s: &[u8] = data;"), "{source}");
+    assert!(
+        text.contains("s = &(data)[l..];"),
+        "the assignment is the checked suffix: {source}"
+    );
+    assert!(text.contains("s[0]") && text.contains("s[1]"), "{source}");
+    assert!(
+        !text.contains("as_ptr()"),
+        "neither end needs a raw view: {source}"
+    );
+}
