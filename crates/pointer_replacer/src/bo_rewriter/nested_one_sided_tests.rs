@@ -17,6 +17,7 @@ mod original;
 const SOURCE: &str = include_str!("nested_one_sided_fixture.rs");
 const BOTH: &str = "indicators::ema::ti_ema";
 const LATE: &str = "indicators::ema_late_out::ti_ema_late_out";
+const LATE_IN: &str = "indicators::ema_late_in::ti_ema_late_in";
 const EXTRA: &str = "indicators::ema_extra_use::ti_ema_extra_use";
 /// wave-5d's pair fixture, read (never edited) as this lane's no-shadow control.
 const PAIR_SOURCE: &str = include_str!("wave5d_ti_abs.rs");
@@ -47,6 +48,16 @@ fn emitted() -> &'static str {
         println!("N1-EMITTED\n{source}\nN1-END");
         source
     })
+}
+
+fn region<'a>(source: &'a str, owner: &str) -> &'a str {
+    source
+        .split(&format!("pub unsafe extern \"C\" fn {owner}("))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{owner} in the emitted tree"))
+        .split("pub mod ")
+        .next()
+        .expect("owner region")
 }
 
 fn decisions(name: &str) -> Vec<(String, Decision)> {
@@ -139,18 +150,58 @@ fn n1_frame_premises_are_exactly_what_the_rule_consumes() {
     .unwrap();
 }
 
-/// **W-N1-DELIVERS** — the pair rule holds this body (it is a lookback
-/// indicator, not the elementwise pattern) and N1 still delivers both tables'
-/// inner levels.
+/// **W-N1-BOUNDARY** — the lane boundary. Both of this function's tables would
+/// deliver, so the function is the PAIR rule's: N1 stands off and wave-5d's
+/// hold — with its own premises about the count, the loop and the accumulator
+/// — stays the only verdict on it.
 #[test]
-fn n1_delivers_every_qualifying_table_where_the_pair_rule_holds() {
+fn n1_stands_off_where_every_table_would_deliver() {
     for parameter in ["inputs", "outputs"] {
         let decision = table_decision(BOTH, parameter);
         assert!(
-            matches!(decision, Decision::NestedSlice { .. }),
-            "{parameter} must deliver its inner level: {decision:?}"
+            matches!(decision, Decision::Slice { .. }),
+            "{parameter} belongs to the pair rule here: {decision:?}"
         );
     }
+    ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let receipt = table
+            .nested_receipts
+            .iter()
+            .find(|r| tcx.def_path_str(r.owner.to_def_id()) == BOTH)
+            .expect("a typed outcome");
+        assert!(receipt.result.is_err(), "{:?}", receipt.result);
+    })
+    .unwrap();
+}
+
+/// **W-N1-DELIVERS-MUT** — the mirror of W-N1-LEADING: where the INPUT table's
+/// load is the late one, the MUTABLE output table is the one that delivers.
+#[test]
+fn n1_delivers_a_mutable_table_when_it_is_the_qualifying_side() {
+    let outputs = table_decision(LATE_IN, "outputs");
+    assert!(
+        matches!(
+            outputs,
+            Decision::NestedSlice {
+                mutable: true,
+                inner_mutable: true,
+                ..
+            }
+        ),
+        "the mutable table delivers its inner level: {outputs:?}"
+    );
+    assert!(
+        matches!(table_decision(LATE_IN, "inputs"), Decision::Slice { .. }),
+        "the late sibling keeps its frame form"
+    );
 }
 
 /// **W-N1-LEADING** — clause (d). The output table's row load sits after an
@@ -190,44 +241,55 @@ fn n1_skips_a_table_with_a_use_that_is_not_a_row_load() {
 
 /// **W-N1-EMISSION** — the wrapper builds an exact descriptor array from the
 /// raw table and the safe helper takes the nested form; the inner
-/// constructions become reborrows of the elements, the mutable one explicitly.
+/// construction becomes a reborrow of the element, explicitly on the mutable
+/// side. Both one-sided fixtures are read: the shared table in `late_out`, the
+/// mutable table in `late_in`.
 #[test]
 fn n1_emits_the_descriptor_array_and_the_nested_helper_signature() {
     let source = emitted();
+    let shared = region(source, "ti_ema_late_out");
     assert!(
-        source.contains("inputs: &[&[std::os::raw::c_double]]"),
-        "shared nested input table"
+        shared.contains("inputs: &[&[std::os::raw::c_double]]"),
+        "shared nested input table:\n{shared}"
     );
     assert!(
-        source.contains("outputs: &mut [&mut [std::os::raw::c_double]]"),
-        "mutable nested output table"
+        shared.contains("outputs: &[*mut std::os::raw::c_double]"),
+        "the sibling keeps EXACTLY its frame form:\n{shared}"
     );
     assert!(
-        source.contains("let __crat_nested_33_raw = *inputs.add(0);"),
-        "the table cell is loaded in the wrapper"
+        shared.contains("_raw = *inputs.add(0);"),
+        "the table cell is loaded in the wrapper:\n{shared}"
     );
     assert!(
-        source.contains(
-            "let __crat_nested_33_view =\n        ::core::slice::from_raw_parts(__crat_nested_33_raw,\n            crate::FALLBACK_SLICE_EXTENT);"
-        ) || source.contains("::core::slice::from_raw_parts(__crat_nested_33_raw,"),
-        "the row view is built in the wrapper"
+        shared.contains("::core::slice::from_raw_parts(__crat_nested_"),
+        "the row view is built in the wrapper:\n{shared}"
     );
     assert!(
-        source.contains("let __crat_nested_4_rows = [__crat_nested_33_view];"),
-        "an exact one-element descriptor array, not a fabricated table extent"
+        shared.contains("_rows = [__crat_nested_"),
+        "an exact one-element descriptor array, not a fabricated table extent:\n{shared}"
     );
     assert!(
-        source.contains("__crat_safe_ti_ema(size, &__crat_nested_4_rows,")
-            && source.contains("&mut __crat_nested_8_rows)"),
-        "the wrapper passes borrows of the descriptor arrays"
+        shared.contains("__crat_safe_ti_ema_late_out(size, &__crat_nested_"),
+        "the wrapper passes a borrow of the descriptor array:\n{shared}"
     );
     assert!(
-        source.contains("let mut input: &[std::os::raw::c_double] = inputs[0];"),
-        "the shared row is a plain reborrow of the element"
+        shared.contains("let mut input: &[std::os::raw::c_double] = inputs[0];"),
+        "the shared row is a plain reborrow of the element:\n{shared}"
+    );
+
+    let mutable = region(source, "ti_ema_late_in");
+    assert!(
+        mutable.contains("outputs: &mut [&mut [std::os::raw::c_double]]"),
+        "mutable nested output table:\n{mutable}"
     );
     assert!(
-        source.contains("&mut *outputs[0]"),
-        "the mutable row is an EXPLICIT reborrow, never a move out of borrowed storage"
+        mutable.contains("&mut *outputs[0]"),
+        "the mutable row is an EXPLICIT reborrow, never a move out of borrowed storage:\n{mutable}"
+    );
+    assert!(
+        mutable.contains("_raw = *outputs.add(0);")
+            && mutable.contains("::core::slice::from_raw_parts_mut(__crat_nested_"),
+        "the mutable view is built in the wrapper:\n{mutable}"
     );
 }
 
@@ -237,57 +299,53 @@ fn n1_emits_the_descriptor_array_and_the_nested_helper_signature() {
 #[test]
 fn n1_does_not_emit_a_count_guard() {
     let source = emitted();
-    let wrapper = source
-        .split("pub unsafe extern \"C\" fn ti_ema(")
-        .nth(1)
-        .expect("ti_ema wrapper")
-        .split("pub unsafe extern \"C\" fn __crat_safe_ti_ema(")
-        .next()
-        .expect("wrapper body");
-    assert!(
-        !wrapper.contains("if size <= 0"),
-        "no count guard belongs in an N1 wrapper:\n{wrapper}"
-    );
-    assert!(
-        !wrapper.contains("__crat_nested_count"),
-        "no shared count binding belongs in an N1 wrapper:\n{wrapper}"
-    );
-    assert!(
-        source.contains("if period < 1 as std::os::raw::c_int"),
-        "the helper keeps its own early return"
-    );
+    for owner in ["ti_ema_late_out", "ti_ema_late_in"] {
+        let body = region(source, owner);
+        let wrapper = body
+            .split(&format!("pub unsafe extern \"C\" fn __crat_safe_{owner}("))
+            .next()
+            .expect("wrapper body");
+        assert!(
+            !wrapper.contains("if size <= 0"),
+            "no count guard belongs in an N1 wrapper:\n{wrapper}"
+        );
+        assert!(
+            !wrapper.contains("__crat_nested_count"),
+            "no shared count binding belongs in an N1 wrapper:\n{wrapper}"
+        );
+        assert!(
+            body.contains("if period < 1 as std::os::raw::c_int"),
+            "the helper keeps its own early return:\n{body}"
+        );
+    }
 }
 
 /// **W-N1-EXTENT** — the fabricated extent is RELOCATED, not removed and not
-/// duplicated: one fabricated inner length per row, still receipted, and the
-/// wrapper's own table extent is now an exact array.
+/// duplicated: the admitted row keeps its fabricated length, still receipted,
+/// and that table's own fabricated outer extent is now an exact array while
+/// the sibling's outer extent is untouched.
 #[test]
 fn n1_relocates_the_fabricated_extent_without_adding_one() {
     let source = emitted();
-    let region = source
-        .split("pub unsafe extern \"C\" fn ti_ema(")
-        .nth(1)
-        .expect("ti_ema")
-        .split("pub mod ema_late_out")
-        .next()
-        .expect("ti_ema region");
-    // The two inner rows keep their fabricated extent, relocated; the third is
-    // the `options` table, a depth-1 subject this arm does not touch.
+    let shared = region(source, "ti_ema_late_out");
+    // Four, and each one is accounted for: the relocated inner row (now in the
+    // wrapper), the untouched `options` table, and the sibling output table's
+    // OWN two — its outer view and its inner row — which this arm did not take.
+    // The count is unchanged from the frame: N1 moved one, it invented none.
     assert_eq!(
-        region.matches("crate::FALLBACK_SLICE_EXTENT").count(),
-        3,
-        "{region}"
+        shared.matches("crate::FALLBACK_SLICE_EXTENT").count(),
+        4,
+        "{shared}"
     );
-    assert_eq!(
-        region.matches("__crat_nested_").filter(|_| true).count(),
-        12,
-        "two rows: raw, view, array, and the two argument sites:\n{region}"
-    );
-    // The OUTER fabricated table extents are gone: the wrapper now builds an
-    // exact descriptor array instead of a 1024-element view of the C table.
+    // The delivered table's OWN fabricated outer extent is gone: the wrapper
+    // builds an exact descriptor array instead of a 1024-element table view.
     assert!(
-        !region.contains("from_raw_parts(inputs,") && !region.contains("from_raw_parts(outputs,"),
-        "no fabricated outer table extent may survive:\n{region}"
+        !shared.contains("from_raw_parts(inputs,"),
+        "no fabricated outer table extent may survive on the delivered side:\n{shared}"
+    );
+    assert!(
+        shared.contains("from_raw_parts(outputs,"),
+        "the sibling's outer extent is untouched:\n{shared}"
     );
     ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
         let (table, _) = super::decide_table_with_ctx_config(
@@ -298,13 +356,33 @@ fn n1_relocates_the_fabricated_extent_without_adding_one() {
             )),
         )
         .unwrap();
+        let plan = table
+            .nested_receipts
+            .iter()
+            .find(|r| tcx.def_path_str(r.owner.to_def_id()) == LATE)
+            .and_then(|r| r.result.as_ref().ok())
+            .expect("an admitted N1 plan");
+        assert!(!plan.count_guard);
+        assert_eq!(plan.parameters.len(), 1, "one side only");
+        assert!(plan.rows.iter().all(|r| r.was_fallback));
+        assert!(
+            plan.rows
+                .iter()
+                .all(|r| r.length == "crate::FALLBACK_SLICE_EXTENT")
+        );
+        let relocated = plan.rows.iter().map(|r| r.local).collect::<Vec<_>>();
         for c in &table.slice_constructions {
-            if tcx.def_path_str(c.node.0.to_def_id()) != BOTH {
+            if tcx.def_path_str(c.node.0.to_def_id()) != LATE {
                 continue;
             }
+            let expected = if relocated.contains(&c.node.1) {
+                "nested-reborrow-relocated-fallback"
+            } else {
+                "place-read"
+            };
             assert_eq!(
-                c.initializer_kind, "nested-reborrow-relocated-fallback",
-                "the relocated arm is named in the receipt"
+                c.initializer_kind, expected,
+                "only the relocated row is re-labelled"
             );
             assert!(
                 c.length.is_fallback(),
@@ -312,19 +390,6 @@ fn n1_relocates_the_fabricated_extent_without_adding_one() {
                 c.length
             );
         }
-        let plan = table
-            .nested_receipts
-            .iter()
-            .find(|r| tcx.def_path_str(r.owner.to_def_id()) == BOTH)
-            .and_then(|r| r.result.as_ref().ok())
-            .expect("an admitted N1 plan");
-        assert!(!plan.count_guard);
-        assert!(plan.rows.iter().all(|r| r.was_fallback));
-        assert!(
-            plan.rows
-                .iter()
-                .all(|r| r.length == "crate::FALLBACK_SLICE_EXTENT")
-        );
     })
     .unwrap();
 }
