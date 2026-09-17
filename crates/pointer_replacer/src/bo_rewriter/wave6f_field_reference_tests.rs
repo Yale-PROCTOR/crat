@@ -1557,3 +1557,180 @@ fn w6f_array_of_references_local_delivers() {
         "{row:?}"
     );
 }
+
+/// The seam query's answers for a list of `(item name, field index)` asks,
+/// read INSIDE the compiler run where `tcx` and the table live. The item is
+/// looked up by its last path segment, which is what a fixture spells; a
+/// FUNCTION name is a legal ask (that is how the array guard is measured).
+fn owning_field_forms(source: &str, asks: &[(&str, usize)]) -> Vec<Option<String>> {
+    let asks: Vec<(String, usize)> = asks
+        .iter()
+        .map(|(name, index)| ((*name).to_owned(), *index))
+        .collect();
+    ::utils::compilation::run_compiler_on_str(source, move |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        asks.iter()
+            .map(|(name, index)| {
+                let did = tcx
+                    .hir_crate_items(())
+                    .free_items()
+                    .map(|id| id.owner_id.def_id)
+                    .find(|did| {
+                        tcx.opt_item_name(did.to_def_id())
+                            .is_some_and(|item| item.as_str() == name)
+                    })
+                    .unwrap_or_else(|| panic!("item {name}"))
+                    .to_def_id();
+                super::decision::field_reference::owning_field_form(tcx, &table, did, *index)
+            })
+            .collect()
+    })
+    .unwrap()
+}
+
+/// Witness 24 (relay 032 / R448-5) — **the field-transaction seam answered
+/// from a real transaction.** The ownership-fields family holds a moved-out
+/// field owner fail-closed (`native-field-load-field-not-owned`) until a
+/// producer names the field's delivered form; this is that answer, measured
+/// on avl's own text where the transaction is real rather than injected.
+///
+/// The RED is exactly their R431 witness's premise: with the query answering
+/// `None` the owner holds, which is the base behaviour their report 035
+/// claim 1 pins. Here it answers `opt-box` for both rotated fields, and
+/// `None` everywhere it must stay fail-closed.
+#[test]
+fn w6f_the_seam_query_answers_an_owning_field_from_its_transaction() {
+    let _frame = frame_lock();
+    avl_frame();
+    let observed = observe(AVL);
+    // The transaction really is there and really is owning (witness 19's pin).
+    for field in ["left", "right"] {
+        let row = field_row(&observed, "Node", field);
+        assert_eq!(
+            (row.2.as_str(), row.3.as_str()),
+            ("applied", "opt-box"),
+            "{row:?}"
+        );
+    }
+    // `Node` is `{ key, left, right, height }`: the two OWNING fields answer
+    // their delivered form; the two scalars, which carry no transaction at
+    // all, answer `None`.
+    let answers = owning_field_forms(AVL, &[("Node", 1), ("Node", 2), ("Node", 0), ("Node", 3)]);
+    super::test_model_override::clear();
+    assert_eq!(
+        answers,
+        vec![
+            Some("opt-box".to_owned()),
+            Some("opt-box".to_owned()),
+            None,
+            None,
+        ],
+        "{answers:?}"
+    );
+}
+
+/// The seam query asked with a transaction's OWN key: for each
+/// `(struct, field)` receipt identity, the answer a consumer gets when it
+/// names exactly the field that transaction owns. This is what makes the
+/// fail-closed arms falsifiable — a guessed field index would answer `None`
+/// for the wrong reason.
+fn owning_field_form_of(source: &str, asks: &[(&str, &str)]) -> Vec<Option<String>> {
+    let asks: Vec<(String, String)> = asks
+        .iter()
+        .map(|(s, f)| ((*s).to_owned(), (*f).to_owned()))
+        .collect();
+    ::utils::compilation::run_compiler_on_str(source, move |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        asks.iter()
+            .map(|(owner, field)| {
+                let transaction = table
+                    .field_transactions
+                    .applied
+                    .iter()
+                    .find(|t| {
+                        t.struct_path
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or(t.struct_path.as_str())
+                            == owner
+                            && &t.field_name == field
+                    })
+                    .unwrap_or_else(|| panic!("no applied transaction for {owner}.{field}"));
+                super::decision::field_reference::owning_field_form(
+                    tcx,
+                    &table,
+                    transaction.key.struct_did.to_def_id(),
+                    transaction.key.field_index,
+                )
+            })
+            .collect()
+    })
+    .unwrap()
+}
+
+/// Witness 25 (relay 032 / R448-5) — the query's fail-closed arms, each asked
+/// with the transaction's own key so the refusal cannot be an accident of a
+/// guessed index.
+///
+/// A BORROWED field is delivered and `applied`, and still answers `None`: a
+/// `Box` local moved out of a field this family delivers as `Option<&T>`
+/// would close memory the container still points into. An ARRAY transaction
+/// keys its `FieldKey` on the owning FUNCTION and a local's `HirId`, not on a
+/// struct and a field index, so asking with that key must not return its
+/// `array-opt-box-slice` form.
+#[test]
+fn w6f_the_seam_query_is_closed_on_every_form_it_does_not_own() {
+    let _frame = frame_lock();
+    // hti `_table` is delivered `opt-ref-shared` — a BORROWED field.
+    let observed = observe(HT);
+    let row = field_row(&observed, "hti", "_table");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "opt-ref-shared"),
+        "{row:?}"
+    );
+    let borrowed = owning_field_form_of(HT, &[("hti", "_table")]);
+    assert_eq!(
+        borrowed,
+        vec![None],
+        "a borrowed field never licenses a Box local: {borrowed:?}"
+    );
+    // `filter`'s array is `array-opt-box-slice`, keyed on the FUNCTION.
+    let observed = observe(OWNED_ARRAY);
+    let row = field_row(&observed, "filter", "attempt");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "array-opt-box-slice"),
+        "{row:?}"
+    );
+    let array = owning_field_form_of(OWNED_ARRAY, &[("filter", "attempt")]);
+    assert_eq!(
+        array,
+        vec![None],
+        "an array transaction is not a struct field: {array:?}"
+    );
+    // And the owning field answers through the same route, so the three arms
+    // are measured against one another rather than against nothing.
+    avl_frame();
+    let owned = owning_field_form_of(AVL, &[("Node", "left"), ("Node", "right")]);
+    super::test_model_override::clear();
+    assert_eq!(
+        owned,
+        vec![Some("opt-box".to_owned()), Some("opt-box".to_owned())],
+        "{owned:?}"
+    );
+}

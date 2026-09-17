@@ -358,6 +358,29 @@ pub(crate) struct FieldTransaction {
     pub site_count: usize,
 }
 
+impl FieldTransaction {
+    /// The delivered form of this transaction, as the receipt's `form` column
+    /// spells it and as [`owning_field_form`] answers it. ONE definition, so
+    /// the seam a consumer reads and the receipt an audit reads cannot drift.
+    pub(crate) fn delivered_form_key(&self) -> &'static str {
+        if let Some(array) = self.array.as_ref() {
+            if array.owning {
+                "array-opt-box-slice"
+            } else {
+                "array-opt-ref-shared"
+            }
+        } else if self.owning {
+            if matches!(self.form, Form::Slice { .. } | Form::Opt { slice: true, .. }) {
+                "opt-box-slice"
+            } else {
+                "opt-box"
+            }
+        } else {
+            self.form.key()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FieldTransactions {
     pub applied: Vec<FieldTransaction>,
@@ -420,7 +443,51 @@ impl FieldTransactions {
                 .all(|owner| !reverted.contains(owner))
         })
     }
+}
 
+/// **R448-5 — the field-transaction seam, as a query.**
+///
+/// The delivered form of an OWNING struct field, in the vocabulary the
+/// ownership-fields family's `owning_field_form` seam reads (`box`,
+/// `opt-box`, `opt-box-slice`), or `None` where no transaction of this family
+/// owns that field. A consumer uses it to type the local a field is moved OUT
+/// of: only an owning field licenses a `Box` local, because a `Box` out of a
+/// field this family delivers as a BORROW (or does not deliver at all) would
+/// close memory the container's raw copy still points into.
+///
+/// Fail-closed by construction — every arm that is not a delivered owning
+/// field of `struct_did` answers `None`:
+///
+/// - a foreign / non-local struct (this family only rewrites local structs);
+/// - a field with no transaction, or one held;
+/// - a transaction that delivers a reference form (`owning == false`);
+/// - an ARRAY transaction, whose key names the owning FUNCTION and a local's
+///   `HirId`, not a struct and a field index.
+///
+/// This line has no production caller: the consumer is the ownership-fields
+/// producer, which composes with this one (relay 032 / their report 035
+/// claim 1). The witnesses below are its callers here.
+#[allow(dead_code)]
+pub(crate) fn owning_field_form(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    struct_did: rustc_span::def_id::DefId,
+    field_index: usize,
+) -> Option<String> {
+    let _ = tcx;
+    let key = FieldKey {
+        struct_did: struct_did.as_local()?,
+        field_index,
+    };
+    table
+        .field_transactions
+        .applied
+        .iter()
+        .find(|t| t.key == key && t.array.is_none() && t.owning)
+        .map(|t| t.delivered_form_key().to_owned())
+}
+
+impl FieldTransactions {
     pub(crate) fn receipt_tsv(&self, tcx: TyCtxt<'_>) -> String {
         let mut out = String::from(
             "struct\tfield\tstatus\tform\tsites\towners\timpls\tsignature_plans\tbridges\tcause\n",
@@ -436,21 +503,7 @@ impl FieldTransactions {
                 "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\n",
                 t.struct_path,
                 t.field_name,
-                if t.array.is_some() {
-                    if t.array.as_ref().is_some_and(|a| a.owning) {
-                        "array-opt-box-slice"
-                    } else {
-                        "array-opt-ref-shared"
-                    }
-                } else if t.owning {
-                    if matches!(t.form, Form::Slice { .. } | Form::Opt { slice: true, .. }) {
-                        "opt-box-slice"
-                    } else {
-                        "opt-box"
-                    }
-                } else {
-                    t.form.key()
-                },
+                t.delivered_form_key(),
                 t.site_count,
                 t.owners
                     .iter()
