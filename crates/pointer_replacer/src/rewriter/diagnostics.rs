@@ -82,6 +82,7 @@ pub enum DecisionStage {
     Downgrade,
     FieldDemotion,
     AbiPreservation,
+    LateCursorResolution,
     AstRewriteFallback,
     Final,
 }
@@ -100,6 +101,7 @@ impl DecisionStage {
             Self::Downgrade => "downgrade",
             Self::FieldDemotion => "field_demotion",
             Self::AbiPreservation => "abi_preservation",
+            Self::LateCursorResolution => "late_cursor_resolution",
             Self::AstRewriteFallback => "ast_rewrite_fallback",
             Self::Final => "final",
         }
@@ -148,6 +150,7 @@ pub enum DecisionReason {
     FreedBorrowOutput,
     FreedBorrowOutputTiedInput,
     RawCastCallInput,
+    NoReachableCursorDemandAfterNormalization,
     CursorInputFromUnanchoredRawCaller,
     OwnedFieldFreeRequiresMutableInput,
     RawCallResult,
@@ -243,6 +246,9 @@ impl DecisionReason {
             Self::FreedBorrowOutput => "freed_borrow_output",
             Self::FreedBorrowOutputTiedInput => "freed_borrow_output_tied_input",
             Self::RawCastCallInput => "raw_cast_call_input",
+            Self::NoReachableCursorDemandAfterNormalization => {
+                "no_reachable_cursor_demand_after_normalization"
+            }
             Self::CursorInputFromUnanchoredRawCaller => "cursor_input_from_unanchored_raw_caller",
             Self::OwnedFieldFreeRequiresMutableInput => "owned_field_free_requires_mutable_input",
             Self::RawCallResult => "raw_call_result",
@@ -654,7 +660,12 @@ fn field_ty(tcx: TyCtxt<'_>, struct_did: LocalDefId, field_index: usize) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{DecisionDiagnostics, DiagnosticsMode};
+    use rustc_hir::def_id::CRATE_DEF_ID;
+
+    use super::{
+        DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject, DiagnosticsMode,
+    };
+    use crate::rewriter::decision::PtrKind;
 
     #[test]
     fn decision_diagnostics_env_mode_parser() {
@@ -698,5 +709,50 @@ mod tests {
         let diagnostics = DecisionDiagnostics::disabled();
         assert!(!diagnostics.is_enabled());
         assert!(diagnostics.events().is_empty());
+    }
+
+    #[test]
+    fn late_cursor_resolution_names_are_stable() {
+        assert_eq!(
+            DecisionStage::LateCursorResolution.as_str(),
+            "late_cursor_resolution"
+        );
+        assert_eq!(
+            DecisionReason::NoReachableCursorDemandAfterNormalization.as_str(),
+            "no_reachable_cursor_demand_after_normalization"
+        );
+    }
+
+    #[test]
+    fn ast_rewrite_fallback_supersedes_late_cursor_resolution_summary() {
+        let subject = DecisionSubject::Return { did: CRATE_DEF_ID };
+        let mut diagnostics = DecisionDiagnostics::for_test(DiagnosticsMode::Full);
+        diagnostics.record(
+            subject,
+            DecisionStage::LateCursorResolution,
+            Some(PtrKind::SliceCursor(false)),
+            Some(PtrKind::Slice(false)),
+            DecisionReason::NoReachableCursorDemandAfterNormalization,
+            None,
+        );
+        diagnostics.record(
+            subject,
+            DecisionStage::AstRewriteFallback,
+            Some(PtrKind::Slice(false)),
+            Some(PtrKind::Raw(false)),
+            DecisionReason::AstRewriteRawRhsLocal,
+            None,
+        );
+
+        let summaries = diagnostics.summaries();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].subject, subject);
+        assert_eq!(summaries[0].final_kind, Some(PtrKind::Raw(false)));
+        assert_eq!(summaries[0].events.len(), 2);
+        assert_eq!(
+            summaries[0].events.last().map(|event| event.stage),
+            Some(DecisionStage::AstRewriteFallback)
+        );
     }
 }

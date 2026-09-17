@@ -380,6 +380,15 @@ pub struct SigDecision {
 }
 
 impl SigDecision {
+    pub(crate) fn demote_cursor_input(&mut self, index: usize) -> bool {
+        let Some(PtrKind::SliceCursor(mutability)) = self.input_decs.get(index).copied().flatten()
+        else {
+            return false;
+        };
+        self.input_decs[index] = Some(PtrKind::Slice(mutability));
+        true
+    }
+
     pub(crate) fn set_input_dec(&mut self, idx: usize, decision: Option<PtrKind>) {
         self.input_decs[idx] = decision;
         if !decision_carries_lifetime(decision)
@@ -1432,5 +1441,74 @@ pub unsafe fn foo(p: *const i32) {
 
         assert_eq!(sig_dec.input_lifetimes, vec![Some(lifetime)]);
         assert_eq!(sig_dec.output_lifetime, None);
+    }
+
+    #[test]
+    fn demote_cursor_input_preserves_shared_cursor_lifetime() {
+        let lifetime = Symbol::new(1);
+        let mut sig = SigDecision {
+            input_decs: vec![Some(PtrKind::SliceCursor(false))],
+            input_lifetimes: vec![Some(lifetime)],
+            output_dec: None,
+            output_lifetime: None,
+            signature_locked: false,
+        };
+        let before_lifetime = sig.input_lifetimes[0];
+
+        assert!(sig.demote_cursor_input(0));
+        assert_eq!(sig.input_decs[0], Some(PtrKind::Slice(false)));
+        assert_eq!(sig.input_lifetimes[0], before_lifetime);
+    }
+
+    #[test]
+    fn demote_cursor_input_preserves_mutable_cursor_lifetime() {
+        let lifetime = Symbol::new(1);
+        let mut sig = SigDecision {
+            input_decs: vec![Some(PtrKind::SliceCursor(true))],
+            input_lifetimes: vec![Some(lifetime)],
+            output_dec: None,
+            output_lifetime: None,
+            signature_locked: false,
+        };
+        let before_lifetime = sig.input_lifetimes[0];
+
+        assert!(sig.demote_cursor_input(0));
+        assert_eq!(sig.input_decs[0], Some(PtrKind::Slice(true)));
+        assert_eq!(sig.input_lifetimes[0], before_lifetime);
+    }
+
+    #[test]
+    fn demote_cursor_input_rejects_non_cursor() {
+        for input_dec in [
+            Some(PtrKind::Raw(false)),
+            Some(PtrKind::Ref(false)),
+            Some(PtrKind::Slice(false)),
+            Some(PtrKind::Box),
+            None,
+        ] {
+            let mut sig = SigDecision {
+                input_decs: vec![input_dec],
+                input_lifetimes: vec![Some(Symbol::new(1))],
+                output_dec: Some(PtrKind::SliceCursor(true)),
+                output_lifetime: Some(Symbol::new(2)),
+                signature_locked: true,
+            };
+            let before = sig.clone();
+
+            assert!(!sig.demote_cursor_input(0));
+            assert_eq!(sig, before);
+        }
+
+        let mut sig = SigDecision {
+            input_decs: vec![Some(PtrKind::SliceCursor(false))],
+            input_lifetimes: vec![Some(Symbol::new(1))],
+            output_dec: None,
+            output_lifetime: None,
+            signature_locked: false,
+        };
+        let before = sig.clone();
+
+        assert!(!sig.demote_cursor_input(1));
+        assert_eq!(sig, before);
     }
 }
