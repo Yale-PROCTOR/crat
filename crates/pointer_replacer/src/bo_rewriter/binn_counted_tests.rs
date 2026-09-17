@@ -1359,3 +1359,134 @@ pub unsafe fn read_only(q: *const i32) -> i32 { *q.offset(1) }
         row("read_only")
     );
 }
+
+/// binn `copy_int_value` (batch-9 census, report 014): the typed-width rule
+/// delivers the callee's `psource` as `&[u8]`, and its RAW callers pass a
+/// field read (`copy_int_value((*value).ptr, ..)`) or forward their own raw
+/// parameter. Every such site must route (the raw twin, or a bridge) or the
+/// class must drop: two of the six sites kept the raw argument against the
+/// safe formal, which is `E0308` at verify — the function reverted and took
+/// its whole closure partition (50 functions, 18 delivered chain heads) with
+/// it.
+const COPY_INT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct binn { pub type_0: i32, pub ptr: *mut core::ffi::c_void }
+unsafe fn int_type(t: i32) -> i32 { if t & 0x10 != 0 { 22 } else { 11 } }
+unsafe extern "C" fn copy_int_value(mut psource: *mut core::ffi::c_void,
+    mut pdest: *mut core::ffi::c_void, mut source_type: i32,
+    mut dest_type: i32) -> i32 {
+    let mut vuint64 = 0 as i32 as u64;
+    let mut vi64 = 0 as i32 as i64;
+    match source_type {
+        33 => { vi64 = *(psource as *mut i8) as i64; }
+        65 => { vi64 = *(psource as *mut i16) as i64; }
+        97 => { vi64 = *(psource as *mut i32) as i64; }
+        129 => { vi64 = *(psource as *mut i64); }
+        32 => {
+            vuint64 = *(psource as *mut u8) as u64;
+        }
+        64 => {
+            vuint64 = *(psource as *mut u16) as u64;
+        }
+        96 => { vuint64 = *(psource as *mut u32) as u64; }
+        128 => { vuint64 = *(psource as *mut u64); }
+        _ => return 0 as i32,
+    }
+    if int_type(source_type) == 22 as i32 &&
+            int_type(dest_type) == 11 as i32 {
+        if vuint64 >
+                9223372036854775807 as i64 as u64 {
+            return 0 as i32;
+        }
+        vi64 = vuint64 as i64;
+    } else if int_type(source_type) == 11 as i32 &&
+            int_type(dest_type) == 22 as i32 {
+        if vi64 < 0 as i32 as i64 {
+            return 0 as i32;
+        }
+        vuint64 = vi64 as u64;
+    }
+    match dest_type {
+        33 => {
+            if vi64 < -(128 as i32) as i64 ||
+                    vi64 > 127 as i32 as i64 {
+                return 0 as i32;
+            }
+            *(pdest as *mut i8) = vi64 as i8;
+        }
+        65 => {
+            if vi64 <
+                        (-(32767 as i32) - 1 as i32) as
+                            i64 ||
+                    vi64 > 32767 as i32 as i64 {
+                return 0 as i32;
+            }
+            *(pdest as *mut i16) = vi64 as i16;
+        }
+        97 => {
+            if vi64 <
+                        (-(2147483647 as i32) - 1 as i32) as
+                            i64 ||
+                    vi64 > 2147483647 as i32 as i64 {
+                return 0 as i32;
+            }
+            *(pdest as *mut i32) = vi64 as i32;
+        }
+        129 => { *(pdest as *mut i64) = vi64; }
+        32 => {
+            if vuint64 > 255 as i32 as u64 {
+                return 0 as i32;
+            }
+            *(pdest as *mut u8) = vuint64 as u8;
+        }
+        64 => {
+            if vuint64 > 65535 as i32 as u64 {
+                return 0 as i32;
+            }
+            *(pdest as *mut u16) = vuint64 as u16;
+        }
+        96 => {
+            if vuint64 > 4294967295 as u32 as u64
+                {
+                return 0 as i32;
+            }
+            *(pdest as *mut u32) = vuint64 as u32;
+        }
+        128 => { *(pdest as *mut u64) = vuint64; }
+        _ => return 0 as i32,
+    }
+    return 1 as i32;
+}
+unsafe extern "C" { fn opaque_store(p: *mut core::ffi::c_void); }
+unsafe fn copy_value(mut psource: *mut core::ffi::c_void, mut pdest: *mut core::ffi::c_void, mut source_type: i32, mut dest_type: i32) -> i32 {
+    if source_type == 0 { opaque_store(psource); return 0; }
+    return copy_int_value(psource, pdest, source_type, dest_type);
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn binn_get_int32(mut value: *mut binn, mut pint: *mut i32) -> i32 {
+    if value.is_null() || pint.is_null() { return 0; }
+    return copy_int_value((*value).ptr, pint as *mut core::ffi::c_void, (*value).type_0, 0x61);
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn binn_get_double(mut value: *mut binn, mut pfloat: *mut f64) -> i32 {
+    let mut vint: i64 = 0;
+    if value.is_null() || pfloat.is_null() { return 0; }
+    if copy_int_value((*value).ptr, &mut vint as *mut i64 as *mut core::ffi::c_void, (*value).type_0, 0x81) == 0 {
+        return 0;
+    }
+    *pfloat = vint as f64;
+    1
+}
+"#;
+
+#[test]
+fn w6v2_delivered_callee_routes_every_raw_caller_site() {
+    let rows = by_function(COPY_INT);
+    let source = super::emit_tests::ast_emitted_source_of(COPY_INT).unwrap();
+    assert!(
+        super::verify::type_checks_str(&source),
+        "every raw site routes (twin or bridge) or the class drops: {rows:?}\n{source}"
+    );
+}
