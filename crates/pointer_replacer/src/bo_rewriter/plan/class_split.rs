@@ -151,6 +151,7 @@ pub(crate) mod fixture {
         pub(crate) subjects: String,
         pub(crate) arm_outcomes: String,
         pub(crate) class_collisions: String,
+        pub(crate) family_receipts: String,
         /// The delivered tree, when one is delivered. A fixture whose every
         /// ready class reverts has none, and its receipts are still the
         /// measurement (the decision table and the plan are complete before
@@ -221,6 +222,10 @@ pub(crate) mod fixture {
             subjects: capture.subject_receipt,
             arm_outcomes: capture.raw_boundary_artifacts.arm_outcomes,
             class_collisions: capture.raw_boundary_artifacts.class_collisions,
+            family_receipts: format!(
+                "{:#?}",
+                capture.raw_boundary_artifacts.additive_family_receipts
+            ),
             emitted,
             escalation: capture.escalation.clone(),
         }
@@ -739,6 +744,127 @@ pub unsafe fn check(chunk: *const u8, out: *mut u8, n: usize) {
                 "the stale original text must not be emitted:\n{tree}"
             );
         }
+    }
+
+    /// **Relay 016 build A — a local typed by its own `'static` literal.**
+    /// libtree `recurse`: `let bold_color = (if excluded { b"\x1B[0;35m\0" as
+    /// *const u8 as *const c_char } else if seen { … } else { … });` — an
+    /// unannotated local whose every initializer arm is a byte-string literal.
+    /// The ladder had no construction for it (`residual_reason` →
+    /// `copy-source-coupled`), and because the row is in the signature class it
+    /// held `recurse`'s own parameter and, through the call, `print_line`'s
+    /// class (`dependency-class-held`). The literal's referent is `'static` and
+    /// read-only, so the local is a shared reference with no extent question
+    /// and no source to wait for.
+    const STATIC_LITERAL_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+pub unsafe fn print_line(name: *const i8, color: *const i8) -> i32 {
+    (*color as i32) + (*name as i32)
+}
+pub unsafe fn recurse(name: *const i8, excluded: i32, seen: i32) -> i32 {
+    let bold_color = (if excluded != 0 {
+        b"\x1B[0;35m\0" as *const u8 as *const i8
+    } else if seen != 0 {
+        b"\x1B[0;34m\0" as *const u8 as *const i8
+    } else {
+        b"\x1B[1;36m\0" as *const u8 as *const i8
+    });
+    print_line(name, bold_color)
+}
+"#;
+
+    /// The control: one arm is NOT a literal (a parameter), so the local's type
+    /// is not knowable from its own initializer and the residue stands.
+    const MIXED_ARM_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+pub unsafe fn print_line(name: *const i8, color: *const i8) -> i32 {
+    (*color as i32) + (*name as i32)
+}
+pub unsafe fn recurse(name: *const i8, fallback: *const i8, excluded: i32) -> i32 {
+    let bold_color = (if excluded != 0 {
+        b"\x1B[0;35m\0" as *const u8 as *const i8
+    } else {
+        fallback
+    });
+    print_line(name, bold_color)
+}
+"#;
+
+    #[test]
+    fn a_static_literal_local_is_typed_by_its_own_initializer() {
+        let got = run(STATIC_LITERAL_SHAPE);
+        for key in [
+            "recurse::bold_color#4",
+            "recurse::name#1",
+            "print_line::name#1",
+            "print_line::color#2",
+        ] {
+            assert_eq!(
+                column(&got.subjects, key, "placed"),
+                "1",
+                "{key}\n{}",
+                got.subjects
+            );
+            assert_eq!(
+                column(&got.subjects, key, "exclusion"),
+                "-",
+                "{key}\n{}",
+                got.subjects
+            );
+        }
+        let text = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("let bold_color: &i8 = &*(if excluded"),
+            "{}",
+            got.tree()
+        );
+        assert!(
+            text.contains("fn print_line(name: &i8, color: &i8)"),
+            "{}",
+            got.tree()
+        );
+    }
+
+    /// The soundness control: a `*mut` local over a literal referent. A string
+    /// literal lives in read-only memory, so a mutable reference to it may not
+    /// be formed — the rule refuses the binding, and the row keeps whatever
+    /// reason the earlier gates give it (here `null-init`, since the cast
+    /// chain reaches a literal); what it may never be is a delivered `&mut`.
+    const MUTABLE_LITERAL_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+pub unsafe fn take(color: *mut i8) -> i32 { *color as i32 }
+pub unsafe fn recurse(excluded: i32) -> i32 {
+    let bold_color = b"\x1B[0;35m\0" as *const u8 as *const i8 as *mut i8;
+    take(bold_color)
+}
+"#;
+
+    #[test]
+    fn a_mutable_literal_local_is_refused() {
+        let got = run(MUTABLE_LITERAL_SHAPE);
+        assert_eq!(
+            column(&got.subjects, "recurse::bold_color#2", "decision"),
+            "degraded",
+            "a mutable binding over a literal referent may not become a reference:\n{}",
+            got.subjects
+        );
+        if let Some(tree) = got.emitted.as_deref() {
+            assert!(
+                !tree.contains("bold_color: &mut"),
+                "no mutable reference to a literal is emitted:\n{tree}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mixed_initializer_keeps_the_residue() {
+        let got = run(MIXED_ARM_SHAPE);
+        assert_eq!(
+            column(&got.subjects, "recurse::bold_color#4", "reason"),
+            "copy-source-coupled",
+            "a non-literal arm leaves the type coupled to its source:\n{}",
+            got.subjects
+        );
     }
 
     /// binn `binn_is_valid_ex(ptr, ptype, …)`: `plimit = p.offset(size)` is

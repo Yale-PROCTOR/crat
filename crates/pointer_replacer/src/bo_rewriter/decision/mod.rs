@@ -122,6 +122,7 @@ pub(crate) mod slice_passon;
 pub(crate) mod slice_return_evidence;
 pub(crate) mod slice_scalar_return;
 pub(crate) mod slice_use;
+pub(crate) mod source_typed_local;
 pub(crate) mod surface_argument;
 pub(crate) mod thin_counted;
 pub(crate) mod thin_counted_entropy;
@@ -2375,6 +2376,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         );
         if subject.ty_span.is_none()
             && !construction_values::permits(ctx, subject)
+            && !source_typed_local::permits(ctx, subject)
             && !slice_construction_values::permits(ctx, subject)
             && !raw_place_values::permits(ctx, subject, subject.mutable)
             && !literal_construction

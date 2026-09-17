@@ -134,6 +134,12 @@ pub(super) fn settle(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) {
             if subject.ty_span.is_some() || plain_reference(decision).is_none() {
                 return None;
             }
+            // wave-5d2: a local this lane does not type may still be typed by
+            // its own initializer's value (`source_typed_local`); it is not a
+            // refusal of THIS rule.
+            if super::source_typed_local::permits(ctx, subject) {
+                return None;
+            }
             let value = copy_value(ctx.tcx, subject)?;
             let source = entries
                 .iter()
