@@ -524,6 +524,33 @@ pub(crate) fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
     }
 }
 
+/// R451: the `T` of a `size_of::<T>()` call written as this expression, under
+/// any casts and grouping. Read from the call's own instantiation, so a type
+/// alias (`pub type binn = binn_struct`) resolves exactly as the operand's
+/// pointee does and the two are comparable as types.
+fn size_of_type_argument<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expr: &Expr<'_>,
+) -> Option<rustc_middle::ty::Ty<'tcx>> {
+    let ExprKind::Call(callee, arguments) = peel_casts(expr).kind else {
+        return None;
+    };
+    if !arguments.is_empty() {
+        return None;
+    }
+    let rustc_middle::ty::TyKind::FnDef(definition, args) = *typeck.expr_ty(callee).kind() else {
+        return None;
+    };
+    if !matches!(
+        tcx.def_path_str(definition).as_str(),
+        "std::mem::size_of" | "core::mem::size_of"
+    ) {
+        return None;
+    }
+    args.types().next()
+}
+
 fn direct_mutable_storage(expr: &Expr<'_>) -> Option<(HirId, Span)> {
     let peeled = peel_casts(expr);
     let ExprKind::AddrOf(_, Mutability::Mut, storage) = peeled.kind else {
@@ -1110,11 +1137,20 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             format!("({}) * ({expression})", size_text.trim());
                                     }
                                 }
+                                let one_pointee = contract.size_argument_index.is_none()
+                                    && match typeck.expr_ty(peel_casts(arg)).kind() {
+                                        rustc_middle::ty::TyKind::RawPtr(pointee, _) => {
+                                            size_of_type_argument(self.tcx, typeck, count)
+                                                == Some(*pointee)
+                                        }
+                                        _ => false,
+                                    };
                                 Some(super::raw_boundary::ContractCountOperandFact {
                                     argument_index: count_index,
                                     span: count.span,
                                     expression,
                                     exact: contract.count_is_exact,
+                                    one_pointee,
                                 })
                             });
                             let return_unused = match self.tcx.parent_hir_node(expr.hir_id) {

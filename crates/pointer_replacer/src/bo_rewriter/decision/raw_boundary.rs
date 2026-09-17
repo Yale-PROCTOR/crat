@@ -670,6 +670,12 @@ pub(crate) struct ContractCountOperandFact {
     pub argument_index: usize,
     pub span: Span,
     pub expression: String,
+    /// R451: the count is exactly `size_of::<T>()` (under its casts) with `T`
+    /// the SAME TYPE as this argument's own pointee — decided on the types,
+    /// never on their spellings, because the count names the type as the call's
+    /// module sees it (`binn`, a C2Rust alias) while a printed pointee is the
+    /// resolved item (`src::binn::binn_struct`).
+    pub one_pointee: bool,
     /// The contract describes the whole range rather than an upper limit.
     /// Units and typed construction validity remain separate decision gates.
     pub exact: bool,

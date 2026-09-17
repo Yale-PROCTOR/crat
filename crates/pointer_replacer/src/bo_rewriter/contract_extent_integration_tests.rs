@@ -1768,3 +1768,45 @@ fn ce_a05_a_sibling_borrowed_through_a_deref_keeps_the_pending_hold() {
     let source = emitted(CE_A05_ADDR_THROUGH_DEREF_SIBLING);
     assert!(!source.contains("name: &[i8]"), "{source}");
 }
+
+/// R451 (batch 10): binn's `memset(value as *mut c_void, 0, size_of::<binn>())`
+/// where `pub type binn = binn_struct` — C2Rust's own spelling. The count names
+/// the ALIAS while the operand's pointee prints the resolved struct, so a name
+/// comparison misses and the one-element refinement failed to fire: the four
+/// binn rows that joined the thin-extent bucket at batch 10.
+const CE_M07_ALIASED_POINTEE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+pub mod src {
+    pub mod binn {
+        extern "C" {
+            fn memset(_: *mut core::ffi::c_void, _: i32, _: u64) -> *mut core::ffi::c_void;
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct binn_struct {
+            pub header: i32,
+            pub count: i32,
+        }
+        pub type binn = binn_struct;
+        pub unsafe fn binn_load(mut value: *mut binn) -> i32 {
+            memset(value as *mut core::ffi::c_void, 0 as i32,
+                ::std::mem::size_of::<binn>() as u64);
+            (*value).header = 1;
+            (*value).count
+        }
+    }
+}
+"#;
+
+#[test]
+fn ce_m07_an_aliased_pointee_still_reads_as_one_element() {
+    let decisions = super::emit_tests::decisions_of(CE_M07_ALIASED_POINTEE);
+    let value = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "value" && *is_param)
+        .expect("CE-M07 value subject");
+    assert_eq!(value.2, "<emitted>", "{decisions:#?}");
+    let source = emitted(CE_M07_ALIASED_POINTEE);
+    assert!(source.contains("value: &mut binn"), "{source}");
+    assert!(!source.contains("[binn]"), "{source}");
+}

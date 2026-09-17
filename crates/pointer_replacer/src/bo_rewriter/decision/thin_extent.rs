@@ -67,44 +67,9 @@ pub(crate) fn position_consumes_many_elements(
 /// comparison the refinement missed every corpus site and libtree's
 /// `small_vec_u64_init::v#1` lost its delivery.
 pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallArgFact) -> bool {
-    let Some(count) = &fact.contract_count else { return false };
-    let pointee = fact.operand_pointee.trim().trim_start_matches("::");
-    if pointee.is_empty() || pointee == "c_void" || pointee.ends_with("::c_void") {
-        return false;
-    }
-    let pointee = pointee.rsplit("::").next().unwrap_or(pointee);
-    let mut spelling = count.expression.split_whitespace().collect::<String>();
-    // Peel the trailing `as <ty>` casts and grouping parentheses C2Rust
-    // wraps a `size_of` in.
-    loop {
-        if let Some((head, _)) = spelling.rsplit_once("as")
-            && head.ends_with(')')
-        {
-            spelling = head.to_owned();
-        } else if spelling.starts_with('(') && spelling.ends_with(')') && spelling.len() > 2 {
-            spelling = spelling[1..spelling.len() - 1].to_owned();
-        } else {
-            break;
-        }
-    }
-    let spelling = spelling.as_str();
-    [
-        "::std::mem::size_of::<",
-        "std::mem::size_of::<",
-        "::core::mem::size_of::<",
-        "core::mem::size_of::<",
-        "size_of::<",
-    ]
-    .iter()
-    .any(|prefix| {
-        spelling
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix(">()"))
-            .is_some_and(|argument| {
-                let argument = argument.trim_start_matches("::");
-                !argument.is_empty() && argument.rsplit("::").next().unwrap_or(argument) == pointee
-            })
-    })
+    fact.contract_count
+        .as_ref()
+        .is_some_and(|count| count.one_pointee)
 }
 
 /// Subjects that reach such a position. A subject in this set may not take a
