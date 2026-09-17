@@ -37,6 +37,18 @@ fn emit_with_receipts(input: &str) -> (String, String) {
             );
         }
         let mut plans = String::new();
+        // A compact, assertable decision line per subject: the emitted form, or
+        // `degraded:<reason>`. A witness of a wall that MOVES (one family's
+        // blocker replaced by another's) needs the reason, not only the text.
+        for (subject, decision) in &table.entries {
+            let state = match decision {
+                super::decision::Decision::Degraded(record) => {
+                    format!("degraded:{}", record.reason.key())
+                }
+                other => super::decision::seam::form_of(other).key().to_owned(),
+            };
+            plans.push_str(&format!("DECISION-KV {} {state}\n", subject.label));
+        }
         for plan in &table.slice_use_receipts {
             println!("SLICE-USE-RECEIPT {plan:#?}");
             plans.push_str(&format!(
@@ -614,4 +626,87 @@ fn wave6s2_computed_view_at_a_fn_pointer_argument_delivers_the_slice() {
         "the computed view at the indirect argument: {source}"
     );
     assert!(receipts.contains("retention=T2"), "{receipts}");
+}
+
+// ---------------------------------------------------------------------------
+// W6S2-5 — the destination of a computed view copied by ASSIGNMENT
+// (`decision/slice_passon.rs`).
+// ---------------------------------------------------------------------------
+
+/// **Witness (brotli `BrotliFindAllStaticDictionaryMatches::s#61`, `s_0`,
+/// `s_1`, `s_2` — four sole rows ENABLED at the batch-9 frame, and lodepng
+/// `addChunk_IHDR::data#9`).** The source `data` delivers and its edit is the
+/// checked suffix; the DESTINATION saw the assignment as an unsupported use
+/// and stayed raw.
+const ASSIGN_COMPUTED_VIEW_DESTINATION: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe fn FindMatches(mut data: *const u8, max_length: usize, mut out: *mut u32) -> i32 {
+    let mut s = 0 as *const u8;
+    let mut l: usize = 0;
+    let mut found = 0;
+    while l < max_length {
+        if *data.offset(l as isize) as i32 == ' ' as i32 { l = l.wrapping_add(1); continue; }
+        s = &*data.offset(l as isize) as *const u8;
+        if *s.offset(0 as isize) as i32 == 'a' as i32 { *out.offset(found as isize) = l as u32; found += 1; }
+        if *s.offset(1 as isize) as i32 == 'b' as i32 { found += 1; }
+        l = l.wrapping_add(1);
+    }
+    found
+ }
+"#;
+
+#[test]
+fn wave6s2_assignment_destination_of_a_computed_view_is_in_scope() {
+    let (source, receipts) = emit_with_receipts(ASSIGN_COMPUTED_VIEW_DESTINATION);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("mut data: &[u8]"),
+        "the source delivers: {source}"
+    );
+    // The wall MOVES: the assignment target is in scope, so the destination is
+    // no longer held by the slice-use wall; what remains is its
+    // null-initialised declaration — wave-6o's Option family — and until that
+    // lands the source keeps rendering its raw view for the raw destination.
+    assert!(
+        receipts.contains("DECISION-KV FindMatches::s degraded:null-init"),
+        "the destination's blocker is now the null-init declaration: {receipts}"
+    );
+    assert!(
+        !receipts.contains("DECISION-KV FindMatches::s degraded:slice-use-unsupported"),
+        "{receipts}"
+    );
+    assert!(
+        joined(&source).contains("s = (&(data)[l..]).as_ptr()"),
+        "the source's view is still rendered for the raw destination: {source}"
+    );
+}
+
+/// **Control.** A BACKWARD assignment (`p = q.offset(-k)`) is the
+/// bidirectional family's (R394-2) and stays out of scope; a self-advance
+/// stays the classifier's own arm.
+const ASSIGN_BACKWARD_DESTINATION: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe fn Walk(mut data: *const u8, n: usize) -> u8 {
+    let mut s = 0 as *const u8;
+    let mut acc = 0u8;
+    let mut l: usize = 1;
+    while l < n {
+        acc = acc.wrapping_add(*data.offset(l as isize));
+        s = &*data.offset((l as isize) + (-1 as isize)) as *const u8;
+        acc = acc.wrapping_add(*s.offset(0 as isize));
+        l = l.wrapping_add(1);
+    }
+    acc
+ }
+"#;
+
+#[test]
+fn wave6s2_backward_assignment_destination_stays_out_of_scope() {
+    let (source, receipts) = emit_with_receipts(ASSIGN_BACKWARD_DESTINATION);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut s = 0 as *const u8"), "{source}");
+    assert!(
+        receipts.contains("DECISION-KV Walk::s degraded:slice-use-unsupported"),
+        "a backward assignment keeps the use wall: {receipts}"
+    );
 }

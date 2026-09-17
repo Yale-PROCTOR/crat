@@ -2492,6 +2492,13 @@ fn collect_slice_uses_with_family(
             if let ExprKind::Assign(lhs, rhs, _) = &call.kind
                 && lhs.hir_id == use_expr.hir_id
             {
+                // wave-6s2 (W6S2-5): the destination of a forward computed view
+                // copied by assignment is in scope and needs no edit of its
+                // own — the right-hand side is the source's (or the Option
+                // value planner's) to render.
+                if super::slice_passon::assignment_from_computed_view(self.tcx, use_expr, key) {
+                    return Some(None);
+                }
                 if !self.advance_ok.contains(&key) {
                     return None;
                 }
