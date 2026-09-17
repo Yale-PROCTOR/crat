@@ -335,6 +335,77 @@ fn r299_2_an_absent_render_is_stated_as_absent_not_reconstructed() {
 /// `kmRay2IntersectBox` (class-mate of `kmRay2IntersectLineSegment`, the one
 /// path the artifact carried) and 24 more rows, which failed the program's
 /// delivery custody by themselves.
+/// R451-2(2). The three derived columns a root table needs: the SUBJECT the
+/// class took with it, the ROOT that drove a `closure:partition` member, and the
+/// attribution's HEAD. Without the root column heman's 63 partition reverts sit
+/// on an empty compiler-diagnostics table with nothing pointing at their cause
+/// (ownership-fields 037 STOP 1); without the head every reader re-derives the
+/// same projection by hand.
+#[test]
+fn r451_2_final_reverts_carry_named_subject_partition_root_and_reason_head() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+
+    let class = SignatureClassId::of(rustc_hir::def_id::LocalDefId {
+        local_def_index: rustc_hir::def_id::DefIndex::from_u32(352),
+    });
+    let withheld = BTreeSet::from([class]);
+    let display = BTreeMap::from([(class, "src::p::member".to_owned())]);
+    let named = BTreeMap::from([(class, BTreeSet::from(["src::p::member::out#3".to_owned()]))]);
+    let reasons = BTreeMap::from([(
+        class,
+        BTreeSet::from([
+            "callee-parameter-input-unavailable:class=118:arg=0..1:root-reverted".to_owned(),
+        ]),
+    )]);
+    let receipt = crate::bo_rewriter::render_raw_boundary_final_reverts(
+        &withheld,
+        &BTreeSet::new(),
+        &named,
+        &reasons,
+        &display,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+        None,
+    );
+    let header = receipt.lines().next().expect("a header");
+    assert_eq!(
+        header,
+        "kind\tidentity\tclass_id\tattribution\tnamed_subject\tpartition_root\treason_head"
+    );
+    let row = receipt
+        .lines()
+        .nth(1)
+        .expect("one row")
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(row[3], "closure:partition", "{receipt}");
+    assert_eq!(row[4], "src::p::member::out#3", "{receipt}");
+    assert_eq!(
+        row[5], "callee-parameter-input-unavailable:class=118:arg=0..1:root-reverted",
+        "the root that drove the partition member is named: {receipt}"
+    );
+    assert_eq!(row[6], "closure:partition", "{receipt}");
+
+    // The head is a projection, not a second classification: the class ids and
+    // site details that make a hold row unique are stripped, the cause is not.
+    assert_eq!(
+        crate::bo_rewriter::raw_boundary_reason_head("held:dependency-class-held:1107"),
+        "dependency-class-held"
+    );
+    assert_eq!(
+        crate::bo_rewriter::raw_boundary_reason_head(
+            "held:dropped-site:seam-site-overlap:seam-site-overlap"
+        ),
+        "dropped-site"
+    );
+    assert_eq!(
+        crate::bo_rewriter::raw_boundary_reason_head("verify-reverted"),
+        "verify-reverted"
+    );
+}
+
 #[test]
 fn r430_final_reverts_name_every_owner_of_a_withheld_class() {
     use std::collections::{BTreeMap, BTreeSet};
@@ -371,6 +442,8 @@ fn r430_final_reverts_name_every_owner_of_a_withheld_class() {
     let receipt = crate::bo_rewriter::render_raw_boundary_final_reverts(
         &withheld,
         &BTreeSet::new(),
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
         &display,
         &owners,
         &withheld,
@@ -401,6 +474,8 @@ fn r430_final_reverts_name_every_owner_of_a_withheld_class() {
     let bare = crate::bo_rewriter::render_raw_boundary_final_reverts(
         &withheld,
         &BTreeSet::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
         &display,
         &BTreeMap::new(),
         &withheld,
@@ -420,6 +495,8 @@ fn r430_final_reverts_name_every_owner_of_a_withheld_class() {
     let unknown = crate::bo_rewriter::render_raw_boundary_final_reverts(
         &withheld,
         &BTreeSet::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
         &withheld,

@@ -576,6 +576,8 @@ mod tests {
                     let receipt = super::super::render_raw_boundary_final_reverts(
                         &reverted,
                         &BTreeSet::new(),
+                        &BTreeMap::new(),
+                        &BTreeMap::new(),
                         &labels,
                         &BTreeMap::new(),
                         &reverted,

@@ -1601,6 +1601,34 @@ fn round_files(
 /// need: DEFERRED-KILLER(R291-5) (the delivery partition takes the effective
 /// set) and DEFERRED-KILLER(R306-1c) (the receipts are derived against the same
 /// set) are both statements about this function's result.
+/// **R451-2(2).** The withheld set together with WHY each member that is not a
+/// root entered it. The closure already records that -- `input_reversion_closure`
+/// returns a reason per class, naming the class and argument whose input became
+/// unavailable -- and it was being discarded one call above the artifact that
+/// needs it. `final-reverts` carries it as `partition_root`, so a lane reading a
+/// `closure:partition` row is not left to guess which verify-revert drove it
+/// (heman's 63 partition reverts sit on an EMPTY compiler-diagnostics table:
+/// ownership-fields 037 STOP 1, wave-6b 016).
+pub(crate) fn effective_withheld_classes_with_reasons(
+    emission_plan: &plan::Plan,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
+) -> (
+    std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
+) {
+    let effective = effective_withheld_classes(emission_plan, reverted, reverted_atoms);
+    let mut withheld = reverted.clone();
+    withheld.extend(emission_plan.held_classes());
+    let (_, reasons) = emission_plan
+        .terminal_call_plans
+        .input_reversion_closure(&withheld, reverted_atoms);
+    (effective, reasons)
+}
+
 pub(crate) fn effective_withheld_classes(
     emission_plan: &plan::Plan,
     reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
@@ -2354,8 +2382,8 @@ fn verify_and_revert(
             // already retired — urlparser's `url_get_query::url#1`, whose
             // parameter stayed `*mut libc::c_char` because `url_get_search` was
             // reverted, while the ledger still called it placed.
-            let effective_reverted =
-                effective_withheld_classes(&emission_plan, &reverted, &reverted_atoms);
+            let (effective_reverted, partition_reasons) =
+                effective_withheld_classes_with_reasons(&emission_plan, &reverted, &reverted_atoms);
             let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects.iter().partition(|subject| {
                 !effective_reverted.contains(&subject.owner_class)
                     && subject
@@ -2376,9 +2404,12 @@ fn verify_and_revert(
             facts.emitted_count = kept.len();
             facts.reverted_count = taken.len();
             facts.files_touched = files_edited;
+            let named_subjects = reverted_named_subjects(&taken);
             facts.raw_boundary_artifacts.final_reverts = render_raw_boundary_final_reverts(
                 &effective_reverted,
                 &reverted_atoms,
+                &named_subjects,
+                &partition_reasons,
                 &class_paths,
                 &class_owner_paths,
                 &reverted,
@@ -2838,9 +2869,14 @@ fn verify_and_revert(
             facts.files_touched = final_edited;
             facts.bisect_probes = probes;
             facts.escalated = Some(escalation);
+            let (_, partition_reasons) =
+                effective_withheld_classes_with_reasons(&emission_plan, &reverted, &reverted_atoms);
+            let named_subjects = reverted_named_subjects(&taken);
             facts.raw_boundary_artifacts.final_reverts = render_raw_boundary_final_reverts(
                 &final_reverted,
                 &reverted_atoms,
+                &named_subjects,
+                &partition_reasons,
                 &class_paths,
                 &class_owner_paths,
                 &reverted,
@@ -3998,9 +4034,51 @@ fn atom_fallback(reason: &'static str) -> AtomSelection {
 /// is the planning-time closure) or `closure:partition` (reached only by the
 /// input-reversion closure at the partition). The first two columns are the
 /// ones every consumer parses.
+/// R451-2(2). The head of a final-reverts attribution: the cause a root table
+/// groups by, with the class ids and site details that make each row unique
+/// stripped. `held:dependency-class-held:1107` -> `dependency-class-held`,
+/// `held:dropped-site:seam-site-overlap:seam-site-overlap` -> `dropped-site`,
+/// `closure:partition` and `verify-reverted` are their own heads. Derived, never
+/// stored: the projection is the same one main's re-itemizer has applied to
+/// every batch's non-delivered table.
+/// R451-2(2). The subjects each withheld class actually took with it, as the
+/// lanes name them. One row per owner path already; this is the other half a
+/// reader needs to recognise the row without joining the subject ledger.
+fn reverted_named_subjects(
+    taken: &[&EmittedSubject],
+) -> std::collections::BTreeMap<bridge_receipt::SignatureClassId, std::collections::BTreeSet<String>>
+{
+    let mut out = std::collections::BTreeMap::<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >::new();
+    for subject in taken {
+        out.entry(subject.owner_class)
+            .or_default()
+            .insert(subject.subject.clone());
+    }
+    out
+}
+
+pub(crate) fn raw_boundary_reason_head(attribution: &str) -> String {
+    match attribution.split_once(':') {
+        Some(("held", rest)) => rest.split(':').next().unwrap_or(rest).to_owned(),
+        Some(("closure", _)) | None => attribution.to_owned(),
+        Some((head, _)) => head.to_owned(),
+    }
+}
+
 fn render_raw_boundary_final_reverts(
     functions: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     atoms: &std::collections::BTreeSet<String>,
+    named_subjects: &std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
+    partition_reasons: &std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
     display_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
     owner_paths: &std::collections::BTreeMap<
         bridge_receipt::SignatureClassId,
@@ -4009,7 +4087,13 @@ fn render_raw_boundary_final_reverts(
     verify_reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     emission_plan: Option<&plan::Plan>,
 ) -> String {
-    let mut out = String::from("kind\tidentity\tclass_id\tattribution\n");
+    // R451-2(2): three derived columns so the root table reads without a join —
+    // the subject a lane recognises, the root that drove a partition member, and
+    // the attribution's head (`reason` itself is a production key and is never
+    // overloaded: main report 046 §6, accepted).
+    let mut out = String::from(
+        "kind\tidentity\tclass_id\tattribution\tnamed_subject\tpartition_root\treason_head\n",
+    );
     for &function in functions {
         // **R430-1 — one row per OWNER PATH of the withheld class.** The census
         // marks a subject reverted by its owner path; a class-mate this
@@ -4038,15 +4122,29 @@ fn render_raw_boundary_final_reverts(
         } else {
             "closure:partition".to_owned()
         };
+        let named = named_subjects
+            .get(&function)
+            .filter(|subjects| !subjects.is_empty())
+            .map_or_else(
+                || "-".to_owned(),
+                |subjects| subjects.iter().cloned().collect::<Vec<_>>().join(" "),
+            );
+        let root = partition_reasons
+            .get(&function)
+            .and_then(|reasons| reasons.iter().next().cloned())
+            .unwrap_or_else(|| "-".to_owned());
+        let head = raw_boundary_reason_head(&attribution);
         for path in owners {
             out.push_str(&format!(
-                "function\t{path}\tlocal-def-index:{}\t{attribution}\n",
+                "function\t{path}\tlocal-def-index:{}\t{attribution}\t{named}\t{root}\t{head}\n",
                 function.order_key()
             ));
         }
     }
     for atom in atoms {
-        out.push_str(&format!("atom\t{atom}\t-\tatom-reverted\n"));
+        out.push_str(&format!(
+            "atom\t{atom}\t-\tatom-reverted\t-\t-\tatom-reverted\n"
+        ));
     }
     out
 }
