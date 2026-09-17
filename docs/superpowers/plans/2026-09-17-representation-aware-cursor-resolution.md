@@ -1439,7 +1439,8 @@ git commit -m "test(pointer): cover late cursor resolution end to end"
 
 **Files:**
 - Verify: all files changed in Tasks 1–9.
-- Generate: a fresh `/home/ubuntu/crat-workspace/transformed-cursor-resolution.*`.
+- Generate: a fresh `/home/ubuntu/crat-workspace/transformed-cursor-resolution.*` and `/tmp/crat-cursor-validation.*` evidence directory.
+- Clone: isolated public and hidden corpus worktrees inside a fresh `/tmp/crat-cursor-harness.*`.
 - Do not modify: `/home/ubuntu/crat-workspace/transformed`.
 
 **Interfaces:**
@@ -1448,7 +1449,7 @@ git commit -m "test(pointer): cover late cursor resolution end to end"
 - [ ] **Step 1: Run repository checks**
 
 ```bash
-cargo fmt
+cargo fmt --check
 cargo clippy --workspace --all-targets
 git diff --check
 cargo test --workspace
@@ -1461,285 +1462,425 @@ Expected: all commands exit zero.
 Run from the implementation checkout:
 
 ```bash
+CURSOR_CHECKOUT="$(pwd -P)"
 CURSOR_HARNESS="$(mktemp -d /tmp/crat-cursor-harness.XXXXXX)"
 CURSOR_OUT="$(mktemp -d \
   /home/ubuntu/crat-workspace/transformed-cursor-resolution.XXXXXX)"
+CURSOR_EVIDENCE="$(mktemp -d /tmp/crat-cursor-validation.XXXXXX)"
 
 cp -a /home/ubuntu/crat-workspace/scripts "$CURSOR_HARNESS/scripts"
-ln -s "$(pwd -P)" "$CURSOR_HARNESS/crat"
+ln -s "$CURSOR_CHECKOUT" "$CURSOR_HARNESS/crat"
 ln -s /home/ubuntu/crat-workspace/c2rust-translated \
   "$CURSOR_HARNESS/c2rust-translated"
-ln -s /home/ubuntu/crat-workspace/Test-Corpus \
+git clone --local --no-hardlinks \
+  /home/ubuntu/crat-workspace/Test-Corpus \
   "$CURSOR_HARNESS/Test-Corpus"
-ln -s /home/ubuntu/crat-workspace/PUBLIC-Test-Corpus \
+git clone --local --no-hardlinks \
+  /home/ubuntu/crat-workspace/PUBLIC-Test-Corpus \
   "$CURSOR_HARNESS/PUBLIC-Test-Corpus"
 
 ln -sfn "$CURSOR_HARNESS" /tmp/crat-cursor-harness-current
 ln -sfn "$CURSOR_OUT" /tmp/crat-cursor-output-current
+ln -sfn "$CURSOR_EVIDENCE" /tmp/crat-cursor-evidence-current
 
-test "$(readlink -f "$CURSOR_HARNESS/crat")" = "$(pwd -P)"
+test "$(readlink -f "$CURSOR_HARNESS/crat")" = "$CURSOR_CHECKOUT"
+test "$(readlink -f "$CURSOR_HARNESS/c2rust-translated")" = \
+  /home/ubuntu/crat-workspace/c2rust-translated
+test ! -L "$CURSOR_HARNESS/Test-Corpus"
+test ! -L "$CURSOR_HARNESS/PUBLIC-Test-Corpus"
+test -z "$(git -C "$CURSOR_HARNESS/Test-Corpus" status --short)"
+test -z "$(git -C "$CURSOR_HARNESS/PUBLIC-Test-Corpus" status --short)"
+
 cd "$CURSOR_HARNESS"
-PYTHONPATH=scripts python3 -c \
-  'import transform; print(transform._crat_dir().resolve())'
+env -u DEBUG PYTHONPATH=scripts python3 -c \
+  'import os, transform; assert "DEBUG" not in os.environ; print(transform._crat_dir().resolve())'
 ```
 
-Expected: the final command prints the implementation checkout, not `/home/ubuntu/crat-workspace/crat`.
+Expected: the final command prints the implementation checkout, not
+`/home/ubuntu/crat-workspace/crat`. `c2rust-translated` remains an input-only
+symlink; the two corpus repositories are independent clones because `test.py`,
+`test_all.py`, and the unsafe scripts write `translated_rust`, runner build
+artifacts, and `unsafe.txt`.
 
 All corpus-script tool calls must use `sandbox_permissions=require_escalated`.
+Never run `scripts/translate.py` or `scripts/translate_all.py`, never access
+`aws-translate` or `bundles`, and never pass the immutable baseline as a
+transform output. Preserve the fresh harness, output, and evidence directories
+until the evidence has been reviewed.
 
 - [ ] **Step 3: Record targeted baseline vector status**
 
 ```bash
 CURSOR_HARNESS="$(readlink -f /tmp/crat-cursor-harness-current)"
+CURSOR_EVIDENCE="$(readlink -f /tmp/crat-cursor-evidence-current)"
 cd "$CURSOR_HARNESS"
 
-python3 scripts/test.py \
-  /home/ubuntu/crat-workspace/transformed \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B01_organic/merge_sort_lib \
-  --verbose
-python3 scripts/test.py \
-  /home/ubuntu/crat-workspace/transformed \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/fallcalc_lib \
-  --verbose
-python3 scripts/test.py \
-  /home/ubuntu/crat-workspace/transformed \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_organic/pinflate_lib \
-  --verbose
-python3 scripts/test.py \
-  /home/ubuntu/crat-workspace/transformed \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/gotomach_lib \
-  --verbose
+set -euo pipefail
+CURSOR_CASES=(
+  B01_organic/merge_sort_lib
+  B02_synthetic/fallcalc_lib
+  B02_organic/pinflate_lib
+  B02_synthetic/gotomach_lib
+)
+for CURSOR_CASE in "${CURSOR_CASES[@]}"; do
+  CURSOR_NAME="${CURSOR_CASE##*/}"
+  python3 scripts/test.py \
+    /home/ubuntu/crat-workspace/transformed \
+    "$CURSOR_HARNESS/Test-Corpus/Public-Tests/$CURSOR_CASE" \
+    --verbose 2>&1 | tee "$CURSOR_EVIDENCE/target-baseline-$CURSOR_NAME.log"
+  sed -E $'s/\x1B\\[[0-9;]*m//g' \
+    "$CURSOR_EVIDENCE/target-baseline-$CURSOR_NAME.log" | rg -n -- \
+    '^- Test (Cases Failed|Vectors Passed|Vectors Skipped|Vectors Failed):' \
+    /dev/stdin
+done
 ```
 
-Record pre-existing failures.
+Record the printed summaries and any pre-existing failures. A zero Python exit
+code is not sufficient: `test.py` suppresses the runner exit code, so the
+summary lines are the evidence.
 
 - [ ] **Step 4: Transform targeted cases through Pointer**
 
 ```bash
 CURSOR_HARNESS="$(readlink -f /tmp/crat-cursor-harness-current)"
+CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
+CURSOR_EVIDENCE="$(readlink -f /tmp/crat-cursor-evidence-current)"
 cd "$CURSOR_HARNESS"
 
-CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
-CRAT_POINTER_DECISION_DIAGNOSTICS=full \
-python3 scripts/transform.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B01_organic/merge_sort_lib \
-  pointer --run-dependencies
-CRAT_POINTER_DECISION_DIAGNOSTICS=full \
-python3 scripts/transform.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/fallcalc_lib \
-  pointer --run-dependencies
-CRAT_POINTER_DECISION_DIAGNOSTICS=full \
-python3 scripts/transform.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_organic/pinflate_lib \
-  pointer --run-dependencies
-CRAT_POINTER_DECISION_DIAGNOSTICS=full \
-python3 scripts/transform.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/gotomach_lib \
-  pointer --run-dependencies
+set -euo pipefail
+CURSOR_CASES=(
+  B01_organic/merge_sort_lib
+  B02_synthetic/fallcalc_lib
+  B02_organic/pinflate_lib
+  B02_synthetic/gotomach_lib
+)
+for CURSOR_CASE in "${CURSOR_CASES[@]}"; do
+  CURSOR_NAME="${CURSOR_CASE##*/}"
+  env -u DEBUG CRAT_POINTER_DECISION_DIAGNOSTICS=full \
+    python3 scripts/transform.py "$CURSOR_OUT" \
+    "$CURSOR_HARNESS/Test-Corpus/Public-Tests/$CURSOR_CASE" \
+    pointer --run-dependencies 2>&1 | \
+    tee "$CURSOR_EVIDENCE/target-pointer-$CURSOR_NAME.log"
+done
+
+test -x "$(readlink -f "$CURSOR_HARNESS/crat")/target/release/crat"
 ```
 
-Expected: all four succeed.
+Expected: all four succeed using the release binary built from the isolated
+checkout. Every transform command in this task uses `env -u DEBUG`: the scripts
+select debug mode by variable presence, so `DEBUG=release` would still select
+`target/debug/crat`.
 
 - [ ] **Step 5: Inspect Pointer diffs**
 
 ```bash
 CURSOR_HARNESS="$(readlink -f /tmp/crat-cursor-harness-current)"
+CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
+CURSOR_EVIDENCE="$(readlink -f /tmp/crat-cursor-evidence-current)"
 cd "$CURSOR_HARNESS"
 
-CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
-diff -ru \
-  /home/ubuntu/crat-workspace/transformed/pointer/Public-Tests/B01_organic/merge_sort_lib \
-  "$CURSOR_OUT/pointer/Public-Tests/B01_organic/merge_sort_lib"
-diff -ru \
-  /home/ubuntu/crat-workspace/transformed/pointer/Public-Tests/B02_synthetic/fallcalc_lib \
-  "$CURSOR_OUT/pointer/Public-Tests/B02_synthetic/fallcalc_lib"
-diff -ru \
-  /home/ubuntu/crat-workspace/transformed/pointer/Public-Tests/B02_organic/pinflate_lib \
-  "$CURSOR_OUT/pointer/Public-Tests/B02_organic/pinflate_lib"
-diff -ru \
-  /home/ubuntu/crat-workspace/transformed/pointer/Public-Tests/B02_synthetic/gotomach_lib \
-  "$CURSOR_OUT/pointer/Public-Tests/B02_synthetic/gotomach_lib"
+CURSOR_CASES=(
+  B01_organic/merge_sort_lib
+  B02_synthetic/fallcalc_lib
+  B02_organic/pinflate_lib
+  B02_synthetic/gotomach_lib
+)
+for CURSOR_CASE in "${CURSOR_CASES[@]}"; do
+  CURSOR_NAME="${CURSOR_CASE##*/}"
+  diff -ru \
+    "/home/ubuntu/crat-workspace/transformed/pointer/Public-Tests/$CURSOR_CASE" \
+    "$CURSOR_OUT/pointer/Public-Tests/$CURSOR_CASE" \
+    > "$CURSOR_EVIDENCE/target-pointer-diff-$CURSOR_NAME.log" || \
+    test "$?" -eq 1
+done
 ```
 
-`diff` exit 1 is expected for intentional changes. Verify:
+`diff` exit 1 is expected for intentional changes. Inspect every saved diff and
+verify:
 
 - `merge_sort`: helpers raw; exposed inputs `&mut [spritebatch_sprite_t]`.
 - `fallcalc`: reverse-walk parameter and `last_element` remain cursors.
 - `pinflate`: cursor field remains protected.
 - `gotomach`: function-pointer signature is unchanged.
 
-- [ ] **Step 6: Transform through Bin and run targeted vectors**
+- [ ] **Step 6: Run remaining targeted passes and compare vectors**
 
 ```bash
 CURSOR_HARNESS="$(readlink -f /tmp/crat-cursor-harness-current)"
+CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
+CURSOR_EVIDENCE="$(readlink -f /tmp/crat-cursor-evidence-current)"
 cd "$CURSOR_HARNESS"
 
-CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
-python3 scripts/transform.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B01_organic/merge_sort_lib \
-  bin --run-dependencies
-python3 scripts/transform.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/fallcalc_lib \
-  bin --run-dependencies
-python3 scripts/transform.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_organic/pinflate_lib \
-  bin --run-dependencies
-python3 scripts/transform.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/gotomach_lib \
-  bin --run-dependencies
+set -euo pipefail
+CURSOR_CASES=(
+  B01_organic/merge_sort_lib
+  B02_synthetic/fallcalc_lib
+  B02_organic/pinflate_lib
+  B02_synthetic/gotomach_lib
+)
+for CURSOR_PASS in io libc static simpl interface unsafe unexpand split bin; do
+  for CURSOR_CASE in "${CURSOR_CASES[@]}"; do
+    CURSOR_NAME="${CURSOR_CASE##*/}"
+    env -u DEBUG python3 scripts/transform.py "$CURSOR_OUT" \
+      "$CURSOR_HARNESS/Test-Corpus/Public-Tests/$CURSOR_CASE" \
+      "$CURSOR_PASS" 2>&1 | \
+      tee "$CURSOR_EVIDENCE/target-$CURSOR_PASS-$CURSOR_NAME.log"
+  done
+done
 
-python3 scripts/test.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B01_organic/merge_sort_lib \
-  --verbose
-python3 scripts/test.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/fallcalc_lib \
-  --verbose
-python3 scripts/test.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_organic/pinflate_lib \
-  --verbose
-python3 scripts/test.py "$CURSOR_OUT" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/gotomach_lib \
-  --verbose
+for CURSOR_CASE in "${CURSOR_CASES[@]}"; do
+  CURSOR_NAME="${CURSOR_CASE##*/}"
+  python3 scripts/test.py "$CURSOR_OUT" \
+    "$CURSOR_HARNESS/Test-Corpus/Public-Tests/$CURSOR_CASE" \
+    --verbose 2>&1 | tee "$CURSOR_EVIDENCE/target-candidate-$CURSOR_NAME.log"
+  sed -E $'s/\x1B\\[[0-9;]*m//g' \
+    "$CURSOR_EVIDENCE/target-candidate-$CURSOR_NAME.log" | rg -n -- \
+    '^- Test (Cases Failed|Vectors Passed|Vectors Skipped|Vectors Failed):' \
+    /dev/stdin
+done
+
+python3 - "$CURSOR_EVIDENCE" <<'PY'
+import pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+fields = ("Test Cases Failed", "Test Vectors Failed")
+pattern = re.compile(r"^-\s*(.+?):\s*(\d+)$", re.MULTILINE)
+ansi = re.compile(r"\x1b\[[0-9;]*m")
+for baseline in sorted(root.glob("target-baseline-*.log")):
+    candidate = root / baseline.name.replace("baseline", "candidate")
+    before = dict(pattern.findall(ansi.sub("", baseline.read_text())))
+    after = dict(pattern.findall(ansi.sub("", candidate.read_text())))
+    for field in fields:
+        assert field in before and field in after, (baseline, candidate, field)
+        assert int(after[field]) <= int(before[field]), (field, before[field], after[field])
+PY
 ```
 
-Expected: no new vector failures.
-
-Inspect candidate Interface output for:
-
-```text
-merge_sort_internal with &mut [spritebatch_sprite_t] inputs
-exported merge_sort with *mut spritebatch_sprite_t inputs
-from_raw_parts_mut in both wrapper adaptations
-```
+Each targeted pass runs once and consumes the preceding pass output; do not add
+`--run-dependencies`. Inspect candidate Interface output and assert it contains
+`merge_sort_internal` with `&mut [spritebatch_sprite_t]` inputs, the exported
+`merge_sort` with raw pointer inputs, and two `from_raw_parts_mut` adaptations.
 
 - [ ] **Step 7: Run full public and hidden transformations**
 
-Only after targeted cases pass:
+Only after targeted cases pass. The passes are sequential; do not run two
+writers against the same output directory concurrently. `transform_all.py`
+already parallelizes independent cases internally.
 
 ```bash
 CURSOR_HARNESS="$(readlink -f /tmp/crat-cursor-harness-current)"
-cd "$CURSOR_HARNESS"
-
 CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
-CRAT_POINTER_DECISION_DIAGNOSTICS=summary \
-python3 scripts/transform_all.py "$CURSOR_OUT" pointer --run-dependencies
-CRAT_POINTER_DECISION_DIAGNOSTICS=summary \
-python3 scripts/transform_all.py "$CURSOR_OUT" bin --run-dependencies
+CURSOR_EVIDENCE="$(readlink -f /tmp/crat-cursor-evidence-current)"
+cd "$CURSOR_HARNESS"
+
+set -euo pipefail
+env -u DEBUG CRAT_POINTER_DECISION_DIAGNOSTICS=summary \
+  python3 scripts/transform_all.py "$CURSOR_OUT" pointer --run-dependencies \
+  2>&1 | tee "$CURSOR_EVIDENCE/full-pointer.log"
+grep -Fx 'Failure: 0' "$CURSOR_EVIDENCE/full-pointer.log"
+
+for CURSOR_PASS in io libc static simpl interface unsafe unexpand split bin; do
+  env -u DEBUG python3 scripts/transform_all.py "$CURSOR_OUT" "$CURSOR_PASS" \
+    2>&1 | tee "$CURSOR_EVIDENCE/full-$CURSOR_PASS.log"
+  grep -Fx 'Failure: 0' "$CURSOR_EVIDENCE/full-$CURSOR_PASS.log"
+done
 ```
 
-Expected: zero transformation failures. Both public and hidden corpora are included.
+The printed `Failure: 0` assertion is mandatory for Pointer and every remaining
+pass. `transform_all.py` reports per-case failures in its summary without
+returning a failing process status, so exit codes alone are insufficient. Run
+Pointer with dependencies exactly once, then each remaining pass exactly once
+without `--run-dependencies`; do not rerun the whole pipeline for Bin.
 
-- [ ] **Step 8: Record baseline and candidate vector/unsafe summaries**
+- [ ] **Step 8: Record strictly paired baseline and candidate vector/unsafe summaries**
 
-Baseline first:
+Run this block in order without inserting another `test_all.py` or any unrelated
+corpus command. Each `test_all.py` replaces the cloned corpora's
+`translated_rust` trees, so its `find_unsafe.py` and `summarize_unsafe.py` must
+follow immediately.
 
 ```bash
 CURSOR_HARNESS="$(readlink -f /tmp/crat-cursor-harness-current)"
-cd "$CURSOR_HARNESS"
-
-python3 scripts/test_all.py /home/ubuntu/crat-workspace/transformed
-python3 scripts/find_unsafe.py
-python3 scripts/summarize_unsafe.py
-```
-
-Candidate second:
-
-```bash
-CURSOR_HARNESS="$(readlink -f /tmp/crat-cursor-harness-current)"
-cd "$CURSOR_HARNESS"
-
 CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
-python3 scripts/test_all.py "$CURSOR_OUT"
-python3 scripts/find_unsafe.py
-python3 scripts/summarize_unsafe.py
+CURSOR_EVIDENCE="$(readlink -f /tmp/crat-cursor-evidence-current)"
+cd "$CURSOR_HARNESS"
+
+set -euo pipefail
+python3 scripts/test_all.py /home/ubuntu/crat-workspace/transformed \
+  2>&1 | tee "$CURSOR_EVIDENCE/full-baseline-vectors.log"
+rg -n -- '^- Test (Cases|Vectors) (Discovered|Tested|Passed|Skipped|Failed):' \
+  "$CURSOR_EVIDENCE/full-baseline-vectors.log"
+python3 scripts/find_unsafe.py \
+  2>&1 | tee "$CURSOR_EVIDENCE/full-baseline-find-unsafe.log"
+grep -Fx 'Failure: 0' "$CURSOR_EVIDENCE/full-baseline-find-unsafe.log"
+python3 scripts/summarize_unsafe.py \
+  2>&1 | tee "$CURSOR_EVIDENCE/full-baseline-unsafe-summary.log"
+
+python3 scripts/test_all.py "$CURSOR_OUT" \
+  2>&1 | tee "$CURSOR_EVIDENCE/full-candidate-vectors.log"
+rg -n -- '^- Test (Cases|Vectors) (Discovered|Tested|Passed|Skipped|Failed):' \
+  "$CURSOR_EVIDENCE/full-candidate-vectors.log"
+python3 scripts/find_unsafe.py \
+  2>&1 | tee "$CURSOR_EVIDENCE/full-candidate-find-unsafe.log"
+grep -Fx 'Failure: 0' "$CURSOR_EVIDENCE/full-candidate-find-unsafe.log"
+python3 scripts/summarize_unsafe.py \
+  2>&1 | tee "$CURSOR_EVIDENCE/full-candidate-unsafe-summary.log"
 ```
 
-Run unsafe scripts immediately after each `test_all.py`. Candidate failures must not exceed baseline failures; unsafe counts must not increase without an intended, documented cause.
+Do not infer vector success from the Python exit code. Compare the captured
+summaries mechanically:
+
+```bash
+CURSOR_EVIDENCE="$(readlink -f /tmp/crat-cursor-evidence-current)"
+python3 - "$CURSOR_EVIDENCE" <<'PY'
+import pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+summary_re = re.compile(r"^-\s*(.+?):\s*(\d+)$", re.MULTILINE)
+baseline = dict(summary_re.findall((root / "full-baseline-vectors.log").read_text()))
+candidate = dict(summary_re.findall((root / "full-candidate-vectors.log").read_text()))
+for field in ("Test Cases Discovered", "Test Cases Tested"):
+    assert field in baseline and field in candidate
+    assert candidate[field] == baseline[field], (field, baseline[field], candidate[field])
+for field in ("Test Cases Failed", "Test Vectors Failed"):
+    assert field in baseline and field in candidate
+    assert int(candidate[field]) <= int(baseline[field]), (field, baseline[field], candidate[field])
+
+def unsafe_counts(path):
+    result = {}
+    for line in path.read_text().splitlines():
+        name, count = line.rsplit(":", 1)
+        result[name] = int(count.strip())
+    return result
+
+before = unsafe_counts(root / "full-baseline-unsafe-summary.log")
+after = unsafe_counts(root / "full-candidate-unsafe-summary.log")
+for name in sorted(set(before) | set(after)):
+    assert after.get(name, 0) <= before.get(name, 0), (
+        name,
+        before.get(name, 0),
+        after.get(name, 0),
+    )
+PY
+```
+
+Any intended unsafe-count increase requires a documented exception rather than
+removing or weakening the assertion.
 
 - [ ] **Step 9: Compare global cursor counts**
 
 ```bash
 CURSOR_HARNESS="$(readlink -f /tmp/crat-cursor-harness-current)"
+CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
+CURSOR_EVIDENCE="$(readlink -f /tmp/crat-cursor-evidence-current)"
 cd "$CURSOR_HARNESS"
 
-CURSOR_OUT="$(readlink -f /tmp/crat-cursor-output-current)"
-rg -o --glob lib.rs \
+BASELINE_CURSOR_COUNT="$(rg -o --glob lib.rs \
   'crate::slice_cursor::SliceCursor(Mut)?' \
-  /home/ubuntu/crat-workspace/transformed/pointer | wc -l
-rg -o --glob lib.rs \
+  /home/ubuntu/crat-workspace/transformed/pointer | wc -l)"
+CANDIDATE_CURSOR_COUNT="$(rg -o --glob lib.rs \
   'crate::slice_cursor::SliceCursor(Mut)?' \
-  "$CURSOR_OUT/pointer" | wc -l
+  "$CURSOR_OUT/pointer" | wc -l)"
+printf 'baseline=%s\ncandidate=%s\n' \
+  "$BASELINE_CURSOR_COUNT" "$CANDIDATE_CURSOR_COUNT" | \
+  tee "$CURSOR_EVIDENCE/full-cursor-counts.log"
+test "$CANDIDATE_CURSOR_COUNT" -le "$BASELINE_CURSOR_COUNT"
 ```
-
-Expected: candidate count does not increase.
 
 - [ ] **Step 10: Check targeted determinism**
 
 ```bash
 CURSOR_HARNESS="$(readlink -f /tmp/crat-cursor-harness-current)"
+CURSOR_EVIDENCE="$(readlink -f /tmp/crat-cursor-evidence-current)"
 cd "$CURSOR_HARNESS"
 
 CURSOR_OUT_1="$(mktemp -d \
   /home/ubuntu/crat-workspace/transformed-cursor-resolution-determinism-a.XXXXXX)"
 CURSOR_OUT_2="$(mktemp -d \
   /home/ubuntu/crat-workspace/transformed-cursor-resolution-determinism-b.XXXXXX)"
-CRAT_POINTER_DECISION_DIAGNOSTICS=full \
-python3 scripts/transform.py "$CURSOR_OUT_1" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B01_organic/merge_sort_lib \
-  pointer --run-dependencies
-CRAT_POINTER_DECISION_DIAGNOSTICS=full \
-python3 scripts/transform.py "$CURSOR_OUT_1" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/fallcalc_lib \
-  pointer --run-dependencies
-CRAT_POINTER_DECISION_DIAGNOSTICS=full \
-python3 scripts/transform.py "$CURSOR_OUT_2" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B01_organic/merge_sort_lib \
-  pointer --run-dependencies
-CRAT_POINTER_DECISION_DIAGNOSTICS=full \
-python3 scripts/transform.py "$CURSOR_OUT_2" \
-  /home/ubuntu/crat-workspace/Test-Corpus/Public-Tests/B02_synthetic/fallcalc_lib \
-  pointer --run-dependencies
+ln -sfn "$CURSOR_OUT_1" /tmp/crat-cursor-determinism-a-current
+ln -sfn "$CURSOR_OUT_2" /tmp/crat-cursor-determinism-b-current
 
-diff -ru \
-  "$CURSOR_OUT_1/pointer/Public-Tests/B01_organic/merge_sort_lib" \
-  "$CURSOR_OUT_2/pointer/Public-Tests/B01_organic/merge_sort_lib"
-diff -ru \
-  "$CURSOR_OUT_1/pointer/Public-Tests/B02_synthetic/fallcalc_lib" \
-  "$CURSOR_OUT_2/pointer/Public-Tests/B02_synthetic/fallcalc_lib"
+set -euo pipefail
+CURSOR_CASES=(B01_organic/merge_sort_lib B02_synthetic/fallcalc_lib)
+for CURSOR_VARIANT in "$CURSOR_OUT_1" "$CURSOR_OUT_2"; do
+  CURSOR_VARIANT_NAME="$(basename "$CURSOR_VARIANT")"
+  for CURSOR_CASE in "${CURSOR_CASES[@]}"; do
+    CURSOR_NAME="${CURSOR_CASE##*/}"
+    env -u DEBUG CRAT_POINTER_DECISION_DIAGNOSTICS=full \
+      python3 scripts/transform.py "$CURSOR_VARIANT" \
+      "$CURSOR_HARNESS/Test-Corpus/Public-Tests/$CURSOR_CASE" \
+      pointer --run-dependencies 2>&1 | \
+      tee "$CURSOR_EVIDENCE/determinism-$CURSOR_VARIANT_NAME-$CURSOR_NAME.log"
+  done
+done
+
+CURSOR_OUT_1="$(readlink -f /tmp/crat-cursor-determinism-a-current)"
+CURSOR_OUT_2="$(readlink -f /tmp/crat-cursor-determinism-b-current)"
+for CURSOR_CASE in "${CURSOR_CASES[@]}"; do
+  CURSOR_NAME="${CURSOR_CASE##*/}"
+  CURSOR_TREE="pointer/Public-Tests/$CURSOR_CASE"
+  diff -ru --exclude=stdout.log --exclude=stderr.log \
+    "$CURSOR_OUT_1/$CURSOR_TREE" "$CURSOR_OUT_2/$CURSOR_TREE"
+  for CURSOR_STREAM in stdout stderr; do
+    sed "s|$CURSOR_OUT_1|<OUT>|g" \
+      "$CURSOR_OUT_1/$CURSOR_TREE/$CURSOR_STREAM.log" \
+      > "$CURSOR_EVIDENCE/determinism-a-$CURSOR_NAME-$CURSOR_STREAM.normalized.log"
+    sed "s|$CURSOR_OUT_2|<OUT>|g" \
+      "$CURSOR_OUT_2/$CURSOR_TREE/$CURSOR_STREAM.log" \
+      > "$CURSOR_EVIDENCE/determinism-b-$CURSOR_NAME-$CURSOR_STREAM.normalized.log"
+    diff -u \
+      "$CURSOR_EVIDENCE/determinism-a-$CURSOR_NAME-$CURSOR_STREAM.normalized.log" \
+      "$CURSOR_EVIDENCE/determinism-b-$CURSOR_NAME-$CURSOR_STREAM.normalized.log"
+  done
+done
 ```
 
-Expected: both diffs exit zero, including their full-diagnostic `stderr.log` files.
+Expected: generated trees match when per-case stdout/stderr logs are excluded,
+and the logs match after replacing only their respective absolute output root
+with `<OUT>`. Do not require byte-identical raw logs across different roots.
 
-- [ ] **Step 11: Inspect and commit task-owned final adjustments**
+- [ ] **Step 11: Inspect and conditionally commit genuine task-owned adjustments**
 
 ```bash
 cd "$(readlink -f /tmp/crat-cursor-harness-current/crat)"
 
 git status --short
 git diff --check
-```
-
-Stage only task files:
-
-```bash
-cd "$(readlink -f /tmp/crat-cursor-harness-current/crat)"
-
-git add \
-  crates/pointer_replacer/src/analyses/offset_sign/sign.rs \
-  crates/pointer_replacer/src/analyses/offset_sign/tests.rs \
-  crates/pointer_replacer/src/analyses/mir_variable_grouping.rs \
-  crates/pointer_replacer/src/rewriter/mod.rs \
-  crates/pointer_replacer/src/rewriter/collector.rs \
-  crates/pointer_replacer/src/rewriter/decision.rs \
-  crates/pointer_replacer/src/rewriter/diagnostics.rs \
-  crates/pointer_replacer/src/rewriter/cursor_resolution.rs \
-  crates/pointer_replacer/src/rewriter/transform/mod.rs \
-  crates/pointer_replacer/src/tests.rs \
+TASK_FILES=(
+  crates/pointer_replacer/src/analyses/offset_sign/sign.rs
+  crates/pointer_replacer/src/analyses/offset_sign/tests.rs
+  crates/pointer_replacer/src/analyses/mir_variable_grouping.rs
+  crates/pointer_replacer/src/rewriter/mod.rs
+  crates/pointer_replacer/src/rewriter/collector.rs
+  crates/pointer_replacer/src/rewriter/decision.rs
+  crates/pointer_replacer/src/rewriter/diagnostics.rs
+  crates/pointer_replacer/src/rewriter/cursor_resolution.rs
+  crates/pointer_replacer/src/rewriter/transform/mod.rs
+  crates/pointer_replacer/src/tests.rs
+  crates/pointer_replacer/src/utils/rustc.rs
   crates/passes/src/interface_fixer.rs
-git commit -m "test(pointer): validate representation-aware cursor resolution"
+  docs/superpowers/specs/2026-09-16-representation-aware-cursor-resolution-design.md
+  docs/superpowers/plans/2026-09-17-representation-aware-cursor-resolution.md
+)
+
+if git diff --quiet -- "${TASK_FILES[@]}"; then
+  echo "No genuine task-owned adjustment; do not create an empty commit."
+else
+  test -z "$(git diff --cached --name-only)"
+  git add -- "${TASK_FILES[@]}"
+  git diff --cached --check
+  git diff --cached --name-only
+  git commit -m "test(pointer): validate representation-aware cursor resolution"
+fi
 ```
 
-Do not stage unrelated changes or generated corpus output.
+Do not use `git add -A` or `git add .`; do not stage generated corpus output,
+evidence, or unrelated changes. Preserve the evidence, harness clones, candidate
+output, and determinism outputs until review. Cleanup, if requested after review,
+must name only the resolved fresh directories and must never target the immutable
+baseline, source corpus repositories, `c2rust-translated`, or the implementation
+checkout.
 
 ---
 
