@@ -895,36 +895,12 @@ pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
         );
     }
 
-    /// **The tripwire for rule B's real blocker (wave-5d2 report 019).**
-    ///
-    /// `ff` is model-Owning and the ownership-fields native producer considers
-    /// it, so a candidate would be readable through `Candidates::plan` — but
-    /// the producer holds it at its SOURCE step, and the reason is the derived
-    /// local this lane wants to type. This pins the mutual dependency so that
-    /// the day the hold lifts, this test fails and rule B is finishable.
-    #[test]
-    fn the_derived_locals_base_is_held_before_any_candidate_exists() {
-        let got = run(HEMAN_DERIVED_SHAPE);
-        let row = "transform_to_coordfield::ff#6";
-        assert_eq!(
-            column(&got.ownership_native, row, "considered"),
-            "true",
-            "the base is a model-Owning subject the native producer looks at:\n{}",
-            got.ownership_native
-        );
-        assert_eq!(
-            column(&got.ownership_native, row, "native_status"),
-            "held",
-            "no candidate is produced, so there is none for rule B to read:\n{}",
-            got.ownership_native
-        );
-        assert_eq!(
-            column(&got.ownership_native, row, "native_hold_kind"),
-            "Source::UnsupportedOwnerUse",
-            "the hold is the SOURCE scan's, not a selection or interface hold:\n{}",
-            got.ownership_native
-        );
-    }
+    // wave-5d2's `the_derived_locals_base_is_held_before_any_candidate_exists`
+    // is WITHDRAWN on the composition (seat relay assembler/018, R442-5; their
+    // relay 021): it pins a stale copy of ownership-fields' file — on this tree
+    // `transform_to_coordfield::ff#6` is still held, but by the native alias
+    // family (`Missing("native-view-alias-family-owned")`) before the source
+    // scan is reached. The lane re-states the tripwire on the composed frame.
 
     #[test]
     fn a_static_literal_local_is_typed_by_its_own_initializer() {
