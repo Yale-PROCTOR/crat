@@ -556,6 +556,15 @@ fn nested_ast_composition(
                     // collision rows `find_::node`, `get_quadrant_::{root,
                     // point}` at census 1.
                     | ("c-raw-reborrow-mut", "shared-weakening")
+                    // Relay 032 STOP 2 / relay 033: brotli's one remaining
+                    // collision row — `PrintHelp(FileName(*argv.offset(0)),
+                    // is_ok)`: the outer class's shared-slice bridge of the
+                    // `FileName(..)` argument strictly contains `FileName`'s
+                    // own const cast of `*argv.offset(0)`. A seam over a
+                    // contained seam in one caller, which wave-6l's
+                    // `c3d9fc93` renders — the twin of the
+                    // `("c-raw-reborrow-shared", "raw-cast-const")` row above.
+                    | ("c-raw-slice-shared", "raw-cast-const")
             );
         let raw_receiver_over_argument = matches!(
             outer.key.bridge_kind.as_str(),
@@ -6454,7 +6463,7 @@ mod wave3_class_tests {
         // over W-C5's argument adapter, and a call bridge over a Box owner's
         // access edit — the AST pass renders both nestings since wave-6l's
         // `f8a2d5e6` — and relay 025's mutable twin of the reborrow row.
-        const PAIRS: [(Arm, &str, Arm, &str); 8] = [
+        const PAIRS: [(Arm, &str, Arm, &str); 9] = [
             (Arm::Pair, "pair-t2-raw-view", Arm::C, "typed-raw-temporary"),
             (
                 Arm::Pair,
@@ -6478,6 +6487,7 @@ mod wave3_class_tests {
                 "box-expression",
             ),
             (Arm::C, "c-raw-reborrow-mut", Arm::Glue, "shared-weakening"),
+            (Arm::C, "c-raw-slice-shared", Arm::C, "raw-cast-const"),
         ];
         for (outer_arm, outer_kind, inner_arm, inner_kind) in PAIRS {
             with_classes(2, |ids| {
