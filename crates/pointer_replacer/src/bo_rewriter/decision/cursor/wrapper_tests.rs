@@ -1330,3 +1330,62 @@ pub unsafe fn emit(input: *const u8, n: usize) -> u64 {
         "the held subject must keep the original text: {source}"
     );
 }
+
+#[test]
+fn slicecursor_reborrow_idiom_at_a_slice_callee_is_a_class_level_wall() {
+    // brotli `BrotliTransformDictionaryWord` (census #6: `dst` is the archive's
+    // single `BorrowedElementUnbuilt`; `uppercase` / `shift` withdraw with it).
+    // The c2rust idiom handed DIRECTLY to a local callee whose parameter the
+    // slice family delivers — `ToUpperCase(&mut *dst.offset(idx - len))`.
+    //
+    // The view itself is mechanical (`dst.offset_by(k).as_slice_mut()`, the same
+    // view a whole-cursor argument takes) and was built and measured; emitting it
+    // makes the ADDITIVE-FAMILY machinery withdraw the owner's family instead
+    // (every receipt disappears), because a cursor argument at a delivered-slice
+    // formal needs its interface dependency registered the way report 013's
+    // arm-C receipt registers a whole-cursor argument. Held until that exists
+    // (MAX-3 stop, report 026); this pins the wall so the day it moves is visible.
+    let input = r#"
+pub unsafe fn to_upper(p: *mut u8) -> i32 {
+    if *p.offset(0) >= 97 && *p.offset(0) <= 122 { *p.offset(0) = *p.offset(0) - 32; }
+    1
+}
+pub unsafe fn shift_all(p: *mut u8, len: i32, param: u8) {
+    let mut i = 0;
+    while i < len { *p.offset(i as isize) = (*p.offset(i as isize)).wrapping_add(param); i += 1; }
+}
+pub unsafe fn transform(dst: *mut u8, idx: i32, mut len: i32, t: i32, param: u8) {
+    if t == 1 {
+        to_upper(&mut *dst.offset((idx - len) as isize));
+    } else if t == 2 {
+        let mut uppercase: *mut u8 = &mut *dst.offset((idx - len) as isize) as *mut u8;
+        while len > 0 {
+            let step = to_upper(uppercase);
+            uppercase = uppercase.offset(step as isize);
+            len -= step;
+        }
+    } else if t == 3 {
+        shift_all(&mut *dst.offset((idx - len) as isize), len, param);
+    }
+}
+"#;
+    let dispositions = cursor_dispositions(input);
+    let of = |label: &str| {
+        dispositions
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, d)| d.as_str())
+            .unwrap_or("<no receipt>")
+    };
+    assert_eq!(
+        (of("transform::dst"), of("transform::uppercase")),
+        ("Err(BorrowedElementUnbuilt)", "Err(UseUnbuilt)"),
+        "the corpus shape's typed hold moved: {dispositions:?}"
+    );
+    let source = emitted(input);
+    save_fixture("reborrow-idiom-at-a-slice-callee", input, &source);
+    assert!(
+        !source.contains("SliceCursorMut::new(dst)"),
+        "the family delivered without the interface dependency: {source}"
+    );
+}
