@@ -105,3 +105,25 @@ pub unsafe extern "C" fn registered(mut len: u64) -> u32 {
     }
     return *(kept[0 as usize]).offset(0 as isize) as u32;
 }
+
+// An owned-element array handed on WHOLE: the element is a boxed slice (two
+// words), so the NPO layout the whole-array view rests on does not hold —
+// the transaction says so instead of skipping the use.
+pub unsafe extern "C" fn take_all(mut ptrs: *const *mut u8, mut len: u64) -> u32 {
+    return (*ptrs.offset(0 as isize)).is_null() as u32;
+}
+pub unsafe extern "C" fn whole(mut len: u64) -> u32 {
+    let mut bufs: [*mut u8; 2] = [0 as *mut u8; 2];
+    let mut i = 0 as usize;
+    while i < 2 as usize {
+        bufs[i] = lodepng_malloc(len) as *mut u8;
+        i = i.wrapping_add(1);
+    }
+    let mut r = take_all(bufs.as_ptr(), len);
+    i = 0 as usize;
+    while i < 2 as usize {
+        lodepng_free(bufs[i] as *mut std::ffi::c_void);
+        i = i.wrapping_add(1);
+    }
+    return r;
+}

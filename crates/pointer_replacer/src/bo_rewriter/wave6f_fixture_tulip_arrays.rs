@@ -43,3 +43,11 @@ pub unsafe extern "C" fn main_0(mut data_in: *const f64, mut data_out: *mut f64)
     let mut options: [f64; 1] = [0.];
     return ti_sma(1 as i32, all_inputs.as_ptr(), options.as_ptr());
 }
+
+// tulip's OTHER value lists: the elements are buffers (a local array's
+// `as_ptr`, a C string literal), whose readers index past the first element.
+pub unsafe extern "C" fn buffers(mut size: i32) -> i32 {
+    let mut scratch: [f64; 4] = [0.; 4];
+    let mut inputs: [*const f64; 1] = [scratch.as_ptr()];
+    return ti_sma(size, inputs.as_ptr(), scratch.as_ptr());
+}

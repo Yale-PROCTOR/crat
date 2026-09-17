@@ -1910,8 +1910,20 @@ fn owned_element_uses<'tcx>(
             let tcx = self.tcx;
             let sm = tcx.sess.source_map();
             // The element's own uses are classified from the element
-            // expression; every other expression walks on.
+            // expression; every other expression walks on — except a use of
+            // the ARRAY itself, which holds: an owned element is a boxed
+            // SLICE (two words), so the whole-array raw view of G build 2
+            // (which rests on `Option<&T>` having `*const T`'s layout) is not
+            // available here, and no other whole-array shape is expressed.
             if !self.is_element(expr) {
+                if matches!(expr.kind, ExprKind::Path(QPath::Resolved(_, path))
+                    if matches!(path.res, Res::Local(id) if id == self.binding))
+                    && !matches!(tcx.parent_hir_node(expr.hir_id),
+                        Node::Expr(p) if matches!(p.kind, ExprKind::Index(base, _, _) if base.hir_id == expr.hir_id))
+                {
+                    self.hold("array-use-shape");
+                    return;
+                }
                 intravisit::walk_expr(self, expr);
                 return;
             }
@@ -2424,9 +2436,35 @@ fn array_local_candidates(
                     None => {}
                     Some(init) => match init.kind {
                         ExprKind::Array(elems) if !all_null(elems) => {
-                            hold = Some(
-                                "array-local-incomplete:initializer-element-source".to_owned(),
-                            );
+                            // A value element that is a BUFFER (a local
+                            // array's `as_ptr`, a byte-string literal) cannot
+                            // become `Option<&T>`: its readers index past the
+                            // first element, and R395-2 never widens a thin
+                            // reference. The fat element form is excluded in
+                            // turn by the whole-array view these arrays are
+                            // handed on through (a fat element is two words).
+                            let buffer_source = elems.iter().any(|elem| {
+                                let mut source = elem;
+                                while let ExprKind::Cast(inner, _) = source.kind {
+                                    source = inner;
+                                }
+                                match source.kind {
+                                    ExprKind::MethodCall(segment, ..) => matches!(
+                                        segment.ident.name.as_str(),
+                                        "as_ptr" | "as_mut_ptr"
+                                    ),
+                                    ExprKind::Lit(literal) => {
+                                        matches!(literal.node, rustc_ast::LitKind::ByteStr(..))
+                                    }
+                                    _ => false,
+                                }
+                            });
+                            hold = Some(if buffer_source {
+                                "array-local-incomplete:initializer-element-buffer-source"
+                                    .to_owned()
+                            } else {
+                                "array-local-incomplete:initializer-element-source".to_owned()
+                            });
                         }
                         ExprKind::Repeat(elem, _) if super::emitability::is_zero_literal(elem) => {
                             sites.push(Site {
@@ -3429,13 +3467,18 @@ fn owned_sites<'t>(
     let consumer_edit = |node: NodeKey, kind: SlotKind| -> Result<(String, &'static str), String> {
         let decision = decision_of(node).ok_or_else(|| "consumer-unknown".to_owned())?;
         match (kind, decision) {
-            (SlotKind::Owning, Decision::Box(plan)) => Ok((
-                if plan.optional {
-                    format!("{inner}.take()")
-                } else {
-                    format!("{inner}.take().unwrap()")
-                },
-                "owned-field-move",
+            // R440-4 (the joint shape with ownership-fields): an owning field
+            // is `Option<Box<T>>` — null is `None` (R395-2) — so a move out
+            // of it is an `Option<Box<T>>`, and the consumer must be the
+            // OPTIONAL form. A non-optional Box consumer would need
+            // `take().unwrap()`, which panics exactly where C read a null
+            // child, so the transaction holds and names the contract instead.
+            (SlotKind::Owning, Decision::Box(plan)) if plan.optional => {
+                Ok((format!("{inner}.take()"), "owned-field-move"))
+            }
+            (SlotKind::Owning, Decision::Box(_)) => Err(format!(
+                "owned-move-needs-optional-box:{}",
+                subject_label(table, node)
             )),
             (SlotKind::Owning, Decision::Degraded(_)) => {
                 Ok((move_to_raw(), "owned-field-raw-move"))

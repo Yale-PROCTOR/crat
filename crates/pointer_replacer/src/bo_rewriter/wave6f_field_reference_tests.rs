@@ -1137,6 +1137,9 @@ fn w6f_a_written_element_names_its_family() {
             "array-local-incomplete:mutable-elements",
         ),
         ("leaked", "scratch", "array-owned-incomplete:no-release"),
+        // handed on WHOLE: an owned element is a boxed slice, two words, so
+        // the whole-array view's layout claim does not hold for it
+        ("whole", "bufs", "array-owned-incomplete:array-use-shape"),
         (
             "registered",
             "kept",
@@ -1256,6 +1259,19 @@ fn w6f_tulip_element_list_initializers_split_by_their_elements() {
         (value_list.2.as_str(), value_list.4.as_str()),
         ("held", "array-local-incomplete:initializer-element-source"),
         "{value_list:?}"
+    );
+    // A value list whose elements are BUFFERS (a local array's `as_ptr`, a C
+    // string literal) says so: those readers index past the first element and
+    // R395-2 never widens a thin reference, while the fat element form is
+    // excluded by the whole-array view these arrays are handed on through.
+    let buffers = field_row(&observed, "buffers", "inputs");
+    assert_eq!(
+        (buffers.2.as_str(), buffers.4.as_str()),
+        (
+            "held",
+            "array-local-incomplete:initializer-element-buffer-source"
+        ),
+        "{buffers:?}"
     );
     // A zero-length array has no element to convert: `[]` is not the null
     // initializer, it is nothing, and the transaction stays out of it.
