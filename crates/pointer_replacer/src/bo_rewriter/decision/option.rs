@@ -498,6 +498,21 @@ pub(crate) fn plan_values(
                     "option-value-encloses-declaration".to_owned(),
                 ));
             }
+            // Wave-6o (relay 024 / R447-5): the same `&*data.offset(l)` shape
+            // where the BASE is delivered as a slice is that slice's SUFFIX —
+            // `Some(&data[l..])`, bounds-checked and forward by the guard the
+            // source side uses. Rendered below; it supersedes the hold.
+            let suffix = slice
+                .then(|| {
+                    super::option_ops::slice_suffix_view(
+                        tcx,
+                        table,
+                        subject.fn_did,
+                        subject.hir_id,
+                        expression,
+                    )
+                })
+                .flatten();
             // Wave-6o (R410-7, STOP 1(b)): an optional SLICE valued at the
             // address of a RAW dereference (`&*data.offset(l)`) with no inner
             // view composed would take the one-element `from_ref` carrier and
@@ -505,6 +520,7 @@ pub(crate) fn plan_values(
             // until the base delivers a real view.
             if reason.is_none()
                 && slice
+                && suffix.is_none()
                 && composed.is_empty()
                 && super::option_ops::address_of_raw_dereference(tcx, subject.fn_did, expression)
             {
@@ -537,6 +553,17 @@ pub(crate) fn plan_values(
                     "option-integer-pointer-construction".to_owned(),
                 ));
                 None
+            } else if let Some(view) = suffix.as_ref() {
+                // The whole right-hand side is replaced, so the base's own
+                // element view inside it is not applied: this arm renders the
+                // suffix from the base's emitted name directly.
+                adapter = "option-slice-value-suffix".to_owned();
+                Some(format!(
+                    "Some(&{}{}[{}..])",
+                    if view.mutable { "mut " } else { "" },
+                    view.base,
+                    view.delta
+                ))
             } else if same_slice {
                 adapter = "owned-same-form-slice-carrier".to_owned();
                 None

@@ -227,6 +227,8 @@ mod option_receiver_tests;
 #[cfg(test)]
 mod option_return_arm_tests;
 #[cfg(test)]
+mod option_suffix_tests;
+#[cfg(test)]
 mod option_thin_extent_tests;
 #[cfg(test)]
 mod option_void_tests;

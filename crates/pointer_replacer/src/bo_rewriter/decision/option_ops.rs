@@ -5,6 +5,7 @@
 use rustc_hash::FxHashMap;
 use rustc_hir::{
     BinOpKind, Expr, ExprKind, HirId, Node,
+    def::Res,
     def_id::LocalDefId,
     intravisit::{self, Visitor},
 };
@@ -12,7 +13,7 @@ use rustc_middle::ty::{TyCtxt, TyKind};
 use rustc_span::Span;
 
 use super::{
-    DecisionTable, Subject, SubjectKind,
+    Decision, DecisionTable, Subject, SubjectKind,
     emitability::{ArgShape, EmitabilityFacts, OptUseSite, OptUses, UseEdit},
     lifetime::FnSignatureSlot,
     raw_boundary::{RawMutability, raw_target_type},
@@ -542,4 +543,111 @@ fn cast_owned_by_call_argument(tcx: TyCtxt<'_>, cast: &Expr<'_>) -> bool {
         }
     }
     false
+}
+
+/// **Relay 024 / R447-5 — the SUFFIX of a delivered slice.**
+///
+/// `s = &*data.offset(l) as *const u8` assigns a computed VIEW of `data`, and
+/// when `data` is delivered as a slice the value is that slice's suffix, not a
+/// one-element carrier: a destination read at `*s.offset(0)` **and**
+/// `*s.offset(1)` indexes past the single element `from_ref` would give, which
+/// is why the planner held such a row (`option-slice-value:one-element-carrier`,
+/// report 009). The sound delivery is `Some(&data[l..])` — bounds-checked, and
+/// forward by the same guard the source side uses (wave-6s2's W6S2-5): the
+/// delta is a non-negative literal or an unsigned-typed expression, the base is
+/// a different local delivered as a slice, and the spine is exactly C2Rust's
+/// `&*…` / `&mut *…` under identity casts.
+pub(super) struct SliceSuffixView {
+    /// The base's emitted name.
+    pub base: String,
+    /// The delta expression, already `usize`-typed for the range.
+    pub delta: String,
+    /// Does the view borrow mutably?
+    pub mutable: bool,
+}
+
+pub(super) fn slice_suffix_view(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    owner: LocalDefId,
+    subject_hir: HirId,
+    expression: &Expr<'_>,
+) -> Option<SliceSuffixView> {
+    let typeck = tcx.typeck(owner);
+    let mut expr = expression;
+    // Identity casts only: a cast that changes the pointee is the caller's
+    // `option-value-cast-pointee-unbuilt` refusal, not a suffix.
+    while let ExprKind::Cast(inner, _) = expr.kind {
+        if !matches!(
+            typeck.expr_ty(inner).kind(),
+            TyKind::RawPtr(..) | TyKind::Ref(..)
+        ) {
+            return None;
+        }
+        expr = inner;
+    }
+    let ExprKind::AddrOf(_, mutability, place) = expr.kind else { return None };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, advanced) = place.kind else { return None };
+    let ExprKind::MethodCall(segment, receiver, [delta], _) = advanced.kind else { return None };
+    if segment.ident.name.as_str() != "offset" {
+        return None;
+    }
+    let mut base = receiver;
+    while let ExprKind::Cast(inner, _) = base.kind {
+        base = inner;
+    }
+    let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = base.kind else { return None };
+    let Res::Local(binding) = path.res else { return None };
+    // A self-advance (`s = &*s.offset(1)`) is the cursor family's, not this arm's.
+    if binding == subject_hir {
+        return None;
+    }
+    let (source, decision) = table
+        .entries
+        .iter()
+        .find(|(source, _)| source.fn_did == owner && source.hir_id == binding)?;
+    let base_mutable = match decision {
+        Decision::Slice { mutable, .. } => *mutable,
+        Decision::Opt {
+            slice: true,
+            mutable,
+            ..
+        } => *mutable,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => return None,
+    };
+    // A shared base cannot supply a mutable view.
+    if mutability.is_mut() && !base_mutable {
+        return None;
+    }
+    let delta = forward_delta(tcx, owner, delta)?;
+    Some(SliceSuffixView {
+        base: source.param_name.clone()?,
+        delta,
+        mutable: mutability.is_mut(),
+    })
+}
+
+/// The delta text, `usize`-typed, when the offset is provably forward: a
+/// non-negative integer literal under its `as` casts, or an unsigned-typed
+/// expression. Anything else (a signed variable, an arithmetic expression that
+/// may go backwards) stays with the cursor family.
+fn forward_delta(tcx: TyCtxt<'_>, owner: LocalDefId, delta: &Expr<'_>) -> Option<String> {
+    let text = tcx.sess.source_map().span_to_snippet(delta.span).ok()?;
+    let mut inner = delta;
+    while let ExprKind::Cast(next, _) = inner.kind {
+        inner = next;
+    }
+    if let ExprKind::Lit(literal) = inner.kind
+        && let rustc_ast::LitKind::Int(value, _) = literal.node
+    {
+        return Some(format!("{}", value.get()));
+    }
+    let unsigned = matches!(tcx.typeck(owner).expr_ty(inner).kind(), TyKind::Uint(_));
+    unsigned.then(|| format!("({text}) as usize"))
 }
