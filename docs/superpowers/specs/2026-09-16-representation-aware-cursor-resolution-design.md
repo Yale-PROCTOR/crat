@@ -85,6 +85,8 @@ a negative offset.
 - Make the late solver independently testable and deterministic.
 - Fail closed when final ownership or representation cannot be mapped reliably.
 - Apply all demotions atomically after the last decision recollection.
+- Let C-exposed inputs participate in late demotion; the existing interface pass
+  restores their raw-pointer C ABI from either a final slice or cursor.
 
 ## Non-goals
 
@@ -94,14 +96,15 @@ a negative offset.
 - Re-solving ownership, nullability, mutability, borrow promotion, or lifetimes.
 - Changing struct field representations.
 - Changing return representations.
-- Changing C-ABI-visible or signature-locked functions.
+- Changing the externally visible C ABI.
+- Changing signature-locked functions.
 - Changing functions that participate in function-pointer groups.
 - Proving which non-raw representations can serve as cursor anchors.
 - Using the pointer-flow graph or offset-annotated provenance as a prerequisite.
 - Removing every cursor/raw adapter in the first stage.
 
-Fields, returns, ABI boundaries, function-pointer groups, and richer anchor
-classification are possible later stages with separate validation.
+Fields, returns, function-pointer groups, and richer anchor classification are
+possible later stages with separate validation.
 
 ## Current pipeline and failure mode
 
@@ -135,10 +138,11 @@ made.
 
 The change has three deliberately narrow parts:
 
-1. The offset-sign analysis retains its pre-closure seeds and graphs while
-   continuing to compute the legacy closed results exactly as before.
-   It separately records complete late-only return edges and unmodeled-call
-   boundaries without feeding them into the legacy closure.
+1. The offset-sign analysis builds a complete retained constraint graph for
+   late resolution while continuing to compute the legacy closed results from
+   separate private graphs with exactly the current collection behavior. The
+   retained graph completes source-order-sensitive direct-call argument and
+   return coverage without feeding either completion into the legacy closure.
 2. A rewriter-side `FinalCursorDecisionView` maps MIR graph nodes to their
    emitted owners and finalized representations.
 3. A cursor-only resolver computes a validated demotion delta, which the
@@ -152,7 +156,7 @@ Proposed file ownership:
 
 | Location | Responsibility |
 | --- | --- |
-| `analyses/offset_sign/sign.rs` | Retain legacy constraints and add late-only return/boundary coverage |
+| `analyses/offset_sign/sign.rs` | Preserve private legacy closure graphs and retain complete late constraints and boundaries |
 | `analyses/mir_variable_grouping.rs` | Expose source-group representatives and members |
 | `rewriter/collector.rs` | Retain bindings whose cursor kind came from `CursorFieldOffsetAlias` |
 | `rewriter/cursor_resolution.rs` | Final decision view, component policy, solver, and result validation |
@@ -162,8 +166,8 @@ Proposed file ownership:
 
 ## Retained cursor constraints
 
-The offset analysis should expose the facts it already builds before SCC
-closure:
+The offset analysis should expose direct seeds and a complete pre-closure graph
+for late solving:
 
 ```rust
 pub(crate) type CursorLocalNode = (LocalDefId, Local);
@@ -176,7 +180,7 @@ pub(crate) enum CursorFieldNode {
 pub(crate) struct CursorConstraints {
     local_seeds: FxHashSet<CursorLocalNode>,
     local_edges: FxHashMap<CursorLocalNode, FxHashSet<CursorLocalNode>>,
-    late_only_edges: FxHashMap<CursorLocalNode, FxHashSet<CursorLocalNode>>,
+    return_edges: FxHashMap<CursorLocalNode, FxHashSet<CursorLocalNode>>,
     unmodeled_call_nodes: FxHashSet<CursorLocalNode>,
     field_seeds: FxHashSet<CursorFieldNode>,
     field_edges: FxHashMap<CursorFieldNode, FxHashSet<CursorFieldNode>>,
@@ -184,20 +188,27 @@ pub(crate) struct CursorConstraints {
 ```
 
 `OffsetSignResult` gains a `cursor_constraints` field. Its existing fields remain
-and are still produced by the existing SCC-based closure. Initial pointer
-decisions continue to consume those existing closed fields, so merely retaining
-constraints cannot alter output.
+and are still produced by the existing SCC-based closure over separate,
+ephemeral `legacy_local_edges` and `legacy_field_edges`. Those private graphs
+preserve the current sequential initialization and collection behavior exactly.
+Initial pointer decisions continue to consume only the existing closed fields,
+so retaining complete constraints cannot alter output.
 
-`local_edges` is the exact graph used by the legacy closure. The new
-`late_only_edges` are consumed only by late resolution and cannot affect initial
-decisions. The late graph is their directed union.
+`local_edges` is the complete non-return local constraint graph. It includes
+assignment, cast, conservative memory, and every modeled direct-local-call
+argument edge independent of source order. `return_edges` remains narrowly the
+complete direct-local-call return graph. The late directed graph is the union of
+`local_edges` and `return_edges`; neither complete graph participates in the
+initial SCC closure.
 
-The late graph must close two known coverage gaps without changing the legacy
-answer. All function/local nodes are established before call edges are
-collected, and a direct local call with pointer-valued return adds
-`caller_destination -> callee::_0` unconditionally. This makes late return flow
-independent of whether the caller or callee is visited first. The legacy graph
-keeps its current return-edge condition for byte-for-byte parity.
+This split closes two known order-sensitive coverage gaps without changing the
+legacy answer. All function/local nodes are established in the complete graphs
+before bodies are visited. Every modeled direct local call records its existing
+`callee_parameter -> caller_argument` constraints in `local_edges`, and a call
+with a pointer-valued return records
+`caller_destination -> callee::_0` in `return_edges`, regardless of whether the
+caller or callee is visited first. Collection into the ephemeral legacy graphs
+keeps the current visitation and insertion behavior for result parity.
 
 Call-boundary classification first excludes `is_pointer_offset_like_call` and
 any future primitive handled by a dedicated constraint rule. Among the remaining
@@ -214,9 +225,9 @@ argument, and caller destination to callee return. Edge-kind and MIR-location
 metadata may be retained for diagnostics, but stage-one solving must not assign
 different semantics to different edge kinds.
 
-The local and field graphs remain separate so their legacy closures cannot
-silently change. The field graph is used by the late stage only to identify
-protected components.
+The retained local and field graphs remain separate. Complete `field_edges` are
+used by the late stage only to identify protected components; only the private
+legacy field graph feeds `field_access_signs`.
 
 Stage one does not infer argument constraints for indirect or foreign calls.
 Instead, every recorded `unmodeled_call_nodes` entry protects its undirected
@@ -249,8 +260,8 @@ Missing or ambiguous mappings are frozen.
 
 The final view is a read-only adapter over `SigDecisions`, `ptr_kinds`,
 `forced_raw_bindings`, source groups, HIR/MIR mappings, function-pointer groups,
-C-exposure information, collector cursor provenance, and constraint boundary
-facts. It does not run an analysis or rewrite decisions.
+collector cursor provenance, and constraint boundary facts. It does not run an
+analysis or rewrite decisions.
 
 ```rust
 enum CursorOwner {
@@ -329,10 +340,32 @@ provenance, or without a complete MIR-member mapping is retained with an
 explicit freeze reason. It must never enter the eligible set merely because no
 directed seed reaches it.
 
+### C-exposed inputs and the final interface adapter
+
+Here, “C-exposed” means a function selected by `Config::c_exposed_fns`, using
+the existing item-name or `export_name` match shared by Pointer and Interface.
+This guarantee does not extend to an arbitrary `extern "C"` or `no_mangle`
+function omitted from that configuration.
+
+C exposure alone is not a protection reason. Pointer already permits a selected
+raw-pointer input to become either a slice or a cursor. Later in the standard
+pipeline, Interface recognizes `&[T]`, `&mut [T]`, `SliceCursor<T>`, and
+`SliceCursorMut<T>`, renames the Rust implementation, and emits the original
+exported symbol with its raw-pointer parameter.
+
+A late cursor-to-slice demotion only changes which of those two supported
+adapters the interface pass emits. It does not change the final exported symbol
+or raw-pointer C signature. This exception is input-only: returns remain frozen,
+struct fields remain governed by the existing field/ABI protections, and a
+C-exposed function that is also signature-locked or in a function-pointer group
+is still protected for those independent reasons. Output immediately after the
+pointer pass is an intermediate representation; a C-facing pipeline must still
+run the interface pass.
+
 ### Protected components
 
 The resolver builds two graph views. The directed demand graph is the union of
-`local_edges` and `late_only_edges`; source-owner fan-out activates all member
+`local_edges` and `return_edges`; source-owner fan-out activates all member
 successors without erasing edge direction or representation barriers.
 
 The separate undirected safety graph contains every constraint endpoint and
@@ -346,7 +379,6 @@ The resolver computes weakly connected components of the safety graph. A
 component is ineligible for demotion if it touches:
 
 - a struct field through the field constraint graph;
-- a C-ABI-visible function;
 - a function in a function-pointer group;
 - a signature-locked function;
 - a cursor-valued return owner;
@@ -360,8 +392,8 @@ For field protection, first find weak field-graph components containing a
 in the undirected safety graph.
 
 The whole component is frozen rather than only the protected owner. This first
-stage avoids introducing new adapters or compatibility assumptions at exact
-signature and storage boundaries.
+stage avoids introducing new adapters or compatibility assumptions at
+unadapted exact-signature and storage boundaries.
 
 ## Late cursor solver
 
@@ -496,7 +528,6 @@ let resolution = {
         &forced_raw_bindings,
         &cursor_field_offset_alias_bindings,
         &fn_ptr_groups,
-        &config.c_exposed_fns,
     );
     resolve_late_cursors(
         &analysis.offset_sign_result.cursor_constraints,
@@ -599,7 +630,7 @@ The implementation must enforce these invariants:
   unchanged by the late delta.
 - The resolver is idempotent: solving the post-delta state yields no new delta.
 - The initial legacy `access_signs` and `field_access_signs` are unchanged by
-  retaining constraints.
+  the separate complete retained graphs.
 - Results and witnesses are deterministic.
 
 Mapping uncertainty is handled locally by freezing its component. Snapshot
@@ -610,16 +641,18 @@ finish before any write so the result cannot be partially applied.
 
 ### Constraint extraction
 
-- Pin the legacy closed local and field results before and after retaining the
-  graphs. The comparison reconstructs the legacy SCC closure from only the
-  legacy seeds and edges, omits `_0` exactly as the current result extraction
-  does, and applies `SourceVarGroups` widening before comparing `access_signs`.
+- Pin the legacy closed local and field results with characterization fixtures
+  and ensure closure consumes only the private legacy graphs. In particular,
+  prove that complete retained call-argument edges coexist with the current
+  source-order-sensitive legacy results and that `_0` remains omitted from
+  `access_signs`.
 - Distinguish direct seeds from transitively reached nodes.
 - Exercise assignment, cast, call-argument, return, recursion, and field edges.
 - Exercise source-variable groups whose temporary, rather than representative,
   receives the seed.
-- Build identical late return edges with caller-before-callee and
-  callee-before-caller function order.
+- Build identical retained call-argument and return edges with
+  caller-before-callee and callee-before-caller function order while preserving
+  the characterized legacy outputs.
 - Mark caller arguments and destinations protected for indirect calls through
   local and struct-field function pointers, and for foreign calls.
 - Assert that a negative pointer-offset operation creates a direct seed without
@@ -659,8 +692,10 @@ Use small synthetic graphs for:
 - Lifetime metadata is unchanged by signature demotion.
 - Rawness, ownership, nullability, and mutability are unchanged.
 - No later collection step restores a demoted local.
-- Fields, returns, C-exposed functions, function-pointer groups, and locked
-  signatures remain unchanged.
+- Fields, returns, function-pointer groups, and locked signatures remain
+  unchanged.
+- C exposure alone does not freeze an input; after a demotion, the interface
+  pass still emits the original raw-pointer wrapper around the internal slice.
 - Every retained cursor has a witness or explicit retention reason.
 - A later AST rewrite fallback records `AstRewriteFallback` and supersedes the
   earlier late-demotion event in the final summary.
@@ -683,8 +718,10 @@ Targeted corpus checks:
 - `merge_sort`: recursive helpers remain raw; wrapper parameters become slices;
   redundant cursor/raw conversions disappear.
 - `fallcalc`: reverse-traversal cursors and their propagation remain intact.
-- representative field, C-ABI, and function-pointer cases: protected decisions
-  do not change.
+- representative field and function-pointer cases: protected decisions do not
+  change;
+- a C-exposed demoted input: the interface pass preserves the exported raw
+  pointer signature and adapts it to the internal slice.
 
 After targeted cases compile and pass their vectors, transform and test the full
 public corpus and compare it with the current transformed baseline.
@@ -697,6 +734,9 @@ public corpus and compare it with the current transformed baseline.
   mutability agree in both `SigDecisions` and `ptr_kinds`; later adapter syntax
   or AST fallbacks are compared separately.
 - Protected components have no representation changes.
+- After the interface pass, every affected C-exposed function retains its
+  original exported raw-pointer signature, while Rust callers target the
+  internal slice-taking function.
 - The report-only run counts freezes by reason and confirms that the intended
   `merge_sort` wrapper candidates are not swallowed by component protection.
 - Global cursor count does not increase.
@@ -707,7 +747,8 @@ public corpus and compare it with the current transformed baseline.
 
 ## Delivery order
 
-1. Retain seeds and graphs and prove parity with legacy sign closure.
+1. Split private legacy closure graphs from complete retained constraints and
+   prove legacy-result parity and source-order-independent late coverage.
 2. Retain `SourceVarGroups` and add its read-only owner queries.
 3. Implement the final decision view and pure resolver with synthetic tests.
 4. Run the resolver report-only during development and inspect targeted deltas;
