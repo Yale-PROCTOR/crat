@@ -22,7 +22,7 @@
 //! a thin reference at a foreign counted position is refused by the existing
 //! `held:thin-extent` gate, which runs before this one).
 
-use rustc_hir::{ExprKind, HirId, Node, PatKind, def::Res};
+use rustc_hir::{ExprKind, HirId, Node, PatKind, def::Res, def_id::LocalDefId};
 use rustc_middle::ty::{TyCtxt, TyKind};
 use rustc_span::Span;
 
@@ -146,19 +146,17 @@ fn literal_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<LiteralValue> {
 /// by the source's own form and the index expression is carried verbatim, so a
 /// negative offset fails the same bounds check the emitted program already
 /// performs. (A negative offset on a raw pointer is UB in the input; §28.)
-fn derived_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<DerivedValue> {
-    if subject.kind != SubjectKind::Local
-        || subject.ty_span.is_some()
-        || subject.decl_shape != DeclShape::RawPtr
-        || subject.ptr_depth != 1
-        || subject.null_init
-    {
-        return None;
-    }
-    let Node::LetStmt(local) = tcx.parent_hir_node(subject.hir_id) else {
+///
+/// **The whole recognizer is HIR-only** (`derived_view`), because it is also
+/// the predicate ownership-fields' source scan consumes: it must answer for a
+/// binding their scan holds, at a point where no `Subject` exists yet. The
+/// subject-side entry adds only the collector's own guards, and both go
+/// through the same body so the two answers cannot drift.
+fn derived_view(tcx: TyCtxt<'_>, owner: LocalDefId, binding: HirId) -> Option<DerivedValue> {
+    let Node::LetStmt(local) = tcx.parent_hir_node(binding) else {
         return None;
     };
-    if !matches!(local.pat.kind, PatKind::Binding(_, hir, _, None) if hir == subject.hir_id)
+    if !matches!(local.pat.kind, PatKind::Binding(_, hir, _, None) if hir == binding)
         || local.ty.is_some()
     {
         return None;
@@ -173,7 +171,7 @@ fn derived_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<DerivedValue> {
     let ExprKind::Path(path) = &receiver.kind else {
         return None;
     };
-    let typeck = tcx.typeck(subject.fn_did);
+    let typeck = tcx.typeck(owner);
     let Res::Local(source) = typeck.qpath_res(path, receiver.hir_id) else {
         return None;
     };
@@ -181,13 +179,17 @@ fn derived_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<DerivedValue> {
     let TyKind::RawPtr(pointee, mutability) = input.kind() else {
         return None;
     };
+    // Depth 1 only: an inner raw pointer is a different subject's question.
+    if matches!(pointee.kind(), TyKind::RawPtr(..)) {
+        return None;
+    }
     // The derived binding and its base must be the same pointer type: a suffix
     // of the base's buffer, not a reinterpretation of it.
     if typeck.expr_ty(receiver) != input
         || initializer.span.from_expansion()
         || arguments[0].span.from_expansion()
-        || subject.binding_span.from_expansion()
-        || !declaration::pointee_is_nameable(tcx, subject.fn_did, *pointee)
+        || local.pat.span.from_expansion()
+        || !declaration::pointee_is_nameable(tcx, owner, *pointee)
     {
         return None;
     }
@@ -198,6 +200,75 @@ fn derived_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<DerivedValue> {
         pointee: declaration::pointee_source(tcx, *pointee),
         mutable: mutability.is_mut(),
     })
+}
+
+fn derived_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<DerivedValue> {
+    if subject.kind != SubjectKind::Local
+        || subject.ty_span.is_some()
+        || subject.decl_shape != DeclShape::RawPtr
+        || subject.ptr_depth != 1
+        || subject.null_init
+        || subject.binding_span.from_expansion()
+    {
+        return None;
+    }
+    derived_view(tcx, subject.fn_did, subject.hir_id)
+}
+
+/// **The predicate ownership-fields' native source scan consumes (R440-3).**
+///
+/// `ownership_fields_source::resolve` refuses an owner whose root has a raw use
+/// outside its `covered` set, and `covered` is filled only from root
+/// occurrences that are ARGUMENTS of a call. `let f = root.offset(k)` puts the
+/// root in RECEIVER position, so the owner is refused — and the refusal is what
+/// keeps the Box candidate from being produced at all, which is what keeps this
+/// lane from typing `f` (wave-5d2 report 019, measured both ways).
+///
+/// This answers, for one occurrence of one root: **is that occurrence the
+/// receiver of the `.offset(k)` that initializes a local this lane types as a
+/// suffix view of the root?** When it is, the occurrence is covered by this
+/// lane's own emission — the local becomes `&mut root[(k) as usize..]` and the
+/// raw read of the root disappears with it — so admitting it into `covered`
+/// leaves no uncovered raw use behind.
+///
+/// It decides nothing on its own: a `true` here is a claim about THIS lane's
+/// emission, and that emission additionally requires the base to deliver a
+/// `Decision::Box` (`complete_derived`). If the base is not delivered, the
+/// derived local is not typed either and both rows stay as they are.
+pub(crate) fn admits_offset_receiver(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    root: HirId,
+    occurrence: HirId,
+) -> bool {
+    // The occurrence must be the receiver of an `.offset(k)` call ...
+    let Node::Expr(call) = tcx.parent_hir_node(occurrence) else {
+        return false;
+    };
+    let ExprKind::MethodCall(_, receiver, _, _) = call.kind else {
+        return false;
+    };
+    if receiver.hir_id != occurrence {
+        return false;
+    }
+    // ... whose value initializes a local, through casts if the source wrote
+    // any (`peel` accepts the same chain on the way down).
+    let mut value = call.hir_id;
+    let binding = loop {
+        match tcx.parent_hir_node(value) {
+            Node::Expr(outer)
+                if matches!(outer.kind, ExprKind::Cast(..) | ExprKind::DropTemps(..)) =>
+            {
+                value = outer.hir_id;
+            }
+            Node::LetStmt(local) => match local.pat.kind {
+                PatKind::Binding(_, hir, _, None) => break hir,
+                _ => return false,
+            },
+            _ => return false,
+        }
+    };
+    derived_view(tcx, owner, binding).is_some_and(|view| view.source == root)
 }
 
 /// The base of a derived local is a Box CANDIDATE of the ownership-fields
@@ -449,4 +520,190 @@ pub(crate) fn has_declaration(table: &DecisionTable, subject: &Subject) -> bool 
                     "static-literal-local" | "derived-suffix-view"
                 )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_hir::{ItemKind, OwnerNode, def::Res, intravisit};
+
+    use super::*;
+
+    /// Every occurrence of `root` in `function` that the exported predicate
+    /// admits, rendered as the source text of the call it sits in. The list is
+    /// the whole answer: what is NOT in it is refused.
+    fn admitted(code: &str, function: &str, root: &str) -> Vec<String> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let mut owner = None;
+            for maybe in tcx.hir_crate(()).owners.iter() {
+                let Some(node) = maybe.as_owner() else { continue };
+                let OwnerNode::Item(item) = node.node() else {
+                    continue;
+                };
+                if matches!(item.kind, ItemKind::Fn { .. })
+                    && tcx.item_name(item.owner_id.to_def_id()).as_str() == function
+                {
+                    owner = Some(item.owner_id.def_id);
+                }
+            }
+            let owner = owner.expect("fixture function");
+            let body = tcx.hir_body_owned_by(owner);
+
+            struct Walk<'tcx> {
+                bindings: Vec<(String, HirId)>,
+                paths: Vec<&'tcx rustc_hir::Expr<'tcx>>,
+            }
+            impl<'tcx> intravisit::Visitor<'tcx> for Walk<'tcx> {
+                fn visit_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
+                    if let PatKind::Binding(_, hir_id, ident, _) = pat.kind {
+                        self.bindings.push((ident.name.to_string(), hir_id));
+                    }
+                    intravisit::walk_pat(self, pat);
+                }
+
+                fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+                    if matches!(expr.kind, ExprKind::Path(_)) {
+                        self.paths.push(expr);
+                    }
+                    intravisit::walk_expr(self, expr);
+                }
+            }
+            let mut walk = Walk {
+                bindings: Vec::new(),
+                paths: Vec::new(),
+            };
+            intravisit::walk_body(&mut walk, body);
+
+            let (_, root_binding) = walk
+                .bindings
+                .iter()
+                .find(|(name, _)| name == root)
+                .expect("fixture root binding");
+            let typeck = tcx.typeck(owner);
+            let source_map = tcx.sess.source_map();
+            let mut admitted = Vec::new();
+            for path in walk.paths {
+                let ExprKind::Path(qpath) = &path.kind else {
+                    continue;
+                };
+                if typeck.qpath_res(qpath, path.hir_id) != Res::Local(*root_binding) {
+                    continue;
+                }
+                if admits_offset_receiver(tcx, owner, *root_binding, path.hir_id) {
+                    let call = tcx.parent_hir_node(path.hir_id);
+                    let rustc_hir::Node::Expr(call) = call else {
+                        unreachable!("admitted occurrence has a call parent")
+                    };
+                    admitted.push(
+                        source_map
+                            .span_to_snippet(call.span)
+                            .expect("snippet")
+                            .replace(char::is_whitespace, ""),
+                    );
+                }
+            }
+            admitted
+        })
+        .expect("fixture compiles")
+    }
+
+    const DERIVED: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+extern "C" {
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
+    let size = width * height;
+    let mut ff = calloc(size as usize, core::mem::size_of::<f32>()) as *mut f32;
+    let mut x: i32 = 0;
+    while x < width {
+        let mut f = ff.offset((height * x) as isize);
+        let mut y: i32 = 0;
+        while y < height {
+            *f.offset(y as isize) = y as f32;
+            y += 1;
+        }
+        x += 1;
+    }
+    free(ff as *mut core::ffi::c_void);
+}
+"#;
+
+    /// The one occurrence this lane covers, and only it: the `free` argument
+    /// and the reads through the derived local are other occurrences of the
+    /// same root and stay outside `covered`.
+    #[test]
+    fn the_initializing_offset_receiver_is_admitted() {
+        assert_eq!(
+            admitted(DERIVED, "transform_to_coordfield", "ff"),
+            vec!["ff.offset((height*x)asisize)".to_owned()]
+        );
+    }
+
+    /// The derived local's OWN uses are not the root's occurrences, so the
+    /// predicate says nothing about them — asked directly, it refuses.
+    #[test]
+    fn a_use_of_the_derived_local_is_not_admitted() {
+        assert!(admitted(DERIVED, "transform_to_coordfield", "f").is_empty());
+    }
+
+    /// An annotated local has a declared type of its own; this lane does not
+    /// type it, so the occurrence stays uncovered and the owner stays held.
+    #[test]
+    fn an_annotated_derived_local_is_not_admitted() {
+        const ANNOTATED: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+extern "C" {
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
+    let mut ff = calloc(width as usize, core::mem::size_of::<f32>()) as *mut f32;
+    let f: *mut f32 = ff.offset(width as isize);
+    *f = 1.0;
+    free(ff as *mut core::ffi::c_void);
+}
+"#;
+        assert!(admitted(ANNOTATED, "transform_to_coordfield", "ff").is_empty());
+    }
+
+    /// A different arithmetic method is a different form with a different
+    /// emission; only `offset` is recognized.
+    #[test]
+    fn a_non_offset_receiver_is_not_admitted() {
+        const ADD: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+extern "C" {
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn transform_to_coordfield(width: i32) {
+    let mut ff = calloc(width as usize, core::mem::size_of::<f32>()) as *mut f32;
+    let mut f = ff.add(width as usize);
+    *f = 1.0;
+    free(ff as *mut core::ffi::c_void);
+}
+"#;
+        assert!(admitted(ADD, "transform_to_coordfield", "ff").is_empty());
+    }
+
+    /// A reinterpreting cast is not a suffix of the same buffer: the derived
+    /// binding must carry the base's own pointer type.
+    #[test]
+    fn a_retyped_derived_local_is_not_admitted() {
+        const RETYPED: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+extern "C" {
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn transform_to_coordfield(width: i32) {
+    let mut ff = calloc(width as usize, core::mem::size_of::<f32>()) as *mut f32;
+    let mut f = ff.offset(width as isize) as *mut u8;
+    *f = 1;
+    free(ff as *mut core::ffi::c_void);
+}
+"#;
+        assert!(admitted(RETYPED, "transform_to_coordfield", "ff").is_empty());
+    }
 }
