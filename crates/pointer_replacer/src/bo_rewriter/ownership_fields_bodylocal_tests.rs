@@ -1303,12 +1303,16 @@ fn r407_real_transform_to_distance_view_aliases_meet_the_owner_class_hold() {
     // derives a bundle for every owner; the seam plans no call glue at the
     // lent alias arguments (the lend is the argument text) and `edt`'s
     // interface takes a dependency on the owner's class. The frontier is
-    // that class: the alias subjects stay `Degraded(copy-source-coupled)`
-    // siblings with a c-arm requirement, which holds the whole owner class
-    // (`blocked-subject:copy-source-coupled`, `missing-required-arm:c`) —
-    // the sibling hold R407-12 exempts a local-only Box plan from (wave-5d's
-    // per-subject scope). Pinned: no interval collision, every bundle
-    // derived, the dependency taken, the owners withdrawn with the class.
+    // that class — and which side of it this frame is on is the frame's own
+    // answer (R217-2(a), restated at relay 045). On a base where no family
+    // takes the aliases they stay `Degraded(copy-source-coupled)` siblings
+    // with a c-arm requirement, which holds the whole owner class
+    // (`blocked-subject:copy-source-coupled`, `missing-required-arm:c`) — the
+    // R407-12 frontier. On a composition carrying wave-5d2's rule B and R442
+    // the aliases are decided slices over a DELIVERED owner (their report
+    // 023), and the same four owners read `selected` / `Box`. Pinned on both:
+    // no interval collision, every bundle derived, `edt`'s dependency taken,
+    // and the four owners agreeing on one frame.
     let input = format!(
         r#"{}
 pub mod uint {{ pub type uint16_t = u16; }}
@@ -1329,6 +1333,7 @@ pub static mut INF: libc::c_float = 1E20f64 as libc::c_float;
             )),
         )
         .unwrap();
+        let mut delivered = 0;
         for name in ["ff", "dd", "zz", "ww"] {
             let (subject, decision) = table
                 .entries
@@ -1343,23 +1348,43 @@ pub static mut INF: libc::c_float = 1E20f64 as libc::c_float;
                 Some(&super::SlotKind::Owning),
                 "{name}: actual model grant"
             );
-            // The native bundle exists (the alias permit admitted every use);
-            // the final decision does not carry it.
+            // The native bundle exists on every frame — the alias permit
+            // admitted every use — and which way it then goes is the frame's:
+            // R217-2(a), restated at relay 045 for the composition wave-5d2's
+            // rule B and R442 make (their report 023).
             let row = ctx
                 .raw_boundary_artifacts
                 .ownership_native
                 .lines()
                 .find(|row| row.starts_with(&format!("transform_to_distance::{name}#")))
                 .unwrap_or_else(|| panic!("{name}: no native audit row"));
-            assert!(
-                row.contains("\ttrue\tnot-selected\tCandidateNotSelected\t"),
-                "{name}: {row}"
-            );
-            assert!(
-                matches!(decision, Decision::Degraded(_)),
-                "{name}: {decision:?}"
-            );
+            assert!(row.contains("\ttrue\t"), "{name}: considered: {row}");
+            if row.contains("\tselected\t") {
+                // The composed reading: the aliases are a deciding family's to
+                // render, R442 keeps the owner typed, and the owner delivers.
+                assert!(
+                    matches!(decision, Decision::Box(_)),
+                    "{name}: selected but not delivered: {decision:?}"
+                );
+                delivered += 1;
+            } else {
+                // This base's reading: no family takes the aliases, they stay
+                // `Degraded(copy-source-coupled)` siblings, and the class hold
+                // withdraws the owner with them (the R407-12 frontier).
+                assert!(
+                    row.contains("\tnot-selected\tCandidateNotSelected\t"),
+                    "{name}: {row}"
+                );
+                assert!(
+                    matches!(decision, Decision::Degraded(_)),
+                    "{name}: {decision:?}"
+                );
+            }
         }
+        assert!(
+            delivered == 0 || delivered == 4,
+            "the four owners share one frame, {delivered} delivered"
+        );
         let ownership_receipts = ctx
             .raw_boundary_artifacts
             .additive_family_receipts
@@ -1373,17 +1398,22 @@ pub static mut INF: libc::c_float = 1E20f64 as libc::c_float;
                 .all(|cause| !cause.contains("newer-family-collision")),
             "{ownership_receipts:?}"
         );
+        // The callee's interface takes a dependency on the owner's class. The
+        // cause text carries a re-derivation anchor on a composition
+        // (`exclusion-rederivation:anchor=…:new-family-dependency:…`), so the
+        // pin is the dependency itself, not the prefix.
         assert!(
             ownership_receipts
                 .iter()
-                .any(|cause| cause.starts_with("edt: new-family-dependency:")),
+                .any(|cause| cause.starts_with("edt: ") && cause.contains("new-family-dependency")),
             "{ownership_receipts:?}"
         );
         assert!(
-            ownership_receipts
-                .iter()
-                .any(|cause| cause.starts_with("transform_to_distance: ")),
-            "{ownership_receipts:?}"
+            delivered == 4
+                || ownership_receipts
+                    .iter()
+                    .any(|cause| cause.starts_with("transform_to_distance: ")),
+            "held here, so the owner class must say so: {ownership_receipts:?}"
         );
     })
     .unwrap();
