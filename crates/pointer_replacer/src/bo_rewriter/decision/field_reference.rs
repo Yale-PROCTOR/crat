@@ -103,7 +103,7 @@ fn sorted_owners(owners: impl IntoIterator<Item = LocalDefId>) -> Vec<LocalDefId
 }
 
 /// What the right-hand side of a store or literal initializer is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Rhs {
     /// `0 as *mut T` — becomes `None`.
     Null,
@@ -113,6 +113,10 @@ pub(crate) enum Rhs {
     /// OWNED field takes it through the `from_raw` bridge, a reference field
     /// holds.
     RawExpression,
+    /// An allocation whose element count its own size argument proves (G
+    /// build 3): a fat owned place reclaims it as a boxed slice of that
+    /// length — no fabricated extent.
+    AllocationWithLength(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,14 +436,18 @@ impl FieldTransactions {
                 "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\n",
                 t.struct_path,
                 t.field_name,
-                if t.owning {
+                if t.array.is_some() {
+                    if t.array.as_ref().is_some_and(|a| a.owning) {
+                        "array-opt-box-slice"
+                    } else {
+                        "array-opt-ref-shared"
+                    }
+                } else if t.owning {
                     if matches!(t.form, Form::Slice { .. } | Form::Opt { slice: true, .. }) {
                         "opt-box-slice"
                     } else {
                         "opt-box"
                     }
-                } else if t.array.is_some() {
-                    "array-opt-ref-shared"
                 } else {
                     t.form.key()
                 },
@@ -1822,13 +1830,247 @@ pub(crate) struct ArrayLocal {
     pub name: String,
     pub len: String,
     pub pointee: String,
+    /// G build 3: every element is its own allocation, released at its own C
+    /// free — the array is `[Option<Box<[T]>>; N]`, not `[Option<&T>; N]`.
+    pub owning: bool,
+}
+
+/// The sites of an OWNED-element array (G build 3 stage 2): the allocation
+/// stores, the null tests, the raw views a callee takes, the element reads
+/// through an offset, and the release casts. Every other use of an element
+/// is a typed hold — the transaction never skips a site in silence.
+fn owned_element_uses<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    info: &ArrayLocal,
+    body: &'tcx rustc_hir::Body<'tcx>,
+    subjects: &FxHashMap<HirId, NodeKey>,
+    kinds: &FxHashMap<NodeKey, SlotKind>,
+) -> (Vec<Site>, Option<String>) {
+    struct Owned<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        owner: LocalDefId,
+        binding: HirId,
+        name: String,
+        subjects: &'a FxHashMap<HirId, NodeKey>,
+        kinds: &'a FxHashMap<NodeKey, SlotKind>,
+        sites: Vec<Site>,
+        hold: Option<String>,
+    }
+    impl<'tcx> Owned<'_, 'tcx> {
+        fn hold(&mut self, reason: &str) {
+            self.hold
+                .get_or_insert_with(|| format!("array-owned-incomplete:{reason}"));
+        }
+
+        fn site(&self, kind: SiteKind, span: Span) -> Site {
+            Site {
+                owner: self.owner,
+                kind,
+                span,
+                field_text: self.name.clone(),
+                rhs: None,
+                local: None,
+                index_text: None,
+                consumer: None,
+                base: None,
+                raw_base: false,
+                assign_span: None,
+                hoists: Vec::new(),
+                cast: None,
+                written: false,
+            }
+        }
+
+        fn is_element(&self, expr: &rustc_hir::Expr<'_>) -> bool {
+            matches!(expr.kind, ExprKind::Index(base, _, _)
+                if matches!(base.kind, ExprKind::Path(QPath::Resolved(_, path))
+                    if matches!(path.res, Res::Local(id) if id == self.binding)))
+        }
+
+        /// The callee's parameter subject at `index`, when the callee is a
+        /// local function whose parameter is a subject of the table.
+        fn callee_parameter(
+            &self,
+            callee: &rustc_hir::Expr<'_>,
+            index: usize,
+        ) -> Option<(NodeKey, SlotKind)> {
+            let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return None };
+            let Res::Def(rustc_hir::def::DefKind::Fn, did) = path.res else { return None };
+            let local = did.as_local()?;
+            let body_id = self.tcx.hir_node_by_def_id(local).body_id()?;
+            let param = self.tcx.hir_body(body_id).params.get(index)?;
+            let node = *self.subjects.get(&param.pat.hir_id)?;
+            let kind = *self.kinds.get(&node)?;
+            Some((node, kind))
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Owned<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            let tcx = self.tcx;
+            let sm = tcx.sess.source_map();
+            // The element's own uses are classified from the element
+            // expression; every other expression walks on.
+            if !self.is_element(expr) {
+                intravisit::walk_expr(self, expr);
+                return;
+            }
+            let parent = tcx.parent_hir_node(expr.hir_id);
+            match parent {
+                // `arr[i] = <allocation>` — the element takes the allocation.
+                Node::Expr(p) if matches!(p.kind, ExprKind::Assign(lhs, _, _) if lhs.hir_id == expr.hir_id) =>
+                {
+                    let ExprKind::Assign(_, rhs, _) = p.kind else { return };
+                    let mut source = rhs;
+                    while let ExprKind::Cast(inner, _) = source.kind {
+                        source = inner;
+                    }
+                    let ExprKind::Call(_, args) = source.kind else {
+                        self.hold("store-source-not-an-allocation");
+                        return;
+                    };
+                    if args.len() != 1 {
+                        self.hold("allocation-shape");
+                        return;
+                    }
+                    let Ok(size) = sm.span_to_snippet(args[0].span) else {
+                        self.hold("allocation-size-text");
+                        return;
+                    };
+                    let mut site = self.site(SiteKind::Store, rhs.span);
+                    site.rhs = Some(Rhs::AllocationWithLength(size));
+                    site.assign_span = Some(p.span);
+                    self.sites.push(site);
+                }
+                // `(arr[i]).is_null()` and `*(arr[i]).offset(k)`.
+                Node::Expr(p) if matches!(p.kind, ExprKind::MethodCall(..)) => {
+                    let ExprKind::MethodCall(segment, _, args, _) = p.kind else { return };
+                    match segment.ident.name.as_str() {
+                        "is_null" => self.sites.push(self.site(SiteKind::IsNull, p.span)),
+                        "offset" | "add" => {
+                            let Node::Expr(grand) = tcx.parent_hir_node(p.hir_id) else {
+                                self.hold("offset-consumer");
+                                return;
+                            };
+                            let ExprKind::Unary(UnOp::Deref, _) = grand.kind else {
+                                self.hold("offset-consumer");
+                                return;
+                            };
+                            let Ok(index) = args
+                                .first()
+                                .map(|arg| sm.span_to_snippet(arg.span))
+                                .unwrap_or(Ok(String::new()))
+                            else {
+                                self.hold("offset-index-text");
+                                return;
+                            };
+                            // A slice is indexed by `usize`; the C cursor is
+                            // written as an `isize` offset.
+                            let mut site = self.site(SiteKind::Element, grand.span);
+                            site.index_text = Some(format!("({index}) as usize"));
+                            site.written = matches!(
+                                tcx.parent_hir_node(grand.hir_id),
+                                Node::Expr(a)
+                                    if matches!(a.kind, ExprKind::Assign(lhs, _, _) if lhs.hir_id == grand.hir_id)
+                                        || matches!(a.kind, ExprKind::AssignOp(_, lhs, _) if lhs.hir_id == grand.hir_id)
+                            );
+                            self.sites.push(site);
+                        }
+                        other => self.hold(&format!("element-method:{other}")),
+                    }
+                }
+                // `f(.., arr[i], ..)` — a callee takes a view of the element.
+                Node::Expr(p) if matches!(p.kind, ExprKind::Call(..)) => {
+                    let ExprKind::Call(callee, args) = p.kind else { return };
+                    let Some(index) = args.iter().position(|arg| arg.hir_id == expr.hir_id) else {
+                        self.hold("call-shape");
+                        return;
+                    };
+                    match self.callee_parameter(callee, index) {
+                        Some(consumer) => {
+                            let mut site = self.site(SiteKind::CallArgument, expr.span);
+                            site.consumer = Some(consumer);
+                            self.sites.push(site);
+                        }
+                        None => self.hold("call-argument-foreign"),
+                    }
+                }
+                // `free(arr[i] as *mut c_void)` — the release site; the
+                // deallocator is read at finalization.
+                Node::Expr(p) if matches!(p.kind, ExprKind::Cast(..)) => {
+                    let ExprKind::Cast(_, target_ty) = p.kind else { return };
+                    let Ok(target) = sm.span_to_snippet(target_ty.span) else {
+                        self.hold("release-cast-text");
+                        return;
+                    };
+                    let Node::Expr(call) = tcx.parent_hir_node(p.hir_id) else {
+                        self.hold("release-consumer");
+                        return;
+                    };
+                    let ExprKind::Call(callee, args) = call.kind else {
+                        self.hold("release-consumer");
+                        return;
+                    };
+                    let Some(index) = args.iter().position(|arg| arg.hir_id == p.hir_id) else {
+                        self.hold("release-consumer");
+                        return;
+                    };
+                    let (local, foreign) = match callee.kind {
+                        ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                            Res::Def(rustc_hir::def::DefKind::Fn, did) => (
+                                did.as_local(),
+                                Some(
+                                    tcx.def_path_str(did)
+                                        .rsplit("::")
+                                        .next()
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                ),
+                            ),
+                            _ => (None, None),
+                        },
+                        _ => (None, None),
+                    };
+                    let mutable = matches!(
+                        tcx.typeck(self.owner).expr_ty(p).kind(),
+                        TyKind::RawPtr(_, mutability) if mutability.is_mut()
+                    );
+                    let mut site = self.site(SiteKind::Cast, p.span);
+                    site.cast = Some(CastSite {
+                        target,
+                        mutable,
+                        callee: local,
+                        foreign,
+                        index,
+                    });
+                    self.sites.push(site);
+                }
+                _ => self.hold("element-use-shape"),
+            }
+        }
+    }
+    let mut owned = Owned {
+        tcx,
+        owner,
+        binding: info.binding,
+        name: info.name.clone(),
+        subjects,
+        kinds,
+        sites: Vec::new(),
+        hold: None,
+    };
+    owned.visit_body(body);
+    (owned.sites, owned.hold)
 }
 
 /// Which family a `*mut`-element array local belongs to (G build 3): the
 /// element stores' sources and the release sites decide. An OWNED-element
 /// array stores a fresh allocation into every element and hands every
 /// element to a releasing call; anything else stays the borrowed shape.
-fn mutable_element_family<'tcx>(binding: HirId, body: &'tcx rustc_hir::Body<'tcx>) -> String {
+fn mutable_element_family<'tcx>(
+    binding: HirId,
+    body: &'tcx rustc_hir::Body<'tcx>,
+) -> Result<(), String> {
     struct Elements {
         binding: HirId,
         stores: usize,
@@ -1878,15 +2120,14 @@ fn mutable_element_family<'tcx>(binding: HirId, body: &'tcx rustc_hir::Body<'tcx
         // Some element is written from something other than a fresh call:
         // the borrowed-element family, whose `&mut` elements need a
         // disjointness argument nothing here supplies.
-        return "array-local-incomplete:mutable-elements".to_owned();
+        return Err("array-local-incomplete:mutable-elements".to_owned());
     }
     if released == 0 {
-        return "array-owned-incomplete:no-release".to_owned();
+        return Err("array-owned-incomplete:no-release".to_owned());
     }
     // Every element is allocated and handed to a releasing call: the owned
-    // family. The forms (`[Option<Box<[T]>>; N]`, the store from the
-    // allocation, the drop at the C free) are build 3's emission.
-    "array-owned-incomplete:emission-not-built".to_owned()
+    // family. Its element count must come from the allocation itself.
+    Ok(())
 }
 
 fn array_local_candidates(
@@ -2160,12 +2401,13 @@ fn array_local_candidates(
                 ) else {
                     return;
                 };
-                let info = ArrayLocal {
+                let mut info = ArrayLocal {
                     owner: self.owner,
                     binding,
                     name: name.to_string(),
                     len,
                     pointee,
+                    owning: false,
                 };
                 // The initializer: a repeated null literal, an element LIST
                 // of null literals (the substrate's other spelling of the
@@ -2240,9 +2482,18 @@ fn array_local_candidates(
                     // the second. They are told apart by the element stores'
                     // sources and the release sites, and named apart so the
                     // census does not read one market as the other.
-                    hold.get_or_insert_with(|| mutable_element_family(info.binding, body));
+                    match mutable_element_family(info.binding, body) {
+                        Ok(()) => info.owning = true,
+                        Err(reason) => {
+                            hold.get_or_insert(reason);
+                        }
+                    }
                 }
-                let (uses, use_hold) = self.classify(&info, body);
+                let (uses, use_hold) = if info.owning {
+                    owned_element_uses(tcx, self.owner, &info, body, self.subjects, self.kinds)
+                } else {
+                    self.classify(&info, body)
+                };
                 sites.extend(uses);
                 if hold.is_none() {
                     hold = use_hold;
@@ -2303,10 +2554,10 @@ fn array_local_candidates(
                     key,
                     struct_path,
                     field_name,
-                    owning: false,
+                    owning: info.owning,
                     form: Form::Opt {
-                        mutable: false,
-                        slice: false,
+                        mutable: info.owning,
+                        slice: info.owning,
                     },
                     sites,
                     mentions: Vec::new(),
@@ -2740,6 +2991,14 @@ pub(crate) fn finalize(
                     });
                 }
                 SiteKind::Literal | SiteKind::Store => match site.rhs {
+                    // An allocation belongs to the owned family; a reference
+                    // place never takes one.
+                    Some(Rhs::AllocationWithLength(_)) => {
+                        cause.get_or_insert_with(|| {
+                            "field-transaction-incomplete:allocation-into-a-reference".to_owned()
+                        });
+                        continue;
+                    }
                     Some(Rhs::Null) => edits.push(ExpressionEdit {
                         owner: site.owner,
                         span: site.span,
@@ -3202,6 +3461,31 @@ fn owned_sites<'t>(
                 ),
                 "owned-field-view",
             )),
+            // A consumer delivered as a SLICE takes the owned buffer's own
+            // slice — the boxed slice IS the extent, so nothing is
+            // fabricated and no raw bridge is needed (G build 3: heman's and
+            // lodepng's element buffers reach their walkers this way).
+            (SlotKind::Ref, Decision::Slice { mutable, .. }) if fat => Ok((
+                format!(
+                    "{inner}.{}().unwrap()",
+                    if *mutable { "as_deref_mut" } else { "as_deref" }
+                ),
+                "owned-field-view",
+            )),
+            (
+                SlotKind::Ref,
+                Decision::Opt {
+                    mutable,
+                    slice: true,
+                    ..
+                },
+            ) if fat => Ok((
+                format!(
+                    "{inner}.{}()",
+                    if *mutable { "as_deref_mut" } else { "as_deref" }
+                ),
+                "owned-field-view",
+            )),
             (SlotKind::Ref, Decision::Degraded(_)) => Ok((
                 view_to_raw(raw_target_mutable(node)),
                 "owned-field-raw-view",
@@ -3216,6 +3500,23 @@ fn owned_sites<'t>(
     };
     for site in &candidate.sites {
         match site.kind {
+            // G build 3: an owned ARRAY's null initializer is the whole
+            // array's, exactly as the reference form's is — but an owned
+            // element is not `Copy`, so the repeat takes the const form.
+            SiteKind::Literal if candidate.array.is_some() => {
+                let len = candidate
+                    .array
+                    .as_ref()
+                    .map(|a| a.len.clone())
+                    .unwrap_or_default();
+                edits.push(ExpressionEdit {
+                    owner: site.owner,
+                    span: site.span,
+                    replacement: format!("[const {{ None }}; {len}]"),
+                    kind: "array-null-repeat",
+                    wrap: false,
+                });
+            }
             SiteKind::Literal | SiteKind::Store => {
                 let replacement = match site.rhs {
                     Some(Rhs::Null) => "None".to_owned(),
@@ -3256,6 +3557,14 @@ fn owned_sites<'t>(
                             continue;
                         }
                     },
+                    // G build 3: a fresh allocation whose own size argument
+                    // proves the element count — the fat place reclaims it as
+                    // a boxed slice of exactly that length (no fabricated
+                    // extent; the allocation and the box are the same bytes).
+                    Some(Rhs::AllocationWithLength(ref elements)) if fat => format!(
+                        "core::ptr::NonNull::new({inner}).map(|__p| Box::from_raw(core::ptr::slice_from_raw_parts_mut(__p.as_ptr(), ({elements}) as usize)))"
+                    ),
+                    Some(Rhs::AllocationWithLength(_)) => from_raw(),
                     Some(Rhs::RawExpression) if fat => {
                         cause.get_or_insert_with(|| {
                             "field-transaction-incomplete:owned-slice-store-length".to_owned()
@@ -3434,6 +3743,16 @@ fn owned_sites<'t>(
                         kind: receipt,
                         wrap: true,
                     }),
+                    // G build 3: an owned ARRAY's element reaches a cast
+                    // only at its release. If the callee is not a known
+                    // deallocator the site cannot be a view — C would free
+                    // memory the Box still owns — so the transaction holds.
+                    None if candidate.array.is_some() => {
+                        cause.get_or_insert_with(|| {
+                            "array-owned-incomplete:release-not-a-deallocator".to_owned()
+                        });
+                        continue;
+                    }
                     None => edits.push(ExpressionEdit {
                         owner: site.owner,
                         span: site.span,

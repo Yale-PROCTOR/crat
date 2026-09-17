@@ -1110,40 +1110,84 @@ fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
 
 const OWNED_ARRAY: &str = include_str!("wave6f_fixture_owned_array.rs");
 
-/// Witness 22 (relay 026, build 3 stage 1) — a written element is TWO
-/// families, and the census must not read one as the other. An OWNED-element
-/// array stores a fresh allocation into every element and hands every
-/// element to a releasing call (lodepng's `filter::attempt*` ×3 and tulip's
-/// `smoke::test_ind_name` ×3 — six of the seven corpus rows): it is named
-/// `array-owned-incomplete:emission-not-built`, whose forms
-/// (`[Option<Box<[T]>>; N]`, the store from the allocation, the drop at the
-/// C free site) are the next stage. An array whose elements are BORROWED
-/// writable views keeps `mutable-elements`: two live `&mut` elements would
-/// be an aliasing violation and R395-2 moves an aliasing hold only on
-/// evidence, which this shape does not carry.
+/// Witness 22 (relay 026, build 3) — a written element is TWO families and
+/// the census must not read one as the other. An OWNED-element array stores
+/// a fresh allocation into every element and releases every element at its
+/// own C free (lodepng's `filter::attempt*` ×3, tulip's
+/// `smoke::test_ind_name` ×3): it DELIVERS as `[Option<Box<[T]>>; N]`
+/// (witness 23). The controls hold, each for its own reason: BORROWED
+/// elements (`mutable-elements` — N live `&mut` would need a disjointness
+/// argument, R395-2); allocated but never released (`no-release` — the drops
+/// sit at C free sites and there is none); released through a call that is
+/// not a deallocator (`release-not-a-deallocator` — handing C a view of
+/// memory the `Box` still owns would double-free at scope exit).
 #[test]
 fn w6f_a_written_element_names_its_family() {
     let observed = observe(OWNED_ARRAY);
     let owned = field_row(&observed, "filter", "attempt");
     assert_eq!(
-        (owned.2.as_str(), owned.4.as_str()),
-        ("held", "array-owned-incomplete:emission-not-built"),
+        (owned.2.as_str(), owned.3.as_str()),
+        ("applied", "array-opt-box-slice"),
         "{owned:?}"
     );
-    let borrowed = field_row(&observed, "borrowed_rows", "rows");
-    assert_eq!(
-        (borrowed.2.as_str(), borrowed.4.as_str()),
-        ("held", "array-local-incomplete:mutable-elements"),
-        "{borrowed:?}"
-    );
-    // Allocated but never released: the drops have no C free site to sit at,
-    // so the owned family's evidence is incomplete and says so.
-    let leaked = field_row(&observed, "leaked", "scratch");
-    assert_eq!(
-        (leaked.2.as_str(), leaked.4.as_str()),
-        ("held", "array-owned-incomplete:no-release"),
-        "{leaked:?}"
-    );
+    for (function, array, reason) in [
+        (
+            "borrowed_rows",
+            "rows",
+            "array-local-incomplete:mutable-elements",
+        ),
+        ("leaked", "scratch", "array-owned-incomplete:no-release"),
+        (
+            "registered",
+            "kept",
+            "array-owned-incomplete:release-not-a-deallocator",
+        ),
+    ] {
+        let row = field_row(&observed, function, array);
+        assert_eq!(
+            (row.2.as_str(), row.4.as_str()),
+            ("held", reason),
+            "{row:?}"
+        );
+    }
+}
+
+/// Witness 23 (relay 027, build 3 stage 2) — the owned-element array
+/// delivers. Every element owns its allocation as a boxed slice whose
+/// length is the allocation's OWN size argument (no fabricated extent); the
+/// null test reads the option; a callee delivered as a slice takes the
+/// buffer's own slice; an offset read indexes it; and the C free site keeps
+/// its call, receiving the allocation back through `take()` +
+/// `Box::into_raw` — the free stays exactly where C put it (R395-2) and the
+/// element is `None` afterwards, so nothing drops twice.
+#[test]
+fn w6f_owned_element_array_delivers() {
+    let outcome = emitted("owned_array", OWNED_ARRAY);
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    assert_eq!(reverted, 0, "{source}");
+    assert!(emitted_count >= 1, "{emitted_count}\n{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "let mut attempt: [Option<Box<[u8]>>; 5] = [const { None }; 5];",
+        "attempt[type_1 as usize] = core::ptr::NonNull::new(lodepng_malloc(linebytes) as *mut u8).map(|__p| Box::from_raw(core::ptr::slice_from_raw_parts_mut(__p.as_ptr(), (linebytes) as usize)));",
+        "if (attempt[type_1 as usize]).is_none() {",
+        "filterScanline(attempt[type_1 as usize].as_deref_mut().unwrap(),",
+        "(attempt[type_1 as usize]).as_deref().unwrap()[(0 as isize) as usize]",
+        "lodepng_free(attempt[type_1 as usize].take().map_or(core::ptr::null_mut(), |__b| Box::into_raw(__b) as *mut std::ffi::c_void));",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+    // The three controls keep their raw arrays in the same tree.
+    for untouched in [
+        "let mut rows: [*mut u8; 2] = [0 as *mut u8; 2];",
+        "let mut scratch: [*mut u8; 2] = [0 as *mut u8; 2];",
+        "let mut kept: [*mut u8; 2] = [0 as *mut u8; 2];",
+    ] {
+        assert!(
+            flat.contains(untouched),
+            "missing {untouched:?} in\n{source}"
+        );
+    }
 }
 
 const TULIP_ARRAYS: &str = include_str!("wave6f_fixture_tulip_arrays.rs");

@@ -304,7 +304,12 @@ pub(super) fn apply(
             t.array.as_ref().map(|a| {
                 (
                     (a.owner, a.binding),
-                    format!("[Option<&{}>; {}]", a.pointee, a.len),
+                    if a.owning {
+                        // G build 3: every element owns its allocation.
+                        format!("[Option<Box<[{}]>>; {}]", a.pointee, a.len)
+                    } else {
+                        format!("[Option<&{}>; {}]", a.pointee, a.len)
+                    },
                 )
             })
         })

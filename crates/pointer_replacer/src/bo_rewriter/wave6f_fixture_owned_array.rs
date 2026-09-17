@@ -14,8 +14,16 @@
     non_snake_case
 )]
 extern "C" {
-    fn lodepng_malloc(size: u64) -> *mut std::ffi::c_void;
-    fn lodepng_free(ptr: *mut std::ffi::c_void);
+    fn malloc(size: u64) -> *mut std::ffi::c_void;
+    fn free(ptr: *mut std::ffi::c_void);
+}
+// lodepng's own wrappers, as the substrate has them: the allocator and the
+// DEALLOCATOR are local functions over libc's.
+pub unsafe extern "C" fn lodepng_malloc(mut size: u64) -> *mut std::ffi::c_void {
+    return malloc(size);
+}
+pub unsafe extern "C" fn lodepng_free(mut ptr: *mut std::ffi::c_void) {
+    free(ptr);
 }
 pub unsafe extern "C" fn filterScanline(mut out: *mut u8, mut scanline: *const u8, mut len: u64) {
     let mut i = 0 as u64;
@@ -82,4 +90,18 @@ pub unsafe extern "C" fn leaked(mut len: u64) -> u32 {
         i = i.wrapping_add(1);
     }
     return *(scratch[0 as usize]).offset(0 as isize) as u32;
+}
+
+// The release is not a deallocator: C would keep a pointer the Box still
+// owns, so the transaction holds rather than hand out a view.
+pub unsafe extern "C" fn record(mut ptr: *mut std::ffi::c_void) {}
+pub unsafe extern "C" fn registered(mut len: u64) -> u32 {
+    let mut kept: [*mut u8; 2] = [0 as *mut u8; 2];
+    let mut i = 0 as usize;
+    while i < 2 as usize {
+        kept[i] = lodepng_malloc(len) as *mut u8;
+        record(kept[i] as *mut std::ffi::c_void);
+        i = i.wrapping_add(1);
+    }
+    return *(kept[0 as usize]).offset(0 as isize) as u32;
 }
