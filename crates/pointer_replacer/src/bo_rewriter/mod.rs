@@ -6066,6 +6066,31 @@ fn prepare_plan_files<'tcx>(
         if reverted.contains(&call.owner_class.local_def_id()) {
             continue;
         }
+        // **The intra-class arm (relay 034).** The PAIR raw-view call renders
+        // this same call for this same class, materializing the raw views the
+        // A5 T2 fallback exists to materialize — planning a SECOND whole-call
+        // rewrite of one interval is what holds the class
+        // (`intra-class-interval-overlap`: lodepng's `lodepng_assign_icc`,
+        // where `pair-t2-raw-view` and `a5-site-proof-t2-fallback` both own
+        // 272439..272561). The fallback yields to the rendering it is a
+        // fallback FOR, and its per-argument proof sites ride that carrier —
+        // which is what `link_a5_fallback_carriers` already does for them
+        // (`calls.push((file, lo, hi, "pair-raw-view"))`). Held to the exact
+        // call, the exact class, and views that cover every A5 argument, so a
+        // PAIR call that renders something else is not a carrier.
+        if table.seams.pair_raw_calls.iter().any(|pair| {
+            pair.owner_class == call.owner_class
+                && pair.caller == call.caller
+                && pair.callee == call.callee
+                && pair.call_span == call.call_span
+                && call.views.iter().all(|view| {
+                    pair.views
+                        .iter()
+                        .any(|other| other.argument_index == view.argument_index)
+                })
+        }) {
+            continue;
+        }
         let (file, lo, hi) = span_to_loc(call.call_span)
             .map_err(|why| format!("unplaceable A5 raw-view call: {why}"))?;
         let source = text_of(&file)
