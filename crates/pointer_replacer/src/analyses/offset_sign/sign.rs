@@ -1249,17 +1249,26 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
     }
 
     fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Location) {
-        if let TerminatorKind::Call {
+        let TerminatorKind::Call {
             func,
             args,
             destination,
             ..
         } = &terminator.kind
-            && let Operand::Constant(box constant) = func
-        {
-            let ty = constant.const_.ty();
-            let ty::TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-            let name = self.tcx.def_path(*def_id).to_string_no_crate_verbose();
+        else {
+            return;
+        };
+
+        let fn_def_id = match func {
+            Operand::Constant(box constant) => match constant.const_.ty().kind() {
+                ty::TyKind::FnDef(def_id, _) => Some(*def_id),
+                _ => None,
+            },
+            Operand::Copy(_) | Operand::Move(_) => None,
+        };
+
+        if let Some(def_id) = fn_def_id {
+            let name = self.tcx.def_path(def_id).to_string_no_crate_verbose();
             if is_pointer_offset_like_call(&name) {
                 if let Operand::Copy(place) | Operand::Move(place) = &args[0].node {
                     // check if the offset argument is negative.
@@ -1282,99 +1291,114 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                         }
                     }
                 }
-            } else {
-                if let Some(local_def_id) = def_id.as_local()
-                    && self.modeled_functions.contains(&local_def_id)
-                {
-                    let fixed_arg_count = self
-                        .tcx
-                        .fn_sig(*def_id)
-                        .skip_binder()
-                        .inputs()
-                        .skip_binder()
-                        .len();
-                    for (idx, arg) in args.iter().take(fixed_arg_count).enumerate() {
-                        if let Operand::Copy(place) | Operand::Move(place) = &arg.node {
-                            let caller_arg = (self.def_id, place.local);
-                            let param = Local::from_usize(idx + 1);
-                            let callee_param = (local_def_id, param);
-                            self.complete_local_edges
-                                .entry(callee_param)
-                                .or_default()
-                                .insert(caller_arg);
+                return;
+            }
+        }
 
-                            let lhs = CursorFieldNode::Local(local_def_id, param);
-                            let rhs = raw_pointer_field_slot(self.body, *place)
-                                .map(CursorFieldNode::Field)
-                                .unwrap_or(CursorFieldNode::Local(self.def_id, place.local));
-                            add_complete_field_edge(self.complete_field_edges, lhs, rhs);
-                        }
-                    }
-
-                    if destination.ty(self.body, self.tcx).ty.is_raw_ptr()
-                        && !contains_deref(destination)
-                    {
-                        let ret = Local::from_usize(0);
-                        self.return_edges
-                            .entry((self.def_id, destination.local))
-                            .or_default()
-                            .insert((local_def_id, ret));
-
-                        let lhs = raw_pointer_field_slot(self.body, *destination)
-                            .map(CursorFieldNode::Field)
-                            .unwrap_or(CursorFieldNode::Local(self.def_id, destination.local));
-                        add_complete_field_edge(
-                            self.complete_field_edges,
-                            lhs,
-                            CursorFieldNode::Local(local_def_id, ret),
-                        );
-                    }
-                }
-                // collect flow edges for offset arguments
-                // if f(a) is called on f(p), add p -> a
-                for (idx, arg) in args.iter().enumerate() {
-                    if let Operand::Copy(place) | Operand::Move(place) = &arg.node
-                        && let Some(local_def_id) = def_id.as_local()
-                    {
-                        let caller_arg = (self.def_id, place.local);
-                        let param = Local::from_usize(idx + 1); // skip return
-                        let callee_param = (local_def_id, param);
-                        // if callee param needs cursor, corresponding caller arg also needs it
-                        self.legacy_local_edges
-                            .entry(callee_param)
-                            .or_default()
-                            .insert(caller_arg);
-
-                        let lhs = CursorFieldNode::Local(local_def_id, param);
-                        let rhs = raw_pointer_field_slot(self.body, *place)
-                            .map(CursorFieldNode::Field)
-                            .unwrap_or(CursorFieldNode::Local(self.def_id, place.local));
-                        add_field_edge(self.legacy_field_edges, lhs, rhs);
-                    }
-                }
-                // if caller destination is tainted, callee's return slot also needs cursor
-                if let Some(local_def_id) = def_id.as_local()
-                    && !contains_deref(destination)
-                    && self
-                        .legacy_local_edges
-                        .contains_key(&(local_def_id, Local::from_usize(0)))
-                {
-                    let ret = Local::from_usize(0);
-                    self.legacy_local_edges
-                        .entry((self.def_id, destination.local))
+        let modeled_function = fn_def_id
+            .and_then(|def_id| def_id.as_local())
+            .filter(|local_def_id| self.modeled_functions.contains(local_def_id));
+        if let Some(local_def_id) = modeled_function {
+            let fixed_arg_count = self
+                .tcx
+                .fn_sig(local_def_id.to_def_id())
+                .skip_binder()
+                .inputs()
+                .skip_binder()
+                .len();
+            for (idx, arg) in args.iter().take(fixed_arg_count).enumerate() {
+                if let Operand::Copy(place) | Operand::Move(place) = &arg.node {
+                    let caller_arg = (self.def_id, place.local);
+                    let param = Local::from_usize(idx + 1);
+                    let callee_param = (local_def_id, param);
+                    self.complete_local_edges
+                        .entry(callee_param)
                         .or_default()
-                        .insert((local_def_id, ret));
+                        .insert(caller_arg);
 
-                    let lhs = raw_pointer_field_slot(self.body, *destination)
+                    let lhs = CursorFieldNode::Local(local_def_id, param);
+                    let rhs = raw_pointer_field_slot(self.body, *place)
                         .map(CursorFieldNode::Field)
-                        .unwrap_or(CursorFieldNode::Local(self.def_id, destination.local));
-                    add_field_edge(
-                        self.legacy_field_edges,
-                        lhs,
-                        CursorFieldNode::Local(local_def_id, ret),
-                    );
+                        .unwrap_or(CursorFieldNode::Local(self.def_id, place.local));
+                    add_complete_field_edge(self.complete_field_edges, lhs, rhs);
                 }
-            };
+            }
+
+            if destination.ty(self.body, self.tcx).ty.is_raw_ptr() && !contains_deref(destination) {
+                let ret = Local::from_usize(0);
+                self.return_edges
+                    .entry((self.def_id, destination.local))
+                    .or_default()
+                    .insert((local_def_id, ret));
+
+                let lhs = raw_pointer_field_slot(self.body, *destination)
+                    .map(CursorFieldNode::Field)
+                    .unwrap_or(CursorFieldNode::Local(self.def_id, destination.local));
+                add_complete_field_edge(
+                    self.complete_field_edges,
+                    lhs,
+                    CursorFieldNode::Local(local_def_id, ret),
+                );
+            }
+        } else {
+            for arg in args {
+                if arg.node.ty(self.body, self.tcx).is_raw_ptr()
+                    && let Operand::Copy(place) | Operand::Move(place) = arg.node
+                {
+                    self.unmodeled_call_nodes.insert((self.def_id, place.local));
+                }
+            }
+
+            if destination.ty(self.body, self.tcx).ty.is_raw_ptr() && !contains_deref(destination) {
+                self.unmodeled_call_nodes
+                    .insert((self.def_id, destination.local));
+            }
+        }
+
+        let Some(local_def_id) = fn_def_id.and_then(|def_id| def_id.as_local()) else {
+            return;
+        };
+
+        // collect flow edges for offset arguments
+        // if f(a) is called on f(p), add p -> a
+        for (idx, arg) in args.iter().enumerate() {
+            if let Operand::Copy(place) | Operand::Move(place) = &arg.node {
+                let caller_arg = (self.def_id, place.local);
+                let param = Local::from_usize(idx + 1); // skip return
+                let callee_param = (local_def_id, param);
+                // if callee param needs cursor, corresponding caller arg also needs it
+                self.legacy_local_edges
+                    .entry(callee_param)
+                    .or_default()
+                    .insert(caller_arg);
+
+                let lhs = CursorFieldNode::Local(local_def_id, param);
+                let rhs = raw_pointer_field_slot(self.body, *place)
+                    .map(CursorFieldNode::Field)
+                    .unwrap_or(CursorFieldNode::Local(self.def_id, place.local));
+                add_field_edge(self.legacy_field_edges, lhs, rhs);
+            }
+        }
+        // if caller destination is tainted, callee's return slot also needs cursor
+        if !contains_deref(destination)
+            && self
+                .legacy_local_edges
+                .contains_key(&(local_def_id, Local::from_usize(0)))
+        {
+            let ret = Local::from_usize(0);
+            self.legacy_local_edges
+                .entry((self.def_id, destination.local))
+                .or_default()
+                .insert((local_def_id, ret));
+
+            let lhs = raw_pointer_field_slot(self.body, *destination)
+                .map(CursorFieldNode::Field)
+                .unwrap_or(CursorFieldNode::Local(self.def_id, destination.local));
+            add_field_edge(
+                self.legacy_field_edges,
+                lhs,
+                CursorFieldNode::Local(local_def_id, ret),
+            );
         }
     }
 }

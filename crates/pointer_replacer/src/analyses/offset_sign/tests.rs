@@ -1604,3 +1604,283 @@ fn complete_variadic_call_edges_stop_at_fixed_formals() {
     )
     .unwrap();
 }
+
+#[derive(Debug)]
+struct CallSnapshot {
+    target_name: Option<String>,
+    function_root: Option<Local>,
+    argument_roots: Vec<(Local, bool)>,
+    destination_root: Local,
+    destination_is_raw: bool,
+    destination_contains_deref: bool,
+}
+
+fn call_snapshots(tcx: TyCtxt<'_>, did: LocalDefId) -> Vec<CallSnapshot> {
+    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+    body.basic_blocks
+        .iter()
+        .filter_map(|block| {
+            let TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } = &block.terminator().kind
+            else {
+                return None;
+            };
+            let target_name = match func {
+                Operand::Constant(box constant) => match constant.const_.ty().kind() {
+                    ty::TyKind::FnDef(def_id, _) => {
+                        Some(tcx.def_path(*def_id).to_string_no_crate_verbose())
+                    }
+                    _ => None,
+                },
+                Operand::Copy(_) | Operand::Move(_) => None,
+            };
+            let function_root = match func {
+                Operand::Copy(place) | Operand::Move(place) => Some(place.local),
+                Operand::Constant(_) => None,
+            };
+            let argument_roots = args
+                .iter()
+                .filter_map(|arg| match arg.node {
+                    Operand::Copy(place) | Operand::Move(place) => {
+                        Some((place.local, arg.node.ty(&*body, tcx).is_raw_ptr()))
+                    }
+                    Operand::Constant(_) => None,
+                })
+                .collect();
+
+            Some(CallSnapshot {
+                target_name,
+                function_root,
+                argument_roots,
+                destination_root: destination.local,
+                destination_is_raw: destination.ty(&*body, tcx).ty.is_raw_ptr(),
+                destination_contains_deref: destination
+                    .projection
+                    .iter()
+                    .any(|elem| matches!(elem, rustc_middle::mir::ProjectionElem::Deref)),
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn indirect_local_fn_pointer_call_is_unmodeled() {
+    ::utils::compilation::run_compiler_on_str(
+        "
+        pub unsafe fn caller(
+            function: unsafe fn(*const i32, i32) -> *mut i32,
+            pointer: *const i32,
+            number: i32,
+        ) -> *mut i32 {
+            function(pointer, number)
+        }
+        ",
+        |tcx| {
+            let rust_program = build_rust_program(tcx);
+            let caller = function_id(&rust_program, "caller");
+            let function = binding_local(tcx, caller, "function");
+            let calls = call_snapshots(tcx, caller);
+            assert_eq!(calls.len(), 1);
+            let call = &calls[0];
+            assert_eq!(call.target_name, None);
+            let function_root = call.function_root.unwrap();
+            assert_eq!(call.argument_roots.len(), 2);
+            let (pointer, pointer_is_raw) = call.argument_roots[0];
+            let (number, number_is_raw) = call.argument_roots[1];
+            assert!(pointer_is_raw);
+            assert!(!number_is_raw);
+            assert!(call.destination_is_raw);
+            assert!(!call.destination_contains_deref);
+
+            let result = offset_sign_analysis(&rust_program);
+            let boundaries = &result.cursor_constraints.unmodeled_call_nodes;
+            assert!(boundaries.contains(&(caller, pointer)));
+            assert!(boundaries.contains(&(caller, call.destination_root)));
+            assert!(!boundaries.contains(&(caller, number)));
+            assert!(!boundaries.contains(&(caller, function)));
+            assert!(!boundaries.contains(&(caller, function_root)));
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn indirect_field_fn_pointer_call_is_unmodeled() {
+    ::utils::compilation::run_compiler_on_str(
+        "
+        pub struct Dispatch {
+            pub function: unsafe fn(*const i32, i32) -> *mut i32,
+        }
+
+        pub unsafe fn caller(
+            dispatch: *const Dispatch,
+            pointer: *const i32,
+            number: i32,
+        ) -> *mut i32 {
+            ((*dispatch).function)(pointer, number)
+        }
+        ",
+        |tcx| {
+            let rust_program = build_rust_program(tcx);
+            let caller = function_id(&rust_program, "caller");
+            let dispatch = binding_local(tcx, caller, "dispatch");
+            let calls = call_snapshots(tcx, caller);
+            assert_eq!(calls.len(), 1);
+            let call = &calls[0];
+            assert_eq!(call.target_name, None);
+            let function_root = call.function_root.unwrap();
+            assert_eq!(call.argument_roots.len(), 2);
+            let (pointer, pointer_is_raw) = call.argument_roots[0];
+            let (number, number_is_raw) = call.argument_roots[1];
+            assert!(pointer_is_raw);
+            assert!(!number_is_raw);
+            assert!(call.destination_is_raw);
+            assert!(!call.destination_contains_deref);
+
+            let result = offset_sign_analysis(&rust_program);
+            let boundaries = &result.cursor_constraints.unmodeled_call_nodes;
+            assert!(boundaries.contains(&(caller, pointer)));
+            assert!(boundaries.contains(&(caller, call.destination_root)));
+            assert!(!boundaries.contains(&(caller, number)));
+            assert!(!boundaries.contains(&(caller, dispatch)));
+            assert!(!boundaries.contains(&(caller, function_root)));
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn foreign_call_is_unmodeled() {
+    ::utils::compilation::run_compiler_on_str(
+        "
+        unsafe extern \"C\" {
+            fn foreign(pointer: *const i32, number: i32) -> *mut i32;
+        }
+
+        pub unsafe fn caller(pointer: *const i32, number: i32) -> *mut i32 {
+            foreign(pointer, number)
+        }
+        ",
+        |tcx| {
+            let rust_program = build_rust_program(tcx);
+            let caller = function_id(&rust_program, "caller");
+            let calls = call_snapshots(tcx, caller);
+            assert_eq!(calls.len(), 1);
+            let call = &calls[0];
+            assert!(
+                call.target_name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with("::foreign"))
+            );
+            assert_eq!(call.function_root, None);
+            assert_eq!(call.argument_roots.len(), 2);
+            let (pointer, pointer_is_raw) = call.argument_roots[0];
+            let (number, number_is_raw) = call.argument_roots[1];
+            assert!(pointer_is_raw);
+            assert!(!number_is_raw);
+            assert!(call.destination_is_raw);
+            assert!(!call.destination_contains_deref);
+
+            let result = offset_sign_analysis(&rust_program);
+            let constraints = &result.cursor_constraints;
+            let boundaries = &constraints.unmodeled_call_nodes;
+            assert!(boundaries.contains(&(caller, pointer)));
+            assert!(boundaries.contains(&(caller, call.destination_root)));
+            assert!(!boundaries.contains(&(caller, number)));
+            assert!(constraints.return_edges.is_empty());
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn pointer_offset_call_is_seed_not_unmodeled() {
+    ::utils::compilation::run_compiler_on_str(
+        "
+        pub unsafe fn caller(pointer: *const i32) -> *const i32 {
+            pointer.offset(-1)
+        }
+        ",
+        |tcx| {
+            let rust_program = build_rust_program(tcx);
+            let caller = function_id(&rust_program, "caller");
+            let calls = call_snapshots(tcx, caller);
+            let call = calls
+                .iter()
+                .find(|call| {
+                    call.target_name
+                        .as_deref()
+                        .is_some_and(|name| name.ends_with("::offset"))
+                })
+                .unwrap();
+            let pointer = call
+                .argument_roots
+                .iter()
+                .find_map(|&(local, is_raw)| is_raw.then_some(local))
+                .unwrap();
+
+            let result = offset_sign_analysis(&rust_program);
+            let constraints = &result.cursor_constraints;
+            assert!(constraints.local_seeds.contains(&(caller, pointer)));
+            assert!(
+                !constraints
+                    .unmodeled_call_nodes
+                    .contains(&(caller, pointer))
+            );
+            assert!(constraints.unmodeled_call_nodes.is_empty());
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn direct_local_call_is_modeled_not_unmodeled() {
+    ::utils::compilation::run_compiler_on_str(
+        "
+        unsafe fn callee(pointer: *const i32, number: i32) -> *mut i32 {
+            pointer as *mut i32
+        }
+
+        pub unsafe fn caller(pointer: *const i32, number: i32) -> *mut i32 {
+            callee(pointer, number)
+        }
+        ",
+        |tcx| {
+            let rust_program = build_rust_program(tcx);
+            let caller = function_id(&rust_program, "caller");
+            let callee = function_id(&rust_program, "callee");
+            let calls = call_snapshots(tcx, caller);
+            assert_eq!(calls.len(), 1);
+            let call = &calls[0];
+            assert!(
+                call.target_name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with("::callee"))
+            );
+            let pointer = call
+                .argument_roots
+                .iter()
+                .find_map(|&(local, is_raw)| is_raw.then_some(local))
+                .unwrap();
+
+            let result = offset_sign_analysis(&rust_program);
+            let constraints = &result.cursor_constraints;
+            assert!(constraints.unmodeled_call_nodes.is_empty());
+            assert!(local_edge_exists(
+                &constraints.local_edges,
+                (callee, Local::from_usize(1)),
+                (caller, pointer),
+            ));
+            assert!(local_edge_exists(
+                &constraints.return_edges,
+                (caller, call.destination_root),
+                (callee, Local::from_usize(0)),
+            ));
+        },
+    )
+    .unwrap();
+}
