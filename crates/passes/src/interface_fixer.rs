@@ -585,6 +585,158 @@ pub unsafe extern "C" fn match_0(test: &[f64], reference: &[f64], bins: i32) -> 
         assert_eq!(transformed.matches("#[export_name = \"match\"]").count(), 1);
     }
 
+    #[test]
+    fn wraps_exposed_slice_and_cursor_inputs_with_same_raw_abi() {
+        let code = r#"
+pub mod slice_cursor {
+    pub struct SliceCursor<'a, T>(pub &'a [T]);
+    impl<'a, T> SliceCursor<'a, T> {
+        pub fn new(slice: &'a [T]) -> Self { Self(slice) }
+        pub fn empty() -> Self { Self(&[]) }
+    }
+
+    pub struct SliceCursorMut<'a, T>(pub &'a mut [T]);
+    impl<'a, T> SliceCursorMut<'a, T> {
+        pub fn new(slice: &'a mut [T]) -> Self { Self(slice) }
+        pub fn empty() -> Self { Self(&mut []) }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn shared_slice(p: &[i32]) { let _ = p.len(); }
+
+#[no_mangle]
+pub unsafe extern "C" fn mutable_slice(p: &mut [i32]) { p.fill(0); }
+
+#[export_name = "shared_cursor_export"]
+pub unsafe extern "C" fn shared_cursor(p: crate::slice_cursor::SliceCursor<'_, i32>) {
+    let _ = p.0.len();
+}
+
+#[export_name = "mutable_cursor_export"]
+pub unsafe extern "C" fn mutable_cursor(p: crate::slice_cursor::SliceCursorMut<'_, i32>) {
+    p.0.fill(0);
+}
+"#;
+        let config = super::Config {
+            c_exposed_fns: FxHashSet::from_iter([
+                "shared_slice".to_string(),
+                "mutable_slice".to_string(),
+                "shared_cursor_export".to_string(),
+                "mutable_cursor_export".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
+            super::fix_interfaces(&config, tcx)
+        })
+        .unwrap();
+        let export_attributes = utils::compilation::run_compiler_on_str(&transformed, |tcx| {
+            utils::type_check(tcx);
+            tcx.hir_crate(())
+                .owners
+                .iter()
+                .filter_map(|owner| {
+                    let rustc_hir::OwnerNode::Item(item) = owner.as_owner()?.node() else {
+                        return None;
+                    };
+                    let rustc_hir::ItemKind::Fn { ident, .. } = item.kind else {
+                        return None;
+                    };
+                    let did = item.owner_id.def_id.to_def_id();
+                    let count = tcx.get_attrs(did, rustc_span::sym::no_mangle).count()
+                        + tcx.get_attrs(did, rustc_span::sym::export_name).count();
+                    Some((ident.name.to_string(), count))
+                })
+                .collect::<rustc_hash::FxHashMap<_, _>>()
+        })
+        .expect(&transformed);
+
+        let compact = transformed.split_whitespace().collect::<String>();
+        for (name, raw, safe, constructor, empty, body) in [
+            (
+                "shared_slice",
+                "*consti32",
+                "&[i32]",
+                "std::slice::from_raw_parts(p,1_000_000)",
+                "&[]",
+                "let_=p.len();",
+            ),
+            (
+                "mutable_slice",
+                "*muti32",
+                "&mut[i32]",
+                "std::slice::from_raw_parts_mut(p,1_000_000)",
+                "&mut[]",
+                "p.fill(0);",
+            ),
+            (
+                "shared_cursor",
+                "*consti32",
+                "crate::slice_cursor::SliceCursor<'_,i32>",
+                "crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts(p,1_000_000))",
+                "crate::slice_cursor::SliceCursor::empty()",
+                "let_=p.0.len();",
+            ),
+            (
+                "mutable_cursor",
+                "*muti32",
+                "crate::slice_cursor::SliceCursorMut<'_,i32>",
+                "crate::slice_cursor::SliceCursorMut::new(std::slice::from_raw_parts_mut(p,1_000_000))",
+                "crate::slice_cursor::SliceCursorMut::empty()",
+                "p.0.fill(0);",
+            ),
+        ] {
+            assert!(
+                compact.contains(&format!("fn{name}(p:{raw})")),
+                "{transformed}"
+            );
+            assert!(
+                compact.contains(&format!("fn{name}_internal(p:{safe}){{{body}}}")),
+                "{transformed}"
+            );
+            let wrapper = compact.split_once(&format!("fn{name}(p:")).unwrap().1;
+            let wrapper = wrapper
+                .split_once("extern\"C\"fn")
+                .map_or(wrapper, |(s, _)| s);
+            assert!(
+                wrapper.contains(&format!(
+                    "{name}_internal(ifp.is_null(){{{empty}}}else{{{constructor}}}"
+                )),
+                "{transformed}"
+            );
+            assert_eq!(export_attributes[name], 1, "{transformed}");
+            assert_eq!(
+                export_attributes[&format!("{name}_internal")],
+                0,
+                "{transformed}"
+            );
+        }
+        assert_eq!(
+            export_attributes.values().sum::<usize>(),
+            4,
+            "{transformed}"
+        );
+        assert_eq!(
+            transformed.matches("#[no_mangle]").count(),
+            2,
+            "{transformed}"
+        );
+        assert_eq!(
+            transformed.matches("#[export_name").count(),
+            2,
+            "{transformed}"
+        );
+        assert!(
+            transformed.contains("#[export_name = \"shared_cursor_export\"]"),
+            "{transformed}"
+        );
+        assert!(
+            transformed.contains("#[export_name = \"mutable_cursor_export\"]"),
+            "{transformed}"
+        );
+    }
+
     // backward compat: config text written before field_spec existed still
     // deserializes, with field_spec defaulting to an empty map
     #[test]

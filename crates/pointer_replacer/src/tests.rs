@@ -3114,10 +3114,7 @@ pub unsafe fn get_bits(bs: *mut Bs, n: i32) -> u32 {
     );
 }
 
-#[test]
-fn test_rewriter_promotes_cursor_field_copied_to_local_offset_alias_without_root_mutation() {
-    run_test(
-        r#"
+const CURSOR_FIELD_OFFSET_ALIAS: &str = r#"
 #[repr(C)]
 pub struct Bs {
     pub buf: *const u8,
@@ -3134,7 +3131,12 @@ pub unsafe fn read_two(bs: *const Bs) -> u32 {
     p = p.offset(1);
     first + (*p as u32)
 }
-"#,
+"#;
+
+#[test]
+fn test_rewriter_promotes_cursor_field_copied_to_local_offset_alias_without_root_mutation() {
+    run_test(
+        CURSOR_FIELD_OFFSET_ALIAS,
         &[
             "pub struct Bs<'a>",
             "pub buf: crate::slice_cursor::SliceCursor<'a, u8>",
@@ -3147,6 +3149,39 @@ pub unsafe fn read_two(bs: *const Bs) -> u32 {
             "*p as u32",
         ],
     );
+}
+
+#[test]
+fn test_late_cursor_resolution_preserves_cursor_field_offset_alias() {
+    let (rewritten, _) = rewrite_with_config(CURSOR_FIELD_OFFSET_ALIAS, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+    assert!(
+        rewritten.contains("pub buf: crate::slice_cursor::SliceCursor<"),
+        "{rewritten}"
+    );
+    let read_two = rewritten
+        .split_once("fn read_two")
+        .unwrap()
+        .1
+        .split_once("pub mod slice_cursor")
+        .unwrap()
+        .0;
+    let initializer = read_two
+        .split_once("let mut p:")
+        .unwrap()
+        .1
+        .split_once(';')
+        .unwrap()
+        .0;
+    assert!(
+        initializer.contains("crate::slice_cursor::SliceCursor<"),
+        "{rewritten}"
+    );
+    assert!(initializer.contains("bs.buf"), "{rewritten}");
+    assert!(initializer.contains(".offset_by("), "{rewritten}");
+    assert!(read_two.contains("p.seek("), "{rewritten}");
+    assert!(!read_two.contains("from_raw_parts"), "{rewritten}");
+    assert!(!read_two.contains(".as_ptr()"), "{rewritten}");
 }
 
 #[test]
@@ -8670,6 +8705,107 @@ pub unsafe extern "C" fn read_bits(bs: *mut Bs, out: *mut Out, hdr: *const u8) -
     );
 }
 
+pub(crate) const MERGE_SORT_RAW_BARRIER: &str = r#"
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Sprite {
+    pub key: i32,
+}
+
+unsafe extern "C" fn iteration(
+    a: *const Sprite,
+    lo: i32,
+    split: i32,
+    hi: i32,
+    b: *mut Sprite,
+) {
+    let mut i = lo;
+    let mut j = split;
+    let mut k = lo;
+    while k < hi {
+        if i < split
+            && (j >= hi
+                || (*a.offset(i as isize)).key
+                    <= (*a.offset(j as isize)).key)
+        {
+            *b.offset(k as isize) = *a.offset(i as isize);
+            i += 1;
+        } else {
+            *b.offset(k as isize) = *a.offset(j as isize);
+            j += 1;
+        }
+        k += 1;
+    }
+}
+
+unsafe extern "C" fn recurse(
+    b: *mut Sprite,
+    lo: i32,
+    hi: i32,
+    a: *mut Sprite,
+) {
+    if hi - lo <= 1 {
+        return;
+    }
+    let split = (lo + hi) / 2;
+    recurse(a, lo, split, b);
+    recurse(a, split, hi, b);
+    iteration(b, lo, split, hi, a);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn merge_sort(
+    a: *mut Sprite,
+    b: *mut Sprite,
+    size: i32,
+) {
+    recurse(b, 0, size, a);
+}
+"#;
+
+#[test]
+fn test_late_cursor_resolution_demotes_merge_sort_wrappers_at_raw_barrier() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("merge_sort".to_string());
+    let (rewritten, _) = rewrite_with_config(MERGE_SORT_RAW_BARRIER, &config);
+    // Pointer emits the expanded Clone derive, which uses this nightly helper.
+    let checkable = format!("#![feature(derive_clone_copy)]\n{rewritten}");
+    ::utils::compilation::run_compiler_on_str(&checkable, ::utils::type_check).expect(&checkable);
+    let rewritten = rewritten.replace("crate::Sprite", "Sprite");
+
+    let signature = |name| {
+        rewritten
+            .split_once(&format!("fn {name}"))
+            .unwrap()
+            .1
+            .split_once('{')
+            .unwrap()
+            .0
+    };
+    let iteration = signature("iteration");
+    assert!(iteration.contains("a: *const Sprite"), "{rewritten}");
+    assert!(iteration.contains("b: *mut Sprite"), "{rewritten}");
+    let recurse = signature("recurse");
+    assert!(recurse.contains("a: *mut Sprite"), "{rewritten}");
+    assert!(recurse.contains("b: *mut Sprite"), "{rewritten}");
+    let merge_sort = signature("merge_sort");
+    assert!(merge_sort.contains("a: &mut [Sprite]"), "{rewritten}");
+    assert!(merge_sort.contains("b: &mut [Sprite]"), "{rewritten}");
+    assert!(!merge_sort.contains("SliceCursor"), "{rewritten}");
+    let call = rewritten
+        .split_once("fn merge_sort")
+        .unwrap()
+        .1
+        .split_once('{')
+        .unwrap()
+        .1
+        .split_once(';')
+        .unwrap()
+        .0;
+    assert!(call.contains("recurse("), "{rewritten}");
+    assert_eq!(call.matches(".as_mut_ptr()").count(), 2, "{rewritten}");
+}
+
 #[test]
 fn test_interproc_negative_offset_propagation() {
     run_test(
@@ -8702,6 +8838,122 @@ pub unsafe extern "C" fn bar() -> libc::c_int {
         ],
         &["let mut last_element: &[i32]"],
     );
+}
+
+#[test]
+fn test_late_cursor_resolution_retains_fallcalc_reverse_chain() {
+    let code = r#"
+pub unsafe fn reverse(end: *mut i32, count: i32) -> i32 {
+    let mut sum = 0;
+    let mut ptr: *mut i32 = end;
+    let mut i = 0;
+    while i < count {
+        sum += *ptr;
+        ptr = ptr.offset(-1);
+        i += 1;
+    }
+    sum
+}
+
+pub unsafe fn calculate() -> i32 {
+    let mut values = [1, 2, 3, 4, 5];
+    let p: *mut i32 = values.as_mut_ptr();
+    let mut last_element: *mut i32 = p.offset(4);
+    reverse(last_element, 5)
+}
+"#;
+    let (rewritten, _) = rewrite_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+    let reverse = rewritten.split_once("fn reverse").unwrap().1;
+    let (signature, body) = reverse.split_once('{').unwrap();
+    assert!(
+        signature.contains("end: crate::slice_cursor::SliceCursor"),
+        "{rewritten}"
+    );
+    let body = body.split_once("fn calculate").unwrap().0;
+    assert!(body.contains("ptr.seek("), "{rewritten}");
+    assert!(body.contains("(-1) as isize"), "{rewritten}");
+    let calculate = rewritten.split_once("fn calculate").unwrap().1;
+    assert!(
+        calculate.contains("let mut last_element: crate::slice_cursor::SliceCursor"),
+        "{rewritten}"
+    );
+    assert!(
+        calculate.contains("reverse(last_element, 5)"),
+        "{rewritten}"
+    );
+    let call = calculate
+        .split_once("reverse(")
+        .unwrap()
+        .1
+        .split_once(')')
+        .unwrap()
+        .0;
+    assert!(!call.contains(".as_mut_ptr"), "{rewritten}");
+}
+
+#[test]
+fn test_late_cursor_resolution_freezes_function_pointer_signature() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("merge_sort".to_string());
+    let (ungrouped, _) = rewrite_with_config(MERGE_SORT_RAW_BARRIER, &config);
+    let checkable = format!("#![feature(derive_clone_copy)]\n{ungrouped}");
+    ::utils::compilation::run_compiler_on_str(&checkable, ::utils::type_check).expect(&checkable);
+    let signature = ungrouped
+        .split_once("fn merge_sort")
+        .unwrap()
+        .1
+        .split_once('{')
+        .unwrap()
+        .0;
+    assert_eq!(
+        signature.matches("&mut [crate::Sprite]").count(),
+        2,
+        "{ungrouped}"
+    );
+
+    let code = format!(
+        "{MERGE_SORT_RAW_BARRIER}
+pub fn keep_fn_pointer() {{
+    let callback: unsafe extern \"C\" fn(*mut Sprite, *mut Sprite, i32) = merge_sort;
+}}"
+    );
+    let (rewritten, _) = rewrite_with_config(&code, &config);
+    let checkable = format!("#![feature(derive_clone_copy)]\n{rewritten}");
+    ::utils::compilation::run_compiler_on_str(&checkable, ::utils::type_check).expect(&checkable);
+    let signature = rewritten
+        .split_once("fn merge_sort")
+        .unwrap()
+        .1
+        .split_once('{')
+        .unwrap()
+        .0;
+    assert_eq!(
+        signature
+            .matches("crate::slice_cursor::SliceCursorMut<")
+            .count(),
+        2,
+        "{rewritten}"
+    );
+    let annotation = rewritten
+        .split_once("let callback:")
+        .unwrap()
+        .1
+        .split_once("= merge_sort")
+        .unwrap()
+        .0;
+    assert!(
+        annotation.contains("unsafe extern \"C\" fn("),
+        "{rewritten}"
+    );
+    assert_eq!(
+        annotation
+            .matches("crate::slice_cursor::SliceCursorMut<")
+            .count(),
+        2,
+        "{rewritten}"
+    );
+    assert!(!annotation.contains("*mut"), "{rewritten}");
 }
 
 #[test]

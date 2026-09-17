@@ -16917,7 +16917,7 @@ mod tests {
             |tcx| {
                 let mut krate = utils::ast::expanded_ast(tcx);
                 let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
-                let (input, analysis) = build_analysis(tcx);
+                let (input, analysis) = build_analysis(tcx, &Config::default());
                 let did = input.functions[0];
                 let binding = tcx.hir_body_owned_by(did).params[0].pat.hir_id;
                 let visitor = TransformVisitor::new(
@@ -16955,7 +16955,7 @@ mod tests {
             |tcx| {
                 let mut krate = utils::ast::expanded_ast(tcx);
                 let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
-                let (input, mut analysis) = build_analysis(tcx);
+                let (input, mut analysis) = build_analysis(tcx, &Config::default());
                 let did = input.functions[0];
                 let binding = tcx.hir_body_owned_by(did).params[0].pat.hir_id;
                 // Keep legacy sign provenance while removing late demand to isolate wiring.
@@ -17001,6 +17001,185 @@ mod tests {
                 );
             },
         )
+        .unwrap();
+    }
+
+    #[test]
+    fn merge_sort_final_view_report_demotes_exposed_inputs() {
+        let mut config = Config::default();
+        config.c_exposed_fns.insert("merge_sort".to_string());
+        let (stats, demotions, retained_inputs) =
+            utils::compilation::run_compiler_on_str(crate::tests::MERGE_SORT_RAW_BARRIER, |tcx| {
+                let mut krate = utils::ast::expanded_ast(tcx);
+                let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+                let (input, analysis) = build_analysis(tcx, &config);
+                let visitor = TransformVisitor::new(
+                    &config,
+                    &input,
+                    &analysis,
+                    ast_to_hir,
+                    FnPtrGroups::default(),
+                    FnPtrRewriteDecision::default(),
+                    DecisionDiagnostics::for_test(DiagnosticsMode::Full),
+                );
+                let resolution = &visitor.cursor_resolution;
+                let stats = resolution.stats();
+                let demotions = resolution
+                    .demotions()
+                    .iter()
+                    .map(|demotion| {
+                        let CursorOwner::Param { did, index, .. } = demotion.owner else {
+                            panic!("unexpected demotion: {demotion:?}; {stats:?}");
+                        };
+                        (
+                            (tcx.def_path_str(did), index),
+                            demotion.expected_old_kind,
+                            demotion.replacement_kind,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let did = *input
+                    .functions
+                    .iter()
+                    .find(|&&did| tcx.item_name(did.to_def_id()).as_str() == "merge_sort")
+                    .unwrap();
+                let body = tcx.hir_body_owned_by(did);
+                let retained_inputs = (0..2)
+                    .filter(|&index| {
+                        resolution
+                            .retention(CursorOwner::Param {
+                                did,
+                                index,
+                                binding: body.params[index].pat.hir_id,
+                            })
+                            .is_some()
+                    })
+                    .map(|index| (tcx.def_path_str(did), index))
+                    .collect::<Vec<_>>();
+                (stats, demotions, retained_inputs)
+            })
+            .unwrap();
+        let report = format!(
+            "{stats:?}; protected_by_reason={:?}",
+            stats.protected_by_reason
+        );
+        assert_eq!(
+            demotions,
+            vec![
+                (
+                    ("merge_sort".to_string(), 0),
+                    PtrKind::SliceCursor(true),
+                    PtrKind::Slice(true)
+                ),
+                (
+                    ("merge_sort".to_string(), 1),
+                    PtrKind::SliceCursor(true),
+                    PtrKind::Slice(true)
+                ),
+            ],
+            "{report}"
+        );
+        assert!(retained_inputs.is_empty(), "{retained_inputs:?}; {report}");
+        assert_eq!(stats.demoted, demotions.len(), "{report}");
+        assert_eq!(
+            stats.candidates,
+            stats.required + stats.protected + stats.poisoned + stats.demoted,
+            "{report}"
+        );
+        assert!(stats.reached_raw_barriers > 0, "{report}");
+    }
+
+    #[test]
+    fn test_late_cursor_resolution_freezes_signature_locked_input() {
+        use crate::rewriter::cursor_resolution::{CursorRetention, FreezeReason};
+
+        let mut config = Config::default();
+        config.c_exposed_fns.insert("merge_sort".to_string());
+        utils::compilation::run_compiler_on_str(crate::tests::MERGE_SORT_RAW_BARRIER, |tcx| {
+            let (input, analysis) = build_analysis(tcx, &config);
+            let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
+            let fn_ptr_groups = FnPtrGroups::default();
+            let mut sig_decs =
+                SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
+            let collected = collect_diffs(&input, &analysis, &sig_decs, &fn_ptr_groups);
+            let mut ptr_kinds = collected.ptr_kinds;
+            let did = *input
+                .functions
+                .iter()
+                .find(|&&did| tcx.item_name(did.to_def_id()).as_str() == "merge_sort")
+                .unwrap();
+            let binding = tcx.hir_body_owned_by(did).params[0].pat.hir_id;
+            let owner = CursorOwner::Param {
+                did,
+                index: 0,
+                binding,
+            };
+            let unlocked_view = FinalCursorDecisionView::new(
+                &input,
+                &analysis,
+                &sig_decs,
+                &ptr_kinds,
+                &FxHashSet::default(),
+                &collected.cursor_field_offset_alias_bindings,
+                &fn_ptr_groups,
+            );
+            let unlocked = resolve_late_cursors(
+                &analysis.offset_sign_result.cursor_constraints,
+                &unlocked_view,
+            );
+            assert!(
+                unlocked
+                    .demotions()
+                    .iter()
+                    .any(|demotion| demotion.owner == owner),
+                "{:?}",
+                unlocked.stats()
+            );
+
+            // Production never sets this bit at present; exercise its existing contract
+            // directly on real analysis/signature/body state, without adding a test hook.
+            sig_decs.data.get_mut(&did).unwrap().signature_locked = true;
+            let before_sigs = sig_decs.clone();
+            let before_kinds = ptr_kinds.clone();
+            let locked_view = FinalCursorDecisionView::new(
+                &input,
+                &analysis,
+                &sig_decs,
+                &ptr_kinds,
+                &FxHashSet::default(),
+                &collected.cursor_field_offset_alias_bindings,
+                &fn_ptr_groups,
+            );
+            let resolution = resolve_late_cursors(
+                &analysis.offset_sign_result.cursor_constraints,
+                &locked_view,
+            );
+            assert_eq!(
+                resolution.retention(owner),
+                Some(&CursorRetention::Protected {
+                    reasons: vec![FreezeReason::SignatureLocked]
+                }),
+                "{:?}",
+                resolution.stats()
+            );
+            assert!(
+                resolution.demotions().is_empty(),
+                "{:?}",
+                resolution.stats()
+            );
+            let mut diagnostics = DecisionDiagnostics::for_test(DiagnosticsMode::Full);
+            apply_cursor_demotions(
+                tcx,
+                &mut sig_decs,
+                &mut ptr_kinds,
+                resolution.demotions(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert_eq!(sig_decs, before_sigs);
+            assert_eq!(ptr_kinds, before_kinds);
+            assert!(diagnostics.events().is_empty());
+        })
         .unwrap();
     }
 
@@ -17516,12 +17695,15 @@ mod tests {
         }
     }
 
-    fn build_analysis<'tcx>(tcx: TyCtxt<'tcx>) -> (RustProgram<'tcx>, super::super::Analysis) {
+    fn build_analysis<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        config: &Config,
+    ) -> (RustProgram<'tcx>, super::super::Analysis) {
         let arena = typed_arena::Arena::new();
         let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
         let andersen_config = points_to::andersen::Config {
             use_optimized_mir: false,
-            c_exposed_fns: FxHashSet::default(),
+            c_exposed_fns: config.c_exposed_fns.clone(),
         };
         let pre_points_to = points_to::andersen::pre_analyze(&andersen_config, &tss, tcx);
         let points_to_solutions =
@@ -17540,11 +17722,8 @@ mod tests {
             analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
         let output_params =
             analyses::output_params::compute_output_params(&input, &mutability_result, &aliases);
-        let ownership_schemes = super::super::maybe_solidified_ownership(
-            &super::super::Config::default(),
-            &input,
-            &output_params,
-        );
+        let ownership_schemes =
+            super::super::maybe_solidified_ownership(config, &input, &output_params);
         let source_var_groups = SourceVarGroups::new(&input);
         let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
         let borrow_promotion_result =
@@ -17584,7 +17763,7 @@ mod tests {
 
     fn field_conflict_reason_names_for_code(code: &str) -> FxHashMap<String, Vec<&'static str>> {
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let (input, analysis) = build_analysis(tcx);
+            let (input, analysis) = build_analysis(tcx, &Config::default());
             let (sig_decs, ptr_kinds, _reason_map, _usage_subreason_map) =
                 simulate_transform_reasons(tcx, &input, &analysis);
             let mut sig_decs = sig_decs;
@@ -17768,7 +17947,7 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
 }
 "#,
             |tcx| {
-                let (input, analysis) = build_analysis(tcx);
+                let (input, analysis) = build_analysis(tcx, &Config::default());
                 let (sig_decs, ptr_kinds, _reason_map, _usage_subreason_map) =
                     simulate_transform_reasons(tcx, &input, &analysis);
                 collect_ownership_field_diagnostics(tcx, &analysis, &sig_decs, &ptr_kinds)
@@ -17795,7 +17974,7 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
             let mut krate = utils::ast::expanded_ast(tcx);
             let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
             utils::ast::remove_unnecessary_items_from_ast(&mut krate);
-            let (input, analysis) = build_analysis(tcx);
+            let (input, analysis) = build_analysis(tcx, &Config::default());
             let visitor = TransformVisitor::new(
                 &Config::default(),
                 &input,
@@ -18483,7 +18662,7 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
     }
 
     fn analyze_pointer_safety_for_program(tcx: TyCtxt<'_>) -> PointerSafetyAnalysisResult {
-        let (input, analysis) = build_analysis(tcx);
+        let (input, analysis) = build_analysis(tcx, &Config::default());
         let tracked_sites = collect_semantic_allocator_sites(tcx, &input);
         let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
         let fn_ptr_groups = FnPtrGroups::default();
@@ -19054,7 +19233,7 @@ pub unsafe fn read(buffer: *const Buffer) -> u8 {
 "#;
 
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let (input, analysis) = build_analysis(tcx);
+            let (input, analysis) = build_analysis(tcx, &Config::default());
             let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
             let fn_ptr_groups = FnPtrGroups::default();
             let sig_decs = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
@@ -19085,7 +19264,7 @@ pub unsafe fn read(values: [u8; 4]) -> u8 {
 "#;
 
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let (input, analysis) = build_analysis(tcx);
+            let (input, analysis) = build_analysis(tcx, &Config::default());
             let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
             let fn_ptr_groups = FnPtrGroups::default();
             let sig_decs = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
