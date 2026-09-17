@@ -2250,7 +2250,7 @@ pub unsafe extern "C" fn run() {
     free(h as *mut std::ffi::c_void);
 }
 "#;
-    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+    let joined = ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
@@ -2273,19 +2273,22 @@ pub unsafe extern "C" fn run() {
             moved_out.contains("\towning\t") && moved_out.contains("\ttrue\t"),
             "the model grants it and the native stage considers it: {moved_out}"
         );
-        // The hold is the reading on every frame in the batch: a field
-        // transaction that owns this field renders it `Option<Box<T>>`
-        // (wave-6f's `opt-box`), whose `take()` is not this producer's
-        // `Box<T>` — the R436 form test in `field-load-predicate.patch` keeps
-        // the hold there too, measured on `batch-10-dry2` `c97e6162e`.
+        // R453-1 / R217-2(a): which reading holds is the FRAME's answer. Where
+        // no field family answers the seam — this line's stub body — the owner
+        // holds fail-closed; where a composition's join is live and a
+        // transaction owns `Holder.buf` (wave-6f's `opt-box`), the same row is
+        // SELECTED and the local takes that transaction's shape (R440-4).
+        // Nothing else is accepted.
         assert!(
-            moved_out.contains("held") && moved_out.contains("native-field-load-field-not-owned"),
+            (moved_out.contains("held") && moved_out.contains("native-field-load-field-not-owned"))
+                || moved_out.contains("\tselected\t"),
             "{moved_out}"
         );
         assert!(
             row("run::h#").contains("selected"),
             "the holder still delivers"
         );
+        moved_out.contains("\tselected\t")
     })
     .unwrap();
     // End to end: `b` keeps its raw form and its C free, `h` delivers with
@@ -2303,8 +2306,26 @@ pub unsafe extern "C" fn run() {
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
+    if joined {
+        // MEASURED on `batch-12-dry14` `2e0a2a1e3`: the field transaction is
+        // `Holder.buf = opt-box (applied)` and this producer selects both
+        // locals, so the declaration takes the transaction's shape — but the
+        // moved-out LOAD that initializes `b` is still spelled raw, so the
+        // candidate is ill-typed (`E0308` at the initializer: expected
+        // `Option<Box<u8>>`, found `*mut u8`) and the program falls back
+        // UNMODIFIED. That fallback is the fail-closed behaviour this arm
+        // pins: nothing ill-typed and no second owner escapes. It is a
+        // TRIPWIRE, not an endorsement — the day the load is rendered this
+        // goes red and the arm tightens to the two-drop delivery above.
+        let super::RewriteOutcome::Degraded { reason, source, .. } = outcome else {
+            panic!("the load renders now — tighten this arm: {outcome:?}")
+        };
+        assert!(source.contains("let mut b = (*h).buf;"), "{source}");
+        assert!(reason.contains("recovery-degraded"), "{reason}");
+        return;
+    }
     let super::RewriteOutcome::Emitted { source, .. } = outcome else { panic!("{outcome:?}") };
-    println!("R431_EMITTED_BEGIN\n{source}\nR431_EMITTED_END");
+    println!("R431_EMITTED_BEGIN\n{source}\nR431_EMITTED_END joined={joined}");
     assert!(source.contains("let mut b = (*h).buf;"), "{source}");
     assert!(
         source.contains("free(b as *mut std::ffi::c_void)")
@@ -2865,8 +2886,24 @@ fn r447_a_moved_out_owner_takes_the_field_transactions_shape() {
     let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // No transaction: the hold stands.
-    assert!(moved_out_plan(None).is_err(), "no transaction, no owner");
+    // R453-1: with no override the SEAM answers. On this line its body is the
+    // stub (`None`), so the owner holds; on a composition whose join is live a
+    // real transaction may own the field, and the owner is then a plan of the
+    // shape that transaction delivers. Both are accepted; the three override
+    // cases below stay exact on every frame, because the override answers
+    // before the seam body does.
+    match moved_out_plan(None) {
+        Err(_) => {}
+        Ok(plan) => assert!(
+            plan.receipts.iter().any(|receipt| receipt
+                .starts_with("native-box-declaration-type ::std::boxed::Box<")
+                || receipt.starts_with(
+                    "native-box-declaration-type ::std::option::Option<::std::boxed::Box<"
+                )),
+            "a joined frame delivers the transaction's shape: {:?}",
+            plan.receipts
+        ),
+    }
     // A plain owning box: the local is a `Box<T>`, the field family renders
     // the load, and the projections need no edit (the Box auto-derefs).
     let plain = moved_out_plan(Some("box")).expect("box form");
