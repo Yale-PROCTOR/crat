@@ -1543,3 +1543,81 @@ fn w6v2_delivered_callee_routes_every_raw_caller_site() {
         "every raw site routes (twin or bridge) or the class drops: {rows:?}\n{source}"
     );
 }
+
+/// R451-7 (relay 023, for wave-6r's seam guard): the caller-level fact.
+/// `get_value` retains its `ptr` by storing it through the out-parameter
+/// `value` — its retention ROW says `retains`, which is what the seam guard
+/// reads today. The fact says the position is nonetheless SETTLED: every call
+/// supplies `value` from a frame-confined caller local, so the store dies with
+/// the caller's frame. The control is the same callee at a call whose
+/// out-parameter escapes: one unconfined call makes the fact false.
+#[test]
+fn w6v2_output_storage_settled_at_every_call() {
+    let settled = |input: &str| {
+        ::utils::compilation::run_compiler_on_str(input, |tcx| {
+            let (_, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .expect("native decisions");
+            let callee = tcx
+                .hir_body_owners()
+                .find(|owner| tcx.def_path_str(owner.to_def_id()).ends_with("get_value"))
+                .expect("the callee exists");
+            (
+                super::decision::binn_counted::output_storage_settled_at_every_call(
+                    &ctx.raw_boundary_sites,
+                    &ctx.retention,
+                    callee,
+                    0,
+                ),
+                ctx.retention
+                    .to_tsv()
+                    .lines()
+                    .find(|line| line.starts_with("get_value\t"))
+                    .unwrap_or("<no row>")
+                    .to_owned(),
+            )
+        })
+        .expect("input type-checks")
+    };
+    let (confined, row) = settled(CONFINED);
+    assert!(
+        row.contains("retains"),
+        "the callee's ROW is what the seam guard reads: {row}"
+    );
+    assert!(
+        confined,
+        "every call supplies a frame-confined output: {row}"
+    );
+    // The control: a second caller whose out-parameter is a global.
+    let escaping = CONFINED.replace(
+        "pub unsafe fn get_type(",
+        "pub static mut KEPT: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;\n\
+         pub unsafe fn leak(mut ptr: *mut u8) -> i32 {\n\
+             let mut value = binn { header: 0, type_0: 0, size: 0, ptr: 0 as *mut core::ffi::c_void };\n\
+             if get_value(ptr, 0, &mut value) == 0 as i32 { return 0 as i32; }\n\
+             KEPT = value.ptr;\n\
+             return 1 as i32;\n\
+         }\n\
+         pub unsafe fn get_type(",
+    );
+    assert_ne!(escaping, CONFINED);
+    let (escaping, row) = settled(&escaping);
+    assert!(
+        !escaping,
+        "one unconfined call makes the position unsettled: {row}"
+    );
+    // A position with NO inventoried call settles nothing: the fact is a claim
+    // about calls, and there is no evidence where there is no call.
+    let uncalled = CONFINED.replace(
+        "pub unsafe fn get_type(mut ptr: *mut u8, mut pos: i32) -> i32 {\n    let mut value = binn { header: 0, type_0: 0, size: 0, ptr: 0 as *mut core::ffi::c_void };\n    if get_value(ptr, pos, &mut value) == 0 as i32 { return 0 as i32; }\n    return value.type_0;\n}",
+        "pub unsafe fn get_type(mut ptr: *mut u8, mut pos: i32) -> i32 { return *ptr as i32 + pos; }",
+    );
+    assert_ne!(uncalled, CONFINED);
+    let (uncalled, row) = settled(&uncalled);
+    assert!(!uncalled, "no call, nothing settled: {row}");
+}

@@ -712,6 +712,56 @@ pub(crate) fn root_rule<'tcx>(
     }
 }
 
+/// R451-7 (relay wave-6v2/023, for wave-6r's seam guard at `seam.rs`): is the
+/// callee's out-parameter alias SETTLED at every call of this position?
+///
+/// The seam guard reads the callee's retention ROW, which for binn's
+/// `binn_{object,map,list}_get_value` and `binn_{map,object}_next` says
+/// `retains` — the argument is stored through an output parameter
+/// (`OutputStorage: store _N through _3`). That row is caller-blind. R406-6's
+/// certificate answers the caller's question instead: the store lands in
+/// storage the CALLER owns and never lets escape, so the retention dies with
+/// the caller's frame.
+///
+/// The fact is true when (i) the callee's only positive sinks are stores
+/// through output parameters and the residual is `NoRetain`
+/// (`output_storage_discharge`), (ii) the position has at least one inventoried
+/// call, and (iii) EVERY such call supplies each of those output parameters
+/// from a frame-confined caller local (`frame_confined`, recorded per site as
+/// `frame_confined_outputs`). One unconfined call anywhere makes it false: the
+/// fact is about the position, not about one site.
+pub(crate) fn output_storage_settled_at_every_call(
+    site_facts: &super::raw_boundary::RawBoundarySiteFacts,
+    retention: &super::raw_boundary::RetentionSummaries,
+    callee: LocalDefId,
+    index: usize,
+) -> bool {
+    let Some((outputs, residual)) = retention.output_storage_discharge(callee, index) else {
+        return false;
+    };
+    if !matches!(
+        residual,
+        super::raw_boundary::RetentionVerdict::NoRetain { .. }
+    ) {
+        return false;
+    }
+    let mut seen = false;
+    for site in site_facts
+        .sites
+        .iter()
+        .filter(|site| site.callee_local == Some(callee) && site.key.argument_index == index)
+    {
+        seen = true;
+        if !outputs
+            .iter()
+            .all(|output| site.frame_confined_outputs.contains(output))
+        {
+            return false;
+        }
+    }
+    seen
+}
+
 /// wave-6r 016 claim 7 / relay wave-6v2/011: a second `&mut local` (or `&`)
 /// is confined when it is the argument of a LOCAL callee whose every pointer
 /// LOADED from a pointer-carrying field of the local is read through only, in

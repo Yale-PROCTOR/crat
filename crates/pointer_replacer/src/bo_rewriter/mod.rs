@@ -9795,7 +9795,7 @@ pub(crate) struct DecideCtx {
     a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
     box_facts: decision::box_facts::BoxOwnershipFacts,
     constructions: decision::construction::ConstructionFacts,
-    raw_boundary_sites: decision::raw_boundary::RawBoundarySiteFacts,
+    pub(crate) raw_boundary_sites: decision::raw_boundary::RawBoundarySiteFacts,
     pub(crate) retention: decision::raw_boundary::RetentionSummaries,
     pub(crate) raw_boundary: decision::raw_boundary::RawBoundaryDispositionIndex,
     exposure: decision::exposure::ExposurePolicy,
