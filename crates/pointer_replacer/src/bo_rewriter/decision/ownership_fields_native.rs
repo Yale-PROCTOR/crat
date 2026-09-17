@@ -14,7 +14,7 @@ use super::{
     ownership_fields_effects::NativeEffects,
     ownership_fields_formal::{self as formal, NativeFormal},
     ownership_fields_hook::Hold,
-    ownership_fields_source::{self as source, SourceCallKey, SourceHold, SourcePlan},
+    ownership_fields_source::{self as source, SourceCallKey, SourceHold, SourcePlan, ViewAlias},
     raw_boundary::{RawBoundarySiteFacts, RetentionSummaries, RetentionVerdict},
 };
 use crate::{
@@ -699,6 +699,68 @@ pub(crate) fn raw_lend_argument(
     }
 }
 
+/// R447: the FIELD family's transactions are not in this lane's line, so this
+/// accessor is the seam: it answers the delivered form of an owning field
+/// (`box`, `opt-box`) or `None` where no transaction owns it. On this base it
+/// always answers `None` — every field-load owner therefore holds, fail-closed,
+/// exactly as before — and a composition carrying wave-6f's line answers from
+/// `table.field_transactions.applied` (their `owning` rows). Keeping the query
+/// here, rather than in a patch, is what lets the assembler take commits.
+fn owning_field_form(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    table: &DecisionTable,
+    struct_did: rustc_span::def_id::DefId,
+    field_index: usize,
+) -> Option<String> {
+    #[cfg(test)]
+    if let Some(form) = field_form_override::get(tcx, struct_did, field_index) {
+        return Some(form);
+    }
+    let _ = (tcx, table, struct_did, field_index);
+    None
+}
+
+/// The composed answer, exercised in this line's own witnesses: a test names
+/// the form a field transaction would deliver for one `(struct, field)`, so
+/// the rules that consume `owning_field_form` are measured here rather than
+/// only on a composition. Production never reads it.
+#[cfg(test)]
+pub(crate) mod field_form_override {
+    use std::sync::Mutex;
+
+    static FORMS: Mutex<Vec<(String, usize, String)>> = Mutex::new(Vec::new());
+    pub(crate) static LOCK: Mutex<()> = Mutex::new(());
+
+    /// `struct_name` is matched on the path's last segment, which is what a
+    /// fixture spells; the lock serialises the witnesses that use it.
+    pub(crate) fn set(rows: Vec<(&str, usize, &str)>) {
+        *FORMS.lock().unwrap() = rows
+            .into_iter()
+            .map(|(name, index, form)| (name.to_owned(), index, form.to_owned()))
+            .collect();
+    }
+
+    pub(crate) fn clear() {
+        FORMS.lock().unwrap().clear();
+    }
+
+    pub(crate) fn get(
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        struct_did: rustc_span::def_id::DefId,
+        field_index: usize,
+    ) -> Option<String> {
+        let rows = FORMS.lock().unwrap();
+        if rows.is_empty() {
+            return None;
+        }
+        let path = tcx.def_path_str(struct_did);
+        let name = path.rsplit("::").next().unwrap_or(path.as_str()).to_owned();
+        rows.iter()
+            .find(|(candidate, index, _)| *candidate == name && *index == field_index)
+            .map(|(_, _, form)| form.clone())
+    }
+}
+
 const DECLARATION_TYPE_RECEIPT: &str = "native-box-declaration-type";
 const VIEW_ALIAS_TYPE_RECEIPT: &str = "native-box-view-alias-type";
 
@@ -891,30 +953,25 @@ fn derive_bundle(
     // leave the container's raw copy pointing into memory this Box closes:
     // the shape holds fail-closed. (The composition lifts the hold for a
     // field wave-6f's transaction owns; see the R431 predicate patch.)
-    // R431 on the composition: the load is an acquisition only where a field
-    // transaction OWNS the field it came out of and delivers it as a PLAIN
-    // owning box. R436: an optional owning field (wave-6f's `opt-box`,
-    // `Option<Box<T>>`) renders the load as a `take()`, whose value is not this
-    // producer's `Box<T>` — measured on `batch-10-dry2` `c97e6162e`, where
-    // lifting the hold there emitted `let mut b: Box<u8> = (*h).buf;` and the
-    // program degraded. That shape needs the `Option<Box<T>>` contract, not
-    // this lift.
+    // R431 / R445(b): a moved-out owner is admitted only where a field
+    // transaction OWNS the field it came out of, and that transaction decides
+    // its shape — `box` gives a `Box<T>` local, `opt-box` (wave-6f's owning
+    // form) an `Option<Box<T>>` one taking their `take()` (R440-4, no third
+    // shape). With no transaction the local's Box would leave the container's
+    // raw copy pointing into memory it closes, so the shape holds.
     let field_load = source.load_field();
-    if let Some((struct_did, field_index)) = field_load
-        && !table.field_transactions.applied.iter().any(|transaction| {
-            transaction.owning
-                && transaction.key.struct_did.to_def_id() == struct_did
-                && transaction.key.field_index == field_index
-                && !format!("{:?}", transaction.form)
-                    .to_lowercase()
-                    .contains("opt")
-        })
-    {
+    let field_form = field_load.and_then(|(struct_did, field_index)| {
+        owning_field_form(tcx, table, struct_did, field_index)
+    });
+    if field_load.is_some() && field_form.is_none() {
         return Err(NativeHold::Missing("native-field-load-field-not-owned"));
     }
+    let optional_owner = field_form
+        .as_deref()
+        .is_some_and(|form| form.to_lowercase().contains("opt"));
     let mut edits = if field_load.is_some() {
-        // The initializer is the field family's; this producer contributes the
-        // type, the close and the receipts, and no constructor edit.
+        // The initializer is the field family's (`take()`); this producer
+        // contributes the type, the projections, the close and the receipts.
         Vec::new()
     } else {
         vec![source.constructor().clone()]
@@ -929,24 +986,48 @@ fn derive_bundle(
         BoxShape::Sized => source.element_spelling().to_owned(),
         BoxShape::Slice => format!("[{}]", source.element_spelling()),
     };
-    // R423: a view alias the table decides for ANOTHER family (a slice or
-    // cursor over the same accesses) owns its own use edits; rendering mine
-    // too would claim one interval twice (`intra-class-interval-overlap`).
-    // The alias is only this producer's while no other family took it.
+    // R423 / R442: a view alias the table decides for ANOTHER family owns its
+    // own use edits; rendering mine too would claim one interval twice
+    // (`intra-class-interval-overlap`). The alias is only this producer's
+    // while no other family took it — with ONE exemption, measured on the
+    // alias-argument wall of report 032/033: a MUTABLE SLICE decision over
+    // this owner is exactly the form this producer would have rendered
+    // (`&mut (*root)[k..]`), so the families agree on the value and differ
+    // only on who writes it. There the alias is THEIRS to render, this
+    // producer contributes no alias edit, and the owner stays typed — which
+    // is what lets the raw-boundary C arm find a bridge template at a call
+    // position, its only `subject-not-safe` arm being `Decision::Degraded`.
+    // Any other decided form still holds: this producer cannot prove its
+    // value equals a cursor's, an option's or a reference's.
+    let alias_decision = |alias: &ViewAlias| {
+        table
+            .entries
+            .iter()
+            .find(|(candidate, _)| {
+                candidate.fn_did == subject.fn_did && candidate.hir_id == alias.hir_id
+            })
+            .map(|(_, decision)| decision)
+    };
+    let rendered_elsewhere = |alias: &ViewAlias| {
+        matches!(
+            alias_decision(alias),
+            Some(Decision::Slice { mutable: true, .. })
+        ) && source.shape() == BoxShape::Slice
+    };
     if source.view_aliases().iter().any(|alias| {
-        table.entries.iter().any(|(candidate, decision)| {
-            let decided = match decision {
+        let decided = match alias_decision(alias) {
+            Some(
                 Decision::Box(_)
                 | Decision::Ref { .. }
                 | Decision::InferredRef { .. }
                 | Decision::Slice { .. }
                 | Decision::NestedSlice { .. }
                 | Decision::Cursor { .. }
-                | Decision::Opt { .. } => true,
-                Decision::Degraded(_) => false,
-            };
-            candidate.fn_did == subject.fn_did && candidate.hir_id == alias.hir_id && decided
-        })
+                | Decision::Opt { .. },
+            ) => true,
+            Some(Decision::Degraded(_)) | None => false,
+        };
+        decided && !rendered_elsewhere(alias)
     }) {
         return Err(NativeHold::Missing("native-view-alias-family-owned"));
     }
@@ -971,6 +1052,10 @@ fn derive_bundle(
         if source.shape() != BoxShape::Slice {
             return Err(NativeHold::Missing("native-view-alias-shape"));
         }
+        // R442: the exempted alias is rendered by the family that decided it.
+        if rendered_elsewhere(alias) {
+            continue;
+        }
         edits.push(BoxExprEdit {
             span: alias.initializer_span,
             replacement: format!("&mut (*({name}))[({}) as usize..]", alias.start),
@@ -984,10 +1069,38 @@ fn derive_bundle(
         subject.local.as_u32(),
         subject.hir_id
     )];
-    receipts.push(format!(
-        "{DECLARATION_TYPE_RECEIPT} ::std::boxed::Box<{payload}>"
-    ));
+    receipts.push(if optional_owner {
+        format!("{DECLARATION_TYPE_RECEIPT} ::std::option::Option<::std::boxed::Box<{payload}>>")
+    } else {
+        format!("{DECLARATION_TYPE_RECEIPT} ::std::boxed::Box<{payload}>")
+    });
+    // A `Box<T>` owner's field projection needs no edit — `*x` derefs it — but
+    // an optional one must be opened: shared for a read, so the two reads in
+    // `max(height((*x).left), height((*x).right))` coexist instead of taking
+    // two mutable borrows of the same local; unique for a write.
+    if optional_owner {
+        for &(span, written) in source.field_projections() {
+            edits.push(BoxExprEdit {
+                span,
+                replacement: if written {
+                    format!("{name}.as_deref_mut().unwrap()")
+                } else {
+                    format!("{name}.as_deref().unwrap()")
+                },
+                receipt: "native-box-optional-owner-projection",
+            });
+        }
+    }
     for alias in source.view_aliases() {
+        if rendered_elsewhere(alias) {
+            receipts.push(format!(
+                "native-view-alias-rendered-by-another-family alias={} start=({}) form=&mut [{}] owner-stays-typed=yes",
+                alias.spelling,
+                alias.start,
+                source.element_spelling()
+            ));
+            continue;
+        }
         receipts.push(format!(
             "{VIEW_ALIAS_TYPE_RECEIPT} {} &mut [{}]",
             alias.hir_id.local_id.as_u32(),
@@ -1303,7 +1416,12 @@ fn derive_bundle(
         receipts.push(format!("native-box-transfer-at-return span={span:?} allocator=linux-System;global-allocators=none;nonempty=numeric-layout caller-free=unchanged"));
         edits.push(BoxExprEdit {
             span,
-            replacement: format!("::std::boxed::Box::into_raw({name})"),
+            replacement: if optional_owner {
+                // R395-2's null rule: the empty option IS the null pointer.
+                format!("{name}.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw)")
+            } else {
+                format!("::std::boxed::Box::into_raw({name})")
+            },
             receipt: "native-box-transfer-at-return",
         });
     }
@@ -1337,21 +1455,18 @@ fn derive_bundle(
                 "guarded-null-for-empty",
             )
         };
-        // R416-12: a field a field transaction OWNS (wave-6f's
-        // `Option<Box<T>>`) takes the moved Box as its store (`Some(owner)`,
-        // rendered by that transaction from this Box decision); the raw
-        // transfer is rendered only into a field that stays raw.
+        // R416-12: a field a transaction OWNS takes the moved owner as its
+        // store, rendered by that transaction; the raw transfer is rendered
+        // only into a field that stays raw.
         let owned_field = source
             .store_field()
             .is_some_and(|(struct_did, field_index)| {
-                table.field_transactions.applied.iter().any(|transaction| {
-                    transaction.owning
-                        && transaction.key.struct_did.to_def_id() == struct_did
-                        && transaction.key.field_index == field_index
-                })
+                owning_field_form(tcx, table, struct_did, field_index).is_some()
             });
         if owned_field {
-            receipts.push(format!("native-box-transfer-to-owning-field span={span:?} store=field-transaction(Some(owner)) nonempty={nonempty}"));
+            receipts.push(format!(
+                "native-box-transfer-to-owning-field span={span:?} store=field-transaction nonempty={nonempty}"
+            ));
         } else {
             receipts.push(format!("native-box-transfer-at-store span={span:?} allocator=linux-System;global-allocators=none;nonempty={nonempty} field-free=unchanged"));
             edits.push(BoxExprEdit {
@@ -1397,7 +1512,7 @@ fn derive_bundle(
         source_elements: source.count().parse::<u64>().ok(),
         plan: BoxPlan {
             shape: source.shape(),
-            optional: false,
+            optional: optional_owner,
             expr_edits: edits,
             delete_statements: Vec::new(),
             receipts,

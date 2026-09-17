@@ -187,6 +187,11 @@ pub(crate) struct SourcePlan {
     /// keyed the same way. The move is the field family's to render; until a
     /// field transaction owns that field the native stage holds.
     load_field: Option<(DefId, usize)>,
+    /// R445(b): every field projection THROUGH this owner (`(*x).height`),
+    /// with `true` where the projection is written. A `Box<T>` owner needs no
+    /// edit at these (it auto-derefs), an `Option<Box<T>>` one does, and only
+    /// this permit knows where they are.
+    field_projections: Vec<(Span, bool)>,
     /// The MIR local that receives the allocator's result: the one source of
     /// every pointer into this fresh allocation while the root never escapes.
     allocation_local: u32,
@@ -216,6 +221,10 @@ impl SourcePlan {
 
     pub(crate) fn load_field(&self) -> Option<(DefId, usize)> {
         self.load_field
+    }
+
+    pub(crate) fn field_projections(&self) -> &[(Span, bool)] {
+        &self.field_projections
     }
 
     pub(crate) fn allocation_local(&self) -> u32 {
@@ -908,6 +917,7 @@ pub(crate) fn derive<'tcx>(
         }
     }
     let mut field_bases: BTreeSet<(u32, Span)> = BTreeSet::new();
+    let mut field_projections: Vec<(Span, bool)> = Vec::new();
     if constructor.shape == BoxShape::Sized {
         for e in &expressions.0 {
             let ExprKind::Field(base, _) = e.kind else { continue };
@@ -915,6 +925,14 @@ pub(crate) fn derive<'tcx>(
             if root_path(operand, binding) {
                 covered.insert(operand.hir_id.local_id.as_u32());
                 field_bases.insert((operand.hir_id.local_id.as_u32(), operand.span));
+                let written = matches!(
+                    tcx.parent_hir_node(e.hir_id),
+                    Node::Expr(Expr {
+                        kind: ExprKind::Assign(target, ..) | ExprKind::AssignOp(_, target, _),
+                        ..
+                    }) if target.hir_id == e.hir_id
+                );
+                field_projections.push((operand.span, written));
             }
         }
     }
@@ -1517,6 +1535,7 @@ pub(crate) fn derive<'tcx>(
         store_transfer: stores.first().map(|s| s.span),
         store_field: store_fields.first().copied(),
         load_field,
+        field_projections,
         allocation_local: allocator_destination.as_u32(),
         element_spelling: constructor.element_spelling,
         view_aliases,

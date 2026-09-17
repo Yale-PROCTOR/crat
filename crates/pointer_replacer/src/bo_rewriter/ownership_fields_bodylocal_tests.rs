@@ -2769,3 +2769,173 @@ fn r435_an_owner_access_nested_in_another_owners_index_composes() {
     })
     .unwrap();
 }
+
+/// The moved-out owner's shape is the FIELD transaction's: avl's rotations in
+/// miniature — a load out of an owning field, a projection read and a
+/// projection write through the loaded owner, and its close.
+fn moved_out_fixture() -> String {
+    format!(
+        "{} #[repr(C)] pub struct R447Node {{ pub key: i32, pub next: *mut R447Node }}\n\
+         pub unsafe fn drop_next(y: *mut R447Node) {{ \
+           let mut x = (*y).next; (*y).next = 0 as *mut R447Node; \
+           (*x).key = (*x).key + 1; \
+           free(x as *mut core::ffi::c_void); }}",
+        declarations()
+    )
+}
+
+fn moved_out_plan(form: Option<&str>) -> Result<super::decision::box_facts::BoxPlan, String> {
+    let input = moved_out_fixture();
+    let form = form.map(str::to_owned);
+    ::utils::compilation::run_compiler_on_str(&input, move |tcx| {
+        match &form {
+            Some(form) => {
+                super::decision::ownership_fields_native::field_form_override::set(vec![(
+                    "R447Node",
+                    1,
+                    form.as_str(),
+                )])
+            }
+            None => super::decision::ownership_fields_native::field_form_override::clear(),
+        }
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        super::decision::ownership_fields_native::field_form_override::clear();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.param_name.as_deref() == Some("x"))
+            .expect("drop_next::x");
+        println!(
+            "R447_AUDIT\n{}",
+            ctx.raw_boundary_artifacts.ownership_native
+        );
+        match decision {
+            Decision::Box(plan) => Ok(plan.clone()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .unwrap()
+}
+
+/// R447 (relay 044): the field transaction's own form decides the moved-out
+/// owner's shape, and this lane's line now carries the query that asks it
+/// (`owning_field_form`) instead of a patch. With no transaction the owner
+/// holds, fail-closed; with a plain owning box it is a `Box<T>`; with
+/// wave-6f's `opt-box` it is an `Option<Box<T>>` whose projections open the
+/// option — shared to read, unique to write — which is R440-4's one shape.
+#[test]
+fn r447_a_moved_out_owner_takes_the_field_transactions_shape() {
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // No transaction: the hold stands.
+    assert!(moved_out_plan(None).is_err(), "no transaction, no owner");
+    // A plain owning box: the local is a `Box<T>`, the field family renders
+    // the load, and the projections need no edit (the Box auto-derefs).
+    let plain = moved_out_plan(Some("box")).expect("box form");
+    assert!(!plain.optional);
+    assert!(
+        plain
+            .receipts
+            .iter()
+            .any(|receipt| receipt
+                == "native-box-declaration-type ::std::boxed::Box<crate::R447Node>"),
+        "{:?}",
+        plain.receipts
+    );
+    assert!(
+        !plain
+            .expr_edits
+            .iter()
+            .any(|edit| edit.receipt == "native-box-optional-owner-projection"),
+        "{:?}",
+        plain.expr_edits
+    );
+    // wave-6f's owning form: the local is optional and every projection
+    // through it opens the option.
+    let optional = moved_out_plan(Some("opt-box")).expect("opt-box form");
+    assert!(optional.optional);
+    assert!(
+        optional.receipts.iter().any(|receipt| receipt
+            == "native-box-declaration-type ::std::option::Option<::std::boxed::Box<crate::R447Node>>"),
+        "{:?}",
+        optional.receipts
+    );
+    let projections: Vec<&str> = optional
+        .expr_edits
+        .iter()
+        .filter(|edit| edit.receipt == "native-box-optional-owner-projection")
+        .map(|edit| edit.replacement.as_str())
+        .collect();
+    assert_eq!(
+        projections
+            .iter()
+            .filter(|r| **r == "x.as_deref_mut().unwrap()")
+            .count(),
+        1,
+        "the write opens uniquely: {projections:?}"
+    );
+    assert_eq!(
+        projections
+            .iter()
+            .filter(|r| **r == "x.as_deref().unwrap()")
+            .count(),
+        1,
+        "the read shares, so two reads in one expression coexist: {projections:?}"
+    );
+    // Neither shape renders the load: that is the transaction's edit.
+    for plan in [&plain, &optional] {
+        assert!(
+            !plan
+                .expr_edits
+                .iter()
+                .any(|edit| edit.receipt == "native-malloc-zero-numeric"
+                    || edit.receipt == "native-owner-moved-out-of-a-field"),
+            "{:?}",
+            plan.expr_edits
+        );
+    }
+}
+
+/// R442 (report 033): an alias another family renders as a mutable slice over
+/// this owner keeps the owner typed instead of holding it. IGNORED on this
+/// base with the measured reason: no family here decides one of this
+/// producer's view aliases, and the injection route does not reach the
+/// bundle derivation (report 033 claim 6), so the rule is exercised on the
+/// composition that carries wave-5d2's rule B — run it there with
+/// `--ignored`.
+#[test]
+#[ignore = "composed gate: needs a family that decides this owner's view alias (wave-5d2 rule B)"]
+fn r442_an_alias_another_family_renders_keeps_the_owner_typed() {
+    let input = format!(
+        "{} pub unsafe fn holder(width:i32,height:i32){{ let mut buf=calloc((width*height) as usize,core::mem::size_of::<f32>()) as *mut f32; let mut x=0; while x<width {{ let mut v=buf.offset((height*x) as isize); *v.offset(0)=1.0f32; sink(v,height); x+=1; }} free(buf as *mut core::ffi::c_void); }} unsafe fn sink(v:*mut f32,n:i32){{ let mut i=0; while i<n {{ *v.offset(i as isize)=0.0f32; i+=1; }} }}",
+        declarations()
+    );
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let audit = &ctx.raw_boundary_artifacts.ownership_native;
+        let row = audit
+            .lines()
+            .find(|line| line.starts_with("holder::buf#"))
+            .unwrap_or_else(|| panic!("{audit}"));
+        assert!(
+            !row.contains("native-view-alias-family-owned"),
+            "the alias is the deciding family's to render: {row}"
+        );
+    })
+    .unwrap();
+}
