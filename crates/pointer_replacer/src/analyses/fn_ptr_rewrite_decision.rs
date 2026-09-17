@@ -400,6 +400,7 @@ mod tests {
                 offset_sign_result,
                 nullity_result,
                 struct_copy_result,
+                source_var_groups,
             };
             let fn_ptr_groups = FnPtrGroups::build(&pre, &solutions, &input, &analysis);
             let decision = FnPtrRewriteDecision::build(

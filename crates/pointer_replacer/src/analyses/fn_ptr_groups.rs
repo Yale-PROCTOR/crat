@@ -244,6 +244,7 @@ mod tests {
                 offset_sign_result,
                 nullity_result,
                 struct_copy_result,
+                source_var_groups,
             };
             let groups = FnPtrGroups::build(&pre, &solutions, &input, &analysis);
             let named = named_fns(tcx);

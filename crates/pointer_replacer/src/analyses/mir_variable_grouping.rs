@@ -23,6 +23,8 @@ use crate::{
 /// This includes both locals with debug info and temporaries that are copies.
 pub struct SourceVarGroups {
     inner: FxHashMap<LocalDefId, FxHashMap<Local, Vec<Local>>>,
+    #[allow(dead_code)]
+    representatives: FxHashMap<LocalDefId, FxHashMap<Local, Local>>,
 }
 
 impl SourceVarGroups {
@@ -37,7 +39,39 @@ impl SourceVarGroups {
             // Store groups for function f
             inner.insert(f, groups);
         }
-        Self { inner }
+        let representatives = inner
+            .iter()
+            .map(|(&did, groups)| {
+                let representatives = groups
+                    .iter()
+                    .flat_map(|(&representative, members)| {
+                        members.iter().map(move |&member| (member, representative))
+                    })
+                    .collect();
+                (did, representatives)
+            })
+            .collect();
+        Self {
+            inner,
+            representatives,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn representative(&self, did: LocalDefId, local: Local) -> Option<Local> {
+        self.representatives
+            .get(&did)
+            .and_then(|representatives| representatives.get(&local))
+            .copied()
+    }
+
+    #[allow(dead_code)]
+    pub fn members(&self, did: LocalDefId, representative: Local) -> &[Local] {
+        self.inner
+            .get(&did)
+            .and_then(|groups| groups.get(&representative))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub fn postprocess_promoted_mut_refs(
@@ -243,4 +277,69 @@ fn find_relationships<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Relationshi
     };
     visitor.visit_body(body);
     visitor.rels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source_var_groups() -> (SourceVarGroups, LocalDefId, Local) {
+        let did = rustc_hir::def_id::CRATE_DEF_ID;
+        let rep = Local::from_usize(1);
+        let inner = [(
+            did,
+            [(rep, vec![rep, Local::from_usize(2), Local::from_usize(3)])]
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect();
+        let representatives = [(
+            did,
+            [
+                (rep, rep),
+                (Local::from_usize(2), rep),
+                (Local::from_usize(3), rep),
+            ]
+            .into_iter()
+            .collect(),
+        )]
+        .into_iter()
+        .collect();
+        (
+            SourceVarGroups {
+                inner,
+                representatives,
+            },
+            did,
+            rep,
+        )
+    }
+
+    #[test]
+    fn source_var_groups_expose_representative_and_members() {
+        let (groups, did, rep) = source_var_groups();
+
+        assert_eq!(groups.representative(did, Local::from_usize(3)), Some(rep));
+        assert_eq!(
+            groups.members(did, rep),
+            &[rep, Local::from_usize(2), Local::from_usize(3)]
+        );
+        assert_eq!(groups.representative(did, Local::from_usize(9)), None);
+        assert!(groups.members(did, Local::from_usize(9)).is_empty());
+    }
+
+    #[test]
+    fn seed_on_nonrepresentative_member_widens_to_owner() {
+        let (groups, did, rep) = source_var_groups();
+        let mut seeded = DenseBitSet::new_empty(10);
+        seeded.insert(Local::from_usize(3));
+
+        let widened = groups.postprocess_offset_signs([(did, seeded)].into_iter().collect());
+
+        assert_eq!(
+            widened[&did].iter().collect::<Vec<_>>(),
+            vec![rep, Local::from_usize(2), Local::from_usize(3)]
+        );
+    }
 }

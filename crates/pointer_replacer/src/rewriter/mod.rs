@@ -21,6 +21,7 @@ use crate::{
         },
         fn_ptr_groups::FnPtrGroups,
         fn_ptr_rewrite_decision::FnPtrRewriteDecision,
+        mir_variable_grouping::SourceVarGroups,
         offset_sign::sign::OffsetSignResult,
         output_params::OutputParams,
         ownership::{
@@ -73,6 +74,8 @@ pub struct Analysis {
     pub(crate) offset_sign_result: OffsetSignResult,
     pub(crate) nullity_result: analyses::nullity::NullityResult,
     pub(crate) struct_copy_result: StructCopyAnalysisResult,
+    #[allow(dead_code)]
+    pub(crate) source_var_groups: SourceVarGroups,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -225,6 +228,7 @@ fn analyze<'tcx>(
         offset_sign_result,
         nullity_result,
         struct_copy_result,
+        source_var_groups,
     };
 
     let fn_ptr_groups = FnPtrGroups::build(

@@ -16928,6 +16928,7 @@ mod tests {
             offset_sign_result,
             nullity_result,
             struct_copy_result,
+            source_var_groups,
         };
 
         (input, analysis)
