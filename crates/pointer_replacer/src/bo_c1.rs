@@ -22026,6 +22026,11 @@ fn raw_boundary_libc_hold_class(
         "held:thin-extent" => Some("thin-extent"),
         "held:io-domain:type" => Some("io-domain-type"),
         "kind-raw" if family == "raw" => Some("analysis-frame-decline"),
+        // R433-4. A subject whose raw view is charged to a PAIR holds at its
+        // libc edges for that reason and for no other; the cause is a class of
+        // its own, as identity-exact as the three above (bzip2's
+        // `copyFileName::from#2` and `addFlagsFromEnvVar::varName#2`).
+        "pair-raw-view" => Some("pair-raw-view"),
         _ => None,
     }
 }
@@ -24649,9 +24654,14 @@ fn raw_boundary_wave2_corpus_census() {
     // 12 `control-unused` rows whose subjects now deliver or hold elsewhere,
     // 3 libtree rows re-classed `slice-use-unsupported`, 2 urlparser rows
     // added; report main/040). The population pin follows the control.
+    // Batch 9 (2026-09-17, main; relay 071 / R433-1): the control is re-pinned
+    // identity-exact from the batch-9 census (42 -> 41 rows: 4 rows whose holds
+    // are gone at this frame, 3 bzip2 `lstat`/`stat` rows added, 1 urlparser
+    // row re-classed `thin-extent`, and the 4 bzip2 `pair-raw-view` rows named
+    // by R433-4 above). The population pin follows the control.
     assert_eq!(
         controls.libc_hold_receipt.lines().count(),
-        43,
+        42,
         "libc contract hold receipt population drift"
     );
     assert_eq!(
@@ -26033,6 +26043,76 @@ fn r342_2_a_listed_hold_resolves_the_edge_and_an_unlisted_or_mismatched_one_dive
         unused.divergences.contains("libc-hold-control-unused"),
         "{}",
         unused.divergences
+    );
+}
+
+#[test]
+fn r433_4_a_pair_charged_raw_view_at_a_libc_edge_is_a_named_hold_class() {
+    // R433-4. bzip2's `copyFileName::from#2` and `addFlagsFromEnvVar::varName#2`
+    // hold at their libc edges for `pair-raw-view` -- a cause the hold-class
+    // vocabulary did not name, so the edge resolved as `libc-hold-unrecognised`
+    // and its control row as `libc-hold-control-unused`, both fail-closed and
+    // both unfixable from the control file. The cause is now a class of its own.
+    let primary = concat!(
+        "read\tprogram\trecord_key\tcategory\ttyped_subkind\tconsumer_edges\n",
+        "A\tp\tp::f::libc#1\tLIBC-CONTRACT-OPENABLE\tknown-libc-no-independent-hard-conflict\tstrlen#0@p/lib.rs:4\n",
+    );
+    let box_control = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\n";
+    let subjects = concat!(
+        "subject_identity\towner\tmir_local\tsubject_kind\thypothetical\tsettled\tdirect_site_count\tdirect_tiers\traw_open\tclass_id\tclass_admits\tclass_block\tnode_block\tptr_depth\n",
+        "p::f::libc#1\tp::f\t1\tparam\tslice\tdegraded\t1\tblocked\t1\t0\t1\t-\t-\t1\n",
+    );
+    let dispositions = "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n";
+    let ledger = concat!(
+        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\tsole_blocker\n",
+        "p::f::libc#1\tp::f\t1\t1\t1\tslice\tref\tdegraded\tpair-raw-view\t-\t-\t0\t-\t-\n",
+    );
+    let listed = concat!(
+        "program\tidentity\tcallee\targument\tline\tclass\n",
+        "p\tp::f::libc#1\tstrlen\t0\t4\tpair-raw-view\n",
+    );
+    let result = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+        &[("p".to_owned(), ledger.to_owned())],
+        listed,
+    )
+    .expect("pair-charged hold reconciles");
+    assert_eq!(
+        result.divergences.lines().count(),
+        1,
+        "a listed pair-charged hold is not a divergence: {}",
+        result.divergences
+    );
+    assert!(
+        result
+            .libc_hold_receipt
+            .contains("\tpair-raw-view\tslice\tpair-raw-view\n"),
+        "{}",
+        result.libc_hold_receipt
+    );
+
+    // the class is still identity-exact: the SAME edge under another class diverges
+    let mismatched = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+        &[("p".to_owned(), ledger.to_owned())],
+        concat!(
+            "program\tidentity\tcallee\targument\tline\tclass\n",
+            "p\tp::f::libc#1\tstrlen\t0\t4\tthin-extent\n",
+        ),
+    )
+    .expect("mismatched pair-charged hold reconciles");
+    assert!(
+        mismatched
+            .divergences
+            .contains("libc-hold-class-mismatch:thin-extent!=pair-raw-view"),
+        "{}",
+        mismatched.divergences
     );
 }
 
