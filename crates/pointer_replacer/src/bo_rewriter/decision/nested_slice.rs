@@ -4,6 +4,9 @@
 #[path = "nested_accumulator.rs"]
 mod accumulator;
 
+#[path = "nested_one_sided.rs"]
+mod one_sided;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     BinOpKind, Expr, ExprKind, HirId, PatKind, QPath, StmtKind, UnOp,
@@ -49,6 +52,11 @@ pub(crate) struct Row {
     pub(crate) index: u64,
     pub(crate) mutable: bool,
     pub(crate) was_fallback: bool,
+    /// The length expression the WRAPPER uses to build this row's view. The
+    /// pair rule binds the positive count once (`__crat_nested_count`); N1
+    /// carries the row's own already-planned expression across unchanged, so a
+    /// fabricated extent stays fabricated and keeps its receipt.
+    pub(crate) length: String,
     pub(crate) raw_name: String,
     pub(crate) view_name: String,
 }
@@ -76,6 +84,10 @@ pub(crate) struct Plan {
     pub(crate) conditional_updates: Vec<HirId>,
     pub(crate) rows: Vec<Row>,
     pub(crate) parameters: Vec<Parameter>,
+    /// The pair rule's wrapper returns early on a non-positive count and binds
+    /// it once. N1 does not: its rows carry their own length expressions and
+    /// the helper body it leaves behind still runs at a non-positive count.
+    pub(crate) count_guard: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Receipt {
@@ -115,16 +127,19 @@ impl Plan {
         }
         // Source table cells are loaded even on this branch; dormant inner
         // values are never converted to references or negative usize counts.
-        s += &format!(
-            "if {} <= 0 {{ return 0; }}\nlet __crat_nested_count = {} as usize;\n",
-            self.count_name, self.count_name
-        );
+        if self.count_guard {
+            s += &format!(
+                "if {} <= 0 {{ return 0; }}\nlet __crat_nested_count = {} as usize;\n",
+                self.count_name, self.count_name
+            );
+        }
         for row in &self.rows {
             s += &format!(
-                "let {} = ::core::slice::from_raw_parts{}({}, __crat_nested_count);\n",
+                "let {} = ::core::slice::from_raw_parts{}({}, {});\n",
                 row.view_name,
                 if row.mutable { "_mut" } else { "" },
-                row.raw_name
+                row.raw_name,
+                row.length
             );
         }
         for parameter in &self.parameters {
@@ -319,14 +334,23 @@ pub(crate) fn inherited_pair(required: super::RequiredArmSet) -> Result<(), Hold
     }
 }
 
-fn inspect<'tcx>(
+pub(super) struct Prelude<'tcx> {
+    pub(super) block: &'tcx rustc_hir::Block<'tcx>,
+    pub(super) count: HirId,
+    pub(super) count_name: String,
+    pub(super) signature: rustc_middle::ty::FnSig<'tcx>,
+}
+
+/// The conditions both nested arms share: the class is ready, the owner has an
+/// exposure wrapper this lane may extend, no other seam edits that wrapper, no
+/// generated name is already taken, and the body is a `size: i32 -> i32` unsafe
+/// block with no tail expression.
+pub(super) fn prelude<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner: LocalDefId,
     table: &DecisionTable,
-    slots: &CrateSlots,
-    model: &FxHashMap<SlotRef, SlotKind>,
     ready: &ClassFinalization,
-) -> Result<Plan, Hold> {
+) -> Result<Prelude<'tcx>, Hold> {
     if !ready
         .classes
         .get(&SignatureClassId::of(owner))
@@ -376,6 +400,45 @@ fn inspect<'tcx>(
     if block.expr.is_some() {
         return Err(Hold::IntervalChanged);
     }
+    Ok(Prelude {
+        block,
+        count,
+        count_name,
+        signature,
+    })
+}
+
+/// The pair rule leads; where it holds, N1 (R436-1) tries the per-parameter
+/// substitution on the same owner. A held owner keeps the PAIR's hold, so no
+/// receipt already in the census moves unless N1 actually delivers.
+fn inspect<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    table: &DecisionTable,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    ready: &ClassFinalization,
+) -> Result<Plan, Hold> {
+    match inspect_pair(tcx, owner, table, slots, model, ready) {
+        Ok(plan) => Ok(plan),
+        Err(pair) => one_sided::inspect(tcx, owner, table, slots, model, ready).map_err(|_| pair),
+    }
+}
+
+fn inspect_pair<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    table: &DecisionTable,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    ready: &ClassFinalization,
+) -> Result<Plan, Hold> {
+    let Prelude {
+        block,
+        count,
+        count_name,
+        signature,
+    } = prelude(tcx, owner, table, ready)?;
     let subjects = table
         .entries
         .iter()
@@ -484,6 +547,7 @@ fn inspect<'tcx>(
                         index: projection,
                         mutable,
                         was_fallback: construction.length.is_fallback(),
+                        length: "__crat_nested_count".to_owned(),
                         raw_name: format!("__crat_nested_{}_raw", id.local_id.as_u32()),
                         view_name: format!("__crat_nested_{}_view", id.local_id.as_u32()),
                     });
@@ -612,6 +676,7 @@ fn inspect<'tcx>(
         conditional_updates,
         rows,
         parameters,
+        count_guard: true,
     })
 }
 
@@ -684,18 +749,26 @@ pub(crate) fn promote(
                     p.name,
                     row.index
                 ));
-                c.length = SliceLengthPlan {
-                    expression: plan.count_name.clone(),
-                    source: SliceLengthSource::AssociatedArgument {
-                        owner,
-                        argument_index: 0,
-                    },
-                    provenance: vec![super::construction::SliceLengthProvenance::Inherited {
-                        owner,
-                        binding: plan.count,
-                    }],
+                if plan.count_guard {
+                    c.length = SliceLengthPlan {
+                        expression: plan.count_name.clone(),
+                        source: SliceLengthSource::AssociatedArgument {
+                            owner,
+                            argument_index: 0,
+                        },
+                        provenance: vec![super::construction::SliceLengthProvenance::Inherited {
+                            owner,
+                            binding: plan.count,
+                        }],
+                    };
+                }
+                // N1 relocates the extent; it does not re-source it, so a
+                // fabricated length keeps its plan and its receipt.
+                c.initializer_kind = if plan.count_guard {
+                    "nested-reborrow-relocated"
+                } else {
+                    "nested-reborrow-relocated-fallback"
                 };
-                c.initializer_kind = "nested-reborrow-relocated";
             }
             changed = true;
         }
@@ -721,9 +794,9 @@ pub(crate) fn observe(tcx: TyCtxt<'_>, table: &DecisionTable) {
     let rows = table.nested_receipts.iter().map(|receipt| {
         let owner = tcx.def_path_str(receipt.owner.to_def_id());
         match &receipt.result {
-            Ok(plan) => serde_json::json!({"owner":owner, "status":"planned", "inherited_pair":"not-required", "count_hir":plan.count.local_id.as_u32(), "count":plan.count_name, "scalar_accumulator_hir":plan.accumulator.map(|h|h.local_id.as_u32()), "conditional_updates":plan.conditional_updates.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
+            Ok(plan) => serde_json::json!({"owner":owner, "status":"planned", "inherited_pair":"not-required", "arm": if plan.count_guard { "pair" } else { "per-parameter" }, "count_hir":plan.count.local_id.as_u32(), "count":plan.count_name, "scalar_accumulator_hir":plan.accumulator.map(|h|h.local_id.as_u32()), "conditional_updates":plan.conditional_updates.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
                 "parameters":plan.parameters.iter().map(|p|serde_json::json!({"hir":p.hir.local_id.as_u32(),"argument":p.index,"name":p.name,"inner_depth":1,"outer_mutable":p.mutable,"inner_mutable":p.mutable})).collect::<Vec<_>>(),
-                "rows":plan.rows.iter().map(|r|serde_json::json!({"source_local_hir":r.local.local_id.as_u32(),"source_formation_hir":r.init.local_id.as_u32(),"table_hir":r.parameter.local_id.as_u32(),"projection":r.index,"destination":r.view_name,"inner_depth":1,"fabricated_before":r.was_fallback,"fabricated_after":false})).collect::<Vec<_>>() }),
+                "rows":plan.rows.iter().map(|r|serde_json::json!({"source_local_hir":r.local.local_id.as_u32(),"source_formation_hir":r.init.local_id.as_u32(),"table_hir":r.parameter.local_id.as_u32(),"projection":r.index,"destination":r.view_name,"inner_depth":1,"fabricated_before":r.was_fallback,"fabricated_after": !plan.count_guard && r.was_fallback})).collect::<Vec<_>>() }),
             Err(hold) => serde_json::json!({"owner":owner,"status":"held","hold":format!("{hold:?}")}),
         }
     }).collect::<Vec<_>>();

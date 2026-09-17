@@ -84,6 +84,8 @@ mod construction_values_tests;
 mod exclusion_rederivation_tests;
 mod field_reference_ast;
 pub(crate) mod flexible_tail_ast;
+#[cfg(test)]
+mod nested_one_sided_tests;
 pub(crate) mod ownership_fields;
 #[cfg(test)]
 mod ownership_fields_bodylocal_tests;
