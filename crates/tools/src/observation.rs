@@ -997,6 +997,7 @@ fn extract_with_tcx(
             &source_statements,
             &target_statements,
             &prepared_function.local_pairs,
+            &prepared_function.labels,
             &ast_to_hir,
             tcx,
         )?;
@@ -1651,12 +1652,14 @@ pub(crate) fn statement_expression(statement: &Stmt) -> Option<&Expr> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pair_bindings(
     source: &SurfaceFunction<'_>,
     target: &SurfaceFunction<'_>,
     source_statements: &[&Stmt],
     target_statements: &[&Stmt],
     local_pairs: &[(usize, usize)],
+    labels: &[PreparedLabel],
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
 ) -> Result<HashMap<hir::HirId, hir::HirId>, ObservationError> {
@@ -1699,6 +1702,7 @@ fn pair_bindings(
         }
         result.insert(source_id, target_id);
     }
+    let required_locals = required_local_bindings(labels, source_statements, ast_to_hir, tcx);
     for &(source_ordinal, target_ordinal) in local_pairs {
         let Some(source_statement) = source_statements.get(source_ordinal) else {
             return Err(correspondence_error("source local declaration disappeared"));
@@ -1715,6 +1719,9 @@ fn pair_bindings(
         else {
             continue;
         };
+        if !required_locals.contains(&source_id) {
+            continue;
+        }
         let Some((target_name, target_id)) = simple_binding(&target_local.pat, ast_to_hir, tcx)
         else {
             continue;
@@ -1734,6 +1741,70 @@ fn pair_bindings(
         }
     }
     Ok(result)
+}
+
+fn required_local_bindings(
+    labels: &[PreparedLabel],
+    source_statements: &[&Stmt],
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> HashSet<hir::HirId> {
+    struct Collector<'a, 'tcx> {
+        opaque_statements: HashSet<NodeId>,
+        bindings: &'a mut HashSet<hir::HirId>,
+        ast_to_hir: &'a utils::ir::AstToHir,
+        tcx: TyCtxt<'tcx>,
+    }
+
+    impl<'ast> Visitor<'ast> for Collector<'_, '_> {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.opaque_statements.contains(&statement.id) {
+                if let StmtKind::Let(local) = &statement.kind
+                    && let Some((_, binding)) =
+                        simple_binding(&local.pat, self.ast_to_hir, self.tcx)
+                {
+                    self.bindings.insert(binding);
+                }
+                return;
+            }
+            visit::walk_stmt(self, statement);
+        }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if let Some(hir_expression) = self.ast_to_hir.get_expr(expression.id, self.tcx)
+                && let hir::ExprKind::Path(path) = hir_expression.kind
+                && let Res::Local(binding) = self
+                    .tcx
+                    .typeck(hir_expression.hir_id.owner)
+                    .qpath_res(&path, hir_expression.hir_id)
+            {
+                self.bindings.insert(binding);
+            }
+            visit::walk_expr(self, expression);
+        }
+    }
+
+    let mut bindings = HashSet::new();
+    for label in labels {
+        if label.macro_skip || label.target_ordinals.len() != 1 || !label.opaque_labels_match {
+            continue;
+        }
+        let Some(statement) = source_statements.get(label.source_ordinal) else { continue };
+        let opaque_statements = label
+            .source_opaque_ordinals
+            .iter()
+            .filter_map(|ordinal| source_statements.get(*ordinal))
+            .map(|statement| statement.id)
+            .collect();
+        Collector {
+            opaque_statements,
+            bindings: &mut bindings,
+            ast_to_hir,
+            tcx,
+        }
+        .visit_stmt(statement);
+    }
+    bindings
 }
 
 fn validate_local_annotations(
@@ -6043,6 +6114,97 @@ unsafe fn target(mut pointer: &mut i32) -> i32 {
         ] {
             assert!(extract_case(&disagreement, "source_copy", "target", vec![0, 1]).is_err());
         }
+    }
+
+    #[test]
+    fn untyped_local_confined_to_preserved_nested_region_is_not_paired() {
+        let source = r#"
+unsafe fn source_copy(mut pointer: *const i32) -> i32 {
+    #[proctor(0)] if true {
+        #[proctor(1)]
+        let mut preserved: i32 = {
+            #[proctor(2)] let mut init = 1_i32;
+            #[proctor(3)] init
+        };
+        #[proctor(4)] *pointer + preserved
+    } else {
+        #[proctor(5)] 0
+    }
+}
+unsafe fn target(mut pointer: &i32) -> i32 {
+    #[proctor(0)] if true {
+        #[proctor(1)]
+        let mut preserved: i32 = {
+            #[proctor(2)] let mut init = 1_i32;
+            #[proctor(3)] init
+        };
+        #[proctor(4)] *pointer + preserved
+    } else {
+        #[proctor(5)] 0
+    }
+}
+"#;
+
+        let document = extract_case(source, "source_copy", "target", vec![0, 4]).unwrap();
+        assert_eq!(document.observations.len(), 1);
+    }
+
+    #[test]
+    fn referenced_preserved_local_still_requires_target_annotation() {
+        let source = r#"
+unsafe fn source_copy(mut pointer: *const i32) -> i32 {
+    #[proctor(0)] let mut preserved: i32 = 1_i32;
+    #[proctor(1)] *pointer + preserved
+}
+unsafe fn target(mut pointer: &i32) -> i32 {
+    #[proctor(0)] let mut preserved = 1_i32;
+    #[proctor(1)] *pointer + preserved
+}
+"#;
+
+        let error = extract_case(source, "source_copy", "target", vec![1]).unwrap_err();
+        assert_eq!(error.code, "binding_correspondence");
+        assert_eq!(error.message, "paired target local has no type annotation");
+    }
+
+    #[test]
+    fn unreferenced_inferred_callable_declaration_is_not_paired() {
+        let source = r#"
+unsafe fn source_copy() {
+    #[proctor(0)] let mut callback = || 1_i32;
+}
+unsafe fn target() {
+    #[proctor(0)] let mut callback = || 1_i32;
+}
+"#;
+
+        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
+        assert!(document.observations.is_empty());
+    }
+
+    #[test]
+    fn opaque_local_boundary_is_paired_for_outer_alignment() {
+        let source = r#"
+unsafe fn source_copy(mut pointer: *const i32) -> i32 {
+    #[proctor(0)] if *pointer > 0 {
+        #[proctor(1)] let mut value: i32 = 1_i32;
+        #[proctor(2)] value
+    } else {
+        #[proctor(3)] 0_i32
+    }
+}
+unsafe fn target(mut pointer: &i32) -> i32 {
+    #[proctor(0)] if *pointer > 0 {
+        #[proctor(1)] let mut value: i32 = 1_i32;
+        #[proctor(2)] value
+    } else {
+        #[proctor(3)] 0_i32
+    }
+}
+"#;
+
+        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
+        assert_eq!(document.observations.len(), 1, "{document:?}");
     }
 
     #[test]
