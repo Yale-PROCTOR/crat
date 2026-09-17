@@ -49,7 +49,7 @@ use rustc_hir::{
     intravisit::{self, Visitor},
 };
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeckResults};
-use rustc_span::Span;
+use rustc_span::{Span, Symbol};
 
 use crate::{analyses::borrow_ownership::mutability_facts::MutFacts, utils::rustc::RustProgram};
 
@@ -676,6 +676,10 @@ fn is_null_literal(expr: &Expr<'_>) -> bool {
 /// `BrotliDefaultAllocFunc`, itself a wrapper of `malloc`).
 struct AllocatorOracle<'a> {
     wrappers: FxHashSet<DefId>,
+    /// Function-pointer FIELDS every assignment to which, program-wide, stores
+    /// a known allocator (R433-6(2)). Keyed by the struct's `DefId` and the
+    /// field's name.
+    allocator_fields: FxHashSet<(DefId, Symbol)>,
     indirect_calls: Option<&'a [super::lifetime::MirCallTargetSite]>,
 }
 
@@ -696,6 +700,15 @@ impl AllocatorOracle<'_> {
         };
         if let Some(did) = callee_def_id(callee) {
             return self.wrappers.contains(&did) || Self::is_libc_allocator(tcx, did);
+        }
+        // A call through a FUNCTION-POINTER FIELD: admitted when every
+        // assignment to that field in the program stores a known allocator
+        // (R433-6(2)). brotli's `((*m).alloc_func).expect(..)(..)` is the
+        // shape; the field is written once, by `BrotliInitMemoryManager`.
+        if let Some(key) = fn_pointer_field_key(tcx, function, callee)
+            && self.allocator_fields.contains(&key)
+        {
+            return true;
         }
         // A call through a function pointer: every closed-world target must be
         // an allocator wrapper already admitted. Foreign targets (libc
@@ -727,10 +740,12 @@ fn allocator_wrappers<'a>(
 ) -> AllocatorOracle<'a> {
     let mut oracle = AllocatorOracle {
         wrappers: FxHashSet::default(),
+        allocator_fields: FxHashSet::default(),
         indirect_calls,
     };
     loop {
-        let before = oracle.wrappers.len();
+        let before = (oracle.wrappers.len(), oracle.allocator_fields.len());
+        oracle.allocator_fields = allocator_fn_pointer_fields(tcx, functions, &oracle);
         for &function in functions {
             if oracle.wrappers.contains(&function.to_def_id()) {
                 continue;
@@ -768,9 +783,173 @@ fn allocator_wrappers<'a>(
                 oracle.wrappers.insert(function.to_def_id());
             }
         }
-        if oracle.wrappers.len() == before {
+        if (oracle.wrappers.len(), oracle.allocator_fields.len()) == before {
             return oracle;
         }
+    }
+}
+
+/// The function-pointer fields a call may be routed through and still count as
+/// an allocation (R433-6(2)). A field qualifies when the program assigns it at
+/// least once and EVERY assignment — an ordinary store or a struct literal —
+/// stores a libc allocator or an already-admitted wrapper. One assignment this
+/// read cannot resolve refuses the field, so the closed world is the same one
+/// the R409-1 allocator contract rests on: nothing outside the crate's own
+/// bodies may have written it. A union's field is never admitted — a union
+/// member shares storage with its siblings.
+fn allocator_fn_pointer_fields(
+    tcx: TyCtxt<'_>,
+    functions: &FxHashSet<LocalDefId>,
+    oracle: &AllocatorOracle<'_>,
+) -> FxHashSet<(DefId, Symbol)> {
+    let mut assignments: FxHashMap<(DefId, Symbol), Vec<bool>> = FxHashMap::default();
+    for &function in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+            continue;
+        };
+        let mut collector = FieldStoreCollector {
+            tcx,
+            typeck: tcx.typeck(function),
+            oracle,
+            assignments: &mut assignments,
+        };
+        collector.visit_body(tcx.hir_body(body_id));
+    }
+    assignments
+        .into_iter()
+        .filter(|(_, stores)| !stores.is_empty() && stores.iter().all(|allocator| *allocator))
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// `(*m).alloc_func` (or `m.alloc_func`), possibly behind `.expect(..)` /
+/// `.unwrap()` as C2Rust spells an `Option<fn>` call: the struct and the field
+/// it reads, when that field's declared type is a function pointer.
+fn fn_pointer_field_key(
+    tcx: TyCtxt<'_>,
+    function: LocalDefId,
+    callee: &Expr<'_>,
+) -> Option<(DefId, Symbol)> {
+    let mut expr = peel_casts(callee);
+    while let ExprKind::MethodCall(segment, receiver, ..) = &expr.kind {
+        if !matches!(segment.ident.name.as_str(), "expect" | "unwrap") {
+            return None;
+        }
+        expr = peel_casts(receiver);
+    }
+    let ExprKind::Field(base, field) = &expr.kind else {
+        return None;
+    };
+    adt_field_key(tcx, tcx.typeck(function), base, field.name)
+}
+
+/// The `(struct, field)` key of a field access, refusing unions and fields
+/// whose declared type is not a function pointer.
+fn adt_field_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    base: &Expr<'_>,
+    field: Symbol,
+) -> Option<(DefId, Symbol)> {
+    let ty::Adt(def, args) = typeck.expr_ty_adjusted(base).peel_refs().kind() else {
+        return None;
+    };
+    if def.is_union() {
+        return None;
+    }
+    let declared = def
+        .all_fields()
+        .find(|candidate| candidate.name == field)?
+        .ty(tcx, args);
+    is_fn_pointer(declared).then_some((def.did(), field))
+}
+
+/// A function pointer, or C2Rust's `Option<unsafe extern "C" fn(..) -> ..>`.
+fn is_fn_pointer(ty: Ty<'_>) -> bool {
+    match ty.kind() {
+        ty::FnPtr(..) => true,
+        ty::Adt(def, args) => {
+            def.is_enum()
+                && args.types().count() == 1
+                && args
+                    .types()
+                    .all(|inner| matches!(inner.kind(), ty::FnPtr(..)))
+        }
+        _ => false,
+    }
+}
+
+/// Every store into a function-pointer field, with whether it stores a known
+/// allocator. An assignment whose value this read cannot resolve to a function
+/// item records `false`, which refuses the field.
+struct FieldStoreCollector<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    typeck: &'tcx TypeckResults<'tcx>,
+    oracle: &'a AllocatorOracle<'a>,
+    assignments: &'a mut FxHashMap<(DefId, Symbol), Vec<bool>>,
+}
+
+impl<'tcx> FieldStoreCollector<'_, 'tcx> {
+    /// Is `value` (a cast, or `Some(..)` of one) a known allocator function?
+    fn stores_allocator(&self, value: &Expr<'_>) -> bool {
+        let value = peel_casts(value);
+        if let ExprKind::Call(callee, args) = &value.kind
+            && args.len() == 1
+            && matches!(&callee.kind, ExprKind::Path(QPath::Resolved(_, path))
+                if matches!(path.res, Res::Def(DefKind::Ctor(..), _)))
+        {
+            return self.stores_allocator(&args[0]);
+        }
+        let ExprKind::Path(QPath::Resolved(_, path)) = &peel_casts(value).kind else {
+            return false;
+        };
+        let Res::Def(DefKind::Fn, did) = path.res else {
+            return false;
+        };
+        self.oracle.wrappers.contains(&did) || AllocatorOracle::is_libc_allocator(self.tcx, did)
+    }
+
+    fn record(&mut self, place: &Expr<'_>, value: &Expr<'_>) {
+        let ExprKind::Field(base, field) = &place.kind else {
+            return;
+        };
+        let Some(key) = adt_field_key(self.tcx, self.typeck, base, field.name) else {
+            return;
+        };
+        let allocator = self.stores_allocator(value);
+        self.assignments.entry(key).or_default().push(allocator);
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for FieldStoreCollector<'_, 'tcx> {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match &expr.kind {
+            ExprKind::Assign(place, value, _) | ExprKind::AssignOp(_, place, value) => {
+                self.record(place, value);
+            }
+            ExprKind::Struct(_, fields, _) => {
+                if let ty::Adt(def, args) = self.typeck.expr_ty(expr).kind()
+                    && !def.is_union()
+                {
+                    for field in *fields {
+                        if let Some(declared) = def
+                            .all_fields()
+                            .find(|candidate| candidate.name == field.ident.name)
+                            .map(|candidate| candidate.ty(self.tcx, args))
+                            && is_fn_pointer(declared)
+                        {
+                            let allocator = self.stores_allocator(field.expr);
+                            self.assignments
+                                .entry((def.did(), field.ident.name))
+                                .or_default()
+                                .push(allocator);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        intravisit::walk_expr(self, expr);
     }
 }
 

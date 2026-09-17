@@ -615,15 +615,164 @@ const FN_PTR_ALLOCATOR: &str = r#"
     }
 "#;
 
-/// End-to-end through the production web. RED at this frame: the Andersen
-/// closed-world inventory does not resolve the field-stored allocator pointer
-/// `(*m).alloc_func` in this reduction (no `BrotliAllocate → *` site is
-/// produced), so the wrapper is not admitted and the type rule's member
-/// clause holds the pair. Kept `#[ignore]`d with that typed reason; the
-/// corpus census decides whether brotli's real instance resolves (the two
-/// `BrotliClusterHistograms*::out_size#6` rows are the measurement).
+/// The SAME program with one more store into `(*m).alloc_func`: a function
+/// that returns its own `opaque` argument, which is not an allocator. The
+/// field's admission is all-or-nothing (R433-6(2)), so `BrotliAllocate` is not
+/// a wrapper here, `distance_histograms` is not a fresh root, and the pair
+/// stays held by the type rule's member clause — the same verdict as before
+/// the admission was built.
+const FN_PTR_ALLOCATOR_FOREIGN_STORE: &str = r#"
+    use core::ffi::c_void;
+    extern "C" { fn malloc(n: u64) -> *mut c_void; fn exit(code: i32) -> !; }
+    #[repr(C)]
+    pub struct MemoryManager { pub alloc_func: Option<unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void>, pub opaque: *mut c_void }
+    #[repr(C)]
+    pub struct HistogramDistance { pub data: [u32; 4], pub total_count: u64 }
+    #[repr(C)]
+    pub struct MetaBlockSplit { pub distance_histograms_size: u64, pub literal_count: u64 }
+    pub unsafe extern "C" fn BrotliDefaultAllocFunc(opaque: *mut c_void, size: u64) -> *mut c_void { malloc(size) }
+    pub unsafe extern "C" fn ArenaAllocFunc(opaque: *mut c_void, size: u64) -> *mut c_void { opaque }
+    pub unsafe fn BrotliInitMemoryManager(m: *mut MemoryManager, opaque: *mut c_void) {
+        (*m).alloc_func = Some(BrotliDefaultAllocFunc as unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void);
+        (*m).opaque = opaque;
+    }
+    pub unsafe fn BrotliUseArena(m: *mut MemoryManager, arena: *mut c_void) {
+        (*m).alloc_func = Some(ArenaAllocFunc as unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void);
+        (*m).opaque = arena;
+    }
+    pub unsafe fn BrotliAllocate(m: *mut MemoryManager, n: u64) -> *mut c_void {
+        let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+        if result.is_null() { exit(1); }
+        return result;
+    }
+    pub unsafe fn ClusterHistograms(histograms: *mut HistogramDistance, out_size: *mut u64) {
+        (*histograms.offset(0)).total_count = 1;
+        *out_size = (*out_size).wrapping_add(1);
+    }
+    pub unsafe fn BrotliBuildMetaBlock(m: *mut MemoryManager, mb: *mut MetaBlockSplit) {
+        let mut distance_histograms = 0 as *mut HistogramDistance;
+        if (*mb).distance_histograms_size > 0 {
+            distance_histograms = BrotliAllocate(m, (*mb).distance_histograms_size.wrapping_mul(::core::mem::size_of::<HistogramDistance>() as u64)) as *mut HistogramDistance;
+        }
+        ClusterHistograms(distance_histograms, &mut (*mb).distance_histograms_size);
+    }
+"#;
+
+/// brotli's REAL init, mirrored: `BrotliInitMemoryManager` stores
+/// `BrotliDefaultAllocFunc` when the caller passes `None` and the caller's own
+/// function pointer otherwise (`lib.rs:488888` and `:488898`; the decoder's
+/// `BrotliDecoderStateInit` is the same shape at `:115002`). The second store
+/// is a PARAMETER, which this read cannot resolve to a function item, so the
+/// field is refused — and since `BrotliEncoderCreateInstance` is a
+/// `#[no_mangle]` entry point that forwards its own parameter, no closed-world
+/// argument can settle it either. Only the allocator CONTRACT can (R409-1,
+/// era-5c). This witness pins that the rule does NOT quietly admit it.
+const FN_PTR_ALLOCATOR_PARAMETER_STORE: &str = r#"
+    use core::ffi::c_void;
+    extern "C" { fn malloc(n: u64) -> *mut c_void; fn exit(code: i32) -> !; }
+    #[repr(C)]
+    pub struct MemoryManager { pub alloc_func: Option<unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void>, pub opaque: *mut c_void }
+    #[repr(C)]
+    pub struct HistogramDistance { pub data: [u32; 4], pub total_count: u64 }
+    #[repr(C)]
+    pub struct MetaBlockSplit { pub distance_histograms_size: u64, pub literal_count: u64 }
+    pub unsafe extern "C" fn BrotliDefaultAllocFunc(opaque: *mut c_void, size: u64) -> *mut c_void { malloc(size) }
+    pub unsafe extern "C" fn BrotliInitMemoryManager(m: *mut MemoryManager, alloc_func: Option<unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void>, opaque: *mut c_void) {
+        if alloc_func.is_none() {
+            (*m).alloc_func = Some(BrotliDefaultAllocFunc as unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void);
+            (*m).opaque = 0 as *mut c_void;
+        } else {
+            (*m).alloc_func = alloc_func;
+            (*m).opaque = opaque;
+        };
+    }
+    pub unsafe fn BrotliAllocate(m: *mut MemoryManager, n: u64) -> *mut c_void {
+        let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+        if result.is_null() { exit(1); }
+        return result;
+    }
+    pub unsafe fn ClusterHistograms(histograms: *mut HistogramDistance, out_size: *mut u64) {
+        (*histograms.offset(0)).total_count = 1;
+        *out_size = (*out_size).wrapping_add(1);
+    }
+    pub unsafe fn BrotliBuildMetaBlock(m: *mut MemoryManager, mb: *mut MetaBlockSplit) {
+        let mut distance_histograms = 0 as *mut HistogramDistance;
+        if (*mb).distance_histograms_size > 0 {
+            distance_histograms = BrotliAllocate(m, (*mb).distance_histograms_size.wrapping_mul(::core::mem::size_of::<HistogramDistance>() as u64)) as *mut HistogramDistance;
+        }
+        ClusterHistograms(distance_histograms, &mut (*mb).distance_histograms_size);
+    }
+"#;
+
+/// The corpus's own shape is refused: a store from a parameter is not a store
+/// of a known allocator. THIS is why the build moves brotli by zero — report
+/// 008 §2.
 #[test]
-#[ignore = "closed-world inventory does not resolve the field-stored allocator pointer in this reduction; census decides on the corpus (report 002)"]
+fn w6p_parameter_supplied_allocator_field_stays_unproved() {
+    ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR_PARAMETER_STORE, |tcx| {
+        let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
+            .expect("parameter-store fixture decision");
+        dump(tcx, &table);
+        let ledger = ctx
+            .a5_site_proofs
+            .pair_certificates()
+            .expect("certificates ride the attested index")
+            .ledger();
+        assert!(
+            ledger
+                .iter()
+                .all(|row| row.outcome != Ok(CertificateKind::DistinctRoots)),
+            "a field one of whose stores is a parameter is not an allocator field: {ledger:?}"
+        );
+        assert!(
+            ledger
+                .iter()
+                .any(|row| row.outcome == Err(Unproved::MemberType)),
+            "the pair stays held by the member clause: {ledger:?}"
+        );
+    })
+    .expect("parameter-store fixture compilation");
+}
+
+/// One store this read cannot call an allocator refuses the whole field.
+#[test]
+fn w6p_one_foreign_store_refuses_the_allocator_field() {
+    ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR_FOREIGN_STORE, |tcx| {
+        let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
+            .expect("arena fixture decision");
+        dump(tcx, &table);
+        let ledger = ctx
+            .a5_site_proofs
+            .pair_certificates()
+            .expect("certificates ride the attested index")
+            .ledger();
+        assert!(
+            ledger
+                .iter()
+                .all(|row| row.outcome != Ok(CertificateKind::DistinctRoots)),
+            "a field with one non-allocator store is not an allocator field: {ledger:?}"
+        );
+        assert!(
+            ledger
+                .iter()
+                .any(|row| row.outcome == Err(Unproved::MemberType)),
+            "the pair stays held by the member clause: {ledger:?}"
+        );
+    })
+    .expect("arena fixture compilation");
+}
+
+/// End-to-end through the production web. RED until R433-6(2): the MIR
+/// inventory does not resolve the field-stored allocator pointer
+/// `(*m).alloc_func` in this reduction (no `BrotliAllocate → *` site is
+/// produced), and the corpus agrees — report 007 measured brotli's 13
+/// `distinct-roots` certificates and not one rests on a heap root. The field
+/// rule admits it instead: every store into `MemoryManager::alloc_func` in
+/// the program is `BrotliDefaultAllocFunc`, itself a wrapper of `malloc`, so
+/// `BrotliAllocate` is a wrapper, `distance_histograms` a fresh root, and the
+/// pair beside `&mut (*mb).distance_histograms_size` certifies by distinct
+/// roots.
+#[test]
 fn w6p_distinct_roots_fn_pointer_allocator_wrapper_delivers() {
     ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR, |tcx| {
         let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(tcx, precise())
@@ -657,7 +806,10 @@ fn w6p_distinct_roots_fn_pointer_allocator_wrapper_delivers() {
 /// the same pair without the inventory stays held by the member clause.
 #[test]
 fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
-    ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR, |tcx| {
+    // The ARENA fixture: its `alloc_func` carries one non-allocator store, so
+    // R433-6(2)'s field rule refuses it and the MIR inventory is the only
+    // route left — which is what this witness is about.
+    ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR_FOREIGN_STORE, |tcx| {
         use rustc_hir::intravisit::{self, Visitor};
         let program = bo_rewriter::collect_program(tcx);
         let mut_facts =
@@ -707,10 +859,10 @@ fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
             ),
             Ok(CertificateKind::DistinctRoots)
         );
-        // A target that is NOT an allocator wrapper (the caller itself) admits nothing.
+        // A target that is NOT an allocator wrapper admits nothing.
         let sites = vec![bo_rewriter::decision::lifetime::MirCallTargetSite {
             caller: allocate,
-            callee: function("EncodeData"),
+            callee: function("ArenaAllocFunc"),
             block: 0,
             argument_count: 2,
             span: calls.0[0],
@@ -756,18 +908,17 @@ fn w6p_distinct_roots_fn_pointer_allocator_wrapper_admitted_by_the_inventory() {
     .expect("fn-pointer allocator mechanism compilation");
 }
 
-/// Negative control: the same wrapper when the function pointer is NOT
-/// resolvable to an allocator (the web is absent) stays unproved.
+/// Negative control: a wrapper whose function pointer is resolvable NEITHER
+/// by the field rule (the arena fixture stores a non-allocator into the same
+/// field) NOR by the web (no inventory) stays unproved.
 #[test]
 fn w6p_fn_pointer_allocator_without_the_web_stays_unproved() {
-    ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR, |tcx| {
+    ::utils::compilation::run_compiler_on_str(FN_PTR_ALLOCATOR_FOREIGN_STORE, |tcx| {
         let program = bo_rewriter::collect_program(tcx);
         let mut_facts =
             crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
         let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
-            &program,
-            &mut_facts,
-            None,
+            &program, &mut_facts, None,
         );
         let function = |name: &str| {
             *program
@@ -777,9 +928,14 @@ fn w6p_fn_pointer_allocator_without_the_web_stays_unproved() {
                 .unwrap_or_else(|| panic!("no fn {name}"))
         };
         assert_eq!(
-            index.certify_recorded(function("BrotliBuildMetaBlock"), function("ClusterHistograms"), 0, 1),
+            index.certify_recorded(
+                function("BrotliBuildMetaBlock"),
+                function("ClusterHistograms"),
+                0,
+                1
+            ),
             Err(Unproved::MemberType),
-            "without the closed-world inventory the wrapper is not an allocator and the type rule holds"
+            "with neither route the wrapper is not an allocator and the type rule holds"
         );
     })
     .expect("fn-pointer allocator control compilation");
