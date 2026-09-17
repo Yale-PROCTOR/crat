@@ -76,6 +76,13 @@ pub(crate) struct Plan {
     /// chartered a second producer for the same receipt list, and a control
     /// that means "the pair arm did not admit" must ask for the arm rather
     /// than for the list being empty.
+    ///
+    /// Nested N1 (R450-10, the composition's single definition): the pair
+    /// rule's wrapper returns early on a non-positive count and binds it once.
+    /// N1 does not — its rows carry their own length expressions and the
+    /// helper body it leaves behind still runs at a non-positive count, so N1
+    /// sets this `false` and `prefix()`'s guard, `promote`'s length branch and
+    /// `observe`'s `arm` key all read it.
     pub(crate) count_guard: bool,
     pub(crate) owner: LocalDefId,
     pub(crate) count: HirId,
@@ -84,10 +91,6 @@ pub(crate) struct Plan {
     pub(crate) conditional_updates: Vec<HirId>,
     pub(crate) rows: Vec<Row>,
     pub(crate) parameters: Vec<Parameter>,
-    /// The pair rule's wrapper returns early on a non-positive count and binds
-    /// it once. N1 does not: its rows carry their own length expressions and
-    /// the helper body it leaves behind still runs at a non-positive count.
-    pub(crate) count_guard: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Receipt {
@@ -676,7 +679,6 @@ fn inspect_pair<'tcx>(
         conditional_updates,
         rows,
         parameters,
-        count_guard: true,
     })
 }
 
