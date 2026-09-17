@@ -624,10 +624,10 @@ fn prepare_observation_source(
                     message: format!("target implementation has no transform label {label}"),
                 });
             }
-            if target_matches
-                .windows(2)
-                .any(|pair| pair[1].ordinal != pair[0].ordinal + 1)
-            {
+            if target_matches.windows(2).any(|pair| {
+                pair[1].statement_list != pair[0].statement_list
+                    || pair[1].sibling_index != pair[0].sibling_index + 1
+            }) {
                 return Err(ObservationError {
                     code: "nonconsecutive_transform_group",
                     message: format!("target transform label {label} is nonconsecutive"),
@@ -858,6 +858,8 @@ fn collect_functions<'a>(
 
 struct LabeledStatement<'a> {
     ordinal: usize,
+    statement_list: usize,
+    sibling_index: usize,
     label: Option<u32>,
     statement: &'a Stmt,
 }
@@ -870,13 +872,27 @@ fn labeled_statements<'a>(
         path: &'a str,
         result: Vec<LabeledStatement<'a>>,
         error: Option<ObservationError>,
+        next_statement_list: usize,
+        current_location: Option<(usize, usize)>,
     }
     impl<'ast> Visitor<'ast> for Collector<'ast> {
+        fn visit_block(&mut self, block: &'ast rustc_ast::Block) {
+            let statement_list = self.next_statement_list;
+            self.next_statement_list += 1;
+            let previous_location = self.current_location;
+            for (sibling_index, statement) in block.stmts.iter().enumerate() {
+                self.current_location = Some((statement_list, sibling_index));
+                self.visit_stmt(statement);
+            }
+            self.current_location = previous_location;
+        }
+
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
             if self.error.is_some() || matches!(statement.kind, StmtKind::Empty | StmtKind::Item(_))
             {
                 return;
             }
+            let (statement_list, sibling_index) = self.current_location.unwrap();
             let attributes = statement_attributes(statement);
             let mut labels = vec![];
             for attribute in attributes
@@ -906,6 +922,8 @@ fn labeled_statements<'a>(
             }
             self.result.push(LabeledStatement {
                 ordinal: self.result.len(),
+                statement_list,
+                sibling_index,
                 label: labels.first().copied(),
                 statement,
             });
@@ -917,6 +935,8 @@ fn labeled_statements<'a>(
         path,
         result: vec![],
         error: None,
+        next_statement_list: 0,
+        current_location: None,
     };
     collector.visit_block(function.body.as_ref().unwrap());
     collector.error.map_or(Ok(collector.result), Err)
@@ -5946,6 +5966,97 @@ unsafe fn target(mut pointer: Option<&i32>) -> i32 {
             serde_json::to_value(&document.observations).unwrap(),
             exact_optional_pointer_observations()
         );
+    }
+
+    #[test]
+    fn consecutive_transform_group_ignores_nested_statement_ordinals() {
+        let source = r#"
+unsafe fn source_copy(flag: bool) -> i32 {
+    #[proctor(2)]
+    if flag { 1 } else { 0 }
+}
+unsafe fn target(flag: bool) -> i32 {
+    #[proctor(2)]
+    let mut value = 0;
+    #[proctor(2)]
+    value += 1;
+    #[proctor(2)]
+    if flag {
+        value += 2;
+    } else {
+        value += 3;
+    }
+    #[proctor(2)]
+    value
+}
+"#;
+        let metadata = case_metadata(source, "source_copy", "target", vec![2]);
+
+        let prepared = rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| prepare_observation_source(source, &metadata),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared.functions[0].labels[0].target_ordinals,
+            vec![0, 1, 2, 5]
+        );
+    }
+
+    #[test]
+    fn nonconsecutive_transform_group_is_rejected_between_siblings() {
+        let source = r#"
+unsafe fn source_copy() -> i32 {
+    #[proctor(2)]
+    0
+}
+unsafe fn target() -> i32 {
+    #[proctor(2)]
+    let value = 0;
+    consume(value);
+    #[proctor(2)]
+    value
+}
+"#;
+        let metadata = case_metadata(source, "source_copy", "target", vec![2]);
+
+        let error = rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| prepare_observation_source(source, &metadata),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code, "nonconsecutive_transform_group");
+    }
+
+    #[test]
+    fn transform_group_is_rejected_across_statement_lists() {
+        let source = r#"
+unsafe fn source_copy(flag: bool) -> i32 {
+    #[proctor(2)]
+    if flag { 1 } else { 0 }
+}
+unsafe fn target(flag: bool) -> i32 {
+    #[proctor(2)]
+    if flag {
+        #[proctor(2)]
+        return 1;
+    }
+    0
+}
+"#;
+        let metadata = case_metadata(source, "source_copy", "target", vec![2]);
+
+        let error = rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| prepare_observation_source(source, &metadata),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code, "nonconsecutive_transform_group");
     }
 
     #[test]
