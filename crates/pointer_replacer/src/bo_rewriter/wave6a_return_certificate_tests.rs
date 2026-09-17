@@ -589,6 +589,17 @@ fn w6a_a1d_urlparser_protocol_buffer_lent_to_sscanf_delivers() {
         out.degradations,
         out.artifacts.return_certificate_receipts
     );
+    // `url_get_protocol` returns null while its buffer is live — the same
+    // waiver site, in the shape that landed in batch 9.
+    assert_eq!(
+        out.artifacts
+            .return_certificate_receipts
+            .matches("waiver-drop(scope-exit) site=")
+            .count(),
+        1,
+        "{}",
+        out.artifacts.return_certificate_receipts
+    );
 }
 
 /// Control: a receiver is returned by a function whose other return is a
@@ -918,5 +929,103 @@ fn w6a_a1b_direct_return_of_a_certified_call_chains() {
             .contains("return-certificate callee=buffer_new output=Box<buffer_t> source=calls"),
         "{}",
         out.artifacts.return_certificate_receipts
+    );
+}
+
+/// **The conditional return** (relay wave-6a/021; urlparser's `get_part`): the
+/// owner leaves through `return if has { ret } else { null }`, not through two
+/// `return` statements. It is the same certificate either way — one owner
+/// return and one null return, so the output is `Option<Box<T>>` — and the
+/// `Some` / `None` edits land on the arms. The census rows read
+/// `return-certificate-return-shape` on the whole conditional (report 016 §2).
+///
+/// The `has == 0` arm abandons a generation the input leaked: Rust closes it
+/// at scope exit under the leak-parity waiver, which carries its receipt.
+const CONDITIONAL_RETURN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+pub unsafe extern "C" fn get_part(mut has: i32) -> *mut std::os::raw::c_char {
+    let mut ret = malloc(::std::mem::size_of::<std::os::raw::c_char>() as std::os::raw::c_ulong) as *mut std::os::raw::c_char;
+    if ret.is_null() {
+        return 0 as *mut std::os::raw::c_char;
+    }
+    *ret = 7 as std::os::raw::c_char;
+    return if has != 0 as i32 { ret } else { 0 as *mut std::os::raw::c_char };
+}
+pub unsafe extern "C" fn use_part(mut has: i32) -> i32 {
+    let mut p = get_part(has);
+    if p.is_null() {
+        return 0 as i32;
+    }
+    let mut v = *p as i32;
+    free(p as *mut core::ffi::c_void);
+    return v;
+}
+pub unsafe extern "C" fn get_part_working_arm(mut has: i32) -> *mut std::os::raw::c_char {
+    let mut ret = malloc(::std::mem::size_of::<std::os::raw::c_char>() as std::os::raw::c_ulong) as *mut std::os::raw::c_char;
+    if ret.is_null() {
+        return 0 as *mut std::os::raw::c_char;
+    }
+    return if has != 0 as i32 { *ret = 1 as std::os::raw::c_char; ret } else { 0 as *mut std::os::raw::c_char };
+}
+pub unsafe extern "C" fn use_working_arm(mut has: i32) -> i32 {
+    let mut q = get_part_working_arm(has);
+    if q.is_null() {
+        return 0 as i32;
+    }
+    free(q as *mut core::ffi::c_void);
+    return 1 as i32;
+}
+"#;
+
+#[test]
+fn w6a_a1_a_conditional_return_carries_the_option_on_its_arms() {
+    let out = emitted("cert-conditional-return", CONDITIONAL_RETURN);
+    record("conditional-return", &out.source);
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert_eq!(
+        out.reverted, 0,
+        "{}\n{:#?}\n{receipts}",
+        out.source, out.degradations
+    );
+    for expected in [
+        "fnget_part(muthas:i32)->Option<Box<std::os::raw::c_char>>",
+        "returnifhas!=0asi32{Some(ret)}else{None};",
+        "letmutp:Option<Box<i8>>=get_part(has);",
+        "drop(p);",
+    ] {
+        assert!(
+            src.contains(expected),
+            "missing `{expected}`\n{}\n{:#?}\n{receipts}",
+            out.source,
+            out.degradations
+        );
+    }
+    assert_eq!(
+        reason_of(&out.degradations, "get_part::ret"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        receipts.matches("waiver-drop(scope-exit) site=").count(),
+        1,
+        "{receipts}"
+    );
+    // CONTROL: an arm that does work before yielding the owner is not read —
+    // what those statements do to the generation is exactly what this rule
+    // would have to prove, so the shape holds fail-closed.
+    assert!(
+        receipts.contains("get_part_working_arm\theld\treturn-certificate-return-shape"),
+        "{receipts}"
+    );
+    assert!(
+        !src.contains("fnget_part_working_arm(muthas:i32)->Option<"),
+        "{}",
+        out.source
     );
 }

@@ -396,6 +396,38 @@ fn local_callee(e: &Expr<'_>) -> Option<DefId> {
     }
 }
 
+/// What a `return` hands back, as the certificate reads it: a returned local,
+/// a null literal, a local callee's result, or a shape this rule does not
+/// read. A returned CONDITIONAL is read through its arms — `return if c {
+/// owner } else { null }` is the same certificate as the two `return`
+/// statements it abbreviates (urlparser's `get_part`, relay wave-6a/021), and
+/// the `Some` / `None` edits land on the arms themselves. An arm with
+/// statements of its own is NOT descended into: what those statements do to
+/// the owner is exactly what this rule would have to prove.
+fn classify_returned<'tcx>(tcx: TyCtxt<'tcx>, value: &'tcx Expr<'tcx>, out: &mut Vec<Returned>) {
+    match &value.kind {
+        ExprKind::If(_, then, Some(otherwise)) => {
+            classify_returned(tcx, then, out);
+            classify_returned(tcx, otherwise, out);
+        }
+        ExprKind::Block(block, _) if block.stmts.is_empty() => match block.expr {
+            Some(tail) => classify_returned(tcx, tail, out),
+            None => out.push(Returned::Other(value.span)),
+        },
+        _ => out.push(if let Some(hir) = bare_local(value) {
+            Returned::Local(hir, value.span)
+        } else if null_literal(value) {
+            Returned::Null(value.span)
+        } else if let Some(did) = local_callee(value)
+            && !foreign_fn(tcx, did)
+        {
+            Returned::Call(did, value.span)
+        } else {
+            Returned::Other(value.span)
+        }),
+    }
+}
+
 impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
     type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
 
@@ -407,17 +439,7 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
         match &e.kind {
             ExprKind::Ret(Some(value)) => {
                 let tcx = self.tcx.expect("scan tcx");
-                self.returns.push(if let Some(hir) = bare_local(value) {
-                    Returned::Local(hir, value.span)
-                } else if null_literal(value) {
-                    Returned::Null(value.span)
-                } else if let Some(did) = local_callee(value)
-                    && !foreign_fn(tcx, did)
-                {
-                    Returned::Call(did, value.span)
-                } else {
-                    Returned::Other(value.span)
-                });
+                classify_returned(tcx, value, &mut self.returns);
             }
             ExprKind::Assign(lhs, rhs, _) => {
                 let tcx = self.tcx.expect("scan tcx");
@@ -2190,6 +2212,20 @@ fn certify<'tcx, 's>(
     certificate.site_edits = site_edits;
     certificate.transfers = transfers;
     certificate.receipts.extend(dead_guard_receipts);
+    // **The leak-parity waiver's receipt on the CALLEE side** (addendum 101).
+    // A LIVE null return abandons the generation the owner is still holding:
+    // the input leaks it, and the emitted `None` arm closes it at scope exit.
+    // The callee's plan asserts `retained_sink` because the certificate's
+    // return is a sink, which is true of every path that returns the owner
+    // and of no path that returns null — so the site is receipted here, where
+    // the live null returns are known (a dead null return, the one before the
+    // allocation, is already out of this set).
+    for span in &null_returns {
+        certificate.receipts.push(format!(
+            "waiver-drop(scope-exit) site={}",
+            super::emitability::EmitabilityFacts::site(tcx, *span)
+        ));
+    }
     certificate.receipts.push(format!(
         "return-certificate callee={callee_path} output={output_type} source={source_receipt} model={kind:?} null_returns={} receivers={} [{}] returned_receivers={} returning_callers={} store_sites={}",
         null_returns.len(),
