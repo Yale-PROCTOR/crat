@@ -339,6 +339,86 @@ pub(crate) fn computed_argument_view<'tcx>(
     ))
 }
 
+/// **W6S-7 — the LHS of `dst = <a forward computed view of another root>`.**
+///
+/// The destination's own use walk sees the assignment and must decide whether
+/// it is in scope. It is: the right-hand side is this lane's computed view,
+/// rendered by [`super::slice_use`] from the DESTINATION's form (a slice takes
+/// the suffix, an optional slice the same suffix inside `Some(..)`), so the
+/// use needs no edit of its own.
+///
+/// Structurally the same walk as wave-6s2's
+/// [`super::slice_passon::assignment_from_computed_view`], under THIS lane's
+/// sign authority ([`forward_delta`]): the two coincide except on the C2Rust
+/// double-cast literal (`2 as i32 as isize`), which is a non-negative literal
+/// under casts that preserve non-negativity and which their narrower rule
+/// refuses. The unification of the two walks is a seat question, not a silent
+/// edit of a neighbour's rule.
+pub(crate) fn assignment_from_forward_view<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    use_expr: &Expr<'_>,
+    key: (LocalDefId, HirId),
+) -> bool {
+    // Only the identity of the use is taken from the caller's borrow; every
+    // expression this walk reads is re-fetched from `tcx`.
+    let rustc_hir::Node::Expr(assign) = tcx.parent_hir_node(use_expr.hir_id) else {
+        return false;
+    };
+    let ExprKind::Assign(lhs, rhs, _) = assign.kind else {
+        return false;
+    };
+    if lhs.hir_id != use_expr.hir_id {
+        return false;
+    }
+    let typeck = tcx.typeck(key.0);
+    let Some(destination_pointee) = raw_target_type(tcx, typeck.expr_ty(lhs)) else {
+        return false;
+    };
+    // The C2Rust spine: identity casts and the borrow-of-deref around the
+    // arithmetic.
+    let mut value = rhs;
+    loop {
+        match value.kind {
+            ExprKind::Cast(inner, _) => value = inner,
+            ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, _, borrowed) => {
+                let ExprKind::Unary(rustc_hir::UnOp::Deref, place) = borrowed.kind else {
+                    return false;
+                };
+                value = place;
+            }
+            _ => break,
+        }
+    }
+    let ExprKind::MethodCall(segment, receiver, [delta], _) = value.kind else {
+        return false;
+    };
+    if !matches!(segment.ident.name.as_str(), "offset" | "add") {
+        return false;
+    }
+    let Some(callee) = typeck.type_dependent_def_id(value.hir_id) else {
+        return false;
+    };
+    if tcx.crate_name(callee.krate).as_str() != "core" {
+        return false;
+    }
+    // A DIFFERENT binding as the root: a self-advance is the classifier's own
+    // arm, and a root that is not a binding has no subject to carry the view.
+    let Some(root) = local(receiver) else {
+        return false;
+    };
+    if root == key.1 {
+        return false;
+    }
+    // The view's element type is the destination's; a retyping cast is the
+    // void-region family's evidence to supply, not this arm's.
+    if raw_target_type(tcx, typeck.expr_ty(receiver))
+        .is_none_or(|root_pointee| root_pointee.pointee != destination_pointee.pointee)
+    {
+        return false;
+    }
+    forward_delta(tcx, delta)
+}
+
 fn local(expression: &Expr<'_>) -> Option<HirId> {
     match expression.kind {
         ExprKind::Path(QPath::Resolved(_, path)) => match path.res {

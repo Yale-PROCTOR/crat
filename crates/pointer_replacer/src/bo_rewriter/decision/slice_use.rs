@@ -677,6 +677,25 @@ pub(crate) fn receipt_plans(
                             adapter = "computed-suffix-copy".to_owned();
                             Some(format!("{amp}({name})[{}..]", view.index))
                         }
+                        // **W6S-7 — the OPTIONAL slice destination.** A
+                        // null-initialized local the ladder decided
+                        // `Option<&[T]>` takes the same suffix this arm
+                        // already renders, and only the suffix: the `Some(..)`
+                        // belongs to the Option family's value planner, which
+                        // composes this edit into its `nullable-assignment`
+                        // receipt. That composition is exactly the "real view"
+                        // wave-6o's R410-7 hold waits for — the one-element
+                        // `from_ref` carrier is what it refuses, and this is
+                        // the root's own extent, nothing fabricated.
+                        Decision::Opt {
+                            mutable,
+                            slice: true,
+                            ..
+                        } if !*mutable || source_mutable_view => {
+                            let amp = if *mutable { "&mut " } else { "&" };
+                            adapter = "computed-suffix-copy-optional".to_owned();
+                            Some(format!("{amp}({name})[{}..]", view.index))
+                        }
                         Decision::Ref { .. }
                         | Decision::InferredRef { .. }
                         | Decision::Slice { .. }

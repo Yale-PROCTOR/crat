@@ -2532,7 +2532,12 @@ fn collect_slice_uses_with_family(
                 // copied by assignment is in scope and needs no edit of its
                 // own — the right-hand side is the source's (or the Option
                 // value planner's) to render.
-                if super::slice_passon::assignment_from_computed_view(self.tcx, use_expr, key) {
+                if super::slice_passon::assignment_from_computed_view(self.tcx, use_expr, key)
+                    // wave-6s (W6S-7): the same assignment under this lane's
+                    // own sign authority, which admits the C2Rust double-cast
+                    // literal the narrower walk refuses.
+                    || super::slice_forms::assignment_from_forward_view(self.tcx, use_expr, key)
+                {
                     return Some(None);
                 }
                 if !self.advance_ok.contains(&key) {
