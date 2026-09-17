@@ -21895,6 +21895,10 @@ struct RawBoundaryControlReconciliation {
     libc_site_movement: String,
     io_domain_migrations: String,
     libc_hold_receipt: String,
+    /// R434-2. Libc-hold rows the control no longer matches that the landing
+    /// re-pins instead of failing on: a class that moved, a hold that retired,
+    /// a cause the vocabulary cannot name.
+    recorded_hold_divergences: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22083,6 +22087,51 @@ fn control_keys_unused(
         .collect()
 }
 
+/// R434-2. The next census's libc contract-hold control, projected from THIS
+/// census's receipt: `program, identity, callee, argument, line, class` — the
+/// control's own columns, one row per hold the frame carries. The landing
+/// publishes it as `libc-contract-hold-control-batch<N>.tsv`.
+fn raw_boundary_libc_hold_control_from_receipt(receipt: &str) -> String {
+    let mut out = String::from("program\tidentity\tcallee\targument\tline\tclass\n");
+    for line in receipt.lines().skip(1) {
+        let mut fields = line.split('\t');
+        let head = fields.by_ref().take(6).collect::<Vec<_>>();
+        if head.len() == 6 {
+            out.push_str(&head.join("\t"));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// R434-2 (seat addendum 434). Which side of the reconciliation a libc-hold
+/// divergence belongs on. The identity-exact re-pin was fail-closed in BOTH
+/// directions, which made every frame that moved a hold's class -- or retired
+/// one -- abort a 90-minute census on bookkeeping the landing itself re-pins
+/// (batch 9 spent three runs on exactly that). From this frame the control is
+/// a RECORD of the previous landing, not a gate: a row whose class moved, whose
+/// hold is gone, or whose cause the vocabulary cannot yet name is written to
+/// `libc-hold-recorded-divergences.tsv` and the landing re-pins from the
+/// receipt. What stays FATAL is the thing a control cannot express: a hold at a
+/// libc callee the contract table does not model at all, and any inconsistency
+/// inside the instrument itself.
+fn raw_boundary_libc_hold_divergence_is_fatal(detail: &str, callee: &str) -> bool {
+    match detail {
+        // (c) an edge the control does not list: fatal only when NOTHING models
+        // this callee -- otherwise it is a control that has not been re-pinned.
+        "libc-hold-unlisted" => {
+            !crate::bo_rewriter::decision::raw_boundary_contracts::contract_table_models_symbol(
+                callee,
+            )
+        }
+        // the instrument contradicting itself: the ledger lost a subject the
+        // edge names, or one control row was consumed twice.
+        "libc-hold-subject-absent" | "libc-hold-control-row-reused" => true,
+        // (a) / (b) / (d) / (e): class moved, hold retired, cause unnamed.
+        _ => false,
+    }
+}
+
 /// R342-2. Resolve one unmatched libc contract edge against the identity-exact
 /// re-pin: the control must list it, and production must actually carry the
 /// hold the control claims. Fail-closed in both directions.
@@ -22245,6 +22294,10 @@ fn reconcile_raw_boundary_controls(
     let mut libc_hold_receipt =
         String::from("program\tidentity\tcallee\targument\tline\tclass\tfamily\tcause\n");
     let mut divergences = String::from("control\tprogram\tidentity\treason\tdetail\n");
+    // R434-2: the non-fatal half of the libc-hold reconciliation -- the rows the
+    // landing re-pins from the receipt rather than aborting on.
+    let mut recorded_hold_divergences =
+        String::from("control\tprogram\tidentity\treason\tdetail\n");
     let mut arm_b = String::from(
         "unit\tprogram\tidentity\tboundary_direction\tmodel_kind\tblocker\tmissing_fact\tarm_a_applicable\n",
     );
@@ -22275,6 +22328,7 @@ fn reconcile_raw_boundary_controls(
         libc_site_movement: String::new(),
         io_domain_migrations: String::new(),
         libc_hold_receipt: String::new(),
+        recorded_hold_divergences: String::new(),
     };
     for row in &primary.rows {
         let program = primary.field(row, "program")?;
@@ -22346,9 +22400,14 @@ fn reconcile_raw_boundary_controls(
                             ) {
                                 Ok(()) => continue,
                                 Err(detail) => {
-                                    divergences.push_str(&format!(
+                                    let row = format!(
                                         "libc-edge\t{program}\t{identity}\t{detail}\t{edge}\n"
-                                    ));
+                                    );
+                                    if raw_boundary_libc_hold_divergence_is_fatal(&detail, callee) {
+                                        divergences.push_str(&row);
+                                    } else {
+                                        recorded_hold_divergences.push_str(&row);
+                                    }
                                     continue;
                                 }
                             }
@@ -22409,9 +22468,13 @@ fn reconcile_raw_boundary_controls(
                         ) {
                             Ok(()) => continue,
                             Err(detail) => {
-                                divergences.push_str(&format!(
-                                    "libc-edge\t{program}\t{identity}\t{detail}\t{edge}\n"
-                                ));
+                                let row =
+                                    format!("libc-edge\t{program}\t{identity}\t{detail}\t{edge}\n");
+                                if raw_boundary_libc_hold_divergence_is_fatal(&detail, callee) {
+                                    divergences.push_str(&row);
+                                } else {
+                                    recorded_hold_divergences.push_str(&row);
+                                }
                                 continue;
                             }
                         }
@@ -22564,7 +22627,7 @@ fn reconcile_raw_boundary_controls(
         t2_cross_tab.push_str(&format!("ALL\t{label}\t{disposition}\t{count}\n"));
     }
     for key in control_keys_unused(&hold_control_rows, &used_hold_control) {
-        divergences.push_str(&format!(
+        recorded_hold_divergences.push_str(&format!(
             "libc-edge\t{}\t{}\tlibc-hold-control-unused\t{}#{}@{}\n",
             key.0, key.1, key.2, key.3, key.4
         ));
@@ -22574,6 +22637,7 @@ fn reconcile_raw_boundary_controls(
     counts.free_arm_b_ledger = free_arm_b;
     counts.t2_cross_tab = t2_cross_tab;
     counts.libc_hold_receipt = libc_hold_receipt;
+    counts.recorded_hold_divergences = recorded_hold_divergences;
     counts.libc_site_movement = libc_site_movement;
     counts.io_domain_migrations = io_domain_migrations;
     Ok(counts)
@@ -24593,6 +24657,19 @@ fn raw_boundary_wave2_corpus_census() {
         &controls.divergences,
     )
     .expect("write control divergences");
+    // R434-2. The half of the libc-hold reconciliation the landing re-pins
+    // rather than aborts on, and the control the NEXT census reads: one row per
+    // hold this frame actually carries, in the control's own column order.
+    fs::write(
+        artifact_dir.join("libc-hold-recorded-divergences.tsv"),
+        &controls.recorded_hold_divergences,
+    )
+    .expect("write recorded libc hold divergences");
+    fs::write(
+        artifact_dir.join("libc-contract-hold-control-next.tsv"),
+        raw_boundary_libc_hold_control_from_receipt(&controls.libc_hold_receipt),
+    )
+    .expect("write the next libc contract hold control");
     fs::write(artifact_dir.join("arm-b-62.tsv"), &controls.arm_b_ledger)
         .expect("write Arm-B ledger");
     fs::write(
@@ -24659,11 +24736,9 @@ fn raw_boundary_wave2_corpus_census() {
     // are gone at this frame, 3 bzip2 `lstat`/`stat` rows added, 1 urlparser
     // row re-classed `thin-extent`, and the 4 bzip2 `pair-raw-view` rows named
     // by R433-4 above). The population pin follows the control.
-    assert_eq!(
-        controls.libc_hold_receipt.lines().count(),
-        42,
-        "libc contract hold receipt population drift"
-    );
+    // R434-2 retires the population pin: with the control a RECORD rather than
+    // a gate, the receipt's size is this frame's measurement (reported in the
+    // census receipt as `libc_hold_rows`), not a number to assert against.
     assert_eq!(
         controls.free_arm_b_rows, 5,
         "free-parameter Arm-B receipt population drift"
@@ -25997,11 +26072,16 @@ fn r342_2_a_listed_hold_resolves_the_edge_and_an_unlisted_or_mismatched_one_dive
         "program\tidentity\tcallee\targument\tline\tclass\n",
     )
     .expect("unlisted hold reconciles");
+    // R434-2: `strlen` IS modelled by the contract table, so an unlisted edge at
+    // it is a control that has not been re-pinned -- recorded, not fatal.
     assert!(
-        unlisted.divergences.contains("libc-hold-unlisted"),
+        unlisted
+            .recorded_hold_divergences
+            .contains("libc-hold-unlisted"),
         "{}",
-        unlisted.divergences
+        unlisted.recorded_hold_divergences
     );
+    assert_eq!(unlisted.divergences.lines().count(), 1);
 
     // a listed edge whose production hold is a DIFFERENT class diverges: the
     // re-pin is identity-exact, not a blanket amnesty
@@ -26017,13 +26097,15 @@ fn r342_2_a_listed_hold_resolves_the_edge_and_an_unlisted_or_mismatched_one_dive
         ),
     )
     .expect("mismatched hold reconciles");
+    // R434-2: a class that moved is recorded and re-pinned by the landing.
     assert!(
         mismatched
-            .divergences
+            .recorded_hold_divergences
             .contains("libc-hold-class-mismatch:io-domain-type!=thin-extent"),
         "{}",
-        mismatched.divergences
+        mismatched.recorded_hold_divergences
     );
+    assert_eq!(mismatched.divergences.lines().count(), 1);
 
     // a control row nothing consumed diverges too
     let unused = reconcile_raw_boundary_controls(
@@ -26039,11 +26121,15 @@ fn r342_2_a_listed_hold_resolves_the_edge_and_an_unlisted_or_mismatched_one_dive
         ),
     )
     .expect("unused hold reconciles");
+    // R434-2: a retired hold is recorded and dropped by the landing's re-pin.
     assert!(
-        unused.divergences.contains("libc-hold-control-unused"),
+        unused
+            .recorded_hold_divergences
+            .contains("libc-hold-control-unused"),
         "{}",
-        unused.divergences
+        unused.recorded_hold_divergences
     );
+    assert_eq!(unused.divergences.lines().count(), 1);
 }
 
 #[test]
@@ -26107,12 +26193,75 @@ fn r433_4_a_pair_charged_raw_view_at_a_libc_edge_is_a_named_hold_class() {
         ),
     )
     .expect("mismatched pair-charged hold reconciles");
+    // R434-2 moved a class mismatch to the recorded half: the rule still
+    // separates the two classes, the landing re-pins instead of failing.
     assert!(
         mismatched
-            .divergences
+            .recorded_hold_divergences
             .contains("libc-hold-class-mismatch:thin-extent!=pair-raw-view"),
         "{}",
-        mismatched.divergences
+        mismatched.recorded_hold_divergences
+    );
+}
+
+#[test]
+fn r434_2_an_unmodelled_callee_is_fatal_and_the_next_control_comes_from_the_receipt() {
+    // R434-2. The control is a RECORD of the last landing, not a gate: only a
+    // hold at a callee the contract table does not model at all still fails the
+    // census, and the receipt projects the next census's control.
+    let primary = concat!(
+        "read\tprogram\trecord_key\tcategory\ttyped_subkind\tconsumer_edges\n",
+        "A\tp\tp::f::libc#1\tLIBC-CONTRACT-OPENABLE\tknown-libc-no-independent-hard-conflict\tqsort#0@p/lib.rs:4\n",
+    );
+    let box_control = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\n";
+    let subjects = concat!(
+        "subject_identity\towner\tmir_local\tsubject_kind\thypothetical\tsettled\tdirect_site_count\tdirect_tiers\traw_open\tclass_id\tclass_admits\tclass_block\tnode_block\tptr_depth\n",
+        "p::f::libc#1\tp::f\t1\tparam\tref\tdegraded\t1\tblocked\t1\t0\t1\t-\t-\t1\n",
+    );
+    let dispositions = "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n";
+    let ledger = concat!(
+        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\tsole_blocker\n",
+        "p::f::libc#1\tp::f\t1\t1\t1\tref\tref\tdegraded\theld:thin-extent\t-\t-\t0\t-\t-\n",
+    );
+    // nothing models `qsort`, and the control does not list the edge: FATAL
+    let unmodelled = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+        &[("p".to_owned(), ledger.to_owned())],
+        "program\tidentity\tcallee\targument\tline\tclass\n",
+    )
+    .expect("unmodelled callee reconciles");
+    assert!(
+        unmodelled.divergences.contains("libc-hold-unlisted"),
+        "an unmodelled callee is the one unlisted edge that still fails: {}",
+        unmodelled.divergences
+    );
+    assert_eq!(unmodelled.recorded_hold_divergences.lines().count(), 1);
+
+    // the same edge, listed: it resolves, and the receipt projects the control
+    // the NEXT census reads
+    let listed = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+        &[("p".to_owned(), ledger.to_owned())],
+        concat!(
+            "program\tidentity\tcallee\targument\tline\tclass\n",
+            "p\tp::f::libc#1\tqsort\t0\t4\tthin-extent\n",
+        ),
+    )
+    .expect("listed hold reconciles");
+    assert_eq!(listed.divergences.lines().count(), 1);
+    assert_eq!(
+        raw_boundary_libc_hold_control_from_receipt(&listed.libc_hold_receipt),
+        concat!(
+            "program\tidentity\tcallee\targument\tline\tclass\n",
+            "p\tp::f::libc#1\tqsort\t0\t4\tthin-extent\n",
+        ),
+        "the next control is this frame's receipt, in the control's columns"
     );
 }
 

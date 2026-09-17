@@ -438,6 +438,22 @@ fn family_contract(
     }))
 }
 
+/// R434-2. Is this callee MODELLED AT ALL — a row in [`TABLE`], or a member of
+/// one of the variadic families [`printf_tail_first`] / [`scanf_tail_first`] /
+/// [`is_stdio_stream_position`] handles? The census's libc contract-hold
+/// reconciliation asks this to separate two very different unlisted edges: a
+/// hold at a callee this table models (a control row that has simply not been
+/// re-pinned yet — recorded) from a hold at a callee nothing here models (a
+/// real gap in the contract table — still fatal). It answers for the SYMBOL,
+/// never for one argument position, which is exactly the question the census
+/// asks.
+pub(crate) fn contract_table_models_symbol(symbol: &str) -> bool {
+    TABLE.iter().any(|row| row.symbol == symbol)
+        || printf_tail_first(symbol).is_some()
+        || scanf_tail_first(symbol).is_some()
+        || function_return_alias(symbol).is_some()
+}
+
 pub(crate) fn classify_contract(
     callee: &ForeignSymbolKey,
     argument_index: usize,
