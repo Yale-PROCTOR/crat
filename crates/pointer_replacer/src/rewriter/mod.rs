@@ -37,6 +37,7 @@ use crate::{
 pub(crate) mod array_local_index_rewriter;
 pub(crate) mod array_local_trace;
 pub(crate) mod collector;
+mod cursor_resolution;
 pub(crate) mod decision;
 pub(crate) mod diagnostics;
 mod epoch_split;
