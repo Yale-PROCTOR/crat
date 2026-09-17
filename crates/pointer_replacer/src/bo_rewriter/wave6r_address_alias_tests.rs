@@ -125,9 +125,13 @@ fn wave6r_address_handed_to_an_unmodeled_foreign_callee_is_refused_by_the_scan()
             .to_owned()
     })
     .expect("input type-checks");
+    // Two admissible readings (R217-2(a)): on this frame the row is BLIND to
+    // the derived address (`no-retain`), on the batch-10 composition
+    // wave-6v2's R412-1 edge sees it and the row is open (`unknown`). Either
+    // way the scan refuses the position, so the discharge cannot fire.
     assert!(
-        row.contains("\tno-retain\t"),
-        "the row of this frame is blind to the derived address (the scan is not): {row}"
+        row.contains("\tno-retain\t") || row.contains("\tunknown\t"),
+        "the row is blind or open, never a proof: {row}"
     );
 }
 
@@ -135,7 +139,7 @@ fn wave6r_address_handed_to_an_unmodeled_foreign_callee_is_refused_by_the_scan()
 /// callee that only reads it through such an address.
 #[test]
 fn wave6r_address_under_an_alias_site_delivers() {
-    let rows = ::utils::compilation::run_compiler_on_str(STORE, |tcx| {
+    let (rows, inner) = ::utils::compilation::run_compiler_on_str(STORE, |tcx| {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
@@ -147,16 +151,42 @@ fn wave6r_address_under_an_alias_site_delivers() {
         let rows = ctx.raw_boundary.receipts_tsv();
         println!("DISPOSITIONS\n{rows}");
         println!("RETENTION\n{}", ctx.retention.to_tsv());
-        rows.lines()
-            .filter(|line| line.starts_with("store_range\t") && line.contains("\tstore_h35\t1\t"))
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
+        let pick = |caller: &str, callee: &str| {
+            rows.lines()
+                .filter(|line| {
+                    line.starts_with(&format!("{caller}\t"))
+                        && line.contains(&format!("\t{callee}\t"))
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        (
+            pick("store_range", "store_h35\t1"),
+            pick("store_h3", "hash_bytes\t0"),
+        )
     })
     .expect("input type-checks");
     assert!(!rows.is_empty(), "the store_h35 site is inventoried");
+    assert!(!inner.is_empty(), "the hash_bytes site is inventoried");
+    // The invariant this build owns: NO position of the chain is held by the
+    // child walk any more. Which of the two sites carries the delivery is
+    // frame-dependent (R217-2(a)): on this frame the outer one does, on the
+    // batch-10 composition the subject of the outer one is degraded by
+    // `held:local-callee-access-extent` (another family) and the inner one
+    // delivers instead.
     assert!(
-        rows.iter().any(|row| row.contains("\tT1\t")),
-        "the read-through address delivers: {rows:?}"
+        !rows
+            .iter()
+            .chain(inner.iter())
+            .any(|row| row.contains("write-through-shared-view")
+                || row.contains("raw-boundary-returned-child-permission")),
+        "the child walk holds nothing here: {rows:?} {inner:?}"
+    );
+    assert!(
+        rows.iter()
+            .chain(inner.iter())
+            .any(|row| row.contains("\tT1\t")),
+        "the read-through address delivers somewhere in the chain: {rows:?} {inner:?}"
     );
 }
 
