@@ -746,3 +746,90 @@ pub struct registry { pub table: *mut ht }
         );
     }
 }
+
+/// **avl's rotations** (relay wave-6a/026): a `Box` parameter the callee does
+/// not free but MOVES INTO THE TREE — `(*x).right = y` — while reading and
+/// writing the owner's own fields, and the function returns the node that now
+/// owns it. The three corpus rows (`rightRotate::y`, `leftRotate::x`,
+/// `insert::node`) hold `box-param-callee-lends`.
+///
+/// This witness pins where the chain stands: the field projections of a sized
+/// `Box` owner are ADMITTED (they compile as written — `*y` derefs the Box —
+/// so the chain needs no edit for them), and what holds the shape now is the
+/// CALLER side, whose argument is its own parameter rather than a local
+/// allocation. Report 021 §3 names the rest of the ladder.
+const AVL_ROTATIONS: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+    pub height: i32,
+}
+pub unsafe extern "C" fn height(mut n: *mut Node) -> i32 {
+    if n.is_null() { return 0 as i32; }
+    return (*n).height;
+}
+pub unsafe extern "C" fn max(mut a: i32, mut b: i32) -> i32 {
+    return if a > b { a } else { b };
+}
+pub unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>() as std::os::raw::c_ulong) as *mut Node;
+    (*node).key = key;
+    (*node).left = 0 as *mut Node;
+    (*node).right = 0 as *mut Node;
+    (*node).height = 1 as i32;
+    return node;
+}
+pub unsafe extern "C" fn rightRotate(mut y: *mut Node) -> *mut Node {
+    let mut x = (*y).left;
+    let mut T2 = (*x).right;
+    (*y).left = T2;
+    (*y).height = max(height((*y).left), height((*y).right)) + 1 as i32;
+    (*x).right = y;
+    (*x).height = max(height((*x).left), height((*x).right)) + 1 as i32;
+    return x;
+}
+pub unsafe extern "C" fn insert(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() { return newNode(key); }
+    if key < (*node).key {
+        (*node).left = insert((*node).left, key);
+    } else {
+        (*node).right = insert((*node).right, key);
+    }
+    (*node).height = 1 as i32 + max(height((*node).left), height((*node).right));
+    if height((*node).left) > height((*node).right) + 1 as i32 {
+        return rightRotate(node);
+    }
+    return node;
+}
+"#;
+
+#[test]
+fn w6a_c1_avls_rotation_owner_passes_the_use_check_and_holds_on_its_caller() {
+    let out = emitted("bp-avl", AVL_ROTATIONS);
+    let receipts = &out.artifacts.box_param_receipts;
+    // The uses of the owner are its own fields, and they no longer hold the
+    // chain: what the collector reads as a raw use is a projection that needs
+    // no edit.
+    assert!(
+        !receipts.contains("raw-use:y"),
+        "a field projection of a sized Box owner is not a raw use\n{receipts}"
+    );
+    // The caller side is what holds it: `insert` hands `rightRotate` its own
+    // PARAMETER, and the chain admits only a local allocation (or a
+    // certificate's receiver) there.
+    assert!(
+        receipts.contains("rightRotate::y\theld\tbox-param-caller-retains:insert:"),
+        "{receipts}"
+    );
+    assert!(
+        !compact(&out.source).contains("Box<Node>"),
+        "{}",
+        out.source
+    );
+}

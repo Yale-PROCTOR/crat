@@ -351,6 +351,48 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
     }
 }
 
+/// Every occurrence of the subject that is the BASE of a field projection —
+/// `(*node).left`, `(*y).height`. On a sized `Box<T>` those compile exactly as
+/// written (`*y` derefs the Box), so they need no edit at all; the slice-use
+/// collector, which reads uses as element accesses, reports them as raw and
+/// this is how the chain tells them apart (relay wave-6a/026: avl's rotations).
+fn field_projection_bases(tcx: TyCtxt<'_>, subject: &Subject) -> Vec<Span> {
+    struct Walk<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        hir: HirId,
+        out: Vec<Span>,
+    }
+    impl<'tcx> Visitor<'tcx> for Walk<'tcx> {
+        type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+        fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
+            self.tcx
+        }
+
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Field(base, _) = &e.kind
+                && let ExprKind::Unary(rustc_hir::UnOp::Deref, inner) = &base.kind
+                && let ExprKind::Path(QPath::Resolved(_, path)) = &inner.kind
+                && let Res::Local(hir) = path.res
+                && hir == self.hir
+            {
+                self.out.push(inner.span);
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let Some(body_id) = tcx.hir_node_by_def_id(subject.fn_did).body_id() else {
+        return Vec::new();
+    };
+    let mut walk = Walk {
+        tcx,
+        hir: subject.hir_id,
+        out: Vec::new(),
+    };
+    walk.visit_body(tcx.hir_body(body_id));
+    walk.out
+}
+
 /// The subject's uses as the slice-use collector sees them, with `boundaries`
 /// (the free / the transfer call) its only admitted raw seams. `Err` names the
 /// use form that is not a deref / element access.
@@ -390,10 +432,12 @@ fn slice_uses_of(
     if !uses.return_handoffs.is_empty() {
         return Err("returned".to_owned());
     }
+    let fields = field_projection_bases(tcx, subject);
     for raw in &uses.raw_uses {
         let admitted = raw
             .boundary_span
-            .is_some_and(|b| boundaries.iter().any(|allowed| allowed.contains(b)));
+            .is_some_and(|b| boundaries.iter().any(|allowed| allowed.contains(b)))
+            || fields.iter().any(|field| *field == raw.span);
         if !admitted {
             return Err(format!(
                 "raw-use:{}",
