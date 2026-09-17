@@ -1215,29 +1215,24 @@ fn avl_frame() {
     );
 }
 
-/// Witness 19 (relay 003 §2 / R426-2, the Box-first market) — avl's
-/// rotations, the substrate's own text. Under an era-5c-shaped frame the
-/// two `Node` pointer fields DERIVE and the transaction is `applied` as
-/// `opt-box`: the field side of the `TerminalRoleC` shape (a child moved
-/// out, the parent stored into it, the rotated owner returned) needs
-/// nothing new from this lane.
+/// Witness 19 (relay 003 §2 / R426-2, re-pinned at relay 025) — avl's
+/// rotations, the substrate's own text. The FIELD side is this lane's and
+/// is stable: under an era-5c-shaped frame both `Node` pointer fields
+/// derive and the transaction is `applied` as `opt-box` — the
+/// `TerminalRoleC` shape needs no new vocabulary here.
 ///
-/// What blocks the delivery is the OWNING LOCALS' side, held by the native
-/// Box family: `newNode::node`, `rightRotate::x` / `T2`, `leftRotate::y` /
-/// `T2` hold `box-initializer-unsupported` (a Box local initialized from an
-/// owning field's load — `let mut x = (*y).left;`), and `rightRotate::y`,
-/// `leftRotate::x`, `insert::node` hold `box-param-caller-unknown` (a Box
-/// PARAMETER whose callers' hand-over is not evidenced; `insert` is itself
-/// held, so the two are one fixpoint). Those holds degrade the parameters,
-/// their signature classes are withheld, and — exactly as witness 18 shows
-/// for heman — the field transaction is then inactive at AST time, so the
-/// struct keeps `*mut Node`.
-///
-/// The pin is a TRIPWIRE for the Box-first route: when ownership-fields
-/// admit either prior key, avl's rotation family delivers and this witness
-/// fails, at which point the emitted forms are pinned here instead.
+/// The owning LOCALS are the native Box family's, and they move: at
+/// `8e84dc6d` all eight hold (`box-initializer-unsupported` ×5 — the
+/// `malloc` cast and the four rotation locals initialized from an owning
+/// field's load; `box-param-caller-unknown` ×3 — the rotation / `insert`
+/// fixpoint), while on the batch-10 composition ownership-fields' newer
+/// build delivers all FIVE as `Box::new(..)` / `Box::into_raw(..)` and the
+/// three parameters hold `box-param-callee-use` instead. So the pin is
+/// the DICHOTOMY: while ANY owner is held the transaction is inactive and
+/// the struct keeps `*mut Node`; when every owner delivers the struct must
+/// carry `Option<Box<Node>>`. That is the tripwire for the Box-first route.
 #[test]
-fn w6f_avl_rotation_fields_derive_and_the_box_locals_hold() {
+fn w6f_avl_rotation_fields_derive_and_follow_their_box_locals() {
     let _frame = frame_lock();
     avl_frame();
     let observed = observe(AVL);
@@ -1251,28 +1246,40 @@ fn w6f_avl_rotation_fields_derive_and_the_box_locals_hold() {
             "{row:?}"
         );
     }
-    for (label, prior) in [
-        ("newNode::node", "box-initializer-unsupported"),
-        ("rightRotate::x", "box-initializer-unsupported"),
-        ("rightRotate::T2", "box-initializer-unsupported"),
-        ("leftRotate::y", "box-initializer-unsupported"),
-        ("leftRotate::T2", "box-initializer-unsupported"),
-        ("rightRotate::y", "box-param-caller-unknown"),
-        ("leftRotate::x", "box-param-caller-unknown"),
-        ("insert::node", "box-param-caller-unknown"),
-    ] {
-        let decision = decision_of(&observed, label);
-        assert!(
-            decision.contains("BoxFailure") && decision.contains(prior),
-            "{label}: {decision}"
-        );
-    }
+    let owners = [
+        "newNode::node",
+        "rightRotate::x",
+        "rightRotate::T2",
+        "leftRotate::y",
+        "leftRotate::T2",
+        "rightRotate::y",
+        "leftRotate::x",
+        "insert::node",
+    ];
+    // "Held" is read as "does not deliver a Box", not by the native family's
+    // reason text: those keys move (at `8e84dc6d` the five loads/`malloc`
+    // hold `box-initializer-unsupported` and the three parameters
+    // `box-param-caller-unknown`; on the batch-10 composition the five
+    // deliver and the three hold `box-param-callee-use` instead).
+    let held: Vec<&str> = owners
+        .into_iter()
+        .filter(|label| !decision_of(&observed, label).starts_with("Box("))
+        .collect();
     let (source, _, _) = emitted_source(&outcome);
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    // The withheld owners keep the raw field declarations …
-    assert!(flat.contains("pub left: *mut Node,"), "{source}");
-    assert!(!flat.contains("Option<Box<Node>>"), "{source}");
-    // … while the readers this lane does not own still deliver.
+    if held.is_empty() {
+        // Every owner delivers: the fields must be the owned form.
+        assert!(
+            flat.contains("pub left: Option<Box<Node>>,"),
+            "every Box local delivers, so the field must too\n{source}"
+        );
+    } else {
+        // A held owner withholds its class, so the transaction is inactive
+        // and the struct keeps the raw field it came with.
+        assert!(flat.contains("pub left: *mut Node,"), "{held:?}\n{source}");
+        assert!(!flat.contains("Option<Box<Node>>"), "{held:?}\n{source}");
+    }
+    // The readers this lane does not own deliver either way.
     assert!(
         flat.contains("fn height(mut N: Option<&Node>) -> i32 {"),
         "{source}"
@@ -1281,25 +1288,22 @@ fn w6f_avl_rotation_fields_derive_and_the_box_locals_hold() {
 
 const HEMAN_RAY2: &str = include_str!("wave6f_fixture_heman_ray2.rs");
 
-/// Witness 18 (relay 020 / R427-3) — heman's OWN `kmRay2IntersectBox`, the
-/// substrate's text. G's transaction is derived and `applied` on the
-/// decision side, and the three element loads decide `Ref` — but the
-/// function's signature class is WITHHELD (its `ray` parameter degrades
-/// `SilentCoercion { via: BorrowedIntoRawParam }`, and the callee
-/// `kmRay2IntersectLineSegment::intersection` degrades `KindRaw`), so the
-/// AST application is inactive for both owners and the two functions keep
-/// their input text — no retype, no element wraps, no load declarations.
-/// The other five functions of the reduction deliver.
-///
-/// This is why the candidate's custody comparator reads
-/// `delivery-custody:inferred-type` on `this_point/next_point/other_point`:
-/// the subjects are decided and counted, their owner is withheld, and the
-/// tree therefore carries the input's inferred `let mut this_point = …`.
-/// The pin is a TRIPWIRE: when the withholding lifts (another family
-/// converts `ray`, or this lane bridges the loads at a withheld consumer),
-/// this witness fails and the array's delivery is re-read here.
+/// Witness 18 (relay 020 / R427-3, re-pinned at relay 025) — heman's OWN
+/// `kmRay2IntersectBox`, the substrate's text. G's transaction is derived
+/// and `applied` on the decision side and the three element loads decide
+/// `Ref`; what the EMISSION then does is decided by the owners' classes,
+/// and that verdict moves with the neighbouring lanes (at `8e84dc6d` the
+/// class is withheld — `ray` degrades `SilentCoercion { via:
+/// BorrowedIntoRawParam }` behind `kmRay2IntersectLineSegment::intersection`
+/// = `KindRaw`; on the batch-10 composition wave-5d2's work has `ray`
+/// reading `Ref`, so the class is PLANNED). The witness pins the
+/// DICHOTOMY, which is the invariant either way: a withheld owner keeps
+/// every line of its input and carries no retype; a planned owner carries
+/// the retype and the declared loads. It stays a tripwire — it fails only
+/// if an owner is planned and the array does NOT deliver, which is the
+/// state that would be a defect of this lane.
 #[test]
-fn w6f_heman_ray2_withheld_class_keeps_the_array_transaction_inactive() {
+fn w6f_heman_ray2_array_follows_its_owner_class() {
     let observed = observe(HEMAN_RAY2);
     let row = field_row(&observed, "kmRay2IntersectBox", "points");
     assert_eq!(
@@ -1318,32 +1322,43 @@ fn w6f_heman_ray2_withheld_class_keeps_the_array_transaction_inactive() {
             "{label}"
         );
     }
-    assert!(
-        decision_of(&observed, "kmRay2IntersectBox::ray").contains("BorrowedIntoRawParam"),
-        "{:?}",
-        decision_of(&observed, "kmRay2IntersectBox::ray")
-    );
+    let withheld = decision_of(&observed, "kmRay2IntersectBox::ray").contains("Degraded");
     let outcome = emitted("heman_ray2", HEMAN_RAY2);
     let (source, _, reverted) = emitted_source(&outcome);
     assert_eq!(reverted, 0, "{source}");
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    for input_text in [
-        // the withheld owner keeps every line of its input
-        "let mut points: [*const kmVec2; 4] = [0 as *const kmVec2; 4];",
-        "points[0 as i32 as usize] = p1;",
-        "let mut this_point = points[i as usize];",
-        // and its signature
-        "fn kmRay2IntersectBox(mut ray: *const kmRay2, mut p1: *const kmVec2,",
-    ] {
+    if withheld {
+        // The withheld owner keeps every line of its input, and its signature.
+        for input_text in [
+            "let mut points: [*const kmVec2; 4] = [0 as *const kmVec2; 4];",
+            "points[0 as i32 as usize] = p1;",
+            "let mut this_point = points[i as usize];",
+            "fn kmRay2IntersectBox(mut ray: *const kmRay2, mut p1: *const kmVec2,",
+        ] {
+            assert!(
+                flat.contains(input_text),
+                "missing {input_text:?} in\n{source}"
+            );
+        }
         assert!(
-            flat.contains(input_text),
-            "missing {input_text:?} in\n{source}"
+            !flat.contains("[Option<&kmVec2>; 4]"),
+            "the withheld class must carry no retype\n{source}"
         );
+    } else {
+        // A planned owner delivers the array: the retype, the stores and the
+        // declared loads (modulo a composition's reborrow).
+        let reborrowless = flat.replace("&*", "");
+        for delivered in [
+            "let mut points: [Option<&kmVec2>; 4] = [None; 4];",
+            "points[0 as i32 as usize] = Some(p1);",
+            "let mut this_point: &crate::kmVec2 = points[i as usize].unwrap();",
+        ] {
+            assert!(
+                flat.contains(delivered) || reborrowless.contains(&delivered.replace("&*", "")),
+                "the planned owner must deliver: missing {delivered:?} in\n{source}"
+            );
+        }
     }
-    assert!(
-        !flat.contains("[Option<&kmVec2>; 4]"),
-        "the withheld class must carry no retype\n{source}"
-    );
     // The five functions whose classes are not withheld DO deliver.
     for delivered in [
         "fn kmVec2Dot(mut pV1: &kmVec2, mut pV2: &kmVec2)",
