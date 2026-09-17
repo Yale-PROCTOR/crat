@@ -661,6 +661,45 @@ mod matcher {
         assert!(report.tree_only.is_empty());
     }
 
+    /// R447-1. The counted-void split leaves the callee's original body under
+    /// `__crat_raw_<callee>` and redirects the sites it could not split to it.
+    /// The expectation still names the original callee, so the custody matcher
+    /// has to follow that one rename or a perfectly correct emission fails as
+    /// `stamped-raw-temporary-has-no-exact-bound-call-use` — which is exactly
+    /// what kept wave-5d's binn fix out of a landable frame (wave-6v2 017:
+    /// `copy_int_value`, callers `binn_get_int32` / `binn_get_int64`).
+    #[test]
+    fn r447_1_the_matcher_follows_a_raw_twin_rename_and_only_a_declared_one() {
+        let lo = INPUT.find("target(w, r)").unwrap();
+        let twin = format!(
+            "fn target(w: &mut i32, r: *const i32) {{}} \
+             fn __crat_raw_target(w: &mut i32, r: *const i32) {{}} \
+             fn caller(w: &mut i32, r: &i32) {{ {{ let __crat_pair_raw_{lo}_1: *const i32 = \
+             core::ptr::from_ref(r); __crat_raw_target(w, __crat_pair_raw_{lo}_1); }} }}"
+        );
+        let report = check(&twin, &[expectation(BridgeKind::PairT2RawView)]);
+        assert!(
+            report.data,
+            "the twin's call carries the custody: {report:#?}"
+        );
+        assert_eq!(report.rows[0].status, ReceiptStatus::MatchedRaw);
+        assert_eq!(report.rows[0].bindings.len(), 1);
+
+        // The alias is followed ONLY when the emitted tree declares the twin:
+        // the same call text without the declaration is an unknown callee, not
+        // this callee's rename.
+        let undeclared = format!(
+            "fn target(w: &mut i32, r: *const i32) {{}} \
+             fn caller(w: &mut i32, r: &i32) {{ {{ let __crat_pair_raw_{lo}_1: *const i32 = \
+             core::ptr::from_ref(r); __crat_raw_target(w, __crat_pair_raw_{lo}_1); }} }}"
+        );
+        let report = check(&undeclared, &[expectation(BridgeKind::PairT2RawView)]);
+        assert!(
+            !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+            "an undeclared __crat_raw_* callee is not a rename to follow: {report:#?}"
+        );
+    }
+
     #[test]
     fn bridge_custody_match_receipt_without_render_is_missing() {
         let report = check(

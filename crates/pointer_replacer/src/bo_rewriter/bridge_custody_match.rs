@@ -723,6 +723,37 @@ fn original_call<'a>(
     Ok((call, indices))
 }
 
+/// R447-1. The key of this callee's raw twin, when the emitted tree declares
+/// one. `None` when the callee text is not a plain path (a twin is inserted
+/// beside a named function, never beside a computed callee) or when no such
+/// function exists in the emitted tree — in both cases there is no rename to
+/// follow and the caller's candidate set is unchanged.
+fn twin_callee_key(
+    input: &BridgeCustodyInput<'_>,
+    callee_text: &str,
+) -> MatchResult<Option<String>> {
+    let Some(name) = callee_text.rsplit("::").next().map(str::trim) else {
+        return Ok(None);
+    };
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Ok(None);
+    }
+    let twin = super::decision::counted_void::raw_twin_name(name);
+    if !input
+        .emitted
+        .functions
+        .iter()
+        .any(|function| function.owner == twin || function.owner.ends_with(&format!("::{twin}")))
+    {
+        return Ok(None);
+    }
+    let text = match callee_text.rsplit_once("::") {
+        Some((prefix, _)) => format!("{prefix}::{twin}"),
+        None => twin,
+    };
+    Ok(Some(expression_key(&*expression(&text)?)))
+}
+
 fn emitted_candidates<'a>(
     input: &'a BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -761,6 +792,22 @@ fn emitted_candidates<'a>(
         _ => return Err("ambiguous-or-unreceipted-callee-mapping".into()),
     };
     let key = expression_key(&*expression(callee_text)?);
+    // **R447-1 — follow the RAW TWIN.** A counted-void callee that could not be
+    // split keeps its original body under `__crat_raw_<callee>`, and the sites
+    // that could not be split call the twin instead
+    // (`decision::counted_void::raw_twin_name`, `insert_raw_twin`). The
+    // expectation still names the original callee, so without this the call
+    // that binds the stamped raw temporaries is simply not in the candidate set
+    // and the receipt fails `stamped-raw-temporary-has-no-exact-bound-call-use`
+    // on an emission that is perfectly correct — wave-6v2 017 measured exactly
+    // that on binn (`copy_int_value`, callers `binn_get_int32`/`int64`), which
+    // is what keeps wave-5d's `4001c0a64` (+12) out of a landable frame.
+    //
+    // The alias is DERIVED, not guessed: the twin's name is a function of this
+    // callee's own text, and it is followed only when the emitted tree actually
+    // declares that function, so a call to an unrelated `__crat_raw_*` cannot
+    // be mistaken for this callee's.
+    let twin_key = twin_callee_key(input, callee_text)?;
     let mut candidates = Vec::new();
     for call in input
         .emitted
@@ -768,7 +815,8 @@ fn emitted_candidates<'a>(
         .iter()
         .filter(|call| call.owner == owner && call.arguments.len() == original.arguments.len())
     {
-        if expression_key(&*expression(&call.callee_text)?) == key {
+        let call_key = expression_key(&*expression(&call.callee_text)?);
+        if call_key == key || twin_key.as_ref() == Some(&call_key) {
             candidates.push(call);
         }
     }
