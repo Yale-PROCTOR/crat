@@ -853,14 +853,6 @@ pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
 "#;
 
     #[test]
-    #[ignore = "RED at the LAST edit (wave-5d2 report 022, composed on batch-10-dry8 with \
-                ownership-fields' R442 patch): both rows now DECIDE and place — `ff` is `box` \
-                through a `selected` native candidate and `f` is `slice` — and the \
-                derived-suffix-view body edit reaches `table.seams.body_edits`, but only in the \
-                two plan builds where the base already reads `Decision::Box`. The plan that emits \
-                is built before that, so the initializer stays `ff.offset(k)` over a `Box<[f32]>` \
-                and the class reverts. The fix is a decision-time certificate (a table-side \
-                record of this rule's rendering), not another emission-time test."]
     fn a_derived_local_is_typed_by_its_base_candidate() {
         let got = run(HEMAN_DERIVED_SHAPE);
         eprintln!(
@@ -880,8 +872,29 @@ pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
         );
         let tree = got.tree();
         assert!(
-            tree.contains("&mut ff[(height * x) as usize..]"),
+            tree.contains("&mut ff[((height * x) as isize) as usize..]"),
             "the derived local is the base's exact suffix view:\n{tree}"
+        );
+        assert_eq!(
+            column(&got.subjects, "transform_to_coordfield::f#17", "decision"),
+            "slice",
+            "and the view itself delivers:\n{}",
+            got.subjects
+        );
+        for key in [
+            "transform_to_coordfield::ff#6",
+            "transform_to_coordfield::f#17",
+        ] {
+            assert_eq!(
+                column(&got.subjects, key, "placed"),
+                "1",
+                "both rows place:\n{}",
+                got.subjects
+            );
+        }
+        assert!(
+            tree.contains("::std::mem::drop(ff)"),
+            "the C free becomes the owner's drop, at its own site:\n{tree}"
         );
         assert!(
             !tree.contains("FALLBACK_SLICE_EXTENT"),
@@ -895,6 +908,58 @@ pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
     // `transform_to_coordfield::ff#6` is held by the native alias family
     // before the source scan is reached, so the counterfactual below prices
     // the derived local instead of pinning which producer answers first.
+
+    /// **The yield costs nothing where no Box is coming.** The same derived
+    /// shape over a parameter the model does not call owning: no candidate, so
+    /// the derived-view rule does not permit, so the constructor-typing family
+    /// is never asked to stand down and keeps whatever it delivers today.
+    const DERIVED_OVER_A_PLAIN_ROOT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+pub unsafe fn fill(ff: *mut f32, width: i32, height: i32) {
+    let mut x: i32 = 0;
+    while x < width {
+        let mut f = ff.offset((height * x) as isize);
+        let mut y: i32 = 0;
+        while y < height {
+            *f.offset(y as isize) = y as f32;
+            y += 1;
+        }
+        x += 1;
+    }
+}
+"#;
+
+    #[test]
+    fn the_yield_does_not_fire_without_a_box_candidate() {
+        let got = run(DERIVED_OVER_A_PLAIN_ROOT);
+        eprintln!("PLAIN\n{}\n{}", got.subjects, got.ownership_native);
+        assert_ne!(
+            column(&got.subjects, "fill::ff#1", "decision"),
+            "box",
+            "the root is not an owner here:\n{}",
+            got.subjects
+        );
+        // The view still delivers, through the family that types it today:
+        // the rule never permits, so `refuses` never yields, and nothing this
+        // lane does is reachable.
+        assert_eq!(
+            column(&got.subjects, "fill::f#9", "decision"),
+            "slice",
+            "the derived view keeps its delivery:\n{}",
+            got.subjects
+        );
+        assert_eq!(
+            column(&got.subjects, "fill::f#9", "placed"),
+            "1",
+            "and it is placed:\n{}",
+            got.subjects
+        );
+        assert!(
+            !got.tree().contains("&mut ff[("),
+            "no suffix view is written over a non-owner root:\n{}",
+            got.tree()
+        );
+    }
 
     /// The counterfactual that prices the derived local: the same body with it
     /// inlined delivers the base as a Box. Everything else about the function

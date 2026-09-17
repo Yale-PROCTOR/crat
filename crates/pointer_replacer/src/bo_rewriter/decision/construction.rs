@@ -895,8 +895,13 @@ pub(crate) fn plan_slice_constructions(
         // R445-2: wave-5d2's derived-view rule renders this initializer as an
         // exact suffix of its Box owner. A constructor over the same
         // initializer would wrap that view in `from_raw_parts_mut` and
-        // fabricate an extent the Box already carries.
-        if super::source_typed_local::renders(tcx, table, subject, decision).is_some() {
+        // fabricate an extent the Box already carries — so the CONSTRUCTION
+        // CHANNEL carries the suffix instead. It is the channel the AST
+        // emission reads (a seam's text is re-rendered from its `GlueSpec`,
+        // which has no core for a computed suffix), so this is where a derived
+        // view has to be written, not beside it.
+        if let Some(plan) = super::source_typed_local::construction(tcx, table, subject, decision) {
+            plans.push(plan);
             continue;
         }
         let (mutable, nullable) = match decision {

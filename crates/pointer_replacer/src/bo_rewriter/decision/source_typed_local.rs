@@ -46,6 +46,8 @@ pub(crate) struct DerivedValue {
     /// The binding the arithmetic starts from.
     source: HirId,
     initializer: Span,
+    /// The initializer expression itself, for the construction channel.
+    init_hir: HirId,
     /// The offset expression, verbatim.
     offset: Span,
     pointee: String,
@@ -196,6 +198,7 @@ fn derived_view(tcx: TyCtxt<'_>, owner: LocalDefId, binding: HirId) -> Option<De
     Some(DerivedValue {
         source,
         initializer: initializer.span,
+        init_hir: initializer.hir_id,
         offset: arguments[0].span,
         pointee: declaration::pointee_source(tcx, *pointee),
         mutable: mutability.is_mut(),
@@ -435,6 +438,62 @@ pub(crate) fn renders(
             }
     });
     base_is_box.then_some((value, mutable))
+}
+
+/// **The construction this rule contributes (R445-2).**
+///
+/// The derived view is written through the CONSTRUCTION channel rather than a
+/// seam: an AST-emitted function re-renders a seam from its `GlueSpec`, whose
+/// cores cover no computed suffix (`Suffix` carries a constant), so a seam edit
+/// for this shape is silently dropped while the span path would have applied
+/// it. The construction channel carries its replacement text to both emitters.
+///
+/// The extent is the owner's own — `Box<[T]>` knows its length — so the plan
+/// records a sealed contract rather than the fallback, and nothing is
+/// fabricated. The text is safe (`&mut root[(k) as usize..]`), so it needs no
+/// unsafe presentation even inside an unsafe function.
+pub(crate) fn construction(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    subject: &Subject,
+    decision: &Decision,
+) -> Option<super::construction::SliceConstructionPlan> {
+    let (value, mutable) = renders(tcx, table, subject, decision)?;
+    let source_map = tcx.sess.source_map();
+    let base = source_map.span_to_snippet(value.initializer).ok()?;
+    let base = base.split(".offset(").next()?.to_owned();
+    let offset = source_map.span_to_snippet(value.offset).ok()?;
+    let borrow = if mutable { "&mut" } else { "&" };
+    Some(super::construction::SliceConstructionPlan {
+        node: (subject.fn_did, subject.hir_id),
+        init_hir: value.init_hir,
+        init_span: value.initializer,
+        replacement: Some(format!("{borrow} {base}[({offset}) as usize..]")),
+        hold_reason: None,
+        element_type: value.pointee.clone(),
+        mutable,
+        nullable: false,
+        initializer_kind: "derived-suffix-view",
+        length: super::construction::SliceLengthPlan {
+            expression: format!("{base}.len() - (({offset}) as usize)"),
+            source: super::construction::SliceLengthSource::SealedContract {
+                contract: "box-owner-suffix".to_owned(),
+            },
+            provenance: Vec::new(),
+        },
+        composed_edit_spans: Vec::new(),
+        unsafe_context: crate::bo_rewriter::mechanical_receipt::UnsafeContextPresentation {
+            unsafe_fn: tcx
+                .fn_sig(subject.fn_did)
+                .skip_binder()
+                .skip_binder()
+                .safety
+                .is_unsafe(),
+            wrapper_inserted: false,
+            edition: 2018,
+            requires_unsafe: false,
+        },
+    })
 }
 
 pub(super) fn complete_derived(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mut seam::SeamPlan) {
