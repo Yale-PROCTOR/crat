@@ -1824,6 +1824,71 @@ pub(crate) struct ArrayLocal {
     pub pointee: String,
 }
 
+/// Which family a `*mut`-element array local belongs to (G build 3): the
+/// element stores' sources and the release sites decide. An OWNED-element
+/// array stores a fresh allocation into every element and hands every
+/// element to a releasing call; anything else stays the borrowed shape.
+fn mutable_element_family<'tcx>(binding: HirId, body: &'tcx rustc_hir::Body<'tcx>) -> String {
+    struct Elements {
+        binding: HirId,
+        stores: usize,
+        allocated: usize,
+        released: usize,
+    }
+    fn peel<'tcx>(mut expr: &'tcx rustc_hir::Expr<'tcx>) -> &'tcx rustc_hir::Expr<'tcx> {
+        while let ExprKind::Cast(inner, _) = expr.kind {
+            expr = inner;
+        }
+        expr
+    }
+    impl<'tcx> Visitor<'tcx> for Elements {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            let indexes_binding = |e: &rustc_hir::Expr<'_>| {
+                matches!(e.kind, ExprKind::Index(base, _, _)
+                    if matches!(base.kind, ExprKind::Path(QPath::Resolved(_, path))
+                        if matches!(path.res, Res::Local(id) if id == self.binding)))
+            };
+            if let ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && indexes_binding(lhs)
+            {
+                self.stores += 1;
+                if matches!(peel(rhs).kind, ExprKind::Call(..)) {
+                    self.allocated += 1;
+                }
+            }
+            if let ExprKind::Call(_, args) = expr.kind {
+                for arg in args {
+                    if indexes_binding(peel(arg)) {
+                        self.released += 1;
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut elements = Elements {
+        binding,
+        stores: 0,
+        allocated: 0,
+        released: 0,
+    };
+    elements.visit_body(body);
+    let (stores, allocated, released) = (elements.stores, elements.allocated, elements.released);
+    if stores == 0 || allocated != stores {
+        // Some element is written from something other than a fresh call:
+        // the borrowed-element family, whose `&mut` elements need a
+        // disjointness argument nothing here supplies.
+        return "array-local-incomplete:mutable-elements".to_owned();
+    }
+    if released == 0 {
+        return "array-owned-incomplete:no-release".to_owned();
+    }
+    // Every element is allocated and handed to a releasing call: the owned
+    // family. The forms (`[Option<Box<[T]>>; N]`, the store from the
+    // allocation, the drop at the C free) are build 3's emission.
+    "array-owned-incomplete:emission-not-built".to_owned()
+}
+
 fn array_local_candidates(
     tcx: TyCtxt<'_>,
     functions: &[LocalDefId],
@@ -2162,16 +2227,21 @@ fn array_local_candidates(
                         _ => hold = Some("array-local-incomplete:initializer".to_owned()),
                     },
                 }
-                if mut_ty.mutbl.is_mut() {
-                    hold.get_or_insert_with(|| {
-                        "array-local-incomplete:mutable-elements".to_owned()
-                    });
-                }
                 let body = tcx.hir_body(
                     tcx.hir_node_by_def_id(self.owner)
                         .body_id()
                         .expect("a function body"),
                 );
+                if mut_ty.mutbl.is_mut() {
+                    // A written element is not one family but two: an array
+                    // of BORROWED writable elements, and an array of OWNED
+                    // buffers (one allocation per element, each released at
+                    // its own C free) — six of the seven corpus arrays are
+                    // the second. They are told apart by the element stores'
+                    // sources and the release sites, and named apart so the
+                    // census does not read one market as the other.
+                    hold.get_or_insert_with(|| mutable_element_family(info.binding, body));
+                }
                 let (uses, use_hold) = self.classify(&info, body);
                 sites.extend(uses);
                 if hold.is_none() {

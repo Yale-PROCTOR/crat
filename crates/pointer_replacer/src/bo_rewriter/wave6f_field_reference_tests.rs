@@ -1108,6 +1108,44 @@ fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
     );
 }
 
+const OWNED_ARRAY: &str = include_str!("wave6f_fixture_owned_array.rs");
+
+/// Witness 22 (relay 026, build 3 stage 1) — a written element is TWO
+/// families, and the census must not read one as the other. An OWNED-element
+/// array stores a fresh allocation into every element and hands every
+/// element to a releasing call (lodepng's `filter::attempt*` ×3 and tulip's
+/// `smoke::test_ind_name` ×3 — six of the seven corpus rows): it is named
+/// `array-owned-incomplete:emission-not-built`, whose forms
+/// (`[Option<Box<[T]>>; N]`, the store from the allocation, the drop at the
+/// C free site) are the next stage. An array whose elements are BORROWED
+/// writable views keeps `mutable-elements`: two live `&mut` elements would
+/// be an aliasing violation and R395-2 moves an aliasing hold only on
+/// evidence, which this shape does not carry.
+#[test]
+fn w6f_a_written_element_names_its_family() {
+    let observed = observe(OWNED_ARRAY);
+    let owned = field_row(&observed, "filter", "attempt");
+    assert_eq!(
+        (owned.2.as_str(), owned.4.as_str()),
+        ("held", "array-owned-incomplete:emission-not-built"),
+        "{owned:?}"
+    );
+    let borrowed = field_row(&observed, "borrowed_rows", "rows");
+    assert_eq!(
+        (borrowed.2.as_str(), borrowed.4.as_str()),
+        ("held", "array-local-incomplete:mutable-elements"),
+        "{borrowed:?}"
+    );
+    // Allocated but never released: the drops have no C free site to sit at,
+    // so the owned family's evidence is incomplete and says so.
+    let leaked = field_row(&observed, "leaked", "scratch");
+    assert_eq!(
+        (leaked.2.as_str(), leaked.4.as_str()),
+        ("held", "array-owned-incomplete:no-release"),
+        "{leaked:?}"
+    );
+}
+
 const TULIP_ARRAYS: &str = include_str!("wave6f_fixture_tulip_arrays.rs");
 
 /// Witness 21 (relay 024, build 2) — the whole array handed to a callee.
