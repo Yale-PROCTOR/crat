@@ -58,3 +58,11 @@ tracing.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true
+
+# R438-3 (seat addendum 438, user-approved 2026-09-17 after the 07:22 UTC host
+# crash): full `debug = 2` debuginfo on the dev profile is the single largest
+# contributor to this repository's on-disk build footprint across ~20 concurrent
+# lane target dirs. Line tables keep every panic backtrace and test failure
+# location readable and do not change codegen, so no test outcome moves.
+[profile.dev]
+debug = "line-tables-only"
