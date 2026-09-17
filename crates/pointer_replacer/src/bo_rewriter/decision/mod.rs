@@ -1828,7 +1828,10 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                     receiver_node,
                     &decision,
                 )
-                && slice_local_construction::refuses(ctx, subject) =>
+                && slice_local_construction::refuses(ctx, subject)
+                // R445-2: clause (d) of that refusal is a YIELD, not a
+                // refusal — the derived-view rule below types this subject.
+                && !source_typed_local::permits(ctx, subject) =>
         {
             degrade(
                 subject,

@@ -853,12 +853,14 @@ pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
 "#;
 
     #[test]
-    #[ignore = "RED for a measured reason (wave-5d2 report 021, re-measured on batch-10-dry6): the \
-                `covered` wall is gone — the source scan admits the receiver — but the base is now \
-                held at `Missing(native-view-alias-family-owned)`, R423's arbitration: another \
-                family already decided the alias, at a FABRICATED extent. Rule B's form delivers \
-                the Box and an exact extent instead, and needs that arbitration to recognize the \
-                alias as the owner's own view."]
+    #[ignore = "RED at the LAST edit (wave-5d2 report 022, composed on batch-10-dry8 with \
+                ownership-fields' R442 patch): both rows now DECIDE and place — `ff` is `box` \
+                through a `selected` native candidate and `f` is `slice` — and the \
+                derived-suffix-view body edit reaches `table.seams.body_edits`, but only in the \
+                two plan builds where the base already reads `Decision::Box`. The plan that emits \
+                is built before that, so the initializer stays `ff.offset(k)` over a `Box<[f32]>` \
+                and the class reverts. The fix is a decision-time certificate (a table-side \
+                record of this rule's rendering), not another emission-time test."]
     fn a_derived_local_is_typed_by_its_base_candidate() {
         let got = run(HEMAN_DERIVED_SHAPE);
         eprintln!(

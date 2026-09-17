@@ -42,7 +42,7 @@ struct LiteralValue {
 
 /// A local derived from another local by pointer arithmetic:
 /// `let f = ff.offset(height * x);`
-struct DerivedValue {
+pub(crate) struct DerivedValue {
     /// The binding the arithmetic starts from.
     source: HirId,
     initializer: Span,
@@ -287,9 +287,12 @@ fn derived_over_a_candidate(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<Deri
 
 /// The decision-side half: such a local has a knowable type, so the residue
 /// gate must not claim it.
-pub(super) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+pub(crate) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    // R445-2: subject scope, not owner scope — the pairing withdraws exactly
+    // this binding when its owner stops delivering, and the constructor family
+    // takes it back on the re-derivation.
     ctx.family_policy
-        .enabled(subject.fn_did, FamilyStage::Declaration)
+        .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
         && (literal_value(ctx.tcx, subject).is_some()
             || derived_over_a_candidate(ctx, subject).is_some())
 }
@@ -391,21 +394,55 @@ pub(super) fn complete(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mut seam::
 /// must be the Box family's, selected (`Box`) or still held as a candidate
 /// (`box-param-caller-unknown`) — so a later rule that decided some other
 /// derived local a slice cannot borrow this emission.
+/// **The rendering test, and the single source of truth for it** (R445-2).
+///
+/// A subject this returns `Some` for is rendered by THIS rule: its initializer
+/// becomes `&mut base[(k) as usize..]` and its binding is declared at the
+/// slice type. The slice-construction planner asks the same question before it
+/// plans a constructor over the same initializer, so the two renderings can
+/// never both be placed — one interval, one writer.
+pub(crate) fn renders(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    subject: &Subject,
+    decision: &Decision,
+) -> Option<(DerivedValue, bool)> {
+    let mutable = match decision {
+        Decision::Slice { mutable, .. } => *mutable,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Cursor { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => return None,
+    };
+    let value = derived_value(tcx, subject)?;
+    let base_is_box = table.entries.iter().any(|(candidate, decision)| {
+        candidate.fn_did == subject.fn_did
+            && candidate.hir_id == value.source
+            && match decision {
+                Decision::Box(_) => true,
+                // A base that is only HELD emits no indexable form, so a
+                // suffix view over it would not type-check.
+                Decision::Degraded(_)
+                | Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Cursor { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Slice { .. }
+                | Decision::Opt { .. } => false,
+            }
+    });
+    base_is_box.then_some((value, mutable))
+}
+
 pub(super) fn complete_derived(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mut seam::SeamPlan) {
     for (subject, decision) in &table.entries {
-        let mutable = match decision {
-            Decision::Slice { mutable, .. } => mutable,
-            Decision::Ref { .. }
-            | Decision::InferredRef { .. }
-            | Decision::Cursor { .. }
-            | Decision::NestedSlice { .. }
-            | Decision::Opt { .. }
-            | Decision::Box(_)
-            | Decision::Degraded(_) => continue,
-        };
-        let Some(value) = derived_value(tcx, subject) else {
+        let Some((value, mutable)) = renders(tcx, table, subject, decision) else {
             continue;
         };
+        let mutable = &mutable;
         let base_is_box_family = table.entries.iter().any(|(candidate, decision)| {
             candidate.fn_did == subject.fn_did
                 && candidate.hir_id == value.source

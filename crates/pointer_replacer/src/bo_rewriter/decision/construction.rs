@@ -892,6 +892,13 @@ pub(crate) fn plan_slice_constructions(
             SubjectKind::Local => {}
             SubjectKind::Param { .. } => continue,
         }
+        // R445-2: wave-5d2's derived-view rule renders this initializer as an
+        // exact suffix of its Box owner. A constructor over the same
+        // initializer would wrap that view in `from_raw_parts_mut` and
+        // fabricate an extent the Box already carries.
+        if super::source_typed_local::renders(tcx, table, subject, decision).is_some() {
+            continue;
+        }
         let (mutable, nullable) = match decision {
             Decision::Slice { mutable, .. } => (*mutable, false),
             Decision::Opt {

@@ -274,7 +274,16 @@ pub(crate) fn refuses(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
         && ((call_result_of_local_callee(ctx.constructions, subject)
             && !super::native_result_expression::bridges_local_callee_result(ctx, subject))
             || argument_of_local_callee(ctx.tcx, subject)
-            || root_is_a_reference_candidate(ctx, subject))
+            || root_is_a_reference_candidate(ctx, subject)
+            // (d) R445-2: the subject is an exact suffix view of an owner this
+            // run delivers as a Box, and wave-5d2's derived-view rule renders
+            // it as `&mut root[k..]`. A constructor over the same initializer
+            // would fabricate an extent for a length the Box already carries,
+            // and the two renderings would claim one interval twice. The yield
+            // costs nothing where no Box is coming: that rule permits only
+            // while the owner's candidate exists, which is the same fact the
+            // native producer's R442 exemption reads.
+            || super::source_typed_local::permits(ctx, subject))
 }
 
 /// Decision-phase hook: the veto in `decide_one` keeps this decision.
