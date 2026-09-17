@@ -220,9 +220,23 @@ fn w5c_returned_child_returned_argument_is_the_waived_tier() {
             .collect::<Vec<_>>()
     })
     .unwrap();
+    // **The tier this site reaches has moved twice, both times upward.**
+    // Report 015 refused the view here (the callee hands the argument back);
+    // wave-6v2's R412-7 re-pinned it as the WAIVED tier (T2,
+    // `retention-returned-alias-used`, delivered under the waiver); with
+    // wave-6r's `d2720f79` the callee's retention is summarized locally and
+    // the negative-write proof is present, so the bridge is CERTIFIED (T1,
+    // `local-retention-summary;negative-write=foster-immutable`) and needs no
+    // waiver. Sound at this site because the bridge is SHARED
+    // (`ref-shared-to-raw-const`): the returned alias is consumed by
+    // `kmVec2Length` in the same expression while the `&(*ray).start` borrow
+    // is live, and `&T` aliasing `&T` is not addendum 130's channel — that
+    // one is a RETAINED alias beside a live `&mut`. A returned alias into a
+    // mutable bridge, or one that is stored, still has no certificate here.
     assert!(
-        site.iter()
-            .any(|l| l.contains("\tT2\t") && l.contains("retention-returned-alias-used")),
+        site.iter().any(|l| l.contains("\tT1\t")
+            && l.contains("local-retention-summary")
+            && !l.contains("retention-returned-alias-used")),
         "{site:?}"
     );
 }
