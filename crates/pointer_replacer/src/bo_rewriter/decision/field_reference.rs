@@ -139,6 +139,11 @@ pub(crate) enum SiteKind {
     /// `PLACE.f as *T` handed to a callee (owned fields only) — the cast
     /// expression span; the callee decides transfer (a deallocator) or view.
     Cast,
+    /// `arr.as_ptr()` on a converted array local (G) — the method-call span.
+    /// `Option<&T>` has the layout and ABI of `*const T` (the null-pointer
+    /// optimisation, `None` = null), so the array's bytes are unchanged and
+    /// the view is a cast, not a copy.
+    ArrayView,
 }
 
 #[derive(Clone, Debug)]
@@ -451,7 +456,7 @@ impl FieldTransactions {
                     .collect::<Vec<_>>()
                     .join(","),
                 count("owned-field-raw-move"),
-                count("owned-field-raw-view"),
+                count("owned-field-raw-view") + count("array-raw-view"),
                 count("owned-field-raw-store"),
                 count(DEALLOC_TRANSFER) + count(DEALLOC_TRANSFER_CONTRACT),
                 count(DEALLOC_TRANSFER_CONTRACT),
@@ -2014,14 +2019,49 @@ fn array_local_candidates(
                         }
                         return;
                     }
-                    // Any other use of the array itself (its address, a copy,
-                    // a call argument) holds.
+                    // The array itself: `arr.as_ptr()` handed on is the
+                    // receipted raw view (G build 2); `as_mut_ptr` belongs to
+                    // the written-element family; anything else (its address,
+                    // a copy) holds.
                     if is_array(expr) {
                         let parent = tcx.parent_hir_node(expr.hir_id);
                         let indexed = matches!(parent, Node::Expr(p) if matches!(p.kind, ExprKind::Index(base, _, _) if base.hir_id == expr.hir_id));
-                        if !indexed {
-                            self.hold("array-use-shape");
+                        if indexed {
+                            return;
                         }
+                        if let Node::Expr(p) = parent
+                            && let ExprKind::MethodCall(segment, receiver, args, _) = p.kind
+                            && receiver.hir_id == expr.hir_id
+                            && args.is_empty()
+                        {
+                            // Only the SHARED view: a written element holds
+                            // earlier (`mutable-elements`), so `as_mut_ptr`
+                            // needs no arm of its own — it falls through to
+                            // the shape hold below.
+                            match segment.ident.name.as_str() {
+                                "as_ptr" => {
+                                    self.sites.push(Site {
+                                        owner: self.owner,
+                                        kind: SiteKind::ArrayView,
+                                        span: p.span,
+                                        field_text: String::new(),
+                                        rhs: None,
+                                        local: None,
+                                        index_text: None,
+                                        consumer: None,
+                                        base: None,
+                                        raw_base: false,
+                                        assign_span: None,
+                                        hoists: Vec::new(),
+                                        cast: None,
+                                        written: false,
+                                    });
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.hold("array-use-shape");
                         return;
                     }
                     intravisit::walk_expr(self, expr);
@@ -2594,6 +2634,26 @@ pub(crate) fn finalize(
         for site in candidate.sites.iter().filter(|_| !candidate.owning) {
             let field = candidate.form;
             match site.kind {
+                // G build 2: the whole array handed on as `arr.as_ptr()`.
+                // `[Option<&T>; N]` has the layout of `[*const T; N]` (NPO),
+                // so the callee reads the same bytes; the cast is the bridge
+                // (R130's second tier, receipted per site).
+                SiteKind::ArrayView => {
+                    let Some(array) = candidate.array.as_ref() else {
+                        cause.get_or_insert_with(|| "array-view-without-array".to_owned());
+                        continue;
+                    };
+                    edits.push(ExpressionEdit {
+                        owner: site.owner,
+                        span: site.span,
+                        replacement: format!(
+                            "{}.as_ptr() as *const *const {}",
+                            array.name, array.pointee
+                        ),
+                        kind: "array-raw-view",
+                        wrap: false,
+                    });
+                }
                 // G: the array's null repeat is `[None; N]`.
                 SiteKind::Literal if candidate.array.is_some() => {
                     let len = candidate
@@ -3282,6 +3342,14 @@ fn owned_sites<'t>(
             // `f as *T` at a callee: a deallocator takes the allocation
             // (`take()` + `Box::into_raw`, the C free site kept as the call);
             // any other callee gets the raw view.
+            // An owning FIELD has no array form: G's view site cannot occur
+            // here, and a stray one is a typed hold, never a silent skip.
+            SiteKind::ArrayView => {
+                cause.get_or_insert_with(|| {
+                    "field-transaction-incomplete:array-view-on-an-owned-field".to_owned()
+                });
+                continue;
+            }
             SiteKind::Cast => {
                 let Some(cast) = &site.cast else { continue };
                 let null = if cast.mutable { null_mut } else { null_const };

@@ -1110,13 +1110,54 @@ fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
 
 const TULIP_ARRAYS: &str = include_str!("wave6f_fixture_tulip_arrays.rs");
 
+/// Witness 21 (relay 024, build 2) — the whole array handed to a callee.
+/// `inputs.as_ptr()` on a converted array is the receipted raw VIEW: an
+/// `Option<&T>` has the layout, size and ABI of `*const T` (the null-pointer
+/// optimisation, `None` = null), so `[Option<&T>; N]` and `[*const T; N]`
+/// are the same bytes and the callee reads exactly what C wrote. The cast is
+/// the bridge (R130's second tier, receipted `raw-view` per site); the view
+/// is SHARED — `as_mut_ptr` belongs to the written-element family and keeps
+/// its hold.
+#[test]
+fn w6f_tulip_array_delivers_through_its_whole_array_view() {
+    let observed = observe(TULIP_ARRAYS);
+    let row = field_row(&observed, "stress", "inputs");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "array-opt-ref-shared"),
+        "{row:?}"
+    );
+    let outcome = emitted("tulip_arrays", TULIP_ARRAYS);
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    assert_eq!(reverted, 0, "{source}");
+    assert!(emitted_count >= 8, "{emitted_count}\n{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "let mut inputs: [Option<&f64>; 4] = [None; 4];",
+        "inputs[0 as usize] = Some(data_in);",
+        "let mut probe: &f64 = inputs[2 as usize].unwrap();",
+        // the view, cast at the seam
+        "inputs.as_ptr() as *const *const f64",
+    ] {
+        let reborrowless = flat.replace("&*", "");
+        assert!(
+            flat.contains(needle) || reborrowless.contains(&needle.replace("&*", "")),
+            "missing {needle:?} in\n{source}"
+        );
+    }
+    // The value-list array beside it is untouched: no view, no retype.
+    assert!(
+        flat.contains("let mut all_inputs: [*const f64; 1] = [data_in];"),
+        "{source}"
+    );
+}
+
 /// Witness 20 (relay 023 §3, build 1) — the census's eleven
 /// `array-local-incomplete:initializer` rows are tulip's element LISTS, the
 /// substrate's other spelling of the same array. A list whose elements are
 /// all the null literal is the repeat form written out: it is admitted and
-/// renders `[None; N]`, so the array reaches its next gate — here the whole
-/// array handed to a callee (`inputs.as_ptr()`), `array-use-shape`, which is
-/// the next build. A list with a VALUE element is a different family (each
+/// renders `[None; N]` (build 2 then carries the whole-array view, so this
+/// array delivers — witness 21). A list with a VALUE element is a different family (each
 /// element is a store whose source must deliver) and holds under its own
 /// reason, `initializer-element-source`, instead of the blanket one.
 #[test]
@@ -1124,8 +1165,8 @@ fn w6f_tulip_element_list_initializers_split_by_their_elements() {
     let observed = observe(TULIP_ARRAYS);
     let null_list = field_row(&observed, "stress", "inputs");
     assert_eq!(
-        (null_list.2.as_str(), null_list.4.as_str()),
-        ("held", "array-local-incomplete:array-use-shape"),
+        (null_list.2.as_str(), null_list.3.as_str()),
+        ("applied", "array-opt-ref-shared"),
         "{null_list:?}"
     );
     let value_list = field_row(&observed, "main_0", "all_inputs");
