@@ -152,6 +152,9 @@ pub(crate) mod fixture {
         pub(crate) arm_outcomes: String,
         pub(crate) class_collisions: String,
         pub(crate) family_receipts: String,
+        /// The ownership-fields candidate audit: one row per model-Owning
+        /// subject with its native status and hold (ownership-fields 031).
+        pub(crate) ownership_native: String,
         /// The delivered tree, when one is delivered. A fixture whose every
         /// ready class reverts has none, and its receipts are still the
         /// measurement (the decision table and the plan are complete before
@@ -222,6 +225,7 @@ pub(crate) mod fixture {
             subjects: capture.subject_receipt,
             arm_outcomes: capture.raw_boundary_artifacts.arm_outcomes,
             class_collisions: capture.raw_boundary_artifacts.class_collisions,
+            ownership_native: capture.raw_boundary_artifacts.ownership_native.clone(),
             family_receipts: format!(
                 "{:#?}",
                 capture.raw_boundary_artifacts.additive_family_receipts
@@ -823,15 +827,44 @@ pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
 }
 "#;
 
+    /// The same function with the derived local INLINED: the only difference
+    /// is that no `let f = ff.offset(k)` exists. If the hold moves, the
+    /// derived local is what causes it.
+    const HEMAN_INLINED_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+extern "C" {
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
+    let size = width * height;
+    let mut ff = calloc(size as usize, core::mem::size_of::<f32>()) as *mut f32;
+    let mut x: i32 = 0;
+    while x < width {
+        let mut y: i32 = 0;
+        while y < height {
+            *ff.offset((height * x + y) as isize) = y as f32;
+            y += 1;
+        }
+        x += 1;
+    }
+    free(ff as *mut core::ffi::c_void);
+}
+"#;
+
     #[test]
-    #[ignore = "RED by design: the Box CANDIDATE is not visible at any stage where this rule is \
-                live — ownership_fields_native::Candidates is derived at the Return stage and this \
-                fixture produces none (wave-5d2 report 016 STOP 1)"]
+    #[ignore = "RED for a measured reason, not a missing query (wave-5d2 report 019): the base's \
+                candidate is never PRODUCED — the native source scan holds `ff` at \
+                Source::UnsupportedOwnerUse because the derived local's own initializer is an \
+                uncovered raw use of the root. Selection was never the blocker. The companion \
+                tripwire below pins that hold; when it goes RED the candidate exists and this \
+                witness is the one to finish."]
     fn a_derived_local_is_typed_by_its_base_candidate() {
         let got = run(HEMAN_DERIVED_SHAPE);
         eprintln!(
-            "DERIVED\n{}\n{}",
+            "DERIVED\n{}\nNATIVE\n{}\n{}",
             got.subjects,
+            got.ownership_native,
             got.emitted.as_deref().unwrap_or("(no tree)")
         );
         assert_ne!(
@@ -839,6 +872,57 @@ pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
             "copy-source-coupled",
             "the derived local is typed by its base's candidate:\n{}",
             got.subjects
+        );
+    }
+
+    /// The control for the tripwire: the same body without the derived local.
+    /// Its base is not held by the source scan, which is what makes the
+    /// tripwire's hold attributable to `let f = ff.offset(k)` and not to the
+    /// allocation, the free, or the loop.
+    #[test]
+    fn without_the_derived_local_the_base_is_not_source_held() {
+        let got = run(HEMAN_INLINED_SHAPE);
+        eprintln!("INLINED\n{}\n{}", got.subjects, got.ownership_native);
+        assert_ne!(
+            column(
+                &got.ownership_native,
+                "transform_to_coordfield::ff#6",
+                "native_hold_kind"
+            ),
+            "Source::UnsupportedOwnerUse",
+            "without the derived local the source scan does not hold the base:\n{}",
+            got.ownership_native
+        );
+    }
+
+    /// **The tripwire for rule B's real blocker (wave-5d2 report 019).**
+    ///
+    /// `ff` is model-Owning and the ownership-fields native producer considers
+    /// it, so a candidate would be readable through `Candidates::plan` — but
+    /// the producer holds it at its SOURCE step, and the reason is the derived
+    /// local this lane wants to type. This pins the mutual dependency so that
+    /// the day the hold lifts, this test fails and rule B is finishable.
+    #[test]
+    fn the_derived_locals_base_is_held_before_any_candidate_exists() {
+        let got = run(HEMAN_DERIVED_SHAPE);
+        let row = "transform_to_coordfield::ff#6";
+        assert_eq!(
+            column(&got.ownership_native, row, "considered"),
+            "true",
+            "the base is a model-Owning subject the native producer looks at:\n{}",
+            got.ownership_native
+        );
+        assert_eq!(
+            column(&got.ownership_native, row, "native_status"),
+            "held",
+            "no candidate is produced, so there is none for rule B to read:\n{}",
+            got.ownership_native
+        );
+        assert_eq!(
+            column(&got.ownership_native, row, "native_hold_kind"),
+            "Source::UnsupportedOwnerUse",
+            "the hold is the SOURCE scan's, not a selection or interface hold:\n{}",
+            got.ownership_native
         );
     }
 

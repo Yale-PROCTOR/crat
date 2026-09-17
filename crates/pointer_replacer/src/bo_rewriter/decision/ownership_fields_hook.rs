@@ -82,9 +82,10 @@ pub(crate) struct Inputs {
     native_candidates: super::ownership_fields_native::Candidates,
 }
 impl Inputs {
-    /// **wave-5d2 hook (R436-3(a))** — the candidate-form query, forwarded.
-    pub(crate) fn candidate_is_plain_slice(&self, node: Node) -> bool {
-        self.native_candidates.candidate_is_plain_slice(node)
+    /// **wave-5d2 hook (R436-3(a))** — the candidate plan, read-only, exactly
+    /// as the ownership stage reads it (`plan`); ownership-fields 031 claim 5.
+    pub(crate) fn candidate_plan(&self, node: Node) -> Option<&BoxPlan> {
+        self.native_candidates.plan(node)
     }
 
     pub(crate) fn selected_slice_elements(

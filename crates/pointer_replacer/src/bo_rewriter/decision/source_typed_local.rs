@@ -26,7 +26,10 @@ use rustc_hir::{ExprKind, HirId, Node, PatKind, def::Res};
 use rustc_middle::ty::{TyCtxt, TyKind};
 use rustc_span::Span;
 
-use super::{Ctx, Decision, DecisionTable, DeclShape, Subject, SubjectKind, declaration, seam};
+use super::{
+    Ctx, Decision, DecisionTable, DeclShape, Subject, SubjectKind, box_facts::BoxShape,
+    declaration, seam,
+};
 use crate::bo_rewriter::{
     additive::FamilyStage,
     bridge_receipt::{BridgeSitePlan, SignatureClassId},
@@ -204,10 +207,11 @@ fn derived_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<DerivedValue> {
 /// together (the paired withdrawal, R436-3(b)).
 fn derived_over_a_candidate(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<DerivedValue> {
     let value = derived_value(ctx.tcx, subject)?;
-    let candidate = ctx
+    let plan = ctx
         .ownership_fields
-        .candidate_is_plain_slice((subject.fn_did, value.source));
-    candidate.then_some(value)
+        .candidate_plan((subject.fn_did, value.source))?;
+    (plan.shape == BoxShape::Slice && !plan.optional && plan.pointee_override.is_none())
+        .then_some(value)
 }
 
 /// The decision-side half: such a local has a knowable type, so the residue
@@ -336,10 +340,14 @@ pub(super) fn complete_derived(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mu
                 && candidate.hir_id == value.source
                 && match decision {
                     Decision::Box(_) => true,
-                    // The candidate's held spelling, by its receipt key: the
-                    // Box family's own reason for "produced, not selected".
-                    Decision::Degraded(record) => record.reason.key() == "box-param-caller-unknown",
-                    Decision::Ref { .. }
+                    // A base that is only HELD emits no indexable form, so a
+                    // suffix view over it would not type-check. The held
+                    // spelling was accepted here while the rule was designed
+                    // against a blocked SELECTION; the measurement in report
+                    // 019 shows the candidate is never produced at all, so
+                    // the only sound base is a delivered Box.
+                    Decision::Degraded(_)
+                    | Decision::Ref { .. }
                     | Decision::InferredRef { .. }
                     | Decision::Cursor { .. }
                     | Decision::NestedSlice { .. }
