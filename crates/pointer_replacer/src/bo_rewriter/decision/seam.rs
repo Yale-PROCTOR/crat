@@ -6412,6 +6412,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     super::raw_initializer::complete(tcx, table, &mut plan);
     super::ownership_fields_native::complete_declarations(tcx, table, &mut plan);
     super::source_typed_local::complete(tcx, table, &mut plan);
+    super::source_typed_local::complete_derived(tcx, table, &mut plan);
     complete_interface_inventory(
         facts,
         table,

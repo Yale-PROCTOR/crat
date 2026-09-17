@@ -1801,7 +1801,11 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             decision
         }
         Decision::Ref { .. } if construction_values::permits(ctx, subject) => decision,
-        Decision::Ref { .. } if source_typed_local::permits(ctx, subject) => decision,
+        Decision::Ref { .. } if source_typed_local::permits(ctx, subject) => {
+            // A derived local takes the base's SLICE form, not a thin
+            // reference: its uses index past the first element.
+            source_typed_local::derived_form(ctx, subject).unwrap_or(decision)
+        }
         Decision::Slice { .. } if slice_construction_values::permits(ctx, subject) => decision,
         Decision::Ref { mutable } if raw_place_values::permits(ctx, subject, mutable) => decision,
         Decision::Ref { mutable } => {
@@ -1880,6 +1884,10 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         {
             decision
         }
+        // wave-5d2: an unannotated local whose type its own initializer
+        // supplies keeps the form the ladder gave it — the residue below is
+        // for locals with no such source.
+        Decision::Slice { .. } if source_typed_local::permits(ctx, subject) => decision,
         Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => degrade(
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),

@@ -22,7 +22,7 @@
 //! a thin reference at a foreign counted position is refused by the existing
 //! `held:thin-extent` gate, which runs before this one).
 
-use rustc_hir::{ExprKind, Node, PatKind};
+use rustc_hir::{ExprKind, HirId, Node, PatKind, def::Res};
 use rustc_middle::ty::{TyCtxt, TyKind};
 use rustc_span::Span;
 
@@ -35,6 +35,18 @@ use crate::bo_rewriter::{
 struct LiteralValue {
     initializer: Span,
     pointee: String,
+}
+
+/// A local derived from another local by pointer arithmetic:
+/// `let f = ff.offset(height * x);`
+struct DerivedValue {
+    /// The binding the arithmetic starts from.
+    source: HirId,
+    initializer: Span,
+    /// The offset expression, verbatim.
+    offset: Span,
+    pointee: String,
+    mutable: bool,
 }
 
 fn plain_shared_reference(decision: &Decision) -> bool {
@@ -126,12 +138,94 @@ fn literal_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<LiteralValue> {
     })
 }
 
+/// `base.offset(k)` over a LOCAL base, on an unannotated local of the same
+/// pointer type. The offset's sign is not read here: a suffix view is licensed
+/// by the source's own form and the index expression is carried verbatim, so a
+/// negative offset fails the same bounds check the emitted program already
+/// performs. (A negative offset on a raw pointer is UB in the input; §28.)
+fn derived_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<DerivedValue> {
+    if subject.kind != SubjectKind::Local
+        || subject.ty_span.is_some()
+        || subject.decl_shape != DeclShape::RawPtr
+        || subject.ptr_depth != 1
+        || subject.null_init
+    {
+        return None;
+    }
+    let Node::LetStmt(local) = tcx.parent_hir_node(subject.hir_id) else {
+        return None;
+    };
+    if !matches!(local.pat.kind, PatKind::Binding(_, hir, _, None) if hir == subject.hir_id)
+        || local.ty.is_some()
+    {
+        return None;
+    }
+    let initializer = local.init?;
+    let ExprKind::MethodCall(segment, receiver, arguments, _) = &peel(initializer).kind else {
+        return None;
+    };
+    if segment.ident.name.as_str() != "offset" || arguments.len() != 1 {
+        return None;
+    }
+    let ExprKind::Path(path) = &receiver.kind else {
+        return None;
+    };
+    let typeck = tcx.typeck(subject.fn_did);
+    let Res::Local(source) = typeck.qpath_res(path, receiver.hir_id) else {
+        return None;
+    };
+    let input = typeck.pat_ty(local.pat);
+    let TyKind::RawPtr(pointee, mutability) = input.kind() else {
+        return None;
+    };
+    // The derived binding and its base must be the same pointer type: a suffix
+    // of the base's buffer, not a reinterpretation of it.
+    if typeck.expr_ty(receiver) != input
+        || initializer.span.from_expansion()
+        || arguments[0].span.from_expansion()
+        || subject.binding_span.from_expansion()
+        || !declaration::pointee_is_nameable(tcx, subject.fn_did, *pointee)
+    {
+        return None;
+    }
+    Some(DerivedValue {
+        source,
+        initializer: initializer.span,
+        offset: arguments[0].span,
+        pointee: declaration::pointee_source(tcx, *pointee),
+        mutable: mutability.is_mut(),
+    })
+}
+
+/// The base of a derived local is a Box CANDIDATE of the ownership-fields
+/// family (R436-3(a)): its own selection is blocked while this derived row is
+/// degraded in the same class, so the candidate — not the settled decision —
+/// is what types the view. The two rows then plan together and are withdrawn
+/// together (the paired withdrawal, R436-3(b)).
+fn derived_over_a_candidate(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<DerivedValue> {
+    let value = derived_value(ctx.tcx, subject)?;
+    let candidate = ctx
+        .ownership_fields
+        .candidate_is_plain_slice((subject.fn_did, value.source));
+    candidate.then_some(value)
+}
+
 /// The decision-side half: such a local has a knowable type, so the residue
 /// gate must not claim it.
 pub(super) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
     ctx.family_policy
         .enabled(subject.fn_did, FamilyStage::Declaration)
-        && literal_value(ctx.tcx, subject).is_some()
+        && (literal_value(ctx.tcx, subject).is_some()
+            || derived_over_a_candidate(ctx, subject).is_some())
+}
+
+/// The form a derived local takes: a slice over the base's buffer, mutable
+/// exactly when the binding is.
+pub(super) fn derived_form(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<Decision> {
+    derived_over_a_candidate(ctx, subject).map(|value| Decision::Slice {
+        mutable: value.mutable,
+        uses: Vec::new(),
+    })
 }
 
 /// The emission half: the initializer becomes a reborrow of the literal and
@@ -213,6 +307,123 @@ pub(super) fn complete(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mut seam::
     }
 }
 
+/// The emission half for a derived local: the initializer becomes a suffix
+/// view of the base and the binding carries its slice type.
+///
+/// The candidate query is not available at seam time, and it does not need to
+/// be: the ladder decided this local a slice only through `derived_form`,
+/// which asked it. The base's own row is re-checked here all the same — it
+/// must be the Box family's, selected (`Box`) or still held as a candidate
+/// (`box-param-caller-unknown`) — so a later rule that decided some other
+/// derived local a slice cannot borrow this emission.
+pub(super) fn complete_derived(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mut seam::SeamPlan) {
+    for (subject, decision) in &table.entries {
+        let mutable = match decision {
+            Decision::Slice { mutable, .. } => mutable,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Cursor { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => continue,
+        };
+        let Some(value) = derived_value(tcx, subject) else {
+            continue;
+        };
+        let base_is_box_family = table.entries.iter().any(|(candidate, decision)| {
+            candidate.fn_did == subject.fn_did
+                && candidate.hir_id == value.source
+                && match decision {
+                    Decision::Box(_) => true,
+                    // The candidate's held spelling, by its receipt key: the
+                    // Box family's own reason for "produced, not selected".
+                    Decision::Degraded(record) => record.reason.key() == "box-param-caller-unknown",
+                    Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Cursor { .. }
+                    | Decision::NestedSlice { .. }
+                    | Decision::Slice { .. }
+                    | Decision::Opt { .. } => false,
+                }
+        });
+        if !base_is_box_family {
+            continue;
+        }
+        let node = (subject.fn_did, subject.hir_id);
+        if plan.raw_boundary_atom_groups.contains_key(&node) {
+            continue;
+        }
+        let source_map = tcx.sess.source_map();
+        let (Ok(base), Ok(offset)) = (
+            source_map.span_to_snippet(value.initializer),
+            source_map.span_to_snippet(value.offset),
+        ) else {
+            continue;
+        };
+        // `ff.offset(k)` — the base text is everything before `.offset(`.
+        let Some(base) = base.split(".offset(").next().map(str::to_owned) else {
+            continue;
+        };
+        let borrow = if *mutable { "&mut" } else { "&" };
+        let replacement = format!("{borrow} {base}[({offset}) as usize..]");
+        let Some(emitted_type) = declaration::emitted_type(decision, &value.pointee, None) else {
+            continue;
+        };
+        if plan
+            .body_edits
+            .iter()
+            .any(|edit| edit.span == value.initializer)
+            || plan
+                .explicit_declarations
+                .iter()
+                .any(|site| site.node == Some(node))
+        {
+            continue;
+        }
+        let owner_class = SignatureClassId::of(subject.fn_did);
+        let expected = seam::form_of(decision);
+        let mut bridge = BridgeSitePlan::local(
+            subject.fn_did,
+            subject.fn_did,
+            "glue",
+            "body:local-initializer",
+            "derived-suffix-view",
+        );
+        bridge.expected_form = expected.key().to_owned();
+        bridge.found_form = seam::Form::Raw.key().to_owned();
+        bridge.argument_kind = "derived-offset".to_owned();
+        plan.body_edits.push(seam::BodyEdit {
+            span: value.initializer,
+            replacement,
+            owner_class,
+            bridge,
+            owner_fn: tcx.def_path_str(subject.fn_did.to_def_id()),
+            destination: subject.label.clone(),
+            context: super::emitability::BodyAdapterContext::LocalInitializer,
+            source_shape: "derived-offset",
+            family: seam::SeamFamily::Safe,
+            spec: seam::GlueSpec::core(seam::GlueCore::Bare, *mutable),
+            arg_span: value.initializer,
+            expected,
+            found: seam::Form::Raw,
+            root_identity: "derived-offset".to_owned(),
+            blind: false,
+        });
+        plan.explicit_declarations
+            .push(seam::ExplicitDeclarationSite {
+                owner_class,
+                caller: subject.fn_did,
+                node: Some(node),
+                span: Some(subject.binding_span.shrink_to_hi()),
+                category: "local",
+                replacement: Some(format!(": {emitted_type}")),
+                emitted_type,
+                arm: "surface",
+            });
+    }
+}
+
 /// The custody predicate for this rule's locals, the twin of
 /// `construction_values::has_declaration`.
 pub(crate) fn has_declaration(table: &DecisionTable, subject: &Subject) -> bool {
@@ -224,6 +435,10 @@ pub(crate) fn has_declaration(table: &DecisionTable, subject: &Subject) -> bool 
                 && site.owner_class == SignatureClassId::of(subject.fn_did)
         })
         && table.seams.body_edits.iter().any(|edit| {
-            edit.destination == subject.label && edit.bridge.bridge_kind == "static-literal-local"
+            edit.destination == subject.label
+                && matches!(
+                    edit.bridge.bridge_kind.as_str(),
+                    "static-literal-local" | "derived-suffix-view"
+                )
         })
 }

@@ -82,6 +82,11 @@ pub(crate) struct Inputs {
     native_candidates: super::ownership_fields_native::Candidates,
 }
 impl Inputs {
+    /// **wave-5d2 hook (R436-3(a))** — the candidate-form query, forwarded.
+    pub(crate) fn candidate_is_plain_slice(&self, node: Node) -> bool {
+        self.native_candidates.candidate_is_plain_slice(node)
+    }
+
     pub(crate) fn selected_slice_elements(
         &self,
         node: Node,

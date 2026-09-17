@@ -87,6 +87,23 @@ impl Candidates {
         self.bundles.is_empty()
     }
 
+    /// **wave-5d2 hook (R436-3(a)) — the CANDIDATE form, read-only.**
+    ///
+    /// A derived local (`p = base.offset(k)`) has no type of its own: it takes
+    /// the source's. Selection of this lane's Box is itself blocked while such
+    /// a derived row is degraded in the same class, so the derived rule must
+    /// read the candidate rather than the settled decision — the deadlock
+    /// ownership-fields 029 claim 7(i) and wave-5d2 014 both named. This
+    /// exposes exactly the candidate's shape and element; it decides nothing
+    /// and cannot make a bundle.
+    pub(crate) fn candidate_is_plain_slice(&self, node: Node) -> bool {
+        self.bundles.get(&node).is_some_and(|bundle| {
+            bundle.plan.shape == BoxShape::Slice
+                && !bundle.plan.optional
+                && bundle.plan.pointee_override.is_none()
+        })
+    }
+
     /// Append-only observation of the already-computed candidate family.
     /// This must run even when there are no successful native bundles.
     pub(crate) fn audit(

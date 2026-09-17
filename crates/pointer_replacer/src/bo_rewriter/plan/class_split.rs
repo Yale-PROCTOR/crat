@@ -794,6 +794,54 @@ pub unsafe fn recurse(name: *const i8, fallback: *const i8, excluded: i32) -> i3
 }
 "#;
 
+    /// **Relay 017 build B — the heman deadlock in one file.**
+    /// `transform_to_coordfield`: `ff` is a `calloc` local the Box family
+    /// produces a candidate for but cannot SELECT while the derived local
+    /// `f = ff.offset(height * x)` is degraded `copy-source-coupled` in the
+    /// same class; the derived local cannot be typed while `ff` has no
+    /// delivered form. Rule B types the derived local from the CANDIDATE.
+    const HEMAN_DERIVED_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+extern "C" {
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn transform_to_coordfield(width: i32, height: i32) {
+    let size = width * height;
+    let mut ff = calloc(size as usize, core::mem::size_of::<f32>()) as *mut f32;
+    let mut x: i32 = 0;
+    while x < width {
+        let mut f = ff.offset((height * x) as isize);
+        let mut y: i32 = 0;
+        while y < height {
+            *f.offset(y as isize) = y as f32;
+            y += 1;
+        }
+        x += 1;
+    }
+    free(ff as *mut core::ffi::c_void);
+}
+"#;
+
+    #[test]
+    #[ignore = "RED by design: the Box CANDIDATE is not visible at any stage where this rule is \
+                live — ownership_fields_native::Candidates is derived at the Return stage and this \
+                fixture produces none (wave-5d2 report 016 STOP 1)"]
+    fn a_derived_local_is_typed_by_its_base_candidate() {
+        let got = run(HEMAN_DERIVED_SHAPE);
+        eprintln!(
+            "DERIVED\n{}\n{}",
+            got.subjects,
+            got.emitted.as_deref().unwrap_or("(no tree)")
+        );
+        assert_ne!(
+            column(&got.subjects, "transform_to_coordfield::f#17", "reason"),
+            "copy-source-coupled",
+            "the derived local is typed by its base's candidate:\n{}",
+            got.subjects
+        );
+    }
+
     #[test]
     fn a_static_literal_local_is_typed_by_its_own_initializer() {
         let got = run(STATIC_LITERAL_SHAPE);
