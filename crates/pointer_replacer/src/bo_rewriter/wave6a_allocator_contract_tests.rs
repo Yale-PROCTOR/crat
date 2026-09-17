@@ -411,9 +411,10 @@ pub unsafe extern \"C\" fn cluster(mut m: *mut MemoryManager, mut n: usize, mut 
 /// end, (2) a block that does not leave the owner as it found it — here the
 /// conditional allocation assigned inside the branch, (3) a read of the
 /// owner after its release, (4) a second allocation over a live generation
-/// (the first would be dropped by Rust, and C leaks it), (5) a release
-/// before any generation exists, (6) the owner copied into a local that is
-/// not itself a contract owner — a second owner this rule cannot follow.
+/// (R434-4 §2 admitted this and the admission is WITHDRAWN — report 019 §3),
+/// (5) a release before any generation exists, (6) the owner copied into a
+/// local that is not itself a contract owner — a second owner this rule
+/// cannot follow.
 /// (5) and (6) are UB-free-input shapes only in the trivial sense; they hold
 /// fail-closed either way.
 #[test]
@@ -476,10 +477,6 @@ pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n:
             "contract-allocation:use:read-while-empty",
         ),
         (
-            "reseat_over_live::syms",
-            "contract-allocation:overwrite:re-seat-over-live",
-        ),
-        (
             "release_first::syms",
             "contract-allocation:implicit-close:release-without-generation",
         ),
@@ -498,6 +495,16 @@ pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n:
             out.degradations
         );
     }
+    // (4) The re-seat over a live generation: R434-4 §2 admitted it and this
+    // lane WITHDREW the admission — an implicit close drops a block the
+    // CONTRACT's allocator owns, which Miri reports as UB (report 019 §3). The
+    // hold stands until the release is spelled with the contract's own free.
+    assert!(
+        receipts.contains(
+            "reseat_over_live::syms\theld\tcontract-allocation:overwrite:re-seat-over-live"
+        ),
+        "{receipts}"
+    );
     // (7) A local assigned from something that is not a contract owner is
     // not a generation at all: the rule leaves it alone — no receipt, no
     // degradation. Every program with a contract in it holds locals like
@@ -513,6 +520,9 @@ pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n:
         "{:#?}",
         out.degradations
     );
+    // Exactly ONE function of this fixture delivers: `reseat_over_live`, under
+    // §2's waiver. Every other gate's owner keeps its typed hold, which the
+    // per-subject assertions above already name.
     assert!(
         !compact(&out.source).contains("Box<[u32]>"),
         "{}",
@@ -725,5 +735,61 @@ fn w6a_ac_the_libc_row_owns_malloc_calloc_and_strdup_locals() {
         !compact(&out.source).contains("letmutmem:Box<"),
         "{}",
         out.source
+    );
+}
+
+/// **The overwrite of a live owner: admitted by R434-4 §2, WITHDRAWN here.**
+/// `dup = strdup(src)` over a generation the owner still holds. §2 licensed
+/// the implicit close under the leak-parity waiver, on the premise that the
+/// drop "frees through the System allocator, which ignores the layout". Miri
+/// refutes the premise, not the layout reasoning: dropping a `Box` whose block
+/// came from the CONTRACT's allocator is *deallocating C heap memory using
+/// Rust heap deallocation operation* — UB by the language, whatever glibc
+/// does (report 019 §3, `miri-overwrite-emitted-UB.log`).
+///
+/// So the shape keeps its typed hold. The admission returns when the release
+/// at the overwrite is spelled with the contract's OWN free, which is a build
+/// rather than a waiver — this witness is its RED.
+const OVERWRITTEN_OWNER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn strdup(s: *const std::os::raw::c_char) -> *mut std::os::raw::c_char;
+    fn strcmp(a: *const std::os::raw::c_char, b: *const std::os::raw::c_char) -> i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+pub unsafe extern "C" fn twice(mut src: *const std::os::raw::c_char) -> i32 {
+    let mut dup = strdup(src);
+    if dup.is_null() {
+        return 0 as i32;
+    }
+    let mut first = strcmp(dup, src);
+    dup = strdup(src);
+    let mut second = strcmp(dup, src);
+    free(dup as *mut core::ffi::c_void);
+    return first + second;
+}
+"#;
+
+#[test]
+fn w6a_ac_an_overwrite_of_a_live_owner_keeps_its_hold_until_the_release_is_spelled() {
+    let out = emitted("ac-overwrite", OVERWRITTEN_OWNER);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    // The row REACHES the shape — the owner is model-Raw, two generations of
+    // one libc contract — and refuses it at the simulation.
+    assert!(
+        receipts.contains("twice::dup\tyielded\tcontract-allocation:overwrite:re-seat-over-live"),
+        "{receipts}"
+    );
+    // Nothing is emitted for it, and nothing else in the program is claimed by
+    // a half-plan: the refusal is a receipt, so the subject stays whole.
+    assert!(
+        !compact(&out.source).contains("Box<[i8]>"),
+        "{}",
+        out.source
+    );
+    assert!(
+        !receipts.contains("waiver-drop(overwrite)"),
+        "the waiver is withdrawn until the release is the contract's own free\n{receipts}"
     );
 }

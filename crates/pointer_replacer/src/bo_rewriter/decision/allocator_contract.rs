@@ -912,11 +912,23 @@ pub(crate) fn derive<'tcx>(
             events.sort_by_key(|(span, _, _, _)| (span.lo(), span.hi()));
             // The simulation: Dead → Create → Live → Release → Dead.
             let mut live = false;
+            let mut overwrites: Vec<Span> = Vec::new();
             let mut block_state: FxHashMap<HirId, (bool, bool)> = FxHashMap::default();
             let mut sequence_error = None;
             for (span, block, event, role) in &events {
                 let entry = block_state.entry(*block).or_insert((live, live));
                 match event {
+                    // **The overwrite of a live owner stays REFUSED** — R434-4
+                    // §2 admitted it, and Miri refutes the premise it was
+                    // admitted on (report 019 §3). An implicit close here
+                    // drops a `Box` whose block came from the CONTRACT's
+                    // allocator, and `Box`'s drop is Rust's deallocation, not
+                    // the contract's: Miri reports "deallocating … C heap
+                    // memory using Rust heap deallocation operation" — UB by
+                    // the language, whatever glibc does with the layout. The
+                    // admission returns when the release at the overwrite is
+                    // spelled with the contract's OWN free, which is a build,
+                    // not a waiver.
                     Event::Create if live => {
                         sequence_error =
                             Some(format!("{OVERWRITE}:re-seat-over-live:{}", snippet(*span)));
@@ -1124,6 +1136,12 @@ pub(crate) fn derive<'tcx>(
                     super::emitability::EmitabilityFacts::site(tcx, *call)
                 ));
             }
+            for span in &overwrites {
+                receipts.push(format!(
+                    "waiver-drop(overwrite) site={}",
+                    super::emitability::EmitabilityFacts::site(tcx, *span)
+                ));
+            }
             for receipt in &receipts {
                 out.admitted.push((label.clone(), receipt.clone()));
             }
@@ -1138,7 +1156,7 @@ pub(crate) fn derive<'tcx>(
                     fabricated_extent: false,
                     pointee_override: None,
                     inferred_binding: subject.ty_span.is_none(),
-                    overwrite_spans: Vec::new(),
+                    overwrite_spans: overwrites.clone(),
                     retained_sink: true,
                     implicit_scope_close: false,
                 },
