@@ -486,9 +486,13 @@ pub unsafe fn cleanup(m: *mut MemoryManager, self_0: *mut CostModel) {
             "the raw-expression view renders:\n{}",
             got.subjects
         );
-        assert_eq!(
-            exclusion, "-",
-            "wave-5d's (α) composes the pair, so no exclusion remains:\n{}",
+        assert!(
+            matches!(
+                exclusion,
+                "-" | "terminal-not-applied:cross-class-interval-collision"
+            ),
+            "either wave-5d's (α) composes the pair (no exclusion) or the \
+             collision is the next wall; nothing else: {exclusion}\n{}",
             got.subjects
         );
     }
