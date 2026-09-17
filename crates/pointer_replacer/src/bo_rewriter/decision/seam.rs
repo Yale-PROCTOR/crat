@@ -3412,7 +3412,6 @@ fn build_candidate(
     len_evidence: Option<LenEvidence>,
     enclosing_unsafe_fn: bool,
     retention_facts: &super::raw_boundary::RetentionSummaries,
-    caller: LocalDefId,
     callee: LocalDefId,
     argument_index: usize,
     return_tied: bool,
@@ -3495,7 +3494,6 @@ fn build_candidate(
     } else if found == Form::Raw && expected != Form::Raw {
         inbound_retention(
             retention_facts,
-            caller,
             callee,
             argument_index,
             return_tied,
@@ -3678,7 +3676,6 @@ pub(crate) fn build_a5_raw_view(
 
 fn inbound_retention(
     retention: &super::raw_boundary::RetentionSummaries,
-    caller: LocalDefId,
     callee: LocalDefId,
     argument_index: usize,
     return_tied: bool,
@@ -3701,14 +3698,6 @@ fn inbound_retention(
                 sink.kind,
                 RetentionEventKind::FieldOrGlobalStore | RetentionEventKind::OutputStorage
             ) && field_tied =>
-        {
-            Ok((BridgeRetentionTier::T1, None))
-        }
-        // wave-6r (relay 021): the callee ROW retains by returning its own
-        // argument, but this caller keeps nothing of it — every call of that
-        // position here discards or consumes the returned alias.
-        Some(RetentionVerdict::Retains { .. })
-            if retention.returned_alias_settled(caller, callee, argument_index) =>
         {
             Ok((BridgeRetentionTier::T1, None))
         }
@@ -4771,7 +4760,6 @@ pub(crate) fn synthesize_with_raw_boundary(
                             len_evidence,
                             enclosing_unsafe_fn,
                             retention,
-                            site.caller,
                             *callee,
                             pos.index,
                             return_tied,
@@ -4820,7 +4808,6 @@ pub(crate) fn synthesize_with_raw_boundary(
                             len_evidence,
                             enclosing_unsafe_fn,
                             retention,
-                            site.caller,
                             *callee,
                             pos.index,
                             return_tied,

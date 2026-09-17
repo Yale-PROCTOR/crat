@@ -86,5 +86,13 @@ fn wave6r_returned_alias_with_store_keeps_hold() {
 fn wave6r_returned_alias_discarded_caller_emits() {
     let source = super::emitted(INPUT);
     assert!(source.contains("reflect(pOut: &mut V"), "{source}");
-    assert!(source.contains("sub(pOut, "), "{source}");
+    // The bridge into the still-raw callee has two admissible spellings
+    // (R217-2(a)): the zero-syntax coercion `&mut V -> *mut V`, and the
+    // explicit `core::ptr::from_mut` the A5 raw view renders once the site
+    // proof is no longer held by the callee row's Return-only retention
+    // (relay wave-6r/021's lever). The emitted tree type-checks either way.
+    assert!(
+        source.contains("sub(pOut, ") || source.contains("sub(core::ptr::from_mut(&mut *pOut), "),
+        "{source}"
+    );
 }

@@ -107,3 +107,64 @@ fn wave6r_stashed_returned_alias_keeps_the_hold() {
         "a returned alias stored through a pointer keeps the hold: {rows:?}"
     );
 }
+
+/// The predicate the seam consults (relay wave-6r/021, addendum 448): a
+/// callee position whose ROW retains by returning its own argument is SETTLED
+/// in a caller that keeps nothing of the returned alias at every call of it —
+/// heman's whole kazmath family (`kmVec3Normalize(pOut, pOut);` discards,
+/// `kmVec2Length(kmVec2Subtract(..))` consumes). One unsettled call in the
+/// caller withholds the position: `kept` reads through the alias afterwards
+/// and `stashed` stores it, and both keep their hold (report 021 claim 4).
+fn settled(caller: &str, callee: &str, index: usize) -> bool {
+    ::utils::compilation::run_compiler_on_str(VEC2, |tcx| {
+        let (_, ctx) = super::super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::super::A5Mode::PreciseReplay,
+                Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        let find = |name: &str| {
+            tcx.hir_body_owners()
+                .find(|owner| tcx.def_path_str(owner.to_def_id()) == name)
+                .expect("the function exists")
+        };
+        ctx.retention
+            .returned_alias_settled(find(caller), find(callee), index)
+    })
+    .expect("input type-checks")
+}
+
+#[test]
+fn wave6r_returned_alias_is_settled_where_the_caller_keeps_nothing() {
+    assert!(
+        settled("discarded", "vec2_subtract", 0),
+        "a discarded result"
+    );
+    assert!(settled("consumed", "vec2_subtract", 0), "a consumed result");
+    assert!(
+        settled("overlapped", "vec2_normalize", 0),
+        "one root at two positions"
+    );
+    assert!(
+        !settled("overlapped", "vec2_normalize", 1),
+        "a no-retain position is not in the set"
+    );
+}
+
+#[test]
+fn wave6r_returned_alias_is_unsettled_where_the_caller_keeps_it() {
+    assert!(
+        !settled("kept", "vec2_subtract", 0),
+        "a global store of the alias"
+    );
+    assert!(
+        !settled("stashed", "vec2_subtract", 0),
+        "a store through a pointer"
+    );
+    assert!(
+        !settled("overlapped_kept", "vec2_normalize", 0),
+        "the overlapped call whose alias is stashed"
+    );
+}
