@@ -585,6 +585,18 @@ fn nested_ast_composition(
                     // composition the AST already renders, and holding the
                     // class for it was the interval layer alone.
                     | ("box-borrow-view-to-raw", "box-expression")
+                    // Relay 045 STOP 1 (report 032 §1): the three collision
+                    // rows that survived batch 10 — the Option glue's unwrap
+                    // over a Box owner's own expression edit, brotli classes
+                    // 1237x1304, 2714x2764, 2726x2764. Two carry class 2440's
+                    // prefix-only geometry (outer.lo = inner.lo - 5, same hi)
+                    // and the third is a strict containment; all three are a
+                    // glue node wrapping the node the box edit grafted, which
+                    // the seam pass renders by building around the node it
+                    // finds. Report 032 §1 names why the bucket was mispriced:
+                    // wave-6a's (ii) closes the rows where `box-expression` is
+                    // the OUTER, never these.
+                    | ("nullable-required-unwrap", "box-expression")
             );
         let raw_receiver_over_argument = matches!(
             outer.key.bridge_kind.as_str(),

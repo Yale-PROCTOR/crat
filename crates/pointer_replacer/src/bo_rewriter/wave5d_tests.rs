@@ -117,18 +117,11 @@ fn held_native(source: &str) {
             "the pair arm must not admit: {:?}",
             receipt.result
         );
-        // **Relay 041 ruling (A).** Scoped to `ti_abs`'s own subjects. While the
-        // pair rule was the only nested producer this was the same statement as
-        // the receipt check above; R435-1 chartered a second one (the `nested`
-        // lane's N1), and a `NestedSlice` decision in ANOTHER owner is not what
-        // this control is about.
-        assert!(
-            !table
-                .entries
-                .iter()
-                .any(|(s, d)| matches!(d, Decision::NestedSlice { .. })
-                    && tcx.def_path_str(s.fn_did.to_def_id()) == "indicators::abs::ti_abs")
-        );
+        // **Relay 045 round 3 (R450-5(1)): DROPPED.** The receipt assertion
+        // above carries this control's whole claim — the PAIR arm does not
+        // admit `ti_abs`. The decision-side twin said "no `NestedSlice`
+        // decision for `ti_abs`", which a second producer (R435-1's N1) can
+        // make false without this arm admitting anything.
     })
     .unwrap();
 }

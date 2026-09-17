@@ -448,6 +448,32 @@ fn superseded_by_an_option_destination(
     ) {
         return false;
     }
+    // Conjunct 3 (wave-6s2 013 §1): the Option VALUE planner owns an RHS edit
+    // at this site's span. Without it the two renderings do not occupy one
+    // span and there is nothing to supersede — which is what narrows the arm
+    // from "this owner gained an `Opt`" to "this site was replaced".
+    let value_edit_here = candidate
+        .plan
+        .class_finalization
+        .classes
+        .get(&owner)
+        .is_some_and(|class| {
+            class.sites.iter().any(|other| {
+                matches!(other.state, plan::ClassSiteState::EditReady)
+                    && other.key.file == site.key.file
+                    && other.key.lo == site.key.lo
+                    && other.key.hi == site.key.hi
+                    && (other.key.bridge_kind.contains("option")
+                        || other.key.bridge_kind.contains("nullable"))
+            })
+        });
+    // Conjunct 3 is a SPAN test, so it applies to a site that has a span. A
+    // dropped site with no text interval (`ClassSite::zero`) cannot be
+    // span-matched and is decided by conjuncts 1 and 2 alone.
+    let has_interval = site.edit_key != "-" && site.key.file != "-";
+    if has_interval && !value_edit_here {
+        return false;
+    }
     let optional = |snapshot: &StageSnapshot| -> BTreeSet<String> {
         snapshot
             .table
@@ -475,6 +501,51 @@ fn superseded_by_an_option_destination(
         .difference(&optional(prior))
         .next()
         .is_some()
+}
+
+/// Is every change this class carries a site the Option family superseded?
+///
+/// Relay 045 §2. `class_changed` sees the superseded site as an ordinary new
+/// dropped site and its derived hold, so the restore step re-requests the owner
+/// one stage after the dropped-site path let it through. Both paths must ask the
+/// same question.
+fn only_change_is_superseded(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    owner: SignatureClassId,
+) -> bool {
+    let Some(class) = candidate.plan.class_finalization.classes.get(&owner) else {
+        return false;
+    };
+    let old = prior.plan.class_finalization.classes.get(&owner);
+    let new_sites = class
+        .sites
+        .iter()
+        .filter(|site| !old.is_some_and(|old| old.sites.contains(site)))
+        .collect::<Vec<_>>();
+    if new_sites.is_empty() {
+        return false;
+    }
+    if !new_sites
+        .iter()
+        .all(|site| superseded_by_an_option_destination(site, owner, prior, candidate))
+    {
+        return false;
+    }
+    let superseded: BTreeSet<String> = new_sites
+        .iter()
+        .filter_map(|site| match &site.state {
+            plan::ClassSiteState::Dropped(reason) => {
+                Some(format!("dropped-site:{}:{}", site.key.bridge_kind, reason))
+            }
+            _ => None,
+        })
+        .collect();
+    class
+        .hold_reasons()
+        .iter()
+        .filter(|reason| !old.is_some_and(|old| old.hold_reasons().contains(reason)))
+        .all(|reason| superseded.contains(reason))
 }
 
 pub(crate) fn withdrawals(
@@ -814,7 +885,17 @@ fn anchors(
             if collision_covered {
                 continue;
             }
-            if enabled(current) && class_changed(prior, candidate, current) {
+            // Relay 045 §2 (wave-6o 018 STOP 1): the supersession is evaluated
+            // BEFORE the restore step, or the same owner withdraws one step
+            // later for the same superseded site — which is exactly what
+            // wave-6o measured once `fe931479f` removed the earlier path
+            // (`…:anchor=3:restore-prior-family-disposition`). A class whose
+            // only change is a superseded site has not changed for this
+            // purpose.
+            if enabled(current)
+                && class_changed(prior, candidate, current)
+                && !only_change_is_superseded(prior, candidate, current)
+            {
                 requested.insert(
                     current,
                     (

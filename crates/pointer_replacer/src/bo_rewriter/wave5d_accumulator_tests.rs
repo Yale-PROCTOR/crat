@@ -102,14 +102,9 @@ fn w5d_acc_ad_native_inherits_five_existing_formations() {
             assert!(!c.length.is_fallback());
         }
         println!("W5D-ACC-PLAN {:?}", plans[0]);
-        assert_eq!(
-            table
-                .entries
-                .iter()
-                .filter(|(_, d)| matches!(d, Decision::NestedSlice { .. }))
-                .count(),
-            2
-        );
+        // **Relay 045 round 3 (R450-5(1)): DROPPED.** The receipt-side
+        // assertions above carry the claim; counting `NestedSlice` decisions
+        // file-wide reads a second producer's admission as this arm's.
     });
 }
 #[test]
