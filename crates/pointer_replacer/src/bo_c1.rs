@@ -12190,6 +12190,14 @@ mod run {
             ("unresolved-classes", artifact.unresolved_classes.as_str()),
             ("interface-inventory", artifact.interface_inventory.as_str()),
             ("subjects", capture.subject_receipt.as_str()),
+            // R450-8 (wave-6a 022 §4 GRANTED): the allocator-contract receipts
+            // reach the artifact set. Without them the libc row's `kind-raw`
+            // population has no reason table on disk — the facts existed in
+            // `table.allocator_contracts` and stopped at the in-memory carrier.
+            (
+                "allocator-contract-receipt",
+                artifact.allocator_contract_receipts.as_str(),
+            ),
         ];
         for (suffix, contents) in artifact_rows {
             std::fs::write(
@@ -24854,6 +24862,14 @@ fn raw_boundary_wave2_corpus_census() {
         "program\tadapter_key\tparameter_subject_key\tclass\tcause\tfamily\tdelivery\n",
     );
     let mut pair_divergences = String::from("program\tadapter_key\texpected\tobserved\n");
+    // **R451-2(5)** — the pair-site retirement control takes R434-2's treatment
+    // (seat addendum 451, on main's two-census evidence: batch 9 lost a run to
+    // 18 rows and batch 10 to 4, every one of them a site the landing re-pins
+    // anyway, and in batch 10 both moved TOWARD delivery). A class that moved,
+    // a retired site and a site the control has not listed yet are RECORDED;
+    // what stays fatal is the instrument contradicting itself — a subject the
+    // ledger no longer carries.
+    let mut recorded_pair_divergences = String::from("program\tadapter_key\texpected\tobserved\n");
     for (program, key, expected) in &expected_pair_sites {
         let observed = observed_pair_sites
             .iter()
@@ -24879,7 +24895,7 @@ fn raw_boundary_wave2_corpus_census() {
         let Some((subject_key, listed_class, listed_cause)) =
             retirement_rows.get(&(program.clone(), key.clone()))
         else {
-            pair_divergences.push_str(&format!(
+            recorded_pair_divergences.push_str(&format!(
                 "{program}\t{key}\t{expected}\tpair-site-retirement-unlisted\n"
             ));
             continue;
@@ -24899,7 +24915,7 @@ fn raw_boundary_wave2_corpus_census() {
         let (class, cause) =
             raw_boundary_pair_site_retirement(family, &delivery, reason, exclusion);
         if class != listed_class || (&cause != listed_cause && listed_class == "held") {
-            pair_divergences.push_str(&format!(
+            recorded_pair_divergences.push_str(&format!(
                 "{program}\t{key}\t{listed_class}/{listed_cause}\tpair-site-class-mismatch:{class}/{cause}\n"
             ));
             continue;
@@ -24915,7 +24931,7 @@ fn raw_boundary_wave2_corpus_census() {
         .cloned()
         .collect::<Vec<_>>()
     {
-        pair_divergences.push_str(&format!(
+        recorded_pair_divergences.push_str(&format!(
             "{program}\t{key}\t-\tpair-site-retirement-unused\n"
         ));
     }
@@ -24929,6 +24945,17 @@ fn raw_boundary_wave2_corpus_census() {
         &pair_divergences,
     )
     .expect("write PAIR site divergences");
+    // R451-2(5). The recorded half is the landing's re-pin list. It is written
+    // beside the fatal stream rather than projected into a control here: the
+    // pair-site control carries wave-6p's own provenance columns
+    // (`callee_owner_fn`, `param_index_zero_based`, the two verdicts, the
+    // certificate) that a receipt cannot reconstruct, so the landing re-pins by
+    // correcting `class`/`cause` in place and keeps every other column.
+    fs::write(
+        artifact_dir.join("pair-site-recorded-divergences.tsv"),
+        &recorded_pair_divergences,
+    )
+    .expect("write recorded PAIR site divergences");
     assert_eq!(pair_divergences.lines().count(), 1, "{pair_divergences}");
 
     let total = |key: &str| {
