@@ -798,10 +798,26 @@ fn derive_bundle(
     // leave the container's raw copy pointing into memory this Box closes:
     // the shape holds fail-closed. (The composition lifts the hold for a
     // field wave-6f's transaction owns; see the R431 predicate patch.)
-    if source.load_field().is_some() {
+    // R431 on the composition: the load is an acquisition only where a field
+    // transaction OWNS the field it came out of; their transaction renders the
+    // move (`take()`), this producer types the local and closes it.
+    let field_load = source.load_field();
+    if let Some((struct_did, field_index)) = field_load
+        && !table.field_transactions.applied.iter().any(|transaction| {
+            transaction.owning
+                && transaction.key.struct_did.to_def_id() == struct_did
+                && transaction.key.field_index == field_index
+        })
+    {
         return Err(NativeHold::Missing("native-field-load-field-not-owned"));
     }
-    let mut edits = vec![source.constructor().clone()];
+    let mut edits = if field_load.is_some() {
+        // The initializer is the field family's; this producer contributes the
+        // type, the close and the receipts, and no constructor edit.
+        Vec::new()
+    } else {
+        vec![source.constructor().clone()]
+    };
     // R402-2(a): every delivered declaration carries its explicit type. The
     // type is registered as an explicit local declaration site (the same
     // channel wave-6k's construction values use), which the text path splices
