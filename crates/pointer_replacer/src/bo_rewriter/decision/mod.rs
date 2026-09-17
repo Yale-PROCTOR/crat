@@ -1801,6 +1801,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             decision
         }
         Decision::Ref { .. } if construction_values::permits(ctx, subject) => decision,
+        Decision::Ref { .. } if source_typed_local::permits(ctx, subject) => decision,
         Decision::Slice { .. } if slice_construction_values::permits(ctx, subject) => decision,
         Decision::Ref { mutable } if raw_place_values::permits(ctx, subject, mutable) => decision,
         Decision::Ref { mutable } => {
