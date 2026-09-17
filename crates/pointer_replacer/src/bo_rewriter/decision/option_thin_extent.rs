@@ -19,6 +19,9 @@ pub(crate) fn hold(
     subject: &Subject,
     thin_extent: &FxHashSet<(LocalDefId, HirId)>,
     local_callee_extent: &rustc_hash::FxHashMap<(LocalDefId, HirId), LocalCalleeAccess>,
+    // Composition arm: wave-5c's counted-thin evidence rides the hold exactly
+    // as it does in the plain arm (the caller computes it the same way).
+    count: impl FnOnce() -> Option<super::thin_counted::Hold>,
 ) -> Option<DegradeReason> {
     let node = (subject.fn_did, subject.hir_id);
     if thin_extent.contains(&node) {
@@ -28,5 +31,6 @@ pub(crate) fn hold(
         .get(&node)
         .map(|access| DegradeReason::LocalCalleeAccessExtent {
             access: Box::new(access.clone()),
+            count: count(),
         })
 }

@@ -2583,7 +2583,9 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         if !slice
             && depth2_npo.is_none()
             && let Some(reason) =
-                option_thin_extent::hold(subject, thin_extent, local_callee_extent)
+                option_thin_extent::hold(subject, thin_extent, local_callee_extent, || {
+                    thin_counted::missing_evidence(tcx, subject, facts, family_policy, exposure)
+                })
         {
             return degrade(subject, decl_site, reason);
         }
