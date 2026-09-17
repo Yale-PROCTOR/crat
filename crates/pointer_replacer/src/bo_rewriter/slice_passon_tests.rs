@@ -774,3 +774,118 @@ fn wave6s2_assignment_destination_delivers_once_its_declaration_is_typed() {
         "neither end needs a raw view: {source}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W6S2-5b (R451-4) — the same assignment with an ARRAY-LOCAL source.
+// ---------------------------------------------------------------------------
+
+/// **Witness (heman `kazmath::quaternion::kmQuaternionRotationMatrix::pMatrix#8`,
+/// an ENABLED `slice-use-unsupported` row of the batch-10 frame, `sole = 0`).**
+/// `pMatrix = &mut *m4x4.as_mut_ptr().offset(0) as *mut c_float` on a
+/// `[c_float; 16]` local, then `*pMatrix.offset(k)` reads. Were the arm built,
+/// the extent would be the array type's own length — no evidence invented
+/// (`sealed-contract:array-length`, the key `decision/construction.rs` already
+/// mints for `arr.as_ptr()`), and the destination is null-initialised so the
+/// Option family, not this lane, would render the right-hand side. The
+/// reduction does not reach that stage; see the STOP on the test below.
+const ARRAY_LOCAL_SOURCE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ #[derive(Copy, Clone)]
+ #[repr(C)]
+ pub struct kmMat3 { pub mat: [f32; 9], }
+ pub unsafe fn kmQuaternionRotationMatrix(mut pIn: *const kmMat3) -> f32 {
+    let mut pMatrix = 0 as *mut f32;
+    let mut m4x4: [f32; 16] = [0.; 16];
+    if pIn.is_null() { return 0.; }
+    m4x4[0 as usize] = (*pIn).mat[0 as usize];
+    m4x4[5 as usize] = (*pIn).mat[4 as usize];
+    m4x4[10 as usize] = (*pIn).mat[8 as usize];
+    m4x4[15 as usize] = 1 as i32 as f32;
+    pMatrix = &mut *m4x4.as_mut_ptr().offset(0 as i32 as isize) as *mut f32;
+    let mut diagonal = *pMatrix.offset(0 as i32 as isize)
+        + *pMatrix.offset(5 as i32 as isize)
+        + *pMatrix.offset(10 as i32 as isize);
+    diagonal
+ }
+"#;
+
+/// **STOP (MAX-3, report 015).** The rule this witness asks for is NOT built:
+/// the reduction cannot exhibit the corpus row's wall. In the corpus
+/// (`batch10/heman.*subjects.tsv`) `pMatrix#8` is model kind **`ref`**, family
+/// `slice`, degraded `slice-use-unsupported` — a USE-stage wall. In three
+/// spellings of the reduction (raw `*const f32` input; no pointer return;
+/// struct-pointer input reproducing `pIn`'s `optional`/`ref` exactly) the model
+/// settles `pMatrix` at **`Raw`** (`degraded:kind-raw`) whenever its value is an
+/// array-local decay, with or without a null-initialised declaration — so the
+/// SliceUse stage never runs on it and no use rule is observable. Admitting the
+/// array-local arm without a witness would be an unwitnessed rule; the arm is
+/// withdrawn and preserved at
+/// `/home/p51lee/dev/.crat-scratch/wave-6s2/w6s2-5b-arm.patch`.
+#[test]
+#[ignore = "W6S2-5b STOP: the reduction settles the array-local destination at \
+            kind-raw in three spellings where the corpus row is model-ref \
+            (analysis-frame divergence, report 015)"]
+fn wave6s2_array_local_source_moves_the_wall_to_the_option_family() {
+    let (source, receipts) = emit_with_receipts(ARRAY_LOCAL_SOURCE);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        receipts.contains("DECISION-KV kmQuaternionRotationMatrix::pMatrix degraded:null-init"),
+        "the array-local assignment is in scope; what remains is the null-init \
+         declaration (the Option family's): {receipts}"
+    );
+    assert!(
+        !receipts.contains(
+            "DECISION-KV kmQuaternionRotationMatrix::pMatrix degraded:slice-use-unsupported"
+        ),
+        "{receipts}"
+    );
+}
+
+/// **Control 1.** The same array-local source with a TYPED destination stays
+/// out of scope: no family owns the right-hand side for an array source, so
+/// admitting it could only produce an ill-typed assignment.
+const ARRAY_LOCAL_SOURCE_TYPED_DESTINATION: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe fn Typed(mut pIn: *const f32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    let mut pMatrix: *mut f32 = m4x4.as_mut_ptr();
+    m4x4[5] = *pIn.offset(4);
+    pMatrix = &mut *m4x4.as_mut_ptr().offset(0 as isize) as *mut f32;
+    *pMatrix.offset(0) + *pMatrix.offset(5)
+ }
+"#;
+
+#[test]
+fn wave6s2_array_local_source_with_a_typed_destination_stays_out_of_scope() {
+    let (source, receipts) = emit_with_receipts(ARRAY_LOCAL_SOURCE_TYPED_DESTINATION);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        !receipts.contains("DECISION-KV Typed::pMatrix slice-shared")
+            && !receipts.contains("DECISION-KV Typed::pMatrix slice-mut"),
+        "a typed destination is not admitted by this arm: {receipts}"
+    );
+}
+
+/// **Control 2.** A source whose extent is NOT in its type — a pointer handed
+/// back by a call — is refused by the array arm (and by the pointer arm, whose
+/// receiver must be a local path).
+const CALL_RESULT_SOURCE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" { fn get_buf() -> *mut f32; }
+ pub unsafe fn FromCall(n: usize) -> f32 {
+    let mut p = 0 as *mut f32;
+    p = &mut *get_buf().offset(1 as isize) as *mut f32;
+    *p.offset(0) + *p.offset(1)
+ }
+"#;
+
+#[test]
+fn wave6s2_call_result_source_is_refused() {
+    let (source, receipts) = emit_with_receipts(CALL_RESULT_SOURCE);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        !receipts.contains("DECISION-KV FromCall::p slice-shared")
+            && !receipts.contains("DECISION-KV FromCall::p slice-mut"),
+        "{receipts}"
+    );
+}
