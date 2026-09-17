@@ -1,4 +1,4 @@
-use super::tests::{compile, cursor_decisions, emitted};
+use super::tests::{compile, cursor_decisions, cursor_dispositions, emitted};
 
 #[test]
 fn slicecursor_strrwd_backward_walk() {
@@ -1278,5 +1278,55 @@ pub unsafe fn header(buf: &mut [u8], p: *mut u8, n: isize) -> i32 {
         Some(
             "fn main() { let mut b = [0u8; 8]; let p = b.as_mut_ptr(); assert_eq!(unsafe { header(&mut b[..], p, 8) }, 1); let mut c = [0u8; 8]; let q = unsafe { c.as_mut_ptr().add(3) }; assert_eq!(unsafe { header(&mut c[..], q, 5) }, 2); let mut d = [0u8; 8]; let r = unsafe { d.as_mut_ptr().add(6) }; assert_eq!(unsafe { header(&mut d[..], r, 2) }, 0); }",
         ),
+    );
+}
+
+#[test]
+fn slicecursor_cursor_cast_to_a_void_formal_reaches_the_boundary_gate() {
+    // brotli `CreateCommands` / the fragment compressors (census #6's archive:
+    // `ip` and `next_ip` hold `RawBoundaryUnbuilt`, and the 14 forwarders'
+    // `DeclarationUnbuilt` sit behind them): a cursor CAST to an opaque pointer
+    // at a FOREIGN formal (`memcpy(dst, next_emit as *const c_void, n)`).
+    //
+    // The cursor's own raw view belongs inside the cast, which keeps its text —
+    // built here. What is NOT this family's to grant is the site's retention
+    // receipt: the raw boundary does not open a cast-to-opaque argument for a
+    // cursor subject, so the subject holds `RawBoundaryUnbuilt` (the use is
+    // built, the receipt is missing) where it held the undiagnosed `UseUnbuilt`
+    // before. A local callee's void parameter stays the region family's.
+    let input = r#"
+use std::os::raw::c_void;
+unsafe extern "C" { fn sink(p: *const c_void) -> u64; }
+pub unsafe fn emit(input: *const u8, n: usize) -> u64 {
+    let mut ip = input.offset(1);
+    let mut acc = 0u64;
+    let mut i = 0usize;
+    while i < n {
+        acc += *ip.offset(-1) as u64;
+        acc = acc.wrapping_add(sink(ip.offset(-1) as *const c_void));
+        ip = ip.offset(1);
+        i += 1;
+    }
+    acc
+}
+"#;
+    let dispositions = cursor_dispositions(input);
+    let of = |label: &str| {
+        dispositions
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, d)| d.as_str())
+            .unwrap_or("<no receipt>")
+    };
+    assert_eq!(
+        of("emit::ip"),
+        "Err(RawBoundaryUnbuilt)",
+        "the cast operand's view is not built, or the gate moved: {dispositions:?}"
+    );
+    let source = emitted(input);
+    save_fixture("cursor-cast-to-void-formal", input, &source);
+    assert!(
+        source.contains("sink(ip.offset(-1) as *const c_void)"),
+        "the held subject must keep the original text: {source}"
     );
 }

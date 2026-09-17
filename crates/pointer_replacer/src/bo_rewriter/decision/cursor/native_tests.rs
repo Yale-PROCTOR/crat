@@ -27,6 +27,31 @@ pub(super) fn cursor_decisions(input: &str) -> Vec<(String, bool)> {
     .expect("cursor decisions")
 }
 
+/// The cursor family's per-subject RECEIPT at the final pass: each subject label
+/// with its typed disposition (`Ok(())`, or `Err(<hold>)`) — the same field the
+/// census archive carries as `native_outcome`.
+pub(super) fn cursor_dispositions(input: &str) -> Vec<(String, String)> {
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        table
+            .cursor_receipts
+            .iter()
+            .filter_map(|receipt| {
+                table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| {
+                        subject.fn_did == receipt.owner && subject.hir_id == receipt.hir_id
+                    })
+                    .map(|(subject, _)| {
+                        (subject.label.clone(), format!("{:?}", receipt.disposition))
+                    })
+            })
+            .collect()
+    })
+    .expect("cursor dispositions")
+}
+
 pub(super) fn emitted(input: &str) -> String {
     let source = utils::compilation::run_compiler_on_str(input, |tcx| {
         let capture = crate::bo_rewriter::ast_transform::capture_ast(tcx).unwrap();

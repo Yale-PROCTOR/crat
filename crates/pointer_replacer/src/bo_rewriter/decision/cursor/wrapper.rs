@@ -1026,6 +1026,67 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         }
         if let hir::ExprKind::Call(callee, args) = e.kind {
             for (index, arg) in args.iter().enumerate() {
+                // A cursor (bare, or an offset chain rooted at it) CAST to a raw
+                // pointer at a FOREIGN formal — `memcpy(dst, next_emit as *const
+                // c_void, n)`, brotli's fragment compressors. The callee consumes
+                // an opaque address, so the cursor's own raw view goes inside the
+                // cast and the cast keeps its text; the boundary owns the site's
+                // retention receipt, and a site it does not open stays held. A
+                // LOCAL callee's void parameter is the region family's subject,
+                // not this one's.
+                if let hir::ExprKind::Cast(operand, _) = arg.kind
+                    && source_binding(self.ctx.tcx, self.subject.fn_did, operand)
+                        == Some(self.subject.hir_id)
+                    && matches!(
+                        self.ctx.tcx.typeck(self.subject.fn_did).expr_ty(arg).kind(),
+                        ty::RawPtr(..)
+                    )
+                    && let ty::FnDef(did, _) =
+                        *self.ctx.tcx.typeck(self.subject.fn_did).expr_ty(callee).kind()
+                    // Foreign = not a local fn ITEM with a body: a callee declared
+                    // in an `extern` block has a local `DefId` too.
+                    && did.as_local().is_none_or(|did| {
+                        !matches!(self.ctx.tcx.hir_node_by_def_id(did), hir::Node::Item(item)
+                            if matches!(item.kind, hir::ItemKind::Fn { .. }))
+                    })
+                {
+                    let view = if self.subject.mutable {
+                        "as_mut_ptr"
+                    } else {
+                        "as_ptr"
+                    };
+                    let opens = self.ctx.raw_boundary.is_none_or(|rb| {
+                        rb.opens_argument(
+                            (self.subject.fn_did, self.subject.hir_id),
+                            arg.span,
+                            index,
+                        )
+                    });
+                    match self.index(operand) {
+                        Ok(_) if !opens => {
+                            self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
+                        }
+                        Ok(d) if local(operand) == Some(self.subject.hir_id) => {
+                            self.push(
+                                operand,
+                                format!("{}.{view}()", self.view()),
+                                "raw-op-cursor-t1",
+                            );
+                            let _ = d;
+                        }
+                        Ok(d) => {
+                            self.push(
+                                operand,
+                                format!("{}.offset_by({d}).{view}()", self.view()),
+                                "raw-op-cursor-t1",
+                            );
+                        }
+                        Err(hold) => {
+                            self.hold.get_or_insert(hold);
+                        }
+                    }
+                    continue;
+                }
                 // An offset chain rooted at this cursor handed to a raw formal
                 // (`strcmp(s.offset(k), ..)`): the chain is the derived cursor
                 // value at the argument, and the boundary's own Arm-A site
