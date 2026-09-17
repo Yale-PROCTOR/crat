@@ -9319,8 +9319,22 @@ fn append_field_load_declaration_plans(table: &mut decision::DecisionTable) -> R
     use bridge_receipt::SignatureClassId;
 
     let mut declarations = Vec::new();
-    for transaction in &table.field_transactions.applied {
-        for (node, emitted_type) in &transaction.load_locals {
+    // W6F-5: a local that decays an inline array field to a pointer needs the
+    // same explicit declaration as a field-load local — the surface placement
+    // has no pointee span to splice without one.
+    let decayed: Vec<&(decision::field_reference::NodeKey, String)> = table
+        .field_transactions
+        .decayed_array_locals
+        .iter()
+        .collect();
+    for pairs in table
+        .field_transactions
+        .applied
+        .iter()
+        .map(|transaction| transaction.load_locals.iter().collect::<Vec<_>>())
+        .chain(std::iter::once(decayed))
+    {
+        for (node, emitted_type) in pairs {
             if let Some(existing) = table
                 .seams
                 .explicit_declarations

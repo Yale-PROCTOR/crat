@@ -1734,3 +1734,57 @@ fn w6f_the_seam_query_is_closed_on_every_form_it_does_not_own() {
         "{owned:?}"
     );
 }
+
+const INLINE_ARRAY: &str = include_str!("wave6f_fixture_inline_array.rs");
+
+/// Witness 26 (relay 034 / R451-4, **W6F-5**) — the inline array field taken
+/// as a pointer. RED at `8a777fa63`: every one of the six locals degrades,
+/// the two market shapes on `place-read-pointee` (the residue reason:
+/// `Construction::ArrayDecay`, "the type lives in a pointee or struct field",
+/// owed forward since 2026-08-12).
+#[test]
+fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
+    let observed = observe(INLINE_ARRAY);
+    let outcome = emitted("inline-array", INLINE_ARRAY);
+    let (source, _, reverted) = emitted_source(&outcome);
+    assert_eq!(reverted, 0, "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The market: both mutabilities, the extent the array type's own length.
+    for (label, needle) in [
+        (
+            "finish_block::last_entropy",
+            "let mut last_entropy: &mut [f64] = core::slice::from_raw_parts_mut(((*self_0).last_entropy_).as_mut_ptr(), 2usize);",
+        ),
+        (
+            "trace3::m",
+            "let mut m: &[f32] = core::slice::from_raw_parts(((*pIn).mat).as_ptr(), 9usize);",
+        ),
+    ] {
+        assert!(
+            decision_of(&observed, label).starts_with("Slice"),
+            "{label}: {}",
+            decision_of(&observed, label)
+        );
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+    assert!(
+        !flat.contains("FALLBACK_SLICE_EXTENT"),
+        "the length is in the array's own type; nothing may be fabricated\n{source}"
+    );
+
+    // The four controls, each for its own reason.
+    for label in [
+        "scratch_sum::p",                // a POINTER field: no length in its type
+        "local_array::p",                // a LOCAL array: wave-6s2's twin
+        "second_touch::last_entropy",    // the field place is touched again
+        "whole_overwrite::last_entropy", // the struct is overwritten whole
+        "widen::w",                      // a shared decay cast to `*mut` and written
+    ] {
+        assert!(
+            decision_of(&observed, label).starts_with("Degraded"),
+            "{label} must stay out: {}",
+            decision_of(&observed, label)
+        );
+    }
+}

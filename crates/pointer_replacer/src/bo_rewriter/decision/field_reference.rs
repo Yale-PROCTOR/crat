@@ -243,6 +243,10 @@ pub(crate) struct FieldCandidates {
     pub holds: Vec<(FieldKey, String, String, String)>,
     /// E5C-3 over moving owned locals (independent of any field).
     pub local_move_hoists: Vec<LocalMoveHoist>,
+    /// **W6F-5**: locals whose value is an INLINE ARRAY FIELD taken as a
+    /// pointer — `((*s).arr).as_mut_ptr()` where `arr: [T; N]`. The value is
+    /// `true` when the view is mutable.
+    decayed_array_views: FxHashMap<NodeKey, bool>,
 }
 
 impl FieldCandidates {
@@ -250,6 +254,29 @@ impl FieldCandidates {
         self.load_permits
             .get(&local)
             .and_then(|key| self.candidates.get(key))
+    }
+
+    /// **W6F-5 (R451-4)** — does this local take its type from an INLINE ARRAY
+    /// FIELD it decays to a pointer?
+    ///
+    /// `let mut last_entropy = ((*self_0).last_entropy_).as_mut_ptr();` where
+    /// `last_entropy_: [f64; 2]`. The local has no declared type, so the
+    /// ladder's residue gate degrades it `place-read-pointee`
+    /// (`Construction::ArrayDecay`, "the type lives in a pointee or struct
+    /// field", owed forward since 2026-08-12). Both halves of the type are in
+    /// the FIELD's declared type — the element type and the length — so the
+    /// slice this permits carries an evidence extent
+    /// (`select_length`'s `array_decay_length`, `sealed-contract:array-length`)
+    /// and never the fallback. The delivering precedent on the corpus is
+    /// lodepng `lodepng_compute_color_stats::p`.
+    /// `mutable` is the form the ladder wants. A `as_mut_ptr` decay licenses
+    /// either; an `as_ptr` decay licenses only the shared one, because the
+    /// initializer may carry a `as *mut T` cast and admitting a mutable view
+    /// over it would widen `&T` to `&mut T` (R395-2, never).
+    pub(crate) fn decayed_array_view(&self, local: NodeKey, mutable: bool) -> bool {
+        self.decayed_array_views
+            .get(&local)
+            .is_some_and(|&decay_mutable| decay_mutable || !mutable)
     }
 
     /// The form a stored subject must take so the store is a zero-syntax or
@@ -391,6 +418,10 @@ pub(crate) struct FieldTransactions {
     pub held: Vec<(String, String, String)>,
     /// E5C-3 over moving owned locals: `(owner, local, statement, read)`.
     pub local_move_hoists: Vec<(LocalDefId, NodeKey, Span, Span)>,
+    /// **W6F-5**: `(local, emitted type)` per inline-array-field decay, so the
+    /// declaration hook can splice a type onto a `let` that has none. These
+    /// belong to no field transaction — the field is `[T; N]`, not `*mut T`.
+    pub decayed_array_locals: Vec<(NodeKey, String)>,
 }
 
 impl FieldTransactions {
@@ -1159,6 +1190,164 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
 
 /// Derive the candidate transactions from the frozen model and the program's
 /// syntax. `withdrawn` carries the fields a previous finalization refused.
+/// **W6F-5 (relay 034 / R451-4)** — the inline array field taken as a pointer.
+///
+/// `let mut m = ((*pIn).mat).as_ptr();` where `mat: [f32; 9]`. The rewriter
+/// already classifies this as [`construction::Construction::ArrayDecay`] and
+/// already knows its length (`array_decay_length` reads the receiver's array
+/// type); what it lacks is a channel that says the local's TYPE may come from
+/// the field, so the residue gate degrades it `place-read-pointee` first.
+/// This is that channel.
+///
+/// # Soundness (conditional on a UB-free input, §28)
+///
+/// The input itself forms `&mut (*s).arr` at the decay — `as_mut_ptr` takes
+/// `&mut self` — so no new reference is created; what changes is that the
+/// borrow lives for the local's scope instead of the call expression. Two
+/// guards keep that extension from creating an alias the input did not have:
+///
+/// - **one mention**: the field place is named exactly once in the body, at
+///   the decay itself, so nothing reads or writes `(*s).arr` through the raw
+///   base while the view is live;
+/// - **no whole-struct write**: `*s = …` would write the view's own bytes
+///   through another path.
+///
+/// Other FIELDS of the same struct stay reachable through the raw base, and
+/// that is not an alias: they are disjoint locations, which both Stacked and
+/// Tree Borrows track per location. The extent is the array type's own length,
+/// so no extent is fabricated and the slice is exactly the object the input
+/// indexed. The view's mutability is the decay's own (`as_ptr` → `&[T]`,
+/// `as_mut_ptr` → `&mut [T]`): no `&T → &mut T` widening.
+fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
+    let tcx = program.tcx;
+    let mut out = FxHashMap::default();
+    for &owner in &program.functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(owner).body_id() else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let typeck = tcx.typeck(owner);
+
+        // Every `(base local, field name)` place named in the body, and every
+        // local whose pointee is assigned as a whole.
+        let mut mentions: FxHashMap<(HirId, String), usize> = FxHashMap::default();
+        let mut whole_writes: FxHashSet<HirId> = FxHashSet::default();
+        struct Places<'a> {
+            mentions: &'a mut FxHashMap<(HirId, String), usize>,
+            whole_writes: &'a mut FxHashSet<HirId>,
+        }
+        impl<'v> Visitor<'v> for Places<'_> {
+            fn visit_expr(&mut self, expr: &'v Expr<'v>) {
+                match expr.kind {
+                    ExprKind::Field(base, ident) => {
+                        if let Some(local) = deref_of_local(base) {
+                            *self
+                                .mentions
+                                .entry((local, ident.name.to_string()))
+                                .or_insert(0) += 1;
+                        }
+                    }
+                    ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) => {
+                        if let ExprKind::Unary(UnOp::Deref, inner) = lhs.kind
+                            && let Some(local) = path_local(inner)
+                        {
+                            self.whole_writes.insert(local);
+                        }
+                    }
+                    _ => {}
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+        Places {
+            mentions: &mut mentions,
+            whole_writes: &mut whole_writes,
+        }
+        .visit_body(body);
+
+        struct Decays<'tcx, 'a> {
+            tcx: TyCtxt<'tcx>,
+            typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+            owner: LocalDefId,
+            mentions: &'a FxHashMap<(HirId, String), usize>,
+            whole_writes: &'a FxHashSet<HirId>,
+            out: &'a mut FxHashMap<NodeKey, bool>,
+        }
+        impl<'v> Visitor<'v> for Decays<'_, '_> {
+            fn visit_stmt(&mut self, stmt: &'v rustc_hir::Stmt<'v>) {
+                if let rustc_hir::StmtKind::Let(let_stmt) = stmt.kind
+                    && let_stmt.ty.is_none()
+                    && let Some(init) = let_stmt.init
+                    && let rustc_hir::PatKind::Binding(_, binding, _, None) = let_stmt.pat.kind
+                {
+                    let mut expression = init;
+                    while let ExprKind::Cast(inner, _) = expression.kind {
+                        expression = inner;
+                    }
+                    if let ExprKind::MethodCall(segment, receiver, [], _) = expression.kind
+                        && let mutable = match segment.ident.name.as_str() {
+                            "as_mut_ptr" => true,
+                            "as_ptr" => false,
+                            _ => {
+                                intravisit::walk_stmt(self, stmt);
+                                return;
+                            }
+                        }
+                        // The receiver is a FIELD of a struct reached through a
+                        // pointer. A LOCAL array's decay is wave-6s2's twin
+                        // (W6S2-5b) and is deliberately not this arm.
+                        && let ExprKind::Field(base, ident) = receiver.kind
+                        && let Some(base_local) = deref_of_local(base)
+                        // and its type carries the length.
+                        && matches!(
+                            self.typeck.expr_ty(receiver).peel_refs().kind(),
+                            TyKind::Array(..)
+                        )
+                        && self
+                            .mentions
+                            .get(&(base_local, ident.name.to_string()))
+                            .copied()
+                            == Some(1)
+                        && !self.whole_writes.contains(&base_local)
+                    {
+                        let _ = self.tcx;
+                        self.out.insert((self.owner, binding), mutable);
+                    }
+                }
+                intravisit::walk_stmt(self, stmt);
+            }
+        }
+        Decays {
+            tcx,
+            typeck,
+            owner,
+            mentions: &mentions,
+            whole_writes: &whole_writes,
+            out: &mut out,
+        }
+        .visit_body(body);
+    }
+    out
+}
+
+/// The local a place expression derefs, for `(*p).f` and `p.f` alike.
+fn deref_of_local(base: &Expr<'_>) -> Option<HirId> {
+    match base.kind {
+        ExprKind::Unary(UnOp::Deref, inner) => path_local(inner),
+        _ => path_local(base),
+    }
+}
+
+fn path_local(expr: &Expr<'_>) -> Option<HirId> {
+    match expr.kind {
+        ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+            Res::Local(id) => Some(id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub(crate) fn derive(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1168,6 +1357,7 @@ pub(crate) fn derive(
 ) -> FieldCandidates {
     let tcx = program.tcx;
     let mut out = FieldCandidates::default();
+    out.decayed_array_views = decayed_array_views(program);
     let struct_dids: FxHashSet<LocalDefId> = program.structs.iter().copied().collect();
     let mutability = mutability_analysis(program);
     let fatness = fatness_analysis(program);
@@ -3002,6 +3192,42 @@ pub(crate) fn finalize(
         .iter()
         .map(|h| (h.owner, h.local, h.statement, h.read))
         .collect();
+    // W6F-5: the decayed array views that the ladder settled as slices carry
+    // their declaration here (the type comes from the local's own pointee and
+    // the decision's form, exactly as a field-load local's does).
+    for (local, _) in &candidates.decayed_array_views {
+        let Some((subject, decision)) = table
+            .entries
+            .iter()
+            .find(|(s, _)| (s.fn_did, s.hir_id) == *local)
+        else {
+            continue;
+        };
+        // Exhaustive, not `matches!`: the ratchet
+        // `production_decision_consumers_are_exhaustive` is right that a new
+        // form this arm does not name is a form that escapes it.
+        match decision {
+            Decision::Slice { .. } => {}
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => continue,
+        }
+        if !candidates.decayed_array_view(*local, subject.mutable) {
+            continue;
+        }
+        let Some(pointee) = local_pointee(tcx, subject) else { continue };
+        let Some(emitted) = super::declaration::emitted_type(decision, &pointee, None) else {
+            continue;
+        };
+        out.decayed_array_locals.push((*local, emitted));
+    }
+    out.decayed_array_locals.sort_by_key(|((owner, local), _)| {
+        (owner.local_def_index.as_u32(), local.local_id.as_u32())
+    });
     let mut refused = BTreeMap::new();
     for (key, _, field, cause) in &candidates.holds {
         let struct_path = tcx.def_path_str(key.struct_did.to_def_id());

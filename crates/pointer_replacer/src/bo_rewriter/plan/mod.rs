@@ -1705,13 +1705,22 @@ pub(crate) struct Plan {
 }
 
 /// wave-6f: does a field transaction plan this local's explicit declaration?
+///
+/// W6F-5: an inline-array-field decay plans one the same way, and is listed
+/// beside the transactions rather than inside one — its field is `[T; N]`, so
+/// no transaction owns it.
 fn typed_field_load(table: &DecisionTable, subject: &super::decision::Subject) -> bool {
     let node = (subject.fn_did, subject.hir_id);
-    table
+    (table
         .field_transactions
         .applied
         .iter()
         .any(|transaction| transaction.load_locals.iter().any(|(n, _)| *n == node))
+        || table
+            .field_transactions
+            .decayed_array_locals
+            .iter()
+            .any(|(n, _)| *n == node))
         && table
             .seams
             .explicit_declarations

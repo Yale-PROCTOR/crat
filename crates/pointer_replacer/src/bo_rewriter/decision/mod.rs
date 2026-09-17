@@ -1941,6 +1941,15 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // supplies keeps the form the ladder gave it — the residue below is
         // for locals with no such source.
         Decision::Slice { .. } if source_typed_local::permits(ctx, subject) => decision,
+        // W6F-5: the array field supplies the local's type; the explicit
+        // declaration is planned beside the slice construction.
+        Decision::Slice { mutable, .. }
+            if ctx.field_reference.is_some_and(|fields| {
+                fields.decayed_array_view((subject.fn_did, subject.hir_id), mutable)
+            }) =>
+        {
+            decision
+        }
         Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => degrade(
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
@@ -2468,6 +2477,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             && field_reference
                 .and_then(|fields| fields.load_permit((subject.fn_did, subject.hir_id)))
                 .is_none()
+            // W6F-5: a local that decays an INLINE ARRAY FIELD to a pointer
+            // takes its type from that field — element type and length both.
+            && !field_reference.is_some_and(|fields| {
+                fields.decayed_array_view((subject.fn_did, subject.hir_id), subject.mutable)
+            })
         {
             return degrade(subject, decl_site, residual_reason(subject.ctor.as_ref()));
         }
