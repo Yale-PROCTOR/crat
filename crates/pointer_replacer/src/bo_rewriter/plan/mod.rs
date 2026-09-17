@@ -1389,9 +1389,11 @@ pub(crate) fn finalize_signature_classes(
             SignatureClassId::of(receiver.callee),
         )
     }));
-    // wave-6b: a region receiver's caller class depends on its accessor's.
+    // wave-6b: a region receiver's caller class depends on its accessor's, and
+    // a chain's two links are one unit in both directions (R447-4).
     dependency_edges.extend(super::decision::void_region::receiver_dependencies(table));
     let dependency_edges = super::revert_closure::narrow(table, dependency_edges, planned);
+    dependency_edges.extend(super::decision::void_region::chain_dependencies(table));
     for (dependent, dependency) in dependency_edges {
         if dependent == dependency || !by_class.contains_key(&dependency) {
             continue;
@@ -1408,6 +1410,15 @@ pub(crate) fn finalize_signature_classes(
                     .into_iter()
                     .map(|reason| format!("blocked-subject:{reason}")),
             );
+        }
+    }
+    // wave-6b (R447-4): a chain whose links disagree holds whole — a surviving
+    // sibling body would otherwise name a signature the delivered link changed.
+    for id in super::decision::void_region::chain_holds(table) {
+        if let Some(class) = by_class.get_mut(&id) {
+            class
+                .block_reasons
+                .push("void-region-chain-not-whole".to_owned());
         }
     }
     for &did in pre_reverted {

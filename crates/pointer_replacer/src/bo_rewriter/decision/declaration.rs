@@ -162,6 +162,10 @@ pub(crate) fn emitted_type(
     pointee: &str,
     lifetime: Option<&str>,
 ) -> Option<String> {
+    // wave-6b (R447-4): one spelling for a void element in a safe form. Every
+    // producer of an emitted type passes through here, so the agreement holds
+    // by construction rather than by each rule remembering it.
+    let pointee = super::void_pointee::byte_element(pointee);
     let (mutable, slice, optional) = match decision {
         Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => {
             (*mutable, false, false)
@@ -173,9 +177,11 @@ pub(crate) fn emitted_type(
             inner_mutable,
             ..
         } => {
-            let element = pointee
-                .strip_prefix("*const ")
-                .or_else(|| pointee.strip_prefix("*mut "))?;
+            let element = super::void_pointee::byte_element(
+                pointee
+                    .strip_prefix("*const ")
+                    .or_else(|| pointee.strip_prefix("*mut "))?,
+            );
             let lifetime = lifetime.map_or_else(String::new, |name| {
                 format!("'{} ", name.trim_start_matches('\''))
             });

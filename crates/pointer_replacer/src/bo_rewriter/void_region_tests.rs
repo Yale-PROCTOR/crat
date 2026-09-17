@@ -746,3 +746,160 @@ fn w6b_byte_recast_of_a_char_pointer_is_not_in_the_class() {
         "a byte-wide scalar has no byte view: {source}"
     );
 }
+
+/// **A void element in a SAFE form is spelled `u8`** (relay 015 item 1,
+/// R447-4). brotli's 49 first-cause compile failures at the census head are
+/// this one disagreement: a producer that spells the element from the DECLARED
+/// pointee emits `&mut [libc::c_void]` / `&[libc::c_void]` where the void
+/// families' neighbours emit `&mut [u8]` / `&[u8]`, and the two are different
+/// types at the same form, so the seam renders no edit and the crate stops
+/// compiling. Every emitted type passes through `declaration::emitted_type`.
+#[test]
+fn w6b_a_void_element_is_spelled_u8_in_every_safe_form() {
+    use super::decision::{Decision, declaration::emitted_type};
+    let slice = Decision::Slice {
+        mutable: true,
+        uses: Vec::new(),
+    };
+    let shared = Decision::Slice {
+        mutable: false,
+        uses: Vec::new(),
+    };
+    let reference = Decision::Ref { mutable: false };
+    let optional = Decision::Opt {
+        mutable: true,
+        slice: true,
+        uses: Vec::new(),
+    };
+    for spelling in [
+        "c_void",
+        "core::ffi::c_void",
+        "::core::ffi::c_void",
+        "std::ffi::c_void",
+        "libc::c_void",
+        "::libc::c_void",
+    ] {
+        assert_eq!(
+            emitted_type(&slice, spelling, None).as_deref(),
+            Some("&mut [u8]"),
+            "{spelling}"
+        );
+        assert_eq!(
+            emitted_type(&shared, spelling, None).as_deref(),
+            Some("&[u8]"),
+            "{spelling}"
+        );
+        assert_eq!(
+            emitted_type(&reference, spelling, None).as_deref(),
+            Some("&u8"),
+            "{spelling}"
+        );
+        assert_eq!(
+            emitted_type(&optional, spelling, None).as_deref(),
+            Some("Option<&mut [u8]>"),
+            "{spelling}"
+        );
+    }
+    // A nested form's INNER element takes the same spelling.
+    let nested = Decision::NestedSlice {
+        mutable: true,
+        inner_mutable: false,
+        uses: Vec::new(),
+    };
+    assert_eq!(
+        emitted_type(&nested, "*const libc::c_void", None).as_deref(),
+        Some("&mut [&[u8]]")
+    );
+    // Every other element is untouched, including one whose NAME contains the
+    // void spelling.
+    assert_eq!(
+        emitted_type(&slice, "uint8_t", None).as_deref(),
+        Some("&mut [uint8_t]")
+    );
+    assert_eq!(
+        emitted_type(&slice, "my_c_void_t", None).as_deref(),
+        Some("&mut [my_c_void_t]")
+    );
+}
+
+/// The emission of one fixture with a decision INJECTED at the plan boundary —
+/// `emit_tests::emit_injected`'s shape for a string fixture, so a later-stage
+/// withdrawal can be witnessed without coaxing one out of source.
+fn emitted_source_with(
+    input: &str,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> Result<String, String> {
+    match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let capture = super::ast_transform::capture_ast(tcx)?;
+            let (mut table, ctx) = super::decide_table_with_ctx(tcx)?;
+            inject(&mut table);
+            let emission = super::emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )?;
+            let held = emission.plan.held_classes();
+            let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+                &held,
+                &std::collections::BTreeSet::new(),
+                &table,
+            )?;
+            let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(
+                tcx,
+                &capture,
+                &reverts,
+                emission.plan.root_file.as_ref(),
+                &table,
+                Some(&emission.plan.terminal_call_plans),
+            )?;
+            files
+                .into_values()
+                .next()
+                .ok_or_else(|| "emitted no source file".to_owned())
+        },
+    ) {
+        Ok(inner) => inner,
+        Err(why) => Err(format!("{why:?}")),
+    }
+}
+
+/// **A chain is one unit at WITHDRAWAL time too** (relay 015 item 1, R447-4).
+///
+/// [`collect`] admits a chain only whole, but a family-stage withdrawal lands
+/// after it. brotli's census head shows what that costs: `HeadH40`'s body keeps
+/// `(AddrH40 as unsafe extern "C" fn(*mut c_void) -> *mut uint32_t)(extra)`
+/// while `AddrH40`'s parameter has become `&mut [u8]` — 45 of the 49 `c_void` ↔
+/// byte compile failures. Injected here as the withdrawal of ONE link.
+#[test]
+fn w6b_a_withdrawn_chain_link_takes_its_siblings() {
+    let withdraw_head = |table: &mut super::decision::DecisionTable| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.starts_with("HeadH40::") {
+                *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                    subject: subject.label.clone(),
+                    site: "<injected withdrawal>".to_owned(),
+                    reason: super::decision::DegradeReason::VoidPointee,
+                });
+            }
+        }
+    };
+    let source = emitted_source_with(H40, &withdraw_head).expect("AST output");
+    let flat = compact(&source);
+    let changed_a_signature = flat.contains("fnAddrH40(mutextra:&mut[u8])")
+        || flat.contains("fnHeadH40(mutextra:&mut[u8])")
+        || flat.contains("fnTinyHashH40(mutextra:&mut[u8])")
+        || flat.contains("fnBanksH40(mutextra:&mut[u8])");
+    let names_the_old_signature = flat.contains("asunsafeextern\"C\"fn(*mutcore::ffi::c_void)");
+    assert!(
+        !(changed_a_signature && names_the_old_signature),
+        "a link changed its signature while a sibling body still names the old \
+         one — the chain must hold whole: {source}"
+    );
+    assert!(
+        super::verify::type_checks_str(&source),
+        "the tree compiles with one link withdrawn: {source}"
+    );
+}

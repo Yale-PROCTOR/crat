@@ -52,6 +52,37 @@ pub(crate) fn has_void_pointee<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u32
     }
 }
 
+/// The element spelling a `c_void` pointee takes in a SAFE emitted form
+/// (wave-6b, R447-4): **`u8`**.
+///
+/// The header's reasoning, carried one step further. `c_void` is a one-byte
+/// type with two hidden variants, so `&c_void` / `&[c_void]` carries a byte of
+/// provenance and no usable value — and every family that DOES deliver a void
+/// buffer safely already spells its element `u8` (this lane's typed regions and
+/// byte views, the counted-void copies' `u8` / `MaybeUninit<u8>`). A producer
+/// that instead spells the element from the DECLARED pointee emits `[c_void]`
+/// against those neighbours' `[u8]`, and the two are different types: the
+/// emitted crate stops compiling at the seam even though both sides are the
+/// same form. One spelling, chosen once, here.
+///
+/// Raw forms are untouched: `*mut c_void` is the C interface's own type and
+/// every bridge that reaches one casts to it explicitly.
+pub(crate) fn byte_element(pointee: &str) -> &str {
+    const VOID: [&str; 6] = [
+        "c_void",
+        "core::ffi::c_void",
+        "::core::ffi::c_void",
+        "std::ffi::c_void",
+        "libc::c_void",
+        "::libc::c_void",
+    ];
+    if VOID.contains(&pointee.trim()) {
+        "u8"
+    } else {
+        pointee
+    }
+}
+
 /// Every subject whose declared type has a `c_void` pointee at any depth.
 pub(crate) fn collect(tcx: TyCtxt<'_>, subjects: &[Subject]) -> FxHashSet<(LocalDefId, HirId)> {
     let mut held = FxHashSet::default();

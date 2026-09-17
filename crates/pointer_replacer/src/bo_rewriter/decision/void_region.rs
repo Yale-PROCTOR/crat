@@ -109,6 +109,10 @@ pub(crate) struct Region {
     /// The span the rewrite covers; references to sibling accessors inside it
     /// disappear with it (see [`covers`]).
     pub(crate) replaced: Span,
+    /// The inner accessor this chain link continues, if any: the body names
+    /// that function's signature (`(Inner as unsafe extern "C" fn(*mut c_void)
+    /// -> *mut T)(p)`), so the two signatures are one unit (R447-4).
+    pub(crate) inner: Option<LocalDefId>,
 }
 
 impl Region {
@@ -631,6 +635,7 @@ pub(crate) fn collect(
                 bridge_kind: "void-region-view",
             }],
             replaced: chain.returned,
+            inner: chain.inner,
         };
         let Some(subject) = subjects.iter().find(|s| (s.fn_did, s.hir_id) == *key) else {
             continue;
@@ -659,6 +664,7 @@ pub(crate) fn collect(
             (subject.fn_did, subject.hir_id),
             Region {
                 shape: Shape::ByteView,
+                inner: None,
                 offset_bytes: 0,
                 len_bytes: Some(view.size),
                 element: "u8".to_owned(),
@@ -1331,6 +1337,87 @@ fn source_delivered(table: &super::DecisionTable, receiver: &Receiver) -> bool {
                 && decided_slice(d)
         }),
     }
+}
+
+/// Every class of a chain that is NOT whole in this table: one link's region
+/// is not the byte slice it contracted for (a later family stage withdrew it,
+/// or a composed rule decided it otherwise), so the SIBLING links' bodies —
+/// which name this link's signature inside
+/// `(Inner as unsafe extern "C" fn(*mut c_void) -> *mut T)(p)` — would keep a
+/// spelling that no longer exists. [`collect`] admits a chain only whole; this
+/// is the same rule read from the finished table, where the withdrawal is
+/// visible and a class dependency is not (a withdrawn link has no class for an
+/// edge to point at).
+pub(crate) fn chain_holds(
+    table: &super::DecisionTable,
+) -> Vec<crate::bo_rewriter::bridge_receipt::SignatureClassId> {
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+    let delivered = |owner: LocalDefId| {
+        table.entries.iter().any(|(s, d)| {
+            s.fn_did == owner
+                && table.void_region.contains_key(&(s.fn_did, s.hir_id))
+                && decided_slice(d)
+        })
+    };
+    let mut broken: Vec<LocalDefId> = Vec::new();
+    for ((owner, _), region) in &table.void_region {
+        let Some(inner) = region.inner else { continue };
+        if delivered(*owner) != delivered(inner) {
+            broken.push(*owner);
+            broken.push(inner);
+        }
+    }
+    // A chain is transitive: a broken link at any depth takes every link that
+    // reaches it, so the walk repeats until the set stops growing.
+    loop {
+        let before = broken.len();
+        for ((owner, _), region) in &table.void_region {
+            let Some(inner) = region.inner else { continue };
+            if (broken.contains(owner) || broken.contains(&inner))
+                && !(broken.contains(owner) && broken.contains(&inner))
+            {
+                broken.push(*owner);
+                broken.push(inner);
+            }
+        }
+        if broken.len() == before {
+            break;
+        }
+    }
+    broken.sort_by_key(|did| did.local_def_index.as_u32());
+    broken.dedup();
+    broken.into_iter().map(SignatureClassId::of).collect()
+}
+
+/// The class dependencies a CHAIN introduces — both ways, so the links are one
+/// atomic unit (R447-4; the planner puts a mutually-reaching pair in one
+/// dependency SCC, so this adds no cycle to its ordering).
+///
+/// Measured on brotli at the batch-9 census head: 45 of the 49 `c_void` ↔ byte
+/// compile failures are one link of an H4x chain changing its parameter while a
+/// sibling link keeps the body that names the OLD signature —
+/// `(AddrH40 as unsafe extern "C" fn(*mut c_void) -> *mut u32)(extra)` against
+/// an `AddrH40` whose parameter is now `&mut [u8]`. [`collect`] admits a chain
+/// only whole, but a LATER withdrawal is not its to see; this is that rule
+/// carried to the stage where withdrawals happen.
+pub(crate) fn chain_dependencies(
+    table: &super::DecisionTable,
+) -> Vec<(
+    crate::bo_rewriter::bridge_receipt::SignatureClassId,
+    crate::bo_rewriter::bridge_receipt::SignatureClassId,
+)> {
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+    table
+        .void_region
+        .iter()
+        .filter_map(|((owner, _), region)| region.inner.map(|inner| (*owner, inner)))
+        .flat_map(|(outer, inner)| {
+            [
+                (SignatureClassId::of(outer), SignatureClassId::of(inner)),
+                (SignatureClassId::of(inner), SignatureClassId::of(outer)),
+            ]
+        })
+        .collect()
 }
 
 /// The class dependency each delivered region receiver introduces: the
