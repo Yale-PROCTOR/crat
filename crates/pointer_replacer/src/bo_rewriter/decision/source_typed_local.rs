@@ -127,10 +127,15 @@ fn literal_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<LiteralValue> {
     let TyKind::RawPtr(pointee, mutability) = input.kind() else {
         return None;
     };
-    // A literal referent is read-only: a `*mut` binding over one would be a
-    // write path this rule may not license.
-    if mutability.is_mut()
-        || typeck.expr_ty(initializer) != input
+    // R453-4 (STOP 2 granted): the `*mut` spelling is C's const-cast idiom, not
+    // a write. Writing through a string literal is UB in the INPUT program, so
+    // under the standing soundness scope (§28, UB-free inputs) crat owes
+    // nothing on that path and the shared reference is the correct rendering.
+    // The corpus market is exactly this spelling — libtree's `bold_color` /
+    // `regular_color` and lil's `sep` are `(… as *const c_char) as *mut
+    // c_char`. `mutability` is therefore read for the RECEIPT, not the gate.
+    let _ = mutability;
+    if typeck.expr_ty(initializer) != input
         || initializer.span.from_expansion()
         || subject.binding_span.from_expansion()
         || !declaration::pointee_is_nameable(tcx, subject.fn_did, *pointee)
