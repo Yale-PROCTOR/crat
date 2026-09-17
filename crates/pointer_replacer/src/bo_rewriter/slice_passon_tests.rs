@@ -704,11 +704,31 @@ const ASSIGN_BACKWARD_DESTINATION: &str = r#"
 fn wave6s2_backward_assignment_destination_stays_out_of_scope() {
     let (source, receipts) = emit_with_receipts(ASSIGN_BACKWARD_DESTINATION);
     assert!(super::verify::type_checks_str(&source), "{source}");
-    assert!(source.contains("mut s = 0 as *const u8"), "{source}");
-    assert!(
-        receipts.contains("DECISION-KV Walk::s degraded:slice-use-unsupported"),
-        "a backward assignment keeps the use wall: {receipts}"
-    );
+    // R217-2(a), measured on batch-10 dry8: what this control fixes is that
+    // W6S2-5 does NOT admit a backward assignment. On this lane's own frame
+    // that shows as the use wall standing; on a composed frame the row is
+    // taken by the BIDIRECTIONAL family instead (R394-2) — the source becomes
+    // a cursor and the destination its element view — which is the routing
+    // this control asserts, not a widening of my rule. Both outcomes are
+    // spelled; no third one passes.
+    if receipts.contains("DECISION-KV Walk::data cursor-shared") {
+        assert!(
+            receipts.contains("DECISION-KV Walk::s opt-slice-shared")
+                || receipts.contains("DECISION-KV Walk::s slice-shared")
+                || receipts.contains("DECISION-KV Walk::s degraded:"),
+            "the bidirectional family owns the row: {receipts}"
+        );
+        assert!(
+            !joined(&source).contains("s = &(data)[l..]"),
+            "never my forward suffix for a backward delta: {source}"
+        );
+    } else {
+        assert!(source.contains("mut s = 0 as *const u8"), "{source}");
+        assert!(
+            receipts.contains("DECISION-KV Walk::s degraded:slice-use-unsupported"),
+            "a backward assignment keeps the use wall: {receipts}"
+        );
+    }
 }
 
 /// **The delivery witness (report 010).** The same destination shape with a
