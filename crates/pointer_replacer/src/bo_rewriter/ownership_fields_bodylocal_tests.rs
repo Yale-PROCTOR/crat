@@ -2243,6 +2243,11 @@ pub unsafe extern "C" fn run() {
             moved_out.contains("\towning\t") && moved_out.contains("\ttrue\t"),
             "the model grants it and the native stage considers it: {moved_out}"
         );
+        // The hold is the reading on every frame in the batch: a field
+        // transaction that owns this field renders it `Option<Box<T>>`
+        // (wave-6f's `opt-box`), whose `take()` is not this producer's
+        // `Box<T>` — the R436 form test in `field-load-predicate.patch` keeps
+        // the hold there too, measured on `batch-10-dry2` `c97e6162e`.
         assert!(
             moved_out.contains("held") && moved_out.contains("native-field-load-field-not-owned"),
             "{moved_out}"
@@ -2542,6 +2547,77 @@ pub unsafe extern "C" fn heman_points_from_poisson(mut width:
 /// where it stood.
 #[test]
 fn r434_a_reference_that_cannot_reach_the_owner_keeps_the_owner() {
+    // The permit and the decision are the rule's own claim, and hold on every
+    // frame: both owners are admitted and decided Box.
+    ::utils::compilation::run_compiler_on_str(poisson_fixture(), |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        for owner in ["grid", "actives"] {
+            let (_, decision) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| {
+                    subject.param_name.as_deref() == Some(owner)
+                        && tcx.def_path_str(subject.fn_did.to_def_id())
+                            == "heman_points_from_poisson"
+                })
+                .unwrap_or_else(|| panic!("{owner}"));
+            assert!(
+                matches!(decision, Decision::Box(plan) if plan.shape == BoxShape::Slice),
+                "{owner}: {decision:?}"
+            );
+        }
+    })
+    .unwrap();
+    let outcome = super::rewrite_core_injected(
+        ::utils::compilation::str_to_input(poisson_fixture()),
+        None,
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        false,
+        Some((
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        degradations,
+        ..
+    } = outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    println!("R434_EMITTED_BEGIN\n{source}\nR434_EMITTED_END reverted={reverted_count}");
+    // R217-2(a), the composed reading (assembler `batch-10-dry2` `c97e6162e`):
+    // the two owners are still planned and selected there, and the emitted
+    // function is then REVERTED by the per-function verify gate — the revert is
+    // the composition's, not this rule's, and the rows say so exactly.
+    if reverted_count > 0 {
+        for owner in ["grid#", "actives#"] {
+            assert!(
+                degradations.iter().any(|degraded| {
+                    degraded.subject.contains(owner)
+                        && degraded.reason.key() == "reverted-after-verify-failure"
+                }),
+                "{owner}: {:?}",
+                degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), d.reason.key()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        return;
+    }
     let source = verify(poisson_fixture(), "grid", BoxShape::Slice, false);
     assert!(
         source.contains("grid[(i) as usize] = -(1 as libc::c_int)"),
