@@ -716,8 +716,10 @@ fn owning_field_form(
     if let Some(form) = field_form_override::get(tcx, struct_did, field_index) {
         return Some(form);
     }
-    let _ = (tcx, table, struct_did, field_index);
-    None
+    // Composition arm (seat relay assembler/025, R452-5; ownership-fields 038
+    // STOP 1): wave-6f's `field_reference` IS in this composition, so the seam
+    // answers from their transactions instead of the lane-local `None`.
+    super::field_reference::owning_field_form(tcx, table, struct_did, field_index)
 }
 
 /// The composed answer, exercised in this line's own witnesses: a test names
