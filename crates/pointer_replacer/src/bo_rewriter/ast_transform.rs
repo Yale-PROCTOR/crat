@@ -2425,6 +2425,12 @@ struct A5RawGraftVisitor<'a> {
     reverts: &'a RevertSet,
     guard: &'a mut Composition,
     consumed: FxHashSet<(u32, u32)>,
+    /// **(α), relay 033.** Argument spans another class's `c`-arm seam owns.
+    /// The seam pass runs BEFORE this one, so such an argument's subtree is
+    /// already the inner's product; the wrapper's raw value is that product
+    /// rather than a re-rendering of the original text.
+    inner_arguments: &'a FxHashSet<(u32, u32)>,
+    inner_products_taken: usize,
     failure: Option<String>,
 }
 
@@ -2461,10 +2467,35 @@ impl MutVisitor for A5RawGraftVisitor<'_> {
                 return;
             }
         }
+        // (α): the CURRENT text of each argument, after the seam pass grafted
+        // whatever another class owns there. `args[i].span` keeps the original
+        // interval even when the node's `kind` was replaced, so the lookup is
+        // exact rather than textual.
+        let mut argument_products: FxHashMap<usize, String> = FxHashMap::default();
+        if let rustc_ast::ExprKind::Call(_, arguments) = &expression.kind {
+            for (index, argument) in arguments.iter().enumerate() {
+                let span = (argument.span.lo().0, argument.span.hi().0);
+                if self.inner_arguments.contains(&span) {
+                    argument_products
+                        .insert(index, rustc_ast_pretty::pprust::expr_to_string(argument));
+                }
+            }
+        }
+        let mut taken = 0usize;
         let views = call
             .views
             .iter()
             .map(|view| {
+                if let Some(product) = argument_products.get(&view.argument_index) {
+                    taken += 1;
+                    return (
+                        view.argument_index,
+                        product.clone(),
+                        view.target_type.clone(),
+                        view.adapted_expression.clone(),
+                        view.extent_expression.clone(),
+                    );
+                }
                 let input = view
                     .source_node
                     .is_some_and(|(owner, hir)| !self.reverts.keeps_subject(owner, hir));
@@ -2491,6 +2522,7 @@ impl MutVisitor for A5RawGraftVisitor<'_> {
                 }
             })
             .collect::<Vec<_>>();
+        self.inner_products_taken += taken;
         let stem = format!("__crat_a5_raw_{}", call.call_span.lo().0);
         let rendered = match super::c9::render_a5_raw_view_source(&source, &stem, &views) {
             Ok(rendered) => rendered,
@@ -4120,11 +4152,26 @@ fn transform_with<'tcx>(
         &mut guard,
         &a5_raw_calls.keys().copied().collect(),
     )?;
+    // (α), relay 033: the argument intervals another class's `c` arm owns and
+    // the seam pass has already grafted.
+    let a5_inner_arguments: FxHashSet<(u32, u32)> = table
+        .seams
+        .edits
+        .iter()
+        .filter(|edit| {
+            edit.bridge.arm == "c"
+                && !edit.zero_syntax
+                && reverts.keeps_edit(edit.owner_class, &edit.atom_ids)
+        })
+        .map(|edit| (edit.span.lo().0, edit.span.hi().0))
+        .collect();
     let mut a5_raw = A5RawGraftVisitor {
         calls: &a5_raw_calls,
         reverts,
         guard: &mut guard,
         consumed: FxHashSet::default(),
+        inner_arguments: &a5_inner_arguments,
+        inner_products_taken: 0,
         failure: None,
     };
     a5_raw.visit_crate(&mut krate);

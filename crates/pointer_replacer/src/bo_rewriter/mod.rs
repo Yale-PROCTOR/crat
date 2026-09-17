@@ -147,6 +147,8 @@ mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;
 
 #[cfg(test)]
+mod a5_inner_argument_tests;
+#[cfg(test)]
 mod additive_tests;
 /// **The AST application layer's bridge** — phases 1–2 of the migration back to
 /// standing decision 3. Test-only while the bar is measured; it becomes
@@ -1858,7 +1860,20 @@ fn verify_and_revert(
     // the seed is already the ruled definition.
     let files_edited = files.len();
     let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
+    // (α), relay 033: an A5 raw-view wrapper whose argument another class's C
+    // arm already renders is an AST-only composition — the wrapper takes the
+    // inner's product — so a string fixture must verify the AST round product,
+    // exactly as the nestings below do.
+    let a5_takes_an_inner_product = table.seams.a5_raw_calls.iter().any(|call| {
+        table.seams.edits.iter().any(|edit| {
+            edit.bridge.arm == "c"
+                && !edit.zero_syntax
+                && call.call_span.lo() < edit.span.lo()
+                && edit.span.hi() < call.call_span.hi()
+        })
+    });
     let nested_seam_composition = !table.seams.pair_raw_calls.is_empty()
+        || a5_takes_an_inner_product
         || emission_plan.by_file.values().any(|edits| {
             edits.iter().enumerate().any(|(index, _)| {
                 nested_kind_under_seam(edits, index)

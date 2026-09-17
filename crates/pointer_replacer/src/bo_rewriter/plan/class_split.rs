@@ -462,13 +462,16 @@ pub unsafe fn cleanup(m: *mut MemoryManager, self_0: *mut CostModel) {
 }
 "#;
 
-    /// The A5 seam path now renders the view; the row's NEXT wall is the
+    /// The A5 seam path now renders the view; the row's next wall WAS the
     /// cross-class interval collision between the callee-owned raw-view call
     /// rewrite and the caller class's own edit inside the same call (the
-    /// caller's `self_0` converts) — wave-5d's collision composition. Asserted
-    /// as measured: the template hold is gone, the collision hold is what
-    /// remains. (Rule inert → the exclusion is the template hold again; that
-    /// is fault F5.)
+    /// caller's `self_0` converts) — wave-5d's collision composition, which
+    /// this frame carries: (α) (relay 033) makes the wrapper's raw value the
+    /// caller's own product, so the pair composes and the row is no longer
+    /// excluded at all. Asserted as measured: the template hold is gone and no
+    /// exclusion remains. (Rule inert → the exclusion is the template hold
+    /// again; that is fault F5. wave-5d re-pinned this line when its (α)
+    /// removed the wall this comment named — R217-2(a), flagged by report.)
     #[test]
     fn a_pure_raw_expression_argument_takes_the_a5_passthrough_view() {
         let got = run(BROTLI_FREE_SHAPE);
@@ -479,8 +482,8 @@ pub unsafe fn cleanup(m: *mut MemoryManager, self_0: *mut CostModel) {
             got.subjects
         );
         assert_eq!(
-            exclusion, "terminal-not-applied:cross-class-interval-collision",
-            "the next wall is the collision composition (wave-5d):\n{}",
+            exclusion, "-",
+            "wave-5d's (α) composes the pair, so no exclusion remains:\n{}",
             got.subjects
         );
     }

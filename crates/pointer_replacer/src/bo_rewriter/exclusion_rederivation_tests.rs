@@ -1219,15 +1219,47 @@ mod a5_wrapper_subsumes_a_selected_view_bridge {
         }
     }
 
-    /// A different source form at the same interval is not the same conversion.
+    /// A different source form at the same interval is not the same
+    /// conversion — and since (α) (relay 033) it does not have to be: the
+    /// wrapper takes the inner's PRODUCT as its raw value instead of
+    /// re-rendering the argument, so a different conversion composes exactly
+    /// like a duplicate one. What still collides is an inner with NO product
+    /// (the two controls below).
     #[test]
-    fn a_different_form_still_collides() {
+    fn a_different_form_composes_on_the_inner_product() {
         with_two(|callee, caller| {
             let f = plan::finalize_class_inputs(vec![
                 wrapper(callee, caller, "raw", ClassSiteState::EditReady),
                 inner(caller, "slice-mut-to-raw-mut", "slice-mut", ARG2),
             ]);
-            assert!(!f.collisions.is_empty());
+            assert!(f.collisions.is_empty(), "{:#?}", f.collisions);
+            assert!(f.classes[&callee].depends_on.contains(&caller));
+        });
+    }
+
+    /// **The (α) control: an inner with no rendered product still collides.**
+    /// A zero-syntax inner site has nothing for the wrapper to take, so the
+    /// two renderings of one interval remain a real conflict.
+    #[test]
+    fn a_zero_syntax_inner_still_collides() {
+        with_two(|callee, caller| {
+            let mut site = ClassSite::edit(
+                caller,
+                caller,
+                Arm::C,
+                "lib.rs",
+                ARG2.0,
+                ARG2.1,
+                "raw-cast-const",
+            );
+            site.expected_form = "raw".to_owned();
+            site.found_form = "slice-mut".to_owned();
+            site.state = ClassSiteState::ZeroSyntaxReady;
+            let f = plan::finalize_class_inputs(vec![
+                wrapper(callee, caller, "raw", ClassSiteState::EditReady),
+                ClassInput::new(caller, RequiredArmSet::default()).with_site(site),
+            ]);
+            assert!(!f.collisions.is_empty(), "{:#?}", f.collisions);
         });
     }
 

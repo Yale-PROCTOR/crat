@@ -683,13 +683,35 @@ fn a5_wrapper_composition(
         {
             None => true,
             Some(view) => {
-                inner.key.arm == "c"
-                    && view.key.lo == inner.key.lo
+                let same_interval = view.key.lo == inner.key.lo
                     && view.key.hi == inner.key.hi
                     && view.state == ClassSiteState::EditReady
+                    && inner.key.arm == "c";
+                // The inner is a DUPLICATE of what the wrapper renders: same
+                // interval, same source form, both converting to raw (the 100
+                // rows of `2e4f3288`'s market). The wrapper's own rendering is
+                // an equivalent one, so it may overwrite it.
+                let duplicate_rendering = same_interval
                     && view.expected_form == "raw"
                     && inner.expected_form == "raw"
-                    && view.found_form == inner.found_form
+                    && view.found_form == inner.found_form;
+                // **(α), relay 033.** The inner is a DIFFERENT product at the
+                // same interval — the caller's own bridge to raw, where the
+                // wrapper would re-render the argument from its source form
+                // (brotli's 68 rows: `BrotliFree(m, (*self_0).literal_costs_
+                // as *mut c_void)`, the callee's A5 wrapper against the
+                // caller's `typed-raw-temporary`). The AST pass grafts seams
+                // BEFORE the A5 pass, so the argument subtree already carries
+                // the inner's product when the wrapper is built; the wrapper
+                // takes that text as its raw value
+                // (`A5RawGraftVisitor::inner_arguments`) instead of the
+                // plan-time rendering, and the two edits compose with the
+                // outer depending on the inner. Held to a REAL inner edit:
+                // a zero-syntax site has no product to take.
+                let inner_product = same_interval
+                    && inner.state == ClassSiteState::EditReady
+                    && view.expected_form == "raw";
+                duplicate_rendering || inner_product
             }
         }
     };
