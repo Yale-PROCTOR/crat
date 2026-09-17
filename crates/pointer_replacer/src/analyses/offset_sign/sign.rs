@@ -21,10 +21,13 @@ use rustc_middle::{
 use rustc_mir_dataflow::{
     Analysis, Forward, JoinSemiLattice, ResultsCursor, fmt::DebugWithContext,
 };
-use rustc_span::def_id::LocalDefId;
+use rustc_span::def_id::{DefId, LocalDefId};
 use utils::graph;
 
-use crate::{analyses::borrow::StructFieldSlot, utils::rustc::RustProgram};
+use crate::{
+    analyses::borrow::StructFieldSlot,
+    utils::rustc::{RustProgram, is_borrow_only_foreign_buffer_arg},
+};
 
 // Analysis output
 
@@ -50,6 +53,25 @@ pub struct OffsetSignResult {
     pub access_signs: FxHashMap<LocalDefId, DenseBitSet<Local>>,
     pub field_access_signs: FxHashSet<StructFieldSlot>,
     pub(crate) cursor_constraints: CursorConstraints,
+}
+
+fn is_direct_borrow_only_foreign_buffer_arg(
+    tcx: TyCtxt<'_>,
+    fn_def_id: Option<DefId>,
+    arg_index: usize,
+) -> bool {
+    let Some(def_id) = fn_def_id else {
+        return false;
+    };
+    if def_id.as_local().is_some_and(|local_def_id| {
+        !matches!(
+            tcx.hir_node_by_def_id(local_def_id),
+            rustc_hir::Node::ForeignItem(_)
+        )
+    }) {
+        return false;
+    }
+    is_borrow_only_foreign_buffer_arg(tcx.item_name(def_id).as_str(), arg_index)
 }
 /// abstract-value lattice combining concrete constants with sign
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1341,9 +1363,10 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                 );
             }
         } else {
-            for arg in args {
+            for (arg_index, arg) in args.iter().enumerate() {
                 if arg.node.ty(self.body, self.tcx).is_raw_ptr()
-                    && let Operand::Copy(place) | Operand::Move(place) = arg.node
+                    && let Operand::Copy(place) | Operand::Move(place) = &arg.node
+                    && !is_direct_borrow_only_foreign_buffer_arg(self.tcx, fn_def_id, arg_index)
                 {
                     self.unmodeled_call_nodes.insert((self.def_id, place.local));
                 }

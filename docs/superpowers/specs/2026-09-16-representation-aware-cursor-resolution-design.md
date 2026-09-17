@@ -213,7 +213,12 @@ keeps the current visitation and insertion behavior for result parity.
 Call-boundary classification first excludes `is_pointer_offset_like_call` and
 any future primitive handled by a dedicated constraint rule. Among the remaining
 calls, every pointer-valued argument or destination of a call that is not a
-modeled direct local `FnDef` is recorded in `unmodeled_call_nodes`.
+modeled direct local `FnDef` is recorded in `unmodeled_call_nodes`, except a
+recognized buffer argument of a resolved direct foreign call whose existing HIR
+adapter policy treats that argument as borrow-only and non-escaping. The shared
+name/argument-position policy covers the buffer arguments of `memcpy`, `memmove`,
+`memchr`, `memset`, and `strncpy`. Pointer-valued destinations, unknown foreign
+calls, and indirect calls remain unmodeled boundaries.
 
 The existing edge direction is preserved. An edge `A -> B` means:
 
@@ -654,7 +659,10 @@ finish before any write so the result cannot be partially applied.
   caller-before-callee and callee-before-caller function order while preserving
   the characterized legacy outputs.
 - Mark caller arguments and destinations protected for indirect calls through
-  local and struct-field function pointers, and for foreign calls.
+  local and struct-field function pointers, and for unknown foreign calls.
+- Exclude only the recognized borrow-only buffer arguments of resolved direct
+  foreign calls from unmodeled protection; keep pointer-valued destinations
+  protected and prove the corresponding HIR raw-pointer adapters still compile.
 - Assert that a negative pointer-offset operation creates a direct seed without
   marking its receiver or safety component as unmodeled.
 

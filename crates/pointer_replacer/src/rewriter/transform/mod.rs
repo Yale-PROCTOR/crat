@@ -44,7 +44,7 @@ use crate::{
         borrow::StructFieldSlot, fn_ptr_groups::FnPtrGroups,
         fn_ptr_rewrite_decision::FnPtrRewriteDecision,
     },
-    utils::rustc::{RustProgram, is_c_exposed_fn},
+    utils::rustc::{RustProgram, is_borrow_only_foreign_buffer_arg, is_c_exposed_fn},
 };
 
 pub(crate) struct TransformVisitor<'a, 'tcx> {
@@ -11454,19 +11454,26 @@ fn hir_is_borrow_only_foreign_buffer_arg(
     expr: &hir::Expr<'_>,
     arg_index: usize,
 ) -> bool {
-    if hir_called_local_fn(tcx, expr).is_some() {
-        return false;
-    }
-    let Some(name) = hir_call_name(expr) else {
+    let hir::ExprKind::Call(func, _) = hir_unwrap_casts(expr).kind else {
         return false;
     };
-    match name.as_str() {
-        "memcpy" | "memmove" => arg_index < 2,
-        "memchr" => arg_index == 0,
-        "memset" => arg_index == 0,
-        "strncpy" => arg_index < 2,
-        _ => false,
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(func).kind else {
+        return false;
+    };
+    let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res else {
+        return false;
+    };
+    if def_id.as_local().is_some_and(|local_def_id| {
+        !matches!(
+            tcx.hir_node_by_def_id(local_def_id),
+            hir::Node::ForeignItem(_)
+        )
+    }) {
+        return false;
     }
+    path.segments.last().is_some_and(|segment| {
+        is_borrow_only_foreign_buffer_arg(segment.ident.name.as_str(), arg_index)
+    })
 }
 
 fn hir_free_like_arg_local_id<'tcx>(
@@ -16509,6 +16516,62 @@ mod tests {
                     replacement_kind: PtrKind::Slice(i % 2 != 0),
                 });
                 check(tcx, sigs, kinds, demotions);
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn borrow_only_foreign_buffer_classifier_rejects_local_static_fn_pointer() {
+        utils::compilation::run_compiler_on_str(
+            r#"
+            unsafe fn passthrough(
+                destination: *mut u8,
+                _source: *const u8,
+                _count: usize,
+            ) -> *mut u8 {
+                destination
+            }
+
+            static memcpy: unsafe fn(*mut u8, *const u8, usize) -> *mut u8 = passthrough;
+
+            pub unsafe fn caller(destination: *mut u8, source: *const u8, count: usize) {
+                let _ = memcpy(destination, source, count);
+            }
+            "#,
+            |tcx| {
+                struct CallVisitor<'tcx> {
+                    tcx: TyCtxt<'tcx>,
+                    borrow_only: Vec<bool>,
+                }
+
+                impl<'tcx> hir::intravisit::Visitor<'tcx> for CallVisitor<'tcx> {
+                    type NestedFilter = OnlyBodies;
+
+                    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+                        self.tcx
+                    }
+
+                    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                        if hir_call_name(expr).is_some_and(|name| name.as_str() == "memcpy") {
+                            self.borrow_only
+                                .push(hir_is_borrow_only_foreign_buffer_arg(self.tcx, expr, 0));
+                        }
+                        hir::intravisit::walk_expr(self, expr);
+                    }
+                }
+
+                let caller = crate::rewriter::collect_input(tcx)
+                    .functions
+                    .into_iter()
+                    .find(|def_id| tcx.item_name(def_id.to_def_id()).as_str() == "caller")
+                    .unwrap();
+                let mut visitor = CallVisitor {
+                    tcx,
+                    borrow_only: Vec::new(),
+                };
+                visitor.visit_body(tcx.hir_body_owned_by(caller));
+                assert_eq!(visitor.borrow_only, [false]);
             },
         )
         .unwrap();

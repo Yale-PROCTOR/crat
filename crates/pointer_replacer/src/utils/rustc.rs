@@ -28,3 +28,12 @@ pub(crate) fn is_c_exposed_fn(
                     .is_some_and(|s| c_exposed_fns.contains(s.as_str()))
             })
 }
+
+pub(crate) fn is_borrow_only_foreign_buffer_arg(name: &str, arg_index: usize) -> bool {
+    match name {
+        "memcpy" | "memmove" => arg_index < 2,
+        "memchr" | "memset" => arg_index == 0,
+        "strncpy" => arg_index < 2,
+        _ => false,
+    }
+}

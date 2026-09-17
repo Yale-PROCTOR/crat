@@ -1932,6 +1932,53 @@ fn foreign_call_is_unmodeled() {
 }
 
 #[test]
+fn known_borrow_only_foreign_buffer_args_are_not_unmodeled() {
+    ::utils::compilation::run_compiler_on_str(
+        r#"
+        unsafe extern "C" {
+            fn memcpy(
+                destination: *mut core::ffi::c_void,
+                source: *const core::ffi::c_void,
+                count: usize,
+            ) -> *mut core::ffi::c_void;
+        }
+
+        pub unsafe fn caller(
+            destination: *mut core::ffi::c_void,
+            source: *const core::ffi::c_void,
+            count: usize,
+        ) -> *mut core::ffi::c_void {
+            memcpy(destination, source, count)
+        }
+        "#,
+        |tcx| {
+            let rust_program = build_rust_program(tcx);
+            let caller = function_id(&rust_program, "caller");
+            let calls = call_snapshots(tcx, caller);
+            assert_eq!(calls.len(), 1);
+            let call = &calls[0];
+            assert!(
+                call.target_name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with("::memcpy"))
+            );
+            let (destination, destination_is_raw) = call.argument_roots[0];
+            let (source, source_is_raw) = call.argument_roots[1];
+            assert!(destination_is_raw);
+            assert!(source_is_raw);
+            assert!(call.destination_is_raw);
+
+            let result = offset_sign_analysis(&rust_program);
+            let boundaries = &result.cursor_constraints.unmodeled_call_nodes;
+            assert!(!boundaries.contains(&(caller, destination)));
+            assert!(!boundaries.contains(&(caller, source)));
+            assert!(boundaries.contains(&(caller, call.destination_root)));
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn pointer_offset_call_is_seed_not_unmodeled() {
     ::utils::compilation::run_compiler_on_str(
         "

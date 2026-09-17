@@ -17,7 +17,7 @@
 - Existing `access_signs` and `field_access_signs` must continue to come only from private legacy graphs with current source-order behavior.
 - Retained `local_edges` must be the complete non-return graph; retained `return_edges` must contain only complete modeled direct-local return edges.
 - Raw is the only absorbing representation. Cursors, including frozen cursors, propagate demand; proven compiler temporaries are transparent; reached unsupported boundaries poison their weak safety component.
-- Struct fields, return owners, function-pointer groups, signature-locked functions, unmodeled calls, unresolved mappings, missing sign provenance, and `CursorFieldOffsetAlias` provenance remain protected.
+- Struct fields, return owners, function-pointer groups, signature-locked functions, unmodeled calls, unresolved mappings, missing sign provenance, and `CursorFieldOffsetAlias` provenance remain protected. Recognized borrow-only buffer arguments of resolved direct foreign calls are not unmodeled; unknown foreign calls, indirect calls, and pointer-valued destinations remain protected.
 - Exposure through `Config::c_exposed_fns` is not by itself a protection reason.
   Pointer and Interface must use the same item-name/`export_name` match, and a
   C-facing pipeline must run Interface so the exported raw-pointer ABI is unchanged.
@@ -306,11 +306,12 @@ Add:
 indirect_local_fn_pointer_call_is_unmodeled
 indirect_field_fn_pointer_call_is_unmodeled
 foreign_call_is_unmodeled
+known_borrow_only_foreign_buffer_args_are_not_unmodeled
 pointer_offset_call_is_seed_not_unmodeled
 direct_local_call_is_modeled_not_unmodeled
 ```
 
-For the first three, raw-pointer `Copy`/`Move` arguments and raw-pointer destinations must enter `unmodeled_call_nodes`; integer operands and function-pointer containers must not.
+For the first three, raw-pointer `Copy`/`Move` arguments and raw-pointer destinations must enter `unmodeled_call_nodes`; integer operands and function-pointer containers must not. The recognized direct-foreign test must exclude only adapter-backed borrow-only buffer arguments while retaining any raw-pointer destination.
 
 - [ ] **Step 2: Confirm the red state**
 
@@ -333,7 +334,14 @@ Apply:
 
 1. recognized pointer-offset primitive: execute the seed rule;
 2. `FnDef` in `modeled_functions`: add complete argument/return constraints;
-3. every other target: record an unmodeled boundary.
+3. resolved direct foreign `FnDef` with a recognized adapter-backed borrow-only
+   buffer argument: exclude only that argument from unmodeled protection;
+4. every other target: record an unmodeled boundary.
+
+Use one shared name/argument-position classifier for MIR collection and the
+existing HIR adapter policy. Each caller retains its own resolved-direct-call
+guard: never name-match an indirect call, and do not exempt a modeled local
+function with the same name.
 
 For private legacy graphs, preserve the existing constant-local-`FnDef` insertion behavior.
 
@@ -358,6 +366,9 @@ if destination.ty(self.body, self.tcx).ty.is_raw_ptr()
 ```
 
 Add no directed parameter or return edge for an unmodeled call. Projected destinations rely on field safety relationships.
+Known borrow-only foreign buffer arguments receive no invented edge either;
+their existing HIR adapter rewrites a finalized slice or cursor to a raw pointer
+at the call. Pointer-valued destinations remain unmodeled.
 
 - [ ] **Step 5: Run the boundary suite**
 

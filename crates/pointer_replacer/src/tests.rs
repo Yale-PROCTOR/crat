@@ -8807,6 +8807,60 @@ fn test_late_cursor_resolution_demotes_merge_sort_wrappers_at_raw_barrier() {
 }
 
 #[test]
+fn test_late_cursor_resolution_demotes_merge_sort_wrappers_with_direct_memcpy() {
+    // Regression: removing the direct-foreign buffer-argument exception from
+    // cursor boundary collection must retain these inputs and fail this test.
+    let merge_sort = MERGE_SORT_RAW_BARRIER.replace(
+        "    recurse(b, 0, size, a);",
+        r#"    memcpy(
+        b as *mut core::ffi::c_void,
+        a as *const core::ffi::c_void,
+        std::mem::size_of::<Sprite>().wrapping_mul(size as usize),
+    );
+    recurse(b, 0, size, a);"#,
+    );
+    let code = format!(
+        r#"
+extern "C" {{
+    fn memcpy(
+        dest: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        n: usize,
+    ) -> *mut core::ffi::c_void;
+}}
+
+{merge_sort}
+"#
+    );
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("merge_sort".to_string());
+    let (rewritten, _) = rewrite_with_config(&code, &config);
+    // Pointer emits the expanded Clone derive, which uses this nightly helper.
+    let checkable = format!("#![feature(derive_clone_copy)]\n{rewritten}");
+    ::utils::compilation::run_compiler_on_str(&checkable, ::utils::type_check).expect(&checkable);
+    let rewritten = rewritten.replace("crate::Sprite", "Sprite");
+
+    let signature = rewritten
+        .split_once("fn merge_sort")
+        .unwrap()
+        .1
+        .split_once('{')
+        .unwrap()
+        .0;
+    assert!(signature.contains("a: &mut [Sprite]"), "{rewritten}");
+    assert!(signature.contains("b: &mut [Sprite]"), "{rewritten}");
+    assert!(!signature.contains("SliceCursor"), "{rewritten}");
+    assert!(
+        rewritten.contains("memcpy((b).as_mut_ptr() as *mut _"),
+        "{rewritten}"
+    );
+    assert!(
+        rewritten.contains("(a).as_ptr() as *const _"),
+        "{rewritten}"
+    );
+}
+
+#[test]
 fn test_interproc_negative_offset_propagation() {
     run_test(
         r#"
