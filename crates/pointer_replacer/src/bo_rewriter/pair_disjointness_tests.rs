@@ -1133,7 +1133,6 @@ fn w6p_option_root_multi_view_certifies_under_the_nullable_root() {
 /// so the witness is kept `#[ignore]`d with that typed reason rather than
 /// weakened (report 006 STOP 1).
 #[test]
-#[ignore = "the batch-8 landed frame degrades two of the three views kind-raw, so the hoist's all-views-safe precondition does not hold; GREEN on batch-8-dry3 (report 005)"]
 fn w6p_option_root_multi_view_emits_with_the_hoist() {
     let (source, reverted, diags) = path_emission(BINN_LOAD, "binn-load");
     for diag in &diags {
