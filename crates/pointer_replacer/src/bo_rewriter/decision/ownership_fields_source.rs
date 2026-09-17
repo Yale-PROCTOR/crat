@@ -380,6 +380,25 @@ fn static_reference(
         _ => false,
     }
 }
+/// The place a reference addresses, peeled to its root expression: `x` for
+/// `&mut x.f`, `samples` for `&mut *samples.offset(i)`. Anything that is not a
+/// projection of a place (a call, a literal) is returned as it stands, and the
+/// caller refuses it.
+fn addressed_root<'tcx>(mut expression: &'tcx Expr<'tcx>) -> &'tcx Expr<'tcx> {
+    loop {
+        expression = match expression.kind {
+            ExprKind::Field(base, _)
+            | ExprKind::Index(base, _, _)
+            | ExprKind::Unary(rustc_hir::UnOp::Deref, base)
+            | ExprKind::Cast(base, _)
+            | ExprKind::AddrOf(_, _, base) => base,
+            // `p.offset(k)` and the other pointer-arithmetic methods: the place
+            // is rooted at the receiver.
+            ExprKind::MethodCall(_, receiver, _, _) => receiver,
+            _ => return expression,
+        };
+    }
+}
 fn root_path(expression: &Expr<'_>, binding: HirId) -> bool {
     matches!(expression.kind, ExprKind::Path(QPath::Resolved(_, path))
         if path.res == Res::Local(binding))
@@ -726,18 +745,18 @@ pub(crate) fn derive<'tcx>(
             return Err(SourceHold::Missing("native-aggregate-fields-supplied"));
         }
     }
-    // Whole-caller reference/closure absence is a deliberately narrow scope.
-    // Merely recognizing the scalar deref nested inside &*root is not enough.
-    // A string / byte-string literal is a `&'static` reference to static
-    // data (the corpus's assertion messages), and so is a `transmute` of one
-    // (the corpus's `__PRETTY_FUNCTION__` spelling); neither can alias the
-    // owner.
+    // A closure or inline asm can capture or name anything, and a reference
+    // VALUE this body did not create (a call's `&T` result) has unknown
+    // provenance: both refuse. A string / byte-string literal is a `&'static`
+    // reference to static data (the corpus's assertion messages), and so is a
+    // `transmute` of one (the corpus's `__PRETTY_FUNCTION__` spelling); neither
+    // can alias the owner. `&mut` expressions this body writes are judged by
+    // R434 below, once the owner's view aliases are known.
     if expressions.0.iter().any(|e| {
-        matches!(
-            e.kind,
-            ExprKind::AddrOf(..) | ExprKind::Closure(..) | ExprKind::InlineAsm(..)
-        ) || (matches!(typeck.expr_ty(e).kind(), TyKind::Ref(..))
-            && !static_reference(tcx, typeck, e))
+        matches!(e.kind, ExprKind::Closure(..) | ExprKind::InlineAsm(..))
+            || (matches!(typeck.expr_ty(e).kind(), TyKind::Ref(..))
+                && !matches!(e.kind, ExprKind::AddrOf(..))
+                && !static_reference(tcx, typeck, e))
     }) {
         return Err(SourceHold::UnsupportedOwnerUse);
     }
@@ -867,6 +886,27 @@ pub(crate) fn derive<'tcx>(
     // the source text is already valid against the delivered type. They are
     // covered uses with no edit (R431; the same shape `newNode`'s field
     // stores already take through F04's supplied set).
+    // R434 (heman's `points_from_{density,poisson}`): a reference this body
+    // takes can alias the owner only if it is rooted AT the owner or at one of
+    // its view aliases — every OTHER use of the owner is accounted below (a
+    // copy of the owner into another local is an uncovered raw use and refuses
+    // the permit), so no other local of this body holds this allocation's
+    // address. `&mut seed`, `&mut delta` and `&mut *samples.offset(i)` (a
+    // different allocation) are therefore harmless; `&mut *root.offset(i)` is
+    // not, and still refuses. The one channel this does not close is a foreign
+    // callee that RETAINS the owner through an out-parameter — the same
+    // retention evidence that licenses the boundary argument itself covers it
+    // (rule C, the native stage).
+    for expression in &expressions.0 {
+        let ExprKind::AddrOf(_, _, referent) = expression.kind else { continue };
+        let root = addressed_root(referent);
+        if !matches!(root.kind, ExprKind::Path(QPath::Resolved(_, path)) if matches!(path.res, Res::Local(_)))
+            || root_path(root, binding)
+            || view_alias_of(tcx, typeck, root, binding)
+        {
+            return Err(SourceHold::UnsupportedOwnerUse);
+        }
+    }
     let mut field_bases: BTreeSet<(u32, Span)> = BTreeSet::new();
     if constructor.shape == BoxShape::Sized {
         for e in &expressions.0 {

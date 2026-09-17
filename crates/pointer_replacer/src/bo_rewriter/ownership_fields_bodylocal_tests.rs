@@ -2278,3 +2278,343 @@ pub unsafe extern "C" fn run() {
     );
     assert_eq!(source.matches("::std::mem::drop(").count(), 1, "{source}");
 }
+
+/// heman's `heman_points_from_poisson`, as the derived substrate spells it
+/// (`benchmarks/rs-crown-derived/heman/lib.rs`): two `malloc`ed `c_int`
+/// buffers indexed throughout and freed at the end, in a body that also takes
+/// `&mut seed`, `&mut rvec`, `&mut delta` and `&mut *samples.offset(i)` — the
+/// last one a reference into ANOTHER allocation.
+fn poisson_fixture() -> &'static str {
+    r#"#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments, unused_variables, non_camel_case_types, non_snake_case)]
+pub mod libc {
+    pub use core::ffi::c_double;
+    pub use core::ffi::c_float;
+    pub use core::ffi::c_int;
+    pub use core::ffi::c_uint;
+    pub use core::ffi::c_ulong;
+    pub use core::ffi::c_void;
+}
+extern "C" {
+    fn malloc(n: libc::c_ulong) -> *mut libc::c_void;
+    fn free(p: *mut libc::c_void);
+    fn sqrtf(x: libc::c_float) -> libc::c_float;
+    fn ceil(x: libc::c_double) -> libc::c_double;
+}
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct kmVec2 { pub x: libc::c_float, pub y: libc::c_float }
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct heman_image_s {
+    pub width: libc::c_int,
+    pub height: libc::c_int,
+    pub nbands: libc::c_int,
+    pub data: *mut libc::c_float,
+}
+pub type heman_image = heman_image_s;
+pub type heman_points = heman_image_s;
+pub unsafe extern "C" fn heman_image_create(w: libc::c_int, h: libc::c_int, n: libc::c_int) -> *mut heman_image {
+    let mut img = malloc(::std::mem::size_of::<heman_image_s>() as libc::c_ulong) as *mut heman_image_s;
+    (*img).width = w;
+    (*img).height = h;
+    (*img).nbands = n;
+    (*img).data = malloc(((w * h * n) as libc::c_ulong).wrapping_mul(::std::mem::size_of::<libc::c_float>() as libc::c_ulong)) as *mut libc::c_float;
+    return img;
+}
+pub unsafe extern "C" fn randhash(seed: libc::c_uint) -> libc::c_uint {
+    return seed.wrapping_mul(1103515245 as libc::c_uint).wrapping_add(12345 as libc::c_uint);
+}
+pub unsafe extern "C" fn randhashf(seed: libc::c_uint, a: libc::c_float, b: libc::c_float) -> libc::c_float {
+    return a + (b - a) * (randhash(seed) as libc::c_float / 4294967295.0f32);
+}
+pub unsafe extern "C" fn sample_annulus(radius: libc::c_float, center: kmVec2, seed: *mut libc::c_uint) -> kmVec2 {
+    let mut r = kmVec2 { x: 0., y: 0. };
+    r.x = center.x + radius * randhash(*seed) as libc::c_float;
+    *seed = (*seed).wrapping_add(1);
+    r.y = center.y + radius * randhash(*seed) as libc::c_float;
+    return r;
+}
+pub unsafe extern "C" fn kmVec2Add(d: *mut kmVec2, a: *mut kmVec2, b: *mut kmVec2) -> *mut kmVec2 {
+    (*d).x = (*a).x + (*b).x;
+    (*d).y = (*a).y + (*b).y;
+    return d;
+}
+pub unsafe extern "C" fn kmVec2Subtract(d: *mut kmVec2, a: *mut kmVec2, b: *mut kmVec2) -> *mut kmVec2 {
+    (*d).x = (*a).x - (*b).x;
+    (*d).y = (*a).y - (*b).y;
+    return d;
+}
+pub unsafe extern "C" fn kmVec2Scale(d: *mut kmVec2, a: *mut kmVec2, s: libc::c_float) -> *mut kmVec2 {
+    (*d).x = (*a).x * s;
+    (*d).y = (*a).y * s;
+    return d;
+}
+pub unsafe extern "C" fn kmVec2LengthSq(a: *mut kmVec2) -> libc::c_float {
+    return (*a).x * (*a).x + (*a).y * (*a).y;
+}
+pub unsafe extern "C" fn heman_points_from_poisson(mut width:
+        libc::c_float, mut height: libc::c_float,
+    mut radius: libc::c_float) -> *mut heman_points {
+    let mut maxattempts = 30 as libc::c_int;
+    let mut rscale =
+        1.0f32 /
+            (2147483647 as libc::c_int as
+                                libc::c_uint).wrapping_mul(2 as
+                            libc::c_uint).wrapping_add(1 as libc::c_uint) as
+                libc::c_float;
+    let mut seed = 0 as libc::c_int as libc::c_uint;
+    let mut rvec = kmVec2 { x: 0., y: 0. };
+    rvec.y = radius;
+    rvec.x = rvec.y;
+    let mut r2 = radius * radius;
+    let mut cellsize =
+        radius / sqrtf(2 as libc::c_int as libc::c_float);
+    let mut invcell = 1.0f32 / cellsize;
+    let mut ncols =
+        ceil((width * invcell) as libc::c_double) as libc::c_int;
+    let mut nrows =
+        ceil((height * invcell) as libc::c_double) as libc::c_int;
+    let mut maxcol = ncols - 1 as libc::c_int;
+    let mut maxrow = nrows - 1 as libc::c_int;
+    let mut ncells = ncols * nrows;
+    let mut grid =
+        malloc((ncells as
+                            libc::c_ulong).wrapping_mul(::std::mem::size_of::<libc::c_int>()
+                        as libc::c_ulong)) as *mut libc::c_int;
+    let mut i = 0 as libc::c_int;
+    while i < ncells {
+        *grid.offset(i as isize) = -(1 as libc::c_int);
+        i += 1;
+    }
+    let mut actives =
+        malloc((ncells as
+                            libc::c_ulong).wrapping_mul(::std::mem::size_of::<libc::c_int>()
+                        as libc::c_ulong)) as *mut libc::c_int;
+    let mut nactives = 0 as libc::c_int;
+    let mut result =
+        heman_image_create(ncells, 1 as libc::c_int,
+            2 as libc::c_int);
+    let mut samples = (*result).data as *mut kmVec2;
+    let mut nsamples = 0 as libc::c_int;
+    let mut pt = kmVec2 { x: 0., y: 0. };
+    let fresh5 = seed;
+    seed = seed.wrapping_add(1);
+    pt.x = width * randhash(fresh5) as libc::c_float * rscale;
+    let fresh6 = seed;
+    seed = seed.wrapping_add(1);
+    pt.y = height * randhash(fresh6) as libc::c_float * rscale;
+    let fresh7 = nactives;
+    nactives = nactives + 1;
+    *actives.offset(fresh7 as isize) = nsamples;
+    *grid.offset(((pt.x * invcell) as libc::c_int +
+                            ncols * (pt.y * invcell) as libc::c_int) as isize) =
+        *actives.offset(fresh7 as isize);
+    let fresh9 = nsamples;
+    nsamples = nsamples + 1;
+    *samples.offset(fresh9 as isize) = pt;
+    while nsamples < ncells {
+        let fresh10 = seed;
+        seed = seed.wrapping_add(1);
+        let mut aindex =
+            (if randhashf(fresh10, 0 as libc::c_int as libc::c_float,
+                                nactives as libc::c_float) >
+                            (nactives - 1 as libc::c_int) as libc::c_float {
+                        (nactives - 1 as libc::c_int) as libc::c_float
+                    } else {
+                        let fresh11 = seed;
+                        seed = seed.wrapping_add(1);
+                        randhashf(fresh11, 0 as libc::c_int as libc::c_float,
+                            nactives as libc::c_float)
+                    }) as libc::c_int;
+        let mut sindex = *actives.offset(aindex as isize);
+        let mut found = 0 as libc::c_int;
+        let mut j = kmVec2 { x: 0., y: 0. };
+        let mut minj = kmVec2 { x: 0., y: 0. };
+        let mut maxj = kmVec2 { x: 0., y: 0. };
+        let mut delta = kmVec2 { x: 0., y: 0. };
+        let mut attempt: libc::c_int = 0;
+        attempt = 0 as libc::c_int;
+        while attempt < maxattempts && found == 0 {
+            pt =
+                sample_annulus(radius, *samples.offset(sindex as isize),
+                    &mut seed);
+            if !(pt.x < 0 as libc::c_int as libc::c_float ||
+                                    pt.x >= width || pt.y < 0 as libc::c_int as libc::c_float ||
+                            pt.y >= height) {
+                maxj = pt;
+                minj = maxj;
+                kmVec2Add(&mut maxj, &mut maxj, &mut rvec);
+                kmVec2Subtract(&mut minj, &mut minj, &mut rvec);
+                kmVec2Scale(&mut minj, &mut minj, invcell);
+                kmVec2Scale(&mut maxj, &mut maxj, invcell);
+                minj.x =
+                    (if 0 as libc::c_int >
+                                    (if maxcol > minj.x as libc::c_int {
+                                            minj.x as libc::c_int
+                                        } else { maxcol }) {
+                                0 as libc::c_int
+                            } else if maxcol > minj.x as libc::c_int {
+                                minj.x as libc::c_int
+                            } else { maxcol }) as libc::c_float;
+                maxj.x =
+                    (if 0 as libc::c_int >
+                                    (if maxcol > maxj.x as libc::c_int {
+                                            maxj.x as libc::c_int
+                                        } else { maxcol }) {
+                                0 as libc::c_int
+                            } else if maxcol > maxj.x as libc::c_int {
+                                maxj.x as libc::c_int
+                            } else { maxcol }) as libc::c_float;
+                minj.y =
+                    (if 0 as libc::c_int >
+                                    (if maxrow > minj.y as libc::c_int {
+                                            minj.y as libc::c_int
+                                        } else { maxrow }) {
+                                0 as libc::c_int
+                            } else if maxrow > minj.y as libc::c_int {
+                                minj.y as libc::c_int
+                            } else { maxrow }) as libc::c_float;
+                maxj.y =
+                    (if 0 as libc::c_int >
+                                    (if maxrow > maxj.y as libc::c_int {
+                                            maxj.y as libc::c_int
+                                        } else { maxrow }) {
+                                0 as libc::c_int
+                            } else if maxrow > maxj.y as libc::c_int {
+                                maxj.y as libc::c_int
+                            } else { maxrow }) as libc::c_float;
+                let mut reject = 0 as libc::c_int;
+                j.y = minj.y;
+                while j.y <= maxj.y && reject == 0 {
+                    j.x = minj.x;
+                    while j.x <= maxj.x && reject == 0 {
+                        let mut entry =
+                            *grid.offset((j.y as libc::c_int * ncols +
+                                                j.x as libc::c_int) as isize);
+                        if entry > -(1 as libc::c_int) && entry != sindex {
+                            kmVec2Subtract(&mut delta,
+                                &mut *samples.offset(entry as isize), &mut pt);
+                            if kmVec2LengthSq(&mut delta) < r2 {
+                                reject = 1 as libc::c_int;
+                            }
+                        }
+                        j.x += 1.;
+                    }
+                    j.y += 1.;
+                }
+                if !(reject != 0) { found = 1 as libc::c_int; }
+            }
+            attempt += 1;
+        }
+        if found != 0 {
+            let fresh12 = nactives;
+            nactives = nactives + 1;
+            *actives.offset(fresh12 as isize) = nsamples;
+            *grid.offset(((pt.x * invcell) as libc::c_int +
+                                    ncols * (pt.y * invcell) as libc::c_int) as isize) =
+                *actives.offset(fresh12 as isize);
+            let fresh14 = nsamples;
+            nsamples = nsamples + 1;
+            *samples.offset(fresh14 as isize) = pt;
+        } else {
+            nactives -= 1;
+            if nactives <= 0 as libc::c_int { break; }
+            *actives.offset(aindex as isize) =
+                *actives.offset(nactives as isize);
+        }
+    }
+    (*result).width = nsamples;
+    free(grid as *mut libc::c_void);
+    free(actives as *mut libc::c_void);
+    return result;
+}
+"#
+}
+
+/// R434 (relay 036 §4, the census-of-record `Source::UnsupportedOwnerUse`
+/// rows): the permit refused EVERY owner of a body that takes ANY reference
+/// anywhere. A reference can alias the owner only when it is ROOTED at the
+/// owner or at one of its view aliases — every other use of the owner is
+/// accounted by this same permit, so no other local of the body holds this
+/// allocation's address. Both of heman's poisson owners now deliver
+/// `Box<[i32]>`, every access becomes indexing, the reference into the other
+/// allocation is left exactly as it was, and each C `free` becomes a drop
+/// where it stood.
+#[test]
+fn r434_a_reference_that_cannot_reach_the_owner_keeps_the_owner() {
+    let source = verify(poisson_fixture(), "grid", BoxShape::Slice, false);
+    assert!(
+        source.contains("grid[(i) as usize] = -(1 as libc::c_int)"),
+        "{source}"
+    );
+    // The reference into the OTHER allocation is untouched, and so is the
+    // scalar one the callee writes through.
+    assert!(
+        source.contains("&mut *samples.offset(entry as isize)"),
+        "{source}"
+    );
+    assert!(source.contains("&mut seed"), "{source}");
+    assert_eq!(source.matches("::std::mem::drop(").count(), 2, "{source}");
+    let other = verify(poisson_fixture(), "actives", BoxShape::Slice, false);
+    assert!(
+        other.contains("actives[(aindex) as usize] = actives[(nactives) as usize]"),
+        "{other}"
+    );
+}
+
+/// The refusals R434 keeps: a reference rooted AT the owner, one rooted at a
+/// view alias of the owner, a closure, and a reference VALUE this body did not
+/// create (a call's `&T` result, whose provenance is unknown). The first two
+/// shapes are ALSO uses of the owner, so on this base the use accounting
+/// refuses them before R434's root test does (measured: disabling either root
+/// clause leaves the refusal in place); the clause is the explicit statement
+/// of the invariant and stays fail-closed for a shape the accounting does not
+/// see.
+#[test]
+fn r434_a_reference_that_can_reach_the_owner_still_refuses() {
+    let owner =
+        "let mut buffer=malloc(4*core::mem::size_of::<i32>()) as *mut i32; *buffer.offset(1)=7;";
+    for body in [
+        // rooted at the owner
+        "let mut r=&mut *buffer.offset(1); *r=9;",
+        // rooted at a view alias of the owner
+        "let mut view=buffer.offset(1); let mut r=&mut *view.offset(0); *r=9;",
+        // a closure can capture anything
+        "let f=||{}; f();",
+        // a reference VALUE this body did not create
+        "let r=borrowed(); let _=*r;",
+    ] {
+        let input = format!(
+            "{} unsafe fn borrowed()->&'static i32 {{ &7 }} pub unsafe fn owner_body(){{ {owner} {body} free(buffer as *mut core::ffi::c_void); }}",
+            declarations()
+        );
+        ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let program = super::collect_program(tcx);
+            let (subject, _) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.param_name.as_deref() == Some("buffer"))
+                .unwrap_or_else(|| panic!("{body}"));
+            assert!(
+                matches!(
+                    super::decision::ownership_fields_source::derive(
+                        &program,
+                        subject,
+                        &ctx.constructions
+                    ),
+                    Err(super::decision::ownership_fields_source::SourceHold::UnsupportedOwnerUse)
+                ),
+                "{body}"
+            );
+        })
+        .unwrap();
+    }
+}
