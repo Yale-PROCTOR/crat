@@ -150,17 +150,16 @@ fn n1_frame_premises_are_exactly_what_the_rule_consumes() {
     .unwrap();
 }
 
-/// **W-N1-BOUNDARY** — the lane boundary. Both of this function's tables would
-/// deliver, so the function is the PAIR rule's: N1 stands off and wave-5d's
-/// hold — with its own premises about the count, the loop and the accumulator
-/// — stays the only verdict on it.
+/// **W-N1-BOTH** — R445-3 dropped the lane boundary. The pair rule holds this
+/// body (it is a lookback indicator, not the elementwise pattern) and N1
+/// delivers BOTH tables' inner levels, in one plan, per parameter.
 #[test]
-fn n1_stands_off_where_every_table_would_deliver() {
+fn n1_delivers_every_qualifying_table_where_the_pair_rule_holds() {
     for parameter in ["inputs", "outputs"] {
         let decision = table_decision(BOTH, parameter);
         assert!(
-            matches!(decision, Decision::Slice { .. }),
-            "{parameter} belongs to the pair rule here: {decision:?}"
+            matches!(decision, Decision::NestedSlice { .. }),
+            "{parameter} must deliver its inner level: {decision:?}"
         );
     }
     ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
@@ -172,12 +171,14 @@ fn n1_stands_off_where_every_table_would_deliver() {
             )),
         )
         .unwrap();
-        let receipt = table
+        let plan = table
             .nested_receipts
             .iter()
             .find(|r| tcx.def_path_str(r.owner.to_def_id()) == BOTH)
-            .expect("a typed outcome");
-        assert!(receipt.result.is_err(), "{:?}", receipt.result);
+            .and_then(|r| r.result.as_ref().ok())
+            .expect("an admitted N1 plan");
+        assert_eq!(plan.parameters.len(), 2, "one plan, both tables");
+        assert!(!plan.count_guard, "still no count guard");
     })
     .unwrap();
 }

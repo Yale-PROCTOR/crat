@@ -4,9 +4,8 @@
 // rule holds it at `IntervalChanged` even though both tables are delivered
 // flat slices with an inner Ref level.
 //
-//   ti_ema           — both tables' row loads lead the block, so BOTH would
-//                      deliver: the function is the pair rule's and N1 stands
-//                      off (the lane boundary).
+//   ti_ema           — both tables' row loads lead the block, so BOTH deliver
+//                      in one plan (R445-3 dropped the lane boundary).
 //   ti_ema_late_out  — the output table's row load sits AFTER an early return,
 //                      so it is not a leading load: only the input table
 //                      delivers and the output table keeps its frame form.

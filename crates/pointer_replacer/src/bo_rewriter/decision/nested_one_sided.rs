@@ -307,18 +307,12 @@ pub(super) fn inspect<'tcx>(
     if parameters.is_empty() {
         return Err(Hold::NullableLevelUnbuilt);
     }
-    // THE LANE BOUNDARY. N1 is the arm for a function the pair rule cannot
-    // deliver WHOLE. Where every depth-2 table of the owner would deliver, the
-    // function is the pair rule's: N1 stands off and that rule's own hold —
-    // and its own premises about the count, the loop and the accumulator —
-    // remain the only verdict on it.
-    let tables = subjects
-        .iter()
-        .filter(|(s, _)| s.ptr_depth == 2 && matches!(s.kind, SubjectKind::Param { .. }))
-        .count();
-    if parameters.len() >= tables {
-        return Err(Hold::PairRequired);
-    }
+    // The pair rule still LEADS — `inspect` only reaches this arm where it
+    // held — but it does not reserve a function. R445-3 dropped the boundary
+    // that stood N1 off wherever every table would deliver: a function whose
+    // tables all qualify is delivered here too, and the pair rule's own
+    // premises about the count, the loop and the accumulator keep their force
+    // over the plan it would have made, not over this one.
     rows.retain(|r| parameters.iter().any(|p| p.hir == r.parameter));
     if rows
         .iter()
