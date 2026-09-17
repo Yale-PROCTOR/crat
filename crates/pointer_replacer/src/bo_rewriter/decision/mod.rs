@@ -2172,6 +2172,17 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             // wrapper, and admitting it would be the mixed-use hazard again.
             let rest_arithmetic = uses.iter().all(|(op, _)| op == "is_null" || arith(op));
 
+            // Wave-6o (relay 027 / R450-9): a destination assigned a forward
+            // computed view of a FAT base inherits that base's twin — the
+            // suffix carries the base's own length, so the fat optional is
+            // evidence-backed here exactly as fatness licenses it below.
+            let inherits_fat_twin = option_ops::assigned_forward_view_of_a_fat_base(
+                ctx.tcx,
+                subject,
+                ctx.subjects,
+                ctx.fat,
+                ctx.opt_uses,
+            );
             if all_arithmetic && is_array && !nullable_value {
                 Form::Slice
             } else if (null_tested || nullable_value)
@@ -2180,11 +2191,12 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 // Item 4 owns None at exact null initializers/assignments.
                 // A thin optional has no image for arithmetic; the fat twin does,
                 // and fatness is the licence for it — the -2 rule, unchanged.
-                && (!has_arithmetic || is_array)
+                && (!has_arithmetic || is_array || inherits_fat_twin)
             {
                 Form::Opt {
                     slice: (has_arithmetic && is_array)
-                        || counted.is_some_and(|c| c.handle.is_none()),
+                        || counted.is_some_and(|c| c.handle.is_none())
+                        || inherits_fat_twin,
                 }
             } else {
                 let (op, span) = uses.first().expect("a recorded use vector is non-empty");

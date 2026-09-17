@@ -199,12 +199,28 @@ unsafe fn FindAllStaticDictionaryMatches(data: *const u8, l: usize, k: usize, n:
             .any(|(operation, _, _)| operation == "null-initialization"),
         "the declaration admits the optional slice into the family: {decision:?} {receipts:?}"
     );
+    // **Both frames, under R217-2(a)** (relay 027 §1). The INVARIANT is that
+    // this shape is never delivered as a one-element carrier; which typed hold
+    // states it depends on the frame:
+    //
+    // * lane frame — the value planner's own refusal,
+    //   `option-slice-value:one-element-carrier`;
+    // * composed frame (`batch-11-dry10` + wave-5d's R448-4 retirement) — the
+    //   base delivers, so the owner's Option family is re-derived and falls
+    //   back whole (`additive-family-fallback:…restore-prior-family-
+    //   disposition`), which holds the row for a STRICTLY stronger reason.
+    //
+    // Either way no `from_ref` carrier is emitted and the tree type-checks.
+    let held_at_the_carrier = receipts.iter().any(|(operation, _, reason)| {
+        operation == "nullable-assignment"
+            && reason.contains("option-slice-value:one-element-carrier")
+    });
+    let family_withdrawn = receipts.iter().any(|(_, state, reason)| {
+        state == "Reclassified" && reason.contains("additive-family-fallback")
+    });
     assert!(
-        receipts
-            .iter()
-            .any(|(operation, _, reason)| operation == "nullable-assignment"
-                && reason.contains("option-slice-value:one-element-carrier")),
-        "the one-element carrier must be the typed hold: {receipts:?}"
+        held_at_the_carrier || family_withdrawn,
+        "the one-element carrier must be a typed hold on either frame: {receipts:?}"
     );
     let output = ast_emitted_source_of(input).expect("hold emission");
     assert!(!output.contains("core::slice::from_ref(&*data"), "{output}");

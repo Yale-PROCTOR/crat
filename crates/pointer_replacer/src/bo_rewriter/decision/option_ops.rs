@@ -651,3 +651,74 @@ fn forward_delta(tcx: TyCtxt<'_>, owner: LocalDefId, delta: &Expr<'_>) -> Option
     let unsigned = matches!(tcx.typeck(owner).expr_ty(inner).kind(), TyKind::Uint(_));
     unsigned.then(|| format!("({text}) as usize"))
 }
+
+/// **Relay 027 / R450-9 — the destination inherits the base's FAT twin.**
+///
+/// `s = &*data.offset(l)` where `data` is an array gives `s` that array's
+/// suffix, so the optional form `s` takes must be the fat one
+/// (`Option<&[T]>`): the assignment IS the extent evidence — the suffix
+/// carries the base's own length — so no `FALLBACK_SLICE_EXTENT` is
+/// fabricated and nothing is widened; `None` stays `None`.
+///
+/// Read at ladder time, where the base's own decision does not exist yet: the
+/// evidence is the fatness verdict for the base (the same authority the
+/// `Slice` arm uses) plus the spine and forward-delta guard of
+/// [`slice_suffix_view`].
+pub(super) fn assigned_forward_view_of_a_fat_base(
+    tcx: TyCtxt<'_>,
+    subject: &Subject,
+    subjects: &[Subject],
+    fat: &crate::bo_rewriter::fat_facts::FatFacts,
+    opt_uses: &FxHashMap<(LocalDefId, HirId), OptUses>,
+) -> bool {
+    let Some(uses) = opt_uses.get(&(subject.fn_did, subject.hir_id)) else {
+        return false;
+    };
+    uses.assignments.iter().any(|assignment| {
+        let Node::Expr(expression) = tcx.hir_node(assignment.rhs) else { return false };
+        forward_view_base(tcx, subject.fn_did, subject.hir_id, expression).is_some_and(|binding| {
+            subjects
+                .iter()
+                .find(|source| source.fn_did == subject.fn_did && source.hir_id == binding)
+                .is_some_and(|source| fat.is_array(source.fn_did, source.local))
+        })
+    })
+}
+
+/// The base binding of `&*BASE.offset(DELTA)` (under identity casts) when the
+/// delta is forward and the base is a different local — the spine
+/// [`slice_suffix_view`] renders, without the decision the ladder cannot see.
+fn forward_view_base(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    subject_hir: HirId,
+    expression: &Expr<'_>,
+) -> Option<HirId> {
+    let typeck = tcx.typeck(owner);
+    let mut expr = expression;
+    while let ExprKind::Cast(inner, _) = expr.kind {
+        if !matches!(
+            typeck.expr_ty(inner).kind(),
+            TyKind::RawPtr(..) | TyKind::Ref(..)
+        ) {
+            return None;
+        }
+        expr = inner;
+    }
+    let ExprKind::AddrOf(_, _, place) = expr.kind else { return None };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, advanced) = place.kind else { return None };
+    let ExprKind::MethodCall(segment, receiver, [delta], _) = advanced.kind else { return None };
+    if segment.ident.name.as_str() != "offset" {
+        return None;
+    }
+    let mut base = receiver;
+    while let ExprKind::Cast(inner, _) = base.kind {
+        base = inner;
+    }
+    let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = base.kind else { return None };
+    let Res::Local(binding) = path.res else { return None };
+    if binding == subject_hir {
+        return None;
+    }
+    forward_delta(tcx, owner, delta).map(|_| binding)
+}
