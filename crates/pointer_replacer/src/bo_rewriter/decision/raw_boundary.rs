@@ -1625,6 +1625,12 @@ pub(crate) struct RetentionSummaries {
     facts: FxHashMap<(LocalDefId, usize), RetentionBodyFacts>,
     attested: bool,
     returned_children: FxHashMap<LocalDefId, Vec<ReturnedChildRecord>>,
+    /// wave-6v2 (R453-6): the caller-level fact wave-6r's seam guard consults,
+    /// recorded once the site facts exist (`record_output_storage_settlement`).
+    /// The guard reads a callee ROW; this says whether that row's output-storage
+    /// retention is settled by R406-6's certificate at EVERY call of the
+    /// position. Absent key = not settled.
+    output_storage_settled: FxHashMap<(LocalDefId, usize), bool>,
     /// K18'/OAP-CHILD-ACCESS: the same descendant evidence for callees with no
     /// pinned contract row, kept apart so the row stays the authority wherever
     /// it exists.
@@ -2736,6 +2742,38 @@ fn evaluate_retention(
 }
 
 impl RetentionSummaries {
+    /// wave-6v2 (R453-6, relay 025 §1): fill the caller-level settled fact.
+    /// Called once, after `RawBoundarySiteFacts::derive`, so wave-6r's seam
+    /// guard — which has no site facts at its call — can ask the summaries
+    /// directly, exactly as it asks `returned_alias_settled`.
+    pub(crate) fn record_output_storage_settlement(&mut self, site_facts: &RawBoundarySiteFacts) {
+        let positions = site_facts
+            .sites
+            .iter()
+            .filter_map(|site| {
+                site.callee_local
+                    .map(|callee| (callee, site.key.argument_index))
+            })
+            .collect::<FxHashSet<_>>();
+        for (callee, index) in positions {
+            let settled = super::binn_counted::output_storage_settled_at_every_call(
+                site_facts, self, callee, index,
+            );
+            self.output_storage_settled.insert((callee, index), settled);
+        }
+    }
+
+    /// wave-6v2 (R453-6): is this position's output-storage retention settled by
+    /// the stack-storage certificate at every call? `false` until
+    /// `record_output_storage_settlement` has run, and for any position with no
+    /// inventoried call.
+    pub(crate) fn output_storage_settled(&self, callee: LocalDefId, index: usize) -> bool {
+        self.output_storage_settled
+            .get(&(callee, index))
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// wave-6v2 (R412-7): does this callee only RETURN the argument — every
     /// positive sink a `return` of it? The returned alias is then the caller's
     /// to account for (its own row continues the walk), and the site is
@@ -3122,6 +3160,7 @@ impl RetentionSummaries {
             rows,
             facts,
             attested,
+            output_storage_settled: FxHashMap::default(),
             returned_children,
             child_access,
             consumed_results,

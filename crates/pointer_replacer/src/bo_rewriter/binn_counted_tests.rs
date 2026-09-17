@@ -1568,12 +1568,10 @@ fn w6v2_output_storage_settled_at_every_call() {
                 .find(|owner| tcx.def_path_str(owner.to_def_id()).ends_with("get_value"))
                 .expect("the callee exists");
             (
-                super::decision::binn_counted::output_storage_settled_at_every_call(
-                    &ctx.raw_boundary_sites,
-                    &ctx.retention,
-                    callee,
-                    0,
-                ),
+                // R453-6: the seam guard's channel — the fact is asked of the
+                // summaries, exactly as `returned_alias_settled` is, with no
+                // site facts at the call.
+                ctx.retention.output_storage_settled(callee, 0),
                 ctx.retention
                     .to_tsv()
                     .lines()

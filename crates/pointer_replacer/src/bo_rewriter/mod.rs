@@ -7749,11 +7749,14 @@ fn finish_decide<'tcx>(
         let raw_boundary_site_derivation_wall_s =
             raw_boundary_sites_started.elapsed().as_secs_f64();
         let retention_started = std::time::Instant::now();
-        let retention = decision::raw_boundary::RetentionSummaries::derive(
+        let mut retention = decision::raw_boundary::RetentionSummaries::derive(
             &program,
             analysis.origins.as_ref(),
             analysis.attestation,
         );
+        // wave-6v2 (R453-6): the caller-level settled fact needs both derives.
+        retention.record_output_storage_settlement(&raw_boundary_sites);
+        let retention = retention;
         let retention_fixpoint_wall_s = retention_started.elapsed().as_secs_f64();
         let raw_boundary_decision_started = std::time::Instant::now();
         let boundary_hypothesis = a5_role_target_hypothesis(tcx, &e2_hypothetical, &a5_roles);
