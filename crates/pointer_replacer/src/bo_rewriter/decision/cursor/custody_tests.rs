@@ -178,3 +178,33 @@ fn delivered_cursor_requires_its_exact_original_initializer() {
 fn custody_native_cursor_initializer_must_derive_from_the_claimed_base() {
     assert_withdrawn(Corruption::DifferentDeliveredBase);
 }
+
+/// The admission archive's identity is the program AND the source frame (a
+/// census re-enters a program in a second worker process — a bisect probe, a
+/// retry — and exports the output directory to every child). A second pid for
+/// the same pair writes on; another frame, or a row without the fields, does
+/// not, and the diagnostic never aborts the run that carries it.
+#[test]
+fn slicecursor_admission_archive_custody_is_program_and_frame_not_pid() {
+    let row = |program: &str, frame: &str, pid: u32| serde_json::json!({"program": program, "frame": frame, "pid": pid});
+    assert!(super::custody_matches(
+        &row("bzip2", "08b9035e", 111),
+        "bzip2",
+        "08b9035e"
+    ));
+    assert!(!super::custody_matches(
+        &row("bzip2", "08b9035e", 111),
+        "bzip2",
+        "deca869c"
+    ));
+    assert!(!super::custody_matches(
+        &row("bzip2", "08b9035e", 111),
+        "brotli",
+        "08b9035e"
+    ));
+    assert!(!super::custody_matches(
+        &serde_json::json!({"pid": 111}),
+        "bzip2",
+        "08b9035e"
+    ));
+}

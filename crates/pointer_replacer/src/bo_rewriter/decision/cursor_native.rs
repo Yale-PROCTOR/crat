@@ -597,6 +597,14 @@ fn model_kinds(
         .collect()
 }
 
+/// The archive belongs to one program at one source frame. A second worker for
+/// the same pair (a census bisect probe, a retry) may write into it; a row from
+/// another program or frame may not.
+fn custody_matches(prior: &serde_json::Value, program: &str, frame: &str) -> bool {
+    prior.get("program").and_then(serde_json::Value::as_str) == Some(program)
+        && prior.get("frame").and_then(serde_json::Value::as_str) == Some(frame)
+}
+
 pub(crate) fn observe(
     ctx: &Ctx<'_, '_>,
     entries: &[(Subject, Decision)],
@@ -616,38 +624,48 @@ pub(crate) fn observe(
     // archive belongs to one worker/frame. Repeated family passes replace a
     // provisional row so the last candidate includes the settled owner stage.
     // Terminal placement/recovery remains a separate custody observation.
-    let program =
-        std::env::var("CRAT_ERA5_PROGRAM").expect("cursor audit needs compiler worker program pin");
-    assert_eq!(
-        std::env::var("CRAT_ERA5_EXECUTION_ROLE").as_deref(),
-        Ok("cache-only")
-    );
-    assert!(
-        !program.is_empty()
-            && program
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || "._-".contains(ch))
-    );
+    // The archive is a DIAGNOSTIC of this lane: it must never abort the run that
+    // carries it. A census re-enters a program in a second worker process (a
+    // bisect probe, a retry) and exports `CRAT_CURSOR_ADMISSION_OUTPUT` to every
+    // child, so a missing pin, a foreign role or a second pid is a reason to
+    // skip the archive, never to panic.
+    let Ok(program) = std::env::var("CRAT_ERA5_PROGRAM") else { return };
+    if std::env::var("CRAT_ERA5_EXECUTION_ROLE").as_deref() != Ok("cache-only") {
+        return;
+    }
+    if program.is_empty()
+        || !program
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "._-".contains(ch))
+    {
+        return;
+    }
+    let Ok(frame) = std::env::var("CRAT_RAW_BOUNDARY_CODE_FRAME") else { return };
     let root = Path::new(&directory).join(&program);
-    std::fs::create_dir_all(&root).expect("cursor audit directory");
-    let frame =
-        std::env::var("CRAT_RAW_BOUNDARY_CODE_FRAME").expect("cursor audit needs source frame");
+    if std::fs::create_dir_all(&root).is_err() {
+        return;
+    }
     let custody =
-        serde_json::json!({"program": program, "pid": std::process::id(), "frame": frame});
+        serde_json::json!({"program": program, "frame": frame, "pid": std::process::id()});
     let guard = root.join("custody.json");
     match OpenOptions::new().write(true).create_new(true).open(&guard) {
-        Ok(mut file) => writeln!(file, "{custody}").expect("write native archive custody"),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let prior: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(&guard).expect("read native archive custody"),
-            )
-            .expect("parse native archive custody");
-            assert_eq!(
-                prior, custody,
-                "cursor archive belongs to another worker/frame"
-            );
+        Ok(mut file) => {
+            if writeln!(file, "{custody}").is_err() {
+                return;
+            }
         }
-        Err(error) => panic!("cursor archive custody: {error}"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The archive's identity is the program AND the source frame; the
+            // worker's pid is provenance, not identity. A row for another frame
+            // would mix two programs' readings, so that archive is left alone.
+            let prior = std::fs::read(&guard)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            if !prior.is_some_and(|prior| custody_matches(&prior, &program, &frame)) {
+                return;
+            }
+        }
+        Err(_) => return,
     }
     for (subject, decision) in entries {
         let path = root.join(format!(
@@ -702,13 +720,17 @@ pub(crate) fn observe(
             },
             "stage": "candidate-pre-finalization", "source_frame": frame,
         });
-        let mut file = OpenOptions::new()
+        let Ok(mut file) = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)
-            .expect("fresh cursor identity receipt");
-        writeln!(file, "{receipt}").expect("write cursor identity receipt");
+        else {
+            return;
+        };
+        if writeln!(file, "{receipt}").is_err() {
+            return;
+        }
     }
 }
 
