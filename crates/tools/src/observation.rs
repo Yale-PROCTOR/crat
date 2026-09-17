@@ -2349,6 +2349,10 @@ pub(crate) fn printf_rule_argument(
             }
             visit::walk_expr(self, expression);
         }
+
+        fn visit_ty(&mut self, _ty: &'ast rustc_ast::Ty) {}
+
+        fn visit_generic_args(&mut self, _generic_args: &'ast rustc_ast::GenericArgs) {}
     }
     SyntaxCollector {
         context: &mut context,
@@ -2475,6 +2479,10 @@ pub(crate) fn select_rule_regions(
                         visit::walk_expr(self, expression);
                     }
                 }
+
+                fn visit_ty(&mut self, _ty: &'ast rustc_ast::Ty) {}
+
+                fn visit_generic_args(&mut self, _generic_args: &'ast rustc_ast::GenericArgs) {}
             }
             let mut syntax = SyntaxCollector {
                 context: &mut context,
@@ -2710,7 +2718,7 @@ fn expression_type<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Option<ty::Ty<'tcx>> {
     let expression = ast_to_hir.get_expr(expression.id, tcx)?;
-    Some(tcx.typeck(expression.hir_id.owner).expr_ty(expression))
+    tcx.typeck(expression.hir_id.owner).expr_ty_opt(expression)
 }
 
 fn pointer_like(ty: ty::Ty<'_>, tcx: TyCtxt<'_>) -> bool {
@@ -3813,7 +3821,7 @@ impl<'a, 'tcx> DumpContext<'a, 'tcx> {
                     .map(|value| self.expression(value))
                     .collect::<Option<_>>()?,
             }),
-            ExprKind::MethodCall(call) => {
+            ExprKind::MethodCall(call) if call.seg.args.is_none() => {
                 let hir = self.ast_to_hir.get_expr(value.id, self.tcx)?;
                 let def = self
                     .tcx
@@ -3856,9 +3864,11 @@ impl<'a, 'tcx> DumpContext<'a, 'tcx> {
                     ty: self.type_tree(semantic)?,
                 })
             }
-            ExprKind::Path(..) => Some(Expression::Path {
-                value: self.path_identity(value)?,
-            }),
+            ExprKind::Path(None, path) if !path_has_explicit_generic_arguments(path) => {
+                Some(Expression::Path {
+                    value: self.path_identity(value)?,
+                })
+            }
             ExprKind::Index(base, index, _) => Some(Expression::Index {
                 base: Box::new(self.expression(base)?),
                 index: Box::new(self.expression(index)?),
@@ -3939,7 +3949,10 @@ impl<'a, 'tcx> DumpContext<'a, 'tcx> {
                     rustc_ast::RangeLimits::Closed => RangeLimits::Closed,
                 },
             }),
-            ExprKind::Struct(struct_value) => {
+            ExprKind::Struct(struct_value)
+                if struct_value.qself.is_none()
+                    && !path_has_explicit_generic_arguments(&struct_value.path) =>
+            {
                 let (adt, variant, definition) = self.struct_identity(value)?;
                 let adt_definition = self.tcx.adt_def(match self.tcx.def_kind(definition) {
                     hir::def::DefKind::Variant => self.tcx.parent(definition),
@@ -4232,6 +4245,10 @@ impl<'a, 'tcx> DumpContext<'a, 'tcx> {
             LitKind::Err(_) => None,
         }
     }
+}
+
+fn path_has_explicit_generic_arguments(path: &rustc_ast::Path) -> bool {
+    path.segments.iter().any(|segment| segment.args.is_some())
 }
 
 fn primitive_name(value: ty::Ty<'_>) -> Option<String> {
@@ -7441,6 +7458,69 @@ unsafe fn target(mut pointer: &i32) -> ([i32; 1], (i32,), [i32; 2]) {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn explicit_generic_arguments_are_not_observed() {
+        let source = r#"
+unsafe extern "C" { fn read_buffer(buffer: *mut i8, size: usize) -> i32; }
+unsafe fn source_copy(mut pointer: *mut i8) -> i32 {
+    #[proctor(0)] read_buffer(pointer, core::mem::size_of::<[i8; 100]>())
+}
+unsafe fn target(mut pointer: &mut i8) -> i32 {
+    #[proctor(0)] read_buffer(pointer as *mut i8, core::mem::size_of::<[i8; 100]>())
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
+        assert!(document.observations.is_empty());
+    }
+
+    #[test]
+    fn qualified_self_type_generics_are_not_observed() {
+        let source = r#"
+unsafe extern "C" { fn consume(count: usize) -> i32; }
+unsafe fn source_copy() -> i32 {
+    #[proctor(0)] consume(<[i8; 100] as IntoIterator>::into_iter([0; 100]).count())
+}
+unsafe fn target() -> i32 {
+    #[proctor(0)] consume(<[i8; 100] as IntoIterator>::into_iter([0; 100]).count())
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
+        assert!(document.observations.is_empty());
+    }
+
+    #[test]
+    fn expression_dump_rejects_explicit_generics_but_keeps_runtime_repeat_counts() {
+        let values = dump_statement_expressions(
+            r#"
+struct Wrapper<T> { value: T }
+fn values() {
+    let _ = core::mem::size_of::<[i8; 100]>();
+    let _: Vec<i32> = [1].into_iter().collect::<Vec<i32>>();
+    let _ = Wrapper::<i32> { value: 2 };
+    let _ = [4_i32; 3];
+    let _ = 0usize as *const Wrapper<i32>;
+}
+"#,
+            "values",
+        );
+        assert_eq!(values.len(), 2);
+        assert!(matches!(values[0], Expression::Repeat { .. }));
+        let Expression::Repeat { count, .. } = &values[0] else { unreachable!() };
+        assert!(matches!(
+            count.as_ref(),
+            Expression::Literal {
+                value: Literal::Integer { value, ty }
+            } if value == "3" && ty == "usize"
+        ));
+        assert!(matches!(
+            values[1],
+            Expression::Cast {
+                ty: TypeTree::RawPointer { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
