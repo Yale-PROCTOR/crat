@@ -2920,6 +2920,25 @@ fn r447_a_moved_out_owner_takes_the_field_transactions_shape() {
         1,
         "the read shares, so two reads in one expression coexist: {projections:?}"
     );
+    // R450: a field delivered as an optional boxed SLICE gives the local the
+    // same payload — only the type text moves, the projections are unchanged.
+    let optional_slice = moved_out_plan(Some("opt-box-slice")).expect("opt-box-slice form");
+    assert!(optional_slice.optional);
+    assert!(
+        optional_slice.receipts.iter().any(|receipt| receipt
+            == "native-box-declaration-type ::std::option::Option<::std::boxed::Box<[crate::R447Node]>>"),
+        "{:?}",
+        optional_slice.receipts
+    );
+    assert_eq!(
+        optional_slice
+            .expr_edits
+            .iter()
+            .filter(|edit| edit.receipt == "native-box-optional-owner-projection")
+            .count(),
+        2,
+        "the projections are unchanged by the payload's shape"
+    );
     // Neither shape renders the load: that is the transaction's edit.
     for plan in [&plain, &optional] {
         assert!(

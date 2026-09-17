@@ -969,6 +969,15 @@ fn derive_bundle(
     let optional_owner = field_form
         .as_deref()
         .is_some_and(|form| form.to_lowercase().contains("opt"));
+    // R450 (wave-6f 030 STOP 1): the FIELD's own form carries the payload's
+    // shape as well as its optionality. A field delivered `opt-box-slice` is
+    // `Option<Box<[T]>>`, so the local taking its `take()` is spelled the same
+    // — `as_deref()` / `as_deref_mut()` already yield `&[T]` / `&mut [T]`, so
+    // only the type text moves. No corpus field answers `slice` at this frame;
+    // the rule is measured here through the form override.
+    let field_payload_is_slice = field_form
+        .as_deref()
+        .is_some_and(|form| form.to_lowercase().contains("slice"));
     let mut edits = if field_load.is_some() {
         // The initializer is the field family's (`take()`); this producer
         // contributes the type, the projections, the close and the receipts.
@@ -1069,6 +1078,11 @@ fn derive_bundle(
         subject.local.as_u32(),
         subject.hir_id
     )];
+    let payload = if field_payload_is_slice {
+        format!("[{}]", source.element_spelling())
+    } else {
+        payload
+    };
     receipts.push(if optional_owner {
         format!("{DECLARATION_TYPE_RECEIPT} ::std::option::Option<::std::boxed::Box<{payload}>>")
     } else {
