@@ -2694,3 +2694,78 @@ fn r434_a_reference_that_can_reach_the_owner_still_refuses() {
         .unwrap();
     }
 }
+
+/// R435 (relay 037 STOP 1, granted): heman's `heman_points_from_density`
+/// indexes one owner THROUGH another — `*grid.offset((gcapacity * gindex +
+/// *ngrid.offset(gindex as isize)) as isize)`. Both accesses are this family's
+/// edits and one contains the other, so the pair claimed a single interval and
+/// the whole Ownership family was withdrawn
+/// (`unwitnessed-family-refusal:intra-class-interval-overlap`). The outer edit
+/// is now rendered OVER its re-rendered inner and the contained edit is
+/// dropped: both owners deliver, and the emitted index reads
+/// `grid[((4*i + ngrid[(i) as usize])) as usize]`.
+#[test]
+fn r435_an_owner_access_nested_in_another_owners_index_composes() {
+    let input = format!(
+        "{} pub unsafe fn density(){{ let mut grid=malloc(8*core::mem::size_of::<i32>()) as *mut i32; let mut ngrid=malloc(4*core::mem::size_of::<i32>()) as *mut i32; let mut i=0; while i<4 {{ *ngrid.offset(i as isize)=0; i+=1; }} *grid.offset((4*i + *ngrid.offset(i as isize)) as isize)=7; *ngrid.offset(i as isize)+=1; free(grid as *mut core::ffi::c_void); free(ngrid as *mut core::ffi::c_void); }}",
+        declarations()
+    );
+    let source = verify(&input, "grid", BoxShape::Slice, false);
+    assert!(
+        source.contains("grid[((4*i + ngrid[(i) as usize])) as usize]=7"),
+        "the outer access carries the rendered inner: {source}"
+    );
+    // The inner owner keeps every other access of its own.
+    assert!(source.contains("ngrid[(i) as usize]=0"), "{source}");
+    assert!(source.contains("ngrid[(i) as usize]+=1"), "{source}");
+    let other = verify(&input, "ngrid", BoxShape::Slice, false);
+    assert_eq!(other, source);
+    // The composition is receipted on the outer plan, and the contained edit
+    // is gone from the inner one.
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let plan_of = |name: &str| {
+            let (_, decision) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.param_name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name}"));
+            let Decision::Box(plan) = decision else { panic!("{name}: {decision:?}") };
+            plan.clone()
+        };
+        let outer = plan_of("grid");
+        let composed: Vec<_> = outer
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.starts_with("native-box-access-composed"))
+            .collect();
+        assert_eq!(composed.len(), 1, "{:?}", outer.receipts);
+        let outer_edit = outer
+            .expr_edits
+            .iter()
+            .find(|edit| edit.receipt == "native-box-slice-access")
+            .expect("the outer access edit");
+        assert!(
+            outer_edit.replacement.contains("ngrid[(i) as usize]"),
+            "{:?}",
+            outer_edit.replacement
+        );
+        let inner = plan_of("ngrid");
+        assert!(
+            !inner
+                .expr_edits
+                .iter()
+                .any(|edit| outer_edit.span.contains(edit.span)),
+            "the contained edit is dropped: {:?}",
+            inner.expr_edits
+        );
+    })
+    .unwrap();
+}

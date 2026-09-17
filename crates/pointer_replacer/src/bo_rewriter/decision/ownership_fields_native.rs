@@ -259,7 +259,97 @@ impl Candidates {
                 }
             }
         }
+        result.compose_nested_accesses(inputs.program.tcx);
         result
+    }
+
+    /// R435 (heman's `heman_points_from_density`): one owner's access can sit
+    /// INSIDE another owner's index — `*grid.offset((gcapacity * gindex +
+    /// *ngrid.offset(gindex as isize)) as isize)`. Two edits of this family
+    /// then claim one interval and the whole family is withdrawn
+    /// (`intra-class-interval-overlap`). The outer edit is rendered over its
+    /// re-rendered inner instead: the inner's source text inside the outer
+    /// replacement becomes the inner's own replacement, and the contained edit
+    /// is dropped. Fail-closed: an outer replacement that does not carry the
+    /// inner's source text exactly once cannot be composed, and that owner is
+    /// held.
+    fn compose_nested_accesses(&mut self, tcx: rustc_middle::ty::TyCtxt<'_>) {
+        let composable = |edit: &BoxExprEdit| edit.receipt == "native-box-slice-access";
+        loop {
+            let mut sites: Vec<(Node, usize, rustc_span::Span)> = Vec::new();
+            for (&node, bundle) in &self.bundles {
+                for (index, edit) in bundle.plan.expr_edits.iter().enumerate() {
+                    if composable(edit) {
+                        sites.push((node, index, edit.span));
+                    }
+                }
+            }
+            // The innermost contained edit first, so a chain composes from the
+            // inside out.
+            let Some(&(inner_node, inner_index, inner_span)) = sites
+                .iter()
+                .filter(|(_, _, inner)| {
+                    sites
+                        .iter()
+                        .any(|(_, _, outer)| *outer != *inner && outer.contains(*inner))
+                        && !sites
+                            .iter()
+                            .any(|(_, _, deeper)| *deeper != *inner && inner.contains(*deeper))
+                })
+                .min_by_key(|(_, _, span)| (span.lo(), span.hi()))
+            else {
+                return;
+            };
+            let Some(&(outer_node, outer_index, _)) = sites
+                .iter()
+                .filter(|(node, index, outer)| {
+                    *outer != inner_span
+                        && outer.contains(inner_span)
+                        && (*node, *index) != (inner_node, inner_index)
+                })
+                .min_by_key(|(_, _, span)| span.hi().0 - span.lo().0)
+            else {
+                return;
+            };
+            let inner = self.bundles[&inner_node].plan.expr_edits[inner_index].clone();
+            let source = tcx.sess.source_map().span_to_snippet(inner.span).ok();
+            let outer = &mut self
+                .bundles
+                .get_mut(&outer_node)
+                .expect("outer bundle")
+                .plan;
+            let carried = source.as_deref().filter(|text| {
+                outer.expr_edits[outer_index]
+                    .replacement
+                    .matches(text)
+                    .count()
+                    == 1
+            });
+            match carried {
+                Some(text) => {
+                    outer.expr_edits[outer_index].replacement = outer.expr_edits[outer_index]
+                        .replacement
+                        .replace(text, &inner.replacement);
+                    outer.receipts.push(format!(
+                        "native-box-access-composed outer={:?} inner={:?} rendered-inner={}",
+                        outer.expr_edits[outer_index].span, inner.span, inner.replacement
+                    ));
+                    self.bundles
+                        .get_mut(&inner_node)
+                        .expect("inner bundle")
+                        .plan
+                        .expr_edits
+                        .remove(inner_index);
+                }
+                None => {
+                    self.bundles.remove(&outer_node);
+                    self.holds.insert(
+                        outer_node,
+                        NativeHold::Missing("native-nested-access-not-composable"),
+                    );
+                }
+            }
+        }
     }
 
     /// This supplies only candidate rendering to the replayed suffix. The
@@ -311,6 +401,9 @@ impl Candidates {
                     self.holds.insert(node, hold);
                 }
             }
+        }
+        if refreshed {
+            self.compose_nested_accesses(inputs.program.tcx);
         }
         (self.invalid_owners(inputs, table, classes), refreshed)
     }
