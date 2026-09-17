@@ -27,16 +27,25 @@ pub unsafe fn FindMatches(mut data: *const u8, max_length: usize, mut out: *mut 
 }
 "#;
 
-/// **The arm is inert where the base does not deliver.** On this lane's own
-/// frame `data` is walled into the cursor family by the very
-/// `&*data.offset(l)` use (`slice-cursor-use`), so there is no delivered slice
-/// to take a suffix of: the destination keeps its existing typed hold and the
-/// emitted tree is unchanged. This is the control that the new arm adds no
-/// rendering of its own without a delivered base.
+/// **Both frames, under R217-2(a).** Which frame this runs on decides what is
+/// assertable, so the witness spells both rather than pinning one:
+///
+/// * **lane frame** — `&*data.offset(l)` is itself the use that walls the base
+///   into the cursor family (`slice-cursor-use`), so there is no delivered
+///   slice to take a suffix of: the destination keeps its typed hold and this
+///   arm adds no rendering of its own. This is the control that the arm is
+///   inert without a delivered base.
+/// * **composed frame** (wave-6s2's line in: `batch-11-dry10`) — the base
+///   delivers, and then the invariant is the one this arm exists for: the
+///   destination is NEVER a one-element `from_ref` carrier for a shape read
+///   past its first element; it is either still held (before wave-5d's
+///   supersession retirement, R448-4) or the suffix.
+///
+/// Measured on both: lane head `403f20e5`, and `batch-11-dry10` (`52c53f1d`).
 #[test]
 fn wave6o_suffix_arm_is_inert_without_a_delivered_base() {
     assert!(verify::type_checks_str(COMPUTED_VIEW));
-    ::utils::compilation::run_compiler_on_str(COMPUTED_VIEW, |tcx| {
+    let base_delivers = ::utils::compilation::run_compiler_on_str(COMPUTED_VIEW, |tcx| {
         let table = super::decide_table(tcx).expect("native decisions");
         let reason = |name: &str| {
             table
@@ -49,23 +58,32 @@ fn wave6o_suffix_arm_is_inert_without_a_delivered_base() {
                 })
                 .unwrap_or_else(|| "<absent>".to_owned())
         };
-        assert_eq!(
-            reason("data"),
-            "slice-cursor-use",
-            "the base is not delivered on this frame, so the suffix arm has nothing to build from"
-        );
-        assert_eq!(
-            reason("s"),
-            "null-init",
-            "and the destination keeps its existing hold"
-        );
+        let base = reason("data");
+        if base == "slice-cursor-use" {
+            assert_eq!(
+                reason("s"),
+                "null-init",
+                "lane frame: no delivered base, so the destination keeps its hold"
+            );
+            false
+        } else {
+            assert!(
+                base.starts_with("Slice"),
+                "composed frame: the base delivers as a slice, got {base}"
+            );
+            true
+        }
     })
     .expect("fixture compiler context");
     let output = ast_emitted_source_of(COMPUTED_VIEW).expect("native emission");
     assert!(
-        !output.contains("Option<&[u8]>") && verify::type_checks_str(&output),
-        "{output}"
+        !output.contains("from_ref"),
+        "a destination read past its first element is never a one-element carrier:\n{output}"
     );
+    if !base_delivers {
+        assert!(!output.contains("Option<&[u8]>"), "{output}");
+    }
+    assert!(verify::type_checks_str(&output), "{output}");
 }
 
 /// **The delivering half.** Where the base DOES deliver — wave-6s2's line
