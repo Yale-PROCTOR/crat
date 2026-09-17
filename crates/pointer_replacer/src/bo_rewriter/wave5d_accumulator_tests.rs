@@ -125,13 +125,30 @@ fn w5d_acc_ad_emits_nested_tables_and_evidence_lengths() {
     assert!(helper.contains("ifhl!=0.0f64"));
     assert!(helper.contains("sum+="));
 }
+/// **Relay 041 ruling (A).** Every mutation below targets `ti_ad`, so the
+/// control is about `ti_ad` — not about the file. While the pair rule
+/// (`decision/nested_slice.rs`) was the only nested producer, "no receipt in
+/// this file is `Ok`" and "`ti_ad` is not admitted" were the same assertion;
+/// R435-1 chartered a second producer (the `nested` lane's N1), which may
+/// legitimately admit a SIBLING of this fixture (`ti_edecay::inputs`,
+/// `ti_obv::inputs`), and that is not what any of these mutations is about.
 fn held(source: &str) {
-    with_table(source, |table| {
+    ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
         assert!(
-            !table.nested_receipts.iter().any(|r| r.result.is_ok()),
-            "no widened native admission"
+            !table.nested_receipts.iter().any(|r| r.result.is_ok()
+                && tcx.def_path_str(r.owner.to_def_id()) == "indicators::ad::ti_ad"),
+            "no widened native admission for ti_ad"
         );
-    });
+    })
+    .unwrap();
 }
 #[test]
 fn w5d_acc_nonzero_initial_accumulator_is_not_this_rule() {

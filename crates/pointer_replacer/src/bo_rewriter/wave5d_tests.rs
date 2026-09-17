@@ -114,11 +114,17 @@ fn held_native(source: &str) {
             "must not admit: {:?}",
             receipt.result
         );
+        // **Relay 041 ruling (A).** Scoped to `ti_abs`'s own subjects. While the
+        // pair rule was the only nested producer this was the same statement as
+        // the receipt check above; R435-1 chartered a second one (the `nested`
+        // lane's N1), and a `NestedSlice` decision in ANOTHER owner is not what
+        // this control is about.
         assert!(
             !table
                 .entries
                 .iter()
-                .any(|(_, d)| matches!(d, Decision::NestedSlice { .. }))
+                .any(|(s, d)| matches!(d, Decision::NestedSlice { .. })
+                    && tcx.def_path_str(s.fn_did.to_def_id()) == "indicators::abs::ti_abs")
         );
     })
     .unwrap();
@@ -130,7 +136,36 @@ fn w5d_storage_negative_retains_raw_elements_without_reinterpretation() {
         "while i < size {",
         "* (outputs as *mut *mut std::os::raw::c_double) = output; while i < size {",
     );
-    held_native(&source);
+    // **Relay 041 ruling (A).** This control is about the `outputs` table — the
+    // one the mutation writes through — so it is pinned to that subject. N1
+    // REFUSES `outputs` here (which is the control's point) and admits the
+    // sibling `inputs`; an owner-wide assertion would read that sibling as a
+    // failure of this control.
+    held_native_subject(&source, "outputs");
+}
+
+/// `held_native`, narrowed to ONE parameter of `ti_abs`.
+fn held_native_subject(source: &str, parameter: &str) {
+    ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        assert!(
+            !table
+                .entries
+                .iter()
+                .any(|(s, d)| matches!(d, Decision::NestedSlice { .. })
+                    && tcx.def_path_str(s.fn_did.to_def_id()) == "indicators::abs::ti_abs"
+                    && s.param_name.as_deref() == Some(parameter)),
+            "{parameter} must not be admitted as a nested slice"
+        );
+    })
+    .unwrap();
 }
 
 #[test]
