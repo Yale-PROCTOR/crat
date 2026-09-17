@@ -140,28 +140,32 @@ const CALLEE_PAIR_HELD: &str = r#"
 "#;
 
 #[test]
-#[ignore = "RED by design (wave-5d2): the A5 pair-arm `a5-site-proof-t2-fallback` edit over the whole call collides with the caller's own `q.as_mut_ptr()` raw-view edit (cross-class-interval-collision) — the pair-charged partner coupling of R403-4"]
 fn wave6s2_pass_on_beside_an_a5_pair_fallback_edit_bridges() {
     let (source, receipts) = emit_with_receipts(CALLEE_PAIR_HELD);
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(source.contains("mut p: &[u8]"), "{source}");
     assert!(source.contains("mut q: &mut [u8]"), "{source}");
+    // R217-2(a): the expectation MOVED with wave-5d's exclusion re-derivation
+    // and the A5 pair arm (batch-9 candidate frame). The collision that held
+    // both classes is gone: the callee's READ parameter converts with the
+    // caller's `p` (zero syntax), and only the WRITE parameter stays raw,
+    // taking the caller's `q` through the A5 arm's temporary.
     assert!(
-        source.contains("mut a: *const u8, mut b: *mut u8"),
-        "the callee keeps its raw parameters: {source}"
+        source.contains("mut a: &[u8], mut b: *mut u8"),
+        "the callee's read parameter converts, the write parameter stays raw: {source}"
+    );
+    let text = joined(&source);
+    assert!(
+        text.contains("let __crat_a5_raw_") && text.contains(": *mut u8 = q.as_mut_ptr();"),
+        "the write pass-on is the A5 arm's raw view of the caller's slice: {source}"
     );
     assert!(
-        joined(&source).contains("pair(p.as_ptr(), q.as_mut_ptr(), n)"),
-        "the pass-ons are the sites' raw bridges: {source}"
+        text.contains("pair(p, __crat_a5_raw_"),
+        "the read pass-on is zero syntax into the converted parameter: {source}"
     );
     assert!(
-        receipts.contains("adapter=slice-to-raw-const")
-            && receipts.contains("adapter=slice-mut-to-raw-mut"),
-        "the receipts name the boundary templates: {receipts}"
-    );
-    assert!(
-        receipts.contains("callee-parameter-degraded:pair-raw-view"),
-        "the receipt names why the callee settles raw: {receipts}"
+        receipts.contains("adapter=slice-mut-to-raw-mut"),
+        "the write bridge's template: {receipts}"
     );
 }
 
@@ -225,7 +229,7 @@ const HUFFMAN_TREE_FAST: &str = r#"
 "#;
 
 #[test]
-#[ignore = "RED by design: the mutable `depth: &mut [u8]` into the shared `depth: &[u8]` parameter is W-C1's `Hold::Form` until wave-6s's coercion arm (`b56f95a1`) lands, and under it the caller is still withdrawn by the R220 restoration walk (`new-family-dependency` / `restore-prior-family-disposition`) that wave-5d's primitive replaces; un-ignore when both are on the head"]
+#[ignore = "RED by design, CALLER side only (batch-9 candidate frame df982371): the callee's `depth: &[u8]` / `bits: &mut [u16]` now deliver, and the caller `BrotliBuildAndStoreHuffmanTreeFast` is withdrawn by the restoration walk (`exclusion-rederivation:anchor=4:restore-family-interface-path:[4, 9]`, then `restore-prior-family-disposition`) — wave-5d's R220 layer; un-ignore when that walk stops withdrawing the caller"]
 fn wave6s2_huffman_tree_fast_mutable_into_shared_pass_on_is_zero_syntax() {
     let (source, receipts) = emit_with_receipts(HUFFMAN_TREE_FAST);
     assert!(super::verify::type_checks_str(&source), "{source}");
@@ -499,7 +503,6 @@ const CHECK_OUTPUT: &str = r#"
 "#;
 
 #[test]
-#[ignore = "pin of wave-6f W6F-2 (+ the return-type refinement of relay wave-6f/005 §2): RED until both are on the head; un-ignore then"]
 fn wave6s2_fn_pointer_call_argument_takes_the_t2_raw_view() {
     let (source, receipts) = emit_with_receipts(CHECK_OUTPUT);
     assert!(super::verify::type_checks_str(&source), "{source}");
@@ -531,7 +534,6 @@ const FN_POINTER_CONTROLS: &str = r#"
 "#;
 
 #[test]
-#[ignore = "pin of wave-6f W6F-2's holds on the Slice family (shared source at a `*mut` parameter; a pointer-returning function pointer): un-ignore with the witness above and re-phrase the receipt keys to W6F-2's"]
 fn wave6s2_fn_pointer_call_controls_stay_held() {
     let (source, receipts) = emit_with_receipts(FN_POINTER_CONTROLS);
     assert!(super::verify::type_checks_str(&source), "{source}");
@@ -548,4 +550,68 @@ fn wave6s2_fn_pointer_call_controls_stay_held() {
         receipts.contains("returned-child") || receipts.contains("negative-write-absent"),
         "{receipts}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// W6S2-4 — a COMPUTED VIEW of a delivered slice at an argument of a call
+// through a function pointer: the composition of wave-6s's computed
+// sub-view spine with wave-6f's `<indirect>` raw-boundary site (relay 005 §1).
+// ---------------------------------------------------------------------------
+
+/// **Witness (brotli `SortHuffmanTreeItems::items#1`, the batch-6 market's
+/// last two `slice-cursor-use` rows — the same function in
+/// `enc::brotli_bit_stream` and in `enc::entropy_encode`, both sole).** The
+/// subject is walked by `*items.offset(i)` reads and writes (the deref-index
+/// arm) and handed to the comparator as `&mut *items.offset(j as isize)` — a
+/// computed view at an argument of a call through a function pointer. Neither
+/// end existed at batch 6: the spine refused the position (unregistered
+/// callee) and the position had no boundary site.
+const SORT_HUFFMAN_TREE_ITEMS: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ #[repr(C)] #[derive(Copy, Clone)] pub struct HuffmanTree { pub total_count_: u32, pub index_left_: i16, pub index_right_or_value_: i16 }
+ pub type HuffmanTreeComparator = Option<unsafe extern "C" fn(*const HuffmanTree, *const HuffmanTree) -> i32>;
+ unsafe extern "C" fn SortHuffmanTreeItemsCmp(v0: *const HuffmanTree, v1: *const HuffmanTree) -> i32 {
+    ((*v0).total_count_ < (*v1).total_count_) as i32
+ }
+ pub unsafe fn BrotliCreateHuffmanTree(mut tree: *mut HuffmanTree, n: usize) {
+    SortHuffmanTreeItems(tree, n, Some(SortHuffmanTreeItemsCmp));
+ }
+ unsafe fn SortHuffmanTreeItems(mut items: *mut HuffmanTree, n: usize, mut comparator: HuffmanTreeComparator) {
+    let mut i: usize = 1;
+    while i < n {
+        let mut tmp = *items.offset(i as isize);
+        let mut k = i;
+        let mut j = i.wrapping_sub(1);
+        while comparator.expect("non-null function pointer")(&mut tmp, &mut *items.offset(j as isize)) != 0 {
+            *items.offset(k as isize) = *items.offset(j as isize);
+            k = j;
+            let fresh0 = j;
+            j = j.wrapping_sub(1);
+            if fresh0 == 0 { break; }
+        }
+        *items.offset(k as isize) = tmp;
+        i = i.wrapping_add(1);
+    }
+ }
+"#;
+
+#[test]
+#[ignore = "RED by design, ANALYSIS frame (batch-9 candidate df982371): the reduction's model settles `items` Raw (`kind-raw`) however it is spelled — measured with and without a concrete comparator target, with a direct call in place of the indirect one, without the struct copy, and with a forward-only walk (report 007, MAX-3). The corpus rows are `slice-cursor-use`, i.e. model-Ref, so the emission question this witness asks is only reachable on an analysis-faithful reduction or on the corpus row itself"]
+fn wave6s2_computed_view_at_a_fn_pointer_argument_delivers_the_slice() {
+    let (source, receipts) = emit_with_receipts(SORT_HUFFMAN_TREE_ITEMS);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("mut items: &mut [HuffmanTree]"),
+        "the subject delivers: {source}"
+    );
+    let text = joined(&source);
+    assert!(text.contains("items[i]"), "the deref-index arm: {source}");
+    assert!(
+        text.contains("(&mut (items)[j..]).as_mut_ptr()")
+            || text.contains("(&mut items[j..]).as_mut_ptr()")
+            || text.contains("&mut (items)[j]")
+            || text.contains("&mut items[j]"),
+        "the computed view at the indirect argument: {source}"
+    );
+    assert!(receipts.contains("retention=T2"), "{receipts}");
 }
