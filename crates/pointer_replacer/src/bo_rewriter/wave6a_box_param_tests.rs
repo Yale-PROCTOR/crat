@@ -833,3 +833,62 @@ fn w6a_c1_avls_rotation_owner_passes_the_use_check_and_holds_on_its_caller() {
         out.source
     );
 }
+
+/// **Rung 3, pinned** (relay wave-6a/027, report 022 §2): a consuming callee
+/// whose owner is a STRUCT — used through its fields and freed there — whose
+/// CALLER allocated it with the contract's allocator. The callee side passes
+/// (rung 1 closed its use check); the chain holds on the caller, because the
+/// ordinary Box arm has no initializer form for a struct pointee.
+///
+/// The obvious repair — let the chain move the CONTRACT's plan for that local —
+/// was built and reverted: with the transfer admitted as the contract's sink,
+/// both families plan the same binding, and C1's own witnesses go red. Which
+/// family owns a local whose allocation is the contract's and whose release is
+/// a callee's is a design question, and report 022 §3 asks it.
+const CONTRACT_OWNER_CHAIN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub height: i32,
+}
+pub unsafe extern "C" fn retire(mut p: *mut Node) -> i32 {
+    (*p).height = 0 as i32;
+    let mut k = (*p).key;
+    free(p as *mut core::ffi::c_void);
+    return k;
+}
+pub unsafe extern "C" fn build_and_retire(mut key: i32) -> i32 {
+    let mut n = malloc(::std::mem::size_of::<Node>() as std::os::raw::c_ulong) as *mut Node;
+    (*n).key = key;
+    (*n).height = 1 as i32;
+    return retire(n);
+}
+"#;
+
+#[test]
+fn w6a_c1_a_contract_owner_holds_on_its_callers_initializer() {
+    let out = emitted("bp-contract-chain", CONTRACT_OWNER_CHAIN);
+    let receipts = &out.artifacts.box_param_receipts;
+    // The CALLEE side is settled: the owner's field uses no longer hold it.
+    assert!(
+        !receipts.contains("raw-use:p"),
+        "rung 1 is closed\n{receipts}"
+    );
+    // The CALLER side is rung 3, named exactly.
+    assert!(
+        receipts.contains(
+            "retire::p\theld\tbox-param-caller-retains:build_and_retire:unplanned-argument:box-initializer-unsupported"
+        ),
+        "{receipts}"
+    );
+    assert!(
+        !compact(&out.source).contains("Box<Node>"),
+        "{}",
+        out.source
+    );
+}
