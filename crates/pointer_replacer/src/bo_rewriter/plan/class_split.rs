@@ -990,6 +990,452 @@ pub unsafe fn fill(ff: *mut f32, width: i32, height: i32) {
         );
     }
 
+    /// **The census reading, reproduced** (ownership-fields'
+    /// `negative-offset-stub.rs`, the one-edit twin of the clean stub: `z` and
+    /// `w` are written at `i - 1` in the callee). Every owner of the caller
+    /// reads `box-param-caller-unknown`, which is heman's census frame in a
+    /// 169-line file.
+    ///
+    /// **It is NOT R459-5's hold-side witness** (wave-5d2 report 030, measured
+    /// both ways): the rows here are identical with and without
+    /// `declarations_rendered_by_another_plan`, because what holds these owners
+    /// is the native producer's own refusal —
+    /// `Missing(NativeIdentity "native-subject-bundle")` — and not a class hold
+    /// the predicate could release. It is a frame PIN: when these owners start
+    /// delivering, this test goes red and whoever made them deliver should say
+    /// so.
+    const COORDFIELD_NEGATIVE_OFFSET: &str = r####"
+#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments, unused_variables, non_camel_case_types, non_snake_case)]
+pub mod libc {
+    pub use core::ffi::c_float;
+    pub use core::ffi::c_int;
+    pub use core::ffi::c_ulong;
+    pub use core::ffi::c_void;
+}
+pub type uint16_t = u16;
+extern "C" {
+    fn calloc(n: libc::c_ulong, s: libc::c_ulong) -> *mut libc::c_void;
+    fn free(p: *mut libc::c_void);
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct heman_image_s {
+    pub width: libc::c_int,
+    pub height: libc::c_int,
+    pub nbands: libc::c_int,
+    pub data: *mut libc::c_float,
+}
+pub type heman_image = heman_image_s;
+unsafe extern "C" fn edt_with_payload(
+    mut f: *mut libc::c_float,
+    mut d: *mut libc::c_float,
+    mut z: *mut libc::c_float,
+    mut w: *mut uint16_t,
+    mut n: libc::c_int,
+    mut payload_in: *mut libc::c_float,
+    mut payload_out: *mut libc::c_float,
+) {
+    let mut i = 0 as libc::c_int;
+    while i < n {
+        *d.offset(i as isize) = *f.offset(i as isize);
+        *z.offset((i - 1 as libc::c_int) as isize) = 0.0f32;
+        *w.offset((i - 1 as libc::c_int) as isize) = 0 as uint16_t;
+        *payload_out.offset(i as isize) = *payload_in.offset(i as isize);
+        i += 1;
+    }
+}
+pub unsafe extern "C" fn entry(mut sdf: *mut heman_image, mut cf: *mut heman_image) {
+    transform_to_coordfield(sdf, cf);
+}
+unsafe extern "C" fn transform_to_coordfield(mut sdf:
+        *mut heman_image, mut cf: *mut heman_image) {
+    let mut width = (*sdf).width;
+    let mut height = (*sdf).height;
+    let mut size = width * height;
+    let mut ff =
+        calloc(size as libc::c_ulong,
+                ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+            *mut libc::c_float;
+    let mut dd =
+        calloc(size as libc::c_ulong,
+                ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+            *mut libc::c_float;
+    let mut zz =
+        calloc(((height + 1 as libc::c_int) *
+                            (width + 1 as libc::c_int)) as libc::c_ulong,
+                ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+            *mut libc::c_float;
+    let mut ww =
+        calloc(size as libc::c_ulong,
+                ::std::mem::size_of::<uint16_t>() as libc::c_ulong) as
+            *mut uint16_t;
+    let mut x: libc::c_int = 0;
+    x = 0 as libc::c_int;
+    while x < width {
+        let mut pl1 =
+            calloc((height * 2 as libc::c_int) as libc::c_ulong,
+                    ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+                *mut libc::c_float;
+        let mut pl2 =
+            calloc((height * 2 as libc::c_int) as libc::c_ulong,
+                    ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+                *mut libc::c_float;
+        let mut f = ff.offset((height * x) as isize);
+        let mut d = dd.offset((height * x) as isize);
+        let mut z =
+            zz.offset(((height + 1 as libc::c_int) * x) as isize);
+        let mut w = ww.offset((height * x) as isize);
+        let mut y = 0 as libc::c_int;
+        while y < height {
+            *f.offset(y as isize) =
+                *((*sdf).data).offset(((y * width) as isize) +
+                            (x as isize));
+            *pl1.offset((y * 2 as libc::c_int) as isize) =
+                *((*cf).data).offset(((2 as libc::c_int * (y * width + x))
+                                    as isize) + (0 as libc::c_int as isize));
+            *pl1.offset((y * 2 as libc::c_int + 1 as libc::c_int) as
+                            isize) =
+                *((*cf).data).offset(((2 as libc::c_int * (y * width + x))
+                                    as isize) + (1 as libc::c_int as isize));
+            y += 1;
+        }
+        edt_with_payload(f, d, z, w, height, pl1, pl2);
+        let mut y_0 = 0 as libc::c_int;
+        while y_0 < height {
+            *((*sdf).data).offset(((y_0 * width) as isize) +
+                            (x as isize)) = *d.offset(y_0 as isize);
+            *((*cf).data).offset(((2 as libc::c_int * (y_0 * width + x))
+                                    as isize) + (0 as libc::c_int as isize)) =
+                *pl2.offset((2 as libc::c_int * y_0) as isize);
+            *((*cf).data).offset(((2 as libc::c_int * (y_0 * width + x))
+                                    as isize) + (1 as libc::c_int as isize)) =
+                *pl2.offset((2 as libc::c_int * y_0 + 1 as libc::c_int) as
+                            isize);
+            y_0 += 1;
+        }
+        free(pl1 as *mut libc::c_void);
+        free(pl2 as *mut libc::c_void);
+        x += 1;
+    }
+    let mut y_1: libc::c_int = 0;
+    y_1 = 0 as libc::c_int;
+    while y_1 < height {
+        let mut pl1_0 =
+            calloc((width * 2 as libc::c_int) as libc::c_ulong,
+                    ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+                *mut libc::c_float;
+        let mut pl2_0 =
+            calloc((width * 2 as libc::c_int) as libc::c_ulong,
+                    ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+                *mut libc::c_float;
+        let mut f_0 = ff.offset((width * y_1) as isize);
+        let mut d_0 = dd.offset((width * y_1) as isize);
+        let mut z_0 =
+            zz.offset(((width + 1 as libc::c_int) * y_1) as isize);
+        let mut w_0 = ww.offset((width * y_1) as isize);
+        let mut x_0 = 0 as libc::c_int;
+        while x_0 < width {
+            *f_0.offset(x_0 as isize) =
+                *((*sdf).data).offset(((y_1 * width) as isize) +
+                            (x_0 as isize));
+            *pl1_0.offset((x_0 * 2 as libc::c_int) as isize) =
+                *((*cf).data).offset(((2 as libc::c_int *
+                                            (y_1 * width + x_0)) as isize) +
+                            (0 as libc::c_int as isize));
+            *pl1_0.offset((x_0 * 2 as libc::c_int + 1 as libc::c_int) as
+                            isize) =
+                *((*cf).data).offset(((2 as libc::c_int *
+                                            (y_1 * width + x_0)) as isize) +
+                            (1 as libc::c_int as isize));
+            x_0 += 1;
+        }
+        edt_with_payload(f_0, d_0, z_0, w_0, width, pl1_0, pl2_0);
+        let mut x_1 = 0 as libc::c_int;
+        while x_1 < width {
+            *((*sdf).data).offset(((y_1 * width) as isize) +
+                            (x_1 as isize)) = *d_0.offset(x_1 as isize);
+            *((*cf).data).offset(((2 as libc::c_int *
+                                            (y_1 * width + x_1)) as isize) +
+                            (0 as libc::c_int as isize)) =
+                *pl2_0.offset((2 as libc::c_int * x_1) as isize);
+            *((*cf).data).offset(((2 as libc::c_int *
+                                            (y_1 * width + x_1)) as isize) +
+                            (1 as libc::c_int as isize)) =
+                *pl2_0.offset((2 as libc::c_int * x_1 + 1 as libc::c_int) as
+                            isize);
+            x_1 += 1;
+        }
+        free(pl1_0 as *mut libc::c_void);
+        free(pl2_0 as *mut libc::c_void);
+        y_1 += 1;
+    }
+    free(ff as *mut libc::c_void);
+    free(dd as *mut libc::c_void);
+    free(zz as *mut libc::c_void);
+    free(ww as *mut libc::c_void);
+}
+"####;
+
+    #[test]
+    fn the_negative_offset_twin_holds_every_owner() {
+        let got = run(COORDFIELD_NEGATIVE_OFFSET);
+        eprintln!("NEGATIVE-OFFSET\n{}", got.subjects);
+        for key in [
+            "transform_to_coordfield::ff#8",
+            "transform_to_coordfield::dd#14",
+            "transform_to_coordfield::zz#20",
+            "transform_to_coordfield::ww#32",
+        ] {
+            assert_eq!(
+                column(&got.subjects, key, "decision"),
+                "degraded",
+                "the census frame, reproduced: every owner is held:\n{}",
+                got.subjects
+            );
+            assert_eq!(
+                column(&got.subjects, key, "placed"),
+                "0",
+                "and none of them places:\n{}",
+                got.subjects
+            );
+        }
+        // The clean twin delivers all four — one edit, in the CALLEE, is the
+        // whole difference (ownership-fields' `the-one-edit.diff`).
+        let clean = run(COORDFIELD_WITH_THE_CALLEE);
+        assert_eq!(
+            column(&clean.subjects, "transform_to_coordfield::ff#8", "decision"),
+            "box",
+            "the clean twin still delivers:\n{}",
+            clean.subjects
+        );
+    }
+
+    /// **The corpus-faithful shape** (ownership-fields' `clean-stub.rs`, the
+    /// fixture their packet
+    /// `2026-09-17-ownership-fields-fixture-vs-corpus/control/` names as the
+    /// one that matches heman): the real `transform_to_coordfield` with all
+    /// four views passed to one local callee, `pl1`/`pl2` allocated and freed
+    /// per iteration, and the post-call reads. Only the callee is a stub, and
+    /// its offsets are non-negative — the negative-offset twin is the census
+    /// reading and is slicecursor's to restore (relay 034).
+    const COORDFIELD_WITH_THE_CALLEE: &str = r####"
+#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments, unused_variables, non_camel_case_types, non_snake_case)]
+pub mod libc {
+    pub use core::ffi::c_float;
+    pub use core::ffi::c_int;
+    pub use core::ffi::c_ulong;
+    pub use core::ffi::c_void;
+}
+pub type uint16_t = u16;
+extern "C" {
+    fn calloc(n: libc::c_ulong, s: libc::c_ulong) -> *mut libc::c_void;
+    fn free(p: *mut libc::c_void);
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct heman_image_s {
+    pub width: libc::c_int,
+    pub height: libc::c_int,
+    pub nbands: libc::c_int,
+    pub data: *mut libc::c_float,
+}
+pub type heman_image = heman_image_s;
+unsafe extern "C" fn edt_with_payload(
+    mut f: *mut libc::c_float,
+    mut d: *mut libc::c_float,
+    mut z: *mut libc::c_float,
+    mut w: *mut uint16_t,
+    mut n: libc::c_int,
+    mut payload_in: *mut libc::c_float,
+    mut payload_out: *mut libc::c_float,
+) {
+    let mut i = 0 as libc::c_int;
+    while i < n {
+        *d.offset(i as isize) = *f.offset(i as isize);
+        *z.offset(i as isize) = 0.0f32;
+        *w.offset(i as isize) = 0 as uint16_t;
+        *payload_out.offset(i as isize) = *payload_in.offset(i as isize);
+        i += 1;
+    }
+}
+pub unsafe extern "C" fn entry(mut sdf: *mut heman_image, mut cf: *mut heman_image) {
+    transform_to_coordfield(sdf, cf);
+}
+unsafe extern "C" fn transform_to_coordfield(mut sdf:
+        *mut heman_image, mut cf: *mut heman_image) {
+    let mut width = (*sdf).width;
+    let mut height = (*sdf).height;
+    let mut size = width * height;
+    let mut ff =
+        calloc(size as libc::c_ulong,
+                ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+            *mut libc::c_float;
+    let mut dd =
+        calloc(size as libc::c_ulong,
+                ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+            *mut libc::c_float;
+    let mut zz =
+        calloc(((height + 1 as libc::c_int) *
+                            (width + 1 as libc::c_int)) as libc::c_ulong,
+                ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+            *mut libc::c_float;
+    let mut ww =
+        calloc(size as libc::c_ulong,
+                ::std::mem::size_of::<uint16_t>() as libc::c_ulong) as
+            *mut uint16_t;
+    let mut x: libc::c_int = 0;
+    x = 0 as libc::c_int;
+    while x < width {
+        let mut pl1 =
+            calloc((height * 2 as libc::c_int) as libc::c_ulong,
+                    ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+                *mut libc::c_float;
+        let mut pl2 =
+            calloc((height * 2 as libc::c_int) as libc::c_ulong,
+                    ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+                *mut libc::c_float;
+        let mut f = ff.offset((height * x) as isize);
+        let mut d = dd.offset((height * x) as isize);
+        let mut z =
+            zz.offset(((height + 1 as libc::c_int) * x) as isize);
+        let mut w = ww.offset((height * x) as isize);
+        let mut y = 0 as libc::c_int;
+        while y < height {
+            *f.offset(y as isize) =
+                *((*sdf).data).offset(((y * width) as isize) +
+                            (x as isize));
+            *pl1.offset((y * 2 as libc::c_int) as isize) =
+                *((*cf).data).offset(((2 as libc::c_int * (y * width + x))
+                                    as isize) + (0 as libc::c_int as isize));
+            *pl1.offset((y * 2 as libc::c_int + 1 as libc::c_int) as
+                            isize) =
+                *((*cf).data).offset(((2 as libc::c_int * (y * width + x))
+                                    as isize) + (1 as libc::c_int as isize));
+            y += 1;
+        }
+        edt_with_payload(f, d, z, w, height, pl1, pl2);
+        let mut y_0 = 0 as libc::c_int;
+        while y_0 < height {
+            *((*sdf).data).offset(((y_0 * width) as isize) +
+                            (x as isize)) = *d.offset(y_0 as isize);
+            *((*cf).data).offset(((2 as libc::c_int * (y_0 * width + x))
+                                    as isize) + (0 as libc::c_int as isize)) =
+                *pl2.offset((2 as libc::c_int * y_0) as isize);
+            *((*cf).data).offset(((2 as libc::c_int * (y_0 * width + x))
+                                    as isize) + (1 as libc::c_int as isize)) =
+                *pl2.offset((2 as libc::c_int * y_0 + 1 as libc::c_int) as
+                            isize);
+            y_0 += 1;
+        }
+        free(pl1 as *mut libc::c_void);
+        free(pl2 as *mut libc::c_void);
+        x += 1;
+    }
+    let mut y_1: libc::c_int = 0;
+    y_1 = 0 as libc::c_int;
+    while y_1 < height {
+        let mut pl1_0 =
+            calloc((width * 2 as libc::c_int) as libc::c_ulong,
+                    ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+                *mut libc::c_float;
+        let mut pl2_0 =
+            calloc((width * 2 as libc::c_int) as libc::c_ulong,
+                    ::std::mem::size_of::<libc::c_float>() as libc::c_ulong) as
+                *mut libc::c_float;
+        let mut f_0 = ff.offset((width * y_1) as isize);
+        let mut d_0 = dd.offset((width * y_1) as isize);
+        let mut z_0 =
+            zz.offset(((width + 1 as libc::c_int) * y_1) as isize);
+        let mut w_0 = ww.offset((width * y_1) as isize);
+        let mut x_0 = 0 as libc::c_int;
+        while x_0 < width {
+            *f_0.offset(x_0 as isize) =
+                *((*sdf).data).offset(((y_1 * width) as isize) +
+                            (x_0 as isize));
+            *pl1_0.offset((x_0 * 2 as libc::c_int) as isize) =
+                *((*cf).data).offset(((2 as libc::c_int *
+                                            (y_1 * width + x_0)) as isize) +
+                            (0 as libc::c_int as isize));
+            *pl1_0.offset((x_0 * 2 as libc::c_int + 1 as libc::c_int) as
+                            isize) =
+                *((*cf).data).offset(((2 as libc::c_int *
+                                            (y_1 * width + x_0)) as isize) +
+                            (1 as libc::c_int as isize));
+            x_0 += 1;
+        }
+        edt_with_payload(f_0, d_0, z_0, w_0, width, pl1_0, pl2_0);
+        let mut x_1 = 0 as libc::c_int;
+        while x_1 < width {
+            *((*sdf).data).offset(((y_1 * width) as isize) +
+                            (x_1 as isize)) = *d_0.offset(x_1 as isize);
+            *((*cf).data).offset(((2 as libc::c_int *
+                                            (y_1 * width + x_1)) as isize) +
+                            (0 as libc::c_int as isize)) =
+                *pl2_0.offset((2 as libc::c_int * x_1) as isize);
+            *((*cf).data).offset(((2 as libc::c_int *
+                                            (y_1 * width + x_1)) as isize) +
+                            (1 as libc::c_int as isize)) =
+                *pl2_0.offset((2 as libc::c_int * x_1 + 1 as libc::c_int) as
+                            isize);
+            x_1 += 1;
+        }
+        free(pl1_0 as *mut libc::c_void);
+        free(pl2_0 as *mut libc::c_void);
+        y_1 += 1;
+    }
+    free(ff as *mut libc::c_void);
+    free(dd as *mut libc::c_void);
+    free(zz as *mut libc::c_void);
+    free(ww as *mut libc::c_void);
+}
+"####;
+
+    /// **The owner already renders all four views** (wave-5d2 report 026).
+    ///
+    /// This is why the Declaration-stage arm R453-4 granted was built,
+    /// measured and then NOT shipped: on this fixture it delivers the four
+    /// view rows and costs the four Box owners, and the owners were already
+    /// rendering those very views themselves —
+    ///
+    ///     let mut f: &mut [f32] = &mut (*(ff))[((height * x) as isize) as usize..];
+    ///
+    /// with `ff`/`dd`/`zz`/`ww` delivered `Box<[T]>`. The view rows read
+    /// `nested-use-edits` and are not COUNTED, but their code is safe and
+    /// exact. heman's sixteen views are a counting question, not an emission
+    /// one, and this witness pins that so the next change to either lane has
+    /// to say what it does to it.
+    #[test]
+    fn the_owner_renders_all_four_views_itself() {
+        let got = run(COORDFIELD_WITH_THE_CALLEE);
+        eprintln!("COORDFIELD\n{}", got.subjects);
+        for key in [
+            "transform_to_coordfield::ff#8",
+            "transform_to_coordfield::dd#14",
+            "transform_to_coordfield::zz#20",
+            "transform_to_coordfield::ww#32",
+        ] {
+            assert_eq!(
+                column(&got.subjects, key, "decision"),
+                "box",
+                "the owner delivers:\n{}",
+                got.subjects
+            );
+        }
+        let tree = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
+        for view in ["(*(ff))[", "(*(dd))[", "(*(zz))[", "(*(ww))["] {
+            assert!(
+                tree.contains(view),
+                "the owner's plan renders the view `{view}`:\n{}",
+                got.tree()
+            );
+        }
+        assert!(
+            !tree.contains("FALLBACK_SLICE_EXTENT"),
+            "and none of them fabricates an extent:\n{}",
+            got.tree()
+        );
+    }
+
     #[test]
     fn a_static_literal_local_is_typed_by_its_own_initializer() {
         let got = run(STATIC_LITERAL_SHAPE);
