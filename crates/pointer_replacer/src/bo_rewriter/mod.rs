@@ -1678,13 +1678,25 @@ pub(crate) fn effective_withheld_classes(
 /// this column says what the tree got, because a transaction whose owner
 /// class is reverted is inactive in `field_reference_ast` and its struct
 /// declaration goes with it (report 039 / R460-11).
-fn refresh_field_transaction_revert_status(
+/// **R469-1** — the set is the EFFECTIVE one, expanded exactly as the AST
+/// layer's is. `field_reference_ast::{apply, apply_wraps, apply_hoists}` run
+/// against `reverts.fns`, which comes from `effective_withheld_classes`: the
+/// held classes, the PARTITION closure, and this lane's field-transaction
+/// owner closure are all in it and none of them is in the raw `reverted`.
+/// Writing the column from the raw set said `active` for a
+/// partition-reverted owner and killed a census (`batch1314`, heman's
+/// `kmRay2IntersectBox`). The expansion happens HERE so no call site can get
+/// it wrong.
+pub(crate) fn refresh_field_transaction_revert_status(
     artifacts: &mut RawBoundaryArtifacts,
     tcx: TyCtxt<'_>,
     table: &decision::DecisionTable,
+    emission_plan: &plan::Plan,
     reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
 ) {
-    artifacts.field_transactions = table.field_transactions.receipt_tsv_at(tcx, reverted);
+    let effective = effective_withheld_classes(emission_plan, reverted, reverted_atoms);
+    artifacts.field_transactions = table.field_transactions.receipt_tsv_at(tcx, &effective);
 }
 
 fn refresh_raw_boundary_receipt_events(
@@ -2434,7 +2446,9 @@ fn verify_and_revert(
                     &mut facts.raw_boundary_artifacts,
                     tcx,
                     table,
+                    &emission_plan,
                     &reverted,
+                    &reverted_atoms,
                 );
                 record_unresolved_classes(
                     &mut facts.raw_boundary_artifacts,
@@ -2502,7 +2516,9 @@ fn verify_and_revert(
                 &mut facts.raw_boundary_artifacts,
                 tcx,
                 table,
+                &emission_plan,
                 &reverted,
+                &reverted_atoms,
             );
             return facts.emitted(source, files);
         }
@@ -2844,7 +2860,9 @@ fn verify_and_revert(
             &mut facts.raw_boundary_artifacts,
             tcx,
             table,
+            &emission_plan,
             &final_reverted,
+            &reverted_atoms,
         );
         record_unresolved_classes(
             &mut facts.raw_boundary_artifacts,
@@ -2981,7 +2999,9 @@ fn verify_and_revert(
                 &mut facts.raw_boundary_artifacts,
                 tcx,
                 table,
+                &emission_plan,
                 &final_reverted,
+                &reverted_atoms,
             );
             facts.emitted(source, final_files)
         }

@@ -2098,6 +2098,14 @@ fn w6f_the_receipt_says_what_the_tree_got() {
     );
 
     // …and the column reads `active()`'s OWN predicate, not a looser one.
+    //
+    // **This is a statement about `receipt_tsv_at`, NOT about the pipeline**
+    // (R469-1). In production the raw revert set is expanded by
+    // `effective_withheld_classes` first, and one of its closures is this
+    // lane's own: a revert of ANY owner pulls in all the others. So the
+    // `newNode` case below is unreachable through the emission — witness 29
+    // pins what the pipeline does, and this one pins the function under it.
+    // Report 040 stated the distinction without that caveat; here it is.
     // A transaction is withdrawn by its DEPENDENT owners — those carrying a
     // store, a load or a signature plan — while an owner of only
     // value-independent sites keeps its edits under any revert set. avl's
@@ -2157,6 +2165,99 @@ fn transaction_owner_split(
             t.owners.iter().map(name).collect::<Vec<_>>(),
             t.dependent_owners.iter().map(name).collect::<Vec<_>>(),
         )
+    })
+    .unwrap()
+}
+
+/// Witness 29 (relay 047 / R469-1) — **the refresh must expand the raw
+/// revert set before it writes the column.**
+///
+/// `batch1314` died on heman with `owner_reverted_but_reads_active:
+/// kmRay2IntersectBox`: the column said `active` while `final-reverts` listed
+/// the owner. The cause is not `receipt_tsv_at`, which is correct given a
+/// set — it is WHICH set reaches it. `apply` / `apply_wraps` / `apply_hoists`
+/// run against `reverts.fns`, built from `effective_withheld_classes`, which
+/// adds the held classes, the PARTITION closure and this lane's own
+/// field-transaction owner closure. The refresh was handed the RAW
+/// `reverted`, so a partition-reverted owner never appeared in it.
+///
+/// This exercises the refresh ITSELF, not its parts: the raw set names one
+/// owner, and the column must still read `withdrawn` because the closure
+/// carries the transaction. Handing the raw set straight through — the bug —
+/// makes it read `active`.
+#[test]
+fn w6f_the_refresh_expands_the_revert_set() {
+    let _frame = frame_lock();
+    avl_frame();
+    let status = refreshed_revert_status(AVL, "Node", "left", &["newNode"]);
+    super::test_model_override::clear();
+    assert_eq!(
+        status, "withdrawn",
+        "a revert anywhere in the transaction's owner set withdraws it: that is \
+         what the plan's closure does and what the AST layer then applies"
+    );
+}
+
+/// Run the production refresh over a decision table and read the column back
+/// out of the artifact it writes.
+fn refreshed_revert_status(
+    source: &str,
+    struct_name: &str,
+    field: &str,
+    reverted_owners: &[&str],
+) -> String {
+    let struct_name = struct_name.to_owned();
+    let field = field.to_owned();
+    let owners: Vec<String> = reverted_owners.iter().map(|o| (*o).to_owned()).collect();
+    ::utils::compilation::run_compiler_on_str(source, move |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let mut raw = std::collections::BTreeSet::new();
+        for owner in &owners {
+            let did = tcx
+                .hir_body_owners()
+                .find(|did| tcx.def_path_str(did.to_def_id()).ends_with(owner.as_str()))
+                .unwrap_or_else(|| panic!("owner {owner}"));
+            raw.insert(super::bridge_receipt::SignatureClassId::of(did));
+        }
+        // The plan carries one owner set per field transaction — the closure
+        // `effective_withheld_classes` applies, and the one a partition
+        // revert reaches this receipt through.
+        let mut plan = super::plan::Plan::default();
+        plan.field_transaction_owners = table
+            .field_transactions
+            .applied
+            .iter()
+            .map(|t| {
+                t.owners
+                    .iter()
+                    .map(|o| super::bridge_receipt::SignatureClassId::of(*o))
+                    .collect()
+            })
+            .collect();
+        let mut artifacts = super::RawBoundaryArtifacts::default();
+        super::refresh_field_transaction_revert_status(
+            &mut artifacts,
+            tcx,
+            &table,
+            &plan,
+            &raw,
+            &std::collections::BTreeSet::new(),
+        );
+        artifacts
+            .field_transactions
+            .lines()
+            .skip(1)
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .find(|cells| cells[0].ends_with(struct_name.as_str()) && cells[1] == field)
+            .unwrap_or_else(|| panic!("no row for {struct_name}.{field}"))[10]
+            .to_owned()
     })
     .unwrap()
 }
