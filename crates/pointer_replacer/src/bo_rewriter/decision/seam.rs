@@ -5060,11 +5060,16 @@ pub(crate) fn synthesize_with_raw_boundary(
                     && proof.verdict != A5SiteProofVerdict::Clear
                     && !pair_owned
                 {
-                    let positive_retention =
-                        matches!(
+                    let positive_retention = matches!(
                             retention.get(*callee, pos.index),
                             Some(super::raw_boundary::RetentionVerdict::Retains { .. })
-                        ) && !retention.returned_alias_settled(site.caller, *callee, pos.index);
+                        ) && !retention.returned_alias_settled(site.caller, *callee, pos.index)
+                            // wave-6v2's certificate answers the other shape:
+                            // the position's only positive sinks are stores
+                            // through its out-parameter, and every inventoried
+                            // call supplies them from frame-confined caller
+                            // locals (binn's `*_get_value` / `*_next`).
+                            && !retention.output_storage_settled(*callee, pos.index);
                     let role = a5_roles
                         .get(&pos.index)
                         .copied()
