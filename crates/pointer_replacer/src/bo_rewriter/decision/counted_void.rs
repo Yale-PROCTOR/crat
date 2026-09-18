@@ -1698,11 +1698,16 @@ fn insert_raw_twin(
     let mut twin = original.clone();
     let rustc_ast::ItemKind::Fn(function) = &mut twin.kind else { unreachable!() };
     function.ident = rustc_span::Ident::new(rustc_span::Symbol::intern(name), function.ident.span);
-    twin.vis = rustc_ast::Visibility {
-        kind: rustc_ast::VisibilityKind::Inherited,
-        span: rustc_span::DUMMY_SP,
-        tokens: None,
-    };
+    // wave-6r (relay wave-6r/025 and /027): the twin keeps the original's
+    // BODY, so it keeps the original's callers — and those are not always in
+    // the callee's module (heman's `kmVec2Add` is called from three others).
+    // A twin the callers cannot name fails with `E0425 … exists but is
+    // inaccessible` and the verify gate reverts the function. The twin
+    // therefore keeps the visibility of the item it clones: the pristine
+    // `pub` (or whatever the input wrote), with no synthesized visibility
+    // path — a `Restricted` one carries a `DUMMY_NODE_ID` the later passes
+    // must resolve, and on the batch-12 composition the item disappeared
+    // instead (the E0425 there had no "exists but is inaccessible" note).
     if !place(&mut krate.items, global_map, callee, &twin) {
         return Err(format!(
             "counted-void raw twin: converted item for {callee:?} not found"
