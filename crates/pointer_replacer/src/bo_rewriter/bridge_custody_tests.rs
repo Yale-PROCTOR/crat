@@ -874,6 +874,67 @@ mod matcher {
         assert!(report.data, "{report:#?}");
     }
 
+    /// **R460-1(b), RULED — an unannotated original local pairs by binding identity.**
+    ///
+    /// C2Rust writes `let mut p = seed;` with no annotation and the delivery
+    /// ledger transforms that local on purpose, so the two `type_text`s can never
+    /// agree and `local_types_correspond` refused on the `None`. That is 31 of
+    /// brotli's custody rows and batch 13's `data=false`. The seat ruled the type
+    /// test is not asked when the original is unannotated.
+    #[test]
+    fn r460_1_b_an_unannotated_original_pairs_by_identity_and_says_so() {
+        use crate::bo_rewriter::bridge_custody_match::Correspondence;
+        let case = |original_decl: &str| {
+            let input = format!(
+                "fn target(w: *mut i32, r: *mut u8) {{}} fn caller(w: *mut i32, seed: *mut u8) {{ {original_decl} target(w, p); }}"
+            );
+            let lo = input.find("target(w, p)").unwrap() as u32;
+            let output = format!(
+                "fn target(w: *mut i32, r: *mut u8) {{}} fn caller(w: *mut i32, seed: &mut [u8]) {{ let mut p: &mut [u8] = seed; {{ let __crat_pair_raw_{lo}_1: *mut u8 = p.as_mut_ptr(); target(w, __crat_pair_raw_{lo}_1); }} }}"
+            );
+            let mut expected = expectation(BridgeKind::PairT2RawView);
+            expected.anchor = SiteAnchor::Call {
+                span: ByteSpan {
+                    lo,
+                    hi: lo + "target(w, p)".len() as u32,
+                },
+                argument_indices: vec![1],
+            };
+            let original = syntax::inventory_source("r460b-original.rs", &input).unwrap();
+            let emitted = syntax::inventory_source("r460b-emitted.rs", &output).unwrap();
+            compare(BridgeCustodyInput {
+                original: &original,
+                emitted: &emitted,
+                original_source: &input,
+                emitted_source: &output,
+                expectations: &[expected],
+                context: &BridgeCustodyContext::default(),
+            })
+        };
+
+        // UNANNOTATED original: paired by identity, and the row says so.
+        let report = case("let mut p = seed;");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::MatchedRaw,
+            "an unannotated original local pairs by identity: {report:#?}"
+        );
+        assert!(report.data, "{report:#?}");
+        assert_eq!(report.rows[0].correspondence, Correspondence::ByIdentity);
+        assert_eq!(Correspondence::ByIdentity.wire(), "by-identity");
+
+        // ANNOTATED original: the type test is still asked, still passes on a
+        // corresponding form, and the row does NOT claim a widening it never used.
+        let annotated = case("let mut p: *mut u8 = seed;");
+        assert_eq!(
+            annotated.rows[0].status,
+            ReceiptStatus::MatchedRaw,
+            "{annotated:#?}"
+        );
+        assert_eq!(annotated.rows[0].correspondence, Correspondence::ByType);
+        assert_eq!(Correspondence::default(), Correspondence::ByType);
+    }
+
     #[test]
     fn bridge_custody_match_pending_local_raw_view_shares_the_ordinary_receipt() {
         let lo = LOCAL_PENDING_INPUT.find("target(w, r)").unwrap();

@@ -193,6 +193,9 @@ pub(crate) struct ReceiptResult {
     pub(crate) emitted_call: Option<ByteSpan>,
     pub(crate) argument_indices: Vec<usize>,
     pub(crate) bindings: Vec<BindingWitness>,
+    /// R460-1(b): which evidence paired this row's source bindings.
+    #[serde(default)]
+    pub(crate) correspondence: Correspondence,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1109,8 +1112,21 @@ fn same_source_binding_inner(
                     && candidate.binding == emitted.name
             });
     }
-    // A local counterpart needs its actual declaration, explicit compatible
-    // type and initializer dependencies. Equal names alone never establish it.
+    // A local counterpart needs its actual declaration, a compatible type where
+    // both sides HAVE one, and initializer dependencies. Equal names alone never
+    // establish it.
+    //
+    // **R460-1(b), RULED.** Where the ORIGINAL local carries no annotation, the
+    // type test is not asked and correspondence is decided by binding identity:
+    // the unique declaration in each owner, reached through the initializer chain
+    // below. C2Rust writes `let mut block_ids = BrotliAllocate(..) as *mut u8;`
+    // with no annotation, the delivery ledger transforms that local on purpose to
+    // `Option<Box<[u8]>>`, and `local_types_correspond` then had a `None` on one
+    // side and refused — 31 of brotli's rows, and batch 13's `data=false`.
+    // Custody checks fidelity of the SOURCE the bridge reads, and identity is
+    // stronger evidence of that than comparing a type the input never wrote.
+    // Annotated-vs-annotated still goes through the type test and an annotated
+    // mismatch still refuses.
     if input
         .original
         .bindings
@@ -1125,10 +1141,15 @@ fn same_source_binding_inner(
             .filter(|binding| binding.owner == emitted.owner && binding.name == emitted.name)
             .count()
             != 1
-        || !local_types_correspond(original.type_text.as_deref(), emitted.type_text.as_deref())
-            .unwrap_or(false)
+        || (original.type_text.is_some()
+            && !local_types_correspond(original.type_text.as_deref(), emitted.type_text.as_deref())
+                .unwrap_or(false))
     {
         return false;
+    }
+    if original.type_text.is_none() {
+        // The widening is countable: every row that used it says so.
+        record_correspondence(Correspondence::ByIdentity);
     }
     let pair = (original.id, emitted.id);
     if !visiting.insert(pair) {
@@ -1296,6 +1317,54 @@ fn source_binding_divergence(
         (None, None, None, None) => "declared-type".to_owned(),
         _ => "initializer-presence".to_owned(),
     }
+}
+
+/// **R460-1(b) — which evidence paired a row's source bindings.**
+///
+/// `ByType` is the standing test: both sides carry an annotation and the types
+/// correspond. `ByIdentity` is the ruled widening: the ORIGINAL local carries no
+/// annotation, so the type test is not asked and the unique declaration in each
+/// owner, reached through the initializer chain, is the evidence instead.
+///
+/// It is an INSTRUMENT, not a gate — it changes no verdict, it records which
+/// evidence a verdict rested on so the widening is countable in the census
+/// (R450-9: a new fact gets a new column).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Correspondence {
+    #[default]
+    ByType,
+    ByIdentity,
+}
+
+impl Correspondence {
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            Self::ByType => "by-type",
+            Self::ByIdentity => "by-identity",
+        }
+    }
+}
+
+thread_local! {
+    /// Set while ONE receipt row is being matched; `compare` clears it before
+    /// each row and reads it after, so the flag can never leak between rows.
+    static ROW_CORRESPONDENCE: std::cell::Cell<Correspondence> =
+        const { std::cell::Cell::new(Correspondence::ByType) };
+}
+
+fn record_correspondence(mode: Correspondence) {
+    if mode == Correspondence::ByIdentity {
+        ROW_CORRESPONDENCE.with(|cell| cell.set(mode));
+    }
+}
+
+fn reset_correspondence() {
+    ROW_CORRESPONDENCE.with(|cell| cell.set(Correspondence::ByType));
+}
+
+fn taken_correspondence() -> Correspondence {
+    ROW_CORRESPONDENCE.with(std::cell::Cell::get)
 }
 
 fn same_source_binding(
@@ -1796,6 +1865,8 @@ fn pending_carrier_witnesses(
             emitted_call: None,
             argument_indices: Vec::new(),
             bindings: Vec::new(),
+            // A companion probe, never published as a row of its own.
+            correspondence: Correspondence::ByType,
         };
         if match_receipt(input, companion, &mut row).is_err()
             || row.original_call != Some(original.span)
@@ -3344,7 +3415,9 @@ pub(crate) fn compare(input: BridgeCustodyInput<'_>) -> BridgeCustodyReport {
                 emitted_call: None,
                 argument_indices: Vec::new(),
                 bindings: Vec::new(),
+                correspondence: Correspondence::ByType,
             };
+            reset_correspondence();
             let result = if duplicates.contains(expected.identity.as_str()) {
                 Err("duplicate-ledger-identity".into())
             } else if !normalized_offsets {
@@ -3357,6 +3430,7 @@ pub(crate) fn compare(input: BridgeCustodyInput<'_>) -> BridgeCustodyReport {
                 row.reason = reason;
                 row.bindings.clear();
             }
+            row.correspondence = taken_correspondence();
             report.rows.push(row);
         }
         report.tree_only = reverse_census(&input, &report.rows);

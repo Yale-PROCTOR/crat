@@ -1735,6 +1735,8 @@ fn compare_applied(
                     emitted_call: None,
                     argument_indices: Vec::new(),
                     bindings: Vec::new(),
+                    // A mapping failure never reached a binding pairing.
+                    correspondence: super::bridge_custody_match::Correspondence::ByType,
                 });
                 comparison.data = false;
             }
