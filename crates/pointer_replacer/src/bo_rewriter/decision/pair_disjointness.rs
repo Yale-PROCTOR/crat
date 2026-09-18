@@ -1208,6 +1208,12 @@ struct LocalFacts {
 enum AssignKind {
     Null,
     Allocator(Freshness),
+    /// The value derives its ADDRESS from one place, whose root binding this
+    /// is: `&mut (*b).f`, `b.offset(k)`, `arr.as_mut_ptr()`, a cast of one of
+    /// those, or the bare local `b`. Every such form addresses the same object
+    /// as `b` on a UB-free input (§28: pointer arithmetic leaves its object
+    /// only as UB), so the local's root IS `b`'s root.
+    Derived(HirId),
     Other,
 }
 
@@ -1242,45 +1248,99 @@ fn classify_locals<'tcx>(
     };
     collector.visit_body(body);
 
-    facts
-        .into_iter()
-        .map(|(hir_id, fact)| {
-            let class = if fact.is_pointer {
-                if fact.address_taken {
-                    RootClass::Unknown
-                } else if fact.is_param {
-                    if fact.assignments.is_empty() {
-                        RootClass::EntryStorage(hir_id)
-                    } else {
+    let mut classes: FxHashMap<HirId, RootClass> = facts
+        .iter()
+        .map(|(&hir_id, fact)| {
+            let class =
+                if fact.is_pointer {
+                    if fact.address_taken {
                         RootClass::Unknown
+                    } else if fact.is_param {
+                        // R460-8: a parameter that only walks WITHIN its own object
+                        // (`p = p.offset(1)`, C2Rust's cursor idiom) still names
+                        // the storage it entered with; any other assignment makes
+                        // its value another object's and is resolved below.
+                        if fact.assignments.iter().all(
+                            |kind| matches!(kind, AssignKind::Derived(base) if *base == hir_id),
+                        ) {
+                            RootClass::EntryStorage(hir_id)
+                        } else {
+                            RootClass::Unknown
+                        }
+                    } else {
+                        let all_fresh = fact.assignments.iter().all(|kind| {
+                            matches!(kind, AssignKind::Null | AssignKind::Allocator(_))
+                        });
+                        let freshness = fact
+                            .assignments
+                            .iter()
+                            .filter_map(|kind| match kind {
+                                AssignKind::Allocator(freshness) => Some(*freshness),
+                                _ => None,
+                            })
+                            .reduce(Freshness::join);
+                        match (all_fresh, freshness) {
+                            (true, Some(freshness)) => RootClass::FreshAlloc(hir_id, freshness),
+                            _ => RootClass::Unknown,
+                        }
                     }
                 } else {
-                    let all_fresh = fact
-                        .assignments
-                        .iter()
-                        .all(|kind| matches!(kind, AssignKind::Null | AssignKind::Allocator(_)));
-                    let freshness = fact
-                        .assignments
-                        .iter()
-                        .filter_map(|kind| match kind {
-                            AssignKind::Allocator(freshness) => Some(*freshness),
-                            _ => None,
-                        })
-                        .reduce(Freshness::join);
-                    match (all_fresh, freshness) {
-                        (true, Some(freshness)) => RootClass::FreshAlloc(hir_id, freshness),
-                        _ => RootClass::Unknown,
-                    }
-                }
-            } else {
-                // A non-pointer binding IS an object on the caller's stack:
-                // every view into it (`&mut x`, `x.as_mut_ptr()`, `&mut x.f`)
-                // addresses that object.
-                RootClass::StackObject(hir_id)
-            };
+                    // A non-pointer binding IS an object on the caller's stack:
+                    // every view into it (`&mut x`, `x.as_mut_ptr()`, `&mut x.f`)
+                    // addresses that object.
+                    RootClass::StackObject(hir_id)
+                };
             (hir_id, class)
         })
-        .collect()
+        .collect();
+
+    // R460-8, the derived-root rule. A binding still `Unknown` whose every
+    // assignment is a null or a derivation of ONE other binding names the same
+    // object as that binding, so it inherits its class. Two different sources
+    // keep it `Unknown` — this is single derivation, not any derivation — and
+    // a derivation of ITSELF carries no information (the cursor case above).
+    // It only ever replaces `Unknown` with a class the rules already judge, so
+    // no certificate widens; the fixpoint is bounded and a cycle stays
+    // `Unknown`.
+    for _ in 0..8 {
+        let mut changed = false;
+        for (&hir_id, fact) in &facts {
+            if !fact.is_pointer
+                || fact.address_taken
+                || classes.get(&hir_id).copied() != Some(RootClass::Unknown)
+            {
+                continue;
+            }
+            let mut bases = FxHashSet::default();
+            let mut derived_only = true;
+            for kind in &fact.assignments {
+                match kind {
+                    AssignKind::Null => {}
+                    AssignKind::Derived(base) if *base == hir_id => {}
+                    AssignKind::Derived(base) => {
+                        bases.insert(*base);
+                    }
+                    _ => {
+                        derived_only = false;
+                        break;
+                    }
+                }
+            }
+            if !derived_only || bases.len() != 1 {
+                continue;
+            }
+            let base = bases.into_iter().next().expect("one base");
+            let inherited = classes.get(&base).copied().unwrap_or(RootClass::Unknown);
+            if inherited != RootClass::Unknown {
+                classes.insert(hir_id, inherited);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    classes
 }
 
 struct LocalCollector<'a, 'tcx> {
@@ -1300,6 +1360,8 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
                 .is_allocator_call(self.tcx, self.function, rhs)
         {
             AssignKind::Allocator(freshness)
+        } else if let Some(base) = derivation_base(self.typeck, rhs) {
+            AssignKind::Derived(base)
         } else {
             AssignKind::Other
         }
@@ -1487,6 +1549,48 @@ fn pointer_value_provenance<'tcx>(
             argument_provenance(tcx, typeck, classes, expr)
         }
         _ => (RootClass::Unknown, None),
+    }
+}
+
+/// R460-8. The binding whose OBJECT an address-producing expression stays
+/// inside. A pointer VALUE loaded out of a place (`(*s).field`) is deliberately
+/// NOT a derivation: it addresses whatever was stored there, which is another
+/// object, so such a local keeps `Unknown` and the pair stays held.
+fn derivation_base<'tcx>(typeck: &TypeckResults<'tcx>, expr: &Expr<'_>) -> Option<HirId> {
+    let expr = peel_casts(expr);
+    match &expr.kind {
+        ExprKind::Path(..) => resolved_local(expr),
+        ExprKind::AddrOf(BorrowKind::Ref, _, operand) => {
+            derivation_place_base(typeck, peel_casts(operand))
+        }
+        ExprKind::MethodCall(segment, receiver, method_args, _) => {
+            let receiver = peel_casts(receiver);
+            match segment.ident.name.as_str() {
+                "as_mut_ptr" | "as_ptr"
+                    if method_args.is_empty()
+                        && matches!(typeck.expr_ty(receiver).kind(), ty::Array(..)) =>
+                {
+                    derivation_place_base(typeck, receiver)
+                }
+                "offset" | "add" | "wrapping_add" | "wrapping_offset" | "cast" => {
+                    derivation_base(typeck, receiver)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The root binding of a PLACE: `(*b).f.g` / `b.arr[i]` → `b`, allowing one
+/// deref of a pointer at the root (the place is inside that pointee).
+fn derivation_place_base<'tcx>(typeck: &TypeckResults<'tcx>, place: &Expr<'_>) -> Option<HirId> {
+    match &place.kind {
+        ExprKind::Field(base, _) => derivation_place_base(typeck, peel_casts(base)),
+        ExprKind::Index(base, ..) => derivation_place_base(typeck, peel_casts(base)),
+        ExprKind::Unary(UnOp::Deref, inner) => derivation_base(typeck, inner),
+        ExprKind::Path(..) => resolved_local(place),
+        _ => None,
     }
 }
 

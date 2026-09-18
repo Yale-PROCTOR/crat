@@ -701,6 +701,116 @@ const CONTRACT_FIND_BLOCKS: &str = r#"
     }
 "#;
 
+/// brotli `CreateBackwardReferencesNH55` → `InitCommand`, mirrored: the
+/// cursor idiom C2Rust emits everywhere — `let fresh15 = commands; commands =
+/// commands.offset(1); InitCommand(fresh15, &mut …)`. Both pointers walk
+/// inside objects the caller can name, but neither is an allocation, so today
+/// `fresh15` and the reassigned parameter both classify `Unknown` and the pair
+/// reads `pair-disjointness-unproved:roots-unknown` — brotli's single largest
+/// unproven reason (2,376 sites; report 012 §3). The peer here is a stack
+/// scalar, so the moment the cursor HAS a class, rule (a) fires.
+const DERIVED_ROOT_CURSOR: &str = r#"
+    #[repr(C)]
+    pub struct Command { pub len: u32, pub code: u32 }
+    pub unsafe fn InitCommand(cmd: *mut Command, scratch: *mut u32, len: u32) {
+        (*cmd).len = len.wrapping_add(*scratch);
+        *scratch = (*cmd).len;
+    }
+    pub unsafe fn CreateBackwardReferences(mut commands: *mut Command, n: u64) {
+        let mut scratch: u32 = 0;
+        let mut i: u64 = 0;
+        while i < n {
+            let fresh15 = commands;
+            commands = commands.offset(1);
+            InitCommand(fresh15, &mut scratch, 3);
+            i = i.wrapping_add(1);
+        }
+    }
+"#;
+
+/// The derived-root rule: a local whose every assignment derives from ONE
+/// place inherits that place's root, and a parameter that only walks within
+/// its own object keeps its entry class. `Command` carries a `u32` member, so
+/// the type rule cannot fire — the roots are what separate the pair.
+#[test]
+fn w6p_derived_root_cursor_certifies_against_a_stack_peer() {
+    ::utils::compilation::run_compiler_on_str(DERIVED_ROOT_CURSOR, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        assert_eq!(
+            index.certify_recorded(
+                function("CreateBackwardReferences"),
+                function("InitCommand"),
+                0,
+                1
+            ),
+            Ok(CertificateKind::DistinctRoots),
+            "the cursor derives from the parameter; the peer is a stack object"
+        );
+    })
+    .expect("derived-root fixture compilation");
+}
+
+/// Two different sources keep the local `Unknown` — the rule is single
+/// derivation, not any derivation.
+const DERIVED_ROOT_TWO_SOURCES: &str = r#"
+    #[repr(C)]
+    pub struct Command { pub len: u32, pub code: u32 }
+    pub unsafe fn InitCommand(cmd: *mut Command, scratch: *mut u32, len: u32) {
+        (*cmd).len = len.wrapping_add(*scratch);
+        *scratch = (*cmd).len;
+    }
+    pub unsafe fn CreateBackwardReferences(mut commands: *mut Command, spare: *mut Command, n: u64) {
+        let mut scratch: u32 = 0;
+        let mut cursor = commands;
+        if n > 7 { cursor = spare; }
+        InitCommand(cursor, &mut scratch, 3);
+    }
+"#;
+
+#[test]
+fn w6p_two_sources_keep_the_root_unknown() {
+    ::utils::compilation::run_compiler_on_str(DERIVED_ROOT_TWO_SOURCES, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        assert_eq!(
+            index.certify_recorded(
+                function("CreateBackwardReferences"),
+                function("InitCommand"),
+                0,
+                1
+            ),
+            // Once the roots decline, `certify` reports the next rule's own
+            // reason — here the member clause (`Command` carries a `u32`).
+            Err(Unproved::MemberType),
+            "a local assigned from two different places has no single root"
+        );
+    })
+    .expect("two-source fixture compilation");
+}
+
 /// brotli `ClusterBlocksCommand` → `RemapBlockIdsCommand`, mirrored: the
 /// caller allocates `block_ids` and `new_id` at two DIFFERENT
 /// `BrotliAllocate` statements and hands both to one call. `*mut u8` beside
