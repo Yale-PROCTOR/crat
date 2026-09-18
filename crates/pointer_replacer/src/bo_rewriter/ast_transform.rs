@@ -3147,13 +3147,56 @@ fn surface_borrowed_type(ty: &Ty) -> Option<(Form, &Ty)> {
     Some((form, pointee))
 }
 
-fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Result<String, String> {
+/// **R470-4** — the wrapper's own parameter keeps the C ABI's type, and where
+/// that type is a pointer to `c_void` the slice it builds for a delivered
+/// slice parameter has no element type to infer: `from_raw_parts_mut(extra,
+/// N)` at a `&mut [u8]` parameter is `expected *mut u8, found *mut c_void`
+/// (21 of brotli's 26 failing rows, `Addr/Head/TinyHash H40-H42` and their
+/// twins). The base is cast to the parameter's own element type first. The
+/// extent is untouched — this is a typing fix, not a length claim, so no
+/// receipt and no waiver moves (§77).
+fn void_base(outer_ty: Option<&str>) -> bool {
+    outer_ty.is_some_and(|ty| {
+        let pointee = ty
+            .strip_prefix("*mut ")
+            .or_else(|| ty.strip_prefix("*const "))
+            .map(str::trim);
+        pointee.is_some_and(|pointee| {
+            pointee
+                .rsplit("::")
+                .next()
+                .is_some_and(|segment| segment == "c_void")
+        })
+    })
+}
+
+fn surface_argument(
+    param: &rustc_ast::Param,
+    enclosing_unsafe_fn: bool,
+    outer_ty: Option<&str>,
+) -> Result<String, String> {
     let rustc_ast::PatKind::Ident(_, ident, None) = &param.pat.kind else {
         return Err("inbound-wrapper-unplaceable: non-identifier parameter".to_owned());
     };
     let name = ident.name.to_string();
     let ty = rustc_ast_pretty::pprust::ty_to_string(&param.ty);
-    let form = surface_borrowed_type(&param.ty).map(|(form, _)| form);
+    let borrowed = surface_borrowed_type(&param.ty);
+    let form = borrowed.map(|(form, _)| form);
+    // The base every slice construction below starts from: the wrapper's own
+    // parameter, cast to the element type when the C ABI handed it a `c_void`.
+    // The null guard of an optional form keeps the parameter itself — the cast
+    // changes no address and the guard is the C ABI's own test.
+    let base = match borrowed {
+        Some((Form::Slice { .. } | Form::Opt { slice: true, .. }, pointee))
+            if void_base(outer_ty) =>
+        {
+            format!(
+                "{name}.cast::<{}>()",
+                rustc_ast_pretty::pprust::ty_to_string(pointee)
+            )
+        }
+        _ => name.clone(),
+    };
     let expression = if matches!(
         form,
         Some(Form::Opt {
@@ -3162,7 +3205,7 @@ fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Resu
         })
     ) {
         let inner = super::mechanical_receipt::present_unsafe_text(
-            format!("core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT)"),
+            format!("core::slice::from_raw_parts_mut({base}, crate::FALLBACK_SLICE_EXTENT)"),
             enclosing_unsafe_fn,
         );
         format!("if {name}.is_null() {{ None }} else {{ Some({inner}) }}")
@@ -3174,7 +3217,7 @@ fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Resu
         })
     ) {
         let inner = super::mechanical_receipt::present_unsafe_text(
-            format!("core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT)"),
+            format!("core::slice::from_raw_parts({base}, crate::FALLBACK_SLICE_EXTENT)"),
             enclosing_unsafe_fn,
         );
         format!("if {name}.is_null() {{ None }} else {{ Some({inner}) }}")
@@ -3202,12 +3245,12 @@ fn surface_argument(param: &rustc_ast::Param, enclosing_unsafe_fn: bool) -> Resu
         )
     } else if matches!(form, Some(Form::Slice { mutable: true })) {
         super::mechanical_receipt::present_unsafe_text(
-            format!("core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT)"),
+            format!("core::slice::from_raw_parts_mut({base}, crate::FALLBACK_SLICE_EXTENT)"),
             enclosing_unsafe_fn,
         )
     } else if matches!(form, Some(Form::Slice { mutable: false })) {
         super::mechanical_receipt::present_unsafe_text(
-            format!("core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT)"),
+            format!("core::slice::from_raw_parts({base}, crate::FALLBACK_SLICE_EXTENT)"),
             enclosing_unsafe_fn,
         )
     } else if matches!(form, Some(Form::Ref { mutable: true })) {
@@ -3236,12 +3279,23 @@ fn surface_return_pointee(ty: &str) -> Option<String> {
     Some(rustc_ast_pretty::pprust::ty_to_string(pointee))
 }
 
+/// The wrapper builder with the ORIGINAL signature beside the converted one
+/// (R470-4: the argument constructor reads the C ABI's own parameter types).
+pub(super) fn surface_wrapper_block_with_outer(
+    inner_name: &str,
+    function: &rustc_ast::Fn,
+    return_temp_type: Option<&str>,
+    outer: &rustc_ast::FnDecl,
+) -> Result<P<rustc_ast::Block>, String> {
+    surface_wrapper_block_with_arguments(inner_name, function, return_temp_type, None, Some(outer))
+}
+
 pub(super) fn surface_wrapper_block(
     inner_name: &str,
     function: &rustc_ast::Fn,
     return_temp_type: Option<&str>,
 ) -> Result<P<rustc_ast::Block>, String> {
-    surface_wrapper_block_with_arguments(inner_name, function, return_temp_type, None)
+    surface_wrapper_block_with_arguments(inner_name, function, return_temp_type, None, None)
 }
 
 fn surface_wrapper_block_with_arguments(
@@ -3249,6 +3303,7 @@ fn surface_wrapper_block_with_arguments(
     function: &rustc_ast::Fn,
     return_temp_type: Option<&str>,
     planned_arguments: Option<&std::collections::BTreeMap<usize, String>>,
+    outer: Option<&rustc_ast::FnDecl>,
 ) -> Result<P<rustc_ast::Block>, String> {
     if function.sig.decl.c_variadic() {
         return Err("inbound-wrapper-unplaceable: variadic function".to_owned());
@@ -3261,6 +3316,10 @@ fn surface_wrapper_block_with_arguments(
         .iter()
         .enumerate()
         .map(|(index, parameter)| {
+            let outer_ty = outer
+                .and_then(|decl| decl.inputs.get(index))
+                .map(|param| rustc_ast_pretty::pprust::ty_to_string(&param.ty));
+            let outer_ty = outer_ty.as_deref();
             if let Some(arguments) = planned_arguments {
                 if let Some(expression) = arguments.get(&index) {
                     return Ok(expression.clone());
@@ -3271,7 +3330,7 @@ fn surface_wrapper_block_with_arguments(
                 // ownership re-entry is the arm below.
                 let ty = rustc_ast_pretty::pprust::ty_to_string(&parameter.ty);
                 if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
-                    return surface_argument(parameter, enclosing_unsafe_fn);
+                    return surface_argument(parameter, enclosing_unsafe_fn, outer_ty);
                 }
                 let rustc_ast::PatKind::Ident(_, ident, None) = &parameter.pat.kind else {
                     return Err("inbound-wrapper-unplaceable: non-identifier parameter".into());
@@ -3279,7 +3338,7 @@ fn surface_wrapper_block_with_arguments(
                 // A reverted or unchanged input already has the original ABI.
                 return Ok(ident.name.to_string());
             }
-            surface_argument(parameter, enclosing_unsafe_fn)
+            surface_argument(parameter, enclosing_unsafe_fn, outer_ty)
         })
         .collect::<Result<Vec<_>, _>>()?
         .join(", ");
@@ -3566,6 +3625,7 @@ fn apply_surface_plans_to_items(
             inner_fn,
             return_temp_types.get(&did).map(String::as_str),
             Some(surface_arguments.get(&did).unwrap_or(&no_arguments)),
+            Some(&outer_fn.sig.decl),
         )?);
         if let Some(nested) = nested.get(&did) {
             let expression = ::utils::ast::parse_expr(format!("{{ {} }}", nested.prefix()));

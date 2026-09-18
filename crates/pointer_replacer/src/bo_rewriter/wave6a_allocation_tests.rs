@@ -1111,3 +1111,110 @@ fn w6a_b1_libc_argument_is_not_a_shared_interface() {
         out.degradations
     );
 }
+
+/// **R470-4 — the exposure wrapper casts a `c_void` base to the parameter's
+/// own element type.** The wrapper keeps the C ABI's signature, so its
+/// parameter is whatever C declared — for brotli's hasher accessors,
+/// `extra: *mut libc::c_void`. The inner function's parameter is delivered
+/// `&mut [u8]` / `&mut [u32]`, and the slice the wrapper builds for it has no
+/// element type to infer from a `c_void` base: `from_raw_parts_mut(extra, N)`
+/// is `expected *mut u8, found *mut libc::c_void`. main 056 read brotli's
+/// first failing verify tree and **21 of its 26 rows are this one shape**, at
+/// nine sites in `Addr/Head/TinyHash H40-H42` and their twins.
+///
+/// The extent is untouched: this is a typing fix over the base, not a length
+/// claim, so no receipt and no waiver moves (§77). Two controls ride with it —
+/// a base that is already the element type takes no cast, and a parameter the
+/// run does not deliver is passed by name — and the fault is the cast removed.
+///
+/// These are consumer controls over explicitly constructed signatures, as
+/// `return_terminal_tests`' wrapper controls are: they claim no model
+/// admission and no execution, only what the production wrapper builder emits.
+#[test]
+fn w6a_the_exposure_wrapper_casts_a_void_base_to_its_element_type() {
+    let cases = [
+        // (outer C signature, inner delivered signature, expected text)
+        (
+            "*mut libc::c_void",
+            "&mut [u8]",
+            "core::slice::from_raw_parts_mut(p.cast::<u8>(), crate::FALLBACK_SLICE_EXTENT)",
+        ),
+        (
+            "*const libc::c_void",
+            "&[u32]",
+            "core::slice::from_raw_parts(p.cast::<u32>(), crate::FALLBACK_SLICE_EXTENT)",
+        ),
+        (
+            "*mut core::ffi::c_void",
+            "Option<&mut [u16]>",
+            "if p.is_null() { None } else { Some(core::slice::from_raw_parts_mut(p.cast::<u16>(), crate::FALLBACK_SLICE_EXTENT)) }",
+        ),
+        // Controls: a base that is ALREADY the element type takes no cast …
+        (
+            "*mut u8",
+            "&mut [u8]",
+            "core::slice::from_raw_parts_mut(p, crate::FALLBACK_SLICE_EXTENT)",
+        ),
+        // … and a parameter this run does not deliver is passed by name.
+        ("*mut libc::c_void", "*mut libc::c_void", "inner(p)"),
+    ];
+    for (outer_ty, inner_ty, expected) in cases {
+        let rendered = wrapper_body(outer_ty, inner_ty);
+        // The pretty printer line-wraps; the text is compared without
+        // whitespace, as every emitted-text assertion in this file is.
+        let rendered = compact(&rendered);
+        let expected = compact(expected);
+        assert!(
+            rendered.contains(&expected),
+            "outer {outer_ty} / inner {inner_ty}\n  expected: {expected}\n  rendered: {rendered}"
+        );
+        if !outer_ty.contains("c_void") || !inner_ty.contains('[') {
+            assert!(
+                !rendered.contains(".cast::<"),
+                "no cast for outer {outer_ty} / inner {inner_ty}: {rendered}"
+            );
+        }
+    }
+}
+
+/// The production wrapper builder, over two explicitly constructed signatures.
+fn wrapper_body(outer_ty: &str, inner_ty: &str) -> String {
+    rustc_span::create_session_globals_then(
+        rustc_span::edition::Edition::Edition2018,
+        &[],
+        None,
+        || {
+            let session = rustc_session::parse::ParseSess::new(
+                rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
+            );
+            let inner_crate = super::slice_use_inventory_tests::parse_crate(
+                &session,
+                "constructed-inner.rs",
+                &format!("unsafe fn inner(p: {inner_ty}) -> u32 {{ 0 }}"),
+            )
+            .expect("the delivered signature parses");
+            let rustc_ast::ItemKind::Fn(inner) = &inner_crate.items[0].kind else {
+                panic!("constructed inner item must be a function");
+            };
+            let outer_crate = super::slice_use_inventory_tests::parse_crate(
+                &session,
+                "constructed-outer.rs",
+                &format!("pub unsafe extern \"C\" fn outer(p: {outer_ty}) -> u32 {{ loop {{}} }}"),
+            )
+            .expect("the C signature parses");
+            let mut outer_crate = outer_crate;
+            let rustc_ast::ItemKind::Fn(outer) = &mut outer_crate.items[0].kind else {
+                panic!("constructed outer item must be a function");
+            };
+            let block = super::ast_transform::surface_wrapper_block_with_outer(
+                "inner",
+                inner,
+                None,
+                &outer.sig.decl,
+            )
+            .expect("actual production wrapper builder");
+            outer.body = Some(block);
+            rustc_ast_pretty::pprust::item_to_string(&outer_crate.items[0])
+        },
+    )
+}
