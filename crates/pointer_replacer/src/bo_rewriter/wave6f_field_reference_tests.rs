@@ -1952,27 +1952,65 @@ fn w6f_a_moved_out_owning_field_reaches_the_tree() {
     // An `applied` transaction whose edits do not reach the tree is the
     // defect: the receipt would claim a conversion the program never got.
     // An `applied` transaction whose edits do not reach the tree would be a
-    // receipt claiming a conversion the program never got. Every one of the
-    // three sites is pinned, not just the declaration.
-    for needle in [
-        "pub buf: Option<Box<u8>>,",
-        "core::ptr::write(&raw mut (*h).buf, core::ptr::NonNull::new(malloc(64 as u64) as *mut u8).map(|__p| Box::from_raw(__p.as_ptr())));",
-        "let mut b = (*h).buf.take().map_or(core::ptr::null_mut(), Box::into_raw);",
-        "core::ptr::write(&raw mut (*h).buf, None);",
-    ] {
-        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
-    }
+    // receipt claiming a conversion the program never got, so every site is
+    // pinned — but HOW the store is spelled is the container's business, and
+    // the container is another producer's. Hence a dichotomy on the one
+    // observable that decides it (their STOP 1 / relay 045 §1).
+    assert!(
+        flat.contains("pub buf: Option<Box<u8>>,"),
+        "the field declaration never reached the tree\n{source}"
+    );
     assert!(
         !flat.contains("pub buf: *mut u8,"),
         "the raw field survived beside an applied transaction\n{source}"
     );
-    // The C frees stay where the input put them (R425-2 / §28): the move
-    // hands the allocation back as a raw pointer and `free(b)` takes it.
-    assert_eq!(flat.matches("free(").count(), 3, "{source}");
-    assert!(
-        !flat.contains("drop("),
-        "no Rust drop may join the C frees\n{source}"
-    );
+    let container_is_a_box = flat.contains("let mut h: ::std::boxed::Box<crate::Holder> =");
+    if container_is_a_box {
+        // The composed frame: `h` is a fully INITIALISED `Box`, so the place
+        // is valid and the ordinary assignment is right — it drops the old
+        // owner, which is addendum 101's waiver. `ptr::write` is the
+        // pre-initialisation spelling and would leak here.
+        for needle in [
+            "(*h).buf = core::ptr::NonNull::new(malloc(64 as u64) as *mut u8).map(|__p| Box::from_raw(__p.as_ptr()));",
+            "let mut b: ::std::option::Option<::std::boxed::Box<u8>> = (*h).buf.take();",
+            "(*h).buf = None;",
+        ] {
+            assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+        }
+        assert!(
+            !flat.contains("core::ptr::write(&raw mut (*h).buf"),
+            "an initialised Box needs no pre-initialisation store\n{source}"
+        );
+        // The C frees become drops AT THE SAME SITES (R425-2 / §28): the
+        // owner is a Box either side of the move, so nothing is freed twice
+        // and nothing leaks.
+        for needle in ["::std::mem::drop(b)", "::std::mem::drop(h)"] {
+            assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+        }
+        // The `extern "C"` declaration is not a call site: count the calls.
+        assert_eq!(
+            flat.matches("free(b").count() + flat.matches("free(h").count(),
+            0,
+            "{source}"
+        );
+    } else {
+        // This lane's frame: `h` is `malloc`ed memory, so the place may be
+        // uninitialised and the store must never drop what is there.
+        for needle in [
+            "core::ptr::write(&raw mut (*h).buf, core::ptr::NonNull::new(malloc(64 as u64) as *mut u8).map(|__p| Box::from_raw(__p.as_ptr())));",
+            "let mut b = (*h).buf.take().map_or(core::ptr::null_mut(), Box::into_raw);",
+            "core::ptr::write(&raw mut (*h).buf, None);",
+        ] {
+            assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+        }
+        // The C frees stay where the input put them and no Rust drop joins
+        // them: the move hands the allocation back as a raw pointer.
+        assert_eq!(flat.matches("free(").count(), 3, "{source}");
+        assert!(
+            !flat.contains("drop("),
+            "no Rust drop may join the C frees\n{source}"
+        );
+    }
 }
 
 /// The receipt at a named revert state, read inside the compiler run.
