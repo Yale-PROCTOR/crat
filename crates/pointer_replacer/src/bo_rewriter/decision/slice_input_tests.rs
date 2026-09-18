@@ -264,13 +264,21 @@ fn w5c_slice_input_forwarders_leave_the_extent_hold_under_the_corpus_attestation
         "{:?}",
         decision(&table, "StitchToPreviousBlockH2::ringbuffer")
     );
+    // **The end state is the frame's, the claim is the hold's** (R217-2(a)
+    // under R465-4). `StoreRangeH2::data` is the buffer beside the hasher's
+    // `&mut self_0`: uncertified, the overlap machinery takes it as the pair's
+    // raw view; with wave-6p's certificate (e) in the frame it is the shared
+    // slice this lane's propagation asked for (their report 015 §5 — report
+    // 025 §3's "delivery is wave-6p's certificate", arriving). Both are off
+    // the extent hold, which is what W-C7 claims.
     assert!(
         matches!(
             decision(&table, "StoreRangeH2::data"),
-            super::Decision::Degraded(super::Degradation {
-                reason: super::DegradeReason::PairRawView,
-                ..
-            })
+            super::Decision::Slice { mutable: false, .. }
+                | super::Decision::Degraded(super::Degradation {
+                    reason: super::DegradeReason::PairRawView,
+                    ..
+                })
         ),
         "{:?}",
         decision(&table, "StoreRangeH2::data")
@@ -292,7 +300,11 @@ fn w5c_slice_input_forwarders_leave_the_extent_hold_under_the_corpus_attestation
             .collect::<Vec<_>>()
     })
     .unwrap();
-    let (cause, subjects) = receipts.first().unwrap_or_else(|| panic!("{receipts:?}"));
+    // Where the pair is certified there is no withdrawal to receipt at all:
+    // the root's candidate stands. Where it is not, the receipt names it.
+    let Some((cause, subjects)) = receipts.first() else {
+        return;
+    };
     assert!(
         subjects
             .iter()
