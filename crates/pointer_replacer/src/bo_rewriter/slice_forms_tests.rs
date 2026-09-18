@@ -1075,11 +1075,32 @@ fn wave6s_lodepng_addchunk_ihdr_reduction_reconciles_after_degradation() {
             ..
         } => raw_boundary_artifacts,
     };
+    // **Restated for both frames (R217-2(a), under R465-5).** What this test
+    // is about is the invariant after it: a retired row of a DEGRADED program
+    // still reconciles. Which retirement produced the row is frame-dependent
+    // and was never the point:
+    //
+    // * **before R465-5** — `addChunk_IHDR::data`'s carrier was built from the
+    //   base's raw form, the Option presentation at that class was dropped
+    //   `option-evidence-held`, and the slice-use family fell back behind it,
+    //   so the row carried a `prior-family-rendering:` adapter and a candidate
+    //   form that differed from its source.
+    // * **after R465-5** — the carrier takes the base's decided form, the
+    //   class is not dropped, and the same two sites (`hir:…:96`, `…:114`)
+    //   carry `source_form == candidate_form == "opt-slice-mut"` with the
+    //   program's own degradation as the only retirement.
     let retired_after_degradation = artifacts.slice_use_rows.iter().any(|row| {
-        row.adapter.starts_with("prior-family-rendering:")
-            && row.source_form != row.candidate_form
-            && row.terminal.reason
-                == Some(super::mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput)
+        row.terminal.reason
+            == Some(
+                super::mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+            )
+            && (
+                // the pre-R465-5 rendering
+                (row.adapter.starts_with("prior-family-rendering:")
+                    && row.source_form != row.candidate_form)
+                // the R465-5 rendering: the option-presented base on both sides
+                || (row.source_form == "opt-slice-mut" && row.candidate_form == "opt-slice-mut")
+            )
     });
     assert!(
         retired_after_degradation,
