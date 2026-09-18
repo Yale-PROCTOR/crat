@@ -597,6 +597,17 @@ fn nested_ast_composition(
                     // wave-6a's (ii) closes the rows where `box-expression` is
                     // the OUTER, never these.
                     | ("nullable-required-unwrap", "box-expression")
+                    // Relay 051 (wave-6k 023's routed row): lil
+                    // `lil_to_string::val#1` — the C arm's optional-slice glue
+                    // at `25296..25342` strictly contains the C arm's optional
+                    // mutable glue at `25310..25341`, wider by 14 bytes at the
+                    // low end and 1 at the high. Two seam edits at different
+                    // spans in one caller, which the seam pass renders by
+                    // building the outer adapter AROUND the node the inner has
+                    // already been grafted into — the same argument as the
+                    // `("c-raw-reborrow-shared", "raw-cast-const")` and
+                    // `("c-raw-slice-shared", "raw-cast-const")` rows above.
+                    | ("c-raw-option-slice", "c-raw-option-mut")
             );
         let raw_receiver_over_argument = matches!(
             outer.key.bridge_kind.as_str(),
@@ -6585,7 +6596,7 @@ mod wave3_class_tests {
         // over W-C5's argument adapter, and a call bridge over a Box owner's
         // access edit — the AST pass renders both nestings since wave-6l's
         // `f8a2d5e6` — and relay 025's mutable twin of the reborrow row.
-        const PAIRS: [(Arm, &str, Arm, &str); 11] = [
+        const PAIRS: [(Arm, &str, Arm, &str); 12] = [
             (Arm::Pair, "pair-t2-raw-view", Arm::C, "typed-raw-temporary"),
             (
                 Arm::Pair,
@@ -6626,6 +6637,9 @@ mod wave3_class_tests {
                 Arm::Surface,
                 "box-expression",
             ),
+            // Relay 051: lil's optional-slice glue over the optional mutable
+            // glue it contains (wave-6k 023's routed row).
+            (Arm::C, "c-raw-option-slice", Arm::C, "c-raw-option-mut"),
         ];
         for (outer_arm, outer_kind, inner_arm, inner_kind) in PAIRS {
             with_classes(2, |ids| {
@@ -6731,6 +6745,57 @@ mod wave3_class_tests {
                 assert!(finalized.collisions.is_empty(), "a cross-class collision");
             });
         }
+    }
+
+    /// **Relay 051 (wave-6k 023's routed row) — lil's `lil_to_string::val#1`,
+    /// on the census's own byte geometry.**
+    ///
+    /// Class 197's `c-raw-option-slice` at `25296..25342` strictly contains
+    /// class 245's `c-raw-option-mut` at `25310..25341` — wider by 14 bytes at
+    /// the low end and 1 at the high, so unlike class 2440's prefix-only shape
+    /// this outer wraps its inner on both sides. Two seam edits at different
+    /// spans in ONE caller: the seam pass builds the outer adapter around the
+    /// node the inner has already been grafted into.
+    ///
+    /// The caller equality is the precondition, not decoration:
+    /// `l07_containment_across_two_callers_is_not_a_composition` pins that a
+    /// containment spanning two callers is still a collision, and this row does
+    /// not weaken it.
+    #[test]
+    fn l07_optional_slice_glue_over_the_optional_mut_glue_it_contains() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(2, |ids| {
+            let outer = ClassInput::new(ids[0], arms(&[Arm::C])).with_site(ClassSite::edit(
+                ids[0],
+                ids[0],
+                Arm::C,
+                "lib.rs",
+                25296,
+                25342,
+                "c-raw-option-slice",
+            ));
+            let inner = ClassInput::new(ids[1], arms(&[Arm::C])).with_site(ClassSite::edit(
+                ids[1],
+                ids[0],
+                Arm::C,
+                "lib.rs",
+                25310,
+                25341,
+                "c-raw-option-mut",
+            ));
+            let finalized = finalize_class_inputs(vec![outer, inner]);
+            assert!(
+                finalized.classes[&ids[0]].is_ready() && finalized.classes[&ids[1]].is_ready(),
+                "held: {:?} / {:?}",
+                finalized.classes[&ids[0]].hold_reasons(),
+                finalized.classes[&ids[1]].hold_reasons()
+            );
+            assert!(finalized.collisions.is_empty(), "still a collision");
+            assert!(
+                finalized.classes[&ids[0]].depends_on.contains(&ids[1]),
+                "composed without registering the dependency"
+            );
+        });
     }
 
     /// The allowlist stays an allowlist. An outer/inner kind combination that
