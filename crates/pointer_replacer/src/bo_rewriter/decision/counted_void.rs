@@ -1520,6 +1520,29 @@ fn contract_at(
 /// Runs after the argument seams. A bridged argument whose callee subject was
 /// withheld is passed through unchanged; a call with no surviving bridged
 /// argument is left as it is.
+/// wave-6r (relay wave-6r/030, R459-2): the raw twin's placement receipt —
+/// one row per callee the graft considered, naming what happened to its twin
+/// and the visibility the twin was rendered with. Instrument-only: nothing
+/// reads it, and it exists because heman's `__crat_raw_kmVec2Add` was called
+/// from three sites with no definition anywhere while two other twins in the
+/// same program were emitted (main 050 §5, wave-6r 032's four-frame table).
+pub(crate) const TWIN_RECEIPT_HEADER: &str = "callee\toutcome\tvisibility\n";
+
+thread_local! {
+    /// The last graft's receipt, for the artifact writer and the witnesses.
+    /// A thread local because the graft runs inside the AST pass, which has
+    /// no artifact sink of its own; the census reads it once per program.
+    static TWIN_RECEIPT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+pub(crate) fn record_twin_receipt(rows: &str) {
+    TWIN_RECEIPT.with(|slot| *slot.borrow_mut() = rows.to_owned());
+}
+
+pub(crate) fn twin_receipt() -> String {
+    TWIN_RECEIPT.with(|slot| slot.borrow().clone())
+}
+
 pub(crate) fn graft_calls(
     calls: &[CallPlan],
     reverts: &crate::bo_rewriter::ast_transform::RevertSet,
@@ -1527,7 +1550,11 @@ pub(crate) fn graft_calls(
     krate: &mut rustc_ast::Crate,
     pristine: &rustc_ast::Crate,
     global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    twin_receipt: &mut String,
 ) -> Result<(), String> {
+    if twin_receipt.is_empty() {
+        twin_receipt.push_str(TWIN_RECEIPT_HEADER);
+    }
     let mut by_span: FxHashMap<(u32, u32), (&CallPlan, Vec<&BridgedArg>)> = FxHashMap::default();
     for call in calls.iter().filter(|call| reverts.keeps(call.owner_class)) {
         let kept = call
@@ -1545,6 +1572,10 @@ pub(crate) fn graft_calls(
         if call.route == Route::RawTwin
             && !signature_converted(krate, pristine, global_map, call.callee)
         {
+            twin_receipt.push_str(&format!(
+                "{:?}\tskipped:signature-not-converted\t-\n",
+                call.callee
+            ));
             continue;
         }
         let key = (call.call_span.lo().0, call.call_span.hi().0);
@@ -1588,7 +1619,20 @@ pub(crate) fn graft_calls(
         return Err(format!("unmatched counted-void call spans: {unmatched:?}"));
     }
     for (_, (callee, name)) in visitor.twins {
-        insert_raw_twin(krate, pristine, global_map, callee, &name)?;
+        match insert_raw_twin(krate, pristine, global_map, callee, &name) {
+            Ok(visibility) => {
+                twin_receipt.push_str(&format!("{callee:?}\tinserted\t{visibility}\n"));
+            }
+            Err(why) => {
+                let outcome = if why.contains("pristine item") {
+                    "pristine-missing"
+                } else {
+                    "place-failed"
+                };
+                twin_receipt.push_str(&format!("{callee:?}\t{outcome}\t-\n"));
+                return Err(why);
+            }
+        }
     }
     Ok(())
 }
@@ -1687,7 +1731,7 @@ fn insert_raw_twin(
     global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
     callee: LocalDefId,
     name: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     fn find<'a>(
         items: &'a [rustc_ast::ptr::P<rustc_ast::Item>],
         global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
@@ -1748,12 +1792,17 @@ fn insert_raw_twin(
     // path — a `Restricted` one carries a `DUMMY_NODE_ID` the later passes
     // must resolve, and on the batch-12 composition the item disappeared
     // instead (the E0425 there had no "exists but is inaccessible" note).
+    let visibility = match &twin.vis.kind {
+        rustc_ast::VisibilityKind::Public => "pub".to_owned(),
+        rustc_ast::VisibilityKind::Inherited => "private".to_owned(),
+        rustc_ast::VisibilityKind::Restricted { .. } => "restricted".to_owned(),
+    };
     if !place(&mut krate.items, global_map, callee, &twin) {
         return Err(format!(
             "counted-void raw twin: converted item for {callee:?} not found"
         ));
     }
-    Ok(())
+    Ok(visibility)
 }
 
 use thin_vec::ThinVec;

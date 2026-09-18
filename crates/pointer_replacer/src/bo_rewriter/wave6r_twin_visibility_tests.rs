@@ -5,10 +5,11 @@
 //! `E0425 … __crat_raw_kmVec2Add … exists but is inaccessible`, the verify
 //! gate reverted the function, and its partition partner `kmVec2Subtract`
 //! fell with it (report 027; main's probe measured the pair as −2).
-const CROSS_MODULE: &str = r#"
+pub(crate) const CROSS_MODULE: &str = r#"
 #![allow(dead_code, unused_mut)]
 pub mod inner {
-    pub unsafe fn lodepng_memcpy(mut dst: *mut core::ffi::c_void,
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lodepng_memcpy(mut dst: *mut core::ffi::c_void,
         mut src: *const core::ffi::c_void, mut size: usize) {
         let mut i: usize = 0;
         i = 0;

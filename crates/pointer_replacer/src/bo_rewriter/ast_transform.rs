@@ -4232,6 +4232,7 @@ fn transform_with<'tcx>(
             "unmatched PAIR raw-view call spans: {unmatched_pair_raw:?}"
         ));
     }
+    let mut twin_receipt = String::new();
     super::decision::counted_void::graft_calls(
         &table.seams.counted_void_calls,
         reverts,
@@ -4239,7 +4240,11 @@ fn transform_with<'tcx>(
         &mut krate,
         &capture.krate,
         &capture.map.global_map,
+        &mut twin_receipt,
     )?;
+    // wave-6r (R459-2): instrument-only; the census writes it beside the
+    // other rows and nothing reads it.
+    crate::bo_rewriter::decision::counted_void::record_twin_receipt(&twin_receipt);
 
     // **C-9 — mandatory companion emission.** The plan is already filtered by
     // the accepted model. Reverts use the mark's callee owner, matching the

@@ -434,3 +434,6 @@ mod wave6r_consumed_result_tests;
 
 #[path = "wave6r_output_storage_seam_tests.rs"]
 mod wave6r_output_storage_seam_tests;
+
+#[path = "wave6r_twin_receipt_tests.rs"]
+mod wave6r_twin_receipt_tests;
