@@ -2184,6 +2184,21 @@ fn verify_and_revert(
             .parent()
             .unwrap_or(staged.root())
             .to_path_buf();
+        // **R465-3 (wave-6f)** — a committed way to read the candidate the
+        // verifier receives at EACH revert state. A finding no other lane can
+        // reproduce is not a finding (ownership-fields 044), and the rounds
+        // of report 039 §1 were read from an uncommitted tree. Test builds
+        // only, and silent unless `CRAT_DUMP_CANDIDATE` names a substring the
+        // candidate contains.
+        #[cfg(test)]
+        if let Ok(needle) = std::env::var("CRAT_DUMP_CANDIDATE") {
+            let candidate = std::fs::read_to_string(staged.root()).unwrap_or_default();
+            if candidate.contains(needle.as_str()) {
+                eprintln!(
+                    "CRAT-ROUND reverted={reverted:?}\nCRAT-CANDIDATE-BEGIN\n{candidate}\nCRAT-CANDIDATE-END"
+                );
+            }
+        }
         let novel: Vec<verify::Diag> = baseline
             .novel(&diagnosis.diags, &observed_root)
             .into_iter()

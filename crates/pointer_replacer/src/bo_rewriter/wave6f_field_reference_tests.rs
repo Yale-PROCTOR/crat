@@ -1925,11 +1925,18 @@ const MOVED_OUT_FIELD: &str = include_str!("wave6f_fixture_moved_out_field.rs");
 fn w6f_a_moved_out_owning_field_reaches_the_tree() {
     let _frame = frame_lock();
     use crate::analyses::borrow_ownership::SlotKind;
-    super::test_model_override::set(
-        "w6f-moved-out-field-frame",
-        vec![("Holder".to_owned(), 0, SlotKind::Owning)],
-        Vec::new(),
-    );
+    // R465-3: the frame override is what makes this witness deterministic on
+    // THIS lane's frame, and it is also the thing a composed frame does not
+    // need — the model settles `Holder.buf` Owning there by itself (report
+    // 037 §1). `CRAT_W6F_NO_FRAME` suppresses it so the two readings are one
+    // committed switch apart instead of an uncommitted edit apart.
+    if std::env::var("CRAT_W6F_NO_FRAME").is_err() {
+        super::test_model_override::set(
+            "w6f-moved-out-field-frame",
+            vec![("Holder".to_owned(), 0, SlotKind::Owning)],
+            Vec::new(),
+        );
+    }
     let observed = observe(MOVED_OUT_FIELD);
     let outcome = emitted("moved-out-field", MOVED_OUT_FIELD);
     super::test_model_override::clear();
