@@ -1103,4 +1103,10 @@ fn w6a_c1_a_parameter_moved_on_to_a_consuming_callee_is_an_owner() {
         "{}",
         out.artifacts.box_param_receipts
     );
+    assert!(
+        text.contains("letmutn:Box<crate::Node>=Box::from_raw(malloc("),
+        "{}",
+        out.source
+    );
+    assert!(text.contains("returnretire(n);"), "{}", out.source);
 }
