@@ -183,6 +183,8 @@ mod contract_extent_integration_tests;
 #[cfg(test)]
 mod counted_void_tests;
 #[cfg(test)]
+mod counted_void_twin_tests;
+#[cfg(test)]
 mod declaration_pattern_tests;
 #[cfg(test)]
 mod declaration_tests;
