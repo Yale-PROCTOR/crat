@@ -319,3 +319,61 @@ fn wave6k_thin_reference_root_is_never_widened() {
     )
     .expect("input compiles");
 }
+
+/// The mutable spelling of C2Rust's address-of-element idiom (lodepng
+/// `lodepng_compute_color_stats::color`, `&mut *…as *mut u8`). The reference
+/// narrows provenance to one element, so a slice built over it is
+/// Stacked-Borrows UB at its own retag — even at the true length (report 022,
+/// Miri `narrow4`); peeled, it is clean under SB and TB (`peeled`).
+const MUTABLE_ADDRESS_OF: &str = r#"
+    #[repr(C)]
+    pub struct Buf { pub data: *mut u8, pub count: u32 }
+    pub unsafe fn fill(b: *mut Buf, idx: isize) {
+        let mut row = &mut *((*b).data).offset(idx) as *mut u8;
+        *row.offset(0) = 1;
+        *row.offset(1) = 2;
+    }
+"#;
+
+/// brotli `BrotliTransformDictionaryWord::{prefix,suffix}`: the same idiom with
+/// the shared spelling over a raw POINTER field.
+const POINTER_FIELD_ADDRESS_OF: &str = r#"
+    #[repr(C)]
+    pub struct Transforms { pub prefix_suffix: *const u8, pub count: u32 }
+    pub unsafe fn word(t: *const Transforms, idx: isize) -> u32 {
+        let mut prefix = &*((*t).prefix_suffix).offset(idx) as *const u8;
+        (*prefix.offset(0) as u32).wrapping_add(*prefix.offset(1) as u32)
+    }
+"#;
+
+#[test]
+fn wave6k_a_mutable_element_address_is_not_the_slices_root() {
+    let (source, decision) = emitted(MUTABLE_ADDRESS_OF, "row");
+    assert!(matches!(decision, Decision::Slice { .. }), "{decision:?}");
+    assert!(
+        compact(&source).contains(&compact(
+            "core::slice::from_raw_parts_mut(((*b).data).offset(idx)"
+        )),
+        "the root must be the raw pointer, not the one-element reference: {source}"
+    );
+    assert!(
+        !compact(&source).contains(&compact("from_raw_parts_mut(&mut *")),
+        "the address-of wrapper must be peeled: {source}"
+    );
+}
+
+#[test]
+fn wave6k_a_shared_element_address_is_not_the_slices_root() {
+    let (source, decision) = emitted(POINTER_FIELD_ADDRESS_OF, "prefix");
+    assert!(matches!(decision, Decision::Slice { .. }), "{decision:?}");
+    assert!(
+        compact(&source).contains(&compact(
+            "core::slice::from_raw_parts(((*t).prefix_suffix).offset(idx)"
+        )),
+        "the root must be the raw pointer, not the one-element reference: {source}"
+    );
+    assert!(
+        !compact(&source).contains(&compact("from_raw_parts(&*")),
+        "the address-of wrapper must be peeled: {source}"
+    );
+}

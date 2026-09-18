@@ -828,6 +828,36 @@ pub(crate) fn collect_composable_edits(
     edits
 }
 
+/// wave-6k (relay 021 §1): C2Rust spells `&place[i]` as `&mut *p.offset(i) as
+/// *mut T`. That reference narrows provenance to ONE element, so a slice built
+/// over it retags past its own tag — Stacked-Borrows UB at the slice's own
+/// creation, and not the extent waiver's: report 022 measured it UB at the
+/// TRUE length too (Miri `narrow4`), and clean once the wrapper is peeled
+/// (`peeled`). The construction's root is the raw pointer the wrapper
+/// dereferences; the wrapper adds nothing a `from_raw_parts` needs.
+fn address_of_deref_root<'h>(
+    tcx: TyCtxt<'h>,
+    owner: LocalDefId,
+    initializer: &'h rustc_hir::Expr<'h>,
+) -> Option<&'h rustc_hir::Expr<'h>> {
+    let rustc_hir::ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, _, place) =
+        Collector::peel(initializer).kind
+    else {
+        return None;
+    };
+    let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) = place.kind else {
+        return None;
+    };
+    if pointer.span.from_expansion() {
+        return None;
+    }
+    matches!(
+        tcx.typeck(owner).expr_ty(pointer).kind(),
+        rustc_middle::ty::TyKind::RawPtr(..)
+    )
+    .then_some(pointer)
+}
+
 pub(crate) fn compose_initializer(
     init_span: Span,
     initializer: &str,
@@ -973,6 +1003,17 @@ pub(crate) fn plan_slice_constructions(
             &known_lengths,
         );
         let composed_edits = collect_composable_edits(table, init_span);
+        // wave-6k: the slice's root is the pointer, never a one-element
+        // reference taken of it (`address_of_deref_root`). Composed edits are
+        // keyed to the whole initializer span, so the peel yields to them.
+        let initializer = match tcx.hir_node(init_hir) {
+            rustc_hir::Node::Expr(expression) if composed_edits.is_empty() => {
+                address_of_deref_root(tcx, subject.fn_did, expression)
+                    .and_then(|root| sm.span_to_snippet(root.span).ok())
+                    .unwrap_or(initializer)
+            }
+            _ => initializer,
+        };
         if !nullable
             && let Some(reslice) =
                 suffix_copy_initializer(tcx, table, subject, init_hir, init_span, &composed_edits)

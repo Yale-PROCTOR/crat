@@ -115,6 +115,8 @@ mod slice_cursor_prelude;
 mod slice_forms_ast;
 #[cfg(test)]
 mod slice_forms_tests;
+#[cfg(test)]
+mod wave6k_typedef_parameter_tests;
 pub(crate) mod use_census;
 pub(crate) mod verify;
 #[cfg(test)]
