@@ -232,7 +232,14 @@ pub(crate) fn derive_with_field_forms<'tcx>(
             (
                 BoxShape::Sized,
                 "1".into(),
-                format!("::std::boxed::Box::new({zero})"),
+                if zero.contains(" {") {
+                    // Only a struct literal's spelling depends on the
+                    // printer's line breaking; every other zero is one token
+                    // and is left byte-identical.
+                    graft_canonical(format!("::std::boxed::Box::new({zero})"))
+                } else {
+                    format!("::std::boxed::Box::new({zero})")
+                },
             )
         } else if peeled.is_some_and(|peeled| {
             wrapping_product_has_exact_size(tcx, typeck, peeled, element, pointer_bits)
@@ -640,6 +647,30 @@ fn spell_element<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
     }
 }
 
+/// R466-4: the text an edit carries must be the text the AST graft accepts,
+/// and `graft_expr` accepts only what round-trips through the pretty printer.
+/// The printer's line-breaking — and therefore whether a struct literal keeps
+/// a trailing comma — depends on the WHOLE expression's width, so only the
+/// final replacement can be canonicalised, not the literal inside it. A text
+/// the graft refuses outright is returned unchanged: that is today's
+/// behaviour for the shapes this cannot normalise, and the edit is refused
+/// downstream exactly as before rather than silently changing form.
+fn graft_canonical(text: String) -> String {
+    // PRINT it, rather than ask the graft whether it already round-trips: the
+    // graft refuses both spellings of a struct literal whose width the printer
+    // decides differently (a trailing comma when it wraps, none when it fits),
+    // so only the printer's own output is guaranteed to pass. Text the parser
+    // rejects is returned unchanged — the same refusal as before, never a
+    // silent change of form.
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ::utils::ast::parse_expr(text.clone())
+    }));
+    match parsed {
+        Ok(expr) => rustc_ast_pretty::pprust::expr_to_string(&expr),
+        Err(_) => text,
+    }
+}
+
 /// The zero of a field in the form a transaction DELIVERS it in. Only the
 /// optional forms have one; every other delivered form holds (R457-4).
 fn delivered_zero(form: &str) -> Result<String, SourceHold> {
@@ -710,14 +741,28 @@ fn zero_value<'tcx>(
             // struct literal with a trailing comma — without it the graft is
             // silently refused and the initializer stays raw (R412-2, the
             // heman probe's `E0308` at `img`).
-            Ok((
-                format!(
-                    "crate::{} {{ {}, }}",
-                    tcx.def_path_str(def.did()),
-                    fields.join(", ")
-                ),
-                layout.size.bits(),
-            ))
+            // R466-4 (relay 057): the text must be what the AST graft ACCEPTS,
+            // and `graft_expr` takes a replacement only if it round-trips
+            // through the pretty printer. The printer spells a SHORT struct
+            // literal on one line without a trailing comma and a long one
+            // broken with it, so writing the comma unconditionally (R412-2,
+            // measured on heman's four-field `heman_image_s`) refuses every
+            // literal short enough to fit — `crate::Holder { buf: None, len:
+            // 0i32, }` by exactly one character, after R457-4 shortened it
+            // from `::core::ptr::null_mut()` to `None`. Asking the printer is
+            // the only way to know which spelling this literal gets, so the
+            // literal IS the printer's, by construction.
+            // The trailing comma is the spelling the printer uses when the
+            // literal WRAPS, which is what every embedded use (a `vec!`
+            // element, a nested field) has always been measured with; the
+            // sized `Box::new` arm re-prints the whole replacement instead of
+            // guessing, so the two spellings no longer have to agree here.
+            let literal = format!(
+                "crate::{} {{ {}, }}",
+                tcx.def_path_str(def.did()),
+                fields.join(", ")
+            );
+            Ok((literal, layout.size.bits()))
         }
         _ => numeric_zero(element, pointer_bits),
     }
@@ -949,7 +994,11 @@ mod tests {
             ),
             Ok((
                 "1".into(),
-                "::std::boxed::Box::new(crate::Rec { width: 0i32, data: ::core::ptr::null_mut(), name: ::core::ptr::null(), inner: crate::Inner { v: [0.0f32; 2], }, })".into(),
+                // R466-4: the text is the PRINTER's — the replacement is
+                // re-printed so the AST graft accepts it, which wraps a
+                // literal this wide and drops the trailing comma on the
+                // nested one that fits.
+                "::std::boxed::Box::new(crate::Rec {\n        width: 0i32,\n        data: ::core::ptr::null_mut(),\n        name: ::core::ptr::null(),\n        inner: crate::Inner { v: [0.0f32; 2] },\n    })".into(),
                 "native-malloc-zero-numeric"
             ))
         );

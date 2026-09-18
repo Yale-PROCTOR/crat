@@ -436,7 +436,12 @@ pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
         census_source.contains("return ::std::boxed::Box::into_raw(img);"),
         "{census_source}"
     );
-    assert!(s.contains("let mut img: ::std::boxed::Box<crate::heman_image_s> = ::std::boxed::Box::new(crate::heman_image_s { width: 0i32, height: 0i32, nbands: 0i32, data: ::core::ptr::null_mut(), });"), "{s}");
+    assert!(
+        s.contains("let mut img: ::std::boxed::Box<crate::heman_image_s> =")
+            && s.contains("width: 0i32")
+            && s.contains("data: ::core::ptr::null_mut()"),
+        "{s}"
+    );
 }
 
 #[test]
@@ -474,7 +479,9 @@ fn r399_aggregate_owner_with_an_unsupplied_field_holds() {
     let supplied = input.replace("(*p).x = n;", "(*p).x = n; (*p).y = n + 1;");
     let s = verify(&supplied, "p", BoxShape::Sized, false);
     assert!(
-        s.contains("::std::boxed::Box::new(crate::Pair { x: 0i32, y: 0i32, })"),
+        // R466-4: the printer keeps a literal this short on one line, with
+        // no trailing comma — and that is the only spelling the graft takes.
+        s.contains("::std::boxed::Box::new(crate::Pair { x: 0i32, y: 0i32 })"),
         "{s}"
     );
 }
@@ -3025,6 +3032,62 @@ fn r457_a_synthesised_struct_literal_initialises_each_field_in_its_delivered_for
 /// `Copy` — must HOLD the owner rather than initialise the field with a value
 /// of the wrong type. Fail-closed, the same way the moved-out load's
 /// non-optional shape holds.
+/// R466-4 (relay 057): the synthesised literal must be text the AST graft
+/// ACCEPTS. `graft_expr` takes a replacement only if it round-trips through
+/// the pretty printer whitespace-insensitively, and the printer spells a
+/// SHORT struct literal on one line **without** a trailing comma — while it
+/// spells a long one broken across lines **with** one. This producer wrote the
+/// trailing comma unconditionally (R412-2, measured on heman's four-field
+/// `heman_image_s`), so a two-field literal was refused by exactly one
+/// character, the edit evaporated, and the declaration landed over a raw
+/// initialiser: the `expected Box<Holder>, found *mut Holder` that wave-6f
+/// 039/041 measured on the composition.
+#[test]
+fn r466_the_synthesised_literal_is_text_the_graft_accepts() {
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The graft parses, so it needs the session: everything runs inside one
+    // compiler closure.
+    for form in [None, Some("opt-box")] {
+        let form = form.map(str::to_owned);
+        ::utils::compilation::run_compiler_on_str(holder_fixture(), move |tcx| {
+            match &form {
+                Some(form) => super::decision::ownership_fields_native::field_form_override::set(
+                    vec![("Holder", 0, form.as_str())],
+                ),
+                None => super::decision::ownership_fields_native::field_form_override::clear(),
+            }
+            let (table, _) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            super::decision::ownership_fields_native::field_form_override::clear();
+            let (_, decision) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.param_name.as_deref() == Some("h"))
+                .expect("run::h");
+            let Decision::Box(plan) = decision else { panic!("{decision:?}") };
+            let literal = plan
+                .expr_edits
+                .iter()
+                .find(|edit| edit.replacement.contains("crate::Holder {"))
+                .expect("the literal edit");
+            assert!(
+                super::ast_transform::graft_expr(&literal.replacement).is_ok(),
+                "{form:?}: the graft refuses {:?}",
+                literal.replacement
+            );
+        })
+        .unwrap();
+    }
+}
+
 #[test]
 fn r457_a_delivered_form_with_no_zero_holds_the_synthesised_literal() {
     let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
