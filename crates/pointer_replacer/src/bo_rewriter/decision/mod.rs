@@ -38,6 +38,9 @@ pub(crate) mod box_facts;
 pub(crate) mod box_param;
 pub(crate) mod callee_parameter_input;
 pub(crate) mod co_conversion;
+pub(crate) mod compare_only_offset;
+#[cfg(test)]
+mod compare_only_offset_tests;
 pub(crate) mod construction;
 pub(crate) mod construction_values;
 pub(crate) mod contract_extent;
@@ -2647,7 +2650,22 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // Reason key **shared** with the plain arm by ruling: the hazard and
         // the owed capability are the same, and the subject's own outcome keeps
         // the two arms attributable in the facts join.
-        if slice && sign.may_be_negative(subject.fn_did, subject.local) {
+        // **R464-3 — the compare-only admission.** The export is two-valued
+        // (`Neg` and `Top` share one bit), so a forward-only walk whose limit
+        // is computed by a non-literal offset is refused for a sign nothing
+        // reads through. Admitted where the owner's MIR says every offset that
+        // moves the read window takes a non-negative literal, and every
+        // non-literal one produces a value that is only compared or
+        // null-tested. A variable ADVANCING offset keeps the refusal.
+        if slice
+            && sign.may_be_negative(subject.fn_did, subject.local)
+            && compare_only_offset::every_advancing_offset_is_a_non_negative_literal(
+                tcx,
+                subject.fn_did,
+                subject.local,
+            )
+            .is_err()
+        {
             return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
         }
         if let Some(site) = uses.return_handoffs.first()
@@ -2738,6 +2756,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         && counted_void::active(ctx, subject).is_none()
         && region.is_none()
         && sign.may_be_negative(subject.fn_did, subject.local)
+    // **R464-3 is NOT applied here, measured.** The relay's parenthetical
+    // asked for the plain twin too; on the suite that admission takes
+    // `fragment::input` (brotli's compress-fragment core loop) away from
+    // the CURSOR family, whose `slicecursor_fragment_fast_core_loop`
+    // witness pins this refusal as its hand-off point: the base becomes
+    // `cursor-shared` precisely because the plain slice form is refused
+    // here. One added red, and it is another lane's rule, not a stale
+    // expectation — so the optional arm carries R464-3 alone and the plain
+    // half waits for slicecursor's read (report 028 §4).
     {
         return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
     }
