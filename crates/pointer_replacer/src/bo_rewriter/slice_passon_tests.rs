@@ -663,21 +663,31 @@ fn wave6s2_assignment_destination_of_a_computed_view_is_in_scope() {
         source.contains("mut data: &[u8]"),
         "the source delivers: {source}"
     );
-    // The wall MOVES: the assignment target is in scope, so the destination is
-    // no longer held by the slice-use wall; what remains is its
-    // null-initialised declaration — wave-6o's Option family — and until that
-    // lands the source keeps rendering its raw view for the raw destination.
-    assert!(
-        receipts.contains("DECISION-KV FindMatches::s degraded:null-init"),
-        "the destination's blocker is now the null-init declaration: {receipts}"
-    );
+    // **Both frames, under R217-2(a)** (wave-6o relay 036 §2; this lane is
+    // closed, so wave-6o restates it rather than letting it read as a red).
+    //
+    // The INVARIANT this control was written for is that the wall leaves THIS
+    // family: the destination is never `slice-use-unsupported` once the
+    // assignment is in scope. What happens next depends on the frame:
+    //
+    // * before wave-6o's `7d7368ec` — the destination stays raw at its
+    //   null-initialised declaration and the source renders the raw view
+    //   `s = (&(data)[l..]).as_ptr()`;
+    // * with it — the Option family takes the destination
+    //   (`Opt { mutable: false, slice: true }`) and the assignment renders
+    //   `s = Some(&data[l..])`, which is the delivery this control's own
+    //   report predicted.
     assert!(
         !receipts.contains("DECISION-KV FindMatches::s degraded:slice-use-unsupported"),
-        "{receipts}"
+        "the wall must leave this family on either frame: {receipts}"
     );
+    let raw_destination = receipts.contains("DECISION-KV FindMatches::s degraded:null-init")
+        && joined(&source).contains("s = (&(data)[l..]).as_ptr()");
+    let optional_destination = joined(&source).contains("s = Some(&data[l..])")
+        || joined(&source).contains("s = Some(&(data)[l..])");
     assert!(
-        joined(&source).contains("s = (&(data)[l..]).as_ptr()"),
-        "the source's view is still rendered for the raw destination: {source}"
+        raw_destination || optional_destination,
+        "either the raw view for a raw destination, or the suffix for an optional one: {source}"
     );
 }
 
