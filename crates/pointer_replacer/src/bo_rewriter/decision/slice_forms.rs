@@ -549,8 +549,22 @@ fn lower_computed_argument_views(
     for entry in 0..table.entries.len() {
         let (subject, decision) = &table.entries[entry];
         let node = (subject.fn_did, subject.hir_id);
-        let mutable = match decision {
-            Decision::Slice { mutable, .. } => *mutable,
+        let (mutable, optional) = match decision {
+            Decision::Slice { mutable, .. } => (*mutable, false),
+            // **R465-5 (relay 038).** An OPTION-presented slice base carries
+            // exactly the same computed views; the only difference is that the
+            // required callee contract opens it first. Taking the base's own
+            // decided form here is what lets the existing
+            // `(Slice, Opt { slice: true })` glue arm supply that unwrap —
+            // without it the carrier is built from the base's RAW form, which
+            // is a `from_raw_parts` with a fabricated extent and no unwrap, and
+            // the Option family then holds the whole class
+            // `option-evidence-held` (lodepng `addChunk_IHDR::data`).
+            Decision::Opt {
+                mutable,
+                slice: true,
+                ..
+            } => (*mutable, true),
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::NestedSlice { .. }
@@ -572,6 +586,31 @@ fn lower_computed_argument_views(
             continue;
         };
         let Some(name) = subject.param_name.clone() else { continue };
+        // An optional base is admitted ALL-OR-NOTHING and never degraded here:
+        // it already owns a typed disposition of its own, so a view this arm
+        // cannot render leaves the subject exactly as it was.
+        if optional
+            && !views.iter().all(|view| {
+                let carriers = table
+                    .seams
+                    .edits
+                    .iter()
+                    .filter(|edit| {
+                        edit.source_node == Some(node) && edit.span == view.argument_span
+                    })
+                    .collect::<Vec<_>>();
+                let [edit] = carriers.as_slice() else { return false };
+                edit.raw_outbound.is_none()
+                    && edit.spec.raw_boundary.is_none()
+                    && edit.spec.forward_slice.is_none()
+                    && edit.spec.shared_address.is_none()
+                    && edit.spec.void_region.is_none()
+                    && matches!(edit.expected, Form::Slice { mutable: expected } if mutable || !expected)
+                    && matches!(edit.spec.core, GlueCore::FromRefMut | GlueCore::FromRawParts)
+            })
+        {
+            continue;
+        }
         let enclosing_unsafe_fn = tcx
             .fn_sig(node.0)
             .skip_binder()
@@ -592,9 +631,17 @@ fn lower_computed_argument_views(
                 })
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
-            let source = Decision::Slice {
-                mutable,
-                uses: Vec::new(),
+            let source = if optional {
+                Decision::Opt {
+                    mutable,
+                    slice: true,
+                    uses: Vec::new(),
+                }
+            } else {
+                Decision::Slice {
+                    mutable,
+                    uses: Vec::new(),
+                }
             };
             let forward = |view_mutable: bool| ForwardView {
                 index_name: view.index.clone(),
@@ -701,6 +748,9 @@ fn lower_computed_argument_views(
                     break;
                 }
                 let mut spec = GlueSpec::core(GlueCore::Bare, expected_mutable);
+                if optional {
+                    spec = spec.with_unwrap(mutable);
+                }
                 spec.forward_slice = Some(forward(expected_mutable));
                 edit.spec = spec;
                 edit.family = SeamFamily::Safe;
@@ -740,6 +790,9 @@ fn lower_computed_argument_views(
             seams.push((index, edit));
         }
         if let Some(site) = hold {
+            if optional {
+                continue;
+            }
             let site = EmitabilityFacts::site(tcx, site);
             table.entries[entry].1 = Decision::Degraded(Degradation {
                 subject: subject.label.clone(),
@@ -753,6 +806,9 @@ fn lower_computed_argument_views(
         }
         match &mut table.entries[entry].1 {
             Decision::Slice { uses, .. } => uses.extend(element_uses),
+            // Every admitted view of an optional base has its own carrier, so
+            // the `[]` element arm cannot fire and there is nothing to extend.
+            Decision::Opt { .. } if optional && element_uses.is_empty() => {}
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
             | Decision::NestedSlice { .. }

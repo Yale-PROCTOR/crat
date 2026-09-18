@@ -215,6 +215,8 @@ mod nested_use_tests;
 #[cfg(test)]
 mod option_call_dependency_tests;
 #[cfg(test)]
+mod option_carrier_tests;
+#[cfg(test)]
 mod option_cmp_tests;
 #[cfg(test)]
 mod option_decl_tests;

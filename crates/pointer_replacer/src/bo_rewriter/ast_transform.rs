@@ -1858,7 +1858,10 @@ fn raw_option_expr(
     (replace.hits == 1).then_some(parsed.kind)
 }
 
-fn method_chain_expr(argument: rustc_ast::Expr, suffix: &str) -> Option<rustc_ast::Expr> {
+pub(super) fn method_chain_expr(
+    argument: rustc_ast::Expr,
+    suffix: &str,
+) -> Option<rustc_ast::Expr> {
     const ARG: &str = "__CRAT_METHOD_CHAIN_ARG";
     let mut parsed = graft_expr(&format!("{ARG}{suffix}")).ok()?;
 
@@ -2102,7 +2105,8 @@ impl<'a> SeamGraftVisitor<'a> {
             };
             // wave-6b × wave-6s: a width read over a computed suffix view takes
             // the view's shaped subtree, then the prefix.
-            let argument = super::slice_forms_ast::argument(argument, spec.forward_slice.as_ref())?;
+            let argument =
+                super::slice_forms_ast::argument(argument, spec.forward_slice.as_ref(), None)?;
             return super::decision::void_region::bridge_ast(
                 region,
                 spec.mutable,
@@ -2122,7 +2126,8 @@ impl<'a> SeamGraftVisitor<'a> {
             } else {
                 find_by_span(e, target.arg_span)?.clone()
             };
-            let argument = super::slice_forms_ast::argument(argument, spec.forward_slice.as_ref())?;
+            let argument =
+                super::slice_forms_ast::argument(argument, spec.forward_slice.as_ref(), None)?;
             return raw_boundary_expr(
                 rustc_ast::Expr {
                     id: DUMMY_NODE_ID,
@@ -2190,9 +2195,16 @@ impl<'a> SeamGraftVisitor<'a> {
             P(inner.clone())
         };
 
+        // R465-5: the unwrap opens the BASE BINDING before the view indexes
+        // it — an `Option` has no index, and the base is the subtree the view
+        // keeps, not the arithmetic around it. The text renderer
+        // (`decision::seam::GlueSpec::render_in_context`) makes the same
+        // choice, and the two must not disagree.
+        let unwrap_consumed = spec.unwrap.is_some() && spec.forward_slice.is_some();
         let arg = P(super::slice_forms_ast::argument(
             (*arg).clone(),
             spec.forward_slice.as_ref(),
+            spec.unwrap.filter(|_| unwrap_consumed),
         )?);
 
         // ---- the length: the ONE genuinely new expression ----
@@ -2231,15 +2243,16 @@ impl<'a> SeamGraftVisitor<'a> {
         if matches!(spec.core, GlueCore::RawOption) {
             return raw_option_expr(source_arg, spec.mutable, self.current_unsafe_fn);
         }
-        let arg = if let Some(found_mutable) = spec.unwrap {
-            let suffix = if found_mutable {
-                ".as_mut().unwrap()"
-            } else {
-                ".unwrap()"
-            };
-            P(method_chain_expr((*arg).clone(), suffix)?)
-        } else {
-            arg
+        let arg = match spec.unwrap {
+            Some(found_mutable) if !unwrap_consumed => {
+                let suffix = if found_mutable {
+                    ".as_mut().unwrap()"
+                } else {
+                    ".unwrap()"
+                };
+                P(method_chain_expr((*arg).clone(), suffix)?)
+            }
+            Some(_) | None => arg,
         };
         if matches!(spec.core, GlueCore::First) {
             let suffix = if spec.mutable {

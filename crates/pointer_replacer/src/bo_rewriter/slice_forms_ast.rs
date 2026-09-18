@@ -17,6 +17,10 @@ use super::{
 pub(super) fn argument(
     original: rustc_ast::Expr,
     view: Option<&super::decision::slice_forms::ForwardView>,
+    // R465-5: `Some(found_mutable)` when the base is OPTION-presented. The
+    // unwrap belongs between the base subtree and the index, because an
+    // `Option` has no index and the arithmetic spine is discarded anyway.
+    open: Option<bool>,
 ) -> Option<rustc_ast::Expr> {
     let Some(view) = view else { return Some(original) };
     // A computed sub-view keeps only the base binding's subtree; the
@@ -24,6 +28,17 @@ pub(super) fn argument(
     let original = match view.root {
         Some(root) => super::ast_transform::find_by_span(&original, root)?.clone(),
         None => original,
+    };
+    let original = match open {
+        None => original,
+        Some(found_mutable) => super::ast_transform::method_chain_expr(
+            original,
+            if found_mutable {
+                ".as_mut().unwrap()"
+            } else {
+                ".unwrap()"
+            },
+        )?,
     };
     const PLACEHOLDER: &str = "__CRAT_FORWARD_SLICE_ARGUMENT";
     let mut expression = graft_expr(&view.render(PLACEHOLDER)).ok()?;

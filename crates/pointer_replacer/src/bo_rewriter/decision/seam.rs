@@ -1503,7 +1503,23 @@ impl GlueSpec {
         if let Some(address) = &self.shared_address {
             return address.render(text);
         }
-        let shifted = self.forward_slice.as_ref().map(|view| view.render(text));
+        // R465-5: an `Option` has no index, so when a spec carries BOTH the
+        // unwrap and a forward view the unwrap opens the base first —
+        // `&mut b.as_mut().unwrap()[e..]`, never `(&mut b[e..]).unwrap()`.
+        // The glue matrix never returns a forward view, so no spec built
+        // before wave-6o's computed-view arm carries both and nothing existing
+        // moves; `wave6o_the_unwrap_opens_the_base_before_the_view_shifts_it`
+        // pins the three renderings.
+        let opened = self
+            .forward_slice
+            .as_ref()
+            .and(self.unwrap)
+            .map(|found_mutable| unwrap_expr(text, found_mutable));
+        let shifted = self
+            .forward_slice
+            .as_ref()
+            .map(|view| view.render(opened.as_deref().unwrap_or(text)));
+        let unwrap_consumed = opened.is_some();
         let text = shifted.as_deref().unwrap_or(text);
         if let Some(weakening) = &self.shared_weakening {
             return weakening.render(text);
@@ -1558,8 +1574,8 @@ impl GlueSpec {
             text
         };
         let base = match self.unwrap {
-            None => text.to_owned(),
-            Some(found_mutable) => unwrap_expr(text, found_mutable),
+            Some(found_mutable) if !unwrap_consumed => unwrap_expr(text, found_mutable),
+            Some(_) | None => text.to_owned(),
         };
         let inner = match self.core {
             GlueCore::Bare => base,
