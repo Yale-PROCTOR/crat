@@ -274,7 +274,8 @@ pub(crate) fn refuses(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
         && ((call_result_of_local_callee(ctx.constructions, subject)
             && !super::native_result_expression::bridges_local_callee_result(ctx, subject))
             || argument_of_local_callee(ctx.tcx, subject)
-            || root_is_a_reference_candidate(ctx, subject)
+            || (root_is_a_reference_candidate(ctx, subject)
+                && !field_decay_reborrows(ctx, subject))
             // (d) R445-2: the subject is an exact suffix view of an owner this
             // run delivers as a Box, and wave-5d2's derived-view rule renders
             // it as `&mut root[k..]`. A constructor over the same initializer
@@ -284,6 +285,29 @@ pub(crate) fn refuses(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
             // while the owner's candidate exists, which is the same fact the
             // native producer's R442 exemption reads.
             || super::source_typed_local::permits(ctx, subject))
+}
+
+/// **(e) wave-6f's W6F-5′ reborrow stands (a) aside** (R456-6). Clause (a)
+/// fires exactly where the root is delivered `Ref`, which is also the
+/// reborrow's own precondition: where the initializer decays an inline array
+/// FIELD of such a root, wave-6f renders the view as `&mut (*s).arr[..]` —
+/// no raw pointer, no extent of any kind, and the aliasing is the compiler's
+/// to check rather than a constructor's to approximate. That is the form (a)
+/// was protecting the subject from losing, so the refusal yields for exactly
+/// those subjects. A raw root has no reference to reborrow from, the query
+/// returns `None` there, and the constructor stays.
+fn field_decay_reborrows(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    ctx.field_reference.is_some_and(|fields| {
+        let node = (subject.fn_did, subject.hir_id);
+        // Both halves of wave-6f's own question, in their own order. The
+        // reborrow query asks only about the ROOT's kind, because at their
+        // call site the decay's own admission has already been asked; here it
+        // has not, and asking only the root would lift this refusal for a
+        // SHARED decay whose subject wants a mutable view — `widen::w`, which
+        // would widen `&T` to `&mut T` (R395-2, never).
+        fields.decayed_array_view(node, subject.mutable)
+            && fields.decayed_reborrow(node, subject.mutable).is_some()
+    })
 }
 
 /// Decision-phase hook: the veto in `decide_one` keeps this decision.
