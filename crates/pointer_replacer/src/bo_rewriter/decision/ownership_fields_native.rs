@@ -980,10 +980,29 @@ fn derive_bundle(
     let field_payload_is_slice = field_form
         .as_deref()
         .is_some_and(|form| form.to_lowercase().contains("slice"));
+    // R455-6(b) (relay 050): the lane that TYPES the moved-out local renders
+    // its initializer too. The field's delivered form is `Option<Box<T>>`, so
+    // the move out of it is `take()`, written at the load's own span; the
+    // field family's `raw-move` count reads the site through the same
+    // `owning_field_form` query. A non-optional owning field has no
+    // renderable move — the place is behind a raw deref (`E0507`) and there is
+    // no `None` to leave in the container — so that shape holds fail-closed
+    // rather than typing a local this producer cannot initialize.
     let mut edits = if field_load.is_some() {
-        // The initializer is the field family's (`take()`); this producer
-        // contributes the type, the projections, the close and the receipts.
-        Vec::new()
+        if !optional_owner {
+            return Err(NativeHold::Missing("native-field-load-owner-not-optional"));
+        }
+        let load = source.constructor();
+        let place = tcx
+            .sess
+            .source_map()
+            .span_to_snippet(load.span)
+            .map_err(|_| NativeHold::Missing("native-field-load-place-text"))?;
+        vec![BoxExprEdit {
+            span: load.span,
+            replacement: format!("{place}.take()"),
+            receipt: "native-box-moved-out-load",
+        }]
     } else {
         vec![source.constructor().clone()]
     };

@@ -2321,7 +2321,22 @@ pub unsafe extern "C" fn run() {
             panic!("the load renders now — tighten this arm: {outcome:?}")
         };
         assert!(source.contains("let mut b = (*h).buf;"), "{source}");
-        assert!(reason.contains("recovery-degraded"), "{reason}");
+        // Two joined readings, both measured on `batch-12-dry14` `2e0a2a1e3`
+        // and both fail-closed (the program is returned unmodified):
+        //   * without R455-6(b): the field family's applied transaction does
+        //     not reach the emitted tree — the struct field stays `*mut u8`
+        //     and the load stays bare — while this producer's declaration
+        //     type lands, so verify reports the `E0308` and recovery finds no
+        //     compiling subset;
+        //   * with R455-6(b): this producer's `take()` claims the load's span
+        //     first and the field family's own `owned-field-move` wrap for the
+        //     same span is refused, so round-0 emit stops there.
+        // Neither is a delivery, and the panic above is what fires the day one
+        // becomes one.
+        assert!(
+            reason.contains("recovery-degraded") || reason.contains("wrap-claim-refused"),
+            "{reason}"
+        );
         return;
     }
     let super::RewriteOutcome::Emitted { source, .. } = outcome else { panic!("{outcome:?}") };
@@ -2875,6 +2890,44 @@ fn moved_out_plan(form: Option<&str>) -> Result<super::decision::box_facts::BoxP
     .unwrap()
 }
 
+/// R455-6(b) (relay 050, STOP 1 answered): the lane that TYPES the moved-out
+/// local also renders its initializer. The field's delivered form is
+/// `Option<Box<T>>`, so the move out of it is `take()` — written at the load's
+/// own span, receipted, and readable by the field family's `raw-move` count
+/// through the same `owning_field_form` query. Without this edit the
+/// declaration carries the transaction's type over an initializer still
+/// spelled raw, which is the `E0308` that degraded the whole program on
+/// `batch-12-dry14` (report 040 §1).
+#[test]
+fn r455_a_moved_out_owner_renders_its_own_initializer() {
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let optional = moved_out_plan(Some("opt-box")).expect("opt-box form");
+    let loads: Vec<&str> = optional
+        .expr_edits
+        .iter()
+        .filter(|edit| edit.receipt == "native-box-moved-out-load")
+        .map(|edit| edit.replacement.as_str())
+        .collect();
+    assert_eq!(loads, vec!["(*y).next.take()"], "{:?}", optional.expr_edits);
+}
+
+/// R455-6(b), the other half: a NON-optional owning field has no renderable
+/// move — `(*y).next` is behind a raw deref, so a `Box<T>` field cannot be
+/// moved out at all (`E0507`) and there is no null to leave behind. Before
+/// (b) this shape was admitted on the assumption the field family would
+/// render the load; now that the rendering is this producer's, the shape
+/// holds fail-closed instead of typing a local it cannot initialize.
+#[test]
+fn r455_a_non_optional_owning_field_holds_the_moved_out_owner() {
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let plain = moved_out_plan(Some("box"));
+    assert!(plain.is_err(), "{plain:?}");
+}
+
 /// R447 (relay 044): the field transaction's own form decides the moved-out
 /// owner's shape, and this lane's line now carries the query that asks it
 /// (`owning_field_form`) instead of a patch. With no transaction the owner
@@ -2904,27 +2957,13 @@ fn r447_a_moved_out_owner_takes_the_field_transactions_shape() {
             plan.receipts
         ),
     }
-    // A plain owning box: the local is a `Box<T>`, the field family renders
-    // the load, and the projections need no edit (the Box auto-derefs).
-    let plain = moved_out_plan(Some("box")).expect("box form");
-    assert!(!plain.optional);
-    assert!(
-        plain
-            .receipts
-            .iter()
-            .any(|receipt| receipt
-                == "native-box-declaration-type ::std::boxed::Box<crate::R447Node>"),
-        "{:?}",
-        plain.receipts
-    );
-    assert!(
-        !plain
-            .expr_edits
-            .iter()
-            .any(|edit| edit.receipt == "native-box-optional-owner-projection"),
-        "{:?}",
-        plain.expr_edits
-    );
+    // A plain owning box: superseded by R455-6(b). While the field family
+    // rendered the load, this shape delivered a `Box<T>` local; now that the
+    // rendering is this producer's there is no move to write — the place is
+    // behind a raw deref and the container has no `None` to keep — so the
+    // shape holds. `r455_a_non_optional_owning_field_holds_the_moved_out_owner`
+    // is the pin; here it is only the contrast with the optional form below.
+    assert!(moved_out_plan(Some("box")).is_err(), "non-optional holds");
     // wave-6f's owning form: the local is optional and every projection
     // through it opens the option.
     let optional = moved_out_plan(Some("opt-box")).expect("opt-box form");
@@ -2976,14 +3015,25 @@ fn r447_a_moved_out_owner_takes_the_field_transactions_shape() {
         2,
         "the projections are unchanged by the payload's shape"
     );
-    // Neither shape renders the load: that is the transaction's edit.
-    for plan in [&plain, &optional] {
+    // The delivered shapes render the load as the move they can prove
+    // (R455-6(b)) and nothing else: no allocation is constructed here, and the
+    // source stage's marker edit never reaches the plan.
+    for plan in [&optional, &optional_slice] {
         assert!(
             !plan
                 .expr_edits
                 .iter()
                 .any(|edit| edit.receipt == "native-malloc-zero-numeric"
                     || edit.receipt == "native-owner-moved-out-of-a-field"),
+            "{:?}",
+            plan.expr_edits
+        );
+        assert_eq!(
+            plan.expr_edits
+                .iter()
+                .filter(|edit| edit.receipt == "native-box-moved-out-load")
+                .count(),
+            1,
             "{:?}",
             plan.expr_edits
         );
