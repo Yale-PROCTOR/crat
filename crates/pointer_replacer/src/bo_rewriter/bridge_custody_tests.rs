@@ -874,6 +874,60 @@ mod matcher {
         assert!(report.data, "{report:#?}");
     }
 
+    /// **R460-1(a), completed — the block's own intermediate is not a source binding.**
+    ///
+    /// Peeling the expression without exempting the binding moved brotli's six
+    /// rows from `raw-initializer-source-relation-unbuilt` to
+    /// `initializer-uses-an-unmatched-or-shadowing-binding` at batch 13d — the
+    /// same six sites refusing one step later.
+    #[test]
+    fn r460_1_a_the_blocks_own_intermediate_is_not_an_unmatched_binding() {
+        let input = "fn target(w: *mut i32, r: *mut u8) {} fn caller(w: *mut i32, seed: *mut u8) { target(w, seed); }";
+        let lo = input.find("target(w, seed)").unwrap() as u32;
+        let case = |init: &str| {
+            let output = format!(
+                "fn target(w: *mut i32, r: *mut u8) {{}} fn caller(w: *mut i32, seed: *mut u8) {{ {{ let __crat_pair_raw_{lo}_1: *mut u8 = {init}; target(w, __crat_pair_raw_{lo}_1); }} }}"
+            );
+            let mut expected = expectation(BridgeKind::PairT2RawView);
+            expected.anchor = SiteAnchor::Call {
+                span: ByteSpan {
+                    lo,
+                    hi: lo + "target(w, seed)".len() as u32,
+                },
+                argument_indices: vec![1],
+            };
+            let original = syntax::inventory_source("r460a2-original.rs", input).unwrap();
+            let emitted = syntax::inventory_source("r460a2-emitted.rs", &output).unwrap();
+            compare(BridgeCustodyInput {
+                original: &original,
+                emitted: &emitted,
+                original_source: input,
+                emitted_source: &output,
+                expectations: &[expected],
+                context: &BridgeCustodyContext::default(),
+            })
+        };
+
+        // brotli's shape: the raw view is rendered through a block that declares
+        // its own `__crat_raw`, which no original binding can correspond to.
+        let report = case("{ let __crat_raw: *mut u8 = seed; __crat_raw }");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::MatchedRaw,
+            "the block's own intermediate is the bridge's, not a source binding: {report:#?}"
+        );
+        assert!(report.data, "{report:#?}");
+
+        // The exemption is for THAT binding only: a block whose tail names some
+        // other local is not the peeled form and stays unmatched.
+        let other = case("{ let __crat_raw: *mut u8 = seed; let sneaky: *mut u8 = seed; sneaky }");
+        assert_eq!(
+            other.rows[0].status,
+            ReceiptStatus::Unresolved,
+            "{other:#?}"
+        );
+    }
+
     /// **R460-1(b), RULED — an unannotated original local pairs by binding identity.**
     ///
     /// C2Rust writes `let mut p = seed;` with no annotation and the delivery
@@ -922,6 +976,48 @@ mod matcher {
         assert!(report.data, "{report:#?}");
         assert_eq!(report.rows[0].correspondence, Correspondence::ByIdentity);
         assert_eq!(Correspondence::ByIdentity.wire(), "by-identity");
+
+        // **The receipt counts rows that RESTED on the widening.** A row whose
+        // original is unannotated but whose pairing fails for some OTHER reason
+        // must not claim it — measured at batch 13d, where all 31 of brotli's
+        // refusing rows carried `by-identity` while none of them paired.
+        let unpaired = {
+            let input = "fn target(w: *mut i32, r: *mut u8) {} fn caller(w: *mut i32, seed: *mut u8) { let mut p = seed; target(w, p); }";
+            let lo = input.find("target(w, p)").unwrap() as u32;
+            // The emitted local's initializer is a DIFFERENT expression, so the
+            // initializer relation refuses after the identity gate has passed.
+            let output = format!(
+                "fn target(w: *mut i32, r: *mut u8) {{}} fn caller(w: *mut i32, seed: &mut [u8]) {{ let mut p: &mut [u8] = &mut seed[1..]; {{ let __crat_pair_raw_{lo}_1: *mut u8 = p.as_mut_ptr(); target(w, __crat_pair_raw_{lo}_1); }} }}"
+            );
+            let mut expected = expectation(BridgeKind::PairT2RawView);
+            expected.anchor = SiteAnchor::Call {
+                span: ByteSpan {
+                    lo,
+                    hi: lo + "target(w, p)".len() as u32,
+                },
+                argument_indices: vec![1],
+            };
+            let original = syntax::inventory_source("r460b2-original.rs", input).unwrap();
+            let emitted = syntax::inventory_source("r460b2-emitted.rs", &output).unwrap();
+            compare(BridgeCustodyInput {
+                original: &original,
+                emitted: &emitted,
+                original_source: input,
+                emitted_source: &output,
+                expectations: &[expected],
+                context: &BridgeCustodyContext::default(),
+            })
+        };
+        assert_eq!(
+            unpaired.rows[0].status,
+            ReceiptStatus::Unresolved,
+            "{unpaired:#?}"
+        );
+        assert_eq!(
+            unpaired.rows[0].correspondence,
+            Correspondence::ByType,
+            "a row that did not pair may not claim the widening: {unpaired:#?}"
+        );
 
         // ANNOTATED original: the type test is still asked, still passes on a
         // corresponding form, and the row does NOT claim a widening it never used.

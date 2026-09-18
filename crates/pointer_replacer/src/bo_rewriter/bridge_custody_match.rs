@@ -1147,10 +1147,7 @@ fn same_source_binding_inner(
     {
         return false;
     }
-    if original.type_text.is_none() {
-        // The widening is countable: every row that used it says so.
-        record_correspondence(Correspondence::ByIdentity);
-    }
+    let by_identity = original.type_text.is_none();
     let pair = (original.id, emitted.id);
     if !visiting.insert(pair) {
         return false;
@@ -1179,6 +1176,13 @@ fn same_source_binding_inner(
         _ => false,
     };
     visiting.remove(&pair);
+    // The widening is countable, and it counts rows that RESTED on it. Recording
+    // before the initializer relation ran marked rows whose pairing then failed —
+    // measured at batch 13d, where all 31 of brotli's refusing rows carried
+    // `by-identity` while none of them paired.
+    if result && by_identity {
+        record_correspondence(Correspondence::ByIdentity);
+    }
     result
 }
 
@@ -1427,6 +1431,20 @@ fn validate_initializer_bindings(
             .bindings
             .get(emitted_id)
             .ok_or("emitted-source-binding-absent")?;
+        // **R460-1(a), completed.** The block form the arm above peels declares
+        // its own intermediate — `{ let __crat_raw: T = <e>; __crat_raw }` — and
+        // that name is the BRIDGE's, not a source binding the original could
+        // have a counterpart for. Peeling the expression without exempting the
+        // binding moved brotli's six rows from
+        // `raw-initializer-source-relation-unbuilt` to
+        // `initializer-uses-an-unmatched-or-shadowing-binding`, which is the same
+        // six sites refusing one step later. The exemption is exact: the binding
+        // must be declared INSIDE this initializer and be the one the block's
+        // tail names, so an emitted binding that merely happens to be local is
+        // still unmatched.
+        if block_intermediate_of(input, temporary, emitted) {
+            continue;
+        }
         if original_ids
             .iter()
             .filter_map(|id| input.original.bindings.get(*id))
@@ -1438,6 +1456,44 @@ fn validate_initializer_bindings(
         }
     }
     Ok(())
+}
+
+/// Whether `candidate` is the named intermediate that `temporary`'s own block
+/// initializer declares — `{ let <n>: T = <e>; <n> }`, the form R460-1(a) peels.
+fn block_intermediate_of(
+    input: &BridgeCustodyInput<'_>,
+    temporary: &Binding,
+    candidate: &Binding,
+) -> bool {
+    let (Some(init_text), Some(init_span)) = (temporary.init_text.as_deref(), temporary.init_span)
+    else {
+        return false;
+    };
+    if candidate.owner != temporary.owner
+        || candidate.declaration_span.lo < init_span.lo
+        || candidate.declaration_span.hi > init_span.hi
+    {
+        return false;
+    }
+    let Ok(initializer) = expression(init_text) else {
+        return false;
+    };
+    let ast::ExprKind::Block(block, None) = &unparen(&initializer).kind else {
+        return false;
+    };
+    let [statement, tail] = block.stmts.as_slice() else {
+        return false;
+    };
+    let (ast::StmtKind::Let(local), ast::StmtKind::Expr(value)) = (&statement.kind, &tail.kind)
+    else {
+        return false;
+    };
+    let ast::PatKind::Ident(_, name, None) = &local.pat.kind else {
+        return false;
+    };
+    let _ = input;
+    name.name.as_str() == candidate.name
+        && path(unparen(value)).is_some_and(|tail| tail == candidate.name)
 }
 
 fn witness(binding: &Binding, index: usize, kind: GeneratedKind) -> BindingWitness {
