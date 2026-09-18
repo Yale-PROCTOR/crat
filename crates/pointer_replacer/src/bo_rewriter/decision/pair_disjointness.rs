@@ -70,6 +70,15 @@ pub(crate) enum CertificateKind {
     DistinctRootsUnderContract,
     TypeRule,
     DisjointFields,
+    /// (e) R462-1. The CALLEE's two parameters never alias, because at every
+    /// in-program call the two arguments are disjoint — by (a)/(b)/(c) at that
+    /// caller, or by (e) again on the caller's own parameters.
+    ParameterPair,
+    /// (e) bottoming out at an EXPORTED entry under the user's waiver
+    /// (R462-1): an embedder's two pointer arguments to a `#[no_mangle]` entry
+    /// are assumed not to alias. An assumption, never a proof — receipted at
+    /// every site that rests on it, as the other waivers are.
+    ExportedEntryWaiver,
 }
 
 impl CertificateKind {
@@ -79,6 +88,8 @@ impl CertificateKind {
             Self::DistinctRootsUnderContract => "pair-disjoint:distinct-roots:allocator-contract",
             Self::TypeRule => "pair-disjoint:type-rule",
             Self::DisjointFields => "pair-disjoint:disjoint-fields",
+            Self::ParameterPair => "pair-disjoint:parameter-pair",
+            Self::ExportedEntryWaiver => "pair-disjoint:exported-entry-waiver",
         }
     }
 }
@@ -256,7 +267,33 @@ pub(crate) struct PairDisjointnessIndex {
     type_rule: FxHashMap<(u32, usize, usize), PairTypeVerdict>,
     /// `(callee, index)` formals with a non-defaulted immutable fact.
     immutable_formals: FxHashSet<(u32, usize)>,
+    /// Each function's pointer-parameter bindings, in formal order: what lets
+    /// (e) map an argument's entry root back to the caller's own formal.
+    param_bindings: FxHashMap<u32, Vec<HirId>>,
+    /// Functions the embedder can call: `#[no_mangle]` / `export_name`. Only
+    /// these may bottom out on R462-1's waiver.
+    exported: FxHashSet<u32>,
+    /// (e)'s memo, keyed by `(callee, i, j)` with `i < j`.
+    parameter_pairs: RefCell<FxHashMap<(u32, usize, usize), Option<PairSeparation>>>,
     ledger: RefCell<Vec<LedgerRow>>,
+}
+
+/// How (e) separated a parameter pair: by the rules alone, or resting on
+/// R462-1's exported-entry waiver somewhere in the chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairSeparation {
+    Proven,
+    Waived,
+}
+
+impl PairSeparation {
+    fn join(self, other: Self) -> Self {
+        if self == Self::Waived || other == Self::Waived {
+            Self::Waived
+        } else {
+            Self::Proven
+        }
+    }
 }
 
 impl PairDisjointnessIndex {
@@ -335,12 +372,166 @@ impl PairDisjointnessIndex {
             }
         }
 
+        // (e) R462-1: each function's pointer-parameter bindings in formal
+        // order, and the entries an embedder can call.
+        let mut param_bindings: FxHashMap<u32, Vec<HirId>> = FxHashMap::default();
+        let mut exported: FxHashSet<u32> = FxHashSet::default();
+        for &function in &program.functions {
+            let key = function.local_def_index.as_u32();
+            if let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() {
+                let bindings = tcx
+                    .hir_body(body_id)
+                    .params
+                    .iter()
+                    .map(|param| match param.pat.kind {
+                        PatKind::Binding(_, hir_id, ..) => Some(hir_id),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                param_bindings.insert(key, bindings.into_iter().flatten().collect());
+            }
+            let attrs = tcx.codegen_fn_attrs(function);
+            if attrs.export_name.is_some()
+                || attrs
+                    .flags
+                    .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NO_MANGLE)
+            {
+                exported.insert(key);
+            }
+        }
+
         Self {
             sites,
             type_rule: type_verdicts,
             immutable_formals,
+            param_bindings,
+            exported,
+            parameter_pairs: RefCell::new(FxHashMap::default()),
             ledger: RefCell::new(Vec::new()),
         }
+    }
+
+    /// (e) R462-1. Do parameters `left` and `right` of `callee` ever alias?
+    /// They do not when EVERY in-program call passes arguments the rules
+    /// separate — by (a) roots or (c) fields at that caller, or, when both
+    /// arguments are the caller's own parameters, by (e) on the caller. The
+    /// chain bottoms out at an EXPORTED entry under the user's waiver: an
+    /// embedder's two pointer arguments are assumed not to alias (R462-1),
+    /// which is an assumption and is receipted as one. A non-exported callee
+    /// with no in-program caller, an argument this read cannot map, two
+    /// arguments that are the caller's SAME parameter, a same-place call, a
+    /// cycle or eight levels of depth all refuse.
+    fn parameter_pair(
+        &self,
+        callee: u32,
+        left: usize,
+        right: usize,
+        depth: usize,
+        seen: &mut Vec<(u32, usize, usize)>,
+    ) -> Option<PairSeparation> {
+        let key = (callee, left.min(right), left.max(right));
+        if let Some(memo) = self.parameter_pairs.borrow().get(&key) {
+            return *memo;
+        }
+        if depth > 8 || seen.contains(&key) {
+            return None;
+        }
+        seen.push(key);
+        let mut result = if self.exported.contains(&callee) {
+            Some(PairSeparation::Waived)
+        } else {
+            Some(PairSeparation::Proven)
+        };
+        let mut callers = 0usize;
+        for ((caller, target), records) in &self.sites {
+            if *target != callee {
+                continue;
+            }
+            for record in records {
+                let find = |index: usize| record.args.iter().find(|arg| arg.index == index);
+                let (Some(a), Some(b)) = (find(left), find(right)) else {
+                    result = None;
+                    break;
+                };
+                callers += 1;
+                // R462-1 (2): an in-crate caller that hands the callee the
+                // same place refuses the pair, waiver or not.
+                if let (Some(pa), Some(pb)) = (&a.place, &b.place)
+                    && pa == pb
+                {
+                    result = None;
+                    break;
+                }
+                if certify_roots(a.class, b.class).is_some() {
+                    continue;
+                }
+                if let (Some(pa), Some(pb)) = (&a.place, &b.place)
+                    && disjoint_fields(pa, pb)
+                {
+                    continue;
+                }
+                let (Some(up_left), Some(up_right)) = (
+                    self.formal_of(*caller, a.class),
+                    self.formal_of(*caller, b.class),
+                ) else {
+                    result = None;
+                    break;
+                };
+                if up_left == up_right {
+                    result = None;
+                    break;
+                }
+                match self.parameter_pair(*caller, up_left, up_right, depth + 1, seen) {
+                    Some(up) => result = result.map(|acc| acc.join(up)),
+                    None => {
+                        result = None;
+                    }
+                }
+            }
+            if result.is_none() {
+                break;
+            }
+        }
+        if callers == 0 && !self.exported.contains(&callee) {
+            result = None;
+        }
+        seen.pop();
+        self.parameter_pairs.borrow_mut().insert(key, result);
+        result
+    }
+
+    /// Test-only reader for (e)'s verdict on a callee's formal pair.
+    #[cfg(test)]
+    pub(crate) fn parameter_pair_for_tests(
+        &self,
+        callee: LocalDefId,
+        left: usize,
+        right: usize,
+    ) -> Option<&'static str> {
+        self.parameter_pair(
+            callee.local_def_index.as_u32(),
+            left,
+            right,
+            0,
+            &mut Vec::new(),
+        )
+        .map(|separation| match separation {
+            PairSeparation::Proven => "proven",
+            PairSeparation::Waived => "waived",
+        })
+    }
+
+    /// The formal index of `class` when its root IS one of `function`'s own
+    /// pointer parameters.
+    fn formal_of(&self, function: u32, class: RootClass) -> Option<usize> {
+        let id = class.object_id()?;
+        if !matches!(class, RootClass::EntryStorage(_)) {
+            return None;
+        }
+        self.param_bindings
+            .get(&function)?
+            .iter()
+            .position(|binding| *binding == id)
     }
 
     /// Certify the argument pair `(left, right)` of the call `caller → callee`
@@ -422,6 +613,14 @@ impl PairDisjointnessIndex {
             && disjoint_fields(pa, pb)
         {
             return Ok(CertificateKind::DisjointFields);
+        }
+        // (e) R462-1, last: the callee's two parameters may be separable even
+        // where this call site's arguments are not, if every in-program call
+        // separates them (or the chain reaches an exported entry's waiver).
+        match self.parameter_pair(callee, left, right, 0, &mut Vec::new()) {
+            Some(PairSeparation::Proven) => return Ok(CertificateKind::ParameterPair),
+            Some(PairSeparation::Waived) => return Ok(CertificateKind::ExportedEntryWaiver),
+            None => {}
         }
         // Report the type rule's reason when it was consulted, the roots
         // otherwise: whichever is the most specific thing the input lacked.

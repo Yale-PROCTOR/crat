@@ -1624,3 +1624,245 @@ fn w6p_probe_pair_roots() {
     })
     .expect("probe compilation");
 }
+
+/// (e) + R462-1. binn's public-API shape: an exported entry takes two pointer
+/// parameters and hands both to a helper. No in-crate caller can say the two
+/// do not alias — the embedder supplies them — so the chain bottoms out on the
+/// user's waiver, and the certificate says so in its own key.
+const EXPORTED_ENTRY_PAIR: &str = r#"
+    use core::ffi::c_void;
+    pub unsafe fn binn_object_set_raw(obj: *mut c_void, key: *mut u8, size: u64) -> i32 {
+        *(obj as *mut u8) = *key;
+        size as i32
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn binn_object_set(obj: *mut c_void, key: *mut u8, size: u64) -> i32 {
+        binn_object_set_raw(obj, key, size)
+    }
+"#;
+
+#[test]
+fn w6p_exported_entry_pair_certifies_under_the_waiver() {
+    ::utils::compilation::run_compiler_on_str(EXPORTED_ENTRY_PAIR, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        let outcome = index.certify_recorded(
+            function("binn_object_set"),
+            function("binn_object_set_raw"),
+            0,
+            1,
+        );
+        assert_eq!(
+            outcome,
+            Ok(CertificateKind::ExportedEntryWaiver),
+            "the embedder's two arguments are waived, not proven"
+        );
+        assert_eq!(
+            outcome.expect("waived").key(),
+            "pair-disjoint:exported-entry-waiver",
+            "the receipt names the waiver at every site that rests on it"
+        );
+    })
+    .expect("exported-entry fixture compilation");
+}
+
+/// The same shape with the entry NOT exported: nothing in the program can
+/// separate the two parameters, and no waiver speaks for them.
+const UNEXPORTED_ENTRY_PAIR: &str = r#"
+    use core::ffi::c_void;
+    pub unsafe fn binn_object_set_raw(obj: *mut c_void, key: *mut u8, size: u64) -> i32 {
+        *(obj as *mut u8) = *key;
+        size as i32
+    }
+    pub unsafe fn binn_object_set(obj: *mut c_void, key: *mut u8, size: u64) -> i32 {
+        binn_object_set_raw(obj, key, size)
+    }
+"#;
+
+#[test]
+fn w6p_unexported_entry_pair_stays_unproved() {
+    ::utils::compilation::run_compiler_on_str(UNEXPORTED_ENTRY_PAIR, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        assert!(
+            index
+                .certify_recorded(
+                    function("binn_object_set"),
+                    function("binn_object_set_raw"),
+                    0,
+                    1
+                )
+                .is_err(),
+            "the waiver speaks only for `#[no_mangle]` entries"
+        );
+    })
+    .expect("unexported fixture compilation");
+}
+
+/// R462-1 (2): the waiver covers the external-caller edge only. An in-crate
+/// caller that hands the entry the SAME place refuses the pair outright.
+const EXPORTED_ENTRY_ALIASING_CALLER: &str = r#"
+    use core::ffi::c_void;
+    pub unsafe fn binn_object_set_raw(obj: *mut c_void, key: *mut u8, size: u64) -> i32 {
+        *(obj as *mut u8) = *key;
+        size as i32
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn binn_object_set(obj: *mut c_void, key: *mut u8, size: u64) -> i32 {
+        binn_object_set_raw(obj, key, size)
+    }
+    pub unsafe fn binn_object_set_self(buf: *mut u8, size: u64) -> i32 {
+        binn_object_set(buf as *mut c_void, buf, size)
+    }
+"#;
+
+#[test]
+fn w6p_in_crate_aliasing_caller_refuses_the_waiver() {
+    ::utils::compilation::run_compiler_on_str(EXPORTED_ENTRY_ALIASING_CALLER, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        assert!(
+            index
+                .certify_recorded(
+                    function("binn_object_set"),
+                    function("binn_object_set_raw"),
+                    0,
+                    1
+                )
+                .is_err(),
+            "an in-crate caller passing one place twice refuses the pair, waiver or not"
+        );
+    })
+    .expect("aliasing-caller fixture compilation");
+}
+
+/// R462-1 (2), the load-bearing form: an in-crate caller whose OWN two
+/// arguments cannot be separated refuses the pair even though the callee is
+/// exported. Here `binn_object_set_pair` is not exported and has no caller, so
+/// nothing can separate its two parameters — and that undischarged in-crate
+/// edge must sink the waiver.
+const EXPORTED_ENTRY_UNDISCHARGED_CALLER: &str = r#"
+    use core::ffi::c_void;
+    pub unsafe fn binn_object_set_raw(obj: *mut c_void, key: *mut u8, size: u64) -> i32 {
+        *(obj as *mut u8) = *key;
+        size as i32
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn binn_object_set(obj: *mut c_void, key: *mut u8, size: u64) -> i32 {
+        binn_object_set_raw(obj, key, size)
+    }
+    pub unsafe fn binn_object_set_pair(first: *mut c_void, second: *mut u8, size: u64) -> i32 {
+        binn_object_set(first, second, size)
+    }
+"#;
+
+#[test]
+fn w6p_undischarged_in_crate_caller_sinks_the_waiver() {
+    ::utils::compilation::run_compiler_on_str(EXPORTED_ENTRY_UNDISCHARGED_CALLER, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        assert!(
+            index
+                .certify_recorded(
+                    function("binn_object_set"),
+                    function("binn_object_set_raw"),
+                    0,
+                    1
+                )
+                .is_err(),
+            "the waiver covers the EXTERNAL edge only; an in-crate call that nothing separates refuses"
+        );
+    })
+    .expect("undischarged-caller fixture compilation");
+}
+
+/// (e) WITHOUT the waiver: a non-exported callee whose every in-program call
+/// hands it two distinct stack objects. This is the arm report 012 measured at
+/// four sole-blocker rows; it rests on no assumption at all.
+const PARAMETER_PAIR_PROVEN: &str = r#"
+    pub unsafe fn write_two(left: *mut u32, right: *mut u32) {
+        *left = *right;
+    }
+    pub unsafe fn caller_one() {
+        let mut a: u32 = 1;
+        let mut b: u32 = 2;
+        write_two(&mut a, &mut b);
+    }
+    pub unsafe fn caller_two() {
+        let mut c: u32 = 3;
+        let mut d: u32 = 4;
+        write_two(&mut c, &mut d);
+    }
+"#;
+
+#[test]
+fn w6p_parameter_pair_certifies_without_the_waiver() {
+    ::utils::compilation::run_compiler_on_str(PARAMETER_PAIR_PROVEN, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        // The pair is separated at both call sites by rule (a), so `write_two`
+        // itself is separated — which is what (e) records.
+        assert_eq!(
+            index
+                .parameter_pair_for_tests(function("write_two"), 0, 1)
+                .expect("both callers separate the pair"),
+            "proven"
+        );
+    })
+    .expect("parameter-pair fixture compilation");
+}
