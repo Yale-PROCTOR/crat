@@ -469,7 +469,12 @@ pub(crate) fn render_bridge(
             format!("&*(({text}) as *const {pointee})")
         });
     }
-    let super::seam::SeamLen::Licensed(count) = spec.len.as_ref()? else { return None };
+    // R464-3: the count is read through `SeamLen::text()` — the single
+    // derivation both emitters share — so a FABRICATED extent renders as the
+    // emitter's named path constant instead of refusing the bridge. A raw
+    // caller of a header-path view has no length to supply; R457-5's waiver is
+    // what licenses the extent, and `LenArm::Fabricated` receipts it.
+    let count = spec.len.as_ref()?.text();
     if spec.core != super::seam::GlueCore::FromRawParts || spec.unwrap.is_some() {
         return None;
     }

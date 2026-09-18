@@ -1731,6 +1731,89 @@ pub unsafe fn copy_be32(mut pdest: *mut u32, mut psource: *mut u32) {
     );
 }
 
+/// **R464-3 — the call-site fallback extent.** A RAW caller of a header-path
+/// view has no length to supply: the callee's count is the ruled fallback
+/// extent, not one of the call's arguments. Report 026 measured this as binn's
+/// second gate (`seam-len-unknown` at `binn_buf_{type,count,size}(ptr)`), and it
+/// is R457-5's own condition one layer out — so the same waiver applies, with
+/// the same per-site receipt.
+const HEADER_WITH_RAW_CALLER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct binn { pub header: i32, pub type_0: i32 }
+pub unsafe fn IsValidBinnHeader(mut pbuf: *mut core::ffi::c_void, mut ptype: *mut i32,
+    mut psize: *mut i32) -> i32 {
+    let mut p = 0 as *mut u8;
+    let mut byte: u8 = 0;
+    if pbuf.is_null() { return 0; }
+    p = pbuf as *mut u8;
+    byte = *p;
+    p = p.offset(1);
+    if byte as i32 & 0xe0 != 0xe0 { return 0; }
+    if !ptype.is_null() { *ptype = byte as i32; }
+    if !psize.is_null() { *psize = *p as i32; }
+    return p.offset_from(pbuf as *mut u8) as i32;
+}
+pub unsafe fn binn_buf_type(mut pbuf: *mut core::ffi::c_void) -> i32 {
+    let mut type_0: i32 = 0;
+    if IsValidBinnHeader(pbuf, &mut type_0, 0 as *mut i32) == 0 { return 0; }
+    return type_0;
+}
+pub unsafe fn binn_type(mut ptr: *mut core::ffi::c_void) -> i32 {
+    let mut item = 0 as *mut binn;
+    if ptr.is_null() { return -1; }
+    item = ptr as *mut binn;
+    if (*item).header == 0x1f22b11f { return (*item).type_0; }
+    return binn_buf_type(ptr);
+}
+"#;
+
+#[test]
+fn w6v2_raw_caller_of_a_header_view_takes_the_fallback_extent() {
+    let source = super::emit_tests::ast_emitted_source_of(HEADER_WITH_RAW_CALLER).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fnbinn_buf_type(mutpbuf:Option<&[u8]>"),
+        "the callee still delivers the view: {source}"
+    );
+    // The caller stays raw (it casts to `binn`), so the call must BRIDGE, and
+    // the only extent available is the ruled fallback one.
+    assert!(
+        source.contains("crate::FALLBACK_SLICE_EXTENT"),
+        "the raw caller's bridge takes the named fallback extent: {source}"
+    );
+    // The number appears exactly once, in the const ITEM the emitter inserts;
+    // the call site names the path, never the literal.
+    assert_eq!(
+        source.matches("1024").count(),
+        1,
+        "the extent is the named const, never an inlined number: {source}"
+    );
+    assert!(
+        c.contains("(crate::FALLBACK_SLICE_EXTENT)asusize"),
+        "the bridge reads the count through the named path: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// **The control.** The waiver is for READ positions. A fabricated extent on a
+/// `&mut [u8]` claims writable bytes, which is a different and worse claim than
+/// a read, so a mutable counted view with no evidence-backed length keeps its
+/// raw caller raw.
+#[test]
+fn w6v2_raw_caller_of_a_written_view_is_refused_the_fallback_extent() {
+    let input = HEADER_WITH_RAW_CALLER
+        .replace("if !psize.is_null() { *psize = *p as i32; }", "*p = 0;")
+        .replace("byte = *p;", "byte = *p; *p = byte;");
+    assert_ne!(input, HEADER_WITH_RAW_CALLER);
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        !source.contains("crate::FALLBACK_SLICE_EXTENT"),
+        "a written-through cursor takes no fabricated extent: {source}"
+    );
+}
+
 #[test]
 fn w6v2_header_path_takes_the_ruled_fallback_extent() {
     let rows = by_function(HEADER);

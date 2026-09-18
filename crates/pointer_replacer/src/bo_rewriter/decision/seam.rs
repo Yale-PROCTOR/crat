@@ -2458,6 +2458,35 @@ mod tests {
         }
     }
 
+    /// **R464-3 — the call-site fallback extent must RECEIPT as fabricated.**
+    ///
+    /// The bridge renders identically whether the constant reaches it as a
+    /// fabricated length or as a "licensed" length whose text happens to be
+    /// [`FABRICATED_LEN_PATH`] — so the emitted code cannot tell the two apart
+    /// and only the receipt can. Routing the constant through `len_text` would
+    /// therefore produce a correct program with a WRONG audit: an
+    /// evidence-backed extent that no evidence backs. This pins the route.
+    #[test]
+    fn the_call_site_fallback_extent_receipts_as_fabricated() {
+        let fabricated = with_length(GlueSpec::core(GlueCore::FromRawParts, false), None);
+        assert_eq!(receipt_extent(&fabricated), BridgeExtentKind::Fallback);
+        assert_eq!(
+            fabricated.len.as_ref().map(SeamLen::text),
+            Some(FABRICATED_LEN_PATH)
+        );
+
+        // The mistake this test exists to catch: same rendering, wrong receipt.
+        let mis_licensed = with_length(
+            GlueSpec::core(GlueCore::FromRawParts, false),
+            Some(FABRICATED_LEN_PATH),
+        );
+        assert_eq!(
+            mis_licensed.len.as_ref().map(SeamLen::text),
+            Some(FABRICATED_LEN_PATH)
+        );
+        assert_ne!(receipt_extent(&mis_licensed), BridgeExtentKind::Fallback);
+    }
+
     /// **Ruling B — a companion length turns the gate into a seam.**
     ///
     /// The same pair that gates with no length produces `from_raw_parts` with
@@ -3451,7 +3480,32 @@ fn build_candidate(
     };
     let mut spec = spec;
     if let Some((contract, route)) = counted {
-        if len_text.is_none() {
+        // **R464-3 — the fallback extent at the CALL SITE.** A raw caller of a
+        // header-path view has no length to supply: the callee's count is the
+        // ruled fallback extent (R457-5), not one of the call's arguments. That
+        // is the same condition the declaration was granted the waiver for, one
+        // layer out, so the same waiver applies — `glue` has already installed
+        // `SeamLen::Fabricated` here, and the receipt reads
+        // `fallback(FALLBACK_SLICE_EXTENT=1024)`.
+        //
+        // **Read positions only.** A fabricated extent on a `&mut [u8]` claims
+        // writable bytes, which is a different and worse claim than a read; the
+        // prove side already refuses a written-through cursor, so this is a
+        // declared redundancy (R312-1) kept because it is the soundness line
+        // the ruling drew.
+        let fallback_extent = contract
+            .width
+            .as_ref()
+            .is_some_and(super::binn_counted::WidthTable::is_fallback_extent)
+            && matches!(
+                expected,
+                Form::Slice { mutable: false }
+                    | Form::Opt {
+                        mutable: false,
+                        slice: true
+                    }
+            );
+        if len_text.is_none() && !fallback_extent {
             return Err(SeamBlock::LengthUnknown);
         }
         spec.counted_byte = Some(super::counted_void::CountedByte {
