@@ -31,6 +31,10 @@ pub(crate) const CACHE_MANIFEST_SHA256: &str = "raw_boundary_cache_manifest_sha2
 /// column of its own and never overloads `CACHE_STATUS`, which reports what the
 /// model cache did, not which manifest licensed the read.
 pub(crate) const CACHE_FRAME_ADMISSION: &str = "raw_boundary_cache_frame_admission";
+/// **R467-3** — planned edits whose replacement failed `graft_expr`'s round trip
+/// and were dropped by their caller: correct in the plan, inert in the tree. An
+/// instrument count, per program; 0 is the expected reading.
+pub(crate) const GRAFT_REFUSED: &str = "raw_boundary_graft_refused";
 pub(crate) const LAUNCH_ENV_SHA256: &str = "raw_boundary_launch_env_sha256";
 pub(crate) const SOLVE_WALL_S: &str = "raw_boundary_solve_wall_s";
 pub(crate) const SOLVER_INVOCATIONS: &str = "raw_boundary_solver_invocations";
@@ -236,6 +240,7 @@ pub(crate) const ALL: &[&str] = &[
     CACHE_MODEL_SHA256,
     CACHE_MANIFEST_SHA256,
     CACHE_FRAME_ADMISSION,
+    GRAFT_REFUSED,
     LAUNCH_ENV_SHA256,
     SOLVE_WALL_S,
     SOLVER_INVOCATIONS,

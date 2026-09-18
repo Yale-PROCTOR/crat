@@ -12089,6 +12089,10 @@ mod run {
             }
             Ok(Ok(available)) => available,
         };
+        // **R467-3** — count this program's silent graft refusals: reset before
+        // the capture, read after, so the count belongs to THIS program and not
+        // to whatever ran in the worker before it.
+        crate::bo_rewriter::ast_transform::reset_graft_refusals();
         let capture = match super::cache_only_before_solve(
             entry_available
                 .then_some(())
@@ -12407,6 +12411,10 @@ mod run {
         // against the final-revert table, checked on the PUBLISHED rows rather
         // than on the predicate that wrote them. It fires on the first census
         // whose receipt carries the column; before that the check is vacuous.
+        row.set(
+            raw_schema::GRAFT_REFUSED,
+            crate::bo_rewriter::ast_transform::graft_refusals(),
+        );
         if let Err(disagreement) = super::field_transaction_revert_status_agrees(
             &artifact.field_transactions,
             &artifact.final_reverts,
@@ -25527,6 +25535,47 @@ fn raw_boundary_wave2_corpus_census() {
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
+}
+
+#[test]
+fn r467_3_silent_graft_refusals_are_counted_at_the_one_choke_point() {
+    use crate::{
+        bo_rewriter::ast_transform::{graft_expr, graft_refusals, reset_graft_refusals},
+        raw_boundary_census_schema as schema,
+    };
+
+    rustc_span::create_session_globals_then(
+        rustc_span::edition::Edition::Edition2018,
+        &[],
+        None,
+        || {
+            reset_graft_refusals();
+            assert_eq!(graft_refusals(), 0, "reset means reset");
+
+            // A replacement that grafts cleanly is not a refusal.
+            assert!(graft_expr("p[0]").is_ok());
+            assert_eq!(graft_refusals(), 0);
+
+            // **The round-trip refusal**: a replacement whose PREFIX parses and
+            // whose tail is dropped. This is the wrong-graft case the round trip
+            // exists to catch, and the one a caller then swallows silently.
+            assert!(graft_expr("p[0] trailing").is_err());
+            assert_eq!(graft_refusals(), 1, "the round-trip refusal is counted");
+
+            // It accumulates across callers, which is the point: every call site
+            // swallows the Err differently, so only the choke point can count.
+            assert!(graft_expr("p[1] also trailing").is_err());
+            assert_eq!(graft_refusals(), 2);
+
+            // And the count is per program, so the reset has to work twice.
+            reset_graft_refusals();
+            assert_eq!(graft_refusals(), 0);
+        },
+    );
+
+    // R450-9: the count is its own additive column.
+    assert!(schema::ALL.contains(&schema::GRAFT_REFUSED));
+    assert_ne!(schema::GRAFT_REFUSED, schema::CACHE_FRAME_ADMISSION);
 }
 
 #[test]

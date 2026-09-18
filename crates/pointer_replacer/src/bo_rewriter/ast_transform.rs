@@ -6725,10 +6725,35 @@ mod alias_declaration_placement_tests {
     }
 }
 
+thread_local! {
+    /// **R467-3 (wave-6f 042 / ownership-fields 046) — silent graft refusals.**
+    ///
+    /// A planned edit whose replacement fails this function's round trip is
+    /// dropped by its caller and nothing records it: the plan says the conversion
+    /// was made and the tree never received it. Every caller swallows the `Err`
+    /// differently (`.ok()?`, a `match` arm, a `let Ok(..) else`), so the only
+    /// honest place to count is the one choke point they all pass through. It is
+    /// an INSTRUMENT: it changes no verdict and no edit.
+    static GRAFT_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn reset_graft_refusals() {
+    GRAFT_REFUSALS.with(|cell| cell.set(0));
+}
+
+pub(crate) fn graft_refusals() -> usize {
+    GRAFT_REFUSALS.with(std::cell::Cell::get)
+}
+
+fn record_graft_refusal() {
+    GRAFT_REFUSALS.with(|cell| cell.set(cell.get() + 1));
+}
+
 pub(crate) fn graft_expr(text: &str) -> Result<rustc_ast::Expr, String> {
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ::utils::ast::parse_expr(text.to_owned())
     }))
+    .inspect_err(|_| record_graft_refusal())
     .map_err(|_| text.to_owned())?;
     // **FULL CONSUMPTION, and it is not belt-and-braces** (adversarial review,
     // arm-2 boundary). `utils::ast::parse_expr` calls `parser.parse_expr()` and
@@ -6756,6 +6781,7 @@ pub(crate) fn graft_expr(text: &str) -> Result<rustc_ast::Expr, String> {
         if std::env::var("CRAT_DUMP_GRAFT_REFUSALS").is_ok() {
             eprintln!("CRAT-GRAFT-REFUSED[EXPR]\n  text    = {text:?}\n  printed = {printed:?}");
         }
+        record_graft_refusal();
         return Err(text.to_owned());
     }
     // Erase AFTER the round-trip check, so the check reads the fragment as
