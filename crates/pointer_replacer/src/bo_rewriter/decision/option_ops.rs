@@ -572,6 +572,13 @@ pub(super) fn slice_suffix_view(
     owner: LocalDefId,
     subject_hir: HirId,
     expression: &Expr<'_>,
+    // **Relay 032 (R455-2) — the DESTINATION's decided mutability is the
+    // authority, not the `&mut` C2Rust writes into every place expression.**
+    // `p = &mut *src.offset(2) as *mut f32` with `p` read only (`*p.offset(0)
+    // + *p.offset(1)`) settles `Opt { mutable: false }`, and a shared base
+    // supplies that view; requiring a mutable base from the spine's syntax
+    // refused the row for a mutability nothing uses.
+    destination_mutable: bool,
 ) -> Option<SliceSuffixView> {
     let typeck = tcx.typeck(owner);
     let mut expr = expression;
@@ -586,7 +593,7 @@ pub(super) fn slice_suffix_view(
         }
         expr = inner;
     }
-    let ExprKind::AddrOf(_, mutability, place) = expr.kind else { return None };
+    let ExprKind::AddrOf(_, _, place) = expr.kind else { return None };
     let ExprKind::Unary(rustc_hir::UnOp::Deref, advanced) = place.kind else { return None };
     let ExprKind::MethodCall(segment, receiver, [delta], _) = advanced.kind else { return None };
     if segment.ident.name.as_str() != "offset" {
@@ -621,15 +628,16 @@ pub(super) fn slice_suffix_view(
         | Decision::Box(_)
         | Decision::Degraded(_) => return None,
     };
-    // A shared base cannot supply a mutable view.
-    if mutability.is_mut() && !base_mutable {
+    // A shared base cannot supply a mutable view — asked of the destination's
+    // own form, which is what the value is used through.
+    if destination_mutable && !base_mutable {
         return None;
     }
     let delta = forward_delta(tcx, owner, delta)?;
     Some(SliceSuffixView {
         base: source.param_name.clone()?,
         delta,
-        mutable: mutability.is_mut(),
+        mutable: destination_mutable,
     })
 }
 

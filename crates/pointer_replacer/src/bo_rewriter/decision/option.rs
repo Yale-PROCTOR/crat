@@ -510,6 +510,7 @@ pub(crate) fn plan_values(
                         subject.fn_did,
                         subject.hir_id,
                         expression,
+                        mutable,
                     )
                 })
                 .flatten();
@@ -528,6 +529,19 @@ pub(crate) fn plan_values(
                     "option-slice-value:one-element-carrier".to_owned(),
                 ));
             }
+            // Relay 032 (R455-6): where the suffix arm renders, the source
+            // lane's own view edit at this assignment (wave-6s's
+            // `computed-suffix-raw-view`, whose span is the whole right-hand
+            // side rather than the inner view this planner reads) is composed
+            // INTO the value — the same discipline the planner already applies
+            // to edits nested in `view_span`, with the wider span. Without it
+            // the two renderings of one interval collide
+            // (`intra-class-interval-overlap`) and the owner's family falls back.
+            let superseded = if suffix.is_some() {
+                construction::collect_composable_edits(table, span)
+            } else {
+                Vec::new()
+            };
             let unsafe_fn = tcx
                 .fn_sig(subject.fn_did)
                 .skip_binder()
@@ -672,7 +686,7 @@ pub(crate) fn plan_values(
                     emitability::UseEdit {
                         span,
                         replacement,
-                        bridge_kind: if composed.is_empty() {
+                        bridge_kind: if composed.is_empty() && superseded.is_empty() {
                             "option-value"
                         } else {
                             "option-value-composed"
@@ -680,6 +694,7 @@ pub(crate) fn plan_values(
                     },
                 ));
                 composed_uses.extend(composed.iter().map(|(span, _)| (node, *span)));
+                composed_uses.extend(superseded.iter().map(|(span, _)| (node, *span)));
                 if initializer {
                     initializers.push(node);
                 }
