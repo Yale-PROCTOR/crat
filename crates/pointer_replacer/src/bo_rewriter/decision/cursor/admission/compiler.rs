@@ -405,6 +405,8 @@ pub(super) fn inspect<'tcx>(
         })
     {
         report.findings[0].outcome = Outcome::Missing(Need::RefAdmission);
+    } else if shape == Shape::RawParameter {
+        derive_parameter(tcx, body, candidate.local, &component, &mut report);
     } else if shape == Shape::LocalArray {
         let Root::Array(root) = *node.roots.first().unwrap() else { unreachable!() };
         derive_array(
@@ -430,6 +432,72 @@ pub(super) fn inspect<'tcx>(
         Status::NeedsFact
     };
     report
+}
+
+/// **The base derivation for a parameter root.** Unlike a local array, whose
+/// origin is a lend site inside the body, a raw parameter arrives already
+/// pointing somewhere: its base origin IS the entry position, and the region it
+/// can address begins there. So the retained base is PROVEN at entry — named by
+/// root and site rather than left at the seeded "nothing was derived" — unless
+/// the body observably needs a position BELOW entry, which this shape cannot
+/// supply. Only literal evidence counts: `p.offset(-1)` and `p.sub(1)` are
+/// backward, a variable delta proves nothing and leaves the base proven, and
+/// the three interprocedural predicates (generation, prefix, schedule) stay
+/// exactly as seeded because nothing here derives them.
+fn derive_parameter<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    root: Local,
+    component: &[Local],
+    report: &mut Admission,
+) {
+    fn constant(operand: &Operand<'_>) -> Option<i128> {
+        let Operand::Constant(value) = operand else { return None };
+        let int = value.const_.try_to_scalar()?.try_to_scalar_int().ok()?;
+        Some(int.to_int(int.size()))
+    }
+    let entry = Location {
+        block: mir::START_BLOCK,
+        statement_index: 0,
+    };
+    report.findings[0].root = Some(root);
+    report.findings[0].site = Some(at(entry));
+    report.findings[0].outcome = Outcome::Proven;
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        let TerminatorKind::Call { func, args, .. } = &data.terminator().kind else {
+            continue;
+        };
+        if method(tcx, body, func, args.first().map(|arg| &arg.node)) != Method::Pointer {
+            continue;
+        }
+        let Some(receiver) = args.first().and_then(|arg| arg.node.place()) else {
+            continue;
+        };
+        if !component.contains(&receiver.local) {
+            continue;
+        }
+        let Some(delta) = args.get(1).and_then(|arg| constant(&arg.node)) else {
+            continue;
+        };
+        let ty::FnDef(did, _) = *func.ty(&body.local_decls, tcx).kind() else {
+            continue;
+        };
+        let backward = if tcx.item_name(did).as_str() == "sub" {
+            delta > 0
+        } else {
+            delta < 0
+        };
+        if backward {
+            reject(
+                &mut report.findings[0],
+                Outcome::Missing(Need::EntryWindow),
+                Location {
+                    block,
+                    statement_index: data.statements.len(),
+                },
+            );
+        }
+    }
 }
 
 fn derive_array<'tcx>(

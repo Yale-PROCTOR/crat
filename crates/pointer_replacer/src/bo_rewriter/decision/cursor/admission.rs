@@ -58,6 +58,10 @@ pub enum Predicate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Need {
     BaseOrigin,
+    /// A cursor rooted at a raw PARAMETER begins at the pointer it was handed,
+    /// so it has no region below that position: an observed backward offset is
+    /// a base origin this shape cannot supply, not merely one nothing derived.
+    EntryWindow,
     Generation,
     Prefix,
     Schedule,

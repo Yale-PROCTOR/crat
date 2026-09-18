@@ -413,3 +413,114 @@ fn assert_typed_hold(input: &str, name: &str) {
     })
     .unwrap();
 }
+
+/// **W-PARAM-BASE** — the base derivation for a PARAMETER root. The base origin
+/// of such a cursor is the entry position itself, so a subject that only walks
+/// forward from it has its retained base PROVEN at entry, named by root and
+/// site, where the seeded default said only "nothing was derived".
+#[test]
+fn native_admission_derives_a_forward_parameter_root() {
+    utils::compilation::run_compiler_on_str(
+        "pub unsafe fn witness(p: *const i32, k: isize) -> i32 { *p.offset(k) + *p.add(2) }",
+        |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+            let subject = &table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .unwrap()
+                .0;
+            let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+            assert_eq!(row.shape, admission::Shape::RawParameter);
+            assert_eq!(
+                row.findings[0].outcome,
+                admission::Outcome::Proven,
+                "{row:#?}"
+            );
+            assert_eq!(row.findings[0].root, Some(subject.local), "{row:#?}");
+            assert!(row.findings[0].site.is_some(), "{row:#?}");
+        },
+    )
+    .unwrap();
+}
+
+/// **W-PARAM-BASE-BACKWARD** — the same derivation types the entry window: a
+/// parameter root has no region BELOW the pointer it was handed, so a literal
+/// backward offset is a typed missing base origin, distinct from the variable
+/// case. This is the column the census archive needs to size the exposure the
+/// emitted form carries (report 033 §3).
+#[test]
+fn native_admission_types_a_backward_parameter_root() {
+    utils::compilation::run_compiler_on_str(
+        "pub unsafe fn witness(p: *const i32) -> i32 { *p.offset(-1) }",
+        |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+            let subject = &table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .unwrap()
+                .0;
+            let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+            assert_eq!(row.shape, admission::Shape::RawParameter);
+            assert_eq!(
+                row.findings[0].outcome,
+                admission::Outcome::Missing(admission::Need::EntryWindow),
+                "{row:#?}"
+            );
+        },
+    )
+    .unwrap();
+}
+
+/// **F-PARAM-BASE-SUB** — `p.sub(1)` is the same backward move with a POSITIVE
+/// constant: the derivation reads the operation, not the sign of the literal.
+#[test]
+fn native_admission_types_a_subtracting_parameter_root() {
+    utils::compilation::run_compiler_on_str(
+        "pub unsafe fn witness(p: *const i32) -> i32 { *p.sub(1) }",
+        |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+            let subject = &table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .unwrap()
+                .0;
+            let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+            assert_eq!(
+                row.findings[0].outcome,
+                admission::Outcome::Missing(admission::Need::EntryWindow),
+                "{row:#?}"
+            );
+        },
+    )
+    .unwrap();
+}
+
+/// **F-PARAM-BASE-UNKNOWN** — a variable delta proves nothing either way: the
+/// derivation leaves the seeded `BaseOrigin`, so the instrument never claims a
+/// window it did not observe.
+#[test]
+fn native_admission_leaves_a_variable_parameter_root_underived() {
+    utils::compilation::run_compiler_on_str(
+        "pub unsafe fn witness(p: *const i32, k: isize) -> i32 { let mut q = p; q = q.offset(k); *q }",
+        |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+            let subject = &table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .unwrap()
+                .0;
+            let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+            assert_eq!(row.shape, admission::Shape::RawParameter);
+            assert_eq!(
+                row.findings[0].outcome,
+                admission::Outcome::Proven,
+                "a variable delta is not a backward move: {row:#?}"
+            );
+        },
+    )
+    .unwrap();
+}
