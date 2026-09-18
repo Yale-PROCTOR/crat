@@ -1961,6 +1961,59 @@ fn r424_slice_construction_initializer_corresponds_exactly() {
 /// `src.as_deref().map_or(null(), |slice| slice.as_ptr().cast::<c_void>())`.
 /// Both are the original's own view; neither was a correspondence the
 /// comparator knew, and four rows failed binn's custody on batch 9's candidate.
+/// **R460-1(a) — brotli's block-rendered raw temporary.**
+///
+/// The AST layer renders some A5 raw views as a BLOCK with one named
+/// intermediate: `{ let __crat_raw: T = ((*mb).f) as T; __crat_raw }`. That is
+/// the same expression as `((*mb).f) as T` with a name attached, but
+/// `raw_initializer_matches` had no `ExprKind::Block` arm, so all six of
+/// `BrotliClusterHistogramsDistance`/`Literal`'s arguments 4 and 6 failed
+/// `raw-initializer-source-relation-unbuilt` and batch 13 ended `data=false`.
+#[test]
+fn r460_1_a_block_with_one_named_intermediate_is_that_intermediate() {
+    use crate::bo_rewriter::bridge_custody_match::raw_initializer_matches_for_test as matches;
+    let under = |emitted: &str, original: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || matches(emitted, original),
+        )
+    };
+    // brotli's exact shape, both spans the census named.
+    assert!(under(
+        "{ let __crat_raw: *mut HistogramDistance = ((*mb).distance_histograms) as *mut HistogramDistance; __crat_raw }",
+        "(*mb).distance_histograms"
+    ));
+    assert!(under(
+        "{ let __crat_raw: *mut u32 = ((*mb).distance_context_map) as *mut u32; __crat_raw }",
+        "(*mb).distance_context_map"
+    ));
+    // The block is transparent, so every relation the inner expression already
+    // had still holds through it.
+    assert!(under(
+        "{ let __crat_raw: *const i32 = core::ptr::from_ref(r); __crat_raw }",
+        "r"
+    ));
+
+    // **A named intermediate and NOTHING else.** Anything that makes the block
+    // more than a rename refuses: a second statement, a tail that is not the
+    // bound name, a different name, or no binding at all.
+    assert!(!under(
+        "{ let __crat_raw: *mut u32 = ((*mb).a) as *mut u32; side_effect(); __crat_raw }",
+        "(*mb).a"
+    ));
+    assert!(!under(
+        "{ let __crat_raw: *mut u32 = ((*mb).a) as *mut u32; other }",
+        "(*mb).a"
+    ));
+    assert!(!under("{ ((*mb).a) as *mut u32 }", "(*mb).a"));
+    assert!(!under(
+        "{ let __crat_raw: *mut u32 = ((*mb).b) as *mut u32; __crat_raw }",
+        "(*mb).a"
+    ));
+}
+
 #[test]
 fn r430_optional_delivery_spellings_correspond_to_their_original_views() {
     use crate::bo_rewriter::bridge_custody_match::raw_initializer_matches_for_test as matches;

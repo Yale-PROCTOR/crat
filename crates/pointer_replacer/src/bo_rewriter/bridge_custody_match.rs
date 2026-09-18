@@ -449,6 +449,38 @@ fn raw_initializer_matches(initializer: &ast::Expr, original: &ast::Expr) -> boo
         return true;
     }
     match &initializer.kind {
+        // **R460-1(a) — a block with ONE named intermediate is that intermediate.**
+        //
+        // The AST layer renders some A5 raw views as `{ let __crat_raw: T = <e>;
+        // __crat_raw }` — the same expression as `<e>` with a name attached. Six
+        // of brotli's `BrotliClusterHistograms*` arguments are spelled that way,
+        // and with no arm here they failed `raw-initializer-source-relation-unbuilt`
+        // and ended batch 13 `data=false`.
+        //
+        // A named intermediate and NOTHING else: exactly one statement, which is
+        // a `let` binding one name to one initializer, and a tail that is exactly
+        // that name. A second statement, a tail that is any other expression, or
+        // a block without a binding all keep their own key and still refuse —
+        // this peels a rename, never a computation.
+        ast::ExprKind::Block(block, None) => {
+            let [statement, tail] = block.stmts.as_slice() else {
+                return false;
+            };
+            let ast::StmtKind::Let(local) = &statement.kind else {
+                return false;
+            };
+            let ast::StmtKind::Expr(value) = &tail.kind else {
+                return false;
+            };
+            let ast::PatKind::Ident(_, name, None) = &local.pat.kind else {
+                return false;
+            };
+            let Some(init) = local.kind.init() else {
+                return false;
+            };
+            path(unparen(value)).is_some_and(|tail| tail == name.name.as_str())
+                && raw_initializer_matches(init, original)
+        }
         ast::ExprKind::Cast(inner, ty) if matches!(ty.kind, ast::TyKind::Ptr(_)) => {
             raw_initializer_matches(inner, original)
         }
