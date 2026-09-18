@@ -24,7 +24,10 @@
 use rustc_hash::FxHashSet;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{
-    mir::{BinOp, Body, Local, Operand, Place, PlaceElem, Rvalue, StatementKind, TerminatorKind},
+    mir::{
+        BinOp, Body, CastKind, Local, Operand, Place, PlaceElem, Rvalue, StatementKind,
+        TerminatorKind,
+    },
     ty::TyCtxt,
 };
 
@@ -83,7 +86,7 @@ pub(crate) fn every_advancing_offset_is_a_non_negative_literal(
         if !chain.contains(&receiver) {
             continue;
         }
-        if non_negative_literal(&operand.node) {
+        if non_negative_literal(body, &operand.node) {
             // A forward step by a literal. It may advance freely.
             continue;
         }
@@ -123,10 +126,57 @@ fn operand_local(operand: &Operand<'_>) -> Option<Local> {
 /// A literal `0`, `1`, `4`, … — the operand's own sign, read off the constant.
 /// A negated literal is `Neg(const)` in MIR and is therefore NOT a constant
 /// operand, so it lands on the non-literal side and is judged by its use.
-fn non_negative_literal(operand: &Operand<'_>) -> bool {
-    let Some(constant) = operand.constant() else { return false };
-    let Some(scalar) = constant.const_.try_to_scalar_int() else { return false };
-    scalar.to_int(scalar.size()) >= 0
+///
+/// **R470-6 — through c2rust's casts.** The corpus writes a sized step as
+/// `p.offset(4 as libc::c_int as isize)`, whose MIR operand is a local holding
+/// `const 4_i32` cast to `isize`. The literal is written down; only the
+/// spelling is indirect. So a local operand is followed back through its
+/// SINGLE defining assignment while that assignment is a copy or an integer
+/// cast, and judged at the constant it reaches. A `Neg` (or any other
+/// computation) is not one of those, so a negated or computed operand still
+/// lands on the non-literal side.
+fn non_negative_literal<'tcx>(body: &Body<'tcx>, operand: &Operand<'tcx>) -> bool {
+    /// c2rust writes at most `const -> as c_int -> as isize`; the bound keeps
+    /// the walk finite for any chain, however written.
+    const HOPS: usize = 4;
+
+    let mut operand = operand.clone();
+    for _ in 0..=HOPS {
+        if let Some(constant) = operand.constant() {
+            let Some(scalar) = constant.const_.try_to_scalar_int() else { return false };
+            return scalar.to_int(scalar.size()) >= 0;
+        }
+        let Some(local) = operand_local(&operand) else { return false };
+        let Some(source) = sole_copy_or_cast_source(body, local) else { return false };
+        operand = source;
+    }
+    false
+}
+
+/// The operand of the single assignment to `local`, when that assignment is a
+/// copy or an integer cast and nothing else writes the local.
+fn sole_copy_or_cast_source<'tcx>(body: &Body<'tcx>, local: Local) -> Option<Operand<'tcx>> {
+    let mut source = None;
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let StatementKind::Assign(assignment) = &statement.kind else { continue };
+            if assignment.0.as_local() != Some(local) {
+                continue;
+            }
+            if source.is_some() {
+                // Written more than once: this is not one spelling of one
+                // literal, and the operand is judged non-literal.
+                return None;
+            }
+            source = match &assignment.1 {
+                Rvalue::Use(operand) | Rvalue::Cast(CastKind::IntToInt, operand, _) => {
+                    Some(operand.clone())
+                }
+                _ => return None,
+            };
+        }
+    }
+    source
 }
 
 /// Copies and casts of a local, plus a raw pointer taken THROUGH one

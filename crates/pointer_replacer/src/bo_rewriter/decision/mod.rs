@@ -40,6 +40,8 @@ pub(crate) mod callee_parameter_input;
 pub(crate) mod co_conversion;
 pub(crate) mod compare_only_offset;
 #[cfg(test)]
+mod compare_only_offset_probe;
+#[cfg(test)]
 mod compare_only_offset_tests;
 pub(crate) mod construction;
 pub(crate) mod construction_values;

@@ -134,3 +134,63 @@ pub unsafe fn walk(mut fmap: *mut u32, mut lo: isize, mut hi: isize) -> u32 {
 "####;
     assert!(verdict(input, "walk", 0).is_err());
 }
+
+/// **R470-6 — the corpus idiom, measured.** The reduction writes the advancing
+/// step as `p.offset(4)`; binn itself writes it as
+/// `p = p.offset(4 as libc::c_int as isize)` (lib.rs:1192), and c2rust writes
+/// every sized step that way. In MIR the operand is then `move _91`, a local
+/// holding `_92 = const 4_i32; _91 = move _92 as isize`, so
+/// `non_negative_literal` — which reads the operand's own constant — sees no
+/// literal and the walk is refused for a step whose sign is written down.
+///
+/// The probe of R470-5(b) measured this on the substrate: binn's
+/// `IsValidBinnHeader::pbuf` refuses at THIS offset, not at `plimit`'s
+/// (whose result is compare-only and already admitted).
+#[test]
+fn w5c_compare_only_admits_a_literal_step_behind_c2rusts_casts() {
+    let input = REDUCTION.replace(
+        "    p = p.offset(4);",
+        "    p = p.offset(4 as core::ffi::c_int as isize);",
+    );
+    assert_ne!(input, REDUCTION, "the witness must change the fixture");
+    assert_eq!(
+        verdict(&input, "IsValidBinnHeader", 0),
+        Ok(()),
+        "a non-negative literal behind c2rust's casts is still a literal step"
+    );
+}
+
+/// **Control** — the same casts around a NEGATED literal. `-(4)` is a MIR
+/// `UnaryOp`, not a cast of a constant, so the operand stays non-literal and
+/// the step (which moves the cursor that is then read) keeps the refusal.
+#[test]
+fn w5c_compare_only_refuses_a_negated_literal_behind_the_same_casts() {
+    let input = REDUCTION.replace(
+        "    p = p.offset(4);",
+        "    p = p.offset(-(4 as core::ffi::c_int) as isize);",
+    );
+    assert_ne!(input, REDUCTION, "the control must change the fixture");
+    assert!(
+        verdict(&input, "IsValidBinnHeader", 0).is_err(),
+        "a negated literal must not be read as a non-negative literal step"
+    );
+}
+
+/// **Control** — a step local written TWICE is not one spelling of one
+/// literal. The walk back stops at the second writer and the operand stays
+/// non-literal, so the step (which moves the cursor that is read) is refused
+/// even though one of the two writers is `4`.
+#[test]
+fn w5c_compare_only_refuses_a_step_local_written_twice() {
+    let input = REDUCTION.replace(
+        "    p = p.offset(4);",
+        "    let mut step: isize = -4isize;\n    \
+         if byte as i32 > 3 { step = 4 as core::ffi::c_int as isize; }\n    \
+         p = p.offset(step);",
+    );
+    assert_ne!(input, REDUCTION, "the control must change the fixture");
+    assert!(
+        verdict(&input, "IsValidBinnHeader", 0).is_err(),
+        "a step written twice must not be read as a literal step"
+    );
+}
