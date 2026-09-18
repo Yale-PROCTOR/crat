@@ -956,6 +956,17 @@ fn anchors(
                 _ => None,
             })
             .collect();
+        // **R456-7 (wave-6o 021 claim 3), MEASURED AND NOT APPLIED.** The
+        // ruling is that a composed pair the final plan accepts is not a
+        // refusal at any stage. Exempting `intra-class-interval-overlap` here
+        // unconditionally is NOT that rule: it also exempts the pairs the final
+        // plan still holds, and report 037 measures what that costs — wave-6o's
+        // own `wave6o_null_init_local_with_no_pending_row_still_receives_its_
+        // declaration` stops delivering, and one wave-5c `thin_counted` row
+        // moves. The stage cannot ask "does the final plan accept it?" as the
+        // code stands, because the composing edit is not kinded
+        // (`option-value-composed`) until after this stage runs. See report 037
+        // §1 for what would make it decidable.
         let new_refusal = class.hold_reasons().iter().find(|reason| {
             !reason.starts_with("dependency-class-held:")
                 && *reason != "cross-class-interval-collision"

@@ -931,6 +931,37 @@ pub(crate) fn link_a5_fallback_carriers(
     }
 }
 
+/// Is this slice-use receipt's destination typed by the Option family?
+///
+/// wave-6s2's supersession predicate (their 013 §1) conjunct 2, read over the
+/// decision table: a subject of the receipt's own owner carries an `Opt`
+/// decision. The loop-side twin lives in `additive.rs`
+/// (`superseded_by_an_option_destination`), which is what stops the drop being
+/// read as an unsatisfied family site; this one is what the RECEIPT says.
+fn option_destination_of(
+    table: &super::decision::DecisionTable,
+    receipt: &super::mechanical_receipt::SliceUseReceiptPlan,
+) -> bool {
+    let super::mechanical_receipt::MechanicalSubjectKey::Local { owner, .. } =
+        receipt.obligation.planned.key.subject
+    else {
+        return false;
+    };
+    table.entries.iter().any(|(subject, decided)| {
+        subject.fn_did == owner
+            && match decided {
+                super::decision::Decision::Opt { .. } => true,
+                super::decision::Decision::Ref { .. }
+                | super::decision::Decision::InferredRef { .. }
+                | super::decision::Decision::Slice { .. }
+                | super::decision::Decision::NestedSlice { .. }
+                | super::decision::Decision::Cursor { .. }
+                | super::decision::Decision::Box(_)
+                | super::decision::Decision::Degraded(_) => false,
+            }
+    })
+}
+
 pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalization {
     let mut merged = BTreeMap::<SignatureClassId, ClassInput>::new();
     for input in inputs {
@@ -3311,7 +3342,34 @@ pub(crate) fn plan(
     let mut cursor_receipt_plans = Vec::new();
     let mut cursor_base_atom_owners = BTreeMap::<String, BTreeSet<SignatureClassId>>::new();
     let mut slice_construction_receipt_plans = table.retired_slice_constructions.clone();
-    let slice_use_receipt_plans = table.slice_use_receipts.clone();
+    // **R450-3 / relay 050 — the `Superseded` text.** wave-6s2's
+    // `computed-suffix-raw-view` carries evidence premised on the destination
+    // staying RAW. When the Option family takes that destination the adapter is
+    // not held for want of evidence, it is REPLACED: the receipt retires
+    // `Reclassified` with `superseded-by-destination:<target_form>` instead of
+    // reading `slice-use-evidence-held`, which is what made a completed
+    // handover look like an unsatisfied site to every consumer of the census.
+    let slice_use_receipt_plans = table
+        .slice_use_receipts
+        .iter()
+        .cloned()
+        .map(|mut receipt| {
+            let superseded = receipt.adapter == "computed-suffix-raw-view"
+                && receipt.obligation.intended_terminal_state
+                    == super::mechanical_receipt::MechanicalState::HeldNonmechanical
+                && option_destination_of(table, &receipt);
+            if superseded {
+                receipt.obligation.intended_terminal_state =
+                    super::mechanical_receipt::MechanicalState::Reclassified;
+                receipt.obligation.intended_terminal_reason = Some(
+                    super::mechanical_receipt::MechanicalTerminalReason::SupersededByDestination(
+                        receipt.target_form.clone(),
+                    ),
+                );
+            }
+            receipt
+        })
+        .collect::<Vec<_>>();
     let option_receipt_plans = table.option_receipts.clone();
     let mut declaration_receipt_plans = declaration_receipts(table, &owner_of);
     let unowned_a5_proof_sites = table
@@ -4110,8 +4168,19 @@ pub(crate) fn plan(
         }
     }
     for receipt in &slice_use_receipt_plans {
-        if receipt.obligation.intended_terminal_state
+        // A superseded adapter still places no edit, so it still drops its
+        // site — what changed above is only what the RECEIPT says about why
+        // (`superseded-by-destination:<form>` rather than
+        // `slice-use-evidence-held`). Reading the state alone here would have
+        // silently removed the site as well, which is a behaviour change the
+        // text was not licensed to make.
+        let superseded = matches!(
+            receipt.obligation.intended_terminal_reason,
+            Some(super::mechanical_receipt::MechanicalTerminalReason::SupersededByDestination(_))
+        );
+        if (receipt.obligation.intended_terminal_state
             == super::mechanical_receipt::MechanicalState::HeldNonmechanical
+            || superseded)
             && receipt.obligation.intended_terminal_reason
                 != Some(super::mechanical_receipt::MechanicalTerminalReason::Cursor)
         {

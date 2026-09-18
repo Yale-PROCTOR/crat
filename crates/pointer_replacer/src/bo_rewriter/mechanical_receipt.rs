@@ -477,6 +477,11 @@ pub(crate) enum MechanicalTerminalReason {
     ImplItem,
     IoDomain,
     EvidenceMissing(String),
+    /// **R450-3.** The adapter was not held for want of evidence — it was
+    /// REPLACED by the family that took its destination (wave-6s2's
+    /// `computed-suffix-raw-view` under an Option destination). The form is the
+    /// destination's, so the row says what superseded it.
+    SupersededByDestination(String),
 }
 
 impl MechanicalTerminalReason {
@@ -505,6 +510,9 @@ impl MechanicalTerminalReason {
             Self::ImplItem => "impl-item".to_owned(),
             Self::IoDomain => "io-domain".to_owned(),
             Self::EvidenceMissing(evidence) => format!("evidence-missing:{evidence}"),
+            Self::SupersededByDestination(form) => {
+                format!("superseded-by-destination:{form}")
+            }
         }
     }
 }
