@@ -1810,10 +1810,12 @@ fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
     }
 
     // The market, and the ordered half of the escape rule beside it.
-    let market = [
-        // W6F-5′: the root is delivered `&mut Splitter` / `&Mat3`, so the view
-        // is the REBORROW — no raw pointer, no extent, and the aliasing is
-        // the compiler's to check.
+    // Two groups, because two different things decide them. The REBORROW
+    // group shares one gate — wave-6a's `root_is_a_reference_candidate`,
+    // which fires exactly on a root the model settles `Ref` — so those three
+    // move together or not at all. The CONSTRUCTOR group has a raw root, so
+    // that refusal's predicate is false for it and it is independent.
+    let reborrow_market = [
         (
             "finish_block::last_entropy",
             "let mut last_entropy: &mut [f64] = &mut ((*self_0).last_entropy_)[..];",
@@ -1831,28 +1833,66 @@ fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
             "let mut last_entropy: &mut [f64] = &mut ((*self_0).last_entropy_)[..];",
             "let mut last_entropy = ((*self_0).last_entropy_).as_mut_ptr();",
         ),
-        // W6F-5 as built: a RAW root has no reference to reborrow from, so
-        // the constructor with its evidence extent is the form.
-        (
-            "raw_root::v",
-            "let mut v: &[f64] = core::slice::from_raw_parts(((*self_0).last_entropy_).as_ptr(), 2usize);",
-            "let mut v = ((*self_0).last_entropy_).as_ptr();",
-        ),
     ];
-    let delivered: Vec<&str> = market
-        .iter()
-        .filter(|(label, _, _)| decision_of(&observed, label).starts_with("Slice"))
-        .map(|(label, _, _)| *label)
-        .collect();
-    if delivered.len() == market.len() {
-        for (_, emitted_form, _) in market {
+    // W6F-5 as built: a RAW root has no reference to reborrow from, so the
+    // constructor with its evidence extent is the form.
+    let constructor_market = [(
+        "raw_root::v",
+        "let mut v: &[f64] = core::slice::from_raw_parts(((*self_0).last_entropy_).as_ptr(), 2usize);",
+        "let mut v = ((*self_0).last_entropy_).as_ptr();",
+    )];
+
+    let mut check = |group: &[(&str, &str, &str)], name: &str| {
+        let delivered: Vec<&str> = group
+            .iter()
+            .filter(|(label, _, _)| decision_of(&observed, label).starts_with("Slice"))
+            .map(|(label, _, _)| *label)
+            .collect();
+        if delivered.len() == group.len() {
+            for (_, emitted_form, _) in group {
+                assert!(
+                    flat.contains(emitted_form),
+                    "missing {emitted_form:?} in\n{source}"
+                );
+            }
+        } else {
             assert!(
-                flat.contains(emitted_form),
-                "missing {emitted_form:?} in\n{source}"
+                delivered.is_empty(),
+                "half the {name} market is a defect, not a frame: {delivered:?}\n{source}"
             );
+            for (_, _, input_form) in group {
+                assert!(
+                    flat.contains(input_form),
+                    "held, so the input text must be kept: missing {input_form:?} in\n{source}"
+                );
+            }
+            // …and the hold is a NEIGHBOUR'S refusal, not a defect in this
+            // rule. The two are distinguishable by the rewriter's own degrade
+            // reason: an earlier refusal reaches the residue
+            // (`place-read-pointee`), while a broken declaration channel
+            // leaves the surface placement unplaceable and walks the
+            // SliceConstruction family back to `Core`, which reports
+            // `slice-local-construction`. Reading the reason here is
+            // deliberate — it is this crate's own vocabulary, not another
+            // lane's hold text, and without it this branch would pass for a
+            // defect of this rule's own making.
+            for (label, _, _) in group {
+                let held = decision_of(&observed, label);
+                assert!(
+                    !held.contains("SliceLocalConstruction"),
+                    "{label} is held because THIS rule's declaration channel \
+                     failed, not because a neighbour refused: {held}\n{source}"
+                );
+            }
         }
-        // Where a constructor is used at all, its extent is the array
-        // type's own length; the reborrows carry no extent to fabricate.
+        !delivered.is_empty()
+    };
+    let reborrowed = check(&reborrow_market, "reborrow");
+    check(&constructor_market, "constructor");
+
+    if reborrowed {
+        // Where a constructor is used at all, its extent is the array type's
+        // own length; the reborrows carry no extent to fabricate.
         for fabricated in [
             "((*self_0).last_entropy_).as_mut_ptr(), crate::FALLBACK_SLICE_EXTENT",
             "((*self_0).last_entropy_).as_ptr(), crate::FALLBACK_SLICE_EXTENT",
@@ -1868,36 +1908,5 @@ fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
             !flat.contains("let mut v: &[f64] = &((*self_0).last_entropy_)[..];"),
             "a raw root has no reference to reborrow from\n{source}"
         );
-    } else {
-        // A neighbour's refusal governs: then NOTHING of this market moves,
-        // and each subject keeps the text it came with.
-        assert!(
-            delivered.is_empty(),
-            "half a market is a defect, not a frame: {delivered:?}\n{source}"
-        );
-        for (_, _, input_form) in market {
-            assert!(
-                flat.contains(input_form),
-                "held, so the input text must be kept: missing {input_form:?} in\n{source}"
-            );
-        }
-        // …and the hold is a NEIGHBOUR'S refusal, not a defect in this rule.
-        // The two are distinguishable by the rewriter's own degrade reason,
-        // and this is the one place the dichotomy must discriminate: an
-        // earlier refusal reaches the residue (`place-read-pointee`), while a
-        // broken declaration channel leaves the surface placement unplaceable
-        // and walks the SliceConstruction family back to `Core`, which
-        // reports `slice-local-construction`. Reading the reason here is
-        // deliberate — it is this crate's own vocabulary, not another lane's
-        // hold text, and without it the held branch would pass for a defect
-        // of this rule's own making.
-        for (label, _, _) in market {
-            let held = decision_of(&observed, label);
-            assert!(
-                !held.contains("SliceLocalConstruction"),
-                "{label} is held because THIS rule's declaration channel \
-                 failed, not because a neighbour refused: {held}\n{source}"
-            );
-        }
     }
 }
