@@ -352,6 +352,138 @@ fn initializer_adapter_correspondence(original: &str, emitted: &str) -> bool {
 }
 
 /// Test seam for the arm above.
+/// **R465-1, RULED — a CONDITIONAL allocation corresponds branch by branch.**
+///
+/// C2Rust guards an allocation with its own size test and the delivery wraps the
+/// allocated pointer without moving the guard:
+///
+/// ```text
+/// original  if length > 0 { BrotliAllocate(..) as *mut uint8_t } else { 0 as *mut uint8_t }
+/// emitted   if length > 0 { Some(Box::from_raw(slice_from_raw_parts_mut(<E>, <len>))) } else { None }
+/// ```
+///
+/// No arm beside this one recognises it — `same_expression` sees two different
+/// texts, `null_initializer_corresponds` wants the WHOLE initializer to be a null
+/// literal, and the slice/adapter arms read a single expression. All 31 of
+/// brotli's `FindBlocks*` rows refused here, through three censuses.
+///
+/// The relation is branch-wise and nothing else: the SAME condition on both
+/// sides, a then-branch whose owning wrapper is over the same allocation
+/// expression, and an else-branch that is `None` against the original's null
+/// literal. `<len>` is the delivered extent and deliberately no part of the source
+/// relation — the custody question is which allocation the bridge reads, not how
+/// long the emitted view says it is. Any other branch shape refuses.
+fn conditional_allocation_corresponds(original: &str, emitted: &str) -> bool {
+    let (Ok(original), Ok(emitted)) = (expression(original), expression(emitted)) else {
+        return false;
+    };
+    let (
+        ast::ExprKind::If(left_cond, left_then, Some(left_else)),
+        ast::ExprKind::If(right_cond, right_then, Some(right_else)),
+    ) = (&unparen(&original).kind, &unparen(&emitted).kind)
+    else {
+        return false;
+    };
+    if expression_key(unparen(left_cond)) != expression_key(unparen(right_cond)) {
+        return false;
+    }
+    let tail = |block: &ast::Block| -> Option<ast::ptr::P<ast::Expr>> {
+        let [statement] = block.stmts.as_slice() else { return None };
+        match &statement.kind {
+            ast::StmtKind::Expr(value) => Some(value.clone()),
+            _ => None,
+        }
+    };
+    let (Some(left_value), Some(right_value)) = (tail(left_then), tail(right_then)) else {
+        return false;
+    };
+    let (Some(left_null), Some(right_null)) = (tail_of_else(left_else), tail_of_else(right_else))
+    else {
+        return false;
+    };
+    owning_wrapper_over(&right_value, &left_value)
+        && expression_key(unparen(&right_null)) == "None"
+        && is_null_pointer_literal(&left_null)
+}
+
+fn tail_of_else(expression: &ast::Expr) -> Option<ast::ptr::P<ast::Expr>> {
+    let ast::ExprKind::Block(block, None) = &unparen(expression).kind else {
+        return None;
+    };
+    let [statement] = block.stmts.as_slice() else { return None };
+    match &statement.kind {
+        ast::StmtKind::Expr(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// `Some(Box::from_raw(slice_from_raw_parts_mut(<E>, <len>)))`, or the thin
+/// `Box::from_raw(<E>)`, over the ORIGINAL's allocation expression `<E>`.
+fn owning_wrapper_over(emitted: &ast::Expr, original: &ast::Expr) -> bool {
+    let mut view = unparen(emitted);
+    // `Some(..)` is optional: a non-nullable delivery wraps the Box directly.
+    if let ast::ExprKind::Call(callee, arguments) = &view.kind
+        && arguments.len() == 1
+        && path(callee).as_deref() == Some("Some")
+    {
+        view = unparen(&arguments[0]);
+    }
+    let ast::ExprKind::Call(callee, arguments) = &view.kind else {
+        return false;
+    };
+    if arguments.len() != 1
+        || !matches!(
+            path(callee).as_deref(),
+            Some("Box::from_raw" | "std::boxed::Box::from_raw" | "alloc::boxed::Box::from_raw")
+        )
+    {
+        return false;
+    }
+    let mut inner = unparen(&arguments[0]);
+    // The fat form carries the delivered extent; it is not part of the relation.
+    if let ast::ExprKind::Call(constructor, parts) = &inner.kind
+        && parts.len() == 2
+        && matches!(
+            path(constructor).as_deref(),
+            Some(
+                "core::ptr::slice_from_raw_parts_mut"
+                    | "core::ptr::slice_from_raw_parts"
+                    | "std::ptr::slice_from_raw_parts_mut"
+                    | "std::ptr::slice_from_raw_parts"
+            )
+        )
+    {
+        inner = unparen(&parts[0]);
+    }
+    expression_key(inner) == expression_key(original)
+}
+
+fn is_null_pointer_literal(expression: &ast::Expr) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    // `core::ptr::null_mut()` is a CALL, not a path.
+    if let ast::ExprKind::Call(callee, arguments) = &view.kind
+        && arguments.is_empty()
+        && matches!(
+            path(callee).as_deref(),
+            Some(
+                "core::ptr::null" | "core::ptr::null_mut" | "std::ptr::null" | "std::ptr::null_mut"
+            )
+        )
+    {
+        return true;
+    }
+    matches!(&view.kind, ast::ExprKind::Lit(literal)
+        if literal.kind == ast::token::LitKind::Integer && literal.symbol.as_str() == "0")
+}
+
+#[cfg(test)]
+pub(crate) fn conditional_allocation_corresponds_for_test(original: &str, emitted: &str) -> bool {
+    conditional_allocation_corresponds(original, emitted)
+}
+
 pub(crate) fn initializer_adapter_correspondence_for_test(original: &str, emitted: &str) -> bool {
     initializer_adapter_correspondence(original, emitted)
 }
@@ -1162,7 +1294,8 @@ fn same_source_binding_inner(
             (same_expression(left, right).unwrap_or(false)
                 || null_initializer_corresponds(left, right, emitted.type_text.as_deref())
                 || slice_construction_corresponds(left, right, emitted.type_text.as_deref())
-                || initializer_adapter_correspondence(left, right))
+                || initializer_adapter_correspondence(left, right)
+                || conditional_allocation_corresponds(left, right))
                 && span_bindings_correspond(
                     input,
                     &original.owner,

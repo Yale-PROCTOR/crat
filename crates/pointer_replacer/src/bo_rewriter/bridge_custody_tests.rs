@@ -2118,6 +2118,135 @@ fn r424_slice_construction_initializer_corresponds_exactly() {
 /// `src.as_deref().map_or(null(), |slice| slice.as_ptr().cast::<c_void>())`.
 /// Both are the original's own view; neither was a correspondence the
 /// comparator knew, and four rows failed binn's custody on batch 9's candidate.
+/// **R465-2 — the OFFLINE replay over `batch13d`'s real pairs.**
+///
+/// Three censuses went to brotli's 37 rows on diagnoses read from `type_text` and
+/// reason strings. This replays the two relations that changed over the pairs
+/// extracted from the two REAL trees — the input at
+/// `benchmarks/rs-crown-derived/brotli/lib.rs` and `batch13d`'s emitted tree — so
+/// the next cut is spent on a measured result rather than a fourth guess.
+///
+/// It replays the RELATIONS, not the whole comparator: the census does not publish
+/// its expectations, so `compare` cannot be reconstructed from the artifacts. What
+/// it does establish is that every pair those rows refused on now corresponds.
+///
+/// Set `CRAT_BRIDGE_REPLAY_PAIRS` to the TSV; unset, the test is inert.
+#[test]
+fn r465_2_the_batch13d_pairs_replay_clean() {
+    use crate::bo_rewriter::bridge_custody_match::{
+        conditional_allocation_corresponds_for_test, raw_initializer_matches_for_test,
+    };
+    let Some(path) = std::env::var_os("CRAT_BRIDGE_REPLAY_PAIRS") else { return };
+    let text = std::fs::read_to_string(path).expect("replay pairs");
+    let mut lines = text.lines();
+    let header = lines.next().expect("header");
+    assert_eq!(header, "relation\tbinding\toriginal\temitted");
+    let (mut checked, mut failed) = (0usize, Vec::new());
+    for line in lines {
+        let [relation, binding, original, emitted] = line.split('\t').collect::<Vec<_>>()[..]
+        else {
+            panic!("four columns");
+        };
+        let ok = rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || match relation {
+                "conditional-allocation" => {
+                    conditional_allocation_corresponds_for_test(original, emitted)
+                }
+                "block-intermediate" => raw_initializer_matches_for_test(emitted, original),
+                other => panic!("unknown relation {other}"),
+            },
+        );
+        checked += 1;
+        if !ok {
+            failed.push(format!("{relation}/{binding}: {original}  VS  {emitted}"));
+        }
+    }
+    assert!(checked > 0, "the replay read no pairs");
+    assert!(
+        failed.is_empty(),
+        "{} of {checked} pairs still refuse:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    println!("R465-2 replay: {checked} pairs, 0 refusing");
+}
+
+/// **R465-1, RULED — a conditional allocation corresponds branch by branch.**
+///
+/// brotli's `FindBlocks*` locals, which refused through three censuses.
+#[test]
+fn r465_1_a_conditional_allocation_corresponds_branch_by_branch() {
+    use crate::bo_rewriter::bridge_custody_match::conditional_allocation_corresponds_for_test as corresponds;
+    let under = |original: &str, emitted: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || corresponds(original, emitted),
+        )
+    };
+    // brotli's exact pair, from `batch13d`'s two trees.
+    let original = "if length > 0 as libc::c_int as libc::c_ulong { BrotliAllocate(m, length.wrapping_mul(::std::mem::size_of::<uint8_t>() as libc::c_ulong)) as *mut uint8_t } else { 0 as *mut uint8_t }";
+    let emitted = "if length > 0 as libc::c_int as libc::c_ulong { Some(Box::from_raw(core::ptr::slice_from_raw_parts_mut(BrotliAllocate(m, length.wrapping_mul(::std::mem::size_of::<uint8_t>() as libc::c_ulong)) as *mut uint8_t, (length) as usize))) } else { None }";
+    assert!(under(original, emitted));
+
+    // The THIN owning form, with no extent at all.
+    assert!(under(
+        "if n > 0 { alloc(n) as *mut u8 } else { 0 as *mut u8 }",
+        "if n > 0 { Some(Box::from_raw(alloc(n) as *mut u8)) } else { None }"
+    ));
+    // A non-nullable delivery wraps the Box without `Some`.
+    assert!(under(
+        "if n > 0 { alloc(n) as *mut u8 } else { 0 as *mut u8 }",
+        "if n > 0 { Box::from_raw(alloc(n) as *mut u8) } else { None }"
+    ));
+    // `<len>` is the delivered extent and no part of the source relation.
+    assert!(under(
+        "if n > 0 { alloc(n) as *mut u8 } else { 0 as *mut u8 }",
+        "if n > 0 { Some(Box::from_raw(core::ptr::slice_from_raw_parts_mut(alloc(n) as *mut u8, crate::FALLBACK_SLICE_EXTENT))) } else { None }"
+    ));
+    // The original may spell its null as a call rather than a literal.
+    assert!(under(
+        "if n > 0 { alloc(n) as *mut u8 } else { core::ptr::null_mut() }",
+        "if n > 0 { Some(Box::from_raw(alloc(n) as *mut u8)) } else { None }"
+    ));
+
+    // **Branch-wise and nothing else.**
+    // A DIFFERENT condition.
+    assert!(!under(
+        "if n > 0 { alloc(n) as *mut u8 } else { 0 as *mut u8 }",
+        "if m > 0 { Some(Box::from_raw(alloc(n) as *mut u8)) } else { None }"
+    ));
+    // A then-branch over a DIFFERENT allocation.
+    assert!(!under(
+        "if n > 0 { alloc(n) as *mut u8 } else { 0 as *mut u8 }",
+        "if n > 0 { Some(Box::from_raw(alloc(other) as *mut u8)) } else { None }"
+    ));
+    // An else-branch that is not `None`.
+    assert!(!under(
+        "if n > 0 { alloc(n) as *mut u8 } else { 0 as *mut u8 }",
+        "if n > 0 { Some(Box::from_raw(alloc(n) as *mut u8)) } else { Some(empty()) }"
+    ));
+    // An original whose else-branch is not a null.
+    assert!(!under(
+        "if n > 0 { alloc(n) as *mut u8 } else { fallback() }",
+        "if n > 0 { Some(Box::from_raw(alloc(n) as *mut u8)) } else { None }"
+    ));
+    // A wrapper that is not an owning one.
+    assert!(!under(
+        "if n > 0 { alloc(n) as *mut u8 } else { 0 as *mut u8 }",
+        "if n > 0 { Some(core::slice::from_raw_parts_mut(alloc(n) as *mut u8, 4)) } else { None }"
+    ));
+    // Not a conditional at all.
+    assert!(!under(
+        "alloc(n) as *mut u8",
+        "Some(Box::from_raw(alloc(n) as *mut u8))"
+    ));
+}
+
 /// **R460-1(a) — brotli's block-rendered raw temporary.**
 ///
 /// The AST layer renders some A5 raw views as a BLOCK with one named
