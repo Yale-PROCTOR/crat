@@ -785,6 +785,106 @@ impl AllocatorOracle<'_> {
     }
 }
 
+/// R459-4(2) PROBE ONLY — no emission path reads this. For every call site
+/// the index recorded, one row per ordered formal pair: the two roots' classes
+/// and, when a root is the caller's own parameter, that parameter's index.
+/// Report 011's source-text read could not map 88 pairs to a caller parameter;
+/// this is the same question asked of the compiler instead of the text.
+#[cfg(test)]
+pub(crate) struct ProbeRow {
+    pub caller: LocalDefId,
+    pub callee: LocalDefId,
+    pub left: usize,
+    pub right: usize,
+    pub left_class: String,
+    pub right_class: String,
+    pub left_param: Option<usize>,
+    pub right_param: Option<usize>,
+    pub outcome: String,
+}
+
+#[cfg(test)]
+impl PairDisjointnessIndex {
+    /// Every recorded pair of pointer arguments, with each side's root class
+    /// and its caller-parameter index when the root IS a parameter binding.
+    pub(crate) fn probe_rows(&self, program: &RustProgram<'_>) -> Vec<ProbeRow> {
+        let tcx = program.tcx;
+        let mut params: FxHashMap<LocalDefId, Vec<HirId>> = FxHashMap::default();
+        for &function in &program.functions {
+            let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+                continue;
+            };
+            let mut ids = Vec::new();
+            for param in tcx.hir_body(body_id).params {
+                if let PatKind::Binding(_, hir_id, ..) = param.pat.kind {
+                    ids.push(hir_id);
+                }
+            }
+            params.insert(function, ids);
+        }
+        let index_of = |function: LocalDefId, class: RootClass| -> Option<usize> {
+            let id = class.object_id()?;
+            params
+                .get(&function)?
+                .iter()
+                .position(|candidate| *candidate == id)
+        };
+        let describe = |class: RootClass| -> String {
+            match class {
+                RootClass::FreshAlloc(_, Freshness::Proven) => "fresh".to_owned(),
+                RootClass::FreshAlloc(_, Freshness::Contract) => "fresh-contract".to_owned(),
+                RootClass::StackObject(_) => "stack".to_owned(),
+                RootClass::EntryStorage(_) => "entry".to_owned(),
+                RootClass::Unknown => "unknown".to_owned(),
+            }
+        };
+        let mut rows = Vec::new();
+        for (&(caller, callee), records) in &self.sites {
+            let caller_did = program
+                .functions
+                .iter()
+                .find(|did| did.local_def_index.as_u32() == caller)
+                .copied();
+            let callee_did = program
+                .functions
+                .iter()
+                .find(|did| did.local_def_index.as_u32() == callee)
+                .copied();
+            let (Some(caller_did), Some(callee_did)) = (caller_did, callee_did) else {
+                continue;
+            };
+            for record in records {
+                for (position, left) in record.args.iter().enumerate() {
+                    for right in record.args.iter().skip(position + 1) {
+                        let outcome = self
+                            .certify(
+                                caller,
+                                callee,
+                                left.index,
+                                right.index,
+                                left.span,
+                                right.span,
+                            )
+                            .map_or_else(|why| why.key().to_owned(), |kind| kind.key().to_owned());
+                        rows.push(ProbeRow {
+                            caller: caller_did,
+                            callee: callee_did,
+                            left: left.index,
+                            right: right.index,
+                            left_class: describe(left.class),
+                            right_class: describe(right.class),
+                            left_param: index_of(caller_did, left.class),
+                            right_param: index_of(caller_did, right.class),
+                            outcome,
+                        });
+                    }
+                }
+            }
+        }
+        rows
+    }
+}
+
 /// Local functions that are allocator WRAPPERS: every value the function
 /// returns is (a cast of) an allocator call, a null literal, or a local that
 /// is itself a fresh-allocation binding of that body. Iterated to a fixpoint

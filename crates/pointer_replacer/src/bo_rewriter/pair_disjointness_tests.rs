@@ -701,6 +701,83 @@ const CONTRACT_FIND_BLOCKS: &str = r#"
     }
 "#;
 
+/// brotli `ClusterBlocksCommand` → `RemapBlockIdsCommand`, mirrored: the
+/// caller allocates `block_ids` and `new_id` at two DIFFERENT
+/// `BrotliAllocate` statements and hands both to one call. `*mut u8` beside
+/// `*mut u16` is a wildcard pair, so rule (b) cannot fire; the two roots are
+/// what separates them. These are the three `RemapBlockIds{Command,Distance,
+/// Literal}::new_id#3` rows — the contract-roots consumer's whole measured
+/// market at batch 12 (report 011 §5).
+const CONTRACT_REMAP_BLOCK_IDS: &str = r#"
+    use core::ffi::c_void;
+    extern "C" { fn malloc(n: u64) -> *mut c_void; fn exit(code: i32) -> !; }
+    #[repr(C)]
+    pub struct MemoryManager { pub alloc_func: Option<unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void>, pub opaque: *mut c_void }
+    pub unsafe extern "C" fn BrotliDefaultAllocFunc(opaque: *mut c_void, size: u64) -> *mut c_void { malloc(size) }
+    pub unsafe extern "C" fn BrotliInitMemoryManager(m: *mut MemoryManager, alloc_func: Option<unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void>, opaque: *mut c_void) {
+        if alloc_func.is_none() {
+            (*m).alloc_func = Some(BrotliDefaultAllocFunc as unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void);
+            (*m).opaque = 0 as *mut c_void;
+        } else {
+            (*m).alloc_func = alloc_func;
+            (*m).opaque = opaque;
+        };
+    }
+    pub unsafe fn BrotliAllocate(m: *mut MemoryManager, n: u64) -> *mut c_void {
+        let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+        if result.is_null() { exit(1); }
+        return result;
+    }
+    pub unsafe fn RemapBlockIdsCommand(block_ids: *mut u8, length: u64, new_id: *mut u16, num_histograms: u64) -> u64 {
+        let mut i: u64 = 0;
+        while i < num_histograms { *new_id.offset(i as isize) = 256; i = i.wrapping_add(1); }
+        i = 0;
+        while i < length {
+            *new_id.offset(*block_ids.offset(i as isize) as isize) = 1;
+            i = i.wrapping_add(1);
+        }
+        num_histograms
+    }
+    pub unsafe fn ClusterBlocksCommand(m: *mut MemoryManager, length: u64, num_histograms: u64) {
+        let mut block_ids = BrotliAllocate(m, length) as *mut u8;
+        let mut new_id = BrotliAllocate(m, num_histograms.wrapping_mul(2)) as *mut u16;
+        RemapBlockIdsCommand(block_ids, length, new_id, num_histograms);
+    }
+"#;
+
+/// The three `RemapBlockIds*::new_id` rows: two ports of one contract-backed
+/// allocator in ONE caller, at two distinct statements, are two fresh roots —
+/// and the pair says which premise it rests on.
+#[test]
+fn w6p_remap_block_ids_pair_certifies_on_two_allocator_ports() {
+    ::utils::compilation::run_compiler_on_str(CONTRACT_REMAP_BLOCK_IDS, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        assert_eq!(
+            index.certify_recorded(
+                function("ClusterBlocksCommand"),
+                function("RemapBlockIdsCommand"),
+                0,
+                2
+            ),
+            Ok(CertificateKind::DistinctRootsUnderContract),
+            "block_ids and new_id are two ports of one allocator at distinct statements"
+        );
+    })
+    .expect("RemapBlockIds fixture compilation");
+}
+
 /// The nine rows: two allocations of one contract-backed allocator are
 /// distinct roots, and the certificate says so — `DistinctRootsUnderContract`,
 /// the auditable receipt R434-4(5) asks for.
@@ -1396,4 +1473,44 @@ pub unsafe fn prepare_h65(s: *mut H65, cache: *mut i32) {
         }
     })
     .expect("c");
+}
+
+/// R459-4(2) PROBE — run explicitly against one corpus program:
+/// `CRAT_PROBE_LIB=<lib.rs> cargo test … w6p_probe_pair_roots -- --ignored --nocapture`.
+/// Reads nothing but the decision layer (no emission, no verify round) and
+/// prints one `W6P_PROBE` row per recorded formal pair: the two root classes,
+/// the caller-parameter index of each root when the root IS a parameter, and
+/// the rule's own verdict. Report 011 §3 could not map 88 pairs to a caller
+/// parameter from the source text; this asks the compiler instead.
+#[test]
+#[ignore = "probe: needs CRAT_PROBE_LIB and the frozen analysis cache (R459-4(2))"]
+fn w6p_probe_pair_roots() {
+    let path = std::env::var("CRAT_PROBE_LIB").expect("CRAT_PROBE_LIB");
+    let input = std::fs::read_to_string(path).expect("probe input");
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let name = |did: rustc_span::def_id::LocalDefId| tcx.def_path_str(did.to_def_id());
+        let rows = index.probe_rows(&program);
+        println!("W6P_PROBE_ROWS {}", rows.len());
+        for row in rows {
+            println!(
+                "W6P_PROBE\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                name(row.caller),
+                name(row.callee),
+                row.left,
+                row.right,
+                row.left_class,
+                row.right_class,
+                row.left_param.map_or("-".to_owned(), |i| i.to_string()),
+                row.right_param.map_or("-".to_owned(), |i| i.to_string()),
+                row.outcome
+            );
+        }
+    })
+    .expect("probe compilation");
 }
