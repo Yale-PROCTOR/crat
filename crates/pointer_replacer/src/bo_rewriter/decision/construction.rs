@@ -1034,6 +1034,43 @@ pub(crate) fn plan_slice_constructions(
             edition: 2018,
             requires_unsafe: true,
         };
+        // **W6F-5′ (R455-5)**: an inline array field whose ROOT is delivered
+        // as a safe reference is reborrowed, not constructed — `&mut
+        // (*s).arr[..]`. No raw pointer, no extent of any kind, and the
+        // aliasing is the compiler's to check rather than a guard's to
+        // approximate. The constructor below never runs for it.
+        if let Some((_, reborrow)) = table
+            .field_transactions
+            .decayed_reborrows
+            .iter()
+            .find(|(candidate, _)| *candidate == node)
+        {
+            plans.push(SliceConstructionPlan {
+                node,
+                init_hir,
+                init_span,
+                replacement: Some(reborrow.clone()),
+                hold_reason: None,
+                element_type,
+                mutable,
+                nullable,
+                initializer_kind: "array-field-reborrow",
+                length: SliceLengthPlan {
+                    expression: String::new(),
+                    source: SliceLengthSource::SealedContract {
+                        contract: "array-field-reborrow".to_owned(),
+                    },
+                    provenance: Vec::new(),
+                },
+                composed_edit_spans: Vec::new(),
+                // The reborrow is safe: no wrapper is inserted for it.
+                unsafe_context: UnsafeContextPresentation {
+                    wrapper_inserted: false,
+                    ..unsafe_context
+                },
+            });
+            continue;
+        }
         let rendered =
             if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
                 // R410-9 (b): each literal arm is its own construction with its

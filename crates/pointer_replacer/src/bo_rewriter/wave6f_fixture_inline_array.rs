@@ -1,3 +1,4 @@
+// w6f-inline-array-frame
 // W6F-5 (relay 034 / R451-4): the INLINE ARRAY FIELD taken as a pointer —
 // `((*s).arr).as_mut_ptr()`, `Construction::ArrayDecay`, whose type and length
 // both live in the field's declared type. The market shapes are brotli's
@@ -132,4 +133,14 @@ pub unsafe extern "C" fn decay_in_a_loop(mut self_0: *mut Splitter, mut n: u64) 
         *last_entropy.offset(0 as isize) = i as f64;
         i = i.wrapping_add(1);
     }
+}
+
+// The W6F-5′ split (R455-5): the same decay under a RAW root. There is no
+// delivered reference to reborrow from, so the slice constructor with its
+// evidence extent — and R453's guards — is the form. The frame stands the
+// root's model kind in.
+#[no_mangle]
+pub unsafe extern "C" fn raw_root(mut self_0: *mut Splitter) -> f64 {
+    let mut v = ((*self_0).last_entropy_).as_ptr();
+    return *v.offset(0 as isize) + *v.offset(1 as isize);
 }

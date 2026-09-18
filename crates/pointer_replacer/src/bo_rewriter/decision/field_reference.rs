@@ -244,9 +244,8 @@ pub(crate) struct FieldCandidates {
     /// E5C-3 over moving owned locals (independent of any field).
     pub local_move_hoists: Vec<LocalMoveHoist>,
     /// **W6F-5**: locals whose value is an INLINE ARRAY FIELD taken as a
-    /// pointer — `((*s).arr).as_mut_ptr()` where `arr: [T; N]`. The value is
-    /// `true` when the view is mutable.
-    decayed_array_views: FxHashMap<NodeKey, bool>,
+    /// pointer — `((*s).arr).as_mut_ptr()` where `arr: [T; N]`.
+    decayed_array_views: FxHashMap<NodeKey, DecayedArrayView>,
 }
 
 impl FieldCandidates {
@@ -276,7 +275,26 @@ impl FieldCandidates {
     pub(crate) fn decayed_array_view(&self, local: NodeKey, mutable: bool) -> bool {
         self.decayed_array_views
             .get(&local)
-            .is_some_and(|&decay_mutable| decay_mutable || !mutable)
+            .is_some_and(|decay| decay.mutable || !mutable)
+    }
+
+    /// **W6F-5′** — the REBORROW initializer for a decay whose root is
+    /// delivered as a safe reference: `&mut (*s).arr[..]`. `None` where the
+    /// root stays raw, and the slice constructor is the form instead.
+    pub(crate) fn decayed_reborrow(&self, local: NodeKey, mutable: bool) -> Option<String> {
+        let decay = self.decayed_array_views.get(&local)?;
+        // Only the root's kind is asked here. A mutable view over a SHARED
+        // decay is already refused by [`Self::decayed_array_view`], so the
+        // subject never reaches this point with that pair — re-checking it
+        // was an unfalsifiable branch and is gone rather than kept.
+        if !decay.root_ref {
+            return None;
+        }
+        Some(format!(
+            "&{}{}[..]",
+            if mutable { "mut " } else { "" },
+            decay.place
+        ))
     }
 
     /// The form a stored subject must take so the store is a zero-syntax or
@@ -422,6 +440,10 @@ pub(crate) struct FieldTransactions {
     /// declaration hook can splice a type onto a `let` that has none. These
     /// belong to no field transaction — the field is `[T; N]`, not `*mut T`.
     pub decayed_array_locals: Vec<(NodeKey, String)>,
+    /// **W6F-5′**: `(local, initializer)` where the root is delivered as a
+    /// safe reference and the view is the reborrow `&mut (*s).arr[..]` — the
+    /// slice constructor is not used at all, so no extent is selected.
+    pub decayed_reborrows: Vec<(NodeKey, String)>,
 }
 
 impl FieldTransactions {
@@ -1225,8 +1247,30 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
 /// so no extent is fabricated and the slice is exactly the object the input
 /// indexed. The view's mutability is the decay's own (`as_ptr` → `&[T]`,
 /// `as_mut_ptr` → `&mut [T]`): no `&T → &mut T` widening.
-fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
+/// One inline-array-field decay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecayedArrayView {
+    /// `as_mut_ptr` (the view may be `&mut [T]`) or `as_ptr` (shared only).
+    pub mutable: bool,
+    /// **W6F-5′ (R455-5)**: the model settles the ROOT `Ref`, so the root is
+    /// delivered as a safe reference and the sound form is the REBORROW —
+    /// `&mut (*s).arr[..]` — which needs no raw pointer and no extent of any
+    /// kind, and whose aliasing the compiler checks. Where the root stays
+    /// raw there is no reference to reborrow from and the slice constructor
+    /// (with R453's guards) is the form.
+    pub root_ref: bool,
+    /// The field place as the source spells it: `(*pM1).mat`.
+    pub place: String,
+}
+
+fn decayed_array_views(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    subjects: &[Subject],
+) -> FxHashMap<NodeKey, DecayedArrayView> {
     let tcx = program.tcx;
+    let sm = tcx.sess.source_map();
     let mut out = FxHashMap::default();
     for &owner in &program.functions {
         let Some(body_id) = tcx.hir_node_by_def_id(owner).body_id() else {
@@ -1234,6 +1278,20 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
         };
         let body = tcx.hir_body(body_id);
         let typeck = tcx.typeck(owner);
+        // R455-5: is a local of this function delivered as a safe reference?
+        let root_is_ref = |root: HirId| -> bool {
+            subjects
+                .iter()
+                .find(|s| s.fn_did == owner && s.hir_id == root)
+                .and_then(|s| {
+                    let slot = slots
+                        .fn_local_slots
+                        .get(&owner)?
+                        .slot_for_local_depth(s.local, 0)?;
+                    model.get(&SlotRef::Local(owner, slot))
+                })
+                .is_some_and(|kind| *kind == SlotKind::Ref)
+        };
 
         // Every `(base local, field name)` place named in the body, and every
         // local whose pointee is assigned as a whole.
@@ -1287,7 +1345,9 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
             mentions: &'a FxHashMap<(HirId, String), usize>,
             escapes: &'a [(HirId, Span)],
             in_loop: usize,
-            out: &'a mut FxHashMap<NodeKey, bool>,
+            root_is_ref: &'a dyn Fn(HirId) -> bool,
+            sm: &'a rustc_span::source_map::SourceMap,
+            out: &'a mut FxHashMap<NodeKey, DecayedArrayView>,
         }
         impl<'v> Visitor<'v> for Decays<'_, '_> {
             fn visit_expr(&mut self, expr: &'v Expr<'v>) {
@@ -1350,7 +1410,18 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
                         })
                     {
                         let _ = self.tcx;
-                        self.out.insert((self.owner, binding), mutable);
+                        let Ok(place) = self.sm.span_to_snippet(receiver.span) else {
+                            intravisit::walk_stmt(self, stmt);
+                            return;
+                        };
+                        self.out.insert(
+                            (self.owner, binding),
+                            DecayedArrayView {
+                                mutable,
+                                root_ref: (self.root_is_ref)(base_local),
+                                place,
+                            },
+                        );
                     }
                 }
                 intravisit::walk_stmt(self, stmt);
@@ -1363,6 +1434,8 @@ fn decayed_array_views(program: &RustProgram<'_>) -> FxHashMap<NodeKey, bool> {
             mentions: &mentions,
             escapes: &escapes,
             in_loop: 0,
+            root_is_ref: &root_is_ref,
+            sm,
             out: &mut out,
         }
         .visit_body(body);
@@ -1397,7 +1470,7 @@ pub(crate) fn derive(
 ) -> FieldCandidates {
     let tcx = program.tcx;
     let mut out = FieldCandidates::default();
-    out.decayed_array_views = decayed_array_views(program);
+    out.decayed_array_views = decayed_array_views(program, slots, model, subjects);
     let struct_dids: FxHashSet<LocalDefId> = program.structs.iter().copied().collect();
     let mutability = mutability_analysis(program);
     let fatness = fatness_analysis(program);
@@ -3263,11 +3336,16 @@ pub(crate) fn finalize(
         let Some(emitted) = super::declaration::emitted_type(decision, &pointee, None) else {
             continue;
         };
+        if let Some(reborrow) = candidates.decayed_reborrow(*local, subject.mutable) {
+            out.decayed_reborrows.push((*local, reborrow));
+        }
         out.decayed_array_locals.push((*local, emitted));
     }
-    out.decayed_array_locals.sort_by_key(|((owner, local), _)| {
+    let order = |((owner, local), _): &(NodeKey, String)| {
         (owner.local_def_index.as_u32(), local.local_id.as_u32())
-    });
+    };
+    out.decayed_array_locals.sort_by_key(order);
+    out.decayed_reborrows.sort_by_key(order);
     let mut refused = BTreeMap::new();
     for (key, _, field, cause) in &candidates.holds {
         let struct_path = tcx.def_path_str(key.struct_did.to_def_id());

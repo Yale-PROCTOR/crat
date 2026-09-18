@@ -1757,8 +1757,19 @@ const INLINE_ARRAY: &str = include_str!("wave6f_fixture_inline_array.rs");
 /// would be the defect, so the pin is that the two move together.
 #[test]
 fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = frame_lock();
+    // Everything in this fixture has a root the model settles `Ref`; one
+    // function's root is stood in as `Raw` so both renderings are measured in
+    // ONE run against one another.
+    super::test_model_override::set(
+        "w6f-inline-array-frame",
+        Vec::new(),
+        vec![("raw_root::self_0".to_owned(), SlotKind::Raw)],
+    );
     let observed = observe(INLINE_ARRAY);
     let outcome = emitted("inline-array", INLINE_ARRAY);
+    super::test_model_override::clear();
     let (source, _, reverted) = emitted_source(&outcome);
     assert_eq!(reverted, 0, "{source}");
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1800,22 +1811,32 @@ fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
 
     // The market, and the ordered half of the escape rule beside it.
     let market = [
+        // W6F-5′: the root is delivered `&mut Splitter` / `&Mat3`, so the view
+        // is the REBORROW — no raw pointer, no extent, and the aliasing is
+        // the compiler's to check.
         (
             "finish_block::last_entropy",
-            "let mut last_entropy: &mut [f64] = core::slice::from_raw_parts_mut(((*self_0).last_entropy_).as_mut_ptr(), 2usize);",
+            "let mut last_entropy: &mut [f64] = &mut ((*self_0).last_entropy_)[..];",
             "let mut last_entropy = ((*self_0).last_entropy_).as_mut_ptr();",
         ),
         (
             "trace3::m",
-            "let mut m: &[f32] = core::slice::from_raw_parts(((*pIn).mat).as_ptr(), 9usize);",
+            "let mut m: &[f32] = &((*pIn).mat)[..];",
             "let mut m = ((*pIn).mat).as_ptr();",
         ),
         (
             // brotli's `StartPosQueuePush` shape: the root is handed to a
             // callee BEFORE the view is taken, so the view is still sound.
             "escape_before::last_entropy",
-            "let mut last_entropy: &mut [f64] = core::slice::from_raw_parts_mut(((*self_0).last_entropy_).as_mut_ptr(), 2usize);",
+            "let mut last_entropy: &mut [f64] = &mut ((*self_0).last_entropy_)[..];",
             "let mut last_entropy = ((*self_0).last_entropy_).as_mut_ptr();",
+        ),
+        // W6F-5 as built: a RAW root has no reference to reborrow from, so
+        // the constructor with its evidence extent is the form.
+        (
+            "raw_root::v",
+            "let mut v: &[f64] = core::slice::from_raw_parts(((*self_0).last_entropy_).as_ptr(), 2usize);",
+            "let mut v = ((*self_0).last_entropy_).as_ptr();",
         ),
     ];
     let delivered: Vec<&str> = market
@@ -1830,9 +1851,11 @@ fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
                 "missing {emitted_form:?} in\n{source}"
             );
         }
-        // Every extent is the array type's own length.
+        // Where a constructor is used at all, its extent is the array
+        // type's own length; the reborrows carry no extent to fabricate.
         for fabricated in [
             "((*self_0).last_entropy_).as_mut_ptr(), crate::FALLBACK_SLICE_EXTENT",
+            "((*self_0).last_entropy_).as_ptr(), crate::FALLBACK_SLICE_EXTENT",
             "((*pIn).mat).as_ptr(), crate::FALLBACK_SLICE_EXTENT",
         ] {
             assert!(
@@ -1840,6 +1863,11 @@ fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
                 "the length is in the array's own type; nothing may be fabricated\n{source}"
             );
         }
+        // And a reborrow never borrows a raw root, which would not compile.
+        assert!(
+            !flat.contains("let mut v: &[f64] = &((*self_0).last_entropy_)[..];"),
+            "a raw root has no reference to reborrow from\n{source}"
+        );
     } else {
         // A neighbour's refusal governs: then NOTHING of this market moves,
         // and each subject keeps the text it came with.
