@@ -1148,12 +1148,70 @@ fn wave6s_ti_trima_outer_slot_pass_on_delivers_and_returns_ti_sma_s_cursor() {
     assert_eq!(receipts.trim(), "[]", "no family withdrawal: {receipts}");
 }
 
-// wave-6s's `wave6s_deref_rooted_view_base_and_destination_are_other_families`
-// is WITHDRAWN on the composition as a test-only OBSOLETE PIN (seat relay
-// assembler/038 item 4, R436-2): it has ridden red since dry16 and wave-6s has
-// filed no restatement. It pinned `out` = `kind-raw` and `chunk_start` =
-// `slice-use-unsupported`; both walls moved when the composition's other
-// families took those rows. The text is on their branch at `1a24023d2`.
+/// **The deref-rooted computed view has no base yet (relay 023).** lodepng
+/// `lodepng_chunk_append` assigns `chunk_start = &mut *(*out).offset(e) as
+/// *mut c_uchar` — this family's computed-view shape whose BASE is a deref of
+/// a depth-2 parameter. Two walls stand before the view rule, and this control
+/// pins both so the ordering is visible when either moves: the base `out` is
+/// `kind-raw` (an inner slot delivers only once the nested family promotes it)
+/// and the destination `chunk_start` is THIS family's `slice-use-unsupported`
+/// (R217-2(a): the batch-8 frame read `null-init` here; at the landed batch-10
+/// frame wave-6o's declaration family types the null-initialized destination,
+/// so the only wall left at this row is the view — and W6S-7's admission does
+/// not reach it, because a deref of a depth-2 parameter is not a binding and
+/// carries no subject to render the view).
+/// Where the base is raw the construction family already delivers a
+/// destination of this shape with the §77 fallback extent
+/// (`from_raw_parts_mut(&mut *(*out).offset(2) as *mut u8,
+/// crate::FALLBACK_SLICE_EXTENT)`), so this lane's arm would change the
+/// EXTENT, not the delivery — and only with a delivered base.
+#[test]
+fn wave6s_deref_rooted_view_base_and_destination_are_other_families() {
+    let input = include_str!("testdata/wave6s-drift/lodepng-chunk-append.rs");
+    let rows = super::emit_tests::decisions_of(input);
+    let reason = |name: &str| {
+        rows.iter()
+            .rev()
+            .find(|(row, _, _)| row == name)
+            .map(|(_, _, reason)| reason.clone())
+            .unwrap_or_else(|| panic!("{name}: {rows:?}"))
+    };
+    assert_eq!(reason("out"), "kind-raw", "{rows:?}");
+    assert_eq!(reason("chunk_start"), "slice-use-unsupported", "{rows:?}");
+    // The same shape with a raw base: the construction family delivers it with
+    // the named fallback extent, which is what an evidence-backed base would
+    // replace. **R217-2(a) — the spelling of that delivery is frame-dependent
+    // and the assertion below is not.** At `046482b8e` the base kept the
+    // C2Rust reborrow (`from_raw_parts_mut(&mut *(*out).offset(2) as *mut u8,
+    // crate::FALLBACK_SLICE_EXTENT)`); on the composed frame
+    // (`batch-14-dry17d`) the reborrow is gone and the base is passed bare
+    // (`from_raw_parts_mut((*out).offset(2 as i32 as isize),
+    // crate::FALLBACK_SLICE_EXTENT)`). What both frames say — and what this
+    // control exists to pin — is that the destination of the deref-rooted
+    // shape is delivered by the CONSTRUCTION family, off this same base, at
+    // the named fallback extent, and never by this lane's view.
+    let fabricated = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe fn copy(mut out: *mut *mut u8, mut src: *const u8, mut n: usize) {
+    let mut start: *mut u8 = &mut *(*out).offset(2 as i32 as isize) as *mut u8;
+    let mut i: usize = 0;
+    while i < n { *start.offset(i as isize) = *src.offset(i as isize); i = i.wrapping_add(1); }
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&fabricated), "{fabricated}");
+    let flat: String = fabricated.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("from_raw_parts_mut("), "{fabricated}");
+    assert!(
+        flat.contains("(*out).offset(2asi32asisize)"),
+        "{fabricated}"
+    );
+    assert!(
+        flat.contains("crate::FALLBACK_SLICE_EXTENT"),
+        "{fabricated}"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // W6S-7 — the Option-slice destination of a forward computed view
@@ -1182,10 +1240,66 @@ fn wave6s_ti_trima_outer_slot_pass_on_delivers_and_returns_ti_sma_s_cursor() {
 // returns empty for this edit. That last link is wave-6o's (report 021 STOP 1).
 // ---------------------------------------------------------------------------
 
-// wave-6s's `wave6s_forward_view_into_a_null_initialized_destination_moves_to_the_option_family`
-// is WITHDRAWN on the same ruling and for the same reason (R436-2): the
-// destination's reason is no longer `null-init` on this frame. Their W6S-7
-// text is on their branch at `1a24023d2`.
+/// **W6S-7 (i)+(ii) — the destination leaves this family.** Before the arm it
+/// was this family's `slice-use-unsupported`; after it, the assignment is
+/// admitted and the row belongs to the Option family.
+///
+/// **R217-2(a) — what the Option family then does with it is frame-dependent,
+/// and this witness asserts only the part that is not.** At `046482b8e` the
+/// row stopped at ONE named hold — candidate `raw -> opt-slice-shared`,
+/// withdrawn on `option-presentation:
+/// EvidenceMissing("option-slice-value:one-element-carrier")` (wave-6o's
+/// R410-7 STOP 1(b), which holds "until the base delivers a real view"). On
+/// the composed frame (`batch-14-dry17d`, with wave-6o's option 1) the hold is
+/// discharged by exactly this lane's view and the row DELIVERS:
+///
+/// ```text
+/// let mut p: Option<&[f32]> = None;
+/// p = Some(&src[2..]);
+/// return p.unwrap()[(0 as i32) as usize] + p.unwrap()[(1 as i32) as usize];
+/// ```
+///
+/// The shared property is the arm's own claim: the destination is never left
+/// with this family's refusal, and whichever frame it is read on, the outcome
+/// is one of those two — the named hold, or the optional suffix view.
+#[test]
+fn wave6s_forward_view_into_a_null_initialized_destination_moves_to_the_option_family() {
+    const INPUT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut src: *mut f32, mut n: i32) -> f32 {
+    let mut p: *mut f32 = 0 as *mut f32;
+    p = &mut *src.offset(2 as i32 as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize) + *p.offset(1 as i32 as isize);
+ }
+"#;
+    let rows = super::emit_tests::decisions_of(INPUT);
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "p" && !is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(reason, "slice-use-unsupported", "{rows:?}");
+    if reason == "<emitted>" {
+        // The composed frame: the hold is discharged and the view is placed.
+        let source = emit(INPUT);
+        assert!(super::verify::type_checks_str(&source), "{source}");
+        let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat.contains("letmutp:Option<&[f32]>=None"), "{source}");
+        assert!(flat.contains("p=Some(&src[2..])"), "{source}");
+        return;
+    }
+    assert_eq!(reason, "null-init", "{rows:?}");
+    let (_, receipts) = emit_with_family_receipts(INPUT);
+    assert!(
+        receipts.contains("opt-slice-shared"),
+        "the Option family must carry this destination as an optional slice candidate: {receipts}"
+    );
+    assert!(
+        receipts.contains("option-presentation") && receipts.contains("option-evidence-held"),
+        "and its withdrawal must be the named presentation hold: {receipts}"
+    );
+}
 
 /// **The bare copy is unchanged.** The same destination whose value is the
 /// root itself still delivers `Option<&[f32]>` — the admission is additive.
