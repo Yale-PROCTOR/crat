@@ -7574,8 +7574,16 @@ fn finish_decide<'tcx>(
         &exported_pairs,
     );
     // wave-6a: allocator-contract owners (relay wave-6a/006, R409-1/3).
-    let allocator_contracts =
-        decision::allocator_contract::derive(tcx, &program.functions, &subjects, &slots, &model);
+    let allocator_contracts = decision::allocator_contract::derive(
+        tcx,
+        &program.functions,
+        &subjects,
+        &slots,
+        &model,
+        &consuming_formals,
+        &box_facts,
+        &ctors,
+    );
     let box_params = decision::box_param::derive(
         tcx,
         &program.functions,
@@ -7585,8 +7593,25 @@ fn finish_decide<'tcx>(
         &slots,
         &model,
         &return_certificates,
+        &allocator_contracts.plans,
         &raw_surface,
         &exported_pairs,
+    );
+    // R450-8 rung 3: the chain has spoken — an owner whose release was a
+    // transfer into a formal it did not plan is withdrawn.
+    let mut allocator_contracts = allocator_contracts;
+    decision::allocator_contract::confirm_transfers(
+        &mut allocator_contracts,
+        tcx,
+        &|did, index| {
+            did.as_local().is_some_and(|callee| {
+            subjects.iter().any(|s| {
+                s.fn_did == callee
+                    && matches!(s.kind, decision::SubjectKind::Param { hir_index } if hir_index == index)
+                    && box_params.plans.contains_key(&(s.fn_did, s.hir_id))
+            })
+        })
+        },
     );
     decision::return_certificate::confirm_transfers(
         &mut return_certificates,

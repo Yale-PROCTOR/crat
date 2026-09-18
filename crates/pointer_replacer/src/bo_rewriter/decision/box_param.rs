@@ -569,6 +569,7 @@ pub(crate) fn derive<'tcx>(
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
     certificates: &super::return_certificate::Certificates,
+    contract_plans: &FxHashMap<(LocalDefId, HirId), BoxPlan>,
     raw_surface: &dyn Fn(LocalDefId) -> bool,
     exported_pairs: &super::exported_pair::Closure,
 ) -> Chains {
@@ -763,6 +764,40 @@ pub(crate) fn derive<'tcx>(
                     member_plans.push((key, plan, local.label.clone(), Vec::new()));
                     continue;
                 }
+                // **R450-8 rung 3**: the CONTRACT row owns a local whose
+                // allocation is the contract's and whose release is THIS call.
+                // Its plan carries the construction (a struct pointee included,
+                // which the ordinary Box arm has no initializer form for) and
+                // its own simulation has already proved the transfer is the
+                // generation's release — no free of its own, nothing after it,
+                // every cast spelled. The chain consumes that plan exactly as
+                // it consumes a certificate's above, and
+                // `allocator_contract::confirm_transfers` withdraws the
+                // owner if this chain does not plan the formal.
+                if let Some(plan) = contract_plans.get(&key) {
+                    if plan.optional {
+                        failure = Some(format!(
+                            "box-param-caller-retains:{caller_path}:optional-owner"
+                        ));
+                        break 'callers;
+                    }
+                    if caller_scan
+                        .local_uses
+                        .iter()
+                        .any(|(hir, span)| *hir == *arg && span.lo() > call_span.hi())
+                    {
+                        failure = Some(format!(
+                            "box-param-caller-retains:{caller_path}:used-after-transfer"
+                        ));
+                        break 'callers;
+                    }
+                    let mut plan = plan.clone();
+                    plan.receipts.push(format!(
+                        "box-param-transfer callee={callee_path} index={hir_index} source=allocator-contract"
+                    ));
+                    member_plans.push((key, plan, local.label.clone(), Vec::new()));
+                    continue;
+                }
                 if !matches!(
                     constructions.by_binding.get(&key),
                     Some(Construction::Alloc { .. })
@@ -949,9 +984,9 @@ pub(crate) fn derive<'tcx>(
         // memory is exactly what refutes that reading — the same finding
         // A1-d's lend walk made (`*slot = it` is not a lend, report 006).
         let formal_kind = model.get(&param_slot).copied();
-        let certified_callers = member_plans
-            .iter()
-            .all(|(k, _, _, _)| certificates.plans.contains_key(k));
+        let certified_callers = member_plans.iter().all(|(k, _, _, _)| {
+            certificates.plans.contains_key(k) || contract_plans.contains_key(k)
+        });
         if !(formal_kind == Some(SlotKind::Owning)
             || (formal_kind == Some(SlotKind::Raw) && certified_callers)
             || (store.is_some() && matches!(formal_kind, Some(SlotKind::Raw | SlotKind::Ref))))
@@ -1042,17 +1077,30 @@ pub(crate) fn derive<'tcx>(
             (None, None) => unreachable!("one sink"),
         }];
         let mut shape_failure = None;
-        for (edit, owner) in param_uses.iter().map(|e| (e, &name)).chain(
+        for (edit, is_formals) in param_uses.iter().map(|e| (e, true)).chain(
             member_plans
                 .iter()
-                .flat_map(|(_, _, label, uses)| uses.iter().map(move |e| (e, label))),
+                .flat_map(|(_, _, _, uses)| uses.iter().map(|e| (e, false))),
         ) {
-            let _ = owner;
             let text = tcx
                 .sess
                 .source_map()
                 .span_to_snippet(edit.span)
                 .unwrap_or_default();
+            // A SIZED owner's use that is ALREADY the deref — `(*p)`, the
+            // whole of a struct owner's field projections (rung 1 of avl's
+            // ladder admitted them as uses; R450-8 rung 3 is the first chain
+            // whose formal has only these) — reads a `Box<T>` exactly as it
+            // read the raw pointer. It needs no edit, and emitting one would
+            // claim an interval for no change. Only the FORMAL's own uses take
+            // this exit: a member's edits are counted for the split below.
+            if !slice
+                && is_formals
+                && let Some(root) = text.strip_prefix("(*").and_then(|t| t.strip_suffix(')'))
+                && !root.contains('.')
+            {
+                continue;
+            }
             let replacement = if slice {
                 edit.replacement.clone()
             } else if let Some(root) = text.strip_prefix('*')

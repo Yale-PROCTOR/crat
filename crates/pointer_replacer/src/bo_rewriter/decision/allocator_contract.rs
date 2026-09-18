@@ -59,7 +59,8 @@ use rustc_span::Span;
 
 use super::{
     Ctx, Decision, DecisionTable, DegradeReason, Subject, SubjectKind,
-    box_facts::{BoxExprEdit, BoxPlan, BoxPlanFailure, BoxShape},
+    box_facts::{BoxExprEdit, BoxOwnershipFacts, BoxPlan, BoxPlanFailure, BoxShape},
+    construction::ConstructionFacts,
     declaration::pointee_source,
     return_certificate::{LendOracle, owner_uses},
     seam::ExplicitDeclarationSite,
@@ -167,6 +168,39 @@ pub(crate) struct Plans {
     pub(crate) yields: Vec<(String, String)>,
     /// Admitted rows: (label, receipt).
     pub(crate) admitted: Vec<(String, String)>,
+    /// **R450-8 rung 3**: owners whose release is a callee's — (owner, callee,
+    /// argument index, label, whether this contract's refusals are receipts).
+    /// [`confirm_transfers`] demotes every owner whose callee the chain did
+    /// not plan, exactly as the allocation-return certificate withdraws an
+    /// unconfirmed transfer of its own.
+    pub(crate) transfers: Vec<((LocalDefId, HirId), DefId, usize, String, bool)>,
+}
+
+/// **R450-8 rung 3** — the chain has spoken: every owner whose release was a
+/// transfer into a formal `box_param` did NOT plan is demoted here, because
+/// its generation would then reach the callee as a `Box` at a raw formal and
+/// close at a scope exit this rule never admits.
+pub(crate) fn confirm_transfers(
+    plans: &mut Plans,
+    tcx: TyCtxt<'_>,
+    confirmed: &dyn Fn(DefId, usize) -> bool,
+) {
+    for (node, did, index, label, yields) in std::mem::take(&mut plans.transfers) {
+        if confirmed(did, index) || !plans.plans.contains_key(&node) {
+            continue;
+        }
+        plans.plans.remove(&node);
+        plans.admitted.retain(|(l, _)| *l != label);
+        let reason = format!(
+            "{USE}:transfer-unconfirmed:{}#{index}",
+            tcx.def_path_str(did)
+        );
+        if yields {
+            plans.yields.push((label, reason));
+        } else {
+            plans.holds.insert(node, (label, reason));
+        }
+    }
 }
 
 impl Plans {
@@ -284,6 +318,29 @@ fn bare_local(e: &Expr<'_>) -> Option<HirId> {
         },
         _ => None,
     }
+}
+
+/// **R450-8 rung 3** — the statement hands a bare local to a LOCAL callee,
+/// `f(x);` or `return f(x);`. Only the shape is read here: which callee, at
+/// which index. Whether that callee CONSUMES the argument is the chain's
+/// question (`box_param::consuming_formals`), and the derive asks it.
+fn transfer_call<'h>(tcx: TyCtxt<'_>, e: &'h Expr<'h>) -> Option<(HirId, DefId, usize)> {
+    let call = match &e.kind {
+        ExprKind::Ret(Some(inner)) => inner,
+        _ => e,
+    };
+    let ExprKind::Call(_, args) = &call.kind else {
+        return None;
+    };
+    let did = callee_of(call)?;
+    if !did.is_local() || contract_of(tcx, did).is_some() {
+        return None;
+    }
+    let (argument, hir) = args
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| Some((index, bare_local(arg)?)))?;
+    Some((hir, did, argument))
 }
 
 fn null_literal(e: &Expr<'_>) -> bool {
@@ -442,6 +499,12 @@ enum Role {
     MoveOut,
     /// `<Free>(m, x as *mut c_void);`
     Free,
+    /// **R450-8 rung 3**: `f(x)` / `return f(x);` where `f` consumes the
+    /// formal — the generation's RELEASE is the callee's, and the chain
+    /// (W6A-C1) plans that free as a `drop`. Whether it really is a release
+    /// depends on `consuming_formals`, which the derive asks; a call to any
+    /// other callee stays a plain use.
+    Transfer,
     /// `x = <null>;`
     NullStore,
     /// `let x = <null>;` — build 2: the ensure-capacity idiom declares the
@@ -479,6 +542,9 @@ struct Scan {
     moves: Vec<(HirId, HirId, Span)>,
     /// build 2: `let x = <null>;` — (binding, the initializer's span).
     null_inits: Vec<(HirId, Span)>,
+    /// R450-8 rung 3: statements that hand the binding to a local callee —
+    /// (binding, callee, argument index, statement span).
+    transfer_calls: Vec<(HirId, DefId, usize, Span)>,
     /// Every CAST of a bare local — (binding, the cast's span). The owner walk
     /// must have spelled each one: a cast this rule leaves alone is a use of
     /// the owner in another pointee's shape, which the emitted `Box` cannot
@@ -564,6 +630,21 @@ impl<'tcx> Visitor<'tcx> for ScanWalk<'tcx> {
                 },
                 rustc_hir::StmtKind::Item(_) => None,
             };
+            // R450-8 rung 3: a statement that hands the binding to a LOCAL
+            // callee — `f(x);` or `return f(x);`. The scan records the shape;
+            // only the derive knows (from `consuming_formals`) whether that
+            // call is the generation's release.
+            let role = role.or_else(|| {
+                let (rustc_hir::StmtKind::Semi(e) | rustc_hir::StmtKind::Expr(e)) = &stmt.kind
+                else {
+                    return None;
+                };
+                let (hir, did, argument) = transfer_call(self.tcx, e)?;
+                self.out
+                    .transfer_calls
+                    .push((hir, did, argument, stmt.span));
+                Some((hir, Role::Transfer))
+            });
             if let Some((hir, role)) = role {
                 self.out
                     .statements
@@ -608,11 +689,22 @@ pub(crate) fn derive<'tcx>(
     subjects: &[Subject],
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
+    consuming_formals: &FxHashSet<(DefId, usize)>,
+    box_facts: &BoxOwnershipFacts,
+    constructions: &ConstructionFacts,
 ) -> Plans {
     let mut out = Plans::default();
     let lend_oracle = LendOracle::new(tcx, functions, slots, model);
     let lend_ok = |did: DefId, index: usize| -> bool { lend_oracle.lend(did, index) };
-    let transfer_ok = |_: DefId, _: usize| -> bool { false };
+    // **R450-8 rung 3**: the generation's RELEASE may be a callee's. A local
+    // callee that frees its formal exactly once and reads it only through
+    // element accesses is the chain's own shape (`box_param::consuming_formals`
+    // — syntactic, optimistic, the same set the allocation-return certificate
+    // asks); the owner moves into it and the chain plans that free as a
+    // `drop`. The chain CONFIRMS the formal afterwards, and
+    // [`confirm_transfers`] demotes any owner whose callee it did not plan.
+    let transfer_ok =
+        |did: DefId, index: usize| -> bool { consuming_formals.contains(&(did, index)) };
     let snippet = |span: Span| {
         tcx.sess
             .source_map()
@@ -728,6 +820,18 @@ pub(crate) fn derive<'tcx>(
                         Role::Free | Role::MoveOut => Event::Release,
                         Role::NullStore | Role::NullInit => Event::NullStore,
                         Role::Store => Event::Store,
+                        // Rung 3: a release only where the callee consumes the
+                        // argument. Any other call is an ordinary use, and the
+                        // owner walk decides it (a proven lend, or a refusal).
+                        Role::Transfer => {
+                            if scan.transfer_calls.iter().any(|(h, did, index, s)| {
+                                *h == subject.hir_id && s == span && transfer_ok(*did, *index)
+                            }) {
+                                Event::Release
+                            } else {
+                                Event::Use
+                            }
+                        }
                     };
                     events.push((*span, *block, event, *role));
                 } else if *role == Role::MoveIn
@@ -847,7 +951,38 @@ pub(crate) fn derive<'tcx>(
             // population (their `box_w1` / `box_w2` / `box2_*` witnesses), and
             // two families planning one binding is an ill-typed function, not
             // an arbitration.
+            //
+            // **R450-8 rung 3 narrows it**: a local whose RELEASE is a
+            // consuming callee's is not that population. The fields family
+            // plans a body local it sees freed here; this one is freed THERE,
+            // and the chain's caller side reads `box-initializer-unsupported`
+            // for exactly it (a struct pointee the ordinary Box arm has no
+            // initializer form for). Yielding it leaves the binding to nobody,
+            // so this rule keeps it and the chain consumes its plan — one
+            // family, one binding, as before.
+            //
+            // The exception is narrow on purpose: it holds only where the
+            // ORDINARY Box arm cannot plan the local either. Where it can — a
+            // scalar or array owner whose initializer that arm renders
+            // (`Box::new(7)`) — the chain plans its own member and this rule
+            // yields as it did before rung 3; two renderings of one binding
+            // would otherwise race, and the contract's would win by accident.
+            let released_by_a_callee =
+                scan.transfer_calls.iter().any(|(hir, did, index, _)| {
+                    *hir == subject.hir_id && transfer_ok(*did, *index)
+                }) && slots
+                    .fn_local_slots
+                    .get(&subject.fn_did)
+                    .and_then(|u| u.slot_for_local_depth(subject.local, 0))
+                    .map(|slot| SlotRef::Local(subject.fn_did, slot))
+                    .is_none_or(|slot| {
+                        box_facts
+                            .without_boundary_hold(slot)
+                            .plan_for_subject(tcx, subject, slot, constructions, slots, subjects)
+                            .is_err()
+                    });
             if contract.id.starts_with("allocator-contract:libc")
+                && !released_by_a_callee
                 && slots
                     .fn_local_slots
                     .get(&subject.fn_did)
@@ -1173,6 +1308,13 @@ pub(crate) fn derive<'tcx>(
             }
             for receipt in &receipts {
                 out.admitted.push((label.clone(), receipt.clone()));
+            }
+            // Rung 3: the callee this owner's generation moves into. The chain
+            // confirms the formal (`confirm_transfers`) or this owner is
+            // demoted with it.
+            for (did, index, _) in &uses.transfers {
+                out.transfers
+                    .push((node, *did, *index, label.clone(), yields));
             }
             // The destinations this owner's generation moves into; the loop
             // after this one demotes the owner if one of them is not itself an

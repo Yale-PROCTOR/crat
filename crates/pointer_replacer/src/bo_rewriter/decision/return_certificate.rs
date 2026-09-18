@@ -583,8 +583,8 @@ pub(crate) struct OwnerUses {
     pub(crate) dead_null_returns: Vec<Span>,
     /// Stores of the owner into raw places (`Box::into_raw` transfers).
     pub(crate) stores: Vec<Span>,
-    /// Transfers into consuming formals: (callee, index).
-    pub(crate) transfers: Vec<(DefId, usize)>,
+    /// Transfers into consuming formals: (callee, index, the call).
+    pub(crate) transfers: Vec<(DefId, usize, Span)>,
     /// `return x` of the owner (the certificate chains it; a contract
     /// allocation holds on it).
     pub(crate) returns: Vec<Span>,
@@ -877,7 +877,7 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     // A1-c: moved into the consuming formal; the chain
                     // confirms it (`confirm_transfers`) or this owner withdraws.
                     if let Ok(uses) = &mut self.out {
-                        uses.transfers.push((did, index));
+                        uses.transfers.push((did, index, parent.span));
                     }
                     return;
                 }
@@ -1629,7 +1629,7 @@ fn certify<'tcx, 's>(
                             ),
                         )
                         .map_err(|reason| hold(reason))?;
-                        transfers.extend(owner_transfers.into_iter().map(|(d, i)| (d, i, key)));
+                        transfers.extend(owner_transfers.into_iter().map(|(d, i, _)| (d, i, key)));
                         (
                             plan,
                             format!("chained-from={}", source_certificate.callee_path),
@@ -1697,7 +1697,7 @@ fn certify<'tcx, 's>(
                     ),
                 )
                 .map_err(|reason| hold(reason))?;
-                transfers.extend(owner_transfers.into_iter().map(|(d, i)| (d, i, key)));
+                transfers.extend(owner_transfers.into_iter().map(|(d, i, _)| (d, i, key)));
                 (
                     plan,
                     format!("assigned-from={}", source_certificate.callee_path),
@@ -1882,7 +1882,7 @@ fn certify<'tcx, 's>(
                 &|_| false,
             )
             .map_err(|form| hold(format!("return-certificate-owner-use:{callee_path}:{form}")))?;
-            transfers.extend(uses.transfers.iter().map(|(d, i)| (*d, *i, key)));
+            transfers.extend(uses.transfers.iter().map(|(d, i, _)| (*d, *i, key)));
             let deleted = plan.delete_statements.clone();
             let owner_edits: Vec<BoxExprEdit> = uses
                 .edits
@@ -2125,7 +2125,7 @@ fn certify<'tcx, 's>(
             &format!("return-certificate-receiver callee={callee_path} model={rkind:?}"),
         )
         .map_err(|reason| (rkey, receiver.label.clone(), reason))?;
-        transfers.extend(rtransfers.into_iter().map(|(d, i)| (d, i, rkey)));
+        transfers.extend(rtransfers.into_iter().map(|(d, i, _)| (d, i, rkey)));
         plans.push((rkey, rplan));
         planned_receivers.push(rkey);
         receiver_labels.push(receiver.label.clone());
@@ -2272,7 +2272,7 @@ fn receiver_plan(
     lend_ok: &dyn Fn(DefId, usize) -> bool,
     transfer_ok: &dyn Fn(DefId, usize) -> bool,
     receipt: &str,
-) -> Result<(BoxPlan, Vec<(DefId, usize)>), String> {
+) -> Result<(BoxPlan, Vec<(DefId, usize, Span)>), String> {
     let name = receiver
         .param_name
         .clone()

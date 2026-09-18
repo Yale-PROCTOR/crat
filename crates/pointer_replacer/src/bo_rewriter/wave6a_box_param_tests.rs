@@ -345,22 +345,100 @@ fn w6a_c1_allocation_lent_before_the_transfer_holds_typed() {
     );
 }
 
+const CONTRACT_CHAIN_UNCONFIRMED: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub height: i32,
+}
+pub unsafe extern "C" fn retire2(mut p: *mut Node) -> i32 {
+    let mut k = (*p).key;
+    free(p as *mut core::ffi::c_void);
+    return k;
+}
+pub unsafe extern "C" fn good(mut key: i32) -> i32 {
+    let mut n = malloc(::std::mem::size_of::<Node>() as std::os::raw::c_ulong) as *mut Node;
+    (*n).key = key;
+    return retire2(n);
+}
+pub unsafe extern "C" fn keeps(mut key: i32) -> i32 {
+    let mut m = malloc(::std::mem::size_of::<Node>() as std::os::raw::c_ulong) as *mut Node;
+    (*m).key = key;
+    let mut r = retire2(m);
+    (*m).height = 0 as i32;
+    return r;
+}
+"#;
+
+/// **The confirmation is load-bearing** (R450-8 rung 3). `good::n` is admitted
+/// by the contract row on the optimistic reading that `retire2` consumes its
+/// formal — `consuming_formals` is syntactic, as the allocation-return
+/// certificate's use of it is. The CHAIN then refuses the formal, because the
+/// second caller reads its local after the call (`keeps`), and without
+/// `confirm_transfers` `good::n` would emit a `Box<Node>` into a raw formal.
+/// The withdrawal names the callee it waited on.
 #[test]
-fn w6a_c1_ht_destroy_without_callers_holds_typed() {
-    // The full ht shape: `ht` closes at the surface (R427-4 — `ht_create` and
-    // `ht_destroy` are its only signatures and no field holds one), so the
-    // chain is attempted with no in-crate caller and refuses LATER, on the
-    // body: the sized owner is indexed (`(*table).entries` walked by
-    // `.offset`), which this rule does not rewrite. A typed hold either way,
-    // and no `Box<ht>` formal.
+fn w6a_c1_an_unconfirmed_contract_transfer_is_withdrawn() {
+    let out = emitted("bp-contract-unconfirmed", CONTRACT_CHAIN_UNCONFIRMED);
+    let contract = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        contract
+            .contains("good::n\tyielded\tcontract-allocation:use:transfer-unconfirmed:retire2#0"),
+        "the owner is withdrawn with its callee named\n{contract}"
+    );
+    assert!(
+        !contract.contains("good::n\tadmitted"),
+        "no admission survives the withdrawal\n{contract}"
+    );
+    let text = compact(&out.source);
+    assert!(!text.contains("Box<Node>"), "{}", out.source);
+    assert!(text.contains("returnretire2(n);"), "{}", out.source);
+}
+
+/// **The full ht shape, delivered.** `ht` closes at the surface (R427-4 —
+/// `ht_create` and `ht_destroy` are its only signatures and no field holds
+/// one), so the exported-pair closure of report 012 admits the chain with no
+/// in-crate caller. Its last wall was the shape check reading `(*table)` — the
+/// owner's own deref, in a field projection — as an indexing use it does not
+/// rewrite. It is not a use to rewrite at all: `(*table).entries` reads a
+/// `Box<ht>` exactly as it read the raw pointer, and R450-8's rung 3 is where
+/// that mattered enough to say so. The field's own `.offset` walk is the
+/// FIELD's raw pointer and is untouched; the C frees of the entries stay C
+/// frees, and only the owner's own free becomes the `drop`.
+#[test]
+fn w6a_c1_ht_destroy_delivers_through_the_surface_closure() {
     let out = emitted("boxparam-ht", &with_prelude(HT_DESTROY));
     let src = compact(&out.source);
-    assert!(!src.contains("table:Box<ht>"), "{}", out.source);
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
     assert!(
-        out.artifacts
-            .box_param_receipts
-            .contains("ht_destroy::table\theld\tbox-param-shape:ht_destroy:sized-owner-indexed"),
+        src.contains("fnht_destroy(muttable:Box<ht>)"),
         "{}",
+        out.source
+    );
+    assert!(src.contains("drop(table);"), "{}", out.source);
+    // The entries are C memory and stay C memory: their frees keep their text
+    // and the field walk keeps its `.offset`.
+    assert!(
+        src.contains("free((*((*table).entries).offset(iasisize)).keyas*mutcore::ffi::c_void);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("free((*table).entriesas*mutcore::ffi::c_void);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        !out.artifacts
+            .box_param_receipts
+            .contains("box-param-shape:ht_destroy:sized-owner-indexed"),
+        "the deref is not an indexing use\n{}",
         out.artifacts.box_param_receipts
     );
 }
@@ -834,17 +912,20 @@ fn w6a_c1_avls_rotation_owner_passes_the_use_check_and_holds_on_its_caller() {
     );
 }
 
-/// **Rung 3, pinned** (relay wave-6a/027, report 022 §2): a consuming callee
-/// whose owner is a STRUCT — used through its fields and freed there — whose
-/// CALLER allocated it with the contract's allocator. The callee side passes
-/// (rung 1 closed its use check); the chain holds on the caller, because the
-/// ordinary Box arm has no initializer form for a struct pointee.
+/// **Rung 3, delivered** (R450-8, ruled at relay wave-6a/031 §4): a consuming
+/// callee whose owner is a STRUCT — used through its fields and freed there —
+/// whose CALLER allocated it with the contract's allocator. The callee side
+/// passed since rung 1; the caller side held on `box-initializer-unsupported`,
+/// because the ordinary Box arm has no initializer form for a struct pointee.
 ///
-/// The obvious repair — let the chain move the CONTRACT's plan for that local —
-/// was built and reverted: with the transfer admitted as the contract's sink,
-/// both families plan the same binding, and C1's own witnesses go red. Which
-/// family owns a local whose allocation is the contract's and whose release is
-/// a callee's is a design question, and report 022 §3 asks it.
+/// The ruling settles which family owns such a binding: **the contract row
+/// owns it** (its allocation is the contract's), and **the chain consumes that
+/// plan** rather than building a second one. Three things make it work
+/// together: the contract reads a call into a consuming formal as the
+/// generation's RELEASE (so no implicit close), the chain takes the contract's
+/// plan for the caller member exactly as it takes a certificate's (A1-c), and
+/// `allocator_contract::confirm_transfers` withdraws the owner if the chain
+/// does not plan the formal after all.
 const CONTRACT_OWNER_CHAIN: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
 extern "C" {
@@ -871,24 +952,44 @@ pub unsafe extern "C" fn build_and_retire(mut key: i32) -> i32 {
 "#;
 
 #[test]
-fn w6a_c1_a_contract_owner_holds_on_its_callers_initializer() {
+fn w6a_c1_a_contract_owners_chain_delivers_through_the_consuming_callee() {
     let out = emitted("bp-contract-chain", CONTRACT_OWNER_CHAIN);
     let receipts = &out.artifacts.box_param_receipts;
-    // The CALLEE side is settled: the owner's field uses no longer hold it.
+    let contract = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    // The contract row keeps the local — it is not yielded to the fields
+    // family — and its generation is released by the callee, so `frees=0`
+    // with no implicit close anywhere.
     assert!(
-        !receipts.contains("raw-use:p"),
-        "rung 1 is closed\n{receipts}"
+        contract.contains("build_and_retire::n\tadmitted")
+            && contract.contains("shape=sized optional=false generations=1 moves_in=0 frees=0"),
+        "the contract owns the local\n{contract}"
     );
-    // The CALLER side is rung 3, named exactly.
+    assert!(
+        !contract.contains("model-owning-is-the-fields-family"),
+        "the yield is narrowed for a callee-released owner\n{contract}"
+    );
+    // The chain plans the formal and names the contract as the member's source.
     assert!(
         receipts.contains(
-            "retire::p\theld\tbox-param-caller-retains:build_and_retire:unplanned-argument:box-initializer-unsupported"
+            "box-param-chain callee=retire index=0 sink=free pointee=Node shape=sized callers=1 members=build_and_retire::n"
         ),
         "{receipts}"
     );
+    let text = compact(&out.source);
+    assert!(text.contains("fnretire(mutp:Box<Node>)"), "{}", out.source);
+    // The drop stays at the C free site; the field uses keep their text; the
+    // caller moves the owner at the call.
+    assert!(text.contains("drop(p);"), "{}", out.source);
     assert!(
-        !compact(&out.source).contains("Box<Node>"),
+        text.contains("(*p).height=0asi32;") && text.contains("letmutk=(*p).key;"),
         "{}",
         out.source
     );
+    assert!(
+        text.contains("letmutn:Box<crate::Node>=Box::from_raw(malloc("),
+        "{}",
+        out.source
+    );
+    assert!(text.contains("returnretire(n);"), "{}", out.source);
 }
