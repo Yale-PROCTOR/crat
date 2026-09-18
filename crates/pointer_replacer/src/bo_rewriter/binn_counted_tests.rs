@@ -1649,6 +1649,88 @@ pub unsafe fn binn_buf_type(mut pbuf: *mut core::ffi::c_void) -> i32 {
 }
 "#;
 
+/// binn's real header reader hands its cursor to a local callee that reads
+/// through it (`copy_be32(&mut int32 as *mut u32, p as *mut u32)`). That is a
+/// read-through at a local callee, which wave-6r's MIR scan decides — and the
+/// scan is a pure function of `tcx` and the program's functions, so the
+/// contract chain can ask it directly (report 025: this instance of the
+/// staging wall is not one).
+const HEADER_WITH_CALLEE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_snake_case)]
+pub unsafe fn copy_be32(mut pdest: *mut u32, mut psource: *mut u32) {
+    let mut source = psource as *mut u8;
+    let mut dest = pdest as *mut u8;
+    *dest.offset(0) = *source.offset(3);
+    *dest.offset(1) = *source.offset(2);
+    *dest.offset(2) = *source.offset(1);
+    *dest.offset(3) = *source.offset(0);
+}
+pub unsafe fn IsValidBinnHeader(mut pbuf: *mut core::ffi::c_void, mut ptype: *mut i32,
+    mut psize: *mut i32) -> i32 {
+    let mut p = 0 as *mut u8;
+    let mut int32: u32 = 0;
+    let mut byte: u8 = 0;
+    if pbuf.is_null() { return 0; }
+    p = pbuf as *mut u8;
+    byte = *p;
+    p = p.offset(1);
+    if byte as i32 & 0xe0 != 0xe0 { return 0; }
+    copy_be32(&mut int32 as *mut u32, p as *mut u32);
+    p = p.offset(4);
+    if !ptype.is_null() { *ptype = byte as i32; }
+    if !psize.is_null() { *psize = int32 as i32; }
+    return p.offset_from(pbuf as *mut u8) as i32;
+}
+pub unsafe fn binn_buf_type(mut pbuf: *mut core::ffi::c_void) -> i32 {
+    let mut type_0: i32 = 0;
+    if IsValidBinnHeader(pbuf, &mut type_0, 0 as *mut i32) == 0 { return 0; }
+    return type_0;
+}
+"#;
+
+#[test]
+fn w6v2_header_path_admits_a_cursor_read_through_at_a_local_callee() {
+    // This family no longer holds the shape: the cursor's local callee reads
+    // through and hands nothing back. In THIS reduction the analysis then
+    // settles the subject `kind-raw` (a fixture artefact: the corpus's own
+    // `IsValidBinnHeader` is not analysis-raw), so what the witness pins is the
+    // family's verdict, and the corpus census is the delivery evidence —
+    // report 025: binn's `held:void-pointee` 79 -> 75 with this arm.
+    let rows = by_function(HEADER_WITH_CALLEE);
+    assert!(
+        !rows.contains(&(
+            "IsValidBinnHeader".to_owned(),
+            "pbuf".to_owned(),
+            "held:void-pointee".to_owned()
+        )),
+        "the read-through callee lifts this family's hold: {rows:?}"
+    );
+}
+
+/// The control: the same call, but the callee KEEPS what it is given. The
+/// cursor escapes through it and the hold stands.
+#[test]
+fn w6v2_header_path_refuses_a_cursor_a_callee_keeps() {
+    let input = HEADER_WITH_CALLEE.replace(
+        "pub unsafe fn copy_be32(mut pdest: *mut u32, mut psource: *mut u32) {
+    let mut source = psource as *mut u8;",
+        "pub static mut KEPT: *mut u32 = 0 as *mut u32;
+pub unsafe fn copy_be32(mut pdest: *mut u32, mut psource: *mut u32) {
+    KEPT = psource;
+    let mut source = psource as *mut u8;",
+    );
+    assert_ne!(input, HEADER_WITH_CALLEE);
+    let rows = by_function(&input);
+    assert!(
+        !rows.contains(&(
+            "IsValidBinnHeader".to_owned(),
+            "pbuf".to_owned(),
+            "<emitted>".to_owned()
+        )),
+        "a callee that keeps the cursor holds the parameter: {rows:?}"
+    );
+}
+
 #[test]
 fn w6v2_header_path_takes_the_ruled_fallback_extent() {
     let rows = by_function(HEADER);

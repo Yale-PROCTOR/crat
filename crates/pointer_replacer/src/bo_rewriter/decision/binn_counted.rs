@@ -466,6 +466,17 @@ pub(crate) fn prove_header_path(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract
                 }
                 ExprKind::Binary(..) => true,
                 ExprKind::Assign(lhs, _, _) => local_of(lhs) == Some(cursor),
+                // R460-10: the cursor, or a cast of it, handed to a LOCAL
+                // callee that reads through the position and hands no
+                // descendant back. wave-6r's scan answers this from MIR alone
+                // — no retention summaries, no site facts — so the contract
+                // chain may ask it here (report 025: this instance of the
+                // staging wall is not one). binn's `copy_be32(.., p as *mut
+                // u32)` is the measured case.
+                ExprKind::Cast(..) => read_through_at_a_local_callee(tcx, parent),
+                ExprKind::Call(..) | ExprKind::MethodCall(..) => {
+                    read_through_at_a_local_callee(tcx, use_)
+                }
                 _ => false,
             };
             if !confined {
@@ -481,6 +492,33 @@ pub(crate) fn prove_header_path(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract
         width: Some(WidthTable::fallback_extent()),
         uses: edits,
     })
+}
+
+/// R460-10: is `argument` passed to a LOCAL callee whose position is
+/// descendant-free — it reads through the pointer and hands nothing back?
+///
+/// The scan is wave-6r's (`position_is_descendant_free`), and it is a pure
+/// function of `tcx` and the program's local functions: no retention
+/// summaries, no site facts. That is why the contract chain can ask it before
+/// either derive exists.
+fn read_through_at_a_local_callee(tcx: TyCtxt<'_>, argument: &Expr<'_>) -> bool {
+    let Node::Expr(call) = tcx.parent_hir_node(argument.hir_id) else { return false };
+    let ExprKind::Call(callee, args) = call.kind else { return false };
+    let Some(index) = args.iter().position(|a| a.hir_id == argument.hir_id) else {
+        return false;
+    };
+    let ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = callee.kind else {
+        return false;
+    };
+    let Res::Def(rustc_hir::def::DefKind::Fn, did) = path.res else { return false };
+    let Some(callee) = did.as_local() else { return false };
+    let functions = tcx.hir_body_owners().collect::<Vec<_>>();
+    if !functions.contains(&callee) {
+        return false;
+    }
+    crate::bo_rewriter::wave6r_child_access::position_is_descendant_free(
+        tcx, &functions, callee, index,
+    )
 }
 
 /// Is this expression's value written through anywhere in the enclosing body?
