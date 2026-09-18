@@ -254,6 +254,7 @@ fn w6v2_width_table_selects_exactly_by_literal() {
     let table = WidthTable {
         discriminant: Some(2),
         arms: vec![(33, "i8".to_owned(), 1), (129, "i64".to_owned(), 8)],
+        fabricated: false,
     };
     assert_eq!(
         table.render(),
@@ -267,6 +268,7 @@ fn w6v2_width_table_selects_exactly_by_literal() {
     let constant = WidthTable {
         discriminant: None,
         arms: vec![(0, "u32".to_owned(), 4)],
+        fabricated: false,
     };
     assert_eq!(constant.render(), "core::mem::size_of::<u32>()");
     assert_eq!(constant.receipt(), "width:size_of::<u32>");
@@ -1618,4 +1620,105 @@ fn w6v2_output_storage_settled_at_every_call() {
     assert_ne!(uncalled, CONFINED);
     let (uncalled, row) = settled(&uncalled);
     assert!(!uncalled, "no call, nothing settled: {row}");
+}
+
+/// R457-5 (the seat's ruling on report 023): binn's `IsValidBinnHeader` walks
+/// the buffer by an extent the program never states — its own `plimit` is built
+/// from a positive `*psize`, and every call passes null or zero. The view takes
+/// the ruled fallback extent with a per-site receipt; the write positions do
+/// not.
+const HEADER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_snake_case)]
+pub unsafe fn IsValidBinnHeader(mut pbuf: *mut core::ffi::c_void, mut ptype: *mut i32,
+    mut psize: *mut i32) -> i32 {
+    let mut p = 0 as *mut u8;
+    let mut byte: u8 = 0;
+    if pbuf.is_null() { return 0; }
+    p = pbuf as *mut u8;
+    byte = *p;
+    p = p.offset(1);
+    if byte as i32 & 0xe0 != 0xe0 { return 0; }
+    if !ptype.is_null() { *ptype = byte as i32; }
+    if !psize.is_null() { *psize = *p as i32; }
+    return p.offset_from(pbuf as *mut u8) as i32;
+}
+pub unsafe fn binn_buf_type(mut pbuf: *mut core::ffi::c_void) -> i32 {
+    let mut type_0: i32 = 0;
+    if IsValidBinnHeader(pbuf, &mut type_0, 0 as *mut i32) == 0 { return 0; }
+    return type_0;
+}
+"#;
+
+#[test]
+fn w6v2_header_path_takes_the_ruled_fallback_extent() {
+    let rows = by_function(HEADER);
+    assert!(
+        rows.contains(&(
+            "IsValidBinnHeader".to_owned(),
+            "pbuf".to_owned(),
+            "<emitted>".to_owned()
+        )),
+        "the header reader delivers under the waiver: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(HEADER).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fnIsValidBinnHeader(mutpbuf:Option<&[u8]>"),
+        "the view is a nullable byte view: {source}"
+    );
+    // The forward-only rule carries the chain: `binn_buf_type` takes the view
+    // too, so this reduction has no RAW caller left and therefore no bridge to
+    // fabricate. The fabricated extent itself is a corpus fact (report 024's
+    // census), not something this fixture can show.
+    assert!(
+        c.contains("fnbinn_buf_type(mutpbuf:Option<&[u8]>"),
+        "the chain carries the view: {source}"
+    );
+    assert!(
+        !source.contains("1024"),
+        "no extent is ever inlined as a number: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// The waiver is for the READ path only, and for a BYTE cursor only. A write
+/// through the parameter's own cast claims writable bytes, which the fallback
+/// extent may not do; a cast to a wider element is not a byte view at all.
+#[test]
+fn w6v2_header_path_refuses_a_write_and_a_wide_cursor() {
+    let held = |input: &str, what: &str| {
+        let rows = by_function(input);
+        assert!(
+            !rows.contains(&(
+                "IsValidBinnHeader".to_owned(),
+                "pbuf".to_owned(),
+                "<emitted>".to_owned()
+            )),
+            "{what}: {rows:?}"
+        );
+    };
+    // The write is through the parameter's own cast, so only the read-path
+    // guard can refuse it.
+    let written = HEADER.replace(
+        "    byte = *p;\n",
+        "    byte = *p;\n    *(pbuf as *mut u8) = 0;\n",
+    );
+    assert_ne!(written, HEADER);
+    held(&written, "a write through the header buffer keeps the hold");
+    // A wide cursor: the cast is to `*mut u32`, so the view would not be a
+    // byte view; only the element-size guard refuses it.
+    let wide = HEADER
+        .replace("let mut p = 0 as *mut u8;", "let mut p = 0 as *mut u32;")
+        .replace("p = pbuf as *mut u8;", "p = pbuf as *mut u32;")
+        .replace("byte = *p;", "byte = *p as u8;")
+        .replace(
+            "if !psize.is_null() { *psize = *p as i32; }",
+            "if !psize.is_null() { *psize = *p as i32; }",
+        )
+        .replace(
+            "return p.offset_from(pbuf as *mut u8) as i32;",
+            "return p.offset_from(pbuf as *mut u32) as i32;",
+        );
+    assert_ne!(wide, HEADER);
+    held(&wide, "a wide cursor is not a byte view");
 }

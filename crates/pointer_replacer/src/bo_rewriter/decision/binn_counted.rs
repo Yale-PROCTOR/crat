@@ -48,11 +48,22 @@ pub(crate) struct WidthTable {
     /// source order; a constant table has exactly one arm whose literal is
     /// unused.
     pub(crate) arms: Vec<(u128, String, u64)>,
+    /// R457-5 (the header path): the callee walks the buffer by an extent the
+    /// program never states, so the view takes the ruled fallback extent with a
+    /// per-site receipt (the 2026-08-30 waiver, addendum 77). Distinct from an
+    /// unknown width, which HOLDS: this is a waiver the seat granted for one
+    /// path, not an absent count.
+    pub(crate) fabricated: bool,
 }
 
 impl WidthTable {
     /// The count text at a snapshotted call.
     pub(crate) fn render(&self) -> String {
+        if self.fabricated {
+            // R457-5: the seam renders this as the ruled fallback extent and
+            // receipts it; the text is the emitter's own path constant.
+            return super::seam::FABRICATED_LEN_PATH.to_owned();
+        }
         match self.discriminant {
             // An unknown width never renders: `count_argument` holds the site.
             None if self.arms.is_empty() => "0".to_owned(),
@@ -73,6 +84,9 @@ impl WidthTable {
 
     /// The typed receipt of the count's form.
     pub(crate) fn receipt(&self) -> String {
+        if self.fabricated {
+            return "width:fallback-extent(R457-5)".to_owned();
+        }
         match self.discriminant {
             None if self.arms.is_empty() => "width:inherited-unknown".to_owned(),
             None => format!("width:size_of::<{}>", self.arms[0].1),
@@ -94,11 +108,27 @@ impl WidthTable {
         Self {
             discriminant: None,
             arms: Vec::new(),
+            fabricated: false,
+        }
+    }
+
+    /// R457-5: the header path's table — no width, and the seat's waiver to
+    /// render the fallback extent instead of holding.
+    pub(crate) fn fallback_extent() -> Self {
+        Self {
+            discriminant: None,
+            arms: Vec::new(),
+            fabricated: true,
         }
     }
 
     pub(crate) fn is_unknown(&self) -> bool {
-        self.arms.is_empty()
+        self.arms.is_empty() && !self.fabricated
+    }
+
+    /// R457-5: does this table render the ruled fallback extent?
+    pub(crate) fn is_fallback_extent(&self) -> bool {
+        self.fabricated
     }
 
     /// The same table keyed on another parameter index (a forwarder's own
@@ -107,6 +137,7 @@ impl WidthTable {
         Self {
             discriminant: self.discriminant.map(|_| discriminant),
             arms: self.arms.clone(),
+            fabricated: self.fabricated,
         }
     }
 
@@ -274,6 +305,201 @@ fn size_of<'tcx>(tcx: TyCtxt<'tcx>, owner: LocalDefId, ty: Ty<'tcx>) -> Option<u
         .map(|layout| layout.size.bytes())
 }
 
+/// R457-5 (relay wave-6v2/028, the seat's ruling on report 023): the HEADER
+/// PATH — a `void *` parameter the callee walks by an extent the program never
+/// states.
+///
+/// `IsValidBinnHeader(pbuf, ..)` is the measured shape: it null-tests `pbuf`,
+/// casts it once to a byte pointer, walks that cursor forward reading at most
+/// nine bytes, and ends with `p.offset_from(pbuf as *mut u8)`. Its own bound
+/// (`plimit`) is built only from a POSITIVE `*psize`, and every call in the
+/// program passes `psize` null or zero — so there is no length to read, and no
+/// proof to find (report 023).
+///
+/// The seat ruled the standing slice-extent waiver (2026-08-30, addendum 77)
+/// for this path: the view is formed with `FALLBACK_SLICE_EXTENT` and a typed
+/// per-site receipt. The conditions kept are the ones that make the waiver a
+/// LENGTH claim and nothing more:
+///
+/// - every use is a null test, a cast of the bare binding to a byte pointer,
+///   or `offset_from` against such a cast — no arithmetic on the parameter
+///   itself, no aggregate, no pass-on;
+/// - nothing is WRITTEN through the parameter or through the cast's result
+///   (write positions stay held: a fabricated extent on a write would claim
+///   writable bytes, a different and worse claim);
+/// - the parameter is not itself reassigned.
+///
+/// Anything else keeps the `held:void-pointee` hold.
+pub(crate) fn prove_header_path(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
+    if s.ptr_depth != 1 || !matches!(s.kind, SubjectKind::Param { .. }) {
+        return None;
+    }
+    let Node::Pat(pat) = tcx.hir_node(s.hir_id) else { return None };
+    let typeck = tcx.typeck(s.fn_did);
+    if !super::void_pointee::has_void_pointee(tcx, typeck.pat_ty(pat), 1) {
+        return None;
+    }
+    // The header path is for a reader the program gives NO length: the seat's
+    // waiver rests on that (report 023). A by-value integer sibling is a
+    // possible count, and a parameter with one belongs to the parent lane's
+    // counted rules — whose "read alias holds" witnesses are exactly the
+    // shapes they refuse on purpose (`csv_fwrite2(src, src_size, quote)`).
+    // `IsValidBinnHeader`'s siblings are all `*mut c_int` OUT-parameters, and
+    // the one that could carry a bound arrives null or zero at every call.
+    let signature = tcx.fn_sig(s.fn_did.to_def_id()).skip_binder().skip_binder();
+    if signature
+        .inputs()
+        .iter()
+        .any(|input| matches!(input.kind(), TyKind::Int(_) | TyKind::Uint(_)))
+    {
+        return None;
+    }
+    let body = tcx.hir_body_owned_by(s.fn_did);
+    let mut uses = Uses {
+        target: s.hir_id,
+        found: Vec::new(),
+        writes: FxHashMap::default(),
+        closures: false,
+    };
+    uses.visit_expr(body.value);
+    if uses.closures || uses.writes.contains_key(&s.hir_id) {
+        return None;
+    }
+    let name = s.param_name.as_ref()?;
+    let unsafe_fn = tcx
+        .fn_sig(s.fn_did.to_def_id())
+        .skip_binder()
+        .skip_binder()
+        .safety
+        .is_unsafe();
+    let mut nullable = false;
+    let mut edits = Vec::new();
+    let mut byte_casts = 0usize;
+    let mut cursors: Vec<HirId> = Vec::new();
+    for use_ in uses.found {
+        let Node::Expr(parent) = tcx.parent_hir_node(use_.hir_id) else { return None };
+        match parent.kind {
+            ExprKind::MethodCall(segment, receiver, [], _)
+                if receiver.hir_id == use_.hir_id && segment.ident.name.as_str() == "is_null" =>
+            {
+                nullable = true;
+                edits.push(UseEdit {
+                    span: parent.span,
+                    replacement: format!("{name}.is_none()"),
+                    bridge_kind: "binn-counted-null-test",
+                });
+            }
+            // `pbuf as *mut u8` / `as *const u8`: the cursor's base. The result
+            // must never be written through.
+            ExprKind::Cast(operand, _) if operand.hir_id == use_.hir_id => {
+                let TyKind::RawPtr(pointee, _) = typeck.expr_ty(parent).kind() else {
+                    return None;
+                };
+                if size_of(tcx, s.fn_did, *pointee)? != 1 {
+                    return None;
+                }
+                if written_through(tcx, parent) {
+                    return None;
+                }
+                match tcx.parent_hir_node(parent.hir_id) {
+                    Node::Expr(assign) => {
+                        if let ExprKind::Assign(lhs, _, _) = assign.kind
+                            && let Some(cursor) = local_of(lhs)
+                        {
+                            cursors.push(cursor);
+                        }
+                    }
+                    // `let mut p = pbuf as *const u8;` — the same cursor, bound
+                    // instead of assigned (wave-6v's fixtures use this form).
+                    Node::LetStmt(let_stmt) => {
+                        if let PatKind::Binding(_, id, _, None) = let_stmt.pat.kind {
+                            cursors.push(id);
+                        }
+                    }
+                    _ => {}
+                }
+                byte_casts += 1;
+                edits.push(UseEdit {
+                    span: parent.span,
+                    replacement: crate::bo_rewriter::mechanical_receipt::present_unsafe_text(
+                        format!("{name}.unwrap_or(&[]).as_ptr().cast_mut()"),
+                        unsafe_fn,
+                    ),
+                    bridge_kind: "binn-counted-header-cursor",
+                });
+            }
+            _ => return None,
+        }
+    }
+    if byte_casts == 0 || !nullable {
+        return None;
+    }
+    // The cursor may not leave the function. wave-6v's counted-void witnesses
+    // are the control: a cursor whose address is observed as an integer, or
+    // handed to a callee, is exactly the shape their rule HOLDS, and the
+    // fabricated extent must not take it from them. A cursor here may only be
+    // read through, stepped, compared, and differenced.
+    for cursor in cursors {
+        let mut cursor_uses = Uses {
+            target: cursor,
+            found: Vec::new(),
+            writes: FxHashMap::default(),
+            closures: false,
+        };
+        cursor_uses.visit_expr(body.value);
+        for use_ in cursor_uses.found {
+            let Node::Expr(parent) = tcx.parent_hir_node(use_.hir_id) else { return None };
+            let confined = match parent.kind {
+                ExprKind::Unary(rustc_hir::UnOp::Deref, _) => !is_written(tcx, parent),
+                ExprKind::MethodCall(segment, receiver, _, _) if receiver.hir_id == use_.hir_id => {
+                    matches!(
+                        segment.ident.name.as_str(),
+                        "offset"
+                            | "add"
+                            | "sub"
+                            | "wrapping_offset"
+                            | "wrapping_add"
+                            | "wrapping_sub"
+                            | "offset_from"
+                            | "is_null"
+                    )
+                }
+                ExprKind::Binary(..) => true,
+                ExprKind::Assign(lhs, _, _) => local_of(lhs) == Some(cursor),
+                _ => false,
+            };
+            if !confined {
+                return None;
+            }
+        }
+    }
+    Some(Contract {
+        count_index: 0,
+        element: ByteElement::Read,
+        nullable,
+        handle: None,
+        width: Some(WidthTable::fallback_extent()),
+        uses: edits,
+    })
+}
+
+/// Is this expression's value written through anywhere in the enclosing body?
+/// Conservative: any `*e = ..` whose base is the expression, or a pass of it
+/// into a call, counts as a possible write and refuses the header path.
+fn written_through(tcx: TyCtxt<'_>, cast: &Expr<'_>) -> bool {
+    match tcx.parent_hir_node(cast.hir_id) {
+        // `p = pbuf as *mut u8` — the cursor local. Its own uses decide, and
+        // the emitted cursor is a raw pointer either way; the parameter's view
+        // is READ-only as long as nothing writes through the parameter itself.
+        Node::Expr(parent) => match parent.kind {
+            ExprKind::Assign(lhs, rhs, _) => lhs.hir_id == cast.hir_id && rhs.hir_id != cast.hir_id,
+            ExprKind::Unary(rustc_hir::UnOp::Deref, _) => is_written(tcx, parent),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// A typed-width read parameter's contract, or `None` (the R271-1 hold stands).
 pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
     if s.ptr_depth != 1 || !matches!(s.kind, SubjectKind::Param { .. }) {
@@ -364,6 +590,7 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         WidthTable {
             discriminant: None,
             arms: vec![(0, ty.clone(), *size)],
+            fabricated: false,
         }
     } else {
         // Every read sits under a literal arm of ONE match over an unchanged
@@ -392,6 +619,7 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         WidthTable {
             discriminant: Some(discriminant),
             arms,
+            fabricated: false,
         }
     };
     let view = if nullable {

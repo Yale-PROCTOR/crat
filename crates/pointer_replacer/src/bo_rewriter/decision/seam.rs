@@ -4610,7 +4610,14 @@ pub(crate) fn synthesize_with_raw_boundary(
                     _ => None,
                 });
                 let (len_text, len_evidence) = if let Some(Ok((count, _))) = counted_len {
-                    (Some(count), Some(LenEvidence::Elsewhere))
+                    // wave-6v2 (R457-5): the header path's count IS the ruled
+                    // fallback path constant; `None` here is what makes the
+                    // spec fabricate and receipt it as such.
+                    if count == FABRICATED_LEN_PATH {
+                        (None, Some(LenEvidence::Elsewhere))
+                    } else {
+                        (Some(count), Some(LenEvidence::Elsewhere))
+                    }
                 } else if let Some(region) = region {
                     // wave-6b: the byte length is the callee's own region.
                     (region.len_text(), Some(LenEvidence::Elsewhere))

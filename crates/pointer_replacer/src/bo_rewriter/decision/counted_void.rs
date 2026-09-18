@@ -129,6 +129,7 @@ pub(crate) fn collect(
                 .or_else(|| super::counted_void_handle::prove(tcx, s))
                 .or_else(|| super::binn_counted::prove(tcx, s))
                 .or_else(|| super::binn_counted::prove_foreign_copy(tcx, s))
+                .or_else(|| super::binn_counted::prove_header_path(tcx, s))
                 .map(|c| (s, c))
         })
         .collect();
@@ -887,6 +888,13 @@ pub(crate) fn count_argument<'tcx>(
         // caller: the site holds typed.
         if width.is_unknown() {
             return Err(SeamBlock::LengthUnknown);
+        }
+        // R457-5: the header path's view takes the ruled fallback extent. The
+        // count text is the emitter's own path constant, which the seam turns
+        // into `SeamLen::Fabricated` — so the receipt reads
+        // `fallback(FALLBACK_SLICE_EXTENT=1024)`, never `evidence-backed`.
+        if width.is_fallback_extent() {
+            return Ok((width.render(), route));
         }
         if route != Route::RawTwin {
             let discriminant = width.discriminant.map(|k| args.get(k)).flatten();
