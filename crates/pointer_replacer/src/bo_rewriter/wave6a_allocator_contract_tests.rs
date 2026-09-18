@@ -1019,3 +1019,108 @@ fn w6a_glue_each_box_shape_renders_its_own_raw_view() {
         "x.as_deref().map_or(core::ptr::null(), |s| s.as_ptr())"
     );
 }
+
+const MOVE_INTO_HELD_OWNER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn exit(code: i32) -> !;
+}
+#[repr(C)]
+pub struct MemoryManager {
+    pub alloc_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, usize) -> *mut std::os::raw::c_void>,
+    pub free_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void)>,
+    pub opaque: *mut std::os::raw::c_void,
+}
+pub unsafe extern "C" fn BrotliAllocate(mut m: *mut MemoryManager, mut n: usize) -> *mut std::os::raw::c_void {
+    let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+    if result.is_null() { exit(1 as i32); }
+    return result;
+}
+pub unsafe extern "C" fn BrotliFree(mut m: *mut MemoryManager, mut p: *mut std::os::raw::c_void) {
+    ((*m).free_func).expect("non-null function pointer")((*m).opaque, p);
+}
+pub unsafe extern "C" fn ensure_capacity(mut m: *mut MemoryManager, mut n: usize) -> *mut u32 {
+    let mut all_values = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    let mut new_array = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(2 as usize).wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    *new_array.offset(0 as isize) = *all_values.offset(0 as isize);
+    BrotliFree(m, all_values as *mut std::os::raw::c_void);
+    all_values = new_array;
+    return all_values;
+}
+pub unsafe extern "C" fn ensure_capacity_freed(mut m: *mut MemoryManager, mut n: usize) {
+    let mut all_values = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    let mut new_array = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(2 as usize).wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    *new_array.offset(0 as isize) = *all_values.offset(0 as isize);
+    BrotliFree(m, all_values as *mut std::os::raw::c_void);
+    all_values = new_array;
+    BrotliFree(m, all_values as *mut std::os::raw::c_void);
+    all_values = 0 as *mut u32;
+}
+"#;
+
+/// **A move's destination must be an owner this rule ADMITS, not merely a
+/// candidate** (report 027). `new_array` hands its generation to
+/// `all_values` — brotli's ensure-capacity shape — and `all_values` is HELD
+/// (here by its return; on the corpus by `use:call-argument-not-a-lend` at
+/// `BrotliHistogramCombine*`). Admitting the mover alone assigns an
+/// `Option<Box<[T]>>` into a place that stays raw, which is exactly the one
+/// diagnostic each of batch 12's six `verify-reverted` Box classes carried:
+/// `expected raw pointer *mut HistogramLiteral, found enum
+/// Option<Box<[HistogramLiteral]>>` (24 of brotli's 45 reverted Box rows, and
+/// the 20 `closure:partition` rows behind them).
+///
+/// One fault: let the destination be any candidate (the pre-fix `move_ok`) and
+/// `new_array` is admitted again — the receipt flips to `admitted` and the
+/// emitted text carries the Box into the raw place.
+#[test]
+fn w6a_ac_a_move_into_a_held_owner_is_refused() {
+    let out = emitted("ac-move-into-held", MOVE_INTO_HELD_OWNER);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        receipts.contains(
+            "ensure_capacity::new_array\theld\tcontract-allocation:use:moved-into-unadmitted-owner:ensure_capacity::all_values"
+        ),
+        "the mover is held with its destination\n{receipts}"
+    );
+    assert!(
+        !receipts.contains("ensure_capacity::new_array\tadmitted"),
+        "no admission for the mover\n{receipts}"
+    );
+    let text = compact(&out.source);
+    let held_fn = &text[text
+        .find("fnensure_capacity(")
+        .expect("the held-destination function")
+        ..text.find("fnensure_capacity_freed").expect("the sibling")];
+    assert!(
+        held_fn.contains("all_values=new_array;"),
+        "the move keeps its text\n{}",
+        out.source
+    );
+    assert!(
+        !held_fn.contains("Box<"),
+        "no Box anywhere in the held-destination function\n{}",
+        out.source
+    );
+    // The fix is a condition on the destination, not a ban on moves: the
+    // sibling whose destination this rule DOES admit (it frees the moved
+    // generation here) keeps both owners and the move's own text.
+    assert!(
+        receipts.contains("ensure_capacity_freed::new_array\tadmitted"),
+        "a move into an admitted owner still delivers\n{receipts}"
+    );
+    assert!(
+        text.contains("fnensure_capacity_freed")
+            && text.contains("letmutall_values:Option<Box<[u32]>>"),
+        "the admitted destination is the Box\n{}",
+        out.source
+    );
+}

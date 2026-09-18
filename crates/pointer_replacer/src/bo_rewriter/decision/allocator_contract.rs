@@ -639,6 +639,10 @@ pub(crate) fn derive<'tcx>(
             .map(|(hir, _, _, _, _)| *hir)
             .collect();
         let move_ok = |destination: HirId| candidates.contains(&destination);
+        // A move's destination must be an owner this rule ADMITS, not merely a
+        // candidate: `moves` records each admitted mover's destination and the
+        // loop after this one demotes any whose destination is not admitted.
+        let mut moves: Vec<(HirId, (LocalDefId, HirId), String, bool, String)> = Vec::new();
         for subject in subjects
             .iter()
             .filter(|s| s.fn_did == function && s.kind == SubjectKind::Local)
@@ -1170,6 +1174,18 @@ pub(crate) fn derive<'tcx>(
             for receipt in &receipts {
                 out.admitted.push((label.clone(), receipt.clone()));
             }
+            // The destinations this owner's generation moves into; the loop
+            // after this one demotes the owner if one of them is not itself an
+            // admitted owner (report 027).
+            for (destination, source, _) in &scan.moves {
+                if *source == subject.hir_id {
+                    let destination_label = subjects
+                        .iter()
+                        .find(|s| s.fn_did == function && s.hir_id == *destination)
+                        .map_or_else(|| "?".to_owned(), |s| s.label.clone());
+                    moves.push((*destination, node, label.clone(), yields, destination_label));
+                }
+            }
             out.plans.insert(
                 node,
                 BoxPlan {
@@ -1186,6 +1202,33 @@ pub(crate) fn derive<'tcx>(
                     implicit_scope_close: false,
                 },
             );
+        }
+        // **A move's destination must be an owner this rule ADMITS**, not
+        // merely a candidate (report 027). The destination has its own uses and
+        // may hold on any of them — brotli's ensure-capacity `all_histograms`
+        // holds at `BrotliHistogramCombine*` (`use:call-argument-not-a-lend`) —
+        // and admitting the mover alone assigns an `Option<Box<[T]>>` into a
+        // place that stays raw. That was the one diagnostic each of batch 12's
+        // six `verify-reverted` Box classes carried: `expected raw pointer
+        // *mut HistogramLiteral, found enum Option<Box<[HistogramLiteral]>>`.
+        // A demotion can strip the destination of ITS mover, so the loop runs
+        // until nothing moves into an unadmitted owner; each turn removes one
+        // plan, which bounds it.
+        while let Some((node, label, yields, text)) = moves
+            .iter()
+            .find(|(destination, node, _, _, _)| {
+                out.plans.contains_key(node) && !out.plans.contains_key(&(function, *destination))
+            })
+            .map(|(_, node, label, yields, text)| (*node, label.clone(), *yields, text.clone()))
+        {
+            out.plans.remove(&node);
+            out.admitted.retain(|(l, _)| *l != label);
+            let reason = format!("{USE}:moved-into-unadmitted-owner:{text}");
+            if yields {
+                out.yields.push((label, reason));
+            } else {
+                out.holds.insert(node, (label, reason));
+            }
         }
     }
     out
