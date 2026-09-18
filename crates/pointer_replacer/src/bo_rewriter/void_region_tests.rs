@@ -903,3 +903,120 @@ fn w6b_a_withdrawn_chain_link_takes_its_siblings() {
         "the tree compiles with one link withdrawn: {source}"
     );
 }
+
+/// The decision table of one fixture, for a test that asks a table question.
+fn table_of<T: Send>(
+    input: &str,
+    ask: impl Fn(&super::decision::DecisionTable) -> T + Sync,
+) -> Result<T, String> {
+    match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let (table, _) = super::decide_table_with_ctx(tcx)?;
+            Ok(ask(&table))
+        },
+    ) {
+        Ok(inner) => inner,
+        Err(why) => Err(format!("{why:?}")),
+    }
+}
+
+/// The width WRITER and its caller (rs-crown/brotli
+/// `src::enc::brotli_bit_stream::{BrotliUnalignedWrite64, BrotliWriteBits}`),
+/// the mirror of [`READ32`]. `BrotliWriteBits` extracts a byte pointer from
+/// its own `array` and hands it to the writer through a `c_void` cast — the
+/// shape wave-5c 023 §3 names as the reason `array` reads `kind-raw`.
+pub(super) const WRITE64: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type uint64_t = u64;
+pub type size_t = usize;
+unsafe extern "C" fn BrotliUnalignedWrite64(mut p: *mut core::ffi::c_void, mut v: uint64_t) {
+    *(p as *mut uint64_t) = v;
+}
+pub unsafe extern "C" fn BrotliWriteBits(
+    mut n_bits: size_t,
+    mut bits: uint64_t,
+    mut pos: *mut size_t,
+    mut array: *mut uint8_t,
+) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    let mut v = *p as uint64_t;
+    v |= bits << (*pos & 7 as i32 as size_t);
+    BrotliUnalignedWrite64(p as *mut core::ffi::c_void, v);
+    *pos = (*pos as size_t).wrapping_add(n_bits) as size_t;
+}
+"#;
+
+/// **The write side is BUILT and the wall is the analysis's** (relay 021 §1,
+/// R455-4). A `c_void` parameter whose whole body is `*(p as *mut T) = v;` is
+/// a region of exactly `size_of::<T>()` bytes, written as a checked copy of
+/// the value's own bytes. The contract is collected here — and the ladder
+/// still refuses the subject with **`kind-raw`**, BO's verdict that a
+/// reference to that slot is not sound, which this lane may not override
+/// (R395-2). Measured at the record frame: all four
+/// `BrotliUnalignedWrite*::p` rows and `BrotliWriteBits`' `array` / `p` carry
+/// `model_kind=raw`, against `model_kind=ref` on all 14 read rows.
+#[test]
+fn w6b_the_width_writer_is_contracted_and_walled_by_the_model() {
+    let region = table_of(WRITE64, |table| {
+        table.void_region.iter().find_map(|((owner, _), region)| {
+            table
+                .entries
+                .iter()
+                .any(|(s, _)| s.fn_did == *owner && s.label.starts_with("BrotliUnalignedWrite64::"))
+                .then(|| {
+                    (
+                        region.shape,
+                        region.len_bytes,
+                        region.mutable,
+                        region.uses.len(),
+                    )
+                })
+        })
+    })
+    .expect("the fixture yields a table")
+    .expect("the writer carries a region contract");
+    assert_eq!(
+        region,
+        (
+            super::decision::void_region::Shape::WidthWrite,
+            Some(8),
+            true,
+            1
+        ),
+        "an exact 8-byte MUTABLE region with one body rewrite"
+    );
+    let rows = super::emit_tests::decisions_of(WRITE64);
+    assert_eq!(
+        reason(&rows, "p"),
+        "kind-raw",
+        "the wall is BO's kind, not this family's hold: {rows:?}"
+    );
+}
+
+/// A writer whose written VALUE reads the buffer is not in the class: the copy
+/// would borrow the region while the value still reads it. Read at the
+/// CONTRACT, because `kind-raw` masks every ladder reason on this shape.
+#[test]
+fn w6b_a_write_whose_value_reads_the_buffer_is_not_contracted() {
+    let self_reading = WRITE64.replace(
+        "    *(p as *mut uint64_t) = v;",
+        "    *(p as *mut uint64_t) = v ^ *(p as *mut uint64_t);",
+    );
+    let contracts = table_of(&self_reading, |table| table.void_region.len())
+        .expect("the fixture yields a table");
+    assert_eq!(contracts, 0, "a self-reading write carries no region");
+}
+
+/// A body with anything beside the single write is not in the class.
+#[test]
+fn w6b_a_write_beside_another_statement_is_not_contracted() {
+    let extra = WRITE64.replace(
+        "    *(p as *mut uint64_t) = v;",
+        "    let mut seen = v;\n    *(p as *mut uint64_t) = seen;",
+    );
+    let contracts =
+        table_of(&extra, |table| table.void_region.len()).expect("the fixture yields a table");
+    assert_eq!(contracts, 0, "a body beyond the write carries no region");
+}

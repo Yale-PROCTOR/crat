@@ -71,6 +71,9 @@ pub(crate) enum Shape {
     Accessor,
     /// `return *(p as *const T)` — one value of `T` read at offset 0.
     WidthRead,
+    /// `*(p as *mut T) = v;` — one value of `T` WRITTEN at offset 0, the
+    /// mirror of [`Shape::WidthRead`] (brotli's `BrotliUnalignedWrite32/64`).
+    WidthWrite,
     /// A LOCAL `let v = p as *mut u8` over a typed scalar parameter `p: *mut T`:
     /// the `size_of::<T>()` bytes of one scalar, viewed byte by byte (relay
     /// 009 / R416-7; binn `copy_be64::source`). The local is the subject; the
@@ -83,6 +86,7 @@ impl Shape {
         match self {
             Self::Accessor => "accessor",
             Self::WidthRead => "width-read",
+            Self::WidthWrite => "width-write",
             Self::ByteView => "byte-view",
         }
     }
@@ -152,8 +156,10 @@ struct Chain {
     element_size: u64,
     element_align: u64,
     mutable: bool,
-    /// The whole returned expression.
+    /// The whole returned expression, or the whole assignment for a writer.
     returned: Span,
+    /// A writer's written VALUE, whose bytes the region copy takes.
+    written: Option<Span>,
     /// The inner accessor this chain continues, if any.
     inner: Option<LocalDefId>,
     /// The parameter binding.
@@ -253,6 +259,25 @@ fn sole_return<'tcx>(body: &'tcx Expr<'tcx>) -> Option<&'tcx Expr<'tcx>> {
         },
         _ => None,
     }
+}
+
+/// The single assignment statement of a body that is nothing else:
+/// `*(p as *mut T) = v;` and no more. The write mirror of [`sole_return`], and
+/// as strict: a body with any other statement is not in the class.
+fn sole_assignment<'tcx>(
+    body: &'tcx Expr<'tcx>,
+) -> Option<(&'tcx Expr<'tcx>, &'tcx Expr<'tcx>, &'tcx Expr<'tcx>)> {
+    let ExprKind::Block(block, _) = body.kind else { return None };
+    let whole = match (block.stmts, block.expr) {
+        ([stmt], None) => match stmt.kind {
+            StmtKind::Semi(expr) | StmtKind::Expr(expr) => expr,
+            _ => return None,
+        },
+        ([], Some(expr)) => expr,
+        _ => return None,
+    };
+    let ExprKind::Assign(place, value, _) = whole.kind else { return None };
+    Some((whole, place, value))
 }
 
 /// Peel casts, returning the operand and the outermost cast's written pointee
@@ -407,11 +432,58 @@ fn read_chain<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<Chain> {
     }
     let param_name = subject.param_name.clone()?;
     let body = tcx.hir_body_owned_by(subject.fn_did).value;
+    let typeck = tcx.typeck(subject.fn_did);
+
+    // Width writer: `*(p as *mut T) = v;`, the mirror of the reader below.
+    // The written value is any expression that does not mention the buffer —
+    // in the corpus it is the function's other parameter — and the whole
+    // assignment is replaced, so `p` has no use left outside the region.
+    if let Some((whole, place, value)) = sole_assignment(body)
+        && !whole.span.from_expansion()
+        && let ExprKind::Unary(UnOp::Deref, operand) = place.kind
+    {
+        let (base, cast) = peel_casts(tcx, operand);
+        let (element, mutable) = cast?;
+        if !is_param_path(base, subject.hir_id) || !mutable {
+            return None;
+        }
+        let ty = typeck.expr_ty(place);
+        if !matches!(
+            ty.kind(),
+            TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+        ) {
+            return None;
+        }
+        // The written value may not reach the buffer: a value derived from `p`
+        // would read the region while the write borrows it.
+        let mut counter = UseCounter {
+            local: subject.hir_id,
+            count: 0,
+        };
+        rustc_hir::intravisit::Visitor::visit_expr(&mut counter, value);
+        if counter.count != 0 {
+            return None;
+        }
+        let (element_size, element_align) = layout_of(tcx, subject.fn_did, ty)?;
+        return Some(Chain {
+            shape: Shape::WidthWrite,
+            offset_bytes: 0,
+            element,
+            element_size,
+            element_align,
+            mutable: true,
+            returned: whole.span,
+            written: Some(value.span),
+            inner: None,
+            param: subject.hir_id,
+            param_name,
+        });
+    }
+
     let returned = sole_return(body)?;
     if returned.span.from_expansion() {
         return None;
     }
-    let typeck = tcx.typeck(subject.fn_did);
 
     // Width reader: `*(p as *const T)`.
     if let ExprKind::Unary(UnOp::Deref, operand) = returned.kind {
@@ -436,6 +508,7 @@ fn read_chain<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<Chain> {
             element_align,
             mutable: false,
             returned: returned.span,
+            written: None,
             inner: None,
             param: subject.hir_id,
             param_name,
@@ -459,6 +532,7 @@ fn read_chain<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<Chain> {
         element_align,
         mutable,
         returned: returned.span,
+        written: None,
         inner: None,
         param: subject.hir_id,
         param_name,
@@ -591,7 +665,7 @@ pub(crate) fn collect(
         let len_bytes = match chain.shape {
             // A chain is read from a parameter's body; a byte view is a local's.
             Shape::ByteView => unreachable!("a chain never reads as a byte view"),
-            Shape::WidthRead => Some(chain.element_size),
+            Shape::WidthRead | Shape::WidthWrite => Some(chain.element_size),
             Shape::Accessor => absolute
                 .iter()
                 .filter(|(other, (off, other_root))| {
@@ -604,6 +678,15 @@ pub(crate) fn collect(
         let element = &chain.element;
         let replacement = match chain.shape {
             Shape::ByteView => unreachable!("a chain never reads as a byte view"),
+            // The whole assignment becomes a checked copy of the value's own
+            // bytes into the region — same width, same order, no pointer.
+            Shape::WidthWrite => {
+                let Some(written) = chain.written else { continue };
+                let Ok(value) = tcx.sess.source_map().span_to_snippet(written) else {
+                    continue;
+                };
+                format!("{name}.copy_from_slice(&({value}).to_ne_bytes())")
+            }
             Shape::WidthRead => {
                 let bytes = (0..chain.element_size)
                     .map(|i| format!("{name}[{i}]"))
@@ -842,8 +925,9 @@ pub(crate) fn retention(
 ) {
     use crate::bo_rewriter::bridge_receipt::BridgeRetentionTier;
     match region.shape {
-        // A byte view is a local's own reborrow; nothing is called.
-        Shape::WidthRead | Shape::ByteView => (BridgeRetentionTier::T1, None),
+        // A byte view is a local's own reborrow; a width read or write calls
+        // nothing and keeps nothing.
+        Shape::WidthRead | Shape::WidthWrite | Shape::ByteView => (BridgeRetentionTier::T1, None),
         Shape::Accessor => (
             BridgeRetentionTier::T2,
             Some(crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
