@@ -765,3 +765,76 @@ fn r453_2_a_candidate_placed_at_the_predecessor_is_not_retired_by_proximity() {
         );
     });
 }
+
+/// **R459-5 (wave-5d2 029 §3) — a degraded subject whose emitted declaration
+/// another subject's plan renders is not a blocker of its class.**
+///
+/// heman's `transform_to_*` views `f` / `d` are degraded `copy-source-coupled`
+/// while the OWNER's plan renders their declarations as exact suffixes. R456-8's
+/// counter already calls such a row delivered whichever plan rendered it; until
+/// this predicate the class hold still read it as a blocker, so the two
+/// consumers disagreed about one row.
+///
+/// Pinned on both halves of the predicate: an edit of ANOTHER subject covering
+/// the degraded subject's declaration puts it in the set, and the same edit
+/// carrying the subject's OWN identity tail does not — a subject never
+/// discharges itself.
+#[test]
+fn r459_5_a_declaration_rendered_by_another_plan_is_not_a_blocker() {
+    with_baseline(|prior| {
+        let (degraded, _) = subject(&prior, "slice_values").clone();
+        let owner = SignatureClassId::of(degraded.fn_did);
+        let tail = format!(
+            "::{}#{}",
+            degraded.param_name.as_deref().unwrap(),
+            degraded.local.as_u32()
+        );
+        let mut table = prior.table.clone();
+        for (subject, decision) in &mut table.entries {
+            if subject.hir_id == degraded.hir_id {
+                *decision = Decision::Degraded(Degradation {
+                    subject: subject.label.clone(),
+                    site: "<the derived view>".to_owned(),
+                    reason: DegradeReason::KindRaw,
+                });
+            }
+        }
+        // The declaration range this fake locator reports for every subject.
+        let locate = |_: rustc_span::Span| {
+            Ok((
+                plan::FileKey::Virtual("main.rs".to_owned()),
+                100usize,
+                120usize,
+            ))
+        };
+        let covering = |subject_id: &str| {
+            let mut planned = prior.plan.clone();
+            let mut edit = planned
+                .by_file
+                .values()
+                .flatten()
+                .next()
+                .expect("the baseline plans at least one edit")
+                .clone();
+            edit.lo = 90;
+            edit.hi = 130;
+            edit.edit_kind = "subject-declaration";
+            edit.owner_class = Some(owner);
+            edit.subject_id = subject_id.to_owned();
+            planned.by_file.clear();
+            planned
+                .by_file
+                .insert(plan::FileKey::Virtual("main.rs".to_owned()), vec![edit]);
+            plan::declarations_rendered_by_another_plan(&planned, &table, locate)
+                .contains(&(degraded.fn_did, degraded.hir_id))
+        };
+        assert!(
+            covering("some_other::owner_value#7"),
+            "another subject's declaration edit covers this one"
+        );
+        assert!(
+            !covering(&format!("slice{tail}")),
+            "a subject must not discharge itself"
+        );
+    });
+}

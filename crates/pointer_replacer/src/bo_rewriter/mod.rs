@@ -6494,7 +6494,14 @@ fn prepare_plan_files<'tcx>(
     }
     shared_read_arguments::plan(tcx, table, reverted, &mut planned, span_to_loc)?;
     plan::link_a5_fallback_carriers(&mut planned, table, span_to_loc);
-    plan::finalize_signature_classes(&mut planned, table, reverted);
+    let declaration_rendered_elsewhere =
+        plan::declarations_rendered_by_another_plan(&planned, table, span_to_loc);
+    plan::finalize_signature_classes(
+        &mut planned,
+        table,
+        reverted,
+        &declaration_rendered_elsewhere,
+    );
     validate_cursor_delivered_bases(tcx, table, &mut planned);
     let return_dependency_edges = planned
         .class_finalization

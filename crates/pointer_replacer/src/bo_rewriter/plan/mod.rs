@@ -1282,10 +1282,75 @@ pub(crate) fn additive_option_fallbacks(
     requests
 }
 
+/// The degraded subjects whose emitted DECLARATION another subject's plan
+/// renders — R456-8's predicate, read over the edits that exist.
+///
+/// wave-5d2 029 §3: heman's `transform_to_*` views `f` / `d` are degraded
+/// `copy-source-coupled`, and the OWNER's plan renders their declarations as
+/// exact suffixes. The counter (R456-8) already says such a row is delivered
+/// whichever plan rendered it; the class hold still read it as a blocker. One
+/// predicate, two consumers — this is the half the hold consumes.
+///
+/// Containment, not equality: the owner's declaration edit covers the view's
+/// own declaration range. An edit of the subject's OWN plan is excluded by its
+/// identity tail (`::<param>#<local>`), so a subject never discharges itself.
+pub(crate) fn declarations_rendered_by_another_plan(
+    planned: &Plan,
+    table: &DecisionTable,
+    span_to_loc: impl Fn(rustc_span::Span) -> Result<(FileKey, usize, usize), &'static str>,
+) -> rustc_hash::FxHashSet<(rustc_hir::def_id::LocalDefId, rustc_hir::HirId)> {
+    let mut out = rustc_hash::FxHashSet::default();
+    for (subject, decision) in &table.entries {
+        // Exhaustive by the import-denylist rule.
+        let degraded = match decision {
+            Decision::Degraded(_) => true,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Opt { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Box(_) => false,
+        };
+        if !degraded {
+            continue;
+        }
+        let Ok((file, lo, hi)) = span_to_loc(subject.attribution_span()) else {
+            continue;
+        };
+        let owner = SignatureClassId::of(subject.fn_did);
+        let tail = format!(
+            "::{}#{}",
+            subject.param_name.as_deref().unwrap_or("<unnamed>"),
+            subject.local.as_u32()
+        );
+        let rendered = planned
+            .by_file
+            .get(&file)
+            .into_iter()
+            .flatten()
+            .any(|edit| {
+                matches!(edit.edit_kind, "subject-declaration" | "cursor-declaration")
+                    && edit.owner_class == Some(owner)
+                    && !edit.subject_id.ends_with(&tail)
+                    && edit.lo <= lo
+                    && hi <= edit.hi
+            });
+        if rendered {
+            out.insert((subject.fn_did, subject.hir_id));
+        }
+    }
+    out
+}
+
 pub(crate) fn finalize_signature_classes(
     planned: &mut Plan,
     table: &DecisionTable,
     pre_reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
+    declaration_rendered_elsewhere: &rustc_hash::FxHashSet<(
+        rustc_hir::def_id::LocalDefId,
+        rustc_hir::HirId,
+    )>,
 ) {
     use sha2::{Digest, Sha256};
 
@@ -1323,7 +1388,13 @@ pub(crate) fn finalize_signature_classes(
                 .or_insert_with(|| ClassInput::new(id, required));
         }
         if let Some(reason) = degraded_reason.filter(|_| {
-            !required.is_empty() && !class_split::raw_form_discharges(table, subject, required)
+            !required.is_empty()
+                && !class_split::raw_form_discharges(table, subject, required)
+                // R459-5: a degraded subject whose emitted declaration another
+                // subject's plan renders is not a blocker of its class. The
+                // counter already calls such a row delivered; the hold agreeing
+                // is what stops the two disagreeing about the same row.
+                && !declaration_rendered_elsewhere.contains(&(subject.fn_did, subject.hir_id))
         }) {
             degraded.entry(id).or_default().push(reason.to_owned());
         }
