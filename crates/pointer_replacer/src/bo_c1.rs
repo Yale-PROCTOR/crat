@@ -1603,6 +1603,83 @@ fn cache_only_before_solve<T>(
     Ok(proceed())
 }
 
+/// **R464-5 (wave-6f 040 STOP 1) — the field receipt's `revert_status` against the
+/// final-revert table, BOTH ways.**
+///
+/// `revert_status` is computed in `field_reference.rs` from the revert set the
+/// caller hands it, and `mod.rs` calls that refresh from four separate sites. The
+/// column is therefore only as true as its wiring: a refresh that misses a path,
+/// or is handed the mid-run set where the final one was meant, produces a receipt
+/// that reads `active` for a conversion the program never received — which is the
+/// exact defect the column was added to prevent.
+///
+/// So the harness checks it against the PUBLISHED `final-reverts` table rather
+/// than against the predicate that wrote it, which would be a tautology:
+///
+/// * forward — a `withdrawn` row names at least one owner that really reverted;
+/// * backward — a row whose owner really reverted does not read `active`;
+/// * a `held` row carries `-`, having never reached a revert set to be withdrawn
+///   from.
+///
+/// A frame whose receipt predates the column is `Ok`: absence is not disagreement.
+fn field_transaction_revert_status_agrees(
+    field_transactions: &str,
+    final_reverts: &str,
+) -> Result<(), String> {
+    let column = |header: &str, name: &str| header.split('\t').position(|c| c == name);
+    let mut reverts = final_reverts.lines();
+    let Some(revert_header) = reverts.next() else {
+        return Ok(());
+    };
+    let identity = column(revert_header, "identity")
+        .ok_or_else(|| "final-reverts lacks identity".to_owned())?;
+    let reverted = reverts
+        .filter_map(|line| line.split('\t').nth(identity).map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut rows = field_transactions.lines();
+    let Some(header) = rows.next() else {
+        return Ok(());
+    };
+    let Some(status_column) = column(header, "revert_status") else {
+        return Ok(()); // a frame before wave-6f's column; nothing to check
+    };
+    let owners = column(header, "owners").ok_or_else(|| "receipt lacks owners".to_owned())?;
+    let status = column(header, "status").ok_or_else(|| "receipt lacks status".to_owned())?;
+    for line in rows {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let (Some(plan), Some(revert_status), Some(owner_list)) = (
+            fields.get(status),
+            fields.get(status_column),
+            fields.get(owners),
+        ) else {
+            continue;
+        };
+        if *plan == "held" {
+            if *revert_status != "-" {
+                return Err(format!("held row carries revert_status {revert_status}"));
+            }
+            continue;
+        }
+        let any = owner_list
+            .split(';')
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty() && *owner != "-")
+            .any(|owner| reverted.contains(owner));
+        match (*revert_status, any) {
+            ("withdrawn", false) => {
+                return Err(format!("withdrawn but no owner reverted: {owner_list}"));
+            }
+            ("active", true) => {
+                return Err(format!("owner reverted but reads active: {owner_list}"));
+            }
+            ("withdrawn" | "active", _) => {}
+            other => return Err(format!("unknown revert_status {:?}", other.0)),
+        }
+    }
+    Ok(())
+}
+
 fn accepted_cache_manifest_contains(
     manifest: &str,
     program: &str,
@@ -12201,6 +12278,18 @@ mod run {
                 artifact.allocator_contract_receipts.as_str(),
             ),
         ];
+        // **R464-5 (wave-6f 040 STOP 1)** — the field receipt's `revert_status`
+        // against the final-revert table, checked on the PUBLISHED rows rather
+        // than on the predicate that wrote them. It fires on the first census
+        // whose receipt carries the column; before that the check is vacuous.
+        if let Err(disagreement) = super::field_transaction_revert_status_agrees(
+            &artifact.field_transactions,
+            &artifact.final_reverts,
+        ) {
+            row.set(raw_schema::STATUS, "field-revert-status-disagreement");
+            row.set("detail", super::report::sanitize(&disagreement));
+            return row;
+        }
         for (suffix, contents) in artifact_rows {
             std::fs::write(
                 directory.join(format!("{name}.raw-boundary-{suffix}.tsv")),
@@ -25313,6 +25402,66 @@ fn raw_boundary_wave2_corpus_census() {
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
+}
+
+#[test]
+fn r464_5_the_field_receipt_revert_status_agrees_with_the_final_revert_table() {
+    let reverts =
+        "program\tkind\tidentity\n                   heman\tfunction\tsrc::a::owner_reverted\n";
+    let receipt = |owners: &str, revert_status: &str| {
+        format!(
+            "program\tstruct\tfield\tstatus\towners\trevert_status\n             heman\tS\tf\tapplied\t{owners}\t{revert_status}\n"
+        )
+    };
+
+    // Agreement, in both directions.
+    assert!(
+        field_transaction_revert_status_agrees(
+            &receipt("src::a::owner_reverted", "withdrawn"),
+            reverts
+        )
+        .is_ok()
+    );
+    assert!(
+        field_transaction_revert_status_agrees(&receipt("src::a::kept", "active"), reverts).is_ok()
+    );
+    // One owner of several reverting is enough to withdraw the transaction.
+    assert!(
+        field_transaction_revert_status_agrees(
+            &receipt("src::a::kept;src::a::owner_reverted", "withdrawn"),
+            reverts
+        )
+        .is_ok()
+    );
+
+    // FORWARD: `withdrawn` must name an owner that really reverted.
+    assert!(
+        field_transaction_revert_status_agrees(&receipt("src::a::kept", "withdrawn"), reverts)
+            .is_err()
+    );
+    // BACKWARD: an owner that really reverted may not read `active` -- the wiring
+    // defect this exists to catch, where a refresh missed a path or was handed the
+    // mid-run revert set.
+    assert!(
+        field_transaction_revert_status_agrees(
+            &receipt("src::a::owner_reverted", "active"),
+            reverts
+        )
+        .is_err()
+    );
+    // A held row never reached a revert set to be withdrawn from.
+    assert!(field_transaction_revert_status_agrees(
+        "program\tstruct\tfield\tstatus\towners\trevert_status\nheman\tS\tf\theld\t-\twithdrawn\n",
+        reverts
+    )
+    .is_err());
+
+    // A frame whose receipt predates the column is not a disagreement.
+    assert!(field_transaction_revert_status_agrees(
+        "program\tstruct\tfield\tstatus\towners\nheman\tS\tf\tapplied\tsrc::a::owner_reverted\n",
+        reverts
+    )
+    .is_ok());
 }
 
 #[test]
