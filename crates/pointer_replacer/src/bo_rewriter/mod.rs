@@ -115,8 +115,6 @@ mod slice_cursor_prelude;
 mod slice_forms_ast;
 #[cfg(test)]
 mod slice_forms_tests;
-#[cfg(test)]
-mod wave6k_typedef_parameter_tests;
 pub(crate) mod use_census;
 pub(crate) mod verify;
 #[cfg(test)]
@@ -140,6 +138,8 @@ mod wave6a_fixture_tulip;
 mod wave6a_return_certificate_tests;
 #[cfg(test)]
 mod wave6f_field_reference_tests;
+#[cfg(test)]
+mod wave6k_typedef_parameter_tests;
 #[cfg(test)]
 mod wave6l_local_box_exemption_tests;
 #[cfg(test)]
