@@ -6695,6 +6695,15 @@ fn graft_ty(text: &str) -> Result<P<Ty>, String> {
     let printed = rustc_ast_pretty::pprust::ty_to_string(&parsed);
     let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     if strip(&printed) != strip(text) {
+        // **R466-4 (wave-6f)** — a refused graft is SILENT by design (the
+        // replacement is dropped and the site keeps its input text), which
+        // makes a producer whose replacement does not round-trip very hard
+        // to find: the plan looks right and the tree does not change. Test
+        // builds only, and only when asked.
+        #[cfg(test)]
+        if std::env::var("CRAT_DUMP_GRAFT_REFUSALS").is_ok() {
+            eprintln!("CRAT-GRAFT-REFUSED[TY]\n  text    = {text:?}\n  printed = {printed:?}");
+        }
         return Err(text.to_owned());
     }
     SpanEraser.visit_ty(&mut parsed);
@@ -6738,6 +6747,15 @@ pub(crate) fn graft_expr(text: &str) -> Result<rustc_ast::Expr, String> {
     let printed = rustc_ast_pretty::pprust::expr_to_string(&parsed);
     let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
     if strip(&printed) != strip(text) {
+        // **R466-4 (wave-6f)** — a refused graft is SILENT by design (the
+        // replacement is dropped and the site keeps its input text), which
+        // makes a producer whose replacement does not round-trip very hard
+        // to find: the plan looks right and the tree does not change. Test
+        // builds only, and only when asked.
+        #[cfg(test)]
+        if std::env::var("CRAT_DUMP_GRAFT_REFUSALS").is_ok() {
+            eprintln!("CRAT-GRAFT-REFUSED[EXPR]\n  text    = {text:?}\n  printed = {printed:?}");
+        }
         return Err(text.to_owned());
     }
     // Erase AFTER the round-trip check, so the check reads the fragment as
