@@ -1617,9 +1617,22 @@ fn cache_only_before_solve<T>(
 /// than against the predicate that wrote it, which would be a tautology:
 ///
 /// * forward — a `withdrawn` row names at least one owner that really reverted;
-/// * backward — a row whose owner really reverted does not read `active`;
 /// * a `held` row carries `-`, having never reached a revert set to be withdrawn
 ///   from.
+///
+/// **There is deliberately NO backward direction.** `revert_status` is computed
+/// from the transaction's DEPENDENT owners, a subset of the published `owners`:
+/// an owner carrying only value-independent sites keeps its edits under any
+/// revert, so a reverted `owners` entry with no reverted dependent owner reads
+/// `active` and is CORRECT — wave-6f's own commit names avl's `Node.left` as
+/// exactly that split. The receipt does not publish `dependent_owners`, so the
+/// harness cannot ask the backward question from the artifacts at all.
+///
+/// The first version asked it anyway, keyed on `owners`, which is verbatim the
+/// third fault wave-6f's own witness rejects. It stopped heman on
+/// `kmRay2IntersectBox` at batches 13/14 after all 20 programs had emitted, and
+/// cost the run. The forward direction stays because it IS sound on the wider
+/// set: dependent ⊆ owners, so a `withdrawn` implies a reverted `owners` entry.
 ///
 /// A frame whose receipt predates the column is `Ok`: absence is not disagreement.
 fn field_transaction_revert_status_agrees(
@@ -1670,9 +1683,7 @@ fn field_transaction_revert_status_agrees(
             ("withdrawn", false) => {
                 return Err(format!("withdrawn but no owner reverted: {owner_list}"));
             }
-            ("active", true) => {
-                return Err(format!("owner reverted but reads active: {owner_list}"));
-            }
+            // ("active", true) is NOT a disagreement: see above.
             ("withdrawn" | "active", _) => {}
             other => return Err(format!("unknown revert_status {:?}", other.0)),
         }
@@ -12407,22 +12418,6 @@ mod run {
                 artifact.allocator_contract_receipts.as_str(),
             ),
         ];
-        // **R464-5 (wave-6f 040 STOP 1)** — the field receipt's `revert_status`
-        // against the final-revert table, checked on the PUBLISHED rows rather
-        // than on the predicate that wrote them. It fires on the first census
-        // whose receipt carries the column; before that the check is vacuous.
-        row.set(
-            raw_schema::GRAFT_REFUSED,
-            crate::bo_rewriter::ast_transform::graft_refusals(),
-        );
-        if let Err(disagreement) = super::field_transaction_revert_status_agrees(
-            &artifact.field_transactions,
-            &artifact.final_reverts,
-        ) {
-            row.set(raw_schema::STATUS, "field-revert-status-disagreement");
-            row.set("detail", super::report::sanitize(&disagreement));
-            return row;
-        }
         for (suffix, contents) in artifact_rows {
             std::fs::write(
                 directory.join(format!("{name}.raw-boundary-{suffix}.tsv")),
@@ -12436,6 +12431,25 @@ mod run {
                 stamp(&artifact.shared_pair_receipts),
             )
             .expect("write shared-pair terminal receipts");
+        }
+        // **R464-5 (wave-6f 040 STOP 1)** — the field receipt's `revert_status`
+        // against the final-revert table, checked on the PUBLISHED rows rather
+        // than on the predicate that wrote them.
+        //
+        // AFTER the artifact write, deliberately: the first version ran before it,
+        // so the one program that disagreed published NO tables and the
+        // disagreement could not be diagnosed from the run that found it.
+        row.set(
+            raw_schema::GRAFT_REFUSED,
+            crate::bo_rewriter::ast_transform::graft_refusals(),
+        );
+        if let Err(disagreement) = super::field_transaction_revert_status_agrees(
+            &artifact.field_transactions,
+            &artifact.final_reverts,
+        ) {
+            row.set(raw_schema::STATUS, "field-revert-status-disagreement");
+            row.set("detail", super::report::sanitize(&disagreement));
+            return row;
         }
         // **R459-3 (wave-6b 019 STOP 2)** — the first failing verify tree is Rust
         // source, not a receipt table, so it is written raw (no TSV stamp) and to
@@ -25613,15 +25627,18 @@ fn r464_5_the_field_receipt_revert_status_agrees_with_the_final_revert_table() {
         field_transaction_revert_status_agrees(&receipt("src::a::kept", "withdrawn"), reverts)
             .is_err()
     );
-    // BACKWARD: an owner that really reverted may not read `active` -- the wiring
-    // defect this exists to catch, where a refresh missed a path or was handed the
-    // mid-run revert set.
+    // **NO BACKWARD DIRECTION.** `revert_status` is computed from DEPENDENT
+    // owners, a subset of the published `owners`, so an owner that reverted while
+    // no dependent owner did reads `active` and is CORRECT -- wave-6f names avl's
+    // `Node.left` as exactly that split. heman's `kmRay2IntersectBox` is one, and
+    // asserting otherwise (keyed on `owners`, which is verbatim the third fault
+    // their own witness rejects) stopped a census after all 20 programs emitted.
     assert!(
         field_transaction_revert_status_agrees(
             &receipt("src::a::owner_reverted", "active"),
             reverts
         )
-        .is_err()
+        .is_ok()
     );
     // A held row never reached a revert set to be withdrawn from.
     assert!(field_transaction_revert_status_agrees(
