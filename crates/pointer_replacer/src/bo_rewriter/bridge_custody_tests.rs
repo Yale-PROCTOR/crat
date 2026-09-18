@@ -2118,60 +2118,116 @@ fn r424_slice_construction_initializer_corresponds_exactly() {
 /// `src.as_deref().map_or(null(), |slice| slice.as_ptr().cast::<c_void>())`.
 /// Both are the original's own view; neither was a correspondence the
 /// comparator knew, and four rows failed binn's custody on batch 9's candidate.
-/// **R465-2 — the OFFLINE replay over `batch13d`'s real pairs.**
+/// **R465-2 / R466-2 — the offline replay over the census's OWN 37 refusals.**
 ///
-/// Three censuses went to brotli's 37 rows on diagnoses read from `type_text` and
-/// reason strings. This replays the two relations that changed over the pairs
-/// extracted from the two REAL trees — the input at
-/// `benchmarks/rs-crown-derived/brotli/lib.rs` and `batch13d`'s emitted tree — so
-/// the next cut is spent on a measured result rather than a fourth guess.
+/// Three censuses went to brotli's rows on diagnoses read from `type_text` and
+/// reason strings. This replays the relations that changed over the 37 rows
+/// `batch13d`'s comparator itself refused — one row in, one verdict out — so the
+/// next cut is spent on a measured result rather than a fourth guess.
 ///
-/// It replays the RELATIONS, not the whole comparator: the census does not publish
-/// its expectations, so `compare` cannot be reconstructed from the artifacts. What
-/// it does establish is that every pair those rows refused on now corresponds.
+/// It replays the RELATIONS, not the whole comparator: the census publishes no
+/// expectations, so `compare` cannot be reconstructed from the artifacts. Each
+/// row's ORIGINAL text is the census's own (its identity carries the interval);
+/// the emitted side is absent from the payload for an unresolved row and is taken
+/// from the emitted tree, which the `provenance` column says per row.
 ///
 /// Set `CRAT_BRIDGE_REPLAY_PAIRS` to the TSV; unset, the test is inert.
 #[test]
 fn r465_2_the_batch13d_pairs_replay_clean() {
     use crate::bo_rewriter::bridge_custody_match::{
-        conditional_allocation_corresponds_for_test, raw_initializer_matches_for_test,
+        conditional_allocation_corresponds_for_test, expressions_correspond_for_test,
+        initializer_adapter_correspondence_for_test, raw_initializer_matches_for_test,
     };
     let Some(path) = std::env::var_os("CRAT_BRIDGE_REPLAY_PAIRS") else { return };
     let text = std::fs::read_to_string(path).expect("replay pairs");
     let mut lines = text.lines();
-    let header = lines.next().expect("header");
-    assert_eq!(header, "relation\tbinding\toriginal\temitted");
-    let (mut checked, mut failed) = (0usize, Vec::new());
-    for line in lines {
-        let [relation, binding, original, emitted] = line.split('\t').collect::<Vec<_>>()[..]
-        else {
-            panic!("four columns");
+    assert_eq!(
+        lines.next().expect("header"),
+        "relation\tbinding\toriginal\temitted\tprovenance"
+    );
+    let (mut rows, mut corresponded, mut unresolvable) = (0usize, 0usize, Vec::new());
+    let mut refusing = Vec::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let [relation, binding, original, emitted, ..] = fields[..] else {
+            panic!("five columns, got {}", fields.len());
         };
+        rows += 1;
+        if relation == "UNRESOLVABLE" || emitted.is_empty() {
+            unresolvable.push(binding.to_owned());
+            continue;
+        }
         let ok = rustc_span::create_session_globals_then(
             rustc_span::edition::Edition::Edition2018,
             &[],
             None,
             || match relation {
+                // Mirror the comparator's DISJUNCTION, not one relation: it tries
+                // key equality and the view relations before the conditional arm,
+                // and a replay that skips them reports a refusal on two identical
+                // texts -- which the first run of this did.
                 "conditional-allocation" => {
-                    conditional_allocation_corresponds_for_test(original, emitted)
+                    expressions_correspond_for_test(original, emitted)
+                        || conditional_allocation_corresponds_for_test(original, emitted)
+                        || initializer_adapter_correspondence_for_test(original, emitted)
                 }
                 "block-intermediate" => raw_initializer_matches_for_test(emitted, original),
                 other => panic!("unknown relation {other}"),
             },
         );
-        checked += 1;
-        if !ok {
-            failed.push(format!("{relation}/{binding}: {original}  VS  {emitted}"));
+        if ok {
+            corresponded += 1;
+        } else {
+            refusing.push(format!("{relation}/{binding}: {original}  VS  {emitted}"));
         }
     }
-    assert!(checked > 0, "the replay read no pairs");
-    assert!(
-        failed.is_empty(),
-        "{} of {checked} pairs still refuse:\n{}",
-        failed.len(),
-        failed.join("\n")
+    println!(
+        "R465-2 replay: {corresponded} of {rows} correspond; {} refuse; {} not reconstructable ({:?})",
+        refusing.len(),
+        unresolvable.len(),
+        unresolvable
     );
-    println!("R465-2 replay: {checked} pairs, 0 refusing");
+    assert!(rows > 0, "the replay read no rows");
+    assert!(
+        refusing.is_empty(),
+        "{} of {rows} rows still refuse:\n{}",
+        refusing.len(),
+        refusing.join("\n")
+    );
+}
+
+/// **R466-1, RULED — the view relations apply inside call arguments, recursively.**
+///
+/// brotli's `clusters` and `pairs`: the local stays raw on both sides and it is the
+/// ALLOCATOR's own receiver that moved. The replay found this before a census did.
+#[test]
+fn r466_1_the_view_relations_apply_inside_call_arguments() {
+    use crate::bo_rewriter::bridge_custody_match::expressions_correspond_for_test as corresponds;
+    let under = |original: &str, emitted: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || corresponds(original, emitted),
+        )
+    };
+    // The exact pair the replay named.
+    assert!(under(
+        "BrotliAllocate(m, in_size.wrapping_mul(4)) as *mut uint32_t",
+        "BrotliAllocate(core::ptr::from_mut(&mut *m), in_size.wrapping_mul(4)) as *mut uint32_t"
+    ));
+    // Recursively, and through casts.
+    assert!(under(
+        "f(g(m), 1)",
+        "f(g(core::ptr::from_mut(&mut *m)) as *mut u8, 1)"
+    ));
+    // Unchanged arguments still correspond by key.
+    assert!(under("f(a, b, c)", "f(a, b, c)"));
+    // **A congruence, not a licence.**
+    assert!(!under("f(m, 1)", "g(core::ptr::from_mut(&mut *m), 1)"));
+    assert!(!under("f(m, 1)", "f(core::ptr::from_mut(&mut *m))"));
+    assert!(!under("f(m, 1)", "f(core::ptr::from_mut(&mut *m), 2)"));
+    assert!(!under("f(m, 1)", "f(core::ptr::from_mut(&mut *other), 1)"));
 }
 
 /// **R465-1, RULED — a conditional allocation corresponds branch by branch.**
@@ -2240,6 +2296,14 @@ fn r465_1_a_conditional_allocation_corresponds_branch_by_branch() {
         "if n > 0 { alloc(n) as *mut u8 } else { 0 as *mut u8 }",
         "if n > 0 { Some(core::slice::from_raw_parts_mut(alloc(n) as *mut u8, 4)) } else { None }"
     ));
+    // **R466-1 — the local that stays RAW on both sides.** brotli's `clusters`:
+    // no owning wrapper anywhere, and the only difference is the allocator's own
+    // receiver inside the call. The conditional rule composes the congruence.
+    assert!(under(
+        "if in_size > 0 { BrotliAllocate(m, in_size.wrapping_mul(4)) as *mut uint32_t } else { 0 as *mut uint32_t }",
+        "if in_size > 0 { BrotliAllocate(core::ptr::from_mut(&mut *m), in_size.wrapping_mul(4)) as *mut uint32_t } else { 0 as *mut uint32_t }"
+    ));
+
     // Not a conditional at all.
     assert!(!under(
         "alloc(n) as *mut u8",

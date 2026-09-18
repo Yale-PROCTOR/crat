@@ -352,6 +352,59 @@ fn initializer_adapter_correspondence(original: &str, emitted: &str) -> bool {
 }
 
 /// Test seam for the arm above.
+/// **R466-1, RULED — the view relations apply INSIDE call arguments, recursively.**
+///
+/// `BrotliAllocate`'s memory-manager receiver is delivered as `&mut MemoryManager`,
+/// so every call site bridges it back: `BrotliAllocate(m, ..)` becomes
+/// `BrotliAllocate(core::ptr::from_mut(&mut *m), ..)`. `core::ptr::from_mut` was
+/// already a relation the comparator knew — but only at the TOP LEVEL of an
+/// initializer, never nested in an argument, so brotli's `clusters` and `pairs`
+/// refused. The replay found them before a census did.
+///
+/// Two calls correspond when the callee is the SAME and each argument corresponds,
+/// recursively and through raw casts. It is a congruence over the relations that
+/// already exist, not a new licence: an argument still has to be a view of the
+/// original's own operand, so a different callee, a different arity, or a
+/// different expression at any one position all refuse.
+fn expressions_correspond(original: &ast::Expr, emitted: &ast::Expr) -> bool {
+    let original = peel_raw_pointer_casts(unparen(original));
+    let emitted = peel_raw_pointer_casts(unparen(emitted));
+    if expression_key(original) == expression_key(emitted) {
+        return true;
+    }
+    // The emitted side may be any view of the original's operand that the
+    // comparator already recognises -- `from_mut(&mut *m)`, `from_ref`, `as_ptr`,
+    // a `cast`, the optional `map_or` spelling.
+    if raw_initializer_matches(emitted, original) {
+        return true;
+    }
+    let (
+        ast::ExprKind::Call(left_callee, left_args),
+        ast::ExprKind::Call(right_callee, right_args),
+    ) = (&original.kind, &emitted.kind)
+    else {
+        return false;
+    };
+    if left_args.len() != right_args.len()
+        || path(left_callee).is_none()
+        || path(left_callee) != path(right_callee)
+    {
+        return false;
+    }
+    left_args
+        .iter()
+        .zip(right_args.iter())
+        .all(|(left, right)| expressions_correspond(left, right))
+}
+
+#[cfg(test)]
+pub(crate) fn expressions_correspond_for_test(original: &str, emitted: &str) -> bool {
+    let (Ok(original), Ok(emitted)) = (expression(original), expression(emitted)) else {
+        return false;
+    };
+    expressions_correspond(&original, &emitted)
+}
+
 /// **R465-1, RULED — a CONDITIONAL allocation corresponds branch by branch.**
 ///
 /// C2Rust guards an allocation with its own size test and the delivery wraps the
@@ -401,9 +454,16 @@ fn conditional_allocation_corresponds(original: &str, emitted: &str) -> bool {
     else {
         return false;
     };
-    owning_wrapper_over(&right_value, &left_value)
-        && expression_key(unparen(&right_null)) == "None"
-        && is_null_pointer_literal(&left_null)
+    // The then-branch either gains an owning wrapper over the same allocation, or
+    // keeps its form and differs only inside the call (R466-1).
+    let then_corresponds = owning_wrapper_over(&right_value, &left_value)
+        || expressions_correspond(&left_value, &right_value);
+    // The else-branch is `None` against the original's null, or -- where the local
+    // stayed raw -- the same null on both sides.
+    let else_corresponds = (expression_key(unparen(&right_null)) == "None"
+        && is_null_pointer_literal(&left_null))
+        || expressions_correspond(&left_null, &right_null);
+    then_corresponds && else_corresponds
 }
 
 fn tail_of_else(expression: &ast::Expr) -> Option<ast::ptr::P<ast::Expr>> {
