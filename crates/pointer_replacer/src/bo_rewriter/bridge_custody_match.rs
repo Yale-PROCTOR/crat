@@ -2083,6 +2083,139 @@ fn peel_casts(mut expression: &ast::Expr) -> &ast::Expr {
     }
 }
 
+/// **R455-1 — an UNANNOTATED re-binding of an optional formal's referent.**
+///
+/// binn's `binn_load` delivers `value: Option<&mut binn>`, and the emitted
+/// pending call reads the referent through a block-scoped re-binding that
+/// carries no type annotation — `{ let value = value.as_deref_mut().unwrap();
+/// binn_is_valid(data, &mut (*value).type_0, ..) }`. The declared form the
+/// pending law asks for is not in the emitted bytes, so the site was
+/// `unresolved` with `pending-reference-type-absent` and the census ended
+/// `data=false`.
+///
+/// The form is DERIVABLE exactly, and only here: the initializer is one
+/// whole-optional access of one binding, and `Option<&mut T>` accessed by
+/// `as_deref_mut().unwrap()` is `&mut T`, by `as_deref().unwrap()` `&T`. No
+/// other access is followed — `as_mut()` on the same optional is `&mut &mut T`,
+/// a different form, and nothing in the emitted vocabulary spells the referent
+/// that way.
+///
+/// The correspondence obligation moves WITH the derivation: the caller
+/// discharges it against the ACCESSED OPTIONAL, never against the re-binding,
+/// so a re-binding of a namesake or of any other optional still fails closed.
+fn pending_optional_access_rebinding(
+    input: &BridgeCustodyInput<'_>,
+    owner: &str,
+    binding: &Binding,
+) -> MatchResult<(Binding, String)> {
+    let (Some(init_text), Some(init_span)) = (binding.init_text.as_deref(), binding.init_span)
+    else {
+        return Err("pending-reference-type-absent".into());
+    };
+    let initializer = expression(init_text)?;
+    let Some((source_name, mutable)) = optional_whole_access(&initializer) else {
+        return Err("pending-reference-type-absent".into());
+    };
+    let source = PendingScalarRead::binding(input.emitted, owner, init_span, &source_name)
+        .ok_or("pending-optional-rebinding-source-binding-unresolved")?;
+    let text = source
+        .type_text
+        .as_deref()
+        .ok_or("pending-optional-rebinding-source-type-absent")?;
+    let Some((payload_mutable, pointee)) = optional_reference_payload(text)? else {
+        return Err(format!(
+            "pending-optional-rebinding-source-is-not-an-optional-reference:{source_name}:{text}"
+        ));
+    };
+    // R295-3: this is its own condition. `as_deref_mut` of `Option<&T>` is not
+    // a form the referent has; refusing it is not the same as refusing a
+    // non-optional source.
+    if mutable && !payload_mutable {
+        return Err(format!(
+            "pending-optional-rebinding-access-exceeds-the-optional:{source_name}:{text}"
+        ));
+    }
+    let form = if mutable {
+        format!("&mut {pointee}")
+    } else {
+        format!("&{pointee}")
+    };
+    Ok((source, form))
+}
+
+/// `<binding>.as_deref().unwrap()` / `<binding>.as_deref_mut().unwrap()` — the
+/// whole optional, accessed once, with no other operand. Returns the accessed
+/// binding's name and whether the access is the mutable one.
+fn optional_whole_access(expression: &ast::Expr) -> Option<(String, bool)> {
+    let ast::ExprKind::MethodCall(unwrap) = &unparen(expression).kind else {
+        return None;
+    };
+    if unwrap.seg.ident.name.as_str() != "unwrap" || !unwrap.args.is_empty() {
+        return None;
+    }
+    let ast::ExprKind::MethodCall(access) = &unparen(&unwrap.receiver).kind else {
+        return None;
+    };
+    if !access.args.is_empty() {
+        return None;
+    }
+    let mutable = match access.seg.ident.name.as_str() {
+        "as_deref" => false,
+        "as_deref_mut" => true,
+        _ => return None,
+    };
+    let name = path(unparen(&access.receiver)).filter(|name| !name.contains("::"))?;
+    Some((name, mutable))
+}
+
+/// The payload of `Option<&T>` / `Option<&mut T>` as (mutable, pointee text).
+/// Any other type — including an `Option` of a non-reference — is `None`.
+fn optional_reference_payload(text: &str) -> MatchResult<Option<(bool, String)>> {
+    let parsed = parsed_type(text)?;
+    let mut ty = &*parsed;
+    while let ast::TyKind::Paren(inner) = &ty.kind {
+        ty = inner;
+    }
+    let ast::TyKind::Path(None, path) = &ty.kind else {
+        return Ok(None);
+    };
+    let name = path
+        .segments
+        .iter()
+        .filter(|segment| segment.ident.name != rustc_span::kw::PathRoot)
+        .map(|segment| segment.ident.name.to_string())
+        .collect::<Vec<_>>()
+        .join("::");
+    if !matches!(
+        name.as_str(),
+        "Option" | "core::option::Option" | "std::option::Option"
+    ) {
+        return Ok(None);
+    }
+    let Some(ast::GenericArgs::AngleBracketed(arguments)) = path
+        .segments
+        .last()
+        .and_then(|segment| segment.args.as_deref())
+    else {
+        return Ok(None);
+    };
+    let [ast::AngleBracketedArg::Arg(ast::GenericArg::Type(payload))] = arguments.args.as_slice()
+    else {
+        return Ok(None);
+    };
+    let mut payload = &**payload;
+    while let ast::TyKind::Paren(inner) = &payload.kind {
+        payload = inner;
+    }
+    let ast::TyKind::Ref(_, reference) = &payload.kind else {
+        return Ok(None);
+    };
+    Ok(Some((
+        reference.mutbl.is_mut(),
+        pprust::ty_to_string(&reference.ty),
+    )))
+}
+
 fn pending_selected_argument(
     input: &BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -2155,12 +2288,22 @@ fn pending_selected_argument(
     };
     let emitted_binding = PendingScalarRead::binding(input.emitted, &call.owner, source_span, name)
         .ok_or("pending-protected-source-binding-unresolved")?;
-    let protected_form = match pointer_type(
-        emitted_binding
-            .type_text
-            .as_deref()
-            .ok_or("pending-reference-type-absent")?,
-    )? {
+    // **R455-1.** An unannotated re-binding of an optional formal's referent
+    // carries its form in the optional, not in its own bytes.
+    let rebinding = match emitted_binding.type_text {
+        Some(_) => None,
+        None => Some(pending_optional_access_rebinding(
+            input,
+            &call.owner,
+            &emitted_binding,
+        )?),
+    };
+    let (source_binding, form_text) = match (&rebinding, emitted_binding.type_text.as_deref()) {
+        (Some((source, form)), _) => (source, form.as_str()),
+        (None, Some(declared)) => (&emitted_binding, declared),
+        (None, None) => return Err("pending-reference-type-absent".into()),
+    };
+    let protected_form = match pointer_type(form_text)? {
         PointerType::Reference(_) => true,
         PointerType::OptionalReference => {
             let source_text = input
@@ -2183,16 +2326,15 @@ fn pending_selected_argument(
     // conditions — the emitted binding is not the original's, and the emitted
     // binding's declared form is not a protected one — and a reader could not
     // tell which had fired.
-    if !same_source_binding(input, &original_binding, &emitted_binding) {
+    if !same_source_binding(input, &original_binding, source_binding) {
         return Err(format!(
             "pending-protected-source-binding-mismatch:{name}:{}",
-            source_binding_divergence(input, &original_binding, &emitted_binding)
+            source_binding_divergence(input, &original_binding, source_binding)
         ));
     }
     if !protected_form {
         return Err(format!(
-            "pending-protected-source-not-a-reference:{name}:{}",
-            emitted_binding.type_text.as_deref().unwrap_or("-")
+            "pending-protected-source-not-a-reference:{name}:{form_text}"
         ));
     }
     Ok(witnesses)

@@ -1011,6 +1011,231 @@ mod matcher {
         pending_optional_parameter(true);
     }
 
+    // **R455-1 — binn's `binn_load` wall.** The emitted caller takes
+    // `value: Option<&mut binn>` and reads its referent at the pending call
+    // through a block-scoped re-binding that carries NO type annotation:
+    // `{ let value = value.as_deref_mut().unwrap(); binn_is_valid(data, &mut
+    // (*value).type_0, ..) }`. The declared form the pending law asks for is
+    // therefore absent from the emitted bytes, and the site was `unresolved`
+    // with `pending-reference-type-absent` at batch 12.
+    const OPTIONAL_REBINDING_INPUT: &str = "struct Blob { kind: i32, count: i32 } unsafe fn target(w: *mut i32, a: *mut i32) {} unsafe fn caller(w: *mut i32, value: *mut Blob, other: *mut Blob) { target(w, &mut (*value).kind); }";
+
+    fn optional_rebinding_case(fault: &str) -> BridgeCustodyReport {
+        let access = match fault {
+            "shared-access-of-a-mutable-optional" => "as_deref",
+            _ => "as_deref_mut",
+        };
+        let payload = match fault {
+            "mutable-access-of-a-shared-optional" => "&Blob",
+            "non-reference-payload" => "Box<Blob>",
+            _ => "&mut Blob",
+        };
+        let source = match fault {
+            "another-binding" => "other",
+            _ => "value",
+        };
+        let formal = match fault {
+            "raw-source" => "mut value: *mut Blob".to_owned(),
+            _ => format!("mut value: Option<{payload}>"),
+        };
+        let rebinding = match fault {
+            "raw-source" => "let value = value;".to_owned(),
+            _ => format!("let value = {source}.{access}().unwrap();"),
+        };
+        let block = format!("{{ {rebinding} target(w, &mut (*value).kind); }}");
+        let output = format!(
+            "struct Blob {{ kind: i32, count: i32 }} unsafe fn target(w: *mut i32, a: *mut i32) {{}} unsafe fn caller(w: *mut i32, {formal}, mut other: Option<&mut Blob>) {{ {block} }}"
+        );
+        let original =
+            syntax::inventory_source("optional-rebinding-original.rs", OPTIONAL_REBINDING_INPUT)
+                .unwrap();
+        let emitted = syntax::inventory_source("optional-rebinding-emitted.rs", &output).unwrap();
+        let bindings = original
+            .bindings
+            .iter()
+            .filter(|binding| binding.owner == "caller" && binding.name == "value")
+            .collect::<Vec<_>>();
+        let [binding] = bindings.as_slice() else { panic!("exact original protected parameter") };
+        let lo = OPTIONAL_REBINDING_INPUT
+            .find("target(w, &mut (*value).kind)")
+            .unwrap() as u32;
+        let mut pending = pending_expectation();
+        pending.anchor = SiteAnchor::Call {
+            span: ByteSpan {
+                lo,
+                hi: lo + "target(w, &mut (*value).kind)".len() as u32,
+            },
+            argument_indices: vec![1],
+        };
+        pending.pending_source = Some(PendingSource {
+            binding: Some("value".into()),
+            binding_span: Some(binding.binding_span),
+            shape: PendingSourceShape::ProjectedReferent,
+        });
+        // **R304-3 — binn states the whole block as the render of this call.**
+        // The producer emits `{ let value = value.as_deref_mut().unwrap();
+        // binn_is_valid(..) }` at the original call's interval, so the matcher
+        // takes the stated-render arm and the argument failure is reported
+        // rather than folded into a candidate rejection.
+        let mut context = BridgeCustodyContext::default();
+        context.pending_call_renders.insert(
+            (lo, lo + "target(w, &mut (*value).kind)".len() as u32),
+            block,
+        );
+        compare(BridgeCustodyInput {
+            original: &original,
+            emitted: &emitted,
+            original_source: OPTIONAL_REBINDING_INPUT,
+            emitted_source: &output,
+            expectations: &[pending],
+            context: &context,
+        })
+    }
+
+    #[test]
+    fn r455_1_the_matcher_derives_a_pending_reference_type_through_an_optional_access_rebinding() {
+        let report = optional_rebinding_case("none");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::WaivedPending,
+            "the unannotated re-binding's form is the optional's payload: {report:#?}"
+        );
+        assert!(report.data && report.tree_only.is_empty(), "{report:#?}");
+    }
+
+    #[test]
+    fn r455_1_the_derivation_needs_the_corresponding_optional_not_a_namesake() {
+        let report = optional_rebinding_case("another-binding");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::Unresolved,
+            "a re-binding of a DIFFERENT optional is not the original's source: {report:#?}"
+        );
+        assert!(
+            report.rows[0]
+                .reason
+                .starts_with("pending-protected-source-binding-mismatch:value:"),
+            "R295-3: the derivation succeeded and the CORRESPONDENCE is what failed: {report:#?}"
+        );
+        assert!(!report.data, "{report:#?}");
+    }
+
+    #[test]
+    fn r455_1_the_derivation_refuses_an_unannotated_rebinding_of_a_raw_source() {
+        let report = optional_rebinding_case("raw-source");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::Unresolved,
+            "an unannotated re-binding of a raw formal derives no protected form: {report:#?}"
+        );
+        assert_eq!(
+            report.rows[0].reason, "pending-reference-type-absent",
+            "R295-3: nothing is derivable here, and that is a different absence: {report:#?}"
+        );
+        assert!(!report.data, "{report:#?}");
+    }
+
+    #[test]
+    fn r455_1_a_shared_access_of_a_mutable_optional_derives_the_shared_form() {
+        let report = optional_rebinding_case("shared-access-of-a-mutable-optional");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::WaivedPending,
+            "`as_deref` of `Option<&mut T>` is `&T`, still a protected form: {report:#?}"
+        );
+        assert!(report.data, "{report:#?}");
+    }
+
+    #[test]
+    fn r455_1_the_binn_load_shape_carries_all_three_arguments_inside_the_condition() {
+        // binn's actual bytes: the re-binding block is the CONDITION's operand
+        // and all three selected arguments read the same re-binding.
+        let input = "struct Blob { kind: i32, count: i32, size: i32 } unsafe fn target(w: *mut i32, a: *mut i32, b: *mut i32, c: *mut i32) -> i32 { 0 } unsafe fn caller(w: *mut i32, value: *mut Blob) -> i32 { if target(w, &mut (*value).kind, &mut (*value).count, &mut (*value).size) == 0 { return 0; } 1 }";
+        let call = "target(w, &mut (*value).kind, &mut (*value).count, &mut (*value).size)";
+        let block = format!("{{ let value = value.as_deref_mut().unwrap(); {call} }}");
+        let output = format!(
+            "struct Blob {{ kind: i32, count: i32, size: i32 }} unsafe fn target(w: *mut i32, a: *mut i32, b: *mut i32, c: *mut i32) -> i32 {{ 0 }} unsafe fn caller(w: *mut i32, mut value: Option<&mut Blob>) -> i32 {{ if ({block}) == 0 {{ return 0; }} 1 }}"
+        );
+        let original = syntax::inventory_source("binn-shape-original.rs", input).unwrap();
+        let emitted = syntax::inventory_source("binn-shape-emitted.rs", &output).unwrap();
+        let bindings = original
+            .bindings
+            .iter()
+            .filter(|binding| binding.owner == "caller" && binding.name == "value")
+            .collect::<Vec<_>>();
+        let [binding] = bindings.as_slice() else { panic!("exact original protected parameter") };
+        let lo = input.find(call).unwrap() as u32;
+        let span = ByteSpan {
+            lo,
+            hi: lo + call.len() as u32,
+        };
+        let mut pending = pending_expectation();
+        pending.anchor = SiteAnchor::Call {
+            span,
+            argument_indices: vec![1, 2, 3],
+        };
+        pending.pending_source = Some(PendingSource {
+            binding: Some("value".into()),
+            binding_span: Some(binding.binding_span),
+            shape: PendingSourceShape::ProjectedReferent,
+        });
+        let mut context = BridgeCustodyContext::default();
+        context
+            .pending_call_renders
+            .insert((span.lo, span.hi), block);
+        let report = compare(BridgeCustodyInput {
+            original: &original,
+            emitted: &emitted,
+            original_source: input,
+            emitted_source: &output,
+            expectations: &[pending],
+            context: &context,
+        });
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::WaivedPending,
+            "all three arguments read the same derived re-binding: {report:#?}"
+        );
+        assert!(report.data && report.tree_only.is_empty(), "{report:#?}");
+    }
+
+    #[test]
+    fn r455_1_a_mutable_access_of_a_shared_optional_is_not_a_form_the_referent_has() {
+        let report = optional_rebinding_case("mutable-access-of-a-shared-optional");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::Unresolved,
+            "{report:#?}"
+        );
+        assert!(
+            report.rows[0]
+                .reason
+                .starts_with("pending-optional-rebinding-access-exceeds-the-optional:value:"),
+            "{report:#?}"
+        );
+        assert!(!report.data, "{report:#?}");
+    }
+
+    #[test]
+    fn r455_1_the_derivation_is_confined_to_an_optional_of_a_reference() {
+        // Conservative on purpose: `Option<Box<T>>::as_deref_mut()` would also
+        // be `&mut T`, but a payload's `Deref` target is not readable from the
+        // emitted bytes in general, and this rule reads bytes.
+        let report = optional_rebinding_case("non-reference-payload");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::Unresolved,
+            "{report:#?}"
+        );
+        assert!(
+            report.rows[0].reason.starts_with(
+                "pending-optional-rebinding-source-is-not-an-optional-reference:value:"
+            ),
+            "{report:#?}"
+        );
+        assert!(!report.data, "{report:#?}");
+    }
+
     // Exact bytes from the one-shot r233-shape-emission-confirmation.json.
     const PROJECTED_INPUT: &str = r##"#![allow(dead_code, unused_unsafe)]
 pub struct Holder { data: *mut i32, scalar: i32 }
