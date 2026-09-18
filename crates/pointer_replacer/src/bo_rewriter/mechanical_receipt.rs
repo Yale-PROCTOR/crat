@@ -467,7 +467,21 @@ pub(crate) enum MechanicalTerminalReason {
     CalleeWrites,
     PositiveRetention,
     SliceUseDestinationUnbuilt(String),
+    /// **The CALLEE side is absent** — no terminal contract exists at the
+    /// parameter this argument reaches.
     TerminalContractMissing,
+    /// **The CALLER side cannot satisfy it** (R466-8) — the contract exists,
+    /// but this site's own carrier has no way to open the source it was built
+    /// from (`decision::option`'s `call-required` check: an optional source
+    /// whose carrier carries no unwrap).
+    ///
+    /// Split out of [`TerminalContractMissing`](Self::TerminalContractMissing)
+    /// because the two are opposite ends of one site and shared one name: an
+    /// artifact could read `terminal_contract = terminal-required:<interface>`
+    /// beside `drop_reason = …terminal-contract-missing` and look
+    /// self-contradictory, which cost report 025 three instrumented probes to
+    /// resolve.
+    CarrierCannotOpen,
     CompositionCrossingUnhoistable(String),
     Cursor,
     BoxFamily,
@@ -499,6 +513,7 @@ impl MechanicalTerminalReason {
                 format!("slice-use-destination-unbuilt:{form}")
             }
             Self::TerminalContractMissing => "terminal-contract-missing".to_owned(),
+            Self::CarrierCannotOpen => "carrier-cannot-open".to_owned(),
             Self::CompositionCrossingUnhoistable(reason) => {
                 format!("composition-crossing-unhoistable:{reason}")
             }
@@ -1066,6 +1081,7 @@ impl MechanicalObligationEvent {
                         | MechanicalTerminalReason::PositiveRetention
                         | MechanicalTerminalReason::SliceUseDestinationUnbuilt(_)
                         | MechanicalTerminalReason::TerminalContractMissing
+                        | MechanicalTerminalReason::CarrierCannotOpen
                         | MechanicalTerminalReason::CompositionCrossingUnhoistable(_)
                         | MechanicalTerminalReason::Cursor
                         | MechanicalTerminalReason::BoxFamily

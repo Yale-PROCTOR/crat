@@ -924,7 +924,10 @@ pub(crate) fn plan_operations(
                         BridgeRetentionTier::None => MechanicalRetention::None,
                     };
                     if operation == "call-required" && carrier.spec.unwrap.is_none() {
-                        reason = Some(MechanicalTerminalReason::TerminalContractMissing);
+                        // R466-8: the CALLER side. The callee's contract may
+                        // well exist; what is missing is this carrier's way of
+                        // opening the optional source.
+                        reason = Some(MechanicalTerminalReason::CarrierCannotOpen);
                     }
                 } else if target != source {
                     reason = Some(match disposition {

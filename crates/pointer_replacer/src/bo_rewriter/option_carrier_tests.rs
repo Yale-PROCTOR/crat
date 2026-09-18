@@ -177,6 +177,71 @@ fn wave6o_a_base_that_is_not_option_presented_never_gains_an_unwrap() {
     }
 }
 
+/// A base with one view this arm cannot render: the `memcpy` argument is a
+/// raw-boundary carrier, so the all-or-nothing refusal leaves every carrier of
+/// this subject exactly as it was — including the `set32` one, whose Option
+/// source it therefore still cannot open.
+const REFUSED_BASE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+unsafe extern "C" { fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void; }
+unsafe fn set32(mut buffer: *mut u8, mut value: u32) {
+    *buffer.offset(0 as isize) = (value >> 24) as u8;
+    *buffer.offset(1 as isize) = (value >> 16) as u8;
+    *buffer.offset(2 as isize) = (value >> 8) as u8;
+    *buffer.offset(3 as isize) = value as u8;
+}
+pub unsafe fn write_header2(mut data: *mut u8, mut src: *const u8, mut w: u32) -> i32 {
+    if data.is_null() { return 0; }
+    memcpy(data.offset(16 as isize) as *mut core::ffi::c_void, src as *const core::ffi::c_void, 4);
+    set32(data.offset(0 as isize), w);
+    *data.offset(8 as isize) = 8 as u8;
+    return 1;
+}
+"#;
+
+/// **W6O-CARRIER-3 (R466-8) — the caller side has its own name.** The reason a
+/// `call-required` receipt is held when its carrier cannot open an optional
+/// source is `carrier-cannot-open`, NOT `terminal-contract-missing`, which
+/// keeps the callee-side meaning (no contract at the parameter at all —
+/// `opt_w1_held_terminal_callee_cannot_license_unwrap` pins that one). The two
+/// are opposite ends of one site and shared a name, so an artifact could read
+/// `terminal_contract = terminal-required:<interface>` beside a drop reason of
+/// `terminal-contract-missing` and look self-contradictory.
+#[test]
+fn wave6o_a_carrier_that_cannot_open_its_source_says_so() {
+    assert!(verify::type_checks_str(REFUSED_BASE));
+    let reasons = ::utils::compilation::run_compiler_on_str(REFUSED_BASE, |tcx| {
+        let table = super::decide_table(tcx).expect("native decisions");
+        table
+            .option_receipts
+            .iter()
+            .filter(|receipt| receipt.operation == "call-required")
+            .map(|receipt| {
+                receipt
+                    .obligation
+                    .intended_terminal_reason
+                    .as_ref()
+                    .map_or_else(|| "<none>".to_owned(), |reason| reason.key())
+            })
+            .collect::<Vec<_>>()
+    })
+    .expect("fixture compiler context");
+    // The retirement rewrites the reason and carries the original as
+    // `site-cause=`, which is the form the census column shows.
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("carrier-cannot-open")),
+        "the caller-side hold names itself: {reasons:?}"
+    );
+    assert!(
+        !reasons
+            .iter()
+            .any(|reason| reason.contains("terminal-contract-missing")),
+        "the callee-side name is not reused here: {reasons:?}"
+    );
+}
+
 /// **W6O-CARRIER-2 — the renderer's order.** An `Option` cannot be indexed, so
 /// when a spec carries both the unwrap and a forward view the unwrap opens the
 /// base FIRST. No spec the glue matrix returns carries both (the matrix never
