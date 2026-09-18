@@ -1910,3 +1910,60 @@ fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
         );
     }
 }
+
+const MOVED_OUT_FIELD: &str = include_str!("wave6f_fixture_moved_out_field.rs");
+
+/// Witness 27 (relay 038 / R456-5) — ownership-fields 041 §3's fixture: an
+/// OWNING struct field whose value is MOVED OUT into a local, the field
+/// nulled, and the local freed. Their dry14 dump shows the transaction
+/// `applied` with its wraps claiming their spans while **none** of its edits
+/// reaches the emitted candidate — `pub buf: *mut u8` survives and the load
+/// stays bare. This is the shape every avl / bst / quadtree node field
+/// becomes once the model settles it Owning, so it gates the whole
+/// CROWN-Box parity market.
+#[test]
+fn w6f_a_moved_out_owning_field_reaches_the_tree() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-moved-out-field-frame",
+        vec![("Holder".to_owned(), 0, SlotKind::Owning)],
+        Vec::new(),
+    );
+    let observed = observe(MOVED_OUT_FIELD);
+    let outcome = emitted("moved-out-field", MOVED_OUT_FIELD);
+    super::test_model_override::clear();
+    let row = field_row(&observed, "Holder", "buf");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "opt-box"),
+        "{row:?}"
+    );
+    let (source, _, reverted) = emitted_source(&outcome);
+    assert_eq!(reverted, 0, "{source}");
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    // An `applied` transaction whose edits do not reach the tree is the
+    // defect: the receipt would claim a conversion the program never got.
+    // An `applied` transaction whose edits do not reach the tree would be a
+    // receipt claiming a conversion the program never got. Every one of the
+    // three sites is pinned, not just the declaration.
+    for needle in [
+        "pub buf: Option<Box<u8>>,",
+        "core::ptr::write(&raw mut (*h).buf, core::ptr::NonNull::new(malloc(64 as u64) as *mut u8).map(|__p| Box::from_raw(__p.as_ptr())));",
+        "let mut b = (*h).buf.take().map_or(core::ptr::null_mut(), Box::into_raw);",
+        "core::ptr::write(&raw mut (*h).buf, None);",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+    assert!(
+        !flat.contains("pub buf: *mut u8,"),
+        "the raw field survived beside an applied transaction\n{source}"
+    );
+    // The C frees stay where the input put them (R425-2 / §28): the move
+    // hands the allocation back as a raw pointer and `free(b)` takes it.
+    assert_eq!(flat.matches("free(").count(), 3, "{source}");
+    assert!(
+        !flat.contains("drop("),
+        "no Rust drop may join the C frees\n{source}"
+    );
+}
