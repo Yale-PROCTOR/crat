@@ -590,11 +590,18 @@ unsafe extern "C" fn ZopfliCostModelSetFromLiteralCosts(mut self_0: *mut ZopfliC
 
 /// `literal_costs` (a raw pointer value loaded from a field of `self_0`)
 /// delivers with the fallback extent: the slice covers that pointer's pointee,
-/// never `self_0`'s memory. `cost_cmd` (the inline array field's decay) is
-/// REFUSED although its length is exact: `self_0` becomes `&mut ZopfliCostModel`
-/// and a `from_raw_parts_mut` over its own field would be a second live safe
-/// view the compiler cannot relate to `self_0` — the sound form is a
-/// reborrow (`&mut self_0.cost_cmd_[..]`), not this rule's constructor.
+/// never `self_0`'s memory. `cost_cmd` (the inline array field's decay) never
+/// takes this rule's constructor: `self_0` becomes `&mut ZopfliCostModel` and
+/// a `from_raw_parts_mut` over its own field would be a second live safe view
+/// the compiler cannot relate to `self_0`.
+///
+/// What happens to it instead is a **dichotomy over the frame**, because the
+/// sound form this refusal was protecting — the reborrow `&mut
+/// (*self_0).cost_cmd_[..]` — is wave-6f's W6F-5′ and exists only where their
+/// rule is composed (R456-6). With it, `cost_cmd` delivers that reborrow and
+/// indexes; without it, the subject is held `place-read-pointee` and keeps
+/// its input text. Neither frame may emit a constructor over the field, and
+/// the assertion that matters holds in both.
 #[test]
 fn w6a_b1_field_rooted_locals_split_by_what_memory_the_slice_covers() {
     let out = emitted("brotli-cost-model", BROTLI_COST_MODEL);
@@ -620,26 +627,50 @@ fn w6a_b1_field_rooted_locals_split_by_what_memory_the_slice_covers() {
         "{:#?}",
         out.degradations
     );
+    // Never, on either frame: a constructor over the field's own memory.
     assert!(
-        src.contains("letmutcost_cmd=((*self_0).cost_cmd_).as_mut_ptr();"),
-        "{}",
+        !src.contains("from_raw_parts_mut(((*self_0).cost_cmd_)"),
+        "no constructor over the field\n{}",
         out.source
     );
-    assert!(
-        src.contains("*cost_cmd.offset(iasisize)="),
-        "{}",
-        out.source
-    );
-    assert_eq!(
-        reason_of(
-            &out.degradations,
-            "ZopfliCostModelSetFromLiteralCosts::cost_cmd"
-        )
-        .as_deref(),
-        Some("place-read-pointee"),
-        "{:#?}",
-        out.degradations
-    );
+    let reborrowed = src.contains("letmutcost_cmd:&mut[f32]=&mut((*self_0).cost_cmd_)[..];");
+    if reborrowed {
+        // The composed frame: wave-6f's W6F-5′ renders the view and this
+        // rule's refusal stands aside for exactly that subject (R456-6).
+        assert!(src.contains("cost_cmd[i]="), "{}", out.source);
+        assert_eq!(
+            reason_of(
+                &out.degradations,
+                "ZopfliCostModelSetFromLiteralCosts::cost_cmd"
+            ),
+            None,
+            "{:#?}",
+            out.degradations
+        );
+    } else {
+        // The lane's own frame: no reborrow rule, so the subject is held and
+        // its text is kept exactly.
+        assert!(
+            src.contains("letmutcost_cmd=((*self_0).cost_cmd_).as_mut_ptr();"),
+            "{}",
+            out.source
+        );
+        assert!(
+            src.contains("*cost_cmd.offset(iasisize)="),
+            "{}",
+            out.source
+        );
+        assert_eq!(
+            reason_of(
+                &out.degradations,
+                "ZopfliCostModelSetFromLiteralCosts::cost_cmd"
+            )
+            .as_deref(),
+            Some("place-read-pointee"),
+            "{:#?}",
+            out.degradations
+        );
+    }
 }
 
 /// The tulip indicator table: `ti_cci` is a fn-pointer web ROOT, so
