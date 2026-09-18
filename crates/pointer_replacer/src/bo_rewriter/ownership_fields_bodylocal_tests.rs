@@ -2890,35 +2890,57 @@ fn moved_out_plan(form: Option<&str>) -> Result<super::decision::box_facts::BoxP
     .unwrap()
 }
 
-/// R455-6(b) (relay 050, STOP 1 answered): the lane that TYPES the moved-out
-/// local also renders its initializer. The field's delivered form is
-/// `Option<Box<T>>`, so the move out of it is `take()` — written at the load's
-/// own span, receipted, and readable by the field family's `raw-move` count
-/// through the same `owning_field_form` query. Without this edit the
-/// declaration carries the transaction's type over an initializer still
-/// spelled raw, which is the `E0308` that degraded the whole program on
-/// `batch-12-dry14` (report 040 §1).
+/// R456-5 (relay 051, STOP 1 → (A)): the withdrawal's pin. The move out of an
+/// owning field is rendered by the FIELD family — `field_reference`'s
+/// `owned-field-move` writes `{inner}.take()` at the load's own span, keyed on
+/// this producer's `Decision::Box(plan).optional` — so this producer writes
+/// NOTHING at that span. R455-6(b) built the same text here for one commit and
+/// the composition refused the second claim (`wrap-claim-refused:(481, 489)`
+/// on `batch-12-dry14`; report 041 §2). What this producer still owns for a
+/// moved-out owner is the type, the projections and the close.
 #[test]
-fn r455_a_moved_out_owner_renders_its_own_initializer() {
+fn r455_the_moved_out_load_is_left_to_the_field_family() {
     let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let optional = moved_out_plan(Some("opt-box")).expect("opt-box form");
-    let loads: Vec<&str> = optional
-        .expr_edits
-        .iter()
-        .filter(|edit| edit.receipt == "native-box-moved-out-load")
-        .map(|edit| edit.replacement.as_str())
-        .collect();
-    assert_eq!(loads, vec!["(*y).next.take()"], "{:?}", optional.expr_edits);
+    assert!(
+        !optional
+            .expr_edits
+            .iter()
+            .any(|edit| edit.receipt == "native-box-moved-out-load"
+                || edit.receipt == "native-owner-moved-out-of-a-field"),
+        "the load's span stays unclaimed: {:?}",
+        optional.expr_edits
+    );
+    // The rest of the moved-out owner is still delivered here.
+    assert!(optional.optional);
+    assert_eq!(
+        optional
+            .expr_edits
+            .iter()
+            .filter(|edit| edit.receipt == "native-box-optional-owner-projection")
+            .count(),
+        2,
+        "{:?}",
+        optional.expr_edits
+    );
+    assert!(
+        optional
+            .expr_edits
+            .iter()
+            .any(|edit| edit.receipt == "c-free-site-drop"),
+        "{:?}",
+        optional.expr_edits
+    );
 }
 
-/// R455-6(b), the other half: a NON-optional owning field has no renderable
-/// move — `(*y).next` is behind a raw deref, so a `Box<T>` field cannot be
-/// moved out at all (`E0507`) and there is no null to leave behind. Before
-/// (b) this shape was admitted on the assumption the field family would
-/// render the load; now that the rendering is this producer's, the shape
-/// holds fail-closed instead of typing a local it cannot initialize.
+/// R456-5, the half that survives the withdrawal: a NON-optional owning field
+/// has no renderable move — `(*y).next` is behind a raw deref, so a `Box<T>`
+/// field cannot be moved out at all (`E0507`) and there is no null to leave
+/// behind. The field family refuses the same shape on its own side
+/// (`owned-move-needs-optional-box`), so holding here keeps one vocabulary
+/// instead of typing a local whose initializer nobody can write.
 #[test]
 fn r455_a_non_optional_owning_field_holds_the_moved_out_owner() {
     let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
@@ -3028,13 +3050,12 @@ fn r447_a_moved_out_owner_takes_the_field_transactions_shape() {
             "{:?}",
             plan.expr_edits
         );
-        assert_eq!(
-            plan.expr_edits
+        assert!(
+            !plan
+                .expr_edits
                 .iter()
-                .filter(|edit| edit.receipt == "native-box-moved-out-load")
-                .count(),
-            1,
-            "{:?}",
+                .any(|edit| edit.receipt == "native-box-moved-out-load"),
+            "R456-5: the load is the field family's edit: {:?}",
             plan.expr_edits
         );
     }

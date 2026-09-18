@@ -980,29 +980,26 @@ fn derive_bundle(
     let field_payload_is_slice = field_form
         .as_deref()
         .is_some_and(|form| form.to_lowercase().contains("slice"));
-    // R455-6(b) (relay 050): the lane that TYPES the moved-out local renders
-    // its initializer too. The field's delivered form is `Option<Box<T>>`, so
-    // the move out of it is `take()`, written at the load's own span; the
-    // field family's `raw-move` count reads the site through the same
-    // `owning_field_form` query. A non-optional owning field has no
-    // renderable move — the place is behind a raw deref (`E0507`) and there is
-    // no `None` to leave in the container — so that shape holds fail-closed
-    // rather than typing a local this producer cannot initialize.
+    // R456-5 (relay 051, withdrawing R455-6(b)): the move out of the field is
+    // the FIELD family's edit and theirs alone. `field_reference`'s
+    // `owned-field-move` renders `{inner}.take()` at the load's own span,
+    // keyed on THIS producer's `Decision::Box(plan).optional` — the R440-4
+    // joint shape — so a second producer of the same text only takes the span
+    // claim away from it (`wrap-claim-refused`, measured on `batch-12-dry14`;
+    // report 041 §2). This producer contributes the type, the projections,
+    // the close and the receipts, and leaves the load's span unclaimed.
+    //
+    // The one rule that stays here is the refusal: a NON-optional owning
+    // field has no renderable move — the place is behind a raw deref
+    // (`E0507`) and the container has no `None` to keep — and the field
+    // family refuses it on its own side too (`owned-move-needs-optional-box`).
+    // Holding here keeps the two sides' vocabularies identical instead of
+    // typing a local whose initializer nobody can write.
     let mut edits = if field_load.is_some() {
         if !optional_owner {
             return Err(NativeHold::Missing("native-field-load-owner-not-optional"));
         }
-        let load = source.constructor();
-        let place = tcx
-            .sess
-            .source_map()
-            .span_to_snippet(load.span)
-            .map_err(|_| NativeHold::Missing("native-field-load-place-text"))?;
-        vec![BoxExprEdit {
-            span: load.span,
-            replacement: format!("{place}.take()"),
-            receipt: "native-box-moved-out-load",
-        }]
+        Vec::new()
     } else {
         vec![source.constructor().clone()]
     };
