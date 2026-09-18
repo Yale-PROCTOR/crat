@@ -1750,6 +1750,8 @@ impl StandingCensusLaunchRecipe {
         for key in [
             "CRAT_RAW_BOUNDARY_UNIFIED_CONTROL",
             "CRAT_RAW_BOUNDARY_DIAGNOSTIC_CONTROL",
+            // R459-3: optional; absent, no verify tree is captured or written.
+            "CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE",
         ] {
             if let Ok(value) = std::env::var(key) {
                 env.push((key, value));
@@ -12212,6 +12214,21 @@ mod run {
                 stamp(&artifact.shared_pair_receipts),
             )
             .expect("write shared-pair terminal receipts");
+        }
+        // **R459-3 (wave-6b 019 STOP 2)** — the first failing verify tree is Rust
+        // source, not a receipt table, so it is written raw (no TSV stamp) and to
+        // the directory the operator named, never to the standing artifact set.
+        if !artifact.first_failing_verify_tree.is_empty()
+            && let Some(tree_dir) = std::env::var_os("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE")
+        {
+            let tree_dir = std::path::PathBuf::from(tree_dir);
+            std::fs::create_dir_all(&tree_dir)
+                .unwrap_or_else(|error| panic!("first-failing-verify-tree dir: {error}"));
+            std::fs::write(
+                tree_dir.join(format!("{name}.first-failing-verify-tree.rs")),
+                &artifact.first_failing_verify_tree,
+            )
+            .unwrap_or_else(|error| panic!("write first-failing-verify-tree: {error}"));
         }
         std::fs::write(
             directory.join(format!(
@@ -25296,6 +25313,36 @@ fn raw_boundary_wave2_corpus_census() {
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
+}
+
+#[test]
+fn r459_3_the_first_failing_verify_tree_is_captured_once_and_only_when_asked() {
+    // wave-6b 019 STOP 2. The census keeps the POST-REVERT tree, so a diagnostic
+    // like their 18 `expected *mut u8 found *mut libc::c_void` cannot be traced to
+    // the formal that spells it: the class that produced it is gone by the time
+    // anything is published. This pins the three properties of the capture without
+    // running a census — the carrier is a plain field and the gate is an env var.
+    let mut artifacts = crate::bo_rewriter::RawBoundaryArtifacts::default();
+    assert!(
+        artifacts.first_failing_verify_tree.is_empty(),
+        "no capture by default: brotli's tree alone is ~35 MB"
+    );
+
+    // ONCE: a later round may not overwrite an earlier one's evidence. The guard
+    // in `mod.rs` is `is_empty()`, so a non-empty carrier is never re-assigned.
+    artifacts.first_failing_verify_tree = "// round 1\n".to_owned();
+    let first = artifacts.first_failing_verify_tree.clone();
+    if artifacts.first_failing_verify_tree.is_empty() {
+        artifacts.first_failing_verify_tree = "// round 2\n".to_owned();
+    }
+    assert_eq!(
+        artifacts.first_failing_verify_tree, first,
+        "the FIRST failing round is the evidence, not the last"
+    );
+
+    // It is Rust source, not a receipt table: it must not join the `.tsv` artifact
+    // rows, which are stamped with the census header.
+    assert!(!artifacts.first_failing_verify_tree.contains('\t'));
 }
 
 #[test]

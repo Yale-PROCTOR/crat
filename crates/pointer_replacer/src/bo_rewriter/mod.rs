@@ -431,6 +431,20 @@ pub(crate) struct RawBoundaryArtifacts {
     /// 50-function closure partition). `eprintln` is not an observable channel in the
     /// census worker, so the collision is reported as a receipt row instead.
     pub(crate) counted_void_call_receipts: String,
+    /// **R459-3 (wave-6b 019 STOP 2) — the FIRST failing verify tree, per program.**
+    ///
+    /// The census keeps the post-revert tree and the receipts, never the source
+    /// the verify stage actually compiled, so a diagnostic like wave-6b's 18
+    /// `expected *mut u8 found *mut libc::c_void` cannot be traced to the formal
+    /// that spells it: by the time anything is published, the class that produced
+    /// it has been reverted out of the tree. This holds the exact bytes handed to
+    /// the FIRST failing verify round and nothing after it — one round, one
+    /// program, so a later round cannot overwrite the evidence for an earlier one.
+    ///
+    /// Empty unless `CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE` names a
+    /// directory: brotli's tree alone is ~35 MB, and the standing census has no
+    /// use for it.
+    pub(crate) first_failing_verify_tree: String,
     /// wave-6a W6A-C1: Box-parameter chains (admitted / held).
     pub(crate) box_param_receipts: String,
     /// wave-6a W6A-A1: allocation-return certificates (admitted / held).
@@ -2079,6 +2093,22 @@ fn verify_and_revert(
         let probe_started = std::time::Instant::now();
         facts.verify_rounds += 1;
         let diagnosis = verify::diagnose_crate(staged.root());
+        // **R459-3 (wave-6b 019 STOP 2)** — the bytes the verify stage actually
+        // compiled, captured at the FIRST failing round and never overwritten.
+        // The post-revert tree the census publishes no longer contains the class
+        // that produced the diagnostic, so the formal a `*mut u8` error names is
+        // unreadable after the fact.
+        if diagnosis.errors > 0
+            && facts
+                .raw_boundary_artifacts
+                .first_failing_verify_tree
+                .is_empty()
+            && std::env::var_os("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE").is_some()
+        {
+            facts.raw_boundary_artifacts.first_failing_verify_tree =
+                std::fs::read_to_string(staged.root().join("lib.rs"))
+                    .unwrap_or_else(|error| format!("// unreadable verify tree: {error}\n"));
+        }
         let probe_wall_s = probe_started.elapsed().as_secs_f64();
         if atom_reverify_count > 0 {
             facts.raw_boundary_artifacts.timings.atom_reverify_wall_s =
@@ -8414,6 +8444,8 @@ fn finish_decide<'tcx>(
         };
         let raw_boundary_receipt_started = std::time::Instant::now();
         let raw_boundary_artifacts = RawBoundaryArtifacts {
+            // R459-3: filled at the first failing verify round, not here.
+            first_failing_verify_tree: String::new(),
             flexible_tail_receipts: table.flexible_tails.receipts_tsv(),
             counted_void_call_receipts: counted_void_call_receipts(tcx, &table),
             box_param_receipts: table.box_params.receipts_tsv(),
