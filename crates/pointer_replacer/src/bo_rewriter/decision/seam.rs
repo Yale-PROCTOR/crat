@@ -4661,7 +4661,13 @@ pub(crate) fn synthesize_with_raw_boundary(
                 ) && !pos.literal_null;
                 let counted_len = counted.map(|contract| {
                     super::counted_void::count_argument(
-                        tcx, table, site, *callee, contract, pos.index,
+                        tcx,
+                        table,
+                        site,
+                        *callee,
+                        contract,
+                        pos.index,
+                        a5_site_proofs.pair_certificates(),
                     )
                 });
                 if let Some(Err(block)) = counted_len {

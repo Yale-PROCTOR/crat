@@ -813,6 +813,10 @@ pub(crate) fn count_argument<'tcx>(
     callee: LocalDefId,
     c: &Contract,
     arg_index: usize,
+    // R467-5 (wave-6v2 029): the `[only]` arm's raw-sibling test is where the
+    // `binn_copy` overlap is produced, so it is the one place a pair
+    // certificate pays. `None` keeps the local root analysis alone.
+    certificates: Option<&super::pair_disjointness::PairDisjointnessIndex>,
 ) -> Result<(String, Route), super::seam::SeamBlock> {
     use super::seam::SeamBlock;
     if c.handle.is_some() {
@@ -852,6 +856,15 @@ pub(crate) fn count_argument<'tcx>(
                         let ty = typeck.expr_ty_adjusted(right);
                         (ty.is_raw_ptr() || ty.is_ref())
                             && !disjoint_roots(tcx, site.caller, argument, right)
+                            // R467-5: and the pair machinery has no
+                            // certificate for this exact pair either.
+                            && !certified_disjoint(
+                                certificates,
+                                site.caller,
+                                callee,
+                                (*only, argument.span),
+                                (other.index, right.span),
+                            )
                     })
             });
             if !raw_sibling {
@@ -1012,6 +1025,32 @@ enum RootClass {
 /// Two argument roots are distinct allocations when one is a fresh allocation
 /// of this call and the other is another fresh allocation or a value that
 /// existed before it (a stable parameter). Anything else is unproved.
+/// R467-5. The pair-disjointness certificate for one ordered pair of formals
+/// at THIS call: `true` only when the rule certifies it (distinct roots, the
+/// type rule, disjoint fields, a fresh stack address, (e), or the exported
+/// entry's waiver), so a certificate this seam does not read can no longer
+/// move zero rows.
+fn certified_disjoint(
+    certificates: Option<&super::pair_disjointness::PairDisjointnessIndex>,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    left: (usize, rustc_span::Span),
+    right: (usize, rustc_span::Span),
+) -> bool {
+    certificates.is_some_and(|index| {
+        index
+            .certify(
+                caller.local_def_index.as_u32(),
+                callee.local_def_index.as_u32(),
+                left.0,
+                right.0,
+                left.1,
+                right.1,
+            )
+            .is_ok()
+    })
+}
+
 fn disjoint_roots<'tcx>(
     tcx: TyCtxt<'tcx>,
     caller: LocalDefId,
