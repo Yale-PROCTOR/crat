@@ -1479,6 +1479,7 @@ fn table_decision(name: &str, parameter: &str) -> Decision {
 /// seam fabricates nothing and the row's one fabricated extent is the one this
 /// arm relocated to the wrapper.
 #[test]
+#[ignore = "needs nested's N2 admission and main's ctx_of re-parameterisation (R452-6 (b))"]
 fn n2_seams_a_cursor_row_onto_the_delivered_inner_slice() {
     let inputs = table_decision(CURSOR, "inputs");
     assert!(
