@@ -1020,3 +1020,68 @@ fn w6b_a_write_beside_another_statement_is_not_contracted() {
         table_of(&extra, |table| table.void_region.len()).expect("the fixture yields a table");
     assert_eq!(contracts, 0, "a body beyond the write carries no region");
 }
+
+/// **The licensed width, for wave-5c's caller lift** (relay 023 §2).
+///
+/// The query answers with the callee parameter's EXACT byte width where this
+/// family has typed it — a chain link sized by its neighbour, or a width read
+/// or write — and with nothing where the extent is the addendum-77 fallback (a
+/// fabricated extent licenses no companion, R408-1) or where the parameter is
+/// not this family's at all.
+#[test]
+fn w6b_the_licensed_width_is_exact_or_absent() {
+    use crate::bo_rewriter::decision::void_region::licensed_width;
+    let widths = table_of(H40, |table| {
+        let of = |name: &str, index: usize| {
+            table.entries.iter().find_map(|(subject, _)| {
+                subject
+                    .label
+                    .starts_with(&format!("{name}::"))
+                    .then(|| licensed_width(table, subject.fn_did, index))
+            })
+        };
+        (
+            of("AddrH40", 0),
+            of("HeadH40", 0),
+            of("BanksH40", 0),
+            of("StoreH40", 0),
+            of("AddrH40", 1),
+        )
+    })
+    .expect("the fixture yields a table");
+    let (addr, head, banks, store, wrong_index) = widths;
+    assert!(
+        matches!(addr, Some(Some(n)) if n > 0),
+        "a chain link sized by its neighbour carries an exact width: {addr:?}"
+    );
+    assert!(
+        matches!(head, Some(Some(n)) if n > 0),
+        "so does the next link: {head:?}"
+    );
+    assert_eq!(
+        banks,
+        Some(None),
+        "the LAST link of a chain rides the addendum-77 fallback and licenses nothing"
+    );
+    assert_eq!(
+        store,
+        Some(None),
+        "a parameter this family never typed licenses nothing"
+    );
+    assert_eq!(
+        wrong_index,
+        Some(None),
+        "the width is the named PARAMETER's, not the function's"
+    );
+    // The width reader's own four bytes, from the other fixture.
+    let reader = table_of(READ32, |table| {
+        table.entries.iter().find_map(|(subject, _)| {
+            subject
+                .label
+                .starts_with("BrotliUnalignedRead32::")
+                .then(|| licensed_width(table, subject.fn_did, 0))
+        })
+    })
+    .expect("the fixture yields a table");
+    assert_eq!(reader, Some(Some(4)), "a width read is exactly its width");
+}

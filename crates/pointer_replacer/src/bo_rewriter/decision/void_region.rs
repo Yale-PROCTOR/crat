@@ -831,6 +831,29 @@ pub(crate) fn parameter(
     })
 }
 
+/// **The licensed byte width of a callee parameter this family has typed**
+/// (relay 023 §2, R408-1 evidence for wave-5c's caller lift).
+///
+/// A caller held `held:local-callee-access-extent` at a LOCAL callee needs a
+/// length for its own parameter, and R408-1 licenses a companion only when a
+/// count position of the callee parameter's own pinned contract names it.
+/// A region contract is exactly such a count, and a stronger one: the width is
+/// the callee's own type, not a position whose value must be read. It is
+/// returned only when it is EXACT — a width read or write (`size_of::<T>()`)
+/// or a chain link sized by its neighbour — never for the fallback arm, whose
+/// extent is `FALLBACK_SLICE_EXTENT` and licenses nothing.
+///
+/// The caller still owes its own root: this says how many bytes the callee
+/// accesses, not that the caller may claim them. A THIN caller widened to this
+/// width is the refusal R416-5 names, and nothing here relaxes it.
+pub(crate) fn licensed_width(
+    table: &super::DecisionTable,
+    callee: LocalDefId,
+    index: usize,
+) -> Option<u64> {
+    parameter(table, callee, index).and_then(|region| region.len_bytes)
+}
+
 /// The caller-side bridge carried by a seam spec.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Bridge {
