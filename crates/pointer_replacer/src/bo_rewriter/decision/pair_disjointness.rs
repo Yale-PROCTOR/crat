@@ -74,6 +74,13 @@ pub(crate) enum CertificateKind {
     /// in-program call the two arguments are disjoint — by (a)/(b)/(c) at that
     /// caller, or by (e) again on the caller's own parameters.
     ParameterPair,
+    /// R466-5, temporal rather than class-based: one side is the address of a
+    /// stack local FIRST taken at this very call, and the callee never retains
+    /// that position. No pointer VALUE computed before the call can name that
+    /// object — on a UB-free input none exists yet (§28) — and the callee
+    /// creates none that outlives the call, so the pair is disjoint however
+    /// unknown the other side is.
+    FreshStackAddress,
     /// (e) bottoming out at an EXPORTED entry under the user's waiver
     /// (R462-1): an embedder's two pointer arguments to a `#[no_mangle]` entry
     /// are assumed not to alias. An assumption, never a proof — receipted at
@@ -88,6 +95,7 @@ impl CertificateKind {
             Self::DistinctRootsUnderContract => "pair-disjoint:distinct-roots:allocator-contract",
             Self::TypeRule => "pair-disjoint:type-rule",
             Self::DisjointFields => "pair-disjoint:disjoint-fields",
+            Self::FreshStackAddress => "pair-disjoint:fresh-stack-address",
             Self::ParameterPair => "pair-disjoint:parameter-pair",
             Self::ExportedEntryWaiver => "pair-disjoint:exported-entry-waiver",
         }
@@ -273,6 +281,10 @@ pub(crate) struct PairDisjointnessIndex {
     /// Functions the embedder can call: `#[no_mangle]` / `export_name`. Only
     /// these may bottom out on R462-1's waiver.
     exported: FxHashSet<u32>,
+    /// R466-5: `(caller, callee, argument index)` where that argument is the
+    /// address of a stack local taken exactly once in the caller's body, at a
+    /// callee position wave-6r's walk proves never retained.
+    fresh_stack: FxHashSet<(u32, u32, usize)>,
     /// (e)'s memo, keyed by `(callee, i, j)` with `i < j`.
     parameter_pairs: RefCell<FxHashMap<(u32, usize, usize), Option<PairSeparation>>>,
     ledger: RefCell<Vec<LedgerRow>>,
@@ -400,8 +412,61 @@ impl PairDisjointnessIndex {
             }
         }
 
+        // R466-5. The address-takings of every binding, then the sites where a
+        // stack argument is the ONLY address-taking of its local and the
+        // callee never retains that position.
+        let mut address_takes: FxHashMap<(u32, HirId), usize> = FxHashMap::default();
+        for &function in &program.functions {
+            let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+                continue;
+            };
+            let mut counter = AddressTakes {
+                typeck: tcx.typeck(function),
+                counts: FxHashMap::default(),
+            };
+            counter.visit_body(tcx.hir_body(body_id));
+            for (binding, count) in counter.counts {
+                address_takes.insert((function.local_def_index.as_u32(), binding), count);
+            }
+        }
+        let by_index: FxHashMap<u32, LocalDefId> = program
+            .functions
+            .iter()
+            .map(|did| (did.local_def_index.as_u32(), *did))
+            .collect();
+        let mut retention: FxHashMap<(u32, usize), bool> = FxHashMap::default();
+        let mut fresh_stack: FxHashSet<(u32, u32, usize)> = FxHashSet::default();
+        for (&(caller, callee), records) in &sites {
+            let Some(&callee_did) = by_index.get(&callee) else {
+                continue;
+            };
+            for record in records {
+                for arg in &record.args {
+                    let RootClass::StackObject(binding) = arg.class else {
+                        continue;
+                    };
+                    if address_takes.get(&(caller, binding)) != Some(&1) {
+                        continue;
+                    }
+                    let free = *retention.entry((callee, arg.index)).or_insert_with(|| {
+                        tcx.is_mir_available(callee_did)
+                            && crate::bo_rewriter::wave6r_child_access::position_is_descendant_free(
+                                tcx,
+                                &program.functions,
+                                callee_did,
+                                arg.index,
+                            )
+                    });
+                    if free {
+                        fresh_stack.insert((caller, callee, arg.index));
+                    }
+                }
+            }
+        }
+
         Self {
             sites,
+            fresh_stack,
             type_rule: type_verdicts,
             immutable_formals,
             param_bindings,
@@ -613,6 +678,13 @@ impl PairDisjointnessIndex {
             && disjoint_fields(pa, pb)
         {
             return Ok(CertificateKind::DisjointFields);
+        }
+        // R466-5, before (e): a fresh stack address at this call cannot be
+        // aliased by a pointer value that existed before it.
+        if self.fresh_stack.contains(&(caller, callee, a.index))
+            || self.fresh_stack.contains(&(caller, callee, b.index))
+        {
+            return Ok(CertificateKind::FreshStackAddress);
         }
         // (e) R462-1, last: the callee's two parameters may be separable even
         // where this call site's arguments are not, if every in-program call
@@ -991,6 +1063,13 @@ impl AllocatorOracle<'_> {
 /// this is the same question asked of the compiler instead of the text.
 #[cfg(test)]
 pub(crate) struct ProbeRow {
+    /// R466-5 sizing: for a side whose root is a STACK object, how many times
+    /// the caller's body takes that local's address, and whether the callee's
+    /// formal at that position is never retained (wave-6r's MIR walk).
+    pub left_takes: Option<usize>,
+    pub right_takes: Option<usize>,
+    pub left_free: Option<bool>,
+    pub right_free: Option<bool>,
     pub caller: LocalDefId,
     pub callee: LocalDefId,
     pub left: usize,
@@ -1037,6 +1116,32 @@ impl PairDisjointnessIndex {
                 RootClass::Unknown => "unknown".to_owned(),
             }
         };
+        // R466-5 sizing inputs, memoized: address-takings per (function,
+        // binding) and the retention verdict per (callee, formal).
+        let functions = program.functions.clone();
+        let mut takes: FxHashMap<(LocalDefId, HirId), usize> = FxHashMap::default();
+        for &function in &program.functions {
+            let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+                continue;
+            };
+            let mut counter = AddressTakes {
+                typeck: tcx.typeck(function),
+                counts: FxHashMap::default(),
+            };
+            counter.visit_body(tcx.hir_body(body_id));
+            for (binding, count) in counter.counts {
+                takes.insert((function, binding), count);
+            }
+        }
+        let mut free: FxHashMap<(LocalDefId, usize), bool> = FxHashMap::default();
+        let mut retention = |callee: LocalDefId, index: usize| -> bool {
+            *free.entry((callee, index)).or_insert_with(|| {
+                crate::bo_rewriter::wave6r_child_access::position_is_descendant_free(
+                    tcx, &functions, callee, index,
+                )
+            })
+        };
+
         let mut rows = Vec::new();
         for (&(caller, callee), records) in &self.sites {
             let caller_did = program
@@ -1065,7 +1170,21 @@ impl PairDisjointnessIndex {
                                 right.span,
                             )
                             .map_or_else(|why| why.key().to_owned(), |kind| kind.key().to_owned());
+                        let stack_take = |class: RootClass| match class {
+                            RootClass::StackObject(id) => {
+                                takes.get(&(caller_did, id)).copied().or(Some(0))
+                            }
+                            _ => None,
+                        };
+                        let left_takes = stack_take(left.class);
+                        let right_takes = stack_take(right.class);
+                        let left_free = left_takes.map(|_| retention(callee_did, left.index));
+                        let right_free = right_takes.map(|_| retention(callee_did, right.index));
                         rows.push(ProbeRow {
+                            left_takes,
+                            right_takes,
+                            left_free,
+                            right_free,
                             caller: caller_did,
                             callee: callee_did,
                             left: left.index,
@@ -1081,6 +1200,39 @@ impl PairDisjointnessIndex {
             }
         }
         rows
+    }
+}
+
+/// R466-5: how many times each binding's ADDRESS is taken in one body
+/// (`&mut x`, `&x`, `x.as_mut_ptr()` on an array). Exactly one taking is the
+/// shape the temporal certificate needs; a second is an escape it refuses.
+struct AddressTakes<'a, 'tcx> {
+    typeck: &'a TypeckResults<'tcx>,
+    counts: FxHashMap<HirId, usize>,
+}
+
+impl<'tcx> Visitor<'tcx> for AddressTakes<'_, 'tcx> {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match &expr.kind {
+            // EVERY address-taking counts, raw borrows (`&raw mut x`) included:
+            // this counter is what makes "first taken at this call" true, so it
+            // must over-count rather than miss one.
+            ExprKind::AddrOf(_, _, operand) => {
+                if let Some(binding) = derivation_place_base(self.typeck, peel_casts(operand)) {
+                    *self.counts.entry(binding).or_default() += 1;
+                }
+            }
+            ExprKind::MethodCall(segment, receiver, args, _)
+                if args.is_empty()
+                    && matches!(segment.ident.name.as_str(), "as_mut_ptr" | "as_ptr") =>
+            {
+                if let Some(binding) = derivation_place_base(self.typeck, peel_casts(receiver)) {
+                    *self.counts.entry(binding).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+        intravisit::walk_expr(self, expr);
     }
 }
 

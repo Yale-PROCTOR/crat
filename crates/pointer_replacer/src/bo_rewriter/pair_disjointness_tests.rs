@@ -795,16 +795,20 @@ fn w6p_two_sources_keep_the_root_unknown() {
                 .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
                 .unwrap_or_else(|| panic!("no fn {name}"))
         };
+        // The control is about the ROOT, so it reads the root directly: a
+        // later certificate (R466-5's temporal one rescues this very call)
+        // must not be able to make the assertion vacuous.
+        let rows = index.probe_rows(&program);
+        let row = rows
+            .iter()
+            .find(|row| {
+                tcx.item_name(row.callee.to_def_id()).as_str() == "InitCommand"
+                    && row.left == 0
+                    && row.right == 1
+            })
+            .expect("the InitCommand pair is recorded");
         assert_eq!(
-            index.certify_recorded(
-                function("CreateBackwardReferences"),
-                function("InitCommand"),
-                0,
-                1
-            ),
-            // Once the roots decline, `certify` reports the next rule's own
-            // reason — here the member clause (`Command` carries a `u32`).
-            Err(Unproved::MemberType),
+            row.left_class, "unknown",
             "a local assigned from two different places has no single root"
         );
     })
@@ -1608,8 +1612,10 @@ fn w6p_probe_pair_roots() {
         let rows = index.probe_rows(&program);
         println!("W6P_PROBE_ROWS {}", rows.len());
         for row in rows {
+            let show = |value: Option<usize>| value.map_or("-".to_owned(), |v| v.to_string());
+            let flag = |value: Option<bool>| value.map_or("-", |v| if v { "free" } else { "kept" });
             println!(
-                "W6P_PROBE\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "W6P_PROBE\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 name(row.caller),
                 name(row.callee),
                 row.left,
@@ -1618,7 +1624,11 @@ fn w6p_probe_pair_roots() {
                 row.right_class,
                 row.left_param.map_or("-".to_owned(), |i| i.to_string()),
                 row.right_param.map_or("-".to_owned(), |i| i.to_string()),
-                row.outcome
+                row.outcome,
+                show(row.left_takes),
+                show(row.right_takes),
+                flag(row.left_free),
+                flag(row.right_free)
             );
         }
     })
@@ -1865,4 +1875,164 @@ fn w6p_parameter_pair_certifies_without_the_waiver() {
         );
     })
     .expect("parameter-pair fixture compilation");
+}
+
+/// R466-5. binn `binn_copy → IsValidBinnHeader(old_ptr as *mut c_void,
+/// &mut type_0, …)`: the peer is a stack scalar whose address is taken at this
+/// very call and which `IsValidBinnHeader` only writes through, while
+/// `old_ptr` has no root at all (`binn_ptr` returns either its argument or a
+/// stored pointer field — report 015 §7). No class rule reaches it; the
+/// temporal one does.
+const FRESH_STACK_HEADER: &str = r#"
+    use core::ffi::c_void;
+    #[repr(C)]
+    pub struct binn { pub header: i32, pub ptr: *mut c_void }
+    pub unsafe fn IsValidBinnHeader(pbuf: *mut c_void, ptype: *mut i32, pcount: *mut i32) -> i32 {
+        if pbuf.is_null() { return 0; }
+        *ptype = *(pbuf as *mut u8) as i32;
+        *pcount = 1;
+        1
+    }
+    pub unsafe fn binn_ptr(ptr: *mut c_void) -> *mut c_void {
+        let item = ptr as *mut binn;
+        if (*item).header != 0 { return (*item).ptr; }
+        return ptr;
+    }
+    pub unsafe fn binn_copy(old: *mut c_void) -> i32 {
+        let old_ptr = binn_ptr(old) as *mut u8;
+        let mut type_0: i32 = 0;
+        let mut count: i32 = 0;
+        IsValidBinnHeader(old_ptr as *mut c_void, &mut type_0, &mut count)
+    }
+"#;
+
+#[test]
+fn w6p_fresh_stack_address_certifies_against_an_unrooted_peer() {
+    ::utils::compilation::run_compiler_on_str(FRESH_STACK_HEADER, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        let outcome =
+            index.certify_recorded(function("binn_copy"), function("IsValidBinnHeader"), 0, 1);
+        assert_eq!(
+            outcome,
+            Ok(CertificateKind::FreshStackAddress),
+            "the stack scalar's address is first taken at this call and never retained"
+        );
+        assert_eq!(
+            outcome.expect("certified").key(),
+            "pair-disjoint:fresh-stack-address"
+        );
+    })
+    .expect("fresh-stack fixture compilation");
+}
+
+/// Control (i): a callee that STORES the address retains it, so the temporal
+/// argument is gone — the pointer outlives the call.
+const FRESH_STACK_RETAINED: &str = r#"
+    use core::ffi::c_void;
+    pub static mut SINK: *mut i32 = 0 as *mut i32;
+    pub unsafe fn IsValidBinnHeader(pbuf: *mut c_void, ptype: *mut i32, pcount: *mut i32) -> i32 {
+        if pbuf.is_null() { return 0; }
+        // written THROUGH (so the pair is not a READ/READ one) and also
+        // RETAINED (so the temporal argument is gone).
+        *ptype = *(pbuf as *mut u8) as i32;
+        SINK = ptype;
+        *pcount = 1;
+        1
+    }
+    #[repr(C)]
+    pub struct binn_r { pub header: i32, pub ptr: *mut c_void }
+    pub unsafe fn binn_ptr(ptr: *mut c_void) -> *mut c_void {
+        let item = ptr as *mut binn_r;
+        if (*item).header != 0 { return (*item).ptr; }
+        return ptr;
+    }
+    pub unsafe fn binn_copy(old: *mut c_void) -> i32 {
+        let old_ptr = binn_ptr(old) as *mut u8;
+        let mut type_0: i32 = 0;
+        let mut count: i32 = 0;
+        IsValidBinnHeader(old_ptr as *mut c_void, &mut type_0, &mut count)
+    }
+"#;
+
+#[test]
+fn w6p_retained_stack_address_is_refused() {
+    ::utils::compilation::run_compiler_on_str(FRESH_STACK_RETAINED, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        assert_ne!(
+            index.certify_recorded(function("binn_copy"), function("IsValidBinnHeader"), 0, 1),
+            Ok(CertificateKind::FreshStackAddress),
+            "a callee that stores the address keeps it alive past the call"
+        );
+    })
+    .expect("retained fixture compilation");
+}
+
+/// Control (ii): the local's address is taken EARLIER in the function, so a
+/// pointer to it may already exist when the call happens.
+const FRESH_STACK_ESCAPED_EARLIER: &str = r#"
+    use core::ffi::c_void;
+    pub unsafe fn note(p: *mut i32) -> i32 { *p }
+    pub unsafe fn IsValidBinnHeader(pbuf: *mut c_void, ptype: *mut i32, pcount: *mut i32) -> i32 {
+        if pbuf.is_null() { return 0; }
+        *ptype = 1;
+        *pcount = 1;
+        1
+    }
+    pub unsafe fn binn_ptr(ptr: *mut c_void) -> *mut c_void { ptr }
+    pub unsafe fn binn_copy(old: *mut c_void) -> i32 {
+        let old_ptr = binn_ptr(old) as *mut u8;
+        let mut type_0: i32 = 0;
+        let mut count: i32 = 0;
+        note(&mut type_0);
+        IsValidBinnHeader(old_ptr as *mut c_void, &mut type_0, &mut count)
+    }
+"#;
+
+#[test]
+fn w6p_stack_address_taken_earlier_is_refused() {
+    ::utils::compilation::run_compiler_on_str(FRESH_STACK_ESCAPED_EARLIER, |tcx| {
+        let program = bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        assert_ne!(
+            index.certify_recorded(function("binn_copy"), function("IsValidBinnHeader"), 0, 1),
+            Ok(CertificateKind::FreshStackAddress),
+            "a second address-taking means a pointer may already exist"
+        );
+    })
+    .expect("escaped-earlier fixture compilation");
 }
