@@ -35,6 +35,10 @@ pub(crate) const CACHE_FRAME_ADMISSION: &str = "raw_boundary_cache_frame_admissi
 /// and were dropped by their caller: correct in the plan, inert in the tree. An
 /// instrument count, per program; 0 is the expected reading.
 pub(crate) const GRAFT_REFUSED: &str = "raw_boundary_graft_refused";
+/// **R469-1** — how many rows of wave-6f's `revert_status` column disagree with the
+/// final-revert table. A NOTE, not a verdict: the count rides beside an `emitted`
+/// outcome and the rows are published in their own receipt table.
+pub(crate) const FIELD_REVERT_STATUS_NOTES: &str = "raw_boundary_field_revert_status_notes";
 pub(crate) const LAUNCH_ENV_SHA256: &str = "raw_boundary_launch_env_sha256";
 pub(crate) const SOLVE_WALL_S: &str = "raw_boundary_solve_wall_s";
 pub(crate) const SOLVER_INVOCATIONS: &str = "raw_boundary_solver_invocations";
@@ -241,6 +245,7 @@ pub(crate) const ALL: &[&str] = &[
     CACHE_MANIFEST_SHA256,
     CACHE_FRAME_ADMISSION,
     GRAFT_REFUSED,
+    FIELD_REVERT_STATUS_NOTES,
     LAUNCH_ENV_SHA256,
     SOLVE_WALL_S,
     SOLVER_INVOCATIONS,

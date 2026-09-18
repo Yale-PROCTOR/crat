@@ -1635,60 +1635,120 @@ fn cache_only_before_solve<T>(
 /// set: dependent ⊆ owners, so a `withdrawn` implies a reverted `owners` entry.
 ///
 /// A frame whose receipt predates the column is `Ok`: absence is not disagreement.
-fn field_transaction_revert_status_agrees(
+/// **R469-1 (seat relay 101)** — a cross-table disagreement is a typed NOTE, never a
+/// verdict. The first version of this check was an `assert_eq!` on the outcome kind and
+/// it killed a completed 20/20 census over one heman row; an instrument column may
+/// describe a program, it may not void the measurement of one.
+///
+/// Both directions are asked again — the backward one (`active` while an owner is
+/// reverted) is the one that found wave-6f's real defect, and dropping it dropped the
+/// finding. Each disagreement returns a row naming the struct, the field, the owner and
+/// both values, so the count is auditable and wave-6f can read the rows.
+fn field_transaction_revert_status_notes(
     field_transactions: &str,
     final_reverts: &str,
-) -> Result<(), String> {
+) -> Vec<FieldRevertStatusNote> {
     let column = |header: &str, name: &str| header.split('\t').position(|c| c == name);
+    let mut notes = Vec::new();
     let mut reverts = final_reverts.lines();
     let Some(revert_header) = reverts.next() else {
-        return Ok(());
+        return notes;
     };
-    let identity = column(revert_header, "identity")
-        .ok_or_else(|| "final-reverts lacks identity".to_owned())?;
+    let Some(identity) = column(revert_header, "identity") else {
+        return notes;
+    };
     let reverted = reverts
         .filter_map(|line| line.split('\t').nth(identity).map(str::to_owned))
         .collect::<std::collections::BTreeSet<_>>();
 
     let mut rows = field_transactions.lines();
     let Some(header) = rows.next() else {
-        return Ok(());
+        return notes;
     };
     let Some(status_column) = column(header, "revert_status") else {
-        return Ok(()); // a frame before wave-6f's column; nothing to check
+        return notes; // a frame before wave-6f's column; nothing to describe
     };
-    let owners = column(header, "owners").ok_or_else(|| "receipt lacks owners".to_owned())?;
-    let status = column(header, "status").ok_or_else(|| "receipt lacks status".to_owned())?;
+    let (Some(owners), Some(status), Some(structs), Some(fields)) = (
+        column(header, "owners"),
+        column(header, "status"),
+        column(header, "struct"),
+        column(header, "field"),
+    ) else {
+        return notes;
+    };
     for line in rows {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        let (Some(plan), Some(revert_status), Some(owner_list)) = (
-            fields.get(status),
-            fields.get(status_column),
-            fields.get(owners),
+        let cells = line.split('\t').collect::<Vec<_>>();
+        let (Some(plan), Some(revert_status), Some(owner_list), Some(owning_struct), Some(field)) = (
+            cells.get(status),
+            cells.get(status_column),
+            cells.get(owners),
+            cells.get(structs),
+            cells.get(fields),
         ) else {
             continue;
         };
+        let mut note = |kind: &str, owner: &str| {
+            notes.push(FieldRevertStatusNote {
+                owning_struct: (*owning_struct).to_owned(),
+                field: (*field).to_owned(),
+                owner: owner.to_owned(),
+                plan: (*plan).to_owned(),
+                revert_status: (*revert_status).to_owned(),
+                kind: kind.to_owned(),
+            });
+        };
         if *plan == "held" {
             if *revert_status != "-" {
-                return Err(format!("held row carries revert_status {revert_status}"));
+                note("held-row-carries-revert-status", "-");
             }
             continue;
         }
-        let any = owner_list
+        let mut reverted_owner = None;
+        let mut any = false;
+        for owner in owner_list
             .split(';')
             .map(str::trim)
             .filter(|owner| !owner.is_empty() && *owner != "-")
-            .any(|owner| reverted.contains(owner));
-        match (*revert_status, any) {
-            ("withdrawn", false) => {
-                return Err(format!("withdrawn but no owner reverted: {owner_list}"));
+        {
+            if reverted.contains(owner) {
+                any = true;
+                reverted_owner.get_or_insert(owner.to_owned());
             }
-            // ("active", true) is NOT a disagreement: see above.
+        }
+        match (*revert_status, any) {
+            ("withdrawn", false) => note("withdrawn-but-no-owner-reverted", "-"),
+            ("active", true) => note(
+                "owner-reverted-but-reads-active",
+                &reverted_owner.unwrap_or_default(),
+            ),
             ("withdrawn" | "active", _) => {}
-            other => return Err(format!("unknown revert_status {:?}", other.0)),
+            (other, _) => note("unknown-revert-status", other),
         }
     }
-    Ok(())
+    notes
+}
+
+/// One cross-table disagreement between wave-6f's `revert_status` column and the
+/// final-revert table, published as a receipt row (R469-1).
+struct FieldRevertStatusNote {
+    owning_struct: String,
+    field: String,
+    owner: String,
+    plan: String,
+    revert_status: String,
+    kind: String,
+}
+
+fn field_revert_status_notes_table(notes: &[FieldRevertStatusNote]) -> String {
+    let mut table =
+        String::from("program\tstruct\tfield\towner\tplan_status\trevert_status\tdisagreement\n");
+    for note in notes {
+        table.push_str(&format!(
+            "\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            note.owning_struct, note.field, note.owner, note.plan, note.revert_status, note.kind
+        ));
+    }
+    table
 }
 
 fn accepted_cache_manifest_program_column(manifest: &str) -> Result<usize, String> {
@@ -12443,13 +12503,22 @@ mod run {
             raw_schema::GRAFT_REFUSED,
             crate::bo_rewriter::ast_transform::graft_refusals(),
         );
-        if let Err(disagreement) = super::field_transaction_revert_status_agrees(
+        let revert_status_notes = super::field_transaction_revert_status_notes(
             &artifact.field_transactions,
             &artifact.final_reverts,
-        ) {
-            row.set(raw_schema::STATUS, "field-revert-status-disagreement");
-            row.set("detail", super::report::sanitize(&disagreement));
-            return row;
+        );
+        row.set(
+            raw_schema::FIELD_REVERT_STATUS_NOTES,
+            revert_status_notes.len().to_string(),
+        );
+        if !revert_status_notes.is_empty() {
+            std::fs::write(
+                directory.join(format!("{name}.raw-boundary-field-revert-status-notes.tsv")),
+                stamp(&super::field_revert_status_notes_table(
+                    &revert_status_notes,
+                )),
+            )
+            .expect("write field revert-status notes");
         }
         // **R459-3 (wave-6b 019 STOP 2)** — the first failing verify tree is Rust
         // source, not a receipt table, so it is written raw (no TSV stamp) and to
@@ -25593,7 +25662,7 @@ fn r467_3_silent_graft_refusals_are_counted_at_the_one_choke_point() {
 }
 
 #[test]
-fn r464_5_the_field_receipt_revert_status_agrees_with_the_final_revert_table() {
+fn r469_1_a_revert_status_disagreement_is_a_typed_note_not_a_verdict() {
     let reverts =
         "program\tkind\tidentity\n                   heman\tfunction\tsrc::a::owner_reverted\n";
     let receipt = |owners: &str, revert_status: &str| {
@@ -25601,58 +25670,63 @@ fn r464_5_the_field_receipt_revert_status_agrees_with_the_final_revert_table() {
             "program\tstruct\tfield\tstatus\towners\trevert_status\n             heman\tS\tf\tapplied\t{owners}\t{revert_status}\n"
         )
     };
+    let notes = |receipt: &str| field_transaction_revert_status_notes(receipt, reverts);
 
-    // Agreement, in both directions.
-    assert!(
-        field_transaction_revert_status_agrees(
-            &receipt("src::a::owner_reverted", "withdrawn"),
-            reverts
-        )
-        .is_ok()
-    );
-    assert!(
-        field_transaction_revert_status_agrees(&receipt("src::a::kept", "active"), reverts).is_ok()
-    );
+    // Agreement, in both directions, is silent.
+    assert!(notes(&receipt("src::a::owner_reverted", "withdrawn")).is_empty());
+    assert!(notes(&receipt("src::a::kept", "active")).is_empty());
     // One owner of several reverting is enough to withdraw the transaction.
-    assert!(
-        field_transaction_revert_status_agrees(
-            &receipt("src::a::kept;src::a::owner_reverted", "withdrawn"),
-            reverts
-        )
-        .is_ok()
-    );
+    assert!(notes(&receipt("src::a::kept;src::a::owner_reverted", "withdrawn")).is_empty());
 
     // FORWARD: `withdrawn` must name an owner that really reverted.
-    assert!(
-        field_transaction_revert_status_agrees(&receipt("src::a::kept", "withdrawn"), reverts)
-            .is_err()
-    );
-    // **NO BACKWARD DIRECTION.** `revert_status` is computed from DEPENDENT
-    // owners, a subset of the published `owners`, so an owner that reverted while
-    // no dependent owner did reads `active` and is CORRECT -- wave-6f names avl's
-    // `Node.left` as exactly that split. heman's `kmRay2IntersectBox` is one, and
-    // asserting otherwise (keyed on `owners`, which is verbatim the third fault
-    // their own witness rejects) stopped a census after all 20 programs emitted.
-    assert!(
-        field_transaction_revert_status_agrees(
-            &receipt("src::a::owner_reverted", "active"),
-            reverts
-        )
-        .is_ok()
-    );
+    let forward = notes(&receipt("src::a::kept", "withdrawn"));
+    assert_eq!(forward.len(), 1);
+    assert_eq!(forward[0].kind, "withdrawn-but-no-owner-reverted");
+
+    // BACKWARD: `active` while an owner reverted. This is the direction that found
+    // wave-6f's real defect on heman, so it is asked again -- but as a NOTE. It
+    // names the reverted owner, because the row is what wave-6f has to read.
+    let backward = notes(&receipt("src::a::owner_reverted", "active"));
+    assert_eq!(backward.len(), 1);
+    assert_eq!(backward[0].kind, "owner-reverted-but-reads-active");
+    assert_eq!(backward[0].owner, "src::a::owner_reverted");
+    assert_eq!(backward[0].owning_struct, "S");
+    assert_eq!(backward[0].field, "f");
+    assert_eq!(backward[0].revert_status, "active");
+
     // A held row never reached a revert set to be withdrawn from.
-    assert!(field_transaction_revert_status_agrees(
+    let held = field_transaction_revert_status_notes(
         "program\tstruct\tfield\tstatus\towners\trevert_status\nheman\tS\tf\theld\t-\twithdrawn\n",
-        reverts
-    )
-    .is_err());
+        reverts,
+    );
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].kind, "held-row-carries-revert-status");
 
     // A frame whose receipt predates the column is not a disagreement.
-    assert!(field_transaction_revert_status_agrees(
-        "program\tstruct\tfield\tstatus\towners\nheman\tS\tf\tapplied\tsrc::a::owner_reverted\n",
-        reverts
-    )
-    .is_ok());
+    assert!(
+        field_transaction_revert_status_notes(
+            "program\tstruct\tfield\tstatus\towners\nheman\tS\tf\tapplied\tsrc::a::owner_reverted\n",
+            reverts,
+        )
+        .is_empty()
+    );
+
+    // The published table carries struct, field, owner and BOTH values, so the
+    // disagreement can be diagnosed without re-running the census.
+    let table = field_revert_status_notes_table(&backward);
+    for cell in ["S", "f", "src::a::owner_reverted", "applied", "active"] {
+        assert!(table.contains(cell), "notes table lacks {cell}: {table}");
+    }
+
+    // R450-9: the count is its own additive column, and it is NOT the status.
+    assert!(
+        crate::raw_boundary_census_schema::ALL
+            .contains(&crate::raw_boundary_census_schema::FIELD_REVERT_STATUS_NOTES)
+    );
+    assert_ne!(
+        crate::raw_boundary_census_schema::FIELD_REVERT_STATUS_NOTES,
+        crate::raw_boundary_census_schema::STATUS
+    );
 }
 
 #[test]
