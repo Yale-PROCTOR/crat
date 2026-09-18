@@ -25,6 +25,12 @@ pub(crate) const CACHE_STATUS: &str = "raw_boundary_cache_status";
 pub(crate) const CACHE_FINGERPRINT: &str = "raw_boundary_cache_fingerprint";
 pub(crate) const CACHE_MODEL_SHA256: &str = "raw_boundary_cache_model_sha256";
 pub(crate) const CACHE_MANIFEST_SHA256: &str = "raw_boundary_cache_manifest_sha256";
+/// **R456-3(d)** — which FRAME's accepted manifest admitted this program's cache
+/// entry: `frame` (this frame's own), `frame-absent` (this frame has no accepted
+/// row and the predecessor frame accepts the SAME fingerprint), or `miss`. It is a
+/// column of its own and never overloads `CACHE_STATUS`, which reports what the
+/// model cache did, not which manifest licensed the read.
+pub(crate) const CACHE_FRAME_ADMISSION: &str = "raw_boundary_cache_frame_admission";
 pub(crate) const LAUNCH_ENV_SHA256: &str = "raw_boundary_launch_env_sha256";
 pub(crate) const SOLVE_WALL_S: &str = "raw_boundary_solve_wall_s";
 pub(crate) const SOLVER_INVOCATIONS: &str = "raw_boundary_solver_invocations";
@@ -229,6 +235,7 @@ pub(crate) const ALL: &[&str] = &[
     CACHE_FINGERPRINT,
     CACHE_MODEL_SHA256,
     CACHE_MANIFEST_SHA256,
+    CACHE_FRAME_ADMISSION,
     LAUNCH_ENV_SHA256,
     SOLVE_WALL_S,
     SOLVER_INVOCATIONS,

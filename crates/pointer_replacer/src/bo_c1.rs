@@ -1680,6 +1680,17 @@ fn field_transaction_revert_status_agrees(
     Ok(())
 }
 
+fn accepted_cache_manifest_program_column(manifest: &str) -> Result<usize, String> {
+    let header = manifest
+        .lines()
+        .next()
+        .ok_or_else(|| "accepted cache manifest is empty".to_owned())?;
+    header
+        .split('\t')
+        .position(|name| name == "program")
+        .ok_or_else(|| "accepted cache manifest lacks program".to_owned())
+}
+
 fn accepted_cache_manifest_contains(
     manifest: &str,
     program: &str,
@@ -1708,6 +1719,87 @@ fn accepted_cache_manifest_contains(
         fields.get(program_column) == Some(&program)
             && fields.get(fingerprint_column) == Some(&fingerprint)
     }))
+}
+
+/// **R456-3(d) — which frame's accepted manifest licensed a cache read.**
+///
+/// era-5c 009 STOP 1 (a): at a NEW analysis frame, a program the frame cannot
+/// solve has no accepted row of its own, so the gate refuses `ManifestMiss` and
+/// the whole census ends `data=false` — L01⁗ could not be censused at all.
+///
+/// **A fingerprint is frame-scoped, so "the predecessor at the same fingerprint"
+/// is not a condition that can ever hold.** Measured on the two manifests this is
+/// built for: of the 17 programs L01‴ and L01⁗ share, **17 carry a different
+/// fingerprint**, and the three that L01⁗ omits entirely — `brotli`, `libzahl`,
+/// `lil` — are exactly the three era-5c cannot solve there. A same-fingerprint
+/// rule would be inert on the only case it exists to serve.
+///
+/// So the condition is SILENCE, not agreement: the predecessor may license a read
+/// only where this frame's manifest **does not name the program at all**. If this
+/// frame names it at a different fingerprint that is a DISAGREEMENT about a
+/// program the frame does have an opinion on, and it stays a miss — that is the
+/// difference between filling a gap and overriding a verdict.
+///
+/// Whether the predecessor's model is actually loadable here is the separate,
+/// unchanged gate immediately below this one (`EntryUnavailable`), so a program
+/// admitted by silence still fails closed if no entry can be read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheFrameAdmission {
+    /// This frame's own accepted manifest names (program, fingerprint).
+    Frame,
+    /// This frame's does not; the predecessor frame's does, at the same fingerprint.
+    FrameAbsent,
+    /// Neither does.
+    Miss,
+}
+
+impl CacheFrameAdmission {
+    fn admitted(self) -> bool {
+        matches!(self, Self::Frame | Self::FrameAbsent)
+    }
+
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Frame => "frame",
+            Self::FrameAbsent => "frame-absent",
+            Self::Miss => "miss",
+        }
+    }
+}
+
+fn cache_frame_admission(
+    manifest: &str,
+    predecessor: Option<&str>,
+    program: &str,
+    fingerprint: &str,
+) -> Result<CacheFrameAdmission, String> {
+    if accepted_cache_manifest_contains(manifest, program, fingerprint)? {
+        return Ok(CacheFrameAdmission::Frame);
+    }
+    // The frame has an opinion about this program and it is not this fingerprint.
+    // Nothing a predecessor says may override it.
+    if accepted_cache_manifest_names(manifest, program)? {
+        return Ok(CacheFrameAdmission::Miss);
+    }
+    let Some(predecessor) = predecessor else {
+        return Ok(CacheFrameAdmission::Miss);
+    };
+    // A malformed predecessor manifest is an ERROR, never a quiet miss: the
+    // difference between "the predecessor does not name this" and "I could not
+    // read the predecessor" is exactly what this status exists to record.
+    if accepted_cache_manifest_names(predecessor, program)? {
+        return Ok(CacheFrameAdmission::FrameAbsent);
+    }
+    Ok(CacheFrameAdmission::Miss)
+}
+
+/// Whether the manifest has any row for this program, at any fingerprint.
+fn accepted_cache_manifest_names(manifest: &str, program: &str) -> Result<bool, String> {
+    let column = accepted_cache_manifest_program_column(manifest)?;
+    Ok(manifest
+        .lines()
+        .skip(1)
+        .any(|line| line.split('\t').collect::<Vec<_>>().get(column) == Some(&program)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1829,6 +1921,8 @@ impl StandingCensusLaunchRecipe {
             "CRAT_RAW_BOUNDARY_DIAGNOSTIC_CONTROL",
             // R459-3: optional; absent, no verify tree is captured or written.
             "CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE",
+            // R456-3(d): optional; absent, the cache gate is unchanged.
+            "CRAT_RAW_BOUNDARY_CACHE_MANIFEST_PREDECESSOR",
         ] {
             if let Ok(value) = std::env::var(key) {
                 env.push((key, value));
@@ -11933,19 +12027,44 @@ mod run {
             }
         };
         let cache_manifest_sha256 = format!("{:x}", Sha256::digest(manifest.as_bytes()));
-        let manifest_match =
-            match super::accepted_cache_manifest_contains(&manifest, &name, &fingerprint) {
-                Ok(found) => found,
-                Err(error) => {
-                    row.set(raw_schema::STATUS, "manifest-error");
-                    row.set("detail", super::report::sanitize(&error));
-                    row.set(raw_schema::SOLVER_INVOCATIONS, 0);
-                    row.set(raw_schema::SOLVE_WALL_S, "0.000000");
-                    return row;
-                }
+        // **R456-3(d)** — the predecessor frame's accepted manifest, if one is
+        // configured. Absent, the gate is byte-for-byte what it was.
+        let predecessor_manifest =
+            match std::env::var_os("CRAT_RAW_BOUNDARY_CACHE_MANIFEST_PREDECESSOR") {
+                None => None,
+                Some(path) => match std::fs::read_to_string(std::path::PathBuf::from(path)) {
+                    Ok(text) => Some(text),
+                    Err(error) => {
+                        row.set(raw_schema::STATUS, "manifest-error");
+                        row.set(
+                            "detail",
+                            super::report::sanitize(&format!("predecessor: {error}")),
+                        );
+                        row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                        row.set(raw_schema::SOLVE_WALL_S, "0.000000");
+                        return row;
+                    }
+                },
             };
+        let admission = match super::cache_frame_admission(
+            &manifest,
+            predecessor_manifest.as_deref(),
+            &name,
+            &fingerprint,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                row.set(raw_schema::STATUS, "manifest-error");
+                row.set("detail", super::report::sanitize(&error));
+                row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                row.set(raw_schema::SOLVE_WALL_S, "0.000000");
+                return row;
+            }
+        };
+        row.set(raw_schema::CACHE_FRAME_ADMISSION, admission.wire());
         let entry_available = match super::cache_only_before_solve(
-            manifest_match
+            admission
+                .admitted()
                 .then_some(())
                 .ok_or(super::CacheOnlyRefusal::ManifestMiss),
             || raw_boundary_cache_entry_available(input),
@@ -12056,6 +12175,12 @@ mod run {
             (
                 "CRAT_RAW_BOUNDARY_EMITTED_TREE_DIR",
                 emitted_tree_dir.display().to_string(),
+            ),
+            // R456-3(d): two runs that differ only in the predecessor manifest are
+            // two different launches, so the digest has to say so.
+            (
+                "CRAT_RAW_BOUNDARY_CACHE_MANIFEST_PREDECESSOR",
+                std::env::var("CRAT_RAW_BOUNDARY_CACHE_MANIFEST_PREDECESSOR").unwrap_or_default(),
             ),
         ]
         .into_iter()
@@ -25509,6 +25634,98 @@ fn r459_3_the_first_failing_verify_tree_is_captured_once_and_only_when_asked() {
     assert!(
         std::fs::read_to_string(staged.root().join("lib.rs")).is_err(),
         "the path the first version used cannot be read"
+    );
+}
+
+#[test]
+fn r456_3_a_frame_that_cannot_solve_a_program_consumes_the_predecessor_entry() {
+    // era-5c 009 STOP 1 (a). Pinned text only: no cache, no solver, no corpus.
+    // The fingerprints are deliberately DIFFERENT between the two frames, because
+    // that is what the real manifests do — measured on L01‴ vs L01⁗: of the 17
+    // programs both name, 17 carry a different fingerprint.
+    const HEADER: &str = "program\tfingerprint";
+    let frame = format!("{HEADER}\nbst\tnew-bst\nheman\tnew-heman");
+    let predecessor = format!("{HEADER}\nbst\told-bst\nlibzahl\told-libzahl\nlil\told-lil");
+
+    // This frame accepts bst itself — the predecessor is never consulted.
+    assert_eq!(
+        cache_frame_admission(&frame, Some(&predecessor), "bst", "new-bst").unwrap(),
+        CacheFrameAdmission::Frame
+    );
+    // libzahl and lil: this frame is SILENT about them and the predecessor names
+    // them. The fingerprints differ, and they must — a same-fingerprint rule would
+    // be inert on precisely this case.
+    for (program, fingerprint) in [("libzahl", "new-libzahl"), ("lil", "new-lil")] {
+        assert_eq!(
+            cache_frame_admission(&frame, Some(&predecessor), program, fingerprint).unwrap(),
+            CacheFrameAdmission::FrameAbsent,
+            "{program}"
+        );
+    }
+    assert_eq!(CacheFrameAdmission::FrameAbsent.wire(), "frame-absent");
+    assert!(CacheFrameAdmission::FrameAbsent.admitted());
+}
+
+#[test]
+fn r456_3_the_predecessor_fills_a_silence_and_never_overrides_a_verdict() {
+    const HEADER: &str = "program\tfingerprint";
+    let frame = format!("{HEADER}\nbst\tnew-bst\nheman\tnew-heman");
+    let predecessor = format!("{HEADER}\nbst\told-bst\nheman\told-heman\nlibzahl\told-libzahl");
+
+    // THE fail-closed case. This frame NAMES heman, at `new-heman`, and the worker
+    // asks about some other fingerprint: the frame has an opinion about heman and
+    // the predecessor may not override it.
+    assert_eq!(
+        cache_frame_admission(&frame, Some(&predecessor), "heman", "stale-heman").unwrap(),
+        CacheFrameAdmission::Miss
+    );
+    // No predecessor configured: the gate is exactly what it was.
+    assert_eq!(
+        cache_frame_admission(&frame, None, "libzahl", "new-libzahl").unwrap(),
+        CacheFrameAdmission::Miss
+    );
+    // A program neither manifest names.
+    assert_eq!(
+        cache_frame_admission(&frame, Some(&predecessor), "lil", "new-lil").unwrap(),
+        CacheFrameAdmission::Miss
+    );
+    assert_eq!(CacheFrameAdmission::Miss.wire(), "miss");
+    assert!(!CacheFrameAdmission::Miss.admitted());
+}
+
+#[test]
+fn r456_3_an_unreadable_predecessor_manifest_is_an_error_not_a_quiet_miss() {
+    const HEADER: &str = "program\tfingerprint";
+    let frame = format!("{HEADER}\nbst\tnew-bst");
+    // R295-3: "the predecessor does not name this" and "I could not read the
+    // predecessor" are two conditions and must not share one outcome.
+    assert!(cache_frame_admission(&frame, Some(""), "libzahl", "f").is_err());
+    assert!(
+        cache_frame_admission(
+            &frame,
+            Some("not_a_program_column\tfingerprint"),
+            "libzahl",
+            "f"
+        )
+        .is_err()
+    );
+    // And a malformed FRAME manifest still errors ahead of any predecessor read.
+    assert!(cache_frame_admission("", Some(&frame), "bst", "new-bst").is_err());
+}
+
+#[test]
+fn r456_3_the_frame_admission_is_its_own_column_and_never_the_cache_status() {
+    use crate::raw_boundary_census_schema as schema;
+    // R450-9's rule: a new fact gets a new column; it does not overload one whose
+    // readers already mean something else by it.
+    assert!(schema::ALL.contains(&schema::CACHE_FRAME_ADMISSION));
+    assert_ne!(schema::CACHE_FRAME_ADMISSION, schema::CACHE_STATUS);
+    assert_eq!(
+        schema::ALL
+            .iter()
+            .filter(|key| **key == schema::CACHE_FRAME_ADMISSION)
+            .count(),
+        1
     );
 }
 
