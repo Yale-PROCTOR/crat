@@ -638,12 +638,28 @@ pub unsafe extern "C" fn transform_to_coordfield(mut data: *mut libc::c_float, m
             match decision {
                 Decision::Box(plan) => {
                     assert_eq!(plan.shape, BoxShape::Slice);
+                    // R461-4 (2): every peer pair of the lend is discharged,
+                    // and WHICH proof discharges it is the frame's. On this
+                    // line the A5 site proof is not clear and this lane's own
+                    // fresh-allocation derivation closure carries each pair;
+                    // on a composition carrying wave-6p's derived-root rule
+                    // (their `9de792e9`) four of them come back
+                    // `clear:pair-disjoint:distinct-roots:pair-disjointness-certificate`
+                    // and this producer never reaches its own closure for
+                    // them. Both are proofs; an undischarged pair is not, so
+                    // the assertion is over EVERY row rather than the
+                    // existence of one.
+                    let pairs: Vec<&String> = plan
+                        .receipts
+                        .iter()
+                        .filter(|r| r.starts_with("native-box-pair "))
+                        .collect();
+                    assert!(!pairs.is_empty(), "{:?}", plan.receipts);
                     assert!(
-                        plan.receipts
-                            .iter()
-                            .any(|r| r.contains("disjoint=fresh-allocation-derivation-closure")),
-                        "{:?}",
-                        plan.receipts
+                        pairs.iter().all(|r| r
+                            .contains("disjoint=fresh-allocation-derivation-closure")
+                            || r.contains(":clear:")),
+                        "{pairs:?}"
                     );
                     Reading::DecidedBox
                 }
