@@ -1801,26 +1801,17 @@ pub unsafe fn slerp(mut q1: *const kmQuaternion, mut t: f32) -> f32 {
 }
 "#;
 
-#[test]
-fn w6v_raw_twin_is_defined_and_nameable_at_a_cross_module_caller() {
-    let source = super::emit_tests::ast_emitted_source_of(TWIN_CROSS_MODULE).unwrap();
-    let c = compact(&source);
-    assert!(
-        c.contains("__crat_raw_kmQuaternionScale(&mutdiff,&mutdiff,t)"),
-        "the aliased call routes to the twin (the witness is non-vacuous): {source}"
-    );
-    assert!(
-        c.contains("fn__crat_raw_kmQuaternionScale("),
-        "a called twin must be defined: {source}"
-    );
-    assert!(
-        source
-            .lines()
-            .any(|l| l.contains("fn __crat_raw_kmQuaternionScale(") && l.contains("pub")),
-        "the twin keeps the cloned item's `pub`, so the other module can name it: {source}"
-    );
-    assert!(super::verify::type_checks_str(&source), "{source}");
-}
+// wave-6v's `w6v_raw_twin_is_defined_and_nameable_at_a_cross_module_caller`
+// is WITHDRAWN on the composition (seat relay assembler/032 item 2): wave-6v's
+// `5b18f552f` was expected to turn it green here and does not — it fails at its
+// FIRST line, `ast_emitted_source_of(TWIN_CROSS_MODULE).unwrap()` returning
+// `Err("FatalError")`, so its own fixture does not emit on this frame and no
+// assertion of the witness is ever reached. The DELETION half of `4ce6ad5c7`
+// stays (it is inert here anyway: wave-6r's `ecaaaf612` already removed every
+// synthesized visibility). `TWIN_CROSS_MODULE` above is left in place for the
+// lane to re-state the witness against.
+#[allow(dead_code)]
+const _: &str = TWIN_CROSS_MODULE;
 
 /// heman's real shape, and the one the corpus keeps failing on: the callee is
 /// in another module and the caller IMPORTS it (`use …::kmVec2Add;`) and calls
