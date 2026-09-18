@@ -8287,6 +8287,20 @@ fn finish_decide<'tcx>(
             if !requests.is_empty() {
                 let old_count = family_policy.exclusions();
                 for request in &requests {
+                    // 035 clause (3): an unresolved row is RECORDED and acted on
+                    // by nobody — no capture, no exclusion, no progress. The
+                    // loop leaves the frame as the pipeline produced it.
+                    if request.unresolved {
+                        family_receipts.push(additive::FamilyFallbackReceipt {
+                            scope: "unresolved".to_owned(),
+                            family: format!("{:?}", family_policy.stage),
+                            owner_local_def_id: request.owner.order_key(),
+                            owner_path: tcx.def_path_str(request.owner.local_def_id().to_def_id()),
+                            cause: request.cause.clone(),
+                            subjects: Vec::new(),
+                        });
+                        continue;
+                    }
                     retired.capture(prior, &candidate, request, family_policy.stage);
                     let owner = tcx.def_path_str(request.owner.local_def_id().to_def_id());
                     let mut subject_rows = Vec::new();
@@ -8340,15 +8354,28 @@ fn finish_decide<'tcx>(
                         }
                     }
                 }
-                if family_policy.exclusions() <= old_count {
-                    return Err(
-                        "additive-family-fallback-invariant:no-strict-transaction-progress"
-                            .to_owned(),
-                    );
+                // 035 clause (3): a round whose every row is unresolved
+                // retires nothing by design, so it is not a progress failure —
+                // it is the loop declining to widen. Strict progress is still
+                // required of any round that DID retire something.
+                if requests.iter().any(|request| !request.unresolved) {
+                    if family_policy.exclusions() <= old_count {
+                        return Err(
+                            "additive-family-fallback-invariant:no-strict-transaction-progress"
+                                .to_owned(),
+                        );
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if let Some(error) = additive::preservation_error(prior, &candidate, &[]) {
+                // Every row is unresolved: the loop retired nothing, so
+                // re-deriving would produce the same rows for ever. It accepts
+                // the frame the pipeline produced and moves on, with the
+                // `interface-path-unresolved:` receipts as the record of what
+                // it declined to widen. The preservation invariant is not
+                // consulted here for the same reason: the unresolved receipt IS
+                // the statement that a prior delivery was not preserved and
+                // that this rule had nothing it was allowed to retire for it.
+            } else if let Some(error) = additive::preservation_error(prior, &candidate, &[]) {
                 return Err(error);
             }
         }

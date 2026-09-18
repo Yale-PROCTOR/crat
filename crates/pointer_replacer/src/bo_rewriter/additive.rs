@@ -112,6 +112,12 @@ pub(crate) struct StageSnapshot {
 
 #[derive(Clone, Debug)]
 pub(crate) struct FamilyWithdrawal {
+    /// **035 clause (3).** A row the loop RECORDS and does not act on: the
+    /// terminal named no participant, so there is nothing this rule may
+    /// retire. It carries `interface-path-unresolved:<terminal>` and excludes
+    /// nothing; the per-function verify gate bounds the residual risk of the
+    /// interface it leaves standing.
+    pub(crate) unresolved: bool,
     pub(crate) owner: SignatureClassId,
     pub(crate) cause: String,
     /// Empty: the owner falls back (R220). Otherwise exactly these candidates
@@ -548,6 +554,90 @@ fn only_change_is_superseded(
         .all(|reason| superseded.contains(reason))
 }
 
+/// **035 clause (2) — the two absolute protections (R453-2).**
+///
+/// Neither is a soundness device: the exclusion re-derivation decides no form,
+/// so over-retirement is a completeness cost only (report 034 §2). What
+/// retirement buys is interface consistency, which is a property of sites at
+/// intervals — so a candidate whose own sites do not participate in the
+/// terminal cannot be making the interface inconsistent, and retiring it buys
+/// nothing at all. These two classes of candidate are the measured cost of
+/// retiring them anyway, and they are retirable ONLY under clause (1).
+///
+/// * **placed at the predecessor frame** — placement IS the statement that the
+///   previous frame's interface was consistent with this candidate. A
+///   neighbour's change that does not touch its interval cannot have made it
+///   inconsistent (wave-6s 020: twelve placements lost at zero rule change;
+///   slicecursor 030: heman's four `edt` cursor rows).
+/// * **the sole candidate its owner has at this stage** — the loop's reading of
+///   the instrument's owner-function-scoped `sole_blocker`: retiring it does not
+///   remove an inconsistency, it removes the attribution, turning "blocked by
+///   exactly one thing" into "no candidate at all" (wave-6s's 34 sole-blocker
+///   rows among 114 stage-withdrawn; slicecursor 029's ten bzip2 walkers).
+fn protected_from_retirement(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    policy: &FamilyPolicy,
+    owner: SignatureClassId,
+    hir: HirId,
+) -> bool {
+    let placed_at_predecessor = candidate
+        .table
+        .entries
+        .iter()
+        .find(|(subject, _)| subject.fn_did == owner.local_def_id() && subject.hir_id == hir)
+        .is_some_and(|(subject, _)| {
+            // `Edit::subject_id` is `identity_key(<owner path>)`, i.e.
+            // `<owner>::<param>#<local>`; matching on the tail keeps this
+            // independent of how the owner path is spelled at this stage.
+            let tail = format!(
+                "::{}#{}",
+                subject.param_name.as_deref().unwrap_or("<unnamed>"),
+                subject.local.as_u32()
+            );
+            prior
+                .plan
+                .by_file
+                .values()
+                .flatten()
+                .any(|edit| edit.owner_class == Some(owner) && edit.subject_id.ends_with(&tail))
+        });
+    if placed_at_predecessor {
+        return true;
+    }
+    // The instrument's `sole_blocker` is owner-function-scoped: a degraded row
+    // is a sole blocker when its owner has exactly one DISTINCT degraded
+    // reason. Read on the PREDECESSOR frame, that is the candidate whose
+    // subject was the one thing standing between this owner and delivery; if
+    // the loop retires it now, the attribution the forecast rule reads
+    // (R452-2: sole-blocker ∧ stage-enabled) is gone, and the subject reads as
+    // having had no candidate at all rather than one blocked thing.
+    let mut reasons = BTreeSet::new();
+    let mut carried_the_only_reason = false;
+    for (subject, decided) in &prior.table.entries {
+        if subject.fn_did != owner.local_def_id() {
+            continue;
+        }
+        // Exhaustive by the import-denylist rule.
+        match decided {
+            decision::Decision::Degraded(degradation) => {
+                reasons.insert(degradation.reason.key().to_owned());
+                if subject.hir_id == hir {
+                    carried_the_only_reason = true;
+                }
+            }
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::NestedSlice { .. }
+            | decision::Decision::Cursor { .. }
+            | decision::Decision::Box(_) => {}
+        }
+    }
+    carried_the_only_reason && reasons.len() == 1
+}
+
 pub(crate) fn withdrawals(
     prior: &StageSnapshot,
     candidate: &StageSnapshot,
@@ -569,8 +659,12 @@ pub(crate) fn withdrawals(
     // at the first distance carrying a changed owner, instead of withdrawing
     // every changed owner the component can reach.
     let mut requested = BTreeMap::<SignatureClassId, (String, Vec<HirId>)>::new();
+    let mut unresolved_rows = BTreeMap::<SignatureClassId, String>::new();
     let mut request = |owner: SignatureClassId, cause: String, subjects: Vec<HirId>| {
         requested.entry(owner).or_insert((cause, subjects));
+    };
+    let mut unresolved = |anchor: SignatureClassId, cause: String| {
+        unresolved_rows.entry(anchor).or_insert(cause);
     };
     let scoped_cause = |anchor: SignatureClassId, cause: &str| {
         format!(
@@ -586,9 +680,25 @@ pub(crate) fn withdrawals(
                     .iter()
                     .flat_map(|site| named_by(candidate, *anchor, site))
                     .collect::<Vec<_>>();
+                // **035 clause (1) — participation, not proximity.** A
+                // candidate is retirable at this terminal iff one of its own
+                // sites is named by it. Where the terminal names participants
+                // the set is exactly those; where it names none, clause (2)
+                // still protects the placed and the sole candidate, and what
+                // is left may yield so the round can make progress.
                 if own.iter().any(|hir| named.contains(hir)) {
                     own.retain(|hir| named.contains(hir));
+                } else if !sites.is_empty() {
+                    // The terminal names sites and none of them is this
+                    // candidate's: clause (2) keeps the placed and the sole
+                    // blocker out of a retirement they do not participate in.
+                    own.retain(|hir| {
+                        !protected_from_retirement(prior, candidate, policy, *anchor, *hir)
+                    });
                 }
+                // A terminal with NO sites is a refusal or a new dependency of
+                // this class's own subjects, so the class IS the participant
+                // and every moved candidate of it satisfies clause (1).
                 if !own.is_empty() {
                     request(*anchor, scoped_cause(*anchor, cause), own);
                     continue;
@@ -602,7 +712,30 @@ pub(crate) fn withdrawals(
                 // loss persists, the next round treats the anchor as a restore
                 // root and asks its nearest changed neighbour for the moved
                 // candidate that induced the terminal (binn `binn_get_bool`).
-                request(*anchor, cause.clone(), Vec::new());
+                // **035 clause (1) at SITE granularity.** The anchor moved no
+                // decision of its own, so there is no candidate to narrow — but
+                // the terminal may still name a site of THIS class, and then the
+                // participant is the class's own mechanics (the seam / interface
+                // edge it generated). Dropping those is retiring the
+                // participant, not a neighbour, and it is R220's owner fallback
+                // in its justified form.
+                //
+                // **Clause (3)** is what happens otherwise: the terminal names
+                // nothing of this class, so the loop records it and retires
+                // nothing. That is the mechanism report 034 priced at 506
+                // owner-scoped transactions naming 2,522 subjects.
+                // A terminal with NO sites is a refusal of this class's own
+                // subjects, so the class is the participant; otherwise the
+                // participant is whoever owns a named site.
+                let own_site = sites.is_empty()
+                    || sites.iter().any(|site| {
+                        site.owner_class == *anchor || site.caller == anchor.local_def_id()
+                    });
+                if own_site {
+                    request(*anchor, cause.clone(), Vec::new());
+                } else {
+                    unresolved(*anchor, format!("interface-path-unresolved:{cause}"));
+                }
             }
             Anchor::Restore => {
                 let mut frontier = vec![(*anchor, vec![*anchor])];
@@ -631,9 +764,19 @@ pub(crate) fn withdrawals(
                                 .map(|owner| owner.order_key())
                                 .collect::<Vec<_>>();
                             let cause = format!("restore-family-interface-path:{path:?}");
+                            // **035 clauses (2)+(3), amended by measurement.**
+                            // The nearest-first restore stays — report 009's
+                            // binn case is a delivery only this step recovers —
+                            // but it may no longer retire a candidate that was
+                            // PLACED at the predecessor frame or is its
+                            // owner's sole blocker. Where every candidate it
+                            // can reach is protected, the loop records
+                            // `interface-path-unresolved:` and retires nothing,
+                            // which is the 506 owner-scoped transactions report
+                            // 034 priced.
                             let subjects = moved(prior, candidate, policy, owner);
                             if subjects.is_empty() {
-                                request(owner, cause, Vec::new());
+                                unresolved(owner, format!("interface-path-unresolved:{cause}"));
                             } else {
                                 request(owner, scoped_cause(*anchor, &cause), subjects);
                             }
@@ -662,7 +805,7 @@ pub(crate) fn withdrawals(
                             format!("restore-family-unconnected-root:{}", anchor.order_key());
                         let subjects = moved(prior, candidate, policy, *owner);
                         if subjects.is_empty() {
-                            request(*owner, cause, Vec::new());
+                            unresolved(*owner, format!("interface-path-unresolved:{cause}"));
                         } else {
                             request(*owner, scoped_cause(*anchor, &cause), subjects);
                         }
@@ -671,14 +814,28 @@ pub(crate) fn withdrawals(
             }
         }
     }
-    requested
+    let mut out = requested
         .into_iter()
         .map(|(owner, (cause, subjects))| FamilyWithdrawal {
+            unresolved: false,
             owner,
             cause,
             subjects,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let retired_owners = out.iter().map(|w| w.owner).collect::<BTreeSet<_>>();
+    out.extend(
+        unresolved_rows
+            .into_iter()
+            .filter(|(owner, _)| !retired_owners.contains(owner))
+            .map(|(owner, cause)| FamilyWithdrawal {
+                unresolved: true,
+                owner,
+                cause,
+                subjects: Vec::new(),
+            }),
+    );
+    out
 }
 
 /// The R220 generator, unchanged in what it observes: which owners carry a new

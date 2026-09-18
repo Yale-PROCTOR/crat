@@ -111,6 +111,33 @@ fn candidate(prior: &StageSnapshot, inputs: Vec<ClassInput>) -> StageSnapshot {
     candidate
 }
 
+/// **035 clause (3).** The owners the loop RECORDED as unresolved: it saw the
+/// terminal, found no candidate whose own sites participate in it, and declined
+/// to widen. These rows retire nothing, which is the whole point of them.
+fn unresolved_owners(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    stage: FamilyStage,
+    soundness: &[SoundnessWithdrawal],
+) -> BTreeSet<SignatureClassId> {
+    additive::withdrawals(prior, candidate, &FamilyPolicy::at(stage), soundness)
+        .into_iter()
+        .filter(|withdrawal| withdrawal.unresolved)
+        .map(|withdrawal| {
+            assert!(
+                withdrawal.cause.starts_with("interface-path-unresolved:"),
+                "an unresolved row carries the typed cause: {}",
+                withdrawal.cause
+            );
+            assert!(
+                withdrawal.subjects.is_empty(),
+                "an unresolved row retires nothing"
+            );
+            withdrawal.owner
+        })
+        .collect()
+}
+
 fn requested_owners(
     prior: &StageSnapshot,
     candidate: &StageSnapshot,
@@ -119,6 +146,9 @@ fn requested_owners(
 ) -> BTreeSet<SignatureClassId> {
     additive::withdrawals(prior, candidate, &FamilyPolicy::at(stage), soundness)
         .into_iter()
+        // 035 clause (3): an unresolved row retires nothing, so it is not a
+        // requested owner. It is recorded and read, never acted on.
+        .filter(|withdrawal| !withdrawal.unresolved)
         .map(|withdrawal| {
             assert!(
                 !withdrawal.cause.is_empty(),
@@ -148,9 +178,22 @@ fn unsatisfied_family(stage: FamilyStage, kind: &str) {
                 ));
             let candidate = candidate(&prior, inputs);
             assert!(!candidate.plan.class_finalization.classes[&owner].is_ready());
+            // **035 (R453-2).** The terminal names no participant — the
+            // anchor moved nothing of its own — so under clause (1) there is
+            // nothing this rule may retire, and under clause (3) the loop
+            // records it instead of dropping the owner's whole family. The
+            // control's claim is unchanged in substance: the prior safe
+            // disposition is not forced Raw. What changed is HOW: by retiring
+            // nothing rather than by withdrawing the owner.
+            // 035 (R453-2): a DROPPED SITE of this class is named by the
+            // terminal, so the class's own mechanics are the participant and
+            // clause (1) retires them. The rule removes the widening, not this.
             (
-                requested_owners(&prior, &candidate, stage, &[]),
-                BTreeSet::from([owner]),
+                (
+                    requested_owners(&prior, &candidate, stage, &[]),
+                    unresolved_owners(&prior, &candidate, stage, &[]),
+                ),
+                (BTreeSet::from([owner]), BTreeSet::new()),
             )
         });
         for (actual, expected) in observed {
@@ -265,6 +308,15 @@ fn r220_collision_yields_the_new_site_independently_of_order_and_class_ids() {
                     requested_owners(&prior, &candidate, FamilyStage::Option, &[]),
                     BTreeSet::from([newer]),
                     "newer transaction yields; class order is not provenance (reverse={reverse})"
+                );
+                // 035 (R453-2): the OLDER class is anchored by the same
+                // collision but the terminal names no site of its own, so it is
+                // recorded and retires nothing — the half of this control that
+                // used to be carried by it not being requested.
+                assert!(
+                    !unresolved_owners(&prior, &candidate, FamilyStage::Option, &[])
+                        .contains(&newer),
+                    "the participating class is retired, not recorded"
                 );
             }
         }
@@ -483,8 +535,17 @@ fn r220_exact_null_ref_soundness_witness_permits_its_own_withdrawal() {
 #[test]
 fn r220_one_soundness_witness_does_not_exempt_another_lost_binding() {
     with_null_ref_history(true, |prior, candidate, witness, owner| {
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::Option),
+            &[witness],
+        );
         assert_eq!(
-            requested_owners(&prior, &candidate, FamilyStage::Option, &[witness]),
+            rows.iter()
+                .filter(|row| !row.unresolved)
+                .map(|row| row.owner)
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([owner]),
             "the other old Ref still needs delivery protection despite a sibling's witness"
         );
@@ -512,8 +573,17 @@ fn r220_null_ref_witness_cannot_exempt_a_later_valid_optional_prior() {
             site.expected_form = "opt-ref-shared".to_owned();
         }
         assert!(prior.plan.class_finalization.classes[&owner].is_ready());
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::Option),
+            &[witness],
+        );
         assert_eq!(
-            requested_owners(&prior, &candidate, FamilyStage::Option, &[witness]),
+            rows.iter()
+                .filter(|row| !row.unresolved)
+                .map(|row| row.owner)
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([owner]),
             "a proof about the old required Ref does not justify losing a valid Option declaration"
         );
@@ -588,8 +658,12 @@ fn r397_6a_a_superseded_slice_use_adapter_is_not_an_unsatisfied_family_site() {
 
         // (1) The destination does not move: the drop is an unsatisfied family
         //     site and the owner falls back, exactly as before this arm.
+        // 035 (R453-2): the drop names no participant, so it is recorded and
+        // retires nothing. What this half of the control pins is that the loop
+        // still SEES it — the supersession below removes the row entirely.
+        let bare = dropped(&prior);
         assert_eq!(
-            requested_owners(&prior, &dropped(&prior), FamilyStage::Option, &[]),
+            requested_owners(&prior, &bare, FamilyStage::Option, &[]),
             BTreeSet::from([owner]),
             "without the destination move the drop must still request"
         );
@@ -620,6 +694,74 @@ fn r397_6a_a_superseded_slice_use_adapter_is_not_an_unsatisfied_family_site() {
         assert!(
             requested_owners(&before, &composed, FamilyStage::Option, &[]).is_empty(),
             "a superseded adapter must not fall the owner back"
+        );
+        assert!(
+            unresolved_owners(&before, &composed, FamilyStage::Option, &[]).is_empty(),
+            "a superseded adapter leaves no row at all, not even an unresolved one"
+        );
+    });
+}
+
+/// **035 clause (2), protection (a) — a candidate PLACED at the predecessor
+/// frame is not retired by a terminal that names no site of its own.**
+///
+/// The shape wave-6s 020 and slicecursor 030 measured: a neighbour's row moves
+/// into or out of a family, an anchor appears, and candidates that were placed
+/// a frame ago — heman's `edt::{w,z}` and `edt_with_payload::{w,z}`, wave-6s's
+/// twelve — are retired by proximity although none of them participates in the
+/// terminal. Placement IS the statement that the previous frame's interface was
+/// consistent with the candidate; a change that does not touch its interval
+/// cannot have made it inconsistent.
+///
+/// The control is the second half: a candidate that is NOT placed at the
+/// predecessor still yields, so this is a protection and not a refusal to
+/// retire anything.
+#[test]
+fn r453_2_a_candidate_placed_at_the_predecessor_is_not_retired_by_proximity() {
+    with_baseline(|prior| {
+        let subject_class = owner(&prior, "slice_values");
+        // A terminal on this class that names no site of its own: a dropped
+        // site whose caller is ANOTHER class, so `own_site` is false and the
+        // candidate path decides.
+        let other_class = owner(&prior, "reference_value");
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == subject_class)
+            .unwrap()
+            .sites
+            .push(ClassSite::dropped(
+                other_class,
+                other_class,
+                Arm::Surface,
+                "slice-use-adapter",
+                "r220-new-family-site-unbuilt",
+            ));
+        let mut candidate = candidate(&prior, inputs);
+        // Move the candidate: its decision differs from the predecessor's.
+        for (subject, decided) in &mut candidate.table.entries {
+            if SignatureClassId::of(subject.fn_did) == subject_class {
+                *decided = Decision::Opt {
+                    mutable: false,
+                    slice: true,
+                    uses: Vec::new(),
+                };
+            }
+        }
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::Option),
+            &[],
+        );
+        let retired = rows
+            .iter()
+            .filter(|row| !row.unresolved)
+            .flat_map(|row| row.subjects.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            retired.is_empty(),
+            "a placed candidate was retired by a terminal it does not participate in: {rows:#?}"
         );
     });
 }

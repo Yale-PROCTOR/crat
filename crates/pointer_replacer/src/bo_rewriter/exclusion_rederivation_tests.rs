@@ -346,12 +346,19 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
                     *decision = Decision::Ref { mutable: true };
                 }
             }
+            // 035 (R453-2): the loop also RECORDS rows it retires nothing for
+            // (`interface-path-unresolved:`). This control is about what is
+            // retired, so it reads the retiring rows; the recorded ones are
+            // asserted separately where they are the claim.
             let requests = additive::withdrawals(
                 &prior,
                 &candidate,
                 &FamilyPolicy::at(FamilyStage::SliceUse),
                 &[],
-            );
+            )
+            .into_iter()
+            .filter(|row| !row.unresolved)
+            .collect::<Vec<_>>();
             let [request] = requests.as_slice() else {
                 panic!("one request for the anchor owner: {requests:#?}")
             };
@@ -453,12 +460,19 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
                     _ => {}
                 }
             }
+            // 035 (R453-2): the loop also RECORDS rows it retires nothing for
+            // (`interface-path-unresolved:`). This control is about what is
+            // retired, so it reads the retiring rows; the recorded ones are
+            // asserted separately where they are the claim.
             let requests = additive::withdrawals(
                 &prior,
                 &candidate,
                 &FamilyPolicy::at(FamilyStage::SliceUse),
                 &[],
-            );
+            )
+            .into_iter()
+            .filter(|row| !row.unresolved)
+            .collect::<Vec<_>>();
             let request = requests
                 .iter()
                 .find(|request| request.owner == far)
@@ -547,12 +561,19 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
                     _ => {}
                 }
             }
+            // 035 (R453-2): the loop also RECORDS rows it retires nothing for
+            // (`interface-path-unresolved:`). This control is about what is
+            // retired, so it reads the retiring rows; the recorded ones are
+            // asserted separately where they are the claim.
             let requests = additive::withdrawals(
                 &prior,
                 &candidate,
                 &FamilyPolicy::at(FamilyStage::SliceUse),
                 &[],
-            );
+            )
+            .into_iter()
+            .filter(|row| !row.unresolved)
+            .collect::<Vec<_>>();
             let request = requests
                 .iter()
                 .find(|request| request.owner == far)
@@ -608,12 +629,19 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
                 }
             }
             assert!(!candidate.plan.class_finalization.classes[&far].is_ready());
+            // 035 (R453-2): the loop also RECORDS rows it retires nothing for
+            // (`interface-path-unresolved:`). This control is about what is
+            // retired, so it reads the retiring rows; the recorded ones are
+            // asserted separately where they are the claim.
             let requests = additive::withdrawals(
                 &prior,
                 &candidate,
                 &FamilyPolicy::at(FamilyStage::SliceUse),
                 &[],
-            );
+            )
+            .into_iter()
+            .filter(|row| !row.unresolved)
+            .collect::<Vec<_>>();
             let by_owner = requests
                 .iter()
                 .map(|request| {
@@ -626,6 +654,10 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
             let (cause, subjects) = by_owner
                 .get(&far)
                 .unwrap_or_else(|| panic!("the anchor `far` yields as an owner: {requests:#?}"));
+            // **035 (R453-2).** A terminal with no sites is a refusal or a new
+            // dependency of this class's own, so the class IS the participant
+            // and R220's owner floor stands for it — what the rule removes is
+            // the fallback where the terminal names a site of somebody else.
             assert_eq!(
                 cause,
                 &format!("new-family-dependency:{}", near.order_key()),
