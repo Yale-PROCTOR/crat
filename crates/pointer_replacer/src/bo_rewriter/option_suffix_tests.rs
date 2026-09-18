@@ -113,3 +113,35 @@ fn wave6o_computed_view_of_a_delivered_slice_is_the_suffix() {
     );
     assert!(verify::type_checks_str(&output), "{output}");
 }
+/// **The forward-delta control (relay 034).** NOT a fault catcher — see report 023 claim 6: The same shape with
+/// a SIGNED delta — `k: i32`, which may run backwards — must never take the
+/// suffix: a backward view belongs to the cursor family. Dropping the guard in
+/// `forward_delta` makes this fixture render `Some(&data[(k) as usize..])`,
+/// which is what the fault must break.
+const SIGNED_DELTA: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+pub unsafe fn FindSigned(mut data: *const u8, max_length: usize, mut k: i32) -> i32 {
+    let mut s = 0 as *const u8;
+    let mut l: usize = 0;
+    let mut found = 0;
+    while l < max_length {
+        if *data.offset(l as isize) as i32 == ' ' as i32 { l = l.wrapping_add(1); continue; }
+        s = &*data.offset(k as isize) as *const u8;
+        if *s.offset(0 as isize) as i32 == 'a' as i32 { found += 1; }
+        if *s.offset(1 as isize) as i32 == 'b' as i32 { found += 1; }
+        l = l.wrapping_add(1);
+    }
+    found
+}
+"#;
+
+#[test]
+fn wave6o_signed_delta_never_takes_the_suffix() {
+    assert!(verify::type_checks_str(SIGNED_DELTA));
+    let output = ast_emitted_source_of(SIGNED_DELTA).expect("native emission");
+    assert!(
+        !output.contains("Some(&data["),
+        "a signed delta may run backwards: the suffix arm must refuse it:\n{output}"
+    );
+    assert!(verify::type_checks_str(&output), "{output}");
+}

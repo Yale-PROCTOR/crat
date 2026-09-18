@@ -218,9 +218,15 @@ unsafe fn FindAllStaticDictionaryMatches(data: *const u8, l: usize, k: usize, n:
     let family_withdrawn = receipts.iter().any(|(_, state, reason)| {
         state == "Reclassified" && reason.contains("additive-family-fallback")
     });
+    // Third frame (relay 034): with wave-6s's view and wave-5d's participation
+    // rule in, the row DELIVERS as the suffix — the invariant holds there too,
+    // and by construction rather than by refusal.
+    let delivered_as_suffix = receipts
+        .iter()
+        .any(|(operation, state, _)| operation == "nullable-assignment" && state == "Applied");
     assert!(
-        held_at_the_carrier || family_withdrawn,
-        "the one-element carrier must be a typed hold on either frame: {receipts:?}"
+        held_at_the_carrier || family_withdrawn || delivered_as_suffix,
+        "the one-element carrier must be a typed hold, or the row must deliver as the suffix: {receipts:?}"
     );
     let output = ast_emitted_source_of(input).expect("hold emission");
     assert!(!output.contains("core::slice::from_ref(&*data"), "{output}");

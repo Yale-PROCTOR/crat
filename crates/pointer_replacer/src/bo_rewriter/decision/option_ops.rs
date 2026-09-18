@@ -646,7 +646,6 @@ pub(super) fn slice_suffix_view(
 /// expression. Anything else (a signed variable, an arithmetic expression that
 /// may go backwards) stays with the cursor family.
 fn forward_delta(tcx: TyCtxt<'_>, owner: LocalDefId, delta: &Expr<'_>) -> Option<String> {
-    let text = tcx.sess.source_map().span_to_snippet(delta.span).ok()?;
     let mut inner = delta;
     while let ExprKind::Cast(next, _) = inner.kind {
         inner = next;
@@ -656,8 +655,15 @@ fn forward_delta(tcx: TyCtxt<'_>, owner: LocalDefId, delta: &Expr<'_>) -> Option
     {
         return Some(format!("{}", value.get()));
     }
-    let unsigned = matches!(tcx.typeck(owner).expr_ty(inner).kind(), TyKind::Uint(_));
-    unsigned.then(|| format!("({text}) as usize"))
+    // Read the index from the PEELED expression: C2Rust's `l as isize` is the
+    // cast `offset` wants, and a range wants the unsigned value itself rather
+    // than `(l as isize) as usize` round-tripped back through it.
+    let text = tcx.sess.source_map().span_to_snippet(inner.span).ok()?;
+    match tcx.typeck(owner).expr_ty(inner).kind() {
+        TyKind::Uint(rustc_middle::ty::UintTy::Usize) => Some(text),
+        TyKind::Uint(_) => Some(format!("({text}) as usize")),
+        _ => None,
+    }
 }
 
 /// **Relay 027 / R450-9 — the destination inherits the base's FAT twin.**

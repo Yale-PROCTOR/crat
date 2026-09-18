@@ -686,7 +686,16 @@ pub(crate) fn plan_values(
                     emitability::UseEdit {
                         span,
                         replacement,
-                        bridge_kind: if composed.is_empty() && superseded.is_empty() {
+                        // R457-3 option 1: the kind is registered when the value
+                        // is PLANNED, not only when a composed edit is visible
+                        // here. A suffix rendering replaces the whole right-hand
+                        // side — every edit inside it is composed by
+                        // construction — so the stage's class check and the
+                        // final one see the same kind and give the same answer.
+                        bridge_kind: if composed.is_empty()
+                            && superseded.is_empty()
+                            && suffix.is_none()
+                        {
                             "option-value"
                         } else {
                             "option-value-composed"
