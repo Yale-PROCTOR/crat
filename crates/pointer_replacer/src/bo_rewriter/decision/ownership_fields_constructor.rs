@@ -112,11 +112,24 @@ fn moved_out<'tcx>(
     Ok(false)
 }
 
+/// The entry every caller outside this lane's source stage uses: no field of
+/// a synthesised literal is delivered by a transaction it can see, so every
+/// field takes its raw zero (R457-4).
 pub(crate) fn derive<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner: LocalDefId,
     init: &'tcx Expr<'tcx>,
     element: Ty<'tcx>,
+) -> Result<Constructor<'tcx>, SourceHold> {
+    derive_with_field_forms(tcx, owner, init, element, &|_, _| None)
+}
+
+pub(crate) fn derive_with_field_forms<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    init: &'tcx Expr<'tcx>,
+    element: Ty<'tcx>,
+    field_form: &dyn Fn(DefId, usize) -> Option<String>,
 ) -> Result<Constructor<'tcx>, SourceHold> {
     if init.hir_id.owner.def_id != owner {
         return Err(SourceHold::Identity);
@@ -166,7 +179,7 @@ pub(crate) fn derive<'tcx>(
             },
         });
     }
-    let (zero, element_bits) = zero_value(tcx, element, pointer_bits)?;
+    let (zero, element_bits) = zero_value(tcx, element, pointer_bits, field_form)?;
     let element_spelling = spell_element(tcx, element);
     let mut allocation = init;
     while let ExprKind::Cast(inner, _) = allocation.kind {
@@ -627,16 +640,37 @@ fn spell_element<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
     }
 }
 
+/// The zero of a field in the form a transaction DELIVERS it in. Only the
+/// optional forms have one; every other delivered form holds (R457-4).
+fn delivered_zero(form: &str) -> Result<String, SourceHold> {
+    let form = form.to_lowercase();
+    if form.contains("opt") && !form.contains("array") {
+        Ok("None".to_owned())
+    } else {
+        Err(SourceHold::ConstructorShape)
+    }
+}
+
 /// A spelled all-zero value for a numeric scalar, a raw pointer (null), an
 /// array of such, or a `repr(C)` struct whose fields are all such (every
 /// field named, so the literal is complete and needs no `unsafe`). C's
 /// `malloc` leaves the object indeterminate; the C program writes before it
 /// reads, so any valid initial value is behaviour-preserving, and all-zero is
 /// a valid value of every such type.
+///
+/// R457-4 (relay 052, wave-6f 036 §2): a field a transaction DELIVERS is not
+/// a raw pointer any more, and this literal is synthesised — it exists in no
+/// input program, so no field transaction can rewrite it. `field_form`
+/// answers the delivered form for one `(struct, field)`: an optional form
+/// (`opt-box`, `opt-box-slice`, `opt-ref-shared`, …) zeroes to `None`, a
+/// field no transaction owns keeps the raw zero, and any other delivered
+/// form has no spellable zero — a `Box<T>`/`&T` field has no null and an
+/// array of non-`Copy` options has no `[None; N]` — so the owner holds.
 fn zero_value<'tcx>(
     tcx: TyCtxt<'tcx>,
     element: Ty<'tcx>,
     pointer_bits: u64,
+    field_form: &dyn Fn(DefId, usize) -> Option<String>,
 ) -> Result<(String, u64), SourceHold> {
     match element.kind() {
         TyKind::RawPtr(_, rustc_hir::Mutability::Mut) => {
@@ -649,7 +683,7 @@ fn zero_value<'tcx>(
             let length = length
                 .try_to_target_usize(tcx)
                 .ok_or(SourceHold::ConstructorShape)?;
-            let (zero, bits) = zero_value(tcx, *inner, pointer_bits)?;
+            let (zero, bits) = zero_value(tcx, *inner, pointer_bits, field_form)?;
             Ok((
                 format!("[{zero}; {length}]"),
                 bits.checked_mul(length)
@@ -658,8 +692,11 @@ fn zero_value<'tcx>(
         }
         TyKind::Adt(def, args) if def.is_struct() && def.repr().c() && def.did().is_local() => {
             let mut fields = Vec::new();
-            for field in def.non_enum_variant().fields.iter() {
-                let (zero, _) = zero_value(tcx, field.ty(tcx, args), pointer_bits)?;
+            for (index, field) in def.non_enum_variant().fields.iter().enumerate() {
+                let zero = match field_form(def.did(), index) {
+                    Some(form) => delivered_zero(&form)?,
+                    None => zero_value(tcx, field.ty(tcx, args), pointer_bits, field_form)?.0,
+                };
                 fields.push(format!("{}: {zero}", field.name));
             }
             let layout = tcx

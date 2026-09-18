@@ -639,6 +639,10 @@ pub(crate) fn derive<'tcx>(
     program: &RustProgram<'tcx>,
     subject: &Subject,
     constructions: &ConstructionFacts,
+    // R457-4: the delivered form of one `(struct, field)`, for the struct
+    // literal this stage synthesises (`ownership_fields_native`'s
+    // `owning_field_form`; `None` everywhere means no transaction owns it).
+    field_form: &dyn Fn(DefId, usize) -> Option<String>,
 ) -> Result<SourcePlan, SourceHold> {
     let tcx = program.tcx;
     if !program.functions.contains(&subject.fn_did)
@@ -666,8 +670,13 @@ pub(crate) fn derive<'tcx>(
         return Err(SourceHold::Identity);
     }
     let typeck = tcx.typeck(subject.fn_did);
-    let constructor =
-        super::ownership_fields_constructor::derive(tcx, subject.fn_did, init, *element)?;
+    let constructor = super::ownership_fields_constructor::derive_with_field_forms(
+        tcx,
+        subject.fn_did,
+        init,
+        *element,
+        field_form,
+    )?;
     // A depth-2 owner is admitted only as a pointer ARRAY (`Box<[*mut T]>`,
     // the count from the allocation); a single boxed pointer cell stays
     // outside the wave (BOX-N5).
@@ -1565,7 +1574,7 @@ mod tests {
                 .filter(|(subject, _)| subject.param_name.as_deref() == Some(name.as_str()))
                 .collect();
             assert_eq!(subjects.len(), 1);
-            let plan = derive(&program, &subjects[0].0, &ctx.constructions)?;
+            let plan = derive(&program, &subjects[0].0, &ctx.constructions, &|_, _| None)?;
             assert_eq!(plan.binding(), subjects[0].0.hir_id);
             assert_eq!(plan.owner(), subjects[0].0.fn_did);
             assert!(
@@ -1629,7 +1638,7 @@ unsafe extern "C" fn holder_free(mut h: *mut Holder) { free((*h).buf as *mut lib
                 .iter()
                 .find(|(subject, _)| subject.param_name.as_deref() == Some("new_data"))
                 .unwrap();
-            let plan = derive(&program, subject, &ctx.constructions).unwrap();
+            let plan = derive(&program, subject, &ctx.constructions, &|_, _| None).unwrap();
             let span = plan.store_transfer().expect("the store is the transfer");
             assert_eq!(
                 tcx.sess.source_map().span_to_snippet(span).unwrap(),
@@ -1666,7 +1675,7 @@ unsafe extern "C" fn holder_free(mut h: *mut Holder) { free((*h).buf as *mut lib
                     .find(|(subject, _)| subject.param_name.as_deref() == Some("new_data"))
                     .unwrap();
                 assert!(
-                    derive(&program, subject, &ctx.constructions).is_err(),
+                    derive(&program, subject, &ctx.constructions, &|_, _| None).is_err(),
                     "{body}"
                 );
             })
@@ -1744,7 +1753,7 @@ pub unsafe extern "C" fn peek(mut y: *mut Node) -> *mut Node { let mut token = (
                             && tcx.def_path_str(subject.fn_did.to_def_id()) == owner
                     })
                     .unwrap_or_else(|| panic!("{owner}::{name}"));
-                derive(&program, subject, &ctx.constructions)
+                derive(&program, subject, &ctx.constructions, &|_, _| None)
             };
             // `Node { key, left, right, height }`: the moved-out field and the
             // field the sibling owner is stored into.
@@ -1832,7 +1841,7 @@ pub unsafe extern "C" fn peek(mut y: *mut Node) -> *mut Node { let mut token = (
                 .iter()
                 .find(|(subject, _)| subject.param_name.as_deref() == Some("new_data"))
                 .unwrap();
-            let plan = derive(&program, subject, &ctx.constructions).unwrap();
+            let plan = derive(&program, subject, &ctx.constructions, &|_, _| None).unwrap();
             assert_eq!(plan.constructor().receipt, "native-malloc-zero-byte-count");
             assert_eq!(
                 plan.count(),
@@ -1869,7 +1878,7 @@ pub unsafe extern "C" fn peek(mut y: *mut Node) -> *mut Node { let mut token = (
                     .find(|(subject, _)| subject.param_name.as_deref() == Some("new_data"))
                     .unwrap();
                 assert!(
-                    derive(&program, subject, &ctx.constructions).is_err(),
+                    derive(&program, subject, &ctx.constructions, &|_, _| None).is_err(),
                     "{copy}"
                 );
             })
@@ -1948,7 +1957,7 @@ pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: libc::c_int) -
                     .unwrap_or_else(|| panic!("{owner}::{name}"));
                 assert!(
                     matches!(
-                        derive(&program, subject, &ctx.constructions),
+                        derive(&program, subject, &ctx.constructions, &|_, _| None),
                         Err(SourceHold::ConstructorIdentity | SourceHold::ConstructorShape)
                     ),
                     "{owner}::{name} must own no allocation"
@@ -1964,7 +1973,8 @@ pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: libc::c_int) -
                         && tcx.def_path_str(subject.fn_did.to_def_id()) == "newNode"
                 })
                 .expect("newNode::temp");
-            let plan = derive(&program, subject, &ctx.constructions).expect("newNode::temp");
+            let plan =
+                derive(&program, subject, &ctx.constructions, &|_, _| None).expect("newNode::temp");
             assert!(plan.frees().is_empty() && plan.return_transfer().is_some());
         })
         .unwrap();

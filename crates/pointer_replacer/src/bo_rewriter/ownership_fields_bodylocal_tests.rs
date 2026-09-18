@@ -507,6 +507,7 @@ fn r399_return_transfer_faults_uncovered_live_exit_and_zero_capable_slice() {
             &super::collect_program(tcx),
             subject,
             &ctx.constructions,
+            &|_, _| None,
         );
         assert!(
             matches!(
@@ -2120,6 +2121,7 @@ fn r395_transfer_site_has_no_later_root_use_or_second_free() {
                 &super::collect_program(tcx),
                 subject,
                 &ctx.constructions,
+                &|_, _| None,
             );
             assert!(
                 matches!(
@@ -2237,6 +2239,12 @@ fn r395_custom_global_allocator_is_not_a_c_free_contract() {
 /// the hold is the field-load rule's and nothing else's.
 #[test]
 fn r431_a_moved_out_field_owner_holds_until_a_field_transaction_owns_the_field() {
+    // R457-4 added witnesses that name `Holder` in the form override, and the
+    // suite runs two threads: take the same lock so neither can see the
+    // other's override.
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let input = r#"#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments, unused_variables, non_camel_case_types, non_snake_case)]
 extern "C" { fn malloc(_: u64) -> *mut std::ffi::c_void; fn free(_: *mut std::ffi::c_void); }
 #[repr(C)] pub struct Holder { pub buf: *mut u8, pub len: i32 }
@@ -2750,7 +2758,8 @@ fn r434_a_reference_that_can_reach_the_owner_still_refuses() {
                     super::decision::ownership_fields_source::derive(
                         &program,
                         subject,
-                        &ctx.constructions
+                        &ctx.constructions,
+                        &|_, _| None
                     ),
                     Err(super::decision::ownership_fields_source::SourceHold::UnsupportedOwnerUse)
                 ),
@@ -2888,6 +2897,128 @@ fn moved_out_plan(form: Option<&str>) -> Result<super::decision::box_facts::BoxP
         }
     })
     .unwrap()
+}
+
+/// wave-6f 036 §2 / relay 052 (R457-4): the struct literal this producer
+/// SYNTHESISES for a `malloc`ed `repr(C)` struct is a site no field
+/// transaction can see — it does not exist in the input — so each field must
+/// be initialised in the form the FIELD is delivered in. `owning_field_form`
+/// is the query that answers it: an optional owning or reference field takes
+/// `None`, and a field no transaction owns keeps the raw zero. On wave-6f's
+/// frame this one initialiser is the whole remaining error (`expected
+/// Option<Box<u8>>, found *mut _`), and `None` there makes the candidate
+/// compile.
+fn holder_fixture() -> &'static str {
+    // Verbatim the input wave-6f's `wave6f_fixture_moved_out_field.rs` and
+    // this lane's `r431` witness share.
+    r#"#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" { fn malloc(_: u64) -> *mut std::ffi::c_void; fn free(_: *mut std::ffi::c_void); }
+#[repr(C)] pub struct Holder { pub buf: *mut u8, pub len: i32 }
+pub unsafe extern "C" fn run() {
+    let mut h = malloc(::std::mem::size_of::<Holder>() as u64) as *mut Holder;
+    (*h).buf = malloc(64 as u64) as *mut u8;
+    (*h).len = 64 as i32;
+    let mut b = (*h).buf;
+    (*h).buf = 0 as *mut u8;
+    free(b as *mut std::ffi::c_void);
+    free(h as *mut std::ffi::c_void);
+}
+"#
+}
+
+fn holder_plan(form: Option<&str>) -> Result<super::decision::box_facts::BoxPlan, String> {
+    let form = form.map(str::to_owned);
+    ::utils::compilation::run_compiler_on_str(holder_fixture(), move |tcx| {
+        match &form {
+            Some(form) => {
+                super::decision::ownership_fields_native::field_form_override::set(vec![(
+                    "Holder",
+                    0,
+                    form.as_str(),
+                )])
+            }
+            None => super::decision::ownership_fields_native::field_form_override::clear(),
+        }
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        super::decision::ownership_fields_native::field_form_override::clear();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.param_name.as_deref() == Some("h"))
+            .expect("run::h");
+        match decision {
+            Decision::Box(plan) => Ok(plan.clone()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .unwrap()
+}
+
+#[test]
+fn r457_a_synthesised_struct_literal_initialises_each_field_in_its_delivered_form() {
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let literal = |plan: &super::decision::box_facts::BoxPlan| {
+        plan.expr_edits
+            .iter()
+            .find(|edit| edit.replacement.contains("crate::Holder {"))
+            .map(|edit| edit.replacement.clone())
+            .unwrap_or_else(|| format!("no literal in {:?}", plan.expr_edits))
+    };
+    // R217-2(a): with no override the SEAM answers, and which reading holds
+    // is the FRAME's. On this line's stub the query says `None` for every
+    // field, so the literal keeps the raw zero; on a composition carrying
+    // wave-6f's transactions `Holder.buf` is delivered `Option<Box<u8>>` and
+    // the same literal spells `None` (measured on `batch-13-dry16`
+    // `acd7b5261`). Nothing else is accepted; the three override cases below
+    // stay exact on every frame, because the override answers first.
+    let raw = holder_plan(None).expect("no form");
+    assert!(
+        literal(&raw).contains("buf: ::core::ptr::null_mut()")
+            || literal(&raw).contains("buf: None"),
+        "{}",
+        literal(&raw)
+    );
+    // wave-6f's owning form: the field is `Option<Box<u8>>`, so the literal
+    // must spell `None` — the one error their 036 §1 measured.
+    let owned = holder_plan(Some("opt-box")).expect("opt-box form");
+    assert!(
+        literal(&owned).contains("buf: None") && literal(&owned).contains("len: 0i32"),
+        "{}",
+        literal(&owned)
+    );
+    // A reference transaction's optional form is `Option<&T>`: also `None`.
+    let shared = holder_plan(Some("opt-ref-shared")).expect("opt-ref-shared form");
+    assert!(
+        literal(&shared).contains("buf: None"),
+        "{}",
+        literal(&shared)
+    );
+}
+
+/// The other half: a delivered form with no spellable zero — a non-optional
+/// `Box<T>`/`&T` field, or an array-of-options field whose element is not
+/// `Copy` — must HOLD the owner rather than initialise the field with a value
+/// of the wrong type. Fail-closed, the same way the moved-out load's
+/// non-optional shape holds.
+#[test]
+fn r457_a_delivered_form_with_no_zero_holds_the_synthesised_literal() {
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(holder_plan(Some("box")).is_err(), "non-optional box");
+    assert!(
+        holder_plan(Some("array-opt-box-slice")).is_err(),
+        "array of options"
+    );
 }
 
 /// R456-5 (relay 051, STOP 1 → (A)): the withdrawal's pin. The move out of an

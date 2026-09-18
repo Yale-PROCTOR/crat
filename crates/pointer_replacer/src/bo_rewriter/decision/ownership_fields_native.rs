@@ -245,11 +245,18 @@ impl Candidates {
                 continue;
             }
             let node = (subject.fn_did, subject.hir_id);
-            let bundle = source::derive(inputs.program, subject, inputs.constructions)
-                .map_err(NativeHold::Source)
-                .and_then(|source| {
-                    derive_bundle(inputs, table, classes, &effects, subject, &source, false)
-                });
+            let bundle = source::derive(
+                inputs.program,
+                subject,
+                inputs.constructions,
+                &|struct_did, field_index| {
+                    owning_field_form(inputs.program.tcx, table, struct_did, field_index)
+                },
+            )
+            .map_err(NativeHold::Source)
+            .and_then(|source| {
+                derive_bundle(inputs, table, classes, &effects, subject, &source, false)
+            });
             match bundle {
                 Ok(bundle) => {
                     result.bundles.insert(node, bundle);
@@ -385,11 +392,18 @@ impl Candidates {
             else {
                 continue;
             };
-            let bundle = source::derive(inputs.program, subject, inputs.constructions)
-                .map_err(NativeHold::Source)
-                .and_then(|source| {
-                    derive_bundle(inputs, table, classes, &effects, subject, &source, true)
-                });
+            let bundle = source::derive(
+                inputs.program,
+                subject,
+                inputs.constructions,
+                &|struct_did, field_index| {
+                    owning_field_form(inputs.program.tcx, table, struct_did, field_index)
+                },
+            )
+            .map_err(NativeHold::Source)
+            .and_then(|source| {
+                derive_bundle(inputs, table, classes, &effects, subject, &source, true)
+            });
             self.refreshed.insert(node);
             match bundle {
                 Ok(bundle) => {
@@ -1766,7 +1780,8 @@ mod audit_tests {
                     continue;
                 };
                 assert!(outer_owning(&ctx.slots, &ctx.model, subject));
-                let source = source::derive(&program, subject, &ctx.constructions).unwrap();
+                let source =
+                    source::derive(&program, subject, &ctx.constructions, &|_, _| None).unwrap();
                 let bundle =
                     derive_bundle(&inputs, &table, &classes, &effects, subject, &source, false)
                         .unwrap();
