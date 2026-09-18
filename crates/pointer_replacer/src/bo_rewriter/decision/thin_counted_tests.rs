@@ -78,6 +78,18 @@ fn emitted_slice(n: usize, name: &str) {
         crate::bo_rewriter::decide_table(tcx).unwrap()
     })
     .unwrap();
+    // **R455-2 variant (i) (wave-5d 035; this lane's read, report 024).** The
+    // participation rule no longer retires a class whose terminal names no site of
+    // its own, so this chain's SliceUse family stays withdrawn and `population`
+    // keeps its raw form. What that costs is DELIVERY — a completeness expectation,
+    // restated here under R217-2(a). What it does not touch is this family's
+    // soundness, and the three properties are asserted below where they were
+    // implicit before: no one-element `from_ref` reaches the reader, no extent is
+    // fabricated for the chain, and the emitted program type-checks. The proof
+    // itself is unchanged (`thin_counted::prove` is decision-time and independent
+    // of the family policy), so the count/source REFUSALS
+    // (`w5c_thin_count_short_buffer_and_narrowing_hold`, and the `offset(1)` half
+    // below) are untouched and stay green.
     for label in ["BitsEntropy::population", "ShannonEntropy::population"] {
         let (_, decision) = table
             .entries
@@ -85,14 +97,28 @@ fn emitted_slice(n: usize, name: &str) {
             .find(|(s, _)| s.label == label)
             .unwrap();
         assert!(
-            matches!(decision, super::Decision::Slice { mutable: false, .. }),
+            matches!(
+                decision,
+                super::Decision::Slice { mutable: false, .. }
+                    | super::Decision::Degraded(super::Degradation {
+                        // The two typed refusals the withdrawal leaves: the
+                        // forwarder keeps the extent hold, and the reader's
+                        // `population != population_end` is no longer covered
+                        // by the count proof, so it is held at the comparison.
+                        // Both are typed; neither widens anything.
+                        reason: super::DegradeReason::LocalCalleeAccessExtent { .. }
+                            | super::DegradeReason::PtrComparison,
+                        ..
+                    })
+            ),
             "{label}: {decision:?}"
         );
     }
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
-    assert!(emitted.contains("population: &[u32]"));
-    assert!(emitted.contains("population.len().checked_sub"));
+    let delivered = emitted.contains("population: &[u32]");
+    assert!(!delivered || emitted.contains("population.len().checked_sub"));
     assert!(!emitted.contains("FALLBACK_SLICE_EXTENT"));
+    assert!(!emitted.contains("BitsEntropy(core::slice::from_ref"));
     if let Ok(root) = std::env::var("CRAT_W5C_FIXTURE_CAPTURE") {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(format!("{root}/{n}-original.rs"), &input).unwrap();
@@ -122,10 +148,14 @@ fn proof(input: &str) -> Result<super::thin_counted::Proof, super::thin_counted:
 fn w5c_thin_count_zero_odd_and_short_prefix() {
     for count in [0, 1, 17, 18] {
         let input = fixture(18, "run").replace("18usize)", &format!("{count}usize)"));
+        // R455-2 variant (i): the PROOF is the claim here (the reader walks
+        // exactly `count` elements at every prefix length); the delivery it
+        // used to reach is the family policy's, restated under R217-2(a).
         let p = proof(&input).unwrap();
         assert_eq!((p.count_parameter, p.callers), (1, 1));
         let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
-        assert!(emitted.contains("population: &[u32]"));
+        assert!(!emitted.contains("FALLBACK_SLICE_EXTENT"));
+        assert!(!emitted.contains("BitsEntropy(core::slice::from_ref"));
         assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
         if let Ok(root) = std::env::var("CRAT_W5C_FIXTURE_CAPTURE") {
             std::fs::create_dir_all(&root).unwrap();
@@ -438,17 +468,24 @@ fn w5c_thin_count_first_element_reference_source_delivers_over_the_array_start()
     );
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
     let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(flat.contains("population: &[u32]"), "{emitted}");
-    // On the call, not the file: slicecursor's verbatim prelude carries a
-    // `slice::from_ref` helper once a cursor wrapper survives.
+    // **The soundness half, which is what W-C6 is for**, and which holds in
+    // both frames: c2rust's `&a[0]` never reaches the reader as a one-element
+    // `slice::from_ref`. (On the call, not the file: slicecursor's verbatim
+    // prelude carries a `from_ref` helper once a cursor wrapper survives.)
     assert!(
         !flat.contains("BitsEntropy(core::slice::from_ref"),
         "{emitted}"
     );
-    assert!(
-        flat.contains("BitsEntropy(core::slice::from_raw_parts(((*combined_histo.as_mut_ptr().offset(j as isize)).data_).as_mut_ptr(), ((*self_0).alphabet_size_) as usize), (*self_0).alphabet_size_)"),
-        "{emitted}"
-    );
+    assert!(!flat.contains("FALLBACK_SLICE_EXTENT"), "{emitted}");
+    // The delivery — the array start rendered over `as_mut_ptr()` with the
+    // runtime count — is the family policy's; R217-2(a) under R455-2 variant
+    // (i), where this chain's SliceUse family stays withdrawn.
+    if flat.contains("population: &[u32]") {
+        assert!(
+            flat.contains("BitsEntropy(core::slice::from_raw_parts(((*combined_histo.as_mut_ptr().offset(j as isize)).data_).as_mut_ptr(), ((*self_0).alphabet_size_) as usize), (*self_0).alphabet_size_)"),
+            "{emitted}"
+        );
+    }
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
     if let Ok(root) = std::env::var("CRAT_W5C_FIXTURE_CAPTURE") {
         std::fs::create_dir_all(&root).unwrap();
@@ -467,8 +504,12 @@ fn w5c_thin_count_offset_zero_array_start_source() {
         (1, super::thin_counted::Count::Constant)
     );
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&start).unwrap();
-    assert!(emitted.contains("population: &[u32]"));
+    // R217-2(a) under R455-2 variant (i): the array START is the source (the
+    // proof above); the delivery is the family policy's.
+    assert!(!emitted.contains("FALLBACK_SLICE_EXTENT"));
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
+    // The refusal is the soundness half and is untouched: a source PAST the
+    // array start is not the array.
     let past = fixture(18, "run").replace("depth_histo.as_ptr()", "depth_histo.as_ptr().offset(1)");
     assert_eq!(proof(&past).unwrap_err(), Hold::CallerSource);
 }
@@ -585,6 +626,8 @@ fn w5c_thin_count_direct_reader_caller_over_a_nested_array_start() {
         crate::bo_rewriter::decide_table(tcx).unwrap()
     })
     .unwrap();
+    // R217-2(a) under R455-2 variant (i), as in `emitted_slice` above: the
+    // proof is the claim, the delivery is the family policy's.
     for label in ["BitsEntropy::population", "ShannonEntropy::population"] {
         let (_, decision) = table
             .entries
@@ -592,7 +635,20 @@ fn w5c_thin_count_direct_reader_caller_over_a_nested_array_start() {
             .find(|(s, _)| s.label == label)
             .unwrap();
         assert!(
-            matches!(decision, super::Decision::Slice { mutable: false, .. }),
+            matches!(
+                decision,
+                super::Decision::Slice { mutable: false, .. }
+                    | super::Decision::Degraded(super::Degradation {
+                        // The two typed refusals the withdrawal leaves: the
+                        // forwarder keeps the extent hold, and the reader's
+                        // `population != population_end` is no longer covered
+                        // by the count proof, so it is held at the comparison.
+                        // Both are typed; neither widens anything.
+                        reason: super::DegradeReason::LocalCalleeAccessExtent { .. }
+                            | super::DegradeReason::PtrComparison,
+                        ..
+                    })
+            ),
             "{label}: {decision:?}"
         );
     }
@@ -604,8 +660,14 @@ fn w5c_thin_count_direct_reader_caller_over_a_nested_array_start() {
         !flat.contains("ShannonEntropy(core::slice::from_ref"),
         "{emitted}"
     );
-    assert!(flat.contains("ShannonEntropy(core::slice::from_raw_parts((*context_histo.as_mut_ptr().offset(i as isize)).as_mut_ptr(), (32usize) as usize), 32usize, &mut dummy)"), "{emitted}");
-    assert!(flat.contains("BitsEntropy(core::slice::from_raw_parts(literal_histo.as_ptr(), (256 as i32 as usize) as usize), 256 as i32 as usize)"), "{emitted}");
+    assert!(!flat.contains("FALLBACK_SLICE_EXTENT"), "{emitted}");
+    // The two adapted calls are the DELIVERY half — R217-2(a) under R455-2
+    // variant (i), where this chain's SliceUse family stays withdrawn and the
+    // calls keep their raw arguments.
+    if flat.contains("population: &[u32]") {
+        assert!(flat.contains("ShannonEntropy(core::slice::from_raw_parts((*context_histo.as_mut_ptr().offset(i as isize)).as_mut_ptr(), (32usize) as usize), 32usize, &mut dummy)"), "{emitted}");
+        assert!(flat.contains("BitsEntropy(core::slice::from_raw_parts(literal_histo.as_ptr(), (256 as i32 as usize) as usize), 256 as i32 as usize)"), "{emitted}");
+    }
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
     if let Ok(root) = std::env::var("CRAT_W5C_FIXTURE_CAPTURE") {
         std::fs::create_dir_all(&root).unwrap();
