@@ -1558,6 +1558,13 @@ pub(crate) fn graft_calls(
     if by_span.is_empty() {
         return Ok(());
     }
+    let mut twin_paths: FxHashMap<u32, Vec<String>> = FxHashMap::default();
+    for (call, _) in by_span.values() {
+        let mut chain = Vec::new();
+        if twin_module_chain(&pristine.items, global_map, call.callee, &mut chain) {
+            twin_paths.insert(call.callee.local_def_index.as_u32(), chain);
+        }
+    }
     let mut visitor = CallGraft {
         calls: &by_span,
         guard,
@@ -1566,6 +1573,7 @@ pub(crate) fn graft_calls(
         unsafe_fn: false,
         yielded: Vec::new(),
         twins: std::collections::BTreeMap::new(),
+        twin_paths,
     };
     rustc_ast::mut_visit::MutVisitor::visit_crate(&mut visitor, krate);
     if let Some(why) = visitor.failure {
@@ -1639,6 +1647,38 @@ fn signature_converted(
         (Some(emitted), Some(original)) => emitted != original,
         _ => false,
     }
+}
+
+/// The module chain that holds the callee's item in the PRISTINE crate, as
+/// path segments. The twin is placed beside that item, so its call must be
+/// spelled `crate::<chain>::__crat_raw_<name>`: the caller's module may have
+/// imported the ORIGINAL name (`use …::kmVec2Add;`) and renaming such a call in
+/// place leaves a name that module never imported (heman's E0425 at every
+/// cross-module caller — with "exists but is inaccessible" when the twin is
+/// private, without it when it is not).
+fn twin_module_chain(
+    items: &[rustc_ast::ptr::P<rustc_ast::Item>],
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    callee: LocalDefId,
+    chain: &mut Vec<String>,
+) -> bool {
+    for item in items {
+        if global_map.get(&item.id) == Some(&callee)
+            && matches!(item.kind, rustc_ast::ItemKind::Fn(_))
+        {
+            return true;
+        }
+        if let rustc_ast::ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(inner, ..)) =
+            &item.kind
+        {
+            chain.push(ident.name.to_string());
+            if twin_module_chain(inner, global_map, callee, chain) {
+                return true;
+            }
+            chain.pop();
+        }
+    }
+    false
 }
 
 fn insert_raw_twin(
@@ -1728,6 +1768,8 @@ struct CallGraft<'a> {
     yielded: Vec<((u32, u32), rustc_span::Span)>,
     /// Callees whose raw twin must be emitted, with the twin's name.
     twins: std::collections::BTreeMap<u32, (LocalDefId, String)>,
+    /// Each callee's module chain in the pristine crate, for the twin's path.
+    twin_paths: FxHashMap<u32, Vec<String>>,
 }
 
 impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
@@ -1797,11 +1839,18 @@ impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
                 ));
                 return;
             };
-            let Some(last) = path.segments.last_mut() else {
+            let Some(last) = path.segments.last() else {
                 self.failure = Some("counted-void raw-twin call: empty callee path".to_owned());
                 return;
             };
             let name = raw_twin_name(last.ident.name.as_str());
+            let Some(chain) = self.twin_paths.get(&call.callee.local_def_index.as_u32()) else {
+                self.failure = Some(format!(
+                    "counted-void raw-twin call at {}..{}: the callee's module chain is unknown",
+                    key.0, key.1
+                ));
+                return;
+            };
             if !self.guard.claim(e.id, e.span, "counted-void-call") {
                 self.failure = Some(format!(
                     "counted-void call at {}..{} collided with another AST transform",
@@ -1809,7 +1858,25 @@ impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
                 ));
                 return;
             }
-            last.ident = rustc_span::Ident::new(rustc_span::Symbol::intern(&name), last.ident.span);
+            // Spelled absolutely, so it resolves from the callee's own module
+            // and from any module that imported the ORIGINAL name.
+            let span = last.ident.span;
+            let segment = |text: &str| rustc_ast::PathSegment {
+                ident: rustc_span::Ident::new(rustc_span::Symbol::intern(text), span),
+                id: rustc_ast::node_id::DUMMY_NODE_ID,
+                args: None,
+            };
+            let mut segments = thin_vec::ThinVec::new();
+            segments.push(rustc_ast::PathSegment {
+                ident: rustc_span::Ident::new(rustc_span::kw::Crate, span),
+                id: rustc_ast::node_id::DUMMY_NODE_ID,
+                args: None,
+            });
+            for module in chain {
+                segments.push(segment(module));
+            }
+            segments.push(segment(&name));
+            path.segments = segments;
             self.twins
                 .insert(call.callee.local_def_index.as_u32(), (call.callee, name));
             self.consumed.insert(key);
