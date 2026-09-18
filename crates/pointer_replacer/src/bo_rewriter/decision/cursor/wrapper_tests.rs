@@ -1505,3 +1505,149 @@ fn n2_seams_a_cursor_row_onto_the_delivered_inner_slice() {
         "the delivered table's own fabricated outer extent is gone:\n{body}"
     );
 }
+
+/// **W-CUR-LOCAL** — the ephemeral copy of a cursor (urlparser `strrwd`'s
+/// `let fresh = ptr; ptr = ptr.offset(-1); *fresh`). A copy whose single use is
+/// a deref READ is not a second cursor: it is the cursor's raw view at the
+/// current position, which is the `raw-op-cursor-local` vocabulary the
+/// delivered-base arm already owns, receipted per site.
+#[test]
+fn slicecursor_read_only_copy_of_a_cursor_takes_its_raw_view() {
+    let input = r#"
+pub unsafe fn scan(mut p: *const i32, n: i32) -> i32 {
+    let mut total = 0i32;
+    p = p.offset(4);
+    let mut i = 0i32;
+    while i < n {
+        let fresh = p;
+        p = p.offset(-1);
+        total += *fresh;
+        i += 1;
+    }
+    total
+}
+pub unsafe fn caller(base: &[i32]) -> i32 { scan(base.as_ptr(), 3) }
+"#;
+    let source = emitted(input);
+    save_fixture("cursor-local-copy", input, &source);
+    assert!(
+        source.contains("slice_cursor::SliceCursor"),
+        "the parameter did not deliver: {source}"
+    );
+    assert!(
+        source.contains("let fresh = p.as_ptr();"),
+        "the copy is not the cursor's raw view: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            r#"fn main() { let mut b = [0i32; 2048]; b[2] = 2; b[3] = 3; b[4] = 4; assert_eq!(unsafe { caller(&b) }, 9); }"#,
+        ),
+    );
+}
+
+/// **F-CUR-LOCAL-EXCLUSIVE** — an exclusive cursor with a raw copy of its own
+/// region alive beside it is a retained alias; the rule is shared-only, and on
+/// this shape the MODEL refuses one step earlier (`RefMissing`, `kind-raw`)
+/// than the rule would.
+#[test]
+fn slicecursor_a_copy_of_an_exclusive_cursor_is_not_a_raw_view() {
+    let input = r#"
+pub unsafe fn scan(mut p: *mut i32, n: i32) -> i32 {
+    let mut total = 0i32;
+    p = p.offset(4);
+    let mut i = 0i32;
+    while i < n {
+        let fresh = p;
+        p = p.offset(-1);
+        total += *fresh;
+        *p = total;
+        i += 1;
+    }
+    total
+}
+pub unsafe fn caller(base: &mut [i32]) -> i32 { scan(base.as_mut_ptr(), 3) }
+"#;
+    assert_eq!(
+        cursor_dispositions(input),
+        vec![("scan::p".to_owned(), "Err(RefMissing)".to_owned())],
+        "an exclusive copy must not admit"
+    );
+}
+
+/// **F-CUR-LOCAL-WRITE** — a WRITE through the copy is a retained alias of the
+/// cursor's region, not a read view: the family holds rather than bridging it.
+#[test]
+fn slicecursor_a_written_copy_of_a_cursor_is_not_a_raw_view() {
+    let input = r#"
+pub unsafe fn scan(mut p: *mut i32, n: i32) -> i32 {
+    let mut i = 0i32;
+    p = p.offset(4);
+    while i < n {
+        let fresh = p;
+        p = p.offset(-1);
+        *fresh = i;
+        i += 1;
+    }
+    i
+}
+pub unsafe fn caller(base: &mut [i32]) -> i32 { scan(base.as_mut_ptr(), 3) }
+"#;
+    assert_eq!(
+        cursor_dispositions(input),
+        vec![("scan::p".to_owned(), "Err(RefMissing)".to_owned())],
+        "a written copy must not admit — here the model refuses first"
+    );
+}
+
+/// **F-CUR-LOCAL-TWICE** — a copy used twice is not ephemeral: the receipt
+/// model is one access per bridge, so the family holds.
+#[test]
+fn slicecursor_a_twice_used_copy_of_a_cursor_is_not_a_raw_view() {
+    let input = r#"
+pub unsafe fn scan(mut p: *const i32, n: i32) -> i32 {
+    let mut total = 0i32;
+    let mut i = 0i32;
+    p = p.offset(4);
+    while i < n {
+        let fresh = p;
+        p = p.offset(-1);
+        total += *fresh + *fresh;
+        i += 1;
+    }
+    total
+}
+pub unsafe fn caller(base: &[i32]) -> i32 { scan(base.as_ptr(), 3) }
+"#;
+    assert_eq!(
+        cursor_dispositions(input),
+        vec![("scan::p".to_owned(), "Err(UseUnbuilt)".to_owned())],
+        "a twice-used copy must not admit"
+    );
+}
+
+/// **F-CUR-LOCAL-ANNOTATED** — an annotated declaration fixes the copy's type,
+/// which the raw view may not match: the family holds.
+#[test]
+fn slicecursor_an_annotated_copy_of_a_cursor_is_not_a_raw_view() {
+    let input = r#"
+pub unsafe fn scan(mut p: *const i32, n: i32) -> i32 {
+    let mut total = 0i32;
+    let mut i = 0i32;
+    p = p.offset(4);
+    while i < n {
+        let fresh: *const i32 = p;
+        p = p.offset(-1);
+        total += *fresh;
+        i += 1;
+    }
+    total
+}
+pub unsafe fn caller(base: &[i32]) -> i32 { scan(base.as_ptr(), 3) }
+"#;
+    assert_eq!(
+        cursor_dispositions(input),
+        vec![("scan::p".to_owned(), "Err(UseUnbuilt)".to_owned())],
+        "an annotated copy must not admit"
+    );
+}

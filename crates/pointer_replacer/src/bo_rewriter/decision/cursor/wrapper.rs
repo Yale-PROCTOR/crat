@@ -485,6 +485,9 @@ struct Uses<'a, 'tcx> {
     /// this cursor, this cursor re-pointed from it). Both are cursors of this
     /// family or neither is emitted.
     peer_cursors: Vec<hir::HirId>,
+    /// Ephemeral raw copies of this cursor: `let fresh = p;` whose single use
+    /// is a deref read. Each carries its typed `raw-op-cursor-local` receipt.
+    local_bridges: Vec<super::CursorLocalBridge>,
 }
 impl Uses<'_, '_> {
     /// A derived pointer leaving the function through its raw return: the tail
@@ -540,6 +543,80 @@ impl Uses<'_, '_> {
                 self.hold.get_or_insert(hold);
             }
         }
+    }
+
+    /// **W-CUR-LOCAL.** The bare subject initialises an unannotated local whose
+    /// SINGLE use is a deref read (`let fresh = p; … *fresh`, urlparser
+    /// `strrwd`'s idiom). That copy is not a second cursor and needs no base of
+    /// its own: it is this cursor's raw view at the current position, which is
+    /// exactly the `raw-op-cursor-local` vocabulary the delivered-base arm
+    /// already owns. A write through the copy, a second use, an annotated
+    /// declaration, an `&mut` of it, an exclusive cursor, or a destination that
+    /// is itself a candidate of this family all fall back to the hold.
+    fn ephemeral_copy(&self, e: &hir::Expr<'_>) -> Option<(hir::HirId, hir::HirId)> {
+        struct Paths<'a, 'tcx> {
+            tcx: ty::TyCtxt<'tcx>,
+            binding: hir::HirId,
+            sites: Vec<&'a hir::Expr<'a>>,
+        }
+        impl<'v> Visitor<'v> for Paths<'v, '_> {
+            fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
+                if local(e) == Some(self.binding) {
+                    self.sites.push(e);
+                }
+                intravisit::walk_expr(self, e);
+            }
+        }
+        // Shared cursors only. An exclusive cursor with a raw copy of its own
+        // region alive beside it is a retained alias, and the model already
+        // calls such a subject raw (`RefMissing`) — measured, with a control.
+        if self.optional || self.subject.mutable {
+            return None;
+        }
+        let tcx = self.ctx.tcx;
+        let hir::Node::LetStmt(stmt) = tcx.parent_hir_node(e.hir_id) else {
+            return None;
+        };
+        if stmt.ty.is_some() || stmt.init.map(|init| init.hir_id) != Some(e.hir_id) {
+            return None;
+        }
+        let hir::PatKind::Binding(_, destination, _, None) = stmt.pat.kind else {
+            return None;
+        };
+        // A destination this family would itself take is not an ephemeral copy;
+        // one it leaves raw (any other subject, or none) is.
+        if self.entries.iter().any(|(other, decision)| {
+            other.fn_did == self.subject.fn_did
+                && other.hir_id == destination
+                && candidate_shape(self.ctx, other, decision)
+        }) {
+            return None;
+        }
+        let mut paths = Paths {
+            tcx,
+            binding: destination,
+            sites: vec![],
+        };
+        paths.visit_body(tcx.hir_body_owned_by(self.subject.fn_did));
+        let [site] = paths.sites[..] else { return None };
+        let hir::Node::Expr(read) = tcx.parent_hir_node(site.hir_id) else {
+            return None;
+        };
+        if !matches!(read.kind, hir::ExprKind::Unary(hir::UnOp::Deref, _)) {
+            return None;
+        }
+        if let hir::Node::Expr(parent) = tcx.parent_hir_node(read.hir_id) {
+            match parent.kind {
+                hir::ExprKind::Assign(lhs, ..) | hir::ExprKind::AssignOp(_, lhs, _)
+                    if lhs.hir_id == read.hir_id =>
+                {
+                    return None;
+                }
+                hir::ExprKind::AddrOf(_, hir::Mutability::Mut, _) => return None,
+                _ => {}
+            }
+        }
+        Some((destination, read.hir_id))
     }
 
     fn view(&self) -> String {
@@ -1254,9 +1331,20 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             };
             match assigned_to_peer {
                 Some(peer) => self.peer_cursors.push(peer),
-                None => {
-                    self.hold.get_or_insert(CursorHold::UseUnbuilt);
-                }
+                None => match self.ephemeral_copy(e) {
+                    Some((destination, access)) => {
+                        let view = format!("{}.as_ptr()", self.view());
+                        self.push(e, view, "raw-op-cursor-local");
+                        self.local_bridges.push(super::CursorLocalBridge {
+                            destination,
+                            initializer: e.hir_id,
+                            access,
+                        });
+                    }
+                    None => {
+                        self.hold.get_or_insert(CursorHold::UseUnbuilt);
+                    }
+                },
             }
         }
         if self.exclusive_base && self.base == local(e) && self.base.is_some() {
@@ -1599,6 +1687,7 @@ fn build(
         hold: None,
         peer_bases: vec![],
         peer_cursors: vec![],
+        local_bridges: vec![],
     };
     v.visit_body(ctx.tcx.hir_body_owned_by(subject.fn_did));
     if let Some(hold) = v.hold {
@@ -1628,7 +1717,7 @@ fn build(
         extent: 0,
         delivered_base: b.delivered,
         bridges: v.bridges,
-        local_bridges: vec![],
+        local_bridges: v.local_bridges,
         composed_edit_spans: b.composed,
         explicit_declaration,
         peer_bases: v.peer_bases,
