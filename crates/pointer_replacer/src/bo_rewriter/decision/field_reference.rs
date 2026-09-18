@@ -39,7 +39,7 @@
 //! have the layout of the raw pointer they replace, so a struct that crosses a
 //! foreign boundary keeps its ABI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
@@ -544,9 +544,41 @@ pub(crate) fn owning_field_form(
 }
 
 impl FieldTransactions {
+    /// The receipt at PLAN time: nothing is reverted yet, so every applied
+    /// transaction's `revert_status` is `active`.
     pub(crate) fn receipt_tsv(&self, tcx: TyCtxt<'_>) -> String {
+        self.receipt_tsv_at(tcx, &BTreeSet::new())
+    }
+
+    /// **R461-5 — the receipt says what the TREE got.**
+    ///
+    /// `status` is PLAN-time and keeps its vocabulary: every consumer means
+    /// plan time by it, and a transaction really was applied when the plan
+    /// was made. The ADDITIVE `revert_status` column is written from the
+    /// FINAL revert set instead — `withdrawn` where any of the transaction's
+    /// dependent owners had its signature class reverted, because
+    /// `field_reference_ast::{apply, apply_wraps, apply_hoists}` each iterate
+    /// [`Self::active`] and the struct declaration goes inactive with the
+    /// rest (report 039 / R460-11).
+    ///
+    /// Without the column a post-revert census row reads `applied` for a
+    /// conversion the program never received. A held row is `-`: it never
+    /// reached a revert set to be withdrawn from.
+    pub(crate) fn receipt_tsv_at(
+        &self,
+        tcx: TyCtxt<'_>,
+        reverted: &BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
+    ) -> String {
+        let withdrawn = |t: &FieldTransaction| -> &'static str {
+            let any = t.dependent_owners.iter().any(|owner| {
+                reverted.contains(&crate::bo_rewriter::bridge_receipt::SignatureClassId::of(
+                    *owner,
+                ))
+            });
+            if any { "withdrawn" } else { "active" }
+        };
         let mut out = String::from(
-            "struct\tfield\tstatus\tform\tsites\towners\timpls\tsignature_plans\tbridges\tcause\n",
+            "struct\tfield\tstatus\tform\tsites\towners\timpls\tsignature_plans\tbridges\tcause\trevert_status\n",
         );
         for t in &self.applied {
             let count = |kind: &str| {
@@ -556,7 +588,7 @@ impl FieldTransactions {
                     .count()
             };
             out.push_str(&format!(
-                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\n",
+                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\t{}\n",
                 t.struct_path,
                 t.field_name,
                 t.delivered_form_key(),
@@ -589,11 +621,12 @@ impl FieldTransactions {
                     ))
                     .collect::<Vec<_>>()
                     .join("|"),
+                withdrawn(t),
             ));
         }
         for (struct_path, field, cause) in &self.held {
             out.push_str(&format!(
-                "{struct_path}\t{field}\theld\t-\t-\t-\t-\t-\t-\t{cause}\n"
+                "{struct_path}\t{field}\theld\t-\t-\t-\t-\t-\t-\t{cause}\t-\n"
             ));
         }
         out

@@ -1967,3 +1967,151 @@ fn w6f_a_moved_out_owning_field_reaches_the_tree() {
         "no Rust drop may join the C frees\n{source}"
     );
 }
+
+/// The receipt at a named revert state, read inside the compiler run.
+/// Returns `(status, revert_status)` per `(struct, field)` ask, once with an
+/// EMPTY revert set and once with the named owners' classes reverted.
+fn receipt_at_reverts(
+    source: &str,
+    asks: &[(&str, &str)],
+    reverted_owners: &[&str],
+) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let asks: Vec<(String, String)> = asks
+        .iter()
+        .map(|(s, f)| ((*s).to_owned(), (*f).to_owned()))
+        .collect();
+    let owners: Vec<String> = reverted_owners.iter().map(|o| (*o).to_owned()).collect();
+    ::utils::compilation::run_compiler_on_str(source, move |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let read = |receipt: &str| -> Vec<(String, String)> {
+            asks.iter()
+                .map(|(s, f)| {
+                    let row = receipt
+                        .lines()
+                        .skip(1)
+                        .map(|line| line.split('\t').collect::<Vec<_>>())
+                        .find(|cells| cells[0].ends_with(s.as_str()) && cells[1] == f)
+                        .unwrap_or_else(|| panic!("no row for {s}.{f} in\n{receipt}"));
+                    (row[2].to_owned(), row[10].to_owned())
+                })
+                .collect()
+        };
+        let mut set = std::collections::BTreeSet::new();
+        for owner in &owners {
+            let did = tcx
+                .hir_body_owners()
+                .find(|did| tcx.def_path_str(did.to_def_id()).ends_with(owner.as_str()))
+                .unwrap_or_else(|| panic!("owner {owner}"));
+            set.insert(super::bridge_receipt::SignatureClassId::of(did));
+        }
+        (
+            read(&table.field_transactions.receipt_tsv(tcx)),
+            read(&table.field_transactions.receipt_tsv_at(tcx, &set)),
+        )
+    })
+    .unwrap()
+}
+
+/// Witness 28 (relay 042 / R461-5) — the receipt says what the TREE got.
+///
+/// `status` is PLAN-time and keeps its vocabulary, because every consumer
+/// means plan time by it. Beside it, the additive `revert_status` column is
+/// written from the FINAL revert set: a transaction whose owner class is
+/// reverted is `withdrawn`, because `field_reference_ast::{apply,
+/// apply_wraps, apply_hoists}` all iterate `active(&reverts.fns)` and the
+/// struct declaration goes inactive with it (report 039 / R460-11). Without
+/// this column a post-revert census row reads `applied` for a conversion the
+/// program never received — which is how two lanes read one table in
+/// opposite directions for three reports.
+#[test]
+fn w6f_the_receipt_says_what_the_tree_got() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-moved-out-field-frame",
+        vec![("Holder".to_owned(), 0, SlotKind::Owning)],
+        Vec::new(),
+    );
+    let (plan_time, after) = receipt_at_reverts(MOVED_OUT_FIELD, &[("Holder", "buf")], &["run"]);
+    super::test_model_override::clear();
+    assert_eq!(
+        plan_time,
+        vec![("applied".to_owned(), "active".to_owned())],
+        "nothing is reverted at plan time"
+    );
+    assert_eq!(
+        after,
+        vec![("applied".to_owned(), "withdrawn".to_owned())],
+        "`run` is this transaction's only owner: reverting it takes the field with it"
+    );
+
+    // …and the column reads `active()`'s OWN predicate, not a looser one.
+    // A transaction is withdrawn by its DEPENDENT owners — those carrying a
+    // store, a load or a signature plan — while an owner of only
+    // value-independent sites keeps its edits under any revert set. avl's
+    // `Node.left` has exactly that split: `newNode` is an owner and is not
+    // dependent, so reverting it must leave the transaction active.
+    avl_frame();
+    let (owners, dependent) = transaction_owner_split(AVL, "Node", "left");
+    super::test_model_override::clear();
+    assert!(
+        owners.iter().any(|o| o.ends_with("newNode"))
+            && !dependent.iter().any(|o| o.ends_with("newNode")),
+        "the fixture must keep a non-dependent owner for this to be falsifiable: {owners:?} / {dependent:?}"
+    );
+    avl_frame();
+    let (_, after_non_dependent) = receipt_at_reverts(AVL, &[("Node", "left")], &["newNode"]);
+    super::test_model_override::clear();
+    assert_eq!(
+        after_non_dependent,
+        vec![("applied".to_owned(), "active".to_owned())],
+        "a non-dependent owner's revert does not withdraw the transaction"
+    );
+    avl_frame();
+    let (_, after_dependent) = receipt_at_reverts(AVL, &[("Node", "left")], &["rightRotate"]);
+    super::test_model_override::clear();
+    assert_eq!(
+        after_dependent,
+        vec![("applied".to_owned(), "withdrawn".to_owned())],
+        "a dependent owner's revert does"
+    );
+}
+
+/// `(struct, field) -> (owners, dependent owners)` as path suffixes.
+fn transaction_owner_split(
+    source: &str,
+    struct_name: &str,
+    field: &str,
+) -> (Vec<String>, Vec<String>) {
+    let struct_name = struct_name.to_owned();
+    let field = field.to_owned();
+    ::utils::compilation::run_compiler_on_str(source, move |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let t = table
+            .field_transactions
+            .applied
+            .iter()
+            .find(|t| t.struct_path.ends_with(struct_name.as_str()) && t.field_name == field)
+            .unwrap_or_else(|| panic!("no applied transaction for {struct_name}.{field}"));
+        let name = |o: &rustc_hir::def_id::LocalDefId| tcx.def_path_str(o.to_def_id());
+        (
+            t.owners.iter().map(name).collect::<Vec<_>>(),
+            t.dependent_owners.iter().map(name).collect::<Vec<_>>(),
+        )
+    })
+    .unwrap()
+}

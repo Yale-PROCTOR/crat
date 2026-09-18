@@ -1669,6 +1669,20 @@ pub(crate) fn effective_withheld_classes(
     effective
 }
 
+/// **R461-5 (wave-6f)** — rewrite the field receipt's additive
+/// `revert_status` column at THIS revert state. `status` stays plan-time;
+/// this column says what the tree got, because a transaction whose owner
+/// class is reverted is inactive in `field_reference_ast` and its struct
+/// declaration goes with it (report 039 / R460-11).
+fn refresh_field_transaction_revert_status(
+    artifacts: &mut RawBoundaryArtifacts,
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+) {
+    artifacts.field_transactions = table.field_transactions.receipt_tsv_at(tcx, reverted);
+}
+
 fn refresh_raw_boundary_receipt_events(
     artifacts: &mut RawBoundaryArtifacts,
     emission_plan: &plan::Plan,
@@ -2392,6 +2406,12 @@ fn verify_and_revert(
                     &reverted,
                     &reverted_atoms,
                 );
+                refresh_field_transaction_revert_status(
+                    &mut facts.raw_boundary_artifacts,
+                    tcx,
+                    table,
+                    &reverted,
+                );
                 record_unresolved_classes(
                     &mut facts.raw_boundary_artifacts,
                     &all_ready_classes,
@@ -2453,6 +2473,12 @@ fn verify_and_revert(
                 &reverted,
                 &reverted_atoms,
                 &call_renders,
+            );
+            refresh_field_transaction_revert_status(
+                &mut facts.raw_boundary_artifacts,
+                tcx,
+                table,
+                &reverted,
             );
             return facts.emitted(source, files);
         }
@@ -2790,6 +2816,12 @@ fn verify_and_revert(
             &final_reverted,
             &reverted_atoms,
         );
+        refresh_field_transaction_revert_status(
+            &mut facts.raw_boundary_artifacts,
+            tcx,
+            table,
+            &final_reverted,
+        );
         record_unresolved_classes(
             &mut facts.raw_boundary_artifacts,
             &unresolved,
@@ -2920,6 +2952,12 @@ fn verify_and_revert(
                 &final_reverted,
                 &reverted_atoms,
                 &final_call_renders,
+            );
+            refresh_field_transaction_revert_status(
+                &mut facts.raw_boundary_artifacts,
+                tcx,
+                table,
+                &final_reverted,
             );
             facts.emitted(source, final_files)
         }
