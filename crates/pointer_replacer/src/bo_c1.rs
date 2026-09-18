@@ -25343,6 +25343,24 @@ fn r459_3_the_first_failing_verify_tree_is_captured_once_and_only_when_asked() {
     // It is Rust source, not a receipt table: it must not join the `.tsv` artifact
     // rows, which are stamped with the census header.
     assert!(!artifacts.first_failing_verify_tree.contains('\t'));
+
+    // **The path the capture reads.** The first version of this instrument read
+    // `staged.root().join("lib.rs")` and wrote `Not a directory (os error 20)`
+    // into every capture — the carrier was right and the READ was wrong, and no
+    // property above would have caught it. `TempCrate::root()` is the crate ROOT
+    // FILE; this pins that, so the capture and `diagnose_crate` cannot drift onto
+    // different paths again.
+    let staged = crate::bo_rewriter::verify::materialize_single_file("fn f() {}\n")
+        .expect("stage a single-file crate");
+    assert!(staged.root().is_file(), "root() is the crate root FILE");
+    assert_eq!(
+        std::fs::read_to_string(staged.root()).expect("the capture's own read"),
+        "fn f() {}\n"
+    );
+    assert!(
+        std::fs::read_to_string(staged.root().join("lib.rs")).is_err(),
+        "the path the first version used cannot be read"
+    );
 }
 
 #[test]

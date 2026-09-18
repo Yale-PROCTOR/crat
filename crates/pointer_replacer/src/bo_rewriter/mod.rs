@@ -2123,8 +2123,13 @@ fn verify_and_revert(
                 .is_empty()
             && std::env::var_os("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE").is_some()
         {
+            // `TempCrate::root()` is the crate ROOT FILE, not its directory
+            // (`materialize_single_file` returns `dir.join("lib.rs")`), which is
+            // also what `diagnose_crate` is handed one line above. Joining
+            // "lib.rs" onto it wrote `Not a directory (os error 20)` into the
+            // capture on its first real census — caught at batch 13d.
             facts.raw_boundary_artifacts.first_failing_verify_tree =
-                std::fs::read_to_string(staged.root().join("lib.rs"))
+                std::fs::read_to_string(staged.root())
                     .unwrap_or_else(|error| format!("// unreadable verify tree: {error}\n"));
         }
         let probe_wall_s = probe_started.elapsed().as_secs_f64();
