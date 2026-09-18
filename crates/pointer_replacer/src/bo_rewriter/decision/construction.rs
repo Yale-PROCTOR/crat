@@ -889,6 +889,23 @@ pub(crate) fn compose_initializer(
         })
         .collect::<Vec<_>>();
     ranges.sort_by_key(|(lo, hi, _)| (*lo, *hi));
+    // Wave-6o (relay 035): two producers rendering the SAME sub-range are not
+    // "crossing" — nothing is interleaved; one interval has two answers, and
+    // the receipt should say which two so the reader does not have to
+    // instrument the planner to find out (report 021 claim 4 needed a probe to
+    // learn that tulip's pair is `argv[1]` against
+    // `from_raw_parts(*argv.offset(1), FALLBACK_SLICE_EXTENT)` — the same
+    // operand rendered twice, one of them with a fabricated extent).
+    if let Some(pair) = ranges
+        .windows(2)
+        .find(|pair| pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1)
+    {
+        let one = pair[0].2.split_whitespace().collect::<Vec<_>>().join(" ");
+        let other = pair[1].2.split_whitespace().collect::<Vec<_>>().join(" ");
+        return Err(format!(
+            "conflicting renderings at one interval: `{one}` vs `{other}`"
+        ));
+    }
     if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
         return Err("crossing initializer adapters".to_owned());
     }
