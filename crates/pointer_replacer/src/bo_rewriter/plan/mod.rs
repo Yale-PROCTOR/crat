@@ -341,11 +341,24 @@ pub(crate) struct SignatureClassPlan {
     pub depends_on: Vec<SignatureClassId>,
     pub disposition: SignatureClassDisposition,
     pub sites: Vec<ClassSite>,
+    /// **Row (iv) (R471-2)** — every hold reason paired with the ordinal at which
+    /// `hold_terminal_class` recorded it, in RECORD order. `hold_reasons()` sorts and
+    /// dedups, which is what its readers want and which destroys exactly the fact a
+    /// cascade needs: which refusal came first. Additive (R450-9) — no existing reader
+    /// is touched.
+    pub hold_ordinals: Vec<(u32, String)>,
 }
 
 impl SignatureClassPlan {
     pub(crate) fn is_ready(&self) -> bool {
         self.disposition == SignatureClassDisposition::Ready
+    }
+
+    /// The hold reasons in the order `hold_terminal_class` recorded them, each with its
+    /// ordinal. A cascade member records the ordinal of the hold that CAUSED it, so the
+    /// lowest ordinal in a closure is its root (row (iv)).
+    pub(crate) fn hold_ordinals(&self) -> &[(u32, String)] {
+        &self.hold_ordinals
     }
 
     pub(crate) fn hold_reasons(&self) -> &[String] {
@@ -1141,6 +1154,7 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
                     depends_on: input.depends_on,
                     disposition,
                     sites: input.sites,
+                    hold_ordinals: Vec::new(),
                 },
             )
         })
@@ -1803,6 +1817,9 @@ pub(crate) struct Plan {
     /// Sites known without a successfully placed text edit (blocked,
     /// unplaceable, or explicit zero-syntax).
     pub preclass_sites: Vec<ClassSite>,
+    /// Row (iv) (R471-2): the next ordinal `hold_terminal_class` will stamp. Monotonic
+    /// per plan, never reset, so ordinals are comparable across the whole emission.
+    pub hold_terminal_ordinal: u32,
     /// Final signature-class transaction inventory.
     pub class_finalization: ClassFinalization,
     /// Whole-call/generated-site intervals used for diagnostics that land
@@ -2229,10 +2246,16 @@ impl Plan {
         class.edit_keys.dedup();
         class.sites.sort_by_key(|site| site.key.receipt_key());
         class.sites.dedup_by(|left, right| left.key == right.key);
+        let ordinal = self.hold_terminal_ordinal;
+        self.hold_terminal_ordinal = self.hold_terminal_ordinal.saturating_add(1);
+        let Some(class) = self.class_finalization.classes.get_mut(&owner) else {
+            return;
+        };
         let mut reasons = class.hold_reasons().to_vec();
-        reasons.push(reason);
+        reasons.push(reason.clone());
         reasons.sort();
         reasons.dedup();
+        class.hold_ordinals.push((ordinal, reason));
         class.disposition = SignatureClassDisposition::Held(reasons);
 
         loop {
@@ -2259,14 +2282,17 @@ impl Plan {
                 break;
             }
             for (id, dependency) in newly_held {
-                self.class_finalization
+                // Row (iv): a cascade member is held at the SAME ordinal as the hold
+                // that reached it, so a closure shares one ordinal and its root is the
+                // member whose reason is not `dependency-class-held`.
+                let reason = format!("dependency-class-held:{}", dependency.order_key());
+                let class = self
+                    .class_finalization
                     .classes
                     .get_mut(&id)
-                    .expect("dependent terminal class exists")
-                    .disposition = SignatureClassDisposition::Held(vec![format!(
-                    "dependency-class-held:{}",
-                    dependency.order_key()
-                )]);
+                    .expect("dependent terminal class exists");
+                class.hold_ordinals.push((ordinal, reason.clone()));
+                class.disposition = SignatureClassDisposition::Held(vec![reason]);
             }
         }
 
@@ -5618,6 +5644,7 @@ pub(crate) fn plan(
     );
 
     Plan {
+        hold_terminal_ordinal: 0,
         narrowed_dependency_edges: BTreeSet::new(),
         native_return_plans,
         outbound_expression_plans,

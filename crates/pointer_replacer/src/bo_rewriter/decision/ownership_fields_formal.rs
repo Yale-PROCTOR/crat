@@ -318,6 +318,7 @@ mod tests {
                     depends_on: Vec::new(),
                     disposition: bo::plan::SignatureClassDisposition::Ready,
                     sites: Vec::new(),
+                    hold_ordinals: Vec::new(),
                 },
             );
             let live = resolve(
@@ -400,6 +401,7 @@ mod tests {
                     depends_on: Vec::new(),
                     disposition: bo::plan::SignatureClassDisposition::Ready,
                     sites: Vec::new(),
+                    hold_ordinals: Vec::new(),
                 },
             );
             // Deliberate finalized-interface perturbation of the read-only

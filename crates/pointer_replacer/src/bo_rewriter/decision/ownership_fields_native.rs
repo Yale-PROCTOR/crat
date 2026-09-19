@@ -1760,6 +1760,7 @@ mod audit_tests {
                     depends_on: Vec::new(),
                     disposition: bo::plan::SignatureClassDisposition::Ready,
                     sites: Vec::new(),
+                    hold_ordinals: Vec::new(),
                 },
             );
             let inputs = Inputs {

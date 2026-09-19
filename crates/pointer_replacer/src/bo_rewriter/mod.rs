@@ -9767,7 +9767,7 @@ fn arm_outcomes_tsv(
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     let mut out = String::from(
-        "subject_identity\towner\trequired_arms\tready_arms\tapplied_arms\tsurface_state\td4_state\tc_state\tpair_state\tglue_state\taddr_state\tterminal\tblocking_arm\tblocking_reason\n",
+        "subject_identity\towner\trequired_arms\tready_arms\tapplied_arms\tsurface_state\td4_state\tc_state\tpair_state\tglue_state\taddr_state\tterminal\tblocking_arm\tblocking_reason\tblocking_reason_ordinals\n",
     );
     for (_, row) in rows {
         out.push_str(&row);
@@ -9831,12 +9831,27 @@ fn atomic_arm_outcomes_tsv(
             .filter(|class| !class.is_ready())
             .map(|class| class.hold_reasons().join(";"))
             .unwrap_or_else(|| "-".to_owned());
+        // **Row (iv) (R471-2)** — the same reasons in RECORD order, each with the
+        // ordinal `hold_terminal_class` stamped it at. Additive beside
+        // `blocking_reason`, which stays sorted for its existing readers.
+        let blocked_reason_ordinals = class
+            .filter(|class| !class.is_ready())
+            .map(|class| {
+                class
+                    .hold_ordinals()
+                    .iter()
+                    .map(|(ordinal, reason)| format!("{reason}@{ordinal}"))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .filter(|rendered| !rendered.is_empty())
+            .unwrap_or_else(|| "-".to_owned());
         let owner = tcx.def_path_str(subject.fn_did.to_def_id());
         let identity = subject.identity_key(&owner);
         rows.push((
             identity.clone(),
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 identity,
                 owner,
                 required.render(),
@@ -9851,6 +9866,7 @@ fn atomic_arm_outcomes_tsv(
                 terminal,
                 if terminal == "blocked" { "class" } else { "-" },
                 blocked_reason,
+                blocked_reason_ordinals,
             ),
         ));
     }

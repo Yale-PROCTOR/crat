@@ -139,6 +139,7 @@ fn class(id: SignatureClassId, disposition: SignatureClassDisposition) -> Signat
         depends_on: Vec::new(),
         disposition,
         sites: Vec::new(),
+        hold_ordinals: Vec::new(),
     }
 }
 
@@ -503,4 +504,80 @@ fn r430_final_reverts_name_every_owner_of_a_withheld_class() {
         None,
     );
     assert!(unknown.contains("<unknown-local-class>"), "{unknown}");
+}
+
+/// **Row (iv) (R471-2)** — each hold reason carries the ordinal `hold_terminal_class`
+/// recorded it at, in RECORD order, and a cascade member shares the ordinal of the hold
+/// that reached it.
+///
+/// `hold_reasons()` sorts and dedups. That is right for its readers and it destroys the
+/// one fact a cascade needs: which refusal came first. R460-13's 201 `closure:partition`
+/// rows bottom out on roots that this column names directly.
+#[test]
+fn r471_2_hold_reasons_carry_the_ordinal_they_were_recorded_at() {
+    use crate::bo_rewriter::plan::SignatureClassDisposition as D;
+
+    let mut plan = super::plan::Plan::default();
+    let ids = class_ids();
+    let (first, second) = (ids[0], ids[1]);
+    plan.class_finalization
+        .classes
+        .insert(first, ready_class(first));
+    plan.class_finalization
+        .classes
+        .insert(second, ready_class(second));
+
+    plan.hold_terminal_class(
+        first,
+        crate::bo_rewriter::decision::Arm::Surface,
+        "kind-a",
+        "zzz-late-alphabetically".into(),
+    );
+    plan.hold_terminal_class(
+        first,
+        crate::bo_rewriter::decision::Arm::Surface,
+        "kind-b",
+        "aaa-early-alphabetically".into(),
+    );
+
+    let class = &plan.class_finalization.classes[&first];
+    // The sorted view puts the SECOND reason first; the ordinal view does not.
+    assert_eq!(
+        class.hold_reasons(),
+        ["aaa-early-alphabetically", "zzz-late-alphabetically"]
+    );
+    assert_eq!(
+        class.hold_ordinals(),
+        [
+            (0, "zzz-late-alphabetically".to_owned()),
+            (1, "aaa-early-alphabetically".to_owned()),
+        ]
+    );
+    assert!(matches!(class.disposition, D::Held(_)));
+
+    // The column the census reads renders in RECORD order, `reason@ordinal`, and is
+    // therefore NOT the sorted `blocking_reason` text with ordinals appended.
+    let rendered = class
+        .hold_ordinals()
+        .iter()
+        .map(|(ordinal, reason)| format!("{reason}@{ordinal}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    assert_eq!(
+        rendered, "zzz-late-alphabetically@0;aaa-early-alphabetically@1",
+        "row (iv) renders in record order, not sorted order"
+    );
+
+    // A class held after the first two carries the NEXT ordinal, so ordinals are
+    // comparable across the whole emission, not per class.
+    plan.hold_terminal_class(
+        second,
+        crate::bo_rewriter::decision::Arm::Surface,
+        "kind-c",
+        "third".into(),
+    );
+    assert_eq!(
+        plan.class_finalization.classes[&second].hold_ordinals(),
+        [(2, "third".to_owned())]
+    );
 }
