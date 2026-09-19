@@ -373,7 +373,7 @@ fn r451_2_final_reverts_carry_named_subject_partition_root_and_reason_head() {
     let header = receipt.lines().next().expect("a header");
     assert_eq!(
         header,
-        "kind\tidentity\tclass_id\tattribution\tnamed_subject\tpartition_root\treason_head"
+        "kind\tidentity\tclass_id\tattribution\tnamed_subject\tpartition_root\treason_head\tinterface_seed"
     );
     let row = receipt
         .lines()
@@ -388,6 +388,9 @@ fn r451_2_final_reverts_carry_named_subject_partition_root_and_reason_head() {
         "the root that drove the partition member is named: {receipt}"
     );
     assert_eq!(row[6], "closure:partition", "{receipt}");
+    // R471-2's orphan column rides beside the three R451-2 pins without moving them:
+    // this row's attribution is not an interface dependency, so it names no seed.
+    assert_eq!(row[7], "-", "{receipt}");
 
     // The head is a projection, not a second classification: the class ids and
     // site details that make a hold row unique are stripped, the cause is not.
