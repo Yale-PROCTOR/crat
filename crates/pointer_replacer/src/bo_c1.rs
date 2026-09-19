@@ -1705,8 +1705,14 @@ fn field_transaction_revert_status_notes(
         }
         let mut reverted_owner = None;
         let mut any = false;
+        // **R472-4 (wave-6f 047)** — the receipt joins `owners` with `,`; splitting on `;`
+        // alone saw a multi-owner transaction as one unmatched blob, so the backward
+        // direction only ever fired on SINGLE-owner rows. heman's note was a coincidence
+        // of arity, and brotli's `BlockEncoder.block_types_` -- 8 of 9 owners reverted --
+        // was silently missed. Both separators are tolerated rather than one swapped for
+        // the other, so a producer that changes its mind cannot re-open the same hole.
         for owner in owner_list
-            .split(';')
+            .split([';', ','])
             .map(str::trim)
             .filter(|owner| !owner.is_empty() && *owner != "-")
         {
@@ -25701,6 +25707,18 @@ fn r469_1_a_revert_status_disagreement_is_a_typed_note_not_a_verdict() {
     );
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].kind, "held-row-carries-revert-status");
+
+    // **R472-4** — the receipt joins several owners with `,`. Splitting on `;` alone made
+    // the backward direction fire only on single-owner rows: brotli's
+    // `BlockEncoder.block_types_` has 8 of 9 owners reverted and read as one blob that
+    // matched nothing. Both separators are accepted.
+    let comma = notes(&receipt("src::a::kept,src::a::owner_reverted", "active"));
+    assert_eq!(comma.len(), 1);
+    assert_eq!(comma[0].kind, "owner-reverted-but-reads-active");
+    assert_eq!(comma[0].owner, "src::a::owner_reverted");
+    // and the forward direction agrees across a comma-joined list, as it already did
+    // across a semicolon-joined one.
+    assert!(notes(&receipt("src::a::kept,src::a::owner_reverted", "withdrawn")).is_empty());
 
     // A frame whose receipt predates the column is not a disagreement.
     assert!(
