@@ -1731,6 +1731,114 @@ pub unsafe fn copy_be32(mut pdest: *mut u32, mut psource: *mut u32) {
     );
 }
 
+/// **R471-5 — the counted snapshot must compose with the Option family's
+/// call reborrow.** binn's `binn_get_str` reads its own subject TWICE inside
+/// one counted call's argument list (`copy_int_value((*value).ptr, .., (*value).type_0, ..)`),
+/// so `option_ops::plan_call_reborrows` replaces the whole call span with
+/// `({ let value = value.as_deref_mut().unwrap(); <composed call> })`. The
+/// composed text already carries this family's argument bridges, which name
+/// the snapshot's closure parameters — and the snapshot itself is an AST
+/// graft keyed on the same span, so it finds a block instead of a call and
+/// yields (R410-2(d)). The binders are then never emitted and the bridges
+/// dangle: `E0425 cannot find value __crat_cv_0`, measured live in binn at
+/// `batch1315` (`ca63e6f44`).
+const GET_STR: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+unsafe extern "C" { fn memset(p: *mut core::ffi::c_void, v: i32, n: usize) -> *mut core::ffi::c_void; }
+#[repr(C)]
+pub struct Binn { pub header: i32, pub type_0: i32, pub ptr: *mut core::ffi::c_void }
+pub unsafe fn copy_int_value(psource: *mut core::ffi::c_void, pdest: *mut core::ffi::c_void,
+    source_type: i32, dest_type: i32) -> i32 {
+    match source_type {
+        33 => { *(pdest as *mut i8) = *(psource as *mut i8); }
+        97 => { *(pdest as *mut i32) = *(psource as *mut i32); }
+        _ => return 0,
+    }
+    return 1;
+}
+pub unsafe fn binn_get_str(mut value: *mut Binn) -> i32 {
+    let mut vint: i64 = 0;
+    if value.is_null() { return 0; }
+    if (*value).header == 0xf2 {
+        if copy_int_value((*value).ptr, &mut vint as *mut i64 as *mut core::ffi::c_void,
+                (*value).type_0, 0x81) == 0 {
+            return 0;
+        }
+        (*value).ptr = 0 as *mut core::ffi::c_void;
+        return vint as i32;
+    }
+    return 1;
+}
+"#;
+
+#[test]
+fn w6v2_counted_snapshot_composes_with_an_option_call_reborrow() {
+    let source = super::emit_tests::ast_emitted_source_of(GET_STR).unwrap();
+    // The bridge's placeholders may only appear where their binder does.
+    for name in ["__crat_cv_0", "__crat_cv_1", "__crat_cv_2", "__crat_cv_3"] {
+        let uses = source.matches(name).count();
+        if uses > 0 {
+            assert!(
+                source.contains(&format!("|{name}")) || source.contains(&format!(" {name},")),
+                "{name} is used but never bound: {source}"
+            );
+        }
+    }
+    assert!(
+        super::verify::type_checks_str(&source),
+        "the composed call must type-check: {source}"
+    );
+}
+
+/// The same collision on the **`Direct`** route — the arm binn's own
+/// `binn_get_str` takes (the snapshot closure, not the twin). The callee has no
+/// raw sibling, so the single view forms in place.
+const GET_STR_DIRECT: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+#[repr(C)]
+pub struct Binn { pub header: i32, pub type_0: i32, pub ptr: *mut core::ffi::c_void }
+pub unsafe fn read_int_value(psource: *mut core::ffi::c_void, source_type: i32,
+    dest_type: i32) -> i64 {
+    match source_type {
+        33 => return *(psource as *mut i8) as i64,
+        97 => return *(psource as *mut i32) as i64,
+        _ => return 0,
+    }
+}
+pub unsafe fn binn_get_str(mut value: *mut Binn) -> i32 {
+    let mut vint: i64 = 0;
+    if value.is_null() { return 0; }
+    if (*value).header == 0xf2 {
+        vint = read_int_value((*value).ptr, (*value).type_0, 0x81);
+        if vint == 0 { return 0; }
+        (*value).ptr = 0 as *mut core::ffi::c_void;
+        return vint as i32;
+    }
+    return 1;
+}
+"#;
+
+#[test]
+fn w6v2_counted_snapshot_composes_on_the_direct_route() {
+    let source = super::emit_tests::ast_emitted_source_of(GET_STR_DIRECT).unwrap();
+    assert!(
+        source.contains("as_deref_mut().unwrap()"),
+        "the Option family's call reborrow is the shape under test: {source}"
+    );
+    for name in ["__crat_cv_0", "__crat_cv_1", "__crat_cv_2"] {
+        if source.contains(name) {
+            assert!(
+                source.contains(&format!("|{name}")) || source.contains(&format!(" {name},")),
+                "{name} is used but never bound: {source}"
+            );
+        }
+    }
+    assert!(
+        super::verify::type_checks_str(&source),
+        "the composed call must type-check: {source}"
+    );
+}
+
 /// **R464-3 — the call-site fallback extent.** A RAW caller of a header-path
 /// view has no length to supply: the callee's count is the ruled fallback
 /// extent, not one of the call's arguments. Report 026 measured this as binn's

@@ -1650,6 +1650,7 @@ pub(crate) fn graft_calls(
     }
     let mut visitor = CallGraft {
         calls: &by_span,
+        pristine,
         guard,
         consumed: rustc_hash::FxHashSet::default(),
         failure: None,
@@ -1861,6 +1862,11 @@ use thin_vec::ThinVec;
 
 struct CallGraft<'a> {
     calls: &'a FxHashMap<(u32, u32), (&'a CallPlan, Vec<&'a BridgedArg>)>,
+    /// The input's AST. R471-5: when another family wraps the call in a block,
+    /// the arguments in the emitted tree may already carry this family's
+    /// bridges (that family composes the call's inner edits into its text), so
+    /// the snapshot's ACTUALS are read from here instead.
+    pristine: &'a rustc_ast::Crate,
     guard: &'a mut crate::bo_rewriter::ast_transform::Composition,
     consumed: rustc_hash::FxHashSet<(u32, u32)>,
     failure: Option<String>,
@@ -1912,6 +1918,54 @@ impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
         // Inner grafts first: an argument may itself carry a snapshotted call.
         rustc_ast::mut_visit::walk_expr(self, e);
         if self.failure.is_some() {
+            return;
+        }
+        if !matches!(e.kind, rustc_ast::ExprKind::Call(..))
+            && self.guard.holder(e.id).is_some()
+            && matches!(call.route, Route::Direct | Route::RawTwin)
+            && let Some(originals) = pristine_call_args(self.pristine, call.call_span)
+            && let Some(inner) = block_tail_call(e)
+        {
+            // **R471-5.** The Option family's call reborrow replaces the whole
+            // call span with `({ let x = x.as_deref_mut().unwrap(); <call> })`
+            // when one subject is read twice in the argument list. The call is
+            // still there, as the block's tail, so the snapshot composes
+            // INSIDE it — their block outside, our closure within — instead of
+            // yielding and leaving the bridges without their binders
+            // (`E0425 cannot find value __crat_cv_0`, measured live in binn).
+            //
+            // The actuals come from the PRISTINE call: that family composes
+            // this one's argument edits into its text, so the block's own
+            // arguments are bridges, not originals. Under the reborrow the
+            // input's argument text is exactly right — that is the premise the
+            // reborrow itself rests on.
+            if call.route == Route::RawTwin {
+                // The twin takes the arguments exactly as the input wrote
+                // them, so the block's composed text is replaced wholesale.
+                let rustc_ast::ExprKind::Call(callee, args) = &mut inner.kind else {
+                    unreachable!("block_tail_call answers only for a call")
+                };
+                let rustc_ast::ExprKind::Path(None, path) = &mut callee.kind else {
+                    self.failure = Some(format!(
+                        "counted-void raw-twin call at {}..{} has no plain path callee",
+                        key.0, key.1
+                    ));
+                    return;
+                };
+                let Some(last) = path.segments.last_mut() else {
+                    self.failure = Some("counted-void raw-twin call: empty callee path".to_owned());
+                    return;
+                };
+                let name = raw_twin_name(last.ident.name.as_str());
+                last.ident =
+                    rustc_span::Ident::new(rustc_span::Symbol::intern(&name), last.ident.span);
+                *args = originals.into_iter().collect();
+                self.twins
+                    .insert(call.callee.local_def_index.as_u32(), (call.callee, name));
+            } else {
+                self.graft_direct(inner, key, call, kept, Some(originals));
+            }
+            self.consumed.insert(key);
             return;
         }
         let rustc_ast::ExprKind::Call(callee, args) = &mut e.kind else {
@@ -1987,71 +2041,7 @@ impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
             self.graft_hoist(e, key, kept);
             return;
         }
-        let arity = args.len();
-        if call.count_index >= arity || kept.iter().any(|b| b.index >= arity) {
-            self.failure = Some(format!(
-                "counted-void call at {}..{} has arity {arity}, outside its plan",
-                key.0, key.1
-            ));
-            return;
-        }
-        const CALLEE: &str = "__crat_cv_callee";
-        let params = (0..arity).map(placeholder).collect::<Vec<_>>().join(", ");
-        let body_args = (0..arity)
-            .map(|i| {
-                kept.iter()
-                    .find(|b| b.index == i)
-                    .map_or_else(|| placeholder(i), |b| b.bridge.clone())
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let body = crate::bo_rewriter::mechanical_receipt::present_unsafe_text(
-            format!("{CALLEE}({body_args})"),
-            self.unsafe_fn,
-        );
-        let originals = (0..arity)
-            .map(|i| format!("{}_orig", placeholder(i)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let text = format!("(|{params}| {body})({originals})");
-        let mut parsed = match crate::bo_rewriter::ast_transform::graft_expr(&text) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                self.failure = Some(format!(
-                    "counted-void call at {}..{} did not round-trip: {text}",
-                    key.0, key.1
-                ));
-                return;
-            }
-        };
-        let mut subst = Substitute {
-            callee: Some(std::mem::replace(callee, rustc_ast::ptr::P(dummy_expr()))),
-            originals: std::mem::take(args).into_iter().map(Some).collect(),
-            substituted: 0,
-        };
-        rustc_ast::mut_visit::MutVisitor::visit_expr(&mut subst, &mut parsed);
-        if subst.substituted != arity + 1
-            || subst.callee.is_some()
-            || subst.originals.iter().any(Option::is_some)
-        {
-            self.failure = Some(format!(
-                "counted-void call at {}..{} substituted {} of {} operands",
-                key.0,
-                key.1,
-                subst.substituted,
-                arity + 1
-            ));
-            return;
-        }
-        if !self.guard.claim(e.id, e.span, "counted-void-call") {
-            self.failure = Some(format!(
-                "counted-void call at {}..{} collided with another AST transform",
-                key.0, key.1
-            ));
-            return;
-        }
-        self.consumed.insert(key);
-        e.kind = parsed.kind;
+        self.graft_direct(e, key, call, kept, None);
     }
 }
 
@@ -2193,4 +2183,137 @@ fn slice_edits(decision: &super::Decision) -> Option<&[UseEdit]> {
         | Decision::Box(_)
         | Decision::Degraded(_) => None,
     }
+}
+
+impl CallGraft<'_> {
+    /// The snapshot proper: `(|__crat_cv_0, ..| callee(<bridges>))(a0, .., an)`.
+    ///
+    /// `actuals` overrides the call's operands with the input's own arguments, which
+    /// is what the R471-5 composition needs — see the caller.
+    #[allow(clippy::too_many_lines)]
+    fn graft_direct(
+        &mut self,
+        e: &mut rustc_ast::Expr,
+        key: (u32, u32),
+        call: &CallPlan,
+        kept: &[&BridgedArg],
+        actuals: Option<Vec<rustc_ast::ptr::P<rustc_ast::Expr>>>,
+    ) {
+        let rustc_ast::ExprKind::Call(callee, args) = &mut e.kind else {
+            self.failure = Some(format!(
+                "counted-void call at {}..{} is not a call at graft time",
+                key.0, key.1
+            ));
+            return;
+        };
+        let arity = actuals.as_ref().map_or(args.len(), Vec::len);
+        if call.count_index >= arity || kept.iter().any(|b| b.index >= arity) {
+            self.failure = Some(format!(
+                "counted-void call at {}..{} has arity {arity}, outside its plan",
+                key.0, key.1
+            ));
+            return;
+        }
+        const CALLEE: &str = "__crat_cv_callee";
+        let params = (0..arity).map(placeholder).collect::<Vec<_>>().join(", ");
+        let body_args = (0..arity)
+            .map(|i| {
+                kept.iter()
+                    .find(|b| b.index == i)
+                    .map_or_else(|| placeholder(i), |b| b.bridge.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = crate::bo_rewriter::mechanical_receipt::present_unsafe_text(
+            format!("{CALLEE}({body_args})"),
+            self.unsafe_fn,
+        );
+        let originals = (0..arity)
+            .map(|i| format!("{}_orig", placeholder(i)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text = format!("(|{params}| {body})({originals})");
+        let mut parsed = match crate::bo_rewriter::ast_transform::graft_expr(&text) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.failure = Some(format!(
+                    "counted-void call at {}..{} did not round-trip: {text}",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        let mut subst = Substitute {
+            callee: Some(std::mem::replace(callee, rustc_ast::ptr::P(dummy_expr()))),
+            originals: actuals.map_or_else(
+                || std::mem::take(args).into_iter().map(Some).collect(),
+                |actuals| actuals.into_iter().map(Some).collect(),
+            ),
+            substituted: 0,
+        };
+        rustc_ast::mut_visit::MutVisitor::visit_expr(&mut subst, &mut parsed);
+        if subst.substituted != arity + 1
+            || subst.callee.is_some()
+            || subst.originals.iter().any(Option::is_some)
+        {
+            self.failure = Some(format!(
+                "counted-void call at {}..{} substituted {} of {} operands",
+                key.0,
+                key.1,
+                subst.substituted,
+                arity + 1
+            ));
+            return;
+        }
+        if !self.guard.claim(e.id, e.span, "counted-void-call") {
+            self.failure = Some(format!(
+                "counted-void call at {}..{} collided with another AST transform",
+                key.0, key.1
+            ));
+            return;
+        }
+        self.consumed.insert(key);
+        e.kind = parsed.kind;
+    }
+}
+
+/// The block's tail expression, when it is a call (R471-5).
+fn block_tail_call(e: &mut rustc_ast::Expr) -> Option<&mut rustc_ast::Expr> {
+    // The reborrow's replacement is parsed as `({ .. })`: a paren around the
+    // block, so the block is one level down.
+    let inner = if matches!(e.kind, rustc_ast::ExprKind::Paren(_)) {
+        let rustc_ast::ExprKind::Paren(inner) = &mut e.kind else { unreachable!() };
+        &mut **inner
+    } else {
+        e
+    };
+    let rustc_ast::ExprKind::Block(block, _) = &mut inner.kind else { return None };
+    let last = block.stmts.last_mut()?;
+    let rustc_ast::StmtKind::Expr(inner) = &mut last.kind else { return None };
+    matches!(inner.kind, rustc_ast::ExprKind::Call(..)).then_some(&mut **inner)
+}
+
+/// The arguments the INPUT passes at this call span (R471-5).
+fn pristine_call_args(
+    pristine: &rustc_ast::Crate,
+    span: rustc_span::Span,
+) -> Option<Vec<rustc_ast::ptr::P<rustc_ast::Expr>>> {
+    struct Find<'a> {
+        span: rustc_span::Span,
+        found: Option<&'a [rustc_ast::ptr::P<rustc_ast::Expr>]>,
+    }
+    impl<'a> rustc_ast::visit::Visitor<'a> for Find<'a> {
+        fn visit_expr(&mut self, e: &'a rustc_ast::Expr) {
+            if self.found.is_none()
+                && e.span == self.span
+                && let rustc_ast::ExprKind::Call(_, args) = &e.kind
+            {
+                self.found = Some(args);
+            }
+            rustc_ast::visit::walk_expr(self, e);
+        }
+    }
+    let mut find = Find { span, found: None };
+    rustc_ast::visit::Visitor::visit_crate(&mut find, pristine);
+    find.found.map(<[_]>::to_vec)
 }
