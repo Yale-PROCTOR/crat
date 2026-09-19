@@ -43,6 +43,8 @@ pub(crate) mod compare_only_offset;
 mod compare_only_offset_probe;
 #[cfg(test)]
 mod compare_only_offset_tests;
+#[cfg(test)]
+mod compare_only_plain_tests;
 pub(crate) mod construction;
 pub(crate) mod construction_values;
 pub(crate) mod contract_extent;
@@ -2754,19 +2756,28 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // Composition (wave-6v2): a lane hook may rebind `counted` above; the void
     // contract is read again here so a counted byte view without arithmetic
     // (no sign fact) is not refused on a lookup miss.
+    // **R471-4 — the plain twin takes the compare-only fact too.** It was
+    // withheld at R465-4 because admitting here takes `fragment::input`
+    // (brotli's compress-fragment core loop) out of the refusal that
+    // `slicecursor_fragment_fast_core_loop` pins as the CURSOR family's
+    // hand-off point. Report 031 measured the trade before deciding it: 14
+    // brotli rows plus binn's `IsValidBinnHeader::pbuf` are refused ONLY
+    // here; all 18 rows of that shape read `emission=unchanged` in the cursor
+    // family's own records, so the hand-off is to nobody; and of the 81 rows
+    // the cursor family DOES deliver, this fact admits exactly one, whose
+    // sign is `nonneg` — so this gate never reads it and the cursor family
+    // loses nothing. The one red is that pinned witness, restated as a
+    // dichotomy by slicecursor (relay 044 §2).
     if counted.is_none()
         && counted_void::active(ctx, subject).is_none()
         && region.is_none()
         && sign.may_be_negative(subject.fn_did, subject.local)
-    // **R464-3 is NOT applied here, measured.** The relay's parenthetical
-    // asked for the plain twin too; on the suite that admission takes
-    // `fragment::input` (brotli's compress-fragment core loop) away from
-    // the CURSOR family, whose `slicecursor_fragment_fast_core_loop`
-    // witness pins this refusal as its hand-off point: the base becomes
-    // `cursor-shared` precisely because the plain slice form is refused
-    // here. One added red, and it is another lane's rule, not a stale
-    // expectation — so the optional arm carries R464-3 alone and the plain
-    // half waits for slicecursor's read (report 028 §4).
+        && compare_only_offset::every_advancing_offset_is_a_non_negative_literal(
+            tcx,
+            subject.fn_did,
+            subject.local,
+        )
+        .is_err()
     {
         return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
     }
