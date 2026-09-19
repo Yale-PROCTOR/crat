@@ -581,3 +581,43 @@ fn r471_2_hold_reasons_carry_the_ordinal_they_were_recorded_at() {
         [(2, "third".to_owned())]
     );
 }
+
+/// **The orphan column (R471-2)** — `input-interface-dependency-reverted` names no
+/// interface. `seed_reaching` walks the return-origin edges backwards to the nearest
+/// reverted class that is not itself a dependent, which is the interface a lane can
+/// route to; a member the graph does not connect reads `orphan`.
+///
+/// At the landed frame 137 of the 201 `closure:partition` rows carry this root and 47 of
+/// the 49 with no `d4-edges` upstream had nothing naming them at all.
+#[test]
+fn r471_2_an_interface_dependency_member_names_the_seed_that_reached_it() {
+    use super::decision::lifetime::ReturnOriginAtomDependencies;
+
+    let ids = class_ids();
+    let (seed, middle, leaf, unrelated) = (ids[0], ids[1], ids[2], ids[3]);
+    // seed -> middle -> leaf; `unrelated` is in no edge at all.
+    let deps = ReturnOriginAtomDependencies::from_edges_for_test(
+        BTreeMap::new(),
+        // `leaf -> seed` closes a CYCLE, so the self-check below is load-bearing: without
+        // it the walk finds the seed by going all the way round.
+        BTreeMap::from([
+            (seed, BTreeSet::from([middle])),
+            (middle, BTreeSet::from([leaf])),
+            (leaf, BTreeSet::from([seed])),
+        ]),
+    );
+    let seeds = BTreeSet::from([seed]);
+
+    // The nearest cause, not merely some cause, and transitively for the leaf.
+    assert_eq!(deps.seed_reaching(middle, &seeds), Some(seed));
+    assert_eq!(deps.seed_reaching(leaf, &seeds), Some(seed));
+    // A seed is not reached BY anything -- it IS the interface.
+    assert_eq!(deps.seed_reaching(seed, &seeds), None);
+    // A class the graph does not connect is an orphan, which is the finding the column
+    // exists to make countable rather than a silent gap.
+    assert_eq!(deps.seed_reaching(unrelated, &seeds), None);
+
+    // With `middle` ALSO reverted, the leaf's answer moves to the closer cause.
+    let both = BTreeSet::from([seed, middle]);
+    assert_eq!(deps.seed_reaching(leaf, &both), Some(middle));
+}

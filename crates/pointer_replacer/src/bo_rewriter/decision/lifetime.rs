@@ -1182,6 +1182,50 @@ impl ReturnOriginAtomDependencies {
 
     /// Follow the same finalized consistency edges for a newly held interface.
     /// Existing unrelated class reverts are not seeds for this closure.
+    /// **The orphan column (R471-2)** — which reverted class REACHED `owner` through the
+    /// return-origin dependency graph.
+    ///
+    /// `input-interface-dependency-reverted` is stamped on every transitive dependent of
+    /// a reverted return origin and records nothing about WHICH origin, so 47 of the 49
+    /// members with no `d4-edges` upstream had nothing in the artifact set naming their
+    /// interface. This walks the edges backwards from `owner` to the nearest member of
+    /// `seeds`, breadth-first so the answer is the closest cause, and takes the smallest
+    /// by order key when several are equidistant, so it is deterministic.
+    pub(crate) fn seed_reaching(
+        &self,
+        owner: crate::bo_rewriter::bridge_receipt::SignatureClassId,
+        seeds: &BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
+    ) -> Option<crate::bo_rewriter::bridge_receipt::SignatureClassId> {
+        if seeds.contains(&owner) {
+            return None; // a seed is not reached BY anything; it is the cause
+        }
+        let mut sources: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for (source, dependents) in &self.dependents_by_class {
+            for dependent in dependents {
+                sources.entry(*dependent).or_default().insert(*source);
+            }
+        }
+        let mut seen = BTreeSet::from([owner]);
+        let mut frontier = vec![owner];
+        while !frontier.is_empty() {
+            let mut next = BTreeSet::new();
+            for node in frontier {
+                for source in sources.get(&node).into_iter().flatten() {
+                    if seeds.contains(source) {
+                        // BTreeSet iteration is ordered, so the first hit at this depth
+                        // is already the smallest by order key.
+                        return Some(*source);
+                    }
+                    if seen.insert(*source) {
+                        next.insert(*source);
+                    }
+                }
+            }
+            frontier = next.into_iter().collect();
+        }
+        None
+    }
+
     pub(crate) fn dependents_of(
         &self,
         owners: &BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,

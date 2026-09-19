@@ -4206,8 +4206,30 @@ fn render_raw_boundary_final_reverts(
     // the attribution's head (`reason` itself is a production key and is never
     // overloaded: main report 046 §6, accepted).
     let mut out = String::from(
-        "kind\tidentity\tclass_id\tattribution\tnamed_subject\tpartition_root\treason_head\n",
+        "kind\tidentity\tclass_id\tattribution\tnamed_subject\tpartition_root\treason_head\tinterface_seed\n",
     );
+    // **The orphan column (R471-2)** — `input-interface-dependency-reverted` names no
+    // interface, so a member held by one could not be routed. The seeds are the reverted
+    // classes that are NOT themselves dependents; every other member resolves to the
+    // nearest one, or to `orphan` when the graph does not reach a seed at all.
+    let interface_seeds = emission_plan
+        .map(|plan| {
+            functions
+                .iter()
+                .copied()
+                .filter(|function| {
+                    !plan
+                        .class_finalization
+                        .classes
+                        .get(function)
+                        .and_then(|class| class.hold_reasons().first())
+                        .is_some_and(|reason| {
+                            reason.starts_with("input-interface-dependency-reverted")
+                        })
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     for &function in functions {
         // **R430-1 — one row per OWNER PATH of the withheld class.** The census
         // marks a subject reverted by its owner path; a class-mate this
@@ -4248,16 +4270,35 @@ fn render_raw_boundary_final_reverts(
             .and_then(|reasons| reasons.iter().next().cloned())
             .unwrap_or_else(|| "-".to_owned());
         let head = raw_boundary_reason_head(&attribution);
+        // The orphan column: `-` for a seed (nothing reached it), the reaching class for
+        // a member, `orphan` for a member the graph does not connect to any seed.
+        let seed = if !attribution.contains("input-interface-dependency-reverted") {
+            "-".to_owned()
+        } else {
+            emission_plan
+                .and_then(|plan| {
+                    plan.terminal_call_plans
+                        .return_origin_dependencies
+                        .seed_reaching(function, &interface_seeds)
+                })
+                .map(|seed| {
+                    display_paths
+                        .get(&seed)
+                        .cloned()
+                        .unwrap_or_else(|| format!("local-def-index:{}", seed.order_key()))
+                })
+                .unwrap_or_else(|| "orphan".to_owned())
+        };
         for path in owners {
             out.push_str(&format!(
-                "function\t{path}\tlocal-def-index:{}\t{attribution}\t{named}\t{root}\t{head}\n",
+                "function\t{path}\tlocal-def-index:{}\t{attribution}\t{named}\t{root}\t{head}\t{seed}\n",
                 function.order_key()
             ));
         }
     }
     for atom in atoms {
         out.push_str(&format!(
-            "atom\t{atom}\t-\tatom-reverted\t-\t-\tatom-reverted\n"
+            "atom\t{atom}\t-\tatom-reverted\t-\t-\tatom-reverted\t-\n"
         ));
     }
     out
