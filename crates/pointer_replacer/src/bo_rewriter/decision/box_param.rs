@@ -481,29 +481,79 @@ pub(crate) fn consuming_formals<'tcx>(
         .flat_map(|s| s.fn_values.iter().copied())
         .collect();
     let mut out = FxHashSet::default();
-    for param in subjects {
-        let SubjectKind::Param { hir_index } = param.kind else { continue };
-        if param.ptr_depth != 1 || fn_values.contains(&param.fn_did.to_def_id()) {
-            continue;
+    // **R450-8 rung 2** — the set is a depth-bounded FIXPOINT. Its seed is the
+    // formals with a sink of their own (a free, or W6A-C2's store); each pass
+    // then adds a formal whose only sink is the MOVE ON — `pass_on(q)` handing
+    // `q` to a callee already in the set. Each pass adds exactly one level of
+    // the chain, and the loop stops as soon as one adds nothing.
+    for _ in 0..RUNG2_DEPTH {
+        let mut added = false;
+        for param in subjects {
+            let SubjectKind::Param { hir_index } = param.kind else { continue };
+            if param.ptr_depth != 1 || fn_values.contains(&param.fn_did.to_def_id()) {
+                continue;
+            }
+            if out.contains(&(param.fn_did.to_def_id(), hir_index)) {
+                continue;
+            }
+            let Some(scan) = scans.get(&param.fn_did) else { continue };
+            let frees: Vec<(Span, Span)> = scan
+                .frees
+                .iter()
+                .filter(|(hir, _, _)| *hir == param.hir_id)
+                .map(|(_, call, arg)| (*call, *arg))
+                .collect();
+            let sink = match (
+                frees.as_slice(),
+                store_sink(tcx, scan, param),
+                move_on_sink(scan, param, &out),
+            ) {
+                ([(_, argument)], None, None) => *argument,
+                ([], Some((value, _)), None) => value,
+                ([], None, Some(argument)) => argument,
+                _ => continue,
+            };
+            if slice_uses_of(tcx, param, &[sink]).is_err() {
+                continue;
+            }
+            out.insert((param.fn_did.to_def_id(), hir_index));
+            added = true;
         }
-        let Some(scan) = scans.get(&param.fn_did) else { continue };
-        let frees: Vec<(Span, Span)> = scan
-            .frees
-            .iter()
-            .filter(|(hir, _, _)| *hir == param.hir_id)
-            .map(|(_, call, arg)| (*call, *arg))
-            .collect();
-        let sink = match (frees.as_slice(), store_sink(tcx, scan, param)) {
-            ([(_, argument)], None) => *argument,
-            ([], Some((value, _))) => value,
-            _ => continue,
-        };
-        if slice_uses_of(tcx, param, &[sink]).is_err() {
-            continue;
+        if !added {
+            break;
         }
-        out.insert((param.fn_did.to_def_id(), hir_index));
     }
     out
+}
+
+/// How deep a parameter-to-parameter chain this rule follows (R450-8 rung 2).
+/// Each pass of [`consuming_formals`] adds one level; four covers every shape
+/// the corpus carries and bounds the cost of a program whose call graph is
+/// deep.
+const RUNG2_DEPTH: usize = 4;
+
+/// **R450-8 rung 2** — the formal's only sink is the MOVE ON: exactly one call
+/// in the body passes it, at an index whose callee formal is already known to
+/// consume, and it is passed nowhere else. The argument's span is the sink, so
+/// every other use of the formal must still be one the slice-use collector
+/// rewrites — the same test a free or a store sink takes.
+fn move_on_sink(
+    scan: &Scan<'_>,
+    param: &Subject,
+    known: &FxHashSet<(DefId, usize)>,
+) -> Option<Span> {
+    let mut passes = scan.calls.iter().filter_map(|(callee, _, args)| {
+        let index = args
+            .iter()
+            .position(|a| a.map(|(hir, _)| hir) == Some(param.hir_id))?;
+        let (_, span) = args[index]?;
+        Some((*callee, index, span))
+    });
+    let (callee, index, span) = passes.next()?;
+    if passes.next().is_some() || !known.contains(&(callee, index)) {
+        return None;
+    }
+    Some(span)
 }
 
 /// **W6A-C2: the store sink.** A formal the callee neither frees nor returns
@@ -570,6 +620,7 @@ pub(crate) fn derive<'tcx>(
     model: &FxHashMap<SlotRef, SlotKind>,
     certificates: &super::return_certificate::Certificates,
     contract_plans: &FxHashMap<(LocalDefId, HirId), BoxPlan>,
+    consuming: &FxHashSet<(DefId, usize)>,
     raw_surface: &dyn Fn(LocalDefId) -> bool,
     exported_pairs: &super::exported_pair::Closure,
 ) -> Chains {
@@ -599,7 +650,47 @@ pub(crate) fn derive<'tcx>(
         .iter()
         .filter(|s| matches!(s.kind, SubjectKind::Param { .. }) && s.ptr_depth == 1)
         .collect();
-    params.sort_by_key(|s| (s.fn_did.local_def_index.as_u32(), s.local.as_u32()));
+    // **R450-8 rung 2 — the order the chains are planned in.** A formal whose
+    // sink is the MOVE ON is a caller MEMBER of the chain it moves into, so
+    // its own plan must exist before that chain's caller loop reads it. Its
+    // depth in the move-on relation says when: the outermost formal is planned
+    // first, and the innermost — the one that frees or stores — last. Every
+    // other formal has depth 0 and keeps the old order among themselves.
+    let mut depth: FxHashMap<(DefId, usize), usize> = FxHashMap::default();
+    for _ in 0..RUNG2_DEPTH {
+        for param in &params {
+            let SubjectKind::Param { hir_index } = param.kind else { continue };
+            let key = (param.fn_did.to_def_id(), hir_index);
+            let Some(scan) = scans.get(&param.fn_did) else { continue };
+            if !scan.frees.iter().any(|(hir, _, _)| *hir == param.hir_id)
+                && store_sink(tcx, scan, param).is_none()
+                && let Some(call) = scan.calls.iter().find_map(|(callee, _, args)| {
+                    let index = args
+                        .iter()
+                        .position(|a| a.map(|(hir, _)| hir) == Some(param.hir_id))?;
+                    Some((*callee, index))
+                })
+            {
+                let inner = depth.get(&call).copied().unwrap_or(0);
+                depth.insert(key, inner + 1);
+            }
+        }
+    }
+    params.sort_by_key(|s| {
+        let hir_index = match s.kind {
+            SubjectKind::Param { hir_index } => hir_index,
+            _ => 0,
+        };
+        let order = depth
+            .get(&(s.fn_did.to_def_id(), hir_index))
+            .copied()
+            .unwrap_or(0);
+        (
+            std::cmp::Reverse(order),
+            s.fn_did.local_def_index.as_u32(),
+            s.local.as_u32(),
+        )
+    });
     for param in params {
         let SubjectKind::Param { hir_index } = param.kind else { continue };
         let callee_path = tcx.def_path_str(param.fn_did.to_def_id());
@@ -614,7 +705,17 @@ pub(crate) fn derive<'tcx>(
         // freeing hands its allocation to the program's own storage; the
         // store is the sink and the move ends there.
         let store = store_sink(tcx, scan, param);
-        if frees.is_empty() && store.is_none() {
+        // **R450-8 rung 2**: the formal's sink may be the MOVE ON — `pass_on(q)`
+        // handing `q` to a callee that consumes it. `consuming_formals` is a
+        // fixpoint over exactly that relation, so the question is already
+        // answered when this rule reads it; the emission for such a formal adds
+        // NO edit at the sink (a `Box` argument at a `Box` formal moves).
+        let moved_on = if frees.is_empty() && store.is_none() {
+            move_on_sink(scan, param, consuming)
+        } else {
+            None
+        };
+        if frees.is_empty() && store.is_none() && moved_on.is_none() {
             // Not a consumer: a lend. Only reported for an Owning-modeled formal
             // (the rows the Box arm holds today); a Ref/Raw formal is not (c).
             if slot_of(param).is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Owning)) {
@@ -682,9 +783,10 @@ pub(crate) fn derive<'tcx>(
                 Some(_) => {}
             }
         }
-        let sink = match (frees.first(), store) {
-            (Some((_, argument)), None) => *argument,
-            (None, Some((value, _))) => value,
+        let sink = match (frees.first(), store, moved_on) {
+            (Some((_, argument)), None, None) => *argument,
+            (None, Some((value, _)), None) => value,
+            (None, None, Some(argument)) => argument,
             _ => unreachable!("exactly one sink reaches here"),
         };
         // Every other use of the formal is a deref / element access the
@@ -712,6 +814,9 @@ pub(crate) fn derive<'tcx>(
         let mut call_count = 0usize;
         let mut member_plans: Vec<((LocalDefId, HirId), BoxPlan, String, Vec<UseEdit>)> =
             Vec::new();
+        // Rung 2: members that are the caller's own PARAMETER — their plan
+        // belongs to the chain that planned that formal, not to this one.
+        let mut moved_on_members: FxHashSet<(LocalDefId, HirId)> = FxHashSet::default();
         let mut failure: Option<String> = None;
         let mut callers: Vec<(&LocalDefId, &Scan<'tcx>)> = scans.iter().collect();
         callers.sort_by_key(|(f, _)| f.local_def_index.as_u32());
@@ -732,6 +837,33 @@ pub(crate) fn derive<'tcx>(
                 let Some(local) = subjects.iter().find(|s| {
                     s.fn_did == *caller && s.hir_id == *arg && s.kind == SubjectKind::Local
                 }) else {
+                    // **R450-8 rung 2**: the caller hands its OWN PARAMETER —
+                    // `pass_on(q)` into `sink_free(p)`. That is a move when the
+                    // caller's formal is itself an owner, which is exactly what
+                    // this chain planned one step earlier (the depth order
+                    // above). The member carries that plan for the shape and
+                    // the licensing; the binding stays the other chain's, so
+                    // nothing is inserted for it here.
+                    if let Some(member) = subjects.iter().find(|s| {
+                        s.fn_did == *caller
+                            && s.hir_id == *arg
+                            && matches!(s.kind, SubjectKind::Param { .. })
+                    }) && let Some(plan) = out.plans.get(&(*caller, *arg)).cloned()
+                    {
+                        if caller_scan
+                            .local_uses
+                            .iter()
+                            .any(|(hir, span)| *hir == *arg && span.lo() > call_span.hi())
+                        {
+                            failure = Some(format!(
+                                "box-param-caller-retains:{caller_path}:used-after-transfer"
+                            ));
+                            break 'callers;
+                        }
+                        moved_on_members.insert(key);
+                        member_plans.push((key, plan, member.label.clone(), Vec::new()));
+                        continue;
+                    }
                     failure = Some(format!(
                         "box-param-caller-retains:{caller_path}:not-a-local"
                     ));
@@ -1054,16 +1186,16 @@ pub(crate) fn derive<'tcx>(
             }
         };
         // The chain's element accesses: slice owners index, sized owners deref.
-        let mut expr_edits = vec![match (frees.first(), store) {
-            (Some((call, _)), _) => BoxExprEdit {
+        let mut expr_edits: Vec<BoxExprEdit> = match (frees.first(), store) {
+            (Some((call, _)), _) => vec![BoxExprEdit {
                 span: *call,
                 replacement: format!("drop({name})"),
                 receipt: "box-param-c-free-site-drop",
-            },
+            }],
             // W6A-C2: ownership leaves Rust's hands into C's storage exactly
             // where the source stored it; the cast the source wrote around
             // the value stays (the raw place keeps its own type).
-            (None, Some((value, _))) => BoxExprEdit {
+            (None, Some((value, _))) => vec![BoxExprEdit {
                 span: value,
                 // A slice owner's `into_raw` is a fat pointer; the place keeps
                 // the thin type the source gave it.
@@ -1073,9 +1205,12 @@ pub(crate) fn derive<'tcx>(
                     format!("Box::into_raw({name})")
                 },
                 receipt: "box-param-store-transfer",
-            },
-            (None, None) => unreachable!("one sink"),
-        }];
+            }],
+            // **Rung 2**: the move on needs no edit at all — the argument is
+            // the owner itself and the callee's formal is a `Box` too, so the
+            // call keeps every character it had.
+            (None, None) => Vec::new(),
+        };
         let mut shape_failure = None;
         for (edit, is_formals) in param_uses.iter().map(|e| (e, true)).chain(
             member_plans
@@ -1159,6 +1294,9 @@ pub(crate) fn derive<'tcx>(
             plan.expr_edits.extend(member_edits.drain(..uses.len()));
             if !chain_callers.contains(&key.0) {
                 chain_callers.push(key.0);
+            }
+            if moved_on_members.contains(&key) {
+                continue;
             }
             out.plans.insert(key, plan);
         }

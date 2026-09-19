@@ -993,3 +993,114 @@ fn w6a_c1_a_contract_owners_chain_delivers_through_the_consuming_callee() {
     );
     assert!(text.contains("returnretire(n);"), "{}", out.source);
 }
+
+const PASS_ON_CHAIN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub height: i32,
+}
+pub unsafe extern "C" fn sink_free(mut p: *mut Node) -> i32 {
+    let mut k = (*p).key;
+    free(p as *mut core::ffi::c_void);
+    return k;
+}
+pub unsafe extern "C" fn pass_on(mut q: *mut Node) -> i32 {
+    (*q).height = 0 as i32;
+    return sink_free(q);
+}
+pub unsafe extern "C" fn build(mut key: i32) -> i32 {
+    let mut n = malloc(::std::mem::size_of::<Node>() as std::os::raw::c_ulong) as *mut Node;
+    (*n).key = key;
+    return pass_on(n);
+}
+pub unsafe extern "C" fn reads_it(mut r: *mut Node) -> i32 {
+    return (*r).key;
+}
+pub unsafe extern "C" fn pass_on_to_a_reader(mut s: *mut Node) -> i32 {
+    return reads_it(s);
+}
+pub unsafe extern "C" fn sink_free2(mut p2: *mut Node) -> i32 {
+    let mut k = (*p2).key;
+    free(p2 as *mut core::ffi::c_void);
+    return k;
+}
+pub unsafe extern "C" fn ping(mut a: *mut Node) -> i32 {
+    if (*a).key > 0 as i32 { return pong(a); }
+    return 0 as i32;
+}
+pub unsafe extern "C" fn pong(mut b: *mut Node) -> i32 {
+    if (*b).height > 0 as i32 { return ping(b); }
+    return 1 as i32;
+}
+pub unsafe extern "C" fn keeps_after(mut t: *mut Node) -> i32 {
+    let mut v = sink_free2(t);
+    return v + (*t).height;
+}
+"#;
+
+/// **Rung 2 (R450-8): the parameter-to-parameter move.** `pass_on` hands its
+/// OWN PARAMETER to a consuming callee, so its formal has no free and no store
+/// of its own — its sink is the move itself. The chain reads that as a third
+/// sink kind and plans `pass_on(q: Box<Node>)`, which makes `pass_on` a
+/// consuming callee in turn, so `build`'s allocation local moves into it. One
+/// pass of the chain cannot see this: the inner chain must be planned before
+/// the outer formal's sink is known, so the derive runs to a depth-bounded
+/// fixpoint.
+#[test]
+fn w6a_c1_a_parameter_moved_on_to_a_consuming_callee_is_an_owner() {
+    let out = emitted("bp-pass-on", PASS_ON_CHAIN);
+    let text = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        text.contains("fnsink_free(mutp:Box<Node>)"),
+        "{}",
+        out.source
+    );
+    assert!(text.contains("fnpass_on(mutq:Box<Node>)"), "{}", out.source);
+    assert!(text.contains("drop(p);"), "{}", out.source);
+    // The move on keeps its text: a `Box` argument at a `Box` formal.
+    assert!(text.contains("returnsink_free(q);"), "{}", out.source);
+    assert!(text.contains("returnpass_on(n);"), "{}", out.source);
+    assert!(
+        text.contains("letmutn:Box<crate::Node>=Box::from_raw(malloc("),
+        "{}",
+        out.source
+    );
+    // Control: a formal moved on to a callee that only READS it is not an
+    // owner — the move-on relation is over CONSUMING formals, not over calls.
+    assert!(
+        !text.contains("fnpass_on_to_a_reader(muts:Box<Node>)")
+            && !text.contains("fnreads_it(mutr:Box<Node>)"),
+        "a reader's argument is not a sink\n{}",
+        out.source
+    );
+    // Control: a formal READ after the move on keeps its raw form — the move
+    // is not the last act, so it is not the sink.
+    assert!(
+        !text.contains("fnkeeps_after(mutt:Box<Node>)"),
+        "a use after the move on refuses the owner\n{}",
+        out.source
+    );
+    // Control: a CYCLE in the move-on relation admits nothing and terminates —
+    // which is what the depth bound is for. Neither formal ever reaches a free
+    // or a store, so no pass can add either, and the loop stops as soon as a
+    // pass adds nothing.
+    assert!(
+        !text.contains("fnping(muta:Box<Node>)") && !text.contains("fnpong(mutb:Box<Node>)"),
+        "a cycle is not an owner\n{}",
+        out.source
+    );
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("box-param-chain callee=sink_free"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+}

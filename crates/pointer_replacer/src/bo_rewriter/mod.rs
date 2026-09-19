@@ -7635,6 +7635,7 @@ fn finish_decide<'tcx>(
         &model,
         &return_certificates,
         &allocator_contracts.plans,
+        &consuming_formals,
         &raw_surface,
         &exported_pairs,
     );
