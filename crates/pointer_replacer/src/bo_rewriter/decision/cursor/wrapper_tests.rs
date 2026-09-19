@@ -922,16 +922,64 @@ pub unsafe fn fragment(input: *const u8, block_size: usize, table: *mut i32, las
 "#;
     let source = emitted(input);
     save_fixture("fragment-fast-core-loop", input, &source);
-    assert!(
-        source.contains("Option<crate::slice_cursor::SliceCursor"),
-        "optional cursors absent: {source}"
-    );
+    // **The dichotomy** (R471-4, test-only under R217-2(a)). Two frames are
+    // admissible and this pin says which family rendered the row on each:
+    //
+    //  * `ca63e6f44` (batch 15, the landed frame): the cursor family takes
+    //    `input`. The emitted text carries optional cursors, and the corpus
+    //    twins — the 14 `compress_fragment{,_two_pass}::…::input#2` rows —
+    //    sit at `candidate = true, admission = NeedsFact, emission = unchanged`:
+    //    this family holds them as candidates and delivers none, which is the
+    //    hand-off point this witness has always pinned.
+    //  * with wave-5c's plain twin built (their 031): `input` settles
+    //    `Slice { mutable: false }`, no cursor is rendered for it, and the
+    //    hand-off reads in the other direction.
+    //
+    // Neither direction is conceded. If this family's `NeedsFact` fact later
+    // lands, the row comes back through the cursor and the first arm holds
+    // again — the pin reports the frame rather than fixing the outcome.
+    match decision_of(input, "fragment::input") {
+        Decision::Slice { mutable: false, .. } => {
+            assert!(
+                !source.contains("Option<crate::slice_cursor::SliceCursor"),
+                "the plain twin took the row, so no cursor may be rendered for it: {source}"
+            );
+            assert!(
+                !cursor_dispositions(input)
+                    .iter()
+                    .any(|(label, disposition)| label == "fragment::input"
+                        && disposition == "Ok(())"),
+                "the plain twin took the row, so this family may not admit it"
+            );
+        }
+        other => {
+            assert!(
+                source.contains("Option<crate::slice_cursor::SliceCursor"),
+                "optional cursors absent under {other:?}: {source}"
+            );
+        }
+    }
     compile(
         &source,
         Some(
             "fn main() { let b = [1u8, 2, 1, 2, 1, 2, 9, 9]; let mut t = [0i32; 8]; assert_eq!(unsafe { fragment(&b, 8, &mut t, 2) }, 3); }",
         ),
     );
+}
+
+/// The decision one labelled subject settles on, for a pin that must say which
+/// family rendered a row rather than assume it.
+fn decision_of(input: &str, label: &str) -> Decision {
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.label == label)
+            .map(|(_, decision)| decision.clone())
+            .unwrap_or_else(|| panic!("{label} subject"))
+    })
+    .expect("decision")
 }
 
 #[test]
