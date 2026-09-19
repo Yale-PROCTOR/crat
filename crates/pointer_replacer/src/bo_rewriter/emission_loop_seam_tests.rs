@@ -624,3 +624,53 @@ fn r471_2_an_interface_dependency_member_names_the_seed_that_reached_it() {
     let both = BTreeSet::from([seed, middle]);
     assert_eq!(deps.seed_reaching(leaf, &both), Some(middle));
 }
+
+/// **R472-6** — the orphan column must key on `partition_root`, which is where the root
+/// actually lives, not on `attribution`, which reads `closure:partition` for every member.
+///
+/// Batch 16's first real reading caught the original: all 137 members emitted `-` and the
+/// column named nothing. This pins the wiring, not the walk — `seed_reaching` was always
+/// correct and its own witness passed throughout, because it was never reached.
+#[test]
+fn r472_6_the_orphan_column_keys_on_partition_root_not_attribution() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+
+    let class = SignatureClassId::of(rustc_hir::def_id::LocalDefId {
+        local_def_index: rustc_hir::def_id::DefIndex::from_u32(472),
+    });
+    let withheld = BTreeSet::from([class]);
+    let display = BTreeMap::from([(class, "src::p::member".to_owned())]);
+    // Exactly the corpus shape: the root is in `partition_root`, and `attribution` will
+    // render as `closure:partition` -- it never contains the root string.
+    let reasons = BTreeMap::from([(
+        class,
+        BTreeSet::from(["input-interface-dependency-reverted".to_owned()]),
+    )]);
+    let receipt = crate::bo_rewriter::render_raw_boundary_final_reverts(
+        &withheld,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &reasons,
+        &display,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+        None,
+    );
+    let row = receipt
+        .lines()
+        .nth(1)
+        .expect("a row")
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(row[5], "input-interface-dependency-reverted", "{receipt}");
+    assert!(
+        !row[3].contains("input-interface-dependency-reverted"),
+        "attribution must NOT carry the root -- that was the whole defect: {receipt}"
+    );
+    // With no plan there is no graph to walk, so the answer is `orphan`: a member the
+    // graph does not connect. What it may never be again is `-`, which means "this row
+    // is not an interface dependency at all".
+    assert_eq!(row[7], "orphan", "{receipt}");
+}

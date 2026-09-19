@@ -4272,7 +4272,13 @@ fn render_raw_boundary_final_reverts(
         let head = raw_boundary_reason_head(&attribution);
         // The orphan column: `-` for a seed (nothing reached it), the reaching class for
         // a member, `orphan` for a member the graph does not connect to any seed.
-        let seed = if !attribution.contains("input-interface-dependency-reverted") {
+        // **R472-6** — keyed on `root`, NOT `attribution`. The first real reading caught
+        // this: every one of the 137 members carries the root in `partition_root` and
+        // `attribution` reads `closure:partition`, so the column tested a field that is
+        // never set and emitted `-` for all 364 rows. An instrument that names nothing
+        // looks exactly like a corpus with nothing to name, which is why it had to be
+        // read against a frame that has the rows before it could be believed.
+        let seed = if !root.contains("input-interface-dependency-reverted") {
             "-".to_owned()
         } else {
             emission_plan
