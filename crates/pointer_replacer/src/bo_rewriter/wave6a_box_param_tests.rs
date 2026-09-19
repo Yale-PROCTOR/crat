@@ -1091,6 +1091,15 @@ fn w6a_c1_a_parameter_moved_on_to_a_consuming_callee_is_an_owner() {
     // which is what the depth bound is for. Neither formal ever reaches a free
     // or a store, so no pass can add either, and the loop stops as soon as a
     // pass adds nothing.
+    // The move-on chain names its own sink, so the census can count rung 2's
+    // rows apart from the frees it never emitted.
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("box-param-chain callee=pass_on index=0 sink=move-on"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
     assert!(
         !text.contains("fnping(muta:Box<Node>)") && !text.contains("fnpong(mutb:Box<Node>)"),
         "a cycle is not an owner\n{}",
@@ -1099,7 +1108,7 @@ fn w6a_c1_a_parameter_moved_on_to_a_consuming_callee_is_an_owner() {
     assert!(
         out.artifacts
             .box_param_receipts
-            .contains("box-param-chain callee=sink_free"),
+            .contains("box-param-chain callee=sink_free index=0 sink=free"),
         "{}",
         out.artifacts.box_param_receipts
     );

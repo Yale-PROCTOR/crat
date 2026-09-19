@@ -1280,7 +1280,13 @@ pub(crate) fn derive<'tcx>(
             .collect();
         out.receipts.push(format!(
             "box-param-chain callee={callee_path} index={hir_index} sink={} pointee={pointee} shape={} callers={call_count}{} members={} formal_model={formal_kind:?}",
-            if store.is_some() { "store" } else { "free" },
+            // R450-8 rung 2: a chain whose sink is the MOVE ON says so, or the
+            // census would read it as a free it never emitted.
+            match (store.is_some(), moved_on.is_some()) {
+                (true, _) => "store",
+                (_, true) => "move-on",
+                _ => "free",
+            },
             if slice { "slice" } else { "sized" },
             if exported_pair { " exported-pair-closure" } else { "" },
             members.join(",")
