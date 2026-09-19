@@ -463,6 +463,13 @@ fn derive_parameter<'tcx>(
     report.findings[0].root = Some(root);
     report.findings[0].site = Some(at(entry));
     report.findings[0].outcome = Outcome::Proven;
+    // A backward move is only outside the window when nothing moves the position
+    // forward first: `p.offset(4)` then `p.offset(-1)` stays inside, and a walk
+    // whose ends are computed forward (`ip_end.offset(-2)` beside `ip.offset(1)`)
+    // is the ordinary bounded loop. The window is unrepresentable only for a
+    // subject that walks below entry and never above it.
+    let mut backward: Option<Location> = None;
+    let mut forward = false;
     for (block, data) in body.basic_blocks.iter_enumerated() {
         let TerminatorKind::Call { func, args, .. } = &data.terminator().kind else {
             continue;
@@ -482,21 +489,26 @@ fn derive_parameter<'tcx>(
         let ty::FnDef(did, _) = *func.ty(&body.local_decls, tcx).kind() else {
             continue;
         };
-        let backward = if tcx.item_name(did).as_str() == "sub" {
+        let moves_back = if tcx.item_name(did).as_str() == "sub" {
             delta > 0
         } else {
             delta < 0
         };
-        if backward {
-            reject(
-                &mut report.findings[0],
-                Outcome::Missing(Need::EntryWindow),
-                Location {
-                    block,
-                    statement_index: data.statements.len(),
-                },
-            );
+        if moves_back {
+            backward.get_or_insert(Location {
+                block,
+                statement_index: data.statements.len(),
+            });
+        } else {
+            forward = true;
         }
+    }
+    if let Some(site) = backward.filter(|_| !forward) {
+        reject(
+            &mut report.findings[0],
+            Outcome::Missing(Need::EntryWindow),
+            site,
+        );
     }
 }
 

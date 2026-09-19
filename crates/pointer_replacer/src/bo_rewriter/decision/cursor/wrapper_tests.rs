@@ -76,14 +76,58 @@ pub unsafe extern "C" fn strrwd(mut ptr: *mut i8, n: i32) -> *mut i8 {
 "#;
     let source = emitted(input);
     save_fixture("native-strrwd", input, &source);
-    assert!(
-        source.contains("slice_cursor::SliceCursor"),
-        "native wrapper absent: {source}"
-    );
-    assert!(
-        source.contains(".seek("),
-        "native parameter seek absent: {source}"
-    );
+    // **The dichotomy** (R472-6 route 1, the same shape as the fragment pin).
+    // This walker goes BELOW the pointer it was handed, and a cursor rooted at a
+    // raw parameter has its window fabricated forward from that pointer, so the
+    // rendered form panics where the input program was correct (report 033 §3
+    // reproduces it). Which arm holds is read from the derivation's own
+    // `RetainedBase`, the same fact the census column reports:
+    //
+    //  * `ca63e6f44` + the guard (this frame): `Missing(EntryWindow)` — the
+    //    family refuses, the parameter keeps its raw form, and the receipt says
+    //    `ScheduleMissing`. The corpus row (`src::test::strrwd::ptr#1`) was
+    //    already `degraded / slice-cursor-use / placed = 0`, so no emitted
+    //    program changes.
+    //  * once a base origin below entry exists (a caller-supplied cursor, or a
+    //    window with a backward extent): the base is proven and the cursor is
+    //    rendered with a `.seek(` as this witness pinned before.
+    if entry_window_held(input, "ptr") {
+        assert!(
+            !source.contains("slice_cursor::SliceCursor"),
+            "the window cannot hold this walk, so no cursor may be rendered: {source}"
+        );
+        assert_eq!(
+            cursor_dispositions(input),
+            vec![("strrwd::ptr".to_owned(), "Err(ScheduleMissing)".to_owned())],
+            "the refusal must be the typed one"
+        );
+    } else {
+        assert!(
+            source.contains("slice_cursor::SliceCursor"),
+            "native wrapper absent: {source}"
+        );
+        assert!(
+            source.contains(".seek("),
+            "native parameter seek absent: {source}"
+        );
+    }
+}
+
+/// Whether the derivation says this parameter root needs a position below its
+/// entry — the `RetainedBase` fact the census column reports and the guard
+/// consults, asked here so the pin reads the frame instead of assuming it.
+fn entry_window_held(input: &str, param: &str) -> bool {
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let (subject, _) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.param_name.as_deref() == Some(param))
+            .unwrap_or_else(|| panic!("{param} subject"));
+        super::inspect_subject(tcx, &ctx.slots, &ctx.model, subject).findings[0].outcome
+            == super::admission::Outcome::Missing(super::admission::Need::EntryWindow)
+    })
+    .expect("admission")
 }
 
 #[test]

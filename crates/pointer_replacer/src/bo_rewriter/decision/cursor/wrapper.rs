@@ -1594,6 +1594,18 @@ fn build(
     entries: &[(Subject, Decision)],
 ) -> Result<CursorPlan, CursorHold> {
     let parameter = matches!(subject.kind, SubjectKind::Param { .. });
+    // **The entry window** (R472-6, route 1). A cursor rooted at a raw parameter
+    // has its window fabricated forward from the pointer, so it cannot represent
+    // a position below the one it was handed: emitting it would panic where the
+    // input program was correct. The fact is the derivation's own — the same
+    // `RetainedBase` the census column reports — so the guard and the column can
+    // never disagree about which rows they mean.
+    if parameter
+        && super::inspect_subject(ctx.tcx, ctx.slots, ctx.model, subject).findings[0].outcome
+            == super::admission::Outcome::Missing(super::admission::Need::EntryWindow)
+    {
+        return Err(CursorHold::ScheduleMissing);
+    }
     let name = emission::binding_name(ctx.tcx, subject)?;
     let init = ctx
         .constructions
