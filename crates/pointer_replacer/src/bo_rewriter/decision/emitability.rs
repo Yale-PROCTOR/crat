@@ -267,6 +267,12 @@ pub(crate) struct Arg {
     /// Distinct field projections remain distinct even when `place_root` is
     /// the same aggregate local.
     pub place_identity: Option<String>,
+    /// R473-2: `&x` / `&mut x` over a LOCAL binding path. See
+    /// [`address_root_facts`].
+    pub address_root_local: bool,
+    /// R473-2: that local's own type is a raw pointer, so the root is a
+    /// pointer subject and keeps its decision path.
+    pub address_root_raw_pointer: bool,
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -563,6 +569,35 @@ fn direct_mutable_storage(expr: &Expr<'_>) -> Option<(HirId, Span)> {
         return None;
     };
     Some((binding, storage.span))
+}
+
+/// R473-2: is this argument `&x` / `&mut x` over a LOCAL binding, and is that
+/// local's own type a raw pointer?
+///
+/// The address of a live local is a sound reference, so such a root needs no
+/// entry in the hypothetical decision table — a non-pointer local is not a
+/// pointer subject, and asking it for a decision asks for a fact it cannot
+/// have. The second component is the exclusion: a raw-pointer local IS a
+/// pointer subject and keeps its decision path, so the admission must not
+/// answer a decision question with a syntactic one.
+///
+/// Projections, dereferences, casts and temporaries are all absent by
+/// construction (`AddrOf` directly over a resolved local path), which is why
+/// the caller-frame claim holds: `&mut (*p).f` would be only as live as `p`.
+fn address_root_facts(
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    expr: &Expr<'_>,
+) -> (bool, bool) {
+    let ExprKind::AddrOf(_, _, place) = expr.kind else {
+        return (false, false);
+    };
+    let ExprKind::Path(QPath::Resolved(_, path)) = place.kind else {
+        return (false, false);
+    };
+    if !matches!(path.res, Res::Local(_)) {
+        return (false, false);
+    }
+    (true, typeck.expr_ty(place).is_raw_ptr())
 }
 
 fn initialized_array_decay(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> Option<u64> {
@@ -1043,6 +1078,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                             adapter_operand_span,
                             adapter_operand_mutability,
                             contract_count: None,
+                            address_root_local: address_root_facts(typeck, arg).0,
+                            address_root_raw_pointer: address_root_facts(typeck, arg).1,
                             return_unused,
                             operand_pointee,
                         });
@@ -1134,6 +1171,11 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                                 .as_ref()
                                                 .map(|s| s.blind),
                                             place_identity: Self::exact_place_identity(arg),
+                                            address_root_local: address_root_facts(typeck, arg).0,
+                                            address_root_raw_pointer: address_root_facts(
+                                                typeck, arg,
+                                            )
+                                            .1,
                                         }
                                     })
                                     .collect(),
@@ -1272,6 +1314,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 adapter_operand_span,
                                 adapter_operand_mutability,
                                 contract_count,
+                                address_root_local: address_root_facts(typeck, arg).0,
+                                address_root_raw_pointer: address_root_facts(typeck, arg).1,
                                 return_unused,
                                 operand_pointee,
                             });

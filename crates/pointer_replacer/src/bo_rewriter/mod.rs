@@ -132,6 +132,8 @@ pub(crate) mod verify;
 #[cfg(test)]
 mod wave5d_accumulator_tests;
 #[cfg(test)]
+mod wave5d_address_root_tests;
+#[cfg(test)]
 mod wave5d_tests;
 mod wave5r_cast;
 mod wave5r_field_borrow;

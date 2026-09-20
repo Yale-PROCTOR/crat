@@ -673,6 +673,10 @@ pub(crate) struct ForeignCallArgFact {
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<RawMutability>,
     pub contract_count: Option<ContractCountOperandFact>,
+    /// R473-2: `&x` / `&mut x` over a LOCAL binding path.
+    pub address_root_local: bool,
+    /// R473-2: that local's own type is a raw pointer.
+    pub address_root_raw_pointer: bool,
     /// Wave-4 #1b: the call's return value is discarded at the call (a `;`
     /// statement or `let _ =`), so a returned alias of an argument is never
     /// retained by the caller.
@@ -732,6 +736,12 @@ pub(crate) struct RawBoundarySiteFact {
     /// Can this callee hand a pointer back — by return or by output storage?
     /// Fails closed: an unresolved callee answers `true`.
     pub callee_may_yield_pointer: bool,
+    /// R473-2: `&x` / `&mut x` over a LOCAL binding path — the address of a
+    /// live local, which needs no decision-table entry.
+    pub address_root_local: bool,
+    /// R473-2: that local's own type is a raw pointer, so the root IS a
+    /// pointer subject and keeps its decision path.
+    pub address_root_raw_pointer: bool,
     /// wave-6v2 (R406-6): the sibling argument positions of this call whose
     /// operand is `&mut local` over a caller local that never leaves the
     /// caller's frame (`binn_counted::frame_confined`). A callee that retains
@@ -903,6 +913,8 @@ impl RawBoundarySiteFacts {
                     direct_storage_span: fact.direct_storage.map(|(_, span)| span),
                     adapter_operand_span: fact.adapter_operand_span,
                     adapter_operand_mutability: fact.adapter_operand_mutability,
+                    address_root_local: fact.address_root_local,
+                    address_root_raw_pointer: fact.address_root_raw_pointer,
                     callee_may_yield_pointer: unique_candidate(&fact.callee, &candidates)
                         .is_none_or(|site| site.may_yield_pointer),
                     frame_confined_outputs: Vec::new(),
@@ -1009,6 +1021,8 @@ impl RawBoundarySiteFacts {
                             direct_storage_span: argument.direct_storage.map(|(_, span)| span),
                             adapter_operand_span: argument.adapter_operand_span,
                             adapter_operand_mutability: argument.adapter_operand_mutability,
+                            address_root_local: argument.address_root_local,
+                            address_root_raw_pointer: argument.address_root_raw_pointer,
                             callee_may_yield_pointer: unique_candidate(&callee_key, &candidates)
                                 .is_none_or(|site| site.may_yield_pointer),
                             frame_confined_outputs: frame_confined_outputs.clone(),
@@ -4478,6 +4492,42 @@ pub(crate) fn outbound_reference_view(
     }
 }
 
+/// **R473-2 — the address of a value local is a trivially safe source.**
+///
+/// `&x` / `&mut x` over a LOCAL binding whose own type is not a raw pointer
+/// borrows a place in the caller's own frame. There is no pointer subject to
+/// decide, so the hypothetical table carries no entry for the root, and the
+/// `SubjectNotSafe` gate would refuse it for want of a fact it cannot have.
+/// A `Degraded` subject IS in that table and takes its own path, so absence
+/// there means "not a pointer subject", never "unsafe".
+///
+/// Three clauses, each independently load-bearing:
+///
+/// 1. the shape is exactly `addr-of` / `addr-of-mut`. A `-cast` variant is a
+///    different source expression and keeps its own path;
+/// 2. the root is a LOCAL binding path — a projection, deref or temporary is
+///    not the address of a local, and `&mut (*p).f` is only as live as `p`;
+/// 3. the local's own type is not a raw pointer — that root IS a pointer
+///    subject, and a syntactic admission must not answer its decision.
+///
+/// The callee's RETENTION of the address is the tier's question, not this
+/// rule's: the admission returns a source form into the same flow every other
+/// source takes, so a retained address is still refused by positive retention.
+pub(crate) fn address_of_value_local_source(
+    source_shape: &str,
+    address_root_local: bool,
+    address_root_raw_pointer: bool,
+) -> Option<super::Decision> {
+    if !address_root_local || address_root_raw_pointer {
+        return None;
+    }
+    match source_shape {
+        "addr-of" => Some(super::Decision::Ref { mutable: false }),
+        "addr-of-mut" => Some(super::Decision::Ref { mutable: true }),
+        _ => None,
+    }
+}
+
 /// Policy seam over an already selected expression form. The target raw
 /// pointer's mutability cannot establish permission for subsequent child uses.
 pub(crate) fn returned_child_permission(
@@ -4943,6 +4993,13 @@ pub(crate) struct RawBoundaryDispositionIndex {
     /// K18'/OAP-CHILD-ACCESS, carried per site so the terminal emission asks
     /// the same question the disposition asked.
     type_backed_child_access: BTreeMap<RawBoundarySiteKey, super::returned_child::ChildAccess>,
+    /// **R473-2.** The disposition a site rooted at the address of a VALUE
+    /// LOCAL would carry if that root needed no decision-table entry. It is
+    /// kept off `by_site` deliberately: the admission unlocks the CALLEE's
+    /// parameter input and nothing else, so no other arm's reading of this
+    /// site moves. Measured cost of publishing it instead: 18 reds over seven
+    /// lanes (report 047).
+    address_root: BTreeMap<RawBoundarySiteKey, RawBoundaryDisposition>,
     /// **Wave-6o (relay 018 §1, R304-2).** Null-init-family locals whose
     /// boundary site would be a PENDING sibling-overlap row if delivered — a
     /// stated hold the family consults before delivering.
@@ -4985,6 +5042,15 @@ impl RawBoundaryDispositionIndex {
         key: &RawBoundarySiteKey,
     ) -> Option<&super::returned_child::ChildAccess> {
         self.type_backed_child_access.get(key)
+    }
+
+    /// R473-2: the address-of-a-value-local disposition for this site, if the
+    /// site is one. Only `callee_parameter_input` consults it.
+    pub(crate) fn address_root_disposition(
+        &self,
+        key: &RawBoundarySiteKey,
+    ) -> Option<&RawBoundaryDisposition> {
+        self.address_root.get(key)
     }
 
     pub(crate) fn returned_child_evidence(
@@ -5034,12 +5100,24 @@ impl RawBoundaryDispositionIndex {
                             "depth-2 out-param storage is not a direct variable local".to_owned(),
                         ));
                     }
-                    let (subject, decision) = decisions.get(&node).copied().ok_or_else(|| {
-                        (
-                            RawBoundaryBlockReason::SubjectNotSafe,
-                            "hypothetical has no safe subject decision".to_owned(),
-                        )
-                    })?;
+                    // R473-2: the address of a value local carries its own
+                    // source form; it is consulted only where the table has
+                    // nothing, so a decided root is untouched.
+                    let address_root = address_of_value_local_source(
+                        site.source_shape,
+                        site.address_root_local,
+                        site.address_root_raw_pointer,
+                    );
+                    let (subject, decision) = match (decisions.get(&node).copied(), &address_root) {
+                        (Some((subject, decision)), _) => (Some(subject), decision),
+                        (None, Some(decision)) => (None, decision),
+                        (None, None) => {
+                            return Err((
+                                RawBoundaryBlockReason::SubjectNotSafe,
+                                "hypothetical has no safe subject decision".to_owned(),
+                            ));
+                        }
+                    };
                     let source_stays_raw = match decision {
                         super::Decision::Degraded(_) => true,
                         super::Decision::Ref { .. }
@@ -5373,12 +5451,12 @@ impl RawBoundaryDispositionIndex {
                             // WRITES through the subject or any alias of it.
                             && !(site.callee_local.is_some_and(|callee| {
                                 retention.returns_argument_only(callee, site.key.argument_index)
-                            }) && match subject.kind {
+                            }) && subject.is_some_and(|subject| match subject.kind {
                                 super::SubjectKind::Param { hir_index } => {
                                     retention.no_write_through(node.0, hir_index)
                                 }
                                 _ => false,
-                            })
+                            }))
                         {
                             // **R283-3 widened this arm to `*mut` positions.**
                             // It used to run only at `*const` targets, so a
@@ -5486,12 +5564,14 @@ impl RawBoundaryDispositionIndex {
                                     if site.callee_local.is_some_and(|callee| {
                                         retention
                                             .returns_argument_only(callee, site.key.argument_index)
-                                    }) && match subject.kind {
-                                        super::SubjectKind::Param { hir_index } => {
-                                            retention.no_write_through(node.0, hir_index)
+                                    }) && subject.is_some_and(|subject| {
+                                        match subject.kind {
+                                            super::SubjectKind::Param { hir_index } => {
+                                                retention.no_write_through(node.0, hir_index)
+                                            }
+                                            _ => false,
                                         }
-                                        _ => false,
-                                    } =>
+                                    }) =>
                                 {
                                     evidence = format!("{evidence};returned-alias-used");
                                     Ok(RawBoundaryDisposition::T2 {
@@ -5517,9 +5597,43 @@ impl RawBoundaryDispositionIndex {
                         }
                     }
                 })();
-            let disposition = disposition.unwrap_or_else(|(reason, detail)| {
-                RawBoundaryDisposition::Blocked { reason, detail }
-            });
+            // R473-2: an admitted address-of-a-value-local site keeps its
+            // PUBLIC refusal and hands the computed disposition to the callee
+            // parameter input alone.
+            let disposition = match disposition {
+                Ok(admitted)
+                    if site.node.is_some_and(|node| !decisions.contains_key(&node))
+                        && address_of_value_local_source(
+                            site.source_shape,
+                            site.address_root_local,
+                            site.address_root_raw_pointer,
+                        )
+                        .is_some() =>
+                {
+                    // The closure published three per-site facts on its way to
+                    // the admission. A publicly-refused site published none of
+                    // them before R473-2 and must publish none now, or another
+                    // arm reads a fact that only exists because this input was
+                    // admitted — the ill-typed `&mut *value` reborrow wave-6o's
+                    // pin caught.
+                    out.returned_children.remove(&site.key);
+                    out.negative_write.remove(&site.key);
+                    out.return_independent.remove(&site.key);
+                    out.address_root.insert(site.key.clone(), admitted);
+                    RawBoundaryDisposition::Blocked {
+                        reason: RawBoundaryBlockReason::SubjectNotSafe,
+                        // The `reason` is a production key and does not move
+                        // (R451-2). The detail carries the receipt, so the
+                        // count of admitted sites stays auditable.
+                        detail: "hypothetical has no safe subject decision;                                 address-of-value-local-input"
+                            .to_owned(),
+                    }
+                }
+                other => other.unwrap_or_else(|(reason, detail)| RawBoundaryDisposition::Blocked {
+                    reason,
+                    detail,
+                }),
+            };
             let box_slice = site
                 .node
                 .and_then(|node| decisions.get(&node).map(|(_, decision)| *decision))
