@@ -1489,6 +1489,35 @@ pub unsafe fn recurse(excluded: i32) -> i32 {
 }
 "#;
 
+    /// **The corpus row, reproduced in 75 seconds without a census slot**
+    /// (wave-5d2 report 035).
+    ///
+    /// libtree's derived substrate is a single-file crate, so the fixture
+    /// harness can run the REAL program. This pins the four `recurse` colour
+    /// rows at exactly what the census reads — `copy-source-coupled`, placed
+    /// 0 — which is how R477-6's clause (e) was measured inert on the very
+    /// rows it was written for: a hand-written reduction of the same shape
+    /// delivers `ref` with or without the clause, and only the real program
+    /// shows the claim that loses them.
+    ///
+    /// Ignored by default (~75 s, 2,656 lines); `--ignored` runs it. When
+    /// these four stop being `copy-source-coupled`, this test says so.
+    #[test]
+    #[ignore = "runs the real libtree crate; --ignored"]
+    fn libtree_colours_on_the_real_crate() {
+        let path = std::path::Path::new(
+            "/home/p51lee/dev/crat/benchmarks/rs-crown-derived/libtree/lib.rs",
+        );
+        let src = std::fs::read_to_string(path).expect("derived libtree");
+        let got = run(&src);
+        for line in got.subjects.lines() {
+            if line.contains("bold_color") || line.contains("regular_color") {
+                let f = line.split('\t').collect::<Vec<_>>();
+                eprintln!("REAL {} | {} | {} | placed={}", f[0], f[7], f[8], f[11]);
+            }
+        }
+    }
+
     #[test]
     fn a_mutable_literal_local_takes_the_shared_form() {
         let got = run(MUTABLE_LITERAL_SHAPE);
