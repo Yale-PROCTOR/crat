@@ -4163,8 +4163,9 @@ fn complete_interface_inventory<'tcx>(
                         ));
                     }
                     "zero-syntax"
-                } else if let Some((spec, family, replacement)) =
-                    inventory_expression_bridge(tcx, expected, found, argument, doubly_passed)
+                } else if non_subject
+                    && let Some((spec, family, replacement)) =
+                        inventory_expression_bridge(tcx, expected, found, argument, doubly_passed)
                 {
                     // **R466-6 — the interface-inventory arm.** The glue matrix already
                     // returns the expression this position needs; the inventory path
@@ -6765,6 +6766,37 @@ mod interface_inventory_arm_tests {
                 "a raw-sourced bridge is emitted WITH its unsafe: {rendered}"
             );
         }
+    }
+
+    /// **R477-1 — the restriction the rule is NAMED for, and which I shipped without.**
+    ///
+    /// R466-6 says the arm writes the bridge "at a NON-SUBJECT argument". `non_subject`
+    /// was computed and only RECORDED; it gated nothing, so the arm also fired on three
+    /// subject arguments in brotli. A subject argument already has an owner, so a second
+    /// edit landed on a span another family plans, and the nested composition could no
+    /// longer find the inner text it expected inside the outer's product —
+    /// `nested-composition:inner-text-not-found:291037..291127`, which cost batch20 its
+    /// brotli row and the whole aggregate.
+    ///
+    /// This pins the gate's PRESENCE in the chain, because the arm's own behaviour is
+    /// identical either way at a non-subject position: nothing about rendering can
+    /// witness a condition that decides whether rendering is attempted at all.
+    #[test]
+    fn r477_1_the_arm_fires_only_at_a_non_subject_argument() {
+        let source = include_str!("seam.rs");
+        let arm = source
+            .split("inventory_expression_bridge(tcx, expected, found, argument, doubly_passed)")
+            .next()
+            .expect("the arm exists");
+        let guard = arm
+            .rfind("} else if non_subject")
+            .expect("the arm is guarded by non_subject");
+        // and the guard is the arm's OWN condition, not an outer block's: nothing
+        // separates it from the call but the `&& let` that follows.
+        assert!(
+            arm[guard..].matches("else if").count() == 1,
+            "the non_subject guard must be this arm's own condition"
+        );
     }
 
     /// The restriction, as a property of the helper's own gate: a doubly-passed or
