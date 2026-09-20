@@ -93,6 +93,16 @@ pub(crate) fn wrapper_base(
 pub(crate) fn delivered_element(region: &super::void_region::Region) -> Option<&'static str> {
     match region.shape {
         super::void_region::Shape::Accessor | super::void_region::Shape::WidthRead => Some("u8"),
+        // Composition arm (assembler, dry22): `WidthWrite` is wave-6b's shape
+        // from batch 17 (`f22cc3f7c`) and wave-6a's R477-3 rule was written
+        // before it existed, so the match is not exhaustive on this frame
+        // (`E0004`). Answering `None` keeps wave-6a's rule exactly as they
+        // wrote it — it fires on the shapes they measured and not on one they
+        // never saw — which is fail-closed: no wrapper cast is built for a
+        // width WRITER. wave-6b states the parameter becomes a byte slice for
+        // the read/write mirror alike, so `Some("u8")` may well be the right
+        // answer; that is the two lanes' call, not the composition's.
+        super::void_region::Shape::WidthWrite => None,
         super::void_region::Shape::ByteView => None,
     }
 }
