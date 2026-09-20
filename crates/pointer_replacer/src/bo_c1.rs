@@ -12516,6 +12516,17 @@ mod run {
             raw_schema::GRAFT_REFUSED,
             crate::bo_rewriter::ast_transform::graft_refusals(),
         );
+        // **R476-1 (USER)**: the frame-bounded discharges, counted per program beside the
+        // box-param holds. The receipt is typed — `retention-discharged:frame-bounded(
+        // subject, container, callees)` — so counting its marker cannot collide with a
+        // waiver or an ordinary retention row.
+        row.set(
+            raw_schema::RETENTION_FRAME_BOUNDED,
+            bridge_receipts
+                .matches("retention-discharged:frame-bounded")
+                .count()
+                .to_string(),
+        );
         // R473-3: the count rides beside the table, so the market is auditable without
         // opening it. A `held` line is one refused parameter with its typed reason.
         row.set(
@@ -34352,5 +34363,47 @@ fn r473_3_the_box_param_receipts_are_published_and_their_holds_counted() {
     assert_ne!(
         crate::raw_boundary_census_schema::BOX_PARAM_HELD,
         crate::raw_boundary_census_schema::GRAFT_REFUSED
+    );
+}
+
+/// **R476-1 (USER)** — the frame-bounded discharges are counted per program.
+///
+/// The column is built BEFORE wave-6o's rule lands, deliberately: their landing then owes
+/// no census change, and a frame that carries the build but reads 0 is a finding rather
+/// than a silence nobody notices.
+#[test]
+fn r476_1_frame_bounded_retention_discharges_are_counted() {
+    // The receipt is typed, and the count keys on that type — not on the word
+    // "retention", which every ordinary retention row carries, and not on "discharged",
+    // which a future rule could reuse.
+    let receipts = "site\tkind\tdetail\n\
+        a\tbridge\tretention-discharged:frame-bounded(s1,c1,f1)\n\
+        b\tbridge\tretention-tier:t1\n\
+        c\tbridge\tretention-discharged:frame-bounded(s2,c2,f2)\n\
+        d\tbridge\tc-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01\n";
+    assert_eq!(
+        receipts
+            .matches("retention-discharged:frame-bounded")
+            .count(),
+        2
+    );
+    // A T2 waiver row is a different fact and must not be counted as a discharge.
+    assert_eq!(
+        receipts
+            .matches("retention-discharged:frame-bounded")
+            .count(),
+        receipts
+            .lines()
+            .filter(|l| l.contains("frame-bounded"))
+            .count(),
+        "the marker and the rows must agree"
+    );
+
+    // R450-9: its own additive column, distinct from the neighbours it sits beside.
+    let all = crate::raw_boundary_census_schema::ALL;
+    assert!(all.contains(&crate::raw_boundary_census_schema::RETENTION_FRAME_BOUNDED));
+    assert_ne!(
+        crate::raw_boundary_census_schema::RETENTION_FRAME_BOUNDED,
+        crate::raw_boundary_census_schema::BOX_PARAM_HELD
     );
 }

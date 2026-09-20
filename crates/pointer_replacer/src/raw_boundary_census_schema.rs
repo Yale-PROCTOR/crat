@@ -40,6 +40,12 @@ pub(crate) const GRAFT_REFUSED: &str = "raw_boundary_graft_refused";
 /// market for the next owning build, and previously invisible because the whole table
 /// was discarded.
 pub(crate) const BOX_PARAM_HELD: &str = "raw_boundary_box_param_held";
+/// **R476-1 (USER)** — positive-retention receipts discharged by the frame-bounded rule:
+/// the subject dead after the store, the container a non-escaping stack local, and every
+/// callee taking the container's address certified no-retention for its pointer fields.
+/// A count, per program, beside the box-param holds. It reads 0 until wave-6o's build
+/// lands, and a 0 on a frame that HAS the build is a finding, not a silence.
+pub(crate) const RETENTION_FRAME_BOUNDED: &str = "raw_boundary_retention_frame_bounded";
 /// **R469-1** — how many rows of wave-6f's `revert_status` column disagree with the
 /// final-revert table. A NOTE, not a verdict: the count rides beside an `emitted`
 /// outcome and the rows are published in their own receipt table.
@@ -251,6 +257,7 @@ pub(crate) const ALL: &[&str] = &[
     CACHE_FRAME_ADMISSION,
     GRAFT_REFUSED,
     BOX_PARAM_HELD,
+    RETENTION_FRAME_BOUNDED,
     FIELD_REVERT_STATUS_NOTES,
     LAUNCH_ENV_SHA256,
     SOLVE_WALL_S,
