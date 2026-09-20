@@ -3675,30 +3675,63 @@ fn apply_surface_plans(
         .filter(|site| site.category == "return-temp")
         .map(|site| (site.owner_class.local_def_id(), site.emitted_type.clone()))
         .collect::<FxHashMap<_, _>>();
+    // **R477-4 (nested 012 step 6)** — an owner dropped HERE is dropped silently: the
+    // consumer below only errors when the surface argument's own form is `NestedSlice`,
+    // so an owner missing from this map with an ordinarily-formed argument simply emits
+    // the ordinary argument. No revert, no hold, no diagnostic — which is exactly the
+    // signature nested reported. The reason is recorded so the drop is visible.
+    let mut nested_dropped: Vec<String> = Vec::new();
     let nested = table
         .nested_receipts
         .iter()
         .filter_map(|receipt| {
             let plan = receipt.result.as_ref().ok()?;
-            (!reverts.fns.contains(&plan.owner)
-                && plan
-                    .required_nodes()
-                    .all(|h| reverts.keeps_subject(plan.owner, h))
-                && plan.parameters.iter().all(|p| {
-                    table
-                        .seams
-                        .surface_arguments
-                        .iter()
-                        .filter(|a| {
-                            a.node == (plan.owner, p.hir)
-                                && reverts.keeps_edit(a.owner_class, &a.atom_ids)
-                        })
-                        .count()
-                        == 1
-                }))
-            .then_some((plan.owner, plan))
+            let owner = format!("{:?}", plan.owner);
+            if reverts.fns.contains(&plan.owner) {
+                nested_dropped.push(format!("{owner}\tfunction-reverted"));
+                return None;
+            }
+            if !plan
+                .required_nodes()
+                .all(|h| reverts.keeps_subject(plan.owner, h))
+            {
+                nested_dropped.push(format!("{owner}\trequired-subject-reverted"));
+                return None;
+            }
+            for p in &plan.parameters {
+                // EXACTLY one, deliberately: zero means nothing renders this parameter
+                // and two means two producers would. Both are drops, and they are
+                // different findings, so they are counted apart.
+                let matches = table
+                    .seams
+                    .surface_arguments
+                    .iter()
+                    .filter(|a| {
+                        a.node == (plan.owner, p.hir)
+                            && reverts.keeps_edit(a.owner_class, &a.atom_ids)
+                    })
+                    .count();
+                if matches != 1 {
+                    nested_dropped.push(format!(
+                        "{owner}\tsurface-arguments-not-exactly-one:{matches}:hir={:?}",
+                        p.hir
+                    ));
+                    return None;
+                }
+            }
+            Some((plan.owner, plan))
         })
         .collect::<FxHashMap<_, _>>();
+    if !nested_dropped.is_empty()
+        && let Some(dir) = std::env::var_os("CRAT_NESTED_DROP_DIAGNOSTIC")
+    {
+        nested_dropped.sort();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            std::path::PathBuf::from(dir).join("nested-dropped.tsv"),
+            format!("owner\treason\n{}\n", nested_dropped.join("\n")),
+        );
+    }
     let mut surface_arguments =
         FxHashMap::<LocalDefId, std::collections::BTreeMap<usize, String>>::default();
     for argument in &table.seams.surface_arguments {
@@ -9617,5 +9650,50 @@ mod template_witnesses {
              produced it"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod nested_drop_diagnostic_tests {
+    /// **R477-4 (nested 012 step 6)** — the owner is dropped by `.count() == 1`, and the
+    /// drop is SILENT.
+    ///
+    /// The consumer below the map errors `nested-surface-argument-withdrawn` only when the
+    /// surface argument's own form is `NestedSlice`. An owner missing from the map whose
+    /// argument is ordinarily formed takes the `else` branch and emits the ordinary
+    /// argument — no revert, no hold, no diagnostic. That is why nested's admission, flip
+    /// and replan all succeed in the table and nothing reaches the tree.
+    ///
+    /// This pins the two halves that make the loss invisible, so neither can be changed
+    /// without the other being reconsidered.
+    #[test]
+    fn r477_4_the_nested_map_drops_an_owner_silently_and_now_records_why() {
+        let source = include_str!("ast_transform.rs");
+        let map = source
+            .split("let nested = table")
+            .nth(1)
+            .expect("the nested map exists");
+
+        // Half one: exactly one, so a zero AND a two both drop the owner.
+        assert!(
+            map.contains("if matches != 1"),
+            "the map requires exactly one surface argument per parameter"
+        );
+        // Half two: the only error path downstream is conditioned on the argument's form,
+        // which is why the drop is not observable where it happens.
+        assert!(
+            source.contains("nested-surface-argument-withdrawn"),
+            "the consumer's error exists"
+        );
+        assert!(
+            source.contains("matches!(argument.form, Form::NestedSlice { .. })"),
+            "and it is reached only for a NestedSlice-formed argument"
+        );
+
+        // And the drop now names itself, separating the two counts rather than merging
+        // them: nothing renders the parameter, versus two producers would.
+        assert!(map.contains("surface-arguments-not-exactly-one:"));
+        assert!(map.contains("function-reverted"));
+        assert!(map.contains("required-subject-reverted"));
     }
 }
