@@ -976,6 +976,7 @@ pub(crate) fn site_retention(
                     },
                 ],
                 attestation: "closed_world_frozen_graph",
+                frame_bounded: None,
             },
         })
     };

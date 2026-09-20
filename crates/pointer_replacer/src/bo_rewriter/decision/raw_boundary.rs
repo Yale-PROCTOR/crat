@@ -1195,6 +1195,10 @@ pub(crate) struct RetentionCertificate {
     pub argument_index: usize,
     pub steps: Vec<RetentionStep>,
     pub attestation: &'static str,
+    /// **R476-1 (USER, relay 045).** Present when this certificate rests on
+    /// the frame-bounded discharge rather than on the absence of any retaining
+    /// step: the receipt names the container and the callees it rests on.
+    pub frame_bounded: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1210,6 +1214,21 @@ pub(crate) enum RetentionVerdict {
         reason: RetentionUnknownReason,
         frontier: Vec<RetentionStep>,
     },
+}
+
+/// **R476-1 (USER ruling, relay 045) — a frame-bounded field store.**
+///
+/// The subject is stored into a field of `container`, a stack local of THIS
+/// frame that does not escape it, and the subject is dead after the store. The
+/// retained pointer therefore cannot outlive the frame through this store —
+/// unless a callee that receives the container's address keeps it, which
+/// `evaluate_retention` decides from those callees' own certificates
+/// (`unknown` or `retains` ⇒ the hold stands).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrameBoundedStore {
+    step: RetentionStep,
+    container: Local,
+    callees: Vec<(LocalDefId, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1617,6 +1636,9 @@ struct RetentionBodyFacts {
     retains: Vec<RetentionStep>,
     unknowns: BTreeMap<RetentionUnknownReason, Vec<RetentionStep>>,
     dependencies: Vec<RetentionDependency>,
+    /// R476-1: the retaining steps this body's own frame bounds, pending the
+    /// container callees' certificates.
+    frame_bounded: Vec<FrameBoundedStore>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1782,6 +1804,168 @@ fn returned_parent_is_raw_field_load<'tcx>(
         }
     }
     false
+}
+
+/// **R476-1 clause (2)+(3) inputs.** Is `container` a stack local of this body
+/// that does not escape the frame, and which callees receive its address?
+///
+/// Conservative by construction: the container may appear only as the base of
+/// a field access (`container.f`, no `Deref` in the projection) or as the
+/// operand of an address-of whose result is passed as a call argument and used
+/// nowhere else. Any other appearance — a whole-value read or move, a return,
+/// an address stored anywhere, an address reaching a non-call use — answers
+/// `None`, and the retention hold stands.
+fn container_frame_confinement<'tcx>(
+    body: &Body<'tcx>,
+    container: Local,
+) -> Option<Vec<(LocalDefId, usize)>> {
+    if container == RETURN_PLACE || container.as_usize() <= body.arg_count {
+        return None;
+    }
+    // Locals holding the container's address: `&container` / `&raw mut
+    // container`, and — to a fixpoint — every reborrow or copy of one
+    // (`_12 = &mut (*_13)` is what a call argument actually passes).
+    let mut addresses = FxHashSet::default();
+    loop {
+        let before = addresses.len();
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else { continue };
+                if !lhs.projection.is_empty() {
+                    continue;
+                }
+                let takes_address = match rhs {
+                    Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                        (place.local == container
+                            && !place
+                                .projection
+                                .iter()
+                                .any(|p| matches!(p, ProjectionElem::Deref)))
+                            || (addresses.contains(&place.local)
+                                && place.projection.len() == 1
+                                && matches!(place.projection[0], ProjectionElem::Deref))
+                    }
+                    Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
+                        operand.place().is_some_and(|place| {
+                            place.projection.is_empty() && addresses.contains(&place.local)
+                        })
+                    }
+                    _ => false,
+                };
+                if takes_address {
+                    addresses.insert(lhs.local);
+                }
+            }
+        }
+        if addresses.len() == before {
+            break;
+        }
+    }
+    let mut callees = Vec::new();
+    let mut escapes = false;
+    // `true` when this appearance of the container (or of its address) is one
+    // the confinement does not admit.
+    let leaks = |place: &rustc_middle::mir::Place<'tcx>, addresses: &FxHashSet<Local>| {
+        (place.local == container
+            && (place.projection.is_empty()
+                || place
+                    .projection
+                    .iter()
+                    .any(|p| matches!(p, ProjectionElem::Deref))))
+            || addresses.contains(&place.local)
+    };
+    // Writing the container — `container = <init>`, `container.f = ..` — is
+    // not an escape; only a whole-value READ of it is (that copies the stored
+    // pointer out of the frame's storage). An address local appearing as a
+    // write target is still an escape, which `leaks` keeps.
+    let leaks_written = |place: &rustc_middle::mir::Place<'tcx>, addresses: &FxHashSet<Local>| {
+        (place.local == container
+            && place
+                .projection
+                .iter()
+                .any(|p| matches!(p, ProjectionElem::Deref)))
+            || addresses.contains(&place.local)
+    };
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            match &statement.kind {
+                StatementKind::Assign(box (lhs, rhs)) => {
+                    if addresses.contains(&lhs.local) && lhs.projection.is_empty() {
+                        // An address definition, admitted by the fixpoint
+                        // above; its operand is the container or another
+                        // address, never a leak.
+                        continue;
+                    }
+                    if addresses.contains(&lhs.local) {
+                        // The address is (re)defined; only the address-of form
+                        // above is admitted, anything else hides it.
+                        if !matches!(rhs, Rvalue::Ref(..) | Rvalue::RawPtr(..)) {
+                            escapes = true;
+                        }
+                        continue;
+                    }
+                    escapes |= leaks_written(lhs, &addresses);
+                    match rhs {
+                        Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                            if place.local != container {
+                                escapes |= leaks(place, &addresses);
+                            }
+                        }
+                        Rvalue::Use(operand)
+                        | Rvalue::Cast(_, operand, _)
+                        | Rvalue::Repeat(operand, _) => {
+                            if let Some(place) = operand.place() {
+                                escapes |= leaks(&place, &addresses);
+                            }
+                        }
+                        Rvalue::Aggregate(_, operands) => {
+                            for operand in operands {
+                                if let Some(place) = operand.place() {
+                                    escapes |= leaks(&place, &addresses);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                StatementKind::SetDiscriminant { place, .. } => escapes |= leaks(place, &addresses),
+                _ => {}
+            }
+        }
+        let Some(terminator) = &data.terminator else { continue };
+        match &terminator.kind {
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } => {
+                let callee = func.const_fn_def().and_then(|(did, _)| did.as_local());
+                for (index, argument) in args.iter().enumerate() {
+                    let Some(place) = argument.node.place() else { continue };
+                    if addresses.contains(&place.local) && place.projection.is_empty() {
+                        match callee {
+                            // The certificate for this position is what
+                            // clause (3) consults; a foreign or indirect
+                            // callee has none, so the hold stands.
+                            Some(callee) => callees.push((callee, index)),
+                            None => escapes = true,
+                        }
+                        continue;
+                    }
+                    escapes |= leaks(&place, &addresses);
+                }
+                escapes |= leaks_written(destination, &addresses);
+            }
+            TerminatorKind::Return => {
+                if addresses.contains(&RETURN_PLACE) {
+                    escapes = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    (!escapes).then_some(callees)
 }
 
 fn collect_retention_facts<'tcx>(
@@ -2029,6 +2213,26 @@ fn collect_retention_facts<'tcx>(
         }
     }
     let is_reachable = |local: Local| reachable.contains(&local.as_u32());
+    // R476-1 clause (1): MIR liveness, so "dead after the store" is the real
+    // property and not a syntactic proxy. Built once per body, lazily, because
+    // only a field store consults it.
+    let liveness = std::cell::RefCell::new(
+        None::<rustc_mir_dataflow::ResultsCursor<'_, '_, crate::analyses::liveness::MaybeLiveLocals>>,
+    );
+    let live_after = |location: Location, local: Local| {
+        let mut slot = liveness.borrow_mut();
+        let cursor = slot.get_or_insert_with(|| {
+            rustc_mir_dataflow::Analysis::iterate_to_fixpoint(
+                crate::analyses::liveness::MaybeLiveLocals,
+                tcx,
+                body,
+                None,
+            )
+            .into_results_cursor(body)
+        });
+        cursor.seek_before_primary_effect(location);
+        cursor.get().contains(local)
+    };
 
     let mut facts = RetentionBodyFacts {
         function,
@@ -2041,6 +2245,7 @@ fn collect_retention_facts<'tcx>(
             .collect(),
         retains: Vec::new(),
         unknowns: BTreeMap::new(),
+        frame_bounded: Vec::new(),
         dependencies: Vec::new(),
     };
     for record in children {
@@ -2236,6 +2441,26 @@ fn collect_retention_facts<'tcx>(
                         storage_root.as_u32()
                     ),
                 );
+                // **R476-1 (USER, relay 045), clauses (1)–(3).** A store into
+                // a field of a non-escaping stack local of THIS frame, after
+                // which the subject is dead, is bounded by the frame. The
+                // callees that receive the container's address are carried so
+                // that `evaluate_retention` can require their certificates.
+                if !output_storage
+                    && !lhs
+                        .projection
+                        .iter()
+                        .any(|p| matches!(p, ProjectionElem::Deref))
+                    && let Some(callees) = container_frame_confinement(body, storage_root)
+                    && !live_after(location, root)
+                    && !live_after(location, source)
+                {
+                    facts.frame_bounded.push(FrameBoundedStore {
+                        step: step.clone(),
+                        container: storage_root,
+                        callees,
+                    });
+                }
                 facts.retains.push(step.clone());
                 facts.unknowns.entry(reason).or_default().push(step);
             }
@@ -2636,6 +2861,7 @@ fn residual_after_discharge_in(
             argument_index: facts.argument_index?,
             steps: facts.steps.clone(),
             attestation: "stack-storage-certificate",
+            frame_bounded: None,
         },
     })
 }
@@ -2671,8 +2897,59 @@ fn direct_verdict(facts: &RetentionBodyFacts, attested: bool) -> RetentionVerdic
             argument_index,
             steps: facts.steps.clone(),
             attestation: "closed_world_frozen_graph",
+            frame_bounded: None,
         },
     }
+}
+
+/// **R476-1 (USER ruling, relay 045).** The receipt when this body's every
+/// retaining step is frame-bounded and every container callee is certified.
+///
+/// `None` is the answer whenever anything is unproved: a retaining step that
+/// is not a frame-bounded store, a parameter-less body (no certificate to
+/// mint), a container callee whose own row is `Retains` or `Unknown`, or a
+/// body with no retaining step at all (which needs no discharge).
+fn frame_bounded_discharge(
+    facts: &RetentionBodyFacts,
+    rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
+) -> Option<String> {
+    if facts.retains.is_empty() || facts.argument_index.is_none() {
+        return None;
+    }
+    if !facts.retains.iter().all(|step| {
+        facts
+            .frame_bounded
+            .iter()
+            .any(|bounded| &bounded.step == step)
+    }) {
+        return None;
+    }
+    let mut containers = Vec::new();
+    let mut callees = Vec::new();
+    for bounded in &facts.frame_bounded {
+        containers.push(format!("_{}", bounded.container.as_u32()));
+        for &(callee, argument) in &bounded.callees {
+            match rows.get(&(callee, argument)) {
+                Some(RetentionVerdict::NoRetain { .. }) => {}
+                _ => return None,
+            }
+            callees.push(format!("{}:arg{argument}", callee.local_def_index.as_u32()));
+        }
+    }
+    containers.sort();
+    containers.dedup();
+    callees.sort();
+    callees.dedup();
+    Some(format!(
+        "retention-discharged:frame-bounded(subject=arg{}, container={}, callees={})",
+        facts.argument_index?,
+        containers.join("+"),
+        if callees.is_empty() {
+            "none".to_owned()
+        } else {
+            callees.join("+")
+        }
+    ))
 }
 
 fn evaluate_retention(
@@ -2703,7 +2980,25 @@ fn evaluate_retention(
                     row.cloned()
                 }
             };
-            let next = if matches!(direct, RetentionVerdict::Retains { .. }) {
+            // **R476-1 (USER, relay 045).** Every retaining step of this body
+            // is a field store into a non-escaping stack local of its own
+            // frame, after which the subject is dead (clauses (1)+(2), decided
+            // in the walk), and every callee that receives a container's
+            // address is certified no-retain at that position (clause (3),
+            // decided here because it needs the other rows). Unknown or
+            // retaining callee ⇒ no discharge and the hold stands.
+            let frame_bounded = frame_bounded_discharge(fact, &previous);
+            let next = if let Some(receipt) = frame_bounded {
+                RetentionVerdict::NoRetain {
+                    certificate: RetentionCertificate {
+                        function: fact.function_path.clone(),
+                        argument_index: fact.argument_index.unwrap_or_default(),
+                        steps: fact.steps.clone(),
+                        attestation: "closed_world_frozen_graph",
+                        frame_bounded: Some(receipt),
+                    },
+                }
+            } else if matches!(direct, RetentionVerdict::Retains { .. }) {
                 direct
             } else if let Some((dependency, sink)) =
                 fact.dependencies.iter().find_map(|dependency| {
@@ -2998,6 +3293,7 @@ impl RetentionSummaries {
                     argument_index,
                     steps: facts.steps.clone(),
                     attestation: "stack-storage-certificate",
+                    frame_bounded: None,
                 },
             }
         };
@@ -3384,7 +3680,7 @@ impl RetentionSummaries {
             let (verdict, reason, steps) = match &self.rows[&key] {
                 RetentionVerdict::NoRetain { certificate } => (
                     "no-retain",
-                    "-",
+                    certificate.frame_bounded.as_deref().unwrap_or("-"),
                     certificate
                         .steps
                         .iter()
@@ -4583,6 +4879,7 @@ impl RawBoundaryDispositionIndex {
                                     argument_index: site.key.argument_index,
                                     steps: Vec::new(),
                                     attestation: "boundary-contract",
+                                    frame_bounded: None,
                                 },
                             },
                             Some(contract.ownership),

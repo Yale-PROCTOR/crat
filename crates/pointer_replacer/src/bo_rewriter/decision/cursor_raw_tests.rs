@@ -185,6 +185,7 @@ fn cursor_unknown_retention_cannot_enter_legacy_t2_waiver() {
             argument_index: 0,
             steps: Vec::new(),
             attestation: "test-only",
+            frame_bounded: None,
         },
     };
     assert_eq!(cursor_retention_permit(&cursor(true), &no_retain), Ok(()));

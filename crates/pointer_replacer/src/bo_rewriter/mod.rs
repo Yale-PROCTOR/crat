@@ -201,6 +201,8 @@ mod escape_seam_tests;
 #[cfg(test)]
 mod expression_sibling_tests;
 #[cfg(test)]
+mod frame_bounded_tests;
+#[cfg(test)]
 mod goldens;
 #[cfg(test)]
 mod import_denylist;
