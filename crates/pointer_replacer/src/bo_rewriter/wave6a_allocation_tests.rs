@@ -1336,6 +1336,13 @@ fn w6a_the_wrapper_cast_takes_the_converted_parameters_element_not_the_regions()
         delivered_element(&region(Shape::WidthRead, "uint32_t", 4)),
         Some("u8")
     );
+    // … and so does its MIRROR, the width WRITE (R478-3): wave-6b gives the
+    // pair one length rule and one parameter form, so the converted parameter
+    // carries bytes for a writer exactly as for a reader.
+    assert_eq!(
+        delivered_element(&region(Shape::WidthWrite, "uint64_t", 8)),
+        Some("u8")
+    );
     // … and a byte view is a LOCAL's region, so no wrapper argument is built
     // from it.
     assert_eq!(
