@@ -1281,9 +1281,81 @@ fn w6a_the_wrapper_bodys_void_base_takes_the_delivered_element_type() {
         wrapper_base("extra", Form::Ref { mutable: true }, true, Some("u8")),
         "extra"
     );
-    // … and a region that carries no element type is left alone.
+    // … and a region that delivers no element for a parameter is left alone.
     assert_eq!(
         wrapper_base("extra", Form::Slice { mutable: true }, true, None),
+        "extra"
+    );
+}
+
+/// **R477-3 — the element is the CONVERTED parameter's, not the region's.**
+/// batch 20 measured the difference: the six `TinyHashH4x` wrappers verified
+/// (their access width IS `u8`, so both readings agree) while `AddrH4{0,1,2}`
+/// stayed `expected *mut u8, found *mut u32` and `HeadH42` `found *mut u16` —
+/// the width the BODY reinterprets at, cast onto a parameter that is a byte
+/// slice. The `Addr` shape is the case the two readings disagree on.
+#[test]
+fn w6a_the_wrapper_cast_takes_the_converted_parameters_element_not_the_regions() {
+    use super::decision::{
+        seam::Form,
+        surface_argument::{delivered_element, wrapper_base_for_region},
+        void_region::{Region, Shape},
+    };
+
+    let region = |shape: Shape, element: &str, size: u64| Region {
+        shape,
+        offset_bytes: 0,
+        len_bytes: None,
+        element: element.to_owned(),
+        element_size: size,
+        mutable: true,
+        uses: Vec::new(),
+        replaced: rustc_span::DUMMY_SP,
+        inner: None,
+    };
+
+    // The `Addr` shape: the body reinterprets at `u32`, the parameter carries
+    // bytes, and the cast must follow the parameter.
+    assert_eq!(
+        delivered_element(&region(Shape::Accessor, "uint32_t", 4)),
+        Some("u8")
+    );
+    // `HeadH42`'s width, same answer.
+    assert_eq!(
+        delivered_element(&region(Shape::Accessor, "uint16_t", 2)),
+        Some("u8")
+    );
+    // `TinyHash`, where the two readings agree — which is why only those six
+    // verified in batch 20.
+    assert_eq!(
+        delivered_element(&region(Shape::Accessor, "uint8_t", 1)),
+        Some("u8")
+    );
+    // A width read delivers a byte slice too …
+    assert_eq!(
+        delivered_element(&region(Shape::WidthRead, "uint32_t", 4)),
+        Some("u8")
+    );
+    // … and a byte view is a LOCAL's region, so no wrapper argument is built
+    // from it.
+    assert_eq!(
+        delivered_element(&region(Shape::ByteView, "uint8_t", 1)),
+        None
+    );
+
+    // The WIRING, not only the pieces: the planner asks this one function, so
+    // a base wired back to the region's own element is red here.
+    assert_eq!(
+        wrapper_base_for_region(
+            "extra",
+            Form::Slice { mutable: true },
+            true,
+            Some(&region(Shape::Accessor, "uint32_t", 4)),
+        ),
+        "extra.cast::<u8>()"
+    );
+    assert_eq!(
+        wrapper_base_for_region("extra", Form::Slice { mutable: true }, true, None),
         "extra"
     );
 }

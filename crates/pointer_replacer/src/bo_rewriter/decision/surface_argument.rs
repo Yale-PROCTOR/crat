@@ -68,14 +68,50 @@ pub(crate) fn wrapper_base(
     parameter_name: &str,
     form: Form,
     void_pointee: bool,
-    element: Option<&str>,
+    delivered_element: Option<&str>,
 ) -> String {
-    match (form, void_pointee, element) {
+    match (form, void_pointee, delivered_element) {
         (Form::Slice { .. } | Form::Opt { slice: true, .. }, true, Some(element)) => {
             format!("{parameter_name}.cast::<{element}>()")
         }
         _ => parameter_name.to_owned(),
     }
+}
+
+/// **R477-3 — the element the CONVERTED parameter carries, which is the one
+/// the call must type-check against.** A void region's parameter becomes a
+/// BYTE slice — wave-6b states it in their module header, "the parameter
+/// becomes a byte slice (`&mut [u8]` / `&[u8]`)" — while `Region::element` is
+/// the width the BODY reinterprets at (`u32` for `AddrH40`, `u16` for
+/// `HeadH42`). Casting to the region's element passed only where the two
+/// agree: batch 20 verified the six `TinyHashH4x` wrappers (`u8` both ways)
+/// and kept `AddrH4{0,1,2}` at `expected *mut u8, found *mut u32` and
+/// `HeadH42` at `found *mut u16`.
+///
+/// A byte view is a LOCAL's region, not a parameter's, so no wrapper argument
+/// is built from it.
+pub(crate) fn delivered_element(region: &super::void_region::Region) -> Option<&'static str> {
+    match region.shape {
+        super::void_region::Shape::Accessor | super::void_region::Shape::WidthRead => Some("u8"),
+        super::void_region::Shape::ByteView => None,
+    }
+}
+
+/// The base for a wrapper parameter that may carry a void region: the two
+/// questions above asked together, so the WIRING is witnessed and not only the
+/// pieces. The planner calls this and nothing else.
+pub(crate) fn wrapper_base_for_region(
+    parameter_name: &str,
+    form: Form,
+    void_pointee: bool,
+    region: Option<&super::void_region::Region>,
+) -> String {
+    wrapper_base(
+        parameter_name,
+        form,
+        void_pointee,
+        region.and_then(delivered_element),
+    )
 }
 
 /// Whether the raw parameter's pointee is `c_void` — the C ABI's untyped
