@@ -159,3 +159,35 @@ pub unsafe fn parse(mut src: *const u8, mut size: usize) -> State {
     let (verdict, _) = retention_row(RETURNED, "parse", 0);
     assert_eq!(verdict, "retains");
 }
+
+/// **Control 5 (R477-4a, main 060d) — an INTERMEDIATE ancestor is read after
+/// the store.** `src -> mid -> cur` is one provenance chain; the store carries
+/// `cur`, and both the root (`src`) and the stored operand (`cur`) are dead
+/// afterwards, so condition (1) asked of those two alone would discharge it.
+/// It must be held: `mid` carries the same provenance and is read after the
+/// store, so the retained pointer's value is still in use in this frame.
+#[test]
+fn wave6o_a_live_intermediate_ancestor_keeps_the_hold() {
+    const REBORROWED: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+#[repr(C)]
+pub struct State { pub src: *const u8, pub size: usize, pub offset: usize }
+unsafe fn read_one(mut st: *mut State) -> i32 {
+    let mut b = *((*st).src).offset((*st).offset as isize);
+    (*st).offset = ((*st).offset).wrapping_add(1);
+    return b as i32;
+}
+pub unsafe fn parse(mut src: *const u8, mut size: usize) -> i32 {
+    let mut state = State { src: 0 as *const u8, size: 0, offset: 0 };
+    if src.is_null() { return 0; }
+    let mut mid = src;
+    let mut cur = mid;
+    state.src = cur;
+    state.size = size;
+    let mut n = read_one(&mut state);
+    return n + (*mid.offset(1 as isize)) as i32;
+}
+"#;
+    let (verdict, reason) = retention_row(REBORROWED, "parse", 0);
+    assert_eq!(verdict, "retains", "reason={reason}");
+}

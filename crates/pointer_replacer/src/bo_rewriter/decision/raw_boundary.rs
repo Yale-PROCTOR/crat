@@ -1815,6 +1815,29 @@ fn returned_parent_is_raw_field_load<'tcx>(
 /// nowhere else. Any other appearance — a whole-value read or move, a return,
 /// an address stored anywhere, an address reaching a non-call use — answers
 /// `None`, and the retention hold stands.
+/// **R477-4a.** Every local whose provenance the value stored from `source`
+/// carries: `source` itself, the walk's `root`, and every alias ancestor
+/// reaching `source` (`_b = _a` copies, `_b = &mut *_a` reborrows — the
+/// `Transparent` chain and every other edge the walk records).
+fn provenance_ancestors(
+    aliases: &[(Local, Local, RetentionStep)],
+    root: Local,
+    source: Local,
+) -> FxHashSet<Local> {
+    let mut set = FxHashSet::from_iter([source, root]);
+    loop {
+        let before = set.len();
+        for (from, to, _) in aliases {
+            if set.contains(to) {
+                set.insert(*from);
+            }
+        }
+        if set.len() == before {
+            return set;
+        }
+    }
+}
+
 fn container_frame_confinement<'tcx>(
     body: &Body<'tcx>,
     container: Local,
@@ -2452,8 +2475,16 @@ fn collect_retention_facts<'tcx>(
                         .iter()
                         .any(|p| matches!(p, ProjectionElem::Deref))
                     && let Some(callees) = container_frame_confinement(body, storage_root)
-                    && !live_after(location, root)
-                    && !live_after(location, source)
+                    // **R477-4a (main 060d).** Condition (1) is asked of the
+                    // provenance chain's ROOT, not only of the stored operand:
+                    // a reborrowed subject is dead only when every ancestor
+                    // whose provenance the stored pointer carries is dead. The
+                    // ancestor set is closed over the walk's own alias edges,
+                    // a superset of the `Transparent` copy/reborrow chain, so
+                    // the question asked here is never weaker than the ruling.
+                    && provenance_ancestors(&aliases, root, source)
+                        .into_iter()
+                        .all(|ancestor| !live_after(location, ancestor))
                 {
                     facts.frame_bounded.push(FrameBoundedStore {
                         step: step.clone(),
