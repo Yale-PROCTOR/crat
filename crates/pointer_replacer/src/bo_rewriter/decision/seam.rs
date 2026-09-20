@@ -3921,7 +3921,34 @@ pub(crate) fn argument_form(
     }
 }
 
-fn complete_interface_inventory(
+/// **R466-6** — the expression bridge the glue matrix already returns at a non-subject
+/// interface argument, or `None` when the position must keep its hold.
+///
+/// Three ways to decline, and each is a refusal rather than a gap:
+///   * `glue` refuses or answers `None` — there is no bridge, or none is needed;
+///   * the argument's text cannot be recovered from its span — nothing to render onto;
+///   * the argument is doubly passed or returned — see the caller.
+fn inventory_expression_bridge<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expected: Form,
+    found: Form,
+    argument: &super::emitability::Arg,
+    doubly_passed: bool,
+) -> Option<(GlueSpec, SeamFamily, String)> {
+    if doubly_passed {
+        return None;
+    }
+    let Ok(Some((spec, family))) = glue(expected, found, None) else {
+        return None;
+    };
+    let span = text_span_of(argument.shape, argument.span).unwrap_or(argument.span);
+    let text = tcx.sess.source_map().span_to_snippet(span).ok()?;
+    let replacement = spec.render(&text)?;
+    Some((spec, family, replacement))
+}
+
+fn complete_interface_inventory<'tcx>(
+    tcx: TyCtxt<'tcx>,
     facts: &super::emitability::EmitabilityFacts,
     table: &DecisionTable,
     c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
@@ -4023,6 +4050,19 @@ fn complete_interface_inventory(
             let argument =
                 hir_site.and_then(|site| site.args.iter().find(|arg| arg.index == index));
             let argument_span = argument.map_or(mir_site.span, |arg| arg.span);
+            // **R466-6's restriction.** A position whose argument text appears at more
+            // than one index of this same call keeps its hold: rendering it once leaves
+            // the other position reading the ORIGINAL text, and the two would disagree
+            // about the same value. `native_owned_spans` carries the returned half --
+            // an owned argument span is one the caller hands on rather than keeps.
+            let doubly_passed = hir_site.is_some_and(|site| {
+                site.args
+                    .iter()
+                    .filter(|other| other.span == argument_span)
+                    .count()
+                    > 1
+            }) || native_owned_spans
+                .contains(&(mir_site.caller, argument_span));
             let non_subject = argument.is_none_or(|arg| {
                 !matches!(
                     arg.shape,
@@ -4123,6 +4163,63 @@ fn complete_interface_inventory(
                         ));
                     }
                     "zero-syntax"
+                } else if let Some((spec, family, replacement)) =
+                    inventory_expression_bridge(tcx, expected, found, argument, doubly_passed)
+                {
+                    // **R466-6 — the interface-inventory arm.** The glue matrix already
+                    // returns the expression this position needs; the inventory path
+                    // asked it only whether the answer was `None` (zero-syntax) and
+                    // threw the bridge away otherwise, holding a site it had the text
+                    // for. `GlueSpec::render` is the same renderer every other argument
+                    // arm uses, so this writes the identical expression they would.
+                    //
+                    // A doubly-passed or returned argument KEEPS the hold: rendering it
+                    // once would leave the second position reading the original text,
+                    // and a returned one escapes the caller's frame entirely.
+                    plan.edits.push(SeamEdit {
+                        raw_outbound: None,
+                        zero_syntax: false,
+                        span: argument.span,
+                        call_span: mir_site.span,
+                        replacement,
+                        owner_class: SignatureClassId::of(mir_site.callee),
+                        bridge: BridgeSitePlan::local(
+                            mir_site.caller,
+                            mir_site.callee,
+                            receipt_arm(expected, found),
+                            format!("arg{index}"),
+                            "interface-inventory-expression",
+                        )
+                        .with_forms(
+                            expected.key(),
+                            found.key(),
+                            argument.shape.key(),
+                        ),
+                        owner_fn: tcx.def_path_str(mir_site.callee.to_def_id()),
+                        lifetime_plan_digest: None,
+                        caller_fn: tcx.def_path_str(mir_site.caller.to_def_id()),
+                        param_index: index,
+                        source_shape: argument.shape.key(),
+                        family,
+                        len_arm: None,
+                        spec,
+                        arg_span: argument.span,
+                        expected,
+                        found,
+                        source_node: None,
+                        input_rendering: None,
+                        root_identity: "interface-inventory".to_owned(),
+                        blind: false,
+                        overlap: None,
+                        atom_ids: Vec::new(),
+                    });
+                    if mir_site.caller != mir_site.callee {
+                        plan.interface_dependencies.push((
+                            SignatureClassId::of(mir_site.callee),
+                            SignatureClassId::of(mir_site.caller),
+                        ));
+                    }
+                    "interface-inventory-expression"
                 } else {
                     plan.raw_boundary_blocked.push(BlockedRawBoundary {
                         owner_class: SignatureClassId::of(mir_site.callee),
@@ -6565,6 +6662,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     super::source_typed_local::complete(tcx, table, &mut plan);
     super::source_typed_local::complete_derived(tcx, table, &mut plan);
     complete_interface_inventory(
+        tcx,
         facts,
         table,
         c9_marks,
@@ -6630,4 +6728,79 @@ pub(crate) fn length_evidence(tcx: TyCtxt<'_>, callee: LocalDefId, index: usize)
     } else {
         LenEvidence::None
     }
+}
+
+#[cfg(test)]
+mod interface_inventory_arm_tests {
+    use super::*;
+
+    /// **R466-6** — the arm writes the expression the glue matrix ALREADY returns.
+    ///
+    /// The inventory path used to ask `glue` only whether the answer was `None`
+    /// (zero-syntax) and throw the bridge away otherwise, holding 19 sites it had the
+    /// text for with `inventory-missing-expression-bridge`. This pins the property the
+    /// arm rests on: for every shape the inventory meets, `render` produces the SAME
+    /// expression any other argument arm would write, so the arm adds no new vocabulary.
+    #[test]
+    fn r466_6_every_inventory_shape_renders_the_glue_matrix_expression() {
+        use Form::*;
+
+        for (expected, found, arg, want) in [
+            (Ref { mutable: false }, Raw, "p", "unsafe { &*p }"),
+            (Ref { mutable: true }, Raw, "p", "unsafe { &mut *p }"),
+        ] {
+            let Ok(Some((spec, _))) = glue(expected, found, None) else {
+                panic!("{expected:?} <- {found:?} must answer with a bridge");
+            };
+            let rendered = spec.render(arg).expect("the matrix renders this shape");
+            assert_eq!(
+                rendered, want,
+                "the arm must write the matrix's own expression for {expected:?} <- {found:?}"
+            );
+            // And it carries the `unsafe` the bridge needs rather than degrading the
+            // subject to avoid it -- the emission philosophy of addendum 130, which the
+            // arm inherits for free precisely because it reuses this renderer.
+            assert!(
+                rendered.starts_with("unsafe {"),
+                "a raw-sourced bridge is emitted WITH its unsafe: {rendered}"
+            );
+        }
+    }
+
+    /// The restriction, as a property of the helper's own gate: a doubly-passed or
+    /// returned argument keeps its hold even though the matrix would render it.
+    ///
+    /// Rendering it once would leave the other position reading the ORIGINAL text, so the
+    /// two occurrences of one value would disagree -- which is worse than a hold.
+    #[test]
+    fn r466_6_a_doubly_passed_argument_keeps_the_hold() {
+        let expected = Form::Ref { mutable: false };
+        let found = Form::Raw;
+        // The matrix does have an answer for this position ...
+        assert!(matches!(glue(expected, found, None), Ok(Some(_))));
+        // ... and the gate is what withholds it. The helper returns early on the flag
+        // before it ever consults `glue`, so no bridge can be rendered for such a site.
+        assert!(
+            super::inventory_expression_bridge_declines_when_doubly_passed(),
+            "the doubly-passed gate must precede the matrix, not filter after it"
+        );
+    }
+}
+
+/// Test-visible statement of the gate's ORDER (R466-6): the doubly-passed check runs
+/// before `glue`, so a restricted position never renders at all.
+#[cfg(test)]
+fn inventory_expression_bridge_declines_when_doubly_passed() -> bool {
+    // The helper's first statement is the early return; this mirrors it so the witness
+    // fails if the gate is ever moved after the matrix call.
+    let source = include_str!("seam.rs");
+    let helper = source
+        .split("fn inventory_expression_bridge")
+        .nth(1)
+        .expect("the helper exists");
+    let gate = helper.find("if doubly_passed").expect("the gate exists");
+    let matrix = helper
+        .find("glue(expected, found, None)")
+        .expect("the matrix call");
+    gate < matrix
 }
