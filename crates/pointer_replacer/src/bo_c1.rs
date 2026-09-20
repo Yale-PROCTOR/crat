@@ -12483,6 +12483,13 @@ mod run {
                 "allocator-contract-receipt",
                 artifact.allocator_contract_receipts.as_str(),
             ),
+            // **R473-3 (wave-6a, granted)** — the box-parameter receipts reach the
+            // artifact set. The table was BUILT every run and written nowhere: every
+            // admitted chain and, more usefully, every parameter the analysis examined
+            // and refused with its typed reason, computed and then dropped at the
+            // in-memory carrier. Same shape of gap as R450-8's allocator contracts, one
+            // family over.
+            ("box-param-receipt", artifact.box_param_receipts.as_str()),
         ];
         for (suffix, contents) in artifact_rows {
             std::fs::write(
@@ -12508,6 +12515,18 @@ mod run {
         row.set(
             raw_schema::GRAFT_REFUSED,
             crate::bo_rewriter::ast_transform::graft_refusals(),
+        );
+        // R473-3: the count rides beside the table, so the market is auditable without
+        // opening it. A `held` line is one refused parameter with its typed reason.
+        row.set(
+            raw_schema::BOX_PARAM_HELD,
+            artifact
+                .box_param_receipts
+                .lines()
+                .skip(1)
+                .filter(|line| line.split('\t').nth(1) == Some("held"))
+                .count()
+                .to_string(),
         );
         let revert_status_notes = super::field_transaction_revert_status_notes(
             &artifact.field_transactions,
@@ -34293,4 +34312,45 @@ fn decl_w1_final_tree_requires_the_changed_alias_annotation() {
         "missing declaration adapter: type_checks={type_checks}, custody={report:?}, source={source}"
     );
     assert_eq!(report.delivered_by_tree, report.delivered_by_ledger);
+}
+
+/// **R473-3 (wave-6a, granted)** — the box-parameter receipts reach the artifact set, and
+/// the count of REFUSED parameters rides beside them as its own column.
+///
+/// The table was built every run and written nowhere. Its `held` lines are the market for
+/// the next owning build — each one a parameter the analysis examined and declined, with
+/// the reason — and they were computed and dropped at the in-memory carrier, exactly the
+/// gap R450-8 closed for the allocator contracts one family over.
+#[test]
+fn r473_3_the_box_param_receipts_are_published_and_their_holds_counted() {
+    // The census writes it under a name a lane can find.
+    let source = include_str!("bo_c1.rs");
+    assert!(
+        source.contains("(\"box-param-receipt\", artifact.box_param_receipts.as_str())"),
+        "the receipts must be registered in the artifact set"
+    );
+
+    // The column counts `held` lines and nothing else: `admitted` rows are a different
+    // fact and must not inflate the market.
+    let table = "parameter\tkind\tdetail\n\
+                 -\tadmitted\tchain-a\n\
+                 f::p#1\theld\tbox-param-caller-unknown\n\
+                 -\tadmitted\tchain-b\n\
+                 g::q#2\theld\tflows-into-raw-param\n";
+    let held = table
+        .lines()
+        .skip(1)
+        .filter(|line| line.split('\t').nth(1) == Some("held"))
+        .count();
+    assert_eq!(held, 2, "two refusals among four rows");
+
+    // R450-9: an additive column of its own, not an overload of an existing one.
+    assert!(
+        crate::raw_boundary_census_schema::ALL
+            .contains(&crate::raw_boundary_census_schema::BOX_PARAM_HELD)
+    );
+    assert_ne!(
+        crate::raw_boundary_census_schema::BOX_PARAM_HELD,
+        crate::raw_boundary_census_schema::GRAFT_REFUSED
+    );
 }

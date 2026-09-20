@@ -35,6 +35,11 @@ pub(crate) const CACHE_FRAME_ADMISSION: &str = "raw_boundary_cache_frame_admissi
 /// and were dropped by their caller: correct in the plan, inert in the tree. An
 /// instrument count, per program; 0 is the expected reading.
 pub(crate) const GRAFT_REFUSED: &str = "raw_boundary_graft_refused";
+/// **R473-3** — parameters the box-parameter analysis examined and REFUSED, with their
+/// typed reasons published beside them in `box-param-receipt`. A count, per program: the
+/// market for the next owning build, and previously invisible because the whole table
+/// was discarded.
+pub(crate) const BOX_PARAM_HELD: &str = "raw_boundary_box_param_held";
 /// **R469-1** — how many rows of wave-6f's `revert_status` column disagree with the
 /// final-revert table. A NOTE, not a verdict: the count rides beside an `emitted`
 /// outcome and the rows are published in their own receipt table.
@@ -245,6 +250,7 @@ pub(crate) const ALL: &[&str] = &[
     CACHE_MANIFEST_SHA256,
     CACHE_FRAME_ADMISSION,
     GRAFT_REFUSED,
+    BOX_PARAM_HELD,
     FIELD_REVERT_STATUS_NOTES,
     LAUNCH_ENV_SHA256,
     SOLVE_WALL_S,
