@@ -1639,6 +1639,10 @@ struct RetentionBodyFacts {
     /// R476-1: the retaining steps this body's own frame bounds, pending the
     /// container callees' certificates.
     frame_bounded: Vec<FrameBoundedStore>,
+    /// R477-4b: the retaining steps that store the parameter's provenance into
+    /// a FRESH ALLOCATION which escapes only back into the parameter's own
+    /// subgraph, so a caller whose frame bounds the parameter bounds them too.
+    retains_into_fresh_allocation: Vec<RetentionStep>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1819,6 +1823,140 @@ fn returned_parent_is_raw_field_load<'tcx>(
 /// carries: `source` itself, the walk's `root`, and every alias ancestor
 /// reaching `source` (`_b = _a` copies, `_b = &mut *_a` reborrows — the
 /// `Transparent` chain and every other edge the walk records).
+/// **R477-4b (relay 046).** Is this body's retaining store a store INTO a
+/// fresh allocation whose only escape is back into the analysed parameter's
+/// own subgraph?
+///
+/// bzip2 `BZ2_bzCompressInit` is the shape: `s = alloc(..); s->strm = strm;
+/// strm->state = s`. The retained address is then reachable only through the
+/// container, whose frame-confinement the caller has already proved, so the
+/// caller's frame bounds it too.
+///
+/// Fails closed: the allocation must come from a DIRECTLY called, named
+/// allocator (an indirect call through a function pointer proves nothing
+/// about freshness), it must be assigned exactly once, and every other
+/// appearance of it must be a store into a place rooted at the parameter.
+fn retains_only_into_a_fresh_allocation<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    parameter: Local,
+    target: Local,
+) -> bool {
+    let allocator = |callee: &rustc_middle::mir::Operand<'tcx>| {
+        let Some((did, _)) = callee.const_fn_def() else { return false };
+        let path = tcx.def_path_str(did);
+        let name = path.rsplit("::").next().unwrap_or(&path).to_owned();
+        super::allocator_contract::CONTRACTS
+            .iter()
+            .any(|contract| contract.allocators.iter().any(|a| a.name == name))
+    };
+    // The locals that hold the fresh block: a named allocator's destination,
+    // closed under the casts and copies c2rust puts between the call and the
+    // typed local (`_t = malloc(..); _s = _t as *mut T`).
+    let mut block = FxHashSet::default();
+    for data in body.basic_blocks.iter() {
+        if let Some(terminator) = &data.terminator
+            && let TerminatorKind::Call {
+                func, destination, ..
+            } = &terminator.kind
+            && destination.projection.is_empty()
+            && allocator(func)
+        {
+            block.insert(destination.local);
+        }
+    }
+    if block.is_empty() {
+        return false;
+    }
+    loop {
+        let before = block.len();
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else { continue };
+                if !lhs.projection.is_empty() {
+                    continue;
+                }
+                if let Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) = rhs
+                    && operand.place().is_some_and(|place| {
+                        place.projection.is_empty() && block.contains(&place.local)
+                    })
+                {
+                    block.insert(lhs.local);
+                }
+            }
+        }
+        if block.len() == before {
+            break;
+        }
+    }
+    if !block.contains(&target) {
+        return false;
+    }
+    // Every other appearance of the block must be a store into the parameter's
+    // own subgraph (`(*strm).state = s`) or a field write through the block
+    // itself (`(*s).strm = strm`, the retaining store this discharges).
+    let mut escapes = false;
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else { continue };
+            if lhs.projection.is_empty() && block.contains(&lhs.local) {
+                // A definition inside the chain, admitted above.
+                continue;
+            }
+            let into_the_parameter = lhs.local == parameter
+                && lhs
+                    .projection
+                    .first()
+                    .is_some_and(|p| matches!(p, ProjectionElem::Deref));
+            let into_the_block = block.contains(&lhs.local);
+            let mentions = |place: &rustc_middle::mir::Place<'tcx>| {
+                place.projection.is_empty() && block.contains(&place.local)
+            };
+            match rhs {
+                Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
+                    if operand.place().as_ref().is_some_and(mentions)
+                        && !into_the_parameter
+                        && !into_the_block
+                    {
+                        escapes = true;
+                    }
+                }
+                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                    if mentions(place) {
+                        escapes = true;
+                    }
+                }
+                Rvalue::Aggregate(_, operands) => {
+                    if operands
+                        .iter()
+                        .any(|o| o.place().as_ref().is_some_and(mentions))
+                    {
+                        escapes = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(terminator) = &data.terminator
+            && let TerminatorKind::Call {
+                args, destination, ..
+            } = &terminator.kind
+        {
+            if args.iter().any(|argument| {
+                argument.node.place().is_some_and(|place| {
+                    place.projection.is_empty() && block.contains(&place.local)
+                })
+            }) {
+                escapes = true;
+            }
+            if destination.local == RETURN_PLACE && block.contains(&destination.local) {
+                escapes = true;
+            }
+        }
+    }
+    !escapes && !block.contains(&RETURN_PLACE)
+}
+
 fn provenance_ancestors(
     aliases: &[(Local, Local, RetentionStep)],
     root: Local,
@@ -2269,6 +2407,7 @@ fn collect_retention_facts<'tcx>(
         retains: Vec::new(),
         unknowns: BTreeMap::new(),
         frame_bounded: Vec::new(),
+        retains_into_fresh_allocation: Vec::new(),
         dependencies: Vec::new(),
     };
     for record in children {
@@ -2491,6 +2630,21 @@ fn collect_retention_facts<'tcx>(
                         container: storage_root,
                         callees,
                     });
+                }
+                // R477-4b: the callee-side half — this store puts the
+                // parameter's provenance into a fresh allocation that escapes
+                // only back into the parameter, so a caller that bounds the
+                // parameter's container bounds this too.
+                if !output_storage
+                    && let Some(index) = argument_index
+                    && retains_only_into_a_fresh_allocation(
+                        tcx,
+                        body,
+                        Local::from_usize(index + 1),
+                        storage_root,
+                    )
+                {
+                    facts.retains_into_fresh_allocation.push(step.clone());
                 }
                 facts.retains.push(step.clone());
                 facts.unknowns.entry(reason).or_default().push(step);
@@ -2943,6 +3097,7 @@ fn direct_verdict(facts: &RetentionBodyFacts, attested: bool) -> RetentionVerdic
 fn frame_bounded_discharge(
     facts: &RetentionBodyFacts,
     rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
+    all: &FxHashMap<(LocalDefId, usize), RetentionBodyFacts>,
 ) -> Option<String> {
     if facts.retains.is_empty() || facts.argument_index.is_none() {
         return None;
@@ -2962,6 +3117,16 @@ fn frame_bounded_discharge(
         for &(callee, argument) in &bounded.callees {
             match rows.get(&(callee, argument)) {
                 Some(RetentionVerdict::NoRetain { .. }) => {}
+                // **R477-4b.** A retaining container callee is admissible when
+                // every one of its retaining steps stores into a fresh
+                // allocation that escapes only back into the container.
+                Some(RetentionVerdict::Retains { .. })
+                    if all.get(&(callee, argument)).is_some_and(|callee_facts| {
+                        !callee_facts.retains.is_empty()
+                            && callee_facts.retains.iter().all(|step| {
+                                callee_facts.retains_into_fresh_allocation.contains(step)
+                            })
+                    }) => {}
                 _ => return None,
             }
             callees.push(format!("{}:arg{argument}", callee.local_def_index.as_u32()));
@@ -3018,7 +3183,7 @@ fn evaluate_retention(
             // address is certified no-retain at that position (clause (3),
             // decided here because it needs the other rows). Unknown or
             // retaining callee ⇒ no discharge and the hold stands.
-            let frame_bounded = frame_bounded_discharge(fact, &previous);
+            let frame_bounded = frame_bounded_discharge(fact, &previous, facts);
             let next = if let Some(receipt) = frame_bounded {
                 RetentionVerdict::NoRetain {
                     certificate: RetentionCertificate {
