@@ -545,6 +545,35 @@ impl Uses<'_, '_> {
         }
     }
 
+    /// **The `let` form of the peer relation** (R478-5). `let base_ip = input;`
+    /// binds a SECOND cursor over the same base — brotli's two-pass terminal —
+    /// and the destination is this family's own candidate, so it owns its
+    /// constructor (`base()`'s parent-cursor arm renders it as the bare name,
+    /// the shared wrapper being `Copy`) and this use needs no edit. Exactly the
+    /// assignment form (`data = start`) one statement shape over.
+    fn let_bound_peer(&self, e: &hir::Expr<'_>) -> Option<hir::HirId> {
+        if self.subject.mutable || self.optional {
+            return None;
+        }
+        let hir::Node::LetStmt(stmt) = self.ctx.tcx.parent_hir_node(e.hir_id) else {
+            return None;
+        };
+        if stmt.init.map(|init| init.hir_id) != Some(e.hir_id) {
+            return None;
+        }
+        let hir::PatKind::Binding(_, destination, _, None) = stmt.pat.kind else {
+            return None;
+        };
+        (destination != self.subject.hir_id
+            && self.entries.iter().any(|(other, decision)| {
+                other.fn_did == self.subject.fn_did
+                    && other.hir_id == destination
+                    && !other.mutable
+                    && candidate_shape(self.ctx, other, decision)
+            }))
+        .then_some(destination)
+    }
+
     /// **W-CUR-LOCAL.** The bare subject initialises an unannotated local whose
     /// SINGLE use is a deref read (`let fresh = p; … *fresh`, urlparser
     /// `strrwd`'s idiom). That copy is not a second cursor and needs no base of
@@ -1329,7 +1358,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             } else {
                 self.assigned_to_shared_peer(e)
             };
-            match assigned_to_peer {
+            match assigned_to_peer.or_else(|| self.let_bound_peer(e)) {
                 Some(peer) => self.peer_cursors.push(peer),
                 None => match self.ephemeral_copy(e) {
                     Some((destination, access)) => {

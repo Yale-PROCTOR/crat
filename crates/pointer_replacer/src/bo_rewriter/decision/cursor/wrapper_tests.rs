@@ -1573,11 +1573,10 @@ fn table_decision(name: &str, parameter: &str) -> Decision {
 #[test]
 #[ignore = "needs nested's N2 admission and main's ctx_of re-parameterisation (R452-6 (b))"]
 fn n2_seams_a_cursor_row_onto_the_delivered_inner_slice() {
-    let inputs = table_decision(CURSOR, "inputs");
-    assert!(
-        matches!(inputs, Decision::NestedSlice { .. }),
-        "the table of a cursor row still delivers: {inputs:?}"
-    );
+    // The decision frame is REPORTED, never gated (nested 013 STOP 3 / R478-5):
+    // a first assertion on the frame masks everything downstream, so the
+    // emitted text is what this witness fails on.
+    println!("N2-FRAME inputs = {:?}", table_decision(CURSOR, "inputs"));
     let source = nested_seam_emitted();
     let body = region(source, "ti_sma_cursor");
     assert!(
@@ -1741,5 +1740,42 @@ pub unsafe fn caller(base: &[i32]) -> i32 { scan(base.as_ptr(), 3) }
         cursor_dispositions(input),
         vec![("scan::p".to_owned(), "Err(UseUnbuilt)".to_owned())],
         "an annotated copy must not admit"
+    );
+}
+
+/// **W-CUR-PEER-LET** — `let base_ip = ip;` binds a second cursor over the same
+/// base (brotli's two-pass terminal, report 040). The destination is this
+/// family's own candidate, so it owns its constructor — the shared wrapper is
+/// `Copy` — and the copy itself needs no edit, exactly as the assignment form
+/// `data = start` does one statement shape over.
+#[test]
+fn slicecursor_let_bound_peer_is_the_peers_own_constructor() {
+    let input = r#"
+pub unsafe fn walk(buf: &[u8], n: usize) -> u32 {
+    let mut ip: *const u8 = buf.as_ptr().add(4);
+    let base_ip = ip;
+    let mut total = 0u32;
+    let mut i = 0usize;
+    while i < n {
+        if ip >= base_ip { total += *ip as u32 + *base_ip.offset(-1) as u32; }
+        ip = ip.offset(-1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let source = emitted(input);
+    save_fixture("peer-let", input, &source);
+    assert!(
+        source.contains("base_ip: crate::slice_cursor::SliceCursor<'_, u8> = ip;"),
+        "the peer's initialiser is not the bare cursor it copies: {source}"
+    );
+    assert!(
+        source.contains("slice_cursor::SliceCursor"),
+        "the pair did not deliver: {source}"
+    );
+    compile(
+        &source,
+        Some("fn main() { let b = [0u8, 1, 2, 3, 4, 5]; assert_eq!(unsafe { walk(&b, 3) }, 7); }"),
     );
 }
