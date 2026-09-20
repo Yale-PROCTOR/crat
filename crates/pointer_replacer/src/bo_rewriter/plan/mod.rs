@@ -5973,6 +5973,7 @@ mod tests {
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
+            licensed_lifts: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
@@ -6061,6 +6062,7 @@ mod tests {
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
+            licensed_lifts: Vec::new(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
             slice_input_companions: Default::default(),
             flexible_tails: Default::default(),
@@ -6141,6 +6143,7 @@ mod tests {
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
+            licensed_lifts: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             entries: vec![(

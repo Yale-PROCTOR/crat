@@ -1810,3 +1810,225 @@ fn ce_m07_an_aliased_pointee_still_reads_as_one_element() {
     assert!(source.contains("value: &mut binn"), "{source}");
     assert!(!source.contains("[binn]"), "{source}");
 }
+
+/// **W4-LIFT (R475-2, addendum 475) — the licensed-width caller lift.**
+///
+/// `BrotliUnalignedRead32(p: *const c_void)` reads FOUR bytes through its
+/// parameter, and wave-6b's region family types that parameter with the exact
+/// width (`void_region::licensed_width(.., 0) == Some(4)`). `HashBytesH40`
+/// hands it a THIN `*const uint8_t`, so the caller's one-element claim is
+/// walked off by four bytes and `held:local-callee-access-extent` holds it.
+/// The width is a count position of the callee parameter's own contract, and a
+/// stronger one (R408-1): it licenses the caller to take the slice form.
+const W4_LIFT_READ32: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type uint32_t = u32;
+pub type size_t = usize;
+static mut kHashMul32: uint32_t = 0x1e35a7bd as uint32_t;
+unsafe extern "C" fn BrotliUnalignedRead32(mut p: *const core::ffi::c_void) -> uint32_t {
+    return *(p as *const uint32_t);
+}
+unsafe extern "C" fn HashBytesH40(mut data: *const uint8_t) -> size_t {
+    let h = (BrotliUnalignedRead32(data as *const core::ffi::c_void)).wrapping_mul(kHashMul32);
+    return (h >> 32 as i32 - 15 as i32) as size_t;
+}
+"#;
+
+/// The SAME reason key, a different license: a `c_void` callee parameter that
+/// this family never typed. `ReadAt` casts its opaque parameter away and then
+/// OFFSETS it, so no region contract exists, `licensed_width` answers `None`,
+/// and the caller keeps the hold. (The corpus half of this control is the 121
+/// arithmetic rows and the 4 void rows outside `BrotliUnalignedRead32/64`.)
+const W4_LIFT_ARITHMETIC: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+unsafe extern "C" fn ReadAt(mut p: *const core::ffi::c_void, mut i: size_t) -> uint8_t {
+    let mut q: *const uint8_t = p as *const uint8_t;
+    return *q.offset(i as isize);
+}
+unsafe extern "C" fn HashBytesVoid(mut data: *const uint8_t) -> size_t {
+    return ReadAt(data as *const core::ffi::c_void, 2 as size_t) as size_t;
+}
+"#;
+
+/// The width WRITE mirror. wave-6b's seam reads a delivered slice at a width
+/// READ only (`region_from_slice`), so lifting the caller here would trade a
+/// held subject for a blocked seam; the lift refuses on the shape.
+const W4_LIFT_WRITE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type uint32_t = u32;
+pub type size_t = usize;
+unsafe extern "C" fn BrotliUnalignedWrite32(mut p: *mut core::ffi::c_void, mut v: uint32_t) {
+    *(p as *mut uint32_t) = v;
+}
+unsafe extern "C" fn PutBytesH40(mut out: *mut uint8_t, mut v: uint32_t) {
+    BrotliUnalignedWrite32(out as *mut core::ffi::c_void, v);
+}
+"#;
+
+fn table_of<T: Send>(
+    input: &str,
+    ask: impl Fn(&super::decision::DecisionTable) -> T + Sync,
+) -> Result<T, String> {
+    match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let (table, _) = super::decide_table_with_ctx(tcx)?;
+            Ok(ask(&table))
+        },
+    ) {
+        Ok(inner) => inner,
+        Err(why) => Err(format!("{why:?}")),
+    }
+}
+
+/// **W4L-1 — the lift fires, and the argument is bridged from the slice.**
+#[test]
+fn w4l01_a_licensed_width_lifts_the_thin_caller() {
+    let decisions = super::emit_tests::decisions_of(W4_LIFT_READ32);
+    let data = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "data" && *is_param)
+        .expect("W4L-1 data subject");
+    assert_eq!(data.2, "<emitted>", "{decisions:#?}");
+    let source = emitted(W4_LIFT_READ32);
+    assert!(source.contains("data: &[uint8_t]"), "{source}");
+    // wave-6b's `region_from_slice` arm: a CHECKED prefix of the delivered
+    // slice, and no fabricated extent anywhere at the site.
+    assert!(source.contains("&(data)[..4]"), "{source}");
+    assert!(!source.contains("from_raw_parts"), "{source}");
+}
+
+/// **W4L-2 — the receipt names the width, the callee and the position.**
+#[test]
+fn w4l02_the_lift_carries_a_typed_receipt() {
+    let receipts = table_of(W4_LIFT_READ32, |table| table.licensed_lifts.clone())
+        .expect("the fixture yields a table");
+    assert_eq!(receipts.len(), 1, "{receipts:#?}");
+    let receipt = &receipts[0];
+    assert!(receipt.subject.starts_with("HashBytesH40::"), "{receipt:?}");
+    assert!(
+        receipt.callee.ends_with("BrotliUnalignedRead32"),
+        "{receipt:?}"
+    );
+    assert_eq!(receipt.parameter_index, 0, "{receipt:?}");
+    assert_eq!(receipt.width_bytes, 4, "{receipt:?}");
+    assert!(
+        !receipt.mutable,
+        "a width READ lifts to a shared slice: {receipt:?}"
+    );
+}
+
+/// **W4L-3 (control) — my entries-shaped twin agrees with wave-6b's export.**
+///
+/// The lift runs inside `decide`, where no `DecisionTable` exists, so
+/// [`decision::licensed_lift::callee_region`] asks `void_region::parameter`'s
+/// three questions over `entries`. This pins the two together: the width the
+/// receipt carries is the width the export answers with.
+#[test]
+fn w4l03_the_twin_agrees_with_the_export() {
+    let (exported, receipt_width) = table_of(W4_LIFT_READ32, |table| {
+        let exported = table.entries.iter().find_map(|(subject, _)| {
+            subject
+                .label
+                .starts_with("BrotliUnalignedRead32::")
+                .then(|| super::decision::void_region::licensed_width(table, subject.fn_did, 0))
+        });
+        (
+            exported.flatten(),
+            table.licensed_lifts.first().map(|lift| lift.width_bytes),
+        )
+    })
+    .expect("the fixture yields a table");
+    assert_eq!(exported, Some(4), "the export's own answer");
+    assert_eq!(receipt_width, exported, "the twin must not drift");
+}
+
+/// **W4L-4 (control) — no region, no lift.** Pointer arithmetic in the callee
+/// licenses no width, so the caller keeps the hold.
+#[test]
+fn w4l04_an_untyped_void_callee_licenses_nothing() {
+    let decisions = super::emit_tests::decisions_of(W4_LIFT_ARITHMETIC);
+    let data = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "data" && *is_param)
+        .expect("W4L-4 data subject");
+    assert_eq!(data.2, "held:local-callee-access-extent", "{decisions:#?}");
+    let receipts = table_of(W4_LIFT_ARITHMETIC, |table| table.licensed_lifts.len())
+        .expect("the fixture yields a table");
+    assert_eq!(receipts, 0, "no width, no receipt");
+}
+
+/// **W4L-5 (control) — the width WRITE mirror is refused on the shape.**
+#[test]
+fn w4l05_a_width_write_is_not_lifted() {
+    let source = emitted(W4_LIFT_WRITE);
+    assert!(!source.contains("out: &mut [uint8_t]"), "{source}");
+    let receipts = table_of(W4_LIFT_WRITE, |table| table.licensed_lifts.len())
+        .expect("the fixture yields a table");
+    assert_eq!(
+        receipts, 0,
+        "the seam reads a delivered slice at a READ only"
+    );
+}
+
+/// A caller that is ALREADY fat: it indexes its own parameter against a length
+/// companion, so the slice form is its own route's and the lift has nothing to
+/// license. The subject still delivers — by the ladder, with no receipt of
+/// mine.
+const W4_LIFT_FAT_CALLER: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type uint32_t = u32;
+pub type size_t = usize;
+unsafe extern "C" fn BrotliUnalignedRead32(mut p: *const core::ffi::c_void) -> uint32_t {
+    return *(p as *const uint32_t);
+}
+unsafe extern "C" fn HashBytesFat(mut data: *const uint8_t, mut n: size_t) -> size_t {
+    let mut acc: size_t = 0;
+    let mut i: size_t = 0;
+    while i < n {
+        acc = acc.wrapping_add(*data.offset(i as isize) as size_t);
+        i = i.wrapping_add(1 as size_t);
+    }
+    return acc.wrapping_add(BrotliUnalignedRead32(data as *const core::ffi::c_void) as size_t);
+}
+"#;
+
+/// A caller with a use that has no slice image (`data as size_t`). `&[T]`
+/// changes the type at every occurrence, so lifting this one would yield an
+/// ill-typed crate; the lift refuses on the same rule the slice ladder applies.
+const W4_LIFT_UNSUPPORTED_USE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type uint32_t = u32;
+pub type size_t = usize;
+unsafe extern "C" fn BrotliUnalignedRead32(mut p: *const core::ffi::c_void) -> uint32_t {
+    return *(p as *const uint32_t);
+}
+unsafe extern "C" fn HashBytesAddr(mut data: *const uint8_t) -> size_t {
+    let mut n: size_t = data as size_t;
+    return (BrotliUnalignedRead32(data as *const core::ffi::c_void) as size_t).wrapping_add(n);
+}
+"#;
+
+/// **W4L-6 (control) — an already-fat caller is not the lift's.**
+#[test]
+fn w4l06_an_already_fat_caller_is_untouched() {
+    let receipts = table_of(W4_LIFT_FAT_CALLER, |table| table.licensed_lifts.len())
+        .expect("the fixture yields a table");
+    assert_eq!(receipts, 0, "the fat caller carries its own extent");
+}
+
+/// **W4L-7 (control) — a use with no slice image refuses the lift.**
+#[test]
+fn w4l07_an_unsupported_use_refuses_the_lift() {
+    let receipts = table_of(W4_LIFT_UNSUPPORTED_USE, |table| table.licensed_lifts.len())
+        .expect("the fixture yields a table");
+    assert_eq!(receipts, 0, "a subject with no slice image is not lifted");
+    let source = emitted(W4_LIFT_UNSUPPORTED_USE);
+    assert!(!source.contains("data: &[uint8_t]"), "{source}");
+}

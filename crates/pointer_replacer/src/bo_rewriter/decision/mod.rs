@@ -65,6 +65,7 @@ pub(crate) mod field_reference;
 pub(crate) mod flexible_tail;
 pub(crate) mod interface;
 pub(crate) mod io_domain;
+pub(crate) mod licensed_lift;
 pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
@@ -1061,6 +1062,9 @@ pub(crate) struct DecisionTable {
     /// Contract-driven slice promotions, keyed by the exact compiler subject.
     pub(crate) contract_extent_promotions:
         FxHashMap<(LocalDefId, rustc_hir::HirId), contract_extent::Promotion>,
+    /// **W4-LIFT (R475-2)** — one receipt per caller lifted by an exact
+    /// licensed width, so the count is auditable at the census.
+    pub(crate) licensed_lifts: Vec<licensed_lift::LiftReceipt>,
     /// wave-6f: the finalized struct-field reference transactions.
     pub field_transactions: field_reference::FieldTransactions,
     /// **R425-3 (wave-5c).** For a parameter the reader chain decided `Slice`
@@ -1251,6 +1255,10 @@ pub(crate) fn decide_with_raw_fallbacks(
     option::inherit_wrapped_payloads(ctx, &mut entries);
     construction_values::settle(ctx, &mut entries);
     let cursor_receipts = cursor_native::promote(ctx, &mut entries);
+    // W4-LIFT (R475-2): a held caller whose callee parameter carries wave-6b's
+    // EXACT licensed width takes the slice form. After the other promotes, so a
+    // subject another family has already re-typed is not a candidate.
+    let licensed_lifts = licensed_lift::promote(ctx, &mut entries);
     cursor_native::observe(ctx, &entries, &cursor_receipts);
     let contract_extent_promotions = entries
         .iter()
@@ -1366,6 +1374,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         option_mut_bindings,
         option_composed_uses: Vec::new(),
         contract_extent_promotions,
+        licensed_lifts,
         field_transactions: Default::default(),
         slice_input_companions: Default::default(),
     }
@@ -2937,6 +2946,7 @@ mod self_consistency_tests {
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
+            licensed_lifts: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             entries: entries
