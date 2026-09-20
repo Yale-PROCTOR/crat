@@ -189,10 +189,21 @@ fn w6b_unaligned_read32_delivers_as_a_byte_slice() {
         flat.contains("uint32_t::from_ne_bytes([p[0],p[1],p[2],p[3]])"),
         "the read is a from_ne_bytes over the slice: {source}"
     );
+    // **Re-premised by wave-4's W4-LIFT (R475-2), disclosed in wave-4 report
+    // 038.** Until that lift the caller stayed THIN and the seam fabricated the
+    // reader's width from a one-element claim
+    // (`from_raw_parts((data as *const c_void) as *const u8, 4)`). The exact
+    // width this family exports now licenses the caller's own slice form, so
+    // the bridge is the `region_from_slice` arm below — a CHECKED prefix of a
+    // delivered slice, with no raw pointer in between. The width is still the
+    // reader's four bytes; what changed is that nothing fabricates it.
     assert!(
-        flat.contains("from_raw_parts((data as*constcore::ffi::c_void)as*constu8,4)")
-            || flat.contains("from_raw_parts(((dataas*constcore::ffi::c_void)as*constu8),4)"),
-        "the thin-source caller bridges with the reader's width: {source}"
+        flat.contains("BrotliUnalignedRead32(&(data)[..4])"),
+        "the delivered-slice caller bridges as a checked prefix: {source}"
+    );
+    assert!(
+        !flat.contains("from_raw_parts"),
+        "and nothing fabricates a view from a one-element claim: {source}"
     );
     assert!(
         !source.contains("FALLBACK_SLICE_EXTENT"),

@@ -435,7 +435,19 @@ fn wave6s_computed_view_refuses_non_argument_consumers() {
     );
     let source = emit(&copied);
     assert!(super::verify::type_checks_str(&source), "{source}");
-    assert!(source.contains("data: *const u8"), "{source}");
+    // **Re-premised by wave-4's W4-LIFT (R475-2), disclosed in wave-4 report
+    // 038.** The callee is lifted to the slice form by its own callee's exact
+    // licensed width, and `StoreH2`'s parameter follows it, so the old
+    // `data: *const u8` no longer states this control's claim. The claim
+    // itself is unchanged and is asserted directly: the arithmetic copied into
+    // a local is NOT a view, so it does not reach the argument as
+    // `&(data)[..]` — it goes through the local, and the bridge at the call is
+    // the §77 fallback with its receipt.
+    assert!(!source.contains("HashBytesH2((&(data)["), "{source}");
+    assert!(
+        source.contains("let q = (&(data)[(ix & mask)..]).as_ptr();"),
+        "{source}"
+    );
     // A borrowed element bound to a local, not passed on.
     let bound = STOREH2.replace(
         "let key = HashBytesH2(&*data.offset((ix & mask) as isize));",
@@ -443,7 +455,7 @@ fn wave6s_computed_view_refuses_non_argument_consumers() {
     );
     let source = emit(&bound);
     assert!(super::verify::type_checks_str(&source), "{source}");
-    assert!(source.contains("data: *const u8"), "{source}");
+    assert!(!source.contains("HashBytesH2((&(data)["), "{source}");
 }
 
 /// A signed delta is the bidirectional family's (R394-2): no view.
@@ -484,9 +496,19 @@ fn wave6s_storeh2_computed_subview_argument() {
     println!("EMITTED {source}");
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(source.contains("data: &[u8]"), "{source}");
+    // **Re-premised by wave-4's W4-LIFT (R475-2), disclosed in wave-4 report
+    // 038.** `HashBytesH2` hands its own parameter to `BrotliUnalignedRead64`,
+    // whose region contract carries an exact eight-byte width, so that callee
+    // is no longer raw: it takes the slice form and the suffix view is passed
+    // WHOLE, with no `as_ptr()` downgrade in between. The view itself is
+    // unchanged — this is the same computed sub-view, one raw bridge shorter.
     assert!(
-        source.contains("HashBytesH2((&(data)[(ix & mask)..]).as_ptr())"),
-        "the suffix view bridges at the raw callee: {source}"
+        source.contains("HashBytesH2((&(data)[(ix & mask)..]))"),
+        "the suffix view is passed whole to a lifted callee: {source}"
+    );
+    assert!(
+        !source.contains(".as_ptr())"),
+        "and the raw downgrade is gone: {source}"
     );
 }
 

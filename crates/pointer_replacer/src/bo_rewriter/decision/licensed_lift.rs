@@ -48,7 +48,7 @@ use rustc_hash::FxHashMap;
 use rustc_hir::{HirId, def_id::LocalDefId};
 
 use super::{
-    Ctx, Decision, DegradeReason, Subject, SubjectKind,
+    Ctx, Decision, DegradeReason, Subject, SubjectKind, local_callee_extent,
     void_region::{Region, Shape},
 };
 
@@ -81,10 +81,49 @@ fn callee_region<'a>(
     entries.iter().find_map(|(subject, decision)| {
         (subject.fn_did == callee
             && matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == index)
-            && matches!(decision, Decision::Slice { .. }))
+            && delivers_slice(decision))
         .then(|| ctx.void_region.get(&(subject.fn_did, subject.hir_id)))
         .flatten()
     })
+}
+
+/// Did the callee parameter deliver as the slice form this family emits under?
+///
+/// Exhaustive on purpose, and for the reason the import denylist enforces: a
+/// `matches!` would compile clean against a new disposition and lift a caller
+/// into a callee whose form nobody checked. The twin of
+/// [`super::void_region::decided_slice`], which asks the same question of the
+/// finished table.
+fn delivers_slice(decision: &Decision) -> bool {
+    match decision {
+        Decision::Slice { .. } => true,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Cursor { .. }
+        | Decision::Degraded(_) => false,
+    }
+}
+
+/// The hold this lift answers, if this is that hold.
+///
+/// Exhaustive for the same reason as [`delivers_slice`].
+fn held_at_a_local_callee(decision: &Decision) -> Option<&local_callee_extent::LocalCalleeAccess> {
+    match decision {
+        Decision::Degraded(record) => match &record.reason {
+            DegradeReason::LocalCalleeAccessExtent { access, .. } => Some(access),
+            _ => None,
+        },
+        Decision::Slice { .. }
+        | Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Cursor { .. } => None,
+    }
 }
 
 /// Would this subject's slice form be well typed at every one of its uses?
@@ -118,12 +157,7 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
     let widths: FxHashMap<(LocalDefId, HirId), (u64, bool, String, usize)> = entries
         .iter()
         .filter_map(|(subject, decision)| {
-            let Decision::Degraded(record) = decision else {
-                return None;
-            };
-            let DegradeReason::LocalCalleeAccessExtent { access, .. } = &record.reason else {
-                return None;
-            };
+            let access = held_at_a_local_callee(decision)?;
             // Already fat: the hold is about a one-element claim, and this
             // subject does not make one.
             if ctx.fat.is_array(subject.fn_did, subject.local) {

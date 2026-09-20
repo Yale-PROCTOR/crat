@@ -11964,25 +11964,49 @@ fn rb_x3_family_contracts_reach_the_shared_emission_path() {
 }
 
 /// R364-2 / R365-1 RED (i): **a one-byte reborrow into a four-byte reader is
-/// held.** The brotli shape, minimised — `Hash14(data: &uint8_t)` bridging into
+/// held — unless the reader's width is LICENSED.** The brotli shape, minimised
+/// — `Hash14(data: &uint8_t)` bridging into
 /// `BrotliUnalignedRead32(p: *const c_void)` whose body is
 /// `*(p as *const uint32_t)`. The reader's own parameter is held
 /// `held:void-pointee` by R271-1; what this witness is for is the CALLER, whose
 /// thin one-element claim the reader walks off.
+///
+/// **Re-premised by wave-4's W4-LIFT (R475-2), disclosed in wave-4 report 038.**
+/// wave-6b's region family now types that exact reader parameter with its four
+/// bytes, and an exact licensed width answers the question this hold asks — so
+/// the caller is LIFTED to the slice form instead of being held. The hold
+/// itself is unchanged and is asserted on the second shape below, where the
+/// callee casts its opaque parameter away and then offsets it: no region, no
+/// width, no licence, and the caller stays held.
 #[test]
 fn r364_2_a_one_byte_reborrow_into_a_four_byte_reader_is_held() {
-    let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+    let licensed = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
                pub unsafe fn read32(p: *const core::ffi::c_void) -> u32 {\n\
                    *(p as *const u32)\n\
                }\n\
                pub unsafe fn hash(data: *const u8) -> u32 {\n\
                    read32(data as *const core::ffi::c_void)\n\
                }\n";
-    let got = decisions_of(src);
+    let got = decisions_of(licensed);
+    assert_eq!(
+        reason_of(&got, "data", true),
+        "<emitted>",
+        "an EXACT licensed width lifts the caller instead of holding it: {got:?}"
+    );
+    let unlicensed = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+               pub unsafe fn read_at(p: *const core::ffi::c_void, i: usize) -> u8 {\n\
+                   let q: *const u8 = p as *const u8;\n\
+                   *q.offset(i as isize)\n\
+               }\n\
+               pub unsafe fn hash(data: *const u8) -> u8 {\n\
+                   read_at(data as *const core::ffi::c_void, 2usize)\n\
+               }\n";
+    let got = decisions_of(unlicensed);
     let reason = reason_of(&got, "data", true);
     assert!(
         reason.starts_with("held:local-callee-access-extent"),
-        "a four-byte read through a one-byte claim must be held: {got:?}"
+        "a read past one element through a one-byte claim, with no licensed \
+         width, must be held: {got:?}"
     );
 }
 
