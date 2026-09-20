@@ -1388,3 +1388,58 @@ fn wave6s_array_local_root_is_not_yet_a_view_root() {
         .unwrap_or_else(|| panic!("{rows:?}"));
     assert_eq!(reason, "slice-use-unsupported", "{rows:?}");
 }
+
+/// **The doubled view (R475-3), as a REPRODUCTION rather than a guess.**
+///
+/// brotli emits `(histograms[(i) as usize].data_).as_ptr().as_ptr()` for the input
+/// `&*((*histograms.offset(i)).data_).as_ptr().offset(0)` — `data_` is a fixed array, so
+/// the FIRST `as_ptr()` is c2rust's own decay and is correct; a second one lands on the
+/// `*const u32` it produced. This is the smallest shape that carries all three features:
+/// a delivered slice parameter, indexed; a fixed-array field on the element; and the
+/// W-C6 `&*….as_ptr().offset(0)` idiom over that field.
+#[test]
+fn r475_3_the_doubled_view_reproduced() {
+    let source = emit(DOUBLED_VIEW);
+    println!("EMITTED {source}");
+    // The defect is not one spelling: brotli renders `.as_ptr().as_ptr()` and this
+    // fixture `.as_ptr().as_mut_ptr().cast::<u32>().cast_const()`. The PROPERTY is a
+    // raw-producing view applied to a receiver that already produced a raw pointer --
+    // the W-C6 operand `(place).as_ptr()` is `*const u32` before anything is appended.
+    for doubled in [
+        ".as_ptr().as_ptr()",
+        ".as_ptr().as_mut_ptr()",
+        ".as_mut_ptr().as_ptr()",
+        ".as_mut_ptr().as_mut_ptr()",
+    ] {
+        assert!(
+            !source.contains(doubled),
+            "a view was emitted over a receiver that had already produced one \
+             ({doubled}):\n{source}"
+        );
+    }
+}
+
+const DOUBLED_VIEW: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ #[derive(Copy, Clone)]
+ #[repr(C)]
+ pub struct Histogram { pub data_: [u32; 4], pub total_: usize }
+ unsafe extern "C" {
+    // FOREIGN: the position can never be delivered, so `expected` stays Raw and the
+    // bridge must go slice -> raw. That is brotli's direction; a local callee converts
+    // and the bridge goes the other way, which is why the first fixture missed.
+    fn consume(counts: *const u32, n: usize) -> u32;
+ }
+ pub unsafe fn drive(mut histograms: *mut Histogram, n: usize) -> u32 {
+    let mut total: u32 = 0;
+    let mut i: usize = 0;
+    while i < n {
+        total = total.wrapping_add(consume(
+            &*((*histograms.offset(i as isize)).data_).as_ptr().offset(0 as isize),
+            4,
+        ));
+        i = i.wrapping_add(1);
+    }
+    return total;
+ }
+"#;

@@ -749,6 +749,72 @@ impl BodyFacts<'_, '_> {
     }
 }
 
+/// R475-3, for the sites that already carry the resolved operand span: the recorded type
+/// follows the ADAPTER OPERAND, so the form and the text the bridge renders describe the
+/// same expression. When the operand is the whole argument nothing changes.
+fn operand_source_type_ty<'tcx>(
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    arg: &'tcx Expr<'tcx>,
+    whole: rustc_middle::ty::Ty<'tcx>,
+    operand: Span,
+) -> String {
+    fn find<'tcx>(e: &'tcx Expr<'tcx>, want: Span) -> Option<&'tcx Expr<'tcx>> {
+        if e.span == want {
+            return Some(e);
+        }
+        match &e.kind {
+            ExprKind::Unary(_, inner)
+            | ExprKind::AddrOf(_, _, inner)
+            | ExprKind::Cast(inner, _)
+            | ExprKind::DropTemps(inner) => find(inner, want),
+            ExprKind::MethodCall(_, receiver, _, _) => find(receiver, want),
+            ExprKind::Field(base, _) | ExprKind::Index(base, _, _) => find(base, want),
+            _ => None,
+        }
+    }
+    if operand != arg.span
+        && let Some(expr) = find(arg, operand)
+    {
+        return format!("{:?}", typeck.expr_ty(expr));
+    }
+    format!("{whole:?}")
+}
+
+/// **R475-3 — the doubled view.** When the adapter operand is a W-C6 array start, the
+/// text the bridge renders over is `A.as_ptr()`, which is ALREADY a raw pointer, while
+/// `expr_ty(arg)` describes the whole `&*A.as_ptr().offset(0)` — a reference. The form
+/// was derived from one expression and the text taken from the other, so a position
+/// needing a raw pointer rendered a SECOND view onto a receiver that had already produced
+/// one (brotli `BuildAndStoreHuffmanTree` ×3: `(h[i].data_).as_ptr().as_ptr()`).
+///
+/// The recorded type follows the operand, so the form and the text describe the same
+/// expression. Every other shape keeps the whole argument's type, unchanged.
+fn operand_source_type<'tcx>(
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    arg: &'tcx Expr<'tcx>,
+    operand: Option<Span>,
+) -> String {
+    fn find<'tcx>(e: &'tcx Expr<'tcx>, want: Span) -> Option<&'tcx Expr<'tcx>> {
+        if e.span == want {
+            return Some(e);
+        }
+        match &e.kind {
+            ExprKind::Unary(_, inner)
+            | ExprKind::AddrOf(_, _, inner)
+            | ExprKind::Cast(inner, _)
+            | ExprKind::DropTemps(inner) => find(inner, want),
+            ExprKind::MethodCall(_, receiver, _, _) => find(receiver, want),
+            ExprKind::Field(base, _) | ExprKind::Index(base, _, _) => find(base, want),
+            _ => None,
+        }
+    }
+    let expr = operand
+        .filter(|operand| *operand != arg.span)
+        .and_then(|operand| find(arg, operand))
+        .unwrap_or(arg);
+    format!("{:?}", typeck.expr_ty(expr))
+}
+
 impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
     fn visit_stmt(&mut self, stmt: &'tcx rustc_hir::Stmt<'tcx>) {
         if wave2_body_owner(self.tcx, self.fn_did)
@@ -966,7 +1032,12 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                             root: shape.place_root(),
                             root_through_deref,
                             shape: shape.key(),
-                            source_type: format!("{source_ty:?}"),
+                            source_type: operand_source_type_ty(
+                                typeck,
+                                arg,
+                                source_ty,
+                                adapter_operand_span,
+                            ),
                             target,
                             direct_storage: direct_mutable_storage(arg),
                             adapter_operand_span,
@@ -1045,7 +1116,11 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             index,
                                             span: arg.span,
                                             shape,
-                                            source_type: format!("{:?}", typeck.expr_ty(arg)),
+                                            source_type: operand_source_type(
+                                                typeck,
+                                                arg,
+                                                array_start.as_ref().map(|s| s.operand),
+                                            ),
                                             target,
                                             direct_storage: direct_mutable_storage(arg),
                                             adapter_operand_span,
@@ -1186,7 +1261,12 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 }),
                                 root_through_deref,
                                 shape: shape.key(),
-                                source_type: format!("{source_ty:?}"),
+                                source_type: operand_source_type_ty(
+                                    typeck,
+                                    arg,
+                                    source_ty,
+                                    adapter_operand_span,
+                                ),
                                 target,
                                 direct_storage: direct_mutable_storage(arg),
                                 adapter_operand_span,
