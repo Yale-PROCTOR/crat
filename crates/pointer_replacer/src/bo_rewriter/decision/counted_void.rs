@@ -1057,6 +1057,17 @@ fn disjoint_roots<'tcx>(
     left: &'tcx Expr<'tcx>,
     right: &'tcx Expr<'tcx>,
 ) -> bool {
+    // **R475-6.** A null pointer has no pointee, so nothing can alias it: a
+    // null-literal operand is disjoint from every other operand, whatever their
+    // roots. Without this, a C API that pads its out-parameters with nulls —
+    // binn's `IsValidBinnHeader(pbuf, &mut type_0, 0 as *mut c_int, …)` — looks
+    // to the raw-sibling test like a pointer that might alias the counted
+    // position, because `value_root` answers `Opaque` for `0 as *mut T` and the
+    // match below folds `Opaque` to "not disjoint". `is_null_literal` already
+    // exists for the contract side; this is its second reader.
+    if is_null_literal(left) || is_null_literal(right) {
+        return true;
+    }
     let facts = LocalFacts::collect(tcx, caller);
     let is_param = |id: HirId| {
         tcx.hir_body_owned_by(caller)

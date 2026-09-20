@@ -1731,6 +1731,84 @@ pub unsafe fn copy_be32(mut pdest: *mut u32, mut psource: *mut u32) {
     );
 }
 
+/// **R475-6 — a null-literal argument is not a raw sibling.** `disjoint_roots`
+/// ends in `_ => false`, and `value_root` answers `Opaque` for `0 as *mut T`,
+/// so a C API that pads its out-parameters with nulls looked to the `[only]`
+/// arm like a pointer that might alias the counted position. A null pointer has
+/// no pointee: nothing can alias it. binn's `IsValidBinnHeader(pbuf, &mut type_0,
+/// 0 as *mut c_int, 0 as *mut c_int, 0 as *mut c_int)` is the shape (report 035
+/// §4); this is its reduction.
+const NULL_SIBLING: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+pub unsafe fn read_header(mut pbuf: *mut core::ffi::c_void, mut ptype: *mut i32,
+    mut pcount: *mut i32) -> i32 {
+    let mut byte: u8 = 0;
+    if pbuf.is_null() { return 0; }
+    byte = *(pbuf as *mut u8);
+    if !ptype.is_null() { *ptype = byte as i32; }
+    // `pcount` stays analysis-raw (arithmetic on the parameter), so it is not
+    // excluded from the raw-sibling test by `parameter_converts` -- which is
+    // what makes the NULL literal at that position the deciding operand, as in
+    // binn's own `pheadersize`.
+    if !pcount.is_null() { *pcount.offset(0) = 1; KEEP = pcount; }
+    return 1;
+}
+pub static mut KEEP: *mut i32 = 0 as *mut i32;
+#[repr(C)]
+pub struct Hdr { pub magic: i32, pub kind: i32 }
+pub unsafe fn header_type(mut p: *mut core::ffi::c_void) -> i32 {
+    let mut item = 0 as *mut Hdr;
+    let mut type_0: i32 = 0;
+    if p.is_null() { return -1; }
+    // The caller stays RAW (it casts to a struct), so the call must BRIDGE --
+    // which is what puts the null-literal sibling in front of the raw-sibling
+    // test. binn's `binn_type` is this shape.
+    item = p as *mut Hdr;
+    if (*item).magic == 0x1f22b11f { return (*item).kind; }
+    if read_header(p, &mut type_0, 0 as *mut i32) == 0 { return 0; }
+    return type_0;
+}
+"#;
+
+#[test]
+fn w6v2_a_null_literal_sibling_does_not_block_the_view() {
+    let source = super::emit_tests::ast_emitted_source_of(NULL_SIBLING).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fnread_header(mutpbuf:&[u8]")
+            || c.contains("fnread_header(mutpbuf:Option<&[u8]>"),
+        "the counted parameter delivers: {source}"
+    );
+    assert!(
+        !source.contains("__crat_raw_read_header"),
+        "a null sibling must not push the call to the pristine twin: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// The control: a sibling that is a REAL pointer of unknown root still refuses —
+/// the narrowing is about null literals, not about raw siblings in general.
+#[test]
+fn w6v2_a_non_null_raw_sibling_still_refuses() {
+    let input = NULL_SIBLING
+        .replace(
+            "pub unsafe fn header_type(mut p: *mut core::ffi::c_void) -> i32 {",
+            "pub unsafe fn header_type(mut p: *mut core::ffi::c_void, mut other: *mut i32) -> i32 {",
+        )
+        .replace(
+            "if read_header(p, &mut type_0, 0 as *mut i32) == 0 { return 0; }",
+            "if read_header(p, &mut type_0, other) == 0 { return 0; }",
+        );
+    assert_ne!(input, NULL_SIBLING);
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        source.contains("__crat_raw_read_header")
+            || source.contains("pbuf: *mut core::ffi::c_void"),
+        "an unprovable raw sibling keeps the raw form: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
 /// **R471-5 — the counted snapshot must compose with the Option family's
 /// call reborrow.** binn's `binn_get_str` reads its own subject TWICE inside
 /// one counted call's argument list (`copy_int_value((*value).ptr, .., (*value).type_0, ..)`),
