@@ -3,7 +3,7 @@
 //! `*const u8` formal whose only derivations are core `offset`s read through
 //! (`BrotliUnalignedRead64`); the callee's out-param carries a pointer field
 //! so it "may yield a pointer" and the write-through arm is exercised.
-const STATIC_DICT: &str = r#"
+pub(crate) const STATIC_DICT: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
 use core::ffi::c_void;
 pub struct Words { offsets: [u32; 4], data: *const u8 }

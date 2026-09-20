@@ -137,9 +137,20 @@ fn wave6r_address_handed_to_an_unmodeled_foreign_callee_is_refused_by_the_scan()
 
 /// The site the extension is for: the shared `data` at a raw formal of a
 /// callee that only reads it through such an address.
-#[test]
-fn wave6r_address_under_an_alias_site_delivers() {
-    let (rows, inner) = ::utils::compilation::run_compiler_on_str(STORE, |tcx| {
+/// The dichotomy (relay wave-6r/032, R478-5). The chain's delivery depends on
+/// whether a masked companion licenses the extent, and BOTH arms are pinned
+/// here so neither is frame-dependent:
+///
+///   * masked (`data.offset(ix & mask)`, wave-5c's R477-6 rule): the subject
+///     becomes a `Slice` and the site takes `slice-to-raw-const`;
+///   * unmasked (`data.offset(ix)`): no extent is licensed, the subject stays
+///     raw, and the address-under-an-alias evidence this lane owns delivers
+///     the read-through row.
+///
+/// In both arms the invariant the build owns holds: NO position of the chain
+/// is held by the child walk.
+fn chain_rows(input: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
@@ -150,43 +161,75 @@ fn wave6r_address_under_an_alias_site_delivers() {
         .expect("native decisions");
         let rows = ctx.raw_boundary.receipts_tsv();
         println!("DISPOSITIONS\n{rows}");
-        println!("RETENTION\n{}", ctx.retention.to_tsv());
-        let pick = |caller: &str, callee: &str| {
-            rows.lines()
-                .filter(|line| {
-                    line.starts_with(&format!("{caller}\t"))
-                        && line.contains(&format!("\t{callee}\t"))
-                })
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        };
-        (
-            pick("store_range", "store_h35\t1"),
-            pick("store_h3", "hash_bytes\t0"),
-        )
+        rows.lines()
+            .filter(|line| line.contains("\tstore_h35\t1\t") || line.contains("\tstore_h3\t1\t"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
     })
-    .expect("input type-checks");
-    assert!(!rows.is_empty(), "the store_h35 site is inventoried");
-    assert!(!inner.is_empty(), "the hash_bytes site is inventoried");
-    // The invariant this build owns: NO position of the chain is held by the
-    // child walk any more. Which of the two sites carries the delivery is
-    // frame-dependent (R217-2(a)): on this frame the outer one does, on the
-    // batch-10 composition the subject of the outer one is degraded by
-    // `held:local-callee-access-extent` (another family) and the inner one
-    // delivers instead.
+    .expect("input type-checks")
+}
+
+fn child_walk_holds_nothing(rows: &[String]) {
     assert!(
         !rows
             .iter()
-            .chain(inner.iter())
             .any(|row| row.contains("write-through-shared-view")
                 || row.contains("raw-boundary-returned-child-permission")),
-        "the child walk holds nothing here: {rows:?} {inner:?}"
+        "the child walk holds nothing here: {rows:?}"
     );
+}
+
+#[test]
+fn wave6r_masked_companion_delivers_the_chain_as_a_slice() {
+    let rows = chain_rows(STORE);
+    assert!(!rows.is_empty(), "the store_h3 sites are inventoried");
+    child_walk_holds_nothing(&rows);
     assert!(
         rows.iter()
-            .chain(inner.iter())
-            .any(|row| row.contains("\tT1\t")),
-        "the read-through address delivers somewhere in the chain: {rows:?} {inner:?}"
+            .any(|row| row.contains("\tT1\t") && row.contains("slice-to-raw-const")),
+        "the masked companion licenses the extent and the subject delivers as a slice: {rows:?}"
+    );
+}
+
+/// The other arm, on a subject no extent rule can license: brotli's
+/// `SearchInStaticDictionary` shape, where the companion is a pointer LOADED
+/// from a field (`&*((*(*dictionary).words).data).offset(offset)`), so the
+/// subject stays raw and the address-under-an-alias evidence is what
+/// delivers the read-through row. (Removing the mask from `STORE` is NOT a
+/// control: the extent is licensed there anyway, measured.)
+#[test]
+fn wave6r_raw_subject_delivers_the_read_through_address() {
+    let rows = ::utils::compilation::run_compiler_on_str(
+        super::wave6r_static_dict_tests::STATIC_DICT,
+        |tcx| {
+            let (_, ctx) = super::super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::super::A5Mode::PreciseReplay,
+                    Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .expect("native decisions");
+            let rows = ctx.raw_boundary.receipts_tsv();
+            println!("DISPOSITIONS\n{rows}");
+            rows.lines()
+                .filter(|line| {
+                    line.contains("\ttest_item\t3\t") || line.contains("\tmatch_len\t0\t")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        },
+    )
+    .expect("input type-checks");
+    assert!(
+        !rows.is_empty(),
+        "the static-dictionary sites are inventoried"
+    );
+    child_walk_holds_nothing(&rows);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\tT1\t") && row.contains("ref-shared-to-raw-const")),
+        "the raw subject's read-through address delivers: {rows:?}"
     );
 }
 
