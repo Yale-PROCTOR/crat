@@ -1832,7 +1832,19 @@ enum CacheFrameAdmission {
 
 impl CacheFrameAdmission {
     fn admitted(self) -> bool {
-        matches!(self, Self::Frame | Self::FrameAbsent)
+        // **R477-5 route (A)** — `FrameAbsent` no longer admits. It used to, and the
+        // worker then walked on to a `load` that returned `None`, so the program ended
+        // `cache-gate-failed` / `data=false` and took the WHOLE census down with it.
+        // A program this frame cannot solve is now recorded with a typed status and
+        // EXCLUDED, so the run completes over the rest and NAMES the absent one.
+        matches!(self, Self::Frame)
+    }
+
+    /// Whether this admission means "excluded and named" rather than "failed".
+    /// Only `FrameAbsent` does: a `Miss` is a disagreement about a program this frame
+    /// DOES name, which is a failure and must stay one.
+    fn excluded(self) -> bool {
+        matches!(self, Self::FrameAbsent)
     }
 
     fn wire(self) -> &'static str {
@@ -12139,6 +12151,25 @@ mod run {
             }
         };
         row.set(raw_schema::CACHE_FRAME_ADMISSION, admission.wire());
+        // **R477-5 route (A)** — a program THIS frame does not name is excluded here,
+        // before any load is attempted, with a typed status and its name on the row.
+        // `data` is deliberately NOT set false: an excluded program is a named absence,
+        // not a corrupt measurement, and the census completes over the rest. A `Miss` is
+        // a different thing — this frame names the program at another fingerprint, which
+        // is a disagreement — and still falls through to the failure path below.
+        if admission.excluded() {
+            row.set(raw_schema::CODE_FRAME, &code_frame);
+            row.set(raw_schema::CACHE_STATUS, "frame-absent");
+            row.set(raw_schema::CACHE_FINGERPRINT, &fingerprint);
+            row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+            row.set(raw_schema::SOLVE_WALL_S, "0.000000");
+            row.set(raw_schema::STATUS, "frame-absent-excluded");
+            row.set(
+                "detail",
+                format!("{name}: this frame does not name the program; excluded and named"),
+            );
+            return row;
+        }
         let entry_available = match super::cache_only_before_solve(
             admission
                 .admitted()
@@ -23901,6 +23932,14 @@ fn raw_boundary_census_rows_have_data(
     attestation: &str,
 ) -> bool {
     for row in rows {
+        // **R477-5 route (A)** — a program this frame does not name is EXCLUDED, not
+        // failed: it carries a typed status and its own name, contributes nothing to any
+        // denominator, and does not make the run `data=false`. The exclusion is only ever
+        // reached when the frame is silent about the program; a `Miss` — this frame
+        // naming it at another fingerprint — is a disagreement and still fails.
+        if row.get(raw_schema::STATUS) == Some("frame-absent-excluded") {
+            continue;
+        }
         if raw_boundary_typed_failure(row)
             && (matches!(
                 row.get(raw_schema::STATUS),
@@ -24242,6 +24281,21 @@ fn raw_boundary_wave2_corpus_census() {
         return;
     }
     assert_eq!(rows.len(), 20);
+    // **R477-5 route (A)** — the excluded programs are NAMED, in the artifact set and on
+    // the aggregate row. An exclusion nobody can see is indistinguishable from a corpus
+    // that never had the program, which is the whole reason the route was a ruling.
+    let frame_absent = rows
+        .iter()
+        .filter(|row| row.get(raw_schema::STATUS) == Some("frame-absent-excluded"))
+        .filter_map(|row| row.get("program").map(str::to_owned))
+        .collect::<Vec<_>>();
+    if !frame_absent.is_empty() {
+        fs::write(
+            artifact_dir.join("frame-absent-excluded.txt"),
+            format!("{}\n", frame_absent.join("\n")),
+        )
+        .expect("write the frame-absent exclusions");
+    }
     if !raw_boundary_census_rows_have_data(&rows, diagnostic_run, recipe.attestation) {
         let per_program = rows
             .iter()
@@ -25851,7 +25905,9 @@ fn r456_3_a_frame_that_cannot_solve_a_program_consumes_the_predecessor_entry() {
         );
     }
     assert_eq!(CacheFrameAdmission::FrameAbsent.wire(), "frame-absent");
-    assert!(CacheFrameAdmission::FrameAbsent.admitted());
+    // **R477-5 route (A)**: `FrameAbsent` no longer ADMITS — it EXCLUDES.
+    assert!(!CacheFrameAdmission::FrameAbsent.admitted());
+    assert!(CacheFrameAdmission::FrameAbsent.excluded());
 }
 
 #[test]
@@ -34405,5 +34461,58 @@ fn r476_1_frame_bounded_retention_discharges_are_counted() {
     assert_ne!(
         crate::raw_boundary_census_schema::RETENTION_FRAME_BOUNDED,
         crate::raw_boundary_census_schema::BOX_PARAM_HELD
+    );
+}
+
+/// **R477-5 route (A)** — a program this frame does not name is EXCLUDED and NAMED, and
+/// the census still completes over the rest.
+///
+/// Before this, `FrameAbsent.admitted()` was true: the worker walked on to a `load` that
+/// returned `None`, the program ended `cache-gate-failed` / `data=false`, and one absent
+/// program took the whole run's verdict with it. Tonight's L01⁵ solve puts lil last and
+/// best-effort, so that is the difference between a census tomorrow morning and none.
+#[test]
+fn r477_5_a_frame_absent_program_is_excluded_and_named_not_failed() {
+    // The three admissions are three different things and only one of them excludes.
+    assert!(CacheFrameAdmission::Frame.admitted());
+    assert!(!CacheFrameAdmission::Frame.excluded());
+    assert!(!CacheFrameAdmission::FrameAbsent.admitted());
+    assert!(CacheFrameAdmission::FrameAbsent.excluded());
+    // A `Miss` is this frame naming the program at ANOTHER fingerprint — a disagreement,
+    // not an absence. It must keep failing, or a real drift would be waved through as a
+    // named exclusion.
+    assert!(!CacheFrameAdmission::Miss.admitted());
+    assert!(
+        !CacheFrameAdmission::Miss.excluded(),
+        "a fingerprint disagreement must never be excluded as an absence"
+    );
+
+    // The data predicate lets an excluded row past without asserting `ok`, and still
+    // holds every other row to it.
+    let excluded = report::Row(vec![
+        ("program".to_owned(), "lil".to_owned()),
+        (
+            raw_schema::STATUS.to_owned(),
+            "frame-absent-excluded".to_owned(),
+        ),
+        (
+            raw_schema::CACHE_STATUS.to_owned(),
+            "frame-absent".to_owned(),
+        ),
+    ]);
+    assert_eq!(
+        excluded.get(raw_schema::STATUS),
+        Some("frame-absent-excluded")
+    );
+    // and the status string is the one the driver names programs by, so a rename cannot
+    // silently stop the exclusions being written.
+    let source = include_str!("bo_c1.rs");
+    assert!(
+        source.contains(r#"row.get(raw_schema::STATUS) == Some("frame-absent-excluded")"#),
+        "the driver must select the exclusions by this exact status"
+    );
+    assert!(
+        source.contains("frame-absent-excluded.txt"),
+        "the excluded programs must be written where a reader can find them"
     );
 }
