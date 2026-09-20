@@ -2032,3 +2032,33 @@ fn w4l07_an_unsupported_use_refuses_the_lift() {
     let source = emitted(W4_LIFT_UNSUPPORTED_USE);
     assert!(!source.contains("data: &[uint8_t]"), "{source}");
 }
+
+/// **W4L-8 — the lift reaches the CENSUS, not only the table.** relay 052 reads
+/// the receipts per program, so they are an artifact row
+/// (`<program>.raw-boundary-licensed-lifts.tsv`), rendered in the same shape as
+/// this lane's decline receipt.
+#[test]
+fn w4l08_the_receipt_is_a_census_artifact_row() {
+    let super::RewriteOutcome::Emitted {
+        raw_boundary_artifacts,
+        ..
+    } = super::rewrite_m1(W4_LIFT_READ32)
+    else {
+        panic!("W4L-8 must emit");
+    };
+    let tsv = &raw_boundary_artifacts.licensed_lifts;
+    let mut lines = tsv.lines();
+    assert_eq!(
+        lines.next(),
+        Some("owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform"),
+        "{tsv}"
+    );
+    let row = lines.next().expect("one lifted caller");
+    let columns = row.split('\t').collect::<Vec<_>>();
+    assert!(columns[1].starts_with("HashBytesH40::"), "{tsv}");
+    assert!(columns[2].ends_with("BrotliUnalignedRead32"), "{tsv}");
+    assert_eq!(columns[3], "0", "{tsv}");
+    assert_eq!(columns[4], "4", "{tsv}");
+    assert_eq!(columns[5], "slice", "{tsv}");
+    assert_eq!(lines.next(), None, "one lift, one row: {tsv}");
+}

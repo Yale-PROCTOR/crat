@@ -208,3 +208,30 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
     receipts.sort_by(|a, b| a.subject.cmp(&b.subject));
     receipts
 }
+
+/// **The census receipt** (relay 052: the lifts are counted at the census, not
+/// only in the table). One row per lift, in the same shape as this lane's
+/// decline receipt: the owner path, the subject, the callee whose width
+/// licensed it, the parameter position, the exact width in bytes, and the form
+/// the caller took.
+pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
+    let mut rows = receipts
+        .iter()
+        .map(|lift| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                lift.subject.split("::").next().unwrap_or(&lift.subject),
+                lift.subject,
+                lift.callee,
+                lift.parameter_index,
+                lift.width_bytes,
+                if lift.mutable { "mut-slice" } else { "slice" },
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    let mut out =
+        String::from("owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\n");
+    out.extend(rows);
+    out
+}

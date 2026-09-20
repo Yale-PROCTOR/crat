@@ -510,6 +510,9 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) unresolved_classes: String,
     /// R397-6(b): contract candidates declined at the selection input.
     pub(crate) contract_candidate_declines: String,
+    /// **W4-LIFT (R475-2)**: callers lifted to the slice form by an exact
+    /// licensed width, one row each.
+    pub(crate) licensed_lifts: String,
     pub(crate) interface_inventory: String,
     /// R261-3 rider (addendum 264): subjects whose io-domain type walk ran out
     /// of depth budget without deciding. A nonzero count reopens the depth
@@ -8700,6 +8703,7 @@ fn finish_decide<'tcx>(
             unresolved_classes: bridge_receipt::unresolved_class_header(),
             contract_candidate_declines: contract_extent_candidates
                 .declines_tsv(tcx, &subjects, &model, &slots, &fat),
+            licensed_lifts: decision::licensed_lift::receipts_tsv(&table.licensed_lifts),
             interface_inventory: table.seams.interface_inventory_tsv(tcx),
             sites_from_non_subject_arguments: table.seams.sites_from_non_subject_arguments(),
             converted_callee_without_site_receipt: table

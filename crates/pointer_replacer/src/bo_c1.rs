@@ -12495,6 +12495,9 @@ mod run {
                 "contract-candidate-declines",
                 artifact.contract_candidate_declines.as_str(),
             ),
+            // W4-LIFT (R475-2): one row per caller lifted by an exact licensed
+            // width, so the census counts what the table already carried.
+            ("licensed-lifts", artifact.licensed_lifts.as_str()),
             ("bridge-receipts", bridge_receipts.as_str()),
             (
                 "unsafe-context-presentation",
