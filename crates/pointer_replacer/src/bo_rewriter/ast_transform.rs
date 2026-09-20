@@ -3719,7 +3719,7 @@ fn apply_surface_plans(
         } else {
             argument
                 .spec
-                .render_in_context(&argument.parameter_name, unsafe_fn)
+                .render_in_context(&argument.base, unsafe_fn)
                 .ok_or("surface-argument-render-unavailable")?
         };
         let prior = surface_arguments

@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use rustc_hir::{HirId, def_id::LocalDefId};
-use rustc_middle::ty::{TyCtxt, TyKind};
+use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 
 use super::{
     Arm, Decision, DecisionTable, SubjectKind,
@@ -30,6 +30,10 @@ pub(crate) struct SurfaceArgumentPlan {
     pub(crate) node: (LocalDefId, HirId),
     pub(crate) parameter_index: usize,
     pub(crate) parameter_name: String,
+    /// **R473-3** — the expression the glue is rendered over: the parameter
+    /// itself, or the parameter cast to the delivered element type where the C
+    /// ABI handed the wrapper a `c_void` pointer. See [`wrapper_base`].
+    pub(crate) base: String,
     pub(crate) atom_ids: Vec<String>,
     pub(crate) form: Form,
     pub(crate) spec: GlueSpec,
@@ -43,6 +47,45 @@ pub(crate) struct SurfaceArgumentFailure {
     pub(crate) node: (LocalDefId, HirId),
     pub(crate) parameter_index: usize,
     pub(crate) reason: &'static str,
+}
+
+/// **R473-3 — the wrapper's base.** The generated wrapper keeps the C ABI's own
+/// signature, so its parameter is whatever C declared: for brotli's hasher
+/// accessors, `extra: *mut libc::c_void`. The inner function's parameter is
+/// delivered `&mut [u32]` / `&mut [u8]`, and the slice the wrapper builds for
+/// it has no element type to infer from a `c_void` base —
+/// `__crat_safe_AddrH40(core::slice::from_raw_parts_mut(extra,
+/// crate::FALLBACK_SLICE_EXTENT))` is `expected *mut u32, found *mut
+/// libc::c_void` at nine wrappers in brotli's first failing verify tree, and
+/// those wrappers then revert.
+///
+/// The element type is the one the converted signature was written from — the
+/// void region's own `element`, not a guess — so the cast is a retyping of the
+/// base and nothing else. The extent is untouched: no receipt moves and no
+/// waiver widens (§77). A base that is not `c_void`, a form that is not a
+/// slice, or a region that carries no element leaves the parameter alone.
+pub(crate) fn wrapper_base(
+    parameter_name: &str,
+    form: Form,
+    void_pointee: bool,
+    element: Option<&str>,
+) -> String {
+    match (form, void_pointee, element) {
+        (Form::Slice { .. } | Form::Opt { slice: true, .. }, true, Some(element)) => {
+            format!("{parameter_name}.cast::<{element}>()")
+        }
+        _ => parameter_name.to_owned(),
+    }
+}
+
+/// Whether the raw parameter's pointee is `c_void` — the C ABI's untyped
+/// region, which carries no element type of its own.
+fn void_pointee<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    let TyKind::RawPtr(pointee, _) = ty.kind() else {
+        return false;
+    };
+    matches!(pointee.kind(), TyKind::Adt(definition, _)
+        if tcx.lang_items().c_void() == Some(definition.did()))
 }
 
 pub(crate) fn plan(
@@ -236,6 +279,15 @@ pub(crate) fn plan(
                     owner_class,
                     node,
                     parameter_index,
+                    base: wrapper_base(
+                        &parameter_name,
+                        form,
+                        void_pointee(tcx, original_type),
+                        table
+                            .void_region
+                            .get(&node)
+                            .map(|region| region.element.as_str()),
+                    ),
                     parameter_name,
                     atom_ids,
                     form,

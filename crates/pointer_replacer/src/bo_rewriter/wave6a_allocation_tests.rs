@@ -1218,3 +1218,72 @@ fn wrapper_body(outer_ty: &str, inner_ty: &str) -> String {
         },
     )
 }
+
+/// **R473-3 — the WRAPPER BODY's base is cast, not just the call site's.**
+/// Report 030 put this cast in `ast_transform::surface_argument`, the builder
+/// that writes a wrapper's arguments when no plan supplies them. brotli's
+/// wrappers come from the other path: `decision::surface_argument::plan`
+/// renders the glue itself and `apply_surface_plans` takes that text verbatim,
+/// so the cast never reached them. The corpus shape is
+/// `batch16-verify-trees/brotli.first-failing-verify-tree.rs`:
+///
+/// ```text
+/// unsafe extern "C" fn AddrH40(mut extra: *mut libc::c_void) -> *mut uint32_t {
+///     __crat_safe_AddrH40(core::slice::from_raw_parts_mut(extra,
+///             crate::FALLBACK_SLICE_EXTENT))
+/// }
+/// unsafe extern "C" fn __crat_safe_AddrH40(mut extra: &mut [u8]) -> *mut uint32_t
+/// ```
+///
+/// nine wrappers (`{Addr,Head,TinyHash}H{40,41,42}`), E0308 at each, and the
+/// class then reverts — which is why the post-revert emitted tree carries none
+/// of them and report 032 read the cast as inert.
+///
+/// The element type is the void region's own (`Region::element`), the string
+/// the converted signature was written from; the extent is untouched.
+#[test]
+fn w6a_the_wrapper_bodys_void_base_takes_the_delivered_element_type() {
+    use super::decision::{seam::Form, surface_argument::wrapper_base};
+
+    // The corpus rows: a `c_void` parameter delivered as a typed slice.
+    assert_eq!(
+        wrapper_base(
+            "extra",
+            Form::Slice { mutable: true },
+            true,
+            Some("uint32_t")
+        ),
+        "extra.cast::<uint32_t>()"
+    );
+    assert_eq!(
+        wrapper_base("extra", Form::Slice { mutable: false }, true, Some("u8")),
+        "extra.cast::<u8>()"
+    );
+    assert_eq!(
+        wrapper_base(
+            "extra",
+            Form::Opt {
+                mutable: true,
+                slice: true
+            },
+            true,
+            Some("uint16_t")
+        ),
+        "extra.cast::<uint16_t>()"
+    );
+    // Controls: a base that is not `c_void` keeps the parameter …
+    assert_eq!(
+        wrapper_base("data", Form::Slice { mutable: true }, false, Some("u8")),
+        "data"
+    );
+    // … a thin form has no constructor to feed …
+    assert_eq!(
+        wrapper_base("extra", Form::Ref { mutable: true }, true, Some("u8")),
+        "extra"
+    );
+    // … and a region that carries no element type is left alone.
+    assert_eq!(
+        wrapper_base("extra", Form::Slice { mutable: true }, true, None),
+        "extra"
+    );
+}
