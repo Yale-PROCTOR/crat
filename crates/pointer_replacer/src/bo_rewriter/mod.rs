@@ -7782,8 +7782,23 @@ fn finish_decide<'tcx>(
         );
         decision::field_reference::lift_store_walls(tcx, &field_candidates, &mut slice_uses);
         let slice_uses = slice_uses;
-        let ctx_of =
-            |gate, coconv, lifetime_eligibility, raw_boundary, exposure, return_receivers| {
+        // **Row (vi), option (a) (R473-1)** — a MACRO, not a closure.
+        //
+        // As a closure this captured `&facts` for its whole live range, so NLL kept the
+        // shared borrow alive across `facts.body_adapters.push(..)` the moment anything
+        // rebuilt a `Ctx` after that push — which is exactly what the nested lane's
+        // `replan_delivered_table_elements` call does, and why 51 rows sat behind an
+        // `E0502`. Re-parameterising cannot fix it: a closure parameter is
+        // higher-ranked, a fresh region per call, while `Ctx<'a, 'tcx>` needs `facts` to
+        // share the one region its other thirty references already have, and that region
+        // has no name inside the function body (main report 051, row (vi)).
+        //
+        // A macro expands at each use site, so each `Ctx` borrows `facts` only for its
+        // own expression and nothing is held across the push. Same struct literal, same
+        // semantics, no signature to spell and no region to name.
+        macro_rules! ctx_of {
+            ($gate:expr, $coconv:expr, $lifetime_eligibility:expr, $raw_boundary:expr,
+             $exposure:expr, $return_receivers:expr $(,)?) => {
                 decision::Ctx {
                     tcx,
                     counted_void: &counted_void,
@@ -7793,7 +7808,7 @@ fn finish_decide<'tcx>(
                     allocator_contracts: &allocator_contracts,
                     void_region: &void_region,
                     void_region_receivers: &void_region_receivers,
-                    return_receivers,
+                    return_receivers: $return_receivers,
                     family_policy: &family_policy,
                     io_domain: &io_domain_subjects,
                     void_pointee: &void_pointee_subjects,
@@ -7814,17 +7829,18 @@ fn finish_decide<'tcx>(
                     ownership_fields: &ownership_fields,
                     constructions: &ctors,
                     subjects: &subjects,
-                    gate,
-                    coconv,
-                    lifetime_eligibility,
-                    raw_boundary,
-                    exposure,
+                    gate: $gate,
+                    coconv: $coconv,
+                    lifetime_eligibility: $lifetime_eligibility,
+                    raw_boundary: $raw_boundary,
+                    exposure: $exposure,
                     field_reference: Some(&field_candidates),
                 }
             };
+        }
 
         let hypothetical = decision::decide(
-            &ctx_of(
+            &ctx_of!(
                 decision::RefGate::LiftAdaptable,
                 None,
                 None,
@@ -7885,7 +7901,7 @@ fn finish_decide<'tcx>(
             &lifetime_eligibility,
         );
         let e2_hypothetical = decision::decide(
-            &ctx_of(
+            &ctx_of!(
                 decision::RefGate::LiftAdaptable,
                 None,
                 Some(&lifetime_eligibility),
@@ -7903,7 +7919,7 @@ fn finish_decide<'tcx>(
         // exactly `lifetime_eligibility`, which is what the rider is about —
         // a lifetime plan annotates signatures and must decide nothing.
         let e2_plan_inert_control = decision::decide(
-            &ctx_of(
+            &ctx_of!(
                 decision::RefGate::LiftAdaptable,
                 None,
                 None,
@@ -8002,7 +8018,7 @@ fn finish_decide<'tcx>(
         // `referenced` gate, and the class gate then governs every node uniformly.
         // The pinned population still blocks inside `LiftAdaptable`.
         let mut table = decision::decide(
-            &ctx_of(
+            &ctx_of!(
                 decision::RefGate::LiftAdaptable,
                 Some(&coconv),
                 Some(&lifetime_eligibility),
