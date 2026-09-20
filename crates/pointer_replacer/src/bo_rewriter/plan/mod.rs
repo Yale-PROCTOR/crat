@@ -5976,6 +5976,7 @@ mod tests {
             licensed_lifts: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
+            slice_input_mask_companions: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -6065,6 +6066,7 @@ mod tests {
             licensed_lifts: Vec::new(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
             slice_input_companions: Default::default(),
+            slice_input_mask_companions: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),
             return_certificates: Default::default(),
@@ -6146,6 +6148,7 @@ mod tests {
             licensed_lifts: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
+            slice_input_mask_companions: Default::default(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

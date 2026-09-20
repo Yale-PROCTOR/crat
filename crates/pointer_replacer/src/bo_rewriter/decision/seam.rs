@@ -275,6 +275,13 @@ pub(crate) enum SeamLen {
     /// inserts. Carries no text because there is none to carry — which is the
     /// point.
     Fabricated,
+    /// **R477-6 — the masked companion's `mask + 1`.** The text is derived from
+    /// a call-site argument, so it is evidence about the indexes the callee
+    /// forms; the read width at such an index and the allocation are NOT
+    /// bounded by it, so the site is ALSO counted as a fabricated extent under
+    /// §77. Both halves of the ruling in one value: the emitted length is the
+    /// derived text, the receipt says fabricated.
+    MaskDerived(String),
 }
 
 impl SeamLen {
@@ -283,13 +290,15 @@ impl SeamLen {
     /// from one derivation rather than two spellings of the same const.
     pub(crate) fn text(&self) -> &str {
         match self {
-            SeamLen::Licensed(t) => t,
+            SeamLen::Licensed(t) | SeamLen::MaskDerived(t) => t,
             SeamLen::Fabricated => FABRICATED_LEN_PATH,
         }
     }
 
+    /// **Counted as fabricated, deliberately** — the mask bounds the indexes
+    /// and nothing else, and §77's audit is where that residue is counted.
     pub(crate) fn is_fabricated(&self) -> bool {
-        matches!(self, SeamLen::Fabricated)
+        matches!(self, SeamLen::Fabricated | SeamLen::MaskDerived(_))
     }
 }
 
@@ -1011,6 +1020,19 @@ fn with_length(spec: GlueSpec, len: Option<&str>) -> GlueSpec {
     }
 }
 
+/// **R477-6 — the masked companion's length, as a pure function.** `mask + 1`
+/// covers every index `expr & mask` the accessing callee forms. `wrapping_add`
+/// because a mask of `usize::MAX` is representable and a debug overflow there
+/// would be a panic this rule did not intend; the extent is then `0`, an empty
+/// slice rather than a wrong one.
+pub(crate) fn masked_len_text(text: String, masked: bool) -> String {
+    if masked {
+        format!("({text}).wrapping_add(1)")
+    } else {
+        text
+    }
+}
+
 /// `&mut ` or `&`.
 fn amp(mutable: bool) -> &'static str {
     if mutable { "&mut " } else { "&" }
@@ -1330,6 +1352,7 @@ impl GlueSpec {
     pub(crate) fn extent_arm_key(&self) -> &'static str {
         match self.len.as_ref() {
             Some(SeamLen::Licensed(_)) => "evidence-backed",
+            Some(SeamLen::MaskDerived(_)) => "mask-plus-one@addendum-77",
             Some(SeamLen::Fabricated) => "fallback-1024",
             None => "-",
         }
@@ -1601,7 +1624,10 @@ impl GlueSpec {
                     // the header and `from_raw_parts` takes `usize`, so the
                     // companion is cast; parenthesised because it may be an
                     // arbitrary expression.
-                    SeamLen::Licensed(len) => {
+                    // R477-6: the masked companion's text is a call-site
+                    // expression like the licensed one and is rendered the same
+                    // way; only the receipt tells them apart.
+                    SeamLen::Licensed(len) | SeamLen::MaskDerived(len) => {
                         format!("core::slice::{ctor}({base}, ({len}) as usize)")
                     }
                     // **No cast and no parentheses**: the const is declared
@@ -3273,6 +3299,7 @@ pub(crate) fn receipt_arm(expected: Form, found: Form) -> &'static str {
 pub(crate) fn receipt_extent(spec: &GlueSpec) -> BridgeExtentKind {
     match spec.len.as_ref() {
         Some(SeamLen::Licensed(source)) => BridgeExtentKind::Evidence(source.clone()),
+        Some(SeamLen::MaskDerived(source)) => BridgeExtentKind::MaskPlusOne(source.clone()),
         Some(SeamLen::Fabricated) => BridgeExtentKind::Fallback,
         None => BridgeExtentKind::None,
     }
@@ -3454,6 +3481,7 @@ fn build_candidate(
     source_type: &str,
     literal_null: bool,
     len_text: Option<&str>,
+    len_masked: bool,
     len_evidence: Option<LenEvidence>,
     enclosing_unsafe_fn: bool,
     retention_facts: &super::raw_boundary::RetentionSummaries,
@@ -3495,6 +3523,11 @@ fn build_candidate(
         spec
     };
     let mut spec = spec;
+    // **R477-6.** The text came from the call site, so `glue` licensed it; the
+    // chain also proved it is a MASK, which the receipt must say.
+    if len_masked && let Some(SeamLen::Licensed(text)) = spec.len.clone() {
+        spec.len = Some(SeamLen::MaskDerived(text));
+    }
     if let Some((contract, route)) = counted {
         // **R464-3 — the fallback extent at the CALL SITE.** A raw caller of a
         // header-path view has no length to supply: the callee's count is the
@@ -4783,18 +4816,19 @@ pub(crate) fn synthesize_with_raw_boundary(
                     Some(Ok((_, route))) => Some((contract, *route)),
                     _ => None,
                 });
-                let (len_text, len_evidence) = if let Some(Ok((count, _))) = counted_len {
+                let (len_text, len_masked, len_evidence) = if let Some(Ok((count, _))) = counted_len
+                {
                     // wave-6v2 (R457-5): the header path's count IS the ruled
                     // fallback path constant; `None` here is what makes the
                     // spec fabricate and receipt it as such.
                     if count == FABRICATED_LEN_PATH {
-                        (None, Some(LenEvidence::Elsewhere))
+                        (None, false, Some(LenEvidence::Elsewhere))
                     } else {
-                        (Some(count), Some(LenEvidence::Elsewhere))
+                        (Some(count), false, Some(LenEvidence::Elsewhere))
                     }
                 } else if let Some(region) = region {
                     // wave-6b: the byte length is the callee's own region.
-                    (region.len_text(), Some(LenEvidence::Elsewhere))
+                    (region.len_text(), false, Some(LenEvidence::Elsewhere))
                 } else if wants_len {
                     // Wave-4 #1b: a contract-extent promotion with an exact
                     // count names the companion argument itself. The count
@@ -4921,15 +4955,29 @@ pub(crate) fn synthesize_with_raw_boundary(
                                     })
                                 })
                         };
+                    // **R477-6 — the masked companion licenses `+ 1`.** Where
+                    // the chain proved the companion MASKS the accessing
+                    // callee's indexes (`data.offset((ix & mask))`), every
+                    // index is `<= mask`, so the length that covers them is
+                    // `mask + 1`. `wrapping_add` because a mask of `usize::MAX`
+                    // is representable and a debug overflow there would be a
+                    // panic this rule did not intend; the extent it produces is
+                    // then `0`, which constructs an empty slice rather than a
+                    // wrong one.
+                    let masked = param_key
+                        .get(&(*callee, pos.index))
+                        .is_some_and(|key| table.slice_input_mask_companions.contains(key));
                     (
                         companion
                             .and_then(|i| site.args.iter().find(|argument| argument.index == i))
                             .and_then(|argument| sm.span_to_snippet(argument.span).ok())
-                            .filter(|text| licensed_spelling(text)),
+                            .filter(|text| licensed_spelling(text))
+                            .map(|text| masked_len_text(text, masked)),
+                        masked,
                         Some(arm),
                     )
                 } else {
-                    (None, None)
+                    (None, false, None)
                 };
                 let owner_view = pos
                     .root
@@ -4958,6 +5006,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             &pos.source_type,
                             pos.literal_null,
                             len_text.as_deref(),
+                            len_masked,
                             len_evidence,
                             enclosing_unsafe_fn,
                             retention,
@@ -5006,6 +5055,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             &pos.source_type,
                             pos.literal_null,
                             len_text.as_deref(),
+                            len_masked,
                             len_evidence,
                             enclosing_unsafe_fn,
                             retention,

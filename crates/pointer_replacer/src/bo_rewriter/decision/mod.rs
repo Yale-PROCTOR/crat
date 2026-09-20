@@ -1075,6 +1075,13 @@ pub(crate) struct DecisionTable {
     /// callers adapt with an evidence-backed extent instead of the fabricated
     /// one.
     pub(crate) slice_input_companions: FxHashMap<(LocalDefId, rustc_hir::HirId), usize>,
+    /// **R477-6 (wave-5c).** The subset of `slice_input_companions` whose
+    /// companion MASKS the index rather than counting elements: the licensed
+    /// length is `companion + 1`, and the site carries §77's fabricated-extent
+    /// receipt for the residue the mask does not bound (the callee's read
+    /// width at that index, and the allocation, which the signature does not
+    /// carry).
+    pub(crate) slice_input_mask_companions: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1377,6 +1384,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         licensed_lifts,
         field_transactions: Default::default(),
         slice_input_companions: Default::default(),
+        slice_input_mask_companions: Default::default(),
     }
 }
 
@@ -2949,6 +2957,7 @@ mod self_consistency_tests {
             licensed_lifts: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
+            slice_input_mask_companions: Default::default(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

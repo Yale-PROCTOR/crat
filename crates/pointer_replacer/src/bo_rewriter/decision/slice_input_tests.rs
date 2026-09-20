@@ -350,3 +350,182 @@ fn w5c_slice_input_forwarders_deliver() {
     );
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
 }
+
+/// **R477-6 — the corpus spelling of the same masked read.** The lane's
+/// `CHAIN` binds the masked index to a local (`let at = (ix & mask) as isize`)
+/// and `index_bound_by_companion` admits it: a local is not another parameter.
+/// brotli writes it INLINE — `HashBytesH2(&*data.offset((ix & mask) as isize))`
+/// — so the index expression names the parameter `ix`, the "reached through
+/// another parameter" test fires, and all 34 corpus rows of this shape read
+/// `Err(CompanionNotIndexBound)` (report 033).
+///
+/// The mask is what decides it: `ix & mask <= mask`, whatever `ix` is, so the
+/// companion bounds every index the callee forms — at `mask + 1` elements, not
+/// `mask`.
+fn masked_inline() -> String {
+    let inlined = fixture()
+        .replace("    let at = (ix & mask) as isize;\n", "")
+        .replace("*data.offset(at)", "*data.offset((ix & mask) as isize)")
+        .replace(
+            "*data.offset(at + 1)",
+            "*data.offset(((ix & mask) + 1) as isize)",
+        )
+        .replace(
+            "*data.offset(at + 2)",
+            "*data.offset(((ix & mask) + 2) as isize)",
+        )
+        .replace(
+            "*data.offset(at + 3)",
+            "*data.offset(((ix & mask) + 3) as isize)",
+        );
+    assert!(
+        !inlined.contains("let at = "),
+        "the fixture must inline the index"
+    );
+    inlined
+}
+
+/// The same unsupplied root the companion witness above uses, so the extent
+/// question is the forwarder's own and not its callers'.
+fn masked_inline_unsupplied() -> String {
+    masked_inline().replace(
+        "    StitchToPreviousBlockH2(self_0, n, n, buf, 4095);",
+        "    let x: u8 = acc as u8;\n    let p: *const u8 = &x;\n    StitchToPreviousBlockH2(self_0, n, n, p, 4095);",
+    )
+}
+
+#[test]
+fn w5c_slice_input_a_masked_index_is_bounded_by_its_mask() {
+    assert_eq!(
+        extent_of(
+            &input_extents(&masked_inline_unsupplied()),
+            "StoreRangeH2::data"
+        ),
+        &Ok(Extent::CompanionMask(super::seam::LenEvidence::Following))
+    );
+}
+
+/// **Control (i)** — the same chain with the index bound the ordinary way (the
+/// lane's own `CHAIN`, whose masked index is bound to a local): the extent is
+/// the companion itself, with no `+ 1`. One rule, two arms, and the arms are
+/// told apart by the spelling that decides them.
+#[test]
+fn w5c_slice_input_an_unmasked_companion_keeps_its_own_length() {
+    let unsupplied = fixture().replace(
+        "    StitchToPreviousBlockH2(self_0, n, n, buf, 4095);",
+        "    let x: u8 = acc as u8;\n    let p: *const u8 = &x;\n    StitchToPreviousBlockH2(self_0, n, n, p, 4095);",
+    );
+    assert_eq!(
+        extent_of(&input_extents(&unsupplied), "StoreRangeH2::data"),
+        &Ok(Extent::Companion(super::seam::LenEvidence::Following))
+    );
+}
+
+/// **Control (ii)** — an index reached through a SECOND pointer parameter
+/// (lodepng's `bitstream[*bitpointer >> 3]`, report 019 §1's false companion):
+/// no mask dominates it, so the refusal stands exactly as before.
+#[test]
+fn w5c_slice_input_an_index_through_another_pointer_is_still_refused() {
+    use super::slice_input::Hold;
+    let through_pointer = masked_inline_unsupplied().replace(
+        "*data.offset((ix & mask) as isize)",
+        "*data.offset((ix.wrapping_add(mask)) as isize)",
+    );
+    assert_ne!(
+        through_pointer,
+        masked_inline_unsupplied(),
+        "the control must change the fixture"
+    );
+    assert_eq!(
+        extent_of(&input_extents(&through_pointer), "StoreRangeH2::data"),
+        &Err(Hold::CompanionNotIndexBound)
+    );
+}
+
+/// **The emission half of R477-6**, at the one place both halves are visible:
+/// the masked length renders exactly like a licensed one — it IS a call-site
+/// expression — and the receipt says fabricated, because the mask bounds the
+/// callee's indexes and neither its read width nor the allocation.
+#[test]
+fn w5c_slice_input_a_masked_length_renders_derived_and_receipts_fabricated() {
+    use super::seam::{GlueCore, GlueSpec, SeamLen, receipt_extent};
+    let spec =
+        GlueSpec::core(GlueCore::FromRawParts, false).with_len("(ringbuffer_mask).wrapping_add(1)");
+    let licensed = spec.clone();
+    let masked = GlueSpec {
+        len: Some(SeamLen::MaskDerived(
+            "(ringbuffer_mask).wrapping_add(1)".to_owned(),
+        )),
+        ..spec
+    };
+    assert_eq!(
+        masked.render("p"),
+        licensed.render("p"),
+        "the derived length is emitted as the expression it is"
+    );
+    assert!(
+        masked
+            .render("p")
+            .is_some_and(|text| text.contains("(ringbuffer_mask).wrapping_add(1)")),
+        "the mask's own `+ 1` must reach the constructed slice"
+    );
+    assert_eq!(
+        super::seam::masked_len_text("ringbuffer_mask".to_owned(), true),
+        "(ringbuffer_mask).wrapping_add(1)",
+        "the mask's length is the mask plus one"
+    );
+    assert_eq!(
+        super::seam::masked_len_text("n".to_owned(), false),
+        "n",
+        "and an ordinary companion is untouched"
+    );
+    assert_eq!(masked.extent_arm_key(), "mask-plus-one@addendum-77");
+    assert!(
+        masked
+            .len
+            .as_ref()
+            .is_some_and(super::seam::SeamLen::is_fabricated),
+        "a masked extent is counted with the fabricated ones (§77)"
+    );
+    assert_ne!(
+        format!("{:?}", receipt_extent(&masked)),
+        format!("{:?}", receipt_extent(&licensed)),
+        "and its receipt is not the licensed one"
+    );
+}
+
+/// **Control (iii)** — masked by the WRONG integer. The index is `ix & ix_end`,
+/// a mask formed from another parameter, which bounds the index by something
+/// the companion does not name. The refusal stands: it is the COMPANION's mask
+/// that licenses the companion's length.
+#[test]
+fn w5c_slice_input_a_mask_by_another_parameter_is_still_refused() {
+    use super::slice_input::Hold;
+    let wrong_mask = masked_inline_unsupplied()
+        .replace(
+            "unsafe fn StoreH2(self_0: *mut H2, data: *const u8, mask: usize, ix: usize) {",
+            "unsafe fn StoreH2(self_0: *mut H2, data: *const u8, mask: usize, ix: usize, ix_end: usize) {",
+        )
+        .replace("(ix & mask)", "(ix & ix_end)")
+        .replace("StoreH2(self_0, data, mask, i);", "StoreH2(self_0, data, mask, i, ix_end);")
+        .replace(
+            "StoreH2(self_0, ringbuffer, ringbuffer_mask, position.wrapping_sub(3));",
+            "StoreH2(self_0, ringbuffer, ringbuffer_mask, position.wrapping_sub(3), position);",
+        )
+        .replace(
+            "StoreH2(self_0, ringbuffer, ringbuffer_mask, position.wrapping_sub(2));",
+            "StoreH2(self_0, ringbuffer, ringbuffer_mask, position.wrapping_sub(2), position);",
+        )
+        .replace(
+            "StoreH2(self_0, ringbuffer, ringbuffer_mask, position.wrapping_sub(1));",
+            "StoreH2(self_0, ringbuffer, ringbuffer_mask, position.wrapping_sub(1), position);",
+        );
+    assert!(
+        wrong_mask.contains("ix & ix_end"),
+        "the control must change the fixture"
+    );
+    assert_eq!(
+        extent_of(&input_extents(&wrong_mask), "StoreRangeH2::data"),
+        &Err(Hold::CompanionNotIndexBound)
+    );
+}

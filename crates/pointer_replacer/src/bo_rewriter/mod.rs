@@ -8077,7 +8077,7 @@ fn finish_decide<'tcx>(
         // R425-3: the reader chain's own companion, for the seam's count
         // evidence (`count_companions`). Read from the settled table so the
         // index the seam licenses is the one the chain proved.
-        table.slice_input_companions = table
+        let slice_input_extents = table
             .entries
             .iter()
             .filter_map(|(subject, _)| {
@@ -8086,8 +8086,22 @@ fn finish_decide<'tcx>(
                 };
                 let proof = decision::slice_input::prove(tcx, subject, &facts, &fat).ok()?;
                 let companion = proof.extent.companion_index(hir_index)?;
-                Some(((subject.fn_did, subject.hir_id), companion))
+                Some((
+                    (subject.fn_did, subject.hir_id),
+                    (companion, proof.extent.is_mask()),
+                ))
             })
+            .collect::<Vec<_>>();
+        // R477-6: the masked arm licenses the same integer and a different
+        // LENGTH (`companion + 1`), so the two facts travel together.
+        table.slice_input_mask_companions = slice_input_extents
+            .iter()
+            .filter(|(_, (_, masked))| *masked)
+            .map(|(key, _)| *key)
+            .collect();
+        table.slice_input_companions = slice_input_extents
+            .into_iter()
+            .map(|(key, (companion, _))| (key, companion))
             .collect();
 
         // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by

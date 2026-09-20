@@ -244,6 +244,7 @@ mod tests {
             licensed_lifts: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
+            slice_input_mask_companions: Default::default(),
         }
     }
 

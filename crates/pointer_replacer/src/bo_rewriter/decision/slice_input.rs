@@ -47,6 +47,19 @@ pub(crate) enum Extent {
     /// (`adler32(data, len)`): its callers adapt raw with it, or take the
     /// slice form themselves, or decline typed (`thin-caller-argument`).
     Companion(super::seam::LenEvidence),
+    /// **R477-6.** The companion MASKS the index rather than counting the
+    /// elements: every index the accessing callee forms is `expr & companion`
+    /// (brotli's hash readers, `data.offset((ix & mask) as isize)`), so it is
+    /// bounded by the companion whatever `expr` is — and the extent that
+    /// covers every one of them is `companion + 1`, not `companion`.
+    ///
+    /// **What this is evidence of, exactly.** It bounds the INDEXES the callee
+    /// forms. A read of several bytes AT such an index — brotli's four- and
+    /// eight-byte hash loads — is not bounded by it, and neither is the
+    /// allocation, which the signature does not carry. That residue is what
+    /// §77's fabricated-extent receipt covers, and every admitted site carries
+    /// one (R477-6 rules (a) with (b)'s receipt).
+    CompanionMask(super::seam::LenEvidence),
 }
 
 impl Extent {
@@ -59,10 +72,17 @@ impl Extent {
     pub(crate) fn companion_index(self, parameter: usize) -> Option<usize> {
         match self {
             Self::Supplied => None,
-            Self::Companion(super::seam::LenEvidence::Following) => Some(parameter + 1),
-            Self::Companion(super::seam::LenEvidence::Preceding) => parameter.checked_sub(1),
-            Self::Companion(_) => None,
+            Self::Companion(super::seam::LenEvidence::Following)
+            | Self::CompanionMask(super::seam::LenEvidence::Following) => Some(parameter + 1),
+            Self::Companion(super::seam::LenEvidence::Preceding)
+            | Self::CompanionMask(super::seam::LenEvidence::Preceding) => parameter.checked_sub(1),
+            Self::Companion(_) | Self::CompanionMask(_) => None,
         }
+    }
+
+    /// Does the length this extent licenses need the mask's `+ 1`?
+    pub(crate) fn is_mask(self) -> bool {
+        matches!(self, Self::CompanionMask(_))
     }
 }
 
@@ -336,14 +356,21 @@ pub(crate) fn prove(
             // BOUNDS the accessing callee's indexes. Checked at every
             // position the chain reaches, so the evidence the seam licenses
             // (`Extent::companion_index`) is the evidence checked here.
+            let mut masked = false;
             for &(callee, parameter) in &accessed {
-                if !index_bound_by_companion(tcx, callee, parameter) {
-                    return Err(Hold::CompanionNotIndexBound);
+                match index_bound_by_companion(tcx, callee, parameter) {
+                    IndexBound::No => return Err(Hold::CompanionNotIndexBound),
+                    IndexBound::MaskedByCompanion => masked = true,
+                    IndexBound::ByCompanion => {}
                 }
             }
             Ok(Proof {
                 members: vec![subject.fn_did],
-                extent: Extent::Companion(evidence),
+                extent: if masked {
+                    Extent::CompanionMask(evidence)
+                } else {
+                    Extent::Companion(evidence)
+                },
             })
         }
     }
@@ -376,10 +403,26 @@ pub(crate) fn enabled_proof(
 /// own companion refuses; locals, fields and literals are fine (they are
 /// bounded by the callee's own loop, which the extent is what it is checked
 /// against).
-fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: usize) -> bool {
+/// How the accessing callee's indexes stand to the companion beside the
+/// pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexBound {
+    /// An index reaches the parameter through something the companion does not
+    /// bound — another parameter, in the general case.
+    No,
+    /// Every index is bounded by the companion itself (`i < len`): the extent
+    /// is the companion.
+    ByCompanion,
+    /// **R477-6.** Every index that would otherwise fail the test is MASKED by
+    /// the companion (`ix & mask`), so it is bounded whatever it names, and the
+    /// extent that covers all of them is `companion + 1`.
+    MaskedByCompanion,
+}
+
+fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: usize) -> IndexBound {
     let body = tcx.hir_body_owned_by(function);
     let Some(param) = body.params.get(parameter) else {
-        return false;
+        return IndexBound::No;
     };
     let binding = param.pat.hir_id;
     let companion = match super::seam::length_evidence(tcx, function, parameter) {
@@ -389,7 +432,7 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
     };
     let companion = companion.and_then(|index| body.params.get(index).map(|p| p.pat.hir_id));
     let Some(companion) = companion else {
-        return false;
+        return IndexBound::No;
     };
     let others: Vec<HirId> = body
         .params
@@ -401,7 +444,9 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
     struct Indexes<'a, 'tcx> {
         binding: HirId,
         others: &'a [HirId],
+        companion: HirId,
         bound: bool,
+        masked: bool,
         _marker: std::marker::PhantomData<&'tcx ()>,
     }
     fn names(e: &Expr<'_>, others: &[HirId]) -> bool {
@@ -427,6 +472,43 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         visitor.visit_expr(e);
         visitor.found
     }
+    /// `(ix & mask)`, `(ix & mask) + 1`, `((ix & mask) as isize)` — the index
+    /// is bounded by the companion when a `&` with the companion on one side
+    /// dominates it. Additions of a CONSTANT are allowed through (brotli's
+    /// `at + 1 .. at + 3` neighbours of a masked index); anything else is not.
+    fn masked_by(e: &Expr<'_>, companion: HirId) -> bool {
+        let mut e = e;
+        loop {
+            match e.kind {
+                ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                ExprKind::Binary(op, left, right)
+                    if matches!(op.node, rustc_hir::BinOpKind::BitAnd) =>
+                {
+                    return is_binding(left, companion)
+                        || is_binding(right, companion)
+                        || masked_by(left, companion)
+                        || masked_by(right, companion);
+                }
+                ExprKind::Binary(op, left, right)
+                    if matches!(op.node, rustc_hir::BinOpKind::Add) =>
+                {
+                    return (masked_by(left, companion) && constant(right))
+                        || (masked_by(right, companion) && constant(left));
+                }
+                _ => return false,
+            }
+        }
+    }
+    fn constant(e: &Expr<'_>) -> bool {
+        let mut e = e;
+        loop {
+            match e.kind {
+                ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                ExprKind::Lit(_) => return true,
+                _ => return false,
+            }
+        }
+    }
     fn is_binding(e: &Expr<'_>, binding: HirId) -> bool {
         let mut e = e;
         loop {
@@ -448,12 +530,20 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                         && is_binding(receiver, self.binding) =>
                 {
                     if names(index, self.others) {
-                        self.bound = false;
+                        if masked_by(index, self.companion) {
+                            self.masked = true;
+                        } else {
+                            self.bound = false;
+                        }
                     }
                 }
                 ExprKind::Index(base, index, _) if is_binding(base, self.binding) => {
                     if names(index, self.others) {
-                        self.bound = false;
+                        if masked_by(index, self.companion) {
+                            self.masked = true;
+                        } else {
+                            self.bound = false;
+                        }
                     }
                 }
                 _ => {}
@@ -464,11 +554,17 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
     let mut visitor = Indexes {
         binding,
         others: &others,
+        companion,
         bound: true,
+        masked: false,
         _marker: std::marker::PhantomData,
     };
     visitor.visit_body(body);
-    visitor.bound
+    match (visitor.bound, visitor.masked) {
+        (false, _) => IndexBound::No,
+        (true, true) => IndexBound::MaskedByCompanion,
+        (true, false) => IndexBound::ByCompanion,
+    }
 }
 
 impl Hold {

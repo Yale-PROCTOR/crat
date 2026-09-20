@@ -76,6 +76,11 @@ pub(crate) enum BridgeExtentKind {
     None,
     Evidence(String),
     Fallback,
+    /// **R477-6.** A masked companion's `mask + 1`: the text is derived from a
+    /// call-site argument and the site is counted with the fabricated extents,
+    /// because the mask bounds the callee's INDEXES and neither its read width
+    /// nor the allocation.
+    MaskPlusOne(String),
 }
 
 impl BridgeExtentKind {
@@ -84,6 +89,9 @@ impl BridgeExtentKind {
             Self::None => "none".to_owned(),
             Self::Evidence(source) => format!("evidence({source})"),
             Self::Fallback => "fallback(FALLBACK_SLICE_EXTENT=1024)".to_owned(),
+            Self::MaskPlusOne(source) => {
+                format!("fallback(mask+1@addendum-77:{source})")
+            }
         }
     }
 }
