@@ -1443,3 +1443,71 @@ const DOUBLED_VIEW: &str = r#"
     return total;
  }
 "#;
+
+/// **`offset_from` (R475-3)** — brotli's `EmitUncompressedMetaBlock` delivers
+/// `end: &uint8_t` and keeps `end.offset_from(begin)` verbatim in the body, which is
+/// `E0599`: `offset_from` is a raw-pointer method. Every other arithmetic use in the
+/// corpus is `offset`/`add`, which the use-rewrite carries; `offset_from` reads a PAIR of
+/// pointers and is the one shape it does not.
+#[test]
+fn r475_3_offset_from_on_delivered_references() {
+    let source = emit(OFFSET_FROM);
+    println!("EMITTED {source}");
+    // The R130 bridge at a use: a delivered reference reaches `offset_from` through
+    // `core::ptr::from_ref`. The defect is a use left BARE on a delivered receiver, not
+    // the presence of `offset_from` -- the bridged form contains it too.
+    for bad in ["end.offset_from(", "begin.offset_from("] {
+        assert!(
+            !source.contains(bad),
+            "a delivered reference kept a bare raw-pointer `offset_from` use ({bad}):\n{source}"
+        );
+    }
+    assert!(
+        source.contains("core::ptr::from_ref(end).offset_from("),
+        "the use must bridge through from_ref:\n{source}"
+    );
+}
+
+/// The ASYMMETRIC shape, which is brotli's: one end delivered, the other kept raw by a
+/// second caller that does arithmetic on it. If the bridge only fires when BOTH sides
+/// convert, this is the one that stays bare.
+/// **RED-first, preserved and `#[ignore]`d until the fix is built** — this is the shape
+/// brotli has, and it fails today. It is ignored rather than deleted so the fix has its
+/// witness already written, and ignored rather than left red so it adds nothing to the
+/// standing set.
+#[test]
+#[ignore = "R475-3: the receiver bridge does not fire when only one side is delivered; fix owed"]
+fn r475_3_offset_from_with_one_side_still_raw() {
+    let source = emit(OFFSET_FROM_ASYMMETRIC);
+    println!("EMITTED {source}");
+    for bad in ["end.offset_from(", "begin.offset_from("] {
+        assert!(
+            !source.contains(bad),
+            "a delivered reference kept a bare `offset_from` ({bad}):\n{source}"
+        );
+    }
+}
+
+const OFFSET_FROM_ASYMMETRIC: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe extern "C" {
+    fn sink(p: *const u8, n: usize);
+ }
+ pub unsafe fn span_len2(mut begin: *const u8, mut end: *const u8) -> usize {
+    let len = end.offset_from(begin) as usize;
+    sink(begin.offset(1), len);
+    return len;
+ }
+"#;
+
+const OFFSET_FROM: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe extern "C" {
+    fn sink(p: *const u8, n: usize);
+ }
+ pub unsafe fn span_len(mut begin: *const u8, mut end: *const u8) -> usize {
+    let len = end.offset_from(begin) as usize;
+    sink(begin, len);
+    return len;
+ }
+"#;
