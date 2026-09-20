@@ -262,18 +262,29 @@ fn w5d_acc_prefix_is_typed_held() {
             .filter(|(s, _)| s.label.starts_with("ti_edecay::") || s.label.starts_with("ti_obv::"))
             .map(|(s, _)| s.fn_did)
             .collect::<rustc_hash::FxHashSet<_>>();
-        // Relay 042: the claim is that THIS arm holds them — a receipt that
-        // carries another producer's plan is not this arm admitting them.
-        let prefix = table
-            .nested_receipts
-            .iter()
-            .filter(|r| owners.contains(&r.owner))
-            .filter(|r| !r.result.as_ref().is_ok_and(|p| p.count_guard))
-            .collect::<Vec<_>>();
-        assert_eq!(prefix.len(), 2);
+        // **Relay 062 (R477-2), the third and last move of this pin.** Relay
+        // 042 already taught it to ignore the pair arm's own admission; it
+        // still counted the rows that were left, and R435-1's second producer
+        // owns those. Measured at this head, BOTH surviving rows are the
+        // per-parameter arm's (`count_guard == false`) — so the count was
+        // never this arm's answer, and every new row of theirs moved it.
+        //
+        // Re-scoped to the question `held` asks: did the PAIR arm admit? The
+        // count is gone because it measured someone else; what replaces it is
+        // the claim the count never made.
         assert!(
-            prefix
+            !table.nested_receipts.iter().any(|r| {
+                owners.contains(&r.owner) && r.result.as_ref().is_ok_and(|p| p.count_guard)
+            }),
+            "no widened native admission for ti_edecay / ti_obv by the pair arm"
+        );
+        assert!(
+            table
+                .nested_receipts
                 .iter()
+                .filter(|r| owners.contains(&r.owner))
+                // Another producer's admission is not this arm's answer.
+                .filter(|r| !r.result.as_ref().is_ok_and(|p| !p.count_guard))
                 .all(|r| matches!(r.result.as_ref().err(), Some(Hold::IntervalChanged) | None)),
             "initial prefix hold"
         );
