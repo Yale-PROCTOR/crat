@@ -242,6 +242,13 @@ struct ArgRecord {
     /// R479-4b: this argument IS the null literal. A rule-side fact, kept
     /// apart from the probe column below, which no rule may read.
     is_null: bool,
+    /// R478-5 probe column; no rule reads it.
+    why: UnknownWhy,
+    /// R478-5: whether this argument is pointer-typed at all. The probe
+    /// enumerates EVERY argument pair, scalars included; the census only ever
+    /// asks about pointer positions, so the column's table filters on this.
+    /// Probe-only; no rule reads it.
+    is_pointer: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -371,13 +378,14 @@ impl PairDisjointnessIndex {
             };
             let body = tcx.hir_body(body_id);
             let typeck = tcx.typeck(caller);
-            let classes = classify_locals(tcx, typeck, body, &allocators, caller);
+            let (classes, why) = classify_locals(tcx, typeck, body, &allocators, caller);
             let mut collector = CallCollector {
                 tcx,
                 typeck,
                 locals: &local_functions,
                 classes: &classes,
                 fresh_fields: &fresh_fields,
+                why: &why,
                 calls: Vec::new(),
             };
             collector.visit_body(body);
@@ -1164,6 +1172,9 @@ pub(crate) struct ProbeRow {
     pub right_class: String,
     pub left_param: Option<usize>,
     pub right_param: Option<usize>,
+    /// R478-5: why each side's root is `Unknown` (`known` when it is not).
+    pub left_why: String,
+    pub right_why: String,
     pub outcome: String,
 }
 
@@ -1251,7 +1262,13 @@ impl PairDisjointnessIndex {
             };
             for record in records {
                 for (position, left) in record.args.iter().enumerate() {
+                    if !left.is_pointer {
+                        continue;
+                    }
                     for right in record.args.iter().skip(position + 1) {
+                        if !right.is_pointer {
+                            continue;
+                        }
                         let outcome = self
                             .certify(
                                 caller,
@@ -1285,6 +1302,8 @@ impl PairDisjointnessIndex {
                             right_class: describe(right.class),
                             left_param: index_of(caller_did, left.class),
                             right_param: index_of(caller_did, right.class),
+                            left_why: left.why.key().to_owned(),
+                            right_why: right.why.key().to_owned(),
                             outcome,
                         });
                     }
@@ -1371,7 +1390,7 @@ fn allocator_wrappers<'a>(
                 continue;
             }
             let typeck = tcx.typeck(function);
-            let classes = classify_locals(tcx, typeck, body, &oracle, function);
+            let (classes, _why) = classify_locals(tcx, typeck, body, &oracle, function);
             // Every returned value must be fresh; the wrapper is only as
             // strong as its weakest return, so one contract-backed return
             // makes the wrapper contract-backed.
@@ -1839,6 +1858,9 @@ struct LocalFacts {
     /// `binding = rhs`. `None` marks an assignment whose RHS is unclassified.
     assignments: Vec<AssignKind>,
     address_taken: bool,
+    /// One tag per `AssignKind::Other` source, in order: what the RHS was.
+    /// Probe-only (R478-5); no rule reads it.
+    other_shapes: Vec<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1854,13 +1876,64 @@ enum AssignKind {
     Other,
 }
 
+/// R478-5, the probe column: WHY a binding's root came out `Unknown`. It is
+/// written at derive time and read only by `#[cfg(test)]` sizing code — no rule
+/// consults it, so the column cannot move a decision. The ban is mechanized by
+/// `w6p_the_probe_column_is_never_read_by_a_rule`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnknownWhy {
+    /// The root is not `Unknown` at all.
+    Known,
+    /// The binding's own address escapes, so its value is not one provenance.
+    AddressTaken,
+    /// More than one source, or a source that is not a derivation of one place.
+    MixedSources,
+    /// Every unclassified source is a call result (report 019's rule 1: a
+    /// callee whose returns are all views of one formal would give these a
+    /// root).
+    CallResult,
+    /// A pointer VALUE loaded out of a field (report 020's wall: the loaded
+    /// pointer's pointee is not the field slot).
+    FieldRead,
+    /// A pointer value read out of an index projection.
+    IndexRead,
+    /// A local with no allocator source and no single derivation.
+    NoFreshSource,
+    /// The argument is the null literal.
+    NullLiteral,
+    /// The argument names a binding whose root IS known, but the argument's own
+    /// expression shape is one `argument_provenance` does not carry a root
+    /// through (`x.as_mut_ptr()` on a non-array, an unrecognised method).
+    ShapeUnsupported,
+    /// The argument expression names no binding at all; the tag is the HIR
+    /// shape that stopped the walk, so the residue is never opaque.
+    NotALocal(&'static str),
+}
+
+impl UnknownWhy {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Known => "known",
+            Self::AddressTaken => "address-taken",
+            Self::MixedSources => "mixed-sources",
+            Self::CallResult => "call-result",
+            Self::FieldRead => "field-read",
+            Self::IndexRead => "index-read",
+            Self::NoFreshSource => "no-fresh-source",
+            Self::NullLiteral => "null-literal",
+            Self::ShapeUnsupported => "shape-unsupported",
+            Self::NotALocal(shape) => shape,
+        }
+    }
+}
+
 fn classify_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
     typeck: &TypeckResults<'tcx>,
     body: &'tcx rustc_hir::Body<'tcx>,
     allocators: &AllocatorOracle<'_>,
     function: LocalDefId,
-) -> FxHashMap<HirId, RootClass> {
+) -> (FxHashMap<HirId, RootClass>, FxHashMap<HirId, UnknownWhy>) {
     let mut facts: FxHashMap<HirId, LocalFacts> = FxHashMap::default();
     for param in body.params {
         if let PatKind::Binding(_, hir_id, ..) = param.pat.kind {
@@ -1872,6 +1945,7 @@ fn classify_locals<'tcx>(
                     is_pointer: matches!(ty.kind(), ty::RawPtr(..)),
                     assignments: Vec::new(),
                     address_taken: false,
+                    other_shapes: Vec::new(),
                 },
             );
         }
@@ -1977,7 +2051,43 @@ fn classify_locals<'tcx>(
             break;
         }
     }
-    classes
+    // R478-5: the reason is read AFTER the fixpoint, so a binding the fixpoint
+    // rescued reads `Known` and only the residue is attributed.
+    let why = facts
+        .iter()
+        .map(|(&hir_id, fact)| {
+            let why = if classes.get(&hir_id).copied() != Some(RootClass::Unknown) {
+                UnknownWhy::Known
+            } else if fact.address_taken {
+                UnknownWhy::AddressTaken
+            } else if !fact.other_shapes.is_empty()
+                && fact.other_shapes.iter().all(|shape| *shape == "call")
+            {
+                UnknownWhy::CallResult
+            } else if fact.other_shapes.iter().any(|shape| *shape == "field") {
+                UnknownWhy::FieldRead
+            } else if fact.other_shapes.iter().any(|shape| *shape == "index") {
+                UnknownWhy::IndexRead
+            } else if fact.assignments.is_empty() {
+                UnknownWhy::NoFreshSource
+            } else {
+                UnknownWhy::MixedSources
+            };
+            (hir_id, why)
+        })
+        .collect();
+    (classes, why)
+}
+
+/// R478-5: what an unclassified RHS was, for the probe column only.
+fn rhs_shape(rhs: &Expr<'_>) -> &'static str {
+    match &peel_casts(rhs).kind {
+        ExprKind::Call(..) => "call",
+        ExprKind::MethodCall(..) => "method",
+        ExprKind::Field(..) => "field",
+        ExprKind::Index(..) => "index",
+        _ => "other",
+    }
 }
 
 struct LocalCollector<'a, 'tcx> {
@@ -2026,9 +2136,14 @@ impl<'tcx> Visitor<'tcx> for LocalCollector<'_, 'tcx> {
                 is_pointer: matches!(ty.kind(), ty::RawPtr(..)),
                 assignments: Vec::new(),
                 address_taken: false,
+                other_shapes: Vec::new(),
             };
             if let Some(init) = local.init {
-                fact.assignments.push(self.assign_kind(init));
+                let kind = self.assign_kind(init);
+                if kind == AssignKind::Other {
+                    fact.other_shapes.push(rhs_shape(init));
+                }
+                fact.assignments.push(kind);
             }
             self.facts.insert(hir_id, fact);
         }
@@ -2044,6 +2159,9 @@ impl<'tcx> Visitor<'tcx> for LocalCollector<'_, 'tcx> {
                         _ => AssignKind::Other,
                     };
                     if let Some(fact) = self.facts.get_mut(&binding) {
+                        if kind == AssignKind::Other {
+                            fact.other_shapes.push(rhs_shape(rhs));
+                        }
                         fact.assignments.push(kind);
                     }
                 }
@@ -2102,12 +2220,22 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                         arg,
                     )
                     .unwrap_or(class);
+                    let why = if class == RootClass::Unknown {
+                        argument_why(self.why, arg)
+                    } else {
+                        UnknownWhy::Known
+                    };
                     ArgRecord {
                         index,
                         span: arg.span,
                         class,
                         place,
                         is_null: is_null_literal(arg),
+                        why,
+                        is_pointer: matches!(
+                            self.typeck.expr_ty(arg).kind(),
+                            ty::RawPtr(..) | ty::Ref(..)
+                        ),
                     }
                 })
                 .collect();
@@ -2196,6 +2324,48 @@ fn fresh_field_root<'tcx>(
         base: base_class.object_id()?,
         freshness,
     })
+}
+
+/// R478-5: attribute an `Unknown` ARGUMENT. When the expression names a binding
+/// the binding's own reason governs; otherwise the expression's own shape does,
+/// which is where the `field-read` bucket (report 020's wall) comes from.
+fn argument_why(why: &FxHashMap<HirId, UnknownWhy>, arg: &Expr<'_>) -> UnknownWhy {
+    if is_null_literal(arg) {
+        return UnknownWhy::NullLiteral;
+    }
+    let mut cur = peel_casts(arg);
+    loop {
+        match &cur.kind {
+            ExprKind::Path(..) => {
+                return match resolved_local(cur).and_then(|binding| why.get(&binding).copied()) {
+                    // The binding's own root is known, so what stopped the
+                    // argument is the expression shape around it.
+                    Some(UnknownWhy::Known) | None => UnknownWhy::ShapeUnsupported,
+                    Some(reason) => reason,
+                };
+            }
+            ExprKind::Field(..) => return UnknownWhy::FieldRead,
+            ExprKind::Index(..) => return UnknownWhy::IndexRead,
+            ExprKind::Call(..) => return UnknownWhy::CallResult,
+            ExprKind::AddrOf(_, _, base)
+            | ExprKind::MethodCall(_, base, ..)
+            | ExprKind::Unary(UnOp::Deref, base)
+            | ExprKind::DropTemps(base) => cur = peel_casts(base),
+            other => {
+                return UnknownWhy::NotALocal(match other {
+                    ExprKind::Binary(..) => "not-a-local:binary",
+                    ExprKind::Lit(..) => "not-a-local:literal",
+                    ExprKind::If(..) => "not-a-local:if",
+                    ExprKind::Block(..) => "not-a-local:block",
+                    ExprKind::Struct(..) => "not-a-local:struct",
+                    ExprKind::Array(..) | ExprKind::Repeat(..) => "not-a-local:array",
+                    ExprKind::Unary(..) => "not-a-local:unary",
+                    ExprKind::Tup(..) => "not-a-local:tuple",
+                    _ => "not-a-local:other",
+                });
+            }
+        }
+    }
 }
 
 /// A pointer-typed VALUE expression: a bare local's class, or unknown.
