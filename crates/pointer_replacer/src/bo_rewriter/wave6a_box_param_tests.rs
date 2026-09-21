@@ -1466,3 +1466,66 @@ fn w6a_a9_the_nine_shapes_take_their_form_from_the_write_facts() {
         "a Ref-modeled lend needs no decline\n{receipts}"
     );
 }
+
+/// **W6A-A9's companion gate** (report 044, option (c)). A struct with a field
+/// another family OWNS — the model calls the field slot `Owning` — is not a
+/// struct whose formal A9 may decline: a reference formal puts the deallocator
+/// argument behind an A5 raw view, and the owned field's edit cannot live
+/// inside one. Measured on wave-6f's own fixture before this control was
+/// written: without the gate their whole program DEGRADES
+/// (`field-transaction-a5-raw-view:owned-edit-inside-view`); with it the
+/// program emits, `reverted=0`, and the field keeps its `opt-box` delivery.
+///
+/// Here the same shape stands on its own frame, with no other lane's file
+/// involved: `Owner::slot_` is forced `Owning`, and the two formals that only
+/// lend the owner are held with the typed reason rather than declined.
+const OWNED_FIELD_LEND: &str = r#"
+// w6a-a9-owned-field-frame
+#[repr(C)]
+pub struct Owner {
+    pub count: i32,
+    pub slot_: *mut i32,
+}
+unsafe extern "C" fn read_count(mut o: *mut Owner) -> i32 {
+    return (*o).count;
+}
+unsafe extern "C" fn bump(mut o: *mut Owner) {
+    (*o).count = (*o).count + 1 as i32;
+}
+pub unsafe extern "C" fn drive() -> i32 {
+    let mut o = malloc(::std::mem::size_of::<Owner>()) as *mut Owner;
+    (*o).count = 0 as i32;
+    (*o).slot_ = malloc(::std::mem::size_of::<i32>()) as *mut i32;
+    bump(o);
+    let mut c = read_count(o);
+    free((*o).slot_ as *mut core::ffi::c_void);
+    free(o as *mut core::ffi::c_void);
+    return c;
+}
+"#;
+
+#[test]
+fn w6a_a9_an_owned_field_keeps_the_formal() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set_with_contract(
+        "w6a-a9-owned-field-frame",
+        vec![("Owner".to_owned(), 1, SlotKind::Owning)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let out = emitted("boxparam-ownedfield", &with_prelude(OWNED_FIELD_LEND));
+    super::test_model_override::clear();
+    let receipts = &out.artifacts.box_param_receipts;
+    for parameter in ["read_count::o", "bump::o"] {
+        assert!(
+            receipts.contains(&format!(
+                "{parameter}\theld\tbox-param-callee-lends-owned-field:"
+            )),
+            "{parameter} must keep its formal for the owned field\n{receipts}"
+        );
+    }
+    assert!(
+        !receipts.contains("box-param-lend-leaves-owning"),
+        "no formal of an owned-field struct is declined\n{receipts}"
+    );
+}

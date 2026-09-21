@@ -638,6 +638,47 @@ fn inside_loop(tcx: TyCtxt<'_>, mut hir: HirId) -> bool {
     }
 }
 
+/// **W6A-A9's companion gate** (report 044). The pointee of `param` is a
+/// struct one of whose fields the model calls `Owning`: another family owns
+/// that field, its edit is an owned one, and an owned edit cannot sit inside
+/// the A5 raw view a reference formal creates at a deallocator argument.
+fn owned_field_struct<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    param: &Subject,
+) -> bool {
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(param.fn_did)
+        .borrow();
+    let Some(decl) = body.local_decls.get(param.local) else {
+        return false;
+    };
+    let TyKind::RawPtr(pointee, _) = decl.ty.kind() else {
+        return false;
+    };
+    let TyKind::Adt(adt, _) = pointee.kind() else {
+        return false;
+    };
+    let Some(struct_did) = adt.did().as_local() else {
+        return false;
+    };
+    (0..adt.all_fields().count()).any(|field_index| {
+        slots
+            .field_slots
+            .slot_for_field_depth(
+                crate::analyses::borrow_ownership::slots::StructFieldSlot {
+                    struct_did,
+                    field_index,
+                },
+                0,
+            )
+            .map(SlotRef::Field)
+            .and_then(|slot| model.get(&slot).copied())
+            == Some(SlotKind::Owning)
+    })
+}
+
 /// Derive every chain for the crate. Runs once, before the family stages; the
 /// model is read only to refuse a chain whose members are not all Owning.
 #[allow(clippy::too_many_arguments)]
@@ -750,6 +791,25 @@ pub(crate) fn derive<'tcx>(
             // Not a consumer: a lend. Only reported for an Owning-modeled formal
             // (the rows the Box arm holds today); a Ref/Raw formal is not (c).
             if slot_of(param).is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Owning)) {
+                // **W6A-A9's companion gate**, the mirror of A1-e's (report
+                // 044): a formal whose pointee struct has a field the model
+                // calls `Owning` is NOT declined. Making such a formal a
+                // reference puts the deallocator argument behind an A5 raw
+                // view, and the owned field's edit cannot live inside one —
+                // wave-6f's field transaction declines it, and the refusal
+                // aborts the program's rewrite rather than holding one row.
+                // The owner of the hoist that would let both deliver is
+                // wave-6f; until it lands, the field keeps the subject.
+                if owned_field_struct(tcx, slots, model, param) {
+                    out.holds.insert(
+                        (param.fn_did, param.hir_id),
+                        (
+                            param.label.clone(),
+                            format!("box-param-callee-lends-owned-field:{callee_path}"),
+                        ),
+                    );
+                    continue;
+                }
                 // **W6A-A9.** The three sinks are all absent, so nothing in
                 // this body releases the allocation and the caller keeps the
                 // owner. The one act left that could carry it out — handing
