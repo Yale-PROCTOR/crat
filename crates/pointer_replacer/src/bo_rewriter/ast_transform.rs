@@ -1569,13 +1569,23 @@ impl MutVisitor for UseGraftVisitor<'_> {
                         // with a receipt and leave the node intact: a
                         // composition this pass cannot locate is a class's
                         // problem, never the program's.
-                        self.composition_failures.push(format!(
+                        let receipt = format!(
                             "composition-held:caller={}:class={}:inner-text-not-found:{}..{}",
                             view.caller.local_def_index.as_u32(),
                             view.owner_class().order_key(),
                             key.0,
                             key.1
-                        ));
+                        );
+                        // **Readable where it happens (relay 033).** The stats
+                        // field below reaches only the arms-full sweep, so a
+                        // census — the place this is read from — would carry no
+                        // trace of a held composition. One line on stderr, on a
+                        // path that fires at most once per view, is what makes
+                        // the five heman receipts readable at batch 20; the
+                        // worker keeps stderr on a diagnostic run (report 015's
+                        // instrument).
+                        eprintln!("W6L-{receipt}");
+                        self.composition_failures.push(receipt);
                         return;
                     }
                 }
