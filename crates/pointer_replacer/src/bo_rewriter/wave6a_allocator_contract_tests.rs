@@ -709,8 +709,12 @@ fn w6a_ac_the_libc_row_owns_malloc_calloc_and_strdup_locals() {
         "letmutgrid:Box<[u32]>=Box::from_raw(core::ptr::slice_from_raw_parts_mut(calloc(nasstd::os::raw::c_ulong,",
         "free(Box::into_raw(grid)as*mutcore::ffi::c_void);",
         // strdup: the contract's postcondition, measured on the block itself —
-        // the count never mentions `src`.
-        "letmutdup:Box<[i8]>={let__crat_alloc=strdup(src);Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_alloc,core::ffi::CStr::from_ptr(__crat_alloc).to_bytes().len().wrapping_add(1)))};",
+        // the count never mentions `src`. The ARGUMENT's spelling is not this
+        // rule's: a composition may hand `strdup` a view of `src`
+        // (`src.as_ptr()`, wave-6s 057) without touching the claim, so the
+        // opening and the postcondition are asserted apart (R217-2(a)).
+        "letmutdup:Box<[i8]>={let__crat_alloc=strdup(",
+        ");Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_alloc,core::ffi::CStr::from_ptr(__crat_alloc).to_bytes().len().wrapping_add(1)))};",
         "free(Box::into_raw(dup)as*mutcore::ffi::c_void);",
     ] {
         assert!(
@@ -826,10 +830,12 @@ fn w6a_ac_an_overwrite_of_a_live_owner_takes_the_leak_parity_waiver() {
         out.degradations
     );
     for expected in [
-        "letmutdup:Option<Box<[i8]>>=Some({let__crat_alloc=strdup(src);",
+        // The argument's spelling is a composition's (wave-6s 057's
+        // `src.as_ptr()`); the generation and its waiver are this rule's.
+        "letmutdup:Option<Box<[i8]>>=Some({let__crat_alloc=strdup(",
         "ifdup.is_none(){return0asi32;}",
         // The overwrite itself: a new generation assigned over a live one.
-        "dup=Some({let__crat_alloc=strdup(src);",
+        "dup=Some({let__crat_alloc=strdup(",
         "free(dup.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutcore::ffi::c_void));",
     ] {
         assert!(
