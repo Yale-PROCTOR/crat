@@ -8142,7 +8142,7 @@ fn finish_decide<'tcx>(
         ) {
             let ctx = decision::Ctx {
                 local_callee_extent: &relaxed,
-                ..ctx_of(
+                ..ctx_of!(
                     decision::RefGate::LiftAdaptable,
                     Some(&coconv),
                     Some(&lifetime_eligibility),
