@@ -164,3 +164,55 @@ fn w6p_a_missing_else_arm_is_not_one_base() {
         "the value the local already held is the other arm"
     );
 }
+
+/// The shape that is actually there. Report 024 read its own dump as "112
+/// conditional DERIVATIONS"; the arm-level dump says **113 of brotli's
+/// conditionals are `call` / `null`** — `p = if n > 0 { alloc(n) } else { null }`
+/// — and only 12 are derivation/derivation. This is the allocating
+/// conditional, and the claim for it is the one already ratified for the
+/// allocator FIELD at `f065993a2`: null or a block the allocator returned is
+/// still one fresh object.
+const AN_ALLOCATING_CONDITIONAL: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+extern "C" { fn malloc(n: libc::c_ulong) -> *mut libc::c_void; }
+pub unsafe fn StoreBits(mut p: *mut u8, mut out: *mut u8) -> i32 {
+    *out = *p;
+    1
+}
+pub unsafe fn emit(mut storage: *mut u8, mut n: libc::c_ulong) -> i32 {
+    let mut scratch = if n > 0 { malloc(n) as *mut u8 } else { 0 as *mut u8 };
+    StoreBits(storage, scratch)
+}
+"#;
+
+#[test]
+fn w6p_an_allocating_conditional_is_one_fresh_object() {
+    assert_eq!(
+        verdict(AN_ALLOCATING_CONDITIONAL, "emit", "StoreBits", 0, 1),
+        Ok(CertificateKind::DistinctRoots),
+        "null or a block the allocator returned is a fresh object either way"
+    );
+}
+
+/// Control: one arm is a caller's pointer, so the local is not fresh.
+const A_CONDITIONAL_WITH_A_FOREIGN_ARM: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+extern "C" { fn malloc(n: libc::c_ulong) -> *mut libc::c_void; }
+pub unsafe fn StoreBits(mut p: *mut u8, mut out: *mut u8) -> i32 {
+    *out = *p;
+    1
+}
+pub unsafe fn emit(mut storage: *mut u8, mut lent: *mut u8, mut n: libc::c_ulong) -> i32 {
+    let mut scratch = if n > 0 { malloc(n) as *mut u8 } else { lent };
+    StoreBits(storage, scratch)
+}
+"#;
+
+#[test]
+fn w6p_a_foreign_arm_is_not_a_fresh_object() {
+    assert_ne!(
+        verdict(A_CONDITIONAL_WITH_A_FOREIGN_ARM, "emit", "StoreBits", 0, 1),
+        Ok(CertificateKind::DistinctRoots),
+        "a caller's pointer in one arm and the local is not one fresh block"
+    );
+}

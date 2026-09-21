@@ -2387,6 +2387,53 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
         derivation_base(self.typeck, args.get(index)?)
     }
 
+    /// R485-4(e): every arm of a conditional allocates or is null, and at
+    /// least one allocates. Mirrors the allocator-field admission's walk; a
+    /// conditional is only as strong as its weakest allocating arm.
+    ///
+    /// `None` refuses. `Some(None)` is an arm that allocates nothing and names
+    /// nothing — the null literal. `Some(Some(f))` is an allocation.
+    fn conditional_allocator_arm(&self, value: &Expr<'_>) -> Option<Option<Freshness>> {
+        let value = peel_casts(value);
+        match &value.kind {
+            ExprKind::If(_, then, els) => {
+                let els = (*els)?;
+                match (
+                    self.conditional_allocator_arm(then)?,
+                    self.conditional_allocator_arm(els)?,
+                ) {
+                    (Some(a), Some(b)) => Some(Some(a.join(b))),
+                    (found, None) | (None, found) => Some(found),
+                }
+            }
+            ExprKind::Block(block, _) => {
+                if !block.stmts.is_empty() {
+                    return None;
+                }
+                self.conditional_allocator_arm(block.expr?)
+            }
+            // The null check is at the LEAF, after the block descent: an arm
+            // written `else { 0 as *mut T }` is a block around a null literal,
+            // and checking it before descending refuses the whole conditional.
+            _ if is_null_literal(value) => Some(None),
+            _ => self
+                .allocators
+                .is_allocator_call(self.tcx, self.function, value)
+                .map(Some),
+        }
+    }
+
+    /// The conditional as a whole: admitted only when it is a CONDITIONAL (a
+    /// bare allocator call is already handled ahead of this) and at least one
+    /// arm allocates.
+    fn conditional_allocator(&self, value: &Expr<'_>) -> Option<Freshness> {
+        let value = peel_casts(value);
+        if !matches!(value.kind, ExprKind::If(..)) {
+            return None;
+        }
+        self.conditional_allocator_arm(value)?
+    }
+
     fn assign_kind(&self, rhs: &Expr<'_>) -> AssignKind {
         if is_null_literal(rhs) {
             AssignKind::Null
@@ -2394,6 +2441,11 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
             self.allocators
                 .is_allocator_call(self.tcx, self.function, rhs)
         {
+            AssignKind::Allocator(freshness)
+        } else if let Some(freshness) = self.conditional_allocator(rhs) {
+            // R485-4(e), the shape the corpus actually has: null or a block the
+            // allocator returned is one fresh object either way — the claim
+            // already ratified for the allocator FIELD at `f065993a2`.
             AssignKind::Allocator(freshness)
         } else if let Some(Some(base)) = conditional_base(self.typeck, rhs) {
             // R485-4(e): every arm walks within one object, so the value does.
@@ -2422,6 +2474,37 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
 /// "null or fresh".
 fn conditional_base<'tcx>(typeck: &TypeckResults<'tcx>, value: &Expr<'_>) -> Option<Option<HirId>> {
     let value = peel_casts(value);
+    #[cfg(test)]
+    if std::env::var_os("W6P_DUMP_COND").is_some()
+        && let ExprKind::If(_, then, els) = &value.kind
+    {
+        let arm = |e: &Expr<'_>| -> &'static str {
+            let e = peel_casts(e);
+            match &e.kind {
+                ExprKind::Block(b, _) if !b.stmts.is_empty() => "block-stmts",
+                ExprKind::Block(b, _) if b.expr.is_none() => "block-empty",
+                _ if is_null_literal(e) => "null",
+                ExprKind::Call(..) => "call",
+                ExprKind::Field(..) => "field",
+                ExprKind::Index(..) => "index",
+                ExprKind::If(..) => "if",
+                _ if derivation_base(typeck, e).is_some() => "derived",
+                _ => "other",
+            }
+        };
+        let inner = |e: &Expr<'_>| -> &'static str {
+            let e = peel_casts(e);
+            match &e.kind {
+                ExprKind::Block(b, _) if b.stmts.is_empty() => b.expr.map_or("block-empty", arm),
+                _ => arm(e),
+            }
+        };
+        println!(
+            "W6P_COND\t{}\t{}",
+            inner(then),
+            els.map_or("no-else", inner)
+        );
+    }
     match &value.kind {
         ExprKind::If(_, then, els) => {
             // An `if` with no `else` leaves the local holding whatever it held
