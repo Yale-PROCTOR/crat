@@ -70,6 +70,10 @@ pub(crate) enum CertificateKind {
     DistinctRootsUnderContract,
     TypeRule,
     DisjointFields,
+    /// R479-4b: one side is the null literal. Null is `Option::None` (the
+    /// standing null semantics), and `None` overlaps no object, so the pair is
+    /// separated whatever the other operand is.
+    NullOperand,
     /// (e) R462-1. The CALLEE's two parameters never alias, because at every
     /// in-program call the two arguments are disjoint — by (a)/(b)/(c) at that
     /// caller, or by (e) again on the caller's own parameters.
@@ -95,6 +99,7 @@ impl CertificateKind {
             Self::DistinctRootsUnderContract => "pair-disjoint:distinct-roots:allocator-contract",
             Self::TypeRule => "pair-disjoint:type-rule",
             Self::DisjointFields => "pair-disjoint:disjoint-fields",
+            Self::NullOperand => "pair-disjoint:null-operand",
             Self::FreshStackAddress => "pair-disjoint:fresh-stack-address",
             Self::ParameterPair => "pair-disjoint:parameter-pair",
             Self::ExportedEntryWaiver => "pair-disjoint:exported-entry-waiver",
@@ -178,6 +183,18 @@ enum RootClass {
     /// A parameter's VALUE, fixed at entry (never reassigned, address never
     /// taken), or a place inside its pointee: storage that existed at entry.
     EntryStorage(HirId),
+    /// R479-4a: the value read out of a pointer field whose EVERY store in the
+    /// program is a directly called named allocator. `base` is the root binding
+    /// of the place the field was read from, because the sound claim is
+    /// *same-base*: `*base` was live when the allocator wrote the field, and an
+    /// allocator never returns storage overlapping a live object. Against an
+    /// unrelated root the claim fails (report 022 §2), so nothing else is
+    /// certified from it.
+    FreshField {
+        adt: DefId,
+        field: Symbol,
+        base: HirId,
+    },
     Unknown,
 }
 
@@ -197,7 +214,7 @@ impl RootClass {
     fn object_id(self) -> Option<HirId> {
         match self {
             Self::FreshAlloc(id, _) | Self::StackObject(id) | Self::EntryStorage(id) => Some(id),
-            Self::Unknown => None,
+            Self::FreshField { .. } | Self::Unknown => None,
         }
     }
 }
@@ -218,6 +235,9 @@ struct ArgRecord {
     span: Span,
     class: RootClass,
     place: Option<PlacePath>,
+    /// R479-4b: this argument IS the null literal. A rule-side fact, kept
+    /// apart from the probe column below, which no rule may read.
+    is_null: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +340,8 @@ impl PairDisjointnessIndex {
         let tcx = program.tcx;
         let local_functions: FxHashSet<LocalDefId> = program.functions.iter().copied().collect();
         let allocators = allocator_wrappers(tcx, &local_functions, indirect_calls);
+        // R479-4a: needs the wrapper set, so it is derived after it.
+        let fresh_fields = allocator_data_fields(tcx, &local_functions, &allocators);
         let unions = union_member_classes(tcx, program);
         // Member closures are shared across every pair: brotli's ~3k functions
         // ask about the same few hundred pointee types, and recomputing the
@@ -339,6 +361,7 @@ impl PairDisjointnessIndex {
                 typeck,
                 locals: &local_functions,
                 classes: &classes,
+                fresh_fields: &fresh_fields,
                 calls: Vec::new(),
             };
             collector.visit_body(body);
@@ -663,6 +686,11 @@ impl PairDisjointnessIndex {
         {
             return Err(Unproved::SamePlace);
         }
+        // R479-4b, before every root rule: `None` overlaps no object, so a
+        // null-literal operand separates the pair on its own.
+        if a.is_null || b.is_null {
+            return Ok(CertificateKind::NullOperand);
+        }
         if let Some(kind) = certify_roots(a.class, b.class) {
             return Ok(kind);
         }
@@ -780,6 +808,26 @@ impl PairDisjointnessIndex {
 /// (a): one side a fresh object of the caller, the other a distinct fresh
 /// object or storage that existed at entry.
 fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
+    // R479-4a, same-base only. `(*base).f` holds a block the allocator returned
+    // while `*base` was live, so it cannot overlap `*base` or any place inside
+    // it. Two DIFFERENT admitted fields are two different allocations. The same
+    // field on both sides is the same block, and an unrelated root is refused:
+    // a pointer taken out of the field after the allocation is that same block.
+    match (a, b) {
+        (RootClass::FreshField { adt, field, base }, other)
+        | (other, RootClass::FreshField { adt, field, base }) => {
+            return match other {
+                RootClass::FreshField {
+                    adt: other_adt,
+                    field: other_field,
+                    ..
+                } => ((adt, field) != (other_adt, other_field))
+                    .then_some(CertificateKind::DistinctRoots),
+                _ => (other.object_id() == Some(base)).then_some(CertificateKind::DistinctRoots),
+            };
+        }
+        _ => {}
+    }
     let (fresh, other) = if a.is_fresh_object() {
         (a, b)
     } else if b.is_fresh_object() {
@@ -788,7 +836,7 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
         return None;
     };
     match other {
-        RootClass::Unknown => None,
+        RootClass::Unknown | RootClass::FreshField { .. } => None,
         RootClass::FreshAlloc(..) | RootClass::StackObject(_) | RootClass::EntryStorage(_) => {
             (fresh.object_id() != other.object_id()).then(|| {
                 match fresh.freshness().join(other.freshness()) {
@@ -1113,6 +1161,7 @@ impl PairDisjointnessIndex {
                 RootClass::FreshAlloc(_, Freshness::Contract) => "fresh-contract".to_owned(),
                 RootClass::StackObject(_) => "stack".to_owned(),
                 RootClass::EntryStorage(_) => "entry".to_owned(),
+                RootClass::FreshField { field, .. } => format!("fresh-field:{field}"),
                 RootClass::Unknown => "unknown".to_owned(),
             }
         };
@@ -1414,6 +1463,162 @@ fn fn_pointer_field_key(
 
 /// The `(struct, field)` key of a field access, refusing unions and fields
 /// whose declared type is not a function pointer.
+/// R479-4a: the `(adt, field)` key of a POINTER-typed field access. A union's
+/// field is never keyed — a union member shares storage with its siblings.
+fn data_field_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    base: &Expr<'_>,
+    field: Symbol,
+) -> Option<(DefId, Symbol)> {
+    let ty::Adt(def, args) = typeck.expr_ty_adjusted(base).peel_refs().kind() else {
+        return None;
+    };
+    if def.is_union() {
+        return None;
+    }
+    let declared = def
+        .all_fields()
+        .find(|candidate| candidate.name == field)?
+        .ty(tcx, args);
+    matches!(declared.kind(), ty::RawPtr(..)).then_some((def.did(), field))
+}
+
+/// R479-4a: the pointer fields every one of whose stores in the program is a
+/// DIRECTLY CALLED NAMED allocator — a libc allocator or a wrapper whose own
+/// freshness is proven — or the null literal. One store of anything else (a
+/// copy of a local or another field, a parameter, an indirect allocator call
+/// through a function pointer) refuses the field outright, so the admitted set
+/// is exactly the fields whose contents the closed world can account for.
+fn allocator_data_fields(
+    tcx: TyCtxt<'_>,
+    functions: &FxHashSet<LocalDefId>,
+    oracle: &AllocatorOracle<'_>,
+) -> FxHashSet<(DefId, Symbol)> {
+    let mut allocator: FxHashSet<(DefId, Symbol)> = FxHashSet::default();
+    let mut refused: FxHashSet<(DefId, Symbol)> = FxHashSet::default();
+    for &function in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+            continue;
+        };
+        let mut collector = DataFieldStoreCollector {
+            tcx,
+            typeck: tcx.typeck(function),
+            oracle,
+            function,
+            allocator: &mut allocator,
+            refused: &mut refused,
+        };
+        collector.visit_body(tcx.hir_body(body_id));
+    }
+    allocator.retain(|key| !refused.contains(key));
+    allocator
+}
+
+struct DataFieldStoreCollector<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    typeck: &'a TypeckResults<'tcx>,
+    oracle: &'a AllocatorOracle<'a>,
+    function: LocalDefId,
+    allocator: &'a mut FxHashSet<(DefId, Symbol)>,
+    refused: &'a mut FxHashSet<(DefId, Symbol)>,
+}
+
+impl<'tcx> DataFieldStoreCollector<'_, 'tcx> {
+    /// A DIRECT call of a NAMED allocator: the fn-pointer-field path that
+    /// `AllocatorOracle::is_allocator_call` also admits is deliberately not
+    /// consulted here, and a contract-backed wrapper is not a proof.
+    fn is_direct_named_allocator(&self, value: &Expr<'_>) -> bool {
+        let ExprKind::Call(callee, _) = &peel_casts(value).kind else {
+            return false;
+        };
+        let Some(did) = callee_def_id(callee) else {
+            return false;
+        };
+        if let Some(freshness) = self.oracle.wrappers.get(&did) {
+            return *freshness == Freshness::Proven;
+        }
+        AllocatorOracle::is_libc_allocator(self.tcx, did)
+    }
+
+    fn record(&mut self, place: &Expr<'_>, value: &Expr<'_>) {
+        let ExprKind::Field(base, field) = &peel_casts(place).kind else {
+            return;
+        };
+        let Some(key) = data_field_key(self.tcx, self.typeck, base, field.name) else {
+            return;
+        };
+        if self.is_direct_named_allocator(value) {
+            self.allocator.insert(key);
+        } else if !is_null_literal(value) {
+            self.refused.insert(key);
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for DataFieldStoreCollector<'_, 'tcx> {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match &expr.kind {
+            ExprKind::Assign(place, value, _) => self.record(place, value),
+            // A compound assignment is pointer ARITHMETIC on the field, never
+            // an allocation: it refuses whatever the field held.
+            ExprKind::AssignOp(_, place, value) => {
+                let _ = value;
+                if let ExprKind::Field(base, field) = &peel_casts(place).kind
+                    && let Some(key) = data_field_key(self.tcx, self.typeck, base, field.name)
+                {
+                    self.refused.insert(key);
+                }
+            }
+            // A struct literal initialises every field it names.
+            ExprKind::Struct(_, fields, rest) => {
+                if let ty::Adt(def, args) = self.typeck.expr_ty(expr).kind()
+                    && !def.is_union()
+                {
+                    for field in *fields {
+                        let Some(declared) = def
+                            .all_fields()
+                            .find(|candidate| candidate.name == field.ident.name)
+                            .map(|candidate| candidate.ty(self.tcx, args))
+                        else {
+                            continue;
+                        };
+                        if !matches!(declared.kind(), ty::RawPtr(..)) {
+                            continue;
+                        }
+                        let key = (def.did(), field.ident.name);
+                        if self.is_direct_named_allocator(field.expr) {
+                            self.allocator.insert(key);
+                        } else if !is_null_literal(field.expr) {
+                            self.refused.insert(key);
+                        }
+                    }
+                    // `..base` copies every field it fills in from elsewhere.
+                    if !matches!(rest, rustc_hir::StructTailExpr::None) {
+                        for candidate in def.all_fields() {
+                            if matches!(candidate.ty(self.tcx, args).kind(), ty::RawPtr(..)) {
+                                self.refused.insert((def.did(), candidate.name));
+                            }
+                        }
+                    }
+                }
+            }
+            // The field's own ADDRESS escapes: whatever holds that address may
+            // store anything through it, so the closed world stops here.
+            ExprKind::AddrOf(_, _, operand) => {
+                if let ExprKind::Field(base, field) = &peel_casts(operand).kind
+                    && let Some(key) = data_field_key(self.tcx, self.typeck, base, field.name)
+                {
+                    self.refused.insert(key);
+                }
+            }
+            _ => {}
+        }
+        let _ = self.function;
+        intravisit::walk_expr(self, expr);
+    }
+}
+
 fn adt_field_key<'tcx>(
     tcx: TyCtxt<'tcx>,
     typeck: &TypeckResults<'tcx>,
@@ -1787,6 +1992,7 @@ struct CallCollector<'a, 'tcx> {
     typeck: &'a TypeckResults<'tcx>,
     locals: &'a FxHashSet<LocalDefId>,
     classes: &'a FxHashMap<HirId, RootClass>,
+    fresh_fields: &'a FxHashSet<(DefId, Symbol)>,
     calls: Vec<(LocalDefId, SiteRecord)>,
 }
 
@@ -1803,11 +2009,23 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                 .map(|(index, arg)| {
                     let (class, place) =
                         argument_provenance(self.tcx, self.typeck, self.classes, arg);
+                    // R479-4a: a read of an admitted pointer field names the
+                    // block its allocator returned, keyed to the base it was
+                    // read from.
+                    let class = fresh_field_root(
+                        self.tcx,
+                        self.typeck,
+                        self.classes,
+                        self.fresh_fields,
+                        arg,
+                    )
+                    .unwrap_or(class);
                     ArgRecord {
                         index,
                         span: arg.span,
                         class,
                         place,
+                        is_null: is_null_literal(arg),
                     }
                 })
                 .collect();
@@ -1871,6 +2089,32 @@ fn argument_provenance<'tcx>(
         }
         _ => pointer_value_provenance(tcx, typeck, classes, expr),
     }
+}
+
+/// R479-4a: the root of `(*b).f` / `b.f` when `f` is an admitted allocator
+/// field — the block the allocator returned, keyed to `b` so `certify_roots`
+/// can apply the same-base claim and nothing wider.
+fn fresh_field_root<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    classes: &FxHashMap<HirId, RootClass>,
+    fresh_fields: &FxHashSet<(DefId, Symbol)>,
+    arg: &Expr<'_>,
+) -> Option<RootClass> {
+    let ExprKind::Field(base, field) = &peel_casts(arg).kind else {
+        return None;
+    };
+    let key = data_field_key(tcx, typeck, base, field.name)?;
+    if !fresh_fields.contains(&key) {
+        return None;
+    }
+    // The base must itself name one object, or "same base" names nothing.
+    let (base_class, _) = place_provenance(tcx, typeck, classes, base);
+    Some(RootClass::FreshField {
+        adt: key.0,
+        field: key.1,
+        base: base_class.object_id()?,
+    })
 }
 
 /// A pointer-typed VALUE expression: a bare local's class, or unknown.
