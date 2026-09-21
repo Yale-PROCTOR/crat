@@ -2253,11 +2253,13 @@ fn w4b103_the_residue_is_counted_with_its_reason() {
 /// not wave-5c's mask companion, not the root walk. The user ruled the subject
 /// takes the slice form regardless, with `FALLBACK_SLICE_EXTENT`.
 ///
-/// **What is waived is BEHAVIOUR:** a checked index past 1024 panics where the
-/// C program read on. No UB is introduced — the slice is a real 1024-byte view
-/// of a live allocation — and the user accepted the trade on the record
-/// (addendum 481); every claims-facing document owes it a line beside the
-/// 2026-08-30 slice-extent waiver it extends.
+/// **What is waived** is a checked index past 1024 panicking where the C
+/// program read on (behaviour, accepted by the user on the record, addendum
+/// 481) AND — the part not to soften — the slice-length UB that constructing a
+/// 1024-element view of an object of unproven size can commit, which the
+/// 2026-08-30 user+advisor ruling already put out of scope under this same
+/// fallback extent. This arm extends that waiver to a new population; it does
+/// not open a new hole, and it does not avoid one either.
 #[test]
 fn w4w01_a_root_with_no_extent_is_lifted_under_the_waiver() {
     let lifts = table_of(W4_B1_UNSIZED_ROOT, |table| {

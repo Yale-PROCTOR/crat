@@ -275,12 +275,23 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
 /// rows whose access nothing bounds — and the user's answer is to lift them
 /// anyway, with `FALLBACK_SLICE_EXTENT`.
 ///
-/// **What is waived is BEHAVIOUR, and it is stated rather than hidden.** A
-/// checked index past 1024 PANICS where the C program read on. That is not a
-/// soundness waiver — no UB is introduced, the slice is a real 1024-byte view
-/// of a live allocation — it is a behavioural one, accepted by the user on the
-/// record and owed a line in every claims-facing document, beside the
-/// slice-extent waiver it extends (2026-08-30).
+/// **What is waived, stated precisely rather than softened.** Two things, and
+/// the second is the one a reader must not miss:
+///
+/// 1. **Behaviour.** A checked index past 1024 PANICS where the C program read
+///    on. The user accepted that trade on the record (addendum 481).
+/// 2. **Slice-length UB, which was ALREADY out of scope.** The fabricated view
+///    is `FALLBACK_SLICE_EXTENT` elements of an object whose real size nothing
+///    here proved, so constructing it can exceed the allocation — and Rust's
+///    contract for `from_raw_parts` is violated by the construction, not only
+///    by a later access. That is exactly the slice-length UB the 2026-08-30
+///    user+advisor ruling put out of scope under the named fallback extent, and
+///    this arm extends that same waiver to a new population rather than opening
+///    a new hole. It would be wrong to write "no UB is introduced" here; what
+///    is true is that the UB in question is one the project has already
+///    declared out of scope, receipted per site so the count is auditable.
+///
+/// Both belong in every claims-facing document beside the 2026-08-30 waiver.
 ///
 /// The discipline that rides it is ORDER: this pass runs LAST, after the exact
 /// width, after the mask companion, and after the root walk, so a fabricated
