@@ -325,14 +325,19 @@ pub(crate) fn plan(
                     owner_class,
                     node,
                     parameter_index,
-                    base: wrapper_base(
+                    // Composition arm (assembler, dry23; seat relay 048 §1):
+                    // wave-6a's R477-3 helpers arrived without their wiring —
+                    // the planner still passed the REGION's element (`u32` for
+                    // `AddrH40`, `u16` for `HeadH42`), which is the width the
+                    // body reinterprets at, not the `u8` the CONVERTED
+                    // parameter carries. Their own doc says the planner calls
+                    // `wrapper_base_for_region` "and nothing else"; this is
+                    // that call.
+                    base: wrapper_base_for_region(
                         &parameter_name,
                         form,
                         void_pointee(tcx, original_type),
-                        table
-                            .void_region
-                            .get(&node)
-                            .map(|region| region.element.as_str()),
+                        table.void_region.get(&node),
                     ),
                     parameter_name,
                     atom_ids,
