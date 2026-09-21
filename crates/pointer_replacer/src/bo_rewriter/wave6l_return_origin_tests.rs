@@ -1007,10 +1007,22 @@ unsafe extern "C" fn lil_parse(mut lil: *mut Lil, mut argc: i32) -> i32 {
 fn w6l_pointer_value_read_from_a_pointer_array_field_is_held_origin_absent() {
     let observed = observe(LIL_FIND);
     let cmd = decision_of(&observed, "lil_parse::cmd");
-    assert!(cmd.contains("ReturnNotAdapted"), "{cmd}");
+    // **Superseded in part by W6L-A8-1** (relay 026): the CALLEE still earns
+    // nothing — the origin edge is still absent, which is what the failure
+    // below pins — but the receiver no longer depends on it. Its own null test
+    // types it `Option<&mut ..>` through the raw pointer's `as_mut()`
+    // (`wave6l_call_result_option_tests`), so the subject is delivered while
+    // the export gap stands. The pin that remains is the one this witness was
+    // written for: no lifetime plan, no callee conversion, no revert.
+    assert!(cmd.contains("Opt"), "{cmd}");
+    // No lifetime failure is recorded any more BECAUSE the subject is no
+    // longer a return residual: the eligibility pass only inspects residuals,
+    // so `None` here means "never asked", not "asked and passed". What the
+    // export gap is measured by now is the empty plan set below — the callee
+    // `find_cmd` earns no return permit and keeps its raw interface.
     assert_eq!(
         failure_of(&observed, "lil_parse::cmd"),
-        Some(LifetimeFailure::OriginAbsent),
+        None,
         "{:?}",
         observed.failures
     );
@@ -1024,7 +1036,11 @@ fn w6l_pointer_value_read_from_a_pointer_array_field_is_held_origin_absent() {
         panic!("lil find emission degraded");
     };
     assert_eq!(reverted_count, 0);
-    assert_eq!(emitted_count, 2, "the two `lil` parameters still deliver");
+    assert_eq!(
+        emitted_count, 3,
+        "the two `lil` parameters still deliver, and `lil_parse::cmd` joins \
+         them under W6L-A8-1"
+    );
 }
 
 /// heman `kmAABB3Scale` (subject `kmAABB3Scale::pOut#1`, `escapes-via-return`):

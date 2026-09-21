@@ -36,6 +36,7 @@ mod array_start_tests;
 pub(crate) mod binn_counted;
 pub(crate) mod box_facts;
 pub(crate) mod box_param;
+pub(crate) mod call_result_option;
 pub(crate) mod callee_parameter_input;
 pub(crate) mod co_conversion;
 pub(crate) mod compare_only_offset;
@@ -1898,6 +1899,11 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         }
         Decision::Slice { .. } if slice_construction_values::permits(ctx, subject) => decision,
         Decision::Ref { mutable } if raw_place_values::permits(ctx, subject, mutable) => decision,
+        // W6L-A8-1: a null-tested raw call result types its own local —
+        // `Option<&mut T>` from the pointer's own `as_mut()`, the callee's
+        // raw return untouched. The untied view's guard is the closed use
+        // vocabulary inside `call_result_option::value`.
+        Decision::Opt { slice: false, .. } if call_result_option::permits(ctx, subject) => decision,
         Decision::Ref { mutable } => {
             if receiver_failed {
                 degrade(
@@ -2499,6 +2505,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             && !source_typed_local::permits(ctx, subject)
             && !slice_construction_values::permits(ctx, subject)
             && !raw_place_values::permits(ctx, subject, subject.mutable)
+            // W6L-A8-1: a null-tested call result types itself through `as_mut()`.
+            && !call_result_option::permits(ctx, subject)
             && !literal_construction
             && !(family_policy
                 .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)

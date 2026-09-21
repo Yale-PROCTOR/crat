@@ -4647,6 +4647,8 @@ pub(crate) fn plan(
             || super::decision::construction_values::has_declaration(table, subject)
             || super::decision::slice_construction_values::has_declaration(table, subject)
             || super::decision::raw_place_values::has_declaration(table, subject)
+            // W6L-A8-1: the null-tested call result's own declaration.
+            || super::decision::call_result_option::has_declaration(table, subject)
             || super::decision::source_typed_local::has_declaration(table, subject);
         let typed_receiver = table
             .return_receivers

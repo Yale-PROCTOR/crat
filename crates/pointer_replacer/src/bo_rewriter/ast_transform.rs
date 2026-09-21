@@ -4052,6 +4052,7 @@ fn transform_with<'tcx>(
             && !super::decision::construction_values::has_declaration(table, subject)
             && !super::decision::slice_construction_values::has_declaration(table, subject)
             && !super::decision::raw_place_values::has_declaration(table, subject)
+            && !super::decision::call_result_option::has_declaration(table, subject)
             && !super::decision::source_typed_local::has_declaration(table, subject)
             && !table
                 .return_receivers

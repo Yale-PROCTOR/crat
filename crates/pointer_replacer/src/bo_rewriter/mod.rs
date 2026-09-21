@@ -145,6 +145,8 @@ mod wave6k_reverted_class_naming_tests;
 #[cfg(test)]
 mod wave6k_typedef_parameter_tests;
 #[cfg(test)]
+mod wave6l_call_result_option_tests;
+#[cfg(test)]
 mod wave6l_local_box_exemption_tests;
 #[cfg(test)]
 mod wave6l_nested_composition_tests;
