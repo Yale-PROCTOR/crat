@@ -66,13 +66,46 @@ pub(crate) struct LiftReceipt {
     /// slice form with `FALLBACK_SLICE_EXTENT`, not with an extent anything
     /// proved.
     pub(crate) fallback: bool,
-    /// **Why the waiver did NOT take this row** (wave-4 report 047). Until this
-    /// column existed the arm receipted only its lifts, so a census could say
-    /// how many rows were fabricated but never why a held row was passed over —
-    /// which is exactly the question C5 asked and the artifacts could not
-    /// answer. A refusal is a decision and carries its reason, as B1's
-    /// two-column table already does.
-    pub(crate) declined: Option<&'static str>,
+    /// **Why this row was NOT lifted**, and by WHICH arm (wave-4 reports 047
+    /// and 048). Until this column existed the family receipted only its lifts,
+    /// so a census could say how many rows were fabricated but never why a held
+    /// row was passed over — which is exactly the question C5 asked and the
+    /// artifacts could not answer. A refusal is a decision and carries its
+    /// reason, as B1's two-column table already does.
+    pub(crate) declined: Option<Refusal>,
+}
+
+/// **Which arm refused, and why.**
+///
+/// The two are separate classes and a census must not add them up: an
+/// `Unlicensed` row was passed over by the EXACT arm and may still have been
+/// lifted by the waiver below it (with a fabricated extent), while a `Declined`
+/// row reached the bottom of the ladder and is held. C5 is the reason the first
+/// variant exists: the row's waiver reason was recoverable from `295cf8b6a` and
+/// the reason no WIDTH licensed it was not, so "why is this twin held while its
+/// identical twin delivers?" stopped one question short of an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Refusal {
+    /// The exact-width arm found no licensed width here.
+    Unlicensed(&'static str),
+    /// The waiver refused the row outright.
+    Declined(&'static str),
+}
+
+impl Refusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Refusal::Unlicensed(reason) | Refusal::Declined(reason) => reason,
+        }
+    }
+
+    /// The census's `extent_class` for this refusal.
+    fn class(self) -> &'static str {
+        match self {
+            Refusal::Unlicensed(_) => "unlicensed",
+            Refusal::Declined(_) => "declined",
+        }
+    }
 }
 
 impl LiftReceipt {
@@ -81,8 +114,19 @@ impl LiftReceipt {
         let index = self
             .parameter_index
             .map_or_else(|| "-".to_owned(), |index| index.to_string());
-        if let Some(reason) = self.declined {
-            return format!("declined(extent-lift:{}:{index}:{reason})", self.callee);
+        if let Some(refusal) = self.declined {
+            let reason = refusal.reason();
+            return match refusal {
+                Refusal::Unlicensed(_) => {
+                    format!(
+                        "unlicensed(licensed-width:{}:{index}:{reason})",
+                        self.callee
+                    )
+                }
+                Refusal::Declined(_) => {
+                    format!("declined(extent-lift:{}:{index}:{reason})", self.callee)
+                }
+            };
         }
         match self.width_bytes {
             Some(width) => format!("evidence(licensed-width:{}:{index}:{width})", self.callee),
@@ -105,13 +149,39 @@ fn callee_region<'a>(
     entries: &[(Subject, Decision)],
     callee: LocalDefId,
     index: usize,
-) -> Option<&'a Region> {
-    entries.iter().find_map(|(subject, decision)| {
-        (subject.fn_did == callee
-            && matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == index)
-            && delivers_slice(decision))
-        .then(|| ctx.void_region.get(&(subject.fn_did, subject.hir_id)))
-        .flatten()
+) -> Result<&'a Region, &'static str> {
+    let mut parameter_in_frame = false;
+    for (subject, decision) in entries.iter() {
+        if subject.fn_did != callee
+            || !matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == index)
+        {
+            continue;
+        }
+        parameter_in_frame = true;
+        if !delivers_slice(decision) {
+            continue;
+        }
+        let Some(region) = ctx.void_region.get(&(subject.fn_did, subject.hir_id)) else {
+            return Err("callee-carries-no-region");
+        };
+        // The seam reads a delivered slice at a width READ only.
+        if region.shape != Shape::WidthRead {
+            return Err("region-is-not-a-width-read");
+        }
+        if region.len_bytes.is_none() {
+            return Err("region-width-is-not-exact");
+        }
+        return Ok(region);
+    }
+    // **The two `None`s a census must not confuse** (report 048). "Not in the
+    // frame" is a callee this pass never saw; "not YET a slice" is one it saw
+    // undecided, which is a statement about pass ORDER and not about the
+    // callee — `void_region::licensed_width` asks the finished table and would
+    // answer where this twin does not.
+    Err(if parameter_in_frame {
+        "callee-parameter-not-yet-a-slice"
+    } else {
+        "callee-parameter-not-in-frame"
     })
 }
 
@@ -184,38 +254,65 @@ pub(crate) fn slice_rewrites(
 /// and re-types held callers whose callee parameter carries an exact licensed
 /// width.
 pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) -> Vec<LiftReceipt> {
-    let widths: FxHashMap<(LocalDefId, HirId), (u64, bool, String, usize)> = entries
-        .iter()
-        .filter_map(|(subject, decision)| {
-            let access = held_at_a_local_callee(decision)?;
-            // Already fat: the hold is about a one-element claim, and this
-            // subject does not make one.
-            if ctx.fat.is_array(subject.fn_did, subject.local) {
-                return None;
+    let mut widths: FxHashMap<(LocalDefId, HirId), (u64, bool, String, usize)> =
+        FxHashMap::default();
+    // **Every row this arm passes over says why** (report 048, relay 064). The
+    // arm used to answer a held row silently, so a census could see that a
+    // twin was not lifted and never learn whether the callee stated no width,
+    // stated one this seam cannot read, or was simply not decided yet when this
+    // pass ran. C5 — one brotli twin delivered, its identical twin held —
+    // could not be answered from the artifacts for exactly that reason.
+    let mut unlicensed: Vec<LiftReceipt> = Vec::new();
+    for (subject, decision) in entries.iter() {
+        let access = match held_at_a_local_callee(decision) {
+            Some(access) => access,
+            None => continue,
+        };
+        let mut refuse = |why: &'static str| {
+            unlicensed.push(LiftReceipt {
+                subject: subject.label.clone(),
+                callee: access.callee.clone(),
+                parameter_index: Some(access.parameter_index),
+                width_bytes: None,
+                mutable: subject.mutable,
+                fallback: false,
+                declined: Some(Refusal::Unlicensed(why)),
+            });
+        };
+        // Already fat: the hold is about a one-element claim, and this
+        // subject does not make one.
+        if ctx.fat.is_array(subject.fn_did, subject.local) {
+            refuse("caller-is-already-fat");
+            continue;
+        }
+        let node = (subject.fn_did, subject.hir_id);
+        if !slice_uses_supported(ctx, node) {
+            refuse("slice-use-unsupported");
+            continue;
+        }
+        // EXACT, never the fallback: this is `void_region::licensed_width`.
+        let region = match callee_region(ctx, entries, access.callee_id, access.parameter_index) {
+            Ok(region) => region,
+            Err(why) => {
+                refuse(why);
+                continue;
             }
-            let node = (subject.fn_did, subject.hir_id);
-            if !slice_uses_supported(ctx, node) {
-                return None;
-            }
-            let region = callee_region(ctx, entries, access.callee_id, access.parameter_index)?;
-            // The seam reads a delivered slice at a width READ only.
-            if region.shape != Shape::WidthRead {
-                return None;
-            }
-            // EXACT, never the fallback: this is `void_region::licensed_width`.
-            let width = region.len_bytes?;
-            Some((
-                node,
-                (
-                    width,
-                    region.mutable,
-                    access.callee.clone(),
-                    access.parameter_index,
-                ),
-            ))
-        })
-        .collect();
-    let mut receipts = Vec::new();
+        };
+        let Some(width) = region.len_bytes else {
+            refuse("region-width-is-not-exact");
+            continue;
+        };
+        widths.insert(
+            node,
+            (
+                width,
+                region.mutable,
+                access.callee.clone(),
+                access.parameter_index,
+            ),
+        );
+    }
+    let mut receipts = unlicensed;
     for (subject, decision) in entries.iter_mut() {
         let Some((width, region_mutable, callee, parameter_index)) =
             widths.get(&(subject.fn_did, subject.hir_id))
@@ -261,7 +358,7 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
                     .map_or_else(|| "-".to_owned(), |width| width.to_string()),
                 if lift.mutable { "mut-slice" } else { "slice" },
                 match (lift.declined, lift.fallback) {
-                    (Some(_), _) => "declined",
+                    (Some(refusal), _) => refusal.class(),
                     (None, true) => "fallback",
                     (None, false) => "evidence",
                 },
@@ -398,7 +495,7 @@ pub(crate) fn promote_fallback(
                 width_bytes: None,
                 mutable: subject.mutable,
                 fallback: false,
-                declined: Some(why),
+                declined: Some(Refusal::Declined(why)),
             });
         };
     let candidates: FxHashMap<(LocalDefId, HirId), (String, Option<usize>)> = entries

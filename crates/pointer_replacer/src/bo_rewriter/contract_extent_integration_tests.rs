@@ -1091,7 +1091,7 @@ fn ce_a02_a_dereference_beside_the_nul_position_keeps_the_fatness_hold() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -1723,7 +1723,7 @@ fn ce_a03_a_contract_alone_candidate_at_a_pending_sibling_site_holds() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -1874,7 +1874,7 @@ fn ce_a05_a_sibling_borrowed_through_a_deref_keeps_the_pending_hold() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -2087,7 +2087,7 @@ fn w4l04_an_untyped_void_callee_licenses_nothing() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -2108,7 +2108,7 @@ fn w4l05_a_width_write_licenses_no_evidence_receipt() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -2409,7 +2409,7 @@ fn w4w01_a_root_with_no_extent_is_lifted_under_the_waiver() {
     .expect("the fixture yields a table");
     let storage = lifts
         .iter()
-        .find(|(subject, ..)| subject.starts_with("StoreUnsized::storage"))
+        .find(|(subject, fallback, _)| subject.starts_with("StoreUnsized::storage") && *fallback)
         .unwrap_or_else(|| panic!("the waiver must lift it: {lifts:?}"));
     assert!(
         storage.1,
@@ -2582,10 +2582,76 @@ fn w4w06_a_refused_row_carries_its_reason() {
             .collect::<Vec<_>>()
     })
     .expect("the fixture yields a table");
+    // Re-premised by report 048: BOTH arms receipt their refusals now, so the
+    // waiver's row is selected by its arm rather than by being the only one.
     let declined = rows
         .iter()
-        .find(|(_, declined, _)| declined.is_some())
+        .find(|(_, declined, _)| {
+            matches!(
+                declined,
+                Some(super::decision::licensed_lift::Refusal::Declined(_))
+            )
+        })
         .unwrap_or_else(|| panic!("the refusal must be receipted: {rows:?}"));
-    assert_eq!(declined.1, Some("slice-use-unsupported"), "{rows:?}");
+    assert_eq!(
+        declined.1,
+        Some(super::decision::licensed_lift::Refusal::Declined(
+            "slice-use-unsupported"
+        )),
+        "{rows:?}"
+    );
     assert!(declined.2.starts_with("declined(extent-lift:"), "{rows:?}");
+}
+
+/// **W4L-9 (wave-4 report 048, relay 064) — the EXACT arm receipts its
+/// refusals too, and says which question failed.**
+///
+/// C5 is the reason this exists. Two byte-identical brotli twins, one
+/// delivered and one held: the waiver's reason for the held one was recoverable
+/// from `295cf8b6a`, and the reason no WIDTH licensed it was not — so the
+/// artifacts could say the row was refused twice and never say by what. The
+/// arm's own ladder is four distinct questions (is the caller already fat, has
+/// it a slice image, is the callee parameter a decided slice IN THIS PASS, does
+/// its region state an exact read width) and a census must be able to tell them
+/// apart: "the callee states no width" and "the callee was not decided yet when
+/// this pass ran" are a fact about the program and a fact about pass ORDER
+/// respectively, and only the second is mine to fix.
+#[test]
+fn w4l09_the_exact_arm_receipts_why_no_width_licensed_a_row() {
+    let rows = table_of(W4_LIFT_WRITE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.subject.clone(), lift.declined, lift.key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let unlicensed = rows
+        .iter()
+        .find(|(_, declined, _)| {
+            matches!(
+                declined,
+                Some(super::decision::licensed_lift::Refusal::Unlicensed(_))
+            )
+        })
+        .unwrap_or_else(|| panic!("the exact arm's refusal must be receipted: {rows:?}"));
+    // **Measured, not assumed.** The first draft of this witness asserted
+    // `region-is-not-a-width-read` and came back RED with
+    // `callee-parameter-not-yet-a-slice` — which is the more basic truth about
+    // this shape and the one worth pinning: a width-WRITE parameter is
+    // `kind-raw` (report 043), so it is never a decided slice and the arm stops
+    // one question earlier than the module's prose suggests. The shape refusal
+    // below it is stated in `callee_region` and is NOT witnessed here; saying so
+    // is cheaper than shaping a fixture whose write parameter delivers.
+    assert_eq!(
+        unlicensed.1,
+        Some(super::decision::licensed_lift::Refusal::Unlicensed(
+            "callee-parameter-not-yet-a-slice"
+        )),
+        "a width-write parameter is not a decided slice at all: {rows:?}"
+    );
+    assert!(
+        unlicensed.2.starts_with("unlicensed(licensed-width:"),
+        "{rows:?}"
+    );
 }
