@@ -479,6 +479,45 @@ fn raw_boundary_delivery_custody(
     report
 }
 
+/// **R492-1** — the pair columns, written from the pairs receipt alone.
+///
+/// Shared by the ordinary path and the typed-failure early return, so a program that
+/// fails a custody or parser gate still reports what the pair machinery saw. These are
+/// descriptive counts, not a verdict: withholding them on a failed run makes the failure
+/// invisible in exactly the population most likely to need sizing.
+fn raw_boundary_set_pair_columns(mut row: report::Row, pairs: &str) -> report::Row {
+    let mut lines = pairs.lines();
+    let header = lines
+        .next()
+        .unwrap_or_default()
+        .split('\t')
+        .collect::<Vec<_>>();
+    let body = lines.collect::<Vec<_>>();
+    let field = |name: &str, value: &str| {
+        let Some(column) = header.iter().position(|candidate| *candidate == name) else {
+            return 0;
+        };
+        body.iter()
+            .filter(|line| line.split('\t').nth(column) == Some(value))
+            .count()
+    };
+    row.set(raw_schema::PAIR_CLEAR, field("verdict", "clear"));
+    row.set(
+        raw_schema::PAIR_OVERLAPPING,
+        field("verdict", "overlapping"),
+    );
+    row.set(
+        raw_schema::PAIR_UNDETERMINABLE,
+        field("verdict", "undeterminable"),
+    );
+    row.set(raw_schema::PAIR_PRIMARY, field("role", "primary"));
+    row.set(raw_schema::PAIR_RAW_VIEW, field("role", "raw-view"));
+    row.set(raw_schema::PAIR_T1, field("tier", "T1"));
+    row.set(raw_schema::PAIR_T2, field("tier", "T2"));
+    row.set(raw_schema::PAIR_BLOCKED, field("role", "blocked"));
+    row
+}
+
 fn raw_boundary_custody_failure(mut row: report::Row, detail: &str) -> report::Row {
     row.set(raw_schema::DATA, "false");
     row.set(raw_schema::STATUS, "instrument-error");
@@ -13058,6 +13097,15 @@ mod run {
             row.set(raw_schema::SOLVER_INVOCATIONS, 0);
             // Return before the ordinary final data/status writes: a parser,
             // identity or sidecar failure cannot be overwritten as success.
+            //
+            // **R492-1 — but a typed failure must not cost the row its PAIR columns.**
+            // batch 19 read `raw_boundary_pair_raw_view` = 67 corpus-wide because
+            // brotli returned here, 450 lines before the pair columns are written, and
+            // brotli is most of the population. A sizing taken from `per-program.kv`
+            // therefore omitted the one program that mattered, silently. The columns are
+            // descriptive, not a verdict: they say what the pair machinery saw, which is
+            // exactly as true on a failed run as on a passing one.
+            row = super::raw_boundary_set_pair_columns(row, &artifact.pairs);
             bridge_custody.issues.extend(custody.issues);
             bridge_custody.data = false;
             return super::raw_boundary_bridge_custody_gate(row, &bridge_custody);
@@ -13497,20 +13545,9 @@ mod run {
             raw_schema::BLOCKED_SUBJECT_WITH_APPLIED_ARM,
             blocked_with_applied,
         );
-        row.set(raw_schema::PAIR_CLEAR, pair_field("verdict", "clear"));
-        row.set(
-            raw_schema::PAIR_OVERLAPPING,
-            pair_field("verdict", "overlapping"),
-        );
-        row.set(
-            raw_schema::PAIR_UNDETERMINABLE,
-            pair_field("verdict", "undeterminable"),
-        );
-        row.set(raw_schema::PAIR_PRIMARY, pair_field("role", "primary"));
-        row.set(raw_schema::PAIR_RAW_VIEW, pair_field("role", "raw-view"));
-        row.set(raw_schema::PAIR_T1, pair_field("tier", "T1"));
-        row.set(raw_schema::PAIR_T2, pair_field("tier", "T2"));
-        row.set(raw_schema::PAIR_BLOCKED, pair_field("role", "blocked"));
+        // R492-1: ONE writer for the pair columns, shared with the typed-failure early
+        // return, so the two paths cannot drift into reporting different things.
+        row = super::raw_boundary_set_pair_columns(row, &artifact.pairs);
         row.set(raw_schema::GLUE_PLACED, glue_placed);
         row.set(raw_schema::GLUE_BLOCKED, glue_blocked);
         row.set(raw_schema::ADDR_VALUE_ONLY, address_class("value-only"));
@@ -34550,5 +34587,76 @@ fn r477_5_a_frame_absent_program_is_excluded_and_named_not_failed() {
     assert!(
         source.contains("frame-absent-excluded.txt"),
         "the excluded programs must be written where a reader can find them"
+    );
+}
+
+/// **R492-1 — a typed failure must not cost the row its pair columns.**
+///
+/// batch 19 read `raw_boundary_pair_raw_view` = 67 corpus-wide while brotli's own
+/// `pairs.tsv` carried 353 `raw-view` rows. brotli returned at the custody gate, 450
+/// lines before the pair columns are written, so its row carried none — and brotli is
+/// most of the population. Anyone sizing the pair machinery from `per-program.kv` was
+/// silently reading the corpus minus its largest program.
+///
+/// The columns are DESCRIPTIVE: they say what the pair machinery saw, which is as true on
+/// a failed run as on a passing one. Withholding them hides the failure exactly where the
+/// sizing is needed.
+#[test]
+fn r492_1_the_pair_columns_survive_a_typed_failure() {
+    let pairs = "program\tverdict\trole\ttier\n\
+                 p\toverlapping\traw-view\tT2\n\
+                 p\toverlapping\traw-view\tT2\n\
+                 p\tclear\tprimary\tT1\n";
+
+    let row = raw_boundary_set_pair_columns(report::Row(Vec::new()), pairs);
+    assert_eq!(
+        row.get(crate::raw_boundary_census_schema::PAIR_RAW_VIEW),
+        Some("2")
+    );
+    assert_eq!(
+        row.get(crate::raw_boundary_census_schema::PAIR_PRIMARY),
+        Some("1")
+    );
+    assert_eq!(
+        row.get(crate::raw_boundary_census_schema::PAIR_CLEAR),
+        Some("1")
+    );
+    assert_eq!(
+        row.get(crate::raw_boundary_census_schema::PAIR_OVERLAPPING),
+        Some("2")
+    );
+
+    // The two paths share ONE writer, so a typed-failure row and a passing row cannot
+    // drift into reporting different things. This pins that the failure path calls it.
+    // Read the PRODUCTION region only. An `include_str!` of this file also contains the
+    // assertion strings below, so a naive count counts the witness itself -- which is how
+    // the first version of this test failed, claiming four callers where there are two.
+    let source = include_str!("bo_c1.rs");
+    let production = source
+        .split("fn r492_1_the_pair_columns_survive_a_typed_failure")
+        .next()
+        .expect("the production region precedes this test");
+    // Anchor on the RETURN itself. `bridge_custody.data = false;` occurs in several
+    // functions, and splitting on its first occurrence measured a region that does not
+    // contain the census path at all -- the first version of this witness failed for that
+    // reason, not because the repair was missing.
+    let ret = production
+        .find("return super::raw_boundary_bridge_custody_gate(row, &bridge_custody);")
+        .expect("the census path's typed-failure return exists");
+    let write = production
+        .find("row = super::raw_boundary_set_pair_columns(row, &artifact.pairs);")
+        .expect("the typed-failure return writes the pair columns");
+    assert!(
+        write < ret,
+        "the pair columns must be written BEFORE the typed-failure return, or the row \
+         leaves without them"
+    );
+    // and the ordinary path uses the same call rather than its own copy.
+    assert_eq!(
+        production
+            .matches("super::raw_boundary_set_pair_columns(row, &artifact.pairs)")
+            .count(),
+        2,
+        "exactly two callers: the failure return and the ordinary path"
     );
 }
