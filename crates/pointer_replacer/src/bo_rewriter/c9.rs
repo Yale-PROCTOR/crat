@@ -35,28 +35,7 @@ pub(crate) fn render_marked_call(
 }
 
 pub(crate) fn render_marked_source(mark: &C9MarkKey, source: &str) -> Result<String, String> {
-    let open = source
-        .char_indices()
-        .find_map(|(index, ch)| (ch == '(').then_some(index))
-        .ok_or_else(|| "C-9 call source has no argument list".to_owned())?;
-    let mut depth = 0usize;
-    let mut close = None;
-    for (offset, ch) in source[open..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth
-                    .checked_sub(1)
-                    .ok_or_else(|| "C-9 call source has unmatched ')'".to_owned())?;
-                if depth == 0 {
-                    close = Some(open + offset);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let close = close.ok_or_else(|| "C-9 call source has unmatched '('".to_owned())?;
+    let (open, close) = argument_list(source, "C-9")?;
     let callee = source[..open].trim();
     if callee.is_empty() {
         return Err("C-9 call source has an empty callee".to_owned());
@@ -111,47 +90,7 @@ fn render_raw_view_source(
     // the callee empty and held the class. Walking the top-level groups and
     // keeping the last one names `(*f)` as the callee and `(a, b)` as its
     // arguments, and leaves every ordinary shape where it was.
-    let bytes = source.as_bytes();
-    let mut group = None;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if let Some(end) = literal_end(bytes, index) {
-            index = end;
-            continue;
-        }
-        if bytes[index] != b'(' {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        let mut depth = 0usize;
-        let mut end = None;
-        while index < bytes.len() {
-            if let Some(skip) = literal_end(bytes, index) {
-                index = skip;
-                continue;
-            }
-            match bytes[index] {
-                b'(' => depth += 1,
-                b')' => {
-                    depth = depth
-                        .checked_sub(1)
-                        .ok_or_else(|| "PAIR call source has unmatched ')'".to_owned())?;
-                    if depth == 0 {
-                        end = Some(index);
-                    }
-                }
-                _ => {}
-            }
-            index += 1;
-            if end.is_some() {
-                break;
-            }
-        }
-        let close = end.ok_or_else(|| "PAIR call source has unmatched '('".to_owned())?;
-        group = Some((start, close));
-    }
-    let (open, close) = group.ok_or_else(|| "PAIR call source has no argument list".to_owned())?;
+    let (open, close) = argument_list(source, "PAIR")?;
     let callee = source[..open].trim();
     if callee.is_empty() {
         return Err("PAIR call source has an empty callee".to_owned());
@@ -198,6 +137,64 @@ fn render_raw_view_source(
         arguments.join(", "),
         &source[close + 1..],
     ))
+}
+
+/// The call's argument list: its LAST top-level parenthesised group, found
+/// with literals skipped whole.
+///
+/// **R482-4(f)** — a `(` inside a string is not a parenthesis.
+/// **R483-3 (STOP 2)** — the argument list is the call's LAST top-level group,
+/// not its first. A C2Rust function-pointer call is `(*f)(a, b)`, whose first
+/// `(` is at offset 0: reading that as the argument list leaves the callee
+/// empty and holds the class. Keeping the last group names `(*f)` as the
+/// callee and `(a, b)` as its arguments, and leaves every ordinary shape where
+/// it was.
+///
+/// **R492-4** — `render_marked_source` had its own copy of this scan carrying
+/// BOTH defects the two rulings above fixed here. The sweep of R490-4 found it;
+/// there is one scan now, so a third copy cannot drift.
+fn argument_list(source: &str, who: &str) -> Result<(usize, usize), String> {
+    let bytes = source.as_bytes();
+    let mut group = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(end) = literal_end(bytes, index) {
+            index = end;
+            continue;
+        }
+        if bytes[index] != b'(' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut depth = 0usize;
+        let mut end = None;
+        while index < bytes.len() {
+            if let Some(skip) = literal_end(bytes, index) {
+                index = skip;
+                continue;
+            }
+            match bytes[index] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| format!("{who} call source has unmatched ')'"))?;
+                    if depth == 0 {
+                        end = Some(index);
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+            if end.is_some() {
+                break;
+            }
+        }
+        let close = end.ok_or_else(|| format!("{who} call source has unmatched '('"))?;
+        group = Some((start, close));
+    }
+    group.ok_or_else(|| format!("{who} call source has no argument list"))
 }
 
 /// **R482-4(f) — a literal is one token, and a delimiter inside it is data.**
@@ -349,6 +346,34 @@ mod tests {
             "i32".to_owned(),
         )
         .unwrap()
+    }
+
+    /// **R492-4 — the sweep's one finding (R490-4 STOP 3).** `render_marked_source`
+    /// carried its own copy of the argument-list scan, and that copy predated
+    /// BOTH rulings the sibling scan has taken: it counted a `(` inside a
+    /// literal as a parenthesis (R482-4(f)) and it took the call's FIRST
+    /// top-level group rather than its last (R483-3 STOP 2). The two tests
+    /// below are the exact shapes those defects refuse; both now render.
+    #[test]
+    fn r492_4_a_marked_call_reads_a_literal_as_one_token() {
+        let rendered = render_marked_source(&mark(), r#"foo(p, b"a(b\0" as *const u8 as *mut i8)"#)
+            .expect("a parenthesis inside a byte-string literal is data");
+        assert!(
+            rendered.contains(r#"b"a(b\0" as *const u8 as *mut i8"#),
+            "the literal argument survives whole: {rendered}"
+        );
+    }
+
+    /// A C2Rust function-pointer call: the first `(` is at offset 0, so the
+    /// old scan left the callee empty and refused the site.
+    #[test]
+    fn r492_4_a_marked_function_pointer_call_keeps_its_callee() {
+        let rendered = render_marked_source(&mark(), "(*f)(p, q)")
+            .expect("the argument list is the LAST top-level group");
+        assert!(
+            rendered.contains("(*f)("),
+            "the callee is `(*f)`, not the empty string: {rendered}"
+        );
     }
 
     /// **R482-4(f).** D13-W1 pinned this shape as a HOLD: libtree's ANSI byte
