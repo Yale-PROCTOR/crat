@@ -2173,3 +2173,81 @@ fn the_outcome_site_scan_ignores_a_destructuring() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// **R488-1 (wave-6p 026) — every `*_tests.rs` under `bo_rewriter/` is DECLARED.**
+///
+/// A cherry-pick dropped a `mod` line and six of wave-6p's witnesses stopped compiling.
+/// Nothing failed: an undeclared module is not built, so its tests neither pass nor fail,
+/// and the suite count moves by six in a direction nobody reads. A test that is not
+/// compiled is indistinguishable from a test that passes, which is the worst way for a
+/// witness to die.
+///
+/// Declaration is checked ANYWHERE in the crate, not only in `mod.rs`: the wave-6r files
+/// are declared inside `wave5r_tests.rs`, which is legitimate, and a ratchet that demanded
+/// `mod.rs` would fail on correct code and be switched off.
+#[test]
+fn every_bo_rewriter_test_module_is_declared() {
+    use std::collections::BTreeSet;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let dir = root.join("bo_rewriter");
+
+    let mut files = BTreeSet::new();
+    for entry in std::fs::read_dir(&dir).expect("read bo_rewriter/") {
+        let path = entry.expect("dir entry").path();
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|e| e.to_str()) == Some("rs") && name.ends_with("_tests") {
+            files.insert(name.to_owned());
+        }
+    }
+    assert!(
+        files.len() > 50,
+        "the scan found {} test modules, which is too few to be the real set",
+        files.len()
+    );
+
+    // Every `mod <name>;` declared anywhere under `src/`, at any nesting.
+    let mut declared = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            for line in text.lines() {
+                let line = line.trim();
+                // A COMMENTED-OUT declaration declares nothing. The first version of this
+                // ratchet missed exactly that: `// mod x;` still ends in `;` and still
+                // contains `mod `, so the fault check -- commenting one out -- passed
+                // while the suite silently lost five tests.
+                if line.starts_with("//") {
+                    continue;
+                }
+                // `mod x;` and `pub(crate) mod x;`, but not `mod x {` (an inline module
+                // declares nothing about a file).
+                if let Some(rest) = line.strip_suffix(';')
+                    && let Some(name) = rest.rsplit_once("mod ").map(|(_, n)| n.trim())
+                    && !name.is_empty()
+                    && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    declared.insert(name.to_owned());
+                }
+            }
+        }
+    }
+
+    let undeclared = files.difference(&declared).cloned().collect::<Vec<_>>();
+    assert!(
+        undeclared.is_empty(),
+        "these bo_rewriter test modules exist as files but are declared nowhere, so they \
+         are NOT COMPILED and their witnesses cannot fail: {undeclared:?}"
+    );
+}
