@@ -194,6 +194,10 @@ enum RootClass {
         adt: DefId,
         field: Symbol,
         base: HirId,
+        /// `Contract` when any admitting store called an allocator that is
+        /// itself contract-backed (brotli's `BrotliAllocate`, which allocates
+        /// through `(*m).alloc_func`). The certificate says so by name.
+        freshness: Freshness,
     },
     Unknown,
 }
@@ -342,6 +346,18 @@ impl PairDisjointnessIndex {
         let allocators = allocator_wrappers(tcx, &local_functions, indirect_calls);
         // R479-4a: needs the wrapper set, so it is derived after it.
         let fresh_fields = allocator_data_fields(tcx, &local_functions, &allocators);
+        #[cfg(test)]
+        if std::env::var_os("W6P_DUMP_FIELDS").is_some() {
+            for ((adt, field), freshness) in &fresh_fields {
+                println!(
+                    "W6P_FIELD\t{}\t{field}\t{freshness:?}",
+                    tcx.def_path_str(*adt)
+                );
+            }
+            for (did, freshness) in &allocators.wrappers {
+                println!("W6P_WRAPPER\t{}\t{freshness:?}", tcx.def_path_str(*did));
+            }
+        }
         let unions = union_member_classes(tcx, program);
         // Member closures are shared across every pair: brotli's ~3k functions
         // ask about the same few hundred pointee types, and recomputing the
@@ -814,16 +830,38 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
     // field on both sides is the same block, and an unrelated root is refused:
     // a pointer taken out of the field after the allocation is that same block.
     match (a, b) {
-        (RootClass::FreshField { adt, field, base }, other)
-        | (other, RootClass::FreshField { adt, field, base }) => {
+        (
+            RootClass::FreshField {
+                adt,
+                field,
+                base,
+                freshness,
+            },
+            other,
+        )
+        | (
+            other,
+            RootClass::FreshField {
+                adt,
+                field,
+                base,
+                freshness,
+            },
+        ) => {
+            let kind = |freshness: Freshness| match freshness {
+                Freshness::Proven => CertificateKind::DistinctRoots,
+                Freshness::Contract => CertificateKind::DistinctRootsUnderContract,
+            };
             return match other {
                 RootClass::FreshField {
                     adt: other_adt,
                     field: other_field,
+                    freshness: other_freshness,
                     ..
                 } => ((adt, field) != (other_adt, other_field))
-                    .then_some(CertificateKind::DistinctRoots),
-                _ => (other.object_id() == Some(base)).then_some(CertificateKind::DistinctRoots),
+                    .then(|| kind(freshness.join(other_freshness))),
+                _ => (other.object_id() == Some(base))
+                    .then(|| kind(freshness.join(other.freshness()))),
             };
         }
         _ => {}
@@ -1161,7 +1199,12 @@ impl PairDisjointnessIndex {
                 RootClass::FreshAlloc(_, Freshness::Contract) => "fresh-contract".to_owned(),
                 RootClass::StackObject(_) => "stack".to_owned(),
                 RootClass::EntryStorage(_) => "entry".to_owned(),
-                RootClass::FreshField { field, .. } => format!("fresh-field:{field}"),
+                RootClass::FreshField {
+                    field, freshness, ..
+                } => match freshness {
+                    Freshness::Proven => format!("fresh-field:{field}"),
+                    Freshness::Contract => format!("fresh-field-contract:{field}"),
+                },
                 RootClass::Unknown => "unknown".to_owned(),
             }
         };
@@ -1494,8 +1537,8 @@ fn allocator_data_fields(
     tcx: TyCtxt<'_>,
     functions: &FxHashSet<LocalDefId>,
     oracle: &AllocatorOracle<'_>,
-) -> FxHashSet<(DefId, Symbol)> {
-    let mut allocator: FxHashSet<(DefId, Symbol)> = FxHashSet::default();
+) -> FxHashMap<(DefId, Symbol), Freshness> {
+    let mut allocator: FxHashMap<(DefId, Symbol), Freshness> = FxHashMap::default();
     let mut refused: FxHashSet<(DefId, Symbol)> = FxHashSet::default();
     for &function in functions {
         let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
@@ -1511,7 +1554,7 @@ fn allocator_data_fields(
         };
         collector.visit_body(tcx.hir_body(body_id));
     }
-    allocator.retain(|key| !refused.contains(key));
+    allocator.retain(|key, _| !refused.contains(key));
     allocator
 }
 
@@ -1520,7 +1563,7 @@ struct DataFieldStoreCollector<'a, 'tcx> {
     typeck: &'a TypeckResults<'tcx>,
     oracle: &'a AllocatorOracle<'a>,
     function: LocalDefId,
-    allocator: &'a mut FxHashSet<(DefId, Symbol)>,
+    allocator: &'a mut FxHashMap<(DefId, Symbol), Freshness>,
     refused: &'a mut FxHashSet<(DefId, Symbol)>,
 }
 
@@ -1528,7 +1571,7 @@ impl<'tcx> DataFieldStoreCollector<'_, 'tcx> {
     /// A DIRECT call of a NAMED allocator: the fn-pointer-field path that
     /// `AllocatorOracle::is_allocator_call` also admits is deliberately not
     /// consulted here, and a contract-backed wrapper is not a proof.
-    fn is_direct_named_allocator(&self, value: &Expr<'_>) -> bool {
+    fn is_direct_named_allocator(&self, value: &Expr<'_>) -> Option<Freshness> {
         let value = peel_casts(value);
         // The C2Rust idiom stores `if size > 0 { alloc(..) } else { null }`.
         // Every arm being an allocation or null still leaves the field holding
@@ -1536,29 +1579,41 @@ impl<'tcx> DataFieldStoreCollector<'_, 'tcx> {
         // so the walk goes through conditionals and block tails.
         match &value.kind {
             ExprKind::If(_, then, els) => {
-                return self.is_fresh_or_null(then)
-                    && els.is_some_and(|els| self.is_fresh_or_null(els));
+                let Some(els) = els else { return None };
+                return match (self.is_fresh_or_null(then)?, self.is_fresh_or_null(els)?) {
+                    (Some(a), Some(b)) => Some(a.join(b)),
+                    (found, None) | (None, found) => found,
+                }
+                .or(Some(Freshness::Proven));
             }
             ExprKind::Block(block, _) => {
-                return block.stmts.is_empty()
-                    && block.expr.is_some_and(|tail| self.is_fresh_or_null(tail));
+                if !block.stmts.is_empty() {
+                    return None;
+                }
+                return self
+                    .is_fresh_or_null(block.expr?)?
+                    .or(Some(Freshness::Proven));
             }
             _ => {}
         }
         let ExprKind::Call(callee, _) = &value.kind else {
-            return false;
+            return None;
         };
-        let Some(did) = callee_def_id(callee) else {
-            return false;
-        };
+        let did = callee_def_id(callee)?;
         if let Some(freshness) = self.oracle.wrappers.get(&did) {
-            return *freshness == Freshness::Proven;
+            return Some(*freshness);
         }
-        AllocatorOracle::is_libc_allocator(self.tcx, did)
+        AllocatorOracle::is_libc_allocator(self.tcx, did).then_some(Freshness::Proven)
     }
 
-    fn is_fresh_or_null(&self, value: &Expr<'_>) -> bool {
-        is_null_literal(value) || self.is_direct_named_allocator(value)
+    /// `None` = not admissible. `Some(None)` = the null literal, which admits
+    /// nothing on its own but refuses nothing either. `Some(Some(f))` = an
+    /// allocation with that freshness.
+    fn is_fresh_or_null(&self, value: &Expr<'_>) -> Option<Option<Freshness>> {
+        if is_null_literal(value) {
+            return Some(None);
+        }
+        self.is_direct_named_allocator(value).map(Some)
     }
 
     fn record(&mut self, place: &Expr<'_>, value: &Expr<'_>) {
@@ -1568,8 +1623,11 @@ impl<'tcx> DataFieldStoreCollector<'_, 'tcx> {
         let Some(key) = data_field_key(self.tcx, self.typeck, base, field.name) else {
             return;
         };
-        if self.is_direct_named_allocator(value) {
-            self.allocator.insert(key);
+        if let Some(freshness) = self.is_direct_named_allocator(value) {
+            self.allocator
+                .entry(key)
+                .and_modify(|seen| *seen = seen.join(freshness))
+                .or_insert(freshness);
         } else if !is_null_literal(value) {
             self.refused.insert(key);
         }
@@ -1607,8 +1665,11 @@ impl<'tcx> Visitor<'tcx> for DataFieldStoreCollector<'_, 'tcx> {
                             continue;
                         }
                         let key = (def.did(), field.ident.name);
-                        if self.is_direct_named_allocator(field.expr) {
-                            self.allocator.insert(key);
+                        if let Some(freshness) = self.is_direct_named_allocator(field.expr) {
+                            self.allocator
+                                .entry(key)
+                                .and_modify(|seen| *seen = seen.join(freshness))
+                                .or_insert(freshness);
                         } else if !is_null_literal(field.expr) {
                             self.refused.insert(key);
                         }
@@ -2012,7 +2073,8 @@ struct CallCollector<'a, 'tcx> {
     typeck: &'a TypeckResults<'tcx>,
     locals: &'a FxHashSet<LocalDefId>,
     classes: &'a FxHashMap<HirId, RootClass>,
-    fresh_fields: &'a FxHashSet<(DefId, Symbol)>,
+    fresh_fields: &'a FxHashMap<(DefId, Symbol), Freshness>,
+    why: &'a FxHashMap<HirId, UnknownWhy>,
     calls: Vec<(LocalDefId, SiteRecord)>,
 }
 
@@ -2118,22 +2180,21 @@ fn fresh_field_root<'tcx>(
     tcx: TyCtxt<'tcx>,
     typeck: &TypeckResults<'tcx>,
     classes: &FxHashMap<HirId, RootClass>,
-    fresh_fields: &FxHashSet<(DefId, Symbol)>,
+    fresh_fields: &FxHashMap<(DefId, Symbol), Freshness>,
     arg: &Expr<'_>,
 ) -> Option<RootClass> {
     let ExprKind::Field(base, field) = &peel_casts(arg).kind else {
         return None;
     };
     let key = data_field_key(tcx, typeck, base, field.name)?;
-    if !fresh_fields.contains(&key) {
-        return None;
-    }
+    let freshness = *fresh_fields.get(&key)?;
     // The base must itself name one object, or "same base" names nothing.
     let (base_class, _) = place_provenance(tcx, typeck, classes, base);
     Some(RootClass::FreshField {
         adt: key.0,
         field: key.1,
         base: base_class.object_id()?,
+        freshness,
     })
 }
 
