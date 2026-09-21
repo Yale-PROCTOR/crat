@@ -4225,6 +4225,22 @@ fn name_reverted_classes(
     }
 }
 
+/// **R482-3** — whether this function's PARTITION ROOT is the interface dependency, read
+/// from `partition_reasons` exactly as `root` is. A member is rooted there; a seed is not,
+/// and that is the only difference between them.
+fn interface_dependency_rooted(
+    partition_reasons: &std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
+    function: bridge_receipt::SignatureClassId,
+) -> bool {
+    partition_reasons
+        .get(&function)
+        .and_then(|reasons| reasons.iter().next())
+        .is_some_and(|reason| reason.starts_with("input-interface-dependency-reverted"))
+}
+
 fn render_raw_boundary_final_reverts(
     functions: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     atoms: &std::collections::BTreeSet<String>,
@@ -4255,24 +4271,21 @@ fn render_raw_boundary_final_reverts(
     // interface, so a member held by one could not be routed. The seeds are the reverted
     // classes that are NOT themselves dependents; every other member resolves to the
     // nearest one, or to `orphan` when the graph does not reach a seed at all.
-    let interface_seeds = emission_plan
-        .map(|plan| {
-            functions
-                .iter()
-                .copied()
-                .filter(|function| {
-                    !plan
-                        .class_finalization
-                        .classes
-                        .get(function)
-                        .and_then(|class| class.hold_reasons().first())
-                        .is_some_and(|reason| {
-                            reason.starts_with("input-interface-dependency-reverted")
-                        })
-                })
-                .collect::<std::collections::BTreeSet<_>>()
-        })
-        .unwrap_or_default();
+    // **R482-3** — the seed set reads `partition_reasons`, the SAME source as `root`.
+    //
+    // It used to filter on `hold_reasons()`, where the root string never appears: a
+    // member's hold reason is `dependency-class-held:N`. So the filter excluded nothing,
+    // every member was in its own seed set, `seed_reaching` took its "a seed is not
+    // reached BY anything" early return for every row, and all 56 rendered `orphan`.
+    //
+    // R472-6 moved the CONSUMER to `partition_root` and left the producer of the seed set
+    // behind; the witness pinned the consumer's field and not the seed set's, so it
+    // passed. Both are now read from one place and the witness pins that they agree.
+    let interface_seeds = functions
+        .iter()
+        .copied()
+        .filter(|function| !interface_dependency_rooted(partition_reasons, *function))
+        .collect::<std::collections::BTreeSet<_>>();
     for &function in functions {
         // **R430-1 — one row per OWNER PATH of the withheld class.** The census
         // marks a subject reverted by its owner path; a class-mate this
@@ -4321,7 +4334,7 @@ fn render_raw_boundary_final_reverts(
         // never set and emitted `-` for all 364 rows. An instrument that names nothing
         // looks exactly like a corpus with nothing to name, which is why it had to be
         // read against a frame that has the rows before it could be believed.
-        let seed = if !root.contains("input-interface-dependency-reverted") {
+        let seed = if !interface_dependency_rooted(partition_reasons, function) {
             "-".to_owned()
         } else {
             emission_plan

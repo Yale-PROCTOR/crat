@@ -674,3 +674,53 @@ fn r472_6_the_orphan_column_keys_on_partition_root_not_attribution() {
     // is not an interface dependency at all".
     assert_eq!(row[7], "orphan", "{receipt}");
 }
+
+/// **R482-3** — the seed set and the member test read ONE source, and a member is not in
+/// its own seed set.
+///
+/// The column rendered `orphan` for all 56 rows because the seed set filtered on
+/// `hold_reasons()`, where the root string never appears — a member's hold reason is
+/// `dependency-class-held:N`. Every member was therefore a seed, `seed_reaching` took its
+/// "a seed is not reached BY anything" early return, and every row was an orphan.
+///
+/// R472-6 fixed the CONSUMER's field and left the seed set behind, and its witness passed
+/// because it pinned only the consumer. This pins that both read `partition_reasons`, so
+/// moving one without the other fails here.
+#[test]
+fn r482_3_the_seed_set_and_the_member_test_read_the_same_source() {
+    let source = include_str!("mod.rs");
+
+    // One helper answers "is this rooted at the interface dependency", and it reads
+    // `partition_reasons`.
+    let helper = source
+        .split("fn interface_dependency_rooted(")
+        .nth(1)
+        .expect("the helper exists");
+    let body = &helper[..helper.find("\n}").unwrap_or(helper.len())];
+    assert!(
+        body.contains("partition_reasons"),
+        "the root test must read partition_reasons: {body}"
+    );
+    assert!(
+        !body.contains("hold_reasons"),
+        "hold_reasons does not carry the root string: {body}"
+    );
+
+    // The seed set is its complement, through that same helper -- not a second spelling.
+    let seeds = source
+        .split("let interface_seeds = functions")
+        .nth(1)
+        .expect("the seed set exists");
+    let seeds = &seeds[..seeds.find(";").unwrap_or(seeds.len())];
+    assert!(
+        seeds.contains("!interface_dependency_rooted(partition_reasons"),
+        "the seed set must be the helper's complement: {seeds}"
+    );
+
+    // And the consumer selects members with the same helper, so a member can never be in
+    // its own seed set -- which is what made every row an orphan.
+    assert!(
+        source.contains("let seed = if !interface_dependency_rooted(partition_reasons, function)"),
+        "the member test must BE the same call, not a second spelling that agrees today"
+    );
+}
