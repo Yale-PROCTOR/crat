@@ -8873,12 +8873,15 @@ fn learn_a5_fallback_roles(
             // Already-raw targets need a materialized call view but no new
             // parameter presentation. Owning admission is never changed here.
             Decision::Degraded(_) => continue,
-            Decision::Cursor { .. } => {
-                proof.fallback = A5ProofSiteFallback::Held {
-                    reason: "a5-fallback-unrenderable:cursor-parameter".into(),
-                };
-                continue;
-            }
+            // **R483-3(c).** A cursor formal used to be held here, which is
+            // the circularity slicecursor reported: the fallback refused
+            // precisely where the parameter was already the form it wanted,
+            // so `cursor_native::promote` never got asked. The renderer now
+            // has the arm (`pair_raw_view_expression`, the slice rule in
+            // slicecursor's vocabulary), so a cursor takes the same path
+            // every other safe form takes — including the R-B refusal a
+            // SHARED cursor still meets there.
+            Decision::Cursor { .. } => {}
             Decision::Box(_) => {
                 proof.fallback = A5ProofSiteFallback::Held {
                     reason: "a5-fallback-unrenderable:owning-parameter".into(),

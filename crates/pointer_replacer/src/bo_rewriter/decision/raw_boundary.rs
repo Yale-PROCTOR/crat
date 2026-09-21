@@ -589,11 +589,20 @@ pub(crate) fn pair_raw_view_expression(
                 (false, RawMutability::Mut) => None,
             }
         }
-        Some(Decision::Slice { mutable, .. }) => match (*mutable, target.mutability) {
-            (true, RawMutability::Mut) => Some(format!("{argument}.as_mut_ptr()")),
-            (_, RawMutability::Const) => Some(format!("{argument}.as_ptr()")),
-            (false, RawMutability::Mut) => None,
-        },
+        // **R483-3(c).** A cursor's raw view is slicecursor's own vocabulary
+        // (`cursor/wrapper.rs`): `as_ptr` / `as_mut_ptr` at the cursor's own
+        // position, in the target's mutability. It is the SLICE rule, and it
+        // is written beside it rather than as a cursor-shaped special case,
+        // because the two forms answer this question identically — including
+        // R-B, which a shared cursor does not escape any more than a shared
+        // slice does.
+        Some(Decision::Slice { mutable, .. }) | Some(Decision::Cursor { mutable, .. }) => {
+            match (*mutable, target.mutability) {
+                (true, RawMutability::Mut) => Some(format!("{argument}.as_mut_ptr()")),
+                (_, RawMutability::Const) => Some(format!("{argument}.as_ptr()")),
+                (false, RawMutability::Mut) => None,
+            }
+        }
         Some(Decision::Opt { mutable, slice, .. }) => match (*mutable, *slice, target.mutability) {
             (true, false, RawMutability::Mut) => Some(format!(
                 "{argument}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), core::ptr::from_mut)"
@@ -619,7 +628,7 @@ pub(crate) fn pair_raw_view_expression(
             }
             _ => raw_passthrough(),
         },
-        Some(Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. }) => None,
+        Some(Decision::Box(_) | Decision::NestedSlice { .. }) => None,
     }
 }
 
@@ -6086,6 +6095,146 @@ mod tests {
     use rustc_hir::def_id::CRATE_DEF_ID;
 
     use super::*;
+
+    /// A minimal cursor plan: this seam reads only the decision's mutability,
+    /// so the plan's contents are deliberately empty rather than fabricated.
+    fn cursor_decision(mutable: bool) -> super::super::Decision {
+        super::super::Decision::Cursor {
+            mutable,
+            plan: crate::bo_rewriter::decision::cursor_native::CursorPlan {
+                parent_cursor: None,
+                wrapper: false,
+                parameter: true,
+                optional: false,
+                fallback: false,
+                uses: Vec::new(),
+                use_hirs: Vec::new(),
+                base: Local::from_u32(1),
+                component: Vec::new(),
+                extent: 0,
+                delivered_base: None,
+                bridges: Vec::new(),
+                local_bridges: Vec::new(),
+                composed_edit_spans: Vec::new(),
+                explicit_declaration: None,
+                peer_bases: Vec::new(),
+                peer_cursors: Vec::new(),
+            },
+        }
+    }
+
+    fn raw_target(pointee: &str, mutability: RawMutability) -> RawTargetType {
+        RawTargetType {
+            rendered: format!(
+                "{} {pointee}",
+                if mutability == RawMutability::Mut {
+                    "*mut"
+                } else {
+                    "*const"
+                }
+            ),
+            pointee: pointee.to_owned(),
+            mutability,
+            depth2: None,
+        }
+    }
+
+    /// **R483-3(c).** The A5 fallback renders the caller's argument from its
+    /// SOURCE form into the call's raw target. Every safe form had an arm
+    /// except the cursor, so a cursor-typed source was unrenderable and the
+    /// class was held `a5-fallback-unrenderable:cursor-parameter` — which is
+    /// the circularity slicecursor reported: the fallback refuses precisely
+    /// where the parameter is already the form it wants.
+    ///
+    /// A cursor's raw view is slicecursor's own vocabulary
+    /// (`cursor/wrapper.rs`): `as_ptr` / `as_mut_ptr` at the cursor's own
+    /// position, in the target's mutability.
+    #[test]
+    fn r483_3c_a_cursor_source_renders_its_raw_view() {
+        let mutable = cursor_decision(true);
+        let shared = cursor_decision(false);
+        assert_eq!(
+            pair_raw_view_expression(
+                Some(&mutable),
+                &raw_target("u8", RawMutability::Mut),
+                "cursor",
+                "bare-local"
+            )
+            .as_deref(),
+            Some("cursor.as_mut_ptr()")
+        );
+        assert_eq!(
+            pair_raw_view_expression(
+                Some(&mutable),
+                &raw_target("u8", RawMutability::Const),
+                "cursor",
+                "bare-local"
+            )
+            .as_deref(),
+            Some("cursor.as_ptr()")
+        );
+        assert_eq!(
+            pair_raw_view_expression(
+                Some(&shared),
+                &raw_target("u8", RawMutability::Const),
+                "cursor",
+                "bare-local"
+            )
+            .as_deref(),
+            Some("cursor.as_ptr()")
+        );
+    }
+
+    /// Control — the R-B rule is not relaxed for cursors: a SHARED cursor
+    /// cannot produce a mutable raw pointer, exactly as a shared slice cannot.
+    #[test]
+    fn r483_3c_a_shared_cursor_still_refuses_a_mutable_raw_target() {
+        let shared = cursor_decision(false);
+        assert_eq!(
+            pair_raw_view_expression(
+                Some(&shared),
+                &raw_target("u8", RawMutability::Mut),
+                "cursor",
+                "bare-local"
+            ),
+            None
+        );
+    }
+
+    /// Control — the existing slice arm is untouched, and the two forms are
+    /// rendered by the same rule rather than by a cursor-shaped special case.
+    #[test]
+    fn r483_3c_the_slice_arm_is_unchanged() {
+        let slice = super::super::Decision::Slice {
+            mutable: true,
+            uses: Vec::new(),
+        };
+        assert_eq!(
+            pair_raw_view_expression(
+                Some(&slice),
+                &raw_target("u8", RawMutability::Mut),
+                "values",
+                "bare-local"
+            )
+            .as_deref(),
+            Some("values.as_mut_ptr()")
+        );
+    }
+
+    /// Control — a source with NO view is still unrenderable. The arm admits
+    /// a cursor, not an absence.
+    #[test]
+    fn r483_3c_a_source_without_a_view_is_still_held() {
+        assert_eq!(
+            pair_raw_view_expression(
+                None,
+                &raw_target("u8", RawMutability::Mut),
+                "opaque",
+                "other"
+            ),
+            None
+        );
+    }
 
     fn constructed_child_access() -> (
         super::super::returned_child::ChildAccess,
