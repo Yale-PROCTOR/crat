@@ -15,7 +15,7 @@
 //! borrow's mutability is the cast's). Everything downstream — the return
 //! permit, the tied lifetime, the wrapper — is the existing family's.
 
-use rustc_hir::{Expr, ExprKind, HirId, QPath, def::Res};
+use rustc_hir::{Expr, ExprKind, HirId, QPath, def::Res, def_id::LocalDefId};
 use rustc_middle::ty::{TyCtxt, TyKind};
 
 use super::emitability::ReturnExprShape;
