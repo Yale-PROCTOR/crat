@@ -8275,6 +8275,22 @@ fn finish_decide<'tcx>(
         // longer applies. The decision is not available when the map is first
         // collected (it is one of the map's own inputs), so the pass runs once
         // over the SETTLED table and re-decides only if a hold actually went.
+        // **R491-7** — the exact C-string extents, recorded for the seam: a
+        // callee parameter whose walk is licensed exact gives its callers
+        // `strlen(p) + 1` rather than the fallback.
+        table.nul_exact_parameters = subjects
+            .iter()
+            .filter_map(|subject| {
+                let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                    return None;
+                };
+                matches!(
+                    decision::local_callee_extent::nul_walk(tcx, subject, &facts),
+                    Some(decision::local_callee_extent::NulWalk::Exact)
+                )
+                .then_some((subject.fn_did, hir_index))
+            })
+            .collect();
         let decided_slice = table
             .entries
             .iter()

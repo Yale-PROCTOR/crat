@@ -6141,6 +6141,7 @@ mod tests {
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            nul_exact_parameters: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -6232,6 +6233,7 @@ mod tests {
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            nul_exact_parameters: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),
             return_certificates: Default::default(),
@@ -6315,6 +6317,7 @@ mod tests {
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            nul_exact_parameters: Default::default(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

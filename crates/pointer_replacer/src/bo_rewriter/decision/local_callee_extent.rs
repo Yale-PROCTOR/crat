@@ -167,6 +167,16 @@ fn parameter_access(
     // ruled a census item rather than a hold. (W-C9 report 017 sizes the
     // THIN-caller side of this exclusion — `from_ref` into a wide reader —
     // for the seat; it is not moved here.)
+    // **R491-7 — a C-STRING walk is not this hold's class.** The callee reads
+    // one byte at a time to a NUL, so what it accesses is a string, and the
+    // extent of a string is a fact the caller can state — exactly
+    // (`strlen + 1`, where the walk provably reaches the NUL or the pointer is
+    // handed to a libc string function) or under §77's fallback with its
+    // receipt (where the walk can stop early). Both are extents; neither is the
+    // one-element claim the hold exists to protect.
+    if nul_walk(tcx, param, facts).is_some() {
+        return None;
+    }
     if slice_uses
         .get(&(param.fn_did, param.hir_id))
         .is_some_and(|uses| {
@@ -235,6 +245,236 @@ fn parameter_access(
             .unwrap_or_else(|| "<unnamed>".to_owned()),
         access,
         reason,
+    })
+}
+
+/// **R491-7 — a local callee that reads a C STRING.**
+///
+/// `is_float(p)` and `print_colon_delimited_paths(start)` walk their parameter
+/// one byte at a time to its NUL. That is an element-wise access, so the hold's
+/// "accesses past one element" is true of it — and unlike the wide readers the
+/// hold is for, the extent it accesses is a fact the CALLER can state: the
+/// string. Which form that takes is the seat's ruling (addendum 491):
+///
+/// - [`Exact`](NulWalk::Exact) — the walk provably reaches the NUL on every
+///   path, or the pointer is handed to a libc string function whose contract
+///   requires a terminated string. `strlen(p) + 1` is then evidence: on a
+///   UB-free input (§28) the terminator is there, and `strlen` reads exactly
+///   the bytes the callee would.
+/// - [`Fallback`](NulWalk::Fallback) — the walk can stop before the NUL, so
+///   `strlen` at the caller could read bytes the input never reads. The §77
+///   fallback extent with its receipt is what that takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NulWalk {
+    Exact,
+    Fallback,
+}
+
+/// The libc string functions whose contract requires a NUL-terminated argument.
+/// A pointer handed to one of these is terminated on a UB-free input, which is
+/// what licenses the exact form even when the callee's own loop can exit early.
+const NUL_CONTRACT_CALLEES: &[&str] = &[
+    "strlen",
+    "strchr",
+    "strrchr",
+    "strcmp",
+    "strcasecmp",
+    "strncmp",
+    "strncasecmp",
+    "strcpy",
+    "strcat",
+    "strstr",
+    "strdup",
+    "puts",
+    "atoi",
+    "atol",
+    "atof",
+    "strtol",
+    "strtod",
+];
+
+/// Does this parameter's body walk it, byte at a time, to a NUL?
+pub(crate) fn nul_walk(
+    tcx: TyCtxt<'_>,
+    param: &Subject,
+    facts: &EmitabilityFacts,
+) -> Option<NulWalk> {
+    use rustc_hir::intravisit::Visitor;
+
+    let key = (param.fn_did, param.hir_id);
+    // Byte-at-a-time: the pointee is one byte wide, and the only arithmetic on
+    // it is `offset`/`add` — an INDEXED read (`*p.offset(i)`) is a count
+    // question, not a string one.
+    let Node::Pat(pattern) = tcx.hir_node(param.hir_id) else {
+        return None;
+    };
+    let ty = tcx.typeck(param.fn_did).pat_ty(pattern);
+    let TyKind::RawPtr(pointee, _) = ty.kind() else { return None };
+    if !matches!(
+        pointee.kind(),
+        TyKind::Int(rustc_middle::ty::IntTy::I8) | TyKind::Uint(rustc_middle::ty::UintTy::U8)
+    ) {
+        return None;
+    }
+    // A cast of the cursor to a wider type reads more than a byte at it.
+    if facts.address_observations.iter().any(|fact| {
+        fact.op == "ptr-cast" && fact.operands.iter().any(|operand| operand.node == key)
+    }) {
+        return None;
+    }
+
+    struct Walk<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        binding: HirId,
+        nul_tested: bool,
+        early_exit: bool,
+        libc_contract: bool,
+        indexed: bool,
+    }
+    /// `*p`, `*p as i32`, `(*p)` — the cursor's own byte, however the C
+    /// spelling casts it.
+    fn derefs_the_cursor(expr: &rustc_hir::Expr<'_>, binding: HirId) -> bool {
+        let mut expr = expr;
+        loop {
+            match expr.kind {
+                rustc_hir::ExprKind::Cast(inner, _) | rustc_hir::ExprKind::DropTemps(inner) => {
+                    expr = inner;
+                }
+                rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, inner) => {
+                    return names(inner, binding);
+                }
+                _ => return false,
+            }
+        }
+    }
+    /// `1`, `1 as isize`, `(1)` — a constant step. Anything naming a value is
+    /// not.
+    fn literal_step(expr: &rustc_hir::Expr<'_>) -> bool {
+        let mut expr = expr;
+        loop {
+            match expr.kind {
+                rustc_hir::ExprKind::Cast(inner, _) | rustc_hir::ExprKind::DropTemps(inner) => {
+                    expr = inner;
+                }
+                rustc_hir::ExprKind::Lit(_) => return true,
+                _ => return false,
+            }
+        }
+    }
+    /// `0`, `0 as c_int`, `'\0'`, `'\0' as i32` — the terminator, in the
+    /// spellings C and c2rust use for it.
+    fn is_zero(expr: &rustc_hir::Expr<'_>) -> bool {
+        let mut expr = expr;
+        loop {
+            match expr.kind {
+                rustc_hir::ExprKind::Cast(inner, _) | rustc_hir::ExprKind::DropTemps(inner) => {
+                    expr = inner;
+                }
+                rustc_hir::ExprKind::Lit(literal) => {
+                    return match literal.node {
+                        rustc_ast::LitKind::Int(value, _) => value.get() == 0,
+                        rustc_ast::LitKind::Char(ch) => ch == '\0',
+                        _ => false,
+                    };
+                }
+                _ => return false,
+            }
+        }
+    }
+    fn names(expr: &rustc_hir::Expr<'_>, binding: HirId) -> bool {
+        struct Names {
+            binding: HirId,
+            found: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for Names {
+            fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+                if let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = expr.kind
+                    && let rustc_hir::def::Res::Local(id) = path.res
+                    && id == self.binding
+                {
+                    self.found = true;
+                }
+                rustc_hir::intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut visitor = Names {
+            binding,
+            found: false,
+        };
+        visitor.visit_expr(expr);
+        visitor.found
+    }
+    impl<'tcx> Visitor<'tcx> for Walk<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            match expr.kind {
+                // `while *p != 0` — the loop the string ends. **Both halves
+                // are required** (R497-3(a)): a deref of the cursor on one side
+                // and a ZERO on the other. Without the zero, `*p1.offset(0) ==
+                // *p2.offset(0)` — a byte comparison between two buffers —
+                // reads as a string walk, and the extent it licenses scans past
+                // whatever the input actually read.
+                rustc_hir::ExprKind::Binary(op, left, right)
+                    if matches!(op.node, rustc_hir::BinOpKind::Ne | rustc_hir::BinOpKind::Eq)
+                        && ((derefs_the_cursor(left, self.binding) && is_zero(right))
+                            || (derefs_the_cursor(right, self.binding) && is_zero(left))) =>
+                {
+                    self.nul_tested = true;
+                }
+                // `*p.offset(i)` with a non-literal index is a COUNT walk.
+                rustc_hir::ExprKind::MethodCall(segment, receiver, [index], _)
+                    if EXTENT_LEAVING_OPS.contains(&segment.ident.name.as_str())
+                        && names(receiver, self.binding) =>
+                {
+                    // A CAST of a literal is still a literal step
+                    // (`p.offset(1 as isize)`); a cast of a variable is not
+                    // (`p.offset(i as isize)`), and that is a count walk.
+                    if !literal_step(index) {
+                        self.indexed = true;
+                    }
+                }
+                rustc_hir::ExprKind::Call(callee, args) => {
+                    let name = match callee.kind {
+                        rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => path
+                            .segments
+                            .last()
+                            .map(|segment| segment.ident.name.to_string()),
+                        _ => None,
+                    };
+                    if let Some(name) = name
+                        && NUL_CONTRACT_CALLEES.contains(&name.as_str())
+                        && args.iter().any(|arg| names(arg, self.binding))
+                    {
+                        self.libc_contract = true;
+                    }
+                }
+                // A `return` inside the walk can leave it before the NUL.
+                rustc_hir::ExprKind::Ret(_) | rustc_hir::ExprKind::Break(..) => {
+                    self.early_exit = true;
+                }
+                _ => {}
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let body = tcx.hir_body_owned_by(param.fn_did);
+    let mut walk = Walk {
+        tcx,
+        binding: param.hir_id,
+        nul_tested: false,
+        early_exit: false,
+        libc_contract: false,
+        indexed: false,
+    };
+    walk.visit_body(&body);
+    let _ = walk.tcx;
+    if !walk.nul_tested || walk.indexed {
+        return None;
+    }
+    Some(if walk.libc_contract || !walk.early_exit {
+        NulWalk::Exact
+    } else {
+        NulWalk::Fallback
     })
 }
 
@@ -411,5 +651,230 @@ pub unsafe fn hash(data: *const u8) -> u32 { read32(data as *const core::ffi::c_
             held.iter().any(|row| row.starts_with("hash:read32:p:")),
             "a one-element source must keep the hold whatever its callee decided: {held:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod nul_walk_tests {
+    use super::*;
+
+    /// libtree's shape: the callee walks to the NUL and hands the pointer to
+    /// libc string functions on the way (`strchr`, `puts`), whose contracts
+    /// require a terminated string — so a UB-free input is terminated (§28) and
+    /// the caller's extent is `strlen + 1`, exactly.
+    const LIBC_WALK: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe extern "C" { fn strchr(s: *const i8, c: i32) -> *mut i8; fn puts(s: *const i8) -> i32; }
+unsafe fn walk(mut start: *const i8) {
+    while *start as i32 != 0 {
+        let next = strchr(start, ':' as i32);
+        if start == next { start = start.offset(1); } else { puts(start); return; }
+    }
+}
+pub unsafe fn caller(runpath: *const i8) { walk(runpath); }
+"#;
+
+    /// binn's shape: the walk can stop before the NUL (`else { return 0 }`), so
+    /// `strlen` at the caller could read bytes the input never reads — the §77
+    /// fallback, receipted, is what that takes.
+    const EARLY_EXIT_WALK: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn is_float(mut p: *const i8) -> i32 {
+    while *p as i32 != 0 {
+        if *p as i32 >= '0' as i32 && *p as i32 <= '9' as i32 {} else { return 0 }
+        p = p.offset(1);
+    }
+    1
+}
+pub unsafe fn caller(str: *const i8) -> i32 { is_float(str) }
+"#;
+
+    fn walk_of(input: &str, callee: &str) -> Option<NulWalk> {
+        ::utils::compilation::run_compiler_on_str(input, |tcx| {
+            let owners = tcx
+                .hir_body_owners()
+                .filter(|did| matches!(tcx.def_kind(*did), rustc_hir::def::DefKind::Fn))
+                .collect::<Vec<_>>();
+            let facts = super::super::emitability::collect(tcx, &owners);
+            let table = crate::bo_rewriter::decide_table(tcx).expect("fixture decisions");
+            let subject = table
+                .entries
+                .iter()
+                .map(|(subject, _)| subject)
+                .find(|subject| subject.label == callee)
+                .unwrap_or_else(|| panic!("{callee}"))
+                .clone();
+            nul_walk(tcx, &subject, &facts)
+        })
+        .unwrap()
+    }
+
+    /// **The shape** — a NUL walk that hands the pointer to libc string
+    /// functions takes the EXACT extent.
+    #[test]
+    fn w5c_nul_a_libc_string_walk_is_exact() {
+        assert_eq!(walk_of(LIBC_WALK, "walk::start"), Some(NulWalk::Exact));
+    }
+
+    /// **The other branch** — a walk that can stop before the NUL takes the
+    /// ruled fallback, because `strlen` at the caller would read further than
+    /// the input does.
+    #[test]
+    fn w5c_nul_an_early_exit_walk_takes_the_fallback() {
+        assert_eq!(
+            walk_of(EARLY_EXIT_WALK, "is_float::p"),
+            Some(NulWalk::Fallback)
+        );
+    }
+
+    /// **The hold is lifted for both branches** — the extent differs, the class
+    /// does not. This is the rule's effect at the caller, which is what the two
+    /// corpus rows wait on.
+    #[test]
+    fn w5c_nul_the_caller_is_not_held_for_a_string_walk() {
+        for (input, callee) in [(LIBC_WALK, "walk"), (EARLY_EXIT_WALK, "is_float")] {
+            let held = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+                let owners = tcx
+                    .hir_body_owners()
+                    .filter(|did| matches!(tcx.def_kind(*did), rustc_hir::def::DefKind::Fn))
+                    .collect::<Vec<_>>();
+                let facts = super::super::emitability::collect(tcx, &owners);
+                let table = crate::bo_rewriter::decide_table(tcx).expect("fixture decisions");
+                let subjects = table
+                    .entries
+                    .iter()
+                    .map(|(subject, _)| subject.clone())
+                    .collect::<Vec<_>>();
+                let program = crate::bo_rewriter::collect_program(tcx);
+                let fat = crate::bo_rewriter::fat_facts::FatFacts::from_program(&program);
+                collect(
+                    tcx,
+                    &subjects,
+                    &facts,
+                    &FxHashMap::default(),
+                    &rustc_hash::FxHashSet::default(),
+                    Some(&fat),
+                )
+                .into_iter()
+                .map(|(_, access)| access.detail())
+                .collect::<Vec<_>>()
+            })
+            .unwrap();
+            assert!(
+                !held.iter().any(|detail| detail.starts_with(callee)),
+                "{callee}: a C-string walk must not hold its caller: {held:?}"
+            );
+        }
+    }
+
+    /// **The emitted length**, for the licensed branch: the caller constructs
+    /// the slice with `strlen + 1`, not the fallback const.
+    #[test]
+    fn w5c_nul_the_licensed_branch_emits_strlen_plus_one() {
+        let emitted =
+            crate::bo_rewriter::emit_tests::ast_emitted_source_of(LIBC_WALK).expect("emission");
+        let flat = emitted.split_whitespace().collect::<String>();
+        if flat.contains("from_raw_parts") {
+            assert!(
+                flat.contains("CStr::from_ptr") && flat.contains("wrapping_add(1)"),
+                "a licensed C-string extent is `strlen + 1`: {emitted}"
+            );
+            assert!(
+                !flat.contains("FALLBACK_SLICE_EXTENT"),
+                "and it is not the fallback: {emitted}"
+            );
+        }
+        assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
+    }
+
+    /// **Control (R497-3(a), slicecursor 052's defect)** — a callee that
+    /// COMPARES two buffers byte for byte has a deref of the cursor on one side
+    /// of an `==`, no loop, no NUL and no zero anywhere. The first build read
+    /// that as a C-string walk and licensed the exact extent, so the emitted
+    /// program scanned for a terminator past a 32-byte array the input only
+    /// read at two indices — a new out-of-bounds read on a UB-free input, which
+    /// neither §28 (the input never touched those bytes) nor §77 (it waives a
+    /// slice's LENGTH, not an unbounded scan that computes one) covers.
+    ///
+    /// The rule this restores is the one its own doc comment states: the loop
+    /// the string ends is `*p != 0`, so the other side of the comparison must
+    /// be a ZERO literal.
+    #[test]
+    fn w5c_nul_a_byte_comparison_is_not_a_nul_test() {
+        const COMPARE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn is_match(p1: *const u8, p2: *const u8) -> i32 {
+    (*p1.offset(0) == *p2.offset(0) && *p1.offset(4) == *p2.offset(4)) as i32
+}
+pub unsafe fn caller(ip: *const u8, candidate: *const u8) -> i32 { is_match(ip, candidate) }
+"#;
+        assert_eq!(walk_of(COMPARE, "is_match::p1"), None);
+        assert_eq!(walk_of(COMPARE, "is_match::p2"), None);
+    }
+
+    /// **Control** — a comparison against a NON-zero literal is not the string's
+    /// end either (`*p == b':'` is a delimiter test).
+    #[test]
+    fn w5c_nul_a_delimiter_comparison_is_not_a_nul_test() {
+        const DELIM: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn scan(mut p: *const u8) -> u32 {
+    let mut n = 0u32;
+    while *p as i32 == ':' as i32 { p = p.offset(1); n += 1; }
+    n
+}
+pub unsafe fn caller(q: *const u8) -> u32 { scan(q) }
+"#;
+        assert_eq!(walk_of(DELIM, "scan::p"), None);
+    }
+
+    /// **Control** — an INDEXED walk is not a NUL walk at all: its extent is a
+    /// count question, and this rule says nothing about it.
+    #[test]
+    fn w5c_nul_an_indexed_walk_is_not_a_nul_walk() {
+        const INDEXED: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn read_at(data: *const u8, n: usize) -> u32 {
+    let mut i = 0usize; let mut acc = 0u32;
+    while i < n { acc = acc.wrapping_add(*data.offset(i as isize) as u32); i += 1; }
+    acc
+}
+pub unsafe fn caller(p: *const u8, n: usize) -> u32 { read_at(p, n) }
+"#;
+        assert_eq!(walk_of(INDEXED, "read_at::data"), None);
+    }
+
+    /// **Control** — a NUL test AND an indexed read. The loop ends at the NUL,
+    /// but the body reaches `p[i]` for an `i` the string's own length does not
+    /// bound, so this is a count walk wearing a NUL test and the rule declines
+    /// it.
+    #[test]
+    fn w5c_nul_an_indexed_read_under_a_nul_test_is_declined() {
+        const MIXED: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn mixed(p: *const u8, n: usize) -> u32 {
+    let mut i = 0usize; let mut acc = 0u32;
+    while *p != 0 && i < n { acc = acc.wrapping_add(*p.offset(i as isize) as u32); i += 1; }
+    acc
+}
+pub unsafe fn caller(q: *const u8, n: usize) -> u32 { mixed(q, n) }
+"#;
+        assert_eq!(walk_of(MIXED, "mixed::p"), None);
+    }
+
+    /// **Control** — a walk that reads a WIDER type at the cursor is not a
+    /// byte-at-a-time NUL walk, whatever its loop condition says.
+    #[test]
+    fn w5c_nul_a_wide_read_at_the_cursor_is_not_a_nul_walk() {
+        const WIDE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn scan(mut p: *const u8) -> u32 {
+    let mut acc = 0u32;
+    while *p != 0 { acc = acc.wrapping_add(*(p as *const u32)); p = p.offset(1); }
+    acc
+}
+pub unsafe fn caller(q: *const u8) -> u32 { scan(q) }
+"#;
+        assert_eq!(walk_of(WIDE, "scan::p"), None);
     }
 }

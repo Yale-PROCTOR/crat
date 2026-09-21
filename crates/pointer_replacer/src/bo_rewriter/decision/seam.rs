@@ -5018,15 +5018,40 @@ pub(crate) fn synthesize_with_raw_boundary(
                     let masked = param_key
                         .get(&(*callee, pos.index))
                         .is_some_and(|key| table.slice_input_mask_companions.contains(key));
-                    (
-                        companion
-                            .and_then(|i| site.args.iter().find(|argument| argument.index == i))
-                            .and_then(|argument| sm.span_to_snippet(argument.span).ok())
-                            .filter(|text| licensed_spelling(text))
-                            .map(|text| masked_len_text(text, masked)),
-                        masked,
-                        Some(arm),
-                    )
+                    // **R491-7 — the C-string extent.** Where the chain proved
+                    // the callee walks this parameter to a NUL and the walk is
+                    // licensed exact (it reaches the NUL on every path, or the
+                    // pointer goes to a libc string function whose contract
+                    // requires a terminated string), the length is the string's
+                    // own: `strlen(p) + 1`, computed from the argument the call
+                    // already passes. No companion is involved and none is
+                    // needed.
+                    let nul_exact = table.nul_exact_parameters.contains(&(*callee, pos.index));
+                    if nul_exact {
+                        // `CStr::from_ptr` walks to the NUL exactly as the
+                        // callee does, and on a UB-free input (§28) the
+                        // terminator is there. `core::ffi` rather than `libc`
+                        // so the emitted crate needs no dependency it did not
+                        // already have. `+ 1` for the terminator, which is part
+                        // of the object the callee reads.
+                        (
+                            Some(format!(
+                                "core::ffi::CStr::from_ptr({text} as *const core::ffi::c_char).to_bytes().len().wrapping_add(1)"
+                            )),
+                            false,
+                            Some(LenEvidence::Elsewhere),
+                        )
+                    } else {
+                        (
+                            companion
+                                .and_then(|i| site.args.iter().find(|argument| argument.index == i))
+                                .and_then(|argument| sm.span_to_snippet(argument.span).ok())
+                                .filter(|text| licensed_spelling(text))
+                                .map(|text| masked_len_text(text, masked)),
+                            masked,
+                            Some(arm),
+                        )
+                    }
                 } else {
                     (None, false, None)
                 };

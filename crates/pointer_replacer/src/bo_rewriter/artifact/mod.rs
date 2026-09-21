@@ -246,6 +246,7 @@ mod tests {
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            nul_exact_parameters: Default::default(),
         }
     }
 

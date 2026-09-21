@@ -1090,6 +1090,12 @@ pub(crate) struct DecisionTable {
     /// width at that index, and the allocation, which the signature does not
     /// carry).
     pub(crate) slice_input_mask_companions: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    /// **R491-7 (wave-5c).** Callee parameters whose body walks them to a NUL
+    /// with the EXACT extent licensed — the walk reaches the NUL on every path,
+    /// or the pointer is handed to a libc string function whose contract
+    /// requires a terminated string. A caller constructing a slice for one of
+    /// these takes `strlen(p) + 1` instead of §77's fallback.
+    pub(crate) nul_exact_parameters: rustc_hash::FxHashSet<(LocalDefId, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1401,6 +1407,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         field_transactions: Default::default(),
         slice_input_companions: Default::default(),
         slice_input_mask_companions: Default::default(),
+        nul_exact_parameters: Default::default(),
     }
 }
 
@@ -3048,6 +3055,7 @@ mod self_consistency_tests {
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            nul_exact_parameters: Default::default(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))
