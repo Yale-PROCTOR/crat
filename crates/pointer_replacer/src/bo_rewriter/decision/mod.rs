@@ -113,6 +113,7 @@ pub(crate) mod returned_child;
 pub(crate) mod returned_child_descent;
 #[cfg(test)]
 mod returned_child_tests;
+pub(crate) mod root_extent;
 pub(crate) mod seam;
 pub(crate) mod shared_read_pairs;
 pub(crate) mod shared_weakening;
@@ -1065,6 +1066,10 @@ pub(crate) struct DecisionTable {
     /// **W4-LIFT (R475-2)** — one receipt per caller lifted by an exact
     /// licensed width, so the count is auditable at the census.
     pub(crate) licensed_lifts: Vec<licensed_lift::LiftReceipt>,
+    /// **W4-B1 (R480-2)** — one row per subject the root-extent rule decided:
+    /// lifted with its evidence, or HELD with the reason no extent was found.
+    /// The held count is the seat's Decision A input.
+    pub(crate) root_extents: Vec<root_extent::RootExtentRow>,
     /// wave-6f: the finalized struct-field reference transactions.
     pub field_transactions: field_reference::FieldTransactions,
     /// **R425-3 (wave-5c).** For a parameter the reader chain decided `Slice`
@@ -1266,6 +1271,9 @@ pub(crate) fn decide_with_raw_fallbacks(
     // EXACT licensed width takes the slice form. After the other promotes, so a
     // subject another family has already re-typed is not a candidate.
     let licensed_lifts = licensed_lift::promote(ctx, &mut entries);
+    // W4-B1 (R480-2): the rows the callee's width cannot answer take their
+    // caller's ROOT extent, or stay held and are counted.
+    let root_extents = root_extent::promote(ctx, &mut entries);
     cursor_native::observe(ctx, &entries, &cursor_receipts);
     let contract_extent_promotions = entries
         .iter()
@@ -1382,6 +1390,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         option_composed_uses: Vec::new(),
         contract_extent_promotions,
         licensed_lifts,
+        root_extents,
         field_transactions: Default::default(),
         slice_input_companions: Default::default(),
         slice_input_mask_companions: Default::default(),
@@ -2955,6 +2964,7 @@ mod self_consistency_tests {
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
+            root_extents: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),

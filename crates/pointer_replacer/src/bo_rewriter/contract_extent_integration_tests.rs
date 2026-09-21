@@ -2062,3 +2062,157 @@ fn w4l08_the_receipt_is_a_census_artifact_row() {
     assert_eq!(columns[5], "slice", "{tsv}");
     assert_eq!(lines.next(), None, "one lift, one row: {tsv}");
 }
+
+/// **W4-B1 (R480-2)** — `BrotliWriteBits`'s shape, minimised: the callee binds
+/// a byte pointer out of `array.offset(..)`, so it is no slice candidate of its
+/// own and the caller is held `held:local-callee-access-extent`. The caller's
+/// ROOT is an allocation whose size is recoverable, and that extent is what the
+/// slice form carries.
+const W4_B1_SIZED_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreIt(mut n: size_t) {
+    let mut storage: *mut uint8_t =
+        malloc(n.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64) as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+/// The same shape with the root one frame further away: the held subject is a
+/// PARAMETER, and its only call site hands it the sized allocation.
+const W4_B1_SIZED_ROOT_THROUGH_A_PARAMETER: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+unsafe extern "C" fn StoreInner(mut pos: *mut size_t, mut storage: *mut uint8_t) {
+    BrotliWriteBits(pos, storage);
+}
+pub unsafe extern "C" fn StoreOuter(mut n: size_t) {
+    let mut buffer: *mut uint8_t =
+        malloc(n.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64) as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    StoreInner(&mut pos, buffer);
+}
+"#;
+
+/// The residue: the root is a call this analysis does not read — no allocation,
+/// no array, no literal, no companion length. It stays held and is COUNTED.
+const W4_B1_UNSIZED_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn GetBuffer() -> *mut uint8_t;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreUnsized() {
+    let mut storage: *mut uint8_t = GetBuffer();
+    let mut pos: size_t = 0 as size_t;
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+fn b1_rows(source: &str) -> Vec<(String, String, String, String)> {
+    table_of(source, |table| {
+        table
+            .root_extents
+            .iter()
+            .map(|row| {
+                (
+                    row.subject.clone(),
+                    row.outcome.to_string(),
+                    row.extent.clone(),
+                    row.evidence.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table")
+}
+
+/// **W4B1-1 (control) — a root that states nothing stays the fallback's.**
+///
+/// The `wrapping_mul` evidence arm itself is witnessed where it lives, in
+/// `construction::slice_construction_tests` (`w4b1_a_wrapping_mul_product_is_length_evidence`
+/// and its no-element-size control): a small integration fixture cannot show it,
+/// because an allocation-rooted local in one of these fixtures is `kind-raw`
+/// and never reaches a slice construction at all.
+/// The same shape with an opaque `GetBuffer()` root: no allocation, no array,
+/// no literal, no companion — the length planner keeps its §77 fallback and
+/// B1 has nothing to propagate.
+const W4_B1_OPAQUE_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn GetBuffer() -> *mut uint8_t;
+}
+pub unsafe extern "C" fn SumOpaque(mut n: size_t) -> size_t {
+    let mut buffer: *mut uint8_t = GetBuffer();
+    let mut acc: size_t = 0 as size_t;
+    let mut i: size_t = 0 as size_t;
+    while i < n {
+        acc = acc.wrapping_add(*buffer.offset(i as isize) as size_t);
+        i = i.wrapping_add(1 as size_t);
+    }
+    return acc;
+}
+"#;
+
+#[test]
+fn w4b101_an_opaque_root_states_no_extent() {
+    let plans = table_of(W4_B1_OPAQUE_ROOT, |table| {
+        table
+            .slice_constructions
+            .iter()
+            .map(|plan| (plan.element_type.clone(), plan.length.source.receipt_key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let buffer = plans
+        .iter()
+        .find(|(element, _)| element.contains("uint8_t"))
+        .unwrap_or_else(|| panic!("no uint8_t construction: {plans:?}"));
+    assert!(
+        buffer.1.starts_with("fabricated-extent"),
+        "nothing to propagate: {plans:?}"
+    );
+}
+
+/// **W4B1-3 — the residue is COUNTED, with its reason.** The held row records
+/// what its root said (`none`) separately from why it was not lifted, because
+/// the first column is the seat's Decision A input and the second is this
+/// build's own gate.
+#[test]
+fn w4b103_the_residue_is_counted_with_its_reason() {
+    let rows = b1_rows(W4_B1_UNSIZED_ROOT);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreUnsized::storage"))
+        .unwrap_or_else(|| panic!("no StoreUnsized::storage row: {rows:?}"));
+    assert_eq!(storage.1, "held", "{rows:?}");
+    assert_eq!(storage.2, "none", "no extent to propagate: {rows:?}");
+    assert_eq!(storage.3, "root-states-no-extent", "{rows:?}");
+}

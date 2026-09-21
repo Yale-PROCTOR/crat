@@ -366,13 +366,29 @@ fn allocation_product_length(
     let expression = Collector::peel(tcx.hir_node(init_hir).expect_expr());
     let rustc_hir::ExprKind::Call(_, args) = expression.kind else { return None };
     let argument_index = usize::from(callee == "realloc");
-    let bytes = args.get(argument_index)?;
-    let rustc_hir::ExprKind::Binary(operator, left, right) = bytes.kind else { return None };
-    if operator.node != rustc_hir::BinOpKind::Mul {
-        return None;
-    }
+    let bytes = Collector::peel(args.get(argument_index)?);
+    // **W4-B1 (R480-2): C2Rust spells the product `wrapping_mul`.** Every
+    // brotli allocation size is `n.wrapping_mul(size_of::<T>() as c_ulong)`,
+    // which is a method call and not `ExprKind::Binary`, so the recogniser saw
+    // no product at all and the root stated no extent. The two spellings mean
+    // the same multiplication and the evidence is the same exact factor; the
+    // receipt stays `allocation-byte-count`, since what is recovered is still
+    // a byte count divided by the element size.
+    let factors: [&rustc_hir::Expr<'_>; 2] = match bytes.kind {
+        rustc_hir::ExprKind::Binary(operator, left, right)
+            if operator.node == rustc_hir::BinOpKind::Mul =>
+        {
+            [left, right]
+        }
+        rustc_hir::ExprKind::MethodCall(segment, receiver, arguments, _)
+            if segment.ident.name.as_str() == "wrapping_mul" && arguments.len() == 1 =>
+        {
+            [receiver, &arguments[0]]
+        }
+        _ => return None,
+    };
     let sm = tcx.sess.source_map();
-    let exact_factor = [left, right].into_iter().any(|factor| {
+    let exact_factor = factors.into_iter().any(|factor| {
         sm.span_to_snippet(factor.span)
             .ok()
             .is_some_and(|text| exact_element_size(&text, element_type))
@@ -494,6 +510,50 @@ fn array_decay_length(
     })
 }
 
+/// **The evidence arms alone — W4-B1 (R480-2).**
+///
+/// Everything [`select_length`] tries BEFORE its fallback, and nothing else:
+/// an allocation whose size is recoverable, an array decay, a NUL-terminated
+/// literal, or a companion length local. `None` means this subject's own root
+/// states no extent, which under B1 is a HOLD and a counted residue rather
+/// than a fabricated 1024 — a checked index beyond a fabricated extent would
+/// panic where C reads on.
+pub(crate) fn root_extent(
+    tcx: TyCtxt<'_>,
+    facts: &ConstructionFacts,
+    subject: &Subject,
+    element_type: &str,
+    init_hir: HirId,
+    known: &FxHashMap<(LocalDefId, HirId), SliceLengthPlan>,
+) -> Option<SliceLengthPlan> {
+    let node = (subject.fn_did, subject.hir_id);
+    if let Some(construction) = facts.by_binding.get(&node)
+        && let Some(length) = allocation_length(construction, element_type)
+            .or_else(|| allocation_product_length(tcx, init_hir, construction, element_type))
+    {
+        return Some(length);
+    }
+    if matches!(facts.by_binding.get(&node), Some(Construction::ArrayDecay))
+        && let Some(length) = array_decay_length(tcx, subject.fn_did, init_hir)
+    {
+        return Some(length);
+    }
+    if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
+        return Some(SliceLengthPlan {
+            expression: arms
+                .iter()
+                .map(|arm| format!("{}usize", arm.bytes))
+                .collect::<Vec<_>>()
+                .join("|"),
+            source: SliceLengthSource::LiteralBytes {
+                arms: arms.iter().map(|arm| arm.bytes).collect(),
+            },
+            provenance: Vec::new(),
+        });
+    }
+    associated_local_length(facts, node, known)
+}
+
 fn select_length(
     tcx: TyCtxt<'_>,
     table: &DecisionTable,
@@ -504,31 +564,7 @@ fn select_length(
     known: &FxHashMap<(LocalDefId, HirId), SliceLengthPlan>,
 ) -> SliceLengthPlan {
     let node = (subject.fn_did, subject.hir_id);
-    if let Some(construction) = facts.by_binding.get(&node)
-        && let Some(length) = allocation_length(construction, element_type)
-            .or_else(|| allocation_product_length(tcx, init_hir, construction, element_type))
-    {
-        return length;
-    }
-    if matches!(facts.by_binding.get(&node), Some(Construction::ArrayDecay))
-        && let Some(length) = array_decay_length(tcx, subject.fn_did, init_hir)
-    {
-        return length;
-    }
-    if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
-        return SliceLengthPlan {
-            expression: arms
-                .iter()
-                .map(|arm| format!("{}usize", arm.bytes))
-                .collect::<Vec<_>>()
-                .join("|"),
-            source: SliceLengthSource::LiteralBytes {
-                arms: arms.iter().map(|arm| arm.bytes).collect(),
-            },
-            provenance: Vec::new(),
-        };
-    }
-    if let Some(length) = associated_local_length(facts, node, known) {
+    if let Some(length) = root_extent(tcx, facts, subject, element_type, init_hir, known) {
         return length;
     }
     SliceLengthPlan {
@@ -1872,6 +1908,58 @@ mod slice_construction_tests {
         );
         assert_eq!(plans.len(), 1);
         assert!(plans[0].length.extent().is_fallback());
+    }
+
+    /// **W4-B1 (R480-2): C2Rust spells the product `wrapping_mul`.** Brotli
+    /// allocates every buffer as `n.wrapping_mul(size_of::<T>() as c_ulong)`,
+    /// which is a method call rather than `ExprKind::Binary`, so the product
+    /// recogniser saw nothing and the root stated no extent. Same
+    /// multiplication, same exact factor, same `allocation-byte-count` receipt.
+    #[test]
+    fn w4b1_a_wrapping_mul_product_is_length_evidence() {
+        let plans = slc_construction_plans(
+            "#![allow(dead_code, unused_unsafe)]\n\
+             extern \"C\" { fn malloc(size: usize) -> *mut i32; }\n\
+             pub unsafe fn target(items: usize) -> i32 {\n\
+                 let p: *mut i32 = malloc(items.wrapping_mul(core::mem::size_of::<i32>()));\n\
+                 *p.offset(1)\n\
+             }\n",
+        );
+        assert_eq!(plans.len(), 1);
+        assert!(
+            !plans[0].length.extent().is_fallback(),
+            "the allocation states its own extent: {:?}",
+            plans[0].length
+        );
+        assert!(
+            plans[0]
+                .length
+                .source
+                .receipt_key()
+                .starts_with("allocation-byte-count"),
+            "{:?}",
+            plans[0].length
+        );
+    }
+
+    /// The control for it: a `wrapping_mul` whose factors are NOT the element
+    /// size states nothing, exactly as the binary form does.
+    #[test]
+    fn w4b1_a_wrapping_mul_without_the_element_size_is_not_evidence() {
+        let plans = slc_construction_plans(
+            "#![allow(dead_code, unused_unsafe)]\n\
+             extern \"C\" { fn malloc(size: usize) -> *mut i32; }\n\
+             pub unsafe fn target(items: usize) -> i32 {\n\
+                 let p: *mut i32 = malloc(items.wrapping_mul(7usize));\n\
+                 *p.offset(1)\n\
+             }\n",
+        );
+        assert_eq!(plans.len(), 1);
+        assert!(
+            plans[0].length.extent().is_fallback(),
+            "no exact element factor, no evidence: {:?}",
+            plans[0].length
+        );
     }
 
     /// Addendum 206 E11: integer adjacency does not license length evidence.

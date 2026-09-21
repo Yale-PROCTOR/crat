@@ -94,7 +94,7 @@ fn callee_region<'a>(
 /// into a callee whose form nobody checked. The twin of
 /// [`super::void_region::decided_slice`], which asks the same question of the
 /// finished table.
-fn delivers_slice(decision: &Decision) -> bool {
+pub(crate) fn delivers_slice(decision: &Decision) -> bool {
     match decision {
         Decision::Slice { .. } => true,
         Decision::Ref { .. }
@@ -110,7 +110,9 @@ fn delivers_slice(decision: &Decision) -> bool {
 /// The hold this lift answers, if this is that hold.
 ///
 /// Exhaustive for the same reason as [`delivers_slice`].
-fn held_at_a_local_callee(decision: &Decision) -> Option<&local_callee_extent::LocalCalleeAccess> {
+pub(crate) fn held_at_a_local_callee(
+    decision: &Decision,
+) -> Option<&local_callee_extent::LocalCalleeAccess> {
     match decision {
         Decision::Degraded(record) => match &record.reason {
             DegradeReason::LocalCalleeAccessExtent { access, .. } => Some(access),
@@ -132,7 +134,7 @@ fn held_at_a_local_callee(decision: &Decision) -> Option<&local_callee_extent::L
 /// which is the thin case this class is about — so absence is supported, the
 /// same default the ladder itself takes (`slice_uses.get(..).unwrap_or_default()`
 /// immediately before its own `unsupported` check).
-fn slice_uses_supported(ctx: &Ctx<'_, '_>, node: (LocalDefId, HirId)) -> bool {
+pub(crate) fn slice_uses_supported(ctx: &Ctx<'_, '_>, node: (LocalDefId, HirId)) -> bool {
     ctx.slice_uses
         .get(&node)
         .is_none_or(|uses| uses.unsupported.is_none())
@@ -140,7 +142,7 @@ fn slice_uses_supported(ctx: &Ctx<'_, '_>, node: (LocalDefId, HirId)) -> bool {
 
 /// The subject's own slice-use rewrites, empty when it has none of its own (the
 /// thin case this class is about: the subject is handed over and not indexed).
-fn slice_rewrites(
+pub(crate) fn slice_rewrites(
     ctx: &Ctx<'_, '_>,
     node: (LocalDefId, HirId),
 ) -> Vec<super::emitability::UseEdit> {
