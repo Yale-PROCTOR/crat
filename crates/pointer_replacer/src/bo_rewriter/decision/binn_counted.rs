@@ -488,6 +488,7 @@ pub(crate) fn prove_header_path(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract
         count_index: 0,
         element: ByteElement::Read,
         nullable,
+        alias: None,
         handle: None,
         width: Some(WidthTable::fallback_extent()),
         uses: edits,
@@ -680,6 +681,7 @@ pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         element: ByteElement::Read,
         nullable,
         // wave-6v void-handle field (01195a79): a typed-width view is not a handle.
+        alias: None,
         handle: None,
         width: Some(width),
         uses: edits,
@@ -779,6 +781,7 @@ pub(crate) fn prove_foreign_copy(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contrac
         count_index: count_index?,
         element: ByteElement::Read,
         nullable,
+        alias: None,
         handle: None,
         width: None,
         uses: edits,
@@ -928,6 +931,7 @@ pub(crate) fn prove_forward_only(
         element,
         nullable,
         // wave-6v void-handle field (01195a79): a typed-width view is not a handle.
+        alias: None,
         handle: None,
         width: Some(width),
         uses: edits,

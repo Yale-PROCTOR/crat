@@ -457,38 +457,10 @@ mod tests {
 /// what the exempting form costs — six of their witnesses turn red when the
 /// subject short-circuits those arms.
 pub(super) fn counted_alias_needs_no_declaration(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
-    use rustc_hir::{ExprKind, Node, PatKind, def::Res};
-    if subject.kind != SubjectKind::Local || subject.ty_span.is_some() {
-        return false;
-    }
-    let Node::LetStmt(local) = ctx.tcx.parent_hir_node(subject.hir_id) else { return false };
-    if !matches!(local.pat.kind, PatKind::Binding(_, hir, _, None) if hir == subject.hir_id)
-        || local.ty.is_some()
-    {
-        return false;
-    }
-    // The shape is a CAST of the parameter, never a bare copy: a bare copy of a
-    // counted parameter is the ordinary copy shape and keeps the refusal.
-    let Some(ExprKind::Cast(source, _)) = local.init.map(|init| init.kind) else {
-        return false;
-    };
-    let ExprKind::Path(path) = &source.kind else { return false };
-    let Res::Local(root) = ctx
-        .tcx
-        .typeck(subject.fn_did)
-        .qpath_res(path, source.hir_id)
-    else {
-        return false;
-    };
-    // The question is whether the ROOT carries an active counted contract, not
-    // whether it happens to be in `ctx.subjects`: in a reduction the parameter
-    // of an inner function is contracted without being a subject of its own.
-    use crate::bo_rewriter::additive::FamilyStage;
-    ctx.counted_void.contains_key(&(subject.fn_did, root))
-        && ctx
-            .family_policy
-            .enabled_for((subject.fn_did, root), FamilyStage::Declaration)
-        && ctx
-            .family_policy
-            .enabled_for((subject.fn_did, root), FamilyStage::SliceUse)
+    // The relation is the CONTRACT's to state, not the initializer's to imply:
+    // report 035 measured three keys derived from this side and all three miss,
+    // because the contract that rewrites the local is not the one keyed on the
+    // parameter it casts. `counted_void_read::prove` records which local it
+    // rewrote (wave-6v's `Contract::alias`), and `alias_contract` resolves it.
+    super::counted_void::alias_contract(ctx, subject).is_some()
 }

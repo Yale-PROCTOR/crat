@@ -275,15 +275,17 @@ const PLAIN_CAST_COPY: &str = r#"
     }
 "#;
 
-/// **RED until wave-6v's hook lands (MAX-3 stop, report 035).** The conjunct is
-/// in place in the refusal, but the predicate cannot identify the alias from
-/// this side: only `counted_void_read::prove` knows WHICH local a contract
-/// rewrote, and in the reduction (as in the corpus) the contract that rewrites
-/// `csrc` is not keyed on `csv_fwrite2::src` — `ctx.counted_void` holds
-/// `csv_fwrite::src` instead. wave-6v 028's `Contract::alias` + `alias_contract`
-/// are that missing key; with them, the predicate below is one line.
+/// **The hook is in and the predicate now reads it (relay 036); this witness
+/// still cannot fire in a REDUCTION.** `alias_contract` answers from the
+/// contract that rewrote the local, and in this fixture no contract is proved
+/// for `csv_fwrite2::src` at all — the family contracts the outer wrapper
+/// (`csv_fwrite::src`, decided `Opt { slice: true }`) and the alias lives in the
+/// inner function. The corpus is the other way round (`csv_write2::src#3` is a
+/// subject decided `optional` in the same function as `csrc`), so the live check
+/// for these three rows is the census, not a reduction — fixture ≠ corpus,
+/// R452-2 (i). Un-ignore when a reduction contracts the aliasing parameter.
 #[test]
-#[ignore = "needs wave-6v's Contract::alias hook (relay 035 / wave-6v 028 STOP 3)"]
+#[ignore = "the reduction contracts the outer wrapper, not the aliasing parameter (report 036)"]
 fn wave6k_a_counted_read_alias_is_not_asked_for_a_declaration() {
     let decided = decisions(COUNTED_READ_ALIAS);
     let csrc = decided
