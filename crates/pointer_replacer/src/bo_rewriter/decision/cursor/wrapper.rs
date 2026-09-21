@@ -1404,6 +1404,60 @@ fn selected(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
     ctx.sign.may_be_negative(s.fn_did, s.local)
         || (ordering_participant(ctx, s) && ordering_degraded(decision))
 }
+/// **R485-4(c) (wave-6o, relay 052) — the ROOT case of the shape below.**
+///
+/// A subject the option family degrades `opt-use-unsupported` whose every
+/// assignment is an offset chain rooted at ITSELF: a nullable pointer that
+/// walks itself (`p = p.offset(1)`; binn `is_integer`, libtree
+/// `parse_ld_library_path::search`). [`derived_from_cursor_root`] is its
+/// sibling and explicitly declines this case ("a self-advance; not a root"),
+/// because there the root must be ANOTHER cursor; and [`selected`] declines it
+/// too, because a forward-only walker has no negative offset. The form these
+/// subjects want already exists — `CursorPlan.optional` renders
+/// `Option<SliceCursor<'_, T>>` with `is_none()`, `as_ref().expect(..)[i]` and
+/// `as_mut().expect(..).seek(..)` — so only the admission was missing.
+///
+/// Deliberately NOT gated on `null_init`: these are nullable by an `is_null`
+/// test on a parameter as often as by a null initialiser, and the option
+/// family has already settled the nullability by degrading them. The offset
+/// itself is still required by `plan`'s own `Offsets` visitor, and a subject
+/// with any assignment that is not a self-advance is refused here.
+fn self_advancing_root(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
+    if s.ptr_depth != 1 || !optional_degraded(decision) {
+        return false;
+    }
+    struct Assigns<'a, 'tcx> {
+        ctx: &'a Ctx<'a, 'tcx>,
+        owner: rustc_hir::def_id::LocalDefId,
+        subject: hir::HirId,
+        advances: usize,
+        other: usize,
+    }
+    impl<'v> Visitor<'v> for Assigns<'_, '_> {
+        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = e.kind
+                && local(lhs) == Some(self.subject)
+            {
+                let rhs = peel_reborrow_idiom(self.ctx.tcx, self.owner, rhs);
+                if source_binding(self.ctx.tcx, self.owner, rhs) == Some(self.subject) {
+                    self.advances += 1;
+                } else {
+                    self.other += 1;
+                }
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut assigns = Assigns {
+        ctx,
+        owner: s.fn_did,
+        subject: s.hir_id,
+        advances: 0,
+        other: 0,
+    };
+    assigns.visit_body(ctx.tcx.hir_body_owned_by(s.fn_did));
+    assigns.advances > 0 && assigns.other == 0
+}
 /// A null-initialised local the option family degrades (`opt-use-unsupported`)
 /// whose every assignment is an offset chain (or the reborrow idiom) rooted at
 /// a cursor root of this family: the optional cursor form covers it.
@@ -1542,7 +1596,8 @@ pub(super) fn plan(
 ) -> Option<Result<CursorPlan, CursorHold>> {
     if (!selected(ctx, subject, decision)
         && !derives_cursor(ctx, subject, decision, entries)
-        && !derived_from_cursor_root(ctx, subject, decision, entries))
+        && !derived_from_cursor_root(ctx, subject, decision, entries)
+        && !self_advancing_root(ctx, subject, decision))
         || subject.ptr_depth != 1
     {
         return None;

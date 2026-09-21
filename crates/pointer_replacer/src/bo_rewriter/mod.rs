@@ -259,6 +259,8 @@ mod option_thin_extent_tests;
 #[cfg(test)]
 mod option_void_tests;
 #[cfg(test)]
+mod optional_cursor_tests;
+#[cfg(test)]
 mod ordinary_argument_permission_tests;
 #[cfg(test)]
 mod outbound_alias_permission_tests;
