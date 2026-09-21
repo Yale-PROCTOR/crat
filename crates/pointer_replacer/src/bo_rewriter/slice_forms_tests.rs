@@ -1437,12 +1437,13 @@ fn wave6s_option_slice_destination_refuses_a_retyped_view() {
     assert_ne!(p.2, "<emitted>", "{rows:?}");
 }
 
-/// **CONTROL — an ARRAY LOCAL as the view's root is not admitted.** heman
-/// `kazmath::quaternion::kmQuaternionRotationMatrix`'s `pMatrix` takes its
-/// view off the function's own `[f32; 16]` (`&mut *m4x4.as_mut_ptr().offset(0)
-/// as *mut c_float`), which is not a pointer binding, so it carries no subject
-/// and no view: the row stays this family's. The boundary is pinned here so it
-/// is visible when the array-local root is built (report 021 §3).
+/// **The heman corpus row, after W6S-11.** `kmQuaternionRotationMatrix`'s
+/// `pMatrix` takes its view off the function's own `[f32; 16]`
+/// (`&mut *m4x4.as_mut_ptr().offset(0) as *mut c_float`). Report 021 pinned it
+/// as NOT admitted — an array local carries no subject, so there was no view.
+/// W6S-11 gives it one, and the row leaves this family: its reason is now the
+/// Option family's `null-init` (R217-2(a); the name is kept so the movement is
+/// traceable to the pin it replaces).
 #[test]
 fn wave6s_array_local_root_is_not_yet_a_view_root() {
     let input = include_str!("testdata/wave6s-drift/heman-quaternion-rotation-matrix.rs");
@@ -1453,7 +1454,7 @@ fn wave6s_array_local_root_is_not_yet_a_view_root() {
         .find(|(name, is_param, _)| name == "pMatrix" && !is_param)
         .map(|(_, _, reason)| reason.clone())
         .unwrap_or_else(|| panic!("{rows:?}"));
-    assert_eq!(reason, "slice-use-unsupported", "{rows:?}");
+    assert_eq!(reason, "null-init", "{rows:?}");
 }
 
 /// **The doubled view (R475-3), as a REPRODUCTION rather than a guess.**
@@ -1866,3 +1867,141 @@ fn wave6s_bare_argument_at_a_slice_callee_passes_the_slice() {
         "no raw bridge is needed: {source}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W6S-11 — the ARRAY-LOCAL view root (058 §2(d), 061 STOP 3)
+//
+// heman `kmQuaternionRotationMatrix` writes
+//
+//     let mut pMatrix = 0 as *mut c_float;          // null-initialised
+//     let mut m4x4: [c_float; 16] = [0.; 16];
+//     pMatrix = &mut *m4x4.as_mut_ptr().offset(0) as *mut c_float;
+//     … *pMatrix.offset(k) …
+//
+// The same shape with the view in the DECLARATION already delivers (the
+// construction family types it). By ASSIGNMENT it does not: W6S-7's walk
+// requires the view's root to be a pointer BINDING, and an array local is
+// not one — it carries no subject to hang the view on. It needs none: the
+// array's own name is the view (`&mut m4x4[e..]`), the extent is the array's,
+// and nothing is fabricated.
+// ---------------------------------------------------------------------------
+
+/// **W6S-11 — an array local is a view root, and the wall moves off this
+/// family.** The use walk admits the assignment and the row becomes the
+/// Option family's `null-init`; what it does with the value is §3 of report
+/// 062's STOP — for a BINDING root the composition works (lodepng
+/// `addChunk_IHDR::data` delivered at batch 13/14 that way), for an ARRAY root
+/// `collect_composable_edits` cannot see this arm's edit, because it reads
+/// only edits attached to OTHER delivered subjects and an array local is not
+/// one.
+#[test]
+fn wave6s_array_local_is_a_view_root() {
+    let rows = super::emit_tests::decisions_of(ARRAY_ROOT_SHAPE);
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "p" && !is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(reason, "slice-use-unsupported", "{rows:?}");
+    let source = emit(ARRAY_ROOT_SHAPE);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    if reason == "<emitted>" {
+        let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("p=Some(&mutm4x4[(0asi32)asusize..])")
+                || flat.contains("p=Some(&m4x4[(0asi32)asusize..])"),
+            "the array's own name is the view: {source}"
+        );
+    } else {
+        assert_eq!(reason, "null-init", "{rows:?}");
+    }
+}
+
+const ARRAY_ROOT_SHAPE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    m4x4[0 as usize] = 1.0f32;
+    let mut p = 0 as *mut f32;
+    p = &mut *m4x4.as_mut_ptr().offset(0 as i32 as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize) + *p.offset(5 as i32 as isize);
+ }
+"#;
+
+/// **CONTROL — the declaration form is untouched.** The same view in the
+/// local's initialiser is the construction family's and already delivers; this
+/// arm must not change it.
+#[test]
+fn wave6s_array_root_in_a_declaration_is_unchanged() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    m4x4[0 as usize] = 1.0f32;
+    let mut p: *mut f32 = &mut *m4x4.as_mut_ptr().offset(2 as i32 as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize) + *p.offset(5 as i32 as isize);
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("p:&[f32]") || flat.contains("p:&mut[f32]"),
+        "{source}"
+    );
+}
+
+/// **FAULT — a BACKWARD delta off an array root is refused.** The sign
+/// authority is one; a view that can move backwards is the bidirectional
+/// family's.
+#[test]
+fn wave6s_array_root_refuses_a_backward_view() {
+    let rows = super::emit_tests::decisions_of(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    m4x4[0 as usize] = 1.0f32;
+    let mut p = 0 as *mut f32;
+    p = &mut *m4x4.as_mut_ptr().offset(-(1 as i32) as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize);
+ }
+"#,
+    );
+    let p = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "p" && !is_param)
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(p.2, "<emitted>", "{rows:?}");
+}
+
+/// **FAULT — a retyped view off an array root is never THIS arm's.** `[u32; 4]`
+/// read as `*mut u8` is a reinterpretation; another family may deliver the row
+/// on its own evidence, but the array's name is never handed over as a view of
+/// the wrong element type.
+#[test]
+fn wave6s_array_root_refuses_a_retyped_view() {
+    let source = emit(RETYPED_ARRAY_ROOT);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!flat.contains("p=Some(&words["), "{source}");
+    assert!(!flat.contains("p=Some(&mutwords["), "{source}");
+    assert!(!flat.contains("p=&words["), "{source}");
+    assert!(!flat.contains("p=&mutwords["), "{source}");
+    let rows = super::emit_tests::decisions_of(RETYPED_ARRAY_ROOT);
+    let _ = &rows;
+}
+
+const RETYPED_ARRAY_ROOT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> u8 {
+    let mut words: [u32; 4] = [0; 4];
+    words[0 as usize] = 1;
+    let mut p = 0 as *mut u8;
+    p = words.as_mut_ptr() as *mut u8;
+    return *p.offset(1 as i32 as isize);
+ }
+"#;

@@ -2592,6 +2592,22 @@ fn collect_slice_uses_with_family(
                 return Some(Some(edit));
             }
 
+            // **W6S-11 — the array-local view root.** The right-hand side is
+            // rendered here rather than by a source subject's plan, because an
+            // array local has no subject: the array's own name IS the view.
+            if let Some((span, replacement)) = super::slice_forms::assignment_from_array_root(
+                self.tcx,
+                use_expr,
+                key,
+                self.mutable_of.contains(&key),
+            ) {
+                return Some(Some(UseEdit {
+                    span,
+                    replacement,
+                    bridge_kind: "subject-use",
+                }));
+            }
+
             // **S3.2′-2b — the PLAIN dereference.** `*p` with no arithmetic
             // under it. On `&[T]` its image is `p[0]`, and it is admitted here
             // because the census showed it never occurs alone: every subject it
