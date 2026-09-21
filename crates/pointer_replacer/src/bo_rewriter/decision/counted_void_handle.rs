@@ -116,6 +116,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         nullable,
         // wave-6v2 typed-width table (ec0e694a): not a width-fixed view.
         width: None,
+        alias: None,
         handle: Some(text),
         uses: edits,
     })

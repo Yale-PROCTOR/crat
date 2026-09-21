@@ -314,6 +314,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
             nullable,
             // wave-6v2 typed-width table (ec0e694a): not a width-fixed view.
             width: None,
+            alias: Some(alias),
             handle: None,
             uses,
         });
@@ -379,6 +380,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         count_index,
         element: ByteElement::Read,
         nullable,
+        alias: Some(alias),
         handle: None,
         uses,
     })

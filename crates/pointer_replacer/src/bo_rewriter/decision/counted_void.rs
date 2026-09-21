@@ -47,7 +47,33 @@ pub(crate) struct Contract {
     /// fix (a constant, or one width per literal of a sibling discriminant);
     /// `count_index` is then the discriminant's index, or the parameter's own.
     pub(crate) width: Option<super::binn_counted::WidthTable>,
+    /// The counted READ alias this contract rewrites (`let a = P as *const B`),
+    /// when there is one: the local's initializer and every use are the
+    /// contract's edits, so the local needs no declaration of its own. The
+    /// declaration family reads this to mark it declaration-free (relay
+    /// wave-6v/030 route (a); wave-6k relay 035).
+    pub(crate) alias: Option<HirId>,
     pub(crate) uses: Vec<UseEdit>,
+}
+
+/// The counted contract whose READ alias is this local — the parameter's,
+/// looked up in the same function. [`active`] answers for the parameter; this
+/// answers for the local it reinterprets, and is the hook the declaration
+/// family uses to classify that local as declaration-free.
+pub(crate) fn alias_contract<'a>(ctx: &super::Ctx<'a, '_>, s: &Subject) -> Option<&'a Contract> {
+    use crate::bo_rewriter::additive::FamilyStage;
+    if !matches!(s.kind, SubjectKind::Local) {
+        return None;
+    }
+    let contract = ctx
+        .counted_void
+        .iter()
+        .find(|((fn_did, _), c)| *fn_did == s.fn_did && c.alias == Some(s.hir_id))
+        .map(|(_, c)| c)?;
+    (ctx.family_policy
+        .enabled(s.fn_did, FamilyStage::Declaration)
+        && ctx.family_policy.enabled(s.fn_did, FamilyStage::SliceUse))
+    .then_some(contract)
 }
 fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
     if s.ptr_depth != 1 || !matches!(s.kind, SubjectKind::Param { .. }) {
@@ -103,6 +129,7 @@ fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
             ByteElement::Read
         },
         nullable: false,
+        alias: None,
         handle: None,
         width: None,
         uses: vec![UseEdit {
@@ -306,6 +333,7 @@ fn prove_forward(
                     count_index,
                     element: contract.element,
                     nullable: contract.nullable,
+                    alias: None,
                     handle: None,
                     width: contract
                         .width
