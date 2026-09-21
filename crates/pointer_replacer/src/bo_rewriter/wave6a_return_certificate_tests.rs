@@ -364,11 +364,27 @@ fn w6a_a1_lil_add_func_is_not_an_owning_return() {
         "{}",
         out.artifacts.return_certificate_receipts
     );
-    assert_ne!(
+    // **Amended by wave-6l W6L-A8-1** (relay 026, wave-6l report 024): this
+    // line read `assert_ne!(reason_of(.., "register::cmd"), None)` — the
+    // receiver earned nothing, because the certificate family declines it and
+    // nothing else could type it. The A8 arm now types it from its own null
+    // test, `Option<&mut lil_func>` through the raw pointer's `as_mut()`, so
+    // the receiver IS delivered — by the Option form, never an owning one,
+    // which is what this witness is about. The `Box<` assertion above is the
+    // unchanged pin; this one records the new, non-owning delivery. Revert if
+    // wave-6a reads the intent differently.
+    assert_eq!(
         reason_of(&out.degradations, "register::cmd"),
         None,
         "{:#?}",
         out.degradations
+    );
+    assert!(
+        src.contains(
+            "letmutcmd:Option<&crate::item>=(add_func(r,id)as*constcrate::item).as_ref();"
+        ),
+        "{}",
+        out.source
     );
 }
 
