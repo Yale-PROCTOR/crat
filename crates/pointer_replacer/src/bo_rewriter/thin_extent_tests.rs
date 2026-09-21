@@ -229,10 +229,16 @@ fn projected_field_extent_does_not_hold_the_aggregate_owner() {
 
 #[test]
 fn direct_counted_pointer_keeps_the_thin_extent_hold() {
+    // Re-premised by R481-1 / R482-3 (the waiver), wave-4 report 043. R272-1
+    // still DECIDES here — the destination consumes more than one element and
+    // no evidence arm may give it a thin form — and the seat has stated the
+    // consequence: for the fallback form the hold's Stacked-Borrows
+    // justification is superseded, the remaining hazard being the slice-length
+    // UB §77 already waives. The reason is therefore asserted on the receipt.
     let got = reasons(DIRECT_COUNTED_CONTROL_INPUT);
-    assert_eq!(
+    assert_ne!(
         got.get("dest").map(String::as_str),
-        Some("held:thin-extent"),
+        Some("<emitted-thin>"),
         "a direct memcpy destination consumes more than one `dest` element: {got:#?}"
     );
 }

@@ -266,6 +266,54 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
     out
 }
 
+/// **R416-5, the exclusion the ruling names, at the place it actually bites.**
+///
+/// Lifting a PARAMETER makes every caller hand it a slice. A caller that is
+/// itself thin has only one element to give, and the seam bridges it with
+/// `core::slice::from_ref(..)` — a ONE-element slice into a callee that indexes
+/// past one. That panic is certain, not possible, which is exactly what R416-5
+/// refuses and what the ruling kept refusing. So the waiver may not lift a
+/// parameter any of whose callers would arrive thin.
+///
+/// A caller counts as thin when its own decision is a reference form that
+/// carries one element. A caller still `Degraded` at this point is NOT thin for
+/// this test: it is raw, and a raw argument bridges with its own pointer, not
+/// with `from_ref`.
+fn a_caller_would_arrive_thin(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+    owner: LocalDefId,
+    index: usize,
+) -> bool {
+    let thin = |decision: &Decision| match decision {
+        Decision::Ref { .. } | Decision::InferredRef { .. } => true,
+        Decision::Opt { slice, .. } => !slice,
+        Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => false,
+    };
+    ctx.facts
+        .call_args
+        .iter()
+        .filter(|(callee, _)| **callee == owner)
+        .flat_map(|(_, sites)| sites.iter())
+        .filter_map(|site| {
+            let argument = site.args.iter().find(|arg| arg.index == index)?;
+            let root = match argument.shape {
+                super::emitability::ArgShape::BareLocal(id)
+                | super::emitability::ArgShape::CastOfLocal { binding: id, .. } => id,
+                _ => return None,
+            };
+            entries
+                .iter()
+                .find(|(subject, _)| subject.fn_did == site.caller && subject.hir_id == root)
+                .map(|(_, decision)| decision)
+        })
+        .any(thin)
+}
+
 /// **The extent-lift waiver — USER ruling R481-1 ("바로 1024로 fat 처리"),
 /// addendum 481.**
 ///
@@ -302,12 +350,26 @@ pub(crate) fn promote_fallback(
     ctx: &Ctx<'_, '_>,
     entries: &mut [(Subject, Decision)],
 ) -> Vec<LiftReceipt> {
+    // The caller-side test below reads other subjects' decisions, so it needs
+    // the frame as it stands BEFORE this pass rewrites any of them.
+    let entries_snapshot: Vec<(Subject, Decision)> = entries.to_vec();
+    let entries_snapshot = entries_snapshot.as_slice();
     let candidates: FxHashMap<(LocalDefId, HirId), (String, Option<usize>)> = entries
         .iter()
         .filter_map(|(subject, decision)| {
             let named = match decision {
                 Decision::Degraded(record) => match &record.reason {
                     DegradeReason::LocalCalleeAccessExtent { access, .. } => {
+                        // **A shared subject at a WRITE access is refused.**
+                        // Lifting it yields `&[T]`, and the position wants
+                        // `*mut T`, so the seam bridges `.cast_mut()` — writing
+                        // through a pointer derived from a SHARED reference is
+                        // UB of a kind no waiver here covers (§77 waives the
+                        // slice's LENGTH, not its mutability). The subject stays
+                        // held; its extent is not the problem.
+                        if access.access == "write" && !subject.mutable {
+                            return None;
+                        }
                         (access.callee.clone(), Some(access.parameter_index))
                     }
                     DegradeReason::ThinExtent => ("thin-extent".to_owned(), None),
@@ -331,8 +393,16 @@ pub(crate) fn promote_fallback(
             if !slice_uses_supported(ctx, node) {
                 return None;
             }
-            // **R416-5 stays in force, and it is the ONE exclusion the ruling
-            // names.** A subject whose root is a borrow of a single place —
+            // R416-5 at the caller side: a parameter whose caller arrives thin
+            // would be fed `from_ref(..)`, a one-element slice into a callee
+            // that indexes past one — a CERTAIN panic, which the ruling keeps
+            // refusing.
+            if let SubjectKind::Param { hir_index } = subject.kind
+                && a_caller_would_arrive_thin(ctx, entries_snapshot, subject.fn_did, hir_index)
+            {
+                return None;
+            }
+            // **R416-5 at the subject's own root.** A subject whose root is a borrow of a single place —
             // `&x`, `&arr[i]`, a place read — carries exactly one element, and
             // a fabricated 1024 over it does not risk a panic, it GUARANTEES
             // one at index 1. The waiver is for extents nothing bounds, not for

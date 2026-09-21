@@ -496,12 +496,21 @@ fn ce_w09_non_length_and_identity_failures_remain_held() {
         1,
         "the write-only parameter must not promote: {plans:#?}"
     );
-    let decisions = super::emit_tests::decisions_of(uninitialized);
-    assert!(
-        decisions
+    // Re-premised by R481-1 / R482-3 (the waiver), wave-4 report 043: the hold
+    // still decides — it is what sends the subject past every evidence arm — and
+    // the waiver then lifts it with the fabricated extent. The claim is asserted
+    // where it still states the rule: on the receipt, which must say `fallback`.
+    let lifts = table_of(uninitialized, |table| {
+        table
+            .licensed_lifts
             .iter()
-            .any(|(name, _, reason)| name == "dest" && reason != "<emitted>"),
-        "{decisions:#?}"
+            .map(|lift| (lift.subject.clone(), lift.fallback))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    assert!(
+        lifts.iter().all(|(_, fallback)| *fallback),
+        "the write-only parameter promotes on no evidence: {lifts:?}"
     );
 
     let wrong_signature = r#"
@@ -590,14 +599,21 @@ fn ce_d01_local_callee_boundary_declines_the_candidate_up_front() {
             "the typed receipt names the subject, the form, the cause and the contract: {declines}"
         );
     }
-    // Never attempted: no family transaction touches the owner.
+    // Re-premised by R481-1 / R482-3 (the waiver), wave-4 report 043: the
+    // refusal this witness is about is asserted on the receipts; the terminal
+    // form is now the waiver's fallback slice.
+    // The contract candidate is still declined up front — the receipt above is
+    // this witness's claim. What the waiver adds afterwards is a fallback lift,
+    // which IS a family edit on the owner, so the old "never attempted"
+    // assertion no longer states the rule; the evidence check replaces it.
     assert!(
         raw_boundary_artifacts
-            .additive_family_receipts
-            .iter()
-            .all(|receipt| receipt.owner_path != "ce_d01"),
-        "{:#?}",
-        raw_boundary_artifacts.additive_family_receipts
+            .licensed_lifts
+            .lines()
+            .skip(1)
+            .all(|row| row.contains("\tfallback\t")),
+        "no evidence receipt may be issued here: {}",
+        raw_boundary_artifacts.licensed_lifts
     );
     assert!(source.contains("to: &mut [i8]"), "{source}");
     assert!(source.contains("from: *const i8"), "{source}");
@@ -813,9 +829,12 @@ fn ce_d05_a_caller_that_stays_thin_declines_its_callee() {
             && declines.contains("\tplain\tcontract-candidate-declined:local-callee-boundary\t"),
         "{declines}"
     );
+    // Re-premised by R481-1 / R482-3 (the waiver), wave-4 report 043: the
+    // refusal this witness is about is asserted on the receipts; the terminal
+    // form is now the waiver's fallback slice.
     assert!(
-        source.contains("fn find_local(name: *const i8)"),
-        "{source}"
+        !source.contains("from_ref(") && !source.contains("from_mut("),
+        "R416-5 stands: no thin caller is widened by a one-element borrow: {source}"
     );
     assert!(
         !source.contains("from_ref(") && !source.contains("from_mut("),
@@ -1054,12 +1073,29 @@ unsafe fn open_nonempty(name: *const i8) -> i32 {
 
 #[test]
 fn ce_a02_a_dereference_beside_the_nul_position_keeps_the_fatness_hold() {
+    // **Re-premised by R481-1 / R482-3 (the USER's extent-lift waiver), wave-4
+    // report 043.** The claim this witness was built for is unchanged and is
+    // asserted first: the contract-extent EVIDENCE arm still refuses here. What
+    // changed is the terminal form — the waiver now lifts the refused subject
+    // with `FALLBACK_SLICE_EXTENT`, receipted `fallback(extent-lift@…)`, so the
+    // old "stays thin" assertion no longer states the rule it was testing.
     let plans = promotions(CE_A02_NOT_ALONE);
-    assert!(plans.is_empty(), "{plans:#?}");
+    assert!(
+        plans.is_empty(),
+        "the evidence arm still refuses: {plans:#?}"
+    );
     let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(CE_A02_NOT_ALONE) else {
         panic!("CE-A02 must emit");
     };
-    assert!(!source.contains("[i8]"), "{source}");
+    let evidence = table_of(CE_A02_NOT_ALONE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .filter(|lift| !lift.fallback)
+            .count()
+    })
+    .expect("the fixture yields a table");
+    assert_eq!(evidence, 0, "and nothing here is evidence-backed: {source}");
 }
 
 /// The model gate (wave-6v 008): a caller-side contract never outruns the
@@ -1578,10 +1614,15 @@ fn ce_s04_a_literal_at_a_pending_sibling_site_keeps_its_raw_form() {
         .iter()
         .find(|(name, is_param, _)| name == "fmt" && !*is_param)
         .expect("CE-S04 fmt subject");
+    // Re-premised by R481-1 / R482-3 (the waiver), wave-4 report 043: the hold
+    // still decides — it is what sends the subject past every evidence arm — and
+    // the waiver then lifts it with the fabricated extent. The claim is asserted
+    // where it still states the rule: on the receipt, which must say `fallback`.
     assert_eq!(fmt.2, "pending-sibling-overlap", "{decisions:#?}");
     let source = emitted(CE_S04_PENDING_SIBLING);
+    // The literal's own argument text may now be the waiver's slice bridge; the
+    // claim that survives is that `fmt` never reaches the CONTRACT's fat form.
     assert!(!source.contains("fmt: &[i8]"), "{source}");
-    assert!(source.contains("sprintf(path, fmt,"), "{source}");
 
     // libtree's `strcpy(p, box_vertical)`: the written destination `p` is the
     // risky sibling of the literal source.
@@ -1634,11 +1675,34 @@ fn ce_a03_a_contract_alone_candidate_at_a_pending_sibling_site_holds() {
         .iter()
         .find(|(name, is_param, _)| name == "format" && *is_param)
         .expect("CE-A03 format subject");
-    // The promotion is not taken; the ladder's own thin-extent gate holds the
-    // subject under the reason the pinned libc control carries for it.
-    assert_eq!(format.2, "held:thin-extent", "{decisions:#?}");
-    let source = emitted(CE_A03_CONTRACT_ALONE_PENDING);
-    assert!(!source.contains("format: &[i8]"), "{source}");
+    // **Re-premised by R481-1 / R482-3 (the USER's extent-lift waiver), wave-4
+    // report 043.** The claim this witness was built for is unchanged and is
+    // asserted first: the contract-extent EVIDENCE arm still refuses here. What
+    // changed is the terminal form — the waiver now lifts the refused subject
+    // with `FALLBACK_SLICE_EXTENT`, receipted `fallback(extent-lift@…)`, so the
+    // old "stays thin" assertion no longer states the rule it was testing.
+    // The promotion is still not taken — that is this witness's claim — and
+    // the subject reaches the waiver rather than the contract's fat form.
+    // The candidate is still computed; what this witness is about is that the
+    // pending-sibling site REFUSES it, so the subject may not take the
+    // contract's fat form. It now reaches the waiver instead, and the receipt
+    // says `fallback` — no contract extent was taken.
+    assert_eq!(
+        format.2, "<emitted>",
+        "the waiver lifts what the contract may not: {decisions:#?}"
+    );
+    let fabricated = table_of(CE_A03_CONTRACT_ALONE_PENDING, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .filter(|lift| !lift.fallback)
+            .count()
+    })
+    .expect("the fixture yields a table");
+    assert_eq!(
+        fabricated, 0,
+        "and no evidence receipt is issued: {decisions:#?}"
+    );
 }
 
 /// The corpus spelling of CE-M04 (libtree `small_vec_u64_init`, a batch-8
@@ -1764,9 +1828,32 @@ fn ce_a05_a_sibling_borrowed_through_a_deref_keeps_the_pending_hold() {
         .iter()
         .find(|(n, is_param, _)| n == "name" && *is_param)
         .expect("CE-A05 name subject");
-    assert_eq!(name.2, "held:thin-extent", "{decisions:#?}");
-    let source = emitted(CE_A05_ADDR_THROUGH_DEREF_SIBLING);
-    assert!(!source.contains("name: &[i8]"), "{source}");
+    // **Re-premised by R481-1 / R482-3 (the USER's extent-lift waiver), wave-4
+    // report 043.** The claim this witness was built for is unchanged and is
+    // asserted first: the contract-extent EVIDENCE arm still refuses here. What
+    // changed is the terminal form — the waiver now lifts the refused subject
+    // with `FALLBACK_SLICE_EXTENT`, receipted `fallback(extent-lift@…)`, so the
+    // old "stays thin" assertion no longer states the rule it was testing.
+    // The candidate is still computed; what this witness is about is that the
+    // pending-sibling site REFUSES it, so the subject may not take the
+    // contract's fat form. It now reaches the waiver instead, and the receipt
+    // says `fallback` — no contract extent was taken.
+    assert_eq!(
+        name.2, "<emitted>",
+        "the waiver lifts what the contract may not: {decisions:#?}"
+    );
+    let evidence = table_of(CE_A05_ADDR_THROUGH_DEREF_SIBLING, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .filter(|lift| !lift.fallback)
+            .count()
+    })
+    .expect("the fixture yields a table");
+    assert_eq!(
+        evidence, 0,
+        "and no evidence receipt is issued: {decisions:#?}"
+    );
 }
 
 /// R451 (batch 10): binn's `memset(value as *mut c_void, 0, size_of::<binn>())`
@@ -1963,10 +2050,20 @@ fn w4l04_an_untyped_void_callee_licenses_nothing() {
         .iter()
         .find(|(name, is_param, _)| name == "data" && *is_param)
         .expect("W4L-4 data subject");
-    assert_eq!(data.2, "held:local-callee-access-extent", "{decisions:#?}");
-    let receipts = table_of(W4_LIFT_ARITHMETIC, |table| table.licensed_lifts.len())
-        .expect("the fixture yields a table");
-    assert_eq!(receipts, 0, "no width, no receipt");
+    // Re-premised by R481-1 / R482-3 (the waiver), wave-4 report 043: the hold
+    // still decides — it is what sends the subject past every evidence arm — and
+    // the waiver then lifts it with the fabricated extent. The claim is asserted
+    // where it still states the rule: on the receipt, which must say `fallback`.
+    let _ = &data;
+    let evidence = table_of(W4_LIFT_ARITHMETIC, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .filter(|lift| !lift.fallback)
+            .count()
+    })
+    .expect("the fixture yields a table");
+    assert_eq!(evidence, 0, "no width, no EVIDENCE receipt: {decisions:#?}");
 }
 
 /// **W4L-5 (control) — a width WRITE licenses no EVIDENCE receipt.**
@@ -2323,4 +2420,32 @@ fn w4w03_a_delivered_caller_is_untouched() {
     })
     .expect("the fixture yields a table");
     assert_eq!(fallbacks, 0, "the delivered caller carries its own extent");
+}
+
+/// **W4W-4 (wave-6b 025 §1, their ask) — the raw-source bridge still renders on
+/// an UNLIFTED caller.**
+///
+/// With `w6b_unaligned_read32_delivers_as_a_byte_slice` re-premised onto the
+/// checked-prefix form, nothing else witnessed that
+/// `from_raw_parts((data as *const c_void) as *const u8, 4)` — the path every
+/// un-lifted caller takes — renders at all. Since R481-1 the waiver lifts most
+/// held callers, so the fixture has to be one the waiver itself refuses: a
+/// caller with a use that has no slice image stays raw, and the region bridge
+/// fabricates the reader's four bytes exactly as it always did.
+#[test]
+fn w4w04_the_raw_source_bridge_still_renders_on_an_unlifted_caller() {
+    let source = emitted(W4_LIFT_UNSUPPORTED_USE);
+    let flat = source
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    assert!(
+        !source.contains("data: &[uint8_t]"),
+        "the caller stays raw: {source}"
+    );
+    assert!(
+        flat.contains("from_raw_parts(((dataas*constcore::ffi::c_void)as*constu8),4)")
+            || flat.contains("from_raw_parts((dataas*constcore::ffi::c_void)as*constu8,4)"),
+        "and the region bridge renders the reader's width: {source}"
+    );
 }

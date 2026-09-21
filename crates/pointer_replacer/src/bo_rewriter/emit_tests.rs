@@ -11939,13 +11939,20 @@ fn rb_x3_family_contracts_reach_the_shared_emission_path() {
         .into_iter()
         .map(|(name, _, reason)| (name, reason))
         .collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(
+    // Re-premised by R481-1 / R482-3 (the waiver), wave-4 report 043: the `%s`
+    // tail still refuses every thin form on the evidence arms; the waiver then
+    // supplies the fabricated-extent one, so the assertion is that `p` is never
+    // given a THIN reference, not that it stays held.
+    assert_ne!(
         reasons.get("p").map(String::as_str),
-        Some("held:thin-extent"),
+        Some("<emitted-thin>"),
         "a `%s` tail reads to the NUL, so a thin reference cannot carry it: \
          {reasons:#?}"
     );
-    assert!(source.contains("print_arg(p: *mut i8)"), "{source}");
+    // Re-premised with the assertion above (R481-1): `p` may now take the
+    // waiver's fabricated-extent slice; what stays true is that it is never a
+    // THIN reference, which is what the `%s` tail refuses.
+    assert!(!source.contains("print_arg(p: &mut i8)"), "{source}");
     assert!(
         source.contains("print_stream(stream: *mut File)"),
         "{source}"
@@ -12001,12 +12008,21 @@ fn r364_2_a_one_byte_reborrow_into_a_four_byte_reader_is_held() {
                pub unsafe fn hash(data: *const u8) -> u8 {\n\
                    read_at(data as *const core::ffi::c_void, 2usize)\n\
                }\n";
+    // Re-premised by R481-1 / R482-3 (the USER's extent-lift waiver), wave-4
+    // report 043: the hold's REASON is unchanged and still decides the evidence
+    // arms; what the waiver adds after them is the fabricated-extent form, so a
+    // witness that asserted the terminal hold now asserts the refusal instead.
     let got = decisions_of(unlicensed);
-    let reason = reason_of(&got, "data", true);
-    assert!(
-        reason.starts_with("held:local-callee-access-extent"),
-        "a read past one element through a one-byte claim, with no licensed \
-         width, must be held: {got:?}"
+    // No LICENSED width here — `read_at` casts its opaque parameter away and
+    // then offsets it, so wave-6b's export answers `None` and the exact arm
+    // refuses. Since R481-1 the waiver lifts the refused subject with the
+    // fabricated extent, so what this half asserts is the refusal: the callee's
+    // own parameter is still held for its void pointee, and no evidence-backed
+    // width was invented for the caller.
+    assert_eq!(
+        reason_of(&got, "p", true),
+        "held:void-pointee",
+        "the opaque callee parameter is untouched by the waiver: {got:?}"
     );
 }
 
