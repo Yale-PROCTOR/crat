@@ -1529,7 +1529,23 @@ impl<'tcx> DataFieldStoreCollector<'_, 'tcx> {
     /// `AllocatorOracle::is_allocator_call` also admits is deliberately not
     /// consulted here, and a contract-backed wrapper is not a proof.
     fn is_direct_named_allocator(&self, value: &Expr<'_>) -> bool {
-        let ExprKind::Call(callee, _) = &peel_casts(value).kind else {
+        let value = peel_casts(value);
+        // The C2Rust idiom stores `if size > 0 { alloc(..) } else { null }`.
+        // Every arm being an allocation or null still leaves the field holding
+        // "null or a block the allocator returned", which is the whole claim,
+        // so the walk goes through conditionals and block tails.
+        match &value.kind {
+            ExprKind::If(_, then, els) => {
+                return self.is_fresh_or_null(then)
+                    && els.is_some_and(|els| self.is_fresh_or_null(els));
+            }
+            ExprKind::Block(block, _) => {
+                return block.stmts.is_empty()
+                    && block.expr.is_some_and(|tail| self.is_fresh_or_null(tail));
+            }
+            _ => {}
+        }
+        let ExprKind::Call(callee, _) = &value.kind else {
             return false;
         };
         let Some(did) = callee_def_id(callee) else {
@@ -1539,6 +1555,10 @@ impl<'tcx> DataFieldStoreCollector<'_, 'tcx> {
             return *freshness == Freshness::Proven;
         }
         AllocatorOracle::is_libc_allocator(self.tcx, did)
+    }
+
+    fn is_fresh_or_null(&self, value: &Expr<'_>) -> bool {
+        is_null_literal(value) || self.is_direct_named_allocator(value)
     }
 
     fn record(&mut self, place: &Expr<'_>, value: &Expr<'_>) {

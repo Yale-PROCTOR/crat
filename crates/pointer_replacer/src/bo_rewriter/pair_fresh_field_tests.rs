@@ -235,3 +235,77 @@ fn w6p_a_non_null_raw_sibling_is_still_unproved() {
         "two real pointers are not separated by the null rule"
     );
 }
+
+/// The C2Rust store idiom: `f = if n > 0 { alloc(n) } else { null }`. Every arm
+/// is an allocation or null, so the field still holds "null or a block the
+/// allocator returned" — brotli writes `(*mb).command_histograms` exactly this
+/// way (lib.rs:489722).
+const FIELD_STORED_CONDITIONALLY: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+extern "C" { fn malloc(n: libc::c_ulong) -> *mut libc::c_void; }
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Split { pub num_types: i32, pub alphabet_size: i32 }
+#[repr(C)]
+pub struct MetaBlock { pub literal_split: Split, pub command_histograms: *mut u32 }
+pub unsafe fn BuildHistograms(mut split: *mut Split, mut histograms: *mut u32) {
+    (*split).num_types = 1;
+    *histograms.offset(1) = 2;
+}
+pub unsafe fn BuildMetaBlock(mut mb: *mut MetaBlock, mut n: libc::c_ulong) {
+    (*mb).command_histograms =
+        if n > 0 { malloc(n) as *mut u32 } else { 0 as *mut u32 };
+    BuildHistograms(&mut (*mb).literal_split, (*mb).command_histograms);
+}
+"#;
+
+#[test]
+fn w6p_a_conditional_allocation_still_admits_the_field() {
+    assert_eq!(
+        verdict(
+            FIELD_STORED_CONDITIONALLY,
+            "BuildMetaBlock",
+            "BuildHistograms",
+            0,
+            1
+        ),
+        Ok(CertificateKind::DistinctRoots),
+        "every arm an allocation or null is still null-or-fresh"
+    );
+}
+
+/// Control: one arm of the conditional is a caller's pointer, and the field is
+/// refused again.
+const FIELD_STORED_CONDITIONALLY_WITH_A_FOREIGN_ARM: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+extern "C" { fn malloc(n: libc::c_ulong) -> *mut libc::c_void; }
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Split { pub num_types: i32, pub alphabet_size: i32 }
+#[repr(C)]
+pub struct MetaBlock { pub literal_split: Split, pub command_histograms: *mut u32 }
+pub unsafe fn BuildHistograms(mut split: *mut Split, mut histograms: *mut u32) {
+    (*split).num_types = 1;
+    *histograms.offset(1) = 2;
+}
+pub unsafe fn BuildMetaBlock(mut mb: *mut MetaBlock, mut n: libc::c_ulong, mut lent: *mut u32) {
+    (*mb).command_histograms =
+        if n > 0 { malloc(n) as *mut u32 } else { lent };
+    BuildHistograms(&mut (*mb).literal_split, (*mb).command_histograms);
+}
+"#;
+
+#[test]
+fn w6p_a_foreign_arm_refuses_the_conditional_store() {
+    assert_ne!(
+        verdict(
+            FIELD_STORED_CONDITIONALLY_WITH_A_FOREIGN_ARM,
+            "BuildMetaBlock",
+            "BuildHistograms",
+            0,
+            1
+        ),
+        Ok(CertificateKind::DistinctRoots),
+        "one arm holding a caller's pointer and the field proves nothing"
+    );
+}
