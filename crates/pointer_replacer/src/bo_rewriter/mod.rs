@@ -94,6 +94,8 @@ mod ownership_fields_cp2_tests;
 #[cfg(test)]
 mod ownership_fields_native_tests;
 #[cfg(test)]
+mod pair_disjoint_field_seam_tests;
+#[cfg(test)]
 mod pair_disjointness_tests;
 #[cfg(test)]
 mod pair_fresh_field_tests;
