@@ -1502,6 +1502,25 @@ pub unsafe fn recurse(excluded: i32) -> i32 {
     ///
     /// Ignored by default (~75 s, 2,656 lines); `--ignored` runs it. When
     /// these four stop being `copy-source-coupled`, this test says so.
+    /// wave-6s probe (relay 036): bzip2's real crate, the `block` rows.
+    #[test]
+    #[ignore = "runs the real bzip2 crate; --ignored"]
+    fn wave6s_probe_bzip2_block_rows() {
+        let path = std::path::Path::new(
+            "/home/p51lee/dev/crat/benchmarks/rs-crown-derived/bzip2/c2rust-lib.rs",
+        );
+        let src = std::fs::read_to_string(path).expect("derived bzip2");
+        let got = run(&src);
+        for line in got.subjects.lines() {
+            if line.contains("mainQSort3")
+                || line.contains("mainSimpleSort")
+                || line.contains("slice-use-unsupported")
+            {
+                eprintln!("W6SBZ {line}");
+            }
+        }
+    }
+
     /// **wave-6s W6S-8 on the real crate (relay 033).** The same 75-second
     /// run, over the rows the foreign-call bridge was built for.
     ///

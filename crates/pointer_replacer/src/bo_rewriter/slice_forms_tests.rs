@@ -1780,3 +1780,89 @@ fn wave6s_local_callee_argument_keeps_its_own_path() {
         "a local callee is not bridged here: {source}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W6S-9 — the UNCOLLECTED call position, MEASURED AND NOT BUILT (report 059)
+//
+// The premise of 058 STOPs 2 and 3 was that these positions lack an ARM. They
+// do not. Both renderings already exist and both fire in a reduction — the
+// two controls below — so what distinguishes the corpus rows is not the
+// rendering but the boundary planner's collected fact set: where the planner
+// did not collect a position, it had REFUSED it, and admitting it in the use
+// walk overrides the refusal rather than supplying anything.
+//
+// Measured: a blanket admission of a bare local-callee argument turns three
+// hold controls red — `emit_tests::slu_w1_positive_retention_stays_held`,
+// `ordinary_argument_permission_tests::
+// ordinary_argument_shared_subject_holds_with_its_typed_reason` and
+// `slice_passon_tests::wave6s2_pin_pass_on_into_a_positively_retaining_callee_stays_held`
+// — i.e. it passes a subject to a callee that STORES it (`KEEP = p`, positive
+// retention, addendum 130's one genuinely new UB channel) and promotes a
+// shared subject with a writable descendant. The arm was reverted; the
+// controls below stay as the record of what a reduction does.
+// ---------------------------------------------------------------------------
+
+/// **CONTROL — a thin `ref` formal already takes the ELEMENT in a reduction**
+/// (058 STOP 3; the corpus row is bzip2
+/// `blocksort::mainQSort3::block#2` at `mainSimpleSort(ptr, block, …)`, whose
+/// refusal this fixture does NOT reproduce).
+#[test]
+fn wave6s_bare_argument_at_a_thin_callee_takes_the_element() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" fn sink(mut p: *mut u8, mut n: i32) -> i32 { return *p as i32 + n; }
+ pub unsafe extern "C" fn drive(mut block: *mut u8, mut n: i32) -> i32 {
+    let mut a = *block.offset(1 as i32 as isize) as i32;
+    return sink(block, n) + a;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("block:&[u8]") || flat.contains("block:&mut[u8]"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("sink(&block[0],n)")
+            || flat.contains("sink(&mutblock[0],n)")
+            || flat.contains("sink(block.first().unwrap(),n)")
+            || flat.contains("sink(block.first_mut().unwrap(),n)"),
+        "the thin formal takes the element: {source}"
+    );
+}
+
+/// **CONTROL — a `slice` formal already takes the slice whole in a
+/// reduction.** The callee delivers; the argument is the delivered subject,
+/// with no adapter of its own and no extent invented. The 18 corpus rows of
+/// this shape are refused by the planner, not by the absence of this.
+#[test]
+fn wave6s_bare_argument_at_a_slice_callee_passes_the_slice() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" fn sum(mut p: *const u8, mut n: i32) -> i32 {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n { acc += *p.offset(i as isize) as i32; i += 1; }
+    return acc;
+ }
+ pub unsafe extern "C" fn drive(mut data: *const u8, mut n: i32) -> i32 {
+    let mut a = *data.offset(1 as i32 as isize) as i32;
+    return sum(data, n) + a;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("data:&[u8]"), "{source}");
+    assert!(
+        flat.contains("sum(data,n)"),
+        "the slice passes whole: {source}"
+    );
+    assert!(
+        !flat.contains("as_ptr()"),
+        "no raw bridge is needed: {source}"
+    );
+}
