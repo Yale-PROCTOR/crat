@@ -64,6 +64,7 @@ pub(super) fn prepare(
     table: &super::DecisionTable,
     callee: LocalDefId,
     site: &super::emitability::CallSite,
+    certificates: Option<&crate::bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex>,
 ) -> Option<SharedCall> {
     use rustc_hir::{
         BorrowKind, Expr, ExprKind, Mutability, QPath, UnOp,
@@ -73,8 +74,18 @@ pub(super) fn prepare(
     if site.args.len() != 2 {
         return None;
     }
-    // Only a settled shared reference endpoint qualifies; every other
-    // disposition (including a mutable reference) keeps the pair hold.
+    // **R493-3 — the FACT, not the settled decision.** Gating on a settled
+    // `Ref { mutable: false }` was circular (report 038 §2): the decision is
+    // DOWNSTREAM of the pair verdict, so the pair the consumer exists to admit
+    // is degraded `pair-raw-view` before this gate can see it shared. wave-6p's
+    // `is_shared_read_pair` answers from the model instead — `*const` in the
+    // input, nothing written through either formal, and no mutable reborrow of
+    // either anywhere in the callee (report 038's guards 1 and 2).
+    // The fact is a SECOND admission path, never a narrower one: wave-6p's
+    // conjuncts want `*const` in the input, and this lane's consumer has always
+    // also admitted a `*mut` formal the model settles shared — `brotli_rolling`
+    // is that witness. Union, so no row this consumer delivers today is lost.
+    // The settled-shared path this consumer has used since R396-2.
     let shared_endpoint = |d: &super::Decision| match d {
         super::Decision::Ref { mutable } => !mutable,
         super::Decision::InferredRef { .. }
@@ -85,11 +96,30 @@ pub(super) fn prepare(
         | super::Decision::Cursor { .. }
         | super::Decision::Degraded(_) => false,
     };
+    let model_shared_read =
+        certificates.is_some_and(|index| index.is_shared_read_pair(callee, 0, 1));
+    // Guard 4 stays, and is not circular: a settled MUTABLE or owning endpoint
+    // refuses the pair. Only the positive direction was the problem.
+    let mutable_endpoint = |d: &super::Decision| match d {
+        super::Decision::Ref { mutable } => *mutable,
+        super::Decision::InferredRef { mutable, .. } => *mutable,
+        super::Decision::Slice { mutable, .. } | super::Decision::NestedSlice { mutable, .. } => {
+            *mutable
+        }
+        super::Decision::Opt { mutable, .. } | super::Decision::Cursor { mutable, .. } => *mutable,
+        super::Decision::Box(_) => true,
+        super::Decision::Degraded(_) => false,
+    };
     let subject = |index| {
         table.entries.iter().find_map(|(s, d)| {
             (s.fn_did == callee
                 && matches!(s.kind, super::SubjectKind::Param { hir_index } if hir_index == index)
-                && shared_endpoint(d))
+                && if model_shared_read {
+                    // R493-3: admitted BEFORE `pair-raw-view` settles it.
+                    !mutable_endpoint(d)
+                } else {
+                    shared_endpoint(d)
+                })
             .then_some(s.hir_id)
         })
     };
@@ -443,6 +473,21 @@ pub unsafe extern "C" fn ExtendLastCommand(last_command: *mut Command, s: *mut S
         );
     }
 
+    /// The pair index the production path passes to `prepare`, derived the same
+    /// way (`pair_fresh_field_tests`' precedent) so the negative witnesses stay
+    /// meaningful after R493-3: with `None` they would refuse trivially and pin
+    /// nothing.
+    fn pair_index(
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+    ) -> crate::bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex {
+        let program = crate::bo_rewriter::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        crate::bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        )
+    }
+
     fn unsupported_call(source: &str, owner: &'static str) {
         ::utils::compilation::run_compiler_on_str(source, move |tcx| {
             let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
@@ -477,11 +522,9 @@ pub unsafe extern "C" fn ExtendLastCommand(last_command: *mut Command, s: *mut S
                     *decision = Decision::Ref { mutable: false };
                 }
             }
-            assert!(
-                sites
-                    .iter()
-                    .all(|site| prepare(tcx, &hypothetical, callee, site).is_none())
-            );
+            assert!(sites.iter().all(|site| {
+                prepare(tcx, &hypothetical, callee, site, Some(&pair_index(tcx))).is_none()
+            }));
         })
         .expect("unsupported input compiles");
     }
@@ -535,9 +578,9 @@ pub unsafe extern "C" fn ExtendLastCommand(last_command: *mut Command, s: *mut S
                 .fn_did;
             let sites = ctx.facts.call_args.get(&callee).unwrap();
             assert!(
-                sites
-                    .iter()
-                    .any(|site| prepare(tcx, &table, callee, site).is_some()),
+                sites.iter().any(
+                    |site| prepare(tcx, &table, callee, site, Some(&pair_index(tcx))).is_some()
+                ),
                 "control: the supported shape prepares"
             );
             let mut hypothetical = table.clone();
@@ -552,9 +595,14 @@ pub unsafe extern "C" fn ExtendLastCommand(last_command: *mut Command, s: *mut S
                 }
             }
             assert!(
-                sites
-                    .iter()
-                    .all(|site| prepare(tcx, &hypothetical, callee, site).is_none()),
+                sites.iter().all(|site| prepare(
+                    tcx,
+                    &hypothetical,
+                    callee,
+                    site,
+                    Some(&pair_index(tcx))
+                )
+                .is_none()),
                 "a mutable reference endpoint must not prepare"
             );
         })

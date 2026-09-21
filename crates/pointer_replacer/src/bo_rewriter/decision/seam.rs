@@ -5206,7 +5206,13 @@ pub(crate) fn synthesize_with_raw_boundary(
 
             // Native immutable facts discharge only the shared/read consumer
             // hold. Preserve the A5 verdict and all incident peer receipts.
-            let shared_read_call = super::shared_read_pairs::prepare(tcx, table, *callee, site);
+            let shared_read_call = super::shared_read_pairs::prepare(
+                tcx,
+                table,
+                *callee,
+                site,
+                a5_site_proofs.pair_certificates(),
+            );
             let mut shared_read_positions = positions
                 .iter()
                 .enumerate()
