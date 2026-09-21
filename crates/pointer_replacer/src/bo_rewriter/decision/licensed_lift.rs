@@ -57,10 +57,28 @@ use super::{
 pub(crate) struct LiftReceipt {
     pub(crate) subject: String,
     pub(crate) callee: String,
-    pub(crate) parameter_index: usize,
-    /// The exact licensed width in bytes, from wave-6b's export.
-    pub(crate) width_bytes: u64,
+    pub(crate) parameter_index: Option<usize>,
+    /// The exact licensed width in bytes, from wave-6b's export. `None` is the
+    /// waiver arm: no width was licensed and none was recovered from a root.
+    pub(crate) width_bytes: Option<u64>,
     pub(crate) mutable: bool,
+    /// **The extent-lift waiver (R481-1).** `true` means this subject took the
+    /// slice form with `FALLBACK_SLICE_EXTENT`, not with an extent anything
+    /// proved.
+    pub(crate) fallback: bool,
+}
+
+impl LiftReceipt {
+    /// The receipt key the seat reads at the census.
+    pub(crate) fn key(&self) -> String {
+        let index = self
+            .parameter_index
+            .map_or_else(|| "-".to_owned(), |index| index.to_string());
+        match self.width_bytes {
+            Some(width) => format!("evidence(licensed-width:{}:{index}:{width})", self.callee),
+            None => format!("fallback(extent-lift@addendum-77:{}:{index})", self.callee),
+        }
+    }
 }
 
 /// The callee parameter's region, looked up over `entries` rather than over a
@@ -202,9 +220,10 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
         receipts.push(LiftReceipt {
             subject: subject.label.clone(),
             callee: callee.clone(),
-            parameter_index: *parameter_index,
-            width_bytes: *width,
+            parameter_index: Some(*parameter_index),
+            width_bytes: Some(*width),
             mutable,
+            fallback: false,
         });
     }
     receipts.sort_by(|a, b| a.subject.cmp(&b.subject));
@@ -221,19 +240,121 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
         .iter()
         .map(|lift| {
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 lift.subject.split("::").next().unwrap_or(&lift.subject),
                 lift.subject,
                 lift.callee,
-                lift.parameter_index,
-                lift.width_bytes,
+                lift.parameter_index
+                    .map_or_else(|| "-".to_owned(), |index| index.to_string()),
+                lift.width_bytes
+                    .map_or_else(|| "-".to_owned(), |width| width.to_string()),
                 if lift.mutable { "mut-slice" } else { "slice" },
+                if lift.fallback {
+                    "fallback"
+                } else {
+                    "evidence"
+                },
+                lift.key(),
             )
         })
         .collect::<Vec<_>>();
     rows.sort();
-    let mut out =
-        String::from("owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\n");
+    let mut out = String::from(
+        "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\treceipt\n",
+    );
     out.extend(rows);
     out
+}
+
+/// **The extent-lift waiver — USER ruling R481-1 ("바로 1024로 fat 처리"),
+/// addendum 481.**
+///
+/// The arms above answer a held row with EVIDENCE: wave-6b's exact licensed
+/// width here, wave-5c's mask companion and [`super::root_extent`]'s root walk
+/// after it. What is left is the population the seat sized for Decision A —
+/// rows whose access nothing bounds — and the user's answer is to lift them
+/// anyway, with `FALLBACK_SLICE_EXTENT`.
+///
+/// **What is waived is BEHAVIOUR, and it is stated rather than hidden.** A
+/// checked index past 1024 PANICS where the C program read on. That is not a
+/// soundness waiver — no UB is introduced, the slice is a real 1024-byte view
+/// of a live allocation — it is a behavioural one, accepted by the user on the
+/// record and owed a line in every claims-facing document, beside the
+/// slice-extent waiver it extends (2026-08-30).
+///
+/// The discipline that rides it is ORDER: this pass runs LAST, after the exact
+/// width, after the mask companion, and after the root walk, so a fabricated
+/// extent is never taken where a proven one exists. Two things stay refused:
+/// a caller already fat (it carries its own extent), and the one-element
+/// `from_ref` form R416-5 names, whose panic is certain rather than possible.
+pub(crate) fn promote_fallback(
+    ctx: &Ctx<'_, '_>,
+    entries: &mut [(Subject, Decision)],
+) -> Vec<LiftReceipt> {
+    let candidates: FxHashMap<(LocalDefId, HirId), (String, Option<usize>)> = entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let named = match decision {
+                Decision::Degraded(record) => match &record.reason {
+                    DegradeReason::LocalCalleeAccessExtent { access, .. } => {
+                        (access.callee.clone(), Some(access.parameter_index))
+                    }
+                    DegradeReason::ThinExtent => ("thin-extent".to_owned(), None),
+                    _ => return None,
+                },
+                Decision::Slice { .. }
+                | Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::Cursor { .. } => return None,
+            };
+            // **No `is_array` refusal here, deliberately.** Fatness says the
+            // subject is USED like an array, which is true of most of this
+            // population — it is why the callee walks off the one-element claim
+            // in the first place. What "already fat" has to mean is "already
+            // delivered in a form carrying an extent", and the `Degraded` filter
+            // above is exactly that test.
+            let node = (subject.fn_did, subject.hir_id);
+            if !slice_uses_supported(ctx, node) {
+                return None;
+            }
+            // **R416-5 stays in force, and it is the ONE exclusion the ruling
+            // names.** A subject whose root is a borrow of a single place —
+            // `&x`, `&arr[i]`, a place read — carries exactly one element, and
+            // a fabricated 1024 over it does not risk a panic, it GUARANTEES
+            // one at index 1. The waiver is for extents nothing bounds, not for
+            // extents something bounds AT ONE.
+            if matches!(
+                ctx.constructions.by_binding.get(&node),
+                Some(super::construction::Construction::AddrOf)
+                    | Some(super::construction::Construction::IndexAddr)
+            ) {
+                return None;
+            }
+            Some((node, named))
+        })
+        .collect();
+    let mut receipts = Vec::new();
+    for (subject, decision) in entries.iter_mut() {
+        let Some((callee, parameter_index)) = candidates.get(&(subject.fn_did, subject.hir_id))
+        else {
+            continue;
+        };
+        *decision = Decision::Slice {
+            mutable: subject.mutable,
+            uses: slice_rewrites(ctx, (subject.fn_did, subject.hir_id)),
+        };
+        receipts.push(LiftReceipt {
+            subject: subject.label.clone(),
+            callee: callee.clone(),
+            parameter_index: *parameter_index,
+            width_bytes: None,
+            mutable: subject.mutable,
+            fallback: true,
+        });
+    }
+    receipts.sort_by(|a, b| a.subject.cmp(&b.subject));
+    receipts
 }

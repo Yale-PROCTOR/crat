@@ -1274,6 +1274,10 @@ pub(crate) fn decide_with_raw_fallbacks(
     // W4-B1 (R480-2): the rows the callee's width cannot answer take their
     // caller's ROOT extent, or stay held and are counted.
     let root_extents = root_extent::promote(ctx, &mut entries);
+    // R481-1 (USER): the extent-lift waiver runs LAST, so a fabricated extent is
+    // never taken where the exact width, the mask companion or a root proved one.
+    let mut licensed_lifts = licensed_lifts;
+    licensed_lifts.extend(licensed_lift::promote_fallback(ctx, &mut entries));
     cursor_native::observe(ctx, &entries, &cursor_receipts);
     let contract_extent_promotions = entries
         .iter()

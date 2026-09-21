@@ -1914,8 +1914,12 @@ fn w4l02_the_lift_carries_a_typed_receipt() {
         receipt.callee.ends_with("BrotliUnalignedRead32"),
         "{receipt:?}"
     );
-    assert_eq!(receipt.parameter_index, 0, "{receipt:?}");
-    assert_eq!(receipt.width_bytes, 4, "{receipt:?}");
+    assert_eq!(receipt.parameter_index, Some(0), "{receipt:?}");
+    assert_eq!(receipt.width_bytes, Some(4), "{receipt:?}");
+    assert!(
+        !receipt.fallback,
+        "the exact arm, not the waiver: {receipt:?}"
+    );
     assert!(
         !receipt.mutable,
         "a width READ lifts to a shared slice: {receipt:?}"
@@ -1939,7 +1943,10 @@ fn w4l03_the_twin_agrees_with_the_export() {
         });
         (
             exported.flatten(),
-            table.licensed_lifts.first().map(|lift| lift.width_bytes),
+            table
+                .licensed_lifts
+                .first()
+                .and_then(|lift| lift.width_bytes),
         )
     })
     .expect("the fixture yields a table");
@@ -1962,15 +1969,26 @@ fn w4l04_an_untyped_void_callee_licenses_nothing() {
     assert_eq!(receipts, 0, "no width, no receipt");
 }
 
-/// **W4L-5 (control) — the width WRITE mirror is refused on the shape.**
+/// **W4L-5 (control) — a width WRITE licenses no EVIDENCE receipt.**
 #[test]
-fn w4l05_a_width_write_is_not_lifted() {
-    let source = emitted(W4_LIFT_WRITE);
-    assert!(!source.contains("out: &mut [uint8_t]"), "{source}");
-    let receipts = table_of(W4_LIFT_WRITE, |table| table.licensed_lifts.len())
-        .expect("the fixture yields a table");
+fn w4l05_a_width_write_licenses_no_evidence_receipt() {
+    // **Re-premised by R481-1, the user's extent-lift waiver.** The exact arm
+    // refuses a width WRITE twice over — wave-6b's seam reads a delivered slice
+    // at a READ only, and every corpus write parameter is `kind-raw` anyway —
+    // and that is what this control was always about. Since the waiver, the
+    // fallback arm may lift such a caller with the fabricated extent, which is
+    // a different question with the user's answer; so the assertion is on the
+    // EVIDENCE receipts, which must stay empty here.
+    let evidence = table_of(W4_LIFT_WRITE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .filter(|lift| !lift.fallback)
+            .count()
+    })
+    .expect("the fixture yields a table");
     assert_eq!(
-        receipts, 0,
+        evidence, 0,
         "the seam reads a delivered slice at a READ only"
     );
 }
@@ -2050,7 +2068,9 @@ fn w4l08_the_receipt_is_a_census_artifact_row() {
     let mut lines = tsv.lines();
     assert_eq!(
         lines.next(),
-        Some("owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform"),
+        Some(
+            "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\treceipt"
+        ),
         "{tsv}"
     );
     let row = lines.next().expect("one lifted caller");
@@ -2060,6 +2080,14 @@ fn w4l08_the_receipt_is_a_census_artifact_row() {
     assert_eq!(columns[3], "0", "{tsv}");
     assert_eq!(columns[4], "4", "{tsv}");
     assert_eq!(columns[5], "slice", "{tsv}");
+    assert_eq!(
+        columns[6], "evidence",
+        "the exact arm, not the waiver: {tsv}"
+    );
+    assert_eq!(
+        columns[7], "evidence(licensed-width:BrotliUnalignedRead32:0:4)",
+        "{tsv}"
+    );
     assert_eq!(lines.next(), None, "one lift, one row: {tsv}");
 }
 
@@ -2215,4 +2243,82 @@ fn w4b103_the_residue_is_counted_with_its_reason() {
     assert_eq!(storage.1, "held", "{rows:?}");
     assert_eq!(storage.2, "none", "no extent to propagate: {rows:?}");
     assert_eq!(storage.3, "root-states-no-extent", "{rows:?}");
+}
+
+/// **W4W-1 (R481-1, the USER's extent-lift waiver) — a root with no extent is
+/// lifted anyway, and the receipt says so.**
+///
+/// `BrotliWriteBits`'s shape over an opaque `GetBuffer()` root: nothing bounds
+/// the access, so no arm above this one can answer — not wave-6b's exact width,
+/// not wave-5c's mask companion, not the root walk. The user ruled the subject
+/// takes the slice form regardless, with `FALLBACK_SLICE_EXTENT`.
+///
+/// **What is waived is BEHAVIOUR:** a checked index past 1024 panics where the
+/// C program read on. No UB is introduced — the slice is a real 1024-byte view
+/// of a live allocation — and the user accepted the trade on the record
+/// (addendum 481); every claims-facing document owes it a line beside the
+/// 2026-08-30 slice-extent waiver it extends.
+#[test]
+fn w4w01_a_root_with_no_extent_is_lifted_under_the_waiver() {
+    let lifts = table_of(W4_B1_UNSIZED_ROOT, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.subject.clone(), lift.fallback, lift.key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let storage = lifts
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreUnsized::storage"))
+        .unwrap_or_else(|| panic!("the waiver must lift it: {lifts:?}"));
+    assert!(
+        storage.1,
+        "and it must say the extent was fabricated: {lifts:?}"
+    );
+    assert!(
+        storage.2.starts_with("fallback(extent-lift@addendum-77:"),
+        "with the receipt the seat counts: {lifts:?}"
+    );
+}
+
+/// **W4W-2 (control) — where a width IS licensed, the exact arm wins and no
+/// fallback receipt is issued.** Order is the discipline of the waiver.
+#[test]
+fn w4w02_the_exact_arm_wins_over_the_waiver() {
+    let lifts = table_of(W4_LIFT_READ32, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.subject.clone(), lift.fallback))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let data = lifts
+        .iter()
+        .find(|(subject, _)| subject.starts_with("HashBytesH40::data"))
+        .unwrap_or_else(|| panic!("no HashBytesH40::data lift: {lifts:?}"));
+    assert!(!data.1, "the exact width answers first: {lifts:?}");
+    assert_eq!(
+        lifts.iter().filter(|(_, fallback)| *fallback).count(),
+        0,
+        "and nothing here is fabricated: {lifts:?}"
+    );
+}
+
+/// **W4W-3 (control) — a caller already DELIVERED is untouched by the waiver.**
+/// The waiver's population is the degraded rows; a subject the ladder already
+/// gave a form carrying its own extent is not reconsidered, and issues no
+/// receipt.
+#[test]
+fn w4w03_a_delivered_caller_is_untouched() {
+    let fallbacks = table_of(W4_LIFT_FAT_CALLER, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .filter(|lift| lift.fallback)
+            .count()
+    })
+    .expect("the fixture yields a table");
+    assert_eq!(fallbacks, 0, "the delivered caller carries its own extent");
 }
