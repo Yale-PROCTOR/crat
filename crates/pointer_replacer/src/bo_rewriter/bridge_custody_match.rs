@@ -1363,6 +1363,28 @@ fn span_bindings_correspond(
     }
     for &id in &emitted_ids {
         let Some(emitted) = input.emitted.bindings.get(id) else { return false };
+        // **R494-1(b) -- a temporary the emission introduced INSIDE this very
+        // initializer is not a source the original wrote.**
+        //
+        // `native_result_expression::render` binds the call once, so the original's
+        // evaluation order survives, and the name it binds exists only in the emitted
+        // program. Asking the input for a counterpart to it is asking for something the
+        // input could not have. This is the same exemption `block_intermediate_of` makes
+        // for R460-1(a)'s plain `{ let __crat_raw: T = e; __crat_raw }`, at the other
+        // place the question is asked.
+        //
+        // Exact on both counts: the generated prefix, so no ordinary local can enter,
+        // and the declaration INSIDE the span under comparison, so a binding that merely
+        // happens to be local to the function is still required to correspond. That the
+        // block RETURNS a view of this binding -- rather than computing something else
+        // with it -- is checked by `native_result_block_call`, which is the conjoined
+        // initializer relation, not this one.
+        if emitted.name.starts_with("__crat_native_result_")
+            && emitted_span.lo <= emitted.declaration_span.lo
+            && emitted.declaration_span.hi <= emitted_span.hi
+        {
+            continue;
+        }
         if original_ids
             .iter()
             .filter_map(|id| input.original.bindings.get(*id))
