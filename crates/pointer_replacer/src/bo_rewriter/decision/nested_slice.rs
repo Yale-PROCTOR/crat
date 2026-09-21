@@ -740,11 +740,20 @@ pub(crate) fn promote(
                     .iter()
                     .find(|p| p.hir == row.parameter)
                     .unwrap();
-                let c = table
+                // N2 (R452-6/R475-3). A row whose inner value is consumed as a
+                // CURSOR has no slice construction to rewrite: its constructor
+                // belongs to the cursor family and is rebuilt there, by
+                // `cursor_native::replan_delivered_table_elements`, after this
+                // flip. A post-hoc rewrite of a finalised cursor plan costs the
+                // cursor entirely (nested 007's A/B), and unwrapping here for a
+                // row that has no slice construction panics outright.
+                let Some(c) = table
                     .slice_constructions
                     .iter_mut()
                     .find(|c| c.node == (owner, row.local))
-                    .unwrap();
+                else {
+                    continue;
+                };
                 c.replacement = Some(format!(
                     "{}{}[{}]",
                     if row.mutable { "&mut *" } else { "" },

@@ -8711,6 +8711,25 @@ fn finish_decide<'tcx>(
             &prepared.plan.class_finalization,
             &family_policy,
         ) {
+            // **R452-6 / R475-3.** A table that just gained its inner level
+            // hands its elements as slices; a cursor built over one of those
+            // elements was planned against the flat form, so it re-plans
+            // through its OWN family here. A post-hoc rewrite of a finalised
+            // cursor plan costs the cursor entirely (nested 007's A/B), which
+            // is why this is a rebuild and not a patch. Inert when no such
+            // cursor exists. Row (vi)'s macro is what lets a `Ctx` be built
+            // after the flip at all (main 051).
+            decision::cursor_native::replan_delivered_table_elements(
+                &ctx_of!(
+                    decision::RefGate::LiftAdaptable,
+                    Some(&coconv),
+                    Some(&lifetime_eligibility),
+                    Some(&raw_boundary),
+                    Some(&candidate_exposure),
+                    Some(&return_receivers),
+                ),
+                &mut table.entries,
+            );
             prepare_plan_files(
                 tcx,
                 &table,

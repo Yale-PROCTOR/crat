@@ -10,8 +10,10 @@
 //!   (b) EVERY use of the binding `t` in the body is the receiver of
 //!       `*t.offset(k)` at a constant `k`, and that deref is the initializer
 //!       of a `let` in the block's leading `let` run;
-//!   (c) each such `let` binds a subject whose slice construction is already
-//!       planned, not held, not nullable, and carries the FABRICATED extent —
+//!   (c) each such `let` binds a subject that is either a planned slice
+//!       construction — not held, not nullable — or (N2, the cursor seam) a
+//!       cursor whose base is this table's element; either way it carries the
+//!       FABRICATED extent —
 //!       a constant, so relocating it to the wrapper cannot change what it
 //!       means (an evidence-backed length may name a helper-local and is
 //!       therefore not relocated by this arm);
@@ -48,8 +50,9 @@ use rustc_hir::{
 use rustc_middle::ty::{TyCtxt, TyKind};
 
 use super::{
-    DecisionTable, Hold, Parameter, Plan, Prelude, Row, SubjectKind, binding, flat_slice,
-    inherited_pair, integer, named, offset, peel, prelude,
+    super::cursor_native::DeliveredBaseProvider, Decision, DecisionTable, Hold, Parameter, Plan,
+    Prelude, Row, SubjectKind, binding, flat_slice, inherited_pair, integer, named, offset, peel,
+    prelude,
 };
 use crate::{
     analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef},
@@ -188,7 +191,6 @@ pub(super) fn inspect<'tcx>(
         let Some(parameter) = binding(receiver).filter(|p| targets.contains(p)) else { continue };
         let Some(projection) = integer(argument) else { continue };
         let Some((_, decision)) = subjects.iter().find(|(s, _)| s.hir_id == id) else { continue };
-        let Some((mutable, _)) = flat_slice(decision) else { continue };
         if inherited_pair(
             table
                 .arm_requirements
@@ -200,39 +202,90 @@ pub(super) fn inspect<'tcx>(
         {
             continue;
         }
-        let Some(construction) = table
-            .slice_constructions
-            .iter()
-            .find(|c| c.node == (owner, id))
-        else {
-            continue;
-        };
-        if construction.init_hir != init.hir_id
-            || construction.mutable != mutable
-            || tcx
-                .typeck(owner)
-                .expr_ty(init)
-                .builtin_deref(true)
-                .is_none()
-            || construction.hold_reason.is_some()
-            || construction.replacement.is_none()
-            || construction.nullable
-            // Only a fabricated extent is known to be a constant, and only a
-            // constant is known to mean the same thing in the wrapper.
-            || !construction.length.is_fallback()
+        if tcx
+            .typeck(owner)
+            .expr_ty(init)
+            .builtin_deref(true)
+            .is_none()
         {
             continue;
         }
+        let (mutable, length) = match decision {
+            // The row becomes a plain slice local.
+            Decision::Slice { mutable, .. } => {
+                let Some(construction) = table
+                    .slice_constructions
+                    .iter()
+                    .find(|c| c.node == (owner, id))
+                else {
+                    continue;
+                };
+                if construction.init_hir != init.hir_id
+                    || construction.mutable != *mutable
+                    || construction.hold_reason.is_some()
+                    || construction.replacement.is_none()
+                    || construction.nullable
+                    // Only a fabricated extent is known to be a constant, and
+                    // only a constant is known to mean the same thing in the
+                    // wrapper.
+                    || !construction.length.is_fallback()
+                {
+                    continue;
+                }
+                (*mutable, construction.length.expression.clone())
+            }
+            // N2 (the cursor seam, relay 002 §2). The row becomes a cursor
+            // over the inner slice. The cursor VERDICT and the runtime type are
+            // the cursor family's; only the constructor at the use site is
+            // ours, and it becomes `new(t[k])` — which takes no length, so this
+            // seam fabricates NOTHING. The row's one fabricated extent is the
+            // one this arm relocates to the wrapper, and it keeps the single
+            // receipt the cursor plan already carries for it.
+            Decision::Cursor { mutable, plan } => {
+                let Some(base) = plan.delivered_base.as_ref() else { continue };
+                if !matches!(base.provider, DeliveredBaseProvider::TableElement)
+                    // `DeliveredBase::initializer` names the TABLE's own
+                    // construction, not this row's; the row correspondence is
+                    // the subject lookup above (`s.hir_id == id`).
+                    || base.binding != parameter
+                    // Only the fallback-receipted base is a bare element load;
+                    // an evidence-backed one is a different construction.
+                    || !plan.fallback
+                    // A derived or re-pointed cursor has bases that are not the
+                    // element, and this arm cannot speak for them.
+                    || plan.parent_cursor.is_some()
+                    || !plan.peer_bases.is_empty()
+                    || plan
+                        .uses
+                        .iter()
+                        .filter(|u| u.bridge_kind == "cursor-constructor")
+                        .count()
+                        != 1
+                {
+                    continue;
+                }
+                // `plan.fallback` is the cursor family's own receipt that this
+                // base took the named fabricated extent; the wrapper rebuilds
+                // the row's view with the same one.
+                (*mutable, "crate::FALLBACK_SLICE_EXTENT".to_owned())
+            }
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => continue,
+        };
         admitted_receivers.insert(peel(receiver).hir_id);
         row_statement.push(position);
         rows.push(Row {
             parameter,
             local: id,
-            init: construction.init_hir,
+            init: init.hir_id,
             index: projection,
             mutable,
             was_fallback: true,
-            length: construction.length.expression.clone(),
+            length,
             raw_name: format!("__crat_nested_{}_raw", id.local_id.as_u32()),
             view_name: format!("__crat_nested_{}_view", id.local_id.as_u32()),
         });

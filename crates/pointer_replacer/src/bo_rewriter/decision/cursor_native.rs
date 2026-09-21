@@ -122,6 +122,56 @@ pub(crate) struct CursorReceipt {
     pub(crate) disposition: Result<(), CursorHold>,
 }
 
+/// **R452-6.** A cursor whose base is a table element (`*t.offset(k)`) is
+/// planned while `t` is still a flat slice of pointers. When `t` later delivers
+/// its inner level (nested's N1), the element becomes a slice VALUE and the
+/// constructor becomes `new(t[k])` — no length, nothing fabricated. That base
+/// is this family's, so the plan is REBUILT here through the family's own
+/// producer: a post-hoc rewrite of a finalised plan costs the cursor entirely
+/// (nested 007's A/B). The caller flips the table first and calls this after.
+///
+/// A rebuild that holds leaves its entry untouched and is reported, so the
+/// caller can withdraw the flip that made this necessary rather than emit a
+/// cursor whose base text no longer types.
+pub(crate) fn replan_delivered_table_elements(
+    ctx: &Ctx<'_, '_>,
+    entries: &mut [(Subject, Decision)],
+) -> Vec<CursorReceipt> {
+    let targets = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (subject, decision))| {
+            let Decision::Cursor { plan, .. } = decision else { return false };
+            let Some(base) = plan.delivered_base.as_ref() else { return false };
+            matches!(base.provider, DeliveredBaseProvider::TableElement)
+                && entries.iter().any(|(table, table_decision)| {
+                    table.fn_did == subject.fn_did
+                        && table.hir_id == base.binding
+                        && matches!(table_decision, Decision::NestedSlice { .. })
+                })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut receipts = Vec::new();
+    for index in targets {
+        let subject = entries[index].0.clone();
+        let rebuilt = wrapper::build(ctx, &subject, entries);
+        receipts.push(CursorReceipt {
+            owner: subject.fn_did,
+            hir_id: subject.hir_id,
+            local: subject.local,
+            disposition: rebuilt.as_ref().map(|_| ()).map_err(|e| *e),
+        });
+        if let Ok(plan) = rebuilt {
+            entries[index].1 = Decision::Cursor {
+                mutable: subject.mutable,
+                plan,
+            };
+        }
+    }
+    receipts
+}
+
 pub(crate) fn promote(
     ctx: &Ctx<'_, '_>,
     entries: &mut [(Subject, Decision)],

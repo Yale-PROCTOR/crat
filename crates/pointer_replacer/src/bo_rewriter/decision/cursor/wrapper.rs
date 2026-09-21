@@ -1911,7 +1911,7 @@ pub(super) fn plan(
     }
     Some(build(ctx, subject, entries))
 }
-fn build(
+pub(super) fn build(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     entries: &[(Subject, Decision)],
