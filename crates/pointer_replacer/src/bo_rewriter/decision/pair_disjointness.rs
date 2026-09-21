@@ -2365,6 +2365,9 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
                 .is_allocator_call(self.tcx, self.function, rhs)
         {
             AssignKind::Allocator(freshness)
+        } else if let Some(Some(base)) = conditional_base(self.typeck, rhs) {
+            // R485-4(e): every arm walks within one object, so the value does.
+            AssignKind::Derived(base)
         } else if let Some(base) = self.view_call_base(rhs) {
             // R482-4(3): the call hands back the argument's own object.
             AssignKind::Derived(base)
@@ -2373,6 +2376,43 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
         } else {
             AssignKind::Other
         }
+    }
+}
+
+/// R485-4(e): the base of a CONDITIONAL store, if every arm derives from one.
+///
+/// `None` refuses the value. `Some(None)` is an arm that names no object — the
+/// null literal — which constrains nothing and lets its siblings govern, the
+/// same tolerance `classify_locals` already gives an `AssignKind::Null` beside
+/// a derivation. `Some(Some(base))` is one named object for the whole value.
+///
+/// An arm that allocates is deliberately refused: "a fresh block or a view of
+/// `base`" is two objects. That is the one place this walk differs from the
+/// allocator-field admission it is modelled on, whose claim is the weaker
+/// "null or fresh".
+fn conditional_base<'tcx>(typeck: &TypeckResults<'tcx>, value: &Expr<'_>) -> Option<Option<HirId>> {
+    let value = peel_casts(value);
+    match &value.kind {
+        ExprKind::If(_, then, els) => {
+            // An `if` with no `else` leaves the local holding whatever it held
+            // before, which this walk cannot see.
+            let els = (*els)?;
+            let then = conditional_base(typeck, then)?;
+            let els = conditional_base(typeck, els)?;
+            match (then, els) {
+                (Some(a), Some(b)) if a == b => Some(Some(a)),
+                (Some(_), Some(_)) => None,
+                (found, None) | (None, found) => Some(found),
+            }
+        }
+        ExprKind::Block(block, _) => {
+            if !block.stmts.is_empty() {
+                return None;
+            }
+            conditional_base(typeck, block.expr?)
+        }
+        _ if is_null_literal(value) => Some(None),
+        _ => derivation_base(typeck, value).map(Some),
     }
 }
 
