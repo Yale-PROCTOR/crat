@@ -266,3 +266,90 @@ pub unsafe fn writer(mut c: *mut i8, mut size: usize) -> i32 {
         "an exclusive re-seed source is not bridged here: {decision:?}"
     );
 }
+
+/// tulip `sample::main_0`, reduced: the walker starts at a static indicator
+/// TABLE (`INDICATORS.as_ptr()` — an array place, not a reference) and is
+/// re-seeded once from a local callee's raw return.
+const RE_SEEDED_TABLE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Info { pub id: i32, pub type_0: i32 }
+pub static INDICATORS: [Info; 3] = [Info { id: 1, type_0: 1 }, Info { id: 2, type_0: 2 }, Info { id: 0, type_0: 0 }];
+unsafe fn find(mut key: i32) -> *const Info { return INDICATORS.as_ptr(); }
+pub unsafe fn main_0(mut key: i32) -> i32 {
+    let mut info: *const Info = INDICATORS.as_ptr();
+    let mut n: i32 = 0;
+    while (*info).type_0 != 0 as i32 {
+        n += (*info).type_0;
+        info = info.offset(1 as isize);
+    }
+    info = find(key);
+    if info.is_null() { return 0 as i32; }
+    return n + (*info).type_0;
+}
+"#;
+
+/// bzip2 `addFlagsFromEnvVar`'s walk, with the re-seed value left RAW (its own
+/// family does not present it): the construction takes the text as it stands.
+const RE_SEEDED_RAW: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+unsafe extern "C" { fn getenv(name: *const i8) -> *mut i8; }
+pub unsafe fn addFlagsFromEnvVar2(mut varName: *const i8) -> i32 {
+    let mut envbase = getenv(varName);
+    let mut p = 0 as *mut i8;
+    let mut n: i32 = 0;
+    let mut q = envbase as usize as *mut i8;
+    p = q;
+    while *p as i32 != 0 as i32 {
+        n += 1 as i32;
+        p = p.offset(1 as isize);
+    }
+    return n;
+}
+"#;
+
+/// **W6O-RS-2 — a table-rooted walker re-seeded from a CALL.** Two things at
+/// once: the initialiser is `STATIC.as_ptr()` on an array PLACE (the input's
+/// own spelling is kept and only the extent is added), and the re-seed is a
+/// local callee's raw return, which the construction takes as its raw value.
+#[test]
+fn wave6o_a_table_rooted_walker_re_seeded_from_a_call_delivers() {
+    assert!(verify::type_checks_str(RE_SEEDED_TABLE));
+    let decision = decision_of(RE_SEEDED_TABLE, "main_0", "info");
+    let Decision::Cursor { plan, .. } = &decision else {
+        panic!("the table-rooted re-seeded walker must take the cursor: {decision:?}");
+    };
+    assert!(plan.fallback, "both extents are fabricated (§77): {plan:?}");
+    let output = ast_emitted_source_of(RE_SEEDED_TABLE).expect("native emission");
+    assert!(
+        output.contains("INDICATORS.as_ptr()"),
+        "the input's own spelling of the table is kept: {output}"
+    );
+    assert!(
+        output.contains("find(key)"),
+        "the re-seed call survives inside the construction: {output}"
+    );
+    assert!(verify::type_checks_str(&output), "{output}");
+}
+
+/// **W6O-RS-3 — a re-seed whose value is still RAW.** No bridge is needed: the
+/// text is already a pointer, and only the extent is fabricated.
+#[test]
+fn wave6o_a_raw_re_seed_value_needs_no_bridge() {
+    assert!(verify::type_checks_str(RE_SEEDED_RAW));
+    let decision = decision_of(RE_SEEDED_RAW, "addFlagsFromEnvVar2", "p");
+    let Decision::Cursor { plan, .. } = &decision else {
+        panic!("the raw-sourced re-seeded walker must take the cursor: {decision:?}");
+    };
+    assert!(
+        plan.fallback,
+        "the fabricated extent is receipted: {plan:?}"
+    );
+    let output = ast_emitted_source_of(RE_SEEDED_RAW).expect("native emission");
+    assert!(
+        !output.contains("core::ptr::from_ref(q)"),
+        "a raw value is not bridged: {output}"
+    );
+    assert!(verify::type_checks_str(&output), "{output}");
+}

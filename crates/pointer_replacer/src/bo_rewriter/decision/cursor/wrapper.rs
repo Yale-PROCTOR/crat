@@ -424,7 +424,19 @@ fn base(
             ctx.tcx.typeck(s.fn_did).expr_ty(raw_origin).kind(),
             ty::RawPtr(..)
         );
-    if !matches!(raw_origin.kind, hir::ExprKind::Path(_)) && !field_base {
+    // **R499-1.** `STATIC.as_ptr()` on an array PLACE (tulip's indicator table):
+    // the earlier `as_ptr` branch wants a reference receiver and this is the
+    // place itself. The input's own spelling is kept — which is what keeps a
+    // `static mut` receiver legal exactly where the input already made it so —
+    // and only the extent is added, receipted.
+    let array_place_as_ptr =
+        emission::method(ctx.tcx, s.fn_did, raw_origin, &["as_ptr", "as_mut_ptr"])
+            && matches!(raw_origin.kind, hir::ExprKind::MethodCall(_, receiver, [], _)
+            if matches!(
+                ctx.tcx.typeck(s.fn_did).expr_ty(receiver).kind(),
+                ty::Slice(_) | ty::Array(..)
+            ));
+    if !matches!(raw_origin.kind, hir::ExprKind::Path(_)) && !field_base && !array_place_as_ptr {
         return Err(CursorHold::BaseMissing);
     }
     let method = if s.mutable {
@@ -498,6 +510,10 @@ struct Uses<'a, 'tcx> {
     /// Set when a re-seed construction fabricated its extent (§77): the plan
     /// carries `fallback`, so the count is auditable.
     re_seed_fabricated: bool,
+    /// Use edits of the RE-SEED SOURCE that this constructor's text has taken
+    /// over: the AST pass applies the constructor at its span and skips these,
+    /// exactly as a table element's outer edit is composed.
+    re_seed_composed: Vec<rustc_span::Span>,
 }
 impl Uses<'_, '_> {
     /// **R497-3(c) — the raw view of a re-seed value.** The re-seed source is
@@ -505,14 +521,43 @@ impl Uses<'_, '_> {
     /// raw pointer out of that form: a still-raw binding is its own text, a
     /// delivered reference is bridged (addendum 130 — emit the bridge, do not
     /// degrade the subject), and anything else holds.
-    fn re_seed_raw_view(&self, rhs: &hir::Expr<'_>) -> Option<String> {
+    fn re_seed_raw_view(&self, rhs: &hir::Expr<'_>) -> Option<(String, Option<rustc_span::Span>)> {
+        // **A call-rooted re-seed** (`strchr(search, ';')`, `find(key)`): the
+        // call itself is the raw value. Its own arguments keep their spans, so
+        // an argument this cursor owns is rewritten by ITS edit and spliced
+        // into this constructor by the nested-edit composition.
+        if matches!(rhs.kind, hir::ExprKind::Call(..))
+            && matches!(
+                self.ctx.tcx.typeck(self.subject.fn_did).expr_ty(rhs).kind(),
+                ty::RawPtr(..)
+            )
+        {
+            return text(self.ctx, rhs).ok().map(|t| (t, None));
+        }
         let binding = local(rhs)?;
         let (source, decision) = self
             .entries
             .iter()
             .find(|(source, _)| source.fn_did == self.subject.fn_did && source.hir_id == binding)?;
         let name = emission::binding_name(self.ctx.tcx, source).ok()?;
-        match decision {
+        // The source's OWN edit at this span (an option's `unwrap`, a slice's
+        // presentation) is taken over by this constructor's text.
+        let composed = match decision {
+            Decision::Opt { uses, .. } => uses
+                .iter()
+                .find(|edit| edit.span.source_callsite() == rhs.span.source_callsite())
+                .map(|edit| edit.span),
+            Decision::Slice { uses, .. } | Decision::NestedSlice { uses, .. } => uses
+                .iter()
+                .find(|edit| edit.span.source_callsite() == rhs.span.source_callsite())
+                .map(|edit| edit.span),
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => None,
+        };
+        let view = match decision {
             // Still raw in the emitted program: the text is already a pointer.
             Decision::Degraded(_) => Some(name),
             // A shared reference bridges with `from_ref`. An exclusive one is
@@ -540,14 +585,16 @@ impl Uses<'_, '_> {
             | Decision::NestedSlice { .. }
             | Decision::Box(_)
             | Decision::Cursor { .. } => None,
-        }
+        };
+        view.map(|view| (view, composed))
     }
 
     /// The construction a re-seed renders, with its §77 fabricated extent. The
     /// re-seed value has no evidence-backed length here — a length recovered
     /// from the source (json.h's `size` bound) is a later, exact form.
     fn re_seed_construction(&mut self, rhs: &hir::Expr<'_>) -> Option<String> {
-        let raw = self.re_seed_raw_view(rhs)?;
+        let (raw, composed) = self.re_seed_raw_view(rhs)?;
+        self.re_seed_composed.extend(composed);
         self.re_seed_fabricated = true;
         let method = if self.subject.mutable {
             "from_raw_parts_mut"
@@ -1982,6 +2029,7 @@ fn build(
             advances > 0 && other == 1
         },
         re_seed_fabricated: false,
+        re_seed_composed: vec![],
     };
     v.visit_body(ctx.tcx.hir_body_owned_by(subject.fn_did));
     if let Some(hold) = v.hold {
@@ -2018,7 +2066,11 @@ fn build(
         delivered_base: b.delivered,
         bridges: v.bridges,
         local_bridges: v.local_bridges,
-        composed_edit_spans: b.composed,
+        composed_edit_spans: {
+            let mut composed = b.composed;
+            composed.extend(v.re_seed_composed);
+            composed
+        },
         explicit_declaration,
         peer_bases: v.peer_bases,
         peer_cursors: v.peer_cursors,
