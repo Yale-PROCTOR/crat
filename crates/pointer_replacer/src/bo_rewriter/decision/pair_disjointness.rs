@@ -767,13 +767,10 @@ impl PairDisjointnessIndex {
         if self.immutable_formals.contains(&(callee, left))
             && self.immutable_formals.contains(&(callee, right))
         {
-            // R492-3: shared-with-shared BOTH ways, or the pair stays unproved
-            // and the ordinary certificates never see it either.
-            if self.shared_reads.contains(&(callee, left))
-                && self.shared_reads.contains(&(callee, right))
-            {
-                return Ok(CertificateKind::ReadReadShared);
-            }
+            // R492-3: the FACT is derived here (`is_shared_read_pair`), but the
+            // verdict is not. `decision/shared_read_pairs.rs` owns the
+            // shared/shared case in the CONSUMER role (R396-2), and this index
+            // refuses the pair to it on purpose — report 031 STOP 1.
             return Err(Unproved::ReadReadPeers);
         }
         // The same syntactic place, however it is cast, is never disjoint from
@@ -947,6 +944,21 @@ impl PairDisjointnessIndex {
         // Without the waiver a function no in-crate caller reaches is no
         // evidence at all; with it, the exported entry IS the evidence.
         (ok && (callers > 0 || waived)).then_some((callers, waived))
+    }
+
+    /// R492-3: are both peer formals model-shared reads — `*const` in the
+    /// input, nothing written through them, and no mutable reborrow anywhere in
+    /// the callee? The fact only; `certify_inner` deliberately does not turn it
+    /// into a verdict, because the shared/shared case belongs to
+    /// `shared_read_pairs`'s consumer role (R396-2).
+    pub(crate) fn is_shared_read_pair(
+        &self,
+        callee: LocalDefId,
+        left: usize,
+        right: usize,
+    ) -> bool {
+        let callee = callee.local_def_index.as_u32();
+        self.shared_reads.contains(&(callee, left)) && self.shared_reads.contains(&(callee, right))
     }
 
     pub(crate) fn ledger(&self) -> Vec<LedgerRow> {

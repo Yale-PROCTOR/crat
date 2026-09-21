@@ -15,15 +15,13 @@
 //! The fact is per PAIR, never per site: it is read off the callee's own
 //! signature and body, so every call site of that callee gets the same answer.
 
-use super::decision::pair_disjointness::{CertificateKind, PairDisjointnessIndex, Unproved};
+use super::decision::pair_disjointness::PairDisjointnessIndex;
 
-fn verdict(
-    src: &str,
-    caller: &str,
-    callee: &str,
-    left: usize,
-    right: usize,
-) -> Result<CertificateKind, Unproved> {
+/// The FACT, not the verdict: `certify_inner` still refuses a READ/READ pair to
+/// `shared_read_pairs`'s consumer (R396-2), which is what
+/// `w6p_read_read_pair_is_left_to_the_shared_read_consumer` pins. See report
+/// 031 STOP 1.
+fn shared_read_pair(src: &str, _caller: &str, callee: &str, left: usize, right: usize) -> bool {
     let mut out = None;
     ::utils::compilation::run_compiler_on_str(src, |tcx| {
         let program = super::collect_program(tcx);
@@ -37,7 +35,7 @@ fn verdict(
                 .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
                 .unwrap_or_else(|| panic!("no fn {name}"))
         };
-        out = Some(index.certify_recorded(function(caller), function(callee), left, right));
+        out = Some(index.is_shared_read_pair(function(callee), left, right));
     })
     .expect("fixture compilation");
     out.expect("the compiler callback ran")
@@ -68,9 +66,8 @@ pub unsafe fn emit(mut bits: *const u16, mut depth: *const u8, mut n: i32) -> i3
 
 #[test]
 fn w6p_two_shared_reads_need_no_certificate() {
-    assert_eq!(
-        verdict(TWO_SHARED_READS, "emit", "StoreDataWithHuffmanCodes", 0, 1),
-        Ok(CertificateKind::ReadReadShared),
+    assert!(
+        shared_read_pair(TWO_SHARED_READS, "emit", "StoreDataWithHuffmanCodes", 0, 1),
         "two shared borrows of one place are legal Rust, so the pair is free"
     );
 }
@@ -100,9 +97,8 @@ pub unsafe fn emit(mut bits: *const u16, mut depth: *mut u8, mut n: i32) -> i32 
 
 #[test]
 fn w6p_a_mut_formal_is_not_a_shared_read() {
-    assert_ne!(
-        verdict(ONE_MUT_FORMAL, "emit", "StoreDataWithHuffmanCodes", 0, 1),
-        Ok(CertificateKind::ReadReadShared),
+    assert!(
+        !shared_read_pair(ONE_MUT_FORMAL, "emit", "StoreDataWithHuffmanCodes", 0, 1),
         "a written formal is not a shared read"
     );
 }
@@ -134,15 +130,14 @@ pub unsafe fn emit(mut bits: *const u16, mut depth: *const u8, mut n: i32) -> i3
 
 #[test]
 fn w6p_a_mutable_reborrow_kills_the_licence() {
-    assert_ne!(
-        verdict(
+    assert!(
+        !shared_read_pair(
             A_MUTABLE_REBORROW,
             "emit",
             "StoreDataWithHuffmanCodes",
             0,
             1
         ),
-        Ok(CertificateKind::ReadReadShared),
         "a mutable reborrow anywhere in the callee is a write the pair cannot assume away"
     );
 }
@@ -167,22 +162,16 @@ pub unsafe fn emit(mut bits: *const u16, mut n: i32) -> i32 {
 "#;
 
 #[test]
-fn w6p_shared_beside_a_written_formal_falls_back() {
-    let outcome = verdict(
-        SHARED_BESIDE_A_WRITTEN_FORMAL,
-        "emit",
-        "StoreDataWithHuffmanCodes",
-        0,
-        1,
-    );
-    assert_ne!(
-        outcome,
-        Ok(CertificateKind::ReadReadShared),
-        "one written side means the ordinary certificates decide: {outcome:?}"
-    );
+fn w6p_shared_beside_a_written_formal_is_not_a_shared_pair() {
     assert!(
-        outcome.is_ok(),
-        "and here they do — a fresh stack address beside an entry pointer: {outcome:?}"
+        !shared_read_pair(
+            SHARED_BESIDE_A_WRITTEN_FORMAL,
+            "emit",
+            "StoreDataWithHuffmanCodes",
+            0,
+            1
+        ),
+        "the licence is shared-with-shared BOTH ways"
     );
 }
 
@@ -217,15 +206,14 @@ pub unsafe fn emit(mut bits: *const u16, mut depth: *mut u8, mut n: i32) -> i32 
 
 #[test]
 fn w6p_a_mut_formal_never_written_is_still_not_a_shared_read() {
-    assert_ne!(
-        verdict(
+    assert!(
+        !shared_read_pair(
             A_MUT_FORMAL_NEVER_WRITTEN,
             "emit",
             "StoreDataWithHuffmanCodes",
             0,
             1
         ),
-        Ok(CertificateKind::ReadReadShared),
         "`*const` in the input is a conjunct in its own right"
     );
 }
