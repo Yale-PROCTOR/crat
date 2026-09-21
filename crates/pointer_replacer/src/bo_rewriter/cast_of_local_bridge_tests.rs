@@ -233,9 +233,12 @@ fn k19_shared_slice_subject_at_a_mut_position_is_still_held() {
     );
 }
 
-/// The tier fault, as a standing control. A callee that RETAINS its argument
-/// may not bridge at all — the whole two-tier design is that retention decides
-/// admission before any carrier is chosen.
+/// The tier control. Retention still decides admission before any carrier is
+/// chosen — but **R481-2 (USER ruling, 2026-09-21) waives KNOWN retention**,
+/// so what this control now pins is that the bridge happens *through the
+/// waiver*: the site is admitted and it carries the per-site tier-2 receipt
+/// naming this subject and this callee. A bridge here WITHOUT that receipt is
+/// the failure the control exists to catch.
 #[test]
 fn k19_retaining_callee_does_not_bridge() {
     let input = format!(
@@ -246,9 +249,15 @@ fn k19_retaining_callee_does_not_bridge() {
          {{ *p.offset(1) += 1; keep(p as *const core::ffi::c_void); *p.offset(0) }}\n"
     );
     let got = reasons(&input);
-    assert_ne!(
+    assert_eq!(
         got.get("p").map(String::as_str),
         Some("<emitted>"),
-        "a retained pointer forbids the bridge: {got:#?}"
+        "a retained pointer bridges under the tier-2 waiver: {got:#?}"
+    );
+    let receipt = super::retention_waiver_tests::waived_receipt(&input, "target")
+        .unwrap_or_else(|| panic!("the admitted site carries no waiver receipt: {got:#?}"));
+    assert!(
+        receipt.contains("retention-waiver(tier-2, kind=known, subject=target::p, callee="),
+        "the receipt names the subject and the callee: {receipt}"
     );
 }

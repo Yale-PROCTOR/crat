@@ -9617,15 +9617,21 @@ fn e2_w1_return_decision_uses_the_typed_permit() {
 /// it must neither call the row planned nor drop the later reason.
 #[test]
 fn e2_w8_return_permit_reports_secondary_degradation_payload() {
+    // **Fixture replaced under R481-2 (USER ruling, 2026-09-21).** The original
+    // blocked its raw flow with a RETAINING sink (`HOLD = p`), and known
+    // retention is now waived — that site bridges, so the payload this test
+    // exists to report would simply be absent. The blocker is now a
+    // NON-retention one, `raw-boundary-shared-to-mut`: a shared-evidence
+    // subject at a `*mut` position, which the waiver explicitly does not lift.
+    // The permit, the secondary disposition and the typed payload are what the
+    // test still reads; only the reason's name moves.
     let fixture = Fixture::new(&[(
         "lib.rs",
         "#![allow(dead_code, unused_unsafe)]\n\
-         static mut HOLD: *mut i32 = core::ptr::null_mut();\n\
-         type P = *mut i32;\n\
-         pub unsafe fn raw_sink(p: P) -> usize { HOLD = p; 0 }\n\
-         pub unsafe fn returns_after_raw_flow(p: *mut i32) -> *mut i32 {\n\
-             *p = 1;\n\
-             let _ = raw_sink(p);\n\
+         pub unsafe fn raw_sink(p: *mut i32) -> usize { *p = 1; 0 }\n\
+         pub unsafe fn returns_after_raw_flow(p: *const i32) -> *const i32 {\n\
+             let _v = *p;\n\
+             let _ = raw_sink(p as *mut i32);\n\
              p\n\
          }\n",
     )]);
@@ -9657,7 +9663,7 @@ fn e2_w8_return_permit_reports_secondary_degradation_payload() {
     let fields = row.split('\t').collect::<Vec<_>>();
     assert_eq!(
         fields[receipt_column(&subjects, "final_decision")],
-        "flows-into-raw-param",
+        "cast-of-converting-local",
         "{row}",
     );
     assert_eq!(
@@ -9667,12 +9673,12 @@ fn e2_w8_return_permit_reports_secondary_degradation_payload() {
     );
     assert_eq!(
         fields[receipt_column(&subjects, "secondary_reason")],
-        "flows-into-raw-param",
+        "cast-of-converting-local",
         "{row}",
     );
     assert_eq!(
         fields[receipt_column(&subjects, "secondary_reason_detail")],
-        "flows-into-raw-param",
+        "cast-of-converting-local",
         "{row}",
     );
 }
@@ -13070,6 +13076,12 @@ fn slu_w1_unknown_retention_uses_the_exact_t2_waiver() {
     );
 }
 
+/// **Re-premised under R481-2 (USER ruling, 2026-09-21).** Positive retention
+/// no longer holds a site on its own: it is waived, per site, with a receipt.
+/// The name is kept because other lanes cite it. What it pins now is that the
+/// retaining call reads `retention-positive-waived` in the disposition, that
+/// the callee's OWN family refusal (`escapes-via-static-store`) is untouched by
+/// the waiver, and that the emitted program still type-checks.
 #[test]
 fn slu_w1_positive_retention_stays_held() {
     let input = "#![allow(dead_code, unused_unsafe)]\n\
@@ -13103,9 +13115,7 @@ fn slu_w1_positive_retention_stays_held() {
         Ok::<_, String>((ctx.raw_boundary_artifacts, table.slice_use_receipts, files.into_values().next().expect("retention fixture root")))
     }).expect("retention fixture compiles").expect("attested retention emission");
     assert!(
-        artifacts
-            .dispositions
-            .contains("raw-boundary-subject-not-safe"),
+        artifacts.dispositions.contains("retention-positive-waived"),
         "{}",
         artifacts.dispositions
     );
@@ -13125,32 +13135,11 @@ fn slu_w1_positive_retention_stays_held() {
         "J13 latest retired adapters: {:?}",
         retired.iter().map(|row| &row.adapter).collect::<Vec<_>>()
     );
-    let rejected = retired
-        .iter()
-        .find(|plan| plan.adapter == "prior-family-rendering:Return")
-        .expect("latest Return-stage retaining-call refusal");
-    slu_r220_assert_retired_use_cause(
-        rejected,
-        super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
-            "slice-use-existing-c-callee-not-settled-safe:parameters=1".to_owned(),
-        ),
-    );
-    assert_eq!(
-        rejected.obligation.planned.evidence.retention,
-        super::mechanical_receipt::MechanicalRetention::None
-    );
-    assert_eq!(
-        rejected.retention,
-        super::mechanical_receipt::MechanicalRetention::None
-    );
-    assert_eq!(
-        rejected.boundary_evidence,
-        "hypothetical-target-stays-raw=false"
-    );
-    assert!(
-        emitted.contains("p: *const i32"),
-        "positive retention admitted: {emitted}"
-    );
+    // R481-2: the `prior-family-rendering:Return` retirement this test used to
+    // read was the REFUSAL of the retaining call. The waiver admits that call,
+    // so the refusal — and with it the raw `p: *const i32` fallback signature —
+    // no longer exists. The callee-side family receipt asserted above is the
+    // part of the old expectation that survives, and it is unchanged.
     assert!(
         verify::type_checks_str(&emitted),
         "retained raw fallback output compiles: {emitted}"

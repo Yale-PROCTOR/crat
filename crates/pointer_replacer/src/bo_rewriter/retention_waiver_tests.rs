@@ -32,7 +32,7 @@ pub unsafe fn caller(mut buf: *mut u8, mut value: *mut Blob) -> i32 {
 
 /// `(callee, argument_index, target_stays_raw, tier, waiver_id, evidence,
 /// reason, atom_group)` of every disposition row for `function`.
-struct Row {
+pub(super) struct Row {
     callee: String,
     argument_index: String,
     target_stays_raw: String,
@@ -60,7 +60,7 @@ impl std::fmt::Debug for Row {
     }
 }
 
-fn dispositions(input: &str, function: &str) -> Vec<Row> {
+pub(super) fn dispositions(input: &str, function: &str) -> Vec<Row> {
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
@@ -113,6 +113,13 @@ fn dispositions(input: &str, function: &str) -> Vec<Row> {
 fn waived(rows: &[Row]) -> Option<&Row> {
     rows.iter()
         .find(|row| row.waiver_id.contains("retention-waiver:tier-2"))
+}
+
+/// The tier-2 receipt at `function`'s waived site, for the controls in other
+/// modules that the waiver re-premises (R481-2, R495-2).
+pub(super) fn waived_receipt(input: &str, function: &str) -> Option<String> {
+    let rows = dispositions(input, function);
+    waived(&rows).map(|row| row.evidence.clone())
 }
 
 /// **W6O-T2-1 — the delivering witness.** The retaining site is bridged under
