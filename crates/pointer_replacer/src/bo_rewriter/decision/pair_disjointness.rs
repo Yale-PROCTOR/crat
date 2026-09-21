@@ -1115,6 +1115,10 @@ struct AllocatorOracle<'a> {
     /// a known allocator (R433-6(2)). Keyed by the struct's `DefId` and the
     /// field's name.
     allocator_fields: FxHashMap<(DefId, Symbol), Freshness>,
+    /// R482-4(3): callees whose EVERY return is null or a view of one formal,
+    /// with that formal's index. A call of one is a derivation of the argument
+    /// at that index.
+    views: FxHashMap<DefId, usize>,
     indirect_calls: Option<&'a [super::lifetime::MirCallTargetSite]>,
 }
 
@@ -1388,11 +1392,17 @@ fn allocator_wrappers<'a>(
     let mut oracle = AllocatorOracle {
         wrappers: FxHashMap::default(),
         allocator_fields: FxHashMap::default(),
+        views: FxHashMap::default(),
         indirect_calls,
     };
     loop {
-        let before = (oracle.wrappers.len(), oracle.allocator_fields.len());
+        let before = (
+            oracle.wrappers.len(),
+            oracle.allocator_fields.len(),
+            oracle.views.len(),
+        );
         oracle.allocator_fields = allocator_fn_pointer_fields(tcx, functions, &oracle);
+        oracle.views = view_of_formal(tcx, functions, &oracle);
         for &function in functions {
             if oracle.wrappers.contains_key(&function.to_def_id()) {
                 continue;
@@ -1450,7 +1460,12 @@ fn allocator_wrappers<'a>(
                 oracle.wrappers.insert(function.to_def_id(), freshness);
             }
         }
-        if (oracle.wrappers.len(), oracle.allocator_fields.len()) == before {
+        if (
+            oracle.wrappers.len(),
+            oracle.allocator_fields.len(),
+            oracle.views.len(),
+        ) == before
+        {
             return oracle;
         }
     }
@@ -1572,6 +1587,86 @@ fn data_field_key<'tcx>(
         .find(|candidate| candidate.name == field)?
         .ty(tcx, args);
     matches!(declared.kind(), ty::RawPtr(..)).then_some((def.did(), field))
+}
+
+/// R482-4(3): the callees whose EVERY return is the null literal or a view of
+/// ONE formal — `return p` where `p` only ever walks within the storage it
+/// entered with. A call of such a callee hands back its argument's object, so
+/// the caller's local keeps that argument's root instead of going `Unknown`.
+///
+/// Computed to a fixpoint with the allocator wrappers, because a view can be
+/// built out of another: binn's `SearchForKey` is a view of its formal 0 only
+/// once `AdvanceDataPos` is known to be one. A callee still unknown on this
+/// round simply contributes no view, so the map only grows and the outer loop
+/// terminates.
+fn view_of_formal(
+    tcx: TyCtxt<'_>,
+    functions: &FxHashSet<LocalDefId>,
+    oracle: &AllocatorOracle<'_>,
+) -> FxHashMap<DefId, usize> {
+    let mut views = FxHashMap::default();
+    for &function in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+            continue;
+        };
+        let output = tcx.fn_sig(function).skip_binder().skip_binder().output();
+        if !matches!(output.kind(), ty::RawPtr(..)) {
+            continue;
+        }
+        let body = tcx.hir_body(body_id);
+        let mut returns = ReturnCollector {
+            returns: Vec::new(),
+        };
+        returns.visit_body(body);
+        if let ExprKind::Block(block, _) = &body.value.kind
+            && let Some(tail) = block.expr
+        {
+            returns.returns.push(tail);
+        }
+        if returns.returns.is_empty() {
+            continue;
+        }
+        let params: Vec<HirId> = body
+            .params
+            .iter()
+            .filter_map(|param| match param.pat.kind {
+                PatKind::Binding(_, hir_id, ..) => Some(hir_id),
+                _ => None,
+            })
+            .collect();
+        let typeck = tcx.typeck(function);
+        let (classes, _why) = classify_locals(tcx, typeck, body, oracle, function);
+        let mut index = None;
+        let mut every = true;
+        for expr in &returns.returns {
+            if is_null_literal(expr) {
+                continue;
+            }
+            // `EntryStorage(h)` is exactly "the storage this parameter entered
+            // with": a fresh allocation, a stack object or an unknown root all
+            // fail here, and so does a second formal.
+            let (class, _) = argument_provenance(tcx, typeck, &classes, expr);
+            let Some(position) = (match class {
+                RootClass::EntryStorage(h) => params.iter().position(|p| *p == h),
+                _ => None,
+            }) else {
+                every = false;
+                break;
+            };
+            match index {
+                None => index = Some(position),
+                Some(seen) if seen == position => {}
+                Some(_) => {
+                    every = false;
+                    break;
+                }
+            }
+        }
+        if let Some(position) = index.filter(|_| every) {
+            views.insert(function.to_def_id(), position);
+        }
+    }
+    views
 }
 
 /// R479-4a: the pointer fields every one of whose stores in the program is a
@@ -2127,6 +2222,17 @@ struct LocalCollector<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
+    /// R482-4(3): the root binding of the argument a view-of-formal call hands
+    /// back.
+    fn view_call_base(&self, rhs: &Expr<'_>) -> Option<HirId> {
+        let ExprKind::Call(callee, args) = &peel_casts(rhs).kind else {
+            return None;
+        };
+        let did = callee_def_id(callee)?;
+        let index = *self.allocators.views.get(&did)?;
+        derivation_base(self.typeck, args.get(index)?)
+    }
+
     fn assign_kind(&self, rhs: &Expr<'_>) -> AssignKind {
         if is_null_literal(rhs) {
             AssignKind::Null
@@ -2135,6 +2241,9 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
                 .is_allocator_call(self.tcx, self.function, rhs)
         {
             AssignKind::Allocator(freshness)
+        } else if let Some(base) = self.view_call_base(rhs) {
+            // R482-4(3): the call hands back the argument's own object.
+            AssignKind::Derived(base)
         } else if let Some(base) = derivation_base(self.typeck, rhs) {
             AssignKind::Derived(base)
         } else {
