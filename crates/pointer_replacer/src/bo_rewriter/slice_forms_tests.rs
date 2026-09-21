@@ -215,6 +215,20 @@ fn wave6s_backward_parameter_keeps_its_separate_hold() {
     assert!(!source.contains("__crat_wave6s_pos_"), "{source}");
 }
 
+/// **The claim: the loop's PREFIX COUNT is never read as the NUL tail's
+/// extent.** `strff` walks `n` bytes forward and hands the REST to `strdup`,
+/// so `n` bounds what was consumed, not what remains — a length taken from it
+/// would be fabricated evidence wearing a proof's clothes.
+///
+/// **R217-2(a) — where the extent comes from instead is frame-dependent, and
+/// the assertion below is not.** At the batch-18 frame the thin incoming
+/// source stays raw and the construction takes the named fallback
+/// (`p: *mut i8` … `crate::FALLBACK_SLICE_EXTENT`). Under wave-4's extent-lift
+/// waiver (`8a83e007f`, USER R481-1 / R482-3) the incoming source is LIFTED —
+/// `drive(p: &[i8])`, `strdup(input: &[i8])` — so this fixture constructs
+/// nothing at all and the fabrication, where it is still owed, moves to
+/// `drive`'s own callers. Both spellings are accepted; a length read off `n`
+/// is accepted in neither.
 #[test]
 fn wave6s_strff_incoming_preserves_tail_extent() {
     let input =
@@ -222,14 +236,28 @@ fn wave6s_strff_incoming_preserves_tail_extent() {
     let source = emit(&input);
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(source.contains("ptr: &[i8]"), "{source}");
+    let compact = source.split_whitespace().collect::<String>();
     assert!(
-        source.contains("p: *mut i8"),
-        "thin incoming source stays raw: {source}"
+        !compact.contains("from_raw_parts(p,(n)asusize)")
+            && !compact.contains("from_raw_parts(p,nasusize)"),
+        "the prefix count is never the tail's extent: {source}"
     );
-    assert!(
-        source.contains("FALLBACK_SLICE_EXTENT"),
-        "prefix count does not prove the NUL tail: {source}"
-    );
+    let raw_incoming = source.contains("p: *mut i8");
+    if raw_incoming {
+        assert!(
+            source.contains("FALLBACK_SLICE_EXTENT"),
+            "a raw incoming source constructs with the named fallback: {source}"
+        );
+    } else {
+        assert!(
+            source.contains("p: &[i8]"),
+            "the incoming source is either raw or lifted, nothing else: {source}"
+        );
+        assert!(
+            !compact.contains("from_raw_parts("),
+            "a lifted chain constructs nothing here: {source}"
+        );
+    }
 }
 
 /// urlparser `url_get_port` → `strff`, reduced with the real caller: the argument
@@ -409,19 +437,36 @@ fn wave6s_storeh2_survives_its_thin_raw_caller() {
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(source.contains("data: &[u8]"), "{source}");
     assert!(source.contains("self_0: &mut H2"), "{source}");
-    // The caller's thin raw `data` is adapted at the call. Under the arm-C
-    // charge probe (report 004) the adjacency arm licensed the FOLLOWING
-    // argument `mask` as the length — a bit mask, not an extent. Wave-4
-    // R408-1 (report 024) licenses a sibling only on a count position of the
-    // callee's own contract, so the construction takes the fallback extent.
+    // **The claim: `mask` is a BIT MASK and is never read as an extent.**
+    // Under the arm-C charge probe (report 004) the adjacency arm licensed
+    // the FOLLOWING argument as the length; wave-4 R408-1 licenses a sibling
+    // only on a count position of the callee's own contract, so no length is
+    // taken from `mask` on any frame.
     let compact = source.split_whitespace().collect::<String>();
-    assert!(
-        compact.contains(
-            "StoreH2(self_0,core::slice::from_raw_parts(data,crate::FALLBACK_SLICE_EXTENT),"
-        ),
-        "{source}"
-    );
     assert!(!compact.contains("(mask)asusize"), "{source}");
+    // **R217-2(a) — which END of the call carries the adaptation is
+    // frame-dependent.** At the batch-18 frame the caller's thin raw `data`
+    // is adapted INTO the callee with the named fallback extent. Under
+    // wave-4's extent-lift waiver (`8a83e007f`, USER R481-1 / R482-3) the
+    // CALLER is lifted instead (`StoreRangeH2(data: &[u8])`), the callee's
+    // `data` settles `pair-raw-view`, and the call crosses back through A5's
+    // T2 raw bridge (`let __crat_a5_raw_…: *const u8 = data.as_ptr();`).
+    // Both spellings keep this witness's own subject — the two `self_0`
+    // deliveries the preservation invariant is about — and both type-check.
+    let lifted_caller = compact.contains("StoreRangeH2(mutself_0:&mutH2,mutdata:&[u8]");
+    if lifted_caller {
+        assert!(
+            compact.contains("__crat_a5_raw_") && compact.contains("=data.as_ptr();"),
+            "the lifted caller crosses back through the A5 raw bridge: {source}"
+        );
+    } else {
+        assert!(
+            compact.contains(
+                "StoreH2(self_0,core::slice::from_raw_parts(data,crate::FALLBACK_SLICE_EXTENT),"
+            ),
+            "{source}"
+        );
+    }
 }
 
 /// Negative controls: the arithmetic consumed by anything other than the
