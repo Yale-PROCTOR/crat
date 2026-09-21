@@ -264,42 +264,27 @@ pub(crate) fn held(ctx: &Ctx<'_, '_>, subject: &Subject, site: &str) -> Option<D
         .return_certificates
         .holds
         .get(&(subject.fn_did, subject.hir_id))?;
+    if !hold.starts_with(PASSED_THROUGH) {
+        return None;
+    }
     Some(Decision::Degraded(super::Degradation {
         subject: subject.label.clone(),
         site: site.to_owned(),
         reason: super::DegradeReason::BoxFailure {
             failure: BoxPlanFailure::NativeEvidenceHeld {
-                prior_key: typed_key(hold),
+                prior_key: PASSED_THROUGH,
                 detail: hold.clone(),
             },
         },
     }))
 }
 
-/// The stable head of a certificate hold, so the census groups these reasons
-/// the way it groups the `box-param-*` ones. Listed longest-prefix-first, since
-/// several share a head (`…-allocation` vs `…-allocation-model`,
-/// `…-receiver-use` vs `…-receiver`).
-fn typed_key(hold: &str) -> &'static str {
-    const KEYS: [&str; 12] = [
-        "return-certificate-struct-field",
-        "return-certificate-allocation-model",
-        "return-certificate-allocation",
-        "return-certificate-return-locals",
-        "return-certificate-return-shape",
-        "return-certificate-receiver-use",
-        "return-certificate-receiver",
-        "return-certificate-owner-use",
-        "return-certificate-indirect-callers",
-        "return-certificate-no-receivers",
-        "return-certificate-transfer-unconfirmed",
-        "return-certificate-chain-open",
-    ];
-    KEYS.iter()
-        .copied()
-        .find(|key| hold.starts_with(key))
-        .unwrap_or("return-certificate-other")
-}
+/// **R497-3(b) — the narrow form.** Only A1-e's companion gate passes through
+/// for now: it is the one key R496-7 needs (the gate that is otherwise
+/// invisible at census), and restricting to it means no other lane's reason pin
+/// moves. The wider set of certificate keys rides a later cut together with
+/// wave-6l's re-pin.
+const PASSED_THROUGH: &str = "return-certificate-struct-field";
 
 /// After the decisions: unannotated receivers get their `Box<..>` spelled out.
 pub(crate) fn append_explicit_declarations(tcx: TyCtxt<'_>, table: &mut DecisionTable) {

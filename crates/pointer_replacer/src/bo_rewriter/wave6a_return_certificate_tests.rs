@@ -1053,6 +1053,7 @@ fn w6a_a1_a_conditional_return_carries_the_option_on_its_arms() {
 /// allocation, reads the field back through a CAST to a different pointee
 /// (`(*result).data as *mut Vec3`), walks it, and returns the owner.
 const HEMAN_IMAGE_CHAIN: &str = r#"
+// w6a-a1e-owned-field-frame
 #![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
 extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
@@ -1196,10 +1197,7 @@ fn w6a_a1e_a_copying_callee_is_not_a_lend() {
     // all. On every fixture in reach the conjunction `Owning AND !walk.ok` is
     // empty, so no fixture can separate the walk from the kind gate.
     //
-    // Read on the producer's own allocation, which nothing masks. Since
-    // R496-7's pass-through, `compute::result` carries the CERTIFICATE's
-    // refusal in place of the generic model reason — that is the point of the
-    // pass-through, and it is asserted just below.
+    // Read on the producer's own allocation, which nothing masks.
     assert_eq!(
         reason_of(&out.degradations, "image_create::img").as_deref(),
         Some("kind-raw"),
@@ -1209,10 +1207,13 @@ fn w6a_a1e_a_copying_callee_is_not_a_lend() {
             .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
             .collect::<Vec<_>>()
     );
+    // R497-3(b) narrows the pass-through to A1-e's companion gate alone, so
+    // `compute::result` keeps the generic model reason here; the gate's own
+    // key is witnessed by `w6a_a1e_an_owned_field_refuses_the_certificate`.
     assert_eq!(
         reason_of(&out.degradations, "compute::result").as_deref(),
-        Some("return-certificate-return-locals"),
-        "R496-7: the certificate's own refusal is the subject's reason\n{:?}",
+        Some("kind-raw"),
+        "{:?}",
         out.degradations
             .iter()
             .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
@@ -1300,5 +1301,49 @@ fn w6a_a1e_a_freeing_callee_is_not_a_lend_however_the_model_reads_it() {
             .iter()
             .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn w6a_a1e_an_owned_field_refuses_the_certificate() {
+    // **A1-e's companion gate, end to end** (report 042 §2; R496-7/R497-3(b)).
+    // A certificate CONSTRUCTS the owner and spells every field as the source
+    // spells it, so a field another family OWNS cannot be spelled that way —
+    // wave-6f promotes it to `Option<Box<T>>` and the literal raw initializer
+    // beside it is an E0308. The gate refuses the certificate; the narrow
+    // pass-through is what makes that refusal visible as the subject's reason
+    // instead of a generic model one.
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set_with_contract(
+        "w6a-a1e-owned-field-frame",
+        vec![("Image".to_owned(), 3, SlotKind::Owning)],
+        Vec::new(),
+        Vec::new(),
+    );
+    // The producer's own allocation must be model-`Raw` for the refusal to be
+    // readable: the pass-through is consulted in the ladder's `Raw` arm, and in
+    // the plain chain `image_create::img` is Owning-modeled and delivers a Box
+    // on its own, so the hold has nowhere to show. The copy that report 042's
+    // control uses is exactly what makes the model drop `Owning` here.
+    let source = HEMAN_IMAGE_CHAIN.replace(
+        "    let mut width = (*heightmap).width;",
+        "    let mut alias = heightmap;\n    let mut width = (*alias).width;",
+    );
+    let out = emitted("a1-owned-field", &source);
+    super::test_model_override::clear();
+    let reasons: Vec<(String, String)> = out
+        .degradations
+        .iter()
+        .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+        .collect();
+    assert_eq!(
+        reason_of(&out.degradations, "image_create::img").as_deref(),
+        Some("return-certificate-struct-field"),
+        "the gate's refusal is the subject's reason\n{reasons:?}"
+    );
+    assert!(
+        !compact(&out.source).contains("->Box<Image>"),
+        "no certificate over a struct with an owned field\n{}",
+        out.source
     );
 }
