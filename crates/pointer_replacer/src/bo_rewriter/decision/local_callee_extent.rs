@@ -478,6 +478,64 @@ pub(crate) fn nul_walk(
     })
 }
 
+/// **R491-7's caller-side clause (relay 060).** The exact form is licensed by
+/// the CALLEE's own walk — or by the caller, when the caller hands the same
+/// pointer to a libc string function. `is_bool_str(str, ..)` calls
+/// `strcasecmp(str, "true")` before it reaches `is_float(str)`, and
+/// `strcasecmp`'s contract requires a terminated string: on a UB-free input
+/// (§28) the terminator is there, so the string's own length reads exactly the
+/// bytes the program already reads.
+///
+/// **The same discipline as the callee side.** A libc STRING function, by name,
+/// with this very binding as an argument — never a counted call (`memcpy`,
+/// `strncpy`), which says nothing about a terminator, and never a comparison
+/// against another byte.
+pub(crate) fn caller_establishes_nul(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
+    use rustc_hir::intravisit::Visitor;
+
+    struct Calls {
+        binding: HirId,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Calls {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Call(callee, args) = expr.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = callee.kind
+                && path.segments.last().is_some_and(|segment| {
+                    NUL_CONTRACT_CALLEES.contains(&segment.ident.name.as_str())
+                })
+                && args.iter().any(|arg| {
+                    let mut arg = arg;
+                    loop {
+                        match arg.kind {
+                            rustc_hir::ExprKind::Cast(inner, _)
+                            | rustc_hir::ExprKind::DropTemps(inner) => arg = inner,
+                            rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+                                return path.res == rustc_hir::def::Res::Local(self.binding);
+                            }
+                            _ => return false,
+                        }
+                    }
+                })
+            {
+                self.found = true;
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+        }
+    }
+
+    if !tcx.hir_body_owners().any(|did| did == subject.fn_did) {
+        return false;
+    }
+    let body = tcx.hir_body_owned_by(subject.fn_did);
+    let mut calls = Calls {
+        binding: subject.hir_id,
+        found: false,
+    };
+    calls.visit_body(&body);
+    calls.found
+}
+
 /// Caller subjects handed to such a position. A subject in this map may not
 /// take a THIN reference form.
 pub(crate) fn collect(
@@ -826,6 +884,99 @@ unsafe fn scan(mut p: *const u8) -> u32 {
 pub unsafe fn caller(q: *const u8) -> u32 { scan(q) }
 "#;
         assert_eq!(walk_of(DELIM, "scan::p"), None);
+    }
+
+    /// binn's row: the callee's walk can stop early (so the callee alone
+    /// licenses only the fallback), but the CALLER hands the same pointer to
+    /// `strcasecmp`, whose contract requires a terminated string — so on a
+    /// UB-free input (§28) the terminator is there and the exact form is
+    /// licensed at THIS caller. Relay 060, the caller-side clause of R491-7.
+    const CALLER_LICENCE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe extern "C" { fn strcasecmp(a: *const i8, b: *const i8) -> i32; }
+unsafe fn is_float(mut p: *const i8) -> i32 {
+    while *p as i32 != 0 {
+        if *p as i32 >= '0' as i32 && *p as i32 <= '9' as i32 {} else { return 0 }
+        p = p.offset(1);
+    }
+    1
+}
+pub unsafe fn is_bool_str(str: *const i8) -> i32 {
+    if strcasecmp(str, b"true\0" as *const u8 as *const i8) == 0 { return 1; }
+    is_float(str)
+}
+"#;
+
+    #[test]
+    fn w5c_nul_a_callers_own_string_call_licenses_the_exact_form() {
+        let licensed = ::utils::compilation::run_compiler_on_str(CALLER_LICENCE, |tcx| {
+            let table = crate::bo_rewriter::decide_table(tcx).expect("fixture decisions");
+            table
+                .entries
+                .iter()
+                .map(|(subject, _)| subject)
+                .find(|subject| subject.label == "is_bool_str::str")
+                .map(|subject| caller_establishes_nul(tcx, subject))
+                .expect("is_bool_str::str")
+        })
+        .unwrap();
+        assert!(
+            licensed,
+            "a caller that hands its own pointer to `strcasecmp` establishes the NUL"
+        );
+    }
+
+    /// **The emitted length under the caller-side licence**: the construction
+    /// takes the string's own length, not the fallback const — the same
+    /// `core::ffi` spelling as the callee-side branch.
+    #[test]
+    fn w5c_nul_the_caller_licence_emits_the_string_length() {
+        let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(CALLER_LICENCE)
+            .expect("emission");
+        let flat = emitted.split_whitespace().collect::<String>();
+        if flat.contains("from_raw_parts") {
+            assert!(
+                flat.contains("CStr::from_ptr") && flat.contains("wrapping_add(1)"),
+                "the caller's licence emits the string's own length: {emitted}"
+            );
+        }
+        assert!(
+            !flat.contains("libc::"),
+            "emitted extents use core::ffi, never libc (R497-3): {emitted}"
+        );
+        assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
+    }
+
+    /// **Control** — the caller's call is NOT a string function. `memcpy` takes
+    /// a count and says nothing about a terminator, so the licence does not
+    /// come from it and the row keeps the fallback.
+    #[test]
+    fn w5c_nul_a_callers_counted_call_licenses_nothing() {
+        let input = CALLER_LICENCE
+            .replace(
+                "unsafe extern \"C\" { fn strcasecmp(a: *const i8, b: *const i8) -> i32; }",
+                "unsafe extern \"C\" { fn memcpy(d: *mut i8, s: *const i8, n: usize) -> *mut i8; }",
+            )
+            .replace(
+                "if strcasecmp(str, b\"true\\0\" as *const u8 as *const i8) == 0 { return 1; }",
+                "let mut buf: [i8; 4] = [0; 4]; memcpy(buf.as_mut_ptr(), str, 4);",
+            );
+        assert!(
+            input.contains("memcpy(buf.as_mut_ptr(), str, 4)") && !input.contains("strcasecmp"),
+            "the control must replace the string call with a counted one:\n{input}"
+        );
+        let licensed = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+            let table = crate::bo_rewriter::decide_table(tcx).expect("fixture decisions");
+            table
+                .entries
+                .iter()
+                .map(|(subject, _)| subject)
+                .find(|subject| subject.label == "is_bool_str::str")
+                .map(|subject| caller_establishes_nul(tcx, subject))
+                .expect("is_bool_str::str")
+        })
+        .unwrap();
+        assert!(!licensed, "a counted call establishes no terminator");
     }
 
     /// **Control** — an INDEXED walk is not a NUL walk at all: its extent is a

@@ -5026,7 +5026,12 @@ pub(crate) fn synthesize_with_raw_boundary(
                     // own: `strlen(p) + 1`, computed from the argument the call
                     // already passes. No companion is involved and none is
                     // needed.
-                    let nul_exact = table.nul_exact_parameters.contains(&(*callee, pos.index));
+                    // The licence is the callee's own walk, or this caller's
+                    // string call on the very pointer it passes (relay 060).
+                    let nul_exact = table.nul_exact_parameters.contains(&(*callee, pos.index))
+                        || pos.root.is_some_and(|root| {
+                            table.nul_exact_callers.contains(&(site.caller, root))
+                        });
                     if nul_exact {
                         // `CStr::from_ptr` walks to the NUL exactly as the
                         // callee does, and on a UB-free input (§28) the

@@ -247,6 +247,7 @@ mod tests {
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
             nul_exact_parameters: Default::default(),
+            nul_exact_callers: Default::default(),
         }
     }
 

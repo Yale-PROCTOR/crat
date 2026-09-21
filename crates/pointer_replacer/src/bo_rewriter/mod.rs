@@ -8291,6 +8291,13 @@ fn finish_decide<'tcx>(
                 .then_some((subject.fn_did, hir_index))
             })
             .collect();
+        // R491-7's caller-side clause: the subjects whose own body establishes
+        // the terminator.
+        table.nul_exact_callers = subjects
+            .iter()
+            .filter(|subject| decision::local_callee_extent::caller_establishes_nul(tcx, subject))
+            .map(|subject| (subject.fn_did, subject.hir_id))
+            .collect();
         let decided_slice = table
             .entries
             .iter()

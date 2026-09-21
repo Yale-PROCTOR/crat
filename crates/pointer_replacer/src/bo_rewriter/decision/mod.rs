@@ -1096,6 +1096,12 @@ pub(crate) struct DecisionTable {
     /// requires a terminated string. A caller constructing a slice for one of
     /// these takes `strlen(p) + 1` instead of §77's fallback.
     pub(crate) nul_exact_parameters: rustc_hash::FxHashSet<(LocalDefId, usize)>,
+    /// **R491-7's caller-side clause (relay 060).** Subjects whose OWN body
+    /// hands the pointer to a libc string function, so the terminator is
+    /// established at this caller even where the callee's walk licenses only
+    /// the fallback. The length is then the string's own here, and the
+    /// fallback everywhere else.
+    pub(crate) nul_exact_callers: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1408,6 +1414,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         slice_input_companions: Default::default(),
         slice_input_mask_companions: Default::default(),
         nul_exact_parameters: Default::default(),
+        nul_exact_callers: Default::default(),
     }
 }
 
@@ -3056,6 +3063,7 @@ mod self_consistency_tests {
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
             nul_exact_parameters: Default::default(),
+            nul_exact_callers: Default::default(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))
