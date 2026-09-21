@@ -1436,6 +1436,32 @@ impl<'a> UseGraftVisitor<'a> {
         Self::compose_over_inner(text, original, inner)
     }
 
+    /// **R491-3 — compose over the PRODUCT the outer already produced.** An
+    /// outer `Decision::Cursor` edit embeds the call it renders, with THIS
+    /// family's argument adapters already applied
+    /// (`heman_image_texel(texture.as_mut().unwrap(), ..)` where the node still
+    /// reads `heman_image_texel(texture, ..)`), so the verbatim search above
+    /// cannot find the original text. `NativeResultExpressionPlan::render`
+    /// wants exactly that adapted call — "the input is the call after its own
+    /// argument adapters" — so the call is located in the outer replacement by
+    /// its callee head and the parenthesis that balances it, and the view is
+    /// rendered over that product. A head that is absent, or parentheses that do
+    /// not balance, returns `None` and the caller holds the class (wave-6l's
+    /// floor) exactly as before; nothing here can abort a program.
+    fn compose_over_adapted_call(
+        text: &str,
+        original: &str,
+        view: &super::decision::native_result_expression::NativeResultExpressionPlan,
+    ) -> Option<String> {
+        let (start, end) = adapted_call_span(text, original)?;
+        Some(format!(
+            "{}{}{}",
+            &text[..start],
+            view.render(&text[start..end]),
+            &text[end..]
+        ))
+    }
+
     /// Close the walk, deriving `unmatched` from what was never reached.
     pub(crate) fn finish(mut self) -> UseGraftStats {
         self.stats.unmatched = self
@@ -1462,6 +1488,30 @@ impl<'a> UseGraftVisitor<'a> {
 /// `needle`'s occurrence in `hay` ignoring whitespace on both sides, as a
 /// byte range of `hay`. Used by the nested-edit composition to find a node's
 /// source text inside a use text rendered from the same source.
+/// **R491-3.** The call as the OUTER replacement spells it: the same callee
+/// head, up to the parenthesis that balances it. The head is `original` up to
+/// and including its first `(`, so an outer that adapted the ARGUMENTS still
+/// matches; an outer that renamed the callee does not, and neither does an
+/// unbalanced text — both answer `None`, and the caller then holds the class.
+fn adapted_call_span(text: &str, original: &str) -> Option<(usize, usize)> {
+    let head = original.find('(').map(|open| &original[..=open])?;
+    let (start, after_head) = find_ignoring_whitespace(text, head)?;
+    let mut depth = 1usize;
+    for (offset, character) in text[after_head..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, after_head + offset + character.len_utf8()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub(crate) fn find_ignoring_whitespace(hay: &str, needle: &str) -> Option<(usize, usize)> {
     let needle: Vec<char> = needle.chars().filter(|c| !c.is_whitespace()).collect();
     if needle.is_empty() {
@@ -1555,7 +1605,9 @@ impl MutVisitor for UseGraftVisitor<'_> {
                     &original,
                     self.originals.get(&key).map(String::as_str),
                     &inner,
-                ) {
+                )
+                .or_else(|| Self::compose_over_adapted_call(text, &original, view))
+                {
                     Some(composed_text) => {
                         composed = composed_text;
                         self.composed.insert(key);
@@ -2905,6 +2957,90 @@ impl MutVisitor for ReceiverInputGraftVisitor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// heman's five, verbatim from wave-5d 055's probe (`2026-09-21-wave-5d-r488`).
+    /// Each pair is (the OUTER replacement, the node's ORIGINAL text).
+    const HEMAN_FIVE: [(&str, &str); 5] = [
+        (
+            "core::slice::from_raw_parts(heman_image_texel(texture.as_mut().unwrap(), u as libc::c_int, v as libc::c_int), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(texture, u as libc::c_int, v as libc::c_int)",
+        ),
+        (
+            "core::slice::from_raw_parts_mut(heman_image_texel(&mut *target, i_0, j), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(target, i_0, j)",
+        ),
+        (
+            "core::slice::from_raw_parts_mut(heman_image_texel(&mut *dst, dstx + x_0, y), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(dst, dstx + x_0, y)",
+        ),
+        (
+            "core::slice::from_raw_parts_mut(heman_image_texel(&mut *result2, i_0, j), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(result2, i_0, j)",
+        ),
+        (
+            "core::slice::from_raw_parts(heman_image_texel(&mut *mapping, i, j), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(mapping, i, j)",
+        ),
+    ];
+
+    /// **W-CUR-PRODUCT** (R491-3) — the locator finds, in each outer
+    /// replacement, the call as THAT text spells it: the callee head through the
+    /// parenthesis that balances it, arguments already adapted. This is the text
+    /// `NativeResultExpressionPlan::render` wants ("the input is the call after
+    /// its own argument adapters"), so the view composes over the product the
+    /// outer produced instead of over a text that is no longer there.
+    #[test]
+    fn slicecursor_the_product_locator_finds_hemans_five() {
+        let expected = [
+            "heman_image_texel(texture.as_mut().unwrap(), u as libc::c_int, v as libc::c_int)",
+            "heman_image_texel(&mut *target, i_0, j)",
+            "heman_image_texel(&mut *dst, dstx + x_0, y)",
+            "heman_image_texel(&mut *result2, i_0, j)",
+            "heman_image_texel(&mut *mapping, i, j)",
+        ];
+        for ((outer, original), want) in HEMAN_FIVE.iter().zip(expected) {
+            let (start, end) = adapted_call_span(outer, original)
+                .unwrap_or_else(|| panic!("not located: {outer}"));
+            assert_eq!(&outer[start..end], want, "in {outer}");
+        }
+    }
+
+    /// **F-CUR-PRODUCT-VERBATIM** — the fault this rule exists for: the verbatim
+    /// search finds none of the five, which is why the composition failed and
+    /// (before wave-6l's floor) aborted heman at round 0. If this ever starts
+    /// finding them, the rule above is dead code and should go.
+    #[test]
+    fn slicecursor_the_verbatim_search_cannot_find_hemans_five() {
+        for (outer, original) in HEMAN_FIVE {
+            assert!(
+                find_ignoring_whitespace(outer, original).is_none(),
+                "the verbatim search found {original} in {outer}"
+            );
+        }
+    }
+
+    /// **F-CUR-PRODUCT-REFUSALS** — the locator answers `None` rather than
+    /// guessing: a callee the outer renamed, and a text whose parentheses do not
+    /// balance. Both leave the class hold in place.
+    #[test]
+    fn slicecursor_the_product_locator_refuses_what_it_cannot_prove() {
+        assert!(
+            adapted_call_span(
+                "core::slice::from_raw_parts(other_call(&mut *dst, i), crate::FALLBACK_SLICE_EXTENT)",
+                "heman_image_texel(dst, i)"
+            )
+            .is_none(),
+            "a different callee must not be taken for the call"
+        );
+        assert!(
+            adapted_call_span(
+                "core::slice::from_raw_parts(heman_image_texel(&mut *dst, i",
+                "heman_image_texel(dst, i)"
+            )
+            .is_none(),
+            "unbalanced parentheses must not be composed over"
+        );
+    }
 
     /// **RED WITNESS for the composition guard** (ruling item 5): a
     /// deliberately conflicting pair, REFUSED.
