@@ -215,24 +215,6 @@ pub(crate) struct RetainedReplay {
     pub(crate) comparison: CheckpointReport,
 }
 
-/// **R490-1(a)** -- does a counted-void call at this exact site take the raw-twin route?
-///
-/// The twin branch replaces the call's arguments with the input's own text, so any other
-/// arm's substitution at those argument spans is discarded by design. Matching is on the
-/// caller AND the exact call span: a different call in the same function, or the same
-/// span in another caller, is a different site and supersedes nothing.
-fn superseded_by_raw_twin(
-    table: &super::decision::DecisionTable,
-    caller: rustc_hir::def_id::LocalDefId,
-    call_span: rustc_span::Span,
-) -> bool {
-    table.seams.counted_void_calls.iter().any(|counted| {
-        counted.route == super::decision::counted_void::Route::RawTwin
-            && counted.caller == caller
-            && counted.call_span == call_span
-    })
-}
-
 pub(crate) fn compare_retained(
     retained: Option<&RetainedReplay>,
     expected_frame: &ReplayFrame,
@@ -476,22 +458,6 @@ fn descriptor_for_event(
         }
         "a5-site-proof-t2-fallback" => {
             for call in &plan.terminal_call_plans.a5_raw_calls {
-                // **R490-1(a) -- one span, one arm.**
-                //
-                // A counted-void call routed `RawTwin` takes its arguments "exactly as
-                // the input wrote them": the twin branch in `counted_void.rs` replaces
-                // `*args` wholesale, deliberately, because the twin's parameters are raw
-                // and so the input's own text is exactly right. When an A5 site proof
-                // also stamped raw temporaries at that call, the twin's rendering is what
-                // the tree carries and the stamps are left inert -- so the comparator
-                // refuses `stamped-raw-temporary-has-no-exact-bound-call-use`, correctly,
-                // on an emission that is itself correct.
-                //
-                // The TWIN owns the span. The A5 expectation is superseded here, in the
-                // ledger, so the comparator is untouched and passes by construction.
-                if superseded_by_raw_twin(table, call.caller, call.call_span) {
-                    continue;
-                }
                 consider(
                     BridgeKind::A5SiteProofT2Fallback,
                     call.caller,
@@ -2978,14 +2944,11 @@ mod tests {
 
 #[cfg(test)]
 mod raw_twin_supersede_tests {
-    /// **R490-1(a) — one span, one arm.**
+    /// **R496-1 — the raw twin owns the span, so the A5 fallback plans NOTHING there.**
     ///
-    /// brotli's `ProcessSingleCodeLength(code_len, &mut (*h).symbol, &mut (*h).repeat,
-    /// &mut (*h).space, …)` is the shape: a pair T2-fallback over three
-    /// sibling-overlap-pending `&mut` field arguments of ONE base at ONE call, where the
-    /// call is also a counted-void site routed `RawTwin`.
-    ///
-    /// The emitted tree at that site reads
+    /// brotli's `ProcessSingleCodeLength` is the shape: a pair T2 fallback over three
+    /// sibling-overlap-pending `&mut` field arguments of one base, at a call that is also a
+    /// counted-void site routed `RawTwin`. The emitted tree read
     ///
     /// ```ignore
     /// let __crat_a5_raw_6925671_3: *mut u32 = core::ptr::from_mut(&mut *&mut (*h).space);
@@ -2993,62 +2956,90 @@ mod raw_twin_supersede_tests {
     ///     &mut (*h).symbol, &mut (*h).repeat, &mut (*h).space, …)
     /// ```
     ///
-    /// — the A5 temporaries are bound and the twin call passes the ORIGINAL arguments, so
-    /// the stamps are inert and the comparator refuses
-    /// `stamped-raw-temporary-has-no-exact-bound-call-use`. It is right to: the receipt
-    /// claims a bridge the tree does not carry.
+    /// — four stamps bound, none read, the twin passing the ORIGINAL arguments because its
+    /// parameters are raw and `counted_void.rs` replaces `*args` wholesale on purpose.
     ///
-    /// The twin is not wrong either — its parameters are raw, so the input's own argument
-    /// text is exactly right, and `counted_void.rs` replaces `*args` wholesale on purpose.
-    /// So the TWIN owns the span and the A5 expectation stands down, in the ledger.
+    /// **`75ce6fedb` withdrew the ledger's CLAIM and that was the wrong layer.** Batch 20
+    /// measured what it cost: the applied receipt outlived its descriptor
+    /// (`bridge-custody:missing-descriptor:…:typed-carrier-candidate-count:0`), one refusal
+    /// traded for another at the same site, and the dead stamps stayed in the tree where no
+    /// receipt could claim them — `reverse_census` counts an unread generated binding as
+    /// `unclaimed-generated-declaration` whatever the ledger says, so `data` could never
+    /// have gone true by a ledger edit.
     ///
-    /// This pins the ownership rule at its two edges, because a supersede that is too
-    /// wide silently drops real custody obligations: the route must be `RawTwin`, and the
-    /// caller AND span must both match.
+    /// The fallback now yields at PLANNING, one arm along from where it already yields to
+    /// the PAIR rendering for the identical reason. This pins that the yield is there, that
+    /// it is narrow at all three edges — a supersede that is too wide silently drops real
+    /// custody obligations — and that the comparator keeps its refusal for every site the
+    /// ledger does still claim.
+    ///
+    /// **What this witness does NOT catch, measured rather than assumed.** It reads source
+    /// text, so it passes against a SEMANTIC disable: pinning the condition `false && …`
+    /// leaves every string it looks for in place and the test still goes green. I tried
+    /// three times to build a fixture that reaches the shape — the cross-module twin
+    /// fixture, field siblings at a same-module callee, and the two combined — and all
+    /// three emit `stamps=0 twin=0`, so none of them exercises it; that is MAX-3 and I
+    /// stopped. **The behavioural check for this change is a brotli probe**, where the
+    /// shape actually occurs, and it is owed before the change is offered for a cut.
     #[test]
-    fn r490_1a_the_raw_twin_owns_the_span_and_the_a5_expectation_stands_down() {
-        let source = include_str!("bridge_custody_export.rs");
+    fn r496_1_the_raw_twin_owns_the_span_so_the_a5_fallback_plans_nothing_there() {
+        let planner = include_str!("mod.rs");
+        let loop_body = planner
+            .split("for call in &table.seams.a5_raw_calls {")
+            .nth(1)
+            .expect("the A5 raw-view planning loop exists");
+        let body = &loop_body[..loop_body
+            .find("let (file, lo, hi) = span_to_loc(call.call_span)")
+            .expect("the loop reaches its placement step")];
 
-        // The supersede is consulted on the A5 arm, BEFORE the expectation is recorded.
-        let arm = source
+        let yielded = body
+            .find("counted_void::Route::RawTwin")
+            .expect("the fallback yields to the raw twin");
+        let pair_yield = body
+            .find("table.seams.pair_raw_calls")
+            .expect("the existing PAIR yield is the precedent this sits beside");
+        assert!(
+            pair_yield < yielded,
+            "the twin yield belongs after the pair yield, with which it shares its reason"
+        );
+
+        // Narrow at all three edges.
+        let arm = &body[yielded..];
+        for (needle, why) in [
+            (
+                "counted.caller == call.caller",
+                "the same span in another caller is another site",
+            ),
+            (
+                "counted.call_span == call.call_span",
+                "another call in the same caller is another site",
+            ),
+            (
+                "Route::RawTwin",
+                "only the twin route replaces arguments wholesale",
+            ),
+        ] {
+            assert!(arm.contains(needle), "{why}: {arm}");
+        }
+
+        // The LEDGER is back to claiming every A5 site it plans — the withdrawal moved to
+        // the planner, so a second withdrawal here would hide a real obligation.
+        let export = include_str!("bridge_custody_export.rs");
+        let a5 = export
             .split(r#""a5-site-proof-t2-fallback" => {"#)
             .nth(1)
             .expect("the A5 arm exists");
-        let guard = arm
-            .find("superseded_by_raw_twin")
-            .expect("the guard is present");
-        let consider = arm.find("consider(").expect("the expectation is recorded");
+        let a5 = &a5[..a5.find("\"pair-copy-snapshot\"").unwrap_or(a5.len())];
         assert!(
-            guard < consider,
-            "the supersede must precede the expectation, or the ledger records a claim it \
-             has already decided it does not own"
+            !a5.contains("superseded_by_raw_twin"),
+            "the ledger no longer second-guesses the planner: {a5}"
         );
 
-        // And it is narrow at both edges.
-        let helper = source
-            .split("fn superseded_by_raw_twin(")
-            .nth(1)
-            .expect("the helper exists");
-        let body = &helper[..helper.find("\n}").unwrap_or(helper.len())];
-        assert!(
-            body.contains("Route::RawTwin"),
-            "only the twin route replaces arguments wholesale: {body}"
-        );
-        assert!(
-            body.contains("counted.caller == caller"),
-            "the same span in another caller is a different site: {body}"
-        );
-        assert!(
-            body.contains("counted.call_span == call_span"),
-            "another call in the same caller is a different site: {body}"
-        );
-
-        // The comparator is NOT touched: this is a ledger fix, and the refusal string
-        // must still exist for every site the ledger does still claim.
+        // And the comparator keeps its refusal for the sites the ledger does claim.
         assert!(
             include_str!("bridge_custody_match.rs")
                 .contains("stamped-raw-temporary-has-no-exact-bound-call-use"),
-            "the comparator keeps its refusal; only the claim is withdrawn"
+            "the comparator is untouched"
         );
     }
 }

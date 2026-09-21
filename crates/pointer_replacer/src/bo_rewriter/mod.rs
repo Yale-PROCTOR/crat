@@ -6428,6 +6428,28 @@ fn prepare_plan_files<'tcx>(
         }) {
             continue;
         }
+        // **R490-1(a), one layer earlier: the raw twin renders this call too.**
+        //
+        // A counted-void call routed `RawTwin` replaces the call's arguments with the
+        // input's own text -- deliberately, because the twin's parameters are raw. The A5
+        // fallback's stamps at that call are then DEAD: brotli's
+        // `ProcessSingleCodeLength` site carried four `let __crat_a5_raw_6925671_*` that
+        // nothing reads, followed by `__crat_raw_ProcessSingleCodeLength(&mut (*h).repeat,
+        // ..)` with the original arguments.
+        //
+        // Suppressing them in the LEDGER (`75ce6fedb`) was the wrong layer, and batch 20
+        // proved it: the applied receipt survived without a descriptor
+        // (`bridge-custody:missing-descriptor:..:typed-carrier-candidate-count:0`), and the
+        // stamps stayed in the tree where no receipt could ever claim them. The fallback
+        // has to yield where it is superseded, exactly as it already yields to the PAIR
+        // rendering above -- same shape, same reason, one arm further along.
+        if table.seams.counted_void_calls.iter().any(|counted| {
+            counted.route == decision::counted_void::Route::RawTwin
+                && counted.caller == call.caller
+                && counted.call_span == call.call_span
+        }) {
+            continue;
+        }
         let (file, lo, hi) = span_to_loc(call.call_span)
             .map_err(|why| format!("unplaceable A5 raw-view call: {why}"))?;
         let source = text_of(&file)
