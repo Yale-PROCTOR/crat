@@ -141,6 +141,8 @@ mod wave6a_return_certificate_tests;
 #[cfg(test)]
 mod wave6f_field_reference_tests;
 #[cfg(test)]
+mod wave6k_reverted_class_naming_tests;
+#[cfg(test)]
 mod wave6k_typedef_parameter_tests;
 #[cfg(test)]
 mod wave6l_local_box_exemption_tests;
@@ -2507,6 +2509,7 @@ fn verify_and_revert(
             facts.reverted_count = taken.len();
             facts.files_touched = files_edited;
             let named_subjects = reverted_named_subjects(&taken);
+            name_reverted_classes(tcx, &effective_reverted, &mut class_paths);
             facts.raw_boundary_artifacts.final_reverts = render_raw_boundary_final_reverts(
                 &effective_reverted,
                 &reverted_atoms,
@@ -2990,6 +2993,7 @@ fn verify_and_revert(
             let (_, partition_reasons) =
                 effective_withheld_classes_with_reasons(&emission_plan, &reverted, &reverted_atoms);
             let named_subjects = reverted_named_subjects(&taken);
+            name_reverted_classes(tcx, &final_reverted, &mut class_paths);
             facts.raw_boundary_artifacts.final_reverts = render_raw_boundary_final_reverts(
                 &final_reverted,
                 &reverted_atoms,
@@ -4191,6 +4195,28 @@ pub(crate) fn raw_boundary_reason_head(attribution: &str) -> String {
         Some(("held", rest)) => rest.split(':').next().unwrap_or(rest).to_owned(),
         Some(("closure", _)) | None => attribution.to_owned(),
         Some((head, _)) => head.to_owned(),
+    }
+}
+
+/// **R477-6 (wave-6k 027) — every reverted class names itself.** `class_paths`
+/// is filled from planned edits, emitted sites and emitted subjects only, so a
+/// class HELD before it produced any of the three had no entry and the
+/// final-reverts artifact wrote `<unknown-local-class>`: 161 rows over eight
+/// programs at batch 16, five of them 100 % unnamed, every row carrying its
+/// class id and its reason head. The run knows the path — `tcx.def_path_str` is
+/// the same call `mechanical_receipt` makes for its `owner_path` column — so
+/// the identity is a lookup, not a derivation. An existing entry wins, so no
+/// already-named row moves, and `class_owner_paths` is deliberately untouched:
+/// R430-1 renders one row per OWNER path, and seeding it would invent rows.
+fn name_reverted_classes(
+    tcx: TyCtxt<'_>,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    class_paths: &mut std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+) {
+    for &class in reverted {
+        class_paths
+            .entry(class)
+            .or_insert_with(|| tcx.def_path_str(class.local_def_id().to_def_id()));
     }
 }
 
