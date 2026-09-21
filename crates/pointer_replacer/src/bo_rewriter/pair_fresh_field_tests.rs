@@ -309,3 +309,67 @@ fn w6p_a_foreign_arm_refuses_the_conditional_store() {
         "one arm holding a caller's pointer and the field proves nothing"
     );
 }
+
+/// brotli's real shape: the field is written by `BrotliAllocate`, a wrapper
+/// that allocates through `(*m).alloc_func` and is therefore admitted under
+/// R409-1's CONTRACT, not proven. The certificate must say so by name.
+const FIELD_STORED_BY_A_CONTRACT_ALLOCATOR: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Split { pub num_types: i32, pub alphabet_size: i32 }
+#[repr(C)]
+pub struct MemoryManager {
+    pub alloc_func: Option<unsafe extern "C" fn(libc::c_ulong) -> *mut libc::c_void>,
+}
+#[repr(C)]
+pub struct MetaBlock { pub literal_split: Split, pub command_histograms: *mut u32 }
+pub unsafe fn BrotliAllocate(mut m: *mut MemoryManager, mut n: libc::c_ulong)
+    -> *mut libc::c_void {
+    ((*m).alloc_func).expect("non-null function pointer")(n)
+}
+extern "C" { fn malloc(n: libc::c_ulong) -> *mut libc::c_void; }
+pub unsafe extern "C" fn BrotliDefaultAllocFunc(mut n: libc::c_ulong) -> *mut libc::c_void {
+    malloc(n)
+}
+#[no_mangle]
+pub unsafe extern "C" fn BrotliInitMemoryManager(
+    mut m: *mut MemoryManager,
+    mut alloc: Option<unsafe extern "C" fn(libc::c_ulong) -> *mut libc::c_void>,
+) {
+    // One resolved allocator store and one the closed world cannot see: the
+    // field is an allocator UNDER the contract, exactly as brotli's is.
+    if alloc.is_none() {
+        (*m).alloc_func = Some(BrotliDefaultAllocFunc);
+    } else {
+        (*m).alloc_func = alloc;
+    }
+}
+pub unsafe fn BuildHistograms(mut split: *mut Split, mut histograms: *mut u32) {
+    (*split).num_types = 1;
+    *histograms.offset(1) = 2;
+}
+pub unsafe fn BuildMetaBlock(
+    mut mb: *mut MetaBlock,
+    mut m: *mut MemoryManager,
+    mut n: libc::c_ulong,
+) {
+    (*mb).command_histograms = BrotliAllocate(m, n) as *mut u32;
+    BuildHistograms(&mut (*mb).literal_split, (*mb).command_histograms);
+}
+"#;
+
+#[test]
+fn w6p_a_contract_backed_allocator_certifies_under_its_contract() {
+    assert_eq!(
+        verdict(
+            FIELD_STORED_BY_A_CONTRACT_ALLOCATOR,
+            "BuildMetaBlock",
+            "BuildHistograms",
+            0,
+            1
+        ),
+        Ok(CertificateKind::DistinctRootsUnderContract),
+        "an allocator admitted under R409-1 never yields a proven receipt"
+    );
+}
