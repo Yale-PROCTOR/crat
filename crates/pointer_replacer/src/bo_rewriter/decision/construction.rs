@@ -180,6 +180,13 @@ pub(crate) enum SliceLengthSource {
     LiteralBytes {
         arms: Vec<usize>,
     },
+    /// **R499-2 — a field root whose size is recorded in a SIBLING field.**
+    /// `(*s).storage_` beside `(*s).storage_size_`: the extent is the
+    /// sibling's value, read at the same base.
+    SiblingSize {
+        field: String,
+        sibling: String,
+    },
     Fallback,
 }
 
@@ -212,6 +219,7 @@ impl SliceLengthSource {
                     .collect::<Vec<_>>()
                     .join(";")
             ),
+            Self::SiblingSize { field, sibling } => format!("sibling-size:{field}:{sibling}"),
             Self::Fallback => FALLBACK_EXTENT_RECEIPT.to_owned(),
         }
     }
@@ -477,6 +485,117 @@ fn associated_local_length(
     Some(inherited)
 }
 
+/// **Does this element type measure ONE BYTE?**
+///
+/// It decides whether a `_size` sibling may be read as an element count. In C
+/// a `<f>_size` beside a byte buffer is a byte count and the two coincide; for
+/// a wider element type the same name may mean bytes and the claim would
+/// over-reach by `size_of::<T>()`, so the arm refuses rather than guesses. A
+/// `_len` / `_length` / `_count` sibling names elements by its own word and is
+/// accepted for any element type.
+fn is_byte_element(element_type: &str) -> bool {
+    let last = element_type
+        .rsplit("::")
+        .next()
+        .unwrap_or(element_type)
+        .trim();
+    matches!(
+        last,
+        "u8" | "i8" | "uint8_t" | "int8_t" | "c_char" | "c_uchar" | "c_schar"
+    )
+}
+
+/// The sibling names a field root may take its extent from, in order.
+///
+/// C2Rust preserves the C spelling, and brotli's encoder state carries the
+/// Google-style trailing underscore (`storage_` / `storage_size_`), so the
+/// convention is derived from the field's own name with that suffix handled —
+/// never from a struct-level `size` field. That refusal is deliberate and
+/// measured: brotli's `RingBuffer` has TWO pointer fields (`data_`, `buffer_`)
+/// beside `size_`, `total_size_` and `cur_size_`, and `buffer_` is an interior
+/// pointer into `data_` — so a struct-level size would state the wrong extent
+/// for it. A name derived from the field itself cannot make that mistake.
+fn sibling_names(field: &str) -> Vec<(String, bool)> {
+    let (base, suffix) = match field.strip_suffix('_') {
+        Some(base) => (base, "_"),
+        None => (field, ""),
+    };
+    let mut names = vec![(format!("{base}_size{suffix}"), true)];
+    for word in ["len", "length", "count"] {
+        names.push((format!("{base}_{word}{suffix}"), false));
+    }
+    names
+}
+
+/// **R499-2 (B1's parameter-emission half) — the root is a FIELD whose size is
+/// recorded in a sibling field.**
+///
+/// `let mut data = (*s).ringbuffer_.buffer_;` and `(*s).storage_` are roots the
+/// walk used to call extent-less: the construction is a `PlaceRead` and nothing
+/// in the initializer states a length. The length is not absent, though — it is
+/// one field along, written by whatever grows the buffer (`GetBrotliStorage`
+/// sets `(*s).storage_size_ = size` beside the allocation it stores into
+/// `(*s).storage_`). This arm reads it there.
+///
+/// The evidence is the SIBLING's value at the same base expression, so the
+/// extent renders where the construction does and needs nothing carried: the
+/// base's own snippet with the sibling's name. Refusals, each because the claim
+/// would otherwise be wider than the evidence: a non-integer sibling, a `_size`
+/// sibling under an element type wider than a byte (it may count bytes), and
+/// any base whose snippet cannot be recovered.
+fn sibling_size_length(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    init_hir: HirId,
+    element_type: &str,
+) -> Option<SliceLengthPlan> {
+    let expression = Collector::peel(tcx.hir_node(init_hir).expect_expr());
+    let rustc_hir::ExprKind::Field(base, field) = expression.kind else {
+        return None;
+    };
+    let field = field.name.as_str().to_owned();
+    let typeck = tcx.typeck(owner);
+    let mut ty = typeck.expr_ty(base);
+    loop {
+        match ty.kind() {
+            rustc_middle::ty::TyKind::Ref(_, inner, _) => ty = *inner,
+            rustc_middle::ty::TyKind::RawPtr(inner, _) => ty = *inner,
+            _ => break,
+        }
+    }
+    let rustc_middle::ty::TyKind::Adt(def, arguments) = ty.kind() else {
+        return None;
+    };
+    if !def.is_struct() {
+        return None;
+    }
+    let variant = def.non_enum_variant();
+    let (sibling, counts_bytes) = sibling_names(&field)
+        .into_iter()
+        .find_map(|(name, bytes)| {
+            variant
+                .fields
+                .iter()
+                .find(|candidate| candidate.name.as_str() == name)
+                .map(|candidate| (candidate, bytes))
+        })?;
+    if !sibling.ty(tcx, arguments).is_integral() {
+        return None;
+    }
+    if counts_bytes && !is_byte_element(element_type) {
+        return None;
+    }
+    let base_text = tcx.sess.source_map().span_to_snippet(base.span).ok()?;
+    Some(SliceLengthPlan {
+        expression: format!("(({base_text}).{}) as usize", sibling.name.as_str()),
+        source: SliceLengthSource::SiblingSize {
+            field,
+            sibling: sibling.name.as_str().to_owned(),
+        },
+        provenance: Vec::new(),
+    })
+}
+
 fn array_decay_length(
     tcx: TyCtxt<'_>,
     owner: LocalDefId,
@@ -550,6 +669,11 @@ pub(crate) fn root_extent(
             },
             provenance: Vec::new(),
         });
+    }
+    if matches!(facts.by_binding.get(&node), Some(Construction::PlaceRead))
+        && let Some(length) = sibling_size_length(tcx, subject.fn_did, init_hir, element_type)
+    {
+        return Some(length);
     }
     associated_local_length(facts, node, known)
 }
@@ -681,6 +805,9 @@ fn bind_allocation_arguments(
         SliceLengthSource::AssociatedArgument { .. }
         | SliceLengthSource::SealedContract { .. }
         | SliceLengthSource::LiteralBytes { .. }
+        // A sibling size is read at the base, not bound out of an allocation
+        // argument: there is no call to hoist an argument from.
+        | SliceLengthSource::SiblingSize { .. }
         | SliceLengthSource::Fallback => {
             return Ok((
                 Vec::new(),

@@ -2311,6 +2311,166 @@ fn b1_rows(source: &str) -> Vec<(String, String, String, String)> {
     .expect("the fixture yields a table")
 }
 
+/// **R499-2 — brotli's `storage_` shape, minimised.** The root is a FIELD read
+/// (`(*s).storage_`) and the struct records its size one field along
+/// (`storage_size_`), exactly as `GetBrotliStorage` maintains it. The caller's
+/// local takes that extent, and — the parameter half — `BrotliWriteBits`'s own
+/// parameter lifts because its one call site now hands it a root that states
+/// one.
+const W4_B1_SIBLING_SIZE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+unsafe extern "C" fn StoreInner(mut pos: *mut size_t, mut storage: *mut uint8_t) {
+    BrotliWriteBits(pos, storage);
+}
+pub unsafe extern "C" fn StoreFromField(mut s: *mut EncoderState) {
+    let mut storage: *mut uint8_t = (*s).storage_;
+    let mut pos: size_t = 0 as size_t;
+    StoreInner(&mut pos, storage);
+}
+"#;
+
+/// **The control the ruling names: a field root with NO size-named sibling.**
+///
+/// brotli's own `RingBuffer` is the shape — two pointer fields beside `size_`,
+/// with `buffer_` an interior pointer into `data_` — so a struct-level size
+/// states the wrong extent for it and the arm must refuse. The row stays held
+/// and keeps `none:place-read`.
+const W4_B1_NO_SIBLING_SIZE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct RingBuffer {
+    pub size_: size_t,
+    pub data_: *mut uint8_t,
+    pub buffer_: *mut uint8_t,
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreFromRing(mut r: *mut RingBuffer) {
+    let mut storage: *mut uint8_t = (*r).buffer_;
+    let mut pos: size_t = 0 as size_t;
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+/// **The byte-count control.** The same shape at a WIDER element type: a
+/// `<f>_size` sibling in C names bytes, and reading it as an element count
+/// would claim `size_of::<T>()` times too much. The arm refuses.
+const W4_B1_SIBLING_SIZE_WIDE_ELEMENT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint32_t = u32;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct TableState {
+    pub table_size_: size_t,
+    pub table_: *mut uint32_t,
+}
+unsafe extern "C" fn WriteWord(mut pos: *mut size_t, mut array: *mut uint32_t) {
+    let mut p: *mut uint32_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint32_t;
+    *p = 1 as uint32_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreWide(mut s: *mut TableState) {
+    let mut table: *mut uint32_t = (*s).table_;
+    let mut pos: size_t = 0 as size_t;
+    WriteWord(&mut pos, table);
+}
+"#;
+
+/// **W4B1-5 (R499-2) — a field root takes its SIBLING's size, and the
+/// parameter one hop along takes it with him.**
+///
+/// This is B1's parameter-emission half on the shape the seat expects to
+/// dominate brotli's `caller-root-states-no-extent` rows. Two claims, and the
+/// second is the half that is new: the caller's local lifts on evidence the
+/// walk could always have read but never asked for, and the CALLEE's parameter
+/// lifts because every one of its call sites now hands it a root that states an
+/// extent.
+#[test]
+fn w4b105_a_field_root_takes_its_sibling_size() {
+    let rows = b1_rows(W4_B1_SIBLING_SIZE);
+    let local = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreFromField::storage"))
+        .unwrap_or_else(|| panic!("no StoreFromField::storage row: {rows:?}"));
+    assert_eq!(local.1, "lifted", "{rows:?}");
+    assert_eq!(
+        local.2, "sibling-size:storage_:storage_size_",
+        "the extent is the sibling's, and the receipt names both fields: {rows:?}"
+    );
+    // **The parameter half, and the wall it actually meets — measured, not
+    // assumed.** With the sibling extent in place the call site DOES state one,
+    // so the parameter clears the root test it used to fail
+    // (`caller-root-states-no-extent` becomes `every-caller-states-an-extent`).
+    // It is then held one step later, by its OWN use: `BrotliWriteBits(pos,
+    // storage)` is an argument to a local callee that is still raw, and
+    // `slice_uses` is a pre-decision fact, so nothing this pass does can make
+    // that use renderable. The chain therefore lifts bottom-up or not at all —
+    // which is a different wall from the one the build was aimed at, and is
+    // recorded here as the next question rather than asserted away.
+    let parameter = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreInner::storage"))
+        .unwrap_or_else(|| panic!("no StoreInner::storage row: {rows:?}"));
+    assert_eq!(
+        parameter.2, "every-caller-states-an-extent",
+        "the root test now passes at the parameter: {rows:?}"
+    );
+    assert_eq!(
+        parameter.3, "slice-use-unsupported",
+        "and the remaining blocker is the use side: {rows:?}"
+    );
+}
+
+/// **W4B1-6 (control) — a field root with no size-named sibling stays held.**
+#[test]
+fn w4b106_a_field_root_without_a_sibling_size_stays_held() {
+    let rows = b1_rows(W4_B1_NO_SIBLING_SIZE);
+    let local = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreFromRing::storage"))
+        .unwrap_or_else(|| panic!("no StoreFromRing::storage row: {rows:?}"));
+    assert_eq!(local.1, "held", "{rows:?}");
+    assert_eq!(
+        local.2, "none:place-read",
+        "a struct-level `size_` is NOT this field's extent: {rows:?}"
+    );
+}
+
+/// **W4B1-7 (control) — a `_size` sibling at a wider element type is refused.**
+#[test]
+fn w4b107_a_size_sibling_is_refused_at_a_wider_element() {
+    let rows = b1_rows(W4_B1_SIBLING_SIZE_WIDE_ELEMENT);
+    let local = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreWide::table"))
+        .unwrap_or_else(|| panic!("no StoreWide::table row: {rows:?}"));
+    assert_eq!(
+        local.1, "held",
+        "a `_size` sibling may count BYTES: {rows:?}"
+    );
+    assert_eq!(local.2, "none:place-read", "{rows:?}");
+}
+
 /// **W4B1-1 (control) — a root that states nothing stays the fallback's.**
 ///
 /// The `wrapping_mul` evidence arm itself is witnessed where it lives, in
