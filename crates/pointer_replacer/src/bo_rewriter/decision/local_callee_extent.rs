@@ -245,12 +245,16 @@ pub(crate) fn collect(
     subjects: &[Subject],
     facts: &EmitabilityFacts,
     slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
+    decided_slice: &rustc_hash::FxHashSet<(LocalDefId, usize)>,
+    fat: Option<&crate::bo_rewriter::fat_facts::FatFacts>,
 ) -> FxHashMap<(LocalDefId, HirId), LocalCalleeAccess> {
     let mut parameters: FxHashMap<(LocalDefId, usize), &Subject> = FxHashMap::default();
+    let mut by_binding: FxHashMap<(LocalDefId, HirId), &Subject> = FxHashMap::default();
     for subject in subjects {
         if let SubjectKind::Param { hir_index } = subject.kind {
             parameters.insert((subject.fn_did, hir_index), subject);
         }
+        by_binding.insert((subject.fn_did, subject.hir_id), subject);
     }
     // One classification per callee parameter, reused across its call sites:
     // the body is a property of the callee, not of any one caller.
@@ -270,6 +274,37 @@ pub(crate) fn collect(
                     parameter_access(tcx, parameter, facts, slice_uses, &parameters, &mut vec![])
                 });
                 if let Some(access) = access {
+                    // **R485-4(b) — the decided-`Slice` callee, narrowly.** A
+                    // parameter this run decided `Slice` carries a checked
+                    // extent for its INDEXES. That is not the whole of what
+                    // this hold protects, and the first build proved it: a
+                    // callee that casts its parameter to a wider type and
+                    // writes through it (`*(p as *mut u64) = 7`) is not bounded
+                    // by any `[u8]`, and a thin caller filling that slice hands
+                    // over one element either way. So the exemption is taken
+                    // only where all three hold:
+                    //   * the callee parameter is decided `Slice`;
+                    //   * its slice USES are element-width and rewritable — the
+                    //     conjuncts R365-2 already trusts — and the one thing
+                    //     that kept it out of that exemption is
+                    //     `needs_full_base`, i.e. it hands its base on rather
+                    //     than reading past its own claim;
+                    //   * the CALLER's own subject is an array, so its form has
+                    //     an extent to fill the slice with.
+                    let element_width = slice_uses
+                        .get(&(parameter.fn_did, parameter.hir_id))
+                        .is_some_and(|uses| {
+                            uses.unsupported.is_none() && !uses.rewrites.is_empty()
+                        });
+                    let caller_is_fat = fat
+                        .zip(by_binding.get(&(site.caller, root)))
+                        .is_some_and(|(fat, subject)| fat.is_array(subject.fn_did, subject.local));
+                    if decided_slice.contains(&(*callee, arg.index))
+                        && element_width
+                        && caller_is_fat
+                    {
+                        continue;
+                    }
                     out.entry((site.caller, root))
                         .or_insert_with(|| access.clone());
                 }
@@ -277,4 +312,104 @@ pub(crate) fn collect(
         }
     }
     out
+}
+
+/// **R485-4(b) — the second pass, as a function.** Re-collects the holds with
+/// every parameter the settled table decided `Slice` exempted, and answers
+/// `Some` only when that actually removes a hold: the caller re-decides on
+/// `Some` and does nothing on `None`, so a run in which no callee parameter
+/// became a slice costs one collect and no second ladder.
+pub(crate) fn relaxed_by_decisions(
+    tcx: TyCtxt<'_>,
+    subjects: &[Subject],
+    facts: &EmitabilityFacts,
+    slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
+    fat: &crate::bo_rewriter::fat_facts::FatFacts,
+    decided_slice: &rustc_hash::FxHashSet<(LocalDefId, usize)>,
+    current: &FxHashMap<(LocalDefId, HirId), LocalCalleeAccess>,
+) -> Option<FxHashMap<(LocalDefId, HirId), LocalCalleeAccess>> {
+    if decided_slice.is_empty() {
+        return None;
+    }
+    let relaxed = collect(tcx, subjects, facts, slice_uses, decided_slice, Some(fat));
+    (relaxed.len() < current.len()).then_some(relaxed)
+}
+
+#[cfg(test)]
+mod decided_slice_tests {
+    use super::*;
+
+    /// `caller::p` is held because `local_read` walks past one element; its
+    /// callee parameter's slice USES do not exempt it (the walk is
+    /// `p.wrapping_add(n)`, not an indexable rewrite), which is what leaves the
+    /// hold in place. That is the corpus shape in miniature — the exemption's
+    /// three conjuncts fall short at collect time — and the only thing R485-4(b)
+    /// adds is the decision.
+    const HELD: &str = r#"
+#![allow(dead_code, unused_unsafe)]
+unsafe fn local_read(p: *const u8, n: usize) -> u8 {
+    let end = p.wrapping_add(n);
+    *end.wrapping_sub(1)
+}
+pub unsafe fn caller(p: *const u8, n: usize) -> u8 {
+    *p.offset(1) + local_read(p, n)
+}
+"#;
+
+    /// **Control (ii) — a THIN caller keeps the hold.** This is the line the
+    /// first build crossed: `read32(data as *const c_void)` with
+    /// `data: *const u8` reads four bytes through a one-element claim, and the
+    /// callee's parameter being a slice does not give the CALLER an extent to
+    /// fill it with. R364-2's own witnesses pin this, and the corpus rows the
+    /// exemption is for are array callers, not thin ones.
+    #[test]
+    fn w5c_r485_a_thin_caller_keeps_the_hold() {
+        const THIN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables)]
+pub unsafe fn read32(p: *const core::ffi::c_void) -> u32 { *(p as *const u32) }
+pub unsafe fn hash(data: *const u8) -> u32 { read32(data as *const core::ffi::c_void) }
+"#;
+        let held = ::utils::compilation::run_compiler_on_str(THIN, |tcx| {
+            let owners = tcx
+                .hir_body_owners()
+                .filter(|did| matches!(tcx.def_kind(*did), rustc_hir::def::DefKind::Fn))
+                .collect::<Vec<_>>();
+            let facts = super::super::emitability::collect(tcx, &owners);
+            let table = crate::bo_rewriter::decide_table(tcx).expect("fixture decisions");
+            let subjects = table
+                .entries
+                .iter()
+                .map(|(subject, _)| subject.clone())
+                .collect::<Vec<_>>();
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let fat = crate::bo_rewriter::fat_facts::FatFacts::from_program(&program);
+            let decided = subjects
+                .iter()
+                .filter(|subject| subject.label == "read32::p")
+                .filter_map(|subject| match subject.kind {
+                    SubjectKind::Param { hir_index } => Some((subject.fn_did, hir_index)),
+                    SubjectKind::Local => None,
+                })
+                .collect::<rustc_hash::FxHashSet<_>>();
+            assert_eq!(decided.len(), 1, "the reader's parameter resolves");
+            collect(
+                tcx,
+                &subjects,
+                &facts,
+                &FxHashMap::default(),
+                &decided,
+                Some(&fat),
+            )
+            .into_iter()
+            .map(|((owner, _), access)| {
+                format!("{}:{}", tcx.item_name(owner.to_def_id()), access.detail())
+            })
+            .collect::<Vec<_>>()
+        })
+        .unwrap();
+        assert!(
+            held.iter().any(|row| row.starts_with("hash:read32:p:")),
+            "a one-element source must keep the hold whatever its callee decided: {held:?}"
+        );
+    }
 }

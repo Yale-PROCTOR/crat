@@ -7433,8 +7433,16 @@ fn finish_decide<'tcx>(
     );
     // After `full_slice_uses`, deliberately: a callee parameter that can become
     // `&[T]` carries its own checked extent and is out of this class (R365-2).
-    let local_callee_extent_subjects =
-        decision::local_callee_extent::collect(tcx, &subjects, &facts, &full_slice_uses);
+    // First pass: no decision is settled yet, so the exemption has only the
+    // use facts to read (R485-4(b)'s second pass supplies the rest below).
+    let local_callee_extent_subjects = decision::local_callee_extent::collect(
+        tcx,
+        &subjects,
+        &facts,
+        &full_slice_uses,
+        &rustc_hash::FxHashSet::default(),
+        None,
+    );
     let return_parameter_nodes = subjects
         .iter()
         .filter(|subject| {
@@ -8096,6 +8104,55 @@ fn finish_decide<'tcx>(
             ),
             &subjects,
         );
+        // **R485-4(b) — the decided-slice exemption, as a second pass.** A
+        // callee parameter this run decided `Slice` carries a checked extent,
+        // so the `held:local-callee-access-extent` hold its callers took no
+        // longer applies. The decision is not available when the map is first
+        // collected (it is one of the map's own inputs), so the pass runs once
+        // over the SETTLED table and re-decides only if a hold actually went.
+        let decided_slice = table
+            .entries
+            .iter()
+            .filter_map(|(subject, decision)| {
+                let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                    return None;
+                };
+                // Exhaustive by rule (`import_denylist`): a new disposition
+                // must be classified here, not silently dropped.
+                match decision {
+                    decision::Decision::Slice { .. } => Some((subject.fn_did, hir_index)),
+                    decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Cursor { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::Degraded(_) => None,
+                }
+            })
+            .collect::<rustc_hash::FxHashSet<_>>();
+        if let Some(relaxed) = decision::local_callee_extent::relaxed_by_decisions(
+            tcx,
+            &subjects,
+            &facts,
+            &full_slice_uses,
+            &fat,
+            &decided_slice,
+            &local_callee_extent_subjects,
+        ) {
+            let ctx = decision::Ctx {
+                local_callee_extent: &relaxed,
+                ..ctx_of(
+                    decision::RefGate::LiftAdaptable,
+                    Some(&coconv),
+                    Some(&lifetime_eligibility),
+                    Some(&raw_boundary),
+                    Some(&candidate_exposure),
+                    Some(&return_receivers),
+                )
+            };
+            table = decision::decide(&ctx, &subjects);
+        }
         // Surface policies are provisional until the full ladder settles. A raw
         // wrapper or entry shim exists only when at least one signature subject
         // survives every arm; blocked functions retain their seed/web evidence but
