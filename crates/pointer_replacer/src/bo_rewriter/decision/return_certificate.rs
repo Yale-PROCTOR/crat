@@ -642,6 +642,26 @@ impl<'tcx> UseWalk<'_, 'tcx> {
 
     /// The deref expression is written: the place of an assignment or a
     /// compound assignment, or borrowed mutably.
+    /// [`Self::written`] through the places a struct owner's uses go through:
+    /// `(*b).f = v` and `(*b).f[i] = v` write `*b` as surely as `*b = v` does,
+    /// and a view taken shared for either would not compile.
+    fn written_through_places(&self, deref: &'tcx Expr<'tcx>) -> bool {
+        let mut node = deref;
+        loop {
+            if self.written(node) {
+                return true;
+            }
+            match self.tcx.parent_hir_node(node.hir_id) {
+                rustc_hir::Node::Expr(parent)
+                    if matches!(parent.kind, ExprKind::Field(..) | ExprKind::Index(..)) =>
+                {
+                    node = parent;
+                }
+                _ => return false,
+            }
+        }
+    }
+
     fn written(&self, deref: &Expr<'_>) -> bool {
         match self.tcx.parent_hir_node(deref.hir_id) {
             rustc_hir::Node::Expr(parent) => match parent.kind {
@@ -807,9 +827,21 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     (BoxShape::Sized, false) => return,
                     (BoxShape::Sized, true) => format!("(*{name}.as_deref_mut().unwrap())"),
                     (BoxShape::Slice, false) => format!("{name}[0]"),
+                    // **A4 / R483-3(i)** — `*b` on an `Option<Box<[T]>>` is the
+                    // first element, which is the same view the `.offset` arm
+                    // renders with an index of zero; the refusal here was a
+                    // missing rendering, not a missing proof. The corpus's two
+                    // are lil's `add_func::cmd` and `lil_clone_value::val`:
+                    // `calloc(1, size_of::<T>())` owners whose uses are
+                    // `(*cmd).field`, so the write must be seen THROUGH the
+                    // projection or the view would be taken shared and the
+                    // assignment would not compile.
                     (BoxShape::Slice, true) => {
-                        self.refuse("optional-slice-deref".to_owned());
-                        return;
+                        if self.written_through_places(parent) {
+                            format!("{name}.as_deref_mut().unwrap()[0]")
+                        } else {
+                            format!("{name}.as_deref().unwrap()[0]")
+                        }
                     }
                 };
                 self.push(parent.span, replacement, "return-certificate-deref");

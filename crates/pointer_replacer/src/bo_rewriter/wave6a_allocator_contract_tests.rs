@@ -1130,3 +1130,72 @@ fn w6a_ac_a_move_into_a_held_owner_is_refused() {
         out.source
     );
 }
+
+const OPTIONAL_SLICE_DEREF: &str = r#"
+#[repr(C)]
+pub struct Cmd {
+    pub arity: i32,
+    pub used: i32,
+}
+pub unsafe extern "C" fn add_func(mut m: *mut MemoryManager, mut n: usize) -> i32 {
+    let mut cmd = if n > 0 as usize {
+        BrotliAllocate(m, (1 as usize).wrapping_mul(::core::mem::size_of::<Cmd>())) as *mut Cmd
+    } else { 0 as *mut Cmd };
+    (*cmd).arity = 2 as i32;
+    (*cmd).used = 1 as i32;
+    let mut seen = (*cmd).arity;
+    BrotliFree(m, cmd as *mut std::os::raw::c_void);
+    cmd = 0 as *mut Cmd;
+    return seen;
+}
+"#;
+
+/// **A4 / R483-3(i): `*b` on an `Option<Box<[T]>>` is its first element.** The
+/// walk refused this shape (`use:optional-slice-deref`) although the
+/// rendering is the one the `.offset` arm already writes with an index of
+/// zero. The corpus's two rows are lil's `add_func::cmd` and
+/// `lil_clone_value::val` — `calloc(1, size_of::<T>())` owners whose every use
+/// is `(*cmd).field` — and this fixture is that shape over the brotli
+/// contract, with a write and a read of the same owner.
+///
+/// The write must be seen THROUGH the field projection: `(*cmd).name = name`
+/// writes the owner, so the view is `as_deref_mut()`; the read beside it takes
+/// `as_deref()`. One fault: refuse the shape again and the owner degrades.
+#[test]
+fn w6a_ac_an_optional_slice_owner_derefs_to_its_first_element() {
+    let out = emitted(
+        "ac-optional-deref",
+        &format!("{PRELUDE}{OPTIONAL_SLICE_DEREF}"),
+    );
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        receipts.contains("add_func::cmd\tadmitted"),
+        "the deref is a rendering, not a refusal\n{receipts}"
+    );
+    assert!(!receipts.contains("optional-slice-deref"), "{receipts}");
+    let text = compact(&out.source);
+    // The writes take the mutable view, through the projection …
+    assert!(
+        text.contains("cmd.as_deref_mut().unwrap()[0].arity=2asi32;"),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("cmd.as_deref_mut().unwrap()[0].used=1asi32;"),
+        "{}",
+        out.source
+    );
+    // … and the read beside them takes the shared one.
+    assert!(
+        text.contains("letmutseen=cmd.as_deref().unwrap()[0].arity;"),
+        "{}",
+        out.source
+    );
+    // The free stays at the C free site.
+    assert!(
+        text.contains("BrotliFree(m,cmd.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutstd::os::raw::c_void));"),
+        "{}",
+        out.source
+    );
+}
