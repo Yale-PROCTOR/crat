@@ -1019,6 +1019,11 @@ fn option_destination_of(
     })
 }
 
+/// **R499-1(b)** — the arms that exist to materialize what another arm may already
+/// materialize, and so may stand down at a span another class edits. Named rather than
+/// inferred: a new fallback has to be added here on purpose.
+const FALLBACK_KINDS: [&str; 1] = ["a5-site-proof-t2-fallback"];
+
 pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalization {
     let mut merged = BTreeMap::<SignatureClassId, ClassInput>::new();
     for input in inputs {
@@ -1040,6 +1045,7 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
         .cloned()
         .collect::<Vec<_>>();
     let mut collisions = Vec::new();
+    let mut fallback_yields = std::collections::BTreeSet::new();
     let mut intra_class_collisions = std::collections::BTreeSet::new();
     let mut composed_dependencies = std::collections::BTreeSet::new();
     for (left_index, left) in all_sites.iter().enumerate() {
@@ -1063,6 +1069,62 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
                 if left.key != right.key || left.edit_key != right.edit_key {
                     intra_class_collisions.insert(left.key.owner_class);
                 }
+                continue;
+            }
+            // **R499-1(b) — one span, one arm, across classes: a FALLBACK yields the span it
+            // strictly contains.**
+            //
+            // batch 20's brotli lost 69 subjects to six rows of one shape: a pair-arm
+            // `a5-site-proof-t2-fallback` interval strictly containing a `surface` edit of
+            // another class at `BrotliHistogramCombine{Literal,Distance,Command}`. Recorded as
+            // a collision it blocks BOTH classes, so the three `ClusterBlocks*` callers went
+            // down with them and 28 of the 97 lost subjects were the whole of
+            // `delivered-box`'s regression.
+            //
+            // A fallback exists to materialize what another arm may already materialize, so
+            // when its interval STRICTLY contains another class's edit it stands down instead
+            // — one class held rather than two, and the contained edit survives. This is the
+            // cross-class form of the yield the A5 planner already makes to the PAIR
+            // rendering, and of R496-1's yield to the raw twin.
+            //
+            // Strict containment only: a fallback that merely OVERLAPS covers bytes the other
+            // arm does not, and yielding there would drop a real edit — that case still
+            // collides. Same-class overlaps are the intra-class hold above and are untouched.
+            let yielded =
+                [(left, right), (right, left)]
+                    .into_iter()
+                    .find_map(|(fallback, inner)| {
+                        let strictly_contains = fallback.key.lo <= inner.key.lo
+                            && inner.key.hi <= fallback.key.hi
+                            && (fallback.key.lo < inner.key.lo || inner.key.hi < fallback.key.hi);
+                        // **Only a SURFACE edit, and wave-5d's controls are why.** The first
+                        // version yielded to anything contained, and the standing set caught
+                        // it: `a5_wrapper_over_unselected_argument` pins that an A5 wrapper
+                        // containing a `C`-arm `raw-cast-const` in a SELECTED argument -- or
+                        // one whose selected views are not recorded at all -- STILL collides.
+                        // That is right: a contained argument bridge is the very thing the
+                        // wrapper's raw view substitutes for, so the two are rival renderings
+                        // of one argument and `a5_wrapper_composition` decides them.
+                        //
+                        // A contained SURFACE edit is not an argument substitution at all --
+                        // it is the callee class's own signature-driven rewrite, which no raw
+                        // view can stand in for. That is brotli's shape, and the only one
+                        // yielded here.
+                        (FALLBACK_KINDS.contains(&fallback.key.bridge_kind.as_str())
+                            && inner.key.arm == super::decision::Arm::Surface.key()
+                            && strictly_contains)
+                            .then_some((fallback, inner))
+                    });
+            if let Some((fallback, inner)) = yielded {
+                fallback_yields.insert((
+                    fallback.key.owner_class,
+                    fallback.edit_key.clone(),
+                    format!(
+                        "fallback-yields-contained-edit:{}:{}",
+                        inner.key.owner_class.order_key(),
+                        inner.key.bridge_kind
+                    ),
+                ));
                 continue;
             }
             let (left, right) = if left.key.owner_class <= right.key.owner_class {
@@ -1094,6 +1156,19 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
             .push(inner);
     }
 
+    // R499-1(b): the yielded sites, marked where they are recorded rather than removed, so
+    // the receipt says which arm took the span and the class that stood down is auditable.
+    for (owner, edit_key, reason) in fallback_yields {
+        if let Some(class) = merged.get_mut(&owner) {
+            for site in class
+                .sites
+                .iter_mut()
+                .filter(|site| site.edit_key == edit_key)
+            {
+                site.state = ClassSiteState::Dropped(reason.clone());
+            }
+        }
+    }
     for class in intra_class_collisions {
         merged
             .get_mut(&class)
