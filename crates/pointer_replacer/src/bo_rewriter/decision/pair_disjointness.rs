@@ -90,6 +90,12 @@ pub(crate) enum CertificateKind {
     /// are assumed not to alias. An assumption, never a proof — receipted at
     /// every site that rests on it, as the other waivers are.
     ExportedEntryWaiver,
+    /// R483-3(f): (e) extended to statics. One side is a `static` item, the
+    /// other a parameter's pointee, and EVERY in-crate call site of that
+    /// function passes, at that position, something whose root is known and is
+    /// not this static. The payload is how many call sites were checked, so
+    /// the evidence behind each certificate is countable in the ledger.
+    StaticVsEntry(u32),
 }
 
 impl CertificateKind {
@@ -103,6 +109,16 @@ impl CertificateKind {
             Self::FreshStackAddress => "pair-disjoint:fresh-stack-address",
             Self::ParameterPair => "pair-disjoint:parameter-pair",
             Self::ExportedEntryWaiver => "pair-disjoint:exported-entry-waiver",
+            Self::StaticVsEntry(_) => "pair-disjoint:static-vs-entry",
+        }
+    }
+
+    /// The receipt with its evidence count. `key()` stays a fixed vocabulary so
+    /// the census can count it; this is what the lane's ledger records.
+    pub(crate) fn receipt(self) -> String {
+        match self {
+            Self::StaticVsEntry(callers) => format!("{}:callers={callers}", self.key()),
+            _ => self.key().to_owned(),
         }
     }
 }
@@ -746,6 +762,18 @@ impl PairDisjointnessIndex {
         {
             return Ok(CertificateKind::FreshStackAddress);
         }
+        // R483-3(f), before (e): a static beside a parameter's pointee, with
+        // the closed world reading every caller of the function the parameter
+        // belongs to.
+        for (statik, entry) in [(a, b), (b, a)] {
+            if let RootClass::Static(did) = statik.class
+                && let Some(formal) = self.formal_of(caller, entry.class)
+                && let Some(callers) =
+                    self.static_vs_formal(caller, formal, did, 0, &mut Vec::new())
+            {
+                return Ok(CertificateKind::StaticVsEntry(callers));
+            }
+        }
         // (e) R462-1, last: the callee's two parameters may be separable even
         // where this call site's arguments are not, if every in-program call
         // separates them (or the chain reaches an exported entry's waiver).
@@ -798,6 +826,68 @@ impl PairDisjointnessIndex {
         reason = "witness surface: every certify() outcome, for the RED-first tests \
                   and the census ledger column main may add"
     )]
+    /// R483-3(f). Can the pointee of `function`'s formal `formal` be the static
+    /// `statik`? The closed world answers by reading every in-crate call site:
+    /// each must pass something whose root is known and is not that static, or
+    /// its own formal, which recurses. Returns how many sites were checked.
+    ///
+    /// Refused for an EXPORTED function — an embedder is outside the closed
+    /// world, and R462-1's waiver is about two of an entry's own parameters,
+    /// not about a program-internal static's address — and for a function no
+    /// in-crate caller reaches, where there is no evidence at all.
+    fn static_vs_formal(
+        &self,
+        function: u32,
+        formal: usize,
+        statik: DefId,
+        depth: usize,
+        seen: &mut Vec<(u32, usize)>,
+    ) -> Option<u32> {
+        if depth > 8 || seen.contains(&(function, formal)) || self.exported.contains(&function) {
+            return None;
+        }
+        seen.push((function, formal));
+        let mut callers = 0u32;
+        let mut ok = true;
+        'sites: for ((caller, target), records) in &self.sites {
+            if *target != function {
+                continue;
+            }
+            for record in records {
+                let Some(arg) = record.args.iter().find(|arg| arg.index == formal) else {
+                    ok = false;
+                    break 'sites;
+                };
+                callers += 1;
+                match arg.class {
+                    RootClass::Static(other) if other != statik => {}
+                    RootClass::StackObject(_)
+                    | RootClass::FreshAlloc(..)
+                    | RootClass::FreshField { .. } => {}
+                    RootClass::EntryStorage(_) => {
+                        let Some(up) = self.formal_of(*caller, arg.class) else {
+                            ok = false;
+                            break 'sites;
+                        };
+                        match self.static_vs_formal(*caller, up, statik, depth + 1, seen) {
+                            Some(up_callers) => callers += up_callers,
+                            None => {
+                                ok = false;
+                                break 'sites;
+                            }
+                        }
+                    }
+                    RootClass::Static(_) | RootClass::Unknown => {
+                        ok = false;
+                        break 'sites;
+                    }
+                }
+            }
+        }
+        seen.pop();
+        (ok && callers > 0).then_some(callers)
+    }
+
     pub(crate) fn ledger(&self) -> Vec<LedgerRow> {
         self.ledger.borrow().clone()
     }
@@ -1313,7 +1403,7 @@ impl PairDisjointnessIndex {
                                 left.span,
                                 right.span,
                             )
-                            .map_or_else(|why| why.key().to_owned(), |kind| kind.key().to_owned());
+                            .map_or_else(|why| why.key().to_owned(), CertificateKind::receipt);
                         let stack_take = |class: RootClass| match class {
                             RootClass::StackObject(id) => {
                                 takes.get(&(caller_did, id)).copied().or(Some(0))
