@@ -914,6 +914,39 @@ pub(crate) fn link_a5_fallback_carriers(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
+        // **R499-1 — the raw twin discharges the A5 obligation with zero syntax.**
+        //
+        // A counted-void call routed `RawTwin` is rendered by renaming the callee and passing
+        // the input's OWN argument text, because the twin's parameters are raw. No safe view
+        // is created at that call, so there is no pair to prove disjoint: the obligation is
+        // discharged, exactly as `Clear` and `Primary` are, and it needs no carrier.
+        //
+        // R496-1 stopped the fallback PLANNING its stamps there, which removed four dead
+        // `let`s from brotli's tree and turned its census row from `instrument-error` to `ok`.
+        // It left this half undone, and batch 20's probe measured the cost: the proof site
+        // still asked for a carrier, found its own call's edit gone, and dropped
+        // `a5-fallback-unrenderable:raw=true;carriers=1;edits=0` — holding
+        // `ProcessSingleCodeLength` and `SafeReadSymbolCodeLengths` and taking seven delivered
+        // subjects with them. A site whose rendering another arm owns must be DISCHARGED, not
+        // left looking for an edit that was correctly never made.
+        //
+        // Narrow at three edges, as the planner yield is: the route must be `RawTwin`, the
+        // caller must match, and the twin's call must contain the proof's own span.
+        if table.seams.counted_void_calls.iter().any(|counted| {
+            counted.route == super::decision::counted_void::Route::RawTwin
+                && counted.caller == proof.caller
+                && counted
+                    .call_span
+                    .source_callsite()
+                    .contains(proof.span.source_callsite())
+        }) {
+            for index in sites {
+                let site = &mut plan.preclass_sites[index];
+                site.expected_form = Form::Raw.key().into();
+                site.state = ClassSiteState::ZeroSyntaxReady;
+            }
+            continue;
+        }
         for index in sites {
             let site = &plan.preclass_sites[index];
             let calls_ref = &calls;

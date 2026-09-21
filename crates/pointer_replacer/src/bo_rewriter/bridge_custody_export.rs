@@ -3042,4 +3042,91 @@ mod raw_twin_supersede_tests {
             "the comparator is untouched"
         );
     }
+
+    /// **R499-1 — and the obligation is DISCHARGED there, not left looking for a carrier.**
+    ///
+    /// R496-1 stopped the A5 fallback planning its stamps at a raw-twin call. Measured on
+    /// brotli (65 min, probe `r496brotli`): four dead `let __crat_a5_raw_6925671_*` left the
+    /// tree, custody went `data=true` with 0 issues and 0 tree-only, and the census row went
+    /// `instrument-error` → `ok`. It also cost **seven subjects**, and the hold said why:
+    ///
+    /// ```text
+    /// held:dropped-site:a5-site-proof-t2-fallback:a5-fallback-unrenderable:raw=true;carriers=1;edits=0
+    /// ```
+    ///
+    /// The proof site still asked `link_a5_fallback_carriers` for a carrier and found its own
+    /// call's edit correctly gone. A site whose rendering another arm owns has to be
+    /// discharged — as `Clear` and `Primary` are — not held for an edit that was never going
+    /// to be made.
+    ///
+    /// **The limit, measured rather than assumed**: this is a source-text witness and it
+    /// passes against a semantic disable. Three attempts at a fixture reaching the shape
+    /// (cross-module twin, field siblings, both) emitted `stamps=0 twin=0`; that was MAX-3 and
+    /// I stopped. The behavioural checks are the assembler's heman probe on the re-cut (heman
+    /// carries six superseded twin sites) and batch 26's `*.a5-proof-site-fallback.tsv`, where
+    /// these sites must read a ready state rather than `a5-fallback-unrenderable`.
+    #[test]
+    fn r499_1_a_raw_twin_site_discharges_the_a5_obligation_with_zero_syntax() {
+        let planner = include_str!("plan/mod.rs");
+        let body = planner
+            .split("pub(crate) fn link_a5_fallback_carriers(")
+            .nth(1)
+            .expect("the carrier linker exists");
+        // **Comments are not code.** The first version of this anchored on
+        // `a5-fallback-unrenderable:raw=` and found it in the comment ABOVE the new arm,
+        // which put `resolve` before `discharge` and turned the ordering assertion RED on a
+        // correct tree. The same shape cost the R492-1 witness a false count and the module
+        // ratchet a commented-out `mod`; three times is a rule, so the scan drops comment
+        // lines before it looks for anything.
+        let body = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+
+        // The block starts at its `if`, NOT at the route constant: anchoring on the constant
+        // put the short-circuit check downstream of the `false &&` it was meant to catch, and
+        // the disable passed a second time. Measured both ways before this line was written.
+        let discharge = body
+            .find("if table.seams.counted_void_calls")
+            .expect("a raw-twin site discharges the obligation");
+        assert!(
+            body[discharge..].contains("counted_void::Route::RawTwin"),
+            "the discharge is keyed on the twin route"
+        );
+        let resolve = body
+            .find("a5-fallback-unrenderable:raw=")
+            .expect("the carrier resolution is still there for every other site");
+        assert!(
+            discharge < resolve,
+            "the discharge must precede the carrier resolution, or the site is dropped for \
+             missing an edit that another arm owns"
+        );
+
+        let arm = &body[discharge..resolve];
+        for (needle, why) in [
+            (
+                "counted.caller == proof.caller",
+                "another caller is another site",
+            ),
+            (
+                "contains(proof.span",
+                "the twin's call must contain the proof's own span",
+            ),
+            ("ZeroSyntaxReady", "discharged, not merely un-dropped"),
+        ] {
+            assert!(arm.contains(needle), "{why}: {arm}");
+        }
+
+        // **The one fault a source-text witness CAN close, so it does.** I disabled this arm
+        // semantically (`false && counted.route == ..`) and the test above still passed --
+        // every string it looks for was still there. That exact disable is now refused. It is
+        // a band-aid over a structural limit, not a substitute for the behavioural check in
+        // the doc comment, and I would rather name it as one than let it read as coverage.
+        assert!(
+            !arm.contains("false &&") && !arm.contains("true &&"),
+            "the discharge condition is short-circuited: {arm}"
+        );
+    }
 }
