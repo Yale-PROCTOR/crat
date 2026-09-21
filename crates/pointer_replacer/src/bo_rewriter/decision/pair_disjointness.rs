@@ -183,6 +183,11 @@ enum RootClass {
     /// A parameter's VALUE, fixed at entry (never reassigned, address never
     /// taken), or a place inside its pointee: storage that existed at entry.
     EntryStorage(HirId),
+    /// R482-4(4): a `static` item — a NAMED global object. Two different
+    /// statics are two objects, and a static is neither this frame's stack nor
+    /// a block an allocator has just returned. It is NOT separable from a
+    /// parameter's pointee: a caller may pass the static itself.
+    Static(DefId),
     /// R479-4a: the value read out of a pointer field whose EVERY store in the
     /// program is a directly called named allocator. `base` is the root binding
     /// of the place the field was read from, because the sound claim is
@@ -218,7 +223,7 @@ impl RootClass {
     fn object_id(self) -> Option<HirId> {
         match self {
             Self::FreshAlloc(id, _) | Self::StackObject(id) | Self::EntryStorage(id) => Some(id),
-            Self::FreshField { .. } | Self::Unknown => None,
+            Self::FreshField { .. } | Self::Static(_) | Self::Unknown => None,
         }
     }
 }
@@ -874,6 +879,28 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
         }
         _ => {}
     }
+    // R482-4(4). A static is a named global: distinct from another static,
+    // from this frame's stack and from a block allocated inside this body. A
+    // parameter's pointee may BE the static, so that pair is refused.
+    match (a, b) {
+        (RootClass::Static(x), RootClass::Static(y)) => {
+            return (x != y).then_some(CertificateKind::DistinctRoots);
+        }
+        (RootClass::Static(_), other) | (other, RootClass::Static(_)) => {
+            return match other {
+                RootClass::StackObject(_) => Some(CertificateKind::DistinctRoots),
+                RootClass::FreshAlloc(_, Freshness::Proven) => Some(CertificateKind::DistinctRoots),
+                RootClass::FreshAlloc(_, Freshness::Contract) => {
+                    Some(CertificateKind::DistinctRootsUnderContract)
+                }
+                RootClass::EntryStorage(_)
+                | RootClass::FreshField { .. }
+                | RootClass::Static(_)
+                | RootClass::Unknown => None,
+            };
+        }
+        _ => {}
+    }
     let (fresh, other) = if a.is_fresh_object() {
         (a, b)
     } else if b.is_fresh_object() {
@@ -882,7 +909,7 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
         return None;
     };
     match other {
-        RootClass::Unknown | RootClass::FreshField { .. } => None,
+        RootClass::Unknown | RootClass::FreshField { .. } | RootClass::Static(_) => None,
         RootClass::FreshAlloc(..) | RootClass::StackObject(_) | RootClass::EntryStorage(_) => {
             (fresh.object_id() != other.object_id()).then(|| {
                 match fresh.freshness().join(other.freshness()) {
@@ -1216,6 +1243,7 @@ impl PairDisjointnessIndex {
                     Freshness::Proven => format!("fresh-field:{field}"),
                     Freshness::Contract => format!("fresh-field-contract:{field}"),
                 },
+                RootClass::Static(_) => "static".to_owned(),
                 RootClass::Unknown => "unknown".to_owned(),
             }
         };
@@ -2115,6 +2143,17 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
     }
 }
 
+/// R482-4(4): the `DefId` of a `static` item named by a path.
+fn resolved_static(expr: &Expr<'_>) -> Option<DefId> {
+    let ExprKind::Path(QPath::Resolved(_, path)) = &peel_casts(expr).kind else {
+        return None;
+    };
+    match path.res {
+        Res::Def(rustc_hir::def::DefKind::Static { .. }, did) => Some(did),
+        _ => None,
+    }
+}
+
 fn resolved_local(expr: &Expr<'_>) -> Option<HirId> {
     let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind else {
         return None;
@@ -2377,6 +2416,10 @@ fn pointer_value_provenance<'tcx>(
 ) -> (RootClass, Option<PlacePath>) {
     let expr = peel_casts(expr);
     match &expr.kind {
+        ExprKind::Path(..) if resolved_local(expr).is_none() => match resolved_static(expr) {
+            Some(did) => (RootClass::Static(did), None),
+            None => (RootClass::Unknown, None),
+        },
         ExprKind::Path(..) => match resolved_local(expr) {
             Some(binding) => {
                 let class = classes.get(&binding).copied().unwrap_or(RootClass::Unknown);
@@ -2484,7 +2527,12 @@ fn place_provenance<'tcx>(
             }
             ExprKind::Path(..) => {
                 let Some(binding) = resolved_local(cur) else {
-                    return (RootClass::Unknown, None);
+                    // A `static` is a named object of its own; it carries no
+                    // `PlacePath`, whose root is a binding.
+                    return match resolved_static(cur) {
+                        Some(did) => (RootClass::Static(did), None),
+                        None => (RootClass::Unknown, None),
+                    };
                 };
                 projections.reverse();
                 let class = match classes.get(&binding).copied() {

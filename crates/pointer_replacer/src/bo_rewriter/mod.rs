@@ -97,6 +97,8 @@ mod ownership_fields_native_tests;
 mod pair_disjointness_tests;
 #[cfg(test)]
 mod pair_fresh_field_tests;
+#[cfg(test)]
+mod pair_static_root_tests;
 pub(crate) mod plan;
 #[cfg(test)]
 mod raw_initializer_tests;
