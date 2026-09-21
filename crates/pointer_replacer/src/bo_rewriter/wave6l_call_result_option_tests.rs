@@ -117,6 +117,26 @@ pub unsafe extern "C" fn make_item(mut n: usize, mut kind: usize) -> *mut item {
 }
 "#;
 
+/// The third control: a FOREIGN callee's null-tested result (libtree
+/// `parse_ld_config_file::comment#83`, `strchr`). A foreign return carries no
+/// body to reason about and belongs to the contract families, so this arm
+/// refuses it and the row stays held.
+const FOREIGN_CALLEE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+unsafe extern "C" {
+    fn strchr(s: *mut i8, c: i32) -> *mut i8;
+}
+#[no_mangle]
+pub unsafe extern "C" fn strip_comment(mut line: *mut i8) -> i32 {
+    let mut comment = strchr(line, '#' as i32);
+    if comment.is_null() {
+        return 0 as i32;
+    }
+    *comment = 0 as i8;
+    return 1 as i32;
+}
+"#;
+
 fn emitted(name: &str, source: &str, exposed: &[&str]) -> RewriteOutcome {
     use sha2::{Digest, Sha256};
     let dir = std::env::temp_dir().join(format!("crat-wave6l-a8-{name}-{}", std::process::id()));
@@ -299,5 +319,27 @@ fn w6l_a8_escaping_receiver_stays_held() {
         degradations.iter().any(|d| d.subject == "make_item::it"
             && format!("{:?}", d.reason).contains("ReturnNotAdapted")),
         "{degradations:?}"
+    );
+}
+
+/// **The foreign control.** `strchr`'s result is not this arm's value: the
+/// callee has no body in the crate, so the row stays raw and held.
+#[test]
+fn w6l_a8_foreign_callee_result_is_refused() {
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        degradations,
+        ..
+    } = emitted("foreign-callee", FOREIGN_CALLEE, &["strip_comment"])
+    else {
+        panic!("foreign-callee fixture degraded to a non-emitting outcome");
+    };
+    println!("W6L-A8-FOREIGN-EMITTED\n{source}\nW6L-A8-FOREIGN-END\n{degradations:?}");
+    assert_eq!(reverted_count, 0, "{degradations:?}");
+    let text = compact(&source);
+    assert!(
+        !text.contains("letmutcomment:Option<"),
+        "a foreign callee's result was typed by the A8 arm: {text}"
     );
 }

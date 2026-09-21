@@ -54,11 +54,18 @@ fn peel<'a>(mut expr: &'a Expr<'a>) -> &'a Expr<'a> {
 /// crate. An indirect call (a function pointer) and a foreign callee are both
 /// refused: the first has no single callee to reason about, and the second is
 /// the allocator families' value, not this one's.
-fn local_callee(expr: &Expr<'_>) -> Option<LocalDefId> {
+fn local_callee(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> Option<LocalDefId> {
     let ExprKind::Call(function, _) = peel(expr).kind else { return None };
     let ExprKind::Path(QPath::Resolved(_, path)) = function.kind else { return None };
     let Res::Def(DefKind::Fn, did) = path.res else { return None };
-    did.as_local()
+    let local = did.as_local()?;
+    // A declaration inside `unsafe extern "C" { .. }` is `DefKind::Fn` and IS
+    // `as_local` — the extern block belongs to this crate. "Local" here means
+    // a function with a BODY (wave-6a's R410-9 (b) rule, same words): a
+    // foreign result carries a contract this arm does not read, and belongs to
+    // the contract families. Measured: without this, libtree's `strchr` row
+    // types itself (`w6l_a8_foreign_callee_result_is_refused`).
+    tcx.hir_node_by_def_id(local).body_id().map(|_| local)
 }
 
 /// The closed use vocabulary. Every use of the local must be one the Option
@@ -142,7 +149,7 @@ pub(crate) fn value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<CallResultValu
     {
         return None;
     }
-    let callee = local_callee(initializer)?;
+    let callee = local_callee(tcx, initializer)?;
     // The callee's own return must still be RAW. A converted return is the
     // return receiver's value (`raw_receiver`), and re-adapting it with
     // `as_mut()` would be ill-typed.
