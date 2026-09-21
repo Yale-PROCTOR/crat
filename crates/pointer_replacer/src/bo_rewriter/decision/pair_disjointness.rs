@@ -96,6 +96,13 @@ pub(crate) enum CertificateKind {
     /// not this static. The payload is how many call sites were checked, so
     /// the evidence behind each certificate is countable in the ledger.
     StaticVsEntry(u32),
+    /// R486-2, USER Decision C, waiver id `exported-entry-static-waiver
+    /// (2026-09-21)`: the same rule where the function is an exported
+    /// `#[no_mangle]` entry, so the callers the closed world CANNOT see are
+    /// assumed not to pass the address of a program-internal static. An
+    /// assumption, never a proof, and receipted as one. The in-crate callers
+    /// are still read, and one of them passing the static still refuses.
+    StaticVsEntryWaived(u32),
 }
 
 impl CertificateKind {
@@ -109,7 +116,9 @@ impl CertificateKind {
             Self::FreshStackAddress => "pair-disjoint:fresh-stack-address",
             Self::ParameterPair => "pair-disjoint:parameter-pair",
             Self::ExportedEntryWaiver => "pair-disjoint:exported-entry-waiver",
-            Self::StaticVsEntry(_) => "pair-disjoint:static-vs-entry",
+            Self::StaticVsEntry(_) | Self::StaticVsEntryWaived(_) => {
+                "pair-disjoint:static-vs-entry"
+            }
         }
     }
 
@@ -118,12 +127,21 @@ impl CertificateKind {
     pub(crate) fn receipt(self) -> String {
         match self {
             Self::StaticVsEntry(callers) => format!("{}:callers={callers}", self.key()),
+            Self::StaticVsEntryWaived(callers) => format!(
+                "{}:callers={callers}:{}",
+                self.key(),
+                EXPORTED_ENTRY_STATIC_WAIVER
+            ),
             _ => self.key().to_owned(),
         }
     }
 }
 
 pub(crate) const CERTIFICATE_FAMILY: &str = "pair-disjointness-certificate";
+
+/// R486-2 (USER Decision C, 2026-09-21). Named so every site that rests on the
+/// assumption can be counted and, if it is ever withdrawn, found.
+pub(crate) const EXPORTED_ENTRY_STATIC_WAIVER: &str = "exported-entry-static-waiver";
 
 /// Why a pair stayed unproved. One fixed vocabulary, so the census can count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -768,10 +786,14 @@ impl PairDisjointnessIndex {
         for (statik, entry) in [(a, b), (b, a)] {
             if let RootClass::Static(did) = statik.class
                 && let Some(formal) = self.formal_of(caller, entry.class)
-                && let Some(callers) =
+                && let Some((callers, waived)) =
                     self.static_vs_formal(caller, formal, did, 0, &mut Vec::new())
             {
-                return Ok(CertificateKind::StaticVsEntry(callers));
+                return Ok(if waived {
+                    CertificateKind::StaticVsEntryWaived(callers)
+                } else {
+                    CertificateKind::StaticVsEntry(callers)
+                });
             }
         }
         // (e) R462-1, last: the callee's two parameters may be separable even
@@ -842,11 +864,14 @@ impl PairDisjointnessIndex {
         statik: DefId,
         depth: usize,
         seen: &mut Vec<(u32, usize)>,
-    ) -> Option<u32> {
-        if depth > 8 || seen.contains(&(function, formal)) || self.exported.contains(&function) {
+    ) -> Option<(u32, bool)> {
+        if depth > 8 || seen.contains(&(function, formal)) {
             return None;
         }
         seen.push((function, formal));
+        // R486-2: an exported entry's unseen callers are assumed not to pass
+        // the static. Its IN-CRATE callers are still read below.
+        let mut waived = self.exported.contains(&function);
         let mut callers = 0u32;
         let mut ok = true;
         'sites: for ((caller, target), records) in &self.sites {
@@ -870,7 +895,10 @@ impl PairDisjointnessIndex {
                             break 'sites;
                         };
                         match self.static_vs_formal(*caller, up, statik, depth + 1, seen) {
-                            Some(up_callers) => callers += up_callers,
+                            Some((up_callers, up_waived)) => {
+                                callers += up_callers;
+                                waived |= up_waived;
+                            }
                             None => {
                                 ok = false;
                                 break 'sites;
@@ -885,7 +913,9 @@ impl PairDisjointnessIndex {
             }
         }
         seen.pop();
-        (ok && callers > 0).then_some(callers)
+        // Without the waiver a function no in-crate caller reaches is no
+        // evidence at all; with it, the exported entry IS the evidence.
+        (ok && (callers > 0 || waived)).then_some((callers, waived))
     }
 
     pub(crate) fn ledger(&self) -> Vec<LedgerRow> {

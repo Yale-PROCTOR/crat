@@ -95,7 +95,7 @@ fn w6p_one_caller_passing_the_static_refuses_it() {
     assert!(
         !matches!(
             verdict(A_CALLER_PASSES_THE_STATIC, "zcmpi", "zcmp", 0, 1),
-            Ok(CertificateKind::StaticVsEntry(_))
+            Ok(CertificateKind::StaticVsEntry(_) | CertificateKind::StaticVsEntryWaived(_))
         ),
         "a single caller handing over the static is the whole counterexample"
     );
@@ -125,15 +125,17 @@ fn w6p_an_unknown_caller_argument_refuses_it() {
     assert!(
         !matches!(
             verdict(A_CALLER_WITH_AN_UNKNOWN_ROOT, "zcmpi", "zcmp", 0, 1),
-            Ok(CertificateKind::StaticVsEntry(_))
+            Ok(CertificateKind::StaticVsEntry(_) | CertificateKind::StaticVsEntryWaived(_))
         ),
         "an unknown root may be the static"
     );
 }
 
-/// Control (iii): an EXPORTED function has callers the closed world cannot
-/// see. R462-1 waives aliasing between two of an entry's own parameters; it
-/// says nothing about whether one of them is a program-internal static.
+/// R486-2, USER Decision C, waiver id `exported-entry-static-waiver
+/// (2026-09-21)`: an exported entry's pointer parameter is not the address of a
+/// program-internal static. An ASSUMPTION about the embedder, never a proof —
+/// so the certificate carries the waiver id in its receipt at every site that
+/// rests on it, exactly as R462-1's does.
 const AN_EXPORTED_FUNCTION: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
 pub static mut libzahl_tmp_cmp: [u32; 4] = [0; 4];
@@ -153,13 +155,52 @@ pub unsafe fn driver() -> i32 {
 "#;
 
 #[test]
-fn w6p_an_exported_function_is_not_closed() {
+fn w6p_an_exported_entry_certifies_under_the_named_waiver() {
+    let outcome = verdict(AN_EXPORTED_FUNCTION, "zcmpi", "zcmp", 0, 1);
+    assert!(
+        matches!(outcome, Ok(CertificateKind::StaticVsEntryWaived(_))),
+        "Decision C lets the exported entry's own callers go unseen: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.expect("certified").receipt(),
+        "pair-disjoint:static-vs-entry:callers=1:exported-entry-static-waiver",
+        "an assumption is receipted at every site that rests on it"
+    );
+}
+
+/// The waiver covers only the callers the closed world cannot see. An IN-CRATE
+/// caller of the exported entry that hands over the static still refuses.
+const AN_EXPORTED_FUNCTION_WITH_AN_IN_CRATE_CALLER_PASSING_THE_STATIC: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+pub static mut libzahl_tmp_cmp: [u32; 4] = [0; 4];
+pub unsafe fn zcmp(mut a: *mut u32, mut b: *mut u32) -> i32 {
+    *a = 1;
+    *b.offset(1) = 2;
+    0
+}
+#[no_mangle]
+pub unsafe extern "C" fn zcmpi(mut a: *mut u32) -> i32 {
+    zcmp(a, libzahl_tmp_cmp.as_mut_ptr())
+}
+pub unsafe fn driver() -> i32 {
+    zcmpi(libzahl_tmp_cmp.as_mut_ptr())
+}
+"#;
+
+#[test]
+fn w6p_the_waiver_does_not_cover_an_in_crate_caller() {
     assert!(
         !matches!(
-            verdict(AN_EXPORTED_FUNCTION, "zcmpi", "zcmp", 0, 1),
-            Ok(CertificateKind::StaticVsEntry(_))
+            verdict(
+                AN_EXPORTED_FUNCTION_WITH_AN_IN_CRATE_CALLER_PASSING_THE_STATIC,
+                "zcmpi",
+                "zcmp",
+                0,
+                1
+            ),
+            Ok(CertificateKind::StaticVsEntry(_) | CertificateKind::StaticVsEntryWaived(_))
         ),
-        "an embedder is outside the closed world"
+        "a caller the closed world CAN see, passing the static, still refuses"
     );
 }
 
@@ -182,7 +223,7 @@ fn w6p_no_in_crate_caller_is_no_evidence() {
     assert!(
         !matches!(
             verdict(NO_CALLER_AT_ALL, "zcmpi", "zcmp", 0, 1),
-            Ok(CertificateKind::StaticVsEntry(_))
+            Ok(CertificateKind::StaticVsEntry(_) | CertificateKind::StaticVsEntryWaived(_))
         ),
         "an uncalled function's parameter is unconstrained"
     );
