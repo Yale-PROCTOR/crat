@@ -9683,6 +9683,8 @@ mod run {
                 let crate::bo_rewriter::ast_transform::UseGraftStats {
                     grafted: _,
                     composed_over_inner: _,
+                    // W6L-FLOOR (R490-2(b)): receipts, not a gate here.
+                    composition_held: _,
                     parse_failed: _,
                     parse_failures: _,
                     unmatched: _,

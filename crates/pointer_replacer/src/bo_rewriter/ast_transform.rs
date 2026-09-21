@@ -1313,6 +1313,15 @@ pub(crate) struct UseGraftStats {
     /// site's range and differ only in `SyntaxContext`, which the `(lo, hi)`
     /// key drops. Corpus expectation is 0 and it is GATED.
     pub multi_matched: usize,
+    /// **W6L-FLOOR (R490-2(b)).** Compositions this pass could not locate, one
+    /// receipt each: the outer edit's text does not contain the call's printed
+    /// form (the outer renderer embedded it with its arguments already
+    /// adapted), so the view cannot be spliced into it. The composition is
+    /// SKIPPED and the receipt carries the caller, the view's owner class and
+    /// the span pair — the program still emits, and the class is held by the
+    /// ordinary revert path rather than by aborting the whole program at
+    /// round 0 (wave-5d 055: five views switching on aborted heman entirely).
+    pub composition_held: Vec<String>,
     /// `(offset, rendered text)` per graft — the text differential's left-hand
     /// side, keyed exactly as the declaration renders are.
     pub rendered: Vec<(u32, String)>,
@@ -1453,7 +1462,7 @@ impl<'a> UseGraftVisitor<'a> {
 /// `needle`'s occurrence in `hay` ignoring whitespace on both sides, as a
 /// byte range of `hay`. Used by the nested-edit composition to find a node's
 /// source text inside a use text rendered from the same source.
-fn find_ignoring_whitespace(hay: &str, needle: &str) -> Option<(usize, usize)> {
+pub(crate) fn find_ignoring_whitespace(hay: &str, needle: &str) -> Option<(usize, usize)> {
     let needle: Vec<char> = needle.chars().filter(|c| !c.is_whitespace()).collect();
     if needle.is_empty() {
         return None;
@@ -1554,9 +1563,18 @@ impl MutVisitor for UseGraftVisitor<'_> {
                         composed.as_str()
                     }
                     None => {
+                        // **W6L-FLOOR (R490-2(b)).** The outer edit's text does
+                        // not contain this node's printed form, so there is
+                        // nothing to splice the view into. Hold the one class
+                        // with a receipt and leave the node intact: a
+                        // composition this pass cannot locate is a class's
+                        // problem, never the program's.
                         self.composition_failures.push(format!(
-                            "nested-composition:inner-text-not-found:{}..{}",
-                            key.0, key.1
+                            "composition-held:caller={}:class={}:inner-text-not-found:{}..{}",
+                            view.caller.local_def_index.as_u32(),
+                            view.owner_class().order_key(),
+                            key.0,
+                            key.1
                         ));
                         return;
                     }
@@ -4273,9 +4291,14 @@ fn transform_with<'tcx>(
         .with_inner_views(inner_views);
     g.visit_crate(&mut krate);
     let (mut grafts, composed_receiver_inputs, composition_failures) = g.finish_composed();
-    if let Some(why) = composition_failures.first() {
-        return Err(why.clone());
-    }
+    // **W6L-FLOOR (R490-2(b)), and the `?` is deliberately NOT here.** This
+    // read `return Err(why)`, which made one unlocatable composition a
+    // program-level failure at round 0 — the shape wave-5d 055 hit when their
+    // admission un-reverted heman's texel class and five views switched on at
+    // once. D13-W3 pins the same property for the PAIR renderer: a source
+    // failure holds its one class. Restoring the propagation here turns this
+    // back into an aborted program and the floor witness fails.
+    grafts.composition_held = composition_failures;
     // wave-6f (W6F-3): owned-field wraps, post-order over the grafted tree.
     // A wrapped node keeps its span, so a use edit nested INSIDE a wrap is
     // reached either way; running after the use pass makes the other nesting

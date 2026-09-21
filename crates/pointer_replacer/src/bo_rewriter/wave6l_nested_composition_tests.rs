@@ -136,3 +136,33 @@ fn w6l_shared_reborrow_composes_over_the_weakened_argument() {
         raw_boundary_artifacts.class_collisions
     );
 }
+
+/// **W6L-FLOOR's trigger, pinned exactly (relay 032, R490-2(b)).**
+///
+/// wave-5d 055 measured the texts: the OUTER replacement carries the call with
+/// its arguments ALREADY ADAPTED, while the view carries the call as written,
+/// so the matcher — which looks for the printed node inside the outer text,
+/// ignoring whitespace — cannot locate it. Before the floor, that returned
+/// `Err` from the AST layer and aborted the WHOLE program at round 0; now it
+/// records `composition-held:caller=..:class=..:inner-text-not-found:lo..hi`
+/// and the class is held like any other. This witness pins the trigger itself
+/// with wave-5d's own strings, so a change that made the matcher accept an
+/// adapted-argument call (and splice the view into the wrong place) fails
+/// here first.
+#[test]
+fn w6l_floor_trigger_the_outer_text_with_adapted_arguments_is_unlocatable() {
+    let outer = "core::slice::from_raw_parts(heman_image_texel(texture.as_mut().unwrap(), \
+                 u as libc::c_int, v as libc::c_int), crate::FALLBACK_SLICE_EXTENT)";
+    let original = "heman_image_texel(texture, u as libc::c_int, v as libc::c_int)";
+    assert!(
+        super::ast_transform::find_ignoring_whitespace(outer, original).is_none(),
+        "the adapted-argument call must NOT be located in the outer text"
+    );
+    // The same outer text WITH the call as written is locatable: the matcher
+    // is not simply broken, it is exact about the arguments.
+    let written = outer.replace("texture.as_mut().unwrap()", "texture");
+    assert!(
+        super::ast_transform::find_ignoring_whitespace(&written, original).is_some(),
+        "the call as written must be locatable"
+    );
+}
