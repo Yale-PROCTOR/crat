@@ -117,6 +117,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         // wave-6v2 typed-width table (ec0e694a): not a width-fixed view.
         width: None,
         alias: None,
+        decl: None,
         handle: Some(text),
         uses: edits,
     })

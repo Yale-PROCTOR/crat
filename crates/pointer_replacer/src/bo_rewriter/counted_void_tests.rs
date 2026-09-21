@@ -1771,3 +1771,34 @@ fn w6v_view_beside_the_callers_own_local_storage_is_disjoint() {
     assert_eq!(original, b"23\n".to_vec());
     assert_eq!(run_binary(&format!("{source}\n{main}")), original);
 }
+
+/// **R491-6 route (i): the counted READ alias is a delivered row of its own.**
+///
+/// The alias `csrc` is what the emitted program reads bytes through, so the
+/// ledger should say so. It cannot say so by carrying the contract's use edits
+/// — those are the contract's, and planning them twice is the duplicate K21
+/// refuses — so it says so by taking the one edit that is genuinely its own:
+/// its DECLARATION, `let mut csrc = src as *const u8` → `src.unwrap_or(&[])`.
+/// The contract keeps every use.
+#[test]
+fn w6v_counted_read_alias_is_a_delivered_row_of_its_own() {
+    let rows = super::emit_tests::decisions_of(CSV_READ);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "csrc" && !*p && r == "<emitted>"),
+        "the alias local delivers on its own declaration: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(CSV_READ).unwrap();
+    let c = compact(&source);
+    // The emitted text is unchanged by the move: one initializer, one of each use.
+    assert_eq!(
+        c.matches("letmutcsrc=src.unwrap_or(&[]);").count(),
+        1,
+        "the declaration is planned exactly once: {source}"
+    );
+    assert!(
+        !c.contains("csrcas*constu8") && !c.contains("*csrcasi32"),
+        "no unrewritten alias site survives: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}

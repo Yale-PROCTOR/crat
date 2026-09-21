@@ -48,11 +48,17 @@ pub(crate) struct Contract {
     /// `count_index` is then the discriminant's index, or the parameter's own.
     pub(crate) width: Option<super::binn_counted::WidthTable>,
     /// The counted READ alias this contract rewrites (`let a = P as *const B`),
-    /// when there is one: the local's initializer and every use are the
-    /// contract's edits, so the local needs no declaration of its own. The
+    /// when there is one: every USE of the local is the contract's edit. The
     /// declaration family reads this to mark it declaration-free (relay
     /// wave-6v/030 route (a); wave-6k relay 035).
     pub(crate) alias: Option<HirId>,
+    /// **The alias's own declaration (R491-6, route (i)).** Its initializer —
+    /// `let a = P as *const B` → `P.unwrap_or(&[])` — is the one edit that
+    /// belongs to the ALIAS and not to the parameter, so the contract plans it
+    /// here and hands it over: [`alias_declaration`] gives it to the alias
+    /// subject, which delivers on it. Planning it in `uses` as well is the
+    /// duplicate K21 refuses (report 031: the same span, twice).
+    pub(crate) decl: Option<UseEdit>,
     pub(crate) uses: Vec<UseEdit>,
 }
 
@@ -74,6 +80,107 @@ pub(crate) fn alias_contract<'a>(ctx: &super::Ctx<'a, '_>, s: &Subject) -> Optio
         .enabled(s.fn_did, FamilyStage::Declaration)
         && ctx.family_policy.enabled(s.fn_did, FamilyStage::SliceUse))
     .then_some(contract)
+}
+
+/// **The declaration edit a counted READ alias delivers on (R491-6, route (i)).**
+///
+/// The contract owns every USE of the alias; what it does not own is the
+/// local's own initializer, and that is exactly one splice target — enough for
+/// the alias to be a row of its own instead of a `copy-source-coupled`
+/// degradation beside the code it is the subject of. Route (ii), a delivered
+/// row with no edits at all, was refused: the ledger may only say "emitted"
+/// where the tree independently witnesses it.
+/// **A decision that carries the alias's own initializer (R491-6, route (i)).**
+///
+/// Readable from the decision alone, because the construction planner has no
+/// `Ctx`: the edit names itself (`counted-void-read-alias`). A constructor over
+/// the same initializer would wrap this edit in `from_raw_parts` and fabricate
+/// an extent — measured, and it costs the contract its own delivery — where the
+/// edit already types the binding by inference from a view the count governs.
+pub(crate) fn declares_its_own_alias(decision: &super::Decision) -> &[UseEdit] {
+    match decision {
+        super::Decision::Slice { uses, .. }
+            if uses.iter().any(|u| u.bridge_kind == "counted-void-read-alias") =>
+        {
+            uses
+        }
+        _ => &[],
+    }
+}
+
+/// **The alias's initializer, carried through the CONSTRUCTION channel.**
+///
+/// The channel is not a formality: it is what the AST emission reads for an
+/// unannotated local, so an edit that only sits in the decision's `uses` is
+/// never placed and the function reverts whole (measured). What this family
+/// needs from the channel is only the text — no `from_raw_parts`, no
+/// fabricated extent — because the initializer is already a view of the
+/// parameter, whose length is the count the contract carries. Deliberately the
+/// same shape as wave-5d2's derived-suffix plan (R445-2), for the same reason.
+pub(crate) fn alias_construction<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    facts: &super::construction::ConstructionFacts,
+    subject: &Subject,
+    decision: &super::Decision,
+) -> Option<super::construction::SliceConstructionPlan> {
+    let edit = declares_its_own_alias(decision)
+        .iter()
+        .find(|u| u.bridge_kind == "counted-void-read-alias")?;
+    let node = (subject.fn_did, subject.hir_id);
+    let init_hir = *facts.init_hirs.get(&node)?;
+    let init_span = *facts.init_spans.get(&node)?;
+    // The edit IS the initializer: anything else is a shape this rule has not
+    // proved, and a construction plan over the wrong span rewrites code that
+    // was never the alias's.
+    if init_span != edit.span {
+        return None;
+    }
+    let mutable = matches!(decision, super::Decision::Slice { mutable: true, .. });
+    let element_type = super::declaration::pointee_source(
+        tcx,
+        match tcx.typeck(subject.fn_did).node_type(subject.hir_id).kind() {
+            rustc_middle::ty::TyKind::RawPtr(pointee, _) => *pointee,
+            _ => return None,
+        },
+    );
+    let value = edit.replacement.clone();
+    Some(super::construction::SliceConstructionPlan {
+        node,
+        init_hir,
+        init_span,
+        replacement: Some(value.clone()),
+        hold_reason: None,
+        element_type,
+        mutable,
+        nullable: false,
+        initializer_kind: "counted-void-read-alias",
+        length: super::construction::SliceLengthPlan {
+            expression: format!("{value}.len()"),
+            source: super::construction::SliceLengthSource::SealedContract {
+                contract: "counted-void-read-alias".to_owned(),
+            },
+            provenance: Vec::new(),
+        },
+        composed_edit_spans: Vec::new(),
+        unsafe_context: crate::bo_rewriter::mechanical_receipt::UnsafeContextPresentation {
+            unsafe_fn: tcx
+                .fn_sig(subject.fn_did)
+                .skip_binder()
+                .skip_binder()
+                .safety
+                .is_unsafe(),
+            wrapper_inserted: false,
+            edition: 2018,
+            requires_unsafe: false,
+        },
+    })
+}
+
+pub(crate) fn alias_declaration<'a>(
+    ctx: &super::Ctx<'a, '_>,
+    s: &Subject,
+) -> Option<&'a UseEdit> {
+    alias_contract(ctx, s)?.decl.as_ref()
 }
 fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
     if s.ptr_depth != 1 || !matches!(s.kind, SubjectKind::Param { .. }) {
@@ -130,6 +237,7 @@ fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         },
         nullable: false,
         alias: None,
+        decl: None,
         handle: None,
         width: None,
         uses: vec![UseEdit {
@@ -334,6 +442,7 @@ fn prove_forward(
                     element: contract.element,
                     nullable: contract.nullable,
                     alias: None,
+                    decl: None,
                     handle: None,
                     width: contract
                         .width

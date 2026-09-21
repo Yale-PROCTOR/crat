@@ -1057,6 +1057,16 @@ pub(crate) fn plan_slice_constructions(
             SubjectKind::Local => {}
             SubjectKind::Param { .. } => continue,
         }
+        // R491-6 route (i): a counted READ alias delivers on its own
+        // initializer edit, which types the binding by inference from the
+        // parameter's view. A constructor here would wrap that edit in
+        // `from_raw_parts` with a fabricated extent beside the count the
+        // contract already carries.
+        if let Some(plan) = super::counted_void::alias_construction(tcx, facts, subject, decision)
+        {
+            plans.push(plan);
+            continue;
+        }
         // R445-2: wave-5d2's derived-view rule renders this initializer as an
         // exact suffix of its Box owner. A constructor over the same
         // initializer would wrap that view in `from_raw_parts_mut` and

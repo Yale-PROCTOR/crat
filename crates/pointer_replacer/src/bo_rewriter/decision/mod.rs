@@ -1999,6 +1999,28 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         {
             decision
         }
+        // **R491-6 route (i): the counted READ alias delivers on its own
+        // declaration.** `counted_alias_needs_no_declaration` above lifts the
+        // receiver-form refusal, but lifting a refusal supplies no form: this
+        // subject has no receiver and no field permit either, so it fell to the
+        // residue below and degraded `copy-source-coupled` beside the very code
+        // it is the subject of (report 031, measured on the composed head).
+        // Its form is the contract's and so is every USE of it; what is its own
+        // is the initializer — `let a = P as *const B` → `P.unwrap_or(&[])` —
+        // one splice target, planned once, here instead of in the contract's
+        // `uses`, because the same span planned twice is the duplicate K21
+        // refuses. The yield belongs HERE, beneath every earlier arm: exempting
+        // the subject further up the ladder is what cost six lane witnesses in
+        // report 028.
+        Decision::Slice { mutable, .. } | Decision::Opt { mutable, slice: true, .. }
+            if counted_void::alias_declaration(ctx, subject).is_some() =>
+        {
+            let uses = counted_void::alias_declaration(ctx, subject)
+                .cloned()
+                .into_iter()
+                .collect();
+            Decision::Slice { mutable, uses }
+        }
         Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => degrade(
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
