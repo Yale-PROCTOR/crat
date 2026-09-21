@@ -63,3 +63,35 @@ fn wave6r_output_storage_settled_is_read_beside_the_returned_alias_fact() {
 // answer instead. The disjunct is one line over the fact above; its evidence
 // is batch 13's census (binn's five `seam-positive-retention` function
 // reverts of report 026 claim 2), not a vacuous local assertion.
+
+// NOTE (report 036): there is no seam-level witness for the block arm
+// either. I wrote one and MEASURED it vacuous — with the disjunct disabled
+// it still passes, because this reduction's site is never blocked. The same
+// wall as report 030's A5 arm: the evidence for both disjuncts is the
+// corpus (binn's five `seam-positive-retention` function reverts), not a
+// local assertion that cannot fail.
+
+/// The twin receipt reaches the artifacts, which is what a census reads.
+#[test]
+fn wave6r_twin_placement_is_exported_to_the_artifacts() {
+    let exported = ::utils::compilation::run_compiler_on_str(OUT_STORAGE, |tcx| {
+        let (_, ctx) = super::super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::super::A5Mode::PreciseReplay,
+                Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        ctx.raw_boundary_artifacts.twin_placement.clone()
+    })
+    .expect("input type-checks");
+    // This fixture grafts no counted-void call, so the receipt is empty —
+    // what the witness pins is that the FIELD exists and is wired, which is
+    // exactly what was missing (the row could never reach a census).
+    assert!(
+        exported.is_empty()
+            || exported.starts_with(super::super::decision::counted_void::TWIN_RECEIPT_HEADER),
+        "{exported}"
+    );
+}

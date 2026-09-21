@@ -484,6 +484,11 @@ pub(crate) struct RawBoundaryArtifacts {
     /// position with its outcome and refusal reason. Instrument-only; main
     /// writes it as `raw-boundary-child-access.tsv` beside the other rows.
     pub(crate) child_access: String,
+    /// wave-6r (R459-2, report 036): the raw twin's placement receipt. It was
+    /// built into the graft but never exported, so no census could read the
+    /// row it exists to answer; main writes it as
+    /// `raw-boundary-twin-placement.tsv` beside the other rows.
+    pub(crate) twin_placement: String,
     pub(crate) dispositions: String,
     pub(crate) subjects: String,
     pub(crate) atoms: String,
@@ -8667,6 +8672,7 @@ fn finish_decide<'tcx>(
             sites: raw_boundary_sites.to_tsv(),
             retention: retention.to_tsv(),
             child_access: retention.child_access.clone(),
+            twin_placement: decision::counted_void::twin_receipt(),
             dispositions: raw_boundary.receipts_tsv(),
             subjects: raw_boundary_subjects_tsv(tcx, &hypothetical, &table, &coconv, &raw_boundary),
             atoms: raw_boundary.atoms_tsv(),

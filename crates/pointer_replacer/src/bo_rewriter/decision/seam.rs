@@ -3804,6 +3804,18 @@ fn inbound_retention(
         {
             Ok((BridgeRetentionTier::T1, None))
         }
+        // wave-6r (report 036): binn's `*_get_value` / `*_next` are blocked
+        // HERE, not at the A5 site proof — their tag is
+        // `seam-positive-retention:seam-positive-retention`, heman's was
+        // `a5-site-proof-reclassified:…`. wave-6v2's certificate answers the
+        // row: the position's only positive sinks are stores through its own
+        // out-parameter, and every inventoried call supplies them from
+        // frame-confined caller locals.
+        Some(RetentionVerdict::Retains { .. })
+            if retention.output_storage_settled(callee, argument_index) =>
+        {
+            Ok((BridgeRetentionTier::T1, None))
+        }
         Some(RetentionVerdict::Retains { .. }) => Err(SeamBlock::PositiveRetention),
         Some(RetentionVerdict::Unknown { .. }) | None => Ok((
             BridgeRetentionTier::T2,
