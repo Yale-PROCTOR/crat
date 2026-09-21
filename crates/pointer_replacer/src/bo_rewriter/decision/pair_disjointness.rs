@@ -366,6 +366,9 @@ impl PairDisjointnessIndex {
                     tcx.def_path_str(*adt)
                 );
             }
+            for (did, index) in &allocators.views {
+                println!("W6P_VIEW\t{}\t{index}", tcx.def_path_str(*did));
+            }
             for (did, freshness) in &allocators.wrappers {
                 println!("W6P_WRAPPER\t{}\t{freshness:?}", tcx.def_path_str(*did));
             }
