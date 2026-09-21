@@ -1867,3 +1867,61 @@ fn w6v_a_withheld_half_of_the_alias_transaction_withdraws_the_other() {
     assert!(closed(&[param]), "the withheld parameter takes its alias");
     assert!(closed(&[alias]), "the withheld alias takes its parameter");
 }
+
+/// **The count must be evidence, not position (report 037).**
+///
+/// json.h's real shape, parameter for parameter: the state aggregate takes
+/// `src_size` AND `flags_bitset` from the signature, so "the sibling parameter
+/// stored beside the pointer" no longer names one thing. The rule refuses
+/// rather than pick, because picking the wrong sibling gives the view a length
+/// that is not its own — the corpus rows stand or fall on this question, not on
+/// the store shape, which the delivering witness above already proves.
+const JSON_REAL: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+pub type size_t = u64;
+pub struct parse_result { pub error: size_t, pub error_offset: size_t }
+pub struct parse_state {
+    pub src: *const i8,
+    pub size: size_t,
+    pub offset: size_t,
+    pub flags_bitset: size_t,
+    pub data: *mut i8,
+    pub error: size_t,
+}
+unsafe fn json_parse_ex(mut src: *const core::ffi::c_void, mut src_size: size_t,
+    mut flags_bitset: size_t,
+    mut alloc_func_ptr: Option<unsafe extern "C" fn(*mut core::ffi::c_void, size_t) -> *mut core::ffi::c_void>,
+    mut user_data: *mut core::ffi::c_void,
+    mut result: *mut parse_result) -> i32 {
+    let mut state = parse_state { src: 0 as *const i8, size: 0, offset: 0, flags_bitset: 0, data: 0 as *mut i8, error: 0 };
+    let mut allocation = 0 as *mut core::ffi::c_void;
+    if !result.is_null() { (*result).error = 0; (*result).error_offset = 0; }
+    if src.is_null() { return -(1 as i32); }
+    state.src = src as *const i8;
+    state.size = src_size;
+    state.offset = 0;
+    state.flags_bitset = flags_bitset;
+    let mut acc: i32 = 0;
+    while state.offset < state.size {
+        acc = acc.wrapping_add(*state.src.offset(state.offset as isize) as i32);
+        state.offset = state.offset.wrapping_add(1);
+    }
+    return acc;
+}
+"#;
+
+#[test]
+fn w6v_counted_store_refuses_an_ambiguous_count() {
+    let rows = super::emit_tests::decisions_of(JSON_REAL);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "src" && *p && r != "<emitted>"),
+        "two parameters stored into one aggregate leave no evidence-backed count: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(JSON_REAL).unwrap();
+    assert!(
+        compact(&source).contains("mutsrc:*constcore::ffi::c_void"),
+        "the parameter stays raw: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
