@@ -1609,6 +1609,11 @@ fn w6p_probe_pair_roots() {
             &program, &mut_facts, None,
         );
         let name = |did: rustc_span::def_id::LocalDefId| tcx.def_path_str(did.to_def_id());
+        if std::env::var_os("W6P_DUMP_EDECLINE").is_some() {
+            for did in &program.functions {
+                println!("W6P_FNID\t{}\t{}", did.local_def_index.as_u32(), name(*did));
+            }
+        }
         let rows = index.probe_rows(&program);
         println!("W6P_PROBE_ROWS {}", rows.len());
         for row in rows {

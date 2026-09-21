@@ -599,6 +599,16 @@ impl PairDisjointnessIndex {
     /// with no in-program caller, an argument this read cannot map, two
     /// arguments that are the caller's SAME parameter, a same-place call, a
     /// cycle or eight levels of depth all refuse.
+    /// R492-3: why (e) declined, for the decline table. Test-only; no rule
+    /// reads it, and it is keyed on the pair so a memoised decline is counted
+    /// once.
+    #[cfg(test)]
+    fn note_decline(callee: u32, left: usize, right: usize, cause: &str) {
+        if std::env::var_os("W6P_DUMP_EDECLINE").is_some() {
+            println!("W6P_EDECLINE\t{callee}\t{left}\t{right}\t{cause}");
+        }
+    }
+
     fn parameter_pair(
         &self,
         callee: u32,
@@ -612,6 +622,8 @@ impl PairDisjointnessIndex {
             return *memo;
         }
         if depth > 8 || seen.contains(&key) {
+            #[cfg(test)]
+            Self::note_decline(callee, left, right, "recursion-or-depth");
             return None;
         }
         seen.push(key);
@@ -628,6 +640,8 @@ impl PairDisjointnessIndex {
             for record in records {
                 let find = |index: usize| record.args.iter().find(|arg| arg.index == index);
                 let (Some(a), Some(b)) = (find(left), find(right)) else {
+                    #[cfg(test)]
+                    Self::note_decline(callee, left, right, "argument-not-recorded");
                     result = None;
                     break;
                 };
@@ -637,6 +651,8 @@ impl PairDisjointnessIndex {
                 if let (Some(pa), Some(pb)) = (&a.place, &b.place)
                     && pa == pb
                 {
+                    #[cfg(test)]
+                    Self::note_decline(callee, left, right, "a-caller-passes-one-place");
                     result = None;
                     break;
                 }
@@ -652,16 +668,36 @@ impl PairDisjointnessIndex {
                     self.formal_of(*caller, a.class),
                     self.formal_of(*caller, b.class),
                 ) else {
+                    // R493-3: which SIDE failed, not just what the classes
+                    // were. Report 031's label printed the class of both sides
+                    // whichever one `formal_of` refused, which is why its
+                    // `entry-but-not-a-formal` count could not be read.
+                    #[cfg(test)]
+                    Self::note_decline(
+                        callee,
+                        left,
+                        right,
+                        &format!(
+                            "root-is-not-a-caller-formal:{}:{}@caller={}",
+                            describe_side(self.formal_of(*caller, a.class), a.class),
+                            describe_side(self.formal_of(*caller, b.class), b.class),
+                            caller
+                        ),
+                    );
                     result = None;
                     break;
                 };
                 if up_left == up_right {
+                    #[cfg(test)]
+                    Self::note_decline(callee, left, right, "a-caller-passes-one-formal-twice");
                     result = None;
                     break;
                 }
                 match self.parameter_pair(*caller, up_left, up_right, depth + 1, seen) {
                     Some(up) => result = result.map(|acc| acc.join(up)),
                     None => {
+                        #[cfg(test)]
+                        Self::note_decline(callee, left, right, "declined-further-up-the-chain");
                         result = None;
                     }
                 }
@@ -671,6 +707,8 @@ impl PairDisjointnessIndex {
             }
         }
         if callers == 0 && !self.exported.contains(&callee) {
+            #[cfg(test)]
+            Self::note_decline(callee, left, right, "no-in-crate-caller-reaches-it");
             result = None;
         }
         seen.pop();
@@ -2651,6 +2689,30 @@ impl<'tcx> Visitor<'tcx> for MutableReborrows<'_, 'tcx> {
             _ => {}
         }
         intravisit::walk_expr(self, expr);
+    }
+}
+
+/// R493-3: a side of a `root-is-not-a-caller-formal` decline, tagged with
+/// whether THIS side is the one `formal_of` refused.
+#[cfg(test)]
+fn describe_side(resolved: Option<usize>, class: RootClass) -> String {
+    format!(
+        "{}{}",
+        describe_class(class),
+        if resolved.is_some() { "" } else { "-FAILED" }
+    )
+}
+
+/// R492-3, for the decline table only.
+#[cfg(test)]
+fn describe_class(class: RootClass) -> &'static str {
+    match class {
+        RootClass::FreshAlloc(..) => "fresh",
+        RootClass::StackObject(_) => "stack",
+        RootClass::EntryStorage(_) => "entry-but-not-a-formal",
+        RootClass::FreshField { .. } => "fresh-field",
+        RootClass::Static(_) => "static",
+        RootClass::Unknown => "unknown",
     }
 }
 
