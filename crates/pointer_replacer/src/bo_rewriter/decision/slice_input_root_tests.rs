@@ -199,16 +199,34 @@ pub unsafe fn entry() -> u32 { let one: u8 = 7; thin_entry(&one) }
     );
     let table = super::slice_input_tests::decisions(&input);
     let thin = super::slice_input_tests::decision(&table, "thin_entry::thin");
-    assert!(
-        matches!(
-            thin,
-            super::Decision::Degraded(super::Degradation {
-                reason: super::DegradeReason::LocalCalleeAccessExtent { access, .. },
-                ..
-            }) if access.detail() == "forwarder:data:read:forwarded-into:raw_reader:data:read:pointer-arithmetic:offset"
-        ),
-        "{thin:?}"
+    // **Restated for both frames (R217-2(a)).** W-C9's claim is that a thin
+    // source does not acquire the reader's extent THROUGH the forwarder; the
+    // FORM that claim takes is frame-dependent since wave-4's extent-lift
+    // waiver (R481-1 / R482-3, the user's ruling), which gives this population
+    // the §77 fallback view instead of the hold. Held here, waived there, and
+    // in neither frame does the one-element source become `n` elements.
+    let held = matches!(
+        thin,
+        super::Decision::Degraded(super::Degradation {
+            reason: super::DegradeReason::LocalCalleeAccessExtent { access, .. },
+            ..
+        }) if access.detail() == "forwarder:data:read:forwarded-into:raw_reader:data:read:pointer-arithmetic:offset"
     );
+    let waived = matches!(thin, super::Decision::Slice { .. });
+    assert!(held || waived, "{thin:?}");
+    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let flat = emitted.split_whitespace().collect::<String>();
+    assert!(
+        !flat.contains("from_raw_parts(thin,(n)asusize)"),
+        "the reader's count must not reach the thin source: {emitted}"
+    );
+    if waived {
+        // As in the W-C2 witness: the lifted form is the parameter's, and the
+        // extent its callers construct is theirs. The claim here is the line
+        // above — the reader's count does not reach this source.
+        assert!(flat.contains("unsafefnthin_entry(thin:&[u8]"), "{emitted}");
+    }
+    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
 }
 
 /// The root must be FRESH: a local whose value is a borrow of something else
