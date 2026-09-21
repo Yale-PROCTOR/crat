@@ -509,6 +509,104 @@ fn superseded_by_an_option_destination(
         .is_some()
 }
 
+/// **R497-6.** The same supersession, for a CURSOR destination.
+///
+/// lodepng `countZeros` is the shape: the slice family delivers the shared root
+/// (`start = data.offset(pos)`), and the adapter it plants for that root
+/// carries evidence premised on the destinations staying raw. The cursor family
+/// then takes those destinations (`data`, `end` — every operand of
+/// `while data != end` is a view of the one parameter, so the comparison is a
+/// position question the family renders with `addr()`), the adapter is dropped
+/// `slice-use-evidence-held`, and reading that drop as an unsatisfied family
+/// site withdraws the owner's WHOLE `Return` family. Both destinations revert
+/// to raw, the census records them `ptr-comparison` with `sole_blocker = 1`,
+/// and the cursor family's receipt list is empty — the archive's
+/// `native_outcome = None`.
+///
+/// This is R397-6(a)'s invariant exactly as the Option arm above states it: a
+/// request means *a candidate of mine failed*, never *a site of mine was
+/// replaced by a later family*. Nothing here decides a form; the conjuncts are
+/// the Option arm's with `Cursor` in place of `Opt`, so a drop with no cursor
+/// destination is untouched and still requests.
+fn superseded_by_a_cursor_destination(
+    site: &plan::ClassSite,
+    owner: SignatureClassId,
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+) -> bool {
+    if site.key.bridge_kind != "slice-use-adapter" {
+        return false;
+    }
+    if !matches!(
+        &site.state,
+        plan::ClassSiteState::Dropped(reason) if reason == "slice-use-evidence-held"
+    ) {
+        return false;
+    }
+    // Conjunct 3, the Option arm's: where the drop HAS a text interval, the
+    // cursor planner must own an edit at it, so that the two renderings occupy
+    // one span and there is something to supersede. `countZeros`' own drop is
+    // `<unplaceable>` and is decided by conjuncts 1, 2 and 4.
+    let value_edit_here = candidate
+        .plan
+        .class_finalization
+        .classes
+        .get(&owner)
+        .is_some_and(|class| {
+            class.sites.iter().any(|other| {
+                matches!(other.state, plan::ClassSiteState::EditReady)
+                    && other.key.file == site.key.file
+                    && other.key.lo == site.key.lo
+                    && other.key.hi == site.key.hi
+                    && other.key.bridge_kind.contains("cursor")
+            })
+        });
+    let has_interval = site.edit_key != "-" && site.key.file != "-";
+    if has_interval && !value_edit_here {
+        return false;
+    }
+    let cursors = |snapshot: &StageSnapshot| -> BTreeSet<String> {
+        snapshot
+            .table
+            .entries
+            .iter()
+            .filter(|(subject, decided)| {
+                // Exhaustive by the import-denylist rule: a new `Decision`
+                // variant is classified here, never swept into a wildcard.
+                let cursor = match decided {
+                    decision::Decision::Cursor { .. } => true,
+                    decision::Decision::Opt { .. }
+                    | decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::Degraded(_) => false,
+                };
+                cursor && SignatureClassId::of(subject.fn_did) == owner
+            })
+            .map(|(subject, _)| subject.label.clone())
+            .collect()
+    };
+    cursors(candidate)
+        .difference(&cursors(prior))
+        .next()
+        .is_some()
+}
+
+/// Was this dropped site replaced by a LATER family of either kind? The three
+/// readers below must ask one question, which is the discipline relay 045 §2
+/// already fixed for the Option arm alone.
+fn superseded_by_a_later_destination(
+    site: &plan::ClassSite,
+    owner: SignatureClassId,
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+) -> bool {
+    superseded_by_an_option_destination(site, owner, prior, candidate)
+        || superseded_by_a_cursor_destination(site, owner, prior, candidate)
+}
+
 /// Is every change this class carries a site the Option family superseded?
 ///
 /// Relay 045 §2. `class_changed` sees the superseded site as an ordinary new
@@ -534,7 +632,7 @@ fn only_change_is_superseded(
     }
     if !new_sites
         .iter()
-        .all(|site| superseded_by_an_option_destination(site, owner, prior, candidate))
+        .all(|site| superseded_by_a_later_destination(site, owner, prior, candidate))
     {
         return false;
     }
@@ -924,7 +1022,7 @@ fn anchors(
                 matches!(site.state, plan::ClassSiteState::Dropped(_))
                     && !old.is_some_and(|old| old.sites.contains(site))
                     && site.key.bridge_kind != "missing-required-site"
-                    && !superseded_by_an_option_destination(site, *owner, prior, candidate)
+                    && !superseded_by_a_later_destination(site, *owner, prior, candidate)
             })
             .collect::<Vec<_>>();
         if let Some(site) = new_dropped.first() {
@@ -948,7 +1046,7 @@ fn anchors(
         let superseded: BTreeSet<String> = class
             .sites
             .iter()
-            .filter(|site| superseded_by_an_option_destination(site, *owner, prior, candidate))
+            .filter(|site| superseded_by_a_later_destination(site, *owner, prior, candidate))
             .filter_map(|site| match &site.state {
                 plan::ClassSiteState::Dropped(reason) => {
                     Some(format!("dropped-site:{}:{}", site.key.bridge_kind, reason))

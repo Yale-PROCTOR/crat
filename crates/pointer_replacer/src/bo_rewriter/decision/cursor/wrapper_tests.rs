@@ -1845,3 +1845,85 @@ pub unsafe fn caller(b: &[u8], out: *mut u32) { two_pass(b.as_ptr(), b.len(), ou
         "the owner's return type changed the ARGUMENT path's receipt: {void:?} vs {raw:?}"
     );
 }
+
+/// The owner-level family-fallback causes a program records: the receipt whose
+/// `slice-use-adapter` line withdraws a whole `Return` family.
+fn family_fallback_causes(input: &str) -> Vec<String> {
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        ctx.raw_boundary_artifacts
+            .additive_family_receipts
+            .iter()
+            .map(|receipt| receipt.cause.clone())
+            .collect::<Vec<_>>()
+    })
+    .expect("family receipts")
+}
+
+/// lodepng `countZeros`, the census's `ptr-comparison` / `sole_blocker = 1`
+/// pair (`data#1`, `end#9`), reproduced whole: `start = data.offset(pos)`,
+/// `end = start.offset(258)` clamped, `data = start`, then
+/// `while data != end && *data == 0 { data = data.offset(1) }`.
+///
+/// The slice family delivers the shared root `start`; the `slice-use-adapter`
+/// it plants there is then dropped `slice-use-evidence-held`, because that
+/// evidence is premised on the destinations staying raw and the cursor family
+/// has taken them. Reading that drop as an unsatisfied family site withdraws
+/// the owner's WHOLE `Return` family — which is the receipt this lane found on
+/// the corpus at `batch25` (report 051) and reproduces here on a fixture, so it
+/// is this shape and not the composed line.
+///
+/// A site a later family replaced is not a site that failed: R397-6(a)'s own
+/// invariant, which `superseded_by_an_option_destination` already restores for
+/// the Option family. This asserts it for a cursor destination.
+///
+/// **Necessary, not sufficient** (report 053): the pair still does not deliver,
+/// because `end`'s delivered base — `start`'s slice, built on a fabricated
+/// extent — fails `provider_delivered`, and because `data` is re-seeded
+/// (`data = start`) so its base binding changes, which is wave-6o's re-seeded
+/// walker, not this arm. The claim here is exactly that the slice adapter no
+/// longer withdraws the owner.
+#[test]
+fn slicecursor_a_cursor_destination_supersedes_the_slice_adapter_it_replaces() {
+    let input = r#"
+unsafe extern "C" fn countZeros(mut data: *const u8, mut size: usize, mut pos: usize) -> u32 {
+    let mut start = data.offset(pos as isize);
+    let mut end = start.offset(258 as isize);
+    if end > data.offset(size as isize) { end = data.offset(size as isize); }
+    data = start;
+    while data != end && *data as i32 == 0 as i32 { data = data.offset(1); }
+    return data.offset_from(start) as i64 as u32;
+}
+pub unsafe fn caller(b: &[u8]) -> u32 { countZeros(b.as_ptr(), b.len(), 0) }
+"#;
+    let causes = family_fallback_causes(input);
+    assert!(
+        !causes
+            .iter()
+            .any(|cause| cause.contains("slice-use-adapter")),
+        "the replaced slice adapter still withdraws the owner: {causes:?}"
+    );
+}
+
+/// The control: the same root, delivered the same way, with NO cursor
+/// destination — the walk is gone, so nothing of this family takes `data` or
+/// `end`. Whatever the receipt layer does with the adapter here, the cursor
+/// supersession cannot be what did it, and the arm stays an exception rather
+/// than a loosening of the drop.
+#[test]
+fn slicecursor_a_slice_adapter_with_no_cursor_destination_is_untouched() {
+    let input = r#"
+unsafe extern "C" fn countBytes(mut data: *const u8, mut size: usize, mut pos: usize) -> u32 {
+    let start = data.offset(pos as isize);
+    let mut end = start.offset(258 as isize);
+    if end > data.offset(size as isize) { end = data.offset(size as isize); }
+    return end.offset_from(start) as i64 as u32;
+}
+pub unsafe fn caller(b: &[u8]) -> u32 { countBytes(b.as_ptr(), b.len(), 0) }
+"#;
+    let decisions = cursor_decisions(input);
+    assert!(
+        !decisions.iter().any(|(_, cursor)| *cursor),
+        "the control grew a cursor destination: {decisions:?}"
+    );
+}
