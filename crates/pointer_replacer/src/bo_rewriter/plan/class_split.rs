@@ -1502,6 +1502,28 @@ pub unsafe fn recurse(excluded: i32) -> i32 {
     ///
     /// Ignored by default (~75 s, 2,656 lines); `--ignored` runs it. When
     /// these four stop being `copy-source-coupled`, this test says so.
+    /// **wave-6s, one of the 18 "callee already delivers a slice" rows, on the
+    /// real crate** (relay 037). lil is 4,621 lines — the smallest program
+    /// carrying one — and `lil_get_var_or::name#2` is passed bare to
+    /// `lil_find_var`, whose own `name#3` formal delivers `slice` and is
+    /// placed. The caller's row is this family's
+    /// `slice-use-unsupported` at `lib.rs:757:57`.
+    ///
+    /// Ignored by default (~5 min); `--ignored` runs it.
+    #[test]
+    #[ignore = "runs the real lil crate; --ignored"]
+    fn wave6s_probe_lil_name_rows() {
+        let path =
+            std::path::Path::new("/home/p51lee/dev/crat/benchmarks/rs-crown-derived/lil/lib.rs");
+        let src = std::fs::read_to_string(path).expect("derived lil");
+        let got = run(&src);
+        for line in got.subjects.lines() {
+            if line.contains("lil_get_var") || line.contains("lil_find_var") {
+                eprintln!("W6SLIL {line}");
+            }
+        }
+    }
+
     /// wave-6s probe (relay 036): bzip2's real crate, the `block` rows.
     #[test]
     #[ignore = "runs the real bzip2 crate; --ignored"]
