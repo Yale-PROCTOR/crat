@@ -1356,3 +1356,113 @@ fn w6a_a9_a_consuming_callee_stays_the_box_familys() {
         out.artifacts.box_param_receipts
     );
 }
+
+/// **The nine `box-param-callee-lends` rows, reduced** (relay wave-6a/050).
+/// Five are signature-only — the body reads or writes FIELDS of the formal —
+/// and four walk elements through `offset`. Each is its own callee here, with
+/// one caller that allocates, lends and frees, so every formal is an
+/// `Owning`-modeled lend of exactly the corpus shape.
+const NINE_SHAPES: &str = r#"
+#[repr(C)]
+pub struct Reader { pub val_: u64, pub bit_pos_: u32 }
+#[repr(C)]
+pub struct Settings { pub width: i32, pub height: i32 }
+/// brotli `BrotliBitReaderRestoreState::from`: read-only field copies.
+unsafe extern "C" fn restore_state(mut to: *mut Reader, mut from: *mut Reader) {
+    (*to).val_ = (*from).val_;
+    (*to).bit_pos_ = (*from).bit_pos_;
+}
+/// lodepng `filter::settings` / `preProcessScanlines::settings`: read-only.
+unsafe extern "C" fn area(mut settings: *const Settings) -> i32 {
+    return (*settings).width * (*settings).height;
+}
+/// lodepng `inflateNoCompression::reader`: a field WRITE.
+unsafe extern "C" fn advance(mut reader: *mut Reader) {
+    (*reader).bit_pos_ = (*reader).bit_pos_.wrapping_add(8 as u32);
+}
+/// heman `edt_with_payload::payload_out` / `generate_gaussian_row::target`:
+/// element stores through `offset`.
+unsafe extern "C" fn fill(mut target: *mut f32, mut n: i32) {
+    let mut i = 0 as i32;
+    while i < n {
+        *target.offset(i as isize) = i as f32;
+        i += 1;
+    }
+}
+pub unsafe extern "C" fn drive(mut n: i32) -> i32 {
+    let mut a = malloc(::std::mem::size_of::<Reader>()) as *mut Reader;
+    let mut b = malloc(::std::mem::size_of::<Reader>()) as *mut Reader;
+    (*b).val_ = 1 as u64;
+    restore_state(a, b);
+    advance(a);
+    let mut s = malloc(::std::mem::size_of::<Settings>()) as *mut Settings;
+    (*s).width = 2 as i32;
+    (*s).height = 3 as i32;
+    let mut q = area(s);
+    let mut v = calloc(n as usize, ::std::mem::size_of::<f32>()) as *mut f32;
+    fill(v, n);
+    free(v as *mut core::ffi::c_void);
+    free(s as *mut core::ffi::c_void);
+    free(b as *mut core::ffi::c_void);
+    free(a as *mut core::ffi::c_void);
+    return q;
+}
+"#;
+
+#[test]
+fn w6a_a9_the_nine_shapes_take_their_form_from_the_write_facts() {
+    // Relay 050 correction 1: the decline decides nothing, so the borrowing
+    // arms must read the mutability facts — a uniform shared form at a written
+    // formal would be the defect. Measured on all four shapes at once:
+    //   restore_state  to written / from read  ->  &mut Reader / &Reader
+    //   area           read only               ->  &Settings (needs no rule:
+    //                                               the model calls it Ref)
+    //   advance        a field write           ->  &mut Reader
+    //   fill           element stores          ->  &mut [f32]
+    // The last answers relay 050's open question for heman's four: the slice
+    // arm DOES render a callee's `offset` element uses as indexing.
+    let out = emitted("boxparam-nine", &with_prelude(NINE_SHAPES));
+    let text = compact(&out.source);
+    for (signature, why) in [
+        (
+            "fnrestore_state(mutto:&mutReader,mutfrom:&Reader)",
+            "the written and read halves split",
+        ),
+        (
+            "fnarea(mutsettings:&Settings)",
+            "a read-only lend is shared",
+        ),
+        (
+            "fnadvance(mutreader:&mutReader)",
+            "a field write takes &mut",
+        ),
+        (
+            "fnfill(muttarget:&mut[f32],mutn:i32)",
+            "element stores take a mutable slice",
+        ),
+    ] {
+        assert!(
+            text.contains(signature),
+            "{why}: {signature}\n{}",
+            out.source
+        );
+    }
+    let receipts = &out.artifacts.box_param_receipts;
+    for parameter in [
+        "restore_state::to",
+        "restore_state::from",
+        "advance::reader",
+        "fill::target",
+    ] {
+        assert!(
+            receipts.contains(&format!(
+                "{parameter}\tyielded\tbox-param-lend-leaves-owning:"
+            )),
+            "{parameter} must be a declined claim\n{receipts}"
+        );
+    }
+    assert!(
+        !receipts.contains("area::settings"),
+        "a Ref-modeled lend needs no decline\n{receipts}"
+    );
+}

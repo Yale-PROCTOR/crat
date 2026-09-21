@@ -1127,14 +1127,18 @@ fn w6a_a1e_the_heman_cascade_root_is_one_lend() {
         "the producer's output type is the certificate\n{}",
         out.source
     );
+    // The chain continues through compute's own certificate. The FORMAL's
+    // form is not this rule's business — it is the parameter family's, and
+    // W6A-A9 moves it — so the assertion is a dichotomy over the two frames:
+    // without A9 the formal stays raw and the owner is bridged at the call,
+    // with A9 it is a reference and the owner is borrowed. Both deliver.
+    let raw_formal = text.contains("fncompute(mutheightmap:*mutImage)->Box<Image>")
+        && text.contains("compute(core::ptr::from_mut(base.as_mut()))");
+    let reference_formal = text.contains("fncompute(mutheightmap:&Image)->Box<Image>")
+        && text.contains("compute(&*base)");
     assert!(
-        text.contains("fncompute(mutheightmap:*mutImage)->Box<Image>"),
-        "the chain continues through compute's own certificate\n{}",
-        out.source
-    );
-    assert!(
-        text.contains("compute(core::ptr::from_mut(base.as_mut()))"),
-        "the lend is a bridge at the call: the formal stays raw\n{}",
+        raw_formal != reference_formal,
+        "exactly one of the two frames, and the owner crosses the call either way\n{}",
         out.source
     );
     assert!(
