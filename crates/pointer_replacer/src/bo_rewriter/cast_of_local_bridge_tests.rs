@@ -239,6 +239,11 @@ fn k19_shared_slice_subject_at_a_mut_position_is_still_held() {
 /// waiver*: the site is admitted and it carries the per-site tier-2 receipt
 /// naming this subject and this callee. A bridge here WITHOUT that receipt is
 /// the failure the control exists to catch.
+///
+/// **The NAME disagrees with the assertion, deliberately.** It is kept because
+/// other lanes and the reports cite `k19_retaining_callee_does_not_bridge` by
+/// name; a reader who notices the disagreement should repair the name (and the
+/// citations with it), never the assertion — the assertion is the ruling.
 #[test]
 fn k19_retaining_callee_does_not_bridge() {
     let input = format!(
