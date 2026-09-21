@@ -1,5 +1,33 @@
 //! Copy initializer reductions from the frozen brotli corpus.
 
+use super::decision::Decision;
+
+/// Every subject's settled decision, keyed by binding name.
+fn decisions(input: &str) -> Vec<(String, Decision)> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        table
+            .entries
+            .iter()
+            .map(|(subject, decision)| {
+                println!("DECISION {} {decision:?}", subject.label);
+                (
+                    subject.param_name.clone().unwrap_or_default(),
+                    decision.clone(),
+                )
+            })
+            .collect()
+    })
+    .expect("input compiles")
+}
+
 fn emitted(input: &str, binding: &str) -> String {
     emitted_reverting(input, binding, false)
 }
@@ -147,4 +175,59 @@ fn wave6k_function_withdrawal_restores_both_copy_sites() {
     assert!(source.contains("let q = p"), "{source}");
     assert!(!source.contains("q: &u8"), "{source}");
     assert!(!source.contains("&*p"), "{source}");
+}
+
+/// heman `heman_ops_sobel::fresh13#271` (A12, relay 031): the copy's source is
+/// a LOCAL already decided a safe form, and the rule refused it because only a
+/// parameter source was admitted — `copy-source-coupled` with nothing wrong.
+const LOCAL_SOURCE: &str = r#"
+    pub unsafe fn pick(p: *mut i32) -> *mut i32 { p }
+    pub unsafe fn walk(p: *mut i32) -> i32 {
+        let got = pick(p);
+        let peer = got;
+        *peer
+    }
+"#;
+
+/// The acyclicity guard: a copy of a copy is refused, so the walk is one hop.
+const COPY_OF_A_COPY: &str = r#"
+    pub unsafe fn chain(p: *mut i32) -> i32 {
+        let first = p;
+        let second = first;
+        *second
+    }
+"#;
+
+#[test]
+fn wave6k_a_copy_of_a_delivered_local_is_typed() {
+    let decided = decisions(LOCAL_SOURCE);
+    for (name, decision) in &decided {
+        println!("PROBE {name} {decision:?}");
+    }
+    let peer = decided
+        .iter()
+        .find(|(name, _)| name == "peer")
+        .map(|(_, d)| d.clone())
+        .expect("the copy");
+    assert!(
+        !matches!(
+            peer,
+            Decision::Degraded(ref degraded) if degraded.reason.key() == "copy-source-coupled"
+        ),
+        "a copy of a delivered LOCAL is this rule's shape: {peer:?}"
+    );
+}
+
+#[test]
+fn wave6k_a_copy_of_a_copy_keeps_the_refusal() {
+    let decided = decisions(COPY_OF_A_COPY);
+    let second = decided
+        .iter()
+        .find(|(name, _)| name == "second")
+        .map(|(_, d)| d.clone())
+        .expect("the second copy");
+    assert!(
+        matches!(second, Decision::Degraded(_)),
+        "the walk stops at one hop, so a copy of a copy is not typed: {second:?}"
+    );
 }

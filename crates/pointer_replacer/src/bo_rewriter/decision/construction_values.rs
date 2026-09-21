@@ -105,8 +105,24 @@ fn compatible(tcx: TyCtxt<'_>, subject: &Subject, value: &CopyValue, decision: &
     }
 }
 
-/// Consult the ordinary ladder for the source parameter. Restricting sources
-/// to parameters makes this query acyclic; no copying-local chain is guessed.
+/// **A12 (relay 031) — a LOCAL source, one hop.** The rule admitted only
+/// parameters, to keep the query acyclic and to guess no copying-local chain.
+/// A local source keeps both properties when it is not ITSELF this shape:
+/// `copy_value(source).is_none()` bounds the walk at one step, so `decide_one`
+/// on the source returns without re-entering this rule. Measured at batch 16:
+/// heman `heman_ops_sobel::fresh13#271` copies a local already decided `slice`;
+/// brotli's four `base*` rows copy `ip`, whose own `ptr-comparison` refusal is
+/// slicecursor's A5 and not this family's to lift (report 031).
+fn admissible_source(tcx: TyCtxt<'_>, source: &Subject) -> bool {
+    match source.kind {
+        SubjectKind::Param { .. } => true,
+        SubjectKind::Local => copy_value(tcx, source).is_none(),
+        _ => false,
+    }
+}
+
+/// Consult the ordinary ladder for the source. Sources are a parameter or a
+/// non-copying local (`admissible_source`), which keeps this query acyclic.
 pub(super) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
     if !ctx
         .family_policy
@@ -120,7 +136,7 @@ pub(super) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
         .find(|source| {
             source.fn_did == subject.fn_did
                 && source.hir_id == value.source
-                && matches!(source.kind, SubjectKind::Param { .. })
+                && admissible_source(ctx.tcx, source)
         })
         .is_some_and(|source| compatible(ctx.tcx, subject, &value, &super::decide_one(ctx, source)))
 }
@@ -171,9 +187,7 @@ pub(super) fn complete(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mut seam::
         else {
             continue;
         };
-        if !compatible(tcx, subject, &value, found)
-            || !matches!(source.kind, SubjectKind::Param { .. })
-        {
+        if !compatible(tcx, subject, &value, found) || !admissible_source(tcx, source) {
             continue;
         }
         // Subject-only withdrawal could otherwise restore a raw parent under
