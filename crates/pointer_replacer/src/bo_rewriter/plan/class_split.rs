@@ -1502,6 +1502,56 @@ pub unsafe fn recurse(excluded: i32) -> i32 {
     ///
     /// Ignored by default (~75 s, 2,656 lines); `--ignored` runs it. When
     /// these four stop being `copy-source-coupled`, this test says so.
+    /// **wave-6s W6S-8 on the real crate (relay 033).** The same 75-second
+    /// run, over the rows the foreign-call bridge was built for.
+    ///
+    /// Before the bridge, `print_line`'s two colour formals were
+    /// `degraded / slice-use-unsupported` at their `fputs(color_*, stdout)`
+    /// sites (`lib.rs:1205:23`, `1210:23`, `1213:44`) — the use walk had no
+    /// arm for a call argument, so the subject died at the very site the
+    /// bridge exists for. After it, the use wall is GONE: both read
+    /// `decision = slice` and libtree carries NO `slice-use-unsupported` row
+    /// at all. They are still not placed, and the reason is another lane's
+    /// defect, pinned here in full so it is visible when it moves:
+    ///
+    /// ```text
+    /// terminal-not-applied:dropped-site:a5-fallback-unrenderable:
+    ///   C-9 argument source has an unclosed delimiter;
+    ///   argument-source=depth, current_file, b"\x1B[1;36m\0" as *const u8 as *…
+    /// ```
+    ///
+    /// Ignored by default (~75 s); `--ignored` runs it.
+    #[test]
+    #[ignore = "runs the real libtree crate; --ignored"]
+    fn wave6s_libtree_foreign_formals_leave_the_use_wall() {
+        let path = std::path::Path::new(
+            "/home/p51lee/dev/crat/benchmarks/rs-crown-derived/libtree/lib.rs",
+        );
+        let src = std::fs::read_to_string(path).expect("derived libtree");
+        let got = run(&src);
+        for key in [
+            "src::libtree::print_line::color_bold#3",
+            "src::libtree::print_line::color_regular#4",
+        ] {
+            assert_eq!(
+                column(&got.subjects, key, "decision"),
+                "slice",
+                "the foreign-call bridge closes the use wall:\n{}",
+                got.subjects
+            );
+        }
+        assert!(
+            !got.subjects.contains("slice-use-unsupported"),
+            "libtree carries no use wall of this family:\n{}",
+            got.subjects
+        );
+        for line in got.subjects.lines() {
+            if line.contains("color_bold#3") || line.contains("color_regular#4") {
+                eprintln!("W6SREAL {line}");
+            }
+        }
+    }
+
     #[test]
     #[ignore = "runs the real libtree crate; --ignored"]
     fn libtree_colours_on_the_real_crate() {

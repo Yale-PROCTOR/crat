@@ -2579,6 +2579,19 @@ fn collect_slice_uses_with_family(
                 return None;
             };
 
+            // **W6S-8 (R479-5) — a FOREIGN raw-pointer formal takes the
+            // slice's own pointer.** libtree's `fputs(color_bold, stdout)`:
+            // the boundary planner owns the operands it collected as
+            // foreign-call-argument facts (`raw_use` short-circuits above),
+            // but the ones it did not reach this walk, which had no arm for a
+            // call argument — so the subject degraded at the very site the
+            // bridge exists for. Addendum 130's bridge, rendered here: no
+            // extent is fabricated, because a raw pointer carries none, and
+            // the subject keeps its slice form.
+            if let Some(edit) = self.foreign_pointer_argument(use_expr, call, key, name) {
+                return Some(Some(edit));
+            }
+
             // **S3.2′-2b — the PLAIN dereference.** `*p` with no arithmetic
             // under it. On `&[T]` its image is `p[0]`, and it is admitted here
             // because the census showed it never occurs alone: every subject it
@@ -2693,6 +2706,80 @@ fn collect_slice_uses_with_family(
                 replacement: format!("{name}[{index}]"),
                 bridge_kind: "subject-use",
             }))
+        }
+
+        /// [`classify`]'s foreign-call arm: `s.as_ptr()` / `s.as_mut_ptr()`
+        /// at a foreign callee's raw-pointer formal, or nothing.
+        ///
+        /// Every refusal here is a position another family owns: a `*mut T`
+        /// formal under a SHARED subject would be `&T -> &mut T`; a formal
+        /// whose pointee is not the subject's element is a reinterpretation
+        /// (the void-region family's evidence); a formal that is itself a
+        /// pointer is depth-2 (the nested family's); the variadic tail has no
+        /// declared formal to read. A LOCAL callee — one with a body — keeps
+        /// the c-raw-slice path it already has (R410-9(b)'s own test).
+        fn foreign_pointer_argument(
+            &self,
+            use_expr: &Expr<'_>,
+            call: &Expr<'_>,
+            key: (LocalDefId, HirId),
+            name: &str,
+        ) -> Option<UseEdit> {
+            use rustc_middle::ty::TyKind;
+            let ExprKind::Call(callee, arguments) = call.kind else {
+                return None;
+            };
+            let index = arguments
+                .iter()
+                .position(|argument| argument.hir_id == use_expr.hir_id)?;
+            let typeck = self.tcx.typeck(key.0);
+            let TyKind::FnDef(callee_did, _) = *typeck.expr_ty(callee).kind() else {
+                return None;
+            };
+            // Foreign = an `extern` block item, or any callee with no body.
+            // The same test R410-9(b) uses to tell a libc callee from a local
+            // one — and it must be the BODY, not the DefId's crate: C2Rust
+            // declares `fputs` in the crate's own `extern "C"` block, so a
+            // locality test alone calls it local.
+            let foreign = self.tcx.is_foreign_item(callee_did)
+                || self
+                    .tcx
+                    .hir_get_if_local(callee_did)
+                    .and_then(|node| node.body_id())
+                    .is_none();
+            if !foreign {
+                return None;
+            }
+            let signature = self.tcx.fn_sig(callee_did).skip_binder().skip_binder();
+            // The variadic tail declares no formal; nothing to read a
+            // permission or a pointee from.
+            let formal = signature.inputs().get(index)?;
+            let TyKind::RawPtr(formal_pointee, formal_mutability) = formal.kind() else {
+                return None;
+            };
+            // Depth-2 is the nested family's position, not a slice's pointer.
+            if formal_pointee.is_raw_ptr() {
+                return None;
+            }
+            let TyKind::RawPtr(subject_pointee, _) = typeck.expr_ty(use_expr).kind() else {
+                return None;
+            };
+            // The element type is the subject's; a formal that changes it is a
+            // reinterpretation and never this arm's.
+            if subject_pointee != formal_pointee {
+                return None;
+            }
+            let accessor = match formal_mutability {
+                Mutability::Not => "as_ptr",
+                // A shared subject may not supply a pointer the callee writes.
+                Mutability::Mut if self.mutable_of.contains(&key) => "as_mut_ptr",
+                Mutability::Mut => return None,
+            };
+            Some(UseEdit {
+                span: use_expr.span,
+                replacement: format!("{name}.{accessor}()"),
+                bridge_kind: "subject-use",
+            })
         }
 
         /// The index expression's source text, **typed as a `usize`**.

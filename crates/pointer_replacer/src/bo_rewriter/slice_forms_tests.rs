@@ -1533,3 +1533,205 @@ const OFFSET_FROM: &str = r#"
     return len;
  }
 "#;
+
+// ---------------------------------------------------------------------------
+// W6S-8 — a delivered slice at a FOREIGN raw-pointer formal (R479-5)
+//
+// libtree's `print_line(… color_bold: *mut c_char …)` uses its formal only at
+// `fputs(color_bold, stdout)`. The boundary planner already owns SOME of those
+// operands (`raw_use` short-circuits on a collected foreign-call-argument
+// fact), but the ones it has not collected reach the use walk, which had no
+// arm for a call argument at all — so the subject degraded
+// `slice-use-unsupported` at the very site the bridge exists for. Measured on
+// the real crate (wave-5d2's 75-second harness): `print_line::color_bold#3`
+// and `color_regular#4`, `family=slice`, refused at `lib.rs:1210:23` /
+// `1205:23` / `1213:44` while their OTHER `fputs` operand was admitted.
+//
+// The rule: a foreign callee's raw-pointer formal takes the slice's own
+// pointer — `s.as_ptr()` for `*const T`, `s.as_mut_ptr()` for `*mut T`
+// (addendum 130's bridge). **No extent is fabricated**: a raw pointer needs
+// none, and the subject keeps its slice form. Refused, each with a control:
+// a `*mut T` formal under a SHARED subject (that would be `&T -> &mut T`),
+// a formal whose pointee is not the subject's element (a reinterpretation,
+// the void-region family's evidence to supply), a formal that is itself a
+// pointer (depth-2, the nested family's), and anything in the variadic tail
+// (no declared formal to read). A LOCAL callee is untouched.
+// ---------------------------------------------------------------------------
+
+/// **W6S-8 (a) — libtree's shape.** The formal is used only at `fputs`, twice,
+/// and the second use sits inside a block the boundary planner did not
+/// collect. Both take the slice's pointer and the subject delivers.
+#[test]
+fn wave6s_foreign_formal_takes_the_slices_pointer() {
+    let source = emit(FOREIGN_FPUTS_SHAPE);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("color_bold:&[libc::c_char]")
+            || flat.contains("color_bold:&mut[libc::c_char]"),
+        "{source}"
+    );
+    assert!(
+        !flat.contains("fputs(color_bold,") && !flat.contains("fputs(color_regular,"),
+        "no RAW operand survives at the foreign call: {source}"
+    );
+    assert!(
+        flat.contains("as_ptr()") || flat.contains("as_mut_ptr()"),
+        "{source}"
+    );
+    let rows = super::emit_tests::decisions_of(FOREIGN_FPUTS_SHAPE);
+    for name in ["color_bold", "color_regular"] {
+        let reason = rows
+            .iter()
+            .rev()
+            .find(|(row, is_param, _)| row == name && *is_param)
+            .map(|(_, _, reason)| reason.clone())
+            .unwrap_or_else(|| panic!("{name}: {rows:?}"));
+        assert_eq!(reason, "<emitted>", "{rows:?}");
+    }
+}
+
+const FOREIGN_FPUTS_SHAPE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_char = i8; pub type c_int = i32; pub type FILE = core::ffi::c_void; }
+ unsafe extern "C" { static mut stdout: *mut libc::FILE; fn fputs(s: *const libc::c_char, f: *mut libc::FILE) -> libc::c_int; }
+ pub unsafe extern "C" fn print_line(mut color_bold: *mut libc::c_char,
+     mut color_regular: *mut libc::c_char, mut on: libc::c_int) {
+    if on != 0 {
+        fputs(color_regular, stdout);
+        fputs(color_bold, stdout);
+    } else {
+        if on == 0 { fputs(color_bold, stdout); }
+    }
+ }
+"#;
+
+/// **W6S-8 (b) — a `*mut T` formal the callee writes.** The mutable subject
+/// hands over `as_mut_ptr()`; the extent is not fabricated, the callee's own
+/// count argument is the C program's.
+#[test]
+fn wave6s_mutable_foreign_formal_takes_the_mutable_pointer() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; pub type size_t = usize; }
+ unsafe extern "C" { fn fill(buf: *mut u8, n: libc::size_t) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut buffer: *mut u8, mut n: libc::size_t) -> libc::c_int {
+    *buffer.offset(0 as isize) = 0u8;
+    return fill(buffer, n);
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("buffer:&mut[u8]"), "{source}");
+    assert!(flat.contains("fill(buffer.as_mut_ptr(),n)"), "{source}");
+}
+
+/// **FAULT — a SHARED subject at a `*mut T` formal is refused.** Handing a
+/// `&[T]` to a formal the callee may write is exactly the `&T -> &mut T` the
+/// soundness line forbids; the subject keeps the use wall.
+#[test]
+fn wave6s_shared_subject_refuses_a_mutable_foreign_formal() {
+    let rows = super::emit_tests::decisions_of(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; pub type size_t = usize; }
+ unsafe extern "C" { fn fill(buf: *mut u8, n: libc::size_t) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut buffer: *const u8, mut n: libc::size_t) -> libc::c_int {
+    let mut acc = *buffer.offset(0 as isize) as libc::c_int;
+    return fill(buffer as *mut u8, n) + acc;
+ }
+"#,
+    );
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "buffer" && *is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(reason, "<emitted>", "{rows:?}");
+}
+
+/// **FAULT — a formal that is itself a pointer is refused.** `*mut *mut T` is
+/// the nested family's depth-2 position, not a slice's own pointer.
+#[test]
+fn wave6s_pointer_to_pointer_foreign_formal_is_refused() {
+    let rows = super::emit_tests::decisions_of(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; }
+ unsafe extern "C" { fn take(pp: *mut *mut u8) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut slots: *mut *mut u8) -> libc::c_int {
+    let mut first = *slots.offset(0 as isize);
+    return take(slots) + (first as libc::c_int);
+ }
+"#,
+    );
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "slots" && *is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(reason, "<emitted>", "{rows:?}");
+}
+
+/// **FAULT — a pointee-changing formal is refused.** `*const c_void` at a
+/// `u32` subject is a reinterpretation, which is the void-region family's
+/// evidence to supply and never this arm's.
+#[test]
+fn wave6s_retyped_foreign_formal_is_refused() {
+    let rows = super::emit_tests::decisions_of(RETYPED_FOREIGN_FORMAL);
+    let _ = &rows;
+    // The boundary planner delivers this row on its own evidence, and its
+    // rendering CARRIES THE CAST (`words.as_ptr().cast::<c_void>()`). What
+    // this control pins is that THIS arm never does it: a formal whose pointee
+    // is not the subject's element never receives the bare pointer, because a
+    // reinterpretation is the void-region family's evidence to supply.
+    let source = emit(RETYPED_FOREIGN_FORMAL);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!flat.contains("sink(words.as_ptr(),"), "{source}");
+    assert!(!flat.contains("sink(words.as_mut_ptr(),"), "{source}");
+}
+
+const RETYPED_FOREIGN_FORMAL: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; pub type c_void = core::ffi::c_void; pub type size_t = usize; }
+ unsafe extern "C" { fn sink(p: *const libc::c_void, n: libc::size_t) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut words: *const u32, mut n: libc::size_t) -> libc::c_int {
+    let mut acc = *words.offset(0 as isize) as libc::c_int;
+    return sink(words as *const libc::c_void, n) + acc;
+ }
+"#;
+
+/// **CONTROL — a LOCAL callee is untouched.** The existing c-raw-slice path
+/// owns a local callee's argument; this arm reads the callee's body to tell
+/// the two apart, exactly as R410-9(b) does.
+#[test]
+fn wave6s_local_callee_argument_keeps_its_own_path() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; }
+ unsafe extern "C" fn sum(mut p: *const u8, mut n: libc::c_int) -> libc::c_int {
+    return *p.offset(0 as isize) as libc::c_int + n;
+ }
+ pub unsafe extern "C" fn run(mut data: *const u8, mut n: libc::c_int) -> libc::c_int {
+    let mut acc = *data.offset(1 as isize) as libc::c_int;
+    return sum(data, n) + acc;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("sum(data,n)") || flat.contains("sum(&(data)"),
+        "{source}"
+    );
+    assert!(
+        !flat.contains("sum(data.as_ptr()"),
+        "a local callee is not bridged here: {source}"
+    );
+}
