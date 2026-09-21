@@ -491,8 +491,80 @@ struct Uses<'a, 'tcx> {
     /// Chains ceded to a destination's own construction (R487-3(c)): counted so
     /// that a subject whose ONLY handled use is a cede does not take the root.
     ceded: usize,
+    /// **R497-3(c).** This subject is a re-seeded walker: exactly one of its
+    /// assignments comes from another value, and that assignment CONSTRUCTS a
+    /// fresh cursor rather than seeking the existing one.
+    re_seeded: bool,
+    /// Set when a re-seed construction fabricated its extent (§77): the plan
+    /// carries `fallback`, so the count is auditable.
+    re_seed_fabricated: bool,
 }
 impl Uses<'_, '_> {
+    /// **R497-3(c) — the raw view of a re-seed value.** The re-seed source is
+    /// whatever the other families decided it is, so the construction takes a
+    /// raw pointer out of that form: a still-raw binding is its own text, a
+    /// delivered reference is bridged (addendum 130 — emit the bridge, do not
+    /// degrade the subject), and anything else holds.
+    fn re_seed_raw_view(&self, rhs: &hir::Expr<'_>) -> Option<String> {
+        let binding = local(rhs)?;
+        let (source, decision) = self
+            .entries
+            .iter()
+            .find(|(source, _)| source.fn_did == self.subject.fn_did && source.hir_id == binding)?;
+        let name = emission::binding_name(self.ctx.tcx, source).ok()?;
+        match decision {
+            // Still raw in the emitted program: the text is already a pointer.
+            Decision::Degraded(_) => Some(name),
+            // A shared reference bridges with `from_ref`. An exclusive one is
+            // NOT bridged here: taking a raw `*mut` out of a live `&mut` while
+            // the cursor walks it is the retained-alias channel, and this arm
+            // has no evidence about it.
+            Decision::Ref { mutable: false } | Decision::InferredRef { mutable: false, .. }
+                if !self.subject.mutable =>
+            {
+                Some(format!("core::ptr::from_ref({name})"))
+            }
+            // A thin optional: `None` re-seeds a null cursor, which the
+            // optional form already represents.
+            Decision::Opt {
+                mutable: false,
+                slice: false,
+                ..
+            } if !self.subject.mutable => Some(format!(
+                "{name}.map_or(core::ptr::null(), core::ptr::from_ref)"
+            )),
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Opt { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. } => None,
+        }
+    }
+
+    /// The construction a re-seed renders, with its §77 fabricated extent. The
+    /// re-seed value has no evidence-backed length here — a length recovered
+    /// from the source (json.h's `size` bound) is a later, exact form.
+    fn re_seed_construction(&mut self, rhs: &hir::Expr<'_>) -> Option<String> {
+        let raw = self.re_seed_raw_view(rhs)?;
+        self.re_seed_fabricated = true;
+        let method = if self.subject.mutable {
+            "from_raw_parts_mut"
+        } else {
+            "from_raw_parts"
+        };
+        let construction = format!(
+            "unsafe {{ {}::{method}({raw}, crate::FALLBACK_SLICE_EXTENT) }}",
+            constructor(self.subject.mutable),
+        );
+        Some(if self.optional {
+            format!("Some({construction})")
+        } else {
+            construction
+        })
+    }
+
     /// A derived pointer leaving the function through its raw return: the tail
     /// view's address under the raw-boundary T2 receipt (retained by the caller).
     /// The seam planner owns a return that is lifetime-planned; a return permit
@@ -1164,7 +1236,26 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                                 );
                             }
                             _ => {
-                                self.hold.get_or_insert(hold);
+                                // **R497-3(c).** A RE-SEEDED walker constructs
+                                // a fresh cursor here instead of holding.
+                                match self
+                                    .re_seeded
+                                    .then(|| self.re_seed_construction(rhs))
+                                    .flatten()
+                                {
+                                    Some(construction) => self.push(
+                                        e,
+                                        format!("{} = {construction}", self.name),
+                                        // The existing constructor vocabulary:
+                                        // a re-seed IS a construction, and the
+                                        // §77 extent receipt rides `fallback`
+                                        // through the same channel.
+                                        "cursor-constructor",
+                                    ),
+                                    None => {
+                                        self.hold.get_or_insert(hold);
+                                    }
+                                }
                             }
                         }
                         return;
@@ -1183,7 +1274,25 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                                 )
                             }
                             _ => {
-                                self.hold.get_or_insert(hold);
+                                // **R497-3(c)** — as above, with the Option.
+                                match self
+                                    .re_seeded
+                                    .then(|| self.re_seed_construction(rhs))
+                                    .flatten()
+                                {
+                                    Some(construction) => self.push(
+                                        e,
+                                        format!("{} = {construction}", self.name),
+                                        // The existing constructor vocabulary:
+                                        // a re-seed IS a construction, and the
+                                        // §77 extent receipt rides `fallback`
+                                        // through the same channel.
+                                        "cursor-constructor",
+                                    ),
+                                    None => {
+                                        self.hold.get_or_insert(hold);
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -1506,6 +1615,13 @@ fn self_advancing_root(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> b
     if s.ptr_depth != 1 || !optional_degraded(decision) {
         return false;
     }
+    let (advances, other) = self_assignments(ctx, s);
+    advances > 0 && other == 0
+}
+
+/// `(assignments rooted at the subject, assignments from anything else)` over
+/// the subject's own body. A declaration initialiser is not an assignment.
+fn self_assignments(ctx: &Ctx<'_, '_>, s: &Subject) -> (usize, usize) {
     struct Assigns<'a, 'tcx> {
         ctx: &'a Ctx<'a, 'tcx>,
         owner: rustc_hir::def_id::LocalDefId,
@@ -1536,8 +1652,32 @@ fn self_advancing_root(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> b
         other: 0,
     };
     assigns.visit_body(ctx.tcx.hir_body_owned_by(s.fn_did));
-    assigns.advances > 0 && assigns.other == 0
+    (assigns.advances, assigns.other)
 }
+/// **R497-3(c) — the RE-SEEDED walker.** `self_advancing_root` wants every
+/// assignment rooted at the subject; five corpus rows advance themselves and
+/// are additionally **re-seeded once** from another value (`p = envbase`,
+/// `p = c`, `search = strchr(search, ';')`, `info = ti_find_indicator(..)`,
+/// `backptr = &*in_0.offset(..)`). Exactly one such assignment is admitted:
+/// the re-seed constructs a fresh cursor at that point (slicecursor 052 §3),
+/// which resets the position, so two of them would make the walker's own
+/// positions incomparable with no single base to name.
+fn re_seeded_walker(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
+    if s.ptr_depth != 1 || !optional_degraded(decision) {
+        return false;
+    }
+    // **Condition (ii), slicecursor 052 §3.** The construction at the re-seed
+    // fabricates its window FORWARD from that pointer, so the cursor cannot
+    // represent a position below it: a walker that may move backwards after
+    // the re-seed would panic where the input program was correct. The sign
+    // slot is the fact, the same one `selected` reads.
+    if ctx.sign.may_be_negative(s.fn_did, s.local) {
+        return false;
+    }
+    let (advances, other) = self_assignments(ctx, s);
+    advances > 0 && other == 1
+}
+
 /// A null-initialised local the option family degrades (`opt-use-unsupported`)
 /// whose every assignment is an offset chain (or the reborrow idiom) rooted at
 /// a cursor root of this family: the optional cursor form covers it.
@@ -1677,7 +1817,8 @@ pub(super) fn plan(
     if (!selected(ctx, subject, decision)
         && !derives_cursor(ctx, subject, decision, entries)
         && !derived_from_cursor_root(ctx, subject, decision, entries)
-        && !self_advancing_root(ctx, subject, decision))
+        && !self_advancing_root(ctx, subject, decision)
+        && !re_seeded_walker(ctx, subject, decision))
         || subject.ptr_depth != 1
     {
         return None;
@@ -1836,6 +1977,11 @@ fn build(
         peer_cursors: vec![],
         local_bridges: vec![],
         ceded: 0,
+        re_seeded: {
+            let (advances, other) = self_assignments(ctx, subject);
+            advances > 0 && other == 1
+        },
+        re_seed_fabricated: false,
     };
     v.visit_body(ctx.tcx.hir_body_owned_by(subject.fn_did));
     if let Some(hold) = v.hold {
@@ -1863,7 +2009,7 @@ fn build(
         wrapper: true,
         parameter,
         optional,
-        fallback: b.fallback,
+        fallback: b.fallback || v.re_seed_fabricated,
         uses: v.edits,
         use_hirs: v.hirs,
         base: b.local,
