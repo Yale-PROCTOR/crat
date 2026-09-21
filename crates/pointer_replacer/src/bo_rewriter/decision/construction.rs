@@ -2047,3 +2047,281 @@ mod slice_construction_tests {
         assert!(!nullable.contains("&mut *next_ptr()"));
     }
 }
+
+/// **R480-2 (B1) — the allocation-root extent, as a query.**
+///
+/// wave-4's root-extent propagation needs the one fact this family already
+/// reads at a construction site: when a pointer's value comes from a SIZED
+/// allocation, how many ELEMENTS that allocation holds. The answer is the
+/// source text of the count, or `None` — never the §77 fallback, which is the
+/// same contract wave-6b's `licensed_width` keeps (exact or absent).
+///
+/// Three exact shapes, all of them the ones `select_length` already treats as
+/// evidence, and nothing else:
+///
+/// - `calloc(n, size_of::<T>())` — the count is its own argument;
+/// - `alloc(n * size_of::<T>())` — the product's other factor;
+/// - `BrotliAllocate(m, n.wrapping_mul(size_of::<T>()))` — c2rust's spelling of
+///   the same product, which is how brotli's ring buffer is allocated
+///   (`RingBufferInitBuffer`: `(2 + buflen) + slack` bytes of `uint8_t`, whose
+///   `mask_` is then `size_ - 1`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RootExtent {
+    /// The element count, as source text from the allocation site.
+    pub(crate) elements: String,
+    /// Which allocator, and how the count was read — the receipt's evidence.
+    pub(crate) source: SliceLengthSource,
+}
+
+pub(crate) fn allocation_root_extent(
+    tcx: TyCtxt<'_>,
+    facts: &ConstructionFacts,
+    node: (LocalDefId, HirId),
+    element_type: &str,
+) -> Option<RootExtent> {
+    let init_hir = *facts.init_hirs.get(&node)?;
+    let expression = Collector::peel(tcx.hir_node(init_hir).expect_expr());
+    let rustc_hir::ExprKind::Call(callee, args) = expression.kind else { return None };
+    let name = callee_item_name(tcx, callee)?;
+    let sm = tcx.sess.source_map();
+    let text = |expr: &rustc_hir::Expr<'_>| sm.span_to_snippet(expr.span).ok();
+    // The ruled allocator table (addendum 409) — the same rows the ownership
+    // family reads, so "which allocator, and where its size is" is answered in
+    // one place rather than by a second list here.
+    let extent = super::allocator_contract::CONTRACTS
+        .iter()
+        .flat_map(|contract| contract.allocators.iter())
+        .find(|allocator| allocator.name == name)
+        .map(|allocator| &allocator.extent)?;
+    match &extent {
+        super::allocator_contract::Extent::ElementCount {
+            count_index,
+            size_index,
+        } => {
+            let (count_index, size_index) = (*count_index, *size_index);
+            let size = text(args.get(size_index)?)?;
+            if !is_element_size(&size, element_type) {
+                return None;
+            }
+            Some(RootExtent {
+                elements: text(args.get(count_index)?)?,
+                source: SliceLengthSource::AllocationElementCount {
+                    allocator: name,
+                    argument_index: count_index as u32,
+                },
+            })
+        }
+        super::allocator_contract::Extent::SizeArgument(index) => {
+            let index = *index;
+            let bytes = args.get(index)?;
+            let (count, size) = product(bytes)?;
+            if !is_element_size(&text(size)?, element_type) {
+                return None;
+            }
+            Some(RootExtent {
+                elements: text(count)?,
+                source: SliceLengthSource::AllocationByteCount {
+                    allocator: name,
+                    argument_index: index as u32,
+                    element_type: element_type.to_owned(),
+                },
+            })
+        }
+        super::allocator_contract::Extent::NulTerminatedCopy => None,
+    }
+}
+
+/// `n * size_of::<T>()`, either factor first, in both spellings the corpus
+/// uses: the operator, and c2rust's `wrapping_mul` method call.
+fn product<'tcx>(
+    bytes: &'tcx rustc_hir::Expr<'tcx>,
+) -> Option<(&'tcx rustc_hir::Expr<'tcx>, &'tcx rustc_hir::Expr<'tcx>)> {
+    let bytes = Collector::peel(bytes);
+    match bytes.kind {
+        rustc_hir::ExprKind::Binary(operator, left, right)
+            if operator.node == rustc_hir::BinOpKind::Mul =>
+        {
+            Some((left, right))
+        }
+        rustc_hir::ExprKind::MethodCall(segment, receiver, [argument], _)
+            if segment.ident.name.as_str() == "wrapping_mul" =>
+        {
+            Some((receiver, argument))
+        }
+        _ => None,
+    }
+    .map(|(left, right)| {
+        // The COUNT is the factor that is not the element size; the caller
+        // checks the other one, so hand them back in that order.
+        (left, right)
+    })
+}
+
+/// `size_of::<T>()` in every spelling the corpus writes, including c2rust's
+/// leading `::` (`::std::mem::size_of::<uint8_t>()`), which
+/// [`exact_element_size`] does not accept and which is deliberately not
+/// widened there: that helper decides EMITTED lengths for another family.
+fn is_element_size(text: &str, element_type: &str) -> bool {
+    let normalized = normalized(text);
+    let mut normalized = normalized.as_str();
+    while let Some(inner) = normalized
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        normalized = inner;
+    }
+    let element = self::normalized(element_type);
+    [
+        "::core::mem::",
+        "::std::mem::",
+        "core::mem::",
+        "std::mem::",
+        "",
+    ]
+    .into_iter()
+    .any(|prefix| normalized == format!("{prefix}size_of::<{element}>()"))
+}
+
+fn callee_item_name(tcx: TyCtxt<'_>, callee: &rustc_hir::Expr<'_>) -> Option<String> {
+    let rustc_hir::ExprKind::Path(path) = Collector::peel(callee).kind else { return None };
+    let rustc_hir::QPath::Resolved(_, path) = path else { return None };
+    let Res::Def(DefKind::Fn, did) = path.res else { return None };
+    Some(tcx.item_name(did).to_string())
+}
+
+#[cfg(test)]
+mod root_extent_tests {
+    use super::*;
+
+    fn extent_of(input: &str, binding: &str, element: &str) -> Option<RootExtent> {
+        ::utils::compilation::run_compiler_on_str(input, |tcx| {
+            let owners = tcx.hir_body_owners().collect::<Vec<_>>();
+            let facts = collect(tcx, &owners);
+            facts
+                .by_binding
+                .keys()
+                .find(|(owner, hir)| {
+                    matches!(
+                        tcx.parent_hir_node(*hir),
+                        rustc_hir::Node::LetStmt(local)
+                            if tcx
+                                .sess
+                                .source_map()
+                                .span_to_snippet(local.pat.span)
+                                .is_ok_and(|text| text.trim_start_matches("mut ").trim() == binding)
+                    ) && tcx.hir_body_owners().any(|id| id == *owner)
+                })
+                .copied()
+                .and_then(|node| allocation_root_extent(tcx, &facts, node, element))
+        })
+        .unwrap()
+    }
+
+    /// **brotli's ring buffer, reduced** — the shape relay 050 names. The
+    /// allocation is `BrotliAllocate(m, count.wrapping_mul(size_of::<u8>()))`
+    /// and the mask the readers take is `size - 1`, so the count is the extent
+    /// the root carries and the mask is one less than it.
+    pub(super) const RING: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_snake_case)]
+unsafe fn BrotliAllocate(m: *mut u8, n: usize) -> *mut core::ffi::c_void { let _ = (m, n); core::ptr::null_mut() }
+pub unsafe fn RingBufferInitBuffer(m: *mut u8, buflen: u32, mask: *mut u32) {
+    let slack: usize = 7;
+    let data = BrotliAllocate(
+        m,
+        ((2u32.wrapping_add(buflen)) as usize).wrapping_add(slack).wrapping_mul(::core::mem::size_of::<u8>()),
+    ) as *mut u8;
+    *mask = ((2u32.wrapping_add(buflen)) as usize).wrapping_add(slack) as u32 - 1;
+    let _ = data;
+}
+"#;
+
+    #[test]
+    fn w5c_b1_the_ring_buffers_allocation_carries_its_element_count() {
+        let extent = extent_of(RING, "data", "u8").expect("the root's extent is exact");
+        assert!(
+            extent.elements.contains("buflen"),
+            "the count is the allocation's own expression: {extent:?}"
+        );
+        assert!(
+            matches!(
+                extent.source,
+                SliceLengthSource::AllocationByteCount { .. }
+                    | SliceLengthSource::AllocationElementCount { .. }
+            ),
+            "and it is receipted as an allocation fact: {extent:?}"
+        );
+    }
+
+    /// **Control (i)** — `calloc(n, size_of::<T>())`: the count is its own
+    /// argument, and the query reads it there rather than dividing bytes.
+    #[test]
+    fn w5c_b1_a_two_argument_allocator_reports_its_count_argument() {
+        let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void { let _ = (n, size); core::ptr::null_mut() }
+pub unsafe fn f(n: usize) {
+    let data = calloc(n, ::core::mem::size_of::<i32>()) as *mut i32;
+    let _ = data;
+}
+"#;
+        let extent = extent_of(input, "data", "i32").expect("the count argument is the extent");
+        assert!(extent.elements.contains('n'), "{extent:?}");
+        assert!(
+            matches!(
+                extent.source,
+                SliceLengthSource::AllocationElementCount { .. }
+            ),
+            "{extent:?}"
+        );
+    }
+
+    /// **Control (ii)** — an allocation whose size is not a product of the
+    /// element size (a dynamic byte count that names no `size_of`): the query
+    /// answers `None` rather than the fallback. That is the contract wave-4
+    /// consumes — exact or absent.
+    /// **Control (iii)** — a product whose other factor is not the element
+    /// size. `malloc(n * 3)` behind a `*mut i32` allocates three bytes per
+    /// `n`, not one element per `n`, so `n` is not the extent and the query
+    /// says nothing rather than something wrong.
+    #[test]
+    fn w5c_b1_a_product_by_the_wrong_size_has_no_root_extent() {
+        let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn malloc(n: usize) -> *mut core::ffi::c_void { let _ = n; core::ptr::null_mut() }
+pub unsafe fn f(n: usize) {
+    let data = malloc(n.wrapping_mul(3)) as *mut i32;
+    let _ = data;
+}
+"#;
+        assert_eq!(extent_of(input, "data", "i32"), None);
+    }
+
+    /// **Control (iv)** — `strdup(s)`. The contract table calls its extent a
+    /// POSTCONDITION read off the result (`strlen + 1`, R434-4 §1), never off
+    /// an argument, so this query — which answers from the CALL — says nothing.
+    #[test]
+    fn w5c_b1_a_nul_terminated_copy_has_no_root_extent_here() {
+        let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn strdup(s: *const i8) -> *mut i8 { let _ = s; core::ptr::null_mut() }
+pub unsafe fn f(s: *const i8) {
+    let data = strdup(s);
+    let _ = data;
+}
+"#;
+        assert_eq!(extent_of(input, "data", "i8"), None);
+    }
+
+    #[test]
+    fn w5c_b1_an_unsized_allocation_has_no_root_extent() {
+        let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn malloc(n: usize) -> *mut core::ffi::c_void { let _ = n; core::ptr::null_mut() }
+pub unsafe fn f(bytes: usize) {
+    let data = malloc(bytes.wrapping_add(7)) as *mut i32;
+    let _ = data;
+}
+"#;
+        assert_eq!(extent_of(input, "data", "i32"), None);
+    }
+}
