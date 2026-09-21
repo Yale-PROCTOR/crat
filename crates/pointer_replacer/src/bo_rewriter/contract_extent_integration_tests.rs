@@ -1381,17 +1381,45 @@ fn ce_m03_a_thin_reference_at_a_memset_position_holds() {
             clear(x, n);
         }
     "#;
+    // **Re-premised by R481-1 / R482-3 (the USER's extent-lift waiver), wave-4
+    // report 045, relay 059.** R272-1 still DECIDES: the thin form is refused
+    // at a `ByteCount` position by every evidence arm, which is why the subject
+    // reaches the waiver at all. What the waiver then gives it is the
+    // fabricated-extent slice, and the seat has stated the consequence — for
+    // the fallback form the hold's Stacked-Borrows justification is superseded,
+    // the remaining hazard being the slice-length UB §77 already waives.
+    //
+    // The claim is therefore asserted where it is frame-independent: the
+    // subject is never given a THIN one-element form, whether the arms above
+    // hold it raw or the waiver lifts it. The original hold survives as a
+    // control below, on a fixture the waiver refuses.
     let decisions = super::emit_tests::decisions_of(source);
-    let s = decisions
-        .iter()
-        .find(|(name, is_param, _)| name == "s" && *is_param)
-        .expect("CE-M03 `s` subject");
-    assert_ne!(
-        s.2, "<emitted>",
-        "a thin reference must not reach memset: {decisions:#?}"
-    );
+    let _ = &decisions;
     let output = emitted(source);
-    assert!(!output.contains("s: &mut u8"), "{output}");
+    assert!(
+        !output.contains("s: &mut u8") && !output.contains("s: &u8"),
+        "no one-element form reaches a byte-counted memset: {output}"
+    );
+
+    // The control: a SHARED subject at a `*mut` foreign position, which
+    // `9685cb948` refuses (R483-3(b)) — writing through a pointer derived from
+    // a shared reference is UB §77 does not waive. There the hold stands whole,
+    // and `held:thin-extent` is still the reason a subject may not be thin at a
+    // multi-element position.
+    let refused = r#"
+        #![allow(dead_code, unused_unsafe, unused_mut)]
+        extern "C" { fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8; }
+        static mut SAVED: *const u8 = 0 as *const u8;
+        pub unsafe fn caller(x: *const u8, n: usize) {
+            SAVED = x;
+            memset(x as *mut u8, 0, n);
+        }
+    "#;
+    let control = emitted(refused);
+    assert!(
+        !control.contains("x: &[u8]") && !control.contains("x: &mut [u8]"),
+        "a shared subject at a *mut position is refused, not lifted: {control}"
+    );
 }
 
 /// A byte count that spells the pointee's own size is ONE element: a thin
