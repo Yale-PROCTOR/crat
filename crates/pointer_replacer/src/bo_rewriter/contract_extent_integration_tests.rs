@@ -2366,7 +2366,13 @@ fn w4b103_the_residue_is_counted_with_its_reason() {
         .find(|(subject, ..)| subject.starts_with("StoreUnsized::storage"))
         .unwrap_or_else(|| panic!("no StoreUnsized::storage row: {rows:?}"));
     assert_eq!(storage.1, "held", "{rows:?}");
-    assert_eq!(storage.2, "none", "no extent to propagate: {rows:?}");
+    // The column now names the SHAPE the root has instead of an extent, so the
+    // next build is chosen on the distribution rather than on a guess: here an
+    // opaque `GetBuffer()` call result.
+    assert_eq!(
+        storage.2, "none:call-result",
+        "no extent to propagate: {rows:?}"
+    );
     assert_eq!(storage.3, "root-states-no-extent", "{rows:?}");
 }
 

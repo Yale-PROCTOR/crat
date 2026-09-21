@@ -95,6 +95,25 @@ fn local_root_extent(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<SliceLength
     .map(|plan| plan.source)
 }
 
+/// **Why a root states nothing — the shape it has instead** (wave-4 report 047).
+///
+/// `none` alone tells the seat that 43 rows have no extent; it does not say
+/// whether those roots are FIELDS whose size is recorded in a sibling (brotli's
+/// `(*s).storage_` beside `(*s).storage_size_`, a shape a later build could
+/// read) or opaque call results nothing could recover. The receipt therefore
+/// carries the root's own construction key, so the next build is chosen on the
+/// distribution rather than on a guess.
+fn root_shape(ctx: &Ctx<'_, '_>, subject: &Subject) -> String {
+    match ctx
+        .constructions
+        .by_binding
+        .get(&(subject.fn_did, subject.hir_id))
+    {
+        Some(construction) => format!("none:{}", construction.key()),
+        None => "none:no-construction".to_owned(),
+    }
+}
+
 /// Does this subject state an extent a caller could pass on — either because it
 /// is already delivered as a slice, or because its own root states one?
 fn states_an_extent(
@@ -215,7 +234,7 @@ pub(crate) fn promote(
                     subject: subject.label.clone(),
                     position,
                     outcome,
-                    extent: "none".to_owned(),
+                    extent: root_shape(ctx, subject),
                     evidence: reason.to_owned(),
                 });
                 continue;
