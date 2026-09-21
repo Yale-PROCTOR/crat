@@ -12556,7 +12556,14 @@ mod run {
         // waiver or an ordinary retention row.
         row.set(
             raw_schema::RETENTION_FRAME_BOUNDED,
-            bridge_receipts
+            // **The table it actually lands in.** The receipt is a field of the retention
+            // CERTIFICATE and is rendered by `RetentionSummaries::to_tsv`, not by
+            // `render_bridge_events` — so counting the bridge receipts read 0 on a frame
+            // that had one. Second time I have counted a column against a source I did
+            // not verify carried the fact (`interface_seed` was the first), so the
+            // witness below now pins the artifact, not just the marker.
+            artifact
+                .retention
                 .matches("retention-discharged:frame-bounded")
                 .count()
                 .to_string(),
@@ -34456,6 +34463,27 @@ fn r476_1_frame_bounded_retention_discharges_are_counted() {
             .filter(|l| l.contains("frame-bounded"))
             .count(),
         "the marker and the rows must agree"
+    );
+
+    // **The artifact, not just the marker.** The first version counted
+    // `bridge_receipts`; the receipt is a field of the retention CERTIFICATE and is
+    // rendered by `RetentionSummaries::to_tsv`, so the column read 0 on batch 18 which
+    // HAD one (json.h `json_parse_ex` arg0). A counter is only as good as the source it
+    // reads, and this pins the source.
+    let source = include_str!("bo_c1.rs");
+    let column = source
+        .split("raw_schema::RETENTION_FRAME_BOUNDED,")
+        .nth(1)
+        .expect("the column is set");
+    let stanza = &column[..column.find(");").unwrap_or(column.len())];
+    assert!(
+        stanza.contains("artifact\n                .retention")
+            || stanza.contains("artifact.retention"),
+        "the count must read the retention table, where the receipt is rendered: {stanza}"
+    );
+    assert!(
+        !stanza.contains("bridge_receipts"),
+        "bridge_receipts does not carry this receipt: {stanza}"
     );
 
     // R450-9: its own additive column, distinct from the neighbours it sits beside.
