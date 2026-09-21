@@ -138,8 +138,15 @@ fn w6p_an_allocating_arm_refuses_the_conditional() {
     );
 }
 
-/// Control (iii): an `if` with no `else` cannot be read as one base — the
-/// implicit arm is whatever the local held before.
+/// Control (iii): the same shape written as TWO assignments rather than one
+/// conditional — `p = other; if c { p = storage.offset(k); }`. The local holds
+/// two different objects and the existing derived-root fixpoint refuses it,
+/// which is what this pins.
+///
+/// It is NOT a test of the walk's `no-else` guard, and fault F46 (removing
+/// that guard) bites nothing: a pointer-valued `if` with no `else` cannot
+/// typecheck in Rust, so that guard is unreachable by construction and is
+/// defensive only. Reported rather than witnessed.
 const NO_ELSE_ARM: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
 pub unsafe fn StoreBits(mut p: *mut u8, mut out: *mut i32) -> i32 {
@@ -157,11 +164,11 @@ pub unsafe fn emit(mut storage: *mut u8, mut other: *mut u8, mut n: i32) -> i32 
 "#;
 
 #[test]
-fn w6p_a_missing_else_arm_is_not_one_base() {
+fn w6p_two_assignments_with_different_bases_stay_unknown() {
     assert_ne!(
         verdict(NO_ELSE_ARM, "emit", "StoreBits", 0, 1),
         Ok(CertificateKind::DistinctRoots),
-        "the value the local already held is the other arm"
+        "two assignments naming two objects are not one object"
     );
 }
 
