@@ -1214,7 +1214,7 @@ fn w6a_ac_an_optional_slice_owner_derefs_to_its_first_element() {
 /// fixture of this lane holds a formal at model-`Raw` (five shapes tried
 /// across reports 024 and 039).
 #[test]
-fn w6a_a_body_proves_a_lend_only_where_the_model_has_no_verdict() {
+fn w6a_a_body_proves_a_lend_for_every_slotted_formal() {
     use super::{
         super::analyses::borrow_ownership::SlotKind,
         decision::return_certificate::model_admits_lend,
@@ -1223,8 +1223,15 @@ fn w6a_a_body_proves_a_lend_only_where_the_model_has_no_verdict() {
     // The model's own lend verdict, and the absence the body may fill.
     assert!(model_admits_lend(Some(SlotKind::Ref)));
     assert!(model_admits_lend(Some(SlotKind::Raw)));
-    // A positive claim of ownership is not superseded by a use walk …
-    assert!(!model_admits_lend(Some(SlotKind::Owning)));
-    // … and a formal the model never slotted answers nothing.
+    // **Restated for W6A-A1-e** (relay wave-6a/049). Report 039 read the
+    // `Owning` case as a claim a use walk may not supersede. That reading was
+    // about the FORMAL — and this oracle does not touch the formal. It answers
+    // one question for the CALLER, whether its certificate survives the call,
+    // and the formal keeps its kind, its raw form and its own family
+    // (ownership-fields emits exactly these as raw views with the `Owning`
+    // label recorded beside them). Nothing is overturned, so the claim is
+    // admitted and the body walk alone decides.
+    assert!(model_admits_lend(Some(SlotKind::Owning)));
+    // A formal the model never slotted answers nothing, in every reading.
     assert!(!model_admits_lend(None));
 }

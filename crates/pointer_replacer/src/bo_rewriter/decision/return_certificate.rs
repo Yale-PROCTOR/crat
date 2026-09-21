@@ -1257,15 +1257,30 @@ impl<'a, 'tcx> LendOracle<'a, 'tcx> {
 /// resolved through the contract table. That is the supersession R410-5 §1
 /// allows over an absence.
 ///
-/// `Owning` is not an absence: it is the model claiming the formal owns its
-/// pointee, and this walk is not the source proof that would be needed to
-/// overturn it (report 011's licensing wall). A formal with no slot at all
-/// answers nothing and is refused.
+/// `Owning` is the model claiming the formal owns its pointee, and this walk
+/// is not the source proof that would overturn it (report 011's licensing
+/// wall). **W6A-A1-e** (relay wave-6a/049) admits it anyway, because nothing
+/// here overturns anything: this oracle answers one question for the CALLER
+/// — may its certificate survive the call — and the formal keeps its kind,
+/// its raw form and its own family. The claim would matter if the callee
+/// could release the allocation, and [`LendWalk`] is exactly the proof that
+/// it cannot: a free, a store, a return or a copy of the formal each refuse.
+/// The precedent is already in the tree — ownership-fields emits these very
+/// formals as raw views and records the `Owning` label beside them, i.e. it
+/// has already established that an `Owning`-modeled formal emitted raw is
+/// lendable (`native_lend_formal` → `Ok(Kind::Owning)`).
 ///
-/// The market this opens is the 37 `contract-allocation:use:call-argument-not-a-lend`
-/// rows of batch 16, 18 of them `BrotliHistogramCombine{Literal,Distance,Command}`.
+/// A formal with no slot at all answers nothing and is refused.
+///
+/// The market: the 37 `contract-allocation:use:call-argument-not-a-lend` rows
+/// of batch 16 (18 `BrotliHistogramCombine{Literal,Distance,Command}`), and —
+/// the `Owning` half — the root of heman's 26-member cascade, which bisects
+/// to exactly one such argument (relay 049, report 042).
 pub(crate) fn model_admits_lend(kind: Option<SlotKind>) -> bool {
-    matches!(kind, Some(SlotKind::Ref) | Some(SlotKind::Raw))
+    matches!(
+        kind,
+        Some(SlotKind::Ref) | Some(SlotKind::Raw) | Some(SlotKind::Owning)
+    )
 }
 
 /// Derive every certificate for the crate (fixpoint over chained returns).
@@ -1652,6 +1667,35 @@ fn certify<'tcx, 's>(
             }
         };
         pointee_ty = Some(ty);
+        // **W6A-A1-e's companion gate.** A certificate constructs the owner
+        // (`Box::new(Struct { field: .. })`) and spells every field as the
+        // source spells it. A field another family OWNS is not spellable that
+        // way — wave-6f promotes such a field to `Option<Box<T>>`, and the
+        // literal raw initializer beside it is an `E0308`. The model's field
+        // kind is the question, and it is asked here, at the one place the
+        // pointee is known.
+        if let TyKind::Adt(adt, _) = ty.kind()
+            && adt.is_struct()
+            && let Some(struct_did) = adt.did().as_local()
+            && (0..adt.all_fields().count()).any(|field_index| {
+                slots
+                    .field_slots
+                    .slot_for_field_depth(
+                        crate::analyses::borrow_ownership::slots::StructFieldSlot {
+                            struct_did,
+                            field_index,
+                        },
+                        0,
+                    )
+                    .map(SlotRef::Field)
+                    .and_then(|slot| model.get(&slot).copied())
+                    == Some(SlotKind::Owning)
+            })
+        {
+            return Err(hold(format!(
+                "return-certificate-struct-field:{callee_path}:owned-field"
+            )));
+        }
         let pointee = pointee_source(tcx, ty);
         let frees: Vec<(Span, Span)> = scan
             .frees

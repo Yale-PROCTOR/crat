@@ -1045,3 +1045,242 @@ fn w6a_a1_a_conditional_return_carries_the_option_on_its_arms() {
         out.source
     );
 }
+
+/// **The heman cascade's shape** (relay wave-6a/049; main 063 §3's routing
+/// table names `heman_lighting_compute_normals` as the seed of 26 of the 69
+/// cascade members). `heman_image_create` mallocs a struct, stores a SECOND
+/// allocation into one of its fields and returns it; `compute` receives that
+/// allocation, reads the field back through a CAST to a different pointee
+/// (`(*result).data as *mut Vec3`), walks it, and returns the owner.
+const HEMAN_IMAGE_CHAIN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Vec3 { pub x: f32, pub y: f32, pub z: f32 }
+#[repr(C)]
+pub struct Image {
+    pub width: i32,
+    pub height: i32,
+    pub nbands: i32,
+    pub data: *mut f32,
+}
+pub unsafe extern "C" fn image_create(mut width: i32, mut height: i32, mut nbands: i32) -> *mut Image {
+    let mut img = malloc(::std::mem::size_of::<Image>()) as *mut Image;
+    (*img).width = width;
+    (*img).height = height;
+    (*img).nbands = nbands;
+    (*img).data = malloc(((width * height * nbands) as usize)
+        .wrapping_mul(::std::mem::size_of::<f32>())) as *mut f32;
+    return img;
+}
+pub unsafe extern "C" fn compute(mut heightmap: *mut Image) -> *mut Image {
+    let mut width = (*heightmap).width;
+    let mut height = (*heightmap).height;
+    let mut result = image_create(width, height, 3 as i32);
+    let mut normals = (*result).data as *mut Vec3;
+    let mut y = 0 as i32;
+    while y < height {
+        let mut n = normals.offset((y * width) as isize);
+        let mut x = 0 as i32;
+        while x < width {
+            (*n).x = x as f32;
+            n = n.offset(1 as i32 as isize);
+            x += 1;
+        }
+        y += 1;
+    }
+    return result;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut base = image_create(2 as i32, 2 as i32, 1 as i32);
+    let mut out = compute(base);
+    let mut w = (*out).width;
+    free((*out).data as *mut core::ffi::c_void);
+    free(out as *mut core::ffi::c_void);
+    free((*base).data as *mut core::ffi::c_void);
+    free(base as *mut core::ffi::c_void);
+    return w;
+}
+"#;
+
+#[test]
+fn w6a_a1e_the_heman_cascade_root_is_one_lend() {
+    // **W6A-A1-e** (relay wave-6a/049). The whole shape turns on ONE hold.
+    // Bisected on this fixture: dropping the nested field allocation changes
+    // nothing, and dropping the call `compute(base)` changes both holds — so
+    // `run::base`'s `call-argument-not-a-lend` is the root, it withdraws
+    // `image_create`'s certificate, and that leaves `compute::result` with an
+    // `uncertified-source`. The callee's formal is `box-param-callee-lends`:
+    // the model calls it `Owning`, which the lend oracle refused.
+    let out = emitted("a1-heman-chain", HEMAN_IMAGE_CHAIN);
+    let text = compact(&out.source);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !certificates.contains("call-argument-not-a-lend"),
+        "a body-proved lend must not read as a consuming argument\n{certificates}"
+    );
+    assert!(
+        text.contains("mutnbands:i32)->Box<Image>"),
+        "the producer's output type is the certificate\n{}",
+        out.source
+    );
+    assert!(
+        text.contains("fncompute(mutheightmap:*mutImage)->Box<Image>"),
+        "the chain continues through compute's own certificate\n{}",
+        out.source
+    );
+    assert!(
+        text.contains("compute(core::ptr::from_mut(base.as_mut()))"),
+        "the lend is a bridge at the call: the formal stays raw\n{}",
+        out.source
+    );
+    assert!(
+        text.contains("free((*out).data") && text.contains("drop(out);"),
+        "the struct's C free becomes a drop AT that site; the field's stays a C free\n{}",
+        out.source
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "compute::result"),
+        None,
+        "the receiver of a certified producer is an owner\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "run::base"),
+        None,
+        "the owner lent across the call keeps its certificate\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Control: the same chain where the lent callee COPIES its formal into a
+/// local (`let mut alias = heightmap;`). Nothing frees it and nothing stores
+/// it, so neither the transfer path nor any plan diverts the question: the
+/// LEND WALK alone must refuse it, on an `Owning`-modeled formal. This is the
+/// control that measures the walk, and the fault that skips the walk for
+/// `Owning` turns it red.
+#[test]
+fn w6a_a1e_a_copying_callee_is_not_a_lend() {
+    let source = HEMAN_IMAGE_CHAIN.replace(
+        "    let mut width = (*heightmap).width;",
+        "    let mut alias = heightmap;\n    let mut width = (*alias).width;",
+    );
+    assert!(
+        source.contains("let mut alias = heightmap;"),
+        "the control must add the copy"
+    );
+    let out = emitted("a1-heman-copying", &source);
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("call-argument-not-a-lend:compute(base)"),
+        "a formal the body copies is not a proven lend\n{}",
+        out.artifacts.return_certificate_receipts
+    );
+    // Measured, and the reason fault 1 (skipping the walk for `Owning`) is
+    // INERT: the copy also removes the model's `Owning` verdict — the whole
+    // chain reads `kind-raw` here and `compute::heightmap` has no lend hold at
+    // all. On every fixture in reach the conjunction `Owning AND !walk.ok` is
+    // empty, so no fixture can separate the walk from the kind gate.
+    assert_eq!(
+        reason_of(&out.degradations, "compute::result").as_deref(),
+        Some("kind-raw"),
+        "{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Control: the same chain where the lent callee STORES its formal into a raw
+/// place. Nothing frees it, so the transfer path does not divert the question
+/// — the LEND WALK itself must refuse, and the caller's certificate must not
+/// stand. This is the control that measures the walk on an `Owning` formal.
+#[test]
+fn w6a_a1e_a_storing_callee_is_not_a_lend() {
+    let source = HEMAN_IMAGE_CHAIN.replace(
+        "    let mut normals = (*result).data as *mut Vec3;",
+        "    (*result).data = heightmap as *mut f32;\n    let mut normals = (*result).data as *mut Vec3;",
+    );
+    assert!(
+        source.contains("(*result).data = heightmap"),
+        "the control must add the store"
+    );
+    let out = emitted("a1-heman-storing", &source);
+    let text = compact(&out.source);
+    assert!(
+        !text.contains("letmutbase:Box<"),
+        "an owner the callee stores away is not the caller's to keep\n{}",
+        out.source
+    );
+    assert!(
+        reason_of(&out.degradations, "run::base").is_some(),
+        "run::base must stay degraded\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The admitted kinds, stated exactly: `Ref` (the model's own lend verdict),
+/// `Raw` (an absence the body may fill) and — W6A-A1-e — `Owning` (a claim
+/// about the FORMAL that the caller's question does not touch). A formal with
+/// no slot answers nothing.
+#[test]
+fn w6a_a1e_the_admitted_kinds_are_exactly_three() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    assert!(super::decision::return_certificate::model_admits_lend(
+        Some(SlotKind::Ref)
+    ));
+    assert!(super::decision::return_certificate::model_admits_lend(
+        Some(SlotKind::Raw)
+    ));
+    assert!(super::decision::return_certificate::model_admits_lend(
+        Some(SlotKind::Owning)
+    ));
+    assert!(!super::decision::return_certificate::model_admits_lend(
+        None
+    ));
+}
+
+/// Control: the same chain where the lent callee FREES its formal. The body
+/// walk refuses it, the argument is a consuming one again, and the caller's
+/// certificate must not stand — a Box moved into a raw free is the
+/// double-free path A1 exists to avoid.
+#[test]
+fn w6a_a1e_a_freeing_callee_is_not_a_lend_however_the_model_reads_it() {
+    let source = HEMAN_IMAGE_CHAIN.replace(
+        "    return result;\n}",
+        "    free(heightmap as *mut core::ffi::c_void);\n    return result;\n}",
+    );
+    assert!(
+        source.contains("free(heightmap"),
+        "the control must add the free"
+    );
+    let out = emitted("a1-heman-freeing", &source);
+    let text = compact(&out.source);
+    assert!(
+        !text.contains("letmutbase:Box<") && !text.contains("letmutbase:::std::boxed::Box<"),
+        "an owner the callee frees is not the caller's to keep\n{}",
+        out.source
+    );
+    assert!(
+        reason_of(&out.degradations, "run::base").is_some(),
+        "run::base must stay degraded\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
