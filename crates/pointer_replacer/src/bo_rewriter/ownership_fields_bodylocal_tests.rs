@@ -2040,7 +2040,7 @@ fn r395_scalar_arithmetic_call_arguments_are_pure_but_effectful_ones_hold() {
         declarations()
     );
     let s = verify(&input, "buffer", BoxShape::Slice, false);
-    assert!(s.contains("read(<[_]>::as_mut_ptr(&mut *(buffer)), (n * 2 + 1) / 3 % 4)"));
+    assert!(lends_buffer(&s, "(n * 2 + 1) / 3 % 4"), "{s}");
     let effectful = format!(
         "{} static mut COUNTER: usize = 0; unsafe fn next()->usize {{ COUNTER+=1; COUNTER }} unsafe fn read(p:*mut u32, k:usize)->u32 {{ *p.offset(k as isize) }} pub unsafe fn prepare()->u32 {{ let mut buffer=calloc(4,core::mem::size_of::<u32>()) as *mut u32; *buffer=9; let value=read(buffer, next() * 2); free(buffer as *mut core::ffi::c_void); value }}",
         declarations()
@@ -2108,10 +2108,7 @@ fn r408_argument_reading_through_the_owner_holds_no_hoist_is_owed() {
             continue;
         }
         let s = verify(&control, "buffer", BoxShape::Slice, false);
-        assert!(
-            s.contains("read(<[_]>::as_mut_ptr(&mut *(buffer)), 1)"),
-            "{s}"
-        );
+        assert!(lends_buffer(&s, "1"), "{s}");
     }
 }
 
@@ -3032,6 +3029,22 @@ fn r457_a_synthesised_struct_literal_initialises_each_field_in_its_delivered_for
 /// `Copy` — must HOLD the owner rather than initialise the field with a value
 /// of the wrong type. Fail-closed, the same way the moved-out load's
 /// non-optional shape holds.
+/// R492-4 (relay 061): the lend of a Box to a callee whose formal is raw is
+/// `<[_]>::as_mut_ptr(&mut *(owner))`; where wave-6a's A9 converts that
+/// formal to a shared slice the SAME lend is `&*(owner)` (report 048 §1's
+/// matrix — both are this producer's renderings, chosen by the callee's
+/// terminal interface). Which one appears is the frame's; the argument after
+/// it is not, and neither is the fact that the owner is lent exactly once.
+fn lends_buffer(source: &str, rest: &str) -> bool {
+    [
+        format!("read(<[_]>::as_mut_ptr(&mut *(buffer)), {rest})"),
+        format!("read(&*(buffer), {rest})"),
+        format!("read(&mut *(buffer), {rest})"),
+    ]
+    .iter()
+    .any(|text| source.contains(text))
+}
+
 /// R466-4 (relay 057): the synthesised literal must be text the AST graft
 /// ACCEPTS. `graft_expr` takes a replacement only if it round-trips through
 /// the pretty printer whitespace-insensitively, and the printer spells a

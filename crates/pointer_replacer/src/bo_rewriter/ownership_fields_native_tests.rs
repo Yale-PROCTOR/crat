@@ -4,6 +4,20 @@
 
 use super::decision::Decision;
 
+/// R492-4 (relay 061): under wave-6a's A9 this fixture's callee formals
+/// convert — `(input:*mut f32,output:*mut f32)` becomes `(input:&f32,output:
+/// &mut f32)` — and then they emit as subjects of their own, so the emitted
+/// count is the caller's two owning locals PLUS the callee's two. Which frame
+/// produced a source is readable in its own signature, so the expectation
+/// stays exact on both instead of becoming a range.
+pub(super) fn expected_native_emitted(source: &str) -> usize {
+    if source.contains("(input:*mut f32,output:*mut f32)") {
+        2
+    } else {
+        4
+    }
+}
+
 pub(super) fn native_fixture_source(callee: &str, body: &str) -> String {
     format!(
         r#"
@@ -172,7 +186,11 @@ fn check_r365_emitted(callee: &str, calls: &str) {
         panic!("native emission refused: {outcome:?}");
     };
     println!("R365_EMITTED_BEGIN {callee}\n{source}\nR365_EMITTED_END {callee}");
-    assert_eq!(emitted_count, 2, "both native owning locals survive");
+    assert_eq!(
+        emitted_count,
+        expected_native_emitted(&source),
+        "both native owning locals survive (plus the callee's formals where A9 converts them)"
+    );
     assert_eq!(reverted_count, 0);
     assert!(unplaceable.is_empty());
     assert!(super::verify::type_checks_str(&source));
@@ -218,11 +236,19 @@ fn check_r365_emitted(callee: &str, calls: &str) {
         }
         let sig = tcx.fn_sig(target.to_def_id()).skip_binder().skip_binder();
         assert_eq!(sig.inputs().len(), 2);
+        // R492-4 (relay 061): whether the callee's formals stay raw is the
+        // FRAME's answer — here they do, and under wave-6a's A9 they are
+        // `&f32` / `&mut f32`. Either way the caller's owners keep their Box
+        // custody (asserted above) and the formals are uniform: a lend never
+        // leaves one of a pair converted and the other raw.
+        let raw: Vec<_> = sig
+            .inputs()
+            .iter()
+            .map(|ty| matches!(ty.kind(), rustc_middle::ty::TyKind::RawPtr(..)))
+            .collect();
         assert!(
-            sig.inputs()
-                .iter()
-                .all(|ty| matches!(ty.kind(), rustc_middle::ty::TyKind::RawPtr(..))),
-            "formal remains raw in compiled output"
+            raw.iter().all(|r| *r) || raw.iter().all(|r| !*r),
+            "the pair's formals are converted together: {sig:?}"
         );
     })
     .unwrap();
@@ -252,15 +278,34 @@ fn check_r365_emitted(callee: &str, calls: &str) {
     let moved_callee = format!(
         "unsafe fn {callee}(input: ::std::boxed::Box<[f32]>,mut output: ::std::boxed::Box<[f32]>) {{ output[0]=input[0]+1.0; }}"
     );
+    // R492-4 (relay 061): the counterfactual is frame-independent — replacing
+    // the lend with a CONSUMING formal must make the owner's later use
+    // illegal — but the text it starts from is not. Under wave-6a's A9 the
+    // callee reads `(input:&f32,output:&mut f32)` and the lend is the thin
+    // reference arm, so the substitution takes whichever spelling this frame
+    // emitted and the E0382 expectation below is unchanged.
+    let reference_callee =
+        format!("unsafe fn {callee}(input:&f32,output:&mut f32) {{ *output=*input+1.0; }}");
+    let emitted_callee = if source.contains(&raw_callee) {
+        raw_callee.clone()
+    } else {
+        reference_callee.clone()
+    };
     assert_eq!(
-        source.matches(&raw_callee).count(),
+        source.matches(&emitted_callee).count(),
         1,
         "exact emitted callee mutation"
     );
-    let mut moved = source.replace(&raw_callee, &moved_callee);
+    let mut moved = source.replace(&emitted_callee, &moved_callee);
     for name in ["pl1", "pl2"] {
-        let view = format!("<[_]>::as_mut_ptr(&mut *({name}))");
-        assert!(moved.contains(&view));
+        let view = [
+            format!("<[_]>::as_mut_ptr(&mut *({name}))"),
+            format!("&mut (*({name}))[0]"),
+            format!("&(*({name}))[0]"),
+        ]
+        .into_iter()
+        .find(|view| moved.contains(view))
+        .unwrap_or_else(|| panic!("no lend view for {name} in {moved}"));
         moved = moved.replace(&view, name);
     }
     let rejected = super::verify::diagnose_str(&moved);
@@ -317,7 +362,10 @@ fn hygienic_output(prefix: &str) -> String {
     else {
         panic!("{outcome:?}")
     };
-    assert_eq!((emitted_count, reverted_count), (2, 0));
+    assert_eq!(
+        (emitted_count, reverted_count),
+        (expected_native_emitted(&source), 0)
+    );
     source
 }
 
