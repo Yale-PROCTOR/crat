@@ -102,6 +102,8 @@ mod pair_disjointness_tests;
 #[cfg(test)]
 mod pair_fresh_field_tests;
 #[cfg(test)]
+mod pair_read_read_tests;
+#[cfg(test)]
 mod pair_static_callers_tests;
 #[cfg(test)]
 mod pair_static_root_tests;

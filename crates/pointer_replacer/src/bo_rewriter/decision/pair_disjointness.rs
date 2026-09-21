@@ -103,6 +103,13 @@ pub(crate) enum CertificateKind {
     /// assumption, never a proof, and receipted as one. The in-crate callers
     /// are still read, and one of them passing the static still refuses.
     StaticVsEntryWaived(u32),
+    /// R492-3 (wave-6k 038's rule, built here under R217-2(a)): the pair needs
+    /// no disjointness at all, because both peer formals are MODEL-SHARED
+    /// READS — `*const` in the input, nothing written through them, and no
+    /// mutable reborrow anywhere in the callee. `&T` beside `&T` is the one
+    /// aliasing question Rust answers for us, so two shared borrows of one
+    /// place are legal and there is nothing to prove.
+    ReadReadShared,
 }
 
 impl CertificateKind {
@@ -119,6 +126,7 @@ impl CertificateKind {
             Self::StaticVsEntry(_) | Self::StaticVsEntryWaived(_) => {
                 "pair-disjoint:static-vs-entry"
             }
+            Self::ReadReadShared => "pair-disjoint:read-read-shared",
         }
     }
 
@@ -345,6 +353,10 @@ pub(crate) struct PairDisjointnessIndex {
     type_rule: FxHashMap<(u32, usize, usize), PairTypeVerdict>,
     /// `(callee, index)` formals with a non-defaulted immutable fact.
     immutable_formals: FxHashSet<(u32, usize)>,
+    /// R492-3: formals that are model-shared reads — the conjunction in
+    /// `CertificateKind::ReadReadShared`. Keyed on the CALLEE alone, so the
+    /// answer is per pair and identical at every call site.
+    shared_reads: FxHashSet<(u32, usize)>,
     /// Each function's pointer-parameter bindings, in formal order: what lets
     /// (e) map an argument's entry root back to the caller's own formal.
     param_bindings: FxHashMap<u32, Vec<HirId>>,
@@ -444,12 +456,23 @@ impl PairDisjointnessIndex {
 
         let mut type_verdicts = FxHashMap::default();
         let mut immutable_formals = FxHashSet::default();
+        let mut shared_reads = FxHashSet::default();
+        let mutably_reborrowed = mutably_reborrowed_formals(tcx, &program.functions);
         for &callee in &program.functions {
             let inputs = tcx.fn_sig(callee).skip_binder().skip_binder().inputs();
             for index in 0..inputs.len() {
                 let local = rustc_middle::mir::Local::from_usize(index + 1);
                 if !mut_facts.is_defaulted(callee, local) && !mut_facts.is_mutable(callee, local) {
                     immutable_formals.insert((callee.local_def_index.as_u32(), index));
+                    // R492-3, the other two conjuncts: `*const` in the INPUT,
+                    // and no mutable reborrow of this formal in the body.
+                    if matches!(
+                        inputs[index].kind(),
+                        ty::RawPtr(_, rustc_middle::mir::Mutability::Not)
+                    ) && !mutably_reborrowed.contains(&(callee, index))
+                    {
+                        shared_reads.insert((callee.local_def_index.as_u32(), index));
+                    }
                 }
             }
             let pointees: Vec<Option<Ty<'_>>> = inputs
@@ -558,6 +581,7 @@ impl PairDisjointnessIndex {
             fresh_stack,
             type_rule: type_verdicts,
             immutable_formals,
+            shared_reads,
             param_bindings,
             exported,
             parameter_pairs: RefCell::new(FxHashMap::default()),
@@ -743,6 +767,13 @@ impl PairDisjointnessIndex {
         if self.immutable_formals.contains(&(callee, left))
             && self.immutable_formals.contains(&(callee, right))
         {
+            // R492-3: shared-with-shared BOTH ways, or the pair stays unproved
+            // and the ordinary certificates never see it either.
+            if self.shared_reads.contains(&(callee, left))
+                && self.shared_reads.contains(&(callee, right))
+            {
+                return Ok(CertificateKind::ReadReadShared);
+            }
             return Err(Unproved::ReadReadPeers);
         }
         // The same syntactic place, however it is cast, is never disjoint from
@@ -2526,6 +2557,88 @@ fn conditional_base<'tcx>(typeck: &TypeckResults<'tcx>, value: &Expr<'_>) -> Opt
         }
         _ if is_null_literal(value) => Some(None),
         _ => derivation_base(typeck, value).map(Some),
+    }
+}
+
+/// R492-3, guard (2): the formals a callee's own body takes a MUTABLE view of,
+/// however little it then does with it — `&mut *p`, `p.as_mut_ptr()`, a cast to
+/// `*mut`, or any `&mut` derivation rooted at the formal. The mutability
+/// analysis answers "is anything written through this"; this answers "does a
+/// mutable view of it exist at all", which is the question `&T` beside `&T`
+/// actually needs, and one such view anywhere kills the licence for every pair
+/// the formal is in.
+fn mutably_reborrowed_formals(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+) -> FxHashSet<(LocalDefId, usize)> {
+    let mut out = FxHashSet::default();
+    for &function in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let params: Vec<HirId> = body
+            .params
+            .iter()
+            .filter_map(|param| match param.pat.kind {
+                PatKind::Binding(_, hir_id, ..) => Some(hir_id),
+                _ => None,
+            })
+            .collect();
+        let mut visitor = MutableReborrows {
+            typeck: tcx.typeck(function),
+            params: &params,
+            function,
+            out: &mut out,
+        };
+        visitor.visit_body(body);
+    }
+    out
+}
+
+struct MutableReborrows<'a, 'tcx> {
+    typeck: &'a TypeckResults<'tcx>,
+    params: &'a [HirId],
+    function: LocalDefId,
+    out: &'a mut FxHashSet<(LocalDefId, usize)>,
+}
+
+impl MutableReborrows<'_, '_> {
+    fn mark(&mut self, expr: &Expr<'_>) {
+        // Walk the derivation back to a binding: `(*p).f`, `p.offset(k)` and a
+        // cast all address the same object as `p`.
+        if let Some(base) = derivation_base(self.typeck, expr)
+            && let Some(index) = self.params.iter().position(|p| *p == base)
+        {
+            self.out.insert((self.function, index));
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for MutableReborrows<'_, 'tcx> {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match &expr.kind {
+            ExprKind::AddrOf(_, rustc_middle::mir::Mutability::Mut, operand) => {
+                self.mark(peel_casts(operand));
+            }
+            ExprKind::MethodCall(segment, receiver, _, _)
+                if segment.ident.name.as_str() == "as_mut_ptr" =>
+            {
+                self.mark(peel_casts(receiver));
+            }
+            // A cast that turns a shared raw pointer into a mutable one is a
+            // mutable view even though nothing is written through it yet.
+            ExprKind::Cast(inner, _)
+                if matches!(
+                    self.typeck.expr_ty(expr).kind(),
+                    ty::RawPtr(_, rustc_middle::mir::Mutability::Mut)
+                ) =>
+            {
+                self.mark(peel_casts(inner));
+            }
+            _ => {}
+        }
+        intravisit::walk_expr(self, expr);
     }
 }
 
