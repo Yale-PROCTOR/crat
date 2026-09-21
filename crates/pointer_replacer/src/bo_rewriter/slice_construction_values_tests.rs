@@ -377,3 +377,78 @@ fn wave6k_a_shared_element_address_is_not_the_slices_root() {
         "the address-of wrapper must be peeled: {source}"
     );
 }
+
+/// lodepng `countZeros` (A12, relay 032 / slicecursor 044 §2): a parameter
+/// cursor and a local THIS family types whose initializer is the cursor's
+/// derived chain. With slicecursor's foreign-local rule in, the cursor's view
+/// edit and this construction claimed the same interval — the slice-use adapter
+/// dropped and the owner was withdrawn. The composition is one edit: the
+/// construction's raw source is the cursor's own view.
+///
+/// The gate (`Decision::Cursor` on the base) cannot be exercised end-to-end at
+/// this frame: three reductions of the corpus shape were probed and in each the
+/// base is `SliceCursorUse` / `RawPointerOperation` / not a subject, never a
+/// DELIVERED cursor, exactly as slicecursor 044 reports for the frame without
+/// their rule. What is deterministic, and what this witness pins, is the
+/// rendering the composition contributes.
+#[test]
+fn wave6k_a_cursor_derived_chain_renders_the_cursors_view() {
+    ::utils::compilation::run_compiler_on_str(
+        r#"
+pub unsafe fn count_zeros(mut data: *const u8, size: usize, pos: usize) -> u32 {
+    let mut start = data.offset(pos as isize);
+    let mut copy = data;
+    while data != start && *data == 0 { data = data.offset(1); }
+    let _ = (size, copy);
+    data.offset_from(start) as u32
+}
+"#,
+        |tcx| {
+            let mut rendered: Vec<(String, Option<String>)> = Vec::new();
+            for id in tcx.hir_crate_items(()).free_items() {
+                let did = id.owner_id.def_id;
+                if !matches!(tcx.def_kind(did.to_def_id()), rustc_hir::def::DefKind::Fn) {
+                    continue;
+                }
+                let body = tcx.hir_body_owned_by(did);
+                let rustc_hir::ExprKind::Block(block, _) = body.value.kind else { continue };
+                for statement in block.stmts {
+                    let rustc_hir::StmtKind::Let(local) = statement.kind else { continue };
+                    let Some(initializer) = local.init else { continue };
+                    let name = tcx
+                        .sess
+                        .source_map()
+                        .span_to_snippet(local.pat.span)
+                        .unwrap_or_default();
+                    rendered.push((
+                        name,
+                        super::decision::construction::cursor_view_text_for_tests(
+                            tcx,
+                            did,
+                            initializer,
+                            false,
+                        ),
+                    ));
+                }
+            }
+            let start = rendered
+                .iter()
+                .find(|(name, _)| name.contains("start"))
+                .expect("the derived local");
+            assert_eq!(
+                start.1.as_deref(),
+                Some("data.offset_by(pos as isize).as_ptr()"),
+                "the cursor's derived chain renders the cursor's view"
+            );
+            let copy = rendered
+                .iter()
+                .find(|(name, _)| name.contains("copy"))
+                .expect("the bare copy");
+            assert_eq!(
+                copy.1, None,
+                "a bare copy is the cursor family's own W-CUR-LOCAL view, not this rendering"
+            );
+        },
+    )
+    .expect("the fixture compiles");
+}

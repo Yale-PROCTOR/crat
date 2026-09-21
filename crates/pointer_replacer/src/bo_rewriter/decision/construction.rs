@@ -894,6 +894,88 @@ fn address_of_deref_root<'h>(
     .then_some(pointer)
 }
 
+/// **A12 (relay 032) — the cursor cedes the span and the construction renders
+/// it.** slicecursor 044 §2: when a cursor's derived chain initialises a local
+/// THIS family types (`let start = data.offset(pos as isize);` with `start`
+/// decided `Slice`), the cursor's view edit and this construction claim the
+/// same interval. Two producers on one span dropped the slice-use adapter and
+/// withdrew the whole owner — a typed hold became an owner-level withdrawal.
+/// The composition is one edit: the construction takes the cursor's OWN view as
+/// its raw source (`data.offset_by(pos as isize).as_ptr()`), report 027's
+/// element-view precedent with the roles exchanged. Only `offset` is admitted —
+/// `add` takes a `usize` where `offset_by` takes an `isize`.
+fn cursor_view_root(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    owner: LocalDefId,
+    initializer: &rustc_hir::Expr<'_>,
+    mutable: bool,
+) -> Option<String> {
+    let (base, text) = cursor_view_text(tcx, owner, initializer, mutable)?;
+    // The gate: only a DELIVERED cursor has a view to cede. Against a raw base
+    // this text would not type, which is why the rendering is inert until the
+    // cursor family delivers the root (slicecursor 044 §2, report 032).
+    table
+        .entries
+        .iter()
+        .any(|(source, decision)| {
+            source.fn_did == owner
+                && source.hir_id == base
+                && match decision {
+                    Decision::Cursor { .. } => true,
+                    Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Slice { .. }
+                    | Decision::NestedSlice { .. }
+                    | Decision::Opt { .. }
+                    | Decision::Box(_)
+                    | Decision::Degraded(_) => false,
+                }
+        })
+        .then_some(text)
+}
+
+/// The rendering half of [`cursor_view_root`]: `<base>.offset(<k>)` becomes the
+/// cursor's own view at that position. Only a bare path receiver and `offset`
+/// are admitted — `add` takes a `usize` where `offset_by` takes an `isize`, and
+/// a computed receiver is another producer's span.
+fn cursor_view_text(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    initializer: &rustc_hir::Expr<'_>,
+    mutable: bool,
+) -> Option<(HirId, String)> {
+    let rustc_hir::ExprKind::MethodCall(segment, receiver, [delta], _) =
+        Collector::peel(initializer).kind
+    else {
+        return None;
+    };
+    if segment.ident.as_str() != "offset" {
+        return None;
+    }
+    let rustc_hir::ExprKind::Path(path) = &receiver.kind else {
+        return None;
+    };
+    let Res::Local(base) = tcx.typeck(owner).qpath_res(path, receiver.hir_id) else {
+        return None;
+    };
+    let sm = tcx.sess.source_map();
+    let name = sm.span_to_snippet(receiver.span).ok()?;
+    let offset = sm.span_to_snippet(delta.span).ok()?;
+    let view = if mutable { "as_mut_ptr" } else { "as_ptr" };
+    Some((base, format!("{name}.offset_by({offset}).{view}()")))
+}
+
+#[cfg(test)]
+pub(crate) fn cursor_view_text_for_tests(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    initializer: &rustc_hir::Expr<'_>,
+    mutable: bool,
+) -> Option<String> {
+    cursor_view_text(tcx, owner, initializer, mutable).map(|(_, text)| text)
+}
+
 pub(crate) fn compose_initializer(
     init_span: Span,
     initializer: &str,
@@ -1061,9 +1143,17 @@ pub(crate) fn plan_slice_constructions(
         // keyed to the whole initializer span, so the peel yields to them.
         let initializer = match tcx.hir_node(init_hir) {
             rustc_hir::Node::Expr(expression) if composed_edits.is_empty() => {
-                address_of_deref_root(tcx, subject.fn_did, expression)
-                    .and_then(|root| sm.span_to_snippet(root.span).ok())
-                    .unwrap_or(initializer)
+                // wave-6k (relay 032): a cursor's derived chain is rendered
+                // through the cursor's own view, so this construction is the
+                // ONLY edit on the span (`cursor_view_root`); otherwise the
+                // root is the pointer the address-of wrapper dereferences.
+                cursor_view_root(tcx, table, subject.fn_did, expression, mutable).unwrap_or_else(
+                    || {
+                        address_of_deref_root(tcx, subject.fn_did, expression)
+                            .and_then(|root| sm.span_to_snippet(root.span).ok())
+                            .unwrap_or(initializer)
+                    },
+                )
             }
             _ => initializer,
         };
