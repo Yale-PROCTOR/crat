@@ -228,11 +228,77 @@ pub(crate) fn confirm_transfers(
 
 /// Decision-phase hook, before the model's verdict is applied: a subject a
 /// certificate plans is a Box whatever kind the model gave it (relay 005).
+///
+/// **R496-7 — the hold passes through too.** A certificate's REFUSAL used to
+/// live only in `Certificates::receipts_tsv()`, which no census writes, so a
+/// subject this family examined and refused was indistinguishable from one it
+/// never saw (report 047: 0 `return-certificate` reasons in every census
+/// table). It now carries its typed reason the way `allocator_contract::planned`
+/// and `box_param::override_plan` already do — the existing
+/// `BoxPlanFailure::NativeEvidenceHeld { prior_key, detail }`, no new variant
+/// and no new census column — which is what makes A1-e's companion gate
+/// (`return-certificate-struct-field:<callee>:owned-field`) countable.
 pub(crate) fn planned(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<Decision> {
     ctx.return_certificates
         .plans
         .get(&(subject.fn_did, subject.hir_id))
         .map(|plan| Decision::Box(plan.clone()))
+}
+
+/// **R496-7 — the hold passes through, where nothing else would deliver.**
+/// A certificate's REFUSAL used to live only in `Certificates::receipts_tsv()`,
+/// which no census writes, so a subject this family examined and refused was
+/// indistinguishable from one it never saw (report 047: 0 `return-certificate`
+/// reasons in every census table). It now carries its typed reason through the
+/// existing `BoxPlanFailure::NativeEvidenceHeld { prior_key, detail }` — no new
+/// variant and no new census column.
+///
+/// It is consulted ONLY in the ladder's `Raw` arm, which degrades
+/// unconditionally, so it can replace a generic `kind-raw` and can never
+/// pre-empt a delivery. Placing it at the pre-model hook instead cost three
+/// W6A-T1 fixtures their whole emission (measured: `tulip-stoch`, `tulip-cci`
+/// and `tulip-cci-web` degraded with two errors attributed to no rewritten
+/// function) because a hold there outranks every family below it.
+pub(crate) fn held(ctx: &Ctx<'_, '_>, subject: &Subject, site: &str) -> Option<Decision> {
+    let (_, hold) = ctx
+        .return_certificates
+        .holds
+        .get(&(subject.fn_did, subject.hir_id))?;
+    Some(Decision::Degraded(super::Degradation {
+        subject: subject.label.clone(),
+        site: site.to_owned(),
+        reason: super::DegradeReason::BoxFailure {
+            failure: BoxPlanFailure::NativeEvidenceHeld {
+                prior_key: typed_key(hold),
+                detail: hold.clone(),
+            },
+        },
+    }))
+}
+
+/// The stable head of a certificate hold, so the census groups these reasons
+/// the way it groups the `box-param-*` ones. Listed longest-prefix-first, since
+/// several share a head (`…-allocation` vs `…-allocation-model`,
+/// `…-receiver-use` vs `…-receiver`).
+fn typed_key(hold: &str) -> &'static str {
+    const KEYS: [&str; 12] = [
+        "return-certificate-struct-field",
+        "return-certificate-allocation-model",
+        "return-certificate-allocation",
+        "return-certificate-return-locals",
+        "return-certificate-return-shape",
+        "return-certificate-receiver-use",
+        "return-certificate-receiver",
+        "return-certificate-owner-use",
+        "return-certificate-indirect-callers",
+        "return-certificate-no-receivers",
+        "return-certificate-transfer-unconfirmed",
+        "return-certificate-chain-open",
+    ];
+    KEYS.iter()
+        .copied()
+        .find(|key| hold.starts_with(key))
+        .unwrap_or("return-certificate-other")
 }
 
 /// After the decisions: unannotated receivers get their `Box<..>` spelled out.

@@ -1195,10 +1195,24 @@ fn w6a_a1e_a_copying_callee_is_not_a_lend() {
     // chain reads `kind-raw` here and `compute::heightmap` has no lend hold at
     // all. On every fixture in reach the conjunction `Owning AND !walk.ok` is
     // empty, so no fixture can separate the walk from the kind gate.
+    //
+    // Read on the producer's own allocation, which nothing masks. Since
+    // R496-7's pass-through, `compute::result` carries the CERTIFICATE's
+    // refusal in place of the generic model reason — that is the point of the
+    // pass-through, and it is asserted just below.
     assert_eq!(
-        reason_of(&out.degradations, "compute::result").as_deref(),
+        reason_of(&out.degradations, "image_create::img").as_deref(),
         Some("kind-raw"),
         "{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "compute::result").as_deref(),
+        Some("return-certificate-return-locals"),
+        "R496-7: the certificate's own refusal is the subject's reason\n{:?}",
         out.degradations
             .iter()
             .map(|d| (d.subject.clone(), d.reason.key().to_owned()))

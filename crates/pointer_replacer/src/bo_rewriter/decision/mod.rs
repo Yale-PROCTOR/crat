@@ -2152,7 +2152,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             if field_reference
                 .is_some_and(|fields| fields.array_load_lift((subject.fn_did, subject.hir_id))) => {
         }
-        Some(SlotKind::Raw) => return degrade(subject, decl_site, DegradeReason::KindRaw),
+        Some(SlotKind::Raw) => {
+            // **R496-7**: this arm degrades unconditionally, so a certificate's
+            // own refusal may replace the generic reason here without ever
+            // pre-empting a family that would deliver.
+            if let Some(decision) = return_certificate::held(ctx, subject, &decl_site) {
+                return decision;
+            }
+            return degrade(subject, decl_site, DegradeReason::KindRaw);
+        }
         Some(SlotKind::Owning) => {
             // Item 5 opens borrowed declaration forms. Owning alias emission
             // remains in the separately chartered Box family.
