@@ -611,7 +611,7 @@ fn ce_d01_local_callee_boundary_declines_the_candidate_up_front() {
             .licensed_lifts
             .lines()
             .skip(1)
-            .all(|row| row.contains("\tfallback\t")),
+            .all(|row| !row.contains("\tevidence\t")),
         "no evidence receipt may be issued here: {}",
         raw_boundary_artifacts.licensed_lifts
     );
@@ -2169,9 +2169,15 @@ fn w4l06_an_already_fat_caller_is_untouched() {
 /// **W4L-7 (control) — a use with no slice image refuses the lift.**
 #[test]
 fn w4l07_an_unsupported_use_refuses_the_lift() {
-    let receipts = table_of(W4_LIFT_UNSUPPORTED_USE, |table| table.licensed_lifts.len())
-        .expect("the fixture yields a table");
-    assert_eq!(receipts, 0, "a subject with no slice image is not lifted");
+    let lifted = table_of(W4_LIFT_UNSUPPORTED_USE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .filter(|lift| lift.declined.is_none())
+            .count()
+    })
+    .expect("the fixture yields a table");
+    assert_eq!(lifted, 0, "a subject with no slice image is not lifted");
     let source = emitted(W4_LIFT_UNSUPPORTED_USE);
     assert!(!source.contains("data: &[uint8_t]"), "{source}");
 }
@@ -2558,4 +2564,28 @@ fn w4b104_a_parameter_with_no_call_site_is_unmeasured_not_held() {
         ),
         "{rows:?}"
     );
+}
+
+/// **W4W-6 (wave-4 report 047) — a refusal is a decision and carries its
+/// reason.** Until this column existed the waiver receipted only its lifts, so
+/// a census could say how many extents were fabricated but never why a held row
+/// was passed over — which is the question C5 asked of batch 24 and the
+/// artifacts could not answer. The unsupported-use fixture is the cheapest
+/// shape that reaches a refusal.
+#[test]
+fn w4w06_a_refused_row_carries_its_reason() {
+    let rows = table_of(W4_LIFT_UNSUPPORTED_USE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.subject.clone(), lift.declined, lift.key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let declined = rows
+        .iter()
+        .find(|(_, declined, _)| declined.is_some())
+        .unwrap_or_else(|| panic!("the refusal must be receipted: {rows:?}"));
+    assert_eq!(declined.1, Some("slice-use-unsupported"), "{rows:?}");
+    assert!(declined.2.starts_with("declined(extent-lift:"), "{rows:?}");
 }

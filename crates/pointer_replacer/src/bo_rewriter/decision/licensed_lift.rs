@@ -66,6 +66,13 @@ pub(crate) struct LiftReceipt {
     /// slice form with `FALLBACK_SLICE_EXTENT`, not with an extent anything
     /// proved.
     pub(crate) fallback: bool,
+    /// **Why the waiver did NOT take this row** (wave-4 report 047). Until this
+    /// column existed the arm receipted only its lifts, so a census could say
+    /// how many rows were fabricated but never why a held row was passed over —
+    /// which is exactly the question C5 asked and the artifacts could not
+    /// answer. A refusal is a decision and carries its reason, as B1's
+    /// two-column table already does.
+    pub(crate) declined: Option<&'static str>,
 }
 
 impl LiftReceipt {
@@ -74,6 +81,9 @@ impl LiftReceipt {
         let index = self
             .parameter_index
             .map_or_else(|| "-".to_owned(), |index| index.to_string());
+        if let Some(reason) = self.declined {
+            return format!("declined(extent-lift:{}:{index}:{reason})", self.callee);
+        }
         match self.width_bytes {
             Some(width) => format!("evidence(licensed-width:{}:{index}:{width})", self.callee),
             None => format!("fallback(extent-lift@addendum-77:{}:{index})", self.callee),
@@ -224,6 +234,7 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
             width_bytes: Some(*width),
             mutable,
             fallback: false,
+            declined: None,
         });
     }
     receipts.sort_by(|a, b| a.subject.cmp(&b.subject));
@@ -249,10 +260,10 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
                 lift.width_bytes
                     .map_or_else(|| "-".to_owned(), |width| width.to_string()),
                 if lift.mutable { "mut-slice" } else { "slice" },
-                if lift.fallback {
-                    "fallback"
-                } else {
-                    "evidence"
+                match (lift.declined, lift.fallback) {
+                    (Some(_), _) => "declined",
+                    (None, true) => "fallback",
+                    (None, false) => "evidence",
                 },
                 lift.key(),
             )
@@ -377,6 +388,19 @@ pub(crate) fn promote_fallback(
     // the frame as it stands BEFORE this pass rewrites any of them.
     let entries_snapshot: Vec<(Subject, Decision)> = entries.to_vec();
     let entries_snapshot = entries_snapshot.as_slice();
+    let mut declines: Vec<LiftReceipt> = Vec::new();
+    let mut decline =
+        |subject: &Subject, callee: String, index: Option<usize>, why: &'static str| {
+            declines.push(LiftReceipt {
+                subject: subject.label.clone(),
+                callee,
+                parameter_index: index,
+                width_bytes: None,
+                mutable: subject.mutable,
+                fallback: false,
+                declined: Some(why),
+            });
+        };
     let candidates: FxHashMap<(LocalDefId, HirId), (String, Option<usize>)> = entries
         .iter()
         .filter_map(|(subject, decision)| {
@@ -391,6 +415,12 @@ pub(crate) fn promote_fallback(
                         // slice's LENGTH, not its mutability). The subject stays
                         // held; its extent is not the problem.
                         if access.access == "write" && !subject.mutable {
+                            decline(
+                                subject,
+                                access.callee.clone(),
+                                Some(access.parameter_index),
+                                "shared-subject-at-a-write",
+                            );
                             return None;
                         }
                         (access.callee.clone(), Some(access.parameter_index))
@@ -423,6 +453,7 @@ pub(crate) fn promote_fallback(
             // above is exactly that test.
             let node = (subject.fn_did, subject.hir_id);
             if !slice_uses_supported(ctx, node) {
+                decline(subject, named.0.clone(), named.1, "slice-use-unsupported");
                 return None;
             }
             // R416-5 at the caller side: a parameter whose caller arrives thin
@@ -432,6 +463,7 @@ pub(crate) fn promote_fallback(
             if let SubjectKind::Param { hir_index } = subject.kind
                 && a_caller_would_arrive_thin(ctx, entries_snapshot, subject.fn_did, hir_index)
             {
+                decline(subject, named.0.clone(), named.1, "a-caller-arrives-thin");
                 return None;
             }
             // **R416-5 at the subject's own root.** A subject whose root is a borrow of a single place —
@@ -444,6 +476,7 @@ pub(crate) fn promote_fallback(
                 Some(super::construction::Construction::AddrOf)
                     | Some(super::construction::Construction::IndexAddr)
             ) {
+                decline(subject, named.0.clone(), named.1, "one-place-root");
                 return None;
             }
             Some((node, named))
@@ -466,8 +499,11 @@ pub(crate) fn promote_fallback(
             width_bytes: None,
             mutable: subject.mutable,
             fallback: true,
+            declined: None,
         });
     }
-    receipts.sort_by(|a, b| a.subject.cmp(&b.subject));
+    drop(decline);
+    receipts.extend(declines);
+    receipts.sort_by(|a, b| (a.subject.clone(), a.declined).cmp(&(b.subject.clone(), b.declined)));
     receipts
 }
