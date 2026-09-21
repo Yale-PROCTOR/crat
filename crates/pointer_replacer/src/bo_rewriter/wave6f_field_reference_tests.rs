@@ -1087,10 +1087,31 @@ fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
     let (source, _, reverted) = emitted_source(&outcome);
     assert_eq!(reverted, 0, "{source}");
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        flat.contains("CustomFree(m, (*h).slot_.take().map_or(core::ptr::null_mut(), |__b| Box::into_raw(__b) as *mut ::std::ffi::c_void));"),
-        "{source}"
-    );
+    // **The transfer, either way `h` is delivered** (R494-2). The allocation
+    // leaves through `take()` + `Box::into_raw` at the contract deallocator's
+    // own call — free timing unmoved, the field `None` afterwards — but WHERE
+    // that expression sits is the container formal's business, and the
+    // container formal is another family's:
+    //
+    //   `h: *mut Holder`   the transfer is the call's argument;
+    //   `h: &mut Holder`   A9 made it a reference, so the call carries an A5
+    //                      raw view and the transfer is HOISTED into the
+    //                      view's own binding — which is the whole point of
+    //                      the hoist: both the field and the formal deliver
+    //                      instead of the program delivering nothing.
+    let transfer = "(*h).slot_.take().map_or(core::ptr::null_mut(), |__b| Box::into_raw(__b) as *mut ::std::ffi::c_void)";
+    assert!(flat.contains(transfer), "{source}");
+    if flat.contains("fn HolderFree(mut m: &mut Mem, mut h: &mut Holder)") {
+        assert!(
+            flat.contains(&format!("let __crat_a5_raw")) && flat.contains(&format!("{transfer};")),
+            "a delivered container hoists the transfer into the A5 view's binding\n{source}"
+        );
+    } else {
+        assert!(
+            flat.contains(&format!("CustomFree(m, {transfer});")),
+            "a raw container keeps the transfer as the call's argument\n{source}"
+        );
+    }
 
     // Control: a by-value instance.
     let by_value = SLOT_CONTRACT.replace(
