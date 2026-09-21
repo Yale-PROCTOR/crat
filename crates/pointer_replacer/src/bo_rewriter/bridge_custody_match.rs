@@ -320,7 +320,20 @@ fn initializer_matches_modulo_adapters(original: &ast::Expr, emitted: &ast::Expr
     if reborrowed && initializer_matches_modulo_adapters(original, view_operand(emitted)) {
         return true;
     }
+    // **R494-1(b)** -- the outbound native-result block is the call it binds.
+    if let Some(call) = native_result_block_call(emitted) {
+        return initializer_matches_modulo_adapters(original, call);
+    }
     match (&original.kind, &emitted.kind) {
+        // **R494-1(b)** -- and the block sits under the original's own cast, so the
+        // cast has to be peeled on BOTH sides to reach it. Exact: the two casts must
+        // print the same type, which is the case that matters here (the block's tail
+        // re-renders precisely the raw type the original wrote) and refuses a cast
+        // that changed.
+        (ast::ExprKind::Cast(left, left_type), ast::ExprKind::Cast(right, right_type)) => {
+            pprust::ty_to_string(left_type) == pprust::ty_to_string(right_type)
+                && initializer_matches_modulo_adapters(left, right)
+        }
         (ast::ExprKind::Call(left, left_args), ast::ExprKind::Call(right, right_args)) => {
             expression_key(left) == expression_key(right)
                 && left_args.len() == right_args.len()
@@ -395,6 +408,60 @@ fn expressions_correspond(original: &ast::Expr, emitted: &ast::Expr) -> bool {
         .iter()
         .zip(right_args.iter())
         .all(|(left, right)| expressions_correspond(left, right))
+}
+
+/// **R494-1(b) -- the outbound native-result block is the call it binds.**
+///
+/// Where a callee's delivered REFERENCE result has to be handed back as the raw
+/// pointer the caller's own initializer wrote, `native_result_expression::render`
+/// emits
+///
+/// ```text
+/// { let [mut] __crat_native_result_<caller>_<hir>: T = (<the adapted call>);
+///   (<a view of that temporary>) as <the original raw type> }
+/// ```
+///
+/// -- one `let`, which binds the call exactly once so the original's evaluation
+/// order survives, and a tail that is a view of precisely what it bound. The
+/// SOURCE the bridge reads is therefore the call, and the comparison continues
+/// there under the relations already in force (R466-1's congruence relates the
+/// call's own adapted arguments).
+///
+/// heman's `heman_image_texel(normals, x, y) as *mut kmVec3` is the corpus row:
+/// with `heman_image_texel` returning `&'static mut f32` under W6L-1, the
+/// initializer of `N` becomes this block, `N`'s correspondence fails, and the A5
+/// stamp the tree does carry at the `kmVec3Lerp` call below it reads
+/// `initializer-original-binding-correspondence-unresolved`.
+///
+/// Exact, and it peels a rename with a view on it -- never a computation. The
+/// generated prefix is required, so an ordinary block cannot enter; there must be
+/// exactly one statement plus the tail; and the tail must be a view of THAT
+/// binding, by `raw_initializer_matches`, not of anything else. A second
+/// statement, a tail naming another value, or a block with a label all refuse and
+/// keep their own key.
+fn native_result_block_call(emitted: &ast::Expr) -> Option<&ast::Expr> {
+    let ast::ExprKind::Block(block, None) = &unparen(emitted).kind else {
+        return None;
+    };
+    let [statement, tail] = block.stmts.as_slice() else {
+        return None;
+    };
+    let ast::StmtKind::Let(local) = &statement.kind else {
+        return None;
+    };
+    let ast::StmtKind::Expr(value) = &tail.kind else {
+        return None;
+    };
+    let ast::PatKind::Ident(_, name, None) = &local.pat.kind else {
+        return None;
+    };
+    let name = name.name.as_str();
+    if !name.starts_with("__crat_native_result_") {
+        return None;
+    }
+    let init = local.kind.init()?;
+    let binding = expression(name).ok()?;
+    raw_initializer_matches(unparen(value), &binding).then_some(init)
 }
 
 #[cfg(test)]

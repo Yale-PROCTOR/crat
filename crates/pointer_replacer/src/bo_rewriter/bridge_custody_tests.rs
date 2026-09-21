@@ -2427,3 +2427,90 @@ fn r430_optional_delivery_spellings_correspond_to_their_original_views() {
         "src"
     ));
 }
+
+/// **R494-1(b) — the outbound native-result block is the call it binds.**
+///
+/// Route B's heman run (`probe-routeb` = `32caeabf4`, realized 442) ends
+/// `bridge-custody:comparison-failed` with three `unresolved` rows, all
+/// `initializer-original-binding-correspondence-unresolved`, and four `tree-only`
+/// witnesses that are the very stamps those rows claim. Two of the three are the
+/// A5 stamp at heman's `kmVec3Lerp(N, N, ..)`, and the reason is one level up:
+/// with `heman_image_texel` delivering `&'static mut f32` under W6L-1, the
+/// initializer of `N` is no longer the bare call but the block
+/// `native_result_expression::render` emits around it. The emitted stamp itself
+/// is present, bound and correct in the tree — only the comparator's vocabulary
+/// was short one shape.
+///
+/// The strings are the real ones: the original from the derived heman source,
+/// the emitted from that run's own tree.
+#[test]
+fn r494_1b_the_native_result_block_is_the_call_it_binds() {
+    use crate::bo_rewriter::bridge_custody_match::initializer_adapter_correspondence_for_test as corresponds;
+    let under = |original: &str, emitted: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || corresponds(original, emitted),
+        )
+    };
+
+    const ORIGINAL: &str = "heman_image_texel(normals, x, y) as *mut kmVec3";
+    const EMITTED: &str = "{ let __crat_native_result_771_2042: &mut f32 = (heman_image_texel(&mut *normals, x, y)); (core::ptr::from_mut(&mut *__crat_native_result_771_2042)) as *mut f32 } as *mut kmVec3";
+
+    assert!(
+        under(ORIGINAL, EMITTED),
+        "the block binds the call once and returns a view of what it bound"
+    );
+
+    // Faults. Each is the block with ONE thing wrong, and each must refuse: the
+    // relation peels a generated rename with a view on it, never a computation.
+    assert!(
+        !under(
+            ORIGINAL,
+            &EMITTED.replace("__crat_native_result_", "__something_else_")
+        ),
+        "an ordinary block is not a native-result block"
+    );
+    assert!(
+        !under(
+            ORIGINAL,
+            &EMITTED.replace(
+                "(core::ptr::from_mut(&mut *__crat_native_result_771_2042))",
+                "(core::ptr::from_mut(&mut *other))"
+            )
+        ),
+        "a tail that views another value is a computation, not a rename"
+    );
+    assert!(
+        !under(
+            ORIGINAL,
+            &EMITTED.replace(
+                "(heman_image_texel(&mut *normals, x, y));",
+                "(heman_image_texel(&mut *normals, x, y)); side_effect();"
+            )
+        ),
+        "a second statement is a computation"
+    );
+    assert!(
+        !under(
+            ORIGINAL,
+            &EMITTED.replace(
+                "heman_image_texel(&mut *normals",
+                "heman_image_other(&mut *normals"
+            )
+        ),
+        "a different callee is a different source"
+    );
+    assert!(
+        !under(ORIGINAL, &EMITTED.replace("x, y))", "y, x))")),
+        "arguments in another order are a different source"
+    );
+    assert!(
+        !under(
+            ORIGINAL,
+            &EMITTED.replace("} as *mut kmVec3", "} as *mut kmVec2")
+        ),
+        "a cast that changed is a different value"
+    );
+}
