@@ -1167,10 +1167,16 @@ pub(crate) enum RetentionUnknownReason {
     AnalysisIncomplete,
     ReturnedAliasUsed,
     ReturnedAliasUnknown,
+    /// **R481-2 (USER ruling, 2026-09-21).** Not an unknown at all: retention
+    /// is KNOWN positive at this site and it is bridged under the confirmed
+    /// tier-2 retention waiver. It lives in this enum because the T2
+    /// disposition carries exactly one reason, and it reads in the artifacts
+    /// beside the unknown kinds it stands next to.
+    PositiveRetentionWaived,
 }
 
 impl RetentionUnknownReason {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::CalleeUnresolved,
         Self::FnPtrWeb,
         Self::OpenBoundary,
@@ -1185,6 +1191,7 @@ impl RetentionUnknownReason {
         Self::AnalysisIncomplete,
         Self::ReturnedAliasUsed,
         Self::ReturnedAliasUnknown,
+        Self::PositiveRetentionWaived,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -1203,6 +1210,7 @@ impl RetentionUnknownReason {
             Self::AnalysisIncomplete => "retention-analysis-incomplete",
             Self::ReturnedAliasUsed => "retention-returned-alias-used",
             Self::ReturnedAliasUnknown => "retention-returned-alias-unknown",
+            Self::PositiveRetentionWaived => "retention-positive-waived",
         }
     }
 }
@@ -3960,6 +3968,15 @@ impl RetentionSummaries {
     }
 }
 
+/// **R481-2 / R486-1 (USER ruling, 2026-09-21) — the tier-2 RETENTION waiver.**
+///
+/// Addendum 130 reserved the known-retention bridge for an explicit waiver
+/// confirmed by the user; the user confirmed it (Decision B, relays 049/053).
+/// Spent only after every proof has been tried, and only where retention is
+/// the site's one remaining hold.
+pub(crate) const RAW_BOUNDARY_RETENTION_WAIVER_ID: &str = "retention-waiver:tier-2@2026-09-21";
+pub(crate) const RAW_BOUNDARY_RETENTION_WAIVER_TEXT: &str = "Tier-2 retention waiver (user ruling 2026-09-21, addendum 130). At a receipted site whose only remaining hold is a retention receipt, crat emits the bridge it would have emitted under tier 1: the subject keeps its safe form and the callee receives the raw pointer. The conditional soundness claim excludes an execution in which the callee uses that retained raw alias while the originating reference is live. It licenses only the recorded safe-to-raw view at that site, and no other hold: a site carrying a second hold stays held.";
+
 pub(crate) const RAW_BOUNDARY_WAIVER_ID: &str =
     "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01";
 pub(crate) const RAW_BOUNDARY_WAIVER_TEXT: &str = "C-aliasing semantics at unsafe bridges. At a receipted T2 site, crat may expose a raw pointer derived from a safe reference to a boundary whose retention behavior is unknown, in order to preserve the source program's C calling convention. Current Rust aliasing models can invalidate a retained raw alias when the originating mutable reference remains live or is later reused. The conditional soundness claim therefore excludes an execution that retains and later uses that raw alias unless no-retention is independently established. This waiver licenses only the recorded safe-to-raw view at that call. It licenses no integer-to-pointer round trip, ownership transfer, unchecked null dereference, positive-retention site, or unreceipted reuse.";
@@ -5086,6 +5103,32 @@ impl RawBoundaryDispositionIndex {
                     .insert(site.key.clone(), access.clone());
             }
             let mut mutable_binding_required = false;
+            // **R481-2.** Hoisted out of the render-site construction below so
+            // that the tier-2 retention waiver can ask it: the waiver licenses
+            // a BRIDGE, and a bridge exists only where the callee's parameter
+            // stays raw. Verbatim the computation that lived there.
+            let target_stays_raw = site.callee_local.is_none_or(|callee| {
+                hypothetical
+                    .entries
+                    .iter()
+                    .find_map(|(subject, decision)| {
+                        let super::SubjectKind::Param { hir_index } = subject.kind else {
+                            return None;
+                        };
+                        (subject.fn_did == callee && hir_index == site.key.argument_index)
+                            .then_some(match decision {
+                                super::Decision::Degraded(_) => true,
+                                super::Decision::Ref { .. }
+                                | super::Decision::InferredRef { .. }
+                                | super::Decision::Slice { .. }
+                                | super::Decision::Opt { .. }
+                                | super::Decision::Box(_)
+                                | super::Decision::NestedSlice { .. }
+                                | super::Decision::Cursor { .. } => false,
+                            })
+                    })
+                    .unwrap_or(true)
+            });
             let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
                 (|| {
                     let node = site.node.ok_or_else(|| {
@@ -5581,10 +5624,47 @@ impl RawBoundaryDispositionIndex {
                                         evidence,
                                     })
                                 }
-                                Some((_, RetentionVerdict::Retains { .. })) | None => Err((
-                                    RawBoundaryBlockReason::PositiveRetention,
-                                    format!("{sink:?}"),
-                                )),
+                                // **R481-2 (USER ruling) — the tier-2 retention
+                                // waiver.** Every proof has been tried before
+                                // this arm: a frame-bounded (R476-1) or
+                                // stack-storage discharge answers `NoRetain`
+                                // above and carries its own proof receipt,
+                                // never this. What is left is a site whose
+                                // ONLY remaining hold is the callee's
+                                // retention. Every other refusal in this
+                                // function is untouched.
+                                Some((_, RetentionVerdict::Retains { .. })) | None
+                                    if !target_stays_raw =>
+                                {
+                                    // No bridge exists where the callee's own
+                                    // parameter is rewritten safe: the waiver
+                                    // licenses a safe-to-raw view and there is
+                                    // no raw view here. The site holds exactly
+                                    // as it did before the waiver.
+                                    Err((
+                                        RawBoundaryBlockReason::PositiveRetention,
+                                        format!("{sink:?}"),
+                                    ))
+                                }
+                                Some((_, RetentionVerdict::Retains { .. })) | None => {
+                                    evidence = format!(
+                                        "{evidence};retention-waiver(tier-2, kind=known, subject={}, callee={}):{sink:?}",
+                                        // `subject` is an Option on lines that
+                                        // carry the address-root arm and a plain
+                                        // Subject on lines that do not; `as_ref`
+                                        // reads the label on both.
+                                        subject
+                                            .as_ref()
+                                            .map_or("-", |subject| subject.label.as_str()),
+                                        site.key.callee.path,
+                                    );
+                                    Ok(RawBoundaryDisposition::T2 {
+                                        template,
+                                        reason: RetentionUnknownReason::PositiveRetentionWaived,
+                                        waiver_id: RAW_BOUNDARY_RETENTION_WAIVER_ID,
+                                        evidence,
+                                    })
+                                }
                             }
                         }
                         RetentionVerdict::Unknown { reason, .. } => {
@@ -5647,28 +5727,6 @@ impl RawBoundaryDispositionIndex {
                     | super::Decision::Cursor { .. }
                     | super::Decision::Degraded(_) => false,
                 });
-            let target_stays_raw = site.callee_local.is_none_or(|callee| {
-                hypothetical
-                    .entries
-                    .iter()
-                    .find_map(|(subject, decision)| {
-                        let super::SubjectKind::Param { hir_index } = subject.kind else {
-                            return None;
-                        };
-                        (subject.fn_did == callee && hir_index == site.key.argument_index)
-                            .then_some(match decision {
-                                super::Decision::Degraded(_) => true,
-                                super::Decision::Ref { .. }
-                                | super::Decision::InferredRef { .. }
-                                | super::Decision::Slice { .. }
-                                | super::Decision::Opt { .. }
-                                | super::Decision::Box(_)
-                                | super::Decision::NestedSlice { .. }
-                                | super::Decision::Cursor { .. } => false,
-                            })
-                    })
-                    .unwrap_or(true)
-            });
             out.render_sites.insert(
                 site.key.clone(),
                 RawBoundaryRenderSite {
@@ -7380,6 +7438,7 @@ mod tests {
                 "retention-analysis-incomplete",
                 "retention-returned-alias-used",
                 "retention-returned-alias-unknown",
+                "retention-positive-waived",
             ]
         );
     }

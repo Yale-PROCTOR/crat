@@ -242,6 +242,10 @@ fn unknown(value: raw_boundary::RetentionUnknownReason) -> RetentionUnknownReaso
         Native::AnalysisIncomplete => RetentionUnknownReason::AnalysisIncomplete,
         Native::ReturnedAliasUsed => RetentionUnknownReason::ReturnedAliasUsed,
         Native::ReturnedAliasUnknown => RetentionUnknownReason::ReturnedAliasUnknown,
+        // R481-2: a waived positive retention travels as the transport's
+        // nearest unknown; the transported row's own waiver id is what names
+        // it, and this enum has no wire variant to add without a schema bump.
+        Native::PositiveRetentionWaived => RetentionUnknownReason::AnalysisIncomplete,
     }
 }
 

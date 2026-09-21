@@ -5856,7 +5856,13 @@ pub(crate) fn synthesize_with_raw_boundary(
                 (BridgeRetentionTier::T1, None)
             }
             super::raw_boundary::RawBoundaryDisposition::T2 { waiver_id, .. } => {
-                debug_assert_eq!(*waiver_id, RAW_BOUNDARY_T2_WAIVER_ID);
+                // R481-2: a T2 site carries either the v1 bridge waiver or
+                // the tier-2 RETENTION waiver the user confirmed.
+                debug_assert!(
+                    *waiver_id == RAW_BOUNDARY_T2_WAIVER_ID
+                        || *waiver_id == super::raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID,
+                    "unexpected T2 waiver id {waiver_id}"
+                );
                 (BridgeRetentionTier::T2, Some((*waiver_id).to_owned()))
             }
             super::raw_boundary::RawBoundaryDisposition::Blocked { .. }
