@@ -352,6 +352,44 @@ fn initializer_matches_modulo_adapters(original: &ast::Expr, emitted: &ast::Expr
                     .zip(right.args.iter())
                     .all(|(l, r)| initializer_matches_modulo_adapters(l, r))
         }
+        // **R494-1(b) -- `*p.offset(i)` and `p[i as usize]` are the same element.**
+        //
+        // A delivered container parameter is INDEXED in the emitted program where the
+        // input walked it with `offset`. heman's `heman_ops_stitch_horizontal` takes
+        // `images: *mut *mut heman_image` and is delivered `&mut [*mut heman_image]`,
+        // so `let mut width = (**images.offset(0)).width;` is emitted
+        // `let mut width = (*images[(0) as usize]).width;`. Every binding downstream of
+        // `width` then failed to correspond, and with it the `pair-t2-raw-view` stamp at
+        // the `copy_row` call -- which the tree carries, bound and correct.
+        //
+        // The same relation already exists, rigorously, in the pending-sibling matcher
+        // (`equivalent`), which can also check that the two bases are the same PARAMETER
+        // with corresponding element types because it holds the inventories. Here it does
+        // not need to: this predicate is one conjunct of `same_source_binding`, and the
+        // other is `span_bindings_correspond`, which pairs every binding the two spans
+        // use -- including the base -- by the full rules. What is left to this arm is the
+        // SHAPE, and it is exact: the receiver must correspond, the method must be
+        // `offset` with one argument and no turbofish, and the two indices must be the
+        // same expression once their casts are off (`as isize` against `as usize`).
+        (ast::ExprKind::Unary(ast::UnOp::Deref, pointer), ast::ExprKind::Index(base, index, _)) => {
+            let ast::ExprKind::MethodCall(offset) = &unparen(pointer).kind else {
+                return false;
+            };
+            offset.seg.ident.name.as_str() == "offset"
+                && offset.seg.args.is_none()
+                && offset.args.len() == 1
+                && initializer_matches_modulo_adapters(&offset.receiver, base)
+                && expression_key(peel_casts(&offset.args[0])) == expression_key(peel_casts(index))
+        }
+        // The congruences that carry the relation above up to the binding: the same
+        // field of corresponding values, and the same dereference of them.
+        (ast::ExprKind::Field(left, left_name), ast::ExprKind::Field(right, right_name)) => {
+            left_name.name == right_name.name && initializer_matches_modulo_adapters(left, right)
+        }
+        (
+            ast::ExprKind::Unary(ast::UnOp::Deref, left),
+            ast::ExprKind::Unary(ast::UnOp::Deref, right),
+        ) => initializer_matches_modulo_adapters(left, right),
         _ => expression_key(original) == expression_key(emitted),
     }
 }

@@ -2514,3 +2514,81 @@ fn r494_1b_the_native_result_block_is_the_call_it_binds() {
         "a cast that changed is a different value"
     );
 }
+
+/// **R494-1(b) — `*p.offset(i)` and `p[i as usize]` are the same element.**
+///
+/// The third of Route B's three unresolved custody rows: the `pair-t2-raw-view`
+/// stamp at heman's `copy_row(*images.offset(tile), result, ..)`. The stamp is in
+/// the tree and correct; what failed is the chain above it. `images` is delivered
+/// `&mut [*mut heman_image]`, so the emitted program INDEXES where the input
+/// walked with `offset`, and `let mut width = (**images.offset(0)).width;` — a
+/// binding `result`'s own initializer depends on — no longer corresponded.
+///
+/// The strings are the real ones, original and emitted.
+#[test]
+fn r494_1b_an_offset_deref_corresponds_to_the_index_of_the_delivered_container() {
+    use crate::bo_rewriter::bridge_custody_match::initializer_adapter_correspondence_for_test as corresponds;
+    let under = |original: &str, emitted: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || corresponds(original, emitted),
+        )
+    };
+
+    // The `width` initializer: a field of a deref of a deref of an offset.
+    assert!(under(
+        "(**images.offset(0 as libc::c_int as isize)).width",
+        "(*images[(0 as libc::c_int) as usize]).width"
+    ));
+    // The argument form, where the emitted side reborrows the element.
+    assert!(under(
+        "*images.offset(tile as isize)",
+        "&mut *images[(tile) as usize]"
+    ));
+
+    // Faults. A DIFFERENT element, a different field, a different base and a
+    // method that is not `offset` must all still refuse -- this arm relates one
+    // element to itself, and nothing else.
+    assert!(
+        !under(
+            "(**images.offset(0 as libc::c_int as isize)).width",
+            "(*images[(1 as libc::c_int) as usize]).width"
+        ),
+        "another index is another element"
+    );
+    assert!(
+        !under(
+            "(**images.offset(0 as libc::c_int as isize)).width",
+            "(*images[(0 as libc::c_int) as usize]).height"
+        ),
+        "another field is another value"
+    );
+    assert!(
+        !under(
+            "(**images.offset(0 as libc::c_int as isize)).width",
+            "(*others[(0 as libc::c_int) as usize]).width"
+        ),
+        "another base is another container"
+    );
+    assert!(
+        !under(
+            "(**images.add(0 as libc::c_int as isize)).width",
+            "(*images[(0 as libc::c_int) as usize]).width"
+        ),
+        "only `offset` is this relation"
+    );
+    assert!(
+        !under(
+            "(**images.offset(0 as libc::c_int as isize, 1)).width",
+            "(*images[(0 as libc::c_int) as usize]).width"
+        ),
+        "one argument, or it is not the walk this relates"
+    );
+    // And a deref that is NOT over an index keeps its own key.
+    assert!(
+        !under("*images.offset(tile as isize)", "*others"),
+        "a bare deref of another value is unrelated"
+    );
+}
