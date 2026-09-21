@@ -1347,6 +1347,10 @@ pub(crate) struct UseGraftVisitor<'a> {
         (u32, u32),
         &'a super::decision::native_result_expression::NativeResultExpressionPlan,
     >,
+    /// **R483-2** — the inner nodes' ORIGINAL source spellings, keyed by the same span
+    /// key the use grafts are keyed on. Consulted only when the inner's current text is
+    /// not what the outer plan carries, i.e. when another family has rewritten it.
+    originals: FxHashMap<(u32, u32), String>,
     /// Keys the composition consumed; the receiver-input pass skips them.
     pub(crate) composed: FxHashSet<(u32, u32)>,
     composition_failures: Vec<String>,
@@ -1360,9 +1364,16 @@ impl<'a> UseGraftVisitor<'a> {
             stats: UseGraftStats::default(),
             consumed: FxHashSet::default(),
             inner_views: FxHashMap::default(),
+            originals: FxHashMap::default(),
             composed: FxHashSet::default(),
             composition_failures: Vec::new(),
         }
+    }
+
+    /// R483-2: the original spellings of the nodes the composition may need to find.
+    pub(crate) fn with_originals(mut self, originals: FxHashMap<(u32, u32), String>) -> Self {
+        self.originals = originals;
+        self
     }
 
     pub(crate) fn with_inner_views(
@@ -1383,6 +1394,37 @@ impl<'a> UseGraftVisitor<'a> {
     fn compose_over_inner(text: &str, original: &str, inner: &str) -> Option<String> {
         let (start, end) = find_ignoring_whitespace(text, original)?;
         Some(format!("{}{inner}{}", &text[..start], &text[end..]))
+    }
+
+    /// **R483-2** — the same composition, with the inner node's ORIGINAL SOURCE spelling
+    /// as a fallback.
+    ///
+    /// The outer plan's text is rendered from the original source; the inner node prints
+    /// through `pprust` AFTER other families have rewritten it. When another family
+    /// rewrites the inner subject, the current spelling is no longer what the outer
+    /// carries and the search fails — and a failure here degrades the WHOLE program
+    /// (`nested-composition:inner-text-not-found`). heman's `heman_color_from_cpcf` is
+    /// that case: the Option family's `texture` rewrite lands inside the slice local's
+    /// outer product.
+    ///
+    /// The current text is tried FIRST, so nothing that composes today moves; the
+    /// original is consulted only where the composition would otherwise be refused.
+    fn compose_over_inner_with_original(
+        text: &str,
+        current: &str,
+        original: Option<&str>,
+        inner: &str,
+    ) -> Option<String> {
+        if let Some(composed) = Self::compose_over_inner(text, current, inner) {
+            return Some(composed);
+        }
+        let original = original?;
+        // An empty or whitespace-only original would match anywhere; `find_ignoring_
+        // whitespace` already refuses an empty needle, and this keeps the intent local.
+        if original.trim().is_empty() || original == current {
+            return None;
+        }
+        Self::compose_over_inner(text, original, inner)
     }
 
     /// Close the walk, deriving `unmatched` from what was never reached.
@@ -1499,7 +1541,12 @@ impl MutVisitor for UseGraftVisitor<'_> {
             let text = if let Some(view) = self.inner_views.get(&key) {
                 let original = rustc_ast_pretty::pprust::expr_to_string(e);
                 let inner = view.render(&original);
-                match Self::compose_over_inner(text, &original, &inner) {
+                match Self::compose_over_inner_with_original(
+                    text,
+                    &original,
+                    self.originals.get(&key).map(String::as_str),
+                    &inner,
+                ) {
                     Some(composed_text) => {
                         composed = composed_text;
                         self.composed.insert(key);
@@ -4206,7 +4253,24 @@ fn transform_with<'tcx>(
         .map(|input| ((input.call_span.lo().0, input.call_span.hi().0), input))
         .filter(|(key, _)| uses.contains_key(key))
         .collect::<FxHashMap<_, _>>();
-    let mut g = UseGraftVisitor::new(&uses, &mut guard).with_inner_views(inner_views);
+    // **R483-2** — the original spelling of every node the composition may need to find,
+    // taken from the source at the SAME span key the use grafts are keyed on. Only the
+    // keys that carry an inner view can ever need one, so this is bounded by them.
+    let originals = inner_views
+        .keys()
+        .filter_map(|&(lo, hi)| {
+            let span =
+                rustc_span::Span::with_root_ctxt(rustc_span::BytePos(lo), rustc_span::BytePos(hi));
+            tcx.sess
+                .source_map()
+                .span_to_snippet(span)
+                .ok()
+                .map(|text| ((lo, hi), text))
+        })
+        .collect::<FxHashMap<_, _>>();
+    let mut g = UseGraftVisitor::new(&uses, &mut guard)
+        .with_originals(originals)
+        .with_inner_views(inner_views);
     g.visit_crate(&mut krate);
     let (mut grafts, composed_receiver_inputs, composition_failures) = g.finish_composed();
     if let Some(why) = composition_failures.first() {
@@ -9696,5 +9760,73 @@ mod nested_drop_diagnostic_tests {
         assert!(map.contains("surface-arguments-not-exactly-one:"));
         assert!(map.contains("function-reverted"));
         assert!(map.contains("required-subject-reverted"));
+    }
+}
+
+#[cfg(test)]
+mod nested_composition_robustness_tests {
+    use super::*;
+
+    /// **R483-2 — a whole program must not be lost to a spelling.**
+    ///
+    /// The outer plan's text is rendered from the ORIGINAL source. The inner node prints
+    /// through `pprust` AFTER other families have rewritten it. When another family
+    /// rewrites the inner subject — heman `heman_color_from_cpcf`, where the Option
+    /// family's `texture` rewrite lands inside the slice local's outer product — the
+    /// inner's current text is no longer the text the outer carries, the search fails,
+    /// and `nested-composition:inner-text-not-found` degrades the entire program.
+    ///
+    /// The composition must find the inner by what the outer ACTUALLY carries — its
+    /// original spelling — not only by what the inner prints as now.
+    #[test]
+    fn r483_2_an_inner_rewritten_by_another_family_still_composes() {
+        // The outer plan, rendered from the original source, carries the ORIGINAL inner.
+        let outer = "core::slice::from_raw_parts(heman_image_texel(texture, u, v), 4)";
+        // Another family has since rewritten the inner subject's spelling.
+        let current = "heman_image_texel(texture.as_mut().unwrap(), u, v)";
+        let original = "heman_image_texel(texture, u, v)";
+        let inner = "unsafe { &*heman_image_texel(texture.as_mut().unwrap(), u, v) }";
+
+        // Today's lookup -- by the inner's CURRENT text -- cannot find it.
+        assert!(
+            UseGraftVisitor::compose_over_inner(outer, current, inner).is_none(),
+            "the premise: the current spelling is not what the outer carries"
+        );
+
+        // The composition must still succeed, by the spelling the outer DOES carry.
+        let composed = UseGraftVisitor::compose_over_inner_with_original(
+            outer,
+            current,
+            Some(original),
+            inner,
+        )
+        .expect("an inner rewritten by another family must still compose");
+        assert!(
+            composed.contains(inner),
+            "the view is spliced in: {composed}"
+        );
+        assert!(
+            composed.starts_with("core::slice::from_raw_parts("),
+            "and the outer is preserved around it: {composed}"
+        );
+        assert!(
+            !composed.contains(original),
+            "the original spelling is replaced, not left beside the view: {composed}"
+        );
+    }
+
+    /// The current text still wins when it IS present -- the fallback must not change
+    /// what already worked, or every composition in the corpus moves at once.
+    #[test]
+    fn r483_2_the_current_text_is_still_preferred() {
+        let outer = "wrap(inner(x), 4)";
+        let composed = UseGraftVisitor::compose_over_inner_with_original(
+            outer,
+            "inner(x)",
+            Some("STALE"),
+            "V",
+        )
+        .expect("composes on the current text");
+        assert_eq!(composed, "wrap(V, 4)");
     }
 }
