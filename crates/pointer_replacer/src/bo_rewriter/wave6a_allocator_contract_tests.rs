@@ -1199,3 +1199,32 @@ fn w6a_ac_an_optional_slice_owner_derefs_to_its_first_element() {
         out.source
     );
 }
+
+/// **A4 part 1's second half (R485-2): a body may prove a lend the model does
+/// not.** The oracle required the callee's formal to be model-`Ref`; the 37
+/// `contract-allocation:use:call-argument-not-a-lend` rows at batch 16 — 18 of
+/// them `BrotliHistogramCombine{Literal,Distance,Command}` — are owners whose
+/// callee the model calls `Raw`, which is the absence of a verdict, not a
+/// claim of ownership. `LendWalk` is the evidence there: a free, a store, a
+/// return or a copy of the formal each refuse it.
+///
+/// `Owning` is a positive claim and is NOT superseded by this walk, and a
+/// formal with no slot answers nothing. This witness pins those four answers;
+/// the end-to-end effect is the next census's to measure, because no small
+/// fixture of this lane holds a formal at model-`Raw` (five shapes tried
+/// across reports 024 and 039).
+#[test]
+fn w6a_a_body_proves_a_lend_only_where_the_model_has_no_verdict() {
+    use super::{
+        super::analyses::borrow_ownership::SlotKind,
+        decision::return_certificate::model_admits_lend,
+    };
+
+    // The model's own lend verdict, and the absence the body may fill.
+    assert!(model_admits_lend(Some(SlotKind::Ref)));
+    assert!(model_admits_lend(Some(SlotKind::Raw)));
+    // A positive claim of ownership is not superseded by a use walk …
+    assert!(!model_admits_lend(Some(SlotKind::Owning)));
+    // … and a formal the model never slotted answers nothing.
+    assert!(!model_admits_lend(None));
+}

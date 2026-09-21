@@ -1214,15 +1214,13 @@ impl<'a, 'tcx> LendOracle<'a, 'tcx> {
                 return Some(false);
             }
             let local = rustc_middle::mir::Local::from_usize(index + 1);
-            let is_ref = self
+            let kind = self
                 .slots
                 .fn_local_slots
                 .get(&callee)
                 .and_then(|u| u.slot_for_local_depth(local, 0))
-                .is_some_and(|slot| {
-                    self.model.get(&SlotRef::Local(callee, slot)) == Some(&SlotKind::Ref)
-                });
-            if !is_ref {
+                .and_then(|slot| self.model.get(&SlotRef::Local(callee, slot)).copied());
+            if !model_admits_lend(kind) {
                 return Some(false);
             }
             let hir_body = tcx.hir_body_owned_by(callee);
@@ -1246,6 +1244,28 @@ impl<'a, 'tcx> LendOracle<'a, 'tcx> {
         self.memo.borrow_mut().insert((did, index), Some(answer));
         answer
     }
+}
+
+/// **R485-2 — which model kinds a body may prove a lend for.**
+///
+/// `Ref` is the model's own lend verdict and needs no help. `Raw` is the
+/// ABSENCE of a verdict — the kind a formal takes when its provenance is
+/// opaque to the model — and there the BODY is the evidence: [`LendWalk`]
+/// admits only a deref, `is_null`, an element access under a deref and an
+/// argument to a callee certified the same way, so a free, a store, a return
+/// or a copy of the formal each refuse it, and a foreign callee's position is
+/// resolved through the contract table. That is the supersession R410-5 §1
+/// allows over an absence.
+///
+/// `Owning` is not an absence: it is the model claiming the formal owns its
+/// pointee, and this walk is not the source proof that would be needed to
+/// overturn it (report 011's licensing wall). A formal with no slot at all
+/// answers nothing and is refused.
+///
+/// The market this opens is the 37 `contract-allocation:use:call-argument-not-a-lend`
+/// rows of batch 16, 18 of them `BrotliHistogramCombine{Literal,Distance,Command}`.
+pub(crate) fn model_admits_lend(kind: Option<SlotKind>) -> bool {
+    matches!(kind, Some(SlotKind::Ref) | Some(SlotKind::Raw))
 }
 
 /// Derive every certificate for the crate (fixpoint over chained returns).
