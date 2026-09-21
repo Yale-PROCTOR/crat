@@ -1062,8 +1062,7 @@ pub(crate) fn plan_slice_constructions(
         // parameter's view. A constructor here would wrap that edit in
         // `from_raw_parts` with a fabricated extent beside the count the
         // contract already carries.
-        if let Some(plan) = super::counted_void::alias_construction(tcx, facts, subject, decision)
-        {
+        if let Some(plan) = super::counted_void::alias_construction(tcx, facts, subject, decision) {
             plans.push(plan);
             continue;
         }

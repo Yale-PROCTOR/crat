@@ -903,9 +903,13 @@ fn w6v_read_cursor_alias_delivers_an_optional_byte_view() {
         "null-tested read view: {source}"
     );
     assert!(c.contains("ifsrc.is_none()"), "null test moves: {source}");
+    // R492-5 route (i): the alias is a delivered subject now, so its
+    // declaration carries its own type — the custody instrument refuses a
+    // delivered declaration whose type is inferred, and the count is still the
+    // contract's (no `from_raw_parts`, no fabricated extent).
     assert!(
-        c.contains("letmutcsrc=src.unwrap_or(&[]);"),
-        "the alias is the view: {source}"
+        c.contains("letmutcsrc:&[u8]=src.unwrap_or(&[]);"),
+        "the alias is the view, typed: {source}"
     );
     assert!(
         c.contains("(csrc[0]asu8)"),
@@ -1096,7 +1100,8 @@ fn w6v_indexed_read_alias_under_a_bounded_guard_delivers() {
         c.contains("fncsv_parse(muts:Option<&[u8]>,mutlen:u64,mutskip:u64)->u64"),
         "{source}"
     );
-    assert!(c.contains("letmutus=s.unwrap_or(&[]);"), "{source}");
+    // R492-5 route (i): the alias declares its own type (see CSV_READ).
+    assert!(c.contains("letmutus:&[u8]=s.unwrap_or(&[]);"), "{source}");
     assert!(
         c.contains("c=(us[(fresh17asisize)asusize]asu8);"),
         "indexed checked read: {source}"
@@ -1792,13 +1797,73 @@ fn w6v_counted_read_alias_is_a_delivered_row_of_its_own() {
     let c = compact(&source);
     // The emitted text is unchanged by the move: one initializer, one of each use.
     assert_eq!(
-        c.matches("letmutcsrc=src.unwrap_or(&[]);").count(),
+        c.matches("letmutcsrc:&[u8]=src.unwrap_or(&[]);").count(),
         1,
-        "the declaration is planned exactly once: {source}"
+        "the declaration is planned exactly once: {rows:?}\n{source}"
     );
     assert!(
         !c.contains("csrcas*constu8") && !c.contains("*csrcasi32"),
         "no unrewritten alias site survives: {source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// **R492-5: the alias and its parameter withdraw together.**
+///
+/// Route (i) puts one contract's edits on two subjects, so a revert that takes
+/// one and keeps the other emits a tree that asks `unwrap_or` of a raw pointer
+/// (report 032, measured). The closure states the transaction to the revert
+/// loop; the two directions are asserted separately because a closure that
+/// only looks one way is exactly the defect that was observed.
+#[test]
+fn w6v_a_withheld_half_of_the_alias_transaction_withdraws_the_other() {
+    use rustc_hir::{
+        def_id::{DefIndex, LocalDefId},
+        hir_id::{HirId, ItemLocalId, OwnerId},
+    };
+
+    use super::decision::{
+        counted_void::{ByteElement, Contract, close_reverts},
+        emitability::UseEdit,
+    };
+
+    let owner = LocalDefId {
+        local_def_index: DefIndex::from_u32(7),
+    };
+    let hir = |id| HirId {
+        owner: OwnerId { def_id: owner },
+        local_id: ItemLocalId::from_u32(id),
+    };
+    let (param, alias) = (hir(1), hir(2));
+    let mut table = super::decision::DecisionTable::default();
+    table.counted_void.insert(
+        (owner, param),
+        Contract {
+            count_index: 1,
+            element: ByteElement::Read,
+            nullable: true,
+            handle: None,
+            width: None,
+            alias: Some(alias),
+            decl: Some(UseEdit {
+                span: rustc_span::DUMMY_SP,
+                replacement: "src.unwrap_or(&[])".to_owned(),
+                bridge_kind: "counted-void-read-alias",
+            }),
+            uses: Vec::new(),
+        },
+    );
+
+    let closed = |withheld: &[HirId]| {
+        let mut reverts = super::ast_transform::RevertSet::default();
+        for hir_id in withheld {
+            reverts.atom_subjects.insert((owner, *hir_id));
+        }
+        close_reverts(&table, &mut reverts);
+        reverts.fns.contains(&owner)
+    };
+
+    assert!(!closed(&[]), "a kept pair withdraws nothing");
+    assert!(closed(&[param]), "the withheld parameter takes its alias");
+    assert!(closed(&[alias]), "the withheld alias takes its parameter");
 }

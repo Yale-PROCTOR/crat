@@ -100,11 +100,47 @@ pub(crate) fn alias_contract<'a>(ctx: &super::Ctx<'a, '_>, s: &Subject) -> Optio
 pub(crate) fn declares_its_own_alias(decision: &super::Decision) -> &[UseEdit] {
     match decision {
         super::Decision::Slice { uses, .. }
-            if uses.iter().any(|u| u.bridge_kind == "counted-void-read-alias") =>
+            if uses
+                .iter()
+                .any(|u| u.bridge_kind == "counted-void-read-alias") =>
         {
             uses
         }
-        _ => &[],
+        super::Decision::Slice { .. }
+        | super::Decision::NestedSlice { .. }
+        | super::Decision::Opt { .. }
+        | super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::Cursor { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Degraded(_) => &[],
+    }
+}
+
+/// **The alias and its parameter are ONE transaction (R492-5).**
+///
+/// Route (i) splits a single contract's edits across two subjects: the
+/// parameter carries every use, the alias carries the initializer that types
+/// it. Either half alone is ill-typed — measured, report 032: the verify loop
+/// withheld the parameter, kept the alias, and the tree asked `unwrap_or` of a
+/// raw pointer — and the per-function revert loop has no way to know they
+/// belong together unless this says so. Exactly the duty
+/// `shared_read_arguments::close_reverts` discharges for its own multi-subject
+/// family, at the same call site, in the same shape: withdraw the FUNCTION, so
+/// neither half can survive the other.
+pub(crate) fn close_reverts(
+    table: &super::DecisionTable,
+    reverts: &mut crate::bo_rewriter::ast_transform::RevertSet,
+) {
+    for ((fn_did, param), contract) in table.counted_void.iter() {
+        // Only the split transaction: a contract that still plans its own
+        // initializer is one subject's, and one subject needs no closure.
+        let (Some(alias), true) = (contract.alias, contract.decl.is_some()) else {
+            continue;
+        };
+        if !reverts.keeps_subject(*fn_did, *param) || !reverts.keeps_subject(*fn_did, alias) {
+            reverts.fns.insert(*fn_did);
+        }
     }
 }
 
@@ -135,7 +171,18 @@ pub(crate) fn alias_construction<'tcx>(
     if init_span != edit.span {
         return None;
     }
-    let mutable = matches!(decision, super::Decision::Slice { mutable: true, .. });
+    // Exhaustive, per the import denylist: a new disposition must be a compile
+    // error here, not a subject silently dropped.
+    let mutable = match decision {
+        super::Decision::Slice { mutable, .. } => *mutable,
+        super::Decision::NestedSlice { .. }
+        | super::Decision::Opt { .. }
+        | super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::Cursor { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Degraded(_) => return None,
+    };
     let element_type = super::declaration::pointee_source(
         tcx,
         match tcx.typeck(subject.fn_did).node_type(subject.hir_id).kind() {
@@ -176,10 +223,7 @@ pub(crate) fn alias_construction<'tcx>(
     })
 }
 
-pub(crate) fn alias_declaration<'a>(
-    ctx: &super::Ctx<'a, '_>,
-    s: &Subject,
-) -> Option<&'a UseEdit> {
+pub(crate) fn alias_declaration<'a>(ctx: &super::Ctx<'a, '_>, s: &Subject) -> Option<&'a UseEdit> {
     alias_contract(ctx, s)?.decl.as_ref()
 }
 fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
@@ -701,15 +745,24 @@ pub(crate) fn owns_address(
         return false;
     }
     let Some(contract) = table.counted_void.get(&site.node) else { return false };
-    table.entries.iter().any(|(s, d)| {
-        (s.fn_did, s.hir_id) == site.node
-            && slice_edits(d).is_some_and(|uses| {
-                contract
-                    .uses
-                    .iter()
-                    .any(|owned| owned.span.contains(site.span) && uses.contains(owned))
+    let owned_by = |node: Key, owned: &UseEdit| {
+        owned.span.contains(site.span)
+            && table.entries.iter().any(|(s, d)| {
+                (s.fn_did, s.hir_id) == node
+                    && slice_edits(d).is_some_and(|uses| uses.contains(owned))
             })
-    })
+    };
+    // R492-5: the cast IS the alias's initializer, and route (i) moved that
+    // edit to the ALIAS subject. The site is no less the contract's for having
+    // changed hands — and reading only the parameter's `uses` here is what let
+    // the seam claim the span as its own address view, which retires the
+    // parameter's stage and tears the transaction in half (report 032).
+    contract.uses.iter().any(|owned| owned_by(site.node, owned))
+        || contract
+            .decl
+            .as_ref()
+            .zip(contract.alias)
+            .is_some_and(|(decl, alias)| owned_by((site.node.0, alias), decl))
 }
 
 fn find_expr<'tcx>(body: &'tcx Expr<'tcx>, span: rustc_span::Span) -> Option<&'tcx Expr<'tcx>> {

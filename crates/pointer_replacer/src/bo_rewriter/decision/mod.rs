@@ -2012,9 +2012,12 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // refuses. The yield belongs HERE, beneath every earlier arm: exempting
         // the subject further up the ladder is what cost six lane witnesses in
         // report 028.
-        Decision::Slice { mutable, .. } | Decision::Opt { mutable, slice: true, .. }
-            if counted_void::alias_declaration(ctx, subject).is_some() =>
-        {
+        Decision::Slice { mutable, .. }
+        | Decision::Opt {
+            mutable,
+            slice: true,
+            ..
+        } if counted_void::alias_declaration(ctx, subject).is_some() => {
             let uses = counted_void::alias_declaration(ctx, subject)
                 .cloned()
                 .into_iter()

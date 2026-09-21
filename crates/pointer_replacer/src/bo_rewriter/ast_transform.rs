@@ -6293,6 +6293,8 @@ pub(crate) fn revert_set_from_classes_and_atoms(
     out.atom_names.extend(atoms.iter().cloned());
     close_nested_reverts(table, &mut out);
     super::shared_read_arguments::close_reverts(table, &mut out);
+    // R492-5: the counted READ alias and its parameter are one transaction.
+    super::decision::counted_void::close_reverts(table, &mut out);
     Ok(out)
 }
 
