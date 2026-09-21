@@ -778,35 +778,50 @@ pub(crate) fn validate(capture: &Capture) -> Result<(), String> {
                 }
                 _ => false,
             };
-            if !source_contract
-                || row.state != state
-                || event.state != state
-                || bridge.state != state
-                || row.reason.is_some()
-                || event.reason.is_some()
-                || bridge.reason.is_some()
-                || row.boundary_kind != required.bridge.kind
-                || row.endpoint != required.bridge.endpoint
-                || row.position != required.bridge.position
-                || row.pair_role != "not-applicable"
-                || row.effect_carrier.is_some()
-                || row.source_form != event.source_form
-                || row.target_form != event.target_form
-                || row.negative_write != event.negative_write
-                || row.tier != event.tier
-                || row.waiver != event.waiver
-                || event.terminal_interface.as_ref() != Some(&required.terminal_interface)
-                || !event.return_adapter
-                || !event.extent_none
-                || bridge.key != required.bridge
-                || bridge.source_form != row.source_form
-                || bridge.target_form != row.target_form
-                || bridge.argument_kind != event.argument_kind
-                || bridge.tier != row.tier
-                || bridge.waiver != row.waiver
-                || !bridge.extent_none
-            {
-                return Err(fail("common-specialized-bridge-drift"));
+            // **R493-1** — name the clause that drifted.
+            //
+            // This was one 27-clause conjunction reporting a single word, so a refusal
+            // said only that the ledger and the tree disagree somewhere. Settling a
+            // drift means moving the LEDGER'S expectation to what the tree carries, and
+            // that cannot be done without knowing which expectation moved. The checks are
+            // unchanged; only their reporting is.
+            let drift: [(&str, bool); 27] = [
+                ("source-contract", !source_contract),
+                ("row-state", row.state != state),
+                ("event-state", event.state != state),
+                ("bridge-state", bridge.state != state),
+                ("row-reason", row.reason.is_some()),
+                ("event-reason", event.reason.is_some()),
+                ("bridge-reason", bridge.reason.is_some()),
+                ("boundary-kind", row.boundary_kind != required.bridge.kind),
+                ("endpoint", row.endpoint != required.bridge.endpoint),
+                ("position", row.position != required.bridge.position),
+                ("pair-role", row.pair_role != "not-applicable"),
+                ("effect-carrier", row.effect_carrier.is_some()),
+                ("row-source-form", row.source_form != event.source_form),
+                ("row-target-form", row.target_form != event.target_form),
+                ("negative-write", row.negative_write != event.negative_write),
+                ("row-tier", row.tier != event.tier),
+                ("row-waiver", row.waiver != event.waiver),
+                (
+                    "terminal-interface",
+                    event.terminal_interface.as_ref() != Some(&required.terminal_interface),
+                ),
+                ("return-adapter", !event.return_adapter),
+                ("event-extent-none", !event.extent_none),
+                ("bridge-key", bridge.key != required.bridge),
+                ("bridge-source-form", bridge.source_form != row.source_form),
+                ("bridge-target-form", bridge.target_form != row.target_form),
+                (
+                    "bridge-argument-kind",
+                    bridge.argument_kind != event.argument_kind,
+                ),
+                ("bridge-tier", bridge.tier != row.tier),
+                ("bridge-waiver", bridge.waiver != row.waiver),
+                ("bridge-extent-none", !bridge.extent_none),
+            ];
+            if let Some((clause, _)) = drift.iter().find(|(_, failed)| *failed) {
+                return Err(fail(&format!("common-specialized-bridge-drift:{clause}")));
             }
         }
         let planned = rows[&(key.clone(), "plan".into())];
@@ -960,4 +975,58 @@ pub(crate) fn validate_sidecars(
         return Err(fail("tsv-payload-mismatch"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod drift_clause_tests {
+    /// **R493-1 — a drift refusal must name the clause that drifted.**
+    ///
+    /// This comparator held one 27-clause conjunction and reported a single word. Route
+    /// B's heman run ends `instrument-error / data=false` on it, and settling a drift
+    /// means moving the LEDGER'S expectation to what the tree carries — which cannot be
+    /// done without knowing which expectation moved. A refusal that says only "something
+    /// disagrees" is a refusal nobody can act on.
+    ///
+    /// The checks themselves are unchanged. This pins that each has a name, that the
+    /// names are distinct (two clauses sharing one label would send a reader to the wrong
+    /// expectation), and that the list still covers all 27.
+    #[test]
+    fn r493_1_every_drift_clause_is_named_and_distinct() {
+        let source = include_str!("outbound_return_transport.rs");
+        let table = source
+            .split("let drift: [(&str, bool); 27] = [")
+            .nth(1)
+            .expect("the clause table exists");
+        let table = &table[..table.find("\n            ];").expect("the table closes")];
+
+        // The names are the FIRST quoted string of each entry, and rustfmt may split an
+        // entry across lines -- the first version of this witness required `("name",` on
+        // one line and found 26 of 27 for exactly that reason, which would have read as a
+        // missing clause rather than a parser that was too strict.
+        let names = table
+            .split(',')
+            .filter_map(|piece| {
+                let piece = piece.trim();
+                piece
+                    .trim_start_matches('(')
+                    .trim_start()
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split('"').next())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names.len(), 27, "every clause is named: {names:?}");
+        let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            27,
+            "two clauses sharing a label would send a reader to the wrong expectation: {names:?}"
+        );
+
+        // And the refusal carries the name rather than the bare word.
+        assert!(
+            source.contains(r#"common-specialized-bridge-drift:{clause}"#),
+            "the refusal must carry the clause"
+        );
+    }
 }
