@@ -102,47 +102,56 @@ fn render_raw_view_source(
     temp_stem: &str,
     views: &[(usize, String, String, String, Option<String>)],
 ) -> Result<String, String> {
-    // R482-4(f): the same literal rule governs the scan that FINDS the
-    // argument list. A `(` inside a string is not the callee's parenthesis.
+    // **R482-4(f)** — the literal rule governs this scan too: a `(` inside a
+    // string is not a parenthesis.
+    //
+    // **R483-3 (STOP 2)** — the argument list is the call's LAST top-level
+    // group, not its first. A C2Rust function-pointer call is `(*f)(a, b)`,
+    // whose first `(` is at offset 0: reading that as the argument list left
+    // the callee empty and held the class. Walking the top-level groups and
+    // keeping the last one names `(*f)` as the callee and `(a, b)` as its
+    // arguments, and leaves every ordinary shape where it was.
     let bytes = source.as_bytes();
-    let mut open = None;
+    let mut group = None;
     let mut index = 0usize;
     while index < bytes.len() {
         if let Some(end) = literal_end(bytes, index) {
             index = end;
             continue;
         }
-        if bytes[index] == b'(' {
-            open = Some(index);
-            break;
-        }
-        index += 1;
-    }
-    let open = open.ok_or_else(|| "PAIR call source has no argument list".to_owned())?;
-    let mut depth = 0usize;
-    let mut close = None;
-    let mut index = open;
-    while index < bytes.len() {
-        if let Some(end) = literal_end(bytes, index) {
-            index = end;
+        if bytes[index] != b'(' {
+            index += 1;
             continue;
         }
-        match bytes[index] {
-            b'(' => depth += 1,
-            b')' => {
-                depth = depth
-                    .checked_sub(1)
-                    .ok_or_else(|| "PAIR call source has unmatched ')'".to_owned())?;
-                if depth == 0 {
-                    close = Some(index);
-                    break;
-                }
+        let start = index;
+        let mut depth = 0usize;
+        let mut end = None;
+        while index < bytes.len() {
+            if let Some(skip) = literal_end(bytes, index) {
+                index = skip;
+                continue;
             }
-            _ => {}
+            match bytes[index] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| "PAIR call source has unmatched ')'".to_owned())?;
+                    if depth == 0 {
+                        end = Some(index);
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+            if end.is_some() {
+                break;
+            }
         }
-        index += 1;
+        let close = end.ok_or_else(|| "PAIR call source has unmatched '('".to_owned())?;
+        group = Some((start, close));
     }
-    let close = close.ok_or_else(|| "PAIR call source has unmatched '('".to_owned())?;
+    let (open, close) = group.ok_or_else(|| "PAIR call source has no argument list".to_owned())?;
     let callee = source[..open].trim();
     if callee.is_empty() {
         return Err("PAIR call source has an empty callee".to_owned());
@@ -405,6 +414,62 @@ mod tests {
         )
         .expect("a lifetime is not a literal");
         assert!(rendered.contains("y as &'static [u8]"), "{rendered}");
+    }
+
+    /// **R483-3, STOP 2.** lil's four rows: a C2Rust function-pointer call is
+    /// `(*f)(a, b)`, whose FIRST `(` is at offset 0, so the callee read empty
+    /// and the class was held `a5-fallback-unrenderable: PAIR call source has
+    /// an empty callee`. The argument list is the call's LAST top-level
+    /// parenthesised group, not its first.
+    #[test]
+    fn r483_3_stop2_a_parenthesised_callee_is_not_an_empty_callee() {
+        let source = "(*f)(x, y)";
+        let rendered = render_pair_raw_view_source(
+            source,
+            "__crat_fnptr",
+            &[(0, "x".to_owned(), "*mut i32".to_owned())],
+        )
+        .expect("a parenthesised callee is a callee");
+        assert!(
+            rendered.contains("(*f)(__crat_fnptr_0, y)"),
+            "the callee keeps its parentheses and only the view moves: {rendered}"
+        );
+    }
+
+    /// Controls — the ordinary shape is unchanged, a nested group inside the
+    /// arguments is not mistaken for the list, and a trailing cast still rides
+    /// along.
+    #[test]
+    fn r483_3_stop2_the_ordinary_and_nested_shapes_are_unchanged() {
+        for (source, expected) in [
+            ("callee(x, y)", "callee(__crat_s_0, y)"),
+            ("callee(x, g(y))", "callee(__crat_s_0, g(y))"),
+            ("(*table[3].fp)(x, y)", "(*table[3].fp)(__crat_s_0, y)"),
+        ] {
+            let rendered = render_pair_raw_view_source(
+                source,
+                "__crat_s",
+                &[(0, "x".to_owned(), "*mut i32".to_owned())],
+            )
+            .unwrap_or_else(|why| panic!("{source}: {why}"));
+            assert!(rendered.contains(expected), "{source}: {rendered}");
+        }
+    }
+
+    /// Control — a parenthesised expression that is NOT a call still has an
+    /// empty callee. The rule admits a callee, not any last group.
+    #[test]
+    fn r483_3_stop2_a_bare_parenthesised_expression_is_still_an_empty_callee() {
+        let error = render_pair_raw_view_source(
+            "(x + y)",
+            "__crat_s",
+            &[(0, "x".to_owned(), "*mut i32".to_owned())],
+        )
+        .expect_err("a parenthesised expression is not a call");
+        assert!(
+            error.contains("PAIR call source has an empty callee"),
+            "{error}"
+        );
     }
 
     /// D13-W1's surviving half: a source that really is unclosed still names
