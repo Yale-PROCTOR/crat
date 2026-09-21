@@ -1869,7 +1869,13 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 && slice_local_construction::refuses(ctx, subject)
                 // R445-2: clause (d) of that refusal is a YIELD, not a
                 // refusal — the derived-view rule below types this subject.
-                && !source_typed_local::permits(ctx, subject) =>
+                && !source_typed_local::permits(ctx, subject)
+                // relay 035 (wave-6v 028 route (a)): a counted READ alias is
+                // DECLARATION-FREE — its type comes from the initializer the
+                // parameter's contract already rewrote — so this refusal has no
+                // claim on it. The arms below still decide its form; exempting
+                // it from them instead costs six of wave-6v's witnesses.
+                && !construction_values::counted_alias_needs_no_declaration(ctx, subject) =>
         {
             degrade(
                 subject,

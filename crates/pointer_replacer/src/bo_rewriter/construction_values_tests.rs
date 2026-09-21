@@ -231,3 +231,85 @@ fn wave6k_a_copy_of_a_copy_keeps_the_refusal() {
         "the walk stops at one hop, so a copy of a copy is not typed: {second:?}"
     );
 }
+
+/// libcsv `csv_write2::csrc#9` (relay 035; wave-6v 028 route (a)): a counted
+/// `*const c_void` parameter reinterpreted as bytes. The contract rewrites the
+/// initializer and every use, so the local needs no declaration of its own; the
+/// receiver-form refusal degraded it `copy-source-coupled` for lacking one.
+const COUNTED_READ_ALIAS: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+static mut SINK: u64 = 0;
+unsafe fn sink(c: i32) -> i32 { SINK = SINK.wrapping_mul(31).wrapping_add(c as u64); 0 }
+unsafe fn csv_fwrite2(mut src: *const core::ffi::c_void, mut src_size: u64, mut quote: u8) -> i32 {
+    let mut csrc = src as *const u8;
+    if src.is_null() { return 0 as i32; }
+    if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }
+    while src_size != 0 {
+        if *csrc as i32 == quote as i32 {
+            if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }
+        }
+        if sink(*csrc as i32) == -(1 as i32) { return -(1 as i32); }
+        src_size = src_size.wrapping_sub(1);
+        csrc = csrc.offset(1);
+    }
+    if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }
+    return 0 as i32;
+}
+unsafe fn csv_fwrite(mut src: *const core::ffi::c_void, mut src_size: u64) -> i32 {
+    return csv_fwrite2(src, src_size, 0x22 as i32 as u8);
+}
+"#;
+
+/// The control: the same copy shape over a source that is NOT a counted
+/// contract keeps the refusal — the exemption is the contract's, not the cast's.
+const PLAIN_CAST_COPY: &str = r#"
+    pub unsafe fn scan(mut src: *const i8, mut n: usize) -> usize {
+        let mut us = src as *const u8;
+        let mut chars = 0usize;
+        while n > 0 {
+            if *us == b'"' { chars += 1; }
+            us = us.offset(1);
+            n -= 1;
+        }
+        chars
+    }
+"#;
+
+/// **RED until wave-6v's hook lands (MAX-3 stop, report 035).** The conjunct is
+/// in place in the refusal, but the predicate cannot identify the alias from
+/// this side: only `counted_void_read::prove` knows WHICH local a contract
+/// rewrote, and in the reduction (as in the corpus) the contract that rewrites
+/// `csrc` is not keyed on `csv_fwrite2::src` — `ctx.counted_void` holds
+/// `csv_fwrite::src` instead. wave-6v 028's `Contract::alias` + `alias_contract`
+/// are that missing key; with them, the predicate below is one line.
+#[test]
+#[ignore = "needs wave-6v's Contract::alias hook (relay 035 / wave-6v 028 STOP 3)"]
+fn wave6k_a_counted_read_alias_is_not_asked_for_a_declaration() {
+    let decided = decisions(COUNTED_READ_ALIAS);
+    let csrc = decided
+        .iter()
+        .find(|(name, _)| name == "csrc")
+        .map(|(_, d)| d.clone())
+        .expect("the alias");
+    assert!(
+        !matches!(
+            csrc,
+            Decision::Degraded(ref degraded) if degraded.reason.key() == "copy-source-coupled"
+        ),
+        "the counted alias needs no declaration and must not be degraded for lacking one: {csrc:?}"
+    );
+}
+
+#[test]
+fn wave6k_a_plain_cast_copy_keeps_the_refusal() {
+    let decided = decisions(PLAIN_CAST_COPY);
+    let us = decided
+        .iter()
+        .find(|(name, _)| name == "us")
+        .map(|(_, d)| d.clone())
+        .expect("the copy");
+    assert!(
+        matches!(us, Decision::Degraded(_)),
+        "a cast copy with no counted contract behind it keeps the veto: {us:?}"
+    );
+}
