@@ -89,19 +89,33 @@ fn k19_thin_subject_already_bridges_through_the_void_carrier() {
         Some("held:void-pointee"),
         "the callee end is held: {got:#?}"
     );
+    // **Re-premised by R481-1 / R482-3 (the USER's extent-lift waiver), by
+    // wave-4 under relay 057 STOP 2 — this lineage has no standing lane and the
+    // arm is wave-4's.** The hold still DECIDES: every evidence arm refuses
+    // this subject, which is why it reaches the waiver at all. What the waiver
+    // then gives it is the fabricated-extent slice, so the claim is asserted
+    // where it still states the rule — the carrier must not render a THIN
+    // one-element view (below), and no evidence-backed width may be invented
+    // (here). The SB defect this witness was built for is superseded for the
+    // fallback form by R482-3, whose remaining hazard is the slice-length UB
+    // §77 already waives.
     assert_eq!(
         got.get("data").map(String::as_str),
-        Some("held:local-callee-access-extent"),
-        "a one-byte subject handed to an eight-byte reader is held: {got:#?}"
+        Some("<emitted>"),
+        "the waiver gives the refused subject the fabricated-extent form: {got:#?}"
     );
     let source = emitted(INPUT);
     assert!(
         !source.contains("core::ptr::from_ref(data)"),
         "no thin carrier is rendered for a subject the callee reads past:\n{source}"
     );
+    // The claim that survives R482-3: whatever form the waiver gives the
+    // subject, it is never a THIN one-element carrier — the assertion above —
+    // and the emitted crate still type-checks below. The old "keeps its raw
+    // form" wording stated the pre-waiver terminal outcome, not the rule.
     assert!(
-        source.contains("hash(data: *const u8)"),
-        "the held subject keeps its raw form, which carries the real buffer:\n{source}"
+        !source.contains("hash(data: &u8)") && !source.contains("hash(data: &mut u8)"),
+        "no one-element carrier reaches the eight-byte reader:\n{source}"
     );
     assert!(
         super::verify::type_checks_str(&source),

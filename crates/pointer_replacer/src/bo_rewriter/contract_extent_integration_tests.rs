@@ -2449,3 +2449,40 @@ fn w4w04_the_raw_source_bridge_still_renders_on_an_unlifted_caller() {
         "and the region bridge renders the reader's width: {source}"
     );
 }
+
+/// A shared subject at a `*mut` foreign position: `printf("%s", p)` where the
+/// pinned contract types the position `*mut i8`. The thin-extent hold sends it
+/// past every evidence arm, and the waiver must NOT take it — lifting a shared
+/// subject there makes the seam bridge `p.as_ptr().cast_mut()`, and a write
+/// through a pointer derived from a shared reference is UB §77 does not waive.
+const W4_W_SHARED_AT_A_MUT_POSITION: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+extern "C" {
+    fn printf(_: *mut i8, _: ...) -> i32;
+}
+static mut FMT: [i8; 3] = [37, 115, 0];
+pub unsafe extern "C" fn print_arg(mut p: *const i8) -> i32 {
+    printf(FMT.as_mut_ptr(), p)
+}
+"#;
+
+/// **W4W-5 (R483-3(b)) — the mutability half, for `held:thin-extent` rows.**
+#[test]
+fn w4w05_a_shared_subject_at_a_mut_foreign_position_is_refused() {
+    let lifts = table_of(W4_W_SHARED_AT_A_MUT_POSITION, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| lift.subject.clone())
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    assert!(
+        !lifts
+            .iter()
+            .any(|subject| subject.starts_with("print_arg::p")),
+        "a shared subject may not be lifted into a cast_mut bridge: {lifts:?}"
+    );
+    let source = emitted(W4_W_SHARED_AT_A_MUT_POSITION);
+    assert!(!source.contains(".cast_mut()"), "{source}");
+}

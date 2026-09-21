@@ -314,6 +314,29 @@ fn a_caller_would_arrive_thin(
         .any(thin)
 }
 
+/// **The mutability half of the same discipline, for `held:thin-extent` rows**
+/// (relay 057, R483-3(b)).
+///
+/// A local-callee row records its access direction, so C2 (ii) of report 043
+/// can refuse a SHARED subject at a WRITE. A thin-extent row records none: its
+/// hold comes from the pinned contract table, not from a body walk. The
+/// equivalent question is asked of the position itself — does any foreign
+/// position this subject reaches take `*mut T`? If it does and the subject is
+/// shared, lifting it makes the seam bridge `shared.as_ptr().cast_mut()`, and
+/// writing through a pointer derived from a shared reference is UB that §77
+/// does not waive: it waives the slice's LENGTH, never its mutability.
+///
+/// `rb_x3`'s `%s` printf subject is the witness — `printf(FMT, p.as_ptr().cast_mut())`
+/// on a `*mut i8` position — and it is why this refusal exists rather than a
+/// re-premised assertion.
+fn reaches_a_mut_foreign_position(ctx: &Ctx<'_, '_>, node: (LocalDefId, HirId)) -> bool {
+    ctx.facts.foreign_call_args.iter().any(|fact| {
+        fact.caller == node.0
+            && fact.direct_subject_root() == Some(node.1)
+            && fact.target.mutability == super::raw_boundary::RawMutability::Mut
+    })
+}
+
 /// **The extent-lift waiver — USER ruling R481-1 ("바로 1024로 fat 처리"),
 /// addendum 481.**
 ///
@@ -372,7 +395,16 @@ pub(crate) fn promote_fallback(
                         }
                         (access.callee.clone(), Some(access.parameter_index))
                     }
-                    DegradeReason::ThinExtent => ("thin-extent".to_owned(), None),
+                    DegradeReason::ThinExtent => {
+                        // R483-3(b): the mutability half, asked of the position
+                        // because a thin-extent row carries no direction.
+                        if !subject.mutable
+                            && reaches_a_mut_foreign_position(ctx, (subject.fn_did, subject.hir_id))
+                        {
+                            return None;
+                        }
+                        ("thin-extent".to_owned(), None)
+                    }
                     _ => return None,
                 },
                 Decision::Slice { .. }
