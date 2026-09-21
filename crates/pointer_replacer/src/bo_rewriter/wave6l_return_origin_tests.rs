@@ -1718,3 +1718,77 @@ fn w6l_lodepng_chunk_receiver_takes_the_delivered_form_or_the_return_holds() {
         "{degradations:?}"
     );
 }
+
+/// heman's texel shape with lil's RETURN: the callee's view is untied (the
+/// parameter is exclusive, R401-8), and the caller returns the receiver
+/// **through an if-expression** — the shape the legacy escape inventory does
+/// not see (`lil/lib.rs:628-636`; wave-6l report 036 claim 6).
+const UNTIED_IF_RETURN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct image {
+    pub data: *mut f32,
+    pub w: i32,
+}
+#[no_mangle]
+pub unsafe extern "C" fn texel(mut img: *mut image, mut i: i32) -> *mut f32 {
+    return ((*img).data).offset(i as isize);
+}
+#[no_mangle]
+pub unsafe extern "C" fn pick(mut img: *mut image, mut i: i32) -> *mut f32 {
+    let mut p = texel(img, i);
+    *p = 1.0f32;
+    return if !p.is_null() { p } else { 0 as *mut f32 };
+}
+"#;
+
+/// **W6L-ESC (relay 039), RED first.** A returned-through-an-if receiver of an
+/// UNTIED view must be held by R401-8's guard. Before the fix the escape
+/// inventory answered `escapes=false` for exactly this shape and the guard
+/// never fired; the guard now asks the syntactic question too, so the subject
+/// is `lifetime-untied-view-escapes` and the view stays inside its frame.
+#[test]
+fn w6l_esc_untied_view_returned_through_an_if_is_held() {
+    let observed = observe(UNTIED_IF_RETURN);
+    assert_eq!(
+        failure_of(&observed, "pick::p"),
+        Some(LifetimeFailure::UntiedViewEscapes),
+        "{:?}",
+        observed.failures
+    );
+}
+
+/// The control: the same callee, the same untied view, and a receiver that
+/// does NOT leave the frame — it is read and dropped. The guard must not fire,
+/// so the fix cannot be "hold everything".
+const UNTIED_LOCAL_USE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct image {
+    pub data: *mut f32,
+    pub w: i32,
+}
+#[no_mangle]
+pub unsafe extern "C" fn texel(mut img: *mut image, mut i: i32) -> *mut f32 {
+    return ((*img).data).offset(i as isize);
+}
+#[no_mangle]
+pub unsafe extern "C" fn total(mut img: *mut image, mut i: i32) -> f32 {
+    let mut p = texel(img, i);
+    *p = 1.0f32;
+    return *p;
+}
+"#;
+
+#[test]
+fn w6l_esc_untied_view_used_in_frame_is_not_held_by_the_escape_guard() {
+    let observed = observe(UNTIED_LOCAL_USE);
+    assert_ne!(
+        failure_of(&observed, "total::p"),
+        Some(LifetimeFailure::UntiedViewEscapes),
+        "{:?}",
+        observed.failures
+    );
+}

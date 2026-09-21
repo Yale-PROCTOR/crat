@@ -941,13 +941,21 @@ pub(crate) fn derive_return_eligibility(
             .through_raw_field
             .get(&callee)
             .is_some_and(|reuse| reuse.untied)
-            && escapes.iter().any(|escape| {
+            && (escapes.iter().any(|escape| {
                 escape.subject == key
                     && matches!(
                         escape.kind,
                         EscapeKind::Return | EscapeKind::FieldStore | EscapeKind::StaticStore
                     )
             })
+            // **W6L-ESC (relay 039).** The inventory sees a BARE returned use
+            // only, so `return if !r.is_null() { r } else { .. };` reads as no
+            // escape at all (report 036 claim 6, measured on lil). A wrong
+            // `false` here admits an untied view that leaves its frame, which
+            // is exactly what R401-8's guard exists to refuse — so the guard
+            // asks the syntactic question too.
+            || super::return_through_raw_field::returned_locals(program.tcx, subject.fn_did)
+                .contains(&subject.hir_id))
         {
             result
                 .failures
