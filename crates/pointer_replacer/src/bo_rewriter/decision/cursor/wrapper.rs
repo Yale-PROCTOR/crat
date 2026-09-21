@@ -488,6 +488,9 @@ struct Uses<'a, 'tcx> {
     /// Ephemeral raw copies of this cursor: `let fresh = p;` whose single use
     /// is a deref read. Each carries its typed `raw-op-cursor-local` receipt.
     local_bridges: Vec<super::CursorLocalBridge>,
+    /// Chains ceded to a destination's own construction (R487-3(c)): counted so
+    /// that a subject whose ONLY handled use is a cede does not take the root.
+    ceded: usize,
 }
 impl Uses<'_, '_> {
     /// A derived pointer leaving the function through its raw return: the tail
@@ -572,6 +575,49 @@ impl Uses<'_, '_> {
                     && candidate_shape(self.ctx, other, decision)
             }))
         .then_some(destination)
+    }
+
+    /// **The ceded chain** (R485-4(g), R487-3(c); wave-6k `7bf81651e`). A chain
+    /// rooted at this cursor that initialises a local ANOTHER family types is
+    /// rendered by that family's construction, which takes the cursor's own view
+    /// as its raw source. One edit on the span, and it is theirs — so this
+    /// family records none.
+    ///
+    /// **R487-3(c)**: the family that delivers the root WITHOUT the chain keeps
+    /// it. So the cede is admissible only for a subject that is a cursor on its
+    /// own account, which is decided at the end of the walk (`plan`): if every
+    /// handled use was a cede, the chain is what would have made this family own
+    /// the root, and it does not get to. `fill`'s `ff` is that case — its only
+    /// use is the chain, and the slice family delivers the destination today.
+    ///
+    /// The conditions otherwise mirror `construction::cursor_view_text`:
+    /// `offset` (not `add`, whose delta is a `usize`), a bare path receiver, and
+    /// a destination the slice family types at this mutability.
+    fn ceded_to_a_construction(&self, e: &hir::Expr<'_>) -> bool {
+        if self.optional {
+            return false;
+        }
+        let tcx = self.ctx.tcx;
+        let hir::ExprKind::MethodCall(segment, receiver, [_], _) = e.kind else {
+            return false;
+        };
+        if segment.ident.as_str() != "offset" || local(receiver) != Some(self.subject.hir_id) {
+            return false;
+        }
+        let hir::Node::LetStmt(stmt) = tcx.parent_hir_node(e.hir_id) else {
+            return false;
+        };
+        if stmt.init.map(|init| init.hir_id) != Some(e.hir_id) {
+            return false;
+        }
+        let hir::PatKind::Binding(_, destination, _, None) = stmt.pat.kind else {
+            return false;
+        };
+        self.entries.iter().any(|(other, decision)| {
+            other.fn_did == self.subject.fn_did
+                && other.hir_id == destination
+                && slice_mutability(decision) == Some(self.subject.mutable)
+        })
     }
 
     /// **W-CUR-LOCAL.** The bare subject initialises an unannotated local whose
@@ -1350,6 +1396,11 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             self.visit_expr(callee);
             return;
         }
+        // A chain this cursor cedes to the destination's own construction.
+        if self.ceded_to_a_construction(e) {
+            self.ceded += 1;
+            return;
+        }
         if local(e) == Some(self.subject.hir_id) {
             // The bare subject as the right-hand side of an assignment into a
             // shared peer cursor (`data = start`) is the peer's edit or no edit.
@@ -1784,10 +1835,17 @@ fn build(
         peer_bases: vec![],
         peer_cursors: vec![],
         local_bridges: vec![],
+        ceded: 0,
     };
     v.visit_body(ctx.tcx.hir_body_owned_by(subject.fn_did));
     if let Some(hold) = v.hold {
         return Err(hold);
+    }
+    // **R487-3(c).** A subject whose only handled use was a ceded chain is not a
+    // cursor on its own account: the chain is what would make this family own
+    // the root, and the family that delivers the root without it keeps it.
+    if v.ceded > 0 && v.edits.is_empty() {
+        return Err(CursorHold::UseUnbuilt);
     }
     if let Some(init) = init {
         v.push(
