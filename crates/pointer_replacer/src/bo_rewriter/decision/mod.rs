@@ -2151,10 +2151,24 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             let prior = flexible_tail::override_plan(ctx, subject, prior);
             // wave-6a W6A-C1: a Box-parameter chain supplies the plan or the typed hold.
             let prior = box_param::override_plan(ctx, subject, prior);
-            return match ownership_fields_hook::plan(ctx, subject, owning_slot, prior) {
-                Ok(plan) => Decision::Box(plan),
-                Err(failure) => degrade(subject, decl_site, DegradeReason::BoxFailure { failure }),
-            };
+            match ownership_fields_hook::plan(ctx, subject, owning_slot, prior) {
+                Ok(plan) => return Decision::Box(plan),
+                // **wave-6a W6A-A9 — a proven lend is not this family's
+                // subject** (relay wave-6a/043 §A9). Every owning producer
+                // above has had its refusal — the Box plan, the flexible-tail
+                // transaction, the parameter chain and the ownership-fields
+                // hook — and none of them owns this formal. Its body says why:
+                // the callee never frees it, never stores it and never moves
+                // it on, so nothing here releases the allocation and the
+                // caller keeps the owner. The arm declines the ownership claim
+                // rather than degrading on it, and the borrowing arms below
+                // decide under their own gates. A9 sits LAST on purpose: it
+                // must not pre-empt a producer that would deliver.
+                Err(_) if box_param::lend_leaves_owning(ctx, subject) => {}
+                Err(failure) => {
+                    return degrade(subject, decl_site, DegradeReason::BoxFailure { failure });
+                }
+            }
         }
         None => return degrade(subject, decl_site, DegradeReason::NoSlot),
     }

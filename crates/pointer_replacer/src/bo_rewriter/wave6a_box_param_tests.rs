@@ -459,13 +459,17 @@ fn w6a_c1_brotli_free_func_behind_a_fn_pointer_holds_typed() {
 
 #[test]
 fn w6a_c1_qselect_lend_is_not_a_box_parameter() {
+    // Restated for W6A-A9 (relay wave-6a/048): the classification is
+    // unchanged — the body lends and this family refuses it — but the refusal
+    // is now a DECLINE that leaves the owning arm rather than a hold that
+    // degrades there, so the row reads `yielded`.
     let out = emitted("boxparam-qselect", &with_prelude(QSELECT));
     let src = compact(&out.source);
     assert!(!src.contains("v:Box<"), "{}", out.source);
     assert!(
         out.artifacts
             .box_param_receipts
-            .contains("qselect::v\theld\tbox-param-callee-lends:qselect"),
+            .contains("qselect::v\tyielded\tbox-param-lend-leaves-owning:qselect"),
         "{}",
         out.artifacts.box_param_receipts
     );
@@ -1109,6 +1113,245 @@ fn w6a_c1_a_parameter_moved_on_to_a_consuming_callee_is_an_owner() {
         out.artifacts
             .box_param_receipts
             .contains("box-param-chain callee=sink_free index=0 sink=free"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+}
+
+/// **wave-6a rule W6A-A9 — a lend is not the Box family's subject** (relay
+/// wave-6a/043 §A9, /048). The corpus rows the `box-param-callee-lends` hold
+/// names are struct-pointer lends: lodepng `filter::settings` /
+/// `preProcessScanlines::settings` (`*const LodePNGEncoderSettings`),
+/// `inflateNoCompression::reader`, brotli `BrotliBitReaderRestoreState::from`
+/// (`*mut BrotliBitReaderState`, read only). Their bodies deref the formal for
+/// fields and nothing else — no free, no store, no move on, no return.
+///
+/// The model calls such a formal `Owning`, so the decide ladder's owning arm
+/// claims it and, finding no consumer, degrades it `BoxFailure`. The body
+/// proof says the Box family is the WRONG family for it: this rule does not
+/// decide what the subject becomes, it declines the ownership claim the body
+/// disproves and lets the borrowing arms below decide under their own gates —
+/// exactly as they would for a `Ref`-modeled formal.
+const STRUCT_LEND: &str = r#"
+#[repr(C)]
+pub struct Settings {
+    pub width: i32,
+    pub height: i32,
+}
+unsafe extern "C" fn area(mut settings: *const Settings) -> i32 {
+    return (*settings).width * (*settings).height;
+}
+pub unsafe extern "C" fn measure() -> i32 {
+    let mut s = malloc(::std::mem::size_of::<Settings>()) as *mut Settings;
+    (*s).width = 3 as i32;
+    (*s).height = 4 as i32;
+    let mut a = area(s);
+    free(s as *mut core::ffi::c_void);
+    return a;
+}
+"#;
+
+/// The corpus shape whose model verdict is `Owning`: the SAME allocation is
+/// lent to one callee and released by another, so the solver carries the
+/// ownership into both formals. lodepng's `filter::settings` sits in exactly
+/// this position.
+const STRUCT_LEND_OWNING: &str = r#"
+#[repr(C)]
+pub struct Settings {
+    pub width: i32,
+    pub height: i32,
+}
+unsafe extern "C" fn area(mut settings: *const Settings) -> i32 {
+    return (*settings).width * (*settings).height;
+}
+unsafe extern "C" fn release(mut settings: *mut Settings) {
+    free(settings as *mut core::ffi::c_void);
+}
+pub unsafe extern "C" fn measure() -> i32 {
+    let mut s = malloc(::std::mem::size_of::<Settings>()) as *mut Settings;
+    (*s).width = 3 as i32;
+    (*s).height = 4 as i32;
+    let mut a = area(s);
+    release(s);
+    return a;
+}
+"#;
+
+/// Control: the same shape where the callee FREES the formal — the chain is a
+/// transfer and the Box family keeps it.
+const STRUCT_CONSUMER: &str = r#"
+#[repr(C)]
+pub struct Settings {
+    pub width: i32,
+    pub height: i32,
+}
+unsafe extern "C" fn area_and_release(mut settings: *mut Settings) -> i32 {
+    let mut a = (*settings).width * (*settings).height;
+    free(settings as *mut core::ffi::c_void);
+    return a;
+}
+pub unsafe extern "C" fn measure() -> i32 {
+    let mut s = malloc(::std::mem::size_of::<Settings>()) as *mut Settings;
+    (*s).width = 3 as i32;
+    (*s).height = 4 as i32;
+    return area_and_release(s);
+}
+"#;
+
+#[test]
+fn w6a_a9_the_model_ref_lend_needs_no_rule() {
+    // Control, and the reason the rule is keyed on the model's verdict rather
+    // than on the body alone: where the model already calls a lent formal
+    // `Ref`, the borrowing arms deliver it today — `area(settings: &Settings)`
+    // with `area(&*s)` at the caller's `Box`. Nothing is receipted, because
+    // the owning arm never claimed it.
+    let out = emitted("boxparam-structlend", &with_prelude(STRUCT_LEND));
+    let text = compact(&out.source);
+    assert!(
+        text.contains("fnarea(mutsettings:&Settings)") && text.contains("area(&*s)"),
+        "{}",
+        out.source
+    );
+    assert!(
+        !out.artifacts
+            .box_param_receipts
+            .contains("box-param-lend-leaves-owning"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+}
+
+#[test]
+fn w6a_a9_qselect_leaves_the_owning_arm() {
+    // The corpus shape (heman `qselect`, and the `box-param-callee-lends`
+    // rows of lodepng / brotli): the model calls the lent formal `Owning`, so
+    // the owning arm claims it, finds no consumer and degrades it. A9 declines
+    // the claim the body disproves and lets the borrowing arms decide.
+    let out = emitted("boxparam-qselect", &with_prelude(QSELECT));
+    let text = compact(&out.source);
+    assert!(
+        !text.contains("v:Box<"),
+        "a lend is not an owner\n{}",
+        out.source
+    );
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("qselect::v\tyielded\tbox-param-lend-leaves-owning:qselect"),
+        "the lend must be receipted as leaving the owning arm\n{}",
+        out.artifacts.box_param_receipts
+    );
+    assert_ne!(
+        reason_of(&out.degradations, "qselect::v").as_deref(),
+        Some("box-failure"),
+        "the owning arm must not claim a proven lend\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn w6a_a9_a_lend_beside_a_release_needs_no_rule() {
+    // The second control, and the measurement that keeps A9's market honest:
+    // lending one callee and releasing through another does NOT make the
+    // model call the lent formal `Owning`. The whole shape delivers with no
+    // rule — `area(settings: &Settings)`, `release(settings: Box<Settings>)`
+    // with `drop`, and `area(&*s)` / `release(s)` at the caller — so the rows
+    // A9 addresses are the narrower ones the model does call `Owning`.
+    let out = emitted("boxparam-lendowning", &with_prelude(STRUCT_LEND_OWNING));
+    let text = compact(&out.source);
+    assert!(
+        text.contains("fnarea(mutsettings:&Settings)")
+            && text.contains("fnrelease(mutsettings:Box<Settings>)")
+            && text.contains("area(&*s)")
+            && text.contains("release(s)"),
+        "{}",
+        out.source
+    );
+    assert!(
+        !out.artifacts
+            .box_param_receipts
+            .contains("box-param-lend-leaves-owning"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+    assert!(out.degradations.is_empty(), "{:?}", out.degradations.len());
+}
+
+/// Control, and the measurement that decided A9 needs no return clause: the
+/// SAME body as `QSELECT` — the one shape in the frame whose lent formal the
+/// model calls `Owning` — with one act added, HANDING THE FORMAL BACK. That
+/// act is the only one left that could carry the allocation out of the body,
+/// and a guard against it would be unwitnessable logic: adding the return
+/// makes the model drop the `Owning` verdict (`qselect::v` degrades
+/// `slice-use-unsupported`, `percentiles::vals` `kind-raw`), so such a formal
+/// never reaches the lend branch at all. This control pins that; if a later
+/// frame ever admits one, it fails and the guard goes in.
+const QSELECT_RETURNS: &str = r#"
+unsafe extern "C" fn qselect(mut v: *mut f32, mut len: i32, mut k: i32) -> *mut f32 {
+    let mut i = 0 as i32;
+    let mut st = 0 as i32;
+    while i < len - 1 as i32 {
+        if !(*v.offset(i as isize) > *v.offset((len - 1 as i32) as isize)) {
+            let mut f = *v.offset(i as isize);
+            *v.offset(i as isize) = *v.offset(st as isize);
+            *v.offset(st as isize) = f;
+            st += 1;
+        }
+        i += 1;
+    }
+    if k == st { return v; }
+    if st > k { return qselect(v, st, k); }
+    return qselect(v.offset(st as isize), len - st, k - st);
+}
+pub unsafe extern "C" fn percentiles(mut n: i32) -> f32 {
+    let mut vals = malloc((n as usize).wrapping_mul(::std::mem::size_of::<f32>())) as *mut f32;
+    let mut i = 0 as i32;
+    while i < n {
+        *vals.offset(i as isize) = i as f32;
+        i += 1;
+    }
+    let mut m = *qselect(vals, n, n / 2 as i32);
+    free(vals as *mut core::ffi::c_void);
+    return m;
+}
+"#;
+
+#[test]
+fn w6a_a9_a_returning_lend_never_reaches_the_branch() {
+    let out = emitted("boxparam-qselectreturns", &with_prelude(QSELECT_RETURNS));
+    let receipts = &out.artifacts.box_param_receipts;
+    assert!(
+        !receipts.contains("box-param-lend-leaves-owning"),
+        "a formal the body hands back must not leave the owning arm\n{receipts}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "qselect::v").as_deref(),
+        Some("slice-use-unsupported"),
+        "the model must still drop Owning for a returned formal\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn w6a_a9_a_consuming_callee_stays_the_box_familys() {
+    let out = emitted("boxparam-structconsumer", &with_prelude(STRUCT_CONSUMER));
+    assert!(
+        !out.artifacts
+            .box_param_receipts
+            .contains("box-param-lend-leaves-owning"),
+        "a callee that frees is not a lend\n{}",
+        out.artifacts.box_param_receipts
+    );
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("box-param-chain callee=area_and_release index=0 sink=free"),
         "{}",
         out.artifacts.box_param_receipts
     );
