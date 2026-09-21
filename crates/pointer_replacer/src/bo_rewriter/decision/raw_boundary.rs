@@ -343,31 +343,49 @@ pub(crate) fn a5_raw_expr_view_admits(source_shape: &str, argument: &str) -> boo
         return false;
     }
     let text = argument.trim();
-    if text.is_empty()
-        || text.contains(['{', '}', ';', '?', '|'])
-        || text.contains("=>")
-        || text.contains("&&")
-    {
+    if text.is_empty() {
         return false;
     }
-    // `=` outside `==` / `!=` / `<=` / `>=` is an assignment.
+    // **R489-3(a) — a literal is one token, and its contents are data.**
+    //
+    // Every scan below is looking for SYNTAX that would make the expression
+    // unsafe to hoist above the call. libtree's `b"\x1B[0;36m\0" as *const u8
+    // as *const c_char as *mut c_char` carries a `;` inside the byte string,
+    // and reading that as a statement separator refused a place read — the
+    // same defect R482-4(f) fixed in the C-9 renderer's delimiter scan, in the
+    // other scan of the same seam. So the three scans skip literals whole,
+    // using that fix's own scanner.
     let bytes = text.as_bytes();
-    for (index, &byte) in bytes.iter().enumerate() {
-        if byte != b'=' {
+    let mut index = 0usize;
+    let mut identifier_start = None;
+    while index < bytes.len() {
+        if let Some(end) = super::super::c9::literal_end(bytes, index) {
+            identifier_start = None;
+            index = end;
             continue;
         }
-        let previous = index.checked_sub(1).map(|i| bytes[i]);
-        let next = bytes.get(index + 1).copied();
-        if !matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) && next != Some(b'=') {
+        let byte = bytes[index];
+        if matches!(byte, b'{' | b'}' | b';' | b'?' | b'|') {
             return false;
         }
-    }
-    // Every call is a method call from the allow-list.
-    let mut identifier_start = None;
-    let mut chars = text.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
+        if byte == b'=' {
+            // `=` outside `==` / `!=` / `<=` / `>=` is an assignment.
+            let previous = index.checked_sub(1).map(|i| bytes[i]);
+            let next = bytes.get(index + 1).copied();
+            if !matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) && next != Some(b'=') {
+                return false;
+            }
+        }
+        if byte == b'&' && bytes.get(index + 1) == Some(&b'&') {
+            return false;
+        }
+        let ch = text[index..]
+            .chars()
+            .next()
+            .expect("byte index is a boundary");
         if ch.is_alphanumeric() || ch == '_' {
             identifier_start.get_or_insert(index);
+            index += ch.len_utf8();
             continue;
         }
         if let Some(start) = identifier_start.take() {
@@ -381,6 +399,7 @@ pub(crate) fn a5_raw_expr_view_admits(source_shape: &str, argument: &str) -> boo
                 }
             }
         }
+        index += ch.len_utf8();
     }
     // A trailing identifier is a place read, never a call.
     true
@@ -6098,6 +6117,86 @@ mod tests {
 
     /// A minimal cursor plan: this seam reads only the decision's mutability,
     /// so the plan's contents are deliberately empty rather than fabricated.
+    /// **R489-3(a).** libtree's `print_line` passes an ANSI colour constant at
+    /// a foreign raw formal:
+    ///
+    /// ```text
+    /// b"\x1B[0;36m\0" as *const u8 as *const libc::c_char as *mut libc::c_char
+    /// ```
+    ///
+    /// The A5 raw view hoists its argument above the call, so the argument must
+    /// be effect-free, and the gate proves that syntactically — it refuses any
+    /// text carrying `;`, `{`, `}`, `?`, `|`, `=>` or `&&`. The `;` here is
+    /// inside the BYTE STRING (`\x1B[0;36m`), which is data, not syntax: the
+    /// same defect R482-4(f) fixed in the C-9 renderer's delimiter scan, in the
+    /// other scan of the same seam. Two rows sit behind it
+    /// (`color_bold#3`, `color_regular#4`).
+    #[test]
+    fn r489_3a_a_semicolon_inside_a_literal_is_data_not_an_effect() {
+        let argument =
+            "b\"\\x1B[0;36m\\0\" as *const u8 as *const libc::c_char as *mut libc::c_char";
+        assert!(
+            a5_raw_expr_view_admits("raw-expr", argument),
+            "an ANSI byte string is a place read, not an effect: {argument}"
+        );
+    }
+
+    /// Every forbidden character, as data inside a literal. Each is a separate
+    /// reason the gate would refuse, so each is asserted rather than assumed.
+    #[test]
+    fn r489_3a_every_forbidden_character_is_data_inside_a_literal() {
+        for argument in [
+            r#"b"a;b" as *const u8"#,
+            r#"b"a{b}c" as *const u8"#,
+            r#"b"a?b" as *const u8"#,
+            r#"b"a|b" as *const u8"#,
+            r#"b"a=>b" as *const u8"#,
+            r#"b"a&&b" as *const u8"#,
+            r#"b"a=b" as *const u8"#,
+            r#"';' as u8 as *const u8"#,
+        ] {
+            assert!(
+                a5_raw_expr_view_admits("raw-expr", argument),
+                "{argument} is one token of data"
+            );
+        }
+    }
+
+    /// Controls — the gate still refuses what it exists to refuse, OUTSIDE a
+    /// literal: a statement, a block, a closure, a short-circuit, an
+    /// assignment, and any call that is not an address method.
+    #[test]
+    fn r489_3a_the_gate_still_refuses_effects_outside_a_literal() {
+        for argument in [
+            "f(); g()",
+            "{ let x = 1; x } as *const u8",
+            "p.map(|q| q) as *const u8",
+            "a && b",
+            "x = 1",
+            "compute() as *const u8",
+            // Each of these is refused by the forbidden-character clause
+            // ALONE — no call, no assignment, no short circuit — so that
+            // clause is load-bearing rather than shadowed by its neighbours.
+            "p ? q",
+            "a | b",
+            "{ x }",
+            "a => b",
+        ] {
+            assert!(
+                !a5_raw_expr_view_admits("raw-expr", argument),
+                "{argument} is not hoistable"
+            );
+        }
+    }
+
+    /// Control — the shape gate is unchanged: only `raw-expr` reaches this
+    /// predicate at all.
+    #[test]
+    fn r489_3a_only_a_raw_expression_shape_is_asked() {
+        assert!(!a5_raw_expr_view_admits("bare-local", "x"));
+        assert!(!a5_raw_expr_view_admits("addr-of", "&x"));
+    }
+
     fn cursor_decision(mutable: bool) -> super::super::Decision {
         super::super::Decision::Cursor {
             mutable,

@@ -215,7 +215,7 @@ fn render_raw_view_source(
 /// raw strings at any hash depth, char and byte-char literals, and — the case
 /// that makes a naive scanner wrong in the other direction — LIFETIMES, where
 /// `'` opens nothing at all.
-fn literal_end(bytes: &[u8], index: usize) -> Option<usize> {
+pub(crate) fn literal_end(bytes: &[u8], index: usize) -> Option<usize> {
     let mut at = index;
     if bytes[at] == b'b' && at + 1 < bytes.len() && matches!(bytes[at + 1], b'"' | b'\'' | b'r') {
         at += 1;
