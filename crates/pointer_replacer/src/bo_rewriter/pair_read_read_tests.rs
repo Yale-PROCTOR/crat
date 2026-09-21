@@ -185,3 +185,47 @@ fn w6p_shared_beside_a_written_formal_falls_back() {
         "and here they do — a fresh stack address beside an entry pointer: {outcome:?}"
     );
 }
+
+/// Control (i′), isolating the `*const` conjunct: a `*mut` formal that nothing
+/// ever writes through. The mutability analysis is content — it is in
+/// `immutable_formals` — so the INPUT's own type is the only thing refusing it,
+/// and fault F47 (dropping that conjunct) bites here and nowhere else.
+///
+/// It matters because the input type is what the emitted program must honour:
+/// a `*mut` formal may still be re-typed `&mut` by another lane's decision, and
+/// a licence taken on today's read-only body would outlive its premise.
+const A_MUT_FORMAL_NEVER_WRITTEN: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+pub unsafe fn StoreDataWithHuffmanCodes(
+    mut cmd_bits: *const u16,
+    mut dist_depth: *mut u8,
+    mut n: i32,
+) -> i32 {
+    let mut total: i32 = 0;
+    let mut i: i32 = 0;
+    while i < n {
+        total += *cmd_bits.offset(i as isize) as i32;
+        total += *dist_depth.offset(i as isize) as i32;
+        i += 1;
+    }
+    total
+}
+pub unsafe fn emit(mut bits: *const u16, mut depth: *mut u8, mut n: i32) -> i32 {
+    StoreDataWithHuffmanCodes(bits, depth, n)
+}
+"#;
+
+#[test]
+fn w6p_a_mut_formal_never_written_is_still_not_a_shared_read() {
+    assert_ne!(
+        verdict(
+            A_MUT_FORMAL_NEVER_WRITTEN,
+            "emit",
+            "StoreDataWithHuffmanCodes",
+            0,
+            1
+        ),
+        Ok(CertificateKind::ReadReadShared),
+        "`*const` in the input is a conjunct in its own right"
+    );
+}
