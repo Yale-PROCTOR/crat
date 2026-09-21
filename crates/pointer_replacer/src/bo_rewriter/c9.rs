@@ -102,26 +102,45 @@ fn render_raw_view_source(
     temp_stem: &str,
     views: &[(usize, String, String, String, Option<String>)],
 ) -> Result<String, String> {
-    let open = source
-        .char_indices()
-        .find_map(|(index, ch)| (ch == '(').then_some(index))
-        .ok_or_else(|| "PAIR call source has no argument list".to_owned())?;
+    // R482-4(f): the same literal rule governs the scan that FINDS the
+    // argument list. A `(` inside a string is not the callee's parenthesis.
+    let bytes = source.as_bytes();
+    let mut open = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(end) = literal_end(bytes, index) {
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'(' {
+            open = Some(index);
+            break;
+        }
+        index += 1;
+    }
+    let open = open.ok_or_else(|| "PAIR call source has no argument list".to_owned())?;
     let mut depth = 0usize;
     let mut close = None;
-    for (offset, ch) in source[open..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
+    let mut index = open;
+    while index < bytes.len() {
+        if let Some(end) = literal_end(bytes, index) {
+            index = end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
                 depth = depth
                     .checked_sub(1)
                     .ok_or_else(|| "PAIR call source has unmatched ')'".to_owned())?;
                 if depth == 0 {
-                    close = Some(open + offset);
+                    close = Some(index);
                     break;
                 }
             }
             _ => {}
         }
+        index += 1;
     }
     let close = close.ok_or_else(|| "PAIR call source has unmatched '('".to_owned())?;
     let callee = source[..open].trim();
@@ -172,6 +191,81 @@ fn render_raw_view_source(
     ))
 }
 
+/// **R482-4(f) — a literal is one token, and a delimiter inside it is data.**
+///
+/// The C-9 / A5 fallback renders from the CALLER's argument source text, and
+/// the scan that finds the argument list and splits it counted every `(`,
+/// `[`, `{` it saw. libtree's `print_line(depth, current_file,
+/// b"\x1B[1;36m\0" as *const u8 as *const c_char, …)` then read the `[` of
+/// an ANSI escape as an opening bracket and the whole class was held
+/// `a5-fallback-unrenderable`. Arguments are split on the call's argument
+/// boundaries; a byte string is not a boundary and does not nest.
+///
+/// Returns the byte index just past the literal starting at `bytes[index]`,
+/// or `None` when this position does not begin one. Handles `"…"`, `b"…"`,
+/// raw strings at any hash depth, char and byte-char literals, and — the case
+/// that makes a naive scanner wrong in the other direction — LIFETIMES, where
+/// `'` opens nothing at all.
+fn literal_end(bytes: &[u8], index: usize) -> Option<usize> {
+    let mut at = index;
+    if bytes[at] == b'b' && at + 1 < bytes.len() && matches!(bytes[at + 1], b'"' | b'\'' | b'r') {
+        at += 1;
+    }
+    match bytes[at] {
+        b'r' => {
+            let mut cursor = at + 1;
+            let mut hashes = 0usize;
+            while cursor < bytes.len() && bytes[cursor] == b'#' {
+                hashes += 1;
+                cursor += 1;
+            }
+            if cursor >= bytes.len() || bytes[cursor] != b'"' {
+                return None;
+            }
+            cursor += 1;
+            while cursor < bytes.len() {
+                if bytes[cursor] == b'"'
+                    && bytes[cursor + 1..]
+                        .iter()
+                        .take(hashes)
+                        .filter(|byte| **byte == b'#')
+                        .count()
+                        == hashes
+                {
+                    return Some(cursor + 1 + hashes);
+                }
+                cursor += 1;
+            }
+            // Unterminated: the caller's own unmatched-delimiter error is the
+            // right answer, so report the rest of the source as consumed.
+            Some(bytes.len())
+        }
+        b'"' => {
+            let mut cursor = at + 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'\\' => cursor += 2,
+                    b'"' => return Some(cursor + 1),
+                    _ => cursor += 1,
+                }
+            }
+            Some(bytes.len())
+        }
+        b'\'' => {
+            // `'a` / `'static` is a lifetime: it opens nothing. A char literal
+            // closes within one escape-aware step.
+            let mut cursor = at + 1;
+            if cursor < bytes.len() && bytes[cursor] == b'\\' {
+                cursor += 2;
+            } else if cursor < bytes.len() {
+                cursor += 1;
+            }
+            (cursor < bytes.len() && bytes[cursor] == b'\'').then_some(cursor + 1)
+        }
+        _ => None,
+    }
+}
+
 fn split_arguments(source: &str) -> Result<Vec<String>, String> {
     if source.trim().is_empty() {
         return Ok(Vec::new());
@@ -179,7 +273,15 @@ fn split_arguments(source: &str) -> Result<Vec<String>, String> {
     let mut answer = Vec::new();
     let mut start = 0usize;
     let mut stack = Vec::new();
-    for (index, ch) in source.char_indices() {
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        // R482-4(f): a literal is one token; its delimiters are data.
+        if let Some(end) = literal_end(bytes, index) {
+            index = end;
+            continue;
+        }
+        let ch = bytes[index] as char;
         match ch {
             '(' | '[' | '{' => stack.push(ch),
             ')' | ']' | '}' => {
@@ -196,6 +298,7 @@ fn split_arguments(source: &str) -> Result<Vec<String>, String> {
             }
             _ => {}
         }
+        index += 1;
     }
     if !stack.is_empty() {
         return Err("C-9 argument source has an unclosed delimiter".to_owned());
@@ -239,22 +342,84 @@ mod tests {
         .unwrap()
     }
 
-    /// D13-W1 — LibTree's ANSI byte string contains `[` as data.  The current
-    /// delimiter-only splitter rejects it, but the rejection must carry the
-    /// exact argument source so the caller can turn this one site into a typed
-    /// class hold instead of degrading the whole program.
+    /// **R482-4(f).** D13-W1 pinned this shape as a HOLD: libtree's ANSI byte
+    /// string contains `[` as data, the delimiter-only splitter counted it as
+    /// an opening bracket, and the site was held. The hold was the splitter's
+    /// defect, not the source's — a literal is one token, and the `[` inside
+    /// it is not a delimiter. Restated under R217-2(a): what D13-W1 protected
+    /// (the rejection carries the exact argument source) is kept below on a
+    /// source that really is unclosed; this shape must now RENDER.
+    #[test]
+    fn r482_4f_a_byte_string_bracket_is_data_not_a_delimiter() {
+        let source = r#"print_line(x, b"\x1B[1;36m\0" as *const u8 as *mut i8)"#;
+        let rendered = render_pair_raw_view_source(
+            source,
+            "__crat_pair_raw_fixture",
+            &[(0, "x".to_owned(), "*mut i32".to_owned())],
+        )
+        .expect("a bracket inside a byte-string literal is data");
+        assert!(
+            rendered.contains(r#"b"\x1B[1;36m\0" as *const u8 as *mut i8"#),
+            "the literal argument survives whole: {rendered}"
+        );
+        assert!(
+            rendered.contains("let __crat_pair_raw_fixture_0: *mut i32 = x;"),
+            "the viewed argument still takes its typed temporary: {rendered}"
+        );
+    }
+
+    /// The other literal shapes that carry a delimiter as data. Each one is a
+    /// separate scanner state, so each is asserted rather than assumed.
+    #[test]
+    fn r482_4f_every_literal_form_carries_its_delimiters_as_data() {
+        for argument in [
+            r#""a ( b [ c { d""#,
+            r#"b"\x1B[1;36m\0""#,
+            r#"'('"#,
+            r#"b'['"#,
+            r#"'\''"#,
+            r#"r"raw ( and [""#,
+            r##"r#"hash " raw ( ["#"##,
+        ] {
+            let source = format!("callee(x, {argument})");
+            let rendered = render_pair_raw_view_source(
+                &source,
+                "__crat_lit",
+                &[(0, "x".to_owned(), "*mut i32".to_owned())],
+            )
+            .unwrap_or_else(|why| panic!("{argument} must be one token: {why}"));
+            assert!(rendered.contains(argument), "{argument}: {rendered}");
+        }
+    }
+
+    /// A lifetime is not an unterminated char literal. `'static` in a cast is
+    /// the shape that makes the char-literal state machine wrong if it simply
+    /// scans to the next `'`.
+    #[test]
+    fn r482_4f_a_lifetime_is_not_a_char_literal() {
+        let source = "callee(x, y as &'static [u8])";
+        let rendered = render_pair_raw_view_source(
+            source,
+            "__crat_lt",
+            &[(0, "x".to_owned(), "*mut i32".to_owned())],
+        )
+        .expect("a lifetime is not a literal");
+        assert!(rendered.contains("y as &'static [u8]"), "{rendered}");
+    }
+
+    /// D13-W1's surviving half: a source that really is unclosed still names
+    /// its argument text, so the caller can hold that one site.
     #[test]
     fn d13_w1_unclosed_delimiter_error_carries_the_argument_text() {
-        let source = r#"print_line(x, b"\x1B[1;36m\0" as *const u8 as *mut i8)"#;
+        let source = "print_line(x, some_call(a, b)";
         let error = render_pair_raw_view_source(
             source,
             "__crat_pair_raw_fixture",
             &[(0, "x".to_owned(), "*mut i32".to_owned())],
         )
-        .expect_err("the byte-string delimiter shape remains a site hold");
+        .expect_err("a genuinely unclosed source is still a site hold");
         assert!(
-            error.contains("C-9 argument source has an unclosed delimiter")
-                && error.contains(r#"b"\x1B[1;36m\0""#),
+            error.contains("PAIR call source has unmatched '('"),
             "{error}"
         );
     }

@@ -12504,7 +12504,17 @@ fn d13_w3_pair_parse_failure_does_not_abort_program_emission() {
                 callee,
                 call_span: call.span,
                 views: vec![super::decision::seam::PairRawViewTemp {
-                    argument_index: 0,
+                    // **R482-4(f), R217-2(a).** This pin used to reach its
+                    // failure through the byte string itself: the splitter
+                    // counted the `[` of the ANSI escape as a bracket. That
+                    // was the splitter's defect and it is fixed, so the source
+                    // now renders. What the pin protects is LOCALIZATION — a
+                    // PAIR source failure holds its one class instead of
+                    // aborting the program — so the failure is now a genuine
+                    // one (a view outside the call's arity) and every original
+                    // assertion is kept verbatim, including that the hold
+                    // carries the byte-string argument text and its hex.
+                    argument_index: 7,
                     raw_expression: "p".to_owned(),
                     target_type: "*mut i32".to_owned(),
                     source_node: None,
