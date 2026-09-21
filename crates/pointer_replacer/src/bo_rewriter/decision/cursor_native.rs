@@ -141,13 +141,37 @@ pub(crate) fn replan_delivered_table_elements(
         .iter()
         .enumerate()
         .filter(|(_, (subject, decision))| {
-            let Decision::Cursor { plan, .. } = decision else { return false };
-            let Some(base) = plan.delivered_base.as_ref() else { return false };
+            // S3.0: a `Decision` is consumed through an EXHAUSTIVE match, so a
+            // new disposition is a compile error here rather than a silent
+            // `false` that drops the row. Both arms below are spelled out for
+            // that reason and must not be collapsed to a wildcard.
+            let plan = match decision {
+                Decision::Cursor { plan, .. } => plan,
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => return false,
+            };
+            let Some(base) = plan.delivered_base.as_ref() else {
+                return false;
+            };
             matches!(base.provider, DeliveredBaseProvider::TableElement)
                 && entries.iter().any(|(table, table_decision)| {
                     table.fn_did == subject.fn_did
                         && table.hir_id == base.binding
-                        && matches!(table_decision, Decision::NestedSlice { .. })
+                        && match table_decision {
+                            Decision::NestedSlice { .. } => true,
+                            Decision::Cursor { .. }
+                            | Decision::Ref { .. }
+                            | Decision::InferredRef { .. }
+                            | Decision::Slice { .. }
+                            | Decision::Opt { .. }
+                            | Decision::Box(_)
+                            | Decision::Degraded(_) => false,
+                        }
                 })
         })
         .map(|(index, _)| index)
