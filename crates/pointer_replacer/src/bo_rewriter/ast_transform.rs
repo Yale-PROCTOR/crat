@@ -1453,7 +1453,7 @@ impl<'a> UseGraftVisitor<'a> {
         original: &str,
         view: &super::decision::native_result_expression::NativeResultExpressionPlan,
     ) -> Option<String> {
-        let (start, end) = adapted_call_span(text, original)?;
+        let (start, end) = adapted_call_span(text, original, original)?;
         Some(format!(
             "{}{}{}",
             &text[..start],
@@ -1488,14 +1488,48 @@ impl<'a> UseGraftVisitor<'a> {
 /// `needle`'s occurrence in `hay` ignoring whitespace on both sides, as a
 /// byte range of `hay`. Used by the nested-edit composition to find a node's
 /// source text inside a use text rendered from the same source.
-/// **R491-3.** The call as the OUTER replacement spells it: the same callee
-/// head, up to the parenthesis that balances it. The head is `original` up to
-/// and including its first `(`, so an outer that adapted the ARGUMENTS still
-/// matches; an outer that renamed the callee does not, and neither does an
-/// unbalanced text — both answer `None`, and the caller then holds the class.
-fn adapted_call_span(text: &str, original: &str) -> Option<(usize, usize)> {
-    let head = original.find('(').map(|open| &original[..=open])?;
-    let (start, after_head) = find_ignoring_whitespace(text, head)?;
+/// Every position in `hay` at which `head` occurs, whitespace-insensitively.
+fn head_occurrences(hay: &str, head: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut base = 0usize;
+    while let Some((lo, hi)) = find_ignoring_whitespace(&hay[base..], head) {
+        found.push((base + lo, base + hi));
+        base += hi;
+    }
+    found
+}
+
+/// **R491-3 / R494-1(a)** — the call as the OUTER replacement spells it, matched
+/// by OCCURRENCE INDEX.
+///
+/// The replacement is the outer node's original text with argument adapters
+/// applied in place, so occurrences of a callee head keep their number and their
+/// order: the view's call is the k-th head in the original and therefore the
+/// k-th head in the replacement. Balancing parentheses from there gives the
+/// adapted call, which is what `NativeResultExpressionPlan::render` documents as
+/// its input ("the input is the call after its own argument adapters").
+///
+/// **Refuse only when the counts differ.** An adapter that added or removed a
+/// head is the one case where the index is not evidence; then the caller holds
+/// the class (wave-6l's floor). An earlier form refused ANY second occurrence
+/// (`42e63e2e1`) — right for one view, fatal for its class: heman's class 729
+/// carries all five views, and one refusal took the admission's whole +96
+/// (R494-1(a)).
+fn adapted_call_span(text: &str, origin: &str, call: &str) -> Option<(usize, usize)> {
+    let head = call.find('(').map(|open| &call[..=open])?;
+    let in_origin = head_occurrences(origin, head);
+    let in_text = head_occurrences(text, head);
+    if in_origin.is_empty() || in_origin.len() != in_text.len() {
+        return None;
+    }
+    // Which occurrence is the view's call: the head at which `call` begins
+    // inside the outer node's original text.
+    let call_start = find_ignoring_whitespace(origin, call).map_or(0, |(lo, _)| lo);
+    let k = in_origin
+        .iter()
+        .position(|(lo, _)| *lo >= call_start)
+        .unwrap_or(0);
+    let (start, after_head) = *in_text.get(k)?;
     let mut depth = 1usize;
     for (offset, character) in text[after_head..].char_indices() {
         match character {
@@ -2999,7 +3033,7 @@ mod tests {
             "heman_image_texel(&mut *mapping, i, j)",
         ];
         for ((outer, original), want) in HEMAN_FIVE.iter().zip(expected) {
-            let (start, end) = adapted_call_span(outer, original)
+            let (start, end) = adapted_call_span(outer, original, original)
                 .unwrap_or_else(|| panic!("not located: {outer}"));
             assert_eq!(&outer[start..end], want, "in {outer}");
         }
@@ -3019,14 +3053,16 @@ mod tests {
         }
     }
 
-    /// **F-CUR-PRODUCT-REFUSALS** — the locator answers `None` rather than
-    /// guessing: a callee the outer renamed, and a text whose parentheses do not
-    /// balance. Both leave the class hold in place.
+    /// **F-CUR-PRODUCT-REFUSALS** — the arm answers `None` rather than guessing:
+    /// a callee the outer renamed, a text whose parentheses do not balance, and
+    /// (R494-1(a)) an adapter that ADDED a head, where the occurrence index stops
+    /// being evidence. Each leaves the class hold in place.
     #[test]
     fn slicecursor_the_product_locator_refuses_what_it_cannot_prove() {
         assert!(
             adapted_call_span(
                 "core::slice::from_raw_parts(other_call(&mut *dst, i), crate::FALLBACK_SLICE_EXTENT)",
+                "heman_image_texel(dst, i)",
                 "heman_image_texel(dst, i)"
             )
             .is_none(),
@@ -3035,11 +3071,38 @@ mod tests {
         assert!(
             adapted_call_span(
                 "core::slice::from_raw_parts(heman_image_texel(&mut *dst, i",
+                "heman_image_texel(dst, i)",
                 "heman_image_texel(dst, i)"
             )
             .is_none(),
             "unbalanced parentheses must not be composed over"
         );
+        assert!(
+            adapted_call_span(
+                "core::slice::from_raw_parts(heman_image_texel(&mut *dst, heman_image_texel(&mut *src, i)), crate::FALLBACK_SLICE_EXTENT)",
+                "heman_image_texel(dst, i)",
+                "heman_image_texel(dst, i)"
+            )
+            .is_none(),
+            "a head the adapters added must hold, not shift the index"
+        );
+    }
+
+    /// **W-CUR-PRODUCT-INDEX** (R494-1(a)) — two calls of the same callee in one
+    /// outer: the k-th head of the original is the k-th head of the replacement,
+    /// so each view composes over ITS OWN call. This is the shape `42e63e2e1`
+    /// refused, and heman's class 729 — which carries all five views — paid the
+    /// admission's whole +96 for that refusal.
+    #[test]
+    fn slicecursor_the_product_locator_matches_by_occurrence_index() {
+        let origin = "*heman_image_texel(dst, i, j) = *heman_image_texel(src, x, y)";
+        let text = "*heman_image_texel(&mut *dst, i, j) = *heman_image_texel(&mut *src, x, y)";
+        let (lo, hi) =
+            adapted_call_span(text, origin, "heman_image_texel(dst, i, j)").expect("k = 1");
+        assert_eq!(&text[lo..hi], "heman_image_texel(&mut *dst, i, j)");
+        let (lo, hi) =
+            adapted_call_span(text, origin, "heman_image_texel(src, x, y)").expect("k = 2");
+        assert_eq!(&text[lo..hi], "heman_image_texel(&mut *src, x, y)");
     }
 
     /// **RED WITNESS for the composition guard** (ruling item 5): a
