@@ -199,7 +199,25 @@ pub(crate) fn promote(
         let extent = match extent {
             Ok(evidence) => evidence,
             Err(reason) => {
-                rows.push(held(subject, position, "none".to_owned(), reason));
+                // **R489-3(b): `no-call-site-read` is UNMEASURED, not
+                // evidence-absent.** A parameter whose function has no call
+                // site the fact table records cannot have its extent proven
+                // from callers — and that is a gap in what was observed, not a
+                // root that states nothing. It carries its own outcome so a
+                // residue count (`outcome == "held"`) leaves it out; the seat's
+                // Decision A is about roots that state nothing.
+                let outcome = if reason == "no-call-site-read" {
+                    "unmeasured"
+                } else {
+                    "held"
+                };
+                rows.push(RootExtentRow {
+                    subject: subject.label.clone(),
+                    position,
+                    outcome,
+                    extent: "none".to_owned(),
+                    evidence: reason.to_owned(),
+                });
                 continue;
             }
         };

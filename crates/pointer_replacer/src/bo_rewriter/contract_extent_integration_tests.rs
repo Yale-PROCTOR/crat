@@ -2514,3 +2514,42 @@ fn w4w05_a_shared_subject_at_a_mut_foreign_position_is_refused() {
     let source = emitted(W4_W_SHARED_AT_A_MUT_POSITION);
     assert!(!source.contains(".cast_mut()"), "{source}");
 }
+
+/// A parameter with no recorded call site: `pub` and never called in the crate.
+/// Its extent cannot be proven from callers, but that is a gap in what was
+/// OBSERVED, not a root that states nothing — R489-3(b) gives it its own
+/// outcome so Decision A's residue means what it says.
+const W4_B1_NO_CALL_SITE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+#[no_mangle]
+pub unsafe extern "C" fn StoreExported(mut pos: *mut size_t, mut storage: *mut uint8_t) {
+    BrotliWriteBits(pos, storage);
+}
+"#;
+
+/// **W4B1-4 (R489-3(b)) — unmeasured is not evidence-absent.**
+#[test]
+fn w4b104_a_parameter_with_no_call_site_is_unmeasured_not_held() {
+    let rows = b1_rows(W4_B1_NO_CALL_SITE);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreExported::storage"))
+        .unwrap_or_else(|| panic!("no StoreExported::storage row: {rows:?}"));
+    assert_eq!(storage.1, "unmeasured", "{rows:?}");
+    assert_eq!(storage.3, "no-call-site-read", "{rows:?}");
+    // And Decision A's residue — the rows whose ROOT states nothing — leaves it out.
+    assert!(
+        !rows.iter().any(
+            |(subject, outcome, ..)| subject.starts_with("StoreExported::storage")
+                && outcome == "held"
+        ),
+        "{rows:?}"
+    );
+}
