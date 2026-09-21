@@ -1570,17 +1570,33 @@ pub unsafe fn recurse(excluded: i32) -> i32 {
         );
         let src = std::fs::read_to_string(path).expect("derived libtree");
         let got = run(&src);
+        // **W6S-12 (R490-4).** `color_bold` now DELIVERS: its only uses are
+        // `fputs` reads at a `*const` formal, so its slice form is the shared
+        // one and the caller's literal origin can supply the view.
+        // `color_regular` left this family too, but by another door — at this
+        // frame it reads `pair-raw-view`, wave-6p's. Both spellings are
+        // named; what neither may be is this family's use wall.
         for key in [
             "src::libtree::print_line::color_bold#3",
             "src::libtree::print_line::color_regular#4",
         ] {
-            assert_eq!(
-                column(&got.subjects, key, "decision"),
-                "slice",
+            assert_ne!(
+                column(&got.subjects, key, "reason"),
+                "slice-use-unsupported",
                 "the foreign-call bridge closes the use wall:\n{}",
                 got.subjects
             );
         }
+        assert_eq!(
+            column(
+                &got.subjects,
+                "src::libtree::print_line::color_bold#3",
+                "placed"
+            ),
+            "1",
+            "the shared slice form delivers:\n{}",
+            got.subjects
+        );
         assert!(
             !got.subjects.contains("slice-use-unsupported"),
             "libtree carries no use wall of this family:\n{}",

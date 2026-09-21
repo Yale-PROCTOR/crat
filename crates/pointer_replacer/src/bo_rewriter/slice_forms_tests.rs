@@ -2005,3 +2005,101 @@ const RETYPED_ARRAY_ROOT: &str = r#"
     return *p.offset(1 as i32 as isize);
  }
 "#;
+
+// ---------------------------------------------------------------------------
+// W6S-12 — a `*mut` formal read through every use takes the SHARED slice
+// (R490-4)
+//
+// libtree's `print_line(color_bold: *mut c_char)` is written `*mut` by C and
+// read at every use (`fputs(color_bold, stdout)`, a `*const` formal). The
+// decided form followed the declaration, so the caller-side seam asked for a
+// MUTABLE view of a value whose origin is a `b"…"` literal and was refused
+// `shared-to-mut` — the row's whole remaining block.
+//
+// The permission the program needs is the one its uses take: a subject whose
+// only rewritten uses are W6S-8 bridges at foreign `*const T` formals is read
+// through every one of them, so its slice form is the shared one. Narrowing
+// only — `&mut` → `&` never widens a permission — and exact: at least one
+// such bridge, and no other rewrite.
+// ---------------------------------------------------------------------------
+
+/// **CONTROL — in a REDUCTION the narrowing must not fire, and does not.**
+/// libtree's shape reduced: here the boundary planner COLLECTS both `fputs`
+/// positions, so they are its bridges (`as_mut_ptr().cast::<i8>().cast_const()`)
+/// and not W6S-8's — `foreign_const_bridges` stays 0 and the mutable form
+/// stands. The narrowing is keyed on this lane's own bridges precisely so it
+/// cannot reach a position another planner owns.
+///
+/// The real-crate witness is `plan::class_split::tests::
+/// wave6s_libtree_foreign_formals_leave_the_use_wall`, where the positions
+/// are NOT collected, W6S-8 renders them, and `color_bold` delivers
+/// (`placed = 1`) as a shared slice.
+#[test]
+fn wave6s_mut_formal_read_at_every_use_takes_the_shared_slice() {
+    let source = emit(LITERAL_AT_A_MUT_FORMAL);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("color_bold:&mut[libc::c_char]"), "{source}");
+    assert!(
+        !flat.contains("fputs(color_bold.as_ptr(),stdout)"),
+        "{source}"
+    );
+}
+
+const LITERAL_AT_A_MUT_FORMAL: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_char = i8; pub type c_int = i32; pub type FILE = core::ffi::c_void; }
+ unsafe extern "C" { static mut stdout: *mut libc::FILE; fn fputs(s: *const libc::c_char, f: *mut libc::FILE) -> libc::c_int; }
+ unsafe extern "C" fn print_line(mut color_bold: *mut libc::c_char, mut on: libc::c_int) {
+    if on != 0 { fputs(color_bold, stdout); }
+    fputs(color_bold, stdout);
+ }
+ pub unsafe extern "C" fn recurse(mut excluded: libc::c_int) {
+    let mut bold_color = (if excluded != 0 { b"\x1B[0;35m\0" as *const u8 as *const libc::c_char } else { b"\x1B[1;36m\0" as *const u8 as *const libc::c_char }) as *mut libc::c_char;
+    print_line(bold_color, excluded);
+ }
+"#;
+
+/// **FAULT — a `*mut` foreign formal keeps the mutable form.** The callee may
+/// write through it, so the permission stands.
+#[test]
+fn wave6s_mut_foreign_formal_keeps_the_mutable_slice() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; pub type size_t = usize; }
+ unsafe extern "C" { fn fill(buf: *mut u8, n: libc::size_t) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut buffer: *mut u8, mut n: libc::size_t) -> libc::c_int {
+    let mut seen = *buffer.offset(1 as i32 as isize) as libc::c_int;
+    return fill(buffer, n) + seen;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("buffer:&mut[u8]"),
+        "the mutable formal keeps it: {source}"
+    );
+}
+
+/// **FAULT — any other rewritten use keeps the mutable form.** A deref WRITE
+/// beside the foreign read is a write, and the narrowing's conjunct is
+/// "no other rewrite" precisely so this case keeps `&mut`.
+#[test]
+fn wave6s_a_write_beside_the_foreign_read_keeps_the_mutable_slice() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_char = i8; pub type c_int = i32; pub type FILE = core::ffi::c_void; }
+ unsafe extern "C" { static mut stdout: *mut libc::FILE; fn fputs(s: *const libc::c_char, f: *mut libc::FILE) -> libc::c_int; }
+ pub unsafe extern "C" fn touch(mut text: *mut libc::c_char, mut on: libc::c_int) {
+    *text.offset(0 as i32 as isize) = 65 as libc::c_char;
+    fputs(text, stdout);
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("text:&mut[libc::c_char]"), "{source}");
+}

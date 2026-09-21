@@ -2880,7 +2880,20 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     Decision::Slice {
         // Composition arm (wave-4 R407-14 x wave-6b): a delivered region carries
         // its own mutability; otherwise wave-4's NUL-contract-alone narrowing.
-        mutable: region.map_or(subject.mutable && !contract_alone, |region| region.mutable),
+        // **W6S-12 (R490-4).** A subject whose only rewritten uses are W6S-8
+        // bridges at foreign `*const T` formals is READ through every one of
+        // them; the `*mut` in the C signature is the input's artifact, not a
+        // permission this program needs. Taking the shared form is what lets
+        // a caller with a literal origin supply the view at all — libtree's
+        // `print_line::color_bold`, whose seam was refused `shared-to-mut`.
+        // Narrowing only: `&mut` -> `&` never widens a permission, and the
+        // conjunct is exact (at least one such bridge, and no other rewrite).
+        mutable: region.map_or(
+            subject.mutable
+                && !contract_alone
+                && !(uses.foreign_const_bridges > 0 && uses.other_rewrites == 0),
+            |region| region.mutable,
+        ),
         uses: uses.rewrites,
     }
 }

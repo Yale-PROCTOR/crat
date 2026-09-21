@@ -1580,6 +1580,13 @@ pub(crate) struct SliceUses {
     /// that are themselves a raw-boundary argument. The raw use above carries
     /// the boundary; this carries the suffix the seam must render.
     pub computed_argument_views: Vec<super::slice_forms::ComputedArgumentView>,
+    /// **W6S-12 (R490-4).** How many of this subject's rewrites are W6S-8
+    /// bridges at a foreign `*const T` formal, and how many rewrites are
+    /// anything else. A subject whose ONLY uses are `*const` foreign
+    /// arguments is read through every one of them, so its slice form is the
+    /// SHARED one — whatever the declared `*mut` of the C signature says.
+    pub foreign_const_bridges: u32,
+    pub other_rewrites: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2377,6 +2384,13 @@ fn collect_slice_uses_with_family(
                 } else {
                     None
                 };
+                // W6S-12: is this admitted use a W6S-8 bridge at a foreign
+                // `*const T` formal? Read before the entry is taken, because
+                // the helper borrows `self`.
+                let foreign_const = classified
+                    .as_ref()
+                    .and_then(|edit| edit.as_ref())
+                    .and(self.foreign_argument_is_shared(expr, key));
                 let entry = self.out.entry(key).or_default();
                 match classified {
                     // **S3.2′-2b — three outcomes, not two.** The self-advance
@@ -2385,7 +2399,13 @@ fn collect_slice_uses_with_family(
                     // keeps its name. Folding it into the reject arm would make
                     // the whole subject unsupported; folding it into the accept
                     // arm would need an edit it does not have.
-                    Some(Some(edit)) => entry.rewrites.push(edit),
+                    Some(Some(edit)) => {
+                        match foreign_const {
+                            Some(true) => entry.foreign_const_bridges += 1,
+                            _ => entry.other_rewrites += 1,
+                        }
+                        entry.rewrites.push(edit);
+                    }
                     Some(None) => {}
                     None => {
                         if entry.unsupported.is_none() {
@@ -2840,6 +2860,46 @@ fn collect_slice_uses_with_family(
                 replacement: format!("{name}.{accessor}()"),
                 bridge_kind: "subject-use",
             })
+        }
+
+        /// **W6S-12** — does this use sit at a foreign callee's `*const T`
+        /// formal? `Some(true)` for a shared foreign formal, `Some(false)` for
+        /// a mutable one, `None` when the use is not a foreign argument at
+        /// all. Only the permission is read here; the rendering is
+        /// [`Self::foreign_pointer_argument`]'s.
+        fn foreign_argument_is_shared(
+            &self,
+            use_expr: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<bool> {
+            use rustc_middle::ty::TyKind;
+            let rustc_hir::Node::Expr(call) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            let ExprKind::Call(callee, arguments) = call.kind else {
+                return None;
+            };
+            let index = arguments
+                .iter()
+                .position(|argument| argument.hir_id == use_expr.hir_id)?;
+            let typeck = self.tcx.typeck(key.0);
+            let TyKind::FnDef(callee_did, _) = *typeck.expr_ty(callee).kind() else {
+                return None;
+            };
+            let foreign = self.tcx.is_foreign_item(callee_did)
+                || self
+                    .tcx
+                    .hir_get_if_local(callee_did)
+                    .and_then(|node| node.body_id())
+                    .is_none();
+            if !foreign {
+                return None;
+            }
+            let signature = self.tcx.fn_sig(callee_did).skip_binder().skip_binder();
+            let TyKind::RawPtr(_, mutability) = signature.inputs().get(index)?.kind() else {
+                return None;
+            };
+            Some(matches!(mutability, Mutability::Not))
         }
 
         /// The index expression's source text, **typed as a `usize`**.
