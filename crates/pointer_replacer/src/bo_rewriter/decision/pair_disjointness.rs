@@ -2272,6 +2272,29 @@ fn classify_locals<'tcx>(
     let why = facts
         .iter()
         .map(|(&hir_id, fact)| {
+            #[cfg(test)]
+            if std::env::var_os("W6P_DUMP_MIXED").is_some()
+                && classes.get(&hir_id).copied() == Some(RootClass::Unknown)
+                && fact.is_pointer
+                && !fact.address_taken
+            {
+                let kinds: Vec<&str> = fact
+                    .assignments
+                    .iter()
+                    .map(|kind| match kind {
+                        AssignKind::Null => "null",
+                        AssignKind::Allocator(_) => "alloc",
+                        AssignKind::Derived(_) => "derived",
+                        AssignKind::Other => "other",
+                    })
+                    .collect();
+                println!(
+                    "W6P_MIXED\t{}\t{}\t{}",
+                    kinds.join(","),
+                    fact.other_shapes.join(","),
+                    if fact.is_param { "param" } else { "local" }
+                );
+            }
             let why = if classes.get(&hir_id).copied() != Some(RootClass::Unknown) {
                 UnknownWhy::Known
             } else if fact.address_taken {
@@ -2302,6 +2325,14 @@ fn rhs_shape(rhs: &Expr<'_>) -> &'static str {
         ExprKind::MethodCall(..) => "method",
         ExprKind::Field(..) => "field",
         ExprKind::Index(..) => "index",
+        ExprKind::If(..) => "if",
+        ExprKind::Block(..) => "block",
+        ExprKind::Binary(..) => "binary",
+        ExprKind::Lit(..) => "literal",
+        ExprKind::Unary(..) => "unary",
+        ExprKind::Path(..) => "path",
+        ExprKind::AddrOf(..) => "addr-of",
+        ExprKind::Struct(..) => "struct",
         _ => "other",
     }
 }
