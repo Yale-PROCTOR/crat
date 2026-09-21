@@ -147,10 +147,18 @@ fn w6p_an_indirect_allocator_does_not_admit_the_field() {
     );
 }
 
-/// Control (iii), the narrowing: the field's block is passed beside an
-/// UNRELATED pointer that the caller derived from that very field. The rule
-/// must refuse, and this is why (a) is same-base only.
-const FIELD_BESIDE_A_DERIVED_STRANGER: &str = r#"
+/// Control (iii), the narrowing, and the counterexample to addendum 479 as
+/// ruled: the field's block stands beside a pointer PARAMETER of the caller —
+/// a known root, and not the base. The rule must refuse, because the caller's
+/// caller may well have passed `(*b).items` itself:
+///
+/// ```text
+/// outer(b) { b->items = malloc(n); caller(b, b->items); }
+/// ```
+///
+/// `q` and `(*b).items` are then one block. Nothing in the allocator argument
+/// separates them, which is why (a) certifies against the BASE alone.
+const FIELD_BESIDE_A_KNOWN_STRANGER: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
 extern "C" { fn malloc(n: libc::c_ulong) -> *mut libc::c_void; }
 #[repr(C)]
@@ -159,19 +167,28 @@ pub unsafe fn touch(mut q: *mut u32, mut items: *mut u32) {
     *q = 1;
     *items.offset(1) = 2;
 }
-pub unsafe fn caller(mut b: *mut Bag, mut n: libc::c_ulong) {
-    (*b).items = malloc(n) as *mut u32;
-    let mut q = (*b).items;
+pub unsafe fn caller(mut b: *mut Bag, mut q: *mut u32) {
     touch(q, (*b).items);
+}
+pub unsafe fn outer(mut b: *mut Bag, mut n: libc::c_ulong) {
+    (*b).items = malloc(n) as *mut u32;
+    caller(b, (*b).items);
 }
 "#;
 
 #[test]
-fn w6p_the_field_is_not_disjoint_from_a_stranger_derived_from_it() {
-    assert_ne!(
-        verdict(FIELD_BESIDE_A_DERIVED_STRANGER, "caller", "touch", 0, 1),
+fn w6p_the_field_is_not_disjoint_from_a_known_stranger() {
+    // Non-vacuous: the field IS admitted here — its only store is `malloc` —
+    // so the refusal is the same-base guard and nothing else.
+    assert_eq!(
+        verdict(FIELD_BESIDE_A_KNOWN_STRANGER, "outer", "caller", 0, 1),
         Ok(CertificateKind::DistinctRoots),
-        "a pointer taken OUT of the field after the allocation is the same block"
+        "the admitted field is disjoint from its own base"
+    );
+    assert_ne!(
+        verdict(FIELD_BESIDE_A_KNOWN_STRANGER, "caller", "touch", 0, 1),
+        Ok(CertificateKind::DistinctRoots),
+        "a known root that is NOT the base proves nothing about the block"
     );
 }
 
