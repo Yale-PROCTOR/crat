@@ -1779,3 +1779,69 @@ pub unsafe fn walk(buf: &[u8], n: usize) -> u32 {
         Some("fn main() { let b = [0u8, 1, 2, 3, 4, 5]; assert_eq!(unsafe { walk(&b, 3) }, 7); }"),
     );
 }
+
+/// **W-CUR-ARG-NOT-RETURN** — the argument path does not consult the OWNER's
+/// return type (relay 046 / main 062a §3, measured rather than read). Two
+/// bodies identical but for the owner's signature — one returning `()`, one
+/// returning a raw pointer it never hands the subject to — settle the SAME
+/// receipt, so the hold on a bare cursor argument at a local callee is the raw
+/// boundary's site permit and nothing about the owner's return.
+///
+/// `raw_return`'s preconditions (the three `RawBoundaryUnbuilt` sites inside it)
+/// are reachable only from `Ret(..)` and the body's tail expression; a void
+/// owner has neither. If someone ever routes the argument path through them,
+/// the two receipts here stop agreeing.
+#[test]
+fn slicecursor_the_argument_path_does_not_ask_the_owners_return_type() {
+    let void_owner = r#"
+unsafe fn core_loop(input: *const u8, base_ip: *const u8, n: usize, out: *mut u32) {
+    let mut ip = input;
+    let mut i = 0usize;
+    while i < n {
+        let candidate = ip.offset(-1);
+        if candidate >= base_ip { *out = *candidate as u32; }
+        ip = ip.offset(1);
+        i += 1;
+    }
+}
+pub unsafe fn two_pass(mut input: *const u8, mut input_size: usize, out: *mut u32) {
+    while input_size > 0 {
+        let block_size = if input_size < 8 { input_size } else { 8 };
+        core_loop(input, input, block_size, out);
+        input = input.offset(block_size as isize);
+        input_size -= block_size;
+    }
+}
+pub unsafe fn caller(b: &[u8], out: *mut u32) { two_pass(b.as_ptr(), b.len(), out) }
+"#;
+    let raw_returning_owner = void_owner
+        .replace(
+            "pub unsafe fn two_pass(mut input: *const u8, mut input_size: usize, out: *mut u32) {",
+            "pub unsafe fn two_pass(mut input: *const u8, mut input_size: usize, out: *mut u32) -> *const u8 {",
+        )
+        .replace(
+            "        input_size -= block_size;\n    }\n}",
+            "        input_size -= block_size;\n    }\n    core::ptr::null()\n}",
+        )
+        .replace(
+            "pub unsafe fn caller(b: &[u8], out: *mut u32) { two_pass(b.as_ptr(), b.len(), out) }",
+            "pub unsafe fn caller(b: &[u8], out: *mut u32) -> *const u8 { two_pass(b.as_ptr(), b.len(), out) }",
+        );
+    let void = cursor_dispositions(void_owner);
+    let raw = cursor_dispositions(&raw_returning_owner);
+    assert!(
+        void.iter()
+            .any(|(label, disposition)| label == "two_pass::input"
+                && disposition == "Err(RawBoundaryUnbuilt)"),
+        "the void owner's hold moved: {void:?}"
+    );
+    assert_eq!(
+        void.iter()
+            .find(|(label, _)| label == "two_pass::input")
+            .map(|(_, disposition)| disposition.clone()),
+        raw.iter()
+            .find(|(label, _)| label == "two_pass::input")
+            .map(|(_, disposition)| disposition.clone()),
+        "the owner's return type changed the ARGUMENT path's receipt: {void:?} vs {raw:?}"
+    );
+}
