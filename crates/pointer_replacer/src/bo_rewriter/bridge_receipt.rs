@@ -463,6 +463,11 @@ pub(crate) fn class_collision_header() -> String {
     "program\tleft_class\tright_class\tleft_edit_key\tright_edit_key\tfile\tlo\thi\tleft_kind\tright_kind\n".to_owned()
 }
 
+/// **R517-8** — one row per held class whose edits the placement layer drops.
+pub(crate) fn class_held_drop_header() -> String {
+    "program\tclass_local_def_index\tclass_path\treason\tdropped_edits\n".to_owned()
+}
+
 pub(crate) fn unresolved_class_header() -> String {
     "program\tclass_local_def_index\tclass_path\treason\n".to_owned()
 }

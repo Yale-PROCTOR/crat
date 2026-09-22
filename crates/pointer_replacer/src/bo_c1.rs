@@ -12591,6 +12591,11 @@ mod run {
             ("class-costs", artifact.class_costs.as_str()),
             ("class-collisions", artifact.class_collisions.as_str()),
             ("unresolved-classes", artifact.unresolved_classes.as_str()),
+            // R517-8 (wave-6o): every edit a HELD class owns is dropped at the
+            // placement layer; until this row existed the drop left nothing at
+            // all -- no revert row, no receipt, no diagnostic, just a
+            // byte-identical function.
+            ("class-held-drops", artifact.class_held_drops.as_str()),
             ("interface-inventory", artifact.interface_inventory.as_str()),
             ("subjects", capture.subject_receipt.as_str()),
             // **wave-6r (reports 017 / 036)** — the lane's two instrument strings

@@ -538,6 +538,9 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
+    /// **R517-8** — one row per held class whose edits the placement layer
+    /// dropped: the reason and how many edits it cost.
+    pub(crate) class_held_drops: String,
     /// R397-6(b): contract candidates declined at the selection input.
     pub(crate) contract_candidate_declines: String,
     /// **W4-LIFT (R475-2)**: callers lifted to the slice form by an exact
@@ -1948,6 +1951,7 @@ fn verify_and_revert(
             .or_default()
             .insert(subject.owner_path.clone());
     }
+    raw_boundary_artifacts.class_held_drops = render_class_held_drops(&emission_plan, &class_paths);
     let all_ready_classes = ready_classes(&emission_plan);
     // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
     // introduced, not what the input already reported: brotli's frozen
@@ -4477,6 +4481,26 @@ fn render_raw_boundary_final_reverts(
     for atom in atoms {
         out.push_str(&format!(
             "atom\t{atom}\t-\tatom-reverted\t-\t-\tatom-reverted\t-\n"
+        ));
+    }
+    out
+}
+
+/// **R517-8** — the class-hold receipt table.
+fn render_class_held_drops(
+    plan: &plan::Plan,
+    class_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+) -> String {
+    let mut out = bridge_receipt::class_held_drop_header();
+    for drop in &plan.class_held_drops {
+        out.push_str(&format!(
+            "-\t{}\t{}\t{}\t{}\n",
+            drop.class.order_key(),
+            class_paths
+                .get(&drop.class)
+                .map_or("<unknown-local-class>", String::as_str),
+            drop.reason.replace(['\t', '\r', '\n'], " "),
+            drop.dropped_edits,
         ));
     }
     out
@@ -8961,6 +8985,7 @@ fn finish_decide<'tcx>(
             class_costs: bridge_receipt::class_cost_header(),
             class_collisions: bridge_receipt::class_collision_header(),
             unresolved_classes: bridge_receipt::unresolved_class_header(),
+            class_held_drops: bridge_receipt::class_held_drop_header(),
             contract_candidate_declines: contract_extent_candidates
                 .declines_tsv(tcx, &subjects, &model, &slots, &fat),
             licensed_lifts: decision::licensed_lift::receipts_tsv(&table.licensed_lifts),

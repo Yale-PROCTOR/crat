@@ -217,6 +217,8 @@ pub(crate) const BRIDGE_RECEIPT_FILE: &str = "raw-boundary-bridge-receipts.tsv";
 pub(crate) const CLASS_COST_ROWS: &str = "raw-boundary-class-costs.tsv";
 pub(crate) const CROSS_CLASS_COLLISION_ROWS: &str = "raw-boundary-class-collisions.tsv";
 pub(crate) const UNRESOLVED_CLASS_ROWS: &str = "raw-boundary-unresolved-classes.tsv";
+/// **R517-8** — one row per held class whose edits the placement layer drops.
+pub(crate) const CLASS_HELD_DROP_ROWS: &str = "raw-boundary-class-held-drops.tsv";
 pub(crate) const MECHANICAL_OBLIGATION_ROWS: &str = "raw-boundary-mechanical-obligations.tsv";
 pub(crate) const UNSAFE_CONTEXT_PRESENTATION_ROWS: &str = "unsafe-context-presentation.tsv";
 pub(crate) const A5_PROOF_SITE_FALLBACK_ROWS: &str = "a5-proof-site-fallback.tsv";

@@ -93,6 +93,14 @@ pub(crate) fn file_key_label(key: &FileKey) -> String {
 /// corpus". It was pinned nowhere. Prose asserting a check the code does not
 /// have is this track's founding failure class, so the claim does not outlive
 /// the slice that measured it.
+/// One held class and what its hold cost, for the census table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClassHeldDrop {
+    pub class: SignatureClassId,
+    pub reason: String,
+    pub dropped_edits: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Unplaceable {
     pub owner_class: SignatureClassId,
@@ -1899,6 +1907,13 @@ pub(crate) struct Plan {
     pub by_file: BTreeMap<FileKey, Vec<Edit>>,
     /// Decisions that produced no placed edit, with attribution.
     pub unplaceable: Vec<Unplaceable>,
+    /// **R517-8 — the class-hold receipt.** Every edit a HELD class owns is
+    /// dropped at `by_file.retain`, and until this row existed it vanished
+    /// with no `final_reverts` row, no additive-family receipt and no
+    /// diagnostic: an emitted function simply came out byte-identical
+    /// (reports 056/057 spent three windows finding one). One row per held
+    /// class that owned edits, written unconditionally.
+    pub class_held_drops: Vec<ClassHeldDrop>,
     /// **The crate ROOT file** — where a crate-level item must go, and the only
     /// place `crate::FALLBACK_SLICE_EXTENT` resolves from.
     ///
@@ -2411,6 +2426,29 @@ impl Plan {
             .filter(|class| class.is_ready())
             .map(|class| class.id)
             .collect::<std::collections::BTreeSet<_>>();
+        // **R517-8.** Count what each hold costs BEFORE dropping it, so the
+        // drop leaves a receipt instead of a byte-identical function.
+        let mut dropped: std::collections::BTreeMap<SignatureClassId, usize> =
+            std::collections::BTreeMap::new();
+        for edits in self.by_file.values() {
+            for edit in edits {
+                if let Some(class) = edit.owner_class
+                    && !ready.contains(&class)
+                {
+                    *dropped.entry(class).or_default() += 1;
+                }
+            }
+        }
+        for (class, count) in dropped {
+            let reason = self
+                .class_hold_reason(class)
+                .unwrap_or_else(|| "class-held:unknown".to_owned());
+            self.class_held_drops.push(ClassHeldDrop {
+                class,
+                reason: format!("class-held:{reason}"),
+                dropped_edits: count,
+            });
+        }
         self.by_file.retain(|_, edits| {
             edits.retain(|edit| edit.owner_class.is_none_or(|class| ready.contains(&class)));
             !edits.is_empty()
@@ -5779,6 +5817,7 @@ pub(crate) fn plan(
         callee_parameter_input_receipts,
         sibling_receipt_plans: sibling_overlap::plans(table, &span_to_loc),
         by_file,
+        class_held_drops: Vec::new(),
         unplaceable,
         // Both filled by the caller; `plan` has no `TyCtxt`, so it can ask
         // neither which file is the crate root nor the parser for an item.
@@ -6338,6 +6377,65 @@ mod wave3_class_tests {
             out.insert(arm);
         }
         out
+    }
+
+    /// **R517-8 — a held class's dropped edits leave a receipt.**
+    ///
+    /// Every edit a held class owns is removed at `by_file.retain`. Until this
+    /// row existed the removal left NOTHING — no `final_reverts` row, no
+    /// additive-family receipt, no diagnostic — and the emitted function came
+    /// out byte-identical. heman's `kmVec4Assign` cost three windows to find
+    /// for exactly that reason (wave-6o reports 056, 057, 061).
+    #[test]
+    fn a_held_class_receipts_the_edits_it_drops() {
+        with_classes(1, |ids| {
+            let owner = ids[0];
+            let file = FileKey::Virtual("main.rs".into());
+            let input = ClassInput::new(owner, RequiredArmSet::default());
+            let edit = Edit {
+                lo: 10,
+                hi: 15,
+                replacement: "carrier".into(),
+                justification: Justification::A5RawView,
+                owner_class: Some(owner),
+                owner_path: "fixture".into(),
+                bridge: None,
+                atom_ids: Vec::new(),
+                subject_id: "fixture-subject".into(),
+                required_arms: "pair".into(),
+                edit_kind: "pair-t2-raw-view",
+            };
+            let mut plan = Plan {
+                by_file: BTreeMap::from([(file, vec![edit])]),
+                class_finalization: finalize_class_inputs(vec![input]),
+                ..Default::default()
+            };
+            assert!(plan.class_held_drops.is_empty(), "nothing held yet");
+            plan.hold_terminal_class(
+                owner,
+                crate::bo_rewriter::decision::Arm::Pair,
+                "a5-fallback-unrenderable",
+                "because the fixture says so".to_owned(),
+            );
+            assert_eq!(
+                plan.class_held_drops.len(),
+                1,
+                "{:?}",
+                plan.class_held_drops
+            );
+            let receipt = &plan.class_held_drops[0];
+            assert_eq!(receipt.class, owner);
+            assert_eq!(receipt.dropped_edits, 1);
+            assert!(
+                receipt.reason.starts_with("class-held:"),
+                "{}",
+                receipt.reason
+            );
+            assert!(
+                plan.by_file.values().flatten().count() == 0,
+                "and the edit really is gone"
+            );
+        });
     }
 
     #[test]
