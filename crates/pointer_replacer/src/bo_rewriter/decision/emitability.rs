@@ -450,6 +450,54 @@ pub(crate) fn is_zero_literal(expr: &Expr<'_>) -> bool {
     )
 }
 
+/// **The shape of a use that has no slice image** (report 058).
+///
+/// Deliberately syntactic and coarse: the point is to say which FAMILY of use
+/// blocks the corpus's widest wall, not to describe any one site. A local
+/// callee's argument is separated from a foreign one because only the first can
+/// be answered by converting the callee, and an assignment target is separated
+/// from everything else because that is the shape main's admission already
+/// covers.
+pub(crate) fn unsupported_use_shape(tcx: TyCtxt<'_>, use_expr: &Expr<'_>) -> &'static str {
+    let rustc_hir::Node::Expr(parent) = tcx.parent_hir_node(use_expr.hir_id) else {
+        return "not-an-expression";
+    };
+    match parent.kind {
+        ExprKind::Assign(lhs, _, _) if lhs.hir_id == use_expr.hir_id => "assignment-target",
+        ExprKind::Assign(..) => "assignment-source",
+        ExprKind::Call(callee, _) => {
+            let local = match tcx
+                .typeck(callee.hir_id.owner.def_id)
+                .expr_ty(callee)
+                .kind()
+            {
+                rustc_middle::ty::TyKind::FnDef(definition, _) => definition
+                    .as_local()
+                    .is_some_and(|local| tcx.hir_node_by_def_id(local).body_id().is_some()),
+                _ => false,
+            };
+            if local {
+                "local-callee-argument"
+            } else {
+                "foreign-callee-argument"
+            }
+        }
+        ExprKind::MethodCall(_, receiver, _, _) if receiver.hir_id == use_expr.hir_id => {
+            "method-receiver"
+        }
+        ExprKind::MethodCall(..) => "method-argument",
+        ExprKind::Cast(..) => "cast",
+        ExprKind::Ret(_) => "return",
+        ExprKind::Binary(..) => "binary",
+        ExprKind::AddrOf(..) => "address-of",
+        ExprKind::Unary(rustc_hir::UnOp::Deref, _) => "deref",
+        ExprKind::Field(..) => "field-of",
+        ExprKind::Index(..) => "index",
+        ExprKind::Struct(..) => "struct-literal",
+        _ => "other",
+    }
+}
+
 /// Classify an argument expression by its **outermost** operator and resolved
 /// type. The type check is what keeps `Other` fail-closed: wave 1 admits a
 /// complex expression only when rustc says the expression itself is a raw
@@ -1576,6 +1624,13 @@ pub(crate) struct SliceUses {
     /// rest is not a partial win — it is an ill-typed crate.
     pub unsupported: Option<Span>,
     pub unsupported_is_cursor: bool,
+    /// **What the blocking use IS** (wave-4 report 058). `slice-use-unsupported`
+    /// is 85 of the corpus's 172 refusals — its widest wall by a distance — and
+    /// until now no table said what the uses behind it are. Main is being asked
+    /// whether the sole-assignment admission generalises; that is a question
+    /// about this distribution, so the distribution is measured rather than
+    /// argued.
+    pub unsupported_shape: Option<&'static str>,
     /// wave-6s: computed sub-views (`&*p.offset(e)`, `p.offset(e) as *const T`)
     /// that are themselves a raw-boundary argument. The raw use above carries
     /// the boundary; this carries the suffix the seam must render.
@@ -2426,6 +2481,7 @@ fn collect_slice_uses_with_family(
                         if entry.unsupported.is_none() {
                             entry.unsupported = Some(expr.span);
                             entry.unsupported_is_cursor = cursor.is_some();
+                            entry.unsupported_shape = Some(unsupported_use_shape(self.tcx, expr));
                         }
                         if let Some(cursor) = cursor {
                             entry.raw_uses.push(cursor);

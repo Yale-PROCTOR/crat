@@ -73,6 +73,12 @@ pub(crate) struct LiftReceipt {
     /// artifacts could not answer. A refusal is a decision and carries its
     /// reason, as B1's two-column table already does.
     pub(crate) declined: Option<Refusal>,
+    /// **What the blocking use IS**, when the refusal is a slice-use one
+    /// (report 058). `slice-use-unsupported` is the corpus's widest refusal —
+    /// 85 of 172 at batch 28 — and "an assignment target" and "an argument at a
+    /// local callee" are answered by completely different builds. The reason
+    /// alone cannot choose between them.
+    pub(crate) use_shape: Option<&'static str>,
 }
 
 /// **Which arm refused, and why.**
@@ -115,7 +121,10 @@ impl LiftReceipt {
             .parameter_index
             .map_or_else(|| "-".to_owned(), |index| index.to_string());
         if let Some(refusal) = self.declined {
-            let reason = refusal.reason();
+            let reason = match self.use_shape {
+                Some(shape) => format!("{}:{shape}", refusal.reason()),
+                None => refusal.reason().to_owned(),
+            };
             return match refusal {
                 Refusal::Unlicensed(_) => {
                     format!(
@@ -250,6 +259,13 @@ pub(crate) fn slice_rewrites(
         .unwrap_or_default()
 }
 
+/// The shape of the use that has no slice image, when there is one — the
+/// column that separates "an assignment target" from "an argument at a local
+/// callee", which are answered by different builds entirely.
+fn unsupported_use_shape(ctx: &Ctx<'_, '_>, node: (LocalDefId, HirId)) -> Option<&'static str> {
+    ctx.slice_uses.get(&node)?.unsupported_shape
+}
+
 /// **The lift.** Runs over the first pass's entries, after the other promotes,
 /// and re-types held callers whose callee parameter carries an exact licensed
 /// width.
@@ -277,6 +293,7 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
                 mutable: subject.mutable,
                 fallback: false,
                 declined: Some(Refusal::Unlicensed(why)),
+                use_shape: unsupported_use_shape(ctx, (subject.fn_did, subject.hir_id)),
             });
         };
         // **The width question is asked FIRST, whatever happens next** (report
@@ -351,6 +368,7 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
             mutable,
             fallback: false,
             declined: None,
+            use_shape: None,
         });
     }
     receipts.sort_by(|a, b| a.subject.cmp(&b.subject));
@@ -367,7 +385,7 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
         .iter()
         .map(|lift| {
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 lift.subject.split("::").next().unwrap_or(&lift.subject),
                 lift.subject,
                 lift.callee,
@@ -381,13 +399,14 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
                     (None, true) => "fallback",
                     (None, false) => "evidence",
                 },
+                lift.use_shape.unwrap_or("-"),
                 lift.key(),
             )
         })
         .collect::<Vec<_>>();
     rows.sort();
     let mut out = String::from(
-        "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\treceipt\n",
+        "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\tuse_shape\treceipt\n",
     );
     out.extend(rows);
     out
@@ -515,6 +534,7 @@ pub(crate) fn promote_fallback(
                 mutable: subject.mutable,
                 fallback: false,
                 declined: Some(Refusal::Declined(why)),
+                use_shape: unsupported_use_shape(ctx, (subject.fn_did, subject.hir_id)),
             });
         };
     let candidates: FxHashMap<(LocalDefId, HirId), (String, Option<usize>)> = entries
@@ -616,6 +636,7 @@ pub(crate) fn promote_fallback(
             mutable: subject.mutable,
             fallback: true,
             declined: None,
+            use_shape: None,
         });
     }
     drop(decline);

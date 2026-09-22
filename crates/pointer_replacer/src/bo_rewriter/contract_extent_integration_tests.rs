@@ -2241,7 +2241,7 @@ fn w4l08_the_receipt_is_a_census_artifact_row() {
     assert_eq!(
         lines.next(),
         Some(
-            "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\treceipt"
+            "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\tuse_shape\treceipt"
         ),
         "{tsv}"
     );
@@ -2256,8 +2256,9 @@ fn w4l08_the_receipt_is_a_census_artifact_row() {
         columns[6], "evidence",
         "the exact arm, not the waiver: {tsv}"
     );
+    assert_eq!(columns[7], "-", "a lift has no blocking use: {tsv}");
     assert_eq!(
-        columns[7], "evidence(licensed-width:BrotliUnalignedRead32:0:4)",
+        columns[8], "evidence(licensed-width:BrotliUnalignedRead32:0:4)",
         "{tsv}"
     );
     assert_eq!(lines.next(), None, "one lift, one row: {tsv}");
@@ -3013,6 +3014,36 @@ fn w4b115_the_admission_is_a_census_row() {
         columns[6], "sized-assignment:storage_:storage_size_",
         "{tsv}"
     );
+}
+
+/// **W4L-11 (report 058) — a slice-use refusal says WHAT the blocking use is.**
+///
+/// `slice-use-unsupported` was 85 of the corpus's 172 refusals at batch 28 —
+/// its widest wall by a distance — and main is being asked whether the
+/// sole-assignment admission should generalise. That is a question about which
+/// SHAPES are behind the wall: an assignment target is the shape the admission
+/// already answers, an argument at a local callee is answered by converting the
+/// callee, and a cast or a return is answered by neither. The reason alone
+/// cannot tell them apart, so the receipt now carries the shape.
+///
+/// The unsupported-use fixture blocks on `data as size_t`.
+#[test]
+fn w4l11_a_slice_use_refusal_names_the_shape() {
+    let rows = table_of(W4_LIFT_UNSUPPORTED_USE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.declined, lift.use_shape, lift.key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let refused = rows
+        .iter()
+        .find(|(declined, ..)| declined.is_some())
+        .unwrap_or_else(|| panic!("a refusal must be receipted: {rows:?}"));
+    assert_eq!(refused.1, Some("cast"), "{rows:?}");
+    assert!(refused.2.contains("slice-use-unsupported"), "{rows:?}");
+    assert!(refused.2.ends_with(":cast)"), "{rows:?}");
 }
 
 /// **W4B1-1 (control) — a root that states nothing stays the fallback's.**
