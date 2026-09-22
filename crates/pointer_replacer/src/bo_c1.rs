@@ -12287,6 +12287,8 @@ mod run {
         // per round inside `transform_with`, because only it is a question
         // about one round.
         crate::bo_rewriter::ast_transform::reset_graft_held();
+        // R523-4: same rhythm — the certificate receipts below are THIS program's.
+        crate::bo_rewriter::decision::return_certificate::reset_certificate_receipts();
         let capture = match super::cache_only_before_solve(
             entry_available
                 .then_some(())
@@ -12657,6 +12659,20 @@ mod run {
             stamp(&crate::bo_rewriter::ast_transform::graft_held_table()),
         )
         .expect("write graft-held receipts");
+        // **R523-4 (ownership-fields 056 STOP 2) — the certificate receipts.**
+        //
+        // `Certificates::receipts_tsv()` has existed since wave-6a's W6A-A1 and
+        // reached NO artifact: its only callers are unit tests, and the
+        // production emission drops the `Certificates` before anything writes a
+        // file. The census row therefore prints the generic
+        // `box-initializer-unsupported` while the receipt that says what to
+        // BUILD — `return-certificate-struct-field:key_free` — is invisible.
+        // Unconditional, like the table above it.
+        std::fs::write(
+            directory.join(format!("{name}.return-certificate-receipts.tsv")),
+            stamp(&crate::bo_rewriter::decision::return_certificate::certificate_receipts_table()),
+        )
+        .expect("write return-certificate receipts");
         // **R464-5 (wave-6f 040 STOP 1)** — the field receipt's `revert_status`
         // against the final-revert table, checked on the PUBLISHED rows rather
         // than on the predicate that wrote them.

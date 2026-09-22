@@ -111,6 +111,47 @@ pub(crate) struct Certificates {
 /// the driver turns it into a `chain_through` entry.
 const CHAIN_THROUGH: &str = "chain-through:";
 
+/// **THE CERTIFICATE RECEIPTS, AS A CENSUS TABLE (R523-4, ownership-fields 056
+/// STOP 2).**
+///
+/// `receipts_tsv` has existed and reached NOTHING: its only callers are unit
+/// tests, and the production emission drops the `Certificates` before anything
+/// writes a file. So a census row prints the generic `box-initializer-unsupported`
+/// while the receipt that says what to BUILD —
+/// `return-certificate-struct-field:key_free` — is invisible.
+///
+/// Same shape and same reason as `GRAFT_HELD`: the fact is produced deep inside
+/// a walk whose callers all drop it, so the honest place to record is the choke
+/// point. It is an INSTRUMENT — it changes no verdict, no edit and no text.
+thread_local! {
+    static CERTIFICATE_RECEIPTS: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Per PROGRAM, beside the other census resets.
+pub(crate) fn reset_certificate_receipts() {
+    CERTIFICATE_RECEIPTS.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Records THIS program's receipts. Called where the decision table is built,
+/// which is the one place a complete `Certificates` exists.
+pub(crate) fn record_certificate_receipts(certificates: &Certificates) {
+    CERTIFICATE_RECEIPTS.with(|cell| *cell.borrow_mut() = certificates.receipts_tsv());
+}
+
+/// The artifact table. **Written even when it is empty** — a header-only table
+/// says the pass ran and admitted nothing, which a missing file cannot say.
+pub(crate) fn certificate_receipts_table() -> String {
+    CERTIFICATE_RECEIPTS.with(|cell| {
+        let recorded = cell.borrow();
+        if recorded.is_empty() {
+            "callee\tkind\tdetail\n".to_owned()
+        } else {
+            recorded.clone()
+        }
+    })
+}
+
 impl Certificates {
     pub(crate) fn is_empty(&self) -> bool {
         self.callees.is_empty()
