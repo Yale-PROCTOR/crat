@@ -2293,6 +2293,55 @@ pub unsafe extern "C" fn StoreUnsized() {
 }
 "#;
 
+/// **brotli's ACTUAL root shape, minimised — the fixture report 049's C6
+/// predicts and dry27's links (1)+(2) will need.**
+///
+/// The corpus writes `let mut storage = 0 as *mut uint8_t;` and assigns the
+/// accessor's result on a later line (`lib.rs:177473` / `:177483`), because
+/// that is how C2Rust renders a C declaration followed by an assignment. The
+/// accessor itself is the ensure-capacity shape: it grows `(*s).storage_` to
+/// `size` and records the new size in `(*s).storage_size_` before returning the
+/// field.
+///
+/// Nothing here is a build. The fixture exists to make the census's shape
+/// column predictable IN PROCESS, so the claim "the walk reads the `let`
+/// initializer and never sees the call" is tested by the analysis rather than
+/// by my reading of `construction.rs`.
+const W4_B1_DECLARED_NULL_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn GetStorage(mut s: *mut EncoderState, mut size: size_t) -> *mut uint8_t {
+    if (*s).storage_size_ < size {
+        (*s).storage_ =
+            malloc(size.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64)
+                as *mut uint8_t;
+        (*s).storage_size_ = size;
+    }
+    return (*s).storage_;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreDeclaredNull(mut s: *mut EncoderState, mut n: size_t) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage = GetStorage(s, n);
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
 fn b1_rows(source: &str) -> Vec<(String, String, String, String)> {
     table_of(source, |table| {
         table
@@ -2469,6 +2518,33 @@ fn w4b107_a_size_sibling_is_refused_at_a_wider_element() {
         "a `_size` sibling may count BYTES: {rows:?}"
     );
     assert_eq!(local.2, "none:place-read", "{rows:?}");
+}
+
+/// **W4B1-8 (report 051) — the shape column scored IN PROCESS, before the
+/// census scores it.**
+///
+/// Report 049's C6 predicted that brotli's `caller-root-states-no-extent` rows
+/// read `none:null-lit` rather than `none:call-result`, on the reading that
+/// `ConstructionFacts::by_binding` is keyed on the `let` initializer and the
+/// later assignment is recorded only as an `owner_overwrites` entry, and only
+/// for an allocator call. That is a claim about the analysis, so the analysis
+/// can settle it without waiting for a corpus frame — and if it is wrong, dry27's
+/// first link is aimed at nothing and I would rather know now.
+///
+/// The companion reading is already pinned by W4B1-3: a root assigned the same
+/// accessor's result AT the declaration reads `none:call-result`.
+#[test]
+fn w4b108_a_declared_null_root_reads_as_a_null_literal() {
+    let rows = b1_rows(W4_B1_DECLARED_NULL_ROOT);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreDeclaredNull::storage"))
+        .unwrap_or_else(|| panic!("no StoreDeclaredNull::storage row: {rows:?}"));
+    assert_eq!(storage.1, "held", "{rows:?}");
+    assert_eq!(
+        storage.2, "none:null-lit",
+        "the walk reads the `let` initializer, never the assignment that follows: {rows:?}"
+    );
 }
 
 /// **W4B1-1 (control) — a root that states nothing stays the fallback's.**
