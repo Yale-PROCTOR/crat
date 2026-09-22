@@ -1927,3 +1927,45 @@ pub unsafe fn caller(b: &[u8]) -> u32 { countBytes(b.as_ptr(), b.len(), 0) }
         "the control grew a cursor destination: {decisions:?}"
     );
 }
+
+/// **R512-4 / nested 018 STOP 1.** The hand-off's shape, pinned by a test so it
+/// is a contract and not just today's code: ONE planner, with the prospective
+/// flip as a query parameter. `plan` is `plan_with(.., None)`; `promote` calls
+/// `plan_with(.., Some(&prospective))` per row and commits the parameter only if
+/// every row came back `Ok`.
+///
+/// Nothing here exercises the prospective ARM — that needs `promote`'s caller,
+/// which is nested's build (their W1–W6). What this pins is the signature they
+/// build against and that the default path is unchanged.
+#[test]
+fn slicecursor_the_prospective_hand_off_keeps_one_planner() {
+    use crate::bo_rewriter::decision::{Ctx, Decision, Subject, cursor_native::ProspectiveTable};
+    let prospective = ProspectiveTable {
+        binding: rustc_hir::CRATE_HIR_ID,
+        inner_mutable: false,
+    };
+    assert!(!prospective.inner_mutable);
+    let _: fn(
+        &Ctx<'_, '_>,
+        &Subject,
+        &Decision,
+        &[(Subject, Decision)],
+    ) -> Option<
+        Result<
+            crate::bo_rewriter::decision::cursor_native::CursorPlan,
+            crate::bo_rewriter::decision::cursor_native::CursorHold,
+        >,
+    > = crate::bo_rewriter::decision::cursor_native::wrapper::plan;
+    let _: fn(
+        &Ctx<'_, '_>,
+        &Subject,
+        &Decision,
+        &[(Subject, Decision)],
+        Option<&ProspectiveTable>,
+    ) -> Option<
+        Result<
+            crate::bo_rewriter::decision::cursor_native::CursorPlan,
+            crate::bo_rewriter::decision::cursor_native::CursorHold,
+        >,
+    > = crate::bo_rewriter::decision::cursor_native::wrapper::plan_with;
+}

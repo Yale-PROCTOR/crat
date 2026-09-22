@@ -370,6 +370,26 @@ pub(crate) fn promote(
     receipts
 }
 
+/// **R512-4 / nested 018 STOP 1.** One bit the cursor family does not have at
+/// plan time: *this table is about to deliver its inner level*. `promote` hands
+/// it in before it writes anything, so `entries` stays pre-flip and is a single
+/// source of truth for the whole query; the family answers with a constructed
+/// `CursorPlan` or a `CursorHold`, and the caller commits the parameter only if
+/// every row came back constructed.
+///
+/// Asked, not installed: report 061 measured what installing a decision before
+/// its dependents are known good costs — a committed cursor beside a sibling
+/// that did not deliver, and `SliceCursor.offset(..)` in the emitted text
+/// (E0599). Rolling that back means unwinding the `uses` the flip wrote and
+/// everything else that read the variant in the same pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProspectiveTable {
+    /// The table being flipped.
+    pub(crate) binding: rustc_hir::HirId,
+    /// The element's mutability after the flip.
+    pub(crate) inner_mutable: bool,
+}
+
 /// Explicit declaration sites for untyped cursor locals (one hook in `mod.rs`).
 pub(crate) fn explicit_declarations(
     table: &super::DecisionTable,

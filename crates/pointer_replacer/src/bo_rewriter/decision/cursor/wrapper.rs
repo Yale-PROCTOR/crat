@@ -94,6 +94,7 @@ fn table_element_base(
     s: &Subject,
     e: &hir::Expr<'_>,
     entries: &[(Subject, Decision)],
+    prospective: Option<&super::ProspectiveTable>,
 ) -> Result<Base, CursorHold> {
     if !model_ref(ctx, s) {
         return Err(CursorHold::RefMissing);
@@ -116,8 +117,20 @@ fn table_element_base(
     // a slice, not a pointer: the constructor is then `new(t[k])`, which takes
     // NO length, so this base fabricates nothing and is evidence-backed by
     // construction (`fallback = false`, 027 (b)).
+    // **R512-4.** The prospective flip is this table's, so read the variant it
+    // is ABOUT to have. The flip reuses the flat decision's `uses` verbatim, so
+    // the element replacement text is the same before and after and only the
+    // variant moves; an exclusive row over an element the flip leaves shared is
+    // refused rather than rendered.
+    let prospective = prospective.filter(|table| table.binding == root);
+    if let Some(table) = prospective
+        && s.mutable
+        && !table.inner_mutable
+    {
+        return Err(CursorHold::BaseMissing);
+    }
     let (uses, delivered_inner) = match decision {
-        Decision::Slice { uses, .. } => (uses, false),
+        Decision::Slice { uses, .. } => (uses, prospective.is_some()),
         Decision::NestedSlice { uses, .. } => (uses, true),
         Decision::Ref { .. }
         | Decision::InferredRef { .. }
@@ -224,18 +237,19 @@ fn base(
     s: &Subject,
     e: &hir::Expr<'_>,
     entries: &[(Subject, Decision)],
+    prospective: Option<&super::ProspectiveTable>,
 ) -> Result<Base, CursorHold> {
     let e = peel_reborrow_idiom(ctx.tcx, s.fn_did, e);
     if let Some(raw) = table_origin(ctx, s, e, entries, &mut rustc_hash::FxHashSet::default()) {
         if raw {
             return Err(CursorHold::BaseModelRaw);
         }
-        return table_element_base(ctx, s, e, entries);
+        return table_element_base(ctx, s, e, entries, prospective);
     }
     if let hir::ExprKind::MethodCall(_, receiver, [delta], _) = e.kind
         && emission::method(ctx.tcx, s.fn_did, e, &["offset", "add", "sub"])
     {
-        let mut b = base(ctx, s, receiver, entries)?;
+        let mut b = base(ctx, s, receiver, entries, prospective)?;
         b.expression = format!(
             "({}).offset_by({})",
             b.expression,
@@ -514,6 +528,7 @@ struct Uses<'a, 'tcx> {
     /// over: the AST pass applies the constructor at its span and skips these,
     /// exactly as a table element's outer edit is composed.
     re_seed_composed: Vec<rustc_span::Span>,
+    prospective: Option<&'a super::ProspectiveTable>,
 }
 impl Uses<'_, '_> {
     /// **R497-3(c) — the raw view of a re-seed value.** The re-seed source is
@@ -1270,7 +1285,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     // family owns (a slice peer, `data = start`) or to a parent
                     // cursor: the base's own constructor, never a fallback.
                     if !self.optional && !self.subject.mutable {
-                        match base(self.ctx, self.subject, rhs, self.entries) {
+                        match base(self.ctx, self.subject, rhs, self.entries, self.prospective) {
                             Ok(b)
                                 if (b.delivered.is_some() || b.parent_cursor.is_some())
                                     && !b.fallback =>
@@ -1308,7 +1323,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                         return;
                     }
                     if self.optional && !self.subject.mutable {
-                        match base(self.ctx, self.subject, rhs, self.entries) {
+                        match base(self.ctx, self.subject, rhs, self.entries, self.prospective) {
                             Ok(b)
                                 if (b.delivered.is_some() || b.parent_cursor.is_some())
                                     && !b.fallback =>
@@ -1855,11 +1870,28 @@ fn derives_cursor(
     roots.visit_body(ctx.tcx.hir_body_owned_by(s.fn_did));
     roots.found
 }
+/// The planner as every caller but `promote` uses it: no table is about to
+/// flip, so the family reads `entries` as it stands.
 pub(super) fn plan(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     decision: &Decision,
     entries: &[(Subject, Decision)],
+) -> Option<Result<CursorPlan, CursorHold>> {
+    plan_with(ctx, subject, decision, entries, None)
+}
+
+/// **R512-4 / nested 018 STOP 1, answered in report 061 §4.** The same planner,
+/// told that one table is about to deliver its inner level. There is ONE base
+/// resolution in this family and this is it: `prospective` is a query parameter
+/// threaded to `table_element_base`, not a second entry point that would
+/// duplicate the resolution and drift from it.
+pub(super) fn plan_with<'a>(
+    ctx: &Ctx<'_, '_>,
+    subject: &Subject,
+    decision: &Decision,
+    entries: &[(Subject, Decision)],
+    prospective: Option<&'a super::ProspectiveTable>,
 ) -> Option<Result<CursorPlan, CursorHold>> {
     if (!selected(ctx, subject, decision)
         && !derives_cursor(ctx, subject, decision, entries)
@@ -1909,12 +1941,14 @@ pub(super) fn plan(
     {
         return None;
     }
-    Some(build(ctx, subject, entries))
+    Some(build(ctx, subject, entries, prospective))
 }
-pub(super) fn build(
+pub(super) 
+fn build<'a>(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     entries: &[(Subject, Decision)],
+    prospective: Option<&'a super::ProspectiveTable>,
 ) -> Result<CursorPlan, CursorHold> {
     let parameter = matches!(subject.kind, SubjectKind::Param { .. });
     // **The entry window** (R472-6, route 1). A cursor rooted at a raw parameter
@@ -1977,6 +2011,7 @@ pub(super) fn build(
                 .hir_node(init.ok_or(CursorHold::BaseMissing)?)
                 .expect_expr(),
             entries,
+            prospective,
         )?
     };
     // An untyped local (`let mut q = p.offset(k)`) gets its cursor type as an
@@ -2004,6 +2039,7 @@ pub(super) fn build(
         ctx,
         subject,
         entries,
+        prospective,
         name,
         init,
         base: b.binding,
