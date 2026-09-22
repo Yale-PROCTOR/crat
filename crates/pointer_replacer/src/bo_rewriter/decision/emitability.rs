@@ -2725,11 +2725,6 @@ fn collect_slice_uses_with_family(
                     // own sign authority, which admits the C2Rust double-cast
                     // literal the narrower walk refuses.
                     || super::slice_forms::assignment_from_forward_view(self.tcx, use_expr, key)
-                // **main 071c (a), wave-4: the assignment IS the
-                // construction.** A null-declared binding whose SOLE
-                // assignment reads the very field its extent evidence names
-                // is not writing to a slice — it is building one, and the
-                // right-hand side is the construction planner's to render.
                 {
                     return Some(None);
                 }

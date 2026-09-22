@@ -2977,6 +2977,44 @@ fn w4b114_a_parameter_row_names_its_callers_roots() {
     );
 }
 
+/// **W4B1-15 (report 057) — the admission reaches the CENSUS.**
+///
+/// Main's STOP 2 keeps the receipt pre-decision on `SliceUses` and has the
+/// census read filter delivered subjects — which presumes a census row, and
+/// there was none: at batch 28 the seat asked what the admission did to
+/// brotli's rows and no table could answer, because the receipt never left the
+/// use inventory. One row per admitted root, carrying the form the subject
+/// ended in so "does it fire, and do those rows deliver?" is a table read.
+#[test]
+fn w4b115_the_admission_is_a_census_row() {
+    let super::RewriteOutcome::Emitted {
+        raw_boundary_artifacts,
+        ..
+    } = super::rewrite_m1(W4_B1_DECLARED_NULL_FIELD)
+    else {
+        panic!("W4B1-15 must emit");
+    };
+    let tsv = &raw_boundary_artifacts.sized_assignments;
+    let mut lines = tsv.lines();
+    assert_eq!(
+        lines.next(),
+        Some("owner_path\tsubject\tform\tfield\tsibling\tassignment_span\treceipt"),
+        "{tsv}"
+    );
+    let row = lines.next().expect("one admitted root");
+    let columns = row.split('\t').collect::<Vec<_>>();
+    assert!(
+        columns[1].starts_with("StoreDeclaredThenField::storage"),
+        "{tsv}"
+    );
+    assert_eq!(columns[3], "storage_", "{tsv}");
+    assert_eq!(columns[4], "storage_size_", "{tsv}");
+    assert_eq!(
+        columns[6], "sized-assignment:storage_:storage_size_",
+        "{tsv}"
+    );
+}
+
 /// **W4B1-1 (control) — a root that states nothing stays the fallback's.**
 ///
 /// The `wrapping_mul` evidence arm itself is witnessed where it lives, in

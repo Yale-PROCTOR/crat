@@ -1073,6 +1073,13 @@ pub(crate) struct DecisionTable {
     /// lifted with its evidence, or HELD with the reason no extent was found.
     /// The held count is the seat's Decision A input.
     pub(crate) root_extents: Vec<root_extent::RootExtentRow>,
+    /// **main 071c (a), report 057** — one row per root whose sole assignment
+    /// the slice-use inventory admitted as its construction, with the form the
+    /// subject ended in. The admission is made PRE-decision (main's STOP 2), so
+    /// without this row a census can see neither how often it fires nor whether
+    /// the subjects it fires on are delivered — which is exactly what the seat
+    /// asked to read at batch 28 and what no table could answer.
+    pub(crate) sized_assignments: Vec<(String, String, sized_assignment::SizedAssignment)>,
     /// wave-6f: the finalized struct-field reference transactions.
     pub field_transactions: field_reference::FieldTransactions,
     /// **R425-3 (wave-5c).** For a parameter the reader chain decided `Slice`
@@ -1325,6 +1332,19 @@ pub(crate) fn decide_with_raw_fallbacks(
                 .map(|promotion| ((subject.fn_did, subject.hir_id), promotion))
         })
         .collect();
+    // The admission's receipt, joined to the form each subject ended in.
+    let sized_assignments: Vec<(String, String, sized_assignment::SizedAssignment)> = entries
+        .iter()
+        .flat_map(|(subject, decision)| {
+            let form = seam::form_of(decision).key().to_owned();
+            ctx.slice_uses
+                .get(&(subject.fn_did, subject.hir_id))
+                .map(|uses| uses.sized_assignments.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |admitted| (subject.label.clone(), form.clone(), admitted))
+        })
+        .collect();
     let option_mut_bindings = entries
         .iter()
         .filter_map(|(subject, decision)| {
@@ -1414,6 +1434,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         contract_extent_promotions,
         licensed_lifts,
         root_extents,
+        sized_assignments,
         field_transactions: Default::default(),
         slice_input_companions: Default::default(),
         slice_input_mask_companions: Default::default(),
@@ -3063,6 +3084,7 @@ mod self_consistency_tests {
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
             root_extents: Vec::new(),
+            sized_assignments: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),

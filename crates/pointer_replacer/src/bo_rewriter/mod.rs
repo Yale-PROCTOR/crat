@@ -549,6 +549,9 @@ pub(crate) struct RawBoundaryArtifacts {
     /// **W4-B1 (R480-2)**: the root-extent rule's decided rows — lifted with
     /// their evidence, or HELD with what the root said and why.
     pub(crate) root_extents: String,
+    /// **main 071c (a), report 057**: the admitted sole assignments, with the
+    /// form each subject ended in.
+    pub(crate) sized_assignments: String,
     pub(crate) interface_inventory: String,
     /// R261-3 rider (addendum 264): subjects whose io-domain type walk ran out
     /// of depth budget without deciding. A nonzero count reopens the depth
@@ -9098,6 +9101,7 @@ fn finish_decide<'tcx>(
                 .declines_tsv(tcx, &subjects, &model, &slots, &fat),
             licensed_lifts: decision::licensed_lift::receipts_tsv(&table.licensed_lifts),
             root_extents: decision::root_extent::receipts_tsv(&table.root_extents),
+            sized_assignments: decision::sized_assignment::receipts_tsv(&table.sized_assignments),
             interface_inventory: table.seams.interface_inventory_tsv(tcx),
             sites_from_non_subject_arguments: table.seams.sites_from_non_subject_arguments(),
             converted_callee_without_site_receipt: table

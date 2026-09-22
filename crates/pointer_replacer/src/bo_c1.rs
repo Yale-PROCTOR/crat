@@ -12587,6 +12587,11 @@ mod run {
             // W4-B1 (R480-2, relay 056 STOP 2): the root-extent rows, whose
             // HELD count is the seat's Decision A input.
             ("root-extent", artifact.root_extents.as_str()),
+            // main 071c (a) (report 057): the assignments the use inventory
+            // admitted as constructions, with the form each subject ended in —
+            // the admission is pre-decision, so this is the only place a census
+            // can see it fire.
+            ("sized-assignments", artifact.sized_assignments.as_str()),
             ("bridge-receipts", bridge_receipts.as_str()),
             (
                 "unsafe-context-presentation",

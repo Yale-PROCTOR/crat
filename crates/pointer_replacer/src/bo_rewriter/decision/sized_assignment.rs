@@ -247,3 +247,30 @@ fn render(
         unsafe_fn,
     )
 }
+
+/// **The census receipt** (condition 4). One row per admitted root: the owner,
+/// the subject, the form it ended in, the field and sibling the admission
+/// matched, and the assignment's span — so "how often does this fire, and do
+/// the rows it fires on deliver?" is a table read rather than an inference.
+pub(crate) fn receipts_tsv(rows: &[(String, String, SizedAssignment)]) -> String {
+    let mut out =
+        String::from("owner_path\tsubject\tform\tfield\tsibling\tassignment_span\treceipt\n");
+    let mut lines = rows
+        .iter()
+        .map(|(subject, form, admitted)| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{:?}\t{}\n",
+                subject.split("::").next().unwrap_or(subject),
+                subject,
+                form,
+                admitted.field,
+                admitted.sibling,
+                admitted.span,
+                admitted.receipt(),
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    out.extend(lines);
+    out
+}
