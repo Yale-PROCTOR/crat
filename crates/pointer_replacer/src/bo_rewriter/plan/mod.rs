@@ -4340,28 +4340,42 @@ pub(crate) fn plan(
         }
     }
     for receipt in &option_receipt_plans {
+        let entry = table.entries.iter().find(|(subject, _)| {
+            receipt.obligation.planned.key.subject
+                == super::mechanical_receipt::MechanicalSubjectKey::Local {
+                    owner: subject.fn_did,
+                    mir_local: subject.local.as_u32(),
+                    slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                }
+        });
+        // **R500-5(b) — a cursor-consumed subject has no option presentation to hold.**
+        //
+        // The three exempt spellings are USE-site classifications (`emitability.rs` reads the
+        // parent of each optional use). wave-6o 052 found the case they miss: when a CURSOR
+        // consumes the subject, the receipt that is held is the source's DECLARATION, whose
+        // operation is none of the three, so the presentation is pushed `option-evidence-held`
+        // — unplaceable, and therefore an owner-wide withdrawal that takes bzip2's
+        // `addFlagsFromEnvVar::p` with it.
+        //
+        // The question the exemption wants to ask is not "how is this use spelled" but "does
+        // anything still need an Option here", and a subject the cursor family has taken
+        // answers no by construction: the cursor owns the rendering and presents nothing
+        // optional. Asked of the DECISION rather than of a string, the same case the
+        // `excluded-cursor` spelling already exempts is exempt however it is reached.
+        let cursor_owns_it = matches!(
+            entry.map(|(_, decision)| decision),
+            Some(super::decision::Decision::Cursor { .. })
+        );
         if receipt.obligation.intended_terminal_state
             == super::mechanical_receipt::MechanicalState::HeldNonmechanical
             && option_receipt_requires_changed_form(table, receipt)
+            && !cursor_owns_it
             && !matches!(
                 receipt.operation.as_str(),
                 "excluded-cursor" | "handoff-return" | "handoff-use"
             )
         {
-            let subject = table
-                .entries
-                .iter()
-                .find(|(subject, _)| {
-                    receipt.obligation.planned.key.subject
-                        == super::mechanical_receipt::MechanicalSubjectKey::Local {
-                            owner: subject.fn_did,
-                            mir_local: subject.local.as_u32(),
-                            slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
-                        }
-                })
-                .expect("Option receipt retains its subject")
-                .0
-                .clone();
+            let subject = entry.expect("Option receipt retains its subject").0.clone();
             let bridge = BridgeSitePlan::local(
                 receipt.owner_class.local_def_id(),
                 receipt.owner_class.local_def_id(),
