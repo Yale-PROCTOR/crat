@@ -2209,13 +2209,41 @@ fn transaction_owner_split(
 #[test]
 fn w6f_the_refresh_expands_the_revert_set() {
     let _frame = frame_lock();
+    // The raw set is EMPTY and the class is reverted only through the atom
+    // expansion. A refresh that reads the raw set sees nothing to withdraw;
+    // the AST layer, which runs against the effective set, withholds the
+    // transaction. The column must agree with the AST layer.
     avl_frame();
-    let status = refreshed_revert_status(AVL, "Node", "left", &["newNode"]);
+    let expanded = refreshed_revert_status(AVL, "Node", "left", &[], Some("rightRotate"));
     super::test_model_override::clear();
     assert_eq!(
-        status, "withdrawn",
-        "a revert anywhere in the transaction's owner set withdraws it: that is \
-         what the plan's closure does and what the AST layer then applies"
+        expanded, "withdrawn",
+        "the refresh expands the raw set before it writes the column"
+    );
+
+    // …and the expansion is not a blanket: a class that reaches neither the
+    // raw set nor any closure leaves the transaction active.
+    avl_frame();
+    let untouched = refreshed_revert_status(AVL, "Node", "left", &[], Some("max"));
+    super::test_model_override::clear();
+    assert_eq!(
+        untouched, "active",
+        "an unrelated class's revert does not withdraw the transaction"
+    );
+
+    // **The dichotomy report 053 owes the note.** `newNode` is an owner of
+    // this transaction and is NOT one of its dependent owners, so reverting
+    // it leaves the transaction active — exactly what `active()` and
+    // `field_reference_ast` do with it. This is main's
+    // `owner-reverted-but-reads-active` shape, through the production
+    // refresh: the column is right and the join was made on `owners`.
+    avl_frame();
+    let non_dependent = refreshed_revert_status(AVL, "Node", "left", &["newNode"], None);
+    super::test_model_override::clear();
+    assert_eq!(
+        non_dependent, "active",
+        "a non-dependent owner's revert does not withdraw the transaction — \
+         the withdrawal key is `dependent_owners`, which the receipt now prints"
     );
 }
 
@@ -2226,10 +2254,12 @@ fn refreshed_revert_status(
     struct_name: &str,
     field: &str,
     reverted_owners: &[&str],
+    atom_owner: Option<&str>,
 ) -> String {
     let struct_name = struct_name.to_owned();
     let field = field.to_owned();
     let owners: Vec<String> = reverted_owners.iter().map(|o| (*o).to_owned()).collect();
+    let atom_owner = atom_owner.map(str::to_owned);
     ::utils::compilation::run_compiler_on_str(source, move |tcx| {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
@@ -2247,21 +2277,37 @@ fn refreshed_revert_status(
                 .unwrap_or_else(|| panic!("owner {owner}"));
             raw.insert(super::bridge_receipt::SignatureClassId::of(did));
         }
-        // The plan carries one owner set per field transaction — the closure
-        // `effective_withheld_classes` applies, and the one a partition
-        // revert reaches this receipt through.
+        // The plan carries one owner set per field transaction — built HERE
+        // exactly as `plan::of` builds it (`owner_sets()`), so this witness
+        // cannot pass against a closure production never constructs.
         let mut plan = super::plan::Plan::default();
         plan.field_transaction_owners = table
             .field_transactions
-            .applied
-            .iter()
-            .map(|t| {
-                t.owners
-                    .iter()
-                    .map(|o| super::bridge_receipt::SignatureClassId::of(*o))
+            .owner_sets()
+            .into_iter()
+            .map(|owners| {
+                owners
+                    .into_iter()
+                    .map(super::bridge_receipt::SignatureClassId::of)
                     .collect()
             })
             .collect();
+        // The atom lever is a production one: `effective_reverted_classes`
+        // expands a reverted cursor-base atom into its owner classes, so a
+        // refresh handed the RAW set sees an empty revert and the correct one
+        // sees the owner. That is R469-1's bug in one step.
+        let mut atoms = std::collections::BTreeSet::new();
+        if let Some(atom) = atom_owner.as_ref() {
+            let did = tcx
+                .hir_body_owners()
+                .find(|did| tcx.def_path_str(did.to_def_id()).ends_with(atom.as_str()))
+                .unwrap_or_else(|| panic!("atom owner {atom}"));
+            plan.cursor_base_atom_owners.insert(
+                "w6f-atom".to_owned(),
+                std::iter::once(super::bridge_receipt::SignatureClassId::of(did)).collect(),
+            );
+            atoms.insert("w6f-atom".to_owned());
+        }
         let mut artifacts = super::RawBoundaryArtifacts::default();
         super::refresh_field_transaction_revert_status(
             &mut artifacts,
@@ -2269,7 +2315,7 @@ fn refreshed_revert_status(
             &table,
             &plan,
             &raw,
-            &std::collections::BTreeSet::new(),
+            &atoms,
         );
         artifacts
             .field_transactions
@@ -2279,6 +2325,154 @@ fn refreshed_revert_status(
             .find(|cells| cells[0].ends_with(struct_name.as_str()) && cells[1] == field)
             .unwrap_or_else(|| panic!("no row for {struct_name}.{field}"))[10]
             .to_owned()
+    })
+    .unwrap()
+}
+
+/// `(struct, field) -> the owners that receive an expression edit`, as path
+/// suffixes. The set the transaction's TEXT actually lands in.
+fn transaction_edit_owners(source: &str, struct_name: &str, field: &str) -> Vec<String> {
+    let struct_name = struct_name.to_owned();
+    let field = field.to_owned();
+    ::utils::compilation::run_compiler_on_str(source, move |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let t = table
+            .field_transactions
+            .applied
+            .iter()
+            .find(|t| t.struct_path.ends_with(struct_name.as_str()) && t.field_name == field)
+            .unwrap_or_else(|| panic!("no applied transaction for {struct_name}.{field}"));
+        let mut owners: Vec<String> = t
+            .expression_edits
+            .iter()
+            .map(|e| tcx.def_path_str(e.owner.to_def_id()))
+            .collect();
+        owners.sort();
+        owners.dedup();
+        owners
+    })
+    .unwrap()
+}
+
+/// Witness 30 (relay 055) — **the receipt publishes the set the withdrawal is
+/// keyed on.**
+///
+/// `owners` is `sites ∪ mentions`: every function whose signature so much as
+/// names the struct is in it, whether or not it touches the field. The
+/// withdrawal — `active()`, and with it `field_reference_ast::{apply,
+/// apply_wraps, apply_hoists}` — is keyed on `dependent_owners`, a strict
+/// subset. A reader joining a revert set against the printed `owners` gets a
+/// disagreement that is not one: that is main's `owner-reverted-but-reads-
+/// active` note on lodepng `LodePNGBitReader.data`, whose reverted owner
+/// `inflateHuffmanBlock` touches `(*reader).bp` and `.bitsize` and never
+/// `data`. The receipt now prints the dependent set as its own ADDITIVE last
+/// column, so the join can be made correctly instead of argued about.
+#[test]
+fn w6f_the_receipt_publishes_the_withdrawal_key() {
+    let _frame = frame_lock();
+    let (owners, dependent) = transaction_owner_split(LODEPNG, "LodePNGBitReader", "data");
+    assert!(
+        owners.iter().any(|o| o.ends_with("advanceBits"))
+            && !dependent.iter().any(|o| o.ends_with("advanceBits")),
+        "the fixture must keep a mention-only owner — the lodepng note's shape: {owners:?} / {dependent:?}"
+    );
+    let row = field_receipt_row(LODEPNG, "LodePNGBitReader", "data");
+    assert_eq!(
+        row.len(),
+        12,
+        "the receipt carries the additive `dependent_owners` column: {row:?}"
+    );
+    let printed = row[11].clone();
+    let expected = dependent
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(
+        printed, expected,
+        "the column IS `dependent_owners`, in the receipt's own order"
+    );
+    assert!(
+        !printed.contains("advanceBits"),
+        "a mention-only owner is not in the withdrawal key: {printed}"
+    );
+    assert!(
+        row[5].contains("advanceBits"),
+        "…while `owners` still carries it, which is what a reader was joining on: {}",
+        row[5]
+    );
+}
+
+/// Witness 31 (relay 055) — **the withdrawal key is narrower than the edit
+/// set, and that gap is now pinned rather than latent.**
+///
+/// `ast_transform.rs` inserts a transaction's expression edits under
+/// `active(&reverts.fns)` and says "the plan closes the revert set over
+/// them" — but the plan's closure (`Plan::field_transaction_owners`) is built
+/// from `owner_sets()`, which is `dependent_owners`. Measured here: lodepng's
+/// `data` is edited in four functions and depends on ONE, and avl's
+/// `Node.left` is edited in seven and depends on six. So an owner can carry
+/// this transaction's text and still not be able to withdraw it. This test
+/// states the gap exactly; it does not bless it (report 053 STOP 1).
+#[test]
+fn w6f_the_edit_set_is_wider_than_the_withdrawal_key() {
+    let _frame = frame_lock();
+    let (_, dependent) = transaction_owner_split(LODEPNG, "LodePNGBitReader", "data");
+    let edited = transaction_edit_owners(LODEPNG, "LodePNGBitReader", "data");
+    assert_eq!(dependent.len(), 1, "{dependent:?}");
+    assert_eq!(edited.len(), 4, "{edited:?}");
+    let uncovered: Vec<&String> = edited
+        .iter()
+        .filter(|o| !dependent.iter().any(|d| d == *o))
+        .collect();
+    assert_eq!(
+        uncovered.len(),
+        3,
+        "three functions carry the field's text and cannot withdraw it: {uncovered:?}"
+    );
+
+    avl_frame();
+    let (_, avl_dependent) = transaction_owner_split(AVL, "Node", "left");
+    super::test_model_override::clear();
+    avl_frame();
+    let avl_edited = transaction_edit_owners(AVL, "Node", "left");
+    super::test_model_override::clear();
+    assert!(
+        avl_edited.iter().any(|o| o.ends_with("newNode"))
+            && !avl_dependent.iter().any(|o| o.ends_with("newNode")),
+        "avl's `newNode` writes the field (`owned-field-raw-store`) and is not a \
+         dependent owner: {avl_edited:?} / {avl_dependent:?}"
+    );
+}
+
+/// The receipt row for `(struct, field)`, split into cells.
+fn field_receipt_row(source: &str, struct_name: &str, field: &str) -> Vec<String> {
+    let struct_name = struct_name.to_owned();
+    let field = field.to_owned();
+    ::utils::compilation::run_compiler_on_str(source, move |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        table
+            .field_transactions
+            .receipt_tsv(tcx)
+            .lines()
+            .skip(1)
+            .map(|line| line.split('\t').map(str::to_owned).collect::<Vec<String>>())
+            .find(|cells| cells[0].ends_with(struct_name.as_str()) && cells[1] == field)
+            .unwrap_or_else(|| panic!("no row for {struct_name}.{field}"))
     })
     .unwrap()
 }

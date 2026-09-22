@@ -578,7 +578,7 @@ impl FieldTransactions {
             if any { "withdrawn" } else { "active" }
         };
         let mut out = String::from(
-            "struct\tfield\tstatus\tform\tsites\towners\timpls\tsignature_plans\tbridges\tcause\trevert_status\n",
+            "struct\tfield\tstatus\tform\tsites\towners\timpls\tsignature_plans\tbridges\tcause\trevert_status\tdependent_owners\n",
         );
         for t in &self.applied {
             let count = |kind: &str| {
@@ -588,7 +588,7 @@ impl FieldTransactions {
                     .count()
             };
             out.push_str(&format!(
-                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\t{}\n",
+                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\t{}\t{}\n",
                 t.struct_path,
                 t.field_name,
                 t.delivered_form_key(),
@@ -622,11 +622,20 @@ impl FieldTransactions {
                     .collect::<Vec<_>>()
                     .join("|"),
                 withdrawn(t),
+                if t.dependent_owners.is_empty() {
+                    "-".to_owned()
+                } else {
+                    t.dependent_owners
+                        .iter()
+                        .map(|o| tcx.def_path_str(o.to_def_id()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                },
             ));
         }
         for (struct_path, field, cause) in &self.held {
             out.push_str(&format!(
-                "{struct_path}\t{field}\theld\t-\t-\t-\t-\t-\t-\t{cause}\t-\n"
+                "{struct_path}\t{field}\theld\t-\t-\t-\t-\t-\t-\t{cause}\t-\t-\n"
             ));
         }
         out
