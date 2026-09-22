@@ -12586,6 +12586,15 @@ mod run {
             ("unresolved-classes", artifact.unresolved_classes.as_str()),
             ("interface-inventory", artifact.interface_inventory.as_str()),
             ("subjects", capture.subject_receipt.as_str()),
+            // **wave-6r (reports 017 / 036)** — the lane's two instrument strings
+            // reach disk. Both were BUILT on every run and written nowhere: the
+            // child-access receipt since relay 017 and the twin-placement receipt
+            // since `efb1bbbb`/`3876963c`, each produced into `RawBoundaryArtifacts`
+            // and consumed by no writer, so the census could never carry the row
+            // they exist to answer (`kmVec2Add`'s placement). Same shape of gap as
+            // R450-8's allocator contracts, two families over.
+            ("child-access", artifact.child_access.as_str()),
+            ("twin-placement", artifact.twin_placement.as_str()),
             // R450-8 (wave-6a 022 §4 GRANTED): the allocator-contract receipts
             // reach the artifact set. Without them the libc row's `kind-raw`
             // population has no reason table on disk — the facts existed in
