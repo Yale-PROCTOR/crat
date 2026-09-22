@@ -234,6 +234,43 @@ pub mod indicators {
             return 0 as std::os::raw::c_int;
         }
     }
+    pub mod sma_twice {
+        // Safety: as above, with TWO output cells. R519-2's W3 shape: the output
+        // table is named twice, so `table_named_once` refuses an exclusive
+        // cursor row over its element and the transaction rolls that parameter
+        // back — while the input table, whose row is an ordinary slice read,
+        // keeps the delivery it earned.
+        pub unsafe extern "C" fn ti_sma_twice(
+            mut size: std::os::raw::c_int,
+            mut inputs: *const *const std::os::raw::c_double,
+            mut options: *const std::os::raw::c_double,
+            mut outputs: *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int {
+            let mut input: *const std::os::raw::c_double =
+                *inputs.offset(0 as std::os::raw::c_int as isize);
+            let period: std::os::raw::c_int =
+                *options.offset(0 as std::os::raw::c_int as isize) as std::os::raw::c_int;
+            let mut lo: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            let mut hi: *mut std::os::raw::c_double =
+                *outputs.offset(1 as std::os::raw::c_int as isize);
+            if period < 1 as std::os::raw::c_int {
+                return 1 as std::os::raw::c_int;
+            }
+            let mut i: std::os::raw::c_int = 0;
+            i = 0 as std::os::raw::c_int;
+            while i < size {
+                *lo.offset(i as isize) = *input.offset(i as isize);
+                i += 1
+            }
+            i = period;
+            while i < size {
+                *hi.offset((i - period) as isize) = *input.offset(i as isize);
+                i += 1
+            }
+            return 0 as std::os::raw::c_int;
+        }
+    }
 }
 pub struct IndicatorInfo {
     pub indicator: Option<
@@ -245,7 +282,7 @@ pub struct IndicatorInfo {
         ) -> std::os::raw::c_int,
     >,
 }
-pub static INDICATORS: [IndicatorInfo; 6] = [
+pub static INDICATORS: [IndicatorInfo; 7] = [
     IndicatorInfo {
         indicator: Some(
             indicators::ema::ti_ema
@@ -304,6 +341,17 @@ pub static INDICATORS: [IndicatorInfo; 6] = [
     IndicatorInfo {
         indicator: Some(
             indicators::sma_cursor_only::ti_sma_cursor_only
+                as unsafe extern "C" fn(
+                    std::os::raw::c_int,
+                    *const *const std::os::raw::c_double,
+                    *const std::os::raw::c_double,
+                    *const *mut std::os::raw::c_double,
+                ) -> std::os::raw::c_int,
+        ),
+    },
+    IndicatorInfo {
+        indicator: Some(
+            indicators::sma_twice::ti_sma_twice
                 as unsafe extern "C" fn(
                     std::os::raw::c_int,
                     *const *const std::os::raw::c_double,

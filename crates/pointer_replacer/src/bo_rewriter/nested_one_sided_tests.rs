@@ -21,6 +21,7 @@ const LATE_IN: &str = "indicators::ema_late_in::ti_ema_late_in";
 const EXTRA: &str = "indicators::ema_extra_use::ti_ema_extra_use";
 const MIXED: &str = "indicators::sma_mixed::ti_sma_mixed";
 const CURSOR_ONLY: &str = "indicators::sma_cursor_only::ti_sma_cursor_only";
+const TWICE: &str = "indicators::sma_twice::ti_sma_twice";
 /// wave-5d's pair fixture, read (never edited) as this lane's no-shadow control.
 const PAIR_SOURCE: &str = include_str!("wave5d_ti_abs.rs");
 
@@ -730,4 +731,60 @@ fn w2_the_mixed_owner_delivers_both_tables() {
              cursor row: {decision:?}"
         );
     }
+}
+
+/// **W3 — the rollback path is NOT reachable at this frame, and this is the
+/// measurement that says so.** `ti_sma_twice` names its output table twice,
+/// which was meant to make `table_element_base` refuse an exclusive row over its
+/// element (`s.mutable && !table_named_once`) and exercise the transaction's
+/// rollback. It does not: naming the table twice degrades **the table itself**,
+/// so `outputs` never becomes a nested candidate (clause (a) wants a flat slice)
+/// and the transaction is never asked about it.
+///
+/// So the two conditions look mutually exclusive at this frame — a table named
+/// more than once cannot also be a nested candidate — and the corpus agrees:
+/// `rebase_refused` is empty across all 93 planned tulipindicators owners
+/// (report 022). What this witness pins is therefore the reachable half: the
+/// sibling delivers, and a table the arm cannot take is skipped rather than
+/// taking its sibling down. The unreachable half is a STOP, not a silent gap.
+#[test]
+fn w3_a_table_the_arm_cannot_take_is_skipped_not_rolled_back() {
+    ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let plan = table
+            .nested_receipts
+            .iter()
+            .find(|r| tcx.def_path_str(r.owner.to_def_id()) == TWICE)
+            .and_then(|r| r.result.as_ref().ok())
+            .expect("the qualifying sibling still gives this owner a plan");
+        assert_eq!(
+            plan.parameters
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["inputs".to_owned()],
+            "the sibling delivers while the twice-named table is skipped"
+        );
+        // Skipped at the CANDIDATE stage, not rolled back by the transaction:
+        // the distinction is the whole finding.
+        assert!(
+            plan.rebase_refused.is_empty(),
+            "a twice-named table reaches the transaction after all: {:?}",
+            plan.rebase_refused
+        );
+        assert!(
+            plan.rows
+                .iter()
+                .all(|r| plan.parameters.iter().any(|p| p.hir == r.parameter)),
+            "a skipped table left its rows behind"
+        );
+    })
+    .unwrap();
 }
