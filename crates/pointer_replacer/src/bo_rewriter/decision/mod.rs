@@ -2240,6 +2240,17 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 // must not pre-empt a producer that would deliver.
                 Err(_) if box_param::lend_leaves_owning(ctx, subject) => {}
                 Err(failure) => {
+                    // **R525-2 — the Owning arm consults the certificate too.**
+                    // The Raw arm has done this since R496-7; without the same
+                    // step here a model-`Owning` subject whose Box family fails
+                    // reports the Box arm's reason and the certificate's own
+                    // refusal never reaches the census, so no model-Owning unit
+                    // can be chased to its actual wall. Consulted only on the
+                    // failure path, so it cannot pre-empt a delivery.
+                    if let Some(decision) = return_certificate::held_final(ctx, subject, &decl_site)
+                    {
+                        return decision;
+                    }
                     return degrade(subject, decl_site, DegradeReason::BoxFailure { failure });
                 }
             }

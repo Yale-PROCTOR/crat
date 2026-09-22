@@ -317,6 +317,22 @@ pub(crate) fn planned(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<Decision> 
 /// W6A-T1 fixtures their whole emission (measured: `tulip-stoch`, `tulip-cci`
 /// and `tulip-cci-web` degraded with two errors attributed to no rewritten
 /// function) because a hold there outranks every family below it.
+/// **R525-2** — the Owning arm's variant. The companion gate
+/// (`…:owned-field`) is a DERIVE-TIME refusal that `finalize` re-derives and
+/// re-admits (ownership-fields 057 §3 (a)), so it is provisional: it may not
+/// become a subject's final reason where another family would still deliver,
+/// and making it one cost ht's exported pair its surface delivery.
+pub(crate) fn held_final(ctx: &Ctx<'_, '_>, subject: &Subject, site: &str) -> Option<Decision> {
+    let (_, hold) = ctx
+        .return_certificates
+        .holds
+        .get(&(subject.fn_did, subject.hir_id))?;
+    if hold.ends_with(":owned-field") {
+        return None;
+    }
+    held(ctx, subject, site)
+}
+
 pub(crate) fn held(ctx: &Ctx<'_, '_>, subject: &Subject, site: &str) -> Option<Decision> {
     let (_, hold) = ctx
         .return_certificates
@@ -2025,8 +2041,29 @@ fn certify<'tcx, 's>(
                 match ordinary {
                     Ok(plan) => (plan, "ordinary-plan".to_owned()),
                     Err(BoxPlanFailure::InitializerUnsupported) => {
-                        let initializer = struct_initializer(tcx, ty)
-                            .map_err(|reason| hold(format!("return-certificate-{reason}")))?;
+                        // **R525-3 edit (a)** — one definition of the
+                        // synthesised literal, ownership-fields'. It spells
+                        // each field in its delivered form where a transaction
+                        // owns it and its type's zero where none does, in the
+                        // printer's own spelling. No transaction is visible at
+                        // this point in the pipeline (certificates derive ~500
+                        // lines before `field_reference::finalize`), so the
+                        // seam passes `None` and every field takes its zero;
+                        // `finalize`'s re-derivation re-admits a certificate
+                        // whose fields ended up unconverted (057 §3 (a)).
+                        let literal = super::ownership_fields_constructor::struct_literal(
+                            tcx,
+                            ty,
+                            &|_, _| None,
+                        )
+                        .map_err(|reason| {
+                            hold(format!("return-certificate-struct-literal:{reason:?}"))
+                        })?;
+                        // Their entry returns the LITERAL; the certificate's
+                        // initializer is the owner, so it is boxed here.
+                        let initializer = rustc_ast_pretty::pprust::expr_to_string(
+                            &::utils::ast::parse_expr(format!("Box::new({literal})")),
+                        );
                         let overwrites = constructions
                             .owner_overwrites
                             .get(&key)

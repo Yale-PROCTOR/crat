@@ -96,7 +96,7 @@ fn w6a_a1_quadtree_node_new_returns_a_box_and_the_receiver_owns_it() {
         out.artifacts.return_certificate_receipts
     );
     assert!(
-        src.contains("letmutnode:Box<crate::quadtree_node>=Box::new(crate::quadtree_node{ne:0as*mutcrate::quadtree_node,nw:0as*mutcrate::quadtree_node,point:0as*muti32,});{}(*node).ne=0as*mutquadtree_node;"),
+        src.contains("letmutnode:Box<crate::quadtree_node>=Box::new(crate::quadtree_node{ne:::core::ptr::null_mut(),nw:::core::ptr::null_mut(),point:::core::ptr::null_mut(),});{}(*node).ne=0as*mutquadtree_node;"),
         "{}",
         out.source
     );
@@ -165,7 +165,7 @@ fn w6a_a1_buffer_chain_returns_through_buffer_slice_and_the_tests_free() {
         out.artifacts.return_certificate_receipts
     );
     assert!(
-        src.contains("letmutself_0:Box<crate::buffer_t>=Box::new(crate::buffer_t{len:0asusize,alloc:0as*muti8,data:0as*muti8,});{}(*self_0).len=n;"),
+        src.contains("letmutself_0:Box<crate::buffer_t>=Box::new(crate::buffer_t{len:0usize,alloc:::core::ptr::null_mut(),data:::core::ptr::null_mut(),});{}(*self_0).len=n;"),
         "{}",
         out.source
     );

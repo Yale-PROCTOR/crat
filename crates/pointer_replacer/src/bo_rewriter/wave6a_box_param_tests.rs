@@ -731,7 +731,7 @@ pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
     );
     assert!(
         src.contains(
-            "letmuttable:Box<crate::ht>=Box::new(crate::ht{length:0asusize,capacity:0asusize});"
+            "letmuttable:Box<crate::ht>=Box::new(crate::ht{length:0usize,capacity:0usize});"
         ),
         "{}",
         out.source
