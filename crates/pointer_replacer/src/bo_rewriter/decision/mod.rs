@@ -54,6 +54,7 @@ pub(crate) mod contract_extent_adapter;
 mod counted_extent_tests;
 pub(crate) mod counted_void;
 mod counted_void_handle;
+mod counted_void_store;
 mod counted_void_loop;
 mod counted_void_read;
 pub(crate) mod cursor_native;
