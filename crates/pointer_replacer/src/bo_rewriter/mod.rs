@@ -2152,6 +2152,77 @@ fn verify_and_revert(
     facts.e2_artifacts.timings.ast_placement_wall_s =
         format!("{:.6}", ast_started.elapsed().as_secs_f64());
     facts.files_touched = files_edited;
+
+    // **THE GRAFT FLOOR'S SECOND HALF (R515-1 ruling 3).**
+    //
+    // A colliding graft no longer aborts the program — it yields, and the arm
+    // records the class it was serving. That half alone would ship a
+    // HALF-COMPOSED call: the node carries the other claimant's edit, and the
+    // yielding class's remaining edits (a C-9 mark's companion temp is the
+    // sharpest case) are still in the tree without it. So the class is reverted
+    // WHOLE here and the round re-emitted, exactly as a verify-attributed
+    // revert would be, before anything is compiled.
+    //
+    // The loop terminates because each pass strictly grows `reverted` over a
+    // finite class set; the cap is a tripwire for a hold that does not clear,
+    // never the mechanism. A reverted class's grafts are not planned, so it
+    // cannot be held twice — if it is, that is the bug the cap reports.
+    const MAX_HOLD_ROUNDS: usize = 4;
+    let mut hold_rounds = 0usize;
+    let mut held_total = 0usize;
+    loop {
+        let held = ast_transform::graft_held_classes();
+        let newly = held
+            .iter()
+            .copied()
+            .filter(|class| !reverted.contains(class))
+            .collect::<Vec<_>>();
+        if newly.is_empty() {
+            break;
+        }
+        hold_rounds += 1;
+        held_total += newly.len();
+        if hold_rounds > MAX_HOLD_ROUNDS {
+            facts.files_touched = files_edited;
+            facts.reverted_count = reverted.len();
+            return facts.degraded(format!(
+                "graft-held: {held_total} class(es) held over {hold_rounds} round(s) without converging"
+            ));
+        }
+        reverted.extend(newly);
+        match round_files(
+            tcx,
+            capture,
+            &emission_plan,
+            &emission_texts,
+            &reverted,
+            &reverted_atoms,
+            root_key.as_ref(),
+            table,
+        ) {
+            Ok((next_files, rollbacks, next_edited, next_maps, next_renders)) => {
+                if !rollbacks.is_empty() {
+                    facts.files_touched = files_edited;
+                    facts.reverted_count = reverted.len();
+                    return facts.degraded(format!(
+                        "graft-held re-emit produced {} rollback(s)",
+                        rollbacks.len()
+                    ));
+                }
+                files = next_files;
+                files_edited = next_edited;
+                line_maps = next_maps;
+                call_renders = next_renders;
+            }
+            Err(why) => {
+                facts.files_touched = files_edited;
+                facts.reverted_count = reverted.len();
+                return facts.degraded(format!("graft-held re-emit failed: {why}"));
+            }
+        }
+    }
+    facts.files_touched = files_edited;
+
     let mut rounds = 0usize;
     let mut previous_errors: Option<usize> = None;
     let mut probe_secs = 0.0f64;

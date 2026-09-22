@@ -2594,6 +2594,11 @@ struct PairRawGraftVisitor<'a> {
     reverts: &'a RevertSet,
     guard: &'a mut Composition,
     consumed: FxHashSet<(u32, u32)>,
+    /// **Keys this arm YIELDED (R515-1 ruling 3).** Every arm inserts into
+    /// `consumed` only on success, so without this a held key looks exactly
+    /// like a key the walk never reached -- and the `unmatched` check below
+    /// would abort the program for the very hold the floor just granted.
+    held: FxHashSet<(u32, u32)>,
     failure: Option<String>,
 }
 
@@ -2608,6 +2613,11 @@ struct A5RawGraftVisitor<'a> {
     /// rather than a re-rendering of the original text.
     inner_arguments: &'a FxHashSet<(u32, u32)>,
     inner_products_taken: usize,
+    /// **Keys this arm YIELDED (R515-1 ruling 3).** Every arm inserts into
+    /// `consumed` only on success, so without this a held key looks exactly
+    /// like a key the walk never reached -- and the `unmatched` check below
+    /// would abort the program for the very hold the floor just granted.
+    held: FxHashSet<(u32, u32)>,
     failure: Option<String>,
 }
 
@@ -2722,10 +2732,26 @@ impl MutVisitor for A5RawGraftVisitor<'_> {
             }
         };
         if !self.guard.claim(expression.id, expression.span, "a5-raw") {
-            self.failure = Some(format!(
-                "A5 raw-view call at {}..{} collided with another AST transform",
-                key.0, key.1
-            ));
+            // **THE FLOOR (R515-1 ruling 3).** A collision is ONE class's problem,
+            // never the program's. This read `self.failure = Some(..)`, which the
+            // apply site turns into `Err` and `mod.rs` turns into
+            // `round-0 emit failed` for the WHOLE program -- batch 26 and batch 27
+            // both lost brotli's entire emission (795 realized rows) to a single
+            // colliding mark. The node keeps the holder's edit, this arm yields,
+            // its class is reverted whole on the next round so nothing
+            // half-composed ships, and the hold is receipted with both parties.
+            record_graft_held(
+                GraftHeldReceipt {
+                    visitor: "a5-raw",
+                    caller: call.caller.local_def_index.as_u32(),
+                    class: call.owner_class.order_key(),
+                    reason: self.guard.holder(expression.id).unwrap_or("unknown-holder"),
+                    lo: key.0,
+                    hi: key.1,
+                },
+                call.owner_class,
+            );
+            self.held.insert(key);
             return;
         }
         self.consumed.insert(key);
@@ -2816,10 +2842,26 @@ impl MutVisitor for PairRawGraftVisitor<'_> {
             }
         };
         if !self.guard.claim(expression.id, expression.span, "pair-raw") {
-            self.failure = Some(format!(
-                "PAIR raw-view call at {}..{} collided with another AST transform",
-                key.0, key.1
-            ));
+            // **THE FLOOR (R515-1 ruling 3).** A collision is ONE class's problem,
+            // never the program's. This read `self.failure = Some(..)`, which the
+            // apply site turns into `Err` and `mod.rs` turns into
+            // `round-0 emit failed` for the WHOLE program -- batch 26 and batch 27
+            // both lost brotli's entire emission (795 realized rows) to a single
+            // colliding mark. The node keeps the holder's edit, this arm yields,
+            // its class is reverted whole on the next round so nothing
+            // half-composed ships, and the hold is receipted with both parties.
+            record_graft_held(
+                GraftHeldReceipt {
+                    visitor: "pair-raw",
+                    caller: call.caller.local_def_index.as_u32(),
+                    class: call.owner_class.order_key(),
+                    reason: self.guard.holder(expression.id).unwrap_or("unknown-holder"),
+                    lo: key.0,
+                    hi: key.1,
+                },
+                call.owner_class,
+            );
+            self.held.insert(key);
             return;
         }
         self.consumed.insert(key);
@@ -2841,6 +2883,11 @@ struct C9GraftVisitor<'a> {
     >,
     guard: &'a mut Composition,
     consumed: FxHashSet<(u32, u32)>,
+    /// **Keys this arm YIELDED (R515-1 ruling 3).** Every arm inserts into
+    /// `consumed` only on success, so without this a held key looks exactly
+    /// like a key the walk never reached -- and the `unmatched` check below
+    /// would abort the program for the very hold the floor just granted.
+    held: FxHashSet<(u32, u32)>,
     failure: Option<String>,
 }
 
@@ -2884,10 +2931,34 @@ impl MutVisitor for C9GraftVisitor<'_> {
             }
         };
         if !self.guard.claim(e.id, e.span, "c9") {
-            self.failure = Some(format!(
-                "retained C-9 mark at {}..{} collided with another AST transform",
-                key.0, key.1
-            ));
+            // **THE FLOOR (R515-1 ruling 3).** A collision is ONE class's problem,
+            // never the program's. This read `self.failure = Some(..)`, which the
+            // apply site turns into `Err` and `mod.rs` turns into
+            // `round-0 emit failed` for the WHOLE program -- batch 26 and batch 27
+            // both lost brotli's entire emission (795 realized rows) to a single
+            // colliding mark. The node keeps the holder's edit, this arm yields,
+            // its class is reverted whole on the next round so nothing
+            // half-composed ships, and the hold is receipted with both parties.
+            //
+            // **This arm is the one brotli hits.** The mark's companion temp is
+            // not emitted when the graft yields, so the both-Ref model would
+            // ship without it -- which is why the hold must REVERT the class
+            // and not merely skip the node. `owner_did`'s class is the same key
+            // the apply site filters marks by, so the revert takes exactly the
+            // marks this one belongs to.
+            let class = super::bridge_receipt::SignatureClassId::of(mark.owner_did);
+            record_graft_held(
+                GraftHeldReceipt {
+                    visitor: "c9",
+                    caller: mark.owner_did.local_def_index.as_u32(),
+                    class: class.order_key(),
+                    reason: self.guard.holder(e.id).unwrap_or("unknown-holder"),
+                    lo: key.0,
+                    hi: key.1,
+                },
+                class,
+            );
+            self.held.insert(key);
             return;
         }
         self.consumed.insert(key);
@@ -2928,6 +2999,20 @@ impl ReceiverGraft<'_> {
         }
     }
 
+    /// The callee whose adapted return this graft restores an input form for.
+    /// **The class gate every variant already keys on** — see
+    /// `RawReceiverPlan::active`, which is `!classes.contains(&of(self.callee))`.
+    fn callee(self) -> rustc_span::def_id::LocalDefId {
+        match self {
+            Self::Retired(input) => input.receiver.callee,
+            Self::Raw(input) => input.callee,
+            Self::Outbound(input) => input.source_callee,
+            Self::Expression(input) | Self::CastReceiver(input) => input.callee,
+            Self::SharedOption(input) => input.callee,
+            Self::Region(receiver) => receiver.callee,
+        }
+    }
+
     /// wave-6b: a byte view wraps the local's CAST initializer (`p as *mut u8`),
     /// not a call — the one graft whose carrier is not a call.
     fn wraps_cast(self) -> bool {
@@ -2939,6 +3024,11 @@ struct ReceiverInputGraftVisitor<'a> {
     inputs: &'a FxHashMap<(u32, u32), ReceiverGraft<'a>>,
     guard: &'a mut Composition,
     consumed: FxHashSet<(u32, u32)>,
+    /// **Keys this arm YIELDED (R515-1 ruling 3).** Every arm inserts into
+    /// `consumed` only on success, so without this a held key looks exactly
+    /// like a key the walk never reached -- and the `unmatched` check below
+    /// would abort the program for the very hold the floor just granted.
+    held: FxHashSet<(u32, u32)>,
     failure: Option<String>,
 }
 
@@ -3004,10 +3094,35 @@ impl MutVisitor for ReceiverInputGraftVisitor<'_> {
             .guard
             .claim(expression.id, expression.span, "receiver-input")
         {
-            self.failure = Some(format!(
-                "receiver-input-invariant:composition:{}..{}",
-                key.0, key.1
-            ));
+            // **THE FLOOR (R515-1 ruling 3).** A collision is ONE class's problem,
+            // never the program's. This read `self.failure = Some(..)`, which the
+            // apply site turns into `Err` and `mod.rs` turns into
+            // `round-0 emit failed` for the WHOLE program -- batch 26 and batch 27
+            // both lost brotli's entire emission (795 realized rows) to a single
+            // colliding mark. The node keeps the holder's edit, this arm yields,
+            // its class is reverted whole on the next round so nothing
+            // half-composed ships, and the hold is receipted with both parties.
+            //
+            // **The class here is the CALLEE's**, not the caller's: every
+            // receiver plan's own `active`/`selection` gate keys on the callee's
+            // signature class (`RawReceiverPlan::active` is the plainest case),
+            // because a receiver graft exists to restore an input form the
+            // CALLEE's adapted return produced. Holding the caller's class would
+            // leave the adapted call in place with no receiver restored, which
+            // is precisely the half-composed call the floor must not ship.
+            let class = super::bridge_receipt::SignatureClassId::of(input.callee());
+            record_graft_held(
+                GraftHeldReceipt {
+                    visitor: "receiver",
+                    caller: input.callee().local_def_index.as_u32(),
+                    class: class.order_key(),
+                    reason: self.guard.holder(expression.id).unwrap_or("unknown-holder"),
+                    lo: key.0,
+                    hi: key.1,
+                },
+                class,
+            );
+            self.held.insert(key);
             return;
         }
         self.consumed.insert(key);
@@ -4141,6 +4256,14 @@ fn transform_with<'tcx>(
     ),
     String,
 > {
+    // **Per ROUND, not per program (R515-1 ruling 3).** The emission asks this
+    // walk "what did you hold, that the next round must revert?" -- carrying an
+    // earlier round's set into the answer would re-revert classes already taken
+    // out and make the round's own hold unreadable. The RECEIPTS accumulate
+    // across rounds and are reset per program in the census worker; only the
+    // class set is reset here, because only it is a question about this round.
+    reset_graft_held_classes();
+
     // The finalizer's complete collections replace the earlier adapter plans.
     // An origin-parameter atom also owns its generated return interface.
     // Apply the same class closure as receipts and verification accounting.
@@ -4603,6 +4726,7 @@ fn transform_with<'tcx>(
         reverts,
         guard: &mut guard,
         consumed: FxHashSet::default(),
+        held: FxHashSet::default(),
         inner_arguments: &a5_inner_arguments,
         inner_products_taken: 0,
         failure: None,
@@ -4613,7 +4737,7 @@ fn transform_with<'tcx>(
     }
     let unmatched_a5_raw = a5_raw_calls
         .keys()
-        .filter(|key| !a5_raw.consumed.contains(key))
+        .filter(|key| !a5_raw.consumed.contains(key) && !a5_raw.held.contains(key))
         .copied()
         .collect::<Vec<_>>();
     if !unmatched_a5_raw.is_empty() {
@@ -4648,6 +4772,7 @@ fn transform_with<'tcx>(
         reverts,
         guard: &mut guard,
         consumed: FxHashSet::default(),
+        held: FxHashSet::default(),
         failure: None,
     };
     pair_raw.visit_crate(&mut krate);
@@ -4656,7 +4781,7 @@ fn transform_with<'tcx>(
     }
     let unmatched_pair_raw = pair_raw_calls
         .keys()
-        .filter(|key| !pair_raw.consumed.contains(key))
+        .filter(|key| !pair_raw.consumed.contains(key) && !pair_raw.held.contains(key))
         .copied()
         .collect::<Vec<_>>();
     if !unmatched_pair_raw.is_empty() {
@@ -4699,6 +4824,7 @@ fn transform_with<'tcx>(
         marks: &c9_marks,
         guard: &mut guard,
         consumed: FxHashSet::default(),
+        held: FxHashSet::default(),
         failure: None,
     };
     c9.visit_crate(&mut krate);
@@ -4707,7 +4833,7 @@ fn transform_with<'tcx>(
     }
     let unmatched = c9_marks
         .keys()
-        .filter(|key| !c9.consumed.contains(key))
+        .filter(|key| !c9.consumed.contains(key) && !c9.held.contains(key))
         .copied()
         .collect::<Vec<_>>();
     if !unmatched.is_empty() {
@@ -4862,6 +4988,7 @@ fn transform_with<'tcx>(
         inputs: &receiver_inputs,
         guard: &mut guard,
         consumed: composed_receiver_inputs,
+        held: FxHashSet::default(),
         failure: None,
     };
     receiver_grafts.visit_crate(&mut krate);
@@ -4870,7 +4997,9 @@ fn transform_with<'tcx>(
     }
     let unmatched_receiver_inputs = receiver_inputs
         .keys()
-        .filter(|key| !receiver_grafts.consumed.contains(key))
+        .filter(|key| {
+            !receiver_grafts.consumed.contains(key) && !receiver_grafts.held.contains(key)
+        })
         .copied()
         .collect::<Vec<_>>();
     if !unmatched_receiver_inputs.is_empty() {
@@ -7156,6 +7285,105 @@ thread_local! {
     /// honest place to count is the one choke point they all pass through. It is
     /// an INSTRUMENT: it changes no verdict and no edit.
     static GRAFT_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// **THE GRAFT FLOOR'S RECEIPT (R515-1 ruling 1).**
+///
+/// One held graft, in the terms a reader can join on: which visitor yielded,
+/// the caller, the class held, who already owned the node, and the span pair.
+///
+/// `reason` is the HOLDER's claimant label, taken from [`Composition::holder`]
+/// — a collision has two parties and the one worth naming is the one that is
+/// still there in the emitted tree. `visitor` is this arm's own label, so the
+/// two together read as "`c9` yielded to `a5-raw` at 1234..1250".
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GraftHeldReceipt {
+    pub(crate) visitor: &'static str,
+    pub(crate) caller: u32,
+    pub(crate) class: u32,
+    pub(crate) reason: &'static str,
+    pub(crate) lo: u32,
+    pub(crate) hi: u32,
+}
+
+thread_local! {
+    /// **The receipts, PER PROGRAM.** Reset beside [`reset_graft_refusals`] in
+    /// the census worker, so a program that is emitted over several revert
+    /// rounds accumulates every hold and `emissions_held` counts a graft held
+    /// again on a later round.
+    static GRAFT_HELD: std::cell::RefCell<Vec<GraftHeldReceipt>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// **The classes to revert, PER ROUND.** A different lifetime from the
+    /// receipts above and deliberately so: the emission asks "what did THIS
+    /// round hold, that the next round must revert?", and answering it with the
+    /// program's accumulated set would re-revert classes an earlier round has
+    /// already taken out. Reset at the top of `transform_with`.
+    static GRAFT_HELD_CLASSES: std::cell::RefCell<
+        std::collections::BTreeSet<super::bridge_receipt::SignatureClassId>,
+    > = const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Per PROGRAM, beside [`reset_graft_refusals`].
+pub(crate) fn reset_graft_held() {
+    GRAFT_HELD.with(|cell| cell.borrow_mut().clear());
+    GRAFT_HELD_CLASSES.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Per ROUND — the class set only. See [`GRAFT_HELD_CLASSES`].
+fn reset_graft_held_classes() {
+    GRAFT_HELD_CLASSES.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Record one hold. **Both sides in one call**, because a receipt without its
+/// class would be a hold nothing reverts and a class without its receipt would
+/// be a revert nothing explains — the two have come apart before.
+pub(crate) fn record_graft_held(
+    receipt: GraftHeldReceipt,
+    class: super::bridge_receipt::SignatureClassId,
+) {
+    GRAFT_HELD.with(|cell| cell.borrow_mut().push(receipt));
+    GRAFT_HELD_CLASSES.with(|cell| {
+        cell.borrow_mut().insert(class);
+    });
+}
+
+/// What THIS round held. The emission reverts these classes whole and re-emits:
+/// a yielded graft means the node carries the other claimant's edit and not
+/// this one's, so the class's remaining edits would ship half-composed.
+pub(crate) fn graft_held_classes()
+-> std::collections::BTreeSet<super::bridge_receipt::SignatureClassId> {
+    GRAFT_HELD_CLASSES.with(|cell| cell.borrow().clone())
+}
+
+pub(crate) fn graft_held_receipts() -> Vec<GraftHeldReceipt> {
+    GRAFT_HELD.with(|cell| cell.borrow().clone())
+}
+
+/// The artifact table. **Written even when it is empty** — a header-only table
+/// says the floor was asked and held nothing, which is exactly the reading a
+/// missing file cannot carry.
+pub(crate) fn graft_held_table() -> String {
+    let mut counted: std::collections::BTreeMap<GraftHeldReceipt, usize> =
+        std::collections::BTreeMap::new();
+    for receipt in graft_held_receipts() {
+        *counted.entry(receipt).or_default() += 1;
+    }
+    let mut out = String::from(
+        "visitor\tcaller_def_index\tclass_order_key\treason\tspan_lo\tspan_hi\temissions_held\n",
+    );
+    for (receipt, emissions) in counted {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            receipt.visitor,
+            receipt.caller,
+            receipt.class,
+            receipt.reason,
+            receipt.lo,
+            receipt.hi,
+            emissions
+        ));
+    }
+    out
 }
 
 pub(crate) fn reset_graft_refusals() {
@@ -10171,10 +10399,218 @@ mod graft_failure_identity_tests {
                 bare.push(body.split_whitespace().collect::<Vec<_>>().join(" "));
             }
         }
-        assert_eq!(total, 19, "the failure vocabulary is nineteen strings");
+        // **Nineteen minus the four the FLOOR deleted (R515-1 ruling 3).** The
+        // collision string of each of the four graft arms is gone, because a
+        // collision no longer fails: the arm yields, its class is reverted
+        // whole, and the hold is receipted in `<program>.graft-held.tsv`.
+        //
+        // Moving this number is how the previous hole was hidden, so it does not
+        // move on its own: `graft_floor_tests::r515_1_every_arm_yields_..`
+        // asserts that those four sites assign no failure at all, and the pair
+        // of counts only agrees when both are true.
+        assert_eq!(
+            total, 15,
+            "the failure vocabulary is nineteen minus the four collision strings the floor deleted"
+        );
         assert!(
             bare.is_empty(),
             "a graft failure that names no site cannot be diagnosed from a log: {bare:#?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod graft_floor_tests {
+    use super::*;
+
+    /// The four arms, as `(visitor label, the claim's claimant string)`. Keeping
+    /// them in one place is deliberate: a fifth arm added without a line here is
+    /// the failure this file has seen three times (a receipt with no channel, a
+    /// scan that could not see the site it was written for, a control that
+    /// confirmed the case its author expected). The `composition` arm is
+    /// wave-6l's and joins this table when their commit composes.
+    const ARMS: [(&str, &str); 4] = [
+        ("a5-raw", "\"a5-raw\""),
+        ("pair-raw", "\"pair-raw\""),
+        ("c9", "\"c9\""),
+        ("receiver", "\"receiver-input\""),
+    ];
+
+    /// Production source with comments stripped and the tests cut off, so a
+    /// scan cannot be satisfied by prose or by its own text. Same shape as
+    /// `r511_3_..`'s, and for the same reason.
+    fn production() -> String {
+        let source = include_str!("ast_transform.rs");
+        // **Cut at the FIRST test module, not at this one.** This module is the
+        // last in the file, so splitting on its own name would hand the scan
+        // the sibling test module above it as "production" — and that module's
+        // string literals are exactly the strings these scans look for.
+        let source = source
+            .split("mod graft_failure_identity_tests")
+            .next()
+            .expect("production precedes every test module here");
+        let strip = |line: &str| -> String {
+            let bytes = line.as_bytes();
+            let (mut quoted, mut index) = (false, 0);
+            while index + 1 < bytes.len() {
+                match bytes[index] {
+                    b'\\' if quoted => index += 1,
+                    b'"' => quoted = !quoted,
+                    b'/' if !quoted && bytes[index + 1] == b'/' => return line[..index].to_owned(),
+                    _ => {}
+                }
+                index += 1;
+            }
+            line.to_owned()
+        };
+        source.lines().map(strip).collect::<Vec<_>>().join("\n")
+    }
+
+    /// **The floor, arm by arm.** A refused `guard.claim` must YIELD: record the
+    /// hold with both parties, add the key to `held`, and return — and above all
+    /// it must not assign `self.failure`, which the apply site turns into `Err`
+    /// and `mod.rs` turns into `round-0 emit failed` for the whole program.
+    /// batch 26 and batch 27 each lost brotli's entire emission that way.
+    #[test]
+    fn r515_1_every_arm_yields_instead_of_aborting() {
+        let code = production();
+        for (visitor, claimant) in ARMS {
+            let at = code
+                .find(&format!(
+                    "guard\n            .claim(expression.id, expression.span, {claimant})"
+                ))
+                .or_else(|| {
+                    code.find(&format!(
+                        ".claim(expression.id, expression.span, {claimant})"
+                    ))
+                })
+                .or_else(|| code.find(&format!(".claim(e.id, e.span, {claimant})")))
+                .unwrap_or_else(|| panic!("no `guard.claim(.., {claimant})` in production"));
+            // The refusal body runs to its `return;`, which every arm has.
+            let rest = &code[at..];
+            let end = rest.find("\n        }").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("record_graft_held("),
+                "{visitor}: a refused claim must RECORD its hold"
+            );
+            assert!(
+                body.contains(&format!("visitor: \"{visitor}\"")),
+                "{visitor}: the receipt must name this arm, not another"
+            );
+            assert!(
+                body.contains("self.held.insert(key)"),
+                "{visitor}: a held key must be recorded held, or `unmatched` aborts on it"
+            );
+            assert!(
+                !body.contains("self.failure = Some"),
+                "{visitor}: a collision is ONE class's problem, never the program's"
+            );
+        }
+    }
+
+    /// **The `unmatched` trap, arm by arm (R515-1 ruling 3).** Every arm inserts
+    /// into `consumed` only on SUCCESS, so a yielded key is indistinguishable
+    /// from a key the walk never reached — and each arm's `unmatched` check
+    /// would then abort the program for exactly the hold the floor granted. The
+    /// filters must subtract the held set.
+    #[test]
+    fn r515_1_every_unmatched_check_subtracts_the_held_set() {
+        let code = production();
+        for visitor in ["a5_raw", "pair_raw", "c9", "receiver_grafts"] {
+            let consumed = format!("!{visitor}.consumed.contains(key)");
+            assert!(
+                code.contains(&consumed),
+                "{visitor}: no `unmatched` filter over `consumed` found — has it been renamed?"
+            );
+            let at = code.find(&consumed).expect("just checked");
+            let window = &code[at..(at + 160).min(code.len())];
+            assert!(
+                window.contains(&format!("{visitor}.held.contains(key)")),
+                "{visitor}: `unmatched` does not subtract the held set, so a held \
+                 key still aborts the program"
+            );
+        }
+    }
+
+    /// The receipt table: header alone when nothing was held, one row per
+    /// distinct hold with `emissions_held`, ordered, and a reset is a reset.
+    #[test]
+    fn r515_1_the_held_table_says_asked_and_held_nothing() {
+        reset_graft_held();
+        assert_eq!(
+            graft_held_table(),
+            "visitor\tcaller_def_index\tclass_order_key\treason\tspan_lo\tspan_hi\temissions_held\n",
+            "an empty table is a HEADER, not a missing file — that distinction is \
+             the whole reason this channel exists"
+        );
+        assert!(graft_held_classes().is_empty());
+    }
+
+    #[test]
+    fn r515_1_a_graft_held_twice_counts_its_emissions() {
+        reset_graft_held();
+        // `SignatureClassId` wraps a `LocalDefId`; the crate root is the one such id
+        // a unit test can name without a `TyCtxt`.
+        let class =
+            super::super::bridge_receipt::SignatureClassId::of(rustc_hir::def_id::CRATE_DEF_ID);
+        let receipt = |visitor, lo| GraftHeldReceipt {
+            visitor,
+            caller: 3,
+            class: 7,
+            reason: "a5-raw",
+            lo,
+            hi: lo + 10,
+        };
+        record_graft_held(receipt("c9", 100), class);
+        record_graft_held(receipt("c9", 100), class);
+        record_graft_held(receipt("receiver", 200), class);
+        let table = graft_held_table();
+        let rows = table.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                "c9\t3\t7\ta5-raw\t100\t110\t2",
+                "receiver\t3\t7\ta5-raw\t200\t210\t1",
+            ],
+            "one row per distinct hold, `emissions_held` counting the repeats"
+        );
+        assert_eq!(graft_held_classes().len(), 1, "one class, held three times");
+        reset_graft_held();
+        assert_eq!(graft_held_table().lines().count(), 1, "a reset is a reset");
+        assert!(graft_held_classes().is_empty());
+    }
+
+    /// The two lifetimes are DIFFERENT and deliberately so: the emission asks
+    /// the class set "what did THIS round hold?", while the census asks the
+    /// receipts "what did this PROGRAM hold?". Resetting one must not reset the
+    /// other, or the next round re-reverts classes already taken out.
+    #[test]
+    fn r515_1_the_class_set_is_per_round_and_the_receipts_are_per_program() {
+        reset_graft_held();
+        let class =
+            super::super::bridge_receipt::SignatureClassId::of(rustc_hir::def_id::CRATE_DEF_ID);
+        record_graft_held(
+            GraftHeldReceipt {
+                visitor: "pair-raw",
+                caller: 1,
+                class: 11,
+                reason: "seam",
+                lo: 5,
+                hi: 9,
+            },
+            class,
+        );
+        reset_graft_held_classes();
+        assert!(
+            graft_held_classes().is_empty(),
+            "the per-round set clears with the round"
+        );
+        assert_eq!(
+            graft_held_table().lines().count(),
+            2,
+            "the program's receipt survives the round that produced it"
+        );
+        reset_graft_held();
     }
 }

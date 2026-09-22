@@ -12275,6 +12275,13 @@ mod run {
         // the capture, read after, so the count belongs to THIS program and not
         // to whatever ran in the worker before it.
         crate::bo_rewriter::ast_transform::reset_graft_refusals();
+        // **R515-1 ruling 1** — same rhythm, same reason: the grafts held below
+        // are THIS program's. The RECEIPTS accumulate across the program's
+        // revert rounds (a graft held again on a later round is a second row's
+        // `emissions_held`); the class set the emission reverts from is reset
+        // per round inside `transform_with`, because only it is a question
+        // about one round.
+        crate::bo_rewriter::ast_transform::reset_graft_held();
         let capture = match super::cache_only_before_solve(
             entry_available
                 .then_some(())
@@ -12625,6 +12632,21 @@ mod run {
             )
             .expect("write shared-pair terminal receipts");
         }
+        // **R515-1 ruling 1 — THE GRAFT FLOOR'S RECEIPT, one table for all five
+        // visitors.**
+        //
+        // UNCONDITIONAL, unlike the table above it: a header-only file says the
+        // floor was asked and held nothing, and a missing file cannot say that.
+        // That ambiguity is the defect this channel exists for — report 069a
+        // found `composition_held` written into a field whose one consumer
+        // destructures it and drops every field, so a held composition reached
+        // no artifact at all and "the floor held nothing" was indistinguishable
+        // from "nobody kept the line".
+        std::fs::write(
+            directory.join(format!("{name}.graft-held.tsv")),
+            stamp(&crate::bo_rewriter::ast_transform::graft_held_table()),
+        )
+        .expect("write graft-held receipts");
         // **R464-5 (wave-6f 040 STOP 1)** — the field receipt's `revert_status`
         // against the final-revert table, checked on the PUBLISHED rows rather
         // than on the predicate that wrote them.
