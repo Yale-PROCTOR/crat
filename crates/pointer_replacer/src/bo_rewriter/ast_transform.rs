@@ -626,7 +626,10 @@ fn expr(kind: rustc_ast::ExprKind) -> P<rustc_ast::Expr> {
 /// spans only.
 pub(crate) fn finish_len(seam_len: &SeamLen, parsed: rustc_ast::Expr) -> P<rustc_ast::Expr> {
     match seam_len {
-        SeamLen::Licensed(_) | SeamLen::MaskDerived(_) => expr(rustc_ast::ExprKind::Cast(
+        SeamLen::Licensed(_)
+        | SeamLen::MaskDerived(_)
+        // R500-8: rendered as the companion it is; the receipt carries the guess.
+        | SeamLen::PositionalSibling { .. } => expr(rustc_ast::ExprKind::Cast(
             expr(rustc_ast::ExprKind::Paren(P(parsed))),
             P(usize_ty()),
         )),

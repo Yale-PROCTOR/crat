@@ -118,6 +118,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         width: None,
         alias: None,
         decl: None,
+        count_positional: None,
         handle: Some(text),
         uses: edits,
     })

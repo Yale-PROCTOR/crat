@@ -52,6 +52,12 @@ pub(crate) struct Contract {
     /// declaration family reads this to mark it declaration-free (relay
     /// wave-6v/030 route (a); wave-6k relay 035).
     pub(crate) alias: Option<HirId>,
+    /// **The count was picked BY POSITION (R500-8).** When no store in the body
+    /// names one sibling as the length, the sibling immediately following the
+    /// pointer in the signature is admissible — and the receipt says so: the
+    /// extent is counted with §77's fabricated ones, never as evidence. `None`
+    /// is the ordinary case, a count the body itself pairs with the pointer.
+    pub(crate) count_positional: Option<String>,
     /// **The alias's own declaration (R491-6, route (i)).** Its initializer —
     /// `let a = P as *const B` → `P.unwrap_or(&[])` — is the one edit that
     /// belongs to the ALIAS and not to the parameter, so the contract plans it
@@ -282,6 +288,7 @@ fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         nullable: false,
         alias: None,
         decl: None,
+        count_positional: None,
         handle: None,
         width: None,
         uses: vec![UseEdit {
@@ -487,6 +494,7 @@ fn prove_forward(
                     nullable: contract.nullable,
                     alias: None,
                     decl: None,
+                    count_positional: None,
                     handle: None,
                     width: contract
                         .width

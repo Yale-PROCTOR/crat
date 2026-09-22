@@ -318,6 +318,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
             width: None,
             alias: Some(alias),
             decl,
+            count_positional: None,
             handle: None,
             uses,
         });
@@ -385,6 +386,7 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         nullable,
         alias: Some(alias),
         decl,
+        count_positional: None,
         handle: None,
         uses,
     })

@@ -282,6 +282,13 @@ pub(crate) enum SeamLen {
     /// §77. Both halves of the ruling in one value: the emitted length is the
     /// derived text, the receipt says fabricated.
     MaskDerived(String),
+    /// **R500-8 — the count picked BY POSITION.** The sibling immediately
+    /// following the pointer in the signature is admissible as the count, and
+    /// the emitted length IS that argument's text — but a positional pick is a
+    /// guess, not evidence, so the receipt counts it with the fabricated
+    /// extents under §77 exactly as the 1024 fallback is counted. The
+    /// parameter's name rides along so the receipt can name what was guessed.
+    PositionalSibling { text: String, param: String },
 }
 
 impl SeamLen {
@@ -291,6 +298,7 @@ impl SeamLen {
     pub(crate) fn text(&self) -> &str {
         match self {
             SeamLen::Licensed(t) | SeamLen::MaskDerived(t) => t,
+            SeamLen::PositionalSibling { text, .. } => text,
             SeamLen::Fabricated => FABRICATED_LEN_PATH,
         }
     }
@@ -298,7 +306,19 @@ impl SeamLen {
     /// **Counted as fabricated, deliberately** — the mask bounds the indexes
     /// and nothing else, and §77's audit is where that residue is counted.
     pub(crate) fn is_fabricated(&self) -> bool {
-        matches!(self, SeamLen::Fabricated | SeamLen::MaskDerived(_))
+        matches!(
+            self,
+            SeamLen::Fabricated | SeamLen::MaskDerived(_) | SeamLen::PositionalSibling { .. }
+        )
+    }
+
+    /// What was guessed, when the length is a positional pick: the receipt
+    /// reads `fallback(sibling-by-position:<param>)`.
+    pub(crate) fn positional_param(&self) -> Option<&str> {
+        match self {
+            SeamLen::PositionalSibling { param, .. } => Some(param),
+            _ => None,
+        }
     }
 }
 
@@ -1353,6 +1373,7 @@ impl GlueSpec {
         match self.len.as_ref() {
             Some(SeamLen::Licensed(_)) => "evidence-backed",
             Some(SeamLen::MaskDerived(_)) => "mask-plus-one@addendum-77",
+            Some(SeamLen::PositionalSibling { .. }) => "fallback-sibling-by-position@addendum-77",
             Some(SeamLen::Fabricated) => "fallback-1024",
             None => "-",
         }
@@ -1627,7 +1648,11 @@ impl GlueSpec {
                     // R477-6: the masked companion's text is a call-site
                     // expression like the licensed one and is rendered the same
                     // way; only the receipt tells them apart.
-                    SeamLen::Licensed(len) | SeamLen::MaskDerived(len) => {
+                    SeamLen::Licensed(len)
+                    | SeamLen::MaskDerived(len)
+                    // R500-8: a positional count is a call-site expression too;
+                    // only the receipt tells it from a licensed one.
+                    | SeamLen::PositionalSibling { text: len, .. } => {
                         format!("core::slice::{ctor}({base}, ({len}) as usize)")
                     }
                     // **No cast and no parentheses**: the const is declared
@@ -3300,6 +3325,8 @@ pub(crate) fn receipt_extent(spec: &GlueSpec) -> BridgeExtentKind {
     match spec.len.as_ref() {
         Some(SeamLen::Licensed(source)) => BridgeExtentKind::Evidence(source.clone()),
         Some(SeamLen::MaskDerived(source)) => BridgeExtentKind::MaskPlusOne(source.clone()),
+        // R500-8: the text is the caller's own argument, the receipt is a fallback.
+        Some(SeamLen::PositionalSibling { .. }) => BridgeExtentKind::Fallback,
         Some(SeamLen::Fabricated) => BridgeExtentKind::Fallback,
         None => BridgeExtentKind::None,
     }
@@ -3527,6 +3554,18 @@ fn build_candidate(
     // chain also proved it is a MASK, which the receipt must say.
     if len_masked && let Some(SeamLen::Licensed(text)) = spec.len.clone() {
         spec.len = Some(SeamLen::MaskDerived(text));
+    }
+    // **R500-8.** The count was picked by POSITION — the sibling following the
+    // pointer — so the emitted length is that argument's own text and the
+    // receipt is a fabricated extent under §77, counted beside the 1024s.
+    if let Some((contract, _)) = counted
+        && let Some(param) = &contract.count_positional
+        && let Some(SeamLen::Licensed(text)) = spec.len.clone()
+    {
+        spec.len = Some(SeamLen::PositionalSibling {
+            text,
+            param: param.clone(),
+        });
     }
     if let Some((contract, route)) = counted {
         // **R464-3 — the fallback extent at the CALL SITE.** A raw caller of a

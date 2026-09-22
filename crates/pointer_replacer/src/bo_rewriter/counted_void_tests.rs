@@ -1840,6 +1840,7 @@ fn w6v_a_withheld_half_of_the_alias_transaction_withdraws_the_other() {
         (owner, param),
         Contract {
             count_index: 1,
+            count_positional: None,
             element: ByteElement::Read,
             nullable: true,
             handle: None,
@@ -1911,17 +1912,98 @@ unsafe fn json_parse_ex(mut src: *const core::ffi::c_void, mut src_size: size_t,
 "#;
 
 #[test]
-fn w6v_counted_store_refuses_an_ambiguous_count() {
+fn w6v_counted_store_picks_the_following_sibling_by_position() {
     let rows = super::emit_tests::decisions_of(JSON_REAL);
     assert!(
         rows.iter()
-            .any(|(n, p, r)| n == "src" && *p && r != "<emitted>"),
-        "two parameters stored into one aggregate leave no evidence-backed count: {rows:?}"
+            .any(|(n, p, r)| n == "src" && *p && r == "<emitted>"),
+        "the positional clause gives the ambiguous shape its count: {rows:?}"
     );
     let source = super::emit_tests::ast_emitted_source_of(JSON_REAL).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fnjson_parse_ex(mutsrc:Option<&[u8]>,mutsrc_size:size_t,"),
+        "the view takes the sibling that follows the pointer: {source}"
+    );
+    assert!(
+        c.contains(
+            "state.src=src.map_or(0as*consti8,|__crat_cv_src|__crat_cv_src.as_ptr()as*consti8);"
+        ),
+        "the store keeps its raw form: {source}"
+    );
+    assert!(
+        c.contains("state.flags_bitset=flags_bitset;"),
+        "the other stored parameter is untouched: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// **The control: a positional pick needs an integer (R500-8).**
+///
+/// The sibling following the pointer is a pointer of its own here, so there is
+/// nothing to read as a length and the rule refuses rather than guess further.
+const STORE_NON_INTEGER_SIBLING: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+pub struct holder { pub src: *const u8, pub other: *const u8, pub size: u64 }
+unsafe fn take(mut src: *const core::ffi::c_void, mut other: *const u8, mut n: u64) -> i32 {
+    let mut h = holder { src: 0 as *const u8, other: 0 as *const u8, size: 0 };
+    if src.is_null() { return -(1 as i32); }
+    h.src = src as *const u8;
+    h.other = other;
+    h.size = n;
+    return 0 as i32;
+}
+"#;
+
+#[test]
+fn w6v_counted_store_refuses_a_non_integer_following_sibling() {
+    let rows = super::emit_tests::decisions_of(STORE_NON_INTEGER_SIBLING);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "src" && *p && r != "<emitted>"),
+        "no integer follows the pointer, so there is no count to pick: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(STORE_NON_INTEGER_SIBLING).unwrap();
     assert!(
         compact(&source).contains("mutsrc:*constcore::ffi::c_void"),
         "the parameter stays raw: {source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// **The receipt tells the truth (R500-8).** A positional count is emitted as
+/// the caller's own argument text and counted with §77's fabricated extents —
+/// never as evidence, because a guess is not evidence.
+#[test]
+fn w6v_positional_count_receipts_as_a_fabricated_extent() {
+    use super::decision::seam::{GlueCore, GlueSpec, SeamLen};
+    let mut spec = GlueSpec::core(GlueCore::Bare, false);
+    spec.len = Some(SeamLen::PositionalSibling {
+        text: "src_size".to_owned(),
+        param: "src_size".to_owned(),
+    });
+    assert_eq!(
+        spec.extent_arm_key(),
+        "fallback-sibling-by-position@addendum-77"
+    );
+    assert!(
+        spec.len.as_ref().is_some_and(SeamLen::is_fabricated),
+        "a positional extent is counted with the fabricated ones (§77)"
+    );
+    assert_eq!(
+        spec.len.as_ref().and_then(SeamLen::positional_param),
+        Some("src_size"),
+        "and the receipt names what was guessed"
+    );
+    assert_eq!(spec.len.as_ref().map(SeamLen::text), Some("src_size"));
+    let licensed = {
+        let mut other = GlueSpec::core(GlueCore::Bare, false);
+        other.len = Some(SeamLen::Licensed("src_size".to_owned()));
+        other
+    };
+    assert_ne!(
+        spec.extent_arm_key(),
+        licensed.extent_arm_key(),
+        "the same text, and never the same receipt"
+    );
 }
