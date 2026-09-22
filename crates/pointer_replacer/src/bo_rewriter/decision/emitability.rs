@@ -1587,6 +1587,12 @@ pub(crate) struct SliceUses {
     /// SHARED one — whatever the declared `*mut` of the C signature says.
     pub foreign_const_bridges: u32,
     pub other_rewrites: u32,
+    /// **main 071c (a) — the assignment that IS the construction**, admitted
+    /// here rather than counted as an unsupported use. Condition 4's receipt:
+    /// the span and the evidence it matched, so a census can audit the
+    /// admission instead of inferring it from a subject that stopped being
+    /// held.
+    pub sized_assignments: Vec<super::sized_assignment::SizedAssignment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2391,7 +2397,16 @@ fn collect_slice_uses_with_family(
                     .as_ref()
                     .and_then(|edit| edit.as_ref())
                     .and(self.foreign_argument_is_shared(expr, key));
+                let admitted = super::sized_assignment::admit(
+                    self.tcx,
+                    expr,
+                    key,
+                    self.mutable_of.contains(&key),
+                );
                 let entry = self.out.entry(key).or_default();
+                if let Some(admitted) = admitted {
+                    entry.sized_assignments.push(admitted);
+                }
                 match classified {
                     // **S3.2′-2b — three outcomes, not two.** The self-advance
                     // assignment's TARGET (`p` on the left of `p = p.offset(1)`)
@@ -2710,8 +2725,30 @@ fn collect_slice_uses_with_family(
                     // own sign authority, which admits the C2Rust double-cast
                     // literal the narrower walk refuses.
                     || super::slice_forms::assignment_from_forward_view(self.tcx, use_expr, key)
+                // **main 071c (a), wave-4: the assignment IS the
+                // construction.** A null-declared binding whose SOLE
+                // assignment reads the very field its extent evidence names
+                // is not writing to a slice — it is building one, and the
+                // right-hand side is the construction planner's to render.
                 {
                     return Some(None);
+                }
+                // **main 071c (a), wave-4: the assignment IS the
+                // construction.** A null-declared binding whose SOLE assignment
+                // reads the very field its extent evidence names is not writing
+                // to a slice — it is building one, and the right-hand side
+                // carries the construction so the crate stays well typed.
+                if let Some(admitted) = super::sized_assignment::admit(
+                    self.tcx,
+                    use_expr,
+                    key,
+                    self.mutable_of.contains(&key),
+                ) {
+                    return Some(Some(UseEdit {
+                        span: admitted.value_span,
+                        replacement: admitted.value,
+                        bridge_kind: "sized-assignment",
+                    }));
                 }
                 if !self.advance_ok.contains(&key) {
                     return None;

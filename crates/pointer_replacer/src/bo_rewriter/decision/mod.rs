@@ -120,6 +120,7 @@ pub(crate) mod seam;
 pub(crate) mod shared_read_pairs;
 pub(crate) mod shared_weakening;
 pub(crate) mod sibling_overlap;
+pub(crate) mod sized_assignment;
 pub(crate) mod slice_carrier;
 pub(crate) mod slice_construction_values;
 pub(crate) mod slice_forms;

@@ -2677,8 +2677,34 @@ fn w4b109_a_null_declared_local_takes_its_sole_assignment() {
     // row cannot yet take the form. Recorded, not asserted away — the residue
     // moves from "no extent" to "an extent this build cannot carry", which is
     // precisely the distinction B1's two columns exist to keep.
-    assert_eq!(storage.1, "held", "{rows:?}");
-    assert_eq!(storage.3, "slice-use-unsupported", "{rows:?}");
+    assert_eq!(
+        storage.1, "lifted",
+        "main 071c (a): the assignment is the construction, so the root's own \
+         initializer no longer holds it: {rows:?}"
+    );
+    // **And it must EMIT, not merely decide.** The first wiring of the
+    // admission produced two defects at once and both are pinned here: a
+    // declaration rendered `from_raw_parts_mut(0 as *mut T, 1024)` — a slice on
+    // a NULL base, instant UB of a kind §77 does not waive — and an assignment
+    // left as a raw pointer on the right of a `&mut [T]` binding, an ill-typed
+    // crate. The empty slice is what the binding holds until the assignment,
+    // and the assignment carries the construction.
+    let source = emitted(W4_B1_DECLARED_NULL_FIELD);
+    assert!(
+        source.contains("let mut storage: &mut [u8] = &mut [];"),
+        "no slice may be built on a null base: {source}"
+    );
+    assert!(
+        source.contains("storage = core::slice::from_raw_parts_mut((*s).storage_,"),
+        "the assignment carries the construction: {source}"
+    );
+    assert!(
+        !source.contains("from_raw_parts_mut(0 as *mut uint8_t"),
+        "the null-base construction must be gone: {source}"
+    );
+    // The parameter one hop along still waits on ITS use: the argument's image
+    // at a callee that is still raw is wave-6s2's pass-on question, not this
+    // rule's, and main's answer does not reach it.
     let parameter = rows
         .iter()
         .find(|(subject, ..)| subject.starts_with("StoreInnerDeclared::storage"))

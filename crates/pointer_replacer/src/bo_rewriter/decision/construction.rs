@@ -526,7 +526,7 @@ fn is_byte_element(element_type: &str) -> bool {
 /// beside `size_`, `total_size_` and `cur_size_`, and `buffer_` is an interior
 /// pointer into `data_` — so a struct-level size would state the wrong extent
 /// for it. A name derived from the field itself cannot make that mistake.
-fn sibling_names(field: &str) -> Vec<(String, bool)> {
+pub(crate) fn sibling_names(field: &str) -> Vec<(String, bool)> {
     let (base, suffix) = match field.strip_suffix('_') {
         Some(base) => (base, "_"),
         None => (field, ""),
@@ -536,6 +536,14 @@ fn sibling_names(field: &str) -> Vec<(String, bool)> {
         names.push((format!("{base}_{word}{suffix}"), false));
     }
     names
+}
+
+/// The cast-peeling [`super::sized_assignment`] needs, kept here so both halves
+/// of the rule read a right-hand side exactly the same way.
+pub(crate) fn peel_for_sized_assignment<'h>(
+    expression: &'h rustc_hir::Expr<'h>,
+) -> &'h rustc_hir::Expr<'h> {
+    Collector::peel(expression)
 }
 
 /// **R499-2 (B1's parameter-emission half) — the root is a FIELD whose size is
@@ -1443,7 +1451,21 @@ pub(crate) fn plan_slice_constructions(
             continue;
         }
         let rendered =
-            if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
+            // **A slice may never be built on a NULL base** (wave-4 report 053).
+            // C2Rust writes `let mut p = 0 as *mut T;` for a C declaration, and
+            // the general arm below would render
+            // `from_raw_parts_mut(0 as *mut T, FALLBACK_SLICE_EXTENT)` — which
+            // is instant UB of a kind §77 does NOT waive: that waiver is about
+            // a LENGTH claimed over a real allocation, and this has no
+            // allocation at all. The binding holds nothing until its
+            // assignment, and the empty slice is exactly that value.
+            if matches!(facts.by_binding.get(&node), Some(Construction::NullLit)) && !nullable {
+                Ok(if mutable {
+                    "&mut []".to_owned()
+                } else {
+                    "&[]".to_owned()
+                })
+            } else if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
                 // R410-9 (b): each literal arm is its own construction with its
                 // own byte length; the outer `as *mut c_char` cast is dropped with
                 // the arms' casts kept inside `from_raw_parts` (a `*mut` operand
