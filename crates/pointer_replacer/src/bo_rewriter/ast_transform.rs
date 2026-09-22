@@ -1316,15 +1316,6 @@ pub(crate) struct UseGraftStats {
     /// site's range and differ only in `SyntaxContext`, which the `(lo, hi)`
     /// key drops. Corpus expectation is 0 and it is GATED.
     pub multi_matched: usize,
-    /// **W6L-FLOOR (R490-2(b)).** Compositions this pass could not locate, one
-    /// receipt each: the outer edit's text does not contain the call's printed
-    /// form (the outer renderer embedded it with its arguments already
-    /// adapted), so the view cannot be spliced into it. The composition is
-    /// SKIPPED and the receipt carries the caller, the view's owner class and
-    /// the span pair — the program still emits, and the class is held by the
-    /// ordinary revert path rather than by aborting the whole program at
-    /// round 0 (wave-5d 055: five views switching on aborted heman entirely).
-    pub composition_held: Vec<String>,
     /// `(offset, rendered text)` per graft — the text differential's left-hand
     /// side, keyed exactly as the declaration renders are.
     pub rendered: Vec<(u32, String)>,
@@ -10625,6 +10616,144 @@ mod graft_floor_tests {
         reset_graft_held();
         assert_eq!(graft_held_table().lines().count(), 1, "a reset is a reset");
         assert!(graft_held_classes().is_empty());
+    }
+
+    /// **THE FLOOR, EXERCISED (R523-5, report 045 STOP 2 (a)).**
+    ///
+    /// Every witness the floor had was a source scan or a unit test on the
+    /// recorder: they prove the yield is WRITTEN, not that it WORKS. Report 043
+    /// scored acceptance check 1 PARTIAL for exactly that, and batch 28 then
+    /// declined to supply the case — twenty `graft-held.tsv` files, every one
+    /// header-only, so no arm refused a claim anywhere in the corpus and the
+    /// path has still never run.
+    ///
+    /// So the collision is CONSTRUCTED, the way `two_transforms_may_not_claim_
+    /// one_node` constructs its own: another arm claims the node first, and the
+    /// C-9 arm is driven over it. What is asserted is the whole floor, not its
+    /// text — no failure, the node keeps the holder's edit, the key is recorded
+    /// HELD (not consumed, or `unmatched` aborts on it), the receipt names both
+    /// parties, and the class reaches the per-round revert set.
+    #[test]
+    fn w6l_floor_a_refused_claim_yields_and_is_receipted() {
+        // Parsing and printing need a source map, as every other parsing test
+        // in this file does.
+        rustc_span::create_default_session_globals_then(
+            w6l_floor_a_refused_claim_yields_and_is_receipted_inner,
+        );
+    }
+
+    fn w6l_floor_a_refused_claim_yields_and_is_receipted_inner() {
+        use rustc_span::{BytePos, Span, SyntaxContext};
+
+        use crate::analyses::borrow_ownership::{
+            a5_overlap::{C9MarkKey, PairSide},
+            a5_producer::PlannedC9Mark,
+            l2::{MirLocationKey, SlotKey},
+        };
+
+        let slot = |slot| SlotKey {
+            variant: 1,
+            owner: 1,
+            slot,
+        };
+        // The same shape `c9::tests::mark()` builds: the shared side is the
+        // RIGHT formal, param 2, so the rendering rewrites argument index 1 and
+        // a two-argument call is within arity.
+        let key = C9MarkKey::new(
+            1,
+            MirLocationKey::new(4, 2),
+            [2],
+            2,
+            1,
+            slot(1),
+            2,
+            slot(2),
+            PairSide::Right,
+            "i32".to_owned(),
+        )
+        .expect("the pair key is well-formed");
+        let span = Span::new(BytePos(10), BytePos(20), SyntaxContext::root(), None);
+        let mark = PlannedC9Mark {
+            key,
+            endpoint_slots: std::collections::BTreeSet::new(),
+            call_span: span,
+            caller_did: rustc_hir::def_id::CRATE_DEF_ID,
+            owner_did: rustc_hir::def_id::CRATE_DEF_ID,
+            owner_fn: "fixture".to_owned(),
+        };
+        let marks: FxHashMap<(u32, u32), &PlannedC9Mark> =
+            [((10u32, 20u32), &mark)].into_iter().collect();
+
+        let drive = |contested: bool| {
+            reset_graft_held();
+            let mut expression = graft_expr("f(a, b)").expect("the fixture parses");
+            // A dummy span is walked past; the mark is keyed on this one.
+            expression.span = span;
+            let before = rustc_ast_pretty::pprust::expr_to_string(&expression);
+            let mut guard = Composition::default();
+            if contested {
+                assert!(
+                    guard.claim(expression.id, span, "a5-raw"),
+                    "the premise: another arm owns the node FIRST"
+                );
+            }
+            let mut c9 = C9GraftVisitor {
+                marks: &marks,
+                guard: &mut guard,
+                consumed: FxHashSet::default(),
+                held: FxHashSet::default(),
+                failure: None,
+            };
+            c9.visit_expr(&mut expression);
+            let after = rustc_ast_pretty::pprust::expr_to_string(&expression);
+            (
+                c9.failure.clone(),
+                c9.held.contains(&(10, 20)),
+                c9.consumed.contains(&(10, 20)),
+                before,
+                after,
+            )
+        };
+
+        // **The positive control runs FIRST**, so a witness that passed because
+        // the rendering failed before ever reaching the claim cannot hide: with
+        // no incumbent, the mark grafts and the text changes.
+        let (failure, held, consumed, before, after) = drive(false);
+        assert_eq!(failure, None, "an uncontested mark must graft");
+        assert!(consumed && !held, "uncontested: consumed, not held");
+        assert_ne!(after, before, "uncontested: the node receives the edit");
+        assert!(
+            after.contains("__crat_c9_4_2"),
+            "uncontested: the companion temp is what it grafted: {after}"
+        );
+        assert_eq!(
+            graft_held_table().lines().count(),
+            1,
+            "uncontested: nothing held"
+        );
+
+        // And now the collision.
+        let (failure, held, consumed, before, after) = drive(true);
+        assert_eq!(
+            failure, None,
+            "a collision is ONE class's problem: it must not fail the program"
+        );
+        assert!(held, "the yielded key must be recorded HELD");
+        assert!(!consumed, "a yielded key was not consumed");
+        assert_eq!(after, before, "the node keeps the holder's edit, untouched");
+        assert_eq!(
+            graft_held_table(),
+            "visitor\tcaller_def_index\tclass_order_key\treason\tspan_lo\tspan_hi\temissions_held\n\
+             c9\t0\t0\ta5-raw\t10\t20\t1\n",
+            "the receipt names both parties: this arm in `visitor`, the incumbent in `reason`"
+        );
+        assert_eq!(
+            graft_held_classes().len(),
+            1,
+            "the held class must reach the per-round revert set, or its other \
+             edits ship around a node that never received this one"
+        );
+        reset_graft_held();
     }
 
     /// **The FIFTH arm, wave-6l's (relay 045 item 1).** A composition this pass

@@ -9760,8 +9760,6 @@ mod run {
                 let crate::bo_rewriter::ast_transform::UseGraftStats {
                     grafted: _,
                     composed_over_inner: _,
-                    // W6L-FLOOR (R490-2(b)): receipts, not a gate here.
-                    composition_held: _,
                     parse_failed: _,
                     parse_failures: _,
                     unmatched: _,
@@ -12650,7 +12648,7 @@ mod run {
         // UNCONDITIONAL, unlike the table above it: a header-only file says the
         // floor was asked and held nothing, and a missing file cannot say that.
         // That ambiguity is the defect this channel exists for — report 069a
-        // found `composition_held` written into a field whose one consumer
+        // found `composition_held` written into a field (since removed) whose one consumer
         // destructures it and drops every field, so a held composition reached
         // no artifact at all and "the floor held nothing" was indistinguishable
         // from "nobody kept the line".
