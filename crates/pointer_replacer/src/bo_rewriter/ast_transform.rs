@@ -5985,7 +5985,12 @@ pub(crate) fn filtered_inputs(
         }
     }
     // wave-6f: a field transaction's expression edits, active only while none
-    // of its owners is reverted (the plan closes the revert set over them).
+    // of its DEPENDENT owners is reverted — the set `Plan::field_transaction_
+    // owners` closes over, not the wider `owners` the receipt prints. That is
+    // exactly enough: a non-dependent owner's revert restores its own
+    // signature and leaves these edits in place, and the tree still
+    // type-checks, because the edits are keyed by span. Measured — report 054,
+    // `w6f_a_non_dependent_owners_revert_leaves_the_text`.
     for transaction in table.field_transactions.active(&reverts.fns) {
         // Wrapping edits compose in the AST (`field_reference_ast::apply_wraps`)
         // after this text channel has grafted their inner edits.
