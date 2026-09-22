@@ -432,7 +432,7 @@ impl PairDisjointnessIndex {
             };
             let body = tcx.hir_body(body_id);
             let typeck = tcx.typeck(caller);
-            let (classes, why) = classify_locals(tcx, typeck, body, &allocators, caller);
+            let (classes, why, prefixes) = classify_locals(tcx, typeck, body, &allocators, caller);
             let mut collector = CallCollector {
                 tcx,
                 typeck,
@@ -440,6 +440,7 @@ impl PairDisjointnessIndex {
                 classes: &classes,
                 fresh_fields: &fresh_fields,
                 why: &why,
+                prefixes: &prefixes,
                 calls: Vec::new(),
             };
             collector.visit_body(body);
@@ -1648,7 +1649,7 @@ fn allocator_wrappers<'a>(
                 continue;
             }
             let typeck = tcx.typeck(function);
-            let (classes, _why) = classify_locals(tcx, typeck, body, &oracle, function);
+            let (classes, _why, _prefixes) = classify_locals(tcx, typeck, body, &oracle, function);
             // Every returned value must be fresh; the wrapper is only as
             // strong as its weakest return, so one contract-backed return
             // makes the wrapper contract-backed.
@@ -1855,7 +1856,7 @@ fn view_of_formal(
             })
             .collect();
         let typeck = tcx.typeck(function);
-        let (classes, _why) = classify_locals(tcx, typeck, body, oracle, function);
+        let (classes, _why, _prefixes) = classify_locals(tcx, typeck, body, oracle, function);
         let mut index = None;
         let mut every = true;
         for expr in &returns.returns {
@@ -2204,6 +2205,11 @@ struct LocalFacts {
     /// One tag per `AssignKind::Other` source, in order: what the RHS was.
     /// Probe-only (R478-5); no rule reads it.
     other_shapes: Vec<&'static str>,
+    /// R513-3: the place this binding's `let` INITIALIZER took the address of
+    /// (`let br = &mut (*s).br` -> `(*s).br`). Only the initializer sets it, so
+    /// a binding with exactly one assignment has no window in which it holds
+    /// anything else; `prefixes` below applies the other two conjuncts.
+    view_prefix: Option<PlacePath>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2276,7 +2282,11 @@ fn classify_locals<'tcx>(
     body: &'tcx rustc_hir::Body<'tcx>,
     allocators: &AllocatorOracle<'_>,
     function: LocalDefId,
-) -> (FxHashMap<HirId, RootClass>, FxHashMap<HirId, UnknownWhy>) {
+) -> (
+    FxHashMap<HirId, RootClass>,
+    FxHashMap<HirId, UnknownWhy>,
+    FxHashMap<HirId, PlacePath>,
+) {
     let mut facts: FxHashMap<HirId, LocalFacts> = FxHashMap::default();
     for param in body.params {
         if let PatKind::Binding(_, hir_id, ..) = param.pat.kind {
@@ -2289,6 +2299,7 @@ fn classify_locals<'tcx>(
                     assignments: Vec::new(),
                     address_taken: false,
                     other_shapes: Vec::new(),
+                    view_prefix: None,
                 },
             );
         }
@@ -2442,7 +2453,44 @@ fn classify_locals<'tcx>(
             (hir_id, why)
         })
         .collect();
-    (classes, why)
+
+    // R513-3, the three conjuncts. A binding whose `let` initializer took the
+    // address of a place (1) IS that place for its whole live range provided
+    // (2) nothing else is ever assigned to it and (3) its own address is never
+    // taken, so no callee can retarget it. Then a path through its pointee is a
+    // path through the place, and folding the prefix back in restores the field
+    // projections the binding consumed. Parameters are excluded structurally:
+    // they have no `let`, so they never carry a prefix.
+    let prefixes: FxHashMap<HirId, PlacePath> = facts
+        .iter()
+        .filter(|(_, fact)| fact.assignments.len() == 1 && !fact.address_taken)
+        .filter_map(|(&hir_id, fact)| Some((hir_id, fact.view_prefix.clone()?)))
+        .collect();
+    (classes, why, prefixes)
+}
+
+/// R513-3. Replace a path rooted at a single-definition view local by the path
+/// it is a view OF: `*br` with `br = &mut (*s).br` is `(*s).br`. Only a path
+/// through the local's POINTEE folds — a path at the local's own slot names its
+/// storage, not the place it points at. Bounded, so a cycle cannot spin.
+fn fold_place_prefix(path: PlacePath, prefixes: &FxHashMap<HirId, PlacePath>) -> PlacePath {
+    let mut path = path;
+    for _ in 0..8 {
+        if !path.deref_root {
+            return path;
+        }
+        let Some(prefix) = prefixes.get(&path.root) else {
+            return path;
+        };
+        let mut projections = prefix.projections.clone();
+        projections.extend(path.projections);
+        path = PlacePath {
+            root: prefix.root,
+            deref_root: prefix.deref_root,
+            projections,
+        };
+    }
+    path
 }
 
 /// R478-5: what an unclassified RHS was, for the probe column only.
@@ -2473,6 +2521,23 @@ struct LocalCollector<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
+    /// R513-3: the PLACE an initializer takes the address of. `&mut (*s).br`
+    /// and `&(*s).br` both give `(*s).br`; anything else gives nothing, so a
+    /// binding initialized from a call, a cast of an integer or another
+    /// pointer's VALUE records no prefix and folds nowhere.
+    fn address_of_place(&self, rhs: &Expr<'_>) -> Option<PlacePath> {
+        let ExprKind::AddrOf(BorrowKind::Ref, _, operand) = &peel_casts(rhs).kind else {
+            return None;
+        };
+        place_provenance(
+            self.tcx,
+            self.typeck,
+            &FxHashMap::default(),
+            peel_casts(operand),
+        )
+        .1
+    }
+
     /// R482-4(3): the root binding of the argument a view-of-formal call hands
     /// back.
     fn view_call_base(&self, rhs: &Expr<'_>) -> Option<HirId> {
@@ -2765,6 +2830,7 @@ impl<'tcx> Visitor<'tcx> for LocalCollector<'_, 'tcx> {
                 assignments: Vec::new(),
                 address_taken: false,
                 other_shapes: Vec::new(),
+                view_prefix: None,
             };
             if let Some(init) = local.init {
                 let kind = self.assign_kind(init);
@@ -2772,6 +2838,7 @@ impl<'tcx> Visitor<'tcx> for LocalCollector<'_, 'tcx> {
                     fact.other_shapes.push(rhs_shape(init));
                 }
                 fact.assignments.push(kind);
+                fact.view_prefix = self.address_of_place(init);
             }
             self.facts.insert(hir_id, fact);
         }
@@ -2821,6 +2888,8 @@ struct CallCollector<'a, 'tcx> {
     classes: &'a FxHashMap<HirId, RootClass>,
     fresh_fields: &'a FxHashMap<(DefId, Symbol), Freshness>,
     why: &'a FxHashMap<HirId, UnknownWhy>,
+    /// R513-3: the place each single-definition view local is a view OF.
+    prefixes: &'a FxHashMap<HirId, PlacePath>,
     calls: Vec<(LocalDefId, SiteRecord)>,
 }
 
@@ -2857,7 +2926,10 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                         index,
                         span: arg.span,
                         class,
-                        place,
+                        // R513-3: restore the field projections the caller's
+                        // view locals consumed, so a pair written as two locals
+                        // reads as the two places it always was.
+                        place: place.map(|path| fold_place_prefix(path, self.prefixes)),
                         is_null: is_null_literal(arg),
                         why,
                         is_pointer: matches!(
@@ -3197,6 +3269,43 @@ mod tests {
                 RootClass::Unknown
             ),
             None
+        );
+    }
+
+    /// R513-3. `fold_place_prefix` is exercised directly because its
+    /// `deref_root` guard is unreachable from a fixture: the only way to build
+    /// a path at a local's own SLOT is `&local`, which sets `address_taken` and
+    /// so keeps that local out of `prefixes` in the first place. The guard is
+    /// the second wall, and this is what holds it up.
+    #[test]
+    fn w6p_a_prefix_folds_through_a_pointee_and_never_through_a_slot() {
+        let local = HirId::make_owner(rustc_hir::def_id::CRATE_DEF_ID);
+        let base = HirId::make_owner(rustc_hir::def_id::LocalDefId {
+            local_def_index: rustc_hir::def_id::DefIndex::from_u32(1),
+        });
+        let path = |root, deref_root: bool, projections: &[&str]| PlacePath {
+            root,
+            deref_root,
+            projections: projections.iter().map(|p| Some((*p).to_owned())).collect(),
+        };
+        let mut prefixes = FxHashMap::default();
+        prefixes.insert(local, path(base, true, &["br"]));
+
+        // `*local` with `local = &mut (*base).br` IS `(*base).br`.
+        assert_eq!(
+            fold_place_prefix(path(local, true, &["bits"]), &prefixes),
+            path(base, true, &["br", "bits"])
+        );
+        // `local` itself is the binding's own storage, which is NOT the place
+        // it points at; folding here would name another object entirely.
+        assert_eq!(
+            fold_place_prefix(path(local, false, &[]), &prefixes),
+            path(local, false, &[])
+        );
+        // A root with no recorded prefix is left exactly as it came.
+        assert_eq!(
+            fold_place_prefix(path(base, true, &["br"]), &prefixes),
+            path(base, true, &["br"])
         );
     }
 
