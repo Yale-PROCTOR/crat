@@ -476,13 +476,37 @@ fn local_callee(e: &Expr<'_>) -> Option<DefId> {
 /// the `Some` / `None` edits land on the arms themselves. An arm with
 /// statements of its own is NOT descended into: what those statements do to
 /// the owner is exactly what this rule would have to prove.
+/// **A1-g**: every statement is a `let` binding a local whose type is not a
+/// pointer (an empty block trivially qualifies).
+fn scalar_let_statements<'tcx>(tcx: TyCtxt<'tcx>, block: &'tcx rustc_hir::Block<'tcx>) -> bool {
+    block.stmts.iter().all(|stmt| {
+        let rustc_hir::StmtKind::Let(local) = stmt.kind else {
+            return false;
+        };
+        let rustc_hir::PatKind::Binding(_, hir, _, None) = local.pat.kind else {
+            return false;
+        };
+        let typeck = tcx.typeck(local.hir_id.owner.def_id);
+        let ty = typeck.node_type(hir);
+        !ty.is_raw_ptr() && !ty.is_ref() && !ty.is_fn_ptr()
+    })
+}
+
 fn classify_returned<'tcx>(tcx: TyCtxt<'tcx>, value: &'tcx Expr<'tcx>, out: &mut Vec<Returned>) {
     match &value.kind {
         ExprKind::If(_, then, Some(otherwise)) => {
             classify_returned(tcx, then, out);
             classify_returned(tcx, otherwise, out);
         }
-        ExprKind::Block(block, _) if block.stmts.is_empty() => match block.expr {
+        // **A1-g (relay wave-6a/072 (e))** — a block is read through when its
+        // statements CANNOT touch the owner: every one a `let` binding a
+        // non-pointer local. c2rust hoists an argument that way
+        // (`{ let __arg_1 = strlen(str); ctor(str, __arg_1) }`), and such a
+        // binding can neither hold, alter nor alias the owner, which does not
+        // exist until the tail returns. A pointer binding, or any other
+        // statement, keeps the old refusal — that IS the thing this rule would
+        // otherwise have to prove.
+        ExprKind::Block(block, _) if scalar_let_statements(tcx, block) => match block.expr {
             Some(tail) => classify_returned(tcx, tail, out),
             None => out.push(Returned::Other(value.span)),
         },

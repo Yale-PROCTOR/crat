@@ -1591,3 +1591,96 @@ fn w6a_a1f_a_storing_middle_is_not_a_chain_through() {
         "a callee that stores its parameter is not passed over\n{certificates}"
     );
 }
+
+/// **W6A-A1-g — a returned block whose statements cannot touch the owner**
+/// (relay wave-6a/072 (e)). buffer's shape, reduced: c2rust hoists an argument
+/// into a `let` and returns the block —
+/// `return { let __arg_1 = strlen(str); buffer_new_with_string_length(str, __arg_1) };`
+/// — so the certificate read `return-shape:{ .. }` for the wrapper and
+/// `call-site-not-a-receiver` for the constructor inside it, and both stopped.
+///
+/// The block is descended into when every statement is a `let` binding a
+/// NON-POINTER local: such a statement cannot hold, alter or alias the owner,
+/// which does not exist until the tail call returns. A statement binding a
+/// pointer, or any other statement, keeps the old refusal — that is precisely
+/// the thing the rule would otherwise have to prove.
+const BLOCK_RETURN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+    fn strlen(s: *const i8) -> usize;
+}
+#[repr(C)]
+pub struct buffer_t {
+    pub len: usize,
+    pub data: *mut i8,
+}
+unsafe extern "C" fn buffer_new_with_size(mut n: usize) -> *mut buffer_t {
+    let mut self_0 = malloc(::std::mem::size_of::<buffer_t>()) as *mut buffer_t;
+    (*self_0).len = n;
+    (*self_0).data = 0 as *mut i8;
+    return self_0;
+}
+unsafe extern "C" fn buffer_new_with_string_length(mut str: *mut i8, mut len: usize)
+    -> *mut buffer_t {
+    return buffer_new_with_size(len);
+}
+pub unsafe extern "C" fn buffer_new_with_string(mut str: *mut i8) -> *mut buffer_t {
+    return {
+        let __arg_1 = strlen(str);
+        buffer_new_with_string_length(str, __arg_1)
+    };
+}
+pub unsafe extern "C" fn run(mut s: *mut i8) -> usize {
+    let mut b = buffer_new_with_string(s);
+    let mut n = (*b).len;
+    free(b as *mut core::ffi::c_void);
+    return n;
+}
+"#;
+
+#[test]
+fn w6a_a1g_a_returned_block_of_scalar_lets_is_descended_into() {
+    let out = emitted("a1g-block-return", BLOCK_RETURN);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !certificates.contains("return-certificate-return-shape:"),
+        "the block is read through, not refused\n{certificates}"
+    );
+    assert!(
+        !certificates.contains("call-site-not-a-receiver"),
+        "and the call inside it has the enclosing return as its receiver\n{certificates}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "buffer_new_with_size::self_0"),
+        None,
+        "the allocation at the bottom of the chain is an owner\nRECEIPTS:\n{certificates}\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Control: the block binds a POINTER local, which this rule cannot read
+/// through — the refusal stands.
+#[test]
+fn w6a_a1g_a_block_binding_a_pointer_keeps_its_refusal() {
+    let source = BLOCK_RETURN.replace(
+        "        let __arg_1 = strlen(str);",
+        "        let __arg_1 = strlen(str);\n        let mut alias = str;",
+    );
+    assert!(
+        source.contains("let mut alias = str;"),
+        "the control must bind a pointer"
+    );
+    let out = emitted("a1g-block-pointer", &source);
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("return-certificate-return-shape:"),
+        "a pointer binding keeps the block opaque\n{}",
+        out.artifacts.return_certificate_receipts
+    );
+}
