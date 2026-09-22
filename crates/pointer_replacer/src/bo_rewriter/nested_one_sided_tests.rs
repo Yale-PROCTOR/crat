@@ -699,7 +699,6 @@ fn n1_reports_no_new_hold_vocabulary() {
 /// the cursor family its base inside the same transaction, the row is
 /// constructed by the flip and the table delivers.
 #[test]
-#[ignore = "armed: needs slicecursor's `plan_with` (R512-4) — the flip cannot construct a cursor row until the cursor family can be asked against the prospective table"]
 fn w1_the_cursor_only_owner_delivers_its_inner_level() {
     let body = region(emitted(), "__crat_safe_ti_sma_cursor_only");
     assert!(
@@ -720,7 +719,6 @@ fn w1_the_cursor_only_owner_delivers_its_inner_level() {
 /// mixed owner delivers BOTH tables, because a cursor sibling that types no
 /// longer has to be forfeited to protect the slice-only one.
 #[test]
-#[ignore = "armed: needs slicecursor's `plan_with` (R512-4) — the flip cannot construct a cursor row until the cursor family can be asked against the prospective table"]
 fn w2_the_mixed_owner_delivers_both_tables() {
     for parameter in ["inputs", "outputs"] {
         let decision = table_decision(MIXED, parameter);

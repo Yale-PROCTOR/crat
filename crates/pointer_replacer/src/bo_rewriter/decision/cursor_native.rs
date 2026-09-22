@@ -179,7 +179,12 @@ pub(crate) fn replan_delivered_table_elements(
     let mut receipts = Vec::new();
     for index in targets {
         let subject = entries[index].0.clone();
-        let rebuilt = wrapper::build(ctx, &subject, entries);
+        // `None`: this consumer re-plans AFTER a flip that already happened, so
+        // there is no prospective table to tell the planner about — the flip is
+        // in `entries`. R513-5 replaces this repair with an assert; the
+        // assembler applies that patch when composing onto a frame that has
+        // this function.
+        let rebuilt = wrapper::build(ctx, &subject, entries, None);
         receipts.push(CursorReceipt {
             owner: subject.fn_did,
             hir_id: subject.hir_id,

@@ -19,7 +19,7 @@ use rustc_middle::ty::{TyCtxt, TyKind};
 use super::{
     Arm, Decision, DecisionTable, Subject, SubjectKind,
     construction::{SliceLengthPlan, SliceLengthSource},
-    cursor_native::{CursorHold, CursorPlan},
+    cursor_native::{CursorHold, CursorPlan, ProspectiveTable},
     exposure::ExposureSurfacePlan,
 };
 use crate::{
@@ -707,55 +707,41 @@ fn inspect_pair<'tcx>(
     })
 }
 
-/// **R506-5 — the prospective flip, as slicecursor accepted it.**
+/// **R506-5 / R513-5 — the flip asks the cursor family, before installing.**
 ///
-/// The one bit the cursor family does not have at plan time: *this table is
-/// about to deliver its inner level*, plus the element mutability that goes
-/// with it. Everything else it already has — `promote`'s flip reuses the flat
-/// decision's `uses` verbatim, so the element replacement text is identical
-/// before and after (report 018 §1).
+/// The row's own CONSTRUCTOR, told that its base table is about to deliver its
+/// inner level. It filters `prospective` to the resolved root, so a cursor
+/// whose base is some other table is built exactly as before, and it refuses an
+/// exclusive row over an element the flip leaves shared — this lane's F-C in
+/// the cursor family's own code (slicecursor 064).
 ///
-/// It is declared HERE only because `cursor_native.rs` is slicecursor's file
-/// and their `plan_with` has not landed. It moves there, unchanged, the moment
-/// it does; this declaration is then deleted and the import takes its place.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProspectiveTable {
-    pub(crate) binding: HirId,
-    pub(crate) inner_mutable: bool,
-}
-
-/// **R506-5 — the single line that waits on slicecursor's `plan_with`.**
+/// **Why `build` and not `plan_with`.** `plan_with` is the SELECTION entry
+/// point and returns `None` for a decision that is already `Decision::Cursor`
+/// (`wrapper.rs`'s own match). By the time this transaction runs, the cursor
+/// family has already run, so every row here is exactly that — selection is
+/// settled and construction is the only question left. `build` is that
+/// construction and takes the same `prospective`. Measured: through
+/// `plan_with` every row came back `None`, never `Err`; through `build` they
+/// are constructed. Named as a STOP for slicecursor — the alternative is that
+/// `plan_with` admit `Decision::Cursor` when a prospective is supplied.
 ///
-/// The agreed entry point is
-/// `plan_with(ctx, subject, decision, entries, prospective: Option<&ProspectiveTable>)`
-/// in `decision::cursor::wrapper`, with `plan` a thin wrapper over it and
-/// `table_element_base` consulting `prospective` when the resolved root is its
-/// `binding` (slicecursor 061 §4, adopted at R512-4). It is not built yet, and
-/// `cursor_native.rs` is theirs to touch, so until their hash lands every row
-/// is REFUSED here — which makes the transaction's rollback path the only
-/// reachable one and keeps this line byte-identical to the cut, exactly as
-/// (b′) left it.
-///
-/// When it lands this body becomes, in full:
-///
-/// ```ignore
-/// let (subject, decision) = entries
-///     .iter()
-///     .find(|(s, _)| s.fn_did == owner && s.hir_id == row.local)?;
-/// super::cursor::wrapper::plan_with(ctx, subject, decision, entries, Some(prospective))
-/// ```
-///
-/// which needs `plan_with` to be `pub(crate)`: `plan` is `pub(super)` today and
-/// `nested_slice` is a sibling of `cursor_native`, not a child. That is the one
-/// interface requirement this lane places on their build.
+/// `None` here means the row is not in `entries` at all.
 fn rebase_row(
-    _ctx: &super::Ctx<'_, '_>,
-    _owner: LocalDefId,
-    _row: &Row,
-    _entries: &[(Subject, Decision)],
-    _prospective: &ProspectiveTable,
+    ctx: &super::Ctx<'_, '_>,
+    owner: LocalDefId,
+    row: &Row,
+    entries: &[(Subject, Decision)],
+    prospective: &ProspectiveTable,
 ) -> Option<Result<CursorPlan, CursorHold>> {
-    None
+    let (subject, _decision) = entries
+        .iter()
+        .find(|(s, _)| s.fn_did == owner && s.hir_id == row.local)?;
+    Some(super::cursor_native::wrapper::build(
+        ctx,
+        subject,
+        entries,
+        Some(prospective),
+    ))
 }
 
 pub(crate) fn promote(
