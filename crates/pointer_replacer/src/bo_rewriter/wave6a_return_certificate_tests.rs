@@ -1347,3 +1347,230 @@ fn w6a_a1e_an_owned_field_refuses_the_certificate() {
         out.source
     );
 }
+
+/// **W6A-A1-f — a chain-through callee does not open the chain** (relay
+/// wave-6a/068, R515-4). avl's and bst's shape, reduced: `newNode` allocates
+/// and returns; `insert` returns either its own PARAMETER or `newNode(..)` —
+/// never a third thing. `insert` cannot be certified (its returned local is a
+/// parameter, not an allocation), and until this rule that refusal
+/// (`return-certificate-return-locals:insert:not-a-subject`) withdrew
+/// `newNode`'s certificate as `chain-open` collateral, costing the allocation
+/// its Box. The callee's own return statements are the proof: it hands the
+/// value onward and originates nothing.
+const INSERT_CHAIN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+}
+unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    (*node).left = 0 as *mut Node;
+    (*node).right = 0 as *mut Node;
+    return node;
+}
+unsafe extern "C" fn insert(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    if key < (*node).key {
+        (*node).left = insert((*node).left, key);
+    } else {
+        (*node).right = insert((*node).right, key);
+    }
+    return node;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut root = newNode(5 as i32);
+    root = insert(root, 3 as i32);
+    let mut k = (*root).key;
+    free(root as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+
+#[test]
+fn w6a_a1f_a_chain_through_callee_does_not_open_the_chain() {
+    let out = emitted("a1f-insert-chain", INSERT_CHAIN);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        certificates.contains("chain-through:insert:returns-parameter-or-certified"),
+        "the pass-over is receipted by name\n{certificates}"
+    );
+    assert!(
+        !certificates.contains("return-certificate-chain-open"),
+        "a chain-through callee does not open the chain\n{certificates}"
+    );
+    assert!(
+        !certificates.contains("return-locals:insert:not-a-subject"),
+        "and it is no longer a refusal\n{certificates}"
+    );
+    // What the ruling bought stops here. `newNode::node` still does not emit,
+    // and the rule is what makes the reason legible: the receiver `run::root`
+    // is passed BACK INTO the chain-through callee (`root = insert(root, 3)`),
+    // which the lend oracle refuses because `insert` returns the formal rather
+    // than only borrowing it. That is a second wall, named, not this one.
+    assert!(
+        certificates.contains("call-argument-not-a-lend:insert(root"),
+        "the next wall is the receiver's own use\n{certificates}"
+    );
+}
+
+/// The same rule where the receiver is NOT handed back to the chain-through
+/// callee: the certificate then stands and the allocation is a `Box`.
+const INSERT_CHAIN_PLAIN_RECEIVER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+}
+unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    (*node).left = 0 as *mut Node;
+    (*node).right = 0 as *mut Node;
+    return node;
+}
+unsafe extern "C" fn pick(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    return node;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut root = newNode(5 as i32);
+    let mut k = (*root).key;
+    free(root as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+
+#[test]
+fn w6a_a1f_the_pass_through_return_is_bridged_and_names_the_next_wall() {
+    // With the pass-over in place this program EMITS — before the bridge it
+    // did not: `pick` keeps its raw return type, so `return newNode(key)`
+    // inside it was an `E0308` once `newNode` returned a `Box`. The owner is
+    // handed back raw at that exact statement.
+    let out = emitted("a1f-plain-receiver", INSERT_CHAIN_PLAIN_RECEIVER);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        certificates.contains("chain-through:pick:returns-parameter-or-certified"),
+        "{certificates}"
+    );
+    // And the rule makes the NEXT wall legible, which is the same class as
+    // buffer's two CROWN units: the call inside the pass-through sits at a
+    // RETURN position, so it is not bound to a receiver, and a certificate
+    // requires every call site to be one.
+    assert!(
+        certificates
+            .contains("return-certificate-call-site-not-a-receiver:newNode:pick:newNode(key)"),
+        "the next wall is the call site's shape\n{certificates}"
+    );
+}
+
+/// Control: the callee STORES its parameter away instead of handing it onward,
+/// so it is not a chain-through and the chain stays open.
+const STORING_MIDDLE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+}
+static mut STASH: *mut Node = 0 as *mut Node;
+unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    return node;
+}
+unsafe extern "C" fn keep(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    STASH = node;
+    return node;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut root = newNode(5 as i32);
+    let mut k = (*root).key;
+    free(root as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+
+#[test]
+fn w6a_a1f_a_storing_middle_is_not_a_chain_through() {
+    let out = emitted("a1f-storing-middle", STORING_MIDDLE);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !certificates.contains("chain-through:keep:"),
+        "a callee that stores its parameter is not passed over\n{certificates}"
+    );
+}
+
+/// Control (relay 068's "a third value"): the middle callee returns its
+/// parameter, a certified constructor's result AND a third local. The proof
+/// the pass-over rests on — that the callee originates nothing — does not
+/// hold, so the chain stays open.
+const THIRD_VALUE_MIDDLE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+}
+unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    return node;
+}
+unsafe extern "C" fn pick3(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    if key < 0 as i32 {
+        let mut other = (*node).left;
+        return other;
+    }
+    return node;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut root = newNode(5 as i32);
+    let mut k = (*root).key;
+    free(root as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+
+#[test]
+fn w6a_a1f_a_third_returned_value_keeps_the_chain_open() {
+    let out = emitted("a1f-third-value", THIRD_VALUE_MIDDLE);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !certificates.contains("chain-through:pick3:"),
+        "a callee that returns a third value originates something\n{certificates}"
+    );
+}

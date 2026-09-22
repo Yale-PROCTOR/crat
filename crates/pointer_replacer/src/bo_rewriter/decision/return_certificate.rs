@@ -97,7 +97,19 @@ pub(crate) struct Certificates {
     /// Refusals: binding → (label, typed reason). Keyed by the returned local
     /// for a callee hold, by the receiver for a receiver hold.
     pub(crate) holds: FxHashMap<(LocalDefId, HirId), (String, String)>,
+    /// **A1-f (R515-4)**: callees passed OVER rather than certified — their own
+    /// return statements prove they return a parameter or a certified
+    /// constructor's result, so they originate nothing and cannot break a chain
+    /// that runs through them.
+    pub(crate) chain_through: FxHashSet<LocalDefId>,
+    /// One receipt per pass-over.
+    pub(crate) chain_through_receipts: Vec<String>,
 }
+
+/// The sentinel a pass-over travels back on: `certify` has no channel for
+/// "neither certified nor refused", so it returns this as its hold text and
+/// the driver turns it into a `chain_through` entry.
+const CHAIN_THROUGH: &str = "chain-through:";
 
 impl Certificates {
     pub(crate) fn is_empty(&self) -> bool {
@@ -112,6 +124,11 @@ impl Certificates {
             for receipt in &c.receipts {
                 out.push_str(&format!("{}\tadmitted\t{receipt}\n", c.callee_path));
             }
+        }
+        let mut passed = self.chain_through_receipts.clone();
+        passed.sort();
+        for receipt in &passed {
+            out.push_str(&format!("-\tpassed-over\t{receipt}\n"));
         }
         let mut holds: Vec<&(String, String)> = self.holds.values().collect();
         holds.sort();
@@ -436,6 +453,10 @@ struct Scan<'tcx> {
     store_calls: Vec<(DefId, Span)>,
     /// Every assignment to a bare local: (local, value span).
     assigns: Vec<(HirId, Span)>,
+    /// **A1-f**: `<non-local place> = <bare local>` — the local is stored away.
+    /// A callee that stores a parameter does not merely hand it onward, so it
+    /// is not passed over as a chain-through.
+    stores_local: Vec<HirId>,
 }
 
 fn local_callee(e: &Expr<'_>) -> Option<DefId> {
@@ -496,6 +517,10 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
                 let tcx = self.tcx.expect("scan tcx");
                 if let Some(hir) = bare_local(lhs) {
                     self.assigns.push((hir, rhs.span));
+                } else if let Some(hir) = bare_local(rhs) {
+                    // A1-f: the local is stored into a place that is not a
+                    // local — it does not merely travel onward.
+                    self.stores_local.push(hir);
                 }
                 let statement = match tcx.parent_hir_node(e.hir_id) {
                     rustc_hir::Node::Stmt(stmt) => stmt.span,
@@ -1334,6 +1359,16 @@ pub(crate) fn model_admits_lend(kind: Option<SlotKind>) -> bool {
     )
 }
 
+/// **A1-f**: is `binding` one of `callee`'s own parameter bindings?
+fn returns_a_parameter(tcx: TyCtxt<'_>, callee: LocalDefId, binding: HirId) -> bool {
+    tcx.hir_body_owned_by(callee).params.iter().any(|p| {
+        matches!(
+            p.pat.kind,
+            rustc_hir::PatKind::Binding(_, hir, _, None) if hir == binding
+        )
+    })
+}
+
 /// Derive every certificate for the crate (fixpoint over chained returns).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn derive<'tcx>(
@@ -1422,6 +1457,43 @@ pub(crate) fn derive<'tcx>(
     for list in receivers_of.values_mut() {
         list.sort_by_key(|s| (s.fn_did.local_def_index.as_u32(), s.local.as_u32()));
     }
+    // **A1-f (R515-4) — the pass-overs are settled BEFORE the fixpoint.**
+    // Whether a callee is a chain-through depends only on its own body, never
+    // on another certificate, and a certificate that bridges a pass-through's
+    // return must see the set already complete: settling it inside the
+    // fixpoint made the bridge depend on the order two independent callees
+    // happened to be visited in.
+    for &callee in &candidates {
+        let Some(scan) = scans.get(&callee) else { continue };
+        let mut owner: Option<HirId> = None;
+        let mut shaped = true;
+        for r in &scan.returns {
+            match r {
+                Returned::Local(hir, _) => match owner {
+                    Some(h) if h == *hir => {}
+                    Some(_) => shaped = false,
+                    None => owner = Some(*hir),
+                },
+                Returned::Call(..) | Returned::Null(_) => {}
+                Returned::Other(_) => shaped = false,
+            }
+        }
+        let Some(hir) = owner.filter(|_| shaped) else { continue };
+        if subject_of(callee, hir).is_some() {
+            continue;
+        }
+        if returns_a_parameter(tcx, callee, hir)
+            && !scan.stores_local.contains(&hir)
+            && !scan.frees.iter().any(|(h, _, _)| *h == hir)
+            && !scan.assigns.iter().any(|(h, _)| *h == hir)
+        {
+            out.chain_through.insert(callee);
+            out.chain_through_receipts.push(format!(
+                "{CHAIN_THROUGH}{}:returns-parameter-or-certified",
+                tcx.def_path_str(callee.to_def_id())
+            ));
+        }
+    }
     let mut pending: Vec<LocalDefId> = candidates;
     let mut changed = true;
     while changed {
@@ -1453,6 +1525,9 @@ pub(crate) fn derive<'tcx>(
                     changed = true;
                 }
                 Ok(None) => next.push(callee),
+                // The pass-over was settled before the fixpoint; `certify`
+                // still reports it so the two can never disagree.
+                Err((_, _, hold)) if hold.starts_with(CHAIN_THROUGH) => {}
                 Err((key, label, hold)) => {
                     out.holds.insert(key, (label, hold));
                 }
@@ -1471,10 +1546,10 @@ pub(crate) fn derive<'tcx>(
             .filter(|c| {
                 c.returned_receivers
                     .iter()
-                    .any(|(f, _)| !out.callees.contains_key(f))
+                    .any(|(f, _)| !out.callees.contains_key(f) && !out.chain_through.contains(f))
                     || c.returning_callers
                         .iter()
-                        .any(|f| !out.callees.contains_key(f))
+                        .any(|f| !out.callees.contains_key(f) && !out.chain_through.contains(f))
                     || c.chained_from
                         .iter()
                         .any(|source| !out.callees.contains_key(source))
@@ -1649,6 +1724,31 @@ fn certify<'tcx, 's>(
         Some((hir, _)) => match subject_of(callee, *hir) {
             Some(s) => Some(s),
             None => {
+                // **A1-f (R515-4) — a chain-through callee is passed over, not
+                // refused.** The returned local is not a pointer subject, so
+                // this callee can never be certified. That used to end every
+                // chain running through it: `insert` returns its own parameter
+                // or `newNode(..)`, so `newNode`'s certificate withdrew as
+                // `chain-open` collateral and the allocation lost its Box.
+                //
+                // The callee's own return statements are the proof. Where the
+                // returned local is a PARAMETER and the callee neither frees
+                // it, stores it away, nor reassigns it, the function
+                // originates nothing — it hands a value onward — and the
+                // emission-side chain is closed the way the analysis's callee
+                // summary closes it. Every other return is already a call or a
+                // null here: a second local and any other shape refused above.
+                if returns_a_parameter(tcx, callee, *hir)
+                    && !scan.stores_local.contains(hir)
+                    && !scan.frees.iter().any(|(h, _, _)| h == hir)
+                    && !scan.assigns.iter().any(|(h, _)| h == hir)
+                {
+                    return Err((
+                        (callee, *hir),
+                        callee_path.clone(),
+                        format!("{CHAIN_THROUGH}{callee_path}:returns-parameter-or-certified"),
+                    ));
+                }
                 return Err((
                     (callee, *hir),
                     callee_path.clone(),
@@ -2296,6 +2396,32 @@ fn certify<'tcx, 's>(
             if let Returned::Call(target, span) = r
                 && *target == callee.to_def_id()
             {
+                // **A1-f**: a caller PASSED OVER as a chain-through keeps its
+                // raw return type, so `return <certified call>` inside it is
+                // an `E0308` unless the owner is handed back raw at that exact
+                // statement — the same `Box::into_raw` the store-transfer arm
+                // emits, at the return position instead of an assignment.
+                if done.chain_through.contains(caller) {
+                    let text = tcx
+                        .sess
+                        .source_map()
+                        .span_to_snippet(*span)
+                        .unwrap_or_default();
+                    let replacement = if optional_output {
+                        format!("{text}.map_or(core::ptr::null_mut(), Box::into_raw)")
+                    } else {
+                        format!("Box::into_raw({text})")
+                    };
+                    site_edits.push((
+                        *caller,
+                        BoxExprEdit {
+                            span: *span,
+                            replacement,
+                            receipt: "return-certificate-chain-through-return",
+                        },
+                    ));
+                    continue;
+                }
                 admitted_calls.push(*span);
                 if !returning_callers.contains(caller) {
                     returning_callers.push(*caller);
