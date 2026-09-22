@@ -707,25 +707,21 @@ fn inspect_pair<'tcx>(
     })
 }
 
-/// **R506-5 / R513-5 — the flip asks the cursor family, before installing.**
+/// **R506-5 / R517-6 — the flip asks the cursor family, before installing.**
 ///
-/// The row's own CONSTRUCTOR, told that its base table is about to deliver its
-/// inner level. It filters `prospective` to the resolved root, so a cursor
-/// whose base is some other table is built exactly as before, and it refuses an
-/// exclusive row over an element the flip leaves shared — this lane's F-C in
-/// the cursor family's own code (slicecursor 064).
+/// `plan_with` is the one door, and slicecursor's `1c702270b` is what makes it
+/// the right one: a row this family has ALREADY taken, re-planned against a
+/// base about to flip, is delegated straight to construction *before* the
+/// selection gate. Re-asking selection there would give the wrong answer rather
+/// than a conservative one — `ordering_degraded` is false for a `Cursor`, so a
+/// row selected by ordering would fail a gate it passed in the same pass.
 ///
-/// **Why `build` and not `plan_with`.** `plan_with` is the SELECTION entry
-/// point and returns `None` for a decision that is already `Decision::Cursor`
-/// (`wrapper.rs`'s own match). By the time this transaction runs, the cursor
-/// family has already run, so every row here is exactly that — selection is
-/// settled and construction is the only question left. `build` is that
-/// construction and takes the same `prospective`. Measured: through
-/// `plan_with` every row came back `None`, never `Err`; through `build` they
-/// are constructed. Named as a STOP for slicecursor — the alternative is that
-/// `plan_with` admit `Decision::Cursor` when a prospective is supplied.
+/// Report 019 reached construction by calling `build` directly and raising its
+/// visibility. That worked and was the wrong seam: it bypassed the gate rather
+/// than being admitted through it. `build` is `pub(super)` again and every row —
+/// cursor or not — goes through `plan_with(.., Some(&prospective))`.
 ///
-/// `None` here means the row is not in `entries` at all.
+/// `None` means the row is not in `entries` at all.
 fn rebase_row(
     ctx: &super::Ctx<'_, '_>,
     owner: LocalDefId,
@@ -733,15 +729,10 @@ fn rebase_row(
     entries: &[(Subject, Decision)],
     prospective: &ProspectiveTable,
 ) -> Option<Result<CursorPlan, CursorHold>> {
-    let (subject, _decision) = entries
+    let (subject, decision) = entries
         .iter()
         .find(|(s, _)| s.fn_did == owner && s.hir_id == row.local)?;
-    Some(super::cursor_native::wrapper::build(
-        ctx,
-        subject,
-        entries,
-        Some(prospective),
-    ))
+    super::cursor_native::wrapper::plan_with(ctx, subject, decision, entries, Some(prospective))
 }
 
 pub(crate) fn promote(

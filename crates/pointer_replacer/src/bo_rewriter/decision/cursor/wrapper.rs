@@ -2060,7 +2060,7 @@ pub(super) fn plan_with<'a>(
     }
     Some(build(ctx, subject, entries, prospective))
 }
-pub(crate) fn build<'a>(
+pub(super) fn build<'a>(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     entries: &[(Subject, Decision)],

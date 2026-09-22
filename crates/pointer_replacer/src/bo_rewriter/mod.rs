@@ -6428,27 +6428,57 @@ fn validate_cursor_delivered_bases(
                     })
             }
             DeliveredBaseProvider::TableElement => {
+                // **R517-5 (nested 020).** The twin of
+                // `wrapper::table_element_base`, which reads the SAME fact: a
+                // table may hand its element as a raw pointer (flat, the
+                // constructor fabricates an extent) or as a slice VALUE (the
+                // inner level delivered, `new(t[k])`, no extent at all). The
+                // constructor learned both forms; this predicate had only the
+                // flat one, and so read "the table delivers its inner level" as
+                // "the base is unavailable" — measured as the sole false field
+                // of `cursor-delivered-base-unavailable` on every owner whose
+                // flip succeeded.
+                //
+                // `fallback` is required on the FLAT side only. There it is the
+                // receipt for a fabricated extent (§77); on the delivered side
+                // `fallback == false` is the success condition, because
+                // `new(t[k])` takes no length — so requiring it would refuse
+                // exactly the rows that cost nothing to fabricate.
+                let delivered_inner = table.entries.iter().any(|(candidate, choice)| {
+                    (candidate.fn_did, candidate.hir_id) == node
+                        && match choice {
+                            decision::Decision::NestedSlice { .. } => true,
+                            decision::Decision::Slice { .. }
+                            | decision::Decision::Ref { .. }
+                            | decision::Decision::InferredRef { .. }
+                            | decision::Decision::Opt { .. }
+                            | decision::Decision::Box(_)
+                            | decision::Decision::Cursor { .. }
+                            | decision::Decision::Degraded(_) => false,
+                        }
+                });
                 cursor.wrapper
-                    && cursor.fallback
+                    && (cursor.fallback || delivered_inner)
                     && (!subject.mutable
                         || decision::cursor_native::wrapper::table_named_once(
                             tcx,
                             subject.fn_did,
                             base.binding,
                         ))
-                    && table.entries.iter().any(|(candidate, choice)| {
-                        (candidate.fn_did, candidate.hir_id) == node
-                            && match choice {
-                                decision::Decision::Slice { .. } => true,
-                                decision::Decision::NestedSlice { .. }
-                                | decision::Decision::Ref { .. }
-                                | decision::Decision::InferredRef { .. }
-                                | decision::Decision::Opt { .. }
-                                | decision::Decision::Box(_)
-                                | decision::Decision::Cursor { .. }
-                                | decision::Decision::Degraded(_) => false,
-                            }
-                    })
+                    && (delivered_inner
+                        || table.entries.iter().any(|(candidate, choice)| {
+                            (candidate.fn_did, candidate.hir_id) == node
+                                && match choice {
+                                    decision::Decision::Slice { .. } => true,
+                                    decision::Decision::NestedSlice { .. }
+                                    | decision::Decision::Ref { .. }
+                                    | decision::Decision::InferredRef { .. }
+                                    | decision::Decision::Opt { .. }
+                                    | decision::Decision::Box(_)
+                                    | decision::Decision::Cursor { .. }
+                                    | decision::Decision::Degraded(_) => false,
+                                }
+                        }))
             }
         };
         if !valid_binding || !provider_delivered || !valid_initializer || !exact_cursor_source {

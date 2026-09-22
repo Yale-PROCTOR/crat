@@ -473,20 +473,14 @@ fn n1_mixed_fixture_carries_one_cursor_row_and_one_slice_row() {
     }
 }
 
-/// **W-N1-ROLLBACK** — R506-5. Clause (f) is retired; this is the witness it
-/// re-points onto. The transaction decides each parameter before anything is
-/// installed: every cursor row of it is offered to the cursor family against
-/// the prospective table, and the parameter commits only if all of them come
-/// back constructed. A refusal rolls back **that parameter only**, so the
-/// owner's slice-only sibling keeps the delivery it already had — which is the
-/// protection (f) used to approximate by refusing the cursor sibling outright.
-///
-/// Today every row is refused, because `plan_with` is not built yet, so this
-/// is the transaction's only reachable path and the line stays tree-identical.
-/// The refusal is receipted with the cursor family's own `CursorHold`, never a
-/// silent skip. When `plan_with` lands, W2 is the other half of this witness.
+/// **W-N1-COMMIT** — R517-5. What the rollback witness measured before the
+/// hand-off worked, measured from the other side now that it does: the mixed
+/// owner commits BOTH parameters, its cursor row is re-based rather than
+/// refused, and nothing is rolled back. The per-parameter rollback itself is
+/// still the protection — it is simply not exercised here any more, because
+/// nothing fails. W3 is where a refusal is exercised, and it is owed (STOP).
 #[test]
-fn n1_a_refused_cursor_row_rolls_back_only_its_own_parameter() {
+fn n1_the_mixed_owner_commits_both_parameters_and_rebases_its_cursor_row() {
     ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
@@ -501,31 +495,28 @@ fn n1_a_refused_cursor_row_rolls_back_only_its_own_parameter() {
             .iter()
             .find(|r| tcx.def_path_str(r.owner.to_def_id()) == MIXED)
             .and_then(|r| r.result.as_ref().ok())
-            .expect("the slice-only sibling still gives this owner a plan");
+            .expect("an admitted plan for the mixed owner");
+        let mut names = plan
+            .parameters
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
         assert_eq!(
-            plan.parameters
-                .iter()
-                .map(|p| p.name.clone())
-                .collect::<Vec<_>>(),
-            vec!["outputs".to_owned()],
-            "the sibling survives its cursor partner's rollback"
-        );
-        assert!(
-            plan.rows
-                .iter()
-                .all(|r| plan.parameters.iter().any(|p| p.hir == r.parameter)),
-            "a rolled-back parameter left its rows behind"
+            names,
+            vec!["inputs".to_owned(), "outputs".to_owned()],
+            "both tables commit once the cursor row can be re-based"
         );
         assert_eq!(
-            plan.rebase_refused.len(),
+            plan.rebased.len(),
             1,
-            "the refusal is receipted with the cursor family's own hold: {:?}",
-            plan.rebase_refused
+            "the cursor row is re-based, and counted: {:?}",
+            plan.rebased
         );
         assert!(
-            plan.rebased.is_empty(),
-            "nothing can be rebased before `plan_with` exists: {:?}",
-            plan.rebased
+            plan.rebase_refused.is_empty(),
+            "nothing was rolled back: {:?}",
+            plan.rebase_refused
         );
     })
     .unwrap();
@@ -541,9 +532,12 @@ fn n1_standoff_keeps_the_slice_only_siblings_delivery() {
         body.contains("outputs: &mut [&mut [std::os::raw::c_double]]"),
         "the slice-only table still delivers its inner level:\n{body}"
     );
+    // R517-5: the cursor sibling no longer keeps its frame form — it delivers
+    // too. Clause (f) used to forfeit it to protect this one; the transaction
+    // protects this one without the forfeit, which is the whole of the ruling.
     assert!(
-        body.contains("inputs: &[*const std::os::raw::c_double]"),
-        "the cursor sibling keeps its frame form:\n{body}"
+        body.contains("inputs: &[&[std::os::raw::c_double]]"),
+        "the cursor sibling did not deliver alongside it:\n{body}"
     );
 }
 
@@ -576,13 +570,18 @@ fn n1_every_planned_row_names_a_construction() {
         for receipt in &table.nested_receipts {
             let Ok(plan) = &receipt.result else { continue };
             for row in &plan.rows {
+                // R517-5: a row is typed either by a slice construction this
+                // loop rewrites, or by the cursor plan the transaction re-based
+                // for it. Both are constructions; only the family differs.
                 assert!(
                     table
                         .slice_constructions
                         .iter()
-                        .any(|c| c.node == (plan.owner, row.local)),
-                    "{} row {:?} has no construction to rewrite — the flip would \
-                     change the table's type and leave this row's base text alone",
+                        .any(|c| c.node == (plan.owner, row.local))
+                        || plan.rebased.contains(&row.local),
+                    "{} row {:?} is typed by neither a slice construction nor a \
+                     re-base — the flip would change the table's type and leave \
+                     this row's base text alone",
                     tcx.def_path_str(plan.owner.to_def_id()),
                     row.local
                 );
@@ -626,16 +625,19 @@ fn n1_an_owner_it_cannot_type_is_held_not_withdrawn() {
         assert!(
             receipt.is_some(),
             "no receipt for {CURSOR_ONLY}: its Return-stage transaction was \
-             withdrawn, which is what (b′) exists to prevent"
+             withdrawn, which is what the transaction exists to prevent"
         );
-        // And it delivers nothing, which is the whole point: tree-neutral where
-        // it cannot type, rather than a cursor traded for nothing.
+        // R517-5: and now it DELIVERS. The guard's point is unchanged — a
+        // withdrawn transaction leaves no receipt behind — but the outcome it
+        // guards has flipped from "tree-neutral" to "delivered", because the
+        // site check no longer reads a delivered inner level as an unavailable
+        // base.
         assert!(
-            !matches!(
+            matches!(
                 table_decision(CURSOR_ONLY, "inputs"),
                 Decision::NestedSlice { .. }
             ),
-            "the table it cannot type must not be flipped"
+            "the owner survived the transaction but did not deliver"
         );
     })
     .unwrap();
