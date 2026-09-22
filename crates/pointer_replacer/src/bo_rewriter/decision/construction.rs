@@ -546,6 +546,189 @@ pub(crate) fn peel_for_sized_assignment<'h>(
     Collector::peel(expression)
 }
 
+/// **R506-6 link (2)(i) — an ENSURE-CAPACITY accessor states the extent of what
+/// it returns.**
+///
+/// brotli hands every bit-writing buffer out through one shape (`lib.rs:176277`):
+///
+/// ```ignore
+/// unsafe extern "C" fn GetBrotliStorage(s: *mut BrotliEncoderState, size: size_t) -> *mut uint8_t {
+///     if (*s).storage_size_ < size { … (*s).storage_ = BrotliAllocate(m, size * 1); (*s).storage_size_ = size; }
+///     return (*s).storage_;
+/// }
+/// ```
+///
+/// At the RETURN the field has at least `(*s).storage_size_` elements, and that
+/// is the claim this arm makes — a **post-condition of the accessor read at the
+/// call**, never a global invariant of the struct. The distinction is
+/// load-bearing and measured: brotli's destructor (`lib.rs:177321-177322`) nulls
+/// `storage_` without clearing `storage_size_`, so the pair is inconsistent
+/// after it, and no read follows. A caller that constructs its slice at the call
+/// is unaffected; a rule that claimed the invariant would be wrong.
+///
+/// Recognised strictly, because it is a body proof and not a name:
+///
+/// 1. every return of the callee is the SAME field of the same parameter;
+/// 2. the body assigns that field's size SIBLING, by the same convention
+///    [`sibling_names`] uses — so the accessor and the root walk name one fact;
+/// 3. the body assigns the field itself, so the pair is maintained here rather
+///    than assumed from elsewhere.
+///
+/// The extent is then read at the CALLER, from its own argument in the position
+/// the returned field is based on: `((*s).storage_size_) as usize` where `s` is
+/// whatever the caller passed.
+fn accessor_return_field(tcx: TyCtxt<'_>, callee: LocalDefId) -> Option<(String, String, usize)> {
+    // **A foreign declaration is a LOCAL DefId with no body.** `extern "C" { fn
+    // GetBuffer() -> *mut u8; }` resolves to this crate, and asking for its body
+    // is an ICE rather than a `None` — which is exactly what the first wiring
+    // did to two of this file's own controls.
+    let body = tcx.hir_node_by_def_id(callee).body_id()?;
+    let body = tcx.hir_body(body);
+    let mut returns = Vec::new();
+    collect_returns(body.value, &mut returns);
+    let [first, rest @ ..] = returns.as_slice() else {
+        return None;
+    };
+    let (field, parameter) = returned_field_of_parameter(tcx, callee, first)?;
+    for other in rest {
+        if returned_field_of_parameter(tcx, callee, other) != Some((field.clone(), parameter)) {
+            return None;
+        }
+    }
+    let index = body
+        .params
+        .iter()
+        .position(|param| param.pat.hir_id == parameter)?;
+    let sibling = sibling_names(&field)
+        .into_iter()
+        .map(|(name, _)| name)
+        .find(|name| assigns_field(tcx, body.value, parameter, name))?;
+    if !assigns_field(tcx, body.value, parameter, &field) {
+        return None;
+    }
+    Some((field, sibling, index))
+}
+
+/// Every `return <e>` in a body, plus its tail expression.
+fn collect_returns<'tcx>(
+    expression: &'tcx rustc_hir::Expr<'tcx>,
+    out: &mut Vec<&'tcx rustc_hir::Expr<'tcx>>,
+) {
+    struct V<'a, 'tcx> {
+        out: &'a mut Vec<&'tcx rustc_hir::Expr<'tcx>>,
+    }
+    impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Ret(Some(returned)) = expression.kind {
+                self.out.push(returned);
+            }
+            rustc_hir::intravisit::walk_expr(self, expression);
+        }
+    }
+    rustc_hir::intravisit::Visitor::visit_expr(&mut V { out }, expression);
+    if let rustc_hir::ExprKind::Block(block, _) = expression.kind
+        && let Some(tail) = block.expr
+        && !matches!(tail.kind, rustc_hir::ExprKind::Ret(_))
+    {
+        out.push(tail);
+    }
+}
+
+/// `(*p).field` where `p` is a binding — the field's name and that binding.
+fn returned_field_of_parameter(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    expression: &rustc_hir::Expr<'_>,
+) -> Option<(String, HirId)> {
+    let _ = tcx;
+    let _ = owner;
+    let expression = Collector::peel(expression);
+    let rustc_hir::ExprKind::Field(base, field) = expression.kind else {
+        return None;
+    };
+    let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, place) = Collector::peel(base).kind
+    else {
+        return None;
+    };
+    let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) =
+        Collector::peel(place).kind
+    else {
+        return None;
+    };
+    let rustc_hir::def::Res::Local(binding) = path.res else {
+        return None;
+    };
+    Some((field.name.as_str().to_owned(), binding))
+}
+
+/// Does the body assign `(*binding).name` anywhere?
+fn assigns_field(tcx: TyCtxt<'_>, body: &rustc_hir::Expr<'_>, binding: HirId, name: &str) -> bool {
+    struct V<'a> {
+        binding: HirId,
+        name: &'a str,
+        found: bool,
+    }
+    impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for V<'_> {
+        fn visit_expr(&mut self, expression: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Assign(place, _, _) = expression.kind
+                && let rustc_hir::ExprKind::Field(base, field) = place.kind
+                && field.name.as_str() == self.name
+                && let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, target) = base.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = target.kind
+                && let rustc_hir::def::Res::Local(local) = path.res
+                && local == self.binding
+            {
+                self.found = true;
+            }
+            rustc_hir::intravisit::walk_expr(self, expression);
+        }
+    }
+    let _ = tcx;
+    let mut visitor = V {
+        binding,
+        name,
+        found: false,
+    };
+    rustc_hir::intravisit::Visitor::visit_expr(&mut visitor, body);
+    visitor.found
+}
+
+/// The caller side of [`accessor_return_field`]: this root is a call to such an
+/// accessor, so its extent is the sibling read at the caller's own argument.
+pub(crate) fn accessor_sibling_at_call(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    expression: &rustc_hir::Expr<'_>,
+) -> Option<(String, String, String)> {
+    let expression = Collector::peel(expression);
+    let rustc_hir::ExprKind::Call(callee, arguments) = expression.kind else {
+        return None;
+    };
+    let rustc_middle::ty::TyKind::FnDef(definition, _) = *tcx.typeck(owner).expr_ty(callee).kind()
+    else {
+        return None;
+    };
+    let callee = definition.as_local()?;
+    let (field, sibling, index) = accessor_return_field(tcx, callee)?;
+    let argument = arguments.get(index)?;
+    let base = tcx.sess.source_map().span_to_snippet(argument.span).ok()?;
+    Some((field, sibling, format!("*{base}")))
+}
+
+pub(crate) fn accessor_sibling_length(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    init_hir: HirId,
+) -> Option<SliceLengthPlan> {
+    let expression = tcx.hir_node(init_hir).expect_expr();
+    let (field, sibling, base) = accessor_sibling_at_call(tcx, owner, expression)?;
+    Some(SliceLengthPlan {
+        expression: format!("(({base}).{sibling}) as usize"),
+        source: SliceLengthSource::SiblingSize { field, sibling },
+        provenance: Vec::new(),
+    })
+}
+
 /// **R499-2 (B1's parameter-emission half) — the root is a FIELD whose size is
 /// recorded in a sibling field.**
 ///
@@ -731,6 +914,13 @@ pub(crate) fn root_extent(
     }
     if matches!(walked, Some(Construction::PlaceRead))
         && let Some(length) = sibling_size_length(tcx, subject.fn_did, init_hir, element_type)
+    {
+        return Some(length);
+    }
+    // R506-6 link (2)(i): the root is an ensure-capacity accessor's result, so
+    // the extent is the sibling it maintains, read at this caller's argument.
+    if matches!(walked, Some(Construction::CallResult))
+        && let Some(length) = accessor_sibling_length(tcx, subject.fn_did, init_hir)
     {
         return Some(length);
     }

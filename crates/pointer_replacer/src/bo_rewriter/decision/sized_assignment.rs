@@ -124,6 +124,15 @@ fn sized_field(
     owner: LocalDefId,
     rhs: &Expr<'_>,
 ) -> Option<(String, String, String)> {
+    // **R506-6 link (2)(i).** The corpus does not usually assign the field; it
+    // assigns an ensure-capacity accessor's RESULT (`storage =
+    // GetBrotliStorage(s, n)`). That accessor names the same pair, one call
+    // away, and condition 2 is satisfied by the same fact — so the admission
+    // and the root walk still agree, which is the whole point of keying on the
+    // root's OWN evidence rather than on "a sized accessor".
+    if let Some(resolved) = super::construction::accessor_sibling_at_call(tcx, owner, rhs) {
+        return Some(resolved);
+    }
     let expression = super::construction::peel_for_sized_assignment(rhs);
     let ExprKind::Field(base, field) = expression.kind else {
         return None;

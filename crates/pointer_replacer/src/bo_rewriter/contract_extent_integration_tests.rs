@@ -2434,6 +2434,73 @@ pub unsafe extern "C" fn WalkForest(mut f: *mut Forest) {
 }
 "#;
 
+/// **The accessor rule's own control: a PLAIN getter states nothing.** Same
+/// struct, same field, same sibling — and the callee only reads the field back.
+/// Nothing here maintains the pair, so the extent claim has no proof and the
+/// root stays held.
+const W4_B1_PLAIN_GETTER_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn PeekStorage(mut s: *mut EncoderState) -> *mut uint8_t {
+    return (*s).storage_;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreFromGetter(mut s: *mut EncoderState) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage = PeekStorage(s);
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+/// **The unsound shape the sibling check exists for.** An accessor that
+/// reallocates the field and does NOT record the new size: at the return the
+/// sibling names the OLD capacity, which may be larger than the buffer. Reading
+/// it as the extent would claim memory that is not there — so the rule must
+/// refuse this even though the field is maintained and the names line up.
+const W4_B1_UNRECORDED_GROWTH_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn GrowStorage(mut s: *mut EncoderState, mut size: size_t) -> *mut uint8_t {
+    (*s).storage_ =
+        malloc(size.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64)
+            as *mut uint8_t;
+    return (*s).storage_;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreFromUnrecorded(mut s: *mut EncoderState, mut n: size_t) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage = GrowStorage(s, n);
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
 fn b1_rows(source: &str) -> Vec<(String, String, String, String)> {
     table_of(source, |table| {
         table
@@ -2621,23 +2688,41 @@ fn w4b107_a_size_sibling_is_refused_at_a_wider_element() {
 /// link (1) exists. **Its premise is now the repair**, so it asserts where the
 /// walk arrives instead: the accessor call the corpus actually assigns.
 ///
-/// One consequence to keep straight when reading a census: batch 26 predates
-/// this rule, so brotli's rows there still read `none:null-lit` — C6's
-/// prediction is about THAT frame. From this commit onward the same rows read
-/// `none:call-result`, and the residue has not changed, only its description.
+/// **Its premise has now moved twice, each time by the rule it was written to
+/// aim.** It first asserted `none:null-lit` (the walk stopped at the `let`);
+/// link (1) made that `none:call-result` (the walk reads the assignment); link
+/// (2)(i) makes it `sibling-size:storage_:storage_size_` and a LIFT (the
+/// accessor states the extent of what it returns). A census read must keep the
+/// frames apart: batch 26 predates all of it and still shows `none:null-lit`.
 #[test]
-fn w4b108_the_walk_follows_the_assignment_to_the_accessor() {
+fn w4b108_the_accessor_states_the_extent_of_what_it_returns() {
     let rows = b1_rows(W4_B1_DECLARED_NULL_ROOT);
     let storage = rows
         .iter()
         .find(|(subject, ..)| subject.starts_with("StoreDeclaredNull::storage"))
         .unwrap_or_else(|| panic!("no StoreDeclaredNull::storage row: {rows:?}"));
-    assert_eq!(storage.1, "held", "{rows:?}");
     assert_eq!(
-        storage.2, "none:call-result",
-        "the walk reads the assignment, and the accessor call states no extent \
-         of its own — that is dry27 link (2)'s job: {rows:?}"
+        storage.1, "lifted",
+        "link (2)(i): the accessor states the extent of what it returns: {rows:?}"
     );
+    assert_eq!(
+        storage.2, "sibling-size:storage_:storage_size_",
+        "read at the CALLER, from its own argument: {rows:?}"
+    );
+    // **The whole shape, emitted.** This is brotli's `storage` root end to end:
+    // the binding holds nothing until its assignment, the assignment builds the
+    // slice from the accessor's result with the sibling the accessor maintains,
+    // and the callee indexes a checked slice.
+    let source = emitted(W4_B1_DECLARED_NULL_ROOT);
+    assert!(
+        source.contains("let mut storage: &mut [u8] = &mut [];"),
+        "{source}"
+    );
+    assert!(
+        source.contains("core::slice::from_raw_parts_mut(GetStorage(s, n),"),
+        "{source}"
+    );
+    assert!(source.contains("((*s).storage_size_) as usize"), "{source}");
 }
 
 /// **W4B1-9 (dry27 link (1)) — a null-declared local takes the construction of
@@ -2760,6 +2845,46 @@ fn w4b111_the_element_type_fallback_takes_primitives_only() {
     assert_eq!(
         nodes.2, "none:place-read",
         "no element type, so no sibling is read: {rows:?}"
+    );
+}
+
+/// **W4B1-12 (control) — a plain getter is not an ensure-capacity accessor.**
+///
+/// The soundness of link (2)(i) is the accessor's POST-CONDITION: it grew the
+/// field to `size` and recorded `size` in the sibling, so at the return the two
+/// agree. A callee that only hands the field back proves nothing about the
+/// sibling — the pair could have been broken by anyone — and the rule must
+/// refuse it even though the names line up perfectly.
+#[test]
+fn w4b112_a_plain_getter_states_no_extent() {
+    let rows = b1_rows(W4_B1_PLAIN_GETTER_ROOT);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreFromGetter::storage"))
+        .unwrap_or_else(|| panic!("no StoreFromGetter::storage row: {rows:?}"));
+    assert_eq!(storage.1, "held", "{rows:?}");
+    assert_eq!(
+        storage.2, "none:call-result",
+        "nothing in the callee maintains the pair: {rows:?}"
+    );
+}
+
+/// **W4B1-13 (control) — growth the accessor does not RECORD is not an
+/// extent.** The dangerous near-miss: the field is reallocated, the sibling is
+/// not updated, so at the return it names the old capacity. Only the
+/// sibling-assignment check refuses this one, and that is why it is separate
+/// from the field check W4B1-12 exercises.
+#[test]
+fn w4b113_unrecorded_growth_states_no_extent() {
+    let rows = b1_rows(W4_B1_UNRECORDED_GROWTH_ROOT);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreFromUnrecorded::storage"))
+        .unwrap_or_else(|| panic!("no StoreFromUnrecorded::storage row: {rows:?}"));
+    assert_eq!(storage.1, "held", "{rows:?}");
+    assert_eq!(
+        storage.2, "none:call-result",
+        "the sibling names the OLD capacity: {rows:?}"
     );
 }
 
