@@ -353,3 +353,73 @@ fn wave6o_a_raw_re_seed_value_needs_no_bridge() {
     );
     assert!(verify::type_checks_str(&output), "{output}");
 }
+
+/// **W6O-RS-4 (R513-4) — a re-seed whose callee has been re-typed is HELD,
+/// not silently withdrawn.**
+///
+/// The construction copies the call's source text, so it is correct only
+/// while that text still type-checks against the callee. tulip's
+/// `sample::main_0` measured the alternative: the plan was built, and then an
+/// `exclusion-rederivation:restore-family-interface-path` took the subject
+/// away with no receipt naming it, because `ti_find_indicator::name` had
+/// become a `&i8`. The guard refuses the re-seed instead.
+#[test]
+fn wave6o_a_re_seed_into_a_retyped_callee_is_held() {
+    const RETYPED_CALLEE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Info { pub id: i32, pub type_0: i32 }
+pub static INDICATORS: [Info; 3] = [Info { id: 1, type_0: 1 }, Info { id: 2, type_0: 2 }, Info { id: 0, type_0: 0 }];
+unsafe fn find(mut key: *const i8) -> *const Info {
+    if *key.offset(0 as isize) as i32 == 0 as i32 { return 0 as *const Info; }
+    return INDICATORS.as_ptr();
+}
+pub unsafe fn main_0(mut key: *const i8) -> i32 {
+    let mut info: *const Info = INDICATORS.as_ptr();
+    let mut n: i32 = 0;
+    while (*info).type_0 != 0 as i32 {
+        n += (*info).type_0;
+        info = info.offset(1 as isize);
+    }
+    info = find(key);
+    if info.is_null() { return 0 as i32; }
+    return n + (*info).type_0;
+}
+"#;
+    assert!(verify::type_checks_str(RETYPED_CALLEE));
+    let callee_param = decision_of(RETYPED_CALLEE, "find", "key");
+    assert!(
+        !matches!(callee_param, Decision::Degraded(_)),
+        "the callee's parameter is re-typed, which is the premise: {callee_param:?}"
+    );
+    let decision = decision_of(RETYPED_CALLEE, "main_0", "info");
+    assert!(
+        !matches!(decision, Decision::Cursor { .. }),
+        "the re-seed is refused while the copied call text is stale: {decision:?}"
+    );
+    // And the refusal is a HOLD, not a withdrawal: no family-fallback receipt
+    // restores an interface path for this owner.
+    let receipts = ::utils::compilation::run_compiler_on_str(RETYPED_CALLEE, |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("decision table");
+        ctx.raw_boundary_artifacts
+            .additive_family_receipts
+            .iter()
+            .map(|receipt| receipt.cause.clone())
+            .collect::<Vec<_>>()
+    })
+    .expect("fixture compiler context");
+    assert!(
+        !receipts
+            .iter()
+            .any(|cause| cause.contains("restore-family-interface-path")),
+        "a held re-seed withdraws nothing: {receipts:?}"
+    );
+}

@@ -541,12 +541,46 @@ impl Uses<'_, '_> {
         // call itself is the raw value. Its own arguments keep their spans, so
         // an argument this cursor owns is rewritten by ITS edit and spliced
         // into this constructor by the nested-edit composition.
-        if matches!(rhs.kind, hir::ExprKind::Call(..))
+        if let hir::ExprKind::Call(callee, _) = rhs.kind
             && matches!(
                 self.ctx.tcx.typeck(self.subject.fn_did).expr_ty(rhs).kind(),
                 ty::RawPtr(..)
             )
         {
+            // **R513-4 — fail closed on a re-typed interface.** The
+            // construction copies the call's SOURCE TEXT, so it is only
+            // correct while that text still type-checks against the callee.
+            // If the callee is local and ANY of its parameters has been
+            // re-typed by another family, the copied text is stale: measured
+            // on tulip's `sample::main_0`, the plan was built and then
+            // SILENTLY withdrawn by `restore-family-interface-path`, because
+            // `ti_find_indicator::name` had become a `&i8`. A hold here is a
+            // receipted refusal instead; the delivering form needs the call's
+            // arguments adapted at the layer where the seam's own edits live.
+            if let ty::FnDef(did, _) = *self
+                .ctx
+                .tcx
+                .typeck(self.subject.fn_did)
+                .expr_ty(callee)
+                .kind()
+                && let Some(callee_did) = did.as_local()
+                && self.entries.iter().any(|(other, decision)| {
+                    other.fn_did == callee_did
+                        && matches!(other.kind, SubjectKind::Param { .. })
+                        && match decision {
+                            Decision::Degraded(_) => false,
+                            Decision::Ref { .. }
+                            | Decision::InferredRef { .. }
+                            | Decision::Slice { .. }
+                            | Decision::Opt { .. }
+                            | Decision::Box(_)
+                            | Decision::NestedSlice { .. }
+                            | Decision::Cursor { .. } => true,
+                        }
+                })
+            {
+                return None;
+            }
             return text(self.ctx, rhs).ok().map(|t| (t, None));
         }
         let binding = local(rhs)?;
