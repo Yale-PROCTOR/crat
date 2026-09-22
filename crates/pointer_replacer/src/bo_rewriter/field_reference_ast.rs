@@ -496,10 +496,15 @@ impl MutVisitor for Substitute {
 /// node's CURRENT expression, so an inner use graft (a reborrowed parameter,
 /// a nested wrap) is already in place.
 struct Wraps<'a> {
-    /// span → (template, edit kind)
-    edits: &'a FxHashMap<(u32, u32), (&'a str, &'static str)>,
+    /// span → (template, edit kind, the transaction's withdrawal key)
+    edits: &'a FxHashMap<(u32, u32), (&'a str, &'static str, &'a [LocalDefId])>,
     guard: &'a mut Composition,
     placed: FxHashSet<(u32, u32)>,
+    /// **Spans this pass YIELDED (R523-3, the floor's sixth arm).** A yielded
+    /// span is removed from `placed` and recorded here, so the `unplaced` check
+    /// below still balances — see the comment at the refusal for why BOTH halves
+    /// of that are load-bearing.
+    held: FxHashSet<(u32, u32)>,
     failures: Vec<String>,
 }
 
@@ -510,13 +515,54 @@ impl MutVisitor for Wraps<'_> {
             return;
         }
         let key = (e.span.lo().0, e.span.hi().0);
-        let Some(&(template, kind)) = self.edits.get(&key) else { return };
+        let Some(&(template, kind, dependent_owners)) = self.edits.get(&key) else { return };
         if !self.placed.insert(key) {
             self.failures.push(format!("wrap-multi-matched:{key:?}"));
             return;
         }
         if !self.guard.claim(e.id, e.span, "field:wrap") {
-            self.failures.push(format!("wrap-claim-refused:{key:?}"));
+            // **THE FLOOR'S SIXTH ARM (R523-3).** This read
+            // `self.failures.push(..)`, which `apply_wraps` turns into `Err` and
+            // `mod.rs` turns into `round-0 emit failed` for the WHOLE program.
+            // Not hypothetical: at the L01^5 frame it cost bst -- the program
+            // that frame exists for -- its entire emission, on one wrap, in
+            // 0.209 s.
+            //
+            // A collision is the TRANSACTION's problem. The node keeps the
+            // holder's edit, this wrap yields, and the transaction is withdrawn
+            // whole so no half-wrapped field ships.
+            //
+            // **The held classes are `dependent_owners`, because that is the
+            // transaction's own withdrawal key**: `FieldTransactions::active`
+            // keeps a transaction iff NO dependent owner is reverted, so
+            // reverting them is exactly what withdraws it. Holding the caller,
+            // or the first owner, would leave the transaction active with one
+            // edit missing -- the half-composed shape the floor exists to
+            // prevent. wave-6f 058 reached the same key independently.
+            //
+            // **`placed.remove` is load-bearing and is not tidying.** The
+            // `insert` above already ran, so without the removal a yielded span
+            // sits in BOTH sets and `placed.len() + held.len()` overshoots
+            // `edits.len()` -- the `unplaced` trap then degrades the program for
+            // exactly the hold just granted, which is the failure this arm
+            // exists to remove.
+            let holder = self.guard.holder(e.id).unwrap_or("unknown-holder");
+            self.placed.remove(&key);
+            self.held.insert(key);
+            for owner in dependent_owners {
+                let class = super::bridge_receipt::SignatureClassId::of(*owner);
+                super::ast_transform::record_graft_held(
+                    super::ast_transform::GraftHeldReceipt {
+                        visitor: super::ast_transform::GraftVisitor::FieldWrap,
+                        caller: owner.local_def_index.as_u32(),
+                        class: class.order_key(),
+                        reason: holder,
+                        lo: key.0,
+                        hi: key.1,
+                    },
+                    class,
+                );
+            }
             return;
         }
         let parsed = match super::ast_transform::graft_expr(template) {
@@ -624,13 +670,18 @@ pub(crate) fn apply_wraps(
     krate: &mut rustc_ast::Crate,
     guard: &mut Composition,
 ) -> Result<(), String> {
-    let mut edits: FxHashMap<(u32, u32), (&str, &'static str)> = FxHashMap::default();
+    let mut edits: FxHashMap<(u32, u32), (&str, &'static str, &[LocalDefId])> =
+        FxHashMap::default();
     for transaction in table.field_transactions.active(&reverts.fns) {
         for edit in transaction.expression_edits.iter().filter(|edit| edit.wrap) {
             if edits
                 .insert(
                     (edit.span.lo().0, edit.span.hi().0),
-                    (edit.replacement.as_str(), edit.kind),
+                    (
+                        edit.replacement.as_str(),
+                        edit.kind,
+                        transaction.dependent_owners.as_slice(),
+                    ),
                 )
                 .is_some()
             {
@@ -648,6 +699,7 @@ pub(crate) fn apply_wraps(
         edits: &edits,
         guard,
         placed: FxHashSet::default(),
+        held: FxHashSet::default(),
         failures: Vec::new(),
     };
     wraps.visit_crate(krate);
@@ -657,11 +709,16 @@ pub(crate) fn apply_wraps(
             wraps.failures.join(";")
         ));
     }
-    if wraps.placed.len() != edits.len() {
+    // **The `unplaced` trap, as the other five arms' `unmatched` traps are.** A
+    // yielded span is in neither `placed` nor the crate's edited set, so it is
+    // indistinguishable from a span the walk never reached -- and this check
+    // would degrade the program for the hold the floor just granted.
+    if wraps.placed.len() + wraps.held.len() != edits.len() {
         return Err(format!(
-            "field-transaction-wrap:unplaced {}/{}",
+            "field-transaction-wrap:unplaced {}/{} (held {})",
             wraps.placed.len(),
-            edits.len()
+            edits.len(),
+            wraps.held.len()
         ));
     }
     Ok(())

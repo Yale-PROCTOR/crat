@@ -7299,6 +7299,11 @@ pub(crate) enum GraftVisitor {
     C9,
     /// wave-6l's use-pass composition over an inner view (W6L-FLOOR).
     Composition,
+    /// The field-transaction wrap (`field_reference_ast.rs`). Declared HERE and
+    /// not at the end so the variant order still matches `key()`'s output order
+    /// — the table sorts by the key, and a variant appended out of order makes
+    /// the enum and the artifact disagree about what "next" means.
+    FieldWrap,
     PairRaw,
     Receiver,
 }
@@ -7309,6 +7314,7 @@ impl GraftVisitor {
             Self::A5Raw => "a5-raw",
             Self::C9 => "c9",
             Self::Composition => "composition",
+            Self::FieldWrap => "field-wrap",
             Self::PairRaw => "pair-raw",
             Self::Receiver => "receiver",
         }
@@ -10473,19 +10479,102 @@ mod graft_floor_tests {
         ("GraftVisitor::Receiver", "\"receiver-input\""),
     ];
 
+    /// **The SIXTH arm lives in another file** (`field_reference_ast.rs`, the
+    /// field-transaction wrap), which is why it is not in `ARMS` — the scans
+    /// above read `ast_transform.rs`. Keeping it visible here is the point: a
+    /// sixth path nobody had listed is how bst lost its whole emission at the
+    /// L01^5 frame while the other five were already floored.
+    const FIELD_WRAP_ARM: (&str, &str) = ("GraftVisitor::FieldWrap", "\"field:wrap\"");
+
+    /// **The sixth arm (R523-3), scanned in its own file.** Same contract as the
+    /// five: a refused claim records its hold, marks the span held, undoes the
+    /// speculative `placed` insert, and does NOT push a failure — because
+    /// `apply_wraps` turns one failure into `Err` and `mod.rs` turns that into a
+    /// degraded PROGRAM.
+    #[test]
+    fn r523_3_the_field_wrap_arm_yields_instead_of_aborting() {
+        let source = include_str!("field_reference_ast.rs");
+        let code = strip_comments(
+            source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("production precedes any test module in that file"),
+        );
+        let code = code.as_str();
+        let (visitor, claimant) = FIELD_WRAP_ARM;
+        let at = code
+            .find(&format!(".claim(e.id, e.span, {claimant})"))
+            .unwrap_or_else(|| panic!("no `guard.claim(.., {claimant})` in production"));
+        // Brace-matched, not indentation-matched: an indentation needle read
+        // past the end of the block and swallowed a later arm's code.
+        let rest = &code[at..];
+        let open = rest.find('{').expect("the refusal block opens");
+        let mut depth = 0i32;
+        let mut end = rest.len();
+        for (offset, byte) in rest[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &rest[open..end];
+        assert!(
+            body.contains("record_graft_held("),
+            "field-wrap: a refused claim must RECORD its hold"
+        );
+        assert!(
+            body.contains(&format!("visitor: super::ast_transform::{visitor},")),
+            "field-wrap: the receipt must name this arm as the ENUM, like the other five — \
+             a free string cannot be exhaustively matched and drifts from `key()`"
+        );
+        assert!(
+            body.contains("self.held.insert(key)"),
+            "field-wrap: a held span must be recorded held, or `unplaced` degrades the program"
+        );
+        // **`placed.remove` is load-bearing, not tidying.** The `insert` ran
+        // before the claim, so without the removal a yielded span is in BOTH
+        // sets, `placed + held` overshoots `edits`, and the `unplaced` trap
+        // degrades the program for exactly the hold just granted.
+        assert!(
+            body.contains("self.placed.remove(&key)"),
+            "field-wrap: the speculative `placed` insert must be undone, or \
+             `placed + held != edits` and the `unplaced` trap fires on the hold"
+        );
+        assert!(
+            !body.contains("self.failures.push"),
+            "field-wrap: a collision is the TRANSACTION's problem, never the program's"
+        );
+        // The CONSTRUCTION site, not the refusal body: `dependent_owners` there
+        // is only the destructured binding's name, so a swap at the construction
+        // site would leave the body unchanged.
+        assert!(
+            code.contains("transaction.dependent_owners.as_slice()"),
+            "field-wrap: the held classes must be the transaction's withdrawal key — \
+             `FieldTransactions::active` keeps a transaction iff no DEPENDENT owner is \
+             reverted, so holding `owners` would not withdraw it"
+        );
+        assert!(
+            code.contains("wraps.placed.len() + wraps.held.len() != edits.len()"),
+            "field-wrap: `unplaced` does not subtract the held set"
+        );
+    }
+
     /// Production source with comments stripped and the tests cut off, so a
     /// scan cannot be satisfied by prose or by its own text. Same shape as
     /// `r511_3_..`'s, and for the same reason.
-    fn production() -> String {
-        let source = include_str!("ast_transform.rs");
-        // **Cut at the FIRST test module, not at this one.** This module is the
-        // last in the file, so splitting on its own name would hand the scan
-        // the sibling test module above it as "production" — and that module's
-        // string literals are exactly the strings these scans look for.
-        let source = source
-            .split("mod graft_failure_identity_tests")
-            .next()
-            .expect("production precedes every test module here");
+    /// A comment is not code, and it is stripped wherever it starts, outside a
+    /// string literal. This has mattered three times in this file: the R511-3
+    /// scan passed its own fault control on a trailing comment, and the
+    /// `field:wrap` scan failed a CORRECT implementation because the comment
+    /// explaining the fix quotes the very call the check forbids.
+    fn strip_comments(source: &str) -> String {
         let strip = |line: &str| -> String {
             let bytes = line.as_bytes();
             let (mut quoted, mut index) = (false, 0);
@@ -10501,6 +10590,20 @@ mod graft_floor_tests {
             line.to_owned()
         };
         source.lines().map(strip).collect::<Vec<_>>().join("\n")
+    }
+
+    fn production() -> String {
+        let source = include_str!("ast_transform.rs");
+        // **Cut at the FIRST test module, not at this one.** This module is the
+        // last in the file, so splitting on its own name would hand the scan
+        // the sibling test module above it as "production" — and that module's
+        // string literals are exactly the strings these scans look for.
+        strip_comments(
+            source
+                .split("mod graft_failure_identity_tests")
+                .next()
+                .expect("production precedes every test module here"),
+        )
     }
 
     /// **The floor, arm by arm.** A refused `guard.claim` must YIELD: record the
