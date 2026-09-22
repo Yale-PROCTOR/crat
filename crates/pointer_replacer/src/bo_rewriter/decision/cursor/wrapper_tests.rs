@@ -1937,6 +1937,13 @@ pub unsafe fn caller(b: &[u8]) -> u32 { countBytes(b.as_ptr(), b.len(), 0) }
 /// Nothing here exercises the prospective ARM — that needs `promote`'s caller,
 /// which is nested's build (their W1–W6). What this pins is the signature they
 /// build against and that the default path is unchanged.
+///
+/// **R515-5(a):** `plan_with` is also the door for a row this family has
+/// ALREADY taken — with a prospective supplied it delegates straight to
+/// construction for a `Decision::Cursor`, because the selection question is
+/// answered and re-asking it would fail a row that passed it in the same pass
+/// (`ordering_degraded` is false for a `Cursor` by definition). `build`
+/// therefore stays `pub(super)`: one entry point, not two.
 #[test]
 fn slicecursor_the_prospective_hand_off_keeps_one_planner() {
     use crate::bo_rewriter::decision::{Ctx, Decision, Subject, cursor_native::ProspectiveTable};

@@ -1947,6 +1947,35 @@ pub(super) fn plan_with<'a>(
     entries: &[(Subject, Decision)],
     prospective: Option<&'a super::ProspectiveTable>,
 ) -> Option<Result<CursorPlan, CursorHold>> {
+    // **R515-5(a), nested 019.** A row this family has ALREADY taken, re-planned
+    // against a base that is about to flip. The selection question is answered —
+    // this family asked it in this pass and said yes — and re-asking it gives
+    // the wrong answer rather than a conservative one, because
+    // `ordering_degraded` is defined to be false for a `Cursor`, so a row
+    // selected by ordering fails a gate it passed minutes earlier. The match
+    // below refuses an existing `Cursor` because an ordinary re-plan would be a
+    // SECOND commitment of the same row; a prospective flip is not that, it is
+    // the same commitment against a different base.
+    //
+    // So this is the one door: `build` stays `pub(super)` and nested calls
+    // `plan_with`. It also makes nested 019 (b) safe by construction — entering
+    // construction directly is sound precisely BECAUSE the subject is already a
+    // committed cursor, and this condition is what enforces that.
+    // S3.0: a `Decision` is consumed through an EXHAUSTIVE match, so a new
+    // disposition is a compile error here rather than a silent `false`.
+    let already_taken = match decision {
+        Decision::Cursor { .. } => true,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => false,
+    };
+    if prospective.is_some() && already_taken {
+        return Some(build(ctx, subject, entries, prospective));
+    }
     if (!selected(ctx, subject, decision)
         && !derives_cursor(ctx, subject, decision, entries)
         && !derived_from_cursor_root(ctx, subject, decision, entries)
