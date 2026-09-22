@@ -1969,3 +1969,237 @@ fn slicecursor_the_prospective_hand_off_keeps_one_planner() {
         >,
     > = crate::bo_rewriter::decision::cursor_native::wrapper::plan_with;
 }
+
+/// wave-6o 059's fixture, verbatim: the body of rgba `rgba_from_rgb_string` as
+/// the corpus has it, with the `strstr` declaration and the local it calls.
+const RGBA_VERBATIM: &str = r##"#![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_camel_case_types, unused_assignments)]
+pub mod libc {
+    pub type c_char = i8;
+    pub type c_int = i32;
+    pub type c_short = i16;
+}
+pub type int32_t = i32;
+pub type uint8_t = u8;
+unsafe fn rgba_from_rgb(r: u8, g: u8, b: u8) -> i32 { return (r as i32) + (g as i32) + (b as i32); }
+unsafe extern "C" {
+    fn strstr(a: *const libc::c_char, b: *const libc::c_char) -> *mut libc::c_char;
+}
+pub unsafe fn rgba_from_rgb_string(mut str:
+                    *const libc::c_char, mut ok: *mut libc::c_short)
+                -> int32_t {
+                if str ==
+                        strstr(str, b"rgb(\0" as *const u8 as *const libc::c_char)
+                            as *const libc::c_char {
+                    str = str.offset(4 as libc::c_int as isize);
+                    while ' ' as i32 == *str as libc::c_int {
+                        str = str.offset(1);
+                    }
+                    let mut r = 0 as libc::c_int as uint8_t;
+                    let mut g = 0 as libc::c_int as uint8_t;
+                    let mut b = 0 as libc::c_int as uint8_t;
+                    let mut c: libc::c_int = 0;
+                    c = 0 as libc::c_int;
+                    if *str as libc::c_int >= '0' as i32 &&
+                            *str as libc::c_int <= '9' as i32 {
+                        loop {
+                            c *= 10 as libc::c_int;
+                            let fresh0 = *str;
+                            str = str.offset(1);
+                            c += fresh0 as libc::c_int - '0' as i32;
+                            if !(*str as libc::c_int >= '0' as i32 &&
+                                            *str as libc::c_int <= '9' as i32) {
+                                break;
+                            }
+                        }
+                    } else { return 0 as libc::c_int }
+                    if c > 255 as libc::c_int { c = 255 as libc::c_int; }
+                    r = c as uint8_t;
+                    while ' ' as i32 == *str as libc::c_int ||
+                            ',' as i32 == *str as libc::c_int {
+                        str = str.offset(1);
+                    }
+                    c = 0 as libc::c_int;
+                    if *str as libc::c_int >= '0' as i32 &&
+                            *str as libc::c_int <= '9' as i32 {
+                        loop {
+                            c *= 10 as libc::c_int;
+                            let fresh1 = *str;
+                            str = str.offset(1);
+                            c += fresh1 as libc::c_int - '0' as i32;
+                            if !(*str as libc::c_int >= '0' as i32 &&
+                                            *str as libc::c_int <= '9' as i32) {
+                                break;
+                            }
+                        }
+                    } else { return 0 as libc::c_int }
+                    if c > 255 as libc::c_int { c = 255 as libc::c_int; }
+                    g = c as uint8_t;
+                    while ' ' as i32 == *str as libc::c_int ||
+                            ',' as i32 == *str as libc::c_int {
+                        str = str.offset(1);
+                    }
+                    c = 0 as libc::c_int;
+                    if *str as libc::c_int >= '0' as i32 &&
+                            *str as libc::c_int <= '9' as i32 {
+                        loop {
+                            c *= 10 as libc::c_int;
+                            let fresh2 = *str;
+                            str = str.offset(1);
+                            c += fresh2 as libc::c_int - '0' as i32;
+                            if !(*str as libc::c_int >= '0' as i32 &&
+                                            *str as libc::c_int <= '9' as i32) {
+                                break;
+                            }
+                        }
+                    } else { return 0 as libc::c_int }
+                    if c > 255 as libc::c_int { c = 255 as libc::c_int; }
+                    b = c as uint8_t;
+                    while ' ' as i32 == *str as libc::c_int ||
+                            ',' as i32 == *str as libc::c_int {
+                        str = str.offset(1);
+                    }
+                    *ok = 1 as libc::c_int as libc::c_short;
+                    return rgba_from_rgb(r, g, b);
+                }
+                *ok = 0 as libc::c_int as libc::c_short;
+                return *ok as int32_t;
+            }
+"##;
+
+/// **R513-5.** A cursor handed to an EXTERN callee's raw formal. rgba's three
+/// `str` subjects are asked and hold `RawBoundaryUnbuilt` at the argument of
+/// `strstr(str, "rgb(")`; `strstr` is a pinned libc contract with no retention,
+/// so the bridge is unconditional under ruling 130 and needs no tier-2 waiver.
+/// The comparison against the returned pointer stays on the cursor's `.addr()`.
+#[test]
+fn slicecursor_a_cursor_bridges_a_pinned_libc_formal() {
+    let dispositions = cursor_dispositions(RGBA_VERBATIM);
+    assert!(
+        !dispositions
+            .iter()
+            .any(|(l, d)| l == "rgba_from_rgb_string::str" && d == "Err(RawBoundaryUnbuilt)"),
+        "the cursor still loses the boundary at a pinned libc formal: {dispositions:?}"
+    );
+}
+
+/// The control: an extern the pinned table does not model is not bridged.
+/// Three shapes were built for it — a standalone body, rgba's body with
+/// `strstr` renamed, and rgba's body with an unmodelled call grafted BESIDE the
+/// `strstr` one — and all three give the same measurement: the family declines
+/// the owner entirely (`[]`), upstream of this arm. So the claim this control
+/// can carry is the one that matters, *not bridged*, and the contract check
+/// itself is **unwitnessed on this lane** — a mutation that drops it leaves all
+/// four witnesses green (report 065 §3). The check stays because it is ruling
+/// 130's gate: an unmodelled extern has unknown retention, and bridging it
+/// unconditionally is exactly what that ruling forbids without a named waiver.
+#[test]
+fn slicecursor_an_unmodelled_extern_is_not_bridged() {
+    for input in [
+        RGBA_VERBATIM.replace("strstr", "vendor_find"),
+        RGBA_VERBATIM
+            .replace("fn strstr(", "fn strstr_vendor(a: *const libc::c_char, b: *const libc::c_char) -> *mut libc::c_char;\n    fn strstr(")
+            .replace(
+                "str = str.offset(4 as libc::c_int as isize);",
+                "str = str.offset(4 as libc::c_int as isize);\n                    strstr_vendor(str, b\"x\\0\" as *const u8 as *const libc::c_char);",
+            ),
+    ] {
+        let dispositions = cursor_dispositions(&input);
+        assert!(
+            !dispositions
+                .iter()
+                .any(|(l, d)| l == "rgba_from_rgb_string::str" && d == "Ok(())"),
+            "an unmodelled extern was bridged: {dispositions:?}"
+        );
+    }
+}
+
+/// The second witness: brotli's foreign-argument surface. `create_commands`'
+/// `next_emit` is handed to `memcpy` — a pinned libc contract — and held
+/// `RawBoundaryUnbuilt` for it. The bridge renders that argument, so the
+/// boundary hold is gone; what is left on the subject is its own use hold,
+/// which is the parked `CreateCommands` diagnosis of report 064 and not this
+/// arm's business.
+#[test]
+fn slicecursor_the_bridge_clears_brotlis_foreign_argument() {
+    const CC: &str = r#"
+pub unsafe fn is_match(p1: *const u8, p2: *const u8) -> i32 { (*p1.offset(0) == *p2.offset(0) && *p1.offset(4) == *p2.offset(4)) as i32 }
+pub unsafe fn match_len(s1: *const u8, s2: *const u8, limit: usize) -> usize { let mut m = 0usize; while m < limit && *s1.offset(m as isize) == *s2.offset(m as isize) { m += 1; } m }
+unsafe extern "C" { fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8; }
+pub unsafe fn create_commands(input: *const u8, block_size: usize, base_ip: *const u8, table: *mut i32, literals: *mut *mut u8) -> i32 {
+    let mut ip = input;
+    let mut ip_end = input.offset(block_size as isize);
+    let mut next_emit = input;
+    let mut last_distance = -1i32;
+    let mut acc = 0;
+    if block_size >= 16 {
+        let mut ip_limit = input.offset((block_size - 16) as isize);
+        ip = ip.offset(1);
+        loop {
+            let mut next_ip = ip;
+            let mut candidate = 0 as *const u8;
+            let mut skip = 32u32;
+            let mut stop = false;
+            loop {
+                let hash = (*ip as usize) & 7;
+                let fresh = skip; skip += 1;
+                ip = next_ip;
+                next_ip = ip.offset((fresh >> 5) as isize);
+                if next_ip > ip_limit { stop = true; break; }
+                candidate = ip.offset(-(last_distance as isize));
+                if is_match(ip, candidate) != 0 && candidate < ip {
+                    *table.offset(hash as isize) = ip.offset_from(base_ip) as i32;
+                } else {
+                    candidate = base_ip.offset(*table.offset(hash as isize) as isize);
+                    *table.offset(hash as isize) = ip.offset_from(base_ip) as i32;
+                    if is_match(ip, candidate) == 0 { continue; }
+                }
+                if !(ip.offset_from(candidate) > 1000) { break; }
+            }
+            if stop { break; }
+            let base = ip;
+            let matched = 5 + match_len(candidate.offset(5), ip.offset(5), (ip_end.offset_from(ip) as usize) - 5);
+            let distance = base.offset_from(candidate) as i32;
+            let insert = base.offset_from(next_emit) as usize;
+            ip = ip.offset(matched as isize);
+            memcpy(*literals, next_emit, insert);
+            *literals = (*literals).offset(insert as isize);
+            acc += distance;
+            last_distance = distance;
+            next_emit = ip;
+            if ip >= ip_limit { break; }
+        }
+    }
+    if next_emit < ip_end {
+        let insert = ip_end.offset_from(next_emit) as usize;
+        memcpy(*literals, next_emit, insert);
+        *literals = (*literals).offset(insert as isize);
+        acc += insert as i32;
+    }
+    acc
+}
+"#;
+    let dispositions = cursor_dispositions(CC);
+    assert!(
+        !dispositions
+            .iter()
+            .any(|(l, d)| l == "create_commands::next_emit" && d == "Err(RawBoundaryUnbuilt)"),
+        "the foreign argument still loses the boundary: {dispositions:?}"
+    );
+}
+
+/// The emitted shape, pinned: the argument is the cursor's raw view and the
+/// comparison against the returned alias stays on `.addr()`. A bridge that
+/// handed the wrapper itself, or that moved the comparison onto `as_ptr()`,
+/// would pass the disposition witness and fail here.
+#[test]
+fn slicecursor_the_bridged_argument_is_a_raw_view_and_the_comparison_is_not() {
+    let source = emitted(RGBA_VERBATIM);
+    assert!(
+        source.contains("strstr(str.as_ptr()"),
+        "the bridged argument is not the cursor's raw view: {source}"
+    );
+    assert!(
+        source.contains("str.addr() =="),
+        "the comparison left the cursor's address view: {source}"
+    );
+}

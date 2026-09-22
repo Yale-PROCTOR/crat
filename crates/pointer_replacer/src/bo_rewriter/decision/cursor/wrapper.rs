@@ -1496,6 +1496,60 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     }
                     continue;
                 }
+                // **R513-5.** A cursor handed to an EXTERN callee's raw formal
+                // whose symbol the PINNED libc contract table models: rgba's
+                // `strstr(str, "rgb(")`, brotli's fragment compressors. The
+                // table's rows are `NoRetain`, so the callee cannot keep the
+                // pointer past the call and the bridge is unconditional under
+                // ruling 130 — no tier-2 waiver, no `opens_argument` permit to
+                // wait for. An extern the table does not model has UNKNOWN
+                // retention and keeps the hold, which is the control.
+                //
+                // The argument is the cursor's raw view at its position
+                // (`as_ptr`/`as_mut_ptr`), or at the derived index for a chain;
+                // the comparison against a returned alias stays on `.addr()`,
+                // where the ordering arm already renders it.
+                if !self.optional
+                    && source_binding(self.ctx.tcx, self.subject.fn_did, arg)
+                        == Some(self.subject.hir_id)
+                    && let ty::FnDef(did, _) = *self
+                        .ctx
+                        .tcx
+                        .typeck(self.subject.fn_did)
+                        .expr_ty(callee)
+                        .kind()
+                    && self.ctx.tcx.is_foreign_item(did)
+                    && super::super::raw_boundary_contracts::contract_table_models_symbol(
+                        self.ctx.tcx.item_name(did).as_str(),
+                    )
+                    && let Some(callee_did) = did.as_local()
+                {
+                    let view = if self.subject.mutable {
+                        "as_mut_ptr"
+                    } else {
+                        "as_ptr"
+                    };
+                    match self.index(arg) {
+                        Ok(d) => {
+                            let text = if local(arg) == Some(self.subject.hir_id) {
+                                format!("{}.{view}()", self.view())
+                            } else {
+                                format!("{}.offset_by({d}).{view}()", self.view())
+                            };
+                            self.push(arg, text, "raw-op-cursor-t1");
+                            self.bridges.push(super::CursorBridge {
+                                call_hir: e.hir_id,
+                                callee: callee_did,
+                                argument_span: arg.span,
+                                argument_index: index,
+                            });
+                        }
+                        Err(hold) => {
+                            self.hold.get_or_insert(hold);
+                        }
+                    }
+                    continue;
+                }
                 if local(arg) == Some(self.subject.hir_id) {
                     let ty::FnDef(did, _) = *self
                         .ctx
