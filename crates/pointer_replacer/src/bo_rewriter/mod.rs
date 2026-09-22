@@ -178,6 +178,8 @@ pub(crate) mod wave6r_shared_root;
 mod a5_inner_argument_tests;
 #[cfg(test)]
 mod additive_tests;
+#[cfg(test)]
+mod address_view_tests;
 /// **The AST application layer's bridge** — phases 1–2 of the migration back to
 /// standing decision 3. Test-only while the bar is measured; it becomes
 /// production when phase 3 ports the edit vocabulary onto it.

@@ -423,3 +423,48 @@ pub unsafe fn main_0(mut key: *const i8) -> i32 {
         "a held re-seed withdraws nothing: {receipts:?}"
     );
 }
+
+#[test]
+fn zz_heldclass_probe() {
+    const CAST_OPERAND: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct V4 { pub x: f32, pub y: f32 }
+pub unsafe fn kmVec4Assign(mut pOut: *mut V4, mut pIn: *const V4) -> i32 {
+    if pOut != pIn as *mut V4 {} else { return 0 as i32; }
+    (*pOut).x = (*pIn).x;
+    (*pOut).y = (*pIn).y;
+    return 1 as i32;
+}
+"#;
+    let out = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(CAST_OPERAND),
+        |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx(tcx)?;
+            let emission = super::emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )?;
+            let held = emission.plan.held_classes();
+            let mut lines = vec![format!("held classes: {}", held.len())];
+            for class in &held {
+                lines.push(format!(
+                    "  HELD {class:?} :: {:?}",
+                    emission.plan.class_hold_reason(*class)
+                ));
+            }
+            for (file, edits) in &emission.plan.by_file {
+                lines.push(format!("  FILE {file:?} edits={}", edits.len()));
+            }
+            Ok::<_, String>(lines)
+        },
+    )
+    .expect("fixture")
+    .expect("emission");
+    for l in out {
+        println!("{l}");
+    }
+}

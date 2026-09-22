@@ -5869,6 +5869,31 @@ impl RawBoundaryDispositionIndex {
             }
             out.address_sites.extend(views);
         }
+        // **R515-5 (i) — one view per operand span.** A cast operand plans two
+        // views at the SAME span (the comparison's `raw-op-address-view` and
+        // the cast's `raw-op-cast-sink`), with the same template and the same
+        // replacement. Two class sites at one interval hold the whole class
+        // (`intra-class-interval-overlap`), which drops every edit the class
+        // owns and leaves the function byte-identical with no receipt. One
+        // view is the whole composition: everything outside that span — the
+        // cast included — is kept verbatim, so `pIn as *mut V4` becomes
+        // `core::ptr::from_ref(pIn) as *mut V4`. The comparison's view is the
+        // one kept, because it is what the gate refuses the subject without.
+        let mut seen: Vec<(
+            (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+            rustc_span::Span,
+        )> = Vec::new();
+        let mut kept: Vec<AddressViewSite> = Vec::new();
+        let mut ordered = std::mem::take(&mut out.address_sites);
+        ordered.sort_by_key(|site| usize::from(site.bridge_kind == "raw-op-cast-sink"));
+        for site in ordered {
+            if seen.contains(&(site.node, site.span)) {
+                continue;
+            }
+            seen.push((site.node, site.span));
+            kept.push(site);
+        }
+        out.address_sites = kept;
         out.address_sites.sort_by_key(|site| {
             (
                 site.node.0.local_def_index.as_u32(),
