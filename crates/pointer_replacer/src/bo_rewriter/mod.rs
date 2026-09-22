@@ -8736,6 +8736,18 @@ fn finish_decide<'tcx>(
             &model,
             &prepared.plan.class_finalization,
             &family_policy,
+            // R506-5: the flip hands the cursor family its base inside the same
+            // transaction, so `promote` needs the same `Ctx` the replan below
+            // already builds. Row (vi)'s macro is what makes that legal beside
+            // `&mut table` — `Ctx` never borrows the `DecisionTable`.
+            &ctx_of!(
+                decision::RefGate::LiftAdaptable,
+                Some(&coconv),
+                Some(&lifetime_eligibility),
+                Some(&raw_boundary),
+                Some(&candidate_exposure),
+                Some(&return_receivers),
+            ),
         ) {
             // **R452-6 / R475-3.** A table that just gained its inner level
             // hands its elements as slices; a cursor built over one of those

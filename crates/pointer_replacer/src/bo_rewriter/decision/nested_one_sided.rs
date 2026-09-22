@@ -197,11 +197,6 @@ pub(super) fn inspect<'tcx>(
     let mut rows = Vec::new();
     let mut admitted_receivers = FxHashSet::default();
     let mut row_statement = Vec::new();
-    // Positionally parallel to `rows`: which of them the N2 cursor arm
-    // admitted. Kept beside the row rather than inside it so the pair rule's
-    // `Row` — a shared type — does not grow a field only this arm reads. Its
-    // one reader is the per-owner precondition below.
-    let mut row_is_cursor: Vec<bool> = Vec::new();
     for (position, stmt) in block.stmts.iter().enumerate() {
         let StmtKind::Let(local) = stmt.kind else { break };
         let Some((id, name)) = named(local.pat) else { continue };
@@ -233,7 +228,7 @@ pub(super) fn inspect<'tcx>(
         {
             continue;
         }
-        let (mutable, length, from_cursor) = match decision {
+        let (mutable, length, _from_cursor) = match decision {
             // The row becomes a plain slice local.
             Decision::Slice { mutable, .. } => {
                 let Some(construction) = table
@@ -301,7 +296,6 @@ pub(super) fn inspect<'tcx>(
         };
         admitted_receivers.insert(peel(receiver).hir_id);
         row_statement.push(position);
-        row_is_cursor.push(from_cursor);
         rows.push(Row {
             parameter,
             local: id,
@@ -335,91 +329,30 @@ pub(super) fn inspect<'tcx>(
         .filter(|i| !rejected.contains(&rows[*i].parameter))
         .collect::<Vec<_>>();
     row_statement = keep.iter().map(|i| row_statement[*i]).collect();
-    row_is_cursor = keep.iter().map(|i| row_is_cursor[*i]).collect();
     rows = keep.into_iter().map(|i| rows[i].clone()).collect();
     if rows.is_empty() {
         return Err(Hold::IntervalChanged);
     }
 
-    // **R500-6 (b) — the per-owner precondition.** A `Plan` is per-OWNER, so
-    // every parameter in it shares one fate: a clause that fails below, or an
-    // emission that does not type, takes the whole owner down. The N2 cursor
-    // arm is the only admission that can put a parameter here whose row is
-    // another family's, and report 015 measured what that costs — five
-    // tulipindicators tables N1 already delivered (`ti_crossany`,
-    // `ti_crossover`, `ti_decay`, `ti_edecay`, `ti_tr`) were withdrawn,
-    // each of them the SIBLING of a cursor row, and the cursor rows
-    // themselves delivered nothing.
+    // **R506-5 — (f) is RETIRED and (g) moved to where its answer is knowable.**
+    // (f) stood a cursor parameter off whenever the owner had a slice-only
+    // sibling. It was a PROXY for "this flip may fail", written when failure
+    // could only be found after the fact — and left standing it refuses five of
+    // the 51 forever (`ti_crossany`, `ti_crossover`, `ti_decay`, `ti_edecay`,
+    // `ti_tr`). `promote`'s per-parameter transaction detects failure directly
+    // and rolls back exactly the parameter that failed, which is the sibling
+    // protection (f) approximated, without forfeiting a cursor row that types.
     //
-    // So where the owner has a table admissible from slice rows ALONE, the
-    // cursor arm stands off it. The rows that remain are exactly the rows the
-    // slice-only arm would have collected, so the owner's plan is the one it
-    // had before this seam existed and the seam can only ever add. Where the
-    // owner has no such table there is nothing to protect and the arm is left
-    // free. The stood-off parameters are named in the plan, so the decision is
-    // typed and counted rather than a silent skip.
-    let mut stood_off = Vec::new();
-    let cursor_parameters = rows
-        .iter()
-        .zip(&row_is_cursor)
-        .filter(|(_, from_cursor)| **from_cursor)
-        .map(|(r, _)| r.parameter)
-        .collect::<FxHashSet<_>>();
-    if !cursor_parameters.is_empty()
-        && rows
-            .iter()
-            .any(|r| !cursor_parameters.contains(&r.parameter))
-    {
-        stood_off = cursor_parameters.iter().copied().collect::<Vec<_>>();
-        stood_off.sort_by_key(|hir| hir.local_id.as_u32());
-        let keep = (0..rows.len())
-            .filter(|i| !cursor_parameters.contains(&rows[*i].parameter))
-            .collect::<Vec<_>>();
-        // Non-empty by the condition above: at least one row is not a cursor's.
-        row_statement = keep.iter().map(|i| row_statement[*i]).collect();
-        rows = keep.into_iter().map(|i| rows[i].clone()).collect();
-    }
-
-    // **R501-4 (iv) — (b′), tree-neutrality by construction.** A table may be
-    // flipped only when EVERY one of its rows has a construction for `promote`
-    // to rewrite. A cursor row has none: its constructor belongs to the cursor
-    // family and is rebuilt only AFTER the flip, so in between the table's type
-    // has changed and the row's base text has not. That gap is not hypothetical
-    // — report 016 measured it as 61 of tulipindicators' 68 `SliceCursor`
-    // constructions turning back into raw pointers, and the instrument above it
-    // shows the consequence in the planner: the Return-stage transaction
-    // carrying such a flip is WITHDRAWN (class-level, `withdrawn=[Return]`) and
-    // the next `Return` pass — the emitting one — re-derives without it.
+    // (g) — every row of a flipped table must have a construction — is KEPT,
+    // and enforced in `promote`: a cursor row's construction is produced BY the
+    // flip, through the cursor family's `plan_with`, so whether the row has one
+    // is not a question `inspect` can answer. Admitting it here and deciding
+    // there is the whole point of the transaction.
     //
-    // So where the arm cannot type the flip it does not make it, and the seam
-    // costs the tree nothing. This is deliberately phrased over constructions
-    // rather than over cursor rows: the day the cursor family constructs a row
-    // before the flip, the condition starts passing on its own and (b) above
-    // becomes the operative gate again.
-    let unconstructed = rows
-        .iter()
-        .filter(|row| {
-            !table
-                .slice_constructions
-                .iter()
-                .any(|c| c.node == (owner, row.local))
-        })
-        .map(|row| row.parameter)
-        .collect::<FxHashSet<_>>();
-    if !unconstructed.is_empty() {
-        stood_off.extend(unconstructed.iter().copied());
-        stood_off.sort_by_key(|hir| hir.local_id.as_u32());
-        stood_off.dedup();
-        let keep = (0..rows.len())
-            .filter(|i| !unconstructed.contains(&rows[*i].parameter))
-            .collect::<Vec<_>>();
-        row_statement = keep.iter().map(|i| row_statement[*i]).collect();
-        rows = keep.into_iter().map(|i| rows[i].clone()).collect();
-    }
-    if rows.is_empty() {
-        return Err(Hold::IntervalChanged);
-    }
-
+    // No flag rides along for it: (g)'s own predicate IS the classifier — a row
+    // with no slice construction is exactly a cursor row — so `promote` asks
+    // `slice_constructions` and needs nothing new on the shared `Row`.
+    let stood_off = Vec::new();
     // (d) The relocation crosses only inert declarations.
     let last = *row_statement.iter().max().expect("a row was admitted");
     for stmt in block.stmts.iter().take(last) {
@@ -495,5 +428,7 @@ pub(super) fn inspect<'tcx>(
         parameters,
         count_guard: false,
         stood_off,
+        rebased: Vec::new(),
+        rebase_refused: Vec::new(),
     })
 }

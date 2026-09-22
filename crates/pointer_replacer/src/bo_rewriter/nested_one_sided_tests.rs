@@ -473,19 +473,20 @@ fn n1_mixed_fixture_carries_one_cursor_row_and_one_slice_row() {
     }
 }
 
-/// **W-N1-STANDOFF** — R500-6 (b). `nested_slice::Plan` is per-OWNER, so every
-/// admitted parameter shares one fate: a clause that fails later, or an
-/// emission that does not type, takes the whole owner down. Report 015
-/// measured the price of ignoring that — admitting a cursor sibling cost
-/// tulipindicators five tables N1 already delivered (`ti_crossany`,
-/// `ti_crossover`, `ti_decay`, `ti_edecay`, `ti_tr`), for nothing gained.
+/// **W-N1-ROLLBACK** — R506-5. Clause (f) is retired; this is the witness it
+/// re-points onto. The transaction decides each parameter before anything is
+/// installed: every cursor row of it is offered to the cursor family against
+/// the prospective table, and the parameter commits only if all of them come
+/// back constructed. A refusal rolls back **that parameter only**, so the
+/// owner's slice-only sibling keeps the delivery it already had — which is the
+/// protection (f) used to approximate by refusing the cursor sibling outright.
 ///
-/// So the cursor arm stands off any owner that has a parameter admissible from
-/// slice rows alone: that owner's plan is then exactly the plan the slice-only
-/// arm would have made, and the seam can only ever add. The stood-off
-/// parameter is named in the receipt — a typed hold, never a silent skip.
+/// Today every row is refused, because `plan_with` is not built yet, so this
+/// is the transaction's only reachable path and the line stays tree-identical.
+/// The refusal is receipted with the cursor family's own `CursorHold`, never a
+/// silent skip. When `plan_with` lands, W2 is the other half of this witness.
 #[test]
-fn n1_cursor_arm_stands_off_an_owner_with_a_slice_only_sibling() {
+fn n1_a_refused_cursor_row_rolls_back_only_its_own_parameter() {
     ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
@@ -501,31 +502,30 @@ fn n1_cursor_arm_stands_off_an_owner_with_a_slice_only_sibling() {
             .find(|r| tcx.def_path_str(r.owner.to_def_id()) == MIXED)
             .and_then(|r| r.result.as_ref().ok())
             .expect("the slice-only sibling still gives this owner a plan");
-        let admitted = plan
-            .parameters
-            .iter()
-            .map(|p| p.name.clone())
-            .collect::<Vec<_>>();
         assert_eq!(
-            admitted,
+            plan.parameters
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
             vec!["outputs".to_owned()],
-            "only the slice-only table is admitted"
+            "the sibling survives its cursor partner's rollback"
         );
         assert!(
-            plan.rows.iter().all(|r| r.parameter
-                == plan
-                    .parameters
-                    .iter()
-                    .find(|p| p.name == "outputs")
-                    .unwrap()
-                    .hir),
-            "the cursor sibling's rows left the plan with it"
+            plan.rows
+                .iter()
+                .all(|r| plan.parameters.iter().any(|p| p.hir == r.parameter)),
+            "a rolled-back parameter left its rows behind"
         );
         assert_eq!(
-            plan.stood_off.len(),
+            plan.rebase_refused.len(),
             1,
-            "the cursor sibling is receipted, not silently dropped: {:?}",
-            plan.stood_off
+            "the refusal is receipted with the cursor family's own hold: {:?}",
+            plan.rebase_refused
+        );
+        assert!(
+            plan.rebased.is_empty(),
+            "nothing can be rebased before `plan_with` exists: {:?}",
+            plan.rebased
         );
     })
     .unwrap();
@@ -684,4 +684,50 @@ fn n1_reports_no_new_hold_vocabulary() {
         Hold::DeclarationUnbuilt,
     ];
     assert_eq!(holds.len(), 10);
+}
+
+// ============================================================================
+// R506-5 — the transaction's witnesses, RED-first and ARMED. These are the
+// outcome assertions of report 018's W1/W2/W5; they are deliberately written
+// over the emitted text and the decision frame, NOT over the hand-off's
+// internal shape, so they are identical under either option in 018's STOP 1
+// and do not prejudge slicecursor's answer.
+// ============================================================================
+
+/// **W1** — the cursor-only owner DELIVERS. Today clause (g) stands it off,
+/// because the cursor row has no construction at flip time; once the flip hands
+/// the cursor family its base inside the same transaction, the row is
+/// constructed by the flip and the table delivers.
+#[test]
+#[ignore = "armed: needs slicecursor's `plan_with` (R512-4) — the flip cannot construct a cursor row until the cursor family can be asked against the prospective table"]
+fn w1_the_cursor_only_owner_delivers_its_inner_level() {
+    let body = region(emitted(), "__crat_safe_ti_sma_cursor_only");
+    assert!(
+        body.contains("inputs: &[&[std::os::raw::c_double]]"),
+        "the cursor-only table did not deliver:\n{body}"
+    );
+    assert!(
+        body.contains("SliceCursor::new(inputs["),
+        "the row's cursor is not built from the delivered element:\n{body}"
+    );
+    assert!(
+        !body.contains("SliceCursor::from_raw_parts(inputs["),
+        "a fabricated extent survives on a delivered element:\n{body}"
+    );
+}
+
+/// **W2** — clause (f)'s retirement, made visible: with the transaction the
+/// mixed owner delivers BOTH tables, because a cursor sibling that types no
+/// longer has to be forfeited to protect the slice-only one.
+#[test]
+#[ignore = "armed: needs slicecursor's `plan_with` (R512-4) — the flip cannot construct a cursor row until the cursor family can be asked against the prospective table"]
+fn w2_the_mixed_owner_delivers_both_tables() {
+    for parameter in ["inputs", "outputs"] {
+        let decision = table_decision(MIXED, parameter);
+        assert!(
+            matches!(decision, Decision::NestedSlice { .. }),
+            "{parameter} must deliver its inner level once the flip types the \
+             cursor row: {decision:?}"
+        );
+    }
 }
