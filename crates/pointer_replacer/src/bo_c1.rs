@@ -1715,6 +1715,31 @@ fn field_transaction_revert_status_notes(
     ) else {
         return notes;
     };
+    // **R501-4(b) — join on the WITHDRAWAL KEY, not on `owners`.**
+    //
+    // wave-6f 053 measured what `owners` is: `key_sites ∪ mentions`, where a mention is any
+    // function whose signature so much as names the struct. The withdrawal is keyed on
+    // `dependent_owners` — "a transaction survives a revert set iff none of its DEPENDENT
+    // owners is reverted" — and the two differ (their fixture: 7 owners, 1 dependent). So a
+    // reader joining a revert set against `owners` asks a question the table never answered,
+    // which is exactly the one note batches 19 and 20 carried: lodepng's
+    // `LodePNGBitReader.data` read `owner-reverted-but-reads-active` because the reverted
+    // `inflateHuffmanBlock` is a mention-only owner that never touches the field.
+    //
+    // `0b1c9324b` publishes the key as the receipt's additive twelfth column. Both directions
+    // move, not just the backward one, because both read the same `any` — and the forward
+    // check has the mirror defect: a mention-only owner in the revert set would suppress a
+    // real `withdrawn-but-no-owner-reverted`.
+    //
+    // A frame WITHOUT the column still gets its note, marked `:owners-key`, rather than
+    // silence: the imprecise join is worth reporting as long as the reader is told which set
+    // answered.
+    let dependents = column(header, "dependent_owners");
+    let key_suffix = if dependents.is_some() {
+        ""
+    } else {
+        ":owners-key"
+    };
     for line in rows {
         let cells = line.split('\t').collect::<Vec<_>>();
         let (Some(plan), Some(revert_status), Some(owner_list), Some(owning_struct), Some(field)) = (
@@ -1742,6 +1767,12 @@ fn field_transaction_revert_status_notes(
             }
             continue;
         }
+        // R501-4(b): the withdrawal key where the frame publishes it, `owners` where it does
+        // not (and the note then says which set answered).
+        let join_list = dependents
+            .and_then(|index| cells.get(index))
+            .copied()
+            .unwrap_or(owner_list);
         let mut reverted_owner = None;
         let mut any = false;
         // **R472-4 (wave-6f 047)** — the receipt joins `owners` with `,`; splitting on `;`
@@ -1750,7 +1781,7 @@ fn field_transaction_revert_status_notes(
         // of arity, and brotli's `BlockEncoder.block_types_` -- 8 of 9 owners reverted --
         // was silently missed. Both separators are tolerated rather than one swapped for
         // the other, so a producer that changes its mind cannot re-open the same hole.
-        for owner in owner_list
+        for owner in join_list
             .split([';', ','])
             .map(str::trim)
             .filter(|owner| !owner.is_empty() && *owner != "-")
@@ -1761,9 +1792,11 @@ fn field_transaction_revert_status_notes(
             }
         }
         match (*revert_status, any) {
-            ("withdrawn", false) => note("withdrawn-but-no-owner-reverted", "-"),
+            ("withdrawn", false) => {
+                note(&format!("withdrawn-but-no-owner-reverted{key_suffix}"), "-")
+            }
             ("active", true) => note(
-                "owner-reverted-but-reads-active",
+                &format!("owner-reverted-but-reads-active{key_suffix}"),
                 &reverted_owner.unwrap_or_default(),
             ),
             ("withdrawn" | "active", _) => {}
@@ -25820,17 +25853,25 @@ fn r469_1_a_revert_status_disagreement_is_a_typed_note_not_a_verdict() {
     // One owner of several reverting is enough to withdraw the transaction.
     assert!(notes(&receipt("src::a::kept;src::a::owner_reverted", "withdrawn")).is_empty());
 
-    // FORWARD: `withdrawn` must name an owner that really reverted.
+    // FORWARD: `withdrawn` must name an owner that really reverted. The `:owners-key` suffix
+    // is R501-4(b)'s: this fixture's receipt predates `dependent_owners`, so the join is the
+    // imprecise one and the note says so rather than passing itself off as the key's answer.
     let forward = notes(&receipt("src::a::kept", "withdrawn"));
     assert_eq!(forward.len(), 1);
-    assert_eq!(forward[0].kind, "withdrawn-but-no-owner-reverted");
+    assert_eq!(
+        forward[0].kind,
+        "withdrawn-but-no-owner-reverted:owners-key"
+    );
 
     // BACKWARD: `active` while an owner reverted. This is the direction that found
     // wave-6f's real defect on heman, so it is asked again -- but as a NOTE. It
     // names the reverted owner, because the row is what wave-6f has to read.
     let backward = notes(&receipt("src::a::owner_reverted", "active"));
     assert_eq!(backward.len(), 1);
-    assert_eq!(backward[0].kind, "owner-reverted-but-reads-active");
+    assert_eq!(
+        backward[0].kind,
+        "owner-reverted-but-reads-active:owners-key"
+    );
     assert_eq!(backward[0].owner, "src::a::owner_reverted");
     assert_eq!(backward[0].owning_struct, "S");
     assert_eq!(backward[0].field, "f");
@@ -25850,7 +25891,7 @@ fn r469_1_a_revert_status_disagreement_is_a_typed_note_not_a_verdict() {
     // matched nothing. Both separators are accepted.
     let comma = notes(&receipt("src::a::kept,src::a::owner_reverted", "active"));
     assert_eq!(comma.len(), 1);
-    assert_eq!(comma[0].kind, "owner-reverted-but-reads-active");
+    assert_eq!(comma[0].kind, "owner-reverted-but-reads-active:owners-key");
     assert_eq!(comma[0].owner, "src::a::owner_reverted");
     // and the forward direction agrees across a comma-joined list, as it already did
     // across a semicolon-joined one.
@@ -25864,6 +25905,54 @@ fn r469_1_a_revert_status_disagreement_is_a_typed_note_not_a_verdict() {
         )
         .is_empty()
     );
+
+    // **R501-4(b) — the join is the WITHDRAWAL KEY where the frame publishes it.**
+    //
+    // wave-6f 053: `owners = key_sites ∪ mentions`, and a mention is any function whose
+    // signature merely names the struct, while the withdrawal is keyed on `dependent_owners`
+    // ("a transaction survives a revert set iff none of its DEPENDENT owners is reverted").
+    // Their fixture splits 7 owners / 1 dependent. Joining a revert set against `owners` asks
+    // a question the table never answered, and that is the one note batches 19 and 20 carried:
+    // lodepng's `LodePNGBitReader.data` read `owner-reverted-but-reads-active` because the
+    // reverted `inflateHuffmanBlock` is a mention-only owner that never touches the field.
+    let keyed = |owners: &str, dependents: &str, revert_status: &str| {
+        field_transaction_revert_status_notes(
+            &format!(
+                "program\tstruct\tfield\tstatus\towners\trevert_status\tdependent_owners\n\
+                 heman\tS\tf\tapplied\t{owners}\t{revert_status}\t{dependents}\n"
+            ),
+            reverts,
+        )
+    };
+    // lodepng's exact shape: the reverted owner is a MENTION, not a dependent. Silent.
+    assert!(
+        keyed(
+            "src::a::kept,src::a::owner_reverted",
+            "src::a::kept",
+            "active"
+        )
+        .is_empty(),
+        "a mention-only owner's revert is not this transaction's"
+    );
+    // The same row when the reverted owner IS a dependent: the note fires, and unsuffixed,
+    // because the key answered.
+    let by_key = keyed(
+        "src::a::kept,src::a::owner_reverted",
+        "src::a::owner_reverted",
+        "active",
+    );
+    assert_eq!(by_key.len(), 1);
+    assert_eq!(by_key[0].kind, "owner-reverted-but-reads-active");
+    assert_eq!(by_key[0].owner, "src::a::owner_reverted");
+    // And the forward direction moves with it: `withdrawn` with no DEPENDENT reverted is a
+    // disagreement even though a mention-only owner did revert.
+    let forward_by_key = keyed(
+        "src::a::kept,src::a::owner_reverted",
+        "src::a::kept",
+        "withdrawn",
+    );
+    assert_eq!(forward_by_key.len(), 1);
+    assert_eq!(forward_by_key[0].kind, "withdrawn-but-no-owner-reverted");
 
     // The published table carries struct, field, owner and BOTH values, so the
     // disagreement can be diagnosed without re-running the census.
