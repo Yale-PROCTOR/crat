@@ -4066,6 +4066,10 @@ impl OutcomeFacts {
         files: std::collections::BTreeMap<plan::FileKey, String>,
     ) -> RewriteOutcome {
         self.stamp_class_costs();
+        // **R517-7** — the placement receipt is an EMISSION fact: the graft
+        // records it during the rounds above, and this is the first point
+        // after them that every exit path passes through.
+        self.raw_boundary_artifacts.twin_placement = decision::counted_void::twin_receipt();
         RewriteOutcome::Emitted {
             source,
             files,
@@ -4098,6 +4102,10 @@ impl OutcomeFacts {
     }
 
     fn degraded(mut self, reason: String) -> RewriteOutcome {
+        // **R517-7** — the placement receipt is an EMISSION fact: the graft
+        // records it during the rounds above, and this is the first point
+        // after them that every exit path passes through.
+        self.raw_boundary_artifacts.twin_placement = decision::counted_void::twin_receipt();
         self.raw_boundary_artifacts.degraded_output_receipt =
             "degraded-unmodified-input".to_owned();
         for event in &mut self.raw_boundary_artifacts.bridge_events {
@@ -9054,7 +9062,12 @@ fn finish_decide<'tcx>(
             sites: raw_boundary_sites.to_tsv(),
             retention: retention.to_tsv(),
             child_access: retention.child_access.clone(),
-            twin_placement: decision::counted_void::twin_receipt(),
+            // EMPTY here on purpose: the graft that records this runs later,
+            // inside `verify_and_revert`'s emission rounds, so the decision
+            // stage has nothing to read. Reading it here is what made every
+            // `twin-placement` table header-only through batch 27; the two
+            // outcome constructors fill it.
+            twin_placement: String::new(),
             dispositions: raw_boundary.receipts_tsv(),
             subjects: raw_boundary_subjects_tsv(tcx, &hypothetical, &table, &coconv, &raw_boundary),
             atoms: raw_boundary.atoms_tsv(),
