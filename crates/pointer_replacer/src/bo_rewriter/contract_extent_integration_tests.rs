@@ -2501,6 +2501,30 @@ pub unsafe extern "C" fn StoreFromUnrecorded(mut s: *mut EncoderState, mut n: si
 }
 "#;
 
+/// **A held PARAMETER whose caller's root states nothing** — the shape the
+/// census column exists to describe, and could not until report 055.
+const W4_B1_PARAM_OVER_OPAQUE_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn GetBuffer() -> *mut uint8_t;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+unsafe extern "C" fn StoreMiddle(mut pos: *mut size_t, mut storage: *mut uint8_t) {
+    BrotliWriteBits(pos, storage);
+}
+pub unsafe extern "C" fn StoreOpaqueOuter() {
+    let mut buffer: *mut uint8_t = GetBuffer();
+    let mut pos: size_t = 0 as size_t;
+    StoreMiddle(&mut pos, buffer);
+}
+"#;
+
 fn b1_rows(source: &str) -> Vec<(String, String, String, String)> {
     table_of(source, |table| {
         table
@@ -2885,6 +2909,30 @@ fn w4b113_unrecorded_growth_states_no_extent() {
     assert_eq!(
         storage.2, "none:call-result",
         "the sibling names the OLD capacity: {rows:?}"
+    );
+}
+
+/// **W4B1-14 (report 055) — a parameter's row reports its CALLERS' root
+/// shapes, because it has no construction of its own.**
+///
+/// Measured at batch 26 and it is why this exists: **every**
+/// `caller-root-states-no-extent` row in the corpus is a parameter, so the
+/// column read `none:no-construction` for all of them and answered nothing.
+/// Report 049's C6 was a claim about the roots the CALL SITES hand over, and
+/// that is what the column now names — counted, so one bad caller among five is
+/// visible rather than averaged away.
+#[test]
+fn w4b114_a_parameter_row_names_its_callers_roots() {
+    let rows = b1_rows(W4_B1_PARAM_OVER_OPAQUE_ROOT);
+    let parameter = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreMiddle::storage"))
+        .unwrap_or_else(|| panic!("no StoreMiddle::storage row: {rows:?}"));
+    assert_eq!(parameter.1, "held", "{rows:?}");
+    assert_eq!(parameter.3, "caller-root-states-no-extent", "{rows:?}");
+    assert_eq!(
+        parameter.2, "callers:call-resultx1",
+        "the shape belongs to the caller's root, not to the parameter: {rows:?}"
     );
 }
 

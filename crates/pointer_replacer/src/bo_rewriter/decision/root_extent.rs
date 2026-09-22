@@ -137,6 +137,60 @@ fn local_root_extent(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<SliceLength
 /// read) or opaque call results nothing could recover. The receipt therefore
 /// carries the root's own construction key, so the next build is chosen on the
 /// distribution rather than on a guess.
+/// **The shape a PARAMETER's row must report is its CALLERS'** (report 055).
+///
+/// Measured at batch 26: every `caller-root-states-no-extent` row in the corpus
+/// is a parameter, and a parameter has no construction of its own — so the
+/// column read `none:no-construction` for all of them and could not score
+/// report 049's C6 at all. The question C6 asks is about the roots the CALL
+/// SITES hand over, which is the walk `every_caller_states_an_extent` already
+/// does; this reports what it sees, as a counted multiset so one bad caller
+/// among five is visible rather than averaged away.
+fn caller_root_shapes(
+    ctx: &Ctx<'_, '_>,
+    subjects: &FxHashMap<(LocalDefId, HirId), &Subject>,
+    owner: LocalDefId,
+    index: usize,
+) -> Option<String> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (callee, sites) in &ctx.facts.call_args {
+        if *callee != owner {
+            continue;
+        }
+        for site in sites {
+            let Some(argument) = site.args.iter().find(|arg| arg.index == index) else {
+                continue;
+            };
+            let key = match argument.shape {
+                ArgShape::BareLocal(id) | ArgShape::CastOfLocal { binding: id, .. } => {
+                    match subjects.get(&(site.caller, id)) {
+                        Some(caller) => match super::construction::walked_construction(
+                            ctx.constructions,
+                            (caller.fn_did, caller.hir_id),
+                        ) {
+                            Some((construction, _)) => construction.key().to_owned(),
+                            None => match caller.kind {
+                                SubjectKind::Param { .. } => "caller-is-a-parameter".to_owned(),
+                                SubjectKind::Local => "no-construction".to_owned(),
+                            },
+                        },
+                        None => "argument-not-a-subject".to_owned(),
+                    }
+                }
+                _ => "argument-not-a-binding".to_owned(),
+            };
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    (!counts.is_empty()).then(|| {
+        counts
+            .into_iter()
+            .map(|(key, n)| format!("{key}x{n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
 fn root_shape(ctx: &Ctx<'_, '_>, subject: &Subject) -> String {
     match super::construction::walked_construction(
         ctx.constructions,
@@ -267,11 +321,20 @@ pub(crate) fn promote(
                 } else {
                     "held"
                 };
+                let shape = match subject.kind {
+                    SubjectKind::Param { hir_index } => {
+                        caller_root_shapes(ctx, &subjects, subject.fn_did, hir_index).map_or_else(
+                            || root_shape(ctx, subject),
+                            |shapes| format!("callers:{shapes}"),
+                        )
+                    }
+                    SubjectKind::Local => root_shape(ctx, subject),
+                };
                 rows.push(RootExtentRow {
                     subject: subject.label.clone(),
                     position,
                     outcome,
-                    extent: root_shape(ctx, subject),
+                    extent: shape,
                     evidence: reason.to_owned(),
                 });
                 continue;
