@@ -269,6 +269,12 @@ fn w6f_ht_store_and_load_deliver_through_the_field() {
 /// callee performs is discharged by the signature's lifetime tie.
 #[test]
 fn w6f_lodepng_slice_field_with_size_delivers() {
+    // **R525-2** — one of the three rotating names. It sets no override of its
+    // own, which is why it had no lock; but it READS shared frame state, and
+    // the member of a coupled group that loses is decided by thread order. It
+    // holds the crate-wide lock for its whole body, cache initialization
+    // included.
+    let _frame = frame_lock();
     let observed = observe(LODEPNG);
     assert_eq!(
         decision_of(&observed, "LodePNGBitReader_init::data"),
@@ -517,9 +523,13 @@ fn w6f_indirect_call_argument_bridges_under_t2() {
 
 /// The frame override is process-global; every test that sets it holds
 /// this lock for its whole run so a concurrent test cannot clear it.
+/// The CRATE-WIDE frame lock (R525-2). This file had its own mutex, which
+/// serialized this lane's witnesses against each other and against nothing
+/// else — and the rotation wave-6l 046 measured is a coupling with wave-6a's
+/// two A1-e tests, in a different file. One lock, named where both can reach
+/// it, is the only version of "serialize it" that can work.
 fn frame_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    super::test_model_override::frame_lock()
 }
 
 const BST: &str = include_str!("wave6f_fixture_bst.rs");

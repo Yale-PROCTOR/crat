@@ -9925,6 +9925,26 @@ pub(crate) mod test_model_override {
         *OVERRIDE.lock().unwrap() = None;
     }
 
+    /// **The ONE lock every test that touches shared frame state should hold**
+    /// (R525-2, wave-6l 046).
+    ///
+    /// The standing set's NAMES rotate: `w6a_a1e_an_owned_field_refuses_the_
+    /// certificate`, `w6a_a1e_the_heman_cascade_root_is_one_lend` and
+    /// `w6f_lodepng_slice_field_with_size_delivers` are a coupled group over
+    /// shared BO model-cache state, and thread order decides which member
+    /// loses — so a gate that compares NAMES reports a phantom pair about half
+    /// the time. A per-file mutex cannot fix that, because the two lanes'
+    /// files each had their own; this one is crate-wide so both can hold it.
+    ///
+    /// It is deliberately NOT `#[cfg(test)]`-gated the way a private helper
+    /// would be: the point is that any test file can name it.
+    pub(crate) fn frame_lock() -> std::sync::MutexGuard<'static, ()> {
+        static FRAME: Mutex<()> = Mutex::new(());
+        FRAME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) fn apply(
         tcx: rustc_middle::ty::TyCtxt<'_>,
         program: &crate::utils::rustc::RustProgram<'_>,
