@@ -486,6 +486,44 @@ impl FieldTransactions {
             .collect()
     }
 
+    /// **The classes a HELD field-transaction edit must withdraw** (relay 061 /
+    /// R523-3 — the sixth claim-refusal arm's key).
+    ///
+    /// A visitor that cannot place one of this family's edits — a refused
+    /// `claim`, a shape mismatch, a parse refusal — must hold the site and let
+    /// the emission revert a class and re-emit, exactly as the floor's five
+    /// arms do. The question this answers is WHICH class, and the obvious
+    /// answer is wrong: **not the edit's own owner.** Report 054 measured what
+    /// reverting a non-dependent owner does — it restores that owner's
+    /// signature and leaves the transaction ACTIVE, declaration converted — so
+    /// a site holding its INPUT text would then be a raw expression against a
+    /// converted field type, which is the ill-typed tree the hold exists to
+    /// avoid.
+    ///
+    /// The unit that takes the declaration with it is the transaction's
+    /// DEPENDENT owners: `active`'s key, and the set
+    /// `Plan::field_transaction_owners` closes over. Registering any one of
+    /// them is enough — `effective_withheld_classes` closes the rest in — but
+    /// this returns all of them so the caller needs no closure of its own.
+    ///
+    /// An empty answer means no applied transaction owns an edit at `span`,
+    /// and the caller must not treat that as "nothing to hold".
+    pub(crate) fn hold_classes_for_edit(
+        &self,
+        span: (u32, u32),
+    ) -> BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId> {
+        self.applied
+            .iter()
+            .filter(|t| {
+                t.expression_edits
+                    .iter()
+                    .any(|edit| (edit.span.lo().0, edit.span.hi().0) == span)
+            })
+            .flat_map(|t| t.dependent_owners.iter())
+            .map(|owner| crate::bo_rewriter::bridge_receipt::SignatureClassId::of(*owner))
+            .collect()
+    }
+
     /// A transaction survives a revert set iff none of its dependent owners
     /// is reverted.
     pub(crate) fn active<'a>(

@@ -2657,3 +2657,75 @@ fn w6f_probe_quadtree_root_as_an_owned_field() {
         }
     }
 }
+
+/// Witness 34 (relay 061 / R523-3) — **the sixth arm's key is the
+/// transaction's dependent owners, not the edit's owner.**
+///
+/// `field_reference_ast` has seventeen `failures.push` sites across its three
+/// visitors, and every one becomes an `Err` that degrades the whole program —
+/// the defect main's floor fixes on five arms, of which `field:wrap` is the
+/// sixth (bst wrote nothing at L01⁵ for exactly this). An arm needs a class to
+/// register with `record_graft_held`, and the natural choice — the edit's own
+/// owner — is measurably wrong: reverting a non-dependent owner leaves the
+/// transaction active and its declaration converted (witness 32), so a site
+/// holding its INPUT text would be a raw expression against a converted field
+/// type.
+///
+/// `hold_classes_for_edit` answers with the set that takes the declaration:
+/// the transaction's DEPENDENT owners. On lodepng, `ensureBits9` carries a
+/// `field-element` edit and is NOT a dependent owner, so asking at its span
+/// must return `LodePNGBitReader_init` — and never `ensureBits9`.
+#[test]
+fn w6f_a_held_edit_withdraws_the_transaction_not_its_owner() {
+    let _frame = frame_lock();
+    let (named, owner_named) = ::utils::compilation::run_compiler_on_str(LODEPNG, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let t = table
+            .field_transactions
+            .applied
+            .iter()
+            .find(|t| t.struct_path.ends_with("LodePNGBitReader") && t.field_name == "data")
+            .expect("the lodepng transaction");
+        // An edit owned by `ensureBits9` — a non-dependent owner.
+        let edit = t
+            .expression_edits
+            .iter()
+            .find(|e| {
+                tcx.def_path_str(e.owner.to_def_id())
+                    .ends_with("ensureBits9")
+            })
+            .expect("ensureBits9 carries an edit");
+        let span = (edit.span.lo().0, edit.span.hi().0);
+        let held = table.field_transactions.hold_classes_for_edit(span);
+        let name_of = |class: &super::bridge_receipt::SignatureClassId| -> String {
+            tcx.hir_body_owners()
+                .find(|did| super::bridge_receipt::SignatureClassId::of(*did) == *class)
+                .map(|did| tcx.def_path_str(did.to_def_id()))
+                .unwrap_or_else(|| "<unknown>".to_owned())
+        };
+        let mut named: Vec<String> = held.iter().map(name_of).collect();
+        named.sort();
+        (named, tcx.def_path_str(edit.owner.to_def_id()))
+    })
+    .unwrap();
+    assert!(
+        owner_named.ends_with("ensureBits9"),
+        "the fixture must keep the non-dependent edited owner: {owner_named}"
+    );
+    assert_eq!(
+        named,
+        vec!["LodePNGBitReader_init".to_owned()],
+        "holding an edit withdraws the transaction through its dependent owner"
+    );
+    assert!(
+        !named.iter().any(|n| n.ends_with("ensureBits9")),
+        "…and never the edit's own owner, which cannot withdraw it: {named:?}"
+    );
+}
