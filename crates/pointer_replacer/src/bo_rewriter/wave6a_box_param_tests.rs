@@ -909,8 +909,14 @@ fn w6a_c1_avls_rotation_owner_passes_the_use_check_and_holds_on_its_caller() {
         receipts.contains("rightRotate::y\theld\tbox-param-caller-retains:insert:"),
         "{receipts}"
     );
+    // Restated for R517-9: `newNode` IS certified now — its allocation local
+    // is a `Box<Node>` returned through the pass-through — so the absence this
+    // control pins is the ROTATION owner's, not the program's. `rightRotate`'s
+    // own parameter stays raw, which is what `caller-retains` above says.
+    let text = compact(&out.source);
     assert!(
-        !compact(&out.source).contains("Box<Node>"),
+        !text.contains("fnrightRotate(muty:Box<Node>)")
+            && !text.contains("fnleftRotate(mutx:Box<Node>)"),
         "{}",
         out.source
     );

@@ -1459,70 +1459,42 @@ pub unsafe extern "C" fn run() -> i32 {
 "#;
 
 #[test]
-fn w6a_a1f_the_pass_through_return_is_bridged_and_names_the_next_wall() {
-    // With the pass-over in place this program EMITS — before the bridge it
-    // did not: `pick` keeps its raw return type, so `return newNode(key)`
-    // inside it was an `E0308` once `newNode` returned a `Box`. The owner is
-    // handed back raw at that exact statement.
+fn w6a_a1f_the_pass_through_delivers_through_the_return_position() {
+    // **R517-9, the return-position arm.** The pass-through keeps its raw
+    // return type, so `return newNode(key)` inside it is bridged back raw —
+    // and the bridge is what makes the enclosing return the call's RECEIVER.
+    // Until that was said, the certificate refused its own bridged site as
+    // `call-site-not-a-receiver` and the constructor stopped one wall short
+    // (report 062).
     let out = emitted("a1f-plain-receiver", INSERT_CHAIN_PLAIN_RECEIVER);
     let certificates = &out.artifacts.return_certificate_receipts;
     assert!(
         certificates.contains("chain-through:pick:returns-parameter-or-certified"),
         "{certificates}"
     );
-    // And the rule makes the NEXT wall legible, which is the same class as
-    // buffer's two CROWN units: the call inside the pass-through sits at a
-    // RETURN position, so it is not bound to a receiver, and a certificate
-    // requires every call site to be one.
     assert!(
-        certificates
-            .contains("return-certificate-call-site-not-a-receiver:newNode:pick:newNode(key)"),
-        "the next wall is the call site's shape\n{certificates}"
+        !certificates.contains("call-site-not-a-receiver"),
+        "the enclosing return IS the receiver\n{certificates}"
     );
-}
-
-/// Control: the callee STORES its parameter away instead of handing it onward,
-/// so it is not a chain-through and the chain stays open.
-const STORING_MIDDLE: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
-extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-    fn free(ptr: *mut core::ffi::c_void);
-}
-#[repr(C)]
-pub struct Node {
-    pub key: i32,
-    pub left: *mut Node,
-    pub right: *mut Node,
-}
-static mut STASH: *mut Node = 0 as *mut Node;
-unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
-    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
-    (*node).key = key;
-    return node;
-}
-unsafe extern "C" fn keep(mut node: *mut Node, mut key: i32) -> *mut Node {
-    if node.is_null() {
-        return newNode(key);
-    }
-    STASH = node;
-    return node;
-}
-pub unsafe extern "C" fn run() -> i32 {
-    let mut root = newNode(5 as i32);
-    let mut k = (*root).key;
-    free(root as *mut core::ffi::c_void);
-    return k;
-}
-"#;
-
-#[test]
-fn w6a_a1f_a_storing_middle_is_not_a_chain_through() {
-    let out = emitted("a1f-storing-middle", STORING_MIDDLE);
-    let certificates = &out.artifacts.return_certificate_receipts;
     assert!(
-        !certificates.contains("chain-through:keep:"),
-        "a callee that stores its parameter is not passed over\n{certificates}"
+        certificates.contains("return-certificate callee=newNode output=Box<Node>"),
+        "the constructor is certified\n{certificates}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "newNode::node"),
+        None,
+        "and its allocation is an owner\nRECEIPTS:\n{certificates}\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+    let text = compact(&out.source);
+    assert!(
+        text.contains("fnnewNode(mutkey:i32)->Box<Node>")
+            && text.contains("Box::into_raw(newNode(key))"),
+        "{}",
+        out.source
     );
 }
 
@@ -1572,5 +1544,50 @@ fn w6a_a1f_a_third_returned_value_keeps_the_chain_open() {
     assert!(
         !certificates.contains("chain-through:pick3:"),
         "a callee that returns a third value originates something\n{certificates}"
+    );
+}
+
+/// Control: the middle callee STORES its parameter away instead of handing it
+/// onward, so it is not a chain-through and the chain stays open.
+const STORING_MIDDLE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+}
+static mut STASH: *mut Node = 0 as *mut Node;
+unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    return node;
+}
+unsafe extern "C" fn keep(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    STASH = node;
+    return node;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut root = newNode(5 as i32);
+    let mut k = (*root).key;
+    free(root as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+
+#[test]
+fn w6a_a1f_a_storing_middle_is_not_a_chain_through() {
+    let out = emitted("a1f-storing-middle", STORING_MIDDLE);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !certificates.contains("chain-through:keep:"),
+        "a callee that stores its parameter is not passed over\n{certificates}"
     );
 }

@@ -2417,9 +2417,17 @@ fn certify<'tcx, 's>(
                         BoxExprEdit {
                             span: *span,
                             replacement,
-                            receipt: "return-certificate-chain-through-return",
+                            receipt: "return-certificate-receiver:return-position",
                         },
                     ));
+                    // **R517-9, the return-position arm.** The call HAS a
+                    // receiver — the enclosing return — and the bridge above
+                    // is what makes it one, so the site is admitted rather
+                    // than counted as a call with nowhere to go. Without this
+                    // the certificate refused its own bridged site
+                    // (`call-site-not-a-receiver`), which is what stopped the
+                    // five constructor units at report 062.
+                    admitted_calls.push(*span);
                     continue;
                 }
                 admitted_calls.push(*span);
