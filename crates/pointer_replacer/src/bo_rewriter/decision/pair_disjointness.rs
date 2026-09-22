@@ -1410,6 +1410,11 @@ pub(crate) struct ProbeRow {
     /// R478-5: why each side's root is `Unknown` (`known` when it is not).
     pub left_why: String,
     pub right_why: String,
+    /// R500-9: is this pair a model-shared READ/READ pair — both formals
+    /// `*const`, unwritten and never mutably reborrowed? The fact
+    /// `is_shared_read_pair` exposes, so the frame's read-read set can be
+    /// stated without reusing an older pair list.
+    pub shared_read: bool,
     pub outcome: String,
 }
 
@@ -1540,6 +1545,8 @@ impl PairDisjointnessIndex {
                             right_param: index_of(caller_did, right.class),
                             left_why: left.why.key().to_owned(),
                             right_why: right.why.key().to_owned(),
+                            shared_read: self.shared_reads.contains(&(callee, left.index))
+                                && self.shared_reads.contains(&(callee, right.index)),
                             outcome,
                         });
                     }
