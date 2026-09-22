@@ -689,7 +689,16 @@ impl PairDisjointnessIndex {
                 };
                 if up_left == up_right {
                     #[cfg(test)]
-                    Self::note_decline(callee, left, right, "a-caller-passes-one-formal-twice");
+                    Self::note_decline(
+                        callee,
+                        left,
+                        right,
+                        &format!(
+                            "a-caller-passes-one-formal-twice@caller={caller} formal={up_left} \
+                             places={:?}/{:?}",
+                            a.place, b.place
+                        ),
+                    );
                     result = None;
                     break;
                 }
