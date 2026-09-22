@@ -2816,8 +2816,10 @@ impl MutVisitor for PairRawGraftVisitor<'_> {
             }
         };
         if !self.guard.claim(expression.id, expression.span, "pair-raw") {
-            self.failure =
-                Some("PAIR raw-view call collided with another AST transform".to_owned());
+            self.failure = Some(format!(
+                "PAIR raw-view call at {}..{} collided with another AST transform",
+                key.0, key.1
+            ));
             return;
         }
         self.consumed.insert(key);
@@ -10139,9 +10141,22 @@ mod graft_failure_identity_tests {
         };
         let code = source.lines().map(strip).collect::<Vec<_>>().join("\n");
 
+        // **The anchor is the ASSIGNMENT, not the assignment-plus-opening-paren.** wave-6l 041
+        // caught this: rustfmt wraps a long assignment as `self.failure =` / newline /
+        // `Some(...)`, so an anchor of `self.failure = Some(` walks straight past it. One site
+        // (the PAIR collision) was formatted that way, the scan read eighteen of nineteen, and
+        // `assert_eq!(total, 18)` locked the hole in as the expected count -- a witness that
+        // certified the exact gap it exists to close. The anchor now skips whitespace.
         let mut bare = Vec::new();
         let mut total = 0;
-        for piece in code.split("self.failure = Some(").skip(1) {
+        for piece in code.split("self.failure =").skip(1) {
+            let piece = piece.trim_start();
+            let Some(piece) = piece.strip_prefix("Some(") else {
+                panic!(
+                    "a `self.failure =` that does not assign `Some(..)`: {}",
+                    &piece[..piece.len().min(80)]
+                );
+            };
             let end = piece.find(");\n").unwrap_or(piece.len());
             let body = &piece[..end];
             total += 1;
@@ -10156,7 +10171,7 @@ mod graft_failure_identity_tests {
                 bare.push(body.split_whitespace().collect::<Vec<_>>().join(" "));
             }
         }
-        assert_eq!(total, 18, "the failure vocabulary is eighteen strings");
+        assert_eq!(total, 19, "the failure vocabulary is nineteen strings");
         assert!(
             bare.is_empty(),
             "a graft failure that names no site cannot be diagnosed from a log: {bare:#?}"
