@@ -1315,6 +1315,7 @@ fn w6f_tulip_element_list_initializers_split_by_their_elements() {
 }
 
 const AVL: &str = include_str!("wave6f_fixture_avl.rs");
+const QUADTREE_ROOT: &str = include_str!("wave6f_fixture_quadtree_root.rs");
 
 /// era-5c-shaped frame for avl (the rotation family, relay 003 §2): both
 /// `Node` pointer fields Owning, the rotation's owners Owning, the readers
@@ -2576,4 +2577,83 @@ fn w6f_a_non_dependent_owners_revert_leaves_the_text() {
         dependent.contains("pub data: *const u8") && !dependent.contains("Option<&'a [u8]>"),
         "a dependent owner's revert takes the declaration with it"
     );
+}
+
+/// Witness 33 (relay 059 / R518-3) — **the second wall behind
+/// `quadtree_new::tree`, named and pinned.**
+///
+/// The CROWN unit `quadtree_new::tree` needs `tree->root` to deliver as an
+/// OWNED field: `(*tree).root = quadtree_node_with_bounds()` stores a
+/// certified constructor result into the field, and A1 declines the
+/// certificate while the field is not owned (`return-certificate-struct-field`).
+///
+/// era-5c 034b has the first wall: `quadtree::quadtree::field0@d0` is
+/// **own-UNSAT** at L01⁵ with a 33-clause core. This witness asks the question
+/// behind it — *if the arm matrix flips the model, does the field deliver?* —
+/// by standing the override in for the matrix's verdict. It does **not**: the
+/// field is then held `argument-consumer-model-raw:quadtree_node_free::node`,
+/// because the destructor it is handed to has a model-Raw formal. That formal
+/// is itself one of the 61 (`quadtree_node_free::node#1`, era-5c's column), so
+/// both walls are upstream of this lane.
+///
+/// **A RED here is news, not a regression**: it means one of the two walls
+/// moved and the unit should be re-costed.
+#[test]
+fn w6f_quadtree_root_is_held_by_its_consumers_model() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    let probe = |kind: SlotKind| -> String {
+        super::test_model_override::set(
+            "w6f-quadtree-root-frame",
+            vec![("quadtree".to_owned(), 0, kind)],
+            Vec::new(),
+        );
+        let observed = observe(QUADTREE_ROOT);
+        super::test_model_override::clear();
+        observed
+            .fields
+            .iter()
+            .find(|(st, f, ..)| st.ends_with("quadtree") && f == "root")
+            .map(|(_, _, status, _, cause)| format!("{status}:{cause}"))
+            .unwrap_or_else(|| "<no row>".to_owned())
+    };
+    assert_eq!(
+        probe(SlotKind::Owning),
+        "held:argument-consumer-model-raw:quadtree_node_free::node:kind-raw",
+        "own-SAT alone does not deliver the field: the destructor's formal is \
+         model-Raw, and that formal is era-5c's row in the 61"
+    );
+    assert_eq!(
+        probe(SlotKind::Ref),
+        "held:store-source-raw-expression",
+        "and the reference form is blocked too — the store's source is a call \
+         result, not a subject"
+    );
+}
+
+/// **Relay 059 / R518-3 probe** — if the analysis ever calls `quadtree.root`
+/// Owning, does anything ELSE hold the field? The model override stands in for
+/// the arm matrix's verdict, so the answer separates "the analysis is the only
+/// wall" from "there is a second one waiting behind it".
+#[test]
+#[ignore = "relay 059 probe: run with --ignored --nocapture"]
+fn w6f_probe_quadtree_root_as_an_owned_field() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    for kind in [SlotKind::Owning, SlotKind::Ref] {
+        super::test_model_override::set(
+            "w6f-quadtree-root-frame",
+            vec![("quadtree".to_owned(), 0, kind)],
+            Vec::new(),
+        );
+        let observed = observe(QUADTREE_ROOT);
+        super::test_model_override::clear();
+        println!("PROBE-059 model={kind:?}");
+        for (st, field, status, form, cause) in &observed.fields {
+            println!("  ROW {st}.{field} status={status} form={form} cause={cause}");
+        }
+        if observed.fields.is_empty() {
+            println!("  ROW <none>");
+        }
+    }
 }
