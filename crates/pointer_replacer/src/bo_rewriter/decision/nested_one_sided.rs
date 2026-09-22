@@ -29,7 +29,18 @@
 //!       price: the cursor rows delivered nothing and cost five tables N1
 //!       already delivered. Standing off leaves exactly the plan the slice-only
 //!       arm would have made, so the seam can only ever add; the stood-off
-//!       table is named in the plan's `stood_off` and counted in the receipt.
+//!       table is named in the plan's `stood_off` and counted in the receipt;
+//!   (g) (R501-4 (iv)) a table is flipped only when EVERY row of it has a
+//!       construction for `promote` to rewrite, so where this arm cannot type
+//!       the flip it does not make one and the emitted tree is untouched. A
+//!       cursor row has no construction — its constructor belongs to the cursor
+//!       family and is rebuilt only after the flip — and report 016 measured
+//!       the gap as 61 of tulipindicators' 68 `SliceCursor` constructions
+//!       reverting to raw pointers. The planner agrees: the `Return`-stage
+//!       transaction carrying such a flip is withdrawn class-level and the next
+//!       `Return` pass re-derives without it. Phrased over constructions rather
+//!       than over cursors, so it releases itself the day a cursor row is
+//!       constructed before the flip.
 //!
 //! What it emits: `t` is re-typed `&[&[T]]` / `&mut [&mut [T]]`, each row's
 //! construction becomes a reborrow of the element (`t[k]`, `&mut *t[k]`), and
@@ -367,6 +378,46 @@ pub(super) fn inspect<'tcx>(
         // Non-empty by the condition above: at least one row is not a cursor's.
         row_statement = keep.iter().map(|i| row_statement[*i]).collect();
         rows = keep.into_iter().map(|i| rows[i].clone()).collect();
+    }
+
+    // **R501-4 (iv) — (b′), tree-neutrality by construction.** A table may be
+    // flipped only when EVERY one of its rows has a construction for `promote`
+    // to rewrite. A cursor row has none: its constructor belongs to the cursor
+    // family and is rebuilt only AFTER the flip, so in between the table's type
+    // has changed and the row's base text has not. That gap is not hypothetical
+    // — report 016 measured it as 61 of tulipindicators' 68 `SliceCursor`
+    // constructions turning back into raw pointers, and the instrument above it
+    // shows the consequence in the planner: the Return-stage transaction
+    // carrying such a flip is WITHDRAWN (class-level, `withdrawn=[Return]`) and
+    // the next `Return` pass — the emitting one — re-derives without it.
+    //
+    // So where the arm cannot type the flip it does not make it, and the seam
+    // costs the tree nothing. This is deliberately phrased over constructions
+    // rather than over cursor rows: the day the cursor family constructs a row
+    // before the flip, the condition starts passing on its own and (b) above
+    // becomes the operative gate again.
+    let unconstructed = rows
+        .iter()
+        .filter(|row| {
+            !table
+                .slice_constructions
+                .iter()
+                .any(|c| c.node == (owner, row.local))
+        })
+        .map(|row| row.parameter)
+        .collect::<FxHashSet<_>>();
+    if !unconstructed.is_empty() {
+        stood_off.extend(unconstructed.iter().copied());
+        stood_off.sort_by_key(|hir| hir.local_id.as_u32());
+        stood_off.dedup();
+        let keep = (0..rows.len())
+            .filter(|i| !unconstructed.contains(&rows[*i].parameter))
+            .collect::<Vec<_>>();
+        row_statement = keep.iter().map(|i| row_statement[*i]).collect();
+        rows = keep.into_iter().map(|i| rows[i].clone()).collect();
+    }
+    if rows.is_empty() {
+        return Err(Hold::IntervalChanged);
     }
 
     // (d) The relocation crosses only inert declarations.

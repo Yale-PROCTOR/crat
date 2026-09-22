@@ -18,6 +18,10 @@
 //                      CURSOR family while the output row is an ordinary slice
 //                      write. The corpus rows it stands for are ti_crossany,
 //                      ti_crossover, ti_decay, ti_edecay and ti_tr.
+//   ti_sma_cursor_only — R501-4 (iv)'s shape: the same body with the output
+//                      row's load moved below the guard, so the ONLY admissible
+//                      row is the cursor's and no sibling needs protecting.
+//                      Clause (g) is the only thing keeping it tree-neutral.
 pub mod indicators {
     pub mod ema {
         // Safety: callers supply one initialized, readable pointer-table cell
@@ -190,6 +194,46 @@ pub mod indicators {
             return 0 as std::os::raw::c_int;
         }
     }
+    pub mod sma_cursor_only {
+        // Safety: as above. `ti_sma_mixed` with the OUTPUT row's load moved
+        // below the period guard, so that table is not a leading load and the
+        // only admissible row left is the CURSOR's. This owner has no
+        // slice-only table, so clause (f) leaves the arm free and clause (g) is
+        // the only thing standing between it and a flip it cannot type.
+        pub unsafe extern "C" fn ti_sma_cursor_only(
+            mut size: std::os::raw::c_int,
+            mut inputs: *const *const std::os::raw::c_double,
+            mut options: *const std::os::raw::c_double,
+            mut outputs: *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int {
+            let mut input: *const std::os::raw::c_double =
+                *inputs.offset(0 as std::os::raw::c_int as isize);
+            let period: std::os::raw::c_int =
+                *options.offset(0 as std::os::raw::c_int as isize) as std::os::raw::c_int;
+            if period < 1 as std::os::raw::c_int {
+                return 1 as std::os::raw::c_int;
+            }
+            let mut output: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            let mut sum: std::os::raw::c_double =
+                0 as std::os::raw::c_int as std::os::raw::c_double;
+            let mut i: std::os::raw::c_int = 0;
+            i = 0 as std::os::raw::c_int;
+            while i < period {
+                sum += *input.offset(i as isize);
+                *output.offset(i as isize) = sum;
+                i += 1
+            }
+            i = period;
+            while i < size {
+                sum += *input.offset(i as isize);
+                sum -= *input.offset((i - period) as isize);
+                *output.offset(i as isize) = sum;
+                i += 1
+            }
+            return 0 as std::os::raw::c_int;
+        }
+    }
 }
 pub struct IndicatorInfo {
     pub indicator: Option<
@@ -201,7 +245,7 @@ pub struct IndicatorInfo {
         ) -> std::os::raw::c_int,
     >,
 }
-pub static INDICATORS: [IndicatorInfo; 5] = [
+pub static INDICATORS: [IndicatorInfo; 6] = [
     IndicatorInfo {
         indicator: Some(
             indicators::ema::ti_ema
@@ -249,6 +293,17 @@ pub static INDICATORS: [IndicatorInfo; 5] = [
     IndicatorInfo {
         indicator: Some(
             indicators::sma_mixed::ti_sma_mixed
+                as unsafe extern "C" fn(
+                    std::os::raw::c_int,
+                    *const *const std::os::raw::c_double,
+                    *const std::os::raw::c_double,
+                    *const *mut std::os::raw::c_double,
+                ) -> std::os::raw::c_int,
+        ),
+    },
+    IndicatorInfo {
+        indicator: Some(
+            indicators::sma_cursor_only::ti_sma_cursor_only
                 as unsafe extern "C" fn(
                     std::os::raw::c_int,
                     *const *const std::os::raw::c_double,

@@ -20,6 +20,7 @@ const LATE: &str = "indicators::ema_late_out::ti_ema_late_out";
 const LATE_IN: &str = "indicators::ema_late_in::ti_ema_late_in";
 const EXTRA: &str = "indicators::ema_extra_use::ti_ema_extra_use";
 const MIXED: &str = "indicators::sma_mixed::ti_sma_mixed";
+const CURSOR_ONLY: &str = "indicators::sma_cursor_only::ti_sma_cursor_only";
 /// wave-5d's pair fixture, read (never edited) as this lane's no-shadow control.
 const PAIR_SOURCE: &str = include_str!("wave5d_ti_abs.rs");
 
@@ -544,6 +545,100 @@ fn n1_standoff_keeps_the_slice_only_siblings_delivery() {
         body.contains("inputs: &[*const std::os::raw::c_double]"),
         "the cursor sibling keeps its frame form:\n{body}"
     );
+}
+
+/// **W-N1-CONSTRUCTED** — R501-4 (iv), (b′). A table is flipped only when every
+/// one of its rows has a construction for `promote` to rewrite. The measured
+/// reason: a cursor row's constructor belongs to the cursor family and is
+/// rebuilt only after the flip, so in between the table's type has changed and
+/// the row's base text has not — report 016 counted that as 61 of
+/// tulipindicators' 68 `SliceCursor` constructions reverting to raw pointers,
+/// and the planner's own answer is to WITHDRAW the Return-stage transaction
+/// carrying the flip (`withdrawn=[Return]`, class-level), after which the
+/// emitting `Return` pass re-derives without it.
+///
+/// So every row that survives into a plan must name a slice construction. This
+/// is asserted over the plan rather than over the arm, deliberately: the day
+/// the cursor family constructs a row before the flip, this witness keeps
+/// passing and the arm is free again.
+#[test]
+fn n1_every_planned_row_names_a_construction() {
+    ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let mut planned = 0;
+        for receipt in &table.nested_receipts {
+            let Ok(plan) = &receipt.result else { continue };
+            for row in &plan.rows {
+                assert!(
+                    table
+                        .slice_constructions
+                        .iter()
+                        .any(|c| c.node == (plan.owner, row.local)),
+                    "{} row {:?} has no construction to rewrite — the flip would \
+                     change the table's type and leave this row's base text alone",
+                    tcx.def_path_str(plan.owner.to_def_id()),
+                    row.local
+                );
+                planned += 1;
+            }
+        }
+        assert!(planned > 0, "no plan reached this witness at all");
+    })
+    .unwrap();
+}
+
+/// **W-N1-NOT-WITHDRAWN** — (b′)'s own shape, and the one that measures the
+/// difference. `ti_sma_cursor_only` has no slice-only table, so clause (f)
+/// leaves the arm free and clause (g) is the only thing between it and a flip
+/// it cannot type.
+///
+/// The assertion is that the owner has a RECEIPT AT ALL. Without (g) it has
+/// none — and the reason corrects report 016, which read that absence as "the
+/// owner is never offered". It is offered: the instrument shows a `Return` pass
+/// admitting it, and then the transaction carrying the untypeable flip is
+/// withdrawn class-level (`withdrawn=[Return]`), so the next `Return` pass —
+/// whose table is the one handed back — re-derives without it and leaves no
+/// receipt behind. With (g) the flip is never made, nothing is withdrawn, and
+/// the owner ends with a typed hold instead of a hole.
+#[test]
+fn n1_an_owner_it_cannot_type_is_held_not_withdrawn() {
+    ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let receipt = table
+            .nested_receipts
+            .iter()
+            .find(|r| tcx.def_path_str(r.owner.to_def_id()) == CURSOR_ONLY)
+            .map(|r| r.result.clone());
+        assert!(
+            receipt.is_some(),
+            "no receipt for {CURSOR_ONLY}: its Return-stage transaction was \
+             withdrawn, which is what (b′) exists to prevent"
+        );
+        // And it delivers nothing, which is the whole point: tree-neutral where
+        // it cannot type, rather than a cursor traded for nothing.
+        assert!(
+            !matches!(
+                table_decision(CURSOR_ONLY, "inputs"),
+                Decision::NestedSlice { .. }
+            ),
+            "the table it cannot type must not be flipped"
+        );
+    })
+    .unwrap();
 }
 
 /// **W-N1-STANDOFF-SCOPED** — an owner with no cursor row at all never reaches
