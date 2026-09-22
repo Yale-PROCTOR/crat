@@ -2476,3 +2476,94 @@ fn field_receipt_row(source: &str, struct_name: &str, field: &str) -> Vec<String
     })
     .unwrap()
 }
+
+/// Witness 32 (relay 056 / R501-7) — **report 053 STOP 1, answered: a
+/// non-dependent owner's revert reverts that owner's own signature and leaves
+/// the transaction's text exactly where it was.**
+///
+/// The instance is the note's own row: lodepng `LodePNGBitReader.data`
+/// delivers `opt-slice-shared`, is edited in four functions and depends on ONE
+/// (`LodePNGBitReader_init`). The seat ruled the question before the
+/// withdrawal key may be widened: when an owner that carries the text but
+/// cannot withdraw it is reverted, does the body show the CONVERTED form (the
+/// revert does not restore input bytes) or the RAW form (a tree type-broken
+/// against its own declaration)?
+///
+/// Measured here, three ways: it is the **converted** form. Reverting
+/// `ensureBits9` changes exactly its own signature back to `*mut`; the field
+/// reads in its body keep `((*reader).data).unwrap()[..]`, which type-checks
+/// against the converted declaration through a raw pointer, and the round
+/// verifies clean. Reverting the mention-only `advanceBits` — the note's exact
+/// shape — likewise touches only that signature and its caller's bridge.
+/// Reverting the dependent owner withdraws the whole transaction, declaration
+/// included. **So the narrow key is safe and what was wrong is the comment in
+/// `ast_transform.rs` that says the plan closes over "its owners".**
+#[test]
+fn w6f_a_non_dependent_owners_revert_leaves_the_text() {
+    let _frame = frame_lock();
+    let run = |force: &str| -> (String, usize, usize) {
+        if !force.is_empty() {
+            // SAFETY: the frame lock serializes the witnesses that set env.
+            unsafe { std::env::set_var("CRAT_W6F_FORCE_REVERT", force) };
+        }
+        let outcome = emitted_with("w6f-054", LODEPNG, &|_| {});
+        unsafe { std::env::remove_var("CRAT_W6F_FORCE_REVERT") };
+        let (source, emitted_count, reverted_count) = emitted_source(&outcome);
+        (source.to_owned(), emitted_count, reverted_count)
+    };
+
+    let (base, base_emitted, base_reverted) = run("");
+    assert_eq!(
+        (base_reverted, base.contains("pub data: Option<&'a [u8]>")),
+        (0, true)
+    );
+    assert!(base.contains("fn ensureBits9(mut reader: &mut LodePNGBitReader"));
+
+    // The non-dependent EDITED owner: its own signature goes back, the
+    // transaction's text stays, and the tree still verifies.
+    let (edited, edited_emitted, edited_reverted) = run("ensureBits9");
+    assert_eq!(edited_reverted, 1, "exactly the forced class reverted");
+    assert_eq!(
+        edited_emitted,
+        base_emitted - 1,
+        "and nothing else was lost with it"
+    );
+    assert!(
+        edited.contains("pub data: Option<&'a [u8]>"),
+        "the declaration stays converted: the transaction is still active"
+    );
+    assert!(
+        edited.contains("fn ensureBits9(mut reader: *mut LodePNGBitReader"),
+        "the reverted owner's own signature is restored"
+    );
+    let body = edited.split("fn ensureBits9").nth(1).unwrap_or_default();
+    let body = &body[..body
+        .find("unsafe extern \"C\" fn peekBits")
+        .unwrap_or(body.len())];
+    assert!(
+        body.contains("((*reader).data).unwrap()["),
+        "…while the field transaction's text is still there — the revert did \
+         NOT restore this function's input bytes: {body}"
+    );
+    assert!(
+        !body.contains("((*reader).data).offset("),
+        "…and the raw form is NOT what the body shows: {body}"
+    );
+
+    // The mention-only owner — main's note's exact shape.
+    let (mention, _, mention_reverted) = run("advanceBits");
+    assert_eq!(mention_reverted, 1);
+    assert!(
+        mention.contains("pub data: Option<&'a [u8]>")
+            && mention.contains("fn advanceBits(mut reader: *mut LodePNGBitReader")
+            && mention.contains("advanceBits(core::ptr::from_mut(&mut *reader)"),
+        "only that signature and its caller's bridge move"
+    );
+
+    // The DEPENDENT owner: the whole transaction withdraws, declaration first.
+    let (dependent, _, _) = run("LodePNGBitReader_init");
+    assert!(
+        dependent.contains("pub data: *const u8") && !dependent.contains("Option<&'a [u8]>"),
+        "a dependent owner's revert takes the declaration with it"
+    );
+}

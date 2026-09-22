@@ -2072,6 +2072,22 @@ fn verify_and_revert(
         .map(|d| d.to_path_buf());
     let mut reverted: std::collections::BTreeSet<bridge_receipt::SignatureClassId> =
         std::collections::BTreeSet::new();
+    // **wave-6f, relay 056 — test-only.** Seed the loop's revert set with the
+    // classes `CRAT_W6F_FORCE_REVERT` names (comma-separated path suffixes),
+    // so a witness can ask what the emitted tree does when a chosen class is
+    // reverted — the question report 053 STOP 1 could not answer because the
+    // lane had no way to force one. `#[cfg(test)]`: production never reads it.
+    #[cfg(test)]
+    if let Ok(names) = std::env::var("CRAT_W6F_FORCE_REVERT") {
+        for name in names.split(',').filter(|s| !s.is_empty()) {
+            if let Some(did) = tcx
+                .hir_body_owners()
+                .find(|did| tcx.def_path_str(did.to_def_id()).ends_with(name))
+            {
+                reverted.insert(bridge_receipt::SignatureClassId::of(did));
+            }
+        }
+    }
     let mut reverted_atoms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut atom_reverify_count = 0usize;
     let mut pending_atom_retry: Option<(String, Vec<String>)> = None;
@@ -2100,13 +2116,18 @@ fn verify_and_revert(
     // **R299-2** — the AST layer's render of every sibling-overlap call, kept
     // in step with `files` so whichever exit emits states the text of the round
     // it emitted.
+    // The two sets are EMPTY here in production — nothing has reverted before
+    // round 0 — so passing them is identical to passing fresh empty sets, which
+    // is what stood here. They are passed so that the `#[cfg(test)]` seed above
+    // reaches round 0's render; without it a forced revert moves the counters
+    // and not one byte of the text (measured, report 054).
     let (mut files, mut files_edited, mut line_maps, mut call_renders) = match round_files(
         tcx,
         capture,
         &emission_plan,
         &emission_texts,
-        &std::collections::BTreeSet::new(),
-        &std::collections::BTreeSet::new(),
+        &reverted,
+        &reverted_atoms,
         root_key.as_ref(),
         table,
     ) {
