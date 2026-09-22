@@ -1365,7 +1365,6 @@ pub(crate) struct UseGraftVisitor<'a> {
     originals: FxHashMap<(u32, u32), String>,
     /// Keys the composition consumed; the receiver-input pass skips them.
     pub(crate) composed: FxHashSet<(u32, u32)>,
-    composition_failures: Vec<String>,
 }
 
 impl<'a> UseGraftVisitor<'a> {
@@ -1378,7 +1377,6 @@ impl<'a> UseGraftVisitor<'a> {
             inner_views: FxHashMap::default(),
             originals: FxHashMap::default(),
             composed: FxHashSet::default(),
-            composition_failures: Vec::new(),
         }
     }
 
@@ -1475,16 +1473,17 @@ impl<'a> UseGraftVisitor<'a> {
         self.stats
     }
 
-    /// Close the walk keeping the composed keys and any composition failure.
-    fn finish_composed(mut self) -> (UseGraftStats, FxHashSet<(u32, u32)>, Vec<String>) {
+    /// Close the walk keeping the composed keys. A composition this pass could
+    /// not locate is no longer carried out of here as a failure: it is held at
+    /// the site, receipted in `graft-held.tsv` and reverted with its class.
+    fn finish_composed(mut self) -> (UseGraftStats, FxHashSet<(u32, u32)>) {
         self.stats.unmatched = self
             .uses
             .keys()
             .filter(|k| !self.consumed.contains(k))
             .count();
         let composed = std::mem::take(&mut self.composed);
-        let failures = std::mem::take(&mut self.composition_failures);
-        (self.stats, composed, failures)
+        (self.stats, composed)
     }
 }
 
@@ -1652,29 +1651,33 @@ impl MutVisitor for UseGraftVisitor<'_> {
                         composed.as_str()
                     }
                     None => {
-                        // **W6L-FLOOR (R490-2(b)).** The outer edit's text does
-                        // not contain this node's printed form, so there is
-                        // nothing to splice the view into. Hold the one class
-                        // with a receipt and leave the node intact: a
-                        // composition this pass cannot locate is a class's
-                        // problem, never the program's.
-                        let receipt = format!(
-                            "composition-held:caller={}:class={}:inner-text-not-found:{}..{}",
-                            view.caller.local_def_index.as_u32(),
-                            view.owner_class().order_key(),
-                            key.0,
-                            key.1
+                        // **THE FLOOR'S FIFTH ARM (W6L-FLOOR, R515-1 ruling 3).**
+                        // The outer edit's text does not contain this node's
+                        // printed form -- the outer renderer embedded it with
+                        // its arguments already adapted -- so there is nothing
+                        // to splice the view into. This pushed a failure that
+                        // `transform_with` turned into `Err` and `mod.rs` into
+                        // `round-0 emit failed`: wave-5d 055 lost heman's whole
+                        // emission to five views switching on at once. It is
+                        // ONE class's problem, exactly as a refused `claim` is.
+                        //
+                        // The node keeps its input text, the hold is receipted
+                        // with its span pair, and the view's owner class is
+                        // reverted WHOLE on the next round -- the same second
+                        // half the four arms have, and it is load-bearing here
+                        // too: this class's other edits would otherwise ship
+                        // around a node that never received its own.
+                        record_graft_held(
+                            GraftHeldReceipt {
+                                visitor: GraftVisitor::Composition,
+                                caller: view.caller.local_def_index.as_u32(),
+                                class: view.owner_class().order_key(),
+                                reason: "inner-text-not-found",
+                                lo: key.0,
+                                hi: key.1,
+                            },
+                            view.owner_class(),
                         );
-                        // **Readable where it happens (relay 033).** The stats
-                        // field below reaches only the arms-full sweep, so a
-                        // census — the place this is read from — would carry no
-                        // trace of a held composition. One line on stderr, on a
-                        // path that fires at most once per view, is what makes
-                        // the five heman receipts readable at batch 20; the
-                        // worker keeps stderr on a diagnostic run (report 015's
-                        // instrument).
-                        eprintln!("W6L-{receipt}");
-                        self.composition_failures.push(receipt);
                         return;
                     }
                 }
@@ -2742,7 +2745,7 @@ impl MutVisitor for A5RawGraftVisitor<'_> {
             // half-composed ships, and the hold is receipted with both parties.
             record_graft_held(
                 GraftHeldReceipt {
-                    visitor: "a5-raw",
+                    visitor: GraftVisitor::A5Raw,
                     caller: call.caller.local_def_index.as_u32(),
                     class: call.owner_class.order_key(),
                     reason: self.guard.holder(expression.id).unwrap_or("unknown-holder"),
@@ -2852,7 +2855,7 @@ impl MutVisitor for PairRawGraftVisitor<'_> {
             // half-composed ships, and the hold is receipted with both parties.
             record_graft_held(
                 GraftHeldReceipt {
-                    visitor: "pair-raw",
+                    visitor: GraftVisitor::PairRaw,
                     caller: call.caller.local_def_index.as_u32(),
                     class: call.owner_class.order_key(),
                     reason: self.guard.holder(expression.id).unwrap_or("unknown-holder"),
@@ -2949,7 +2952,7 @@ impl MutVisitor for C9GraftVisitor<'_> {
             let class = super::bridge_receipt::SignatureClassId::of(mark.owner_did);
             record_graft_held(
                 GraftHeldReceipt {
-                    visitor: "c9",
+                    visitor: GraftVisitor::C9,
                     caller: mark.owner_did.local_def_index.as_u32(),
                     class: class.order_key(),
                     reason: self.guard.holder(e.id).unwrap_or("unknown-holder"),
@@ -3113,7 +3116,7 @@ impl MutVisitor for ReceiverInputGraftVisitor<'_> {
             let class = super::bridge_receipt::SignatureClassId::of(input.callee());
             record_graft_held(
                 GraftHeldReceipt {
-                    visitor: "receiver",
+                    visitor: GraftVisitor::Receiver,
                     caller: input.callee().local_def_index.as_u32(),
                     class: class.order_key(),
                     reason: self.guard.holder(expression.id).unwrap_or("unknown-holder"),
@@ -4651,15 +4654,11 @@ fn transform_with<'tcx>(
         .with_originals(originals)
         .with_inner_views(inner_views);
     g.visit_crate(&mut krate);
-    let (mut grafts, composed_receiver_inputs, composition_failures) = g.finish_composed();
-    // **W6L-FLOOR (R490-2(b)), and the `?` is deliberately NOT here.** This
-    // read `return Err(why)`, which made one unlocatable composition a
-    // program-level failure at round 0 — the shape wave-5d 055 hit when their
-    // admission un-reverted heman's texel class and five views switched on at
-    // once. D13-W3 pins the same property for the PAIR renderer: a source
-    // failure holds its one class. Restoring the propagation here turns this
-    // back into an aborted program and the floor witness fails.
-    grafts.composition_held = composition_failures;
+    // **The `?` is deliberately NOT here, and neither is an `Err`.** This read
+    // `return Err(why.clone())`, which made one unlocatable composition a
+    // program-level failure at round 0 -- the fifth arm of the same defect the
+    // floor removed from the other four. The hold now happens at the site.
+    let (mut grafts, composed_receiver_inputs) = g.finish_composed();
     // wave-6f (W6F-3): owned-field wraps, post-order over the grafted tree.
     // A wrapped node keeps its span, so a use edit nested INSIDE a wrap is
     // reached either way; running after the use pass makes the other nesting
@@ -7292,6 +7291,39 @@ thread_local! {
     static GRAFT_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// **The table's visitor axis, CLOSED (wave-6l 043, relay 045 item 2).**
+///
+/// The arms are five and only five. As a free `&'static str` a typo'd sixth
+/// reads as a new arm and the table grows a column value nothing declares — the
+/// same shape as the receipt that had no channel and the scan that could not see
+/// its own site. `key()` is the only way a label reaches the table.
+///
+/// **Declaration order reproduces the string order the table already had**
+/// (`a5-raw` < `c9` < `composition` < `pair-raw` < `receiver`), so porting the
+/// enum moves no row anywhere: the derived `Ord` on [`GraftHeldReceipt`] leads
+/// with this field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GraftVisitor {
+    A5Raw,
+    C9,
+    /// wave-6l's use-pass composition over an inner view (W6L-FLOOR).
+    Composition,
+    PairRaw,
+    Receiver,
+}
+
+impl GraftVisitor {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::A5Raw => "a5-raw",
+            Self::C9 => "c9",
+            Self::Composition => "composition",
+            Self::PairRaw => "pair-raw",
+            Self::Receiver => "receiver",
+        }
+    }
+}
+
 /// **THE GRAFT FLOOR'S RECEIPT (R515-1 ruling 1).**
 ///
 /// One held graft, in the terms a reader can join on: which visitor yielded,
@@ -7301,9 +7333,14 @@ thread_local! {
 /// — a collision has two parties and the one worth naming is the one that is
 /// still there in the emitted tree. `visitor` is this arm's own label, so the
 /// two together read as "`c9` yielded to `a5-raw` at 1234..1250".
+///
+/// The `composition` arm is the exception, and it has to be: its hold is not a
+/// collision, so there is no holder to name. The outer edit's text simply does
+/// not contain the inner node, and `reason` carries that — `inner-text-not-
+/// found` — which is why the column is `reason` and not `holder`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct GraftHeldReceipt {
-    pub(crate) visitor: &'static str,
+    pub(crate) visitor: GraftVisitor,
     pub(crate) caller: u32,
     pub(crate) class: u32,
     pub(crate) reason: &'static str,
@@ -7379,7 +7416,7 @@ pub(crate) fn graft_held_table() -> String {
     for (receipt, emissions) in counted {
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            receipt.visitor,
+            receipt.visitor.key(),
             receipt.caller,
             receipt.class,
             receipt.reason,
@@ -10434,11 +10471,15 @@ mod graft_floor_tests {
     /// scan that could not see the site it was written for, a control that
     /// confirmed the case its author expected). The `composition` arm is
     /// wave-6l's and joins this table when their commit composes.
+    /// `(the receipt's variant, the claim's claimant string)`. The first column
+    /// became a `GraftVisitor` variant when wave-6l 043 closed the axis: a scan
+    /// looking for `visitor: "a5-raw"` would now pass vacuously on every arm, so
+    /// it looks for what the source actually says.
     const ARMS: [(&str, &str); 4] = [
-        ("a5-raw", "\"a5-raw\""),
-        ("pair-raw", "\"pair-raw\""),
-        ("c9", "\"c9\""),
-        ("receiver", "\"receiver-input\""),
+        ("GraftVisitor::A5Raw", "\"a5-raw\""),
+        ("GraftVisitor::PairRaw", "\"pair-raw\""),
+        ("GraftVisitor::C9", "\"c9\""),
+        ("GraftVisitor::Receiver", "\"receiver-input\""),
     ];
 
     /// Production source with comments stripped and the tests cut off, so a
@@ -10500,7 +10541,7 @@ mod graft_floor_tests {
                 "{visitor}: a refused claim must RECORD its hold"
             );
             assert!(
-                body.contains(&format!("visitor: \"{visitor}\"")),
+                body.contains(&format!("visitor: {visitor},")),
                 "{visitor}: the receipt must name this arm, not another"
             );
             assert!(
@@ -10567,9 +10608,9 @@ mod graft_floor_tests {
             lo,
             hi: lo + 10,
         };
-        record_graft_held(receipt("c9", 100), class);
-        record_graft_held(receipt("c9", 100), class);
-        record_graft_held(receipt("receiver", 200), class);
+        record_graft_held(receipt(GraftVisitor::C9, 100), class);
+        record_graft_held(receipt(GraftVisitor::C9, 100), class);
+        record_graft_held(receipt(GraftVisitor::Receiver, 200), class);
         let table = graft_held_table();
         let rows = table.lines().skip(1).collect::<Vec<_>>();
         assert_eq!(
@@ -10586,6 +10627,73 @@ mod graft_floor_tests {
         assert!(graft_held_classes().is_empty());
     }
 
+    /// **The FIFTH arm, wave-6l's (relay 045 item 1).** A composition this pass
+    /// cannot locate is held at the site, exactly as a refused `claim` is: the
+    /// node keeps its input text, the hold is receipted as `composition`, and the
+    /// view's owner class is reverted whole. The site is shaped differently from
+    /// the four above -- there is no `guard.claim` to refuse, the outer text
+    /// simply does not contain the inner node -- so `ARMS` cannot cover it and
+    /// it is scanned on its own terms.
+    #[test]
+    fn w6l_floor_the_composition_arm_yields_and_records() {
+        let code = production();
+        let at = code
+            .find("Self::compose_over_inner_with_original(")
+            .expect("the composition site");
+        let body = &code[at..(at + 2_400).min(code.len())];
+        assert!(
+            body.contains("record_graft_held("),
+            "an unlocatable composition must RECORD its hold"
+        );
+        assert!(
+            body.contains("visitor: GraftVisitor::Composition,"),
+            "the receipt must name this arm, not another"
+        );
+        assert!(
+            body.contains("view.owner_class(),"),
+            "the held class must reach the per-round revert set, or the class \
+             ships around a node that never received its edit"
+        );
+        // **The abort is gone, and its whole channel with it.** The failure used
+        // to travel out of `finish_composed` as a `Vec<String>` and become
+        // `Err(why)` at the apply site; a floor that only stopped pushing would
+        // have left that path alive for the next writer to reuse.
+        assert!(
+            !code.contains("composition_failures"),
+            "the composition failure channel is gone: there is one table now"
+        );
+        assert!(
+            !code.contains("if let Some(why) = composition_failures.first()"),
+            "an unlocatable composition must not fail the program"
+        );
+    }
+
+    /// **The table\'s visitor axis is CLOSED (relay 045 item 2).** main\'s arms
+    /// wrote a free `&\'static str`, where a typo\'d sixth arm reads as a new arm
+    /// -- the same shape as a receipt with no channel. Every label now reaches
+    /// the table through `GraftVisitor::key()`, and the variants are five.
+    #[test]
+    fn w6l_the_visitor_axis_is_closed_and_declaration_order_holds_the_table() {
+        use GraftVisitor::{A5Raw, C9, Composition, PairRaw, Receiver};
+        let all = [A5Raw, C9, Composition, PairRaw, Receiver];
+        assert_eq!(
+            all.map(GraftVisitor::key),
+            ["a5-raw", "c9", "composition", "pair-raw", "receiver"],
+        );
+        // Declaration order REPRODUCES the string order the table had before the
+        // port, so no row moved anywhere when the axis closed.
+        let mut sorted = all;
+        sorted.sort();
+        assert_eq!(sorted, all, "declaration order is the table\'s order");
+        let mut keys = all.map(GraftVisitor::key);
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            all.map(GraftVisitor::key),
+            "and it is the keys\' order"
+        );
+    }
+
     /// The two lifetimes are DIFFERENT and deliberately so: the emission asks
     /// the class set "what did THIS round hold?", while the census asks the
     /// receipts "what did this PROGRAM hold?". Resetting one must not reset the
@@ -10597,7 +10705,7 @@ mod graft_floor_tests {
             super::super::bridge_receipt::SignatureClassId::of(rustc_hir::def_id::CRATE_DEF_ID);
         record_graft_held(
             GraftHeldReceipt {
-                visitor: "pair-raw",
+                visitor: GraftVisitor::PairRaw,
                 caller: 1,
                 class: 11,
                 reason: "seam",
