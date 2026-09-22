@@ -2084,6 +2084,11 @@ impl StandingCensusLaunchRecipe {
             "CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE",
             // R456-3(d): optional; absent, the cache gate is unchanged.
             "CRAT_RAW_BOUNDARY_CACHE_MANIFEST_PREDECESSOR",
+            // R519-2: optional; absent, no nested admission receipt is written.
+            // `nested_slice::observe` writes the plan's `rebased` /
+            // `stood_off` / `rebase_refused` rows, which are the only place a
+            // refusal's `CursorHold` is readable from a corpus run.
+            "CRAT_NESTED_ADMISSION_OUTPUT",
         ] {
             if let Ok(value) = std::env::var(key) {
                 env.push((key, value));

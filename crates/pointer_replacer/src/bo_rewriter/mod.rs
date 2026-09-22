@@ -6428,57 +6428,42 @@ fn validate_cursor_delivered_bases(
                     })
             }
             DeliveredBaseProvider::TableElement => {
-                // **R517-5 (nested 020).** The twin of
-                // `wrapper::table_element_base`, which reads the SAME fact: a
-                // table may hand its element as a raw pointer (flat, the
-                // constructor fabricates an extent) or as a slice VALUE (the
-                // inner level delivered, `new(t[k])`, no extent at all). The
-                // constructor learned both forms; this predicate had only the
-                // flat one, and so read "the table delivers its inner level" as
-                // "the base is unavailable" — measured as the sole false field
-                // of `cursor-delivered-base-unavailable` on every owner whose
-                // flip succeeded.
+                // **R519-3 (slicecursor 067 §2).** The twin of
+                // `wrapper::table_element_base`, stated as the exact
+                // correspondence it is rather than as two conjuncts that happen
+                // to coincide: `fallback` is DEFINED as `!delivered_inner`, and
+                // `delivered_inner` is true exactly when the table is
+                // `NestedSlice`. So the table's form and the plan's `fallback`
+                // must agree, and the pair `(NestedSlice, fallback == true)` is
+                // not a case to admit — it is a fabricated
+                // `FALLBACK_SLICE_EXTENT` window over an element whose length is
+                // evidence-backed. Dropping the conjunct on the delivered side
+                // would wave that through; this re-asserts the invariant the
+                // constructor established, for the same admissions.
                 //
-                // `fallback` is required on the FLAT side only. There it is the
-                // receipt for a fabricated extent (§77); on the delivered side
-                // `fallback == false` is the success condition, because
-                // `new(t[k])` takes no length — so requiring it would refuse
-                // exactly the rows that cost nothing to fabricate.
-                let delivered_inner = table.entries.iter().any(|(candidate, choice)| {
-                    (candidate.fn_did, candidate.hir_id) == node
-                        && match choice {
-                            decision::Decision::NestedSlice { .. } => true,
-                            decision::Decision::Slice { .. }
-                            | decision::Decision::Ref { .. }
-                            | decision::Decision::InferredRef { .. }
-                            | decision::Decision::Opt { .. }
-                            | decision::Decision::Box(_)
-                            | decision::Decision::Cursor { .. }
-                            | decision::Decision::Degraded(_) => false,
-                        }
-                });
+                // `table_named_once` is unchanged on both sides. It keeps its
+                // force on the flat side and gains some on the delivered one: a
+                // second naming of a `&mut [&mut [T]]` table is an `E0499`.
                 cursor.wrapper
-                    && (cursor.fallback || delivered_inner)
                     && (!subject.mutable
                         || decision::cursor_native::wrapper::table_named_once(
                             tcx,
                             subject.fn_did,
                             base.binding,
                         ))
-                    && (delivered_inner
-                        || table.entries.iter().any(|(candidate, choice)| {
-                            (candidate.fn_did, candidate.hir_id) == node
-                                && match choice {
-                                    decision::Decision::Slice { .. } => true,
-                                    decision::Decision::NestedSlice { .. }
-                                    | decision::Decision::Ref { .. }
-                                    | decision::Decision::InferredRef { .. }
-                                    | decision::Decision::Opt { .. }
-                                    | decision::Decision::Box(_)
-                                    | decision::Decision::Cursor { .. }
-                                    | decision::Decision::Degraded(_) => false,
-                                }
-                        }))
+                    && table.entries.iter().any(|(candidate, choice)| {
+                        (candidate.fn_did, candidate.hir_id) == node
+                            && match choice {
+                                decision::Decision::Slice { .. } => cursor.fallback,
+                                decision::Decision::NestedSlice { .. } => !cursor.fallback,
+                                decision::Decision::Ref { .. }
+                                | decision::Decision::InferredRef { .. }
+                                | decision::Decision::Opt { .. }
+                                | decision::Decision::Box(_)
+                                | decision::Decision::Cursor { .. }
+                                | decision::Decision::Degraded(_) => false,
+                            }
+                    })
             }
         };
         if !valid_binding || !provider_delivered || !valid_initializer || !exact_cursor_source {

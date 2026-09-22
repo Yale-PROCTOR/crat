@@ -816,20 +816,6 @@ pub(crate) fn promote(
                 .retain(|p| committed.iter().any(|(c, _)| c.hir == p.hir));
             plan.rows
                 .retain(|r| plan.parameters.iter().any(|p| p.hir == r.parameter));
-            for (p, rebased) in &committed {
-                for (local, rebuilt) in rebased {
-                    if let Some((subject, decision)) = table
-                        .entries
-                        .iter_mut()
-                        .find(|(s, _)| s.fn_did == owner && s.hir_id == *local)
-                    {
-                        *decision = Decision::Cursor {
-                            mutable: subject.mutable,
-                            plan: rebuilt.clone(),
-                        };
-                    }
-                }
-            }
             for p in &plan.parameters {
                 let (_, d) = table
                     .entries
@@ -858,6 +844,28 @@ pub(crate) fn promote(
                     surface.obligation.planned.expected_form = surface.form.key().into();
                     surface.obligation.planned.evidence.extent =
                         MechanicalExtent::Evidence("finite-scoped-descriptor-array".into());
+                }
+            }
+            // **R519-3, the ordering condition.** The re-based plans are
+            // installed AFTER the flip, never before. `fallback` is defined as
+            // `!delivered_inner`, so a re-based plan (`fallback == false`)
+            // beside a table still `Decision::Slice` is the one pair the site
+            // check must refuse — and installing in the other order would put
+            // exactly that pair in `table.entries`. No observer runs between
+            // these two loops today, so the invariant held either way; this
+            // makes it hold by construction rather than by statement order.
+            for (_, rebased) in &committed {
+                for (local, rebuilt) in rebased {
+                    if let Some((subject, decision)) = table
+                        .entries
+                        .iter_mut()
+                        .find(|(s, _)| s.fn_did == owner && s.hir_id == *local)
+                    {
+                        *decision = Decision::Cursor {
+                            mutable: subject.mutable,
+                            plan: rebuilt.clone(),
+                        };
+                    }
                 }
             }
             for row in &plan.rows {
