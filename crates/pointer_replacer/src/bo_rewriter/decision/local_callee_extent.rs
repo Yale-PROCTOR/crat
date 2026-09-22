@@ -152,6 +152,8 @@ fn parameter_access(
     facts: &EmitabilityFacts,
     slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
     parameters: &FxHashMap<(LocalDefId, usize), &Subject>,
+    cursor_candidates: &CursorCandidates,
+    decided: Option<&DecidedForms>,
     visited: &mut Vec<(LocalDefId, HirId)>,
 ) -> Option<LocalCalleeAccess> {
     let Node::Pat(pattern) = tcx.hir_node(param.hir_id) else {
@@ -174,7 +176,18 @@ fn parameter_access(
     // handed to a libc string function) or under §77's fallback with its
     // receipt (where the walk can stop early). Both are extents; neither is the
     // one-element claim the hold exists to protect.
-    if nul_walk(tcx, param, facts).is_some() {
+    // **R517-11 — and it yields to a cursor CANDIDATE, read in this pass.** A
+    // parameter the cursor family can admit keeps its caller's hold: two cursor
+    // deliveries are not worth one string extent (wave-5c 046 §3). R505-2 read
+    // that off the SETTLED decision, which needed a second pass — and a row
+    // lifted by a second pass is decided but never planned, so it does not
+    // place and its siblings fall with it (047 §2, measured −3 on libtree). The
+    // candidate set carries the same intent from facts that exist before any
+    // decision, so the lift happens in the FIRST pass and the planning sees it.
+    if let SubjectKind::Param { hir_index } = param.kind
+        && !cursor_candidates.contains(&(param.fn_did, hir_index))
+        && nul_walk(tcx, param, facts).is_some()
+    {
         return None;
     }
     if slice_uses
@@ -222,7 +235,16 @@ fn parameter_access(
             .filter(|(_, arg)| matches!(arg.shape, ArgShape::BareLocal(binding) if binding == param.hir_id))
             .find_map(|(callee, arg)| {
                 let target = parameters.get(&(callee, arg.index))?;
-                parameter_access(tcx, target, facts, slice_uses, parameters, visited)
+                parameter_access(
+                    tcx,
+                    target,
+                    facts,
+                    slice_uses,
+                    parameters,
+                    cursor_candidates,
+                    decided,
+                    visited,
+                )
             })?;
         AccessReason::Forwarded {
             into: into.detail(),
@@ -536,6 +558,44 @@ pub(crate) fn caller_establishes_nul(tcx: TyCtxt<'_>, subject: &Subject) -> bool
     calls.found
 }
 
+/// **The decisions a second pass may read** (R485-4(b)). Absent on the FIRST
+/// pass, where nothing is decided yet. The C-string exemption no longer reads
+/// this: it takes the pre-decision [`CursorCandidates`] instead (R517-11), so
+/// that lift happens in the first pass and its rows are planned.
+#[derive(Debug, Default)]
+pub(crate) struct DecidedForms {
+    /// Parameters decided `Slice` — a checked extent at the callee.
+    pub(crate) slice: rustc_hash::FxHashSet<(LocalDefId, usize)>,
+}
+
+/// **Callee parameters the cursor family can admit** (R517-11), keyed by
+/// `(callee, parameter index)` and derived in `bo_rewriter::mod` from the facts
+/// that exist BEFORE any decision — the BO model's kind for the slot, and the
+/// slice-use / offset-sign verdicts the three reasons
+/// `cursor_native::is_cursor_reason` admits from. It is a CANDIDATE set, not a
+/// delivery: a parameter in it may still fail the family's own plan. That is
+/// the conservative direction for this rule, which uses it only to KEEP a hold.
+pub(crate) type CursorCandidates = rustc_hash::FxHashSet<(LocalDefId, usize)>;
+
+/// **The candidate predicate itself** (R517-11), pure, so each conjunct answers
+/// for itself. `cursor_native::promote` admits a degraded subject on three
+/// reasons; `SliceCursorUse` and `SliceUseUnsupported` are both
+/// `SliceUses::unsupported`, and `SliceNegOrUnknownOffset` is the offset-sign
+/// refusal the caller passes in. Every one of them sits BELOW BO's kind in the
+/// ladder, which is why the kind is read first and alone decides a `Raw` slot:
+/// such a subject degrades at `kind-raw`, and the family then reaches it only
+/// through a DELIVERED base — which a bare C-string walk never has.
+pub(crate) fn is_cursor_candidate(
+    model_kind: Option<crate::analyses::borrow_ownership::SlotKind>,
+    uses: Option<&SliceUses>,
+    sign_refuses: bool,
+) -> bool {
+    if model_kind != Some(crate::analyses::borrow_ownership::SlotKind::Ref) {
+        return false;
+    }
+    uses.is_some_and(|uses| uses.unsupported.is_some()) || sign_refuses
+}
+
 /// Caller subjects handed to such a position. A subject in this map may not
 /// take a THIN reference form.
 pub(crate) fn collect(
@@ -543,7 +603,8 @@ pub(crate) fn collect(
     subjects: &[Subject],
     facts: &EmitabilityFacts,
     slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
-    decided_slice: &rustc_hash::FxHashSet<(LocalDefId, usize)>,
+    cursor_candidates: &CursorCandidates,
+    decided: Option<&DecidedForms>,
     fat: Option<&crate::bo_rewriter::fat_facts::FatFacts>,
 ) -> FxHashMap<(LocalDefId, HirId), LocalCalleeAccess> {
     let mut parameters: FxHashMap<(LocalDefId, usize), &Subject> = FxHashMap::default();
@@ -569,7 +630,16 @@ pub(crate) fn collect(
                     continue;
                 };
                 let access = classified.entry((*callee, arg.index)).or_insert_with(|| {
-                    parameter_access(tcx, parameter, facts, slice_uses, &parameters, &mut vec![])
+                    parameter_access(
+                        tcx,
+                        parameter,
+                        facts,
+                        slice_uses,
+                        &parameters,
+                        cursor_candidates,
+                        decided,
+                        &mut vec![],
+                    )
                 });
                 if let Some(access) = access {
                     // **R485-4(b) — the decided-`Slice` callee, narrowly.** A
@@ -597,7 +667,7 @@ pub(crate) fn collect(
                     let caller_is_fat = fat
                         .zip(by_binding.get(&(site.caller, root)))
                         .is_some_and(|(fat, subject)| fat.is_array(subject.fn_did, subject.local));
-                    if decided_slice.contains(&(*callee, arg.index))
+                    if decided.is_some_and(|decided| decided.slice.contains(&(*callee, arg.index)))
                         && element_width
                         && caller_is_fat
                     {
@@ -622,14 +692,20 @@ pub(crate) fn relaxed_by_decisions(
     subjects: &[Subject],
     facts: &EmitabilityFacts,
     slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
+    cursor_candidates: &CursorCandidates,
     fat: &crate::bo_rewriter::fat_facts::FatFacts,
-    decided_slice: &rustc_hash::FxHashSet<(LocalDefId, usize)>,
+    decided: &DecidedForms,
     current: &FxHashMap<(LocalDefId, HirId), LocalCalleeAccess>,
 ) -> Option<FxHashMap<(LocalDefId, HirId), LocalCalleeAccess>> {
-    if decided_slice.is_empty() {
-        return None;
-    }
-    let relaxed = collect(tcx, subjects, facts, slice_uses, decided_slice, Some(fat));
+    let relaxed = collect(
+        tcx,
+        subjects,
+        facts,
+        slice_uses,
+        cursor_candidates,
+        Some(decided),
+        Some(fat),
+    );
     (relaxed.len() < current.len()).then_some(relaxed)
 }
 
@@ -695,7 +771,8 @@ pub unsafe fn hash(data: *const u8) -> u32 { read32(data as *const core::ffi::c_
                 &subjects,
                 &facts,
                 &FxHashMap::default(),
-                &decided,
+                &CursorCandidates::default(),
+                Some(&DecidedForms { slice: decided }),
                 Some(&fat),
             )
             .into_iter()
@@ -810,7 +887,8 @@ pub unsafe fn caller(str: *const i8) -> i32 { is_float(str) }
                     &subjects,
                     &facts,
                     &FxHashMap::default(),
-                    &rustc_hash::FxHashSet::default(),
+                    &CursorCandidates::default(),
+                    Some(&DecidedForms::default()),
                     Some(&fat),
                 )
                 .into_iter()
@@ -977,6 +1055,118 @@ pub unsafe fn is_bool_str(str: *const i8) -> i32 {
         })
         .unwrap();
         assert!(!licensed, "a counted call establishes no terminator");
+    }
+
+    /// **R517-11 controls — one per conjunct of the candidate predicate.**
+    /// libtree's `print_colon_delimited_paths::start` and binn's `is_float::p`
+    /// are the SAME source shape — a self-advancing C-string walk — and what
+    /// separates them at the corpus is BO's kind: libtree's slot is `Raw` and
+    /// decides `kind-raw`, binn's is `Ref` and delivers a cursor (batch 27's
+    /// `raw-boundary-subjects.tsv`, both programs). The predicate is read here
+    /// on that pair's two shapes.
+    #[test]
+    fn w5c_r517_the_candidate_predicate_reads_the_kind_first() {
+        let unsupported = SliceUses {
+            unsupported: Some(rustc_span::DUMMY_SP),
+            ..SliceUses::default()
+        };
+        let supported = SliceUses::default();
+        use crate::analyses::borrow_ownership::SlotKind;
+        // libtree's shape: a cursor-shaped walk the model calls `Raw`.
+        assert!(
+            !is_cursor_candidate(Some(SlotKind::Raw), Some(&unsupported), false),
+            "a `Raw` slot is no cursor candidate whatever its uses look like"
+        );
+        assert!(
+            !is_cursor_candidate(Some(SlotKind::Raw), Some(&unsupported), true),
+            "and the sign refusal does not lift a `Raw` slot either"
+        );
+        assert!(
+            !is_cursor_candidate(Some(SlotKind::Owning), Some(&unsupported), true),
+            "nor an `Owning` one"
+        );
+        assert!(
+            !is_cursor_candidate(None, Some(&unsupported), true),
+            "an unmodelled slot is not a candidate on absence of evidence"
+        );
+        // binn's shape: a cursor-shaped walk the model calls `Ref`.
+        assert!(
+            is_cursor_candidate(Some(SlotKind::Ref), Some(&unsupported), false),
+            "an unsupported slice use is `SliceCursorUse`/`SliceUseUnsupported`"
+        );
+        assert!(
+            is_cursor_candidate(Some(SlotKind::Ref), Some(&supported), true),
+            "and the sign refusal is `SliceNegOrUnknownOffset`"
+        );
+        // Neither reason: nothing for the cursor family to admit from.
+        assert!(
+            !is_cursor_candidate(Some(SlotKind::Ref), Some(&supported), false),
+            "a `Ref` slot whose uses are supported and whose sign is fine is not one"
+        );
+        assert!(
+            !is_cursor_candidate(Some(SlotKind::Ref), None, false),
+            "and neither is one with no slice uses at all"
+        );
+    }
+
+    /// **R517-11 — the exemption yields to a cursor CANDIDATE.** binn's shape:
+    /// the caller is held on `is_float`, whose parameter the cursor family can
+    /// admit. With that candidate fact the hold stays (two cursor deliveries
+    /// are not worth one string extent); without it the exemption is the one
+    /// R491-7 built. Both readings are taken in the SAME pass — which is the
+    /// whole of the change from R505-2, whose reading needed a second one
+    /// (047 §2). Restated per R217-2(a) to the property both frames share: what
+    /// decides the hold is the candidate set, not when it is consulted.
+    #[test]
+    fn w5c_nul_the_exemption_yields_to_a_cursor_candidate() {
+        let held = |cursor: bool| {
+            ::utils::compilation::run_compiler_on_str(EARLY_EXIT_WALK, |tcx| {
+                let owners = tcx
+                    .hir_body_owners()
+                    .filter(|did| matches!(tcx.def_kind(*did), rustc_hir::def::DefKind::Fn))
+                    .collect::<Vec<_>>();
+                let facts = super::super::emitability::collect(tcx, &owners);
+                let table = crate::bo_rewriter::decide_table(tcx).expect("fixture decisions");
+                let subjects = table
+                    .entries
+                    .iter()
+                    .map(|(subject, _)| subject.clone())
+                    .collect::<Vec<_>>();
+                let program = crate::bo_rewriter::collect_program(tcx);
+                let fat = crate::bo_rewriter::fat_facts::FatFacts::from_program(&program);
+                let mut candidates = CursorCandidates::default();
+                if cursor {
+                    for subject in &subjects {
+                        if subject.label == "is_float::p"
+                            && let SubjectKind::Param { hir_index } = subject.kind
+                        {
+                            candidates.insert((subject.fn_did, hir_index));
+                        }
+                    }
+                    assert_eq!(candidates.len(), 1, "the callee parameter resolves");
+                }
+                collect(
+                    tcx,
+                    &subjects,
+                    &facts,
+                    &FxHashMap::default(),
+                    &candidates,
+                    None,
+                    Some(&fat),
+                )
+                .into_iter()
+                .any(|(_, access)| access.detail().starts_with("is_float:p:"))
+            })
+            .unwrap()
+        };
+        assert!(
+            held(true),
+            "a callee parameter the cursor family can admit keeps its caller's hold"
+        );
+        assert!(
+            !held(false),
+            "and one it cannot takes the exemption R491-7 built, in this same pass"
+        );
     }
 
     /// **Control** — an INDEXED walk is not a NUL walk at all: its extent is a

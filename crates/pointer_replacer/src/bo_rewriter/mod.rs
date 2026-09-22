@@ -7596,16 +7596,58 @@ fn finish_decide<'tcx>(
         &advance_ok,
         &raw_boundary_argument_paths,
     );
+    // **R517-11 — the cursor CANDIDATES, derived where their facts live.** The
+    // C-string exemption yields to a callee parameter the cursor family can
+    // admit, and it must do so in THIS pass: a hold lifted by a second pass is
+    // decided but never planned (wave-5c 047 §2). `cursor_native` admits from
+    // three degrade reasons — `SliceCursorUse` / `SliceUseUnsupported`, both of
+    // which are `uses.unsupported`, and `SliceNegOrUnknownOffset`, which is the
+    // sign verdict the self-advance gate reads — and every subject reaching any
+    // of them has first passed BO's kind, which is the authority on whether a
+    // reference is sound at all. A `Raw` slot degrades at `kind-raw` long
+    // before the slice arm, and the family then reaches it only through a
+    // DELIVERED base, which a bare C-string walk never has.
+    //
+    // It is deliberately a CANDIDATE set and not a prediction of the family's
+    // plan: it is read only to KEEP a hold, so over-inclusion costs yield and
+    // never soundness.
+    let cursor_candidates: decision::local_callee_extent::CursorCandidates = subjects
+        .iter()
+        .filter(|subject| {
+            decision::local_callee_extent::is_cursor_candidate(
+                slots
+                    .fn_local_slots
+                    .get(&subject.fn_did)
+                    .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                    .and_then(|slot| model.get(&SlotRef::Local(subject.fn_did, slot)))
+                    .copied(),
+                full_slice_uses.get(&(subject.fn_did, subject.hir_id)),
+                sign.may_be_negative(subject.fn_did, subject.local)
+                    && decision::compare_only_offset::every_advancing_offset_is_a_non_negative_literal(
+                        tcx,
+                        subject.fn_did,
+                        subject.local,
+                    )
+                    .is_err(),
+            )
+        })
+        .filter_map(|subject| match subject.kind {
+            decision::SubjectKind::Param { hir_index } => Some((subject.fn_did, hir_index)),
+            decision::SubjectKind::Local => None,
+        })
+        .collect();
     // After `full_slice_uses`, deliberately: a callee parameter that can become
     // `&[T]` carries its own checked extent and is out of this class (R365-2).
-    // First pass: no decision is settled yet, so the exemption has only the
-    // use facts to read (R485-4(b)'s second pass supplies the rest below).
+    // First pass: no decision is settled yet, so the exemption has the use facts
+    // and the candidate set to read (R485-4(b)'s second pass supplies the
+    // decided-`Slice` exemption below).
     let local_callee_extent_subjects = decision::local_callee_extent::collect(
         tcx,
         &subjects,
         &facts,
         &full_slice_uses,
-        &rustc_hash::FxHashSet::default(),
+        &cursor_candidates,
+        None,
         None,
     );
     let return_parameter_nodes = subjects
@@ -8275,6 +8317,52 @@ fn finish_decide<'tcx>(
         // longer applies. The decision is not available when the map is first
         // collected (it is one of the map's own inputs), so the pass runs once
         // over the SETTLED table and re-decides only if a hold actually went.
+        let mut decided = decision::local_callee_extent::DecidedForms::default();
+        for (subject, decision) in &table.entries {
+            let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                continue;
+            };
+            // Exhaustive by rule (`import_denylist`): a new disposition must be
+            // classified here, not silently dropped.
+            match decision {
+                decision::Decision::Slice { .. } => {
+                    decided.slice.insert((subject.fn_did, hir_index));
+                }
+                decision::Decision::Cursor { .. }
+                | decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Box(_)
+                | decision::Decision::Degraded(_) => {}
+            }
+        }
+        if let Some(relaxed) = decision::local_callee_extent::relaxed_by_decisions(
+            tcx,
+            &subjects,
+            &facts,
+            &full_slice_uses,
+            &cursor_candidates,
+            &fat,
+            &decided,
+            &local_callee_extent_subjects,
+        ) {
+            let ctx = decision::Ctx {
+                local_callee_extent: &relaxed,
+                ..ctx_of!(
+                    decision::RefGate::LiftAdaptable,
+                    Some(&coconv),
+                    Some(&lifetime_eligibility),
+                    Some(&raw_boundary),
+                    Some(&candidate_exposure),
+                    Some(&return_receivers),
+                )
+            };
+            table = decision::decide(&ctx, &subjects);
+        }
+        // **After the re-decide, deliberately.** `decide` returns a fresh table,
+        // so anything recorded on the old one is gone; the seam's C-string
+        // licences are recomputed here, on whatever table the ladder settled.
         // **R491-7** — the exact C-string extents, recorded for the seam: a
         // callee parameter whose walk is licensed exact gives its callers
         // `strlen(p) + 1` rather than the fallback.
@@ -8298,49 +8386,6 @@ fn finish_decide<'tcx>(
             .filter(|subject| decision::local_callee_extent::caller_establishes_nul(tcx, subject))
             .map(|subject| (subject.fn_did, subject.hir_id))
             .collect();
-        let decided_slice = table
-            .entries
-            .iter()
-            .filter_map(|(subject, decision)| {
-                let decision::SubjectKind::Param { hir_index } = subject.kind else {
-                    return None;
-                };
-                // Exhaustive by rule (`import_denylist`): a new disposition
-                // must be classified here, not silently dropped.
-                match decision {
-                    decision::Decision::Slice { .. } => Some((subject.fn_did, hir_index)),
-                    decision::Decision::Ref { .. }
-                    | decision::Decision::InferredRef { .. }
-                    | decision::Decision::Opt { .. }
-                    | decision::Decision::Cursor { .. }
-                    | decision::Decision::NestedSlice { .. }
-                    | decision::Decision::Box(_)
-                    | decision::Decision::Degraded(_) => None,
-                }
-            })
-            .collect::<rustc_hash::FxHashSet<_>>();
-        if let Some(relaxed) = decision::local_callee_extent::relaxed_by_decisions(
-            tcx,
-            &subjects,
-            &facts,
-            &full_slice_uses,
-            &fat,
-            &decided_slice,
-            &local_callee_extent_subjects,
-        ) {
-            let ctx = decision::Ctx {
-                local_callee_extent: &relaxed,
-                ..ctx_of!(
-                    decision::RefGate::LiftAdaptable,
-                    Some(&coconv),
-                    Some(&lifetime_eligibility),
-                    Some(&raw_boundary),
-                    Some(&candidate_exposure),
-                    Some(&return_receivers),
-                )
-            };
-            table = decision::decide(&ctx, &subjects);
-        }
         // Surface policies are provisional until the full ladder settles. A raw
         // wrapper or entry shim exists only when at least one signature subject
         // survives every arm; blocked functions retain their seed/web evidence but
