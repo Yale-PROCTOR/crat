@@ -22,7 +22,14 @@
 //!       or loop, so moving the loads above them preserves both the order of
 //!       effects and the values read;
 //!   (e) the rows of `t` project 0..n at one mutability, and neither `t` nor
-//!       its rows carry a raw-boundary atom group.
+//!       its rows carry a raw-boundary atom group;
+//!   (f) (R500-6 (b)) a table admitted through (c)'s CURSOR branch stands off
+//!       any owner that has a table admissible from slice rows alone. The plan
+//!       is per-owner, so the two share one fate, and report 015 measured the
+//!       price: the cursor rows delivered nothing and cost five tables N1
+//!       already delivered. Standing off leaves exactly the plan the slice-only
+//!       arm would have made, so the seam can only ever add; the stood-off
+//!       table is named in the plan's `stood_off` and counted in the receipt.
 //!
 //! What it emits: `t` is re-typed `&[&[T]]` / `&mut [&mut [T]]`, each row's
 //! construction becomes a reborrow of the element (`t[k]`, `&mut *t[k]`), and
@@ -179,6 +186,11 @@ pub(super) fn inspect<'tcx>(
     let mut rows = Vec::new();
     let mut admitted_receivers = FxHashSet::default();
     let mut row_statement = Vec::new();
+    // Positionally parallel to `rows`: which of them the N2 cursor arm
+    // admitted. Kept beside the row rather than inside it so the pair rule's
+    // `Row` — a shared type — does not grow a field only this arm reads. Its
+    // one reader is the per-owner precondition below.
+    let mut row_is_cursor: Vec<bool> = Vec::new();
     for (position, stmt) in block.stmts.iter().enumerate() {
         let StmtKind::Let(local) = stmt.kind else { break };
         let Some((id, name)) = named(local.pat) else { continue };
@@ -210,7 +222,7 @@ pub(super) fn inspect<'tcx>(
         {
             continue;
         }
-        let (mutable, length) = match decision {
+        let (mutable, length, from_cursor) = match decision {
             // The row becomes a plain slice local.
             Decision::Slice { mutable, .. } => {
                 let Some(construction) = table
@@ -232,7 +244,7 @@ pub(super) fn inspect<'tcx>(
                 {
                     continue;
                 }
-                (*mutable, construction.length.expression.clone())
+                (*mutable, construction.length.expression.clone(), false)
             }
             // N2 (the cursor seam, relay 002 §2). The row becomes a cursor
             // over the inner slice. The cursor VERDICT and the runtime type are
@@ -267,7 +279,7 @@ pub(super) fn inspect<'tcx>(
                 // `plan.fallback` is the cursor family's own receipt that this
                 // base took the named fabricated extent; the wrapper rebuilds
                 // the row's view with the same one.
-                (*mutable, "crate::FALLBACK_SLICE_EXTENT".to_owned())
+                (*mutable, "crate::FALLBACK_SLICE_EXTENT".to_owned(), true)
             }
             Decision::Ref { .. }
             | Decision::InferredRef { .. }
@@ -278,6 +290,7 @@ pub(super) fn inspect<'tcx>(
         };
         admitted_receivers.insert(peel(receiver).hir_id);
         row_statement.push(position);
+        row_is_cursor.push(from_cursor);
         rows.push(Row {
             parameter,
             local: id,
@@ -311,9 +324,49 @@ pub(super) fn inspect<'tcx>(
         .filter(|i| !rejected.contains(&rows[*i].parameter))
         .collect::<Vec<_>>();
     row_statement = keep.iter().map(|i| row_statement[*i]).collect();
+    row_is_cursor = keep.iter().map(|i| row_is_cursor[*i]).collect();
     rows = keep.into_iter().map(|i| rows[i].clone()).collect();
     if rows.is_empty() {
         return Err(Hold::IntervalChanged);
+    }
+
+    // **R500-6 (b) — the per-owner precondition.** A `Plan` is per-OWNER, so
+    // every parameter in it shares one fate: a clause that fails below, or an
+    // emission that does not type, takes the whole owner down. The N2 cursor
+    // arm is the only admission that can put a parameter here whose row is
+    // another family's, and report 015 measured what that costs — five
+    // tulipindicators tables N1 already delivered (`ti_crossany`,
+    // `ti_crossover`, `ti_decay`, `ti_edecay`, `ti_tr`) were withdrawn,
+    // each of them the SIBLING of a cursor row, and the cursor rows
+    // themselves delivered nothing.
+    //
+    // So where the owner has a table admissible from slice rows ALONE, the
+    // cursor arm stands off it. The rows that remain are exactly the rows the
+    // slice-only arm would have collected, so the owner's plan is the one it
+    // had before this seam existed and the seam can only ever add. Where the
+    // owner has no such table there is nothing to protect and the arm is left
+    // free. The stood-off parameters are named in the plan, so the decision is
+    // typed and counted rather than a silent skip.
+    let mut stood_off = Vec::new();
+    let cursor_parameters = rows
+        .iter()
+        .zip(&row_is_cursor)
+        .filter(|(_, from_cursor)| **from_cursor)
+        .map(|(r, _)| r.parameter)
+        .collect::<FxHashSet<_>>();
+    if !cursor_parameters.is_empty()
+        && rows
+            .iter()
+            .any(|r| !cursor_parameters.contains(&r.parameter))
+    {
+        stood_off = cursor_parameters.iter().copied().collect::<Vec<_>>();
+        stood_off.sort_by_key(|hir| hir.local_id.as_u32());
+        let keep = (0..rows.len())
+            .filter(|i| !cursor_parameters.contains(&rows[*i].parameter))
+            .collect::<Vec<_>>();
+        // Non-empty by the condition above: at least one row is not a cursor's.
+        row_statement = keep.iter().map(|i| row_statement[*i]).collect();
+        rows = keep.into_iter().map(|i| rows[i].clone()).collect();
     }
 
     // (d) The relocation crosses only inert declarations.
@@ -390,5 +443,6 @@ pub(super) fn inspect<'tcx>(
         rows,
         parameters,
         count_guard: false,
+        stood_off,
     })
 }

@@ -91,6 +91,16 @@ pub(crate) struct Plan {
     pub(crate) conditional_updates: Vec<HirId>,
     pub(crate) rows: Vec<Row>,
     pub(crate) parameters: Vec<Parameter>,
+    /// **R500-6 (b).** Parameters this plan ADMITTED and then stood off. A
+    /// `Plan` is per-OWNER, so every admitted parameter shares one fate: a
+    /// clause that fails later, or an emission that does not type, takes the
+    /// whole owner with it. Report 015 measured that price — N2's cursor arm
+    /// admitting a sibling cost tulipindicators five tables N1 already
+    /// delivered. A stood-off parameter is therefore one the arm could have
+    /// taken and deliberately did not, recorded here so the decision is typed
+    /// and counted rather than a silent skip. The pair rule stands nothing off
+    /// and leaves this empty.
+    pub(crate) stood_off: Vec<HirId>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Receipt {
@@ -679,6 +689,7 @@ fn inspect_pair<'tcx>(
         conditional_updates,
         rows,
         parameters,
+        stood_off: Vec::new(),
     })
 }
 
@@ -807,6 +818,7 @@ pub(crate) fn observe(tcx: TyCtxt<'_>, table: &DecisionTable) {
         match &receipt.result {
             Ok(plan) => serde_json::json!({"owner":owner, "status":"planned", "inherited_pair":"not-required", "arm": if plan.count_guard { "pair" } else { "per-parameter" }, "count_hir":plan.count.local_id.as_u32(), "count":plan.count_name, "scalar_accumulator_hir":plan.accumulator.map(|h|h.local_id.as_u32()), "conditional_updates":plan.conditional_updates.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
                 "parameters":plan.parameters.iter().map(|p|serde_json::json!({"hir":p.hir.local_id.as_u32(),"argument":p.index,"name":p.name,"inner_depth":1,"outer_mutable":p.mutable,"inner_mutable":p.mutable})).collect::<Vec<_>>(),
+                "stood_off":plan.stood_off.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
                 "rows":plan.rows.iter().map(|r|serde_json::json!({"source_local_hir":r.local.local_id.as_u32(),"source_formation_hir":r.init.local_id.as_u32(),"table_hir":r.parameter.local_id.as_u32(),"projection":r.index,"destination":r.view_name,"inner_depth":1,"fabricated_before":r.was_fallback,"fabricated_after": !plan.count_guard && r.was_fallback})).collect::<Vec<_>>() }),
             Err(hold) => serde_json::json!({"owner":owner,"status":"held","hold":format!("{hold:?}")}),
         }
