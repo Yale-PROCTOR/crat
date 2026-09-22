@@ -339,7 +339,17 @@ impl BridgeReceiptEvent {
             return Err("non-dropped bridge receipt has a drop reason".to_owned());
         }
         match (self.retention, self.waiver_id.as_deref()) {
+            // **R523-1.** A T2 receipt carries the id of the waiver actually
+            // spent: the v1 bridge waiver for an UNKNOWN retention, or — since
+            // R481-2 — the tier-2 retention waiver for a KNOWN one. The count
+            // of `retention-positive-waived` sites is what makes that waiver
+            // auditable, so the receipt must not be made to lie about which one
+            // it spent; the comparator accepts both ids and nothing else.
             (BridgeRetentionTier::T2, Some(RAW_BOUNDARY_T2_WAIVER_ID)) => {}
+            (
+                BridgeRetentionTier::T2,
+                Some(crate::bo_rewriter::decision::raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID),
+            ) => {}
             (BridgeRetentionTier::T2, _) => {
                 return Err("T2 bridge receipt lacks the exact waiver ID".to_owned());
             }
@@ -465,7 +475,7 @@ pub(crate) fn class_collision_header() -> String {
 
 /// **R517-8** — one row per held class whose edits the placement layer drops.
 pub(crate) fn class_held_drop_header() -> String {
-    "program\tclass_local_def_index\tclass_path\treason\tdropped_edits\n".to_owned()
+    "class_local_def_index\tclass_path\treason\tdropped_edits\n".to_owned()
 }
 
 pub(crate) fn unresolved_class_header() -> String {
@@ -516,6 +526,47 @@ mod tests {
                 .all(|row| row.contains("\tref-mut\traw\tfield-projection\t")),
             "{rendered}"
         );
+    }
+
+    /// **R523-1 (wave-6o) — a T2 bridge receipt may carry EITHER waiver.**
+    ///
+    /// R481-2 gave the known-retention bridge its own id, because it licenses
+    /// a different thing from the v1 bridge waiver. `MechanicalRetention`
+    /// learned that at the transport (`a09fd1650`); this comparator is one
+    /// over, and until it learned too, batch 28 read
+    /// `reconciliation-drift:bridge / T2_bridge_receipt_lacks_the_exact_waiver_ID`
+    /// on binn, lil, bzip2 and brotli — `data=false`, nothing lands. The
+    /// receipt carries the id of the waiver actually spent, because the count
+    /// of `retention-positive-waived` sites is what makes the waiver
+    /// auditable; so it is the comparator that accepts both, and nothing else.
+    #[test]
+    fn rcp_w2b_t2_accepts_the_tier_2_retention_waiver() {
+        let event = |waiver: Option<&str>| {
+            BridgeReceiptEvent::for_test(
+                "t2-waivers",
+                BridgeReceiptStage::Plan,
+                BridgeReceiptState::Planned,
+            )
+            .with_retention(BridgeRetentionTier::T2, waiver)
+        };
+        assert_eq!(
+            event(Some(
+                crate::bo_rewriter::decision::raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID
+            ))
+            .validate(),
+            Ok(()),
+            "the tier-2 retention waiver is a T2 waiver"
+        );
+        assert_eq!(
+            event(Some(RAW_BOUNDARY_T2_WAIVER_ID)).validate(),
+            Ok(()),
+            "and the v1 bridge waiver still is"
+        );
+        assert!(
+            event(Some("not-a-waiver")).validate().is_err(),
+            "and an unknown id is still refused"
+        );
+        assert!(event(None).validate().is_err(), "as is none at all");
     }
 
     #[test]

@@ -4502,7 +4502,7 @@ fn render_class_held_drops(
     let mut out = bridge_receipt::class_held_drop_header();
     for drop in &plan.class_held_drops {
         out.push_str(&format!(
-            "-\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\n",
             drop.class.order_key(),
             class_paths
                 .get(&drop.class)

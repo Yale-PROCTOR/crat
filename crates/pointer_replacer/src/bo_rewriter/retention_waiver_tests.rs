@@ -255,3 +255,47 @@ pub unsafe fn caller(mut buf: *mut u8, mut r: *mut Reg) -> i32 {
         "an unwaived site leaves no unadapted argument: {mismatches:?}\n{output}"
     );
 }
+
+/// **W6O-T2-6 (R523-1) — the BRIDGE receipts of a waived site reconcile.**
+///
+/// One comparator over from the transport: `BridgeReceiptEvent::validate`
+/// knew only the v1 bridge waiver, so at batch 28 binn, lil, bzip2 and brotli
+/// read `reconciliation-drift:bridge /
+/// T2_bridge_receipt_lacks_the_exact_waiver_ID` and the census was
+/// `data=false` — nothing could land while the arm was in.
+#[test]
+fn wave6o_a_waived_sites_bridge_receipts_reconcile() {
+    let outcome = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(RETAINED),
+        |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx(tcx)?;
+            let emission = super::emit_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &ctx.retained_c9_plans,
+            )?;
+            let events = emission
+                .plan
+                .bridge_events(&std::collections::BTreeSet::new());
+            let waived = events
+                .iter()
+                .filter(|event| {
+                    event.waiver_id.as_deref()
+                        == Some(super::decision::raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID)
+                })
+                .count();
+            Ok::<_, String>((
+                waived,
+                super::bridge_receipt::reconcile_bridge_events(&events).map(|_| ()),
+            ))
+        },
+    )
+    .expect("fixture compiler context")
+    .expect("emission");
+    assert!(
+        outcome.0 > 0,
+        "the fixture carries a tier-2 waived bridge receipt"
+    );
+    assert_eq!(outcome.1, Ok(()), "and the bridge events reconcile");
+}
