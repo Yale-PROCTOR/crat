@@ -133,6 +133,32 @@ pub(crate) struct CursorReceipt {
 /// A rebuild that holds leaves its entry untouched and is reported, so the
 /// caller can withdraw the flip that made this necessary rather than emit a
 /// cursor whose base text no longer types.
+thread_local! {
+    /// **R525-7 (slicecursor 071) — the stale-replan count, PER PROGRAM.**
+    ///
+    /// The `debug_assert!` beside the increment is the loud form and a release
+    /// census compiles it out; the receipt vector counts TARGETS, which after
+    /// nested's transaction are exactly the rebased rows and so are non-zero by
+    /// design; and the call site discards that vector. So the detector's exit
+    /// condition — two consecutive censuses at zero and it goes — had nothing
+    /// to read. This is the thing it reads, on the same mechanism as
+    /// `ast_transform::graft_refusals`: a per-program cell, reset by the census
+    /// worker and published as one additive column.
+    static STALE_REPLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn reset_stale_replans() {
+    STALE_REPLANS.with(|cell| cell.set(0));
+}
+
+pub(crate) fn stale_replans() -> usize {
+    STALE_REPLANS.with(std::cell::Cell::get)
+}
+
+fn record_stale_replan() {
+    STALE_REPLANS.with(|cell| cell.set(cell.get() + 1));
+}
+
 pub(crate) fn replan_delivered_table_elements(
     ctx: &Ctx<'_, '_>,
     entries: &mut [(Subject, Decision)],
@@ -205,6 +231,9 @@ pub(crate) fn replan_delivered_table_elements(
             | Decision::Box(_)
             | Decision::Degraded(_) => false,
         };
+        if stale {
+            record_stale_replan();
+        }
         debug_assert!(
             !stale,
             "cursor-replan-after-flip: {:?} kept a fabricated window after its \

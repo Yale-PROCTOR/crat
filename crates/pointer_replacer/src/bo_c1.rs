@@ -12278,6 +12278,7 @@ mod run {
         // the capture, read after, so the count belongs to THIS program and not
         // to whatever ran in the worker before it.
         crate::bo_rewriter::ast_transform::reset_graft_refusals();
+        crate::bo_rewriter::decision::cursor_native::reset_stale_replans();
         // **R515-1 ruling 1** — same rhythm, same reason: the grafts held below
         // are THIS program's. The RECEIPTS accumulate across the program's
         // revert rounds (a graft held again on a later round is a second row's
@@ -12686,6 +12687,13 @@ mod run {
         row.set(
             raw_schema::GRAFT_REFUSED,
             crate::bo_rewriter::ast_transform::graft_refusals(),
+        );
+        // **R525-7**: the stale-replan count, the detector's exit condition made
+        // readable. 0 is the expected reading and two consecutive censuses at 0
+        // retire `replan_delivered_table_elements`.
+        row.set(
+            raw_schema::REPLAN_STALE,
+            crate::bo_rewriter::decision::cursor_native::stale_replans(),
         );
         // **R476-1 (USER)**: the frame-bounded discharges, counted per program beside the
         // box-param holds. The receipt is typed — `retention-discharged:frame-bounded(
