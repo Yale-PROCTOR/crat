@@ -77,13 +77,47 @@ fn held(subject: &Subject, position: &'static str, extent: String, reason: &str)
     }
 }
 
+/// **The element type, when the declaration does not spell one** (R501, dry27).
+///
+/// `Subject::pointee_span` is the pointee's SOURCE TEXT, kept so a plan can copy
+/// it verbatim — and an unannotated declaration has none. That is not a rare
+/// shape: C2Rust writes `let mut storage = 0 as *mut uint8_t;` for every C
+/// declaration-then-assignment, brotli's whole `storage` tree among them, so
+/// without a fallback link (1) would follow the assignment and then fail for
+/// want of a type name.
+///
+/// The fallback is rustc's own rendering of the pointee, and it is taken **only
+/// for a primitive**. A printed struct or alias path is not guaranteed to name
+/// the same type in the emitted crate, and an extent expression that does not
+/// compile is worse than no extent; a primitive prints as itself (`uint8_t` →
+/// `u8`), which is both valid there and correct here.
+fn printed_element_type(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<String> {
+    let ty = ctx
+        .tcx
+        .typeck(subject.fn_did)
+        .node_type_opt(subject.hir_id)?;
+    let rustc_middle::ty::TyKind::RawPtr(pointee, _) = ty.kind() else {
+        return None;
+    };
+    matches!(
+        pointee.kind(),
+        rustc_middle::ty::TyKind::Int(_)
+            | rustc_middle::ty::TyKind::Uint(_)
+            | rustc_middle::ty::TyKind::Float(_)
+            | rustc_middle::ty::TyKind::Bool
+            | rustc_middle::ty::TyKind::Char
+    )
+    .then(|| pointee.to_string())
+}
+
 /// The subject's own root extent, if its construction states one.
 fn local_root_extent(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<SliceLengthSource> {
     let node = (subject.fn_did, subject.hir_id);
     let init_hir = *ctx.constructions.init_hirs.get(&node)?;
     let element_type = subject
         .pointee_span
-        .and_then(|span| ctx.tcx.sess.source_map().span_to_snippet(span).ok())?;
+        .and_then(|span| ctx.tcx.sess.source_map().span_to_snippet(span).ok())
+        .or_else(|| printed_element_type(ctx, subject))?;
     super::construction::root_extent(
         ctx.tcx,
         ctx.constructions,
@@ -104,12 +138,15 @@ fn local_root_extent(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<SliceLength
 /// carries the root's own construction key, so the next build is chosen on the
 /// distribution rather than on a guess.
 fn root_shape(ctx: &Ctx<'_, '_>, subject: &Subject) -> String {
-    match ctx
-        .constructions
-        .by_binding
-        .get(&(subject.fn_did, subject.hir_id))
-    {
-        Some(construction) => format!("none:{}", construction.key()),
+    match super::construction::walked_construction(
+        ctx.constructions,
+        (subject.fn_did, subject.hir_id),
+    ) {
+        // R501 link (1): the SHAPE follows the walk, so a null-declared local
+        // whose assignment the walk now reads reports the assignment's shape.
+        // Reporting `null-lit` here would say the walk stopped at the
+        // declaration when it did not.
+        Some((construction, _)) => format!("none:{}", construction.key()),
         None => "none:no-construction".to_owned(),
     }
 }

@@ -2342,6 +2342,98 @@ pub unsafe extern "C" fn StoreDeclaredNull(mut s: *mut EncoderState, mut n: size
 }
 "#;
 
+/// **dry27 link (1) — the corpus's declaration-then-assignment shape over an
+/// allocation the walk can already read.**
+///
+/// The same `let mut storage = 0 as *mut uint8_t;` C2Rust writes for a C
+/// declaration, with the allocation on a later line instead of the accessor.
+/// The extent is evidence the walk already knows how to recover
+/// (`allocation-byte-count`); what stops it is only that `by_binding` is keyed
+/// on the initializer, which is the null literal.
+const W4_B1_DECLARED_NULL_ALLOCATION: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreDeclaredThenAllocated(mut n: size_t) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage =
+        malloc(n.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64) as *mut uint8_t;
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+/// **Link (1) composed with the sibling arm.** The same declaration-then-
+/// assignment shape, with the assignment reading the field directly. The walk
+/// must follow the assignment AND then find the sibling that records its size —
+/// which is the whole point of reading the assignment rather than the
+/// declaration.
+const W4_B1_DECLARED_NULL_FIELD: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+unsafe extern "C" fn StoreInnerDeclared(mut pos: *mut size_t, mut storage: *mut uint8_t) {
+    BrotliWriteBits(pos, storage);
+}
+pub unsafe extern "C" fn StoreDeclaredThenField(mut s: *mut EncoderState) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage = (*s).storage_;
+    StoreInnerDeclared(&mut pos, storage);
+}
+"#;
+
+/// **The element-type fallback's own control.** The same declaration-then-
+/// assignment shape at a STRUCT pointee, with a `_count` sibling the byte rule
+/// would otherwise allow. rustc prints the pointee as a bare path that need not
+/// name the same type in the emitted crate, so the fallback takes primitives
+/// only and this root states nothing.
+const W4_B1_DECLARED_NULL_STRUCT_ELEMENT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Node {
+    pub weight: size_t,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Forest {
+    pub nodes_count_: size_t,
+    pub nodes_: *mut Node,
+}
+unsafe extern "C" fn TouchNode(mut pos: *mut size_t, mut nodes: *mut Node) {
+    let mut n: *mut Node = &mut *nodes.offset((*pos >> 3 as i32) as isize) as *mut Node;
+    (*n).weight = 1 as size_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn WalkForest(mut f: *mut Forest) {
+    let mut nodes = 0 as *mut Node;
+    let mut pos: size_t = 0 as size_t;
+    nodes = (*f).nodes_;
+    TouchNode(&mut pos, nodes);
+}
+"#;
+
 fn b1_rows(source: &str) -> Vec<(String, String, String, String)> {
     table_of(source, |table| {
         table
@@ -2520,21 +2612,21 @@ fn w4b107_a_size_sibling_is_refused_at_a_wider_element() {
     assert_eq!(local.2, "none:place-read", "{rows:?}");
 }
 
-/// **W4B1-8 (report 051) — the shape column scored IN PROCESS, before the
-/// census scores it.**
+/// **W4B1-8 (report 051) — the walk follows the ASSIGNMENT, and brotli's shape
+/// arrives at the accessor call.**
 ///
-/// Report 049's C6 predicted that brotli's `caller-root-states-no-extent` rows
-/// read `none:null-lit` rather than `none:call-result`, on the reading that
-/// `ConstructionFacts::by_binding` is keyed on the `let` initializer and the
-/// later assignment is recorded only as an `owner_overwrites` entry, and only
-/// for an allocator call. That is a claim about the analysis, so the analysis
-/// can settle it without waiting for a corpus frame — and if it is wrong, dry27's
-/// first link is aimed at nothing and I would rather know now.
+/// This witness was written before the rule, to score report 049's C6 in
+/// process: it asserted `none:null-lit`, passed, and so established that the
+/// walk stopped at the `let` initializer — which is the whole reason dry27's
+/// link (1) exists. **Its premise is now the repair**, so it asserts where the
+/// walk arrives instead: the accessor call the corpus actually assigns.
 ///
-/// The companion reading is already pinned by W4B1-3: a root assigned the same
-/// accessor's result AT the declaration reads `none:call-result`.
+/// One consequence to keep straight when reading a census: batch 26 predates
+/// this rule, so brotli's rows there still read `none:null-lit` — C6's
+/// prediction is about THAT frame. From this commit onward the same rows read
+/// `none:call-result`, and the residue has not changed, only its description.
 #[test]
-fn w4b108_a_declared_null_root_reads_as_a_null_literal() {
+fn w4b108_the_walk_follows_the_assignment_to_the_accessor() {
     let rows = b1_rows(W4_B1_DECLARED_NULL_ROOT);
     let storage = rows
         .iter()
@@ -2542,8 +2634,106 @@ fn w4b108_a_declared_null_root_reads_as_a_null_literal() {
         .unwrap_or_else(|| panic!("no StoreDeclaredNull::storage row: {rows:?}"));
     assert_eq!(storage.1, "held", "{rows:?}");
     assert_eq!(
-        storage.2, "none:null-lit",
-        "the walk reads the `let` initializer, never the assignment that follows: {rows:?}"
+        storage.2, "none:call-result",
+        "the walk reads the assignment, and the accessor call states no extent \
+         of its own — that is dry27 link (2)'s job: {rows:?}"
+    );
+}
+
+/// **W4B1-9 (dry27 link (1)) — a null-declared local takes the construction of
+/// its SOLE later assignment, and the evidence arms then apply to it.**
+///
+/// C2Rust renders a C declaration followed by an assignment as `let mut p = 0
+/// as *mut T;` with the store on a later line, and `ConstructionFacts::by_binding`
+/// is keyed on the initializer — so the walk read `null-lit` and never the
+/// construction. W4B1-8 measured exactly that before the repair. The rule is
+/// confined to the root WALK: `by_binding` itself is unchanged, since it is the
+/// S3.2′ measurement substrate and feeds Box sizing, forecasts and receipts
+/// that have nothing to do with extents.
+///
+/// **Why a use before the assignment is not a hazard** (user ruling §28,
+/// 2026-08-23): the binding holds NULL until then, so a dereferencing use
+/// before it is a null dereference — a bug in the INPUT program, on which crat
+/// owes no soundness. The rule needs no dominance proof; it needs the
+/// assignment to be the only one.
+#[test]
+fn w4b109_a_null_declared_local_takes_its_sole_assignment() {
+    let rows = b1_rows(W4_B1_DECLARED_NULL_FIELD);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreDeclaredThenField::storage"))
+        .unwrap_or_else(|| panic!("no StoreDeclaredThenField::storage row: {rows:?}"));
+    // **Column one — the root.** The walk followed the assignment, the element
+    // type came from rustc because the declaration spells none, and the sibling
+    // arm answered: this root STATES an extent where it used to state nothing.
+    assert_eq!(
+        storage.2, "sibling-size:storage_:storage_size_",
+        "the walk followed the assignment and the sibling arm answered it: {rows:?}"
+    );
+    // **Column two — and the row is still held, by the USE side.** The
+    // assignment `storage = (*s).storage_;` is itself a use of the binding with
+    // no slice image, and `slice_uses` is a pre-decision fact. So this shape
+    // carries report 049's C4 wall inside it: the extent is now known and the
+    // row cannot yet take the form. Recorded, not asserted away — the residue
+    // moves from "no extent" to "an extent this build cannot carry", which is
+    // precisely the distinction B1's two columns exist to keep.
+    assert_eq!(storage.1, "held", "{rows:?}");
+    assert_eq!(storage.3, "slice-use-unsupported", "{rows:?}");
+    let parameter = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreInnerDeclared::storage"))
+        .unwrap_or_else(|| panic!("no StoreInnerDeclared::storage row: {rows:?}"));
+    assert_eq!(
+        parameter.2, "every-caller-states-an-extent",
+        "and the parameter one hop along clears the root test: {rows:?}"
+    );
+}
+
+/// **W4B1-10 (control) — an ALLOCATION assigned to a null-declared local is not
+/// this walk's at all.**
+///
+/// Measured, not assumed: `let mut p = 0 as *mut u8; p = malloc(n * 1);` decides
+/// **`kind-raw`** — the model's own verdict on storing an allocation into a live
+/// binding — so it never reaches a root walk and the rule's market is the
+/// NON-allocating assignment (brotli's accessor call, a field read). The same
+/// measurement covers the sole-assignment refusal: a binding assigned twice is
+/// `kind-raw` too, which is why that refusal is belt-and-braces rather than
+/// witnessed, and why this control says so out loud.
+#[test]
+fn w4b110_an_allocation_assignment_is_the_ownership_family() {
+    let rows = b1_rows(W4_B1_DECLARED_NULL_ALLOCATION);
+    assert!(
+        !rows
+            .iter()
+            .any(|(subject, ..)| subject.starts_with("StoreDeclaredThenAllocated::storage")),
+        "the walk must not see it: {rows:?}"
+    );
+    let decisions = super::emit_tests::decisions_of(W4_B1_DECLARED_NULL_ALLOCATION);
+    let storage = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "storage" && !*is_param)
+        .unwrap_or_else(|| panic!("no storage subject: {decisions:#?}"));
+    assert_eq!(storage.2, "kind-raw", "{decisions:#?}");
+}
+
+/// **W4B1-11 (control) — the element-type fallback is primitives only.**
+///
+/// Without a spelling from the declaration, the type name comes from rustc, and
+/// a printed struct path is not guaranteed to resolve in the emitted crate — an
+/// extent expression that does not compile is worse than no extent. So a struct
+/// pointee gets no fallback and its root states nothing, even where the sibling
+/// is there to be read.
+#[test]
+fn w4b111_the_element_type_fallback_takes_primitives_only() {
+    let rows = b1_rows(W4_B1_DECLARED_NULL_STRUCT_ELEMENT);
+    let nodes = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("WalkForest::nodes"))
+        .unwrap_or_else(|| panic!("no WalkForest::nodes row: {rows:?}"));
+    assert_eq!(nodes.1, "held", "{rows:?}");
+    assert_eq!(
+        nodes.2, "none:place-read",
+        "no element type, so no sibling is read: {rows:?}"
     );
 }
 

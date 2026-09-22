@@ -156,6 +156,17 @@ pub(crate) struct ConstructionFacts {
     /// with a separately-sized trailing region. Box wave 2 holds this class;
     /// it is not an initializer failure.
     pub flexible_tail_allocations: FxHashMap<(LocalDefId, HirId), FlexibleTailEvidence>,
+    /// **R501 / dry27 link (1) — every assignment to a binding, with the
+    /// construction its right-hand side classifies as.**
+    ///
+    /// `by_binding` is keyed on the `let` INITIALIZER, and C2Rust renders a C
+    /// declaration followed by an assignment as `let mut p = 0 as *mut T;` with
+    /// the real construction on a later line — so the initializer is a null
+    /// literal and the construction table says `null-lit` for the whole class
+    /// (measured: W4B1-8). This records the assignments so the root WALK can
+    /// see through that, without reclassifying `by_binding` itself, which is
+    /// the S3.2′ measurement substrate and feeds far more than an extent.
+    pub assignments: FxHashMap<(LocalDefId, HirId), Vec<(HirId, Construction)>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -637,27 +648,67 @@ fn array_decay_length(
 /// states no extent, which under B1 is a HOLD and a counted residue rather
 /// than a fabricated 1024 — a checked index beyond a fabricated extent would
 /// panic where C reads on.
+/// **R501 / dry27 link (1) — the construction the ROOT WALK should read, which
+/// is not always the one the construction table records.**
+///
+/// C2Rust renders a C declaration followed by an assignment as `let mut p = 0
+/// as *mut T;` with the real construction on a later line, so `by_binding` —
+/// keyed on the initializer — says `null-lit` for that whole class (measured:
+/// W4B1-8, and brotli's `storage` tree is exactly this shape). Where the
+/// initializer is a null literal and the binding has exactly ONE assignment,
+/// the walk reads that assignment instead.
+///
+/// **Why a use before the assignment is not a hazard** (user ruling §28,
+/// 2026-08-23): the binding holds NULL until then, so a dereferencing use
+/// before it is a null dereference — a bug in the INPUT program, on which crat
+/// owes no soundness. The rule therefore needs no dominance proof; it needs the
+/// assignment to be the only one. (A binding assigned twice never reaches this
+/// walk in any case: measured, it decides `kind-raw`, the model's own verdict on
+/// overwriting a live owner.)
+///
+/// `by_binding` itself is deliberately NOT reclassified: it is the S3.2′
+/// measurement substrate and feeds Box sizing, forecasts and receipts that have
+/// nothing to do with extents.
+pub(crate) fn walked_construction<'a>(
+    facts: &'a ConstructionFacts,
+    node: (LocalDefId, HirId),
+) -> Option<(&'a Construction, HirId)> {
+    let declared = facts.by_binding.get(&node)?;
+    let init_hir = *facts.init_hirs.get(&node)?;
+    if !matches!(declared, Construction::NullLit) {
+        return Some((declared, init_hir));
+    }
+    match facts.assignments.get(&node).map(Vec::as_slice) {
+        Some([(assigned_hir, assigned)]) => Some((assigned, *assigned_hir)),
+        _ => Some((declared, init_hir)),
+    }
+}
+
 pub(crate) fn root_extent(
     tcx: TyCtxt<'_>,
     facts: &ConstructionFacts,
     subject: &Subject,
     element_type: &str,
-    init_hir: HirId,
+    declared_hir: HirId,
     known: &FxHashMap<(LocalDefId, HirId), SliceLengthPlan>,
 ) -> Option<SliceLengthPlan> {
     let node = (subject.fn_did, subject.hir_id);
-    if let Some(construction) = facts.by_binding.get(&node)
+    let (walked, init_hir) = match walked_construction(facts, node) {
+        Some(pair) => (Some(pair.0), pair.1),
+        None => (facts.by_binding.get(&node), declared_hir),
+    };
+    if let Some(construction) = walked
         && let Some(length) = allocation_length(construction, element_type)
             .or_else(|| allocation_product_length(tcx, init_hir, construction, element_type))
     {
         return Some(length);
     }
-    if matches!(facts.by_binding.get(&node), Some(Construction::ArrayDecay))
+    if matches!(walked, Some(Construction::ArrayDecay))
         && let Some(length) = array_decay_length(tcx, subject.fn_did, init_hir)
     {
         return Some(length);
     }
-    if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
+    if let Some(Construction::StringLiteral { arms }) = walked {
         return Some(SliceLengthPlan {
             expression: arms
                 .iter()
@@ -670,7 +721,7 @@ pub(crate) fn root_extent(
             provenance: Vec::new(),
         });
     }
-    if matches!(facts.by_binding.get(&node), Some(Construction::PlaceRead))
+    if matches!(walked, Some(Construction::PlaceRead))
         && let Some(length) = sibling_size_length(tcx, subject.fn_did, init_hir, element_type)
     {
         return Some(length);
@@ -1815,6 +1866,11 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
             && let rustc_hir::def::Res::Local(binding) = lhs_path.res
         {
             let construction = self.classify(rhs);
+            self.facts
+                .assignments
+                .entry((self.fn_did, binding))
+                .or_default()
+                .push((rhs.hir_id, construction.clone()));
             if matches!(construction, Construction::Alloc { .. }) {
                 self.facts
                     .owner_overwrites
