@@ -1974,7 +1974,7 @@ pub(super) fn plan(
 /// resolution in this family and this is it: `prospective` is a query parameter
 /// threaded to `table_element_base`, not a second entry point that would
 /// duplicate the resolution and drift from it.
-pub(super) fn plan_with<'a>(
+pub(crate) fn plan_with<'a>(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     decision: &Decision,
