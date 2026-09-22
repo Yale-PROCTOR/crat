@@ -279,19 +279,38 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
                 declined: Some(Refusal::Unlicensed(why)),
             });
         };
+        // **The width question is asked FIRST, whatever happens next** (report
+        // 056). The ladder still refuses in its own order, but the census needs
+        // to know whether a refusal is hiding a licensable width behind it: at
+        // batch 27 ten of thirteen refusals were `caller-is-already-fat`, and
+        // nothing in the tables could say whether those ten had a width waiting
+        // or would have failed one question deeper. A reason that reports only
+        // the first failing gate is an aim nobody can act on.
+        let width = callee_region(ctx, entries, access.callee_id, access.parameter_index);
+        let licensed = width
+            .as_ref()
+            .is_ok_and(|region| region.shape == Shape::WidthRead && region.len_bytes.is_some());
         // Already fat: the hold is about a one-element claim, and this
         // subject does not make one.
         if ctx.fat.is_array(subject.fn_did, subject.local) {
-            refuse("caller-is-already-fat");
+            refuse(if licensed {
+                "caller-is-already-fat-with-a-licensed-width"
+            } else {
+                "caller-is-already-fat"
+            });
             continue;
         }
         let node = (subject.fn_did, subject.hir_id);
         if !slice_uses_supported(ctx, node) {
-            refuse("slice-use-unsupported");
+            refuse(if licensed {
+                "slice-use-unsupported-with-a-licensed-width"
+            } else {
+                "slice-use-unsupported"
+            });
             continue;
         }
         // EXACT, never the fallback: this is `void_region::licensed_width`.
-        let region = match callee_region(ctx, entries, access.callee_id, access.parameter_index) {
+        let region = match width {
             Ok(region) => region,
             Err(why) => {
                 refuse(why);

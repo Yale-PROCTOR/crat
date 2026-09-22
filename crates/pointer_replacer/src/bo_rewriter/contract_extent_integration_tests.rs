@@ -2182,6 +2182,47 @@ fn w4l07_an_unsupported_use_refuses_the_lift() {
     assert!(!source.contains("data: &[uint8_t]"), "{source}");
 }
 
+/// **W4L-10 (report 056) — a refusal says whether a WIDTH was waiting behind
+/// it.**
+///
+/// At batch 27 the exact arm's thirteen refusals were `caller-is-already-fat`
+/// ten times and `slice-use-unsupported` three, and nothing in the tables could
+/// say whether those rows had a licensed width one question deeper or would
+/// have failed there too. The two are different pieces of news — the first says
+/// a gate of mine is in the way, the second says the callee states nothing —
+/// and a column that cannot tell them apart is an aim nobody can act on.
+///
+/// The unsupported-use fixture is the cheap case: its callee IS
+/// `BrotliUnalignedRead32`, so a width of 4 is licensed and only the use blocks
+/// the lift.
+#[test]
+fn w4l10_a_refusal_says_whether_a_width_was_waiting() {
+    let rows = table_of(W4_LIFT_UNSUPPORTED_USE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.subject.clone(), lift.declined, lift.key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let unlicensed = rows
+        .iter()
+        .find(|(_, declined, _)| {
+            matches!(
+                declined,
+                Some(super::decision::licensed_lift::Refusal::Unlicensed(_))
+            )
+        })
+        .unwrap_or_else(|| panic!("the exact arm's refusal must be receipted: {rows:?}"));
+    assert_eq!(
+        unlicensed.1,
+        Some(super::decision::licensed_lift::Refusal::Unlicensed(
+            "slice-use-unsupported-with-a-licensed-width"
+        )),
+        "the callee licenses 4 here; only the use blocks it: {rows:?}"
+    );
+}
+
 /// **W4L-8 — the lift reaches the CENSUS, not only the table.** relay 052 reads
 /// the receipts per program, so they are an artifact row
 /// (`<program>.raw-boundary-licensed-lifts.tsv`), rendered in the same shape as
