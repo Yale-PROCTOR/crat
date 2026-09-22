@@ -2704,19 +2704,28 @@ impl MutVisitor for A5RawGraftVisitor<'_> {
         let rendered = match super::c9::render_a5_raw_view_source(&source, &stem, &views) {
             Ok(rendered) => rendered,
             Err(why) => {
-                self.failure = Some(format!("could not render A5 raw-view call: {why}"));
+                self.failure = Some(format!(
+                    "could not render A5 raw-view call at {}..{}: {why}",
+                    key.0, key.1
+                ));
                 return;
             }
         };
         let parsed = match graft_expr(&rendered) {
             Ok(parsed) => parsed,
             Err(_) => {
-                self.failure = Some("A5 raw-view call did not round-trip".to_owned());
+                self.failure = Some(format!(
+                    "A5 raw-view call at {}..{} did not round-trip",
+                    key.0, key.1
+                ));
                 return;
             }
         };
         if !self.guard.claim(expression.id, expression.span, "a5-raw") {
-            self.failure = Some("A5 raw-view call collided with another AST transform".to_owned());
+            self.failure = Some(format!(
+                "A5 raw-view call at {}..{} collided with another AST transform",
+                key.0, key.1
+            ));
             return;
         }
         self.consumed.insert(key);
@@ -2789,14 +2798,20 @@ impl MutVisitor for PairRawGraftVisitor<'_> {
         let rendered = match super::c9::render_pair_raw_view_source(&source, &stem, &views) {
             Ok(rendered) => rendered,
             Err(why) => {
-                self.failure = Some(format!("could not render PAIR raw-view call: {why}"));
+                self.failure = Some(format!(
+                    "could not render PAIR raw-view call at {}..{}: {why}",
+                    key.0, key.1
+                ));
                 return;
             }
         };
         let parsed = match graft_expr(&rendered) {
             Ok(parsed) => parsed,
             Err(_) => {
-                self.failure = Some("PAIR raw-view call did not round-trip".to_owned());
+                self.failure = Some(format!(
+                    "PAIR raw-view call at {}..{} did not round-trip",
+                    key.0, key.1
+                ));
                 return;
             }
         };
@@ -2849,19 +2864,28 @@ impl MutVisitor for C9GraftVisitor<'_> {
         let rendered = match super::c9::render_marked_source(&mark.key, &source) {
             Ok(rendered) => rendered,
             Err(why) => {
-                self.failure = Some(format!("could not render retained C-9 mark: {why}"));
+                self.failure = Some(format!(
+                    "could not render retained C-9 mark at {}..{}: {why}",
+                    key.0, key.1
+                ));
                 return;
             }
         };
         let parsed = match graft_expr(&rendered) {
             Ok(parsed) => parsed,
             Err(_) => {
-                self.failure = Some("retained C-9 mark did not round-trip as an expression".into());
+                self.failure = Some(format!(
+                    "retained C-9 mark at {}..{} did not round-trip as an expression",
+                    key.0, key.1
+                ));
                 return;
             }
         };
         if !self.guard.claim(e.id, e.span, "c9") {
-            self.failure = Some("retained C-9 mark collided with another AST transform".into());
+            self.failure = Some(format!(
+                "retained C-9 mark at {}..{} collided with another AST transform",
+                key.0, key.1
+            ));
             return;
         }
         self.consumed.insert(key);
@@ -10065,5 +10089,77 @@ mod nested_composition_robustness_tests {
         )
         .expect("composes on the current text");
         assert_eq!(composed, "wrap(V, 4)");
+    }
+}
+
+#[cfg(test)]
+mod graft_failure_identity_tests {
+    /// **R511-3 — every graft failure names its site.**
+    ///
+    /// batch 26 lost brotli's whole emission to
+    /// `retained C-9 mark collided with another AST transform`, and that string is the entire
+    /// record: the program's `.census.err` is **zero bytes**, the census log carries the
+    /// status and nothing else, and the message named no span. Relay 136 asked for the floor
+    /// to be built RED-first "on brotli's exact site (the batch-26 `.census.err` names it)" —
+    /// it does not, and could not, because eight of the eighteen failure strings were bare.
+    ///
+    /// A diagnostic that cannot say WHERE turns a one-site collision into a whole-program
+    /// abort with no way back to the site. This pins that every one of them carries an
+    /// identity, so the floor's fixture can be written from a log rather than from a rerun.
+    #[test]
+    fn r511_3_every_graft_failure_carries_its_site() {
+        let source = include_str!("ast_transform.rs");
+        // **The witness must not count ITSELF.** The first run of this read 19 of 18, because
+        // the `split` pattern below is the very string it searches for and this module is in
+        // the file it reads. That is the third time this shape has bitten a witness of mine
+        // (R492-1 counted its own `include_str!` assertions; R499-1 anchored on a string in
+        // its own comment) -- so the scan stops where production ends.
+        let source = source
+            .split("mod graft_failure_identity_tests")
+            .next()
+            .expect("production precedes this module");
+        // **Comments are not code, INCLUDING trailing ones.** Dropping only whole comment
+        // lines was not enough: the fault control that removes a span left
+        // `"" // FAULT: the span is gone again` behind, the word "span" in that trailing
+        // comment satisfied the check, and the witness passed its own fault. A comment is
+        // stripped wherever it starts, and only outside a string literal.
+        let strip = |line: &str| -> String {
+            let bytes = line.as_bytes();
+            let (mut quoted, mut index) = (false, 0);
+            while index + 1 < bytes.len() {
+                match bytes[index] {
+                    b'\\' if quoted => index += 1,
+                    b'"' => quoted = !quoted,
+                    b'/' if !quoted && bytes[index + 1] == b'/' => return line[..index].to_owned(),
+                    _ => {}
+                }
+                index += 1;
+            }
+            line.to_owned()
+        };
+        let code = source.lines().map(strip).collect::<Vec<_>>().join("\n");
+
+        let mut bare = Vec::new();
+        let mut total = 0;
+        for piece in code.split("self.failure = Some(").skip(1) {
+            let end = piece.find(");\n").unwrap_or(piece.len());
+            let body = &piece[..end];
+            total += 1;
+            // An identity is a span pair, a span, or a receipt key — anything that gets a
+            // reader back to one site.
+            if !(body.contains("{}..{}")
+                || body.contains("key.0")
+                || body.contains(".lo().0")
+                || body.contains("span")
+                || body.contains("receipt_key()"))
+            {
+                bare.push(body.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+        assert_eq!(total, 18, "the failure vocabulary is eighteen strings");
+        assert!(
+            bare.is_empty(),
+            "a graft failure that names no site cannot be diagnosed from a log: {bare:#?}"
+        );
     }
 }
