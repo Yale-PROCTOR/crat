@@ -8982,6 +8982,12 @@ fn finish_decide<'tcx>(
                     // by nobody — no capture, no exclusion, no progress. The
                     // loop leaves the frame as the pipeline produced it.
                     if request.unresolved {
+                        // **R500-4.** Remember that this owner had nothing of
+                        // its own to retire at this stage. A later re-ask from
+                        // it is a repeated guess, and `unwithdrawn` declines it.
+                        family_policy
+                            .unresolved_anchors
+                            .insert((family_policy.stage, request.owner));
                         family_receipts.push(additive::FamilyFallbackReceipt {
                             scope: "unresolved".to_owned(),
                             family: format!("{:?}", family_policy.stage),
@@ -9042,6 +9048,15 @@ fn finish_decide<'tcx>(
                                 request.owner,
                                 hir_id.local_id.as_u32(),
                             ));
+                            // **R500-4.** Beside the exclusion, who asked for
+                            // it. `exclusions()` still counts the set above, so
+                            // strict transaction progress is untouched.
+                            if let Some(anchor) = request.anchor {
+                                family_policy.withdrawal_anchors.insert(
+                                    (family_policy.stage, request.owner, hir_id.local_id.as_u32()),
+                                    anchor,
+                                );
+                            }
                         }
                     }
                 }

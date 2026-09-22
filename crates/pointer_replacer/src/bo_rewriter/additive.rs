@@ -56,6 +56,15 @@ pub(crate) struct FamilyPolicy {
     /// prior result instead of the whole family falling back.
     /// Keyed by the binding's item-local id: the owner fixes the `HirId` owner.
     pub(crate) withdrawn_subjects: BTreeSet<(FamilyStage, SignatureClassId, u32)>,
+    /// **R500-4.** Which anchor asked for each subject-scoped withdrawal. Kept
+    /// BESIDE `withdrawn_subjects` rather than inside its key so that
+    /// `enabled`, `enabled_for` and `exclusions` — which the whole family loop
+    /// reads — keep their exact meaning and their exact arithmetic.
+    pub(crate) withdrawal_anchors: BTreeMap<(FamilyStage, SignatureClassId, u32), SignatureClassId>,
+    /// **R500-4.** Owners that recorded `interface-path-unresolved:` at a stage:
+    /// a restore anchor with nothing of its own to retire, which reached a
+    /// neighbour instead. Its later re-asks are guesses, not new evidence.
+    pub(crate) unresolved_anchors: BTreeSet<(FamilyStage, SignatureClassId)>,
 }
 
 impl FamilyPolicy {
@@ -64,6 +73,8 @@ impl FamilyPolicy {
             stage,
             withdrawn: BTreeSet::new(),
             withdrawn_subjects: BTreeSet::new(),
+            withdrawal_anchors: BTreeMap::new(),
+            unresolved_anchors: BTreeSet::new(),
         }
     }
 
@@ -123,6 +134,8 @@ pub(crate) struct FamilyWithdrawal {
     /// Empty: the owner falls back (R220). Otherwise exactly these candidates
     /// of `owner` are excluded at the selection input (R397-6(a)).
     pub(crate) subjects: Vec<HirId>,
+    /// **R500-4.** The anchor whose loss this request answers, when one asked.
+    pub(crate) anchor: Option<SignatureClassId>,
 }
 
 /// A concrete old rendering error, tied to one binding and its actual site.
@@ -376,6 +389,56 @@ fn moved(
                     .is_none_or(|(_, old)| old != decision)
         })
         .map(|(subject, _)| subject.hir_id)
+        .collect()
+}
+
+/// **R500-4 — a guess re-asked is not new evidence; a guess that worked is.**
+///
+/// Report 061 traced the withdrawal channel to a self-feeding loop: `moved`
+/// compares the candidate against the PRIOR snapshot, and the prior snapshot is
+/// the previous stage's OUTPUT, so a subject this loop withdrew at stage S
+/// reads `raw` in the prior at S+1 and `safe` in the candidate — the shape
+/// `moved` calls a move. `enabled_for` is keyed on the CURRENT stage only, so
+/// nothing suppresses the repeat, and its walk-back is chained, so four
+/// consecutive steps roll the subject back past `SliceConstruction` to raw.
+/// brotli's `HashBytesH10::data#1` is taken back four times by ONE anchor
+/// (1244) whose own interface path never resolves at any stage of any frame.
+///
+/// Suppressing EVERY repeat was built and refuted three ways (report 061): two
+/// standing pins go red — `binn_emits_the_prior_deliveries_with_the_candidate_excluded`,
+/// whose delivery the restore arm's own comment says only that step recovers,
+/// and `r424_typed_view_pending_source` — and brotli loses 37 realized subjects
+/// with two new `E0596`s. A repeat is sometimes the step that does the work.
+///
+/// So the condition is the one the evidence separates them by: suppress only
+/// when the SAME anchor re-asks AND that anchor has itself recorded
+/// `interface-path-unresolved:` — it had nothing of its own to retire and
+/// reached for a neighbour's candidate on a hypothesis. That is hq exactly. An
+/// anchor that resolved its own path, or a different anchor arriving at the
+/// same subject with its own reason, is untouched.
+fn unwithdrawn(
+    policy: &FamilyPolicy,
+    anchor: SignatureClassId,
+    owner: SignatureClassId,
+    subjects: Vec<HirId>,
+) -> Vec<HirId> {
+    subjects
+        .into_iter()
+        .filter(|hir_id| {
+            !policy
+                .withdrawal_anchors
+                .iter()
+                .any(|((stage, class, local), asked_by)| {
+                    *class == owner
+                        && *local == hir_id.local_id.as_u32()
+                        && *stage < policy.stage
+                        && *asked_by == anchor
+                        && policy
+                            .unresolved_anchors
+                            .iter()
+                            .any(|(seen, unresolved)| *unresolved == anchor && seen <= stage)
+                })
+        })
         .collect()
 }
 
@@ -756,10 +819,14 @@ pub(crate) fn withdrawals(
     // restore anchor searches its interface component nearest-first and stops
     // at the first distance carrying a changed owner, instead of withdrawing
     // every changed owner the component can reach.
-    let mut requested = BTreeMap::<SignatureClassId, (String, Vec<HirId>)>::new();
+    let mut requested =
+        BTreeMap::<SignatureClassId, (String, Vec<HirId>, Option<SignatureClassId>)>::new();
     let mut unresolved_rows = BTreeMap::<SignatureClassId, String>::new();
-    let mut request = |owner: SignatureClassId, cause: String, subjects: Vec<HirId>| {
-        requested.entry(owner).or_insert((cause, subjects));
+    let mut request = |owner: SignatureClassId,
+                       cause: String,
+                       subjects: Vec<HirId>,
+                       anchor: Option<SignatureClassId>| {
+        requested.entry(owner).or_insert((cause, subjects, anchor));
     };
     let mut unresolved = |anchor: SignatureClassId, cause: String| {
         unresolved_rows.entry(anchor).or_insert(cause);
@@ -798,7 +865,7 @@ pub(crate) fn withdrawals(
                 // this class's own subjects, so the class IS the participant
                 // and every moved candidate of it satisfies clause (1).
                 if !own.is_empty() {
-                    request(*anchor, scoped_cause(*anchor, cause), own);
+                    request(*anchor, scoped_cause(*anchor, cause), own, Some(*anchor));
                     continue;
                 }
                 // The anchor moved no decision of its own: R220's owner
@@ -830,7 +897,7 @@ pub(crate) fn withdrawals(
                         site.owner_class == *anchor || site.caller == anchor.local_def_id()
                     });
                 if own_site {
-                    request(*anchor, cause.clone(), Vec::new());
+                    request(*anchor, cause.clone(), Vec::new(), Some(*anchor));
                 } else {
                     unresolved(*anchor, format!("interface-path-unresolved:{cause}"));
                 }
@@ -872,11 +939,21 @@ pub(crate) fn withdrawals(
                             // `interface-path-unresolved:` and retires nothing,
                             // which is the 506 owner-scoped transactions report
                             // 034 priced.
-                            let subjects = moved(prior, candidate, policy, owner);
+                            let subjects = unwithdrawn(
+                                policy,
+                                *anchor,
+                                owner,
+                                moved(prior, candidate, policy, owner),
+                            );
                             if subjects.is_empty() {
                                 unresolved(owner, format!("interface-path-unresolved:{cause}"));
                             } else {
-                                request(owner, scoped_cause(*anchor, &cause), subjects);
+                                request(
+                                    owner,
+                                    scoped_cause(*anchor, &cause),
+                                    subjects,
+                                    Some(*anchor),
+                                );
                             }
                         }
                         resolved = true;
@@ -901,11 +978,21 @@ pub(crate) fn withdrawals(
                         }
                         let cause =
                             format!("restore-family-unconnected-root:{}", anchor.order_key());
-                        let subjects = moved(prior, candidate, policy, *owner);
+                        let subjects = unwithdrawn(
+                            policy,
+                            *anchor,
+                            *owner,
+                            moved(prior, candidate, policy, *owner),
+                        );
                         if subjects.is_empty() {
                             unresolved(*owner, format!("interface-path-unresolved:{cause}"));
                         } else {
-                            request(*owner, scoped_cause(*anchor, &cause), subjects);
+                            request(
+                                *owner,
+                                scoped_cause(*anchor, &cause),
+                                subjects,
+                                Some(*anchor),
+                            );
                         }
                     }
                 }
@@ -914,11 +1001,12 @@ pub(crate) fn withdrawals(
     }
     let mut out = requested
         .into_iter()
-        .map(|(owner, (cause, subjects))| FamilyWithdrawal {
+        .map(|(owner, (cause, subjects, anchor))| FamilyWithdrawal {
             unresolved: false,
             owner,
             cause,
             subjects,
+            anchor,
         })
         .collect::<Vec<_>>();
     let retired_owners = out.iter().map(|w| w.owner).collect::<BTreeSet<_>>();
@@ -931,6 +1019,7 @@ pub(crate) fn withdrawals(
                 owner,
                 cause,
                 subjects: Vec::new(),
+                anchor: None,
             }),
     );
     out
@@ -1341,6 +1430,146 @@ impl RetiredReceipts {
             self.constructions
                 .into_iter()
                 .filter_map(|(key, receipt)| (!active.contains(&key)).then_some(receipt)),
+        );
+    }
+}
+
+#[cfg(test)]
+mod r500_tests {
+    use rustc_hir::{
+        HirId, ItemLocalId,
+        def_id::{DefIndex, LocalDefId},
+    };
+
+    use super::*;
+
+    fn class(index: u32) -> SignatureClassId {
+        SignatureClassId::of(LocalDefId {
+            local_def_index: DefIndex::from_u32(index),
+        })
+    }
+
+    fn subject(local: u32) -> HirId {
+        HirId {
+            owner: rustc_hir::OwnerId {
+                def_id: LocalDefId {
+                    local_def_index: DefIndex::from_u32(0),
+                },
+            },
+            local_id: ItemLocalId::from_u32(local),
+        }
+    }
+
+    /// The hq shape: anchor 1244 withdrew owner 1241's `data#1` at `SliceUse`
+    /// and has itself recorded `interface-path-unresolved:` there, so its
+    /// `Option`-stage re-ask is the same guess and finds nothing.
+    fn hq(stage: FamilyStage) -> FamilyPolicy {
+        let mut policy = FamilyPolicy::at(stage);
+        policy
+            .withdrawn_subjects
+            .insert((FamilyStage::SliceUse, class(1241), 1));
+        policy
+            .withdrawal_anchors
+            .insert((FamilyStage::SliceUse, class(1241), 1), class(1244));
+        policy
+            .unresolved_anchors
+            .insert((FamilyStage::SliceUse, class(1244)));
+        policy
+    }
+
+    #[test]
+    fn r500_4_an_unresolved_anchor_re_asking_for_its_own_earlier_withdrawal_finds_nothing() {
+        assert!(
+            unwithdrawn(
+                &hq(FamilyStage::Option),
+                class(1244),
+                class(1241),
+                vec![subject(1)]
+            )
+            .is_empty(),
+            "the same guess, re-asked, is not new evidence"
+        );
+    }
+
+    /// Control 1 — **this is why the global rule was refused.** An anchor that
+    /// RESOLVED its own path is not guessing: it named a participant and asked
+    /// for it. Report 009's binn delivery is recovered by exactly such a step,
+    /// and the pin that protects it stays green because this clause never
+    /// fires for it.
+    #[test]
+    fn r500_4_an_anchor_that_resolved_its_own_path_is_never_suppressed() {
+        let mut policy = hq(FamilyStage::Option);
+        policy.unresolved_anchors.clear();
+        assert_eq!(
+            unwithdrawn(&policy, class(1244), class(1241), vec![subject(1)]),
+            vec![subject(1)]
+        );
+    }
+
+    /// Control 2 — a DIFFERENT anchor arriving at the same subject brings its
+    /// own reason, so it is untouched however unresolved the first one was.
+    ///
+    /// The other anchor is made unresolved here TOO, deliberately: with only
+    /// 1244 unresolved the case is refused by the unresolved clause and this
+    /// control proves nothing about identity. Both unresolved, only
+    /// `asked_by == anchor` can decide it, and dropping that clause turns this
+    /// red.
+    #[test]
+    fn r500_4_a_different_anchor_is_never_suppressed() {
+        let mut policy = hq(FamilyStage::Option);
+        policy
+            .unresolved_anchors
+            .insert((FamilyStage::SliceUse, class(1243)));
+        assert_eq!(
+            unwithdrawn(&policy, class(1243), class(1241), vec![subject(1)]),
+            vec![subject(1)]
+        );
+    }
+
+    /// Control 3 — the anchor's unresolved row must be no LATER than the
+    /// withdrawal it is meant to explain; an anchor that only failed afterwards
+    /// did not guess when it asked.
+    #[test]
+    fn r500_4_an_unresolved_row_after_the_withdrawal_does_not_suppress() {
+        let mut policy = hq(FamilyStage::Return);
+        policy.unresolved_anchors.clear();
+        policy
+            .unresolved_anchors
+            .insert((FamilyStage::Declaration, class(1244)));
+        assert_eq!(
+            unwithdrawn(&policy, class(1244), class(1241), vec![subject(1)]),
+            vec![subject(1)]
+        );
+    }
+
+    /// Control 4 — within a stage the loop iterates to a fixed point, so a
+    /// withdrawal at the CURRENT stage is not an earlier one.
+    #[test]
+    fn r500_4_a_withdrawal_at_the_current_stage_does_not_suppress() {
+        assert_eq!(
+            unwithdrawn(
+                &hq(FamilyStage::SliceUse),
+                class(1244),
+                class(1241),
+                vec![subject(1)]
+            ),
+            vec![subject(1)]
+        );
+    }
+
+    /// Control 5 — a sibling's withdrawal, and another owner's withdrawal of
+    /// the same local index, leave this subject offerable: the rule's key is
+    /// (owner, subject), which is R397-6(a)'s own granularity.
+    #[test]
+    fn r500_4_a_siblings_withdrawal_never_suppresses() {
+        let policy = hq(FamilyStage::Return);
+        assert_eq!(
+            unwithdrawn(&policy, class(1244), class(1241), vec![subject(2)]),
+            vec![subject(2)]
+        );
+        assert_eq!(
+            unwithdrawn(&policy, class(1244), class(9999), vec![subject(1)]),
+            vec![subject(1)]
         );
     }
 }
