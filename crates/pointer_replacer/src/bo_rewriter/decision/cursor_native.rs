@@ -179,6 +179,39 @@ pub(crate) fn replan_delivered_table_elements(
     let mut receipts = Vec::new();
     for index in targets {
         let subject = entries[index].0.clone();
+        // **R512-4 / slicecursor 064 §3, 068.** Since nested's transaction,
+        // `promote` asks `plan_with(.., Some(&prospective))` BEFORE it writes,
+        // so a row whose table has flipped was already built against the
+        // delivered base and this re-build is a no-op: `table_element_base`
+        // takes the `NestedSlice` arm either way and returns the same
+        // `new(t[k])` with `fallback == false`.
+        //
+        // A target still carrying a FALLBACK plan is the opposite: a plan built
+        // against the flat form whose table flipped afterwards, which is the
+        // stale-plan case this pass exists to repair and which the transaction
+        // is supposed to have made unreachable. It stays a repair rather than a
+        // deletion, because "no other producer can flip a table later" is a
+        // cross-family ordering claim and is not provable locally — but it is
+        // now loud. The auditable count is this function's own receipt vector.
+        //
+        // S3.0: the `Decision` read is exhaustive.
+        let stale = match &entries[index].1 {
+            Decision::Cursor { plan, .. } => plan.fallback,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => false,
+        };
+        debug_assert!(
+            !stale,
+            "cursor-replan-after-flip: {:?} kept a fabricated window after its \
+             table delivered its inner level — `promote` must ask \
+             `plan_with(.., Some(..))` before it writes",
+            subject.label
+        );
         // `None`: this consumer re-plans AFTER a flip that already happened, so
         // there is no prospective table to tell the planner about — the flip is
         // in `entries`. R513-5 replaces this repair with an assert; the
