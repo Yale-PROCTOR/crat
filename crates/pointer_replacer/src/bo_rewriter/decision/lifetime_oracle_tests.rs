@@ -47,6 +47,25 @@ fn control_dir() -> PathBuf {
         })
 }
 
+/// Why the frozen control may go unread without that being a defect: the
+/// default path lives in the docs repository, which a worktree without
+/// `docs/` does not have (ownership-fields 062, R538-3 (v)). Only the absence
+/// of the WHOLE docs checkout skips; a docs checkout that lacks the control,
+/// or an explicit `CRAT_E2_PB_CONTROL_DIR` that is absent, still fails.
+#[derive(Debug, PartialEq, Eq)]
+enum ControlSkip {
+    DocsCheckoutAbsent(PathBuf),
+}
+
+fn control_skip(explicit_dir: bool, docs_root: &Path) -> Option<ControlSkip> {
+    (!explicit_dir && !docs_root.is_dir())
+        .then(|| ControlSkip::DocsCheckoutAbsent(docs_root.to_path_buf()))
+}
+
+fn docs_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs")
+}
+
 fn checked_text(path: &Path, expected_sha256: &str) -> Result<String, String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("P-b control {} unreadable: {error}", path.display()))?;
@@ -131,6 +150,11 @@ pub(crate) fn load_frozen_pb_control() -> Result<FrozenPbControl, String> {
 
 #[test]
 fn frozen_pb_control_has_exact_93_root_164_member_identity_sets() {
+    let explicit = std::env::var_os("CRAT_E2_PB_CONTROL_DIR").is_some();
+    if let Some(skip) = control_skip(explicit, &docs_root()) {
+        eprintln!("typed skip: frozen P-b control unread: {skip:?}");
+        return;
+    }
     let control = load_frozen_pb_control().expect("frozen P-b identity control");
     assert_eq!(control.total_roots(), 93);
     assert_eq!(control.total_members(), 164);
@@ -142,4 +166,20 @@ fn frozen_pb_control_has_exact_93_root_164_member_identity_sets() {
             roots.difference(&members).collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn the_frozen_pb_skip_is_typed_to_an_absent_docs_checkout() {
+    let absent = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-docs-checkout");
+    assert_eq!(
+        control_skip(false, &absent),
+        Some(ControlSkip::DocsCheckoutAbsent(absent.clone()))
+    );
+    // An explicit control directory is a request, never skipped.
+    assert_eq!(control_skip(true, &absent), None);
+    // A docs checkout that exists is read, and a missing control there fails.
+    assert_eq!(
+        control_skip(false, Path::new(env!("CARGO_MANIFEST_DIR"))),
+        None
+    );
 }
