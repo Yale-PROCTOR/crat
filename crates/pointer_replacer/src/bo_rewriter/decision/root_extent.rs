@@ -52,6 +52,10 @@ use super::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RootExtentRow {
     pub(crate) subject: String,
+    /// **The census `subject_key`** (R536-6, report 062 R1) — see
+    /// [`super::licensed_lift::LiftReceipt::subject_key`]: the label is not
+    /// unique across C2Rust's per-module duplicates, and this is.
+    pub(crate) subject_key: String,
     pub(crate) position: &'static str,
     /// `lifted` or `held`.
     pub(crate) outcome: &'static str,
@@ -67,9 +71,16 @@ pub(crate) struct RootExtentRow {
 
 /// Why a row could not be lifted. Each is a counted residue class, and the
 /// count is what the seat's Decision A is about.
-fn held(subject: &Subject, position: &'static str, extent: String, reason: &str) -> RootExtentRow {
+fn held(
+    ctx: &Ctx<'_, '_>,
+    subject: &Subject,
+    position: &'static str,
+    extent: String,
+    reason: &str,
+) -> RootExtentRow {
     RootExtentRow {
         subject: subject.label.clone(),
+        subject_key: super::licensed_lift::subject_key(ctx, subject),
         position,
         outcome: "held",
         extent,
@@ -332,6 +343,7 @@ pub(crate) fn promote(
                 };
                 rows.push(RootExtentRow {
                     subject: subject.label.clone(),
+                    subject_key: super::licensed_lift::subject_key(ctx, subject),
                     position,
                     outcome,
                     extent: shape,
@@ -345,12 +357,19 @@ pub(crate) fn promote(
         // its extent is recorded above, which is what separates "no extent to
         // propagate" from "an extent this build cannot yet carry".
         if !super::licensed_lift::slice_uses_supported(ctx, node) {
-            rows.push(held(subject, position, extent, "slice-use-unsupported"));
+            rows.push(held(
+                ctx,
+                subject,
+                position,
+                extent,
+                "slice-use-unsupported",
+            ));
             continue;
         }
         lift.insert(node);
         rows.push(RootExtentRow {
             subject: subject.label.clone(),
+            subject_key: super::licensed_lift::subject_key(ctx, subject),
             position,
             outcome: "lifted",
             extent,
@@ -374,19 +393,21 @@ pub(crate) fn promote(
 /// evidence key and, the point of the rule, the HELD rows with the reason no
 /// extent was found. The held count is the seat's Decision A input.
 pub(crate) fn receipts_tsv(rows: &[RootExtentRow]) -> String {
-    let mut out =
-        String::from("owner_path\tsubject\tposition\toutcome\troot_extent\theld_reason\n");
+    let mut out = String::from(
+        "owner_path\tsubject\tposition\toutcome\troot_extent\theld_reason\tsubject_key\n",
+    );
     let mut lines = rows
         .iter()
         .map(|row| {
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 row.subject.split("::").next().unwrap_or(&row.subject),
                 row.subject,
                 row.position,
                 row.outcome,
                 row.extent,
                 row.evidence,
+                row.subject_key,
             )
         })
         .collect::<Vec<_>>();
