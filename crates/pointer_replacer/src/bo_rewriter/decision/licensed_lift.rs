@@ -318,8 +318,10 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
             continue;
         }
         let node = (subject.fn_did, subject.hir_id);
+        // R533-4: ask with the mutability THIS arm lifts with.
+        let lift_mutable = subject.mutable && width.as_ref().is_ok_and(|region| region.mutable);
         if !slice_uses_supported(ctx, node)
-            && super::pass_on::supported(ctx, entries, node).is_none()
+            && super::pass_on::supported(ctx, entries, node, lift_mutable).is_none()
         {
             refuse(if licensed {
                 "slice-use-unsupported-with-a-licensed-width"
@@ -591,7 +593,7 @@ pub(crate) fn promote_fallback(
             // above is exactly that test.
             let node = (subject.fn_did, subject.hir_id);
             if !slice_uses_supported(ctx, node)
-                && super::pass_on::supported(ctx, entries_snapshot, node).is_none()
+                && super::pass_on::supported(ctx, entries_snapshot, node, subject.mutable).is_none()
             {
                 decline(subject, named.0.clone(), named.1, "slice-use-unsupported");
                 return None;
