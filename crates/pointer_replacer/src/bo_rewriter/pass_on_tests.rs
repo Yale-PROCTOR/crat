@@ -204,3 +204,213 @@ fn w6s13_control_a_second_non_pass_on_use_keeps_the_decline() {
     assert!(declined_by_use(&lifts), "{lifts:#?}");
     assert!(receipts.is_empty(), "{receipts:#?}");
 }
+
+/// W6S-13b: brotli `backward_references::StoreRangeH35::data#2` — one use at a
+/// `Slice` formal (`StoreRangeH3`), one at a thin formal
+/// (`StoreRangeHROLLING_FAST`, whose body never reads it).
+const RANGE: &str = r#"
+// crat-test-withdraw: SliceUse StoreRangeH35
+// crat-test-withdraw: Option StoreRangeH35
+// crat-test-withdraw: Declaration StoreRangeH35
+// crat-test-withdraw: Return StoreRangeH35
+unsafe extern "C" fn StoreRangeH3(mut self_0: *mut H2, mut data: *const uint8_t, mask: size_t, ix_start: size_t, ix_end: size_t) {
+    let mut i: size_t = ix_start;
+    while i < ix_end {
+        StoreH2(self_0, data, mask, i);
+        i = i.wrapping_add(1);
+    }
+}
+unsafe extern "C" fn StoreRangeHROLLING_FAST(mut self_0: *mut H2, mut data: *const uint8_t, mask: size_t, ix_start: size_t, ix_end: size_t) {}
+unsafe extern "C" fn StoreRangeH35(mut self_0: *mut H2, mut data: *const uint8_t, mask: size_t, ix_start: size_t, ix_end: size_t) {
+    StoreRangeH3(self_0, data, mask, ix_start, ix_end);
+    StoreRangeHROLLING_FAST(self_0, data, mask, ix_start, ix_end);
+}
+"#;
+
+/// The chain: `Top::storage` hands on to `Mid::storage`, which hands on to a
+/// delivering `Leaf::storage`; both owners withdrawn, as brotli's
+/// `BuildAndStoreCommandPrefixCode` → `BrotliStoreHuffmanTree` are.
+const CHAIN: &str = r#"
+// crat-test-withdraw: SliceUse InitOrStitch
+// crat-test-withdraw: Option InitOrStitch
+// crat-test-withdraw: Declaration InitOrStitch
+// crat-test-withdraw: Return InitOrStitch
+unsafe extern "C" fn InitOrStitch(mut self_0: *mut H2, mut data: *const uint8_t, mut mask: size_t,
+        mut position: size_t, mut input_size: size_t) {
+    StitchToPreviousBlockH2(self_0, input_size, position, data, mask);
+}
+"#;
+
+/// Mutability (d): the STITCH shape with the callee's formal seeded MUTABLE
+/// and the caller left shared — `&[T]` handed to `&mut [T]`.
+const MUT_SEED: &str = "\n// crat-test-mutable: StoreH2::data\n";
+
+fn emitted(input: &str) -> String {
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(input) else {
+        panic!("the fixture must emit")
+    };
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    source
+}
+
+/// **W6S-13b — a thin formal takes the first element.** `StoreRangeH35::data`
+/// hands on to `StoreRangeH3::data` (`Slice`) and `StoreRangeHROLLING_FAST::data`
+/// (thin `Ref`): lifted by the pass-on, one receipt per pair, and the seam's
+/// glue renders the thin argument as the slice's first element —
+/// `data.first().unwrap()`, which panics on an empty slice exactly where
+/// `&data[0]` would (the real `StoreRangeHROLLING_FAST` never reads it).
+#[test]
+fn w6s13b_a_thin_formal_takes_the_first_element() {
+    let input = fixture(STORE_DELIVERS, RANGE);
+    let (lifts, receipts, entries) = table(&input);
+    assert!(
+        entries
+            .iter()
+            .any(|(l, d)| l == "StoreRangeHROLLING_FAST::data" && d.starts_with("Ref {")),
+        "the second formal is thin: {entries:#?}"
+    );
+    assert!(
+        lifts
+            .iter()
+            .any(|(s, d, _, shape)| s == "StoreRangeH35::data"
+                && d.is_none()
+                && *shape == Some("pass-on")),
+        "{lifts:#?}"
+    );
+    let pairs = receipts
+        .iter()
+        .filter(|r| r.caller == "StoreRangeH35::data")
+        .map(|r| (r.callee.as_str(), r.parameter_index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pairs,
+        vec![("StoreRangeH3", 1), ("StoreRangeHROLLING_FAST", 1)],
+        "{receipts:#?}"
+    );
+    let source = emitted(&input);
+    assert!(source.contains("data: &[uint8_t]"), "{source}");
+    // Measured: the seam's `(Ref, Slice)` glue is `First`, rendered checked.
+    assert!(
+        source.contains("StoreRangeHROLLING_FAST(self_0, data.first().unwrap(), mask"),
+        "the thin argument is the first element: {source}"
+    );
+}
+
+/// **The chain round.** `InitOrStitch::data` hands on to
+/// `StitchToPreviousBlockH2::ringbuffer`, which is itself held until the
+/// first round lifts it; the second round lifts the caller.
+#[test]
+fn w6s13_the_chain_round_lifts_the_caller_of_a_lifted_caller() {
+    let input = format!("{}{CHAIN}", fixture(STORE_DELIVERS, STITCH));
+    let (lifts, receipts, _) = table(&input);
+    for subject in ["StitchToPreviousBlockH2::ringbuffer", "InitOrStitch::data"] {
+        assert!(
+            lifts
+                .iter()
+                .any(|(s, d, _, shape)| s == subject && d.is_none() && *shape == Some("pass-on")),
+            "{subject}: {lifts:#?}"
+        );
+        assert!(
+            !lifts.iter().any(|(s, d, ..)| s == subject
+                && d.is_some_and(|r| matches!(
+                    r,
+                    super::decision::licensed_lift::Refusal::Declined(_)
+                ))),
+            "a lifted row keeps no decline: {subject}: {lifts:#?}"
+        );
+    }
+    assert!(
+        receipts.iter().any(|r| r.caller == "InitOrStitch::data"
+            && r.callee == "StitchToPreviousBlockH2"
+            && r.parameter_index == 3),
+        "{receipts:#?}"
+    );
+    emitted(&input);
+}
+
+/// **(d) — a shared caller is never handed to a mutable formal.** Refused, and
+/// the decline row says why.
+#[test]
+fn w6s13_a_shared_caller_at_a_mutable_formal_is_refused_and_receipted() {
+    let input = format!("{}{MUT_SEED}", fixture(STORE_DELIVERS, STITCH));
+    let (lifts, receipts, entries) = table(&input);
+    assert!(
+        entries
+            .iter()
+            .any(|(l, d)| l == "StoreH2::data" && d.starts_with("Slice { mutable: true")),
+        "the seed makes the formal mutable: {entries:#?}"
+    );
+    assert!(declined_by_use(&lifts), "{lifts:#?}");
+    assert!(
+        lifts.iter().any(
+            |(s, d, _, shape)| s == "StitchToPreviousBlockH2::ringbuffer"
+                && d.is_some()
+                && *shape == Some("pass-on-refused:shared-into-mut")
+        ),
+        "{lifts:#?}"
+    );
+    assert!(receipts.is_empty(), "{receipts:#?}");
+}
+
+/// (c) B1's root walk: a caller that passes a sized array states the extent.
+const SIZED_CALLER: &str = r#"
+pub unsafe fn drive(mut h: *mut H2) {
+    let mut buf: [uint8_t; 64] = [0; 64];
+    let mut ringbuffer: *const uint8_t = buf.as_ptr();
+    StitchToPreviousBlockH2(h, 64, 3, ringbuffer, 63);
+}
+"#;
+
+/// **(c) The third gate.** A pass-on row whose every caller states an extent
+/// lifts on B1's EVIDENCE, and the waiver never fabricates one for it.
+#[test]
+fn w6s13_a_pass_on_row_with_a_root_extent_lifts_on_evidence() {
+    let input = format!("{}{SIZED_CALLER}", fixture(STORE_DELIVERS, STITCH));
+    let rows = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(&input),
+        |tcx| {
+            let (table, _ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )?;
+            Ok::<_, String>((
+                table
+                    .root_extents
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.subject.clone(),
+                            r.outcome,
+                            r.extent.clone(),
+                            r.evidence.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                table
+                    .licensed_lifts
+                    .iter()
+                    .map(|l| (l.subject.clone(), l.key()))
+                    .collect::<Vec<_>>(),
+            ))
+        },
+    )
+    .expect("fixture compiles")
+    .expect("table");
+    let (roots, lifts) = rows;
+    assert!(
+        roots.iter().any(
+            |(s, outcome, ..)| s == "StitchToPreviousBlockH2::ringbuffer" && *outcome == "lifted"
+        ),
+        "B1 lifts it on the callers' extent: {roots:#?}\n{lifts:#?}"
+    );
+    assert!(
+        !lifts
+            .iter()
+            .any(|(s, key)| s == "StitchToPreviousBlockH2::ringbuffer"
+                && key.starts_with("fallback(")),
+        "never on the waiver: {lifts:#?}"
+    );
+}

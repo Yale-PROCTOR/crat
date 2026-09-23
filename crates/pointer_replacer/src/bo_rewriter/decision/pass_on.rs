@@ -20,11 +20,22 @@
 //!
 //! What it does NOT admit:
 //! - a caller with any refused use that is not such an argument;
-//! - a callee parameter decided anything but `Slice` (a thin `Ref` would be a
-//!   one-element claim; `Degraded` has no safe form to receive a slice);
-//! - a MUTABLE callee slice from a SHARED caller (`&[T]` → `&mut [T]`);
-//! - a callee parameter lifted in the same pass (the fixpoint's two rows are
-//!   named in 068 and left for a second round).
+//! - a callee parameter decided anything but `Slice` or a thin `Ref` (an
+//!   `Opt`, `Box`, `Cursor` or `Degraded` formal has no image of a slice here);
+//! - a MUTABLE formal from a SHARED caller (`&[T]` → `&mut [T]` / `&mut T`):
+//!   refused, and the decline row says so (`use_shape =
+//!   pass-on-refused:shared-into-mut`).
+//!
+//! **W6S-13b (R531-5(a)) — a thin `Ref` formal.** The slice hands on its first
+//! element. The call-site seam already renders exactly that for a `Slice`
+//! caller at a `Ref` formal (`seam.rs`'s `(Ref, Slice)` glue, `&s[0]` /
+//! `&mut s[0]`, bounds-checked), so the rule adds no argument edit of its own.
+//!
+//! **The chain round (R531-5(b)).** Every lift arm reads a pre-pass view, so a
+//! callee lifted by the same pass is invisible to its caller. [`close`] runs the
+//! three arms again until a round lifts nothing: monotone (a lifted row is never
+//! a candidate again and the set of receiving formals only grows), bounded by
+//! the held rows, and measured cycle-free (068).
 
 use rustc_hir::{HirId, def_id::LocalDefId};
 
@@ -57,30 +68,143 @@ pub(crate) fn supported(
         .mutable;
     uses.pass_on
         .iter()
-        .all(|&(callee, index)| {
-            entries.iter().any(|(subject, decision)| {
-                subject.fn_did == callee
-                    && matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == index)
-                    && receives(decision, caller_mutable)
-            })
-        })
+        .all(|&(callee, index)| formal(entries, callee, index, caller_mutable) == Receive::Yes)
         .then(|| uses.pass_on.clone())
+}
+
+/// Would `node` be a pass-on but for mutability — every refused use a pass-on
+/// into a formal that has an image of the slice, and at least one of those
+/// formals MUTABLE under a SHARED caller?
+pub(crate) fn refused_by_mutability(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+    node: (LocalDefId, HirId),
+) -> bool {
+    let Some(uses) = ctx.slice_uses.get(&node) else {
+        return false;
+    };
+    if uses.unsupported.is_none() || uses.other_unsupported != 0 || uses.pass_on.is_empty() {
+        return false;
+    }
+    let Some((caller, _)) = entries
+        .iter()
+        .find(|(subject, _)| (subject.fn_did, subject.hir_id) == node)
+    else {
+        return false;
+    };
+    let answers = uses
+        .pass_on
+        .iter()
+        .map(|&(callee, index)| formal(entries, callee, index, caller.mutable))
+        .collect::<Vec<_>>();
+    answers.iter().all(|answer| *answer != Receive::No) && answers.contains(&Receive::Mutability)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Receive {
+    Yes,
+    /// The formal has an image of the slice, but writes through it and the
+    /// caller is shared.
+    Mutability,
+    No,
+}
+
+/// The callee parameter at `index`, asked whether it receives the caller's
+/// slice.
+fn formal(
+    entries: &[(Subject, Decision)],
+    callee: LocalDefId,
+    index: usize,
+    caller_mutable: bool,
+) -> Receive {
+    entries
+        .iter()
+        .find(|(subject, _)| {
+            subject.fn_did == callee
+                && matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == index)
+        })
+        .map_or(Receive::No, |(_, decision)| {
+            receives(decision, caller_mutable)
+        })
 }
 
 /// Can this callee-parameter decision receive the caller's slice?
 ///
 /// Exhaustive for the reason `licensed_lift::delivers_slice` is: a new
 /// disposition must be answered here, not admitted by a wildcard.
-fn receives(decision: &Decision, caller_mutable: bool) -> bool {
+fn receives(decision: &Decision, caller_mutable: bool) -> Receive {
+    let permitted = |mutable: bool| {
+        if !mutable || caller_mutable {
+            Receive::Yes
+        } else {
+            Receive::Mutability
+        }
+    };
     match decision {
-        Decision::Slice { mutable, .. } => !*mutable || caller_mutable,
-        Decision::Ref { .. }
-        | Decision::InferredRef { .. }
-        | Decision::NestedSlice { .. }
+        Decision::Slice { mutable, .. } => permitted(*mutable),
+        // W6S-13b: a thin formal takes the first element (the seam's glue).
+        Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => permitted(*mutable),
+        Decision::NestedSlice { .. }
         | Decision::Opt { .. }
         | Decision::Box(_)
         | Decision::Cursor { .. }
-        | Decision::Degraded(_) => false,
+        | Decision::Degraded(_) => Receive::No,
+    }
+}
+
+/// **The chain round (R531-5(b)).** Re-run the three lift arms until a round
+/// lifts nothing, keeping every lift and dropping a refusal row whose subject a
+/// later round lifted. A later round's refusals for rows still held repeat the
+/// first round's and are discarded.
+pub(crate) fn close(
+    ctx: &Ctx<'_, '_>,
+    entries: &mut [(Subject, Decision)],
+    lifts: &mut Vec<super::licensed_lift::LiftReceipt>,
+    roots: &mut Vec<super::root_extent::RootExtentRow>,
+) {
+    let held = |entries: &[(Subject, Decision)]| {
+        entries
+            .iter()
+            .filter(|(_, decision)| {
+                super::licensed_lift::held_at_a_local_callee(decision).is_some()
+            })
+            .count()
+    };
+    for _ in 0..entries.len() {
+        // Only a held row some pass-on now reaches can move; otherwise stop.
+        let movable = entries.iter().any(|(subject, decision)| {
+            super::licensed_lift::held_at_a_local_callee(decision).is_some()
+                && supported(ctx, entries, (subject.fn_did, subject.hir_id)).is_some()
+        });
+        if !movable {
+            return;
+        }
+        let before = held(entries);
+        let mut round = super::licensed_lift::promote(ctx, entries);
+        let round_roots = super::root_extent::promote(ctx, entries);
+        round.extend(super::licensed_lift::promote_fallback(ctx, entries));
+        if held(entries) == before {
+            return;
+        }
+        let lifted = round
+            .iter()
+            .filter(|lift| lift.declined.is_none())
+            .map(|lift| lift.subject.clone())
+            .chain(
+                round_roots
+                    .iter()
+                    .filter(|row| row.outcome == "lifted")
+                    .map(|row| row.subject.clone()),
+            )
+            .collect::<rustc_hash::FxHashSet<_>>();
+        lifts.retain(|lift| lift.declined.is_none() || !lifted.contains(&lift.subject));
+        lifts.extend(round.into_iter().filter(|lift| lift.declined.is_none()));
+        roots.retain(|row| row.outcome == "lifted" || !lifted.contains(&row.subject));
+        roots.extend(
+            round_roots
+                .into_iter()
+                .filter(|row| row.outcome == "lifted"),
+        );
     }
 }
 
@@ -94,6 +218,17 @@ pub(crate) fn receipts(
     lifts: &mut [super::licensed_lift::LiftReceipt],
 ) -> Vec<Receipt> {
     let mut out = Vec::new();
+    for (subject, _) in entries {
+        if !refused_by_mutability(ctx, entries, (subject.fn_did, subject.hir_id)) {
+            continue;
+        }
+        for lift in lifts
+            .iter_mut()
+            .filter(|lift| lift.declined.is_some() && lift.subject == subject.label)
+        {
+            lift.use_shape = Some("pass-on-refused:shared-into-mut");
+        }
+    }
     for (subject, decision) in entries {
         if !super::licensed_lift::delivers_slice(decision) {
             continue;
