@@ -781,17 +781,22 @@ struct Hoists<'a> {
     /// The binding names this pass generated, so the block pass below can
     /// tell its own `let`s from the program's.
     generated: FxHashSet<String>,
+    /// Every name whose storage may be reached through a pointer: see
+    /// [`address_taken_names`].
+    address_taken: FxHashSet<String>,
 }
 
 impl MutVisitor for Hoists<'_> {
     /// **R538-3: a hoist ABSORBS the preceding assignment of the same read.**
     /// After this block's hoists are placed, a generated
     /// `let __crat_hoistN = R;` moves above the statement just before its
-    /// group when that statement is `P = R` — the SAME pure read — and `P` is
-    /// a pure place. The move is value-preserving with no alias analysis: if
-    /// `P` is `R`'s place, the statement stores `R`'s own value there, so `R`
-    /// reads the same before and after it; if not, the statement does not
-    /// touch `R`, and `P`'s evaluation has no effect to observe. What it buys:
+    /// group when that statement is `P = R` — the SAME pure read — and the
+    /// store cannot change what `R` reads ([`same_read_assignment`]). `R`
+    /// reads its own place and the locals it goes through, nothing else. If
+    /// the store lands on `R`'s place it stores `R`'s own value there; the
+    /// locals it cannot reach — not by name, and not through memory unless
+    /// their address is taken. So `R` reads the same before and after the
+    /// statement, and `P`'s evaluation has no effect to observe. What it buys:
     /// a reference the read goes through has its last use in that statement's
     /// value, which Rust evaluates BEFORE the place — so a write through a
     /// re-seated owner (`(*root.as_deref_mut().unwrap()).key = ..`) no longer
@@ -799,7 +804,7 @@ impl MutVisitor for Hoists<'_> {
     /// order of two statements changes.
     fn visit_block(&mut self, block: &mut rustc_ast::Block) {
         rustc_ast::mut_visit::walk_block(self, block);
-        absorb_preceding_same_read(&mut block.stmts, &self.generated);
+        absorb_preceding_same_read(&mut block.stmts, &self.generated, &self.address_taken);
     }
 
     fn flat_map_stmt(
@@ -910,17 +915,124 @@ fn pure_place(expr: &rustc_ast::Expr) -> bool {
     }
 }
 
-/// `statement` is `P = R` with `P` a pure place and `R` printing exactly as
-/// `read` does. A plain `=` only: a compound assignment reads `P` first.
-fn same_read_assignment(statement: &rustc_ast::Stmt, read: &rustc_ast::Expr) -> bool {
+/// A local named by a one-segment path, through parentheses.
+fn local_name(expr: &rustc_ast::Expr) -> Option<String> {
+    match &expr.kind {
+        rustc_ast::ExprKind::Path(None, path) if path.segments.len() == 1 => {
+            Some(path.segments[0].ident.name.to_string())
+        }
+        rustc_ast::ExprKind::Paren(inner) => local_name(inner),
+        _ => None,
+    }
+}
+
+/// The locals a read goes through, when those locals are ALL it reads
+/// besides its own place: fields of a local or of a local's pointee
+/// (`t.f`, `(*t).key`), never a pointer loaded from memory (`(*(*a).b).key`).
+fn read_locals(expr: &rustc_ast::Expr, locals: &mut Vec<String>) -> bool {
+    match &expr.kind {
+        rustc_ast::ExprKind::Field(base, _) | rustc_ast::ExprKind::Paren(base) => {
+            read_locals(base, locals)
+        }
+        rustc_ast::ExprKind::Unary(rustc_ast::UnOp::Deref, base) => {
+            local_name(base).map(|name| locals.push(name)).is_some()
+        }
+        _ => local_name(expr).map(|name| locals.push(name)).is_some(),
+    }
+}
+
+/// The local a place's store lands in, or `None` when it lands in memory
+/// (a deref on the way to the root).
+fn stored_local(expr: &rustc_ast::Expr) -> Option<Option<String>> {
+    match &expr.kind {
+        rustc_ast::ExprKind::Field(base, _)
+        | rustc_ast::ExprKind::Paren(base)
+        | rustc_ast::ExprKind::Index(base, _, _) => stored_local(base),
+        rustc_ast::ExprKind::Unary(rustc_ast::UnOp::Deref, _) => Some(None),
+        _ => local_name(expr).map(Some),
+    }
+}
+
+/// `statement` is `P = R` with `P` a pure place, `R` printing exactly as
+/// `read` does, and a store to `P` unable to change what `R` reads. A plain
+/// `=` only: a compound assignment reads `P` first. Two places of `R`'s
+/// type are the same place or disjoint (no packed or union overlap).
+fn same_read_assignment(
+    statement: &rustc_ast::Stmt,
+    read: &rustc_ast::Expr,
+    address_taken: &FxHashSet<String>,
+) -> bool {
     let (rustc_ast::StmtKind::Expr(expr) | rustc_ast::StmtKind::Semi(expr)) = &statement.kind
     else {
         return false;
     };
     let rustc_ast::ExprKind::Assign(place, value, _) = &expr.kind else { return false };
-    pure_place(place)
-        && rustc_ast_pretty::pprust::expr_to_string(value)
-            == rustc_ast_pretty::pprust::expr_to_string(read)
+    let mut locals = Vec::new();
+    if !pure_place(place)
+        || rustc_ast_pretty::pprust::expr_to_string(value)
+            != rustc_ast_pretty::pprust::expr_to_string(read)
+        || !read_locals(read, &mut locals)
+    {
+        return false;
+    }
+    match stored_local(place) {
+        // Into a local: not one `R` goes through.
+        Some(Some(stored)) => !locals.contains(&stored),
+        // Into memory: it reaches a local only through that local's address.
+        Some(None) => locals.iter().all(|local| !address_taken.contains(local)),
+        None => false,
+    }
+}
+
+/// Every name whose storage a pointer may reach: the root of an `&`/`&raw`
+/// operand or of a method receiver (autoref) that is not behind a deref,
+/// and every name a closure mentions. Crate-wide and by name, so it over-
+/// approximates each function's own set.
+pub(crate) fn address_taken_names(krate: &rustc_ast::Crate) -> FxHashSet<String> {
+    struct Names(FxHashSet<String>, usize);
+    impl Names {
+        fn root(&mut self, expr: &rustc_ast::Expr) {
+            match &expr.kind {
+                rustc_ast::ExprKind::Field(base, _)
+                | rustc_ast::ExprKind::Paren(base)
+                | rustc_ast::ExprKind::Index(base, _, _) => self.root(base),
+                rustc_ast::ExprKind::Path(_, path) => {
+                    if let Some(last) = path.segments.last() {
+                        self.0.insert(last.ident.name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    impl<'a> rustc_ast::visit::Visitor<'a> for Names {
+        fn visit_expr(&mut self, expr: &'a rustc_ast::Expr) {
+            match &expr.kind {
+                rustc_ast::ExprKind::AddrOf(_, _, operand) => self.root(operand),
+                rustc_ast::ExprKind::MethodCall(call) => self.root(&call.receiver),
+                rustc_ast::ExprKind::Closure(..) => {
+                    self.1 += 1;
+                    rustc_ast::visit::walk_expr(self, expr);
+                    self.1 -= 1;
+                    return;
+                }
+                _ => {}
+            }
+            rustc_ast::visit::walk_expr(self, expr);
+        }
+
+        fn visit_path(&mut self, path: &'a rustc_ast::Path) {
+            if self.1 > 0 {
+                if let Some(last) = path.segments.last() {
+                    self.0.insert(last.ident.name.to_string());
+                }
+            }
+            rustc_ast::visit::walk_path(self, path);
+        }
+    }
+    let mut names = Names(FxHashSet::default(), 0);
+    rustc_ast::visit::walk_crate(&mut names, krate);
+    names.0
 }
 
 /// Move each generated hoist `let` above the statement just before its
@@ -928,6 +1040,7 @@ fn same_read_assignment(statement: &rustc_ast::Stmt, read: &rustc_ast::Expr) -> 
 pub(crate) fn absorb_preceding_same_read(
     statements: &mut thin_vec::ThinVec<rustc_ast::Stmt>,
     generated: &FxHashSet<String>,
+    address_taken: &FxHashSet<String>,
 ) {
     let mut index = 1;
     while index < statements.len() {
@@ -936,7 +1049,7 @@ pub(crate) fn absorb_preceding_same_read(
             while first > 0 && hoist_let_init(&statements[first - 1], generated).is_some() {
                 first -= 1;
             }
-            first > 0 && same_read_assignment(&statements[first - 1], read)
+            first > 0 && same_read_assignment(&statements[first - 1], read, address_taken)
         });
         if absorbs {
             let mut first = index;
@@ -1005,6 +1118,7 @@ pub(crate) fn apply_hoists(
     if plans.is_empty() {
         return Ok(());
     }
+    let address_taken = address_taken_names(krate);
     let mut hoists = Hoists {
         plans: &plans,
         guard,
@@ -1012,6 +1126,7 @@ pub(crate) fn apply_hoists(
         counter: 0,
         failures: Vec::new(),
         generated: FxHashSet::default(),
+        address_taken,
     };
     hoists.visit_crate(krate);
     if !hoists.failures.is_empty() {

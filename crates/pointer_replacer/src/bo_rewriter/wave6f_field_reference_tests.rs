@@ -3236,22 +3236,57 @@ fn w6f_a_seam_consumer_withdraws_with_its_transaction() {
 fn w6f_the_hoist_absorbs_only_the_same_read_through_a_pure_place() {
     let _frame = frame_lock();
     let cases = ::utils::compilation::run_compiler_on_str("fn main() {}", |_tcx| {
-        let order = |previous: &str| -> bool {
+        let order = |previous: &str, read: &str, address_taken: &[&str]| -> bool {
             let mut statements: thin_vec::ThinVec<rustc_ast::Stmt> = thin_vec::ThinVec::new();
             statements.push(::utils::ast::parse_stmt(previous.to_owned()));
-            statements.push(::utils::ast::parse_stmt(
-                "let __crat_hoist0 = (*t).key;".to_owned(),
-            ));
+            statements.push(::utils::ast::parse_stmt(format!(
+                "let __crat_hoist0 = {read};"
+            )));
             let generated: rustc_hash::FxHashSet<String> =
                 std::iter::once("__crat_hoist0".to_owned()).collect();
-            super::field_reference_ast::absorb_preceding_same_read(&mut statements, &generated);
+            let address_taken: rustc_hash::FxHashSet<String> = address_taken
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect();
+            super::field_reference_ast::absorb_preceding_same_read(
+                &mut statements,
+                &generated,
+                &address_taken,
+            );
             matches!(statements[0].kind, rustc_ast::StmtKind::Let(_))
         };
         vec![
-            ("same read, pure place", order("(*root).key = (*t).key;")),
-            ("a different value", order("(*root).key = (*u).key;")),
-            ("a compound assignment", order("(*root).key += (*t).key;")),
-            ("a place that calls", order("(*pick(root)).key = (*t).key;")),
+            (
+                "same read, pure place",
+                order("(*root).key = (*t).key;", "(*t).key", &[]),
+            ),
+            (
+                "a different value",
+                order("(*root).key = (*u).key;", "(*t).key", &[]),
+            ),
+            (
+                "a compound assignment",
+                order("(*root).key += (*t).key;", "(*t).key", &[]),
+            ),
+            (
+                "a place that calls",
+                order("(*pick(root)).key = (*t).key;", "(*t).key", &[]),
+            ),
+            // The write lands in a local the read goes through: `p` moves on.
+            (
+                "the write is the read's own local",
+                order("p = (*p).next;", "(*p).next", &[]),
+            ),
+            // A write through memory can reach `t` only through its address.
+            (
+                "the read's local is address-taken",
+                order("(*root).key = (*t).key;", "(*t).key", &["t"]),
+            ),
+            // The read goes through memory the write may reach.
+            (
+                "the read derefs through memory",
+                order("(*root).key = (*(*a).b).key;", "(*(*a).b).key", &[]),
+            ),
         ]
     })
     .unwrap();
@@ -3262,6 +3297,33 @@ fn w6f_the_hoist_absorbs_only_the_same_read_through_a_pure_place() {
             ("a different value", false),
             ("a compound assignment", false),
             ("a place that calls", false),
+            ("the write is the read's own local", false),
+            ("the read's local is address-taken", false),
+            ("the read derefs through memory", false),
         ]
     );
+}
+
+/// Witness 40 (R538-3): the names the absorption treats as reachable through
+/// memory — an `&`/`&raw` operand's root, a method receiver's (autoref), any
+/// name a closure mentions — and NOT a root behind a deref (`&mut (*p).f`
+/// takes the pointee's address, not `p`'s).
+#[test]
+fn w6f_the_absorption_reads_address_taken_names_crate_wide() {
+    let _frame = frame_lock();
+    let names = ::utils::compilation::run_compiler_on_str("fn main() {}", |_tcx| {
+        let krate = ::utils::ast::parse_crate(
+            "unsafe fn f(p: *mut S, mut a: [i32; 2], mut x: i32, y: i32, z: i32) {\n\
+             let q = &mut x; let r = a.as_mut_ptr(); let c = || y + 1;\n\
+             let s = &mut (*p).f; let t = z; }"
+                .to_owned(),
+        );
+        let mut names: Vec<String> = super::field_reference_ast::address_taken_names(&krate)
+            .into_iter()
+            .collect();
+        names.sort();
+        names
+    })
+    .unwrap();
+    assert_eq!(names, ["a", "x", "y"]);
 }
