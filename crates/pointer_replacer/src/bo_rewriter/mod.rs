@@ -111,6 +111,8 @@ mod pair_static_callers_tests;
 mod pair_static_root_tests;
 #[cfg(test)]
 mod pair_view_of_formal_tests;
+#[cfg(test)]
+mod pass_on_tests;
 pub(crate) mod plan;
 #[cfg(test)]
 mod raw_initializer_tests;
@@ -7970,6 +7972,8 @@ fn finish_decide<'tcx>(
         },
     );
     let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
+    #[cfg(test)]
+    test_model_override::seed_withdrawals(tcx, &program, &mut family_policy);
     let mut predecessor: Option<additive::StageSnapshot> = None;
     let mut native_ownership_candidates = decision::ownership_fields_native::Candidates::default();
     let mut retired = additive::RetiredReceipts::default();
@@ -9964,6 +9968,54 @@ pub(crate) mod test_model_override {
         FRAME
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// **W6S-13 (R528-4)** — owner-scope family withdrawals a fixture names in
+    /// its own source, one `// crat-test-withdraw: <Stage> <fn>` line each. A
+    /// reduction does not reproduce the census's R220 transactions (brotli
+    /// withdraws `StitchToPreviousBlockH2`'s SliceUse family on a
+    /// `new-family-dependency` its caller graph produces), so the witness seeds
+    /// the recorded one. Read from the source, not a global: fixtures run
+    /// concurrently.
+    pub(crate) fn seed_withdrawals(
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        program: &crate::utils::rustc::RustProgram<'_>,
+        policy: &mut super::additive::FamilyPolicy,
+    ) {
+        use super::additive::FamilyStage;
+        let named = tcx
+            .sess
+            .source_map()
+            .files()
+            .iter()
+            .filter_map(|file| file.src.as_ref().map(|src| src.to_string()))
+            .flat_map(|src| {
+                src.lines()
+                    .filter_map(|line| line.trim().strip_prefix("// crat-test-withdraw:"))
+                    .filter_map(|rest| {
+                        let mut words = rest.split_whitespace();
+                        Some((words.next()?.to_owned(), words.next()?.to_owned()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for (stage, name) in named {
+            let stage = match stage.as_str() {
+                "SliceConstruction" => FamilyStage::SliceConstruction,
+                "SliceUse" => FamilyStage::SliceUse,
+                "Option" => FamilyStage::Option,
+                "Declaration" => FamilyStage::Declaration,
+                "Return" => FamilyStage::Return,
+                _ => continue,
+            };
+            for &function in &program.functions {
+                if tcx.item_name(function.to_def_id()).as_str() == name {
+                    policy
+                        .withdrawn
+                        .insert((stage, super::bridge_receipt::SignatureClassId::of(function)));
+                }
+            }
+        }
     }
 
     pub(crate) fn apply(

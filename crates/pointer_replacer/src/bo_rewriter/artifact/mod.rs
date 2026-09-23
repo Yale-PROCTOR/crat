@@ -242,6 +242,7 @@ mod tests {
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
+            pass_on_receipts: Vec::new(),
             root_extents: Vec::new(),
             sized_assignments: Vec::new(),
             field_transactions: Default::default(),

@@ -1648,6 +1648,14 @@ pub(crate) struct SliceUses {
     /// admission instead of inferring it from a subject that stopped being
     /// held.
     pub sized_assignments: Vec<super::sized_assignment::SizedAssignment>,
+    /// **W6S-13 (R528-4) — the pass-on uses.** Every REFUSED use that is a
+    /// bare argument at a local callee (one with a body), as `(callee,
+    /// parameter index)`, and how many refused uses are anything else. The
+    /// collector cannot tell whether a callee parameter delivers a slice — no
+    /// decision exists yet — so it records the pair and
+    /// [`super::pass_on::supported`] asks the question at promote time.
+    pub pass_on: Vec<(LocalDefId, usize)>,
+    pub other_unsupported: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2458,6 +2466,14 @@ fn collect_slice_uses_with_family(
                     key,
                     self.mutable_of.contains(&key),
                 );
+                // W6S-13: a refused use that is a bare argument at a local
+                // callee is recorded with its position. Read before the entry
+                // is taken, because the helper borrows `self`.
+                let pass_on = if classified.is_none() && cursor.is_none() {
+                    self.local_callee_position(expr)
+                } else {
+                    None
+                };
                 let entry = self.out.entry(key).or_default();
                 if let Some(admitted) = admitted {
                     entry.sized_assignments.push(admitted);
@@ -2482,6 +2498,10 @@ fn collect_slice_uses_with_family(
                             entry.unsupported = Some(expr.span);
                             entry.unsupported_is_cursor = cursor.is_some();
                             entry.unsupported_shape = Some(unsupported_use_shape(self.tcx, expr));
+                        }
+                        match pass_on {
+                            Some(position) => entry.pass_on.push(position),
+                            None => entry.other_unsupported += 1,
                         }
                         if let Some(cursor) = cursor {
                             entry.raw_uses.push(cursor);
@@ -2948,6 +2968,31 @@ fn collect_slice_uses_with_family(
                 replacement: format!("{name}.{accessor}()"),
                 bridge_kind: "subject-use",
             })
+        }
+
+        /// **W6S-13** — `(callee, parameter index)` when this use is, bare,
+        /// an argument of a direct call to a LOCAL function with a body. The
+        /// same locality test as [`Self::foreign_pointer_argument`], inverted:
+        /// only a callee with a body has a parameter that can be decided.
+        fn local_callee_position(&self, use_expr: &Expr<'_>) -> Option<(LocalDefId, usize)> {
+            let rustc_hir::Node::Expr(call) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            let ExprKind::Call(callee, arguments) = call.kind else {
+                return None;
+            };
+            let index = arguments
+                .iter()
+                .position(|argument| argument.hir_id == use_expr.hir_id)?;
+            let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else {
+                return None;
+            };
+            let Res::Def(rustc_hir::def::DefKind::Fn, callee_did) = path.res else {
+                return None;
+            };
+            let callee_did = callee_did.as_local()?;
+            self.tcx.hir_node_by_def_id(callee_did).body_id()?;
+            Some((callee_did, index))
         }
 
         /// **W6S-12** — does this use sit at a foreign callee's `*const T`

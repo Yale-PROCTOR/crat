@@ -94,6 +94,7 @@ pub(crate) mod ownership_fields_native;
 mod ownership_fields_roles_tests;
 pub(crate) mod ownership_fields_source;
 pub(crate) mod pair_disjointness;
+pub(crate) mod pass_on;
 pub(crate) mod pending_sibling;
 pub(crate) mod pinned_local;
 #[cfg(test)]
@@ -1069,6 +1070,9 @@ pub(crate) struct DecisionTable {
     /// **W4-LIFT (R475-2)** — one receipt per caller lifted by an exact
     /// licensed width, so the count is auditable at the census.
     pub(crate) licensed_lifts: Vec<licensed_lift::LiftReceipt>,
+    /// W6S-13 (R528-4): one receipt per `(caller, callee parameter)` pass-on
+    /// pair the licensed lift admitted.
+    pub(crate) pass_on_receipts: Vec<pass_on::Receipt>,
     /// **W4-B1 (R480-2)** — one row per subject the root-extent rule decided:
     /// lifted with its evidence, or HELD with the reason no extent was found.
     /// The held count is the seat's Decision A input.
@@ -1300,6 +1304,7 @@ pub(crate) fn decide_with_raw_fallbacks(
     // never taken where the exact width, the mask companion or a root proved one.
     let mut licensed_lifts = licensed_lifts;
     licensed_lifts.extend(licensed_lift::promote_fallback(ctx, &mut entries));
+    let pass_on_receipts = pass_on::receipts(ctx, &entries, &mut licensed_lifts);
     cursor_native::observe(ctx, &entries, &cursor_receipts);
     let contract_extent_promotions = entries
         .iter()
@@ -1433,6 +1438,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         option_composed_uses: Vec::new(),
         contract_extent_promotions,
         licensed_lifts,
+        pass_on_receipts,
         root_extents,
         sized_assignments,
         field_transactions: Default::default(),
@@ -3078,6 +3084,7 @@ mod self_consistency_tests {
             option_composed_uses: Vec::new(),
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
+            pass_on_receipts: Vec::new(),
             root_extents: Vec::new(),
             sized_assignments: Vec::new(),
             field_transactions: Default::default(),
