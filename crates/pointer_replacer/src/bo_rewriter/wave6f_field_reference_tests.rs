@@ -978,7 +978,11 @@ fn w6f_hoist_pure_read_before_a_moving_argument() {
     };
     for needle in [
         format!(
-            "pub unsafe extern \"C\" fn removeMin(mut root: &mut node) {{ let mut temp: &crate::node = (*root).right.as_deref().unwrap(); (*root).key = (*temp).key; let __crat_hoist0 = (*temp).key; (*root).right = core::ptr::NonNull::new(deleteNode({moved}, __crat_hoist0)).map(|__p| Box::from_raw(__p.as_ptr())); }}"
+            // R538-3: the hoisted read ABSORBS the preceding assignment of the
+            // same read — the binding moves above `(*root).key = (*temp).key;`,
+            // so `temp`'s last use precedes the write through the owner (the
+            // E0499 wave-6a measured once the owner is a re-seated Box).
+            "pub unsafe extern \"C\" fn removeMin(mut root: &mut node) {{ let mut temp: &crate::node = (*root).right.as_deref().unwrap(); let __crat_hoist0 = (*temp).key; (*root).key = (*temp).key; (*root).right = core::ptr::NonNull::new(deleteNode({moved}, __crat_hoist0)).map(|__p| Box::from_raw(__p.as_ptr())); }}"
         ),
         // a bare local read (`key`) is not hoisted — nothing a move invalidates
         bare.to_owned(),
@@ -3220,5 +3224,44 @@ fn w6f_a_seam_consumer_withdraws_with_its_transaction() {
     assert!(
         !unknown,
         "no transaction owns node.key: nothing is registered"
+    );
+}
+
+/// Witness 39 (R538-3) — **the hoist absorbs ONLY the preceding assignment
+/// of the same read, through a pure place.** The value argument holds for
+/// exactly that shape: `P = R` stores `R`'s own value if `P` is `R`'s place
+/// and touches nothing `R` reads otherwise, and a pure `P` has no effect to
+/// observe. Each control breaks one condition and must leave the order alone.
+#[test]
+fn w6f_the_hoist_absorbs_only_the_same_read_through_a_pure_place() {
+    let _frame = frame_lock();
+    let cases = ::utils::compilation::run_compiler_on_str("fn main() {}", |_tcx| {
+        let order = |previous: &str| -> bool {
+            let mut statements: thin_vec::ThinVec<rustc_ast::Stmt> = thin_vec::ThinVec::new();
+            statements.push(::utils::ast::parse_stmt(previous.to_owned()));
+            statements.push(::utils::ast::parse_stmt(
+                "let __crat_hoist0 = (*t).key;".to_owned(),
+            ));
+            let generated: rustc_hash::FxHashSet<String> =
+                std::iter::once("__crat_hoist0".to_owned()).collect();
+            super::field_reference_ast::absorb_preceding_same_read(&mut statements, &generated);
+            matches!(statements[0].kind, rustc_ast::StmtKind::Let(_))
+        };
+        vec![
+            ("same read, pure place", order("(*root).key = (*t).key;")),
+            ("a different value", order("(*root).key = (*u).key;")),
+            ("a compound assignment", order("(*root).key += (*t).key;")),
+            ("a place that calls", order("(*pick(root)).key = (*t).key;")),
+        ]
+    })
+    .unwrap();
+    assert_eq!(
+        cases,
+        vec![
+            ("same read, pure place", true),
+            ("a different value", false),
+            ("a compound assignment", false),
+            ("a place that calls", false),
+        ]
     );
 }

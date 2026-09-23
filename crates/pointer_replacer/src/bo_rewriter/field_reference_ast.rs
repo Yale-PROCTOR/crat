@@ -778,9 +778,30 @@ struct Hoists<'a> {
     placed: usize,
     counter: usize,
     failures: Vec<String>,
+    /// The binding names this pass generated, so the block pass below can
+    /// tell its own `let`s from the program's.
+    generated: FxHashSet<String>,
 }
 
 impl MutVisitor for Hoists<'_> {
+    /// **R538-3: a hoist ABSORBS the preceding assignment of the same read.**
+    /// After this block's hoists are placed, a generated
+    /// `let __crat_hoistN = R;` moves above the statement just before its
+    /// group when that statement is `P = R` — the SAME pure read — and `P` is
+    /// a pure place. The move is value-preserving with no alias analysis: if
+    /// `P` is `R`'s place, the statement stores `R`'s own value there, so `R`
+    /// reads the same before and after it; if not, the statement does not
+    /// touch `R`, and `P`'s evaluation has no effect to observe. What it buys:
+    /// a reference the read goes through has its last use in that statement's
+    /// value, which Rust evaluates BEFORE the place — so a write through a
+    /// re-seated owner (`(*root.as_deref_mut().unwrap()).key = ..`) no longer
+    /// overlaps the borrow (wave-6a 081, E0499). Text is untouched: only the
+    /// order of two statements changes.
+    fn visit_block(&mut self, block: &mut rustc_ast::Block) {
+        rustc_ast::mut_visit::walk_block(self, block);
+        absorb_preceding_same_read(&mut block.stmts, &self.generated);
+    }
+
     fn flat_map_stmt(
         &mut self,
         mut statement: rustc_ast::Stmt,
@@ -846,10 +867,86 @@ impl MutVisitor for Hoists<'_> {
             };
             **init = read_expr;
             out.push(binding);
+            self.generated.insert(name);
             self.placed += 1;
         }
         out.extend(rustc_ast::mut_visit::walk_flat_map_stmt(self, statement));
         out
+    }
+}
+
+/// The initializer of a `let` this pass generated (see [`Hoists::generated`]).
+fn hoist_let_init<'s>(
+    statement: &'s rustc_ast::Stmt,
+    generated: &FxHashSet<String>,
+) -> Option<&'s rustc_ast::Expr> {
+    let rustc_ast::StmtKind::Let(local) = &statement.kind else { return None };
+    let rustc_ast::PatKind::Ident(_, ident, None) = &local.pat.kind else { return None };
+    if !generated.contains(ident.name.as_str()) {
+        return None;
+    }
+    match &local.kind {
+        rustc_ast::LocalKind::Init(init) => Some(init),
+        _ => None,
+    }
+}
+
+/// A place whose evaluation has no effect: locals, fields, derefs, parens,
+/// and an index by a local or a literal. No call, no method call.
+fn pure_place(expr: &rustc_ast::Expr) -> bool {
+    match &expr.kind {
+        rustc_ast::ExprKind::Path(..) => true,
+        rustc_ast::ExprKind::Field(base, _)
+        | rustc_ast::ExprKind::Paren(base)
+        | rustc_ast::ExprKind::Unary(rustc_ast::UnOp::Deref, base) => pure_place(base),
+        rustc_ast::ExprKind::Index(base, index, _) => {
+            pure_place(base)
+                && matches!(
+                    index.kind,
+                    rustc_ast::ExprKind::Path(..) | rustc_ast::ExprKind::Lit(..)
+                )
+        }
+        _ => false,
+    }
+}
+
+/// `statement` is `P = R` with `P` a pure place and `R` printing exactly as
+/// `read` does. A plain `=` only: a compound assignment reads `P` first.
+fn same_read_assignment(statement: &rustc_ast::Stmt, read: &rustc_ast::Expr) -> bool {
+    let (rustc_ast::StmtKind::Expr(expr) | rustc_ast::StmtKind::Semi(expr)) = &statement.kind
+    else {
+        return false;
+    };
+    let rustc_ast::ExprKind::Assign(place, value, _) = &expr.kind else { return false };
+    pure_place(place)
+        && rustc_ast_pretty::pprust::expr_to_string(value)
+            == rustc_ast_pretty::pprust::expr_to_string(read)
+}
+
+/// Move each generated hoist `let` above the statement just before its
+/// group of hoist `let`s when that statement assigns the same read.
+pub(crate) fn absorb_preceding_same_read(
+    statements: &mut thin_vec::ThinVec<rustc_ast::Stmt>,
+    generated: &FxHashSet<String>,
+) {
+    let mut index = 1;
+    while index < statements.len() {
+        let absorbs = hoist_let_init(&statements[index], generated).is_some_and(|read| {
+            let mut first = index;
+            while first > 0 && hoist_let_init(&statements[first - 1], generated).is_some() {
+                first -= 1;
+            }
+            first > 0 && same_read_assignment(&statements[first - 1], read)
+        });
+        if absorbs {
+            let mut first = index;
+            while first > 0 && hoist_let_init(&statements[first - 1], generated).is_some() {
+                first -= 1;
+            }
+            let moved = statements.remove(index);
+            statements.insert(first - 1, moved);
+        }
+        index += 1;
     }
 }
 
@@ -914,6 +1011,7 @@ pub(crate) fn apply_hoists(
         placed: 0,
         counter: 0,
         failures: Vec::new(),
+        generated: FxHashSet::default(),
     };
     hoists.visit_crate(krate);
     if !hoists.failures.is_empty() {
