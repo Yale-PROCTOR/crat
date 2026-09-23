@@ -466,3 +466,97 @@ fn w6s13_wave4_shape_a_mutable_caller_is_never_lifted_shared() {
     let source = emitted(READ_THEN_WRITE);
     assert!(source.contains("Clear("), "{source}");
 }
+
+/// **R536-6 R1 (wave-4 062) — per-module duplicates share a label.** Module `a`
+/// is the chain (its `InitOrStitch::data` lifts in the second round); module
+/// `b` is C2Rust's copy of the same functions, whose `InitOrStitch::data` has a
+/// second, non-pass-on use and stays held. The chain round must not delete
+/// `b`'s refusal because `a`'s twin — same LABEL — lifted.
+fn twins() -> String {
+    let body = |extra: &str| {
+        format!("{STORE_DELIVERS}{STITCH}{CHAIN}").replace(
+            "    StitchToPreviousBlockH2(self_0, input_size, position, data, mask);\n}",
+            &format!(
+                "    StitchToPreviousBlockH2(self_0, input_size, position, data, mask);\n{extra}}}"
+            ),
+        )
+    };
+    let a = body("");
+    let b = body("    let _address = data as size_t;\n");
+    let prelude = PREFIX.replace("pub type", "pub type");
+    format!(
+        "{prelude}\nmod a {{\n    use super::*;\n{a}\n}}\nmod b {{\n    use super::*;\n{b}\n}}\n"
+    )
+}
+
+#[test]
+fn w6s13_r1_a_twins_lift_does_not_delete_the_held_twins_refusal() {
+    let (lifts, _receipts, entries) = table(&twins());
+    let states = entries
+        .iter()
+        .filter(|(l, _)| l == "InitOrStitch::data")
+        .map(|(_, d)| d.chars().take(12).collect::<String>())
+        .collect::<Vec<_>>();
+    assert_eq!(states.len(), 2, "two twins: {entries:#?}");
+    assert!(
+        states.iter().any(|d| d.starts_with("Slice"))
+            && states.iter().any(|d| d.starts_with("Degraded")),
+        "one twin lifts, one stays held: {states:?}"
+    );
+    use super::decision::licensed_lift::Refusal;
+    assert!(
+        lifts
+            .iter()
+            .any(|(s, d, ..)| s == "InitOrStitch::data" && matches!(d, Some(Refusal::Declined(_)))),
+        "the held twin keeps its refusal row: {lifts:#?}"
+    );
+    assert!(
+        lifts
+            .iter()
+            .any(|(s, d, _, shape)| s == "InitOrStitch::data"
+                && d.is_none()
+                && *shape == Some("pass-on")),
+        "the lifted twin keeps its lift row: {lifts:#?}"
+    );
+}
+
+/// **R536-6 R2 — a still-held row keeps the LAST round's reason.** `entry::p`
+/// (its owner withdrawn, as brotli's are) hands itself to
+/// `StitchToPreviousBlockH2::ringbuffer`, which is held until round 1 lifts
+/// it. In round 1 `p` stops at the use gate; in round 2 it clears it and stops
+/// at the one-place-root gate (`p = &x` is one element). The recorded refusal
+/// is round 2's, not round 1's `slice-use-unsupported`.
+const PLACE_ROOT: &str = r#"
+// crat-test-withdraw: SliceUse entry
+// crat-test-withdraw: Option entry
+// crat-test-withdraw: Declaration entry
+// crat-test-withdraw: Return entry
+pub unsafe fn entry(mut h: *mut H2) {
+    let mut x: uint8_t = 0;
+    let mut p: *const uint8_t = &mut x;
+    StitchToPreviousBlockH2(h, 3, 3, p, 63);
+}
+"#;
+
+#[test]
+fn w6s13_r2_a_still_held_row_keeps_the_last_rounds_reason() {
+    let input = format!("{}{PLACE_ROOT}", fixture(STORE_DELIVERS, STITCH));
+    let (lifts, _receipts, entries) = table(&input);
+    assert!(
+        entries
+            .iter()
+            .any(|(l, d)| l == "entry::p" && d.starts_with("Degraded")),
+        "held at the fixpoint: {entries:#?}"
+    );
+    use super::decision::licensed_lift::Refusal;
+    let declines = lifts
+        .iter()
+        .filter(|(s, d, ..)| s == "entry::p" && matches!(d, Some(Refusal::Declined(_))))
+        .map(|(_, d, ..)| *d)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        declines,
+        vec![Some(Refusal::Declined("one-place-root"))],
+        "exactly one refusal, the one true at the fixpoint: {lifts:#?}"
+    );
+}

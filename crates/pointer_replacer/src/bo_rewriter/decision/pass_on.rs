@@ -155,27 +155,81 @@ fn receives(decision: &Decision, caller_mutable: bool) -> Receive {
 }
 
 /// **The chain round (R531-5(b)).** Re-run the three lift arms until a round
-/// lifts nothing, keeping every lift and dropping a refusal row whose subject a
-/// later round lifted. A later round's refusals for rows still held repeat the
-/// first round's and are discarded.
+/// lifts nothing.
+///
+/// **The receipts (R536-6, wave-4 062 R1/R2).** Every round re-emits a full set
+/// of receipts for each row still held when it starts, so the record needs no
+/// cross-round matching at all:
+///
+/// - a lift is kept from the round that made it, with the refusals that same
+///   round wrote for that subject before lifting it (the exact arm's, ahead of
+///   the waiver or B1);
+/// - a row still held keeps **the LAST round's** refusal — the reason that is
+///   true at the fixpoint, not the use gate a callee's lift has since cleared
+///   (R2);
+/// - B1 writes one row per held subject per round, so its held rows are the
+///   last round's and its lifted rows every round's.
+///
+/// Within one round a refusal is paired with its lift by the identity the
+/// census row itself carries — subject label, licensing callee path,
+/// parameter index. C2Rust's per-module duplicates share a LABEL (R1) but
+/// license from their own module's callee, so that identity separates them;
+/// where even it collides, the two rows are indistinguishable in the census
+/// schema too, and wave-4's `subject_key` (relay 078) makes it exact.
 pub(crate) fn close(
     ctx: &Ctx<'_, '_>,
     entries: &mut [(Subject, Decision)],
     lifts: &mut Vec<super::licensed_lift::LiftReceipt>,
     roots: &mut Vec<super::root_extent::RootExtentRow>,
 ) {
-    let held = |entries: &[(Subject, Decision)]| {
+    use super::{
+        licensed_lift::{LiftReceipt, held_at_a_local_callee},
+        root_extent::RootExtentRow,
+    };
+    let held_count = |entries: &[(Subject, Decision)]| {
         entries
             .iter()
-            .filter(|(_, decision)| {
-                super::licensed_lift::held_at_a_local_callee(decision).is_some()
-            })
+            .filter(|(_, decision)| held_at_a_local_callee(decision).is_some())
             .count()
     };
-    for _ in 0..entries.len() {
-        // Only a held row some pass-on now reaches can move; otherwise stop.
-        let movable = entries.iter().any(|(subject, decision)| {
-            super::licensed_lift::held_at_a_local_callee(decision).is_some()
+    let identity = |lift: &LiftReceipt| {
+        (
+            lift.subject.clone(),
+            lift.callee.clone(),
+            lift.parameter_index,
+        )
+    };
+    // Split one round's receipts into what is final now (its lifts, and the
+    // refusals it wrote for subjects it lifted) and what only the LAST round
+    // may keep (refusals of rows still held).
+    let settle = |entries: &[(Subject, Decision)],
+                  round: Vec<LiftReceipt>,
+                  round_roots: &[RootExtentRow]|
+     -> (Vec<LiftReceipt>, Vec<LiftReceipt>) {
+        let lifted = round
+            .iter()
+            .filter(|lift| lift.declined.is_none())
+            .map(identity)
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let still_held = entries
+            .iter()
+            .filter(|(_, decision)| held_at_a_local_callee(decision).is_some())
+            .map(|(subject, _)| subject.label.clone())
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let lifted_by_b1 = round_roots
+            .iter()
+            .filter(|row| row.outcome == "lifted" && !still_held.contains(&row.subject))
+            .map(|row| row.subject.clone())
+            .collect::<rustc_hash::FxHashSet<_>>();
+        round.into_iter().partition(|lift| {
+            lift.declined.is_none()
+                || lifted.contains(&identity(lift))
+                || lifted_by_b1.contains(&lift.subject)
+        })
+    };
+    let movable = |entries: &[(Subject, Decision)]| {
+        entries.iter().any(|(subject, decision)| {
+            held_at_a_local_callee(decision).is_some()
                 && supported(
                     ctx,
                     entries,
@@ -183,37 +237,62 @@ pub(crate) fn close(
                     subject.mutable,
                 )
                 .is_some()
-        });
-        if !movable {
-            return;
+        })
+    };
+    // No chain to follow: the first round's receipts stand exactly as written.
+    if !movable(entries) {
+        return;
+    }
+    let (mut kept, mut pending) = settle(entries, std::mem::take(lifts), roots);
+    let mut kept_roots = roots
+        .iter()
+        .filter(|row| row.outcome == "lifted")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut pending_roots = roots
+        .iter()
+        .filter(|row| row.outcome != "lifted")
+        .cloned()
+        .collect::<Vec<_>>();
+    for _ in 0..entries.len() {
+        // Only a held row some pass-on now reaches can move; otherwise stop.
+        if !movable(entries) {
+            break;
         }
-        let before = held(entries);
+        let before = held_count(entries);
         let mut round = super::licensed_lift::promote(ctx, entries);
         let round_roots = super::root_extent::promote(ctx, entries);
         round.extend(super::licensed_lift::promote_fallback(ctx, entries));
-        if held(entries) == before {
-            return;
-        }
-        let lifted = round
-            .iter()
-            .filter(|lift| lift.declined.is_none())
-            .map(|lift| lift.subject.clone())
-            .chain(
-                round_roots
-                    .iter()
-                    .filter(|row| row.outcome == "lifted")
-                    .map(|row| row.subject.clone()),
-            )
-            .collect::<rustc_hash::FxHashSet<_>>();
-        lifts.retain(|lift| lift.declined.is_none() || !lifted.contains(&lift.subject));
-        lifts.extend(round.into_iter().filter(|lift| lift.declined.is_none()));
-        roots.retain(|row| row.outcome == "lifted" || !lifted.contains(&row.subject));
-        roots.extend(
+        let progressed = held_count(entries) != before;
+        // This round is now the latest view of every row still held.
+        let (final_now, still_held) = settle(entries, round, &round_roots);
+        kept.extend(final_now);
+        pending = still_held;
+        kept_roots.extend(
             round_roots
-                .into_iter()
-                .filter(|row| row.outcome == "lifted"),
+                .iter()
+                .filter(|row| row.outcome == "lifted")
+                .cloned(),
         );
+        pending_roots = round_roots
+            .into_iter()
+            .filter(|row| row.outcome != "lifted")
+            .collect();
+        if !progressed {
+            break;
+        }
     }
+    // Where even the census identity collides (twins licensed by ONE callee),
+    // a paired refusal that a still-held row also carries is that row's.
+    let held_identities = pending
+        .iter()
+        .map(identity)
+        .collect::<rustc_hash::FxHashSet<_>>();
+    kept.retain(|lift| lift.declined.is_none() || !held_identities.contains(&identity(lift)));
+    kept.extend(pending);
+    kept_roots.extend(pending_roots);
+    *lifts = kept;
+    *roots = kept_roots;
 }
 
 /// The receipts, one per `(caller, callee parameter)` pair, for the lifts this
