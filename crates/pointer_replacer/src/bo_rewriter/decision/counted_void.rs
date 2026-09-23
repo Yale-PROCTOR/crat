@@ -1728,7 +1728,30 @@ fn types_disjoint<'tcx>(
     pointee: rustc_middle::ty::Ty<'tcx>,
 ) -> bool {
     use rustc_middle::ty::{IntTy, UintTy};
-    fn contains<'tcx>(
+    if matches!(
+        pointee.kind(),
+        TyKind::Uint(UintTy::U8)
+            | TyKind::Int(IntTy::I8)
+            | TyKind::Foreign(_)
+            | TyKind::Param(_)
+            | TyKind::Alias(..)
+            | TyKind::Dynamic(..)
+            | TyKind::Str
+    ) {
+        return false;
+    }
+    !type_contains(tcx, root, pointee) && !type_contains(tcx, pointee, root)
+}
+
+/// Does `outer` hold a value of type `inner`, reflexively and transitively,
+/// through fields (every variant's), arrays and tuples? Indirection is not
+/// containment.
+fn type_contains<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    outer: rustc_middle::ty::Ty<'tcx>,
+    inner: rustc_middle::ty::Ty<'tcx>,
+) -> bool {
+    fn walk<'tcx>(
         tcx: TyCtxt<'tcx>,
         outer: rustc_middle::ty::Ty<'tcx>,
         inner: rustc_middle::ty::Ty<'tcx>,
@@ -1743,26 +1766,13 @@ fn types_disjoint<'tcx>(
         match outer.kind() {
             TyKind::Adt(def, args) => def
                 .all_fields()
-                .any(|field| contains(tcx, field.ty(tcx, args), inner, seen)),
-            TyKind::Array(elem, _) | TyKind::Slice(elem) => contains(tcx, *elem, inner, seen),
-            TyKind::Tuple(tys) => tys.iter().any(|ty| contains(tcx, ty, inner, seen)),
+                .any(|field| walk(tcx, field.ty(tcx, args), inner, seen)),
+            TyKind::Array(elem, _) | TyKind::Slice(elem) => walk(tcx, *elem, inner, seen),
+            TyKind::Tuple(tys) => tys.iter().any(|ty| walk(tcx, ty, inner, seen)),
             _ => false,
         }
     }
-    if matches!(
-        pointee.kind(),
-        TyKind::Uint(UintTy::U8)
-            | TyKind::Int(IntTy::I8)
-            | TyKind::Foreign(_)
-            | TyKind::Param(_)
-            | TyKind::Alias(..)
-            | TyKind::Dynamic(..)
-            | TyKind::Str
-    ) {
-        return false;
-    }
-    !contains(tcx, root, pointee, &mut Default::default())
-        && !contains(tcx, pointee, root, &mut Default::default())
+    walk(tcx, outer, inner, &mut Default::default())
 }
 
 /// What a stored value can point at, as far as conjunct (2) is concerned.
@@ -1791,8 +1801,9 @@ impl StoreOrigin {
 /// Conjunct (2): every value the whole program stores into `adt.field` is null
 /// or a fresh allocation born at `pointee`. A shape that can write the field
 /// without a visible store — its address taken, a compound assignment, a
-/// functional-update literal, a byte-level writer aimed at the struct — makes
-/// the answer unknown, and unknown is no.
+/// functional-update literal, a byte-level writer aimed at the struct, or a
+/// pointer that reaches the struct retyped to any other non-byte, non-void
+/// pointee — makes the answer unknown, and unknown is no.
 fn field_stores_are_fresh<'tcx>(
     tcx: TyCtxt<'tcx>,
     adt: rustc_hir::def_id::DefId,
@@ -1814,18 +1825,46 @@ fn field_stores_are_fresh<'tcx>(
                 && self.typeck.opt_field_index(e.hir_id) == Some(self.field)
         }
 
-        fn reaches_the_struct(&self, e: &Expr<'_>) -> bool {
-            let ty = self.typeck.expr_ty(strip_casts(e));
+        /// A pointer whose pointee holds the struct at ANY depth — not only the
+        /// struct itself or a type with a direct field of it (main 084 §4 (3)).
+        fn points_at_the_struct(&self, ty: rustc_middle::ty::Ty<'tcx>) -> bool {
             let target = match ty.kind() {
                 TyKind::RawPtr(t, _) | TyKind::Ref(_, t, _) => *t,
                 _ => return false,
             };
             let adt_ty = self.tcx.type_of(self.adt).instantiate_identity();
-            target == adt_ty
-                || matches!(target.kind(), TyKind::Adt(def, _) if def.all_fields().any(|f| {
-                    matches!(f.ty(self.tcx, rustc_middle::ty::GenericArgs::identity_for_item(self.tcx, def.did())).kind(),
-                        TyKind::Adt(inner, _) if inner.did() == self.adt)
-                }))
+            type_contains(self.tcx, target, adt_ty)
+        }
+
+        fn reaches_the_struct(&self, e: &Expr<'tcx>) -> bool {
+            self.points_at_the_struct(self.typeck.expr_ty(strip_casts(e)))
+        }
+
+        /// **A pun (main 084 §4 (1)).** A pointer that reaches the struct, cast to
+        /// a pointer of any other non-byte, non-void pointee, can write the field
+        /// through an lvalue the store scan never sees —
+        /// `*(tree as *mut *mut node_t) = …` writes `tree_t`'s first field. A
+        /// cast to bytes or `void` is how storage is handed to `free`/`memcpy`,
+        /// whose writers are checked by name; a cast to its own pointee is no
+        /// retyping at all.
+        fn retypes_the_struct(&self, inner: &Expr<'tcx>, cast: &Expr<'tcx>) -> bool {
+            use rustc_middle::ty::{IntTy, UintTy};
+            let from = self.typeck.expr_ty(inner);
+            let to = self.typeck.expr_ty(cast);
+            if !self.points_at_the_struct(from) {
+                return false;
+            }
+            let (Some(from_pointee), Some(to_pointee)) =
+                (from.builtin_deref(true), to.builtin_deref(true))
+            else {
+                return false;
+            };
+            from_pointee != to_pointee
+                && !matches!(
+                    to_pointee.kind(),
+                    TyKind::Uint(UintTy::U8) | TyKind::Int(IntTy::I8)
+                )
+                && !super::void_pointee::has_void_pointee(self.tcx, to, 1)
         }
     }
     impl<'tcx> Visitor<'tcx> for Stores<'_, 'tcx> {
@@ -1834,6 +1873,7 @@ fn field_stores_are_fresh<'tcx>(
                 ExprKind::Assign(lhs, rhs, _) if self.is_the_field(lhs) => self.values.push(rhs),
                 ExprKind::AssignOp(_, lhs, _) if self.is_the_field(lhs) => self.opaque = true,
                 ExprKind::AddrOf(_, _, place) if self.is_the_field(place) => self.opaque = true,
+                ExprKind::Cast(inner, _) if self.retypes_the_struct(inner, e) => self.opaque = true,
                 ExprKind::Struct(_, fields, tail) if matches!(self.typeck.expr_ty(e).kind(), TyKind::Adt(def, _) if def.did() == self.adt) =>
                 {
                     if !matches!(tail, rustc_hir::StructTailExpr::None) {

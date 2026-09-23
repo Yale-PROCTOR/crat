@@ -2205,3 +2205,48 @@ fn w6v_field_load_of_a_type_containing_the_root_still_overlaps() {
         "a pointee that can enclose the root keeps the site overlapping: {source}"
     );
 }
+
+/// **Control (2''), main 084 §4 (1): a first-field punning store.** `root` is
+/// `tree_t`'s first field, so `*(tree as *mut *mut node_t) = …` writes it without
+/// a `Field` lvalue the store scan could see. The cast that makes the pun — a
+/// pointer that reaches the struct, retyped to a non-byte, non-void pointee — is
+/// what the rule refuses on.
+#[test]
+fn w6v_field_load_with_a_punned_store_into_the_root_still_overlaps() {
+    let input = QT_INSERT.replace(
+        "    (*tree).root = node_new();\n",
+        "    (*tree).root = node_new();\n    if (*tree).length > 7 as u32 { *(tree as *mut *mut node_t) = tree as *mut node_t; }\n",
+    );
+    assert!(
+        input.contains("*(tree as *mut *mut node_t)"),
+        "fixture edit applied"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        compact(&source).contains("fninsert_(muttree:*muttree_t,"),
+        "a punned store into the root keeps the site overlapping: {source}"
+    );
+}
+
+/// **Control, main 084 §4 (3): a byte writer aimed two levels up.** `outer_t`
+/// holds a `mid_t` that holds the tree, so zeroing an `outer_t` writes the tree's
+/// `root`. The writer check reads containment at any depth, not only the struct
+/// or a type with a direct field of it.
+#[test]
+fn w6v_field_load_beside_a_writer_two_levels_up_still_overlaps() {
+    let input = QT_INSERT
+        .replace(
+            "    fn free(_: *mut core::ffi::c_void);\n",
+            "    fn free(_: *mut core::ffi::c_void);\n    fn memset(_: *mut core::ffi::c_void, _: i32, _: u64) -> *mut core::ffi::c_void;\n",
+        )
+        .replace(
+            "unsafe fn node_new() -> *mut node_t {",
+            "pub struct mid_t { pub tree: tree_t, pub tag: u32 }\npub struct outer_t { pub mid: mid_t, pub n: u32 }\nunsafe fn clear(mut o: *mut outer_t) { memset(o as *mut core::ffi::c_void, 0 as i32, ::std::mem::size_of::<outer_t>() as u64); }\nunsafe fn node_new() -> *mut node_t {",
+        );
+    assert!(input.contains("unsafe fn clear("), "fixture edit applied");
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        compact(&source).contains("fninsert_(muttree:*muttree_t,"),
+        "a writer that reaches the tree through two containers keeps the site overlapping: {source}"
+    );
+}
