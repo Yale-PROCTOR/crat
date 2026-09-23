@@ -2223,8 +2223,9 @@ fn certify<'tcx, 's>(
                         // this point in the pipeline (certificates derive ~500
                         // lines before `field_reference::finalize`), so the
                         // seam passes `None` and every field takes its zero;
-                        // `finalize`'s re-derivation re-admits a certificate
-                        // whose fields ended up unconverted (057 §3 (a)).
+                        // a certificate whose owned field a transaction then
+                        // delivers is withdrawn after `finalize`
+                        // (`withdraw_delivered_owned_fields`, R528-3).
                         let literal = super::ownership_fields_constructor::struct_literal(
                             tcx,
                             ty,
@@ -2234,9 +2235,11 @@ fn certify<'tcx, 's>(
                             hold(format!("return-certificate-struct-literal:{reason:?}"))
                         })?;
                         // Their entry returns the LITERAL; the certificate's
-                        // initializer is the owner, so it is boxed here.
+                        // initializer is the owner, so it is boxed here — in
+                        // their path's spelling, so one owner reads the same
+                        // whichever family delivers it.
                         let initializer = rustc_ast_pretty::pprust::expr_to_string(
-                            &::utils::ast::parse_expr(format!("Box::new({literal})")),
+                            &::utils::ast::parse_expr(format!("::std::boxed::Box::new({literal})")),
                         );
                         let overwrites = constructions
                             .owner_overwrites
@@ -2772,14 +2775,27 @@ fn certify<'tcx, 's>(
             .output();
         let closed = matches!(output_pointee.kind(), TyKind::RawPtr(pointee, _)
             if exported_pairs.closes(tcx, *pointee));
-        if !closed {
+        if closed {
+            certificate_stub
+                .receipts
+                .push(format!("exported-pair-closure callee={callee_path}"));
+        } else if super::exported_pair::exported(tcx, callee) {
+            // **The callee-less extension of R427-4** (R517-9, relay
+            // wave-6a/069 §2): an exported producer whose result nothing in
+            // the program receives delivers `Box` at the surface — the
+            // consumer is outside the program, and the converted
+            // `#[no_mangle]` signature hands the owner out as the same
+            // pointer (R415-7). Whatever releases it there, a libc `free`
+            // included, releases a block the system allocator made (R443).
+            // A waiver of the same class as the closure, receipted per unit.
+            certificate_stub
+                .receipts
+                .push(format!("exported-producer-waiver callee={callee_path}"));
+        } else {
             return Err(hold(format!(
                 "return-certificate-no-receivers:{callee_path}"
             )));
         }
-        certificate_stub
-            .receipts
-            .push(format!("exported-pair-closure callee={callee_path}"));
     }
     let mut certificate = certificate_stub;
     certificate.receivers = planned_receivers;

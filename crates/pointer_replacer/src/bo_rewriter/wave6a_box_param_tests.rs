@@ -736,7 +736,7 @@ pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
     );
     assert!(
         src.contains(
-            "letmuttable:Box<crate::ht>=Box::new(crate::ht{length:0usize,capacity:0usize});"
+            "letmuttable:Box<crate::ht>=::std::boxed::Box::new(crate::ht{length:0usize,capacity:0usize,});"
         ),
         "{}",
         out.source
@@ -766,8 +766,11 @@ pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
 /// a THIRD signature mentioning the pointee (a lend the closure cannot
 /// account for), a struct FIELD holding one (it could be stored and released
 /// anywhere), an end that is not exported (an in-crate caller could still
-/// hand in a foreign block), and a producer with no consumer (the owner would
-/// cross the surface with nothing to release it). None of them converts.
+/// hand in a foreign block), and a producer with no consumer. None of them
+/// converts the CONSUMER. Restated for R517-9's callee-less extension: the
+/// PRODUCER is an exported function nothing in the program receives, so it
+/// delivers `Box<ht>` at the surface under the exported-producer waiver in
+/// every shape — the closure no longer decides it.
 #[test]
 fn w6a_c1_exported_pair_gates_hold_one_violation_each() {
     const CREATE: &str = r#"
@@ -827,11 +830,65 @@ pub struct registry { pub table: *mut ht }
             out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
         );
         assert!(
-            !src.contains("->Box<ht>") && !src.contains("table:Box<ht>"),
+            !src.contains("table:Box<ht>"),
+            "{name}: {}\n{receipts}",
+            out.source
+        );
+        assert!(
+            src.contains("fnht_create()->Box<ht>{")
+                && receipts.contains("exported-producer-waiver callee=ht_create"),
             "{name}: {}\n{receipts}",
             out.source
         );
     }
+}
+
+/// **R517-9 — the callee-less exported producer.** ht's `ht_create` with a
+/// lending third signature (`ht_length`, the corpus's `ht_get` / `ht_set`):
+/// the closure holds, nothing in the program receives the result, and the
+/// export delivers `Box<ht>` under the waiver. The control drops the export
+/// attribute: an unexported producer with no receivers has no one to hand the
+/// owner to and keeps `no-receivers`.
+#[test]
+fn w6a_r517_9_a_callee_less_export_delivers_under_the_waiver() {
+    const PRODUCER: &str = r#"
+#[repr(C)]
+pub struct ht { pub length: usize, pub capacity: usize }
+#[no_mangle]
+pub unsafe extern "C" fn ht_create() -> *mut ht {
+    let mut table = malloc(::std::mem::size_of::<ht>()) as *mut ht;
+    if table.is_null() { return 0 as *mut ht; }
+    (*table).length = 0 as usize;
+    (*table).capacity = 16 as usize;
+    return table;
+}
+#[no_mangle]
+pub unsafe extern "C" fn ht_length(mut table: *mut ht) -> usize { return (*table).length; }
+"#;
+    let out = emitted("r517-9-export", &with_prelude(PRODUCER));
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        compact(&out.source).contains("fnht_create()->Box<ht>{"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        receipts.contains("exported-producer-waiver callee=ht_create"),
+        "{receipts}"
+    );
+    let unexported = PRODUCER.replacen("#[no_mangle]\n", "", 1);
+    assert_ne!(unexported, PRODUCER);
+    let out = emitted("r517-9-unexported", &with_prelude(&unexported));
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !compact(&out.source).contains("->Box<ht>"),
+        "{}",
+        out.source
+    );
+    assert!(
+        receipts.contains("return-certificate-no-receivers:ht_create"),
+        "{receipts}"
+    );
 }
 
 /// **avl's rotations** (relay wave-6a/026): a `Box` parameter the callee does

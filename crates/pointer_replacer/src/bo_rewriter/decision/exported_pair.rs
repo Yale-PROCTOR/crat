@@ -96,7 +96,7 @@ impl<T> Pipe for T {}
 /// members, so this — not `raw_surface` — is what "exported" means for the
 /// closure; an unsurfaced export keeps its converted `extern "C"` signature,
 /// which R415-7 rules admissible (relay wave-6a/015 STOP 2).
-fn exported(tcx: TyCtxt<'_>, function: LocalDefId) -> bool {
+pub(crate) fn exported(tcx: TyCtxt<'_>, function: LocalDefId) -> bool {
     let did = function.to_def_id();
     tcx.get_attrs(did, rustc_span::sym::no_mangle)
         .next()
