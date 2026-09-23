@@ -836,7 +836,7 @@ pub struct registry { pub table: *mut ht }
         // keeps its raw formal.
         let consumer_waived = matches!(name, "third-signature" | "struct-field");
         assert_eq!(
-            src.contains("table:Box<ht>"),
+            src.contains("fnht_destroy(muttable:Option<Box<ht>>)"),
             consumer_waived,
             "{name}: {}\n{receipts}",
             out.source
@@ -1783,12 +1783,15 @@ pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
 }
 "#;
 
-/// **R531-4 (vi) — the exported-consumer waiver** (provisional; the mirror of
-/// R517-9's producer). An exported consumer nothing in the program calls,
-/// whose body consumes its formal (C1's proof: one free, no store, no move
-/// on), takes `Box<ht>`: the caller is outside the program, and under R443 its
-/// handle is a block the system allocator made, released by our drop. The
-/// control drops the export attribute and keeps `box-param-no-callers`.
+/// **R534-1 (USER) — the exported-consumer waiver**, the mirror of R517-9's
+/// producer. An exported consumer nothing in the program calls, whose body
+/// consumes its formal (C1's proof: one free, no store, no move on), takes
+/// `Option<Box<ht>>`: the caller is outside the program, its handle may be
+/// null (`free(NULL)` is legal C), and under R443 the block is one the system
+/// allocator made, released by our drop at the C free site. Two controls, as
+/// ruled: the exported LENDING body in the same program (`ht_length`) is not
+/// waived, and the same consumer without `#[no_mangle]` keeps
+/// `box-param-no-callers`.
 #[test]
 fn w6a_r531_an_exported_consumer_takes_the_box_under_the_waiver() {
     let out = emitted("r531-exported-consumer", &with_prelude(EXPORTED_CONSUMER));
@@ -1796,13 +1799,22 @@ fn w6a_r531_an_exported_consumer_takes_the_box_under_the_waiver() {
     let receipts = &out.artifacts.box_param_receipts;
     assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
     assert!(
-        src.contains("fnht_destroy(muttable:Box<ht>){(*table).length=0asusize;drop(table);}"),
+        src.contains(
+            "fnht_destroy(muttable:Option<Box<ht>>){(*table.as_deref_mut().unwrap()).length=0asusize;drop(table);}"
+        ),
         "{}\n{receipts}",
         out.source
     );
     assert!(
         receipts.contains("exported-consumer-waiver callee=ht_destroy"),
         "{receipts}"
+    );
+    assert!(
+        !src.contains("fnht_length(muttable:Option<Box<ht>>)")
+            && !src.contains("fnht_length(muttable:Box<ht>)")
+            && !receipts.contains("exported-consumer-waiver callee=ht_length"),
+        "a lending body is not waived\n{}\n{receipts}",
+        out.source
     );
     let unexported = EXPORTED_CONSUMER.replace(
         "#[no_mangle]\npub unsafe extern \"C\" fn ht_destroy",
@@ -1824,9 +1836,8 @@ fn w6a_r531_an_exported_consumer_takes_the_box_under_the_waiver() {
     );
 }
 
-/// The waiver's `Option` form: a consumer whose body tests its formal for
-/// null accepts `NULL` from outside (`free(NULL)` is legal C), so it takes
-/// `Option<Box<ht>>` and the test reads `is_none()`.
+/// A consumer whose body tests its formal for null: the owner walk renders
+/// the test as `is_none()` on the waived `Option<Box<ht>>`.
 #[test]
 fn w6a_r531_a_null_testing_exported_consumer_takes_an_option() {
     let source = EXPORTED_CONSUMER.replace(
@@ -1848,4 +1859,59 @@ fn w6a_r531_a_null_testing_exported_consumer_takes_an_option() {
         receipts.contains("exported-consumer-waiver callee=ht_destroy"),
         "{receipts}"
     );
+}
+
+/// Controls for the waiver's sink: an exported function nothing calls that
+/// STORES its formal into the program's own storage, and one that MOVES it on
+/// into a consuming callee, are not consumers by C1's proof of a free — the
+/// ruling licenses the free alone — so neither is waived. The waived formal
+/// is rendered by the certificate's owner walk, and that walk refuses a store
+/// or a transfer of it (`optional-owner-escapes`).
+#[test]
+fn w6a_r534_a_storing_or_moving_export_is_not_waived() {
+    const STORE: &str = r#"
+#[repr(C)]
+pub struct ht { pub length: usize }
+#[repr(C)]
+pub struct registry { pub table: *mut ht }
+#[no_mangle]
+pub unsafe extern "C" fn ht_park(mut holder: *mut registry, mut table: *mut ht) {
+    (*table).length = 1 as usize;
+    (*holder).table = table;
+}
+"#;
+    const MOVE_ON: &str = r#"
+#[repr(C)]
+pub struct ht { pub length: usize }
+unsafe extern "C" fn ht_sink(mut table: *mut ht) {
+    free(table as *mut core::ffi::c_void);
+}
+#[no_mangle]
+pub unsafe extern "C" fn ht_release(mut table: *mut ht) {
+    (*table).length = 0 as usize;
+    ht_sink(table);
+}
+"#;
+    for (name, source, formal) in [
+        ("r534-store", STORE, "fnht_park"),
+        ("r534-move-on", MOVE_ON, "fnht_release"),
+    ] {
+        let out = emitted(name, &with_prelude(source));
+        let src = compact(&out.source);
+        let receipts = &out.artifacts.box_param_receipts;
+        assert!(
+            receipts.contains("optional-owner-escapes"),
+            "{name}: the owner walk refuses the sink\n{receipts}"
+        );
+        assert!(
+            !receipts.contains("exported-consumer-waiver"),
+            "{name}\n{receipts}"
+        );
+        assert!(src.contains(formal), "{name}: {}", out.source);
+        assert!(
+            !src.contains("table:Option<Box<ht>>"),
+            "{name}: {}\n{receipts}",
+            out.source
+        );
+    }
 }

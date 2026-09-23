@@ -935,7 +935,7 @@ pub(crate) fn derive<'tcx>(
         // Every other use of the formal is a deref / element access the
         // slice-use collector rewrites; the sink is its one raw boundary.
         // R531-4 (vi): an exported function nothing in the program calls
-        // may take the consumer waiver, whose nullable form renders its
+        // may take the consumer waiver, whose `Option` formal renders its
         // formal through the certificate's owner walk instead — so a use the
         // slice-use collector cannot rewrite (`is_null()`) is decided there.
         let no_caller_export = super::exported_pair::exported(tcx, param.fn_did)
@@ -1286,54 +1286,40 @@ pub(crate) fn derive<'tcx>(
             matches!(body.local_decls[param.local].ty.kind(),
                     TyKind::RawPtr(pointee, _) if exported_pairs.closes(tcx, *pointee))
         };
-        // **R531-4 (vi) — the exported-consumer waiver** (ruled provisionally
-        // as the mirror of R517-9, user confirmation pending): an exported
+        // **R531-4 (vi) / R534-1 (USER) — the exported-consumer waiver**, the
+        // mirror of R517-9's producer waiver: an exported
         // consumer nothing in the program calls, whose body consumes the
         // formal (one free, no store, no move on), takes the owner — the
         // caller is outside the program, and under R443 the block it hands in
         // is one the system allocator made, released by our drop. A body that
-        // tests the formal for null accepts `NULL` from outside, so it takes
-        // `Option<Box<T>>`. Receipted per unit.
+        // tests the formal for null — or simply hands it on from a producer
+        // that returned `None` — passes `NULL` legally, so the formal is an
+        // `Option<Box<T>>` (below). CONFIRMED by the user (R534-1). Receipted
+        // per site; never a lending body, never an unexported consumer.
         let consumer_waiver = call_count == 0
             && !exported_pair
-            && no_caller_export
-            && frees.len() == 1
-            && store.is_none()
-            && moved_on.is_none();
+            // The sink must be the free. A lending body never reaches here (A9's
+            // lend branch above); a store or a move on of the waived
+            // `Option` formal is refused by the owner walk below
+            // (`optional-owner-escapes`).
+            && no_caller_export;
         if call_count == 0 && !exported_pair && !consumer_waiver {
             hold(format!("box-param-no-callers:{callee_path}"), &mut out);
             continue;
         }
-        let nullable = consumer_waiver && {
-            let lend_oracle =
-                super::return_certificate::LendOracle::new(tcx, functions, slots, model);
-            super::return_certificate::owner_uses(
-                tcx,
-                param,
-                BoxShape::Sized,
-                false,
-                false,
-                &frees,
-                &|did, index| lend_oracle.lend(did, index),
-                &|did, index| consuming.contains(&(did, index)),
-                &|_| false,
-            )
-            .is_ok_and(|uses| {
-                !uses.dead_guards.is_empty()
-                    || uses
-                        .edits
-                        .iter()
-                        .any(|edit| edit.receipt == "return-certificate-null-test")
-            })
-        };
-        if let Some(form) = deferred_use.filter(|_| !nullable) {
+        if let Some(form) = deferred_use.filter(|_| !consumer_waiver) {
             hold(
                 format!("box-param-callee-use:{callee_path}:{form}"),
                 &mut out,
             );
             continue;
         }
-        let optional = optional || nullable;
+        // The waived formal is ALWAYS `Option<Box<T>>`: its caller is outside
+        // the program, and a C handle may be null there (`ht_create` returns
+        // `None` on failure; `free(NULL)` is legal C) — `None` is null's image
+        // (R534-1: ht's pair closes as `ht_create() -> Option<Box<ht>>` /
+        // `ht_destroy(table: Option<Box<ht>>)`). Its uses are the owner walk's.
+        let optional = optional || consumer_waiver;
         let Some(param_slot) = slot_of(param) else { continue };
         // The formal's kind: Owning admits; Raw admits when every caller
         // transfers a CERTIFIED owner (A1-c) — the same licensing wall R410-5
