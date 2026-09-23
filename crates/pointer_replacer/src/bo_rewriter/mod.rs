@@ -461,6 +461,20 @@ pub(crate) struct E2Timings {
 pub(crate) struct RawBoundaryArtifacts {
     /// wave-6a W6A-T1: flexible-tail struct transactions (admitted / held).
     pub(crate) flexible_tail_receipts: String,
+    /// **The session's per-program cells, carried OUT of the compiler thread.**
+    ///
+    /// `rustc_interface::run_compiler` runs its closure on a thread it spawns, so a
+    /// `thread_local!` written during the rewrite is gone when it returns — measured:
+    /// `same_thread=false value_after_return=0`. The census read four such cells
+    /// AFTER the capture returned, on its own thread, and so read a permanent zero:
+    /// `graft-held.tsv` was header-only on all twenty programs at batch 29 whether or not
+    /// the floor fired (so 072's "the floor never fired" was unproven), and
+    /// `raw_boundary_graft_refused` / `raw_boundary_replan_stale` could never be
+    /// non-zero — the latter being slicecursor's RETIREMENT condition. The cells are
+    /// snapshotted here, on the compiler thread, at the end of the session.
+    pub(crate) session_graft_held_table: String,
+    pub(crate) session_graft_refusals: usize,
+    pub(crate) session_stale_replans: usize,
     /// wave-6v2 (R442-4): one row per counted-void CALL plan, with the whole-call
     /// replacements that cover it. An A5 proof-site raw view, a PAIR raw view or a
     /// C-9 mark replaces the entire call expression, so an argument adapter planned
@@ -1467,7 +1481,7 @@ fn rewrite_core_injected_with_config(
         // of `Ref` decisions (which is what the deleted `emitted_count()`
         // computed): it is the placed set, already filtered above, so `emitted`
         // names what the rewrite actually did to the source.
-        Ok(verify_and_revert(
+        Ok(with_session_receipts(verify_and_revert(
             tcx,
             &capture,
             &table,
@@ -1493,7 +1507,7 @@ fn rewrite_core_injected_with_config(
             decide_ctx.e2_artifacts.clone(),
             decide_ctx.raw_boundary_artifacts.clone(),
             e1_box_drop_policies,
-        ))
+        )))
     });
 
     match result {
@@ -3738,6 +3752,25 @@ pub(crate) fn diagnose_raw_boundary_census(root: &std::path::Path) -> Result<E1C
         None,
     )
     .into_e1_capture()
+}
+
+/// Copy the session's thread-local cells into the outcome, ON the compiler thread.
+/// See [`RawBoundaryArtifacts::session_graft_held_table`] for why this exists.
+fn with_session_receipts(mut outcome: RewriteOutcome) -> RewriteOutcome {
+    let artifacts = match &mut outcome {
+        RewriteOutcome::Emitted {
+            raw_boundary_artifacts,
+            ..
+        }
+        | RewriteOutcome::Degraded {
+            raw_boundary_artifacts,
+            ..
+        } => raw_boundary_artifacts,
+    };
+    artifacts.session_graft_held_table = ast_transform::graft_held_table();
+    artifacts.session_graft_refusals = ast_transform::graft_refusals();
+    artifacts.session_stale_replans = decision::cursor_native::stale_replans();
+    outcome
 }
 
 pub(crate) fn diagnose_raw_boundary_census_with_config(
@@ -9157,6 +9190,11 @@ fn finish_decide<'tcx>(
                 initial_verify_wall_s: "pending".to_owned(),
                 atom_reverify_wall_s: "0.000000".to_owned(),
             },
+            // Filled at the END of the session by `with_session_receipts`, on the
+            // compiler thread; empty here by construction.
+            session_graft_held_table: String::new(),
+            session_graft_refusals: 0,
+            session_stale_replans: 0,
         };
 
         // C.2: the in-process coverage gate is GONE. Its replacement is the
@@ -12898,5 +12936,124 @@ mod raw_boundary_atom_tests {
     #[test]
     fn raw_boundary_atom_reverify_is_bounded_to_one() {
         assert_eq!(super::MAX_ATOM_REVERIFIES, 1);
+    }
+}
+
+/// **The session boundary (R531, main 077).** `rustc_interface::run_compiler` runs its
+/// closure on a thread it spawns, so a `thread_local!` written during the rewrite is
+/// invisible once it returns. Four census columns read such cells after the capture
+/// had returned and so could only ever read zero; a fifth table ignored a field the
+/// session already carried. These three witnesses pin the boundary, the copy that
+/// crosses it, and the one channel that already worked.
+#[cfg(test)]
+mod session_receipts_tests {
+    /// The boundary itself. If this ever reads `true`, the snapshot below is merely
+    /// redundant; while it reads `false`, a census that reads a cell instead of a
+    /// carried field reads a permanent zero.
+    #[test]
+    fn the_compiler_callback_runs_on_another_thread() {
+        thread_local! { static CELL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+        let outer = std::thread::current().id();
+        let inner = ::utils::compilation::run_compiler_on_str("pub fn f() {}", |_tcx| {
+            CELL.with(|c| c.set(7));
+            std::thread::current().id()
+        })
+        .unwrap();
+        assert_ne!(outer, inner, "the callback ran on the caller's thread");
+        assert_eq!(
+            CELL.with(|c| c.get()),
+            0,
+            "a cell written in the session leaked out"
+        );
+    }
+
+    /// The copy: `with_session_receipts` reads the cells on the thread that wrote them
+    /// and puts them on the outcome, which is what crosses the boundary.
+    #[test]
+    fn with_session_receipts_carries_the_four_cells() {
+        super::ast_transform::reset_graft_held();
+        super::ast_transform::reset_graft_refusals();
+        super::ast_transform::record_graft_held(
+            super::ast_transform::GraftHeldReceipt {
+                visitor: super::ast_transform::GraftVisitor::C9,
+                caller: 3,
+                class: 3,
+                reason: "a5-raw",
+                lo: 10,
+                hi: 20,
+            },
+            super::bridge_receipt::SignatureClassId::of(rustc_hir::def_id::CRATE_DEF_ID),
+        );
+        let outcome =
+            super::with_session_receipts(super::OutcomeFacts::default().degraded("fixture".into()));
+        let artifacts = match &outcome {
+            super::RewriteOutcome::Emitted {
+                raw_boundary_artifacts,
+                ..
+            }
+            | super::RewriteOutcome::Degraded {
+                raw_boundary_artifacts,
+                ..
+            } => raw_boundary_artifacts,
+        };
+        assert_eq!(
+            artifacts.session_graft_held_table.lines().count(),
+            2,
+            "the held graft must travel on the outcome, header plus one row:\n{}",
+            artifacts.session_graft_held_table
+        );
+        assert!(artifacts.session_graft_held_table.contains("\t10\t20\t"));
+        super::ast_transform::reset_graft_held();
+    }
+
+    /// The channel that already worked end to end, and that the census now writes:
+    /// a certificate admitted in the session reaches `return_certificate_receipts`.
+    /// quadtree's `quadtree_node_new` is certificate-emitted as `Box`, so its table
+    /// cannot be header-only — which is exactly what every batch-29 table was.
+    #[test]
+    fn a_certificate_admitted_in_the_session_reaches_the_carried_receipts() {
+        let out = super::wave6a_allocation_tests::emitted(
+            "session-cert",
+            super::wave6a_allocation_tests::QUADTREE_NODE_NEW,
+        );
+        assert!(
+            out.artifacts
+                .return_certificate_receipts
+                .lines()
+                .skip(1)
+                .any(|row| row.contains("\tadmitted\t")),
+            "the certificate's admission must be on the carried receipts:\n{}",
+            out.artifacts.return_certificate_receipts
+        );
+        // The copy must actually run: the session's one successful exit is wrapped.
+        // Cut at THIS module: the needle below is also in this test's own text, and a
+        // witness that finds itself passes its own fault (the fifth time that shape
+        // has bitten a scan in this crate).
+        let this = include_str!("mod.rs");
+        let this = &this[..this
+            .find("mod session_receipts_tests")
+            .expect("this module is in the file")];
+        assert!(
+            this.contains("Ok(with_session_receipts(verify_and_revert("),
+            "the session's exit must pass through with_session_receipts, or the cells stay behind"
+        );
+        let census = include_str!("../bo_c1.rs");
+        assert!(
+            census.contains("stamp(&artifact.return_certificate_receipts),"),
+            "the census must write the carried field, not a thread-local"
+        );
+        for cell in [
+            "ast_transform::graft_held_table()",
+            "ast_transform::graft_refusals()",
+            "decision::cursor_native::stale_replans()",
+        ] {
+            // The WHOLE file: its test modules are interleaved with production, so a
+            // cut at the first `#[cfg(test)] mod` hid the very read this looks for.
+            // The fully-qualified path appears only where production reads the cell.
+            assert!(
+                !census.contains(&format!("crate::bo_rewriter::{cell}")),
+                "the census reads `{cell}` across the session boundary -- it can only be zero"
+            );
+        }
     }
 }

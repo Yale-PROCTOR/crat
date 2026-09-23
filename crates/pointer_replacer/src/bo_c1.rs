@@ -12286,8 +12286,6 @@ mod run {
         // per round inside `transform_with`, because only it is a question
         // about one round.
         crate::bo_rewriter::ast_transform::reset_graft_held();
-        // R523-4: same rhythm — the certificate receipts below are THIS program's.
-        crate::bo_rewriter::decision::return_certificate::reset_certificate_receipts();
         let capture = match super::cache_only_before_solve(
             entry_available
                 .then_some(())
@@ -12660,7 +12658,7 @@ mod run {
         // from "nobody kept the line".
         std::fs::write(
             directory.join(format!("{name}.graft-held.tsv")),
-            stamp(&crate::bo_rewriter::ast_transform::graft_held_table()),
+            stamp(&artifact.session_graft_held_table),
         )
         .expect("write graft-held receipts");
         // **R523-4 (ownership-fields 056 STOP 2) — the certificate receipts.**
@@ -12674,7 +12672,7 @@ mod run {
         // Unconditional, like the table above it.
         std::fs::write(
             directory.join(format!("{name}.return-certificate-receipts.tsv")),
-            stamp(&crate::bo_rewriter::decision::return_certificate::certificate_receipts_table()),
+            stamp(&artifact.return_certificate_receipts),
         )
         .expect("write return-certificate receipts");
         // **R464-5 (wave-6f 040 STOP 1)** — the field receipt's `revert_status`
@@ -12684,17 +12682,11 @@ mod run {
         // AFTER the artifact write, deliberately: the first version ran before it,
         // so the one program that disagreed published NO tables and the
         // disagreement could not be diagnosed from the run that found it.
-        row.set(
-            raw_schema::GRAFT_REFUSED,
-            crate::bo_rewriter::ast_transform::graft_refusals(),
-        );
+        row.set(raw_schema::GRAFT_REFUSED, artifact.session_graft_refusals);
         // **R525-7**: the stale-replan count, the detector's exit condition made
         // readable. 0 is the expected reading and two consecutive censuses at 0
         // retire `replan_delivered_table_elements`.
-        row.set(
-            raw_schema::REPLAN_STALE,
-            crate::bo_rewriter::decision::cursor_native::stale_replans(),
-        );
+        row.set(raw_schema::REPLAN_STALE, artifact.session_stale_replans);
         // **R476-1 (USER)**: the frame-bounded discharges, counted per program beside the
         // box-param holds. The receipt is typed — `retention-discharged:frame-bounded(
         // subject, container, callees)` — so counting its marker cannot collide with a

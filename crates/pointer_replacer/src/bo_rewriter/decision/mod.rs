@@ -1383,10 +1383,6 @@ pub(crate) fn decide_with_raw_fallbacks(
             needed.then_some((subject.fn_did, subject.hir_id))
         })
         .collect();
-    // R523-4: the one place a COMPLETE `Certificates` exists before every
-    // consumer drops it. Recording here rather than at a use site is what makes
-    // the census table the same facts the decision layer had.
-    return_certificate::record_certificate_receipts(ctx.return_certificates);
     DecisionTable {
         counted_void: ctx.counted_void.clone(),
         flexible_tails: ctx.flexible_tails.clone(),
