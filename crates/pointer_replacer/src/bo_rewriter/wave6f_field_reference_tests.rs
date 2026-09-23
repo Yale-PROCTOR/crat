@@ -1316,6 +1316,7 @@ fn w6f_tulip_element_list_initializers_split_by_their_elements() {
 
 const AVL: &str = include_str!("wave6f_fixture_avl.rs");
 const QUADTREE_ROOT: &str = include_str!("wave6f_fixture_quadtree_root.rs");
+const MALLOC_FREE_FIELD: &str = include_str!("wave6f_fixture_malloc_free_field.rs");
 
 /// era-5c-shaped frame for avl (the rotation family, relay 003 §2): both
 /// `Node` pointer fields Owning, the rotation's owners Owning, the readers
@@ -2727,5 +2728,80 @@ fn w6f_a_held_edit_withdraws_the_transaction_not_its_owner() {
     assert!(
         !named.iter().any(|n| n.ends_with("ensureBits9")),
         "…and never the edit's own owner, which cannot withdraw it: {named:?}"
+    );
+}
+
+/// Witness 35 (relay 064 / R528-2) — **defect B of report 059 is reachable in
+/// the commonest C owned-field idiom, not merely representable.**
+///
+/// `s->buf = malloc(n); if (!s->buf) …; free(s->buf);` — every site is a store
+/// of a call result, a NULL test, or a cast into the deallocator, none of which
+/// is a `dependent_owners` kind, and no function stores a parameter into the
+/// field. So the transaction is APPLIED (`opt-box`), all three of its edits
+/// are WRAPS, and its withdrawal key is EMPTY. Two consequences follow, and
+/// this witness pins the fact both rest on:
+///
+/// * the sixth arm (`49adca944`) registers `dependent_owners` when a wrap's
+///   claim is refused; on this transaction that loop registers NOTHING, writes
+///   no receipt, still balances `placed + held`, and leaves the transaction
+///   active with one site un-wrapped — a silent half-composition;
+/// * `FieldTransactions::active` is vacuously true for an empty key, so no
+///   revert can ever withdraw this transaction.
+///
+/// A RED here is news: it means the dependent set is no longer empty on the
+/// commonest shape, and the arm's fallback question changes with it.
+#[test]
+fn w6f_malloc_free_field_has_an_empty_withdrawal_key() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-malloc-free-field-frame",
+        vec![("holder".to_owned(), 0, SlotKind::Owning)],
+        Vec::new(),
+    );
+    let (form, dependent, edits) =
+        ::utils::compilation::run_compiler_on_str(MALLOC_FREE_FIELD, |tcx| {
+            let (table, _ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    A5Mode::PreciseReplay,
+                    Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let t = table
+                .field_transactions
+                .applied
+                .iter()
+                .find(|t| t.struct_path.ends_with("holder") && t.field_name == "buf")
+                .expect("the malloc/free field is an applied transaction");
+            let mut edits: Vec<(String, bool)> = t
+                .expression_edits
+                .iter()
+                .map(|e| (e.kind.to_owned(), e.wrap))
+                .collect();
+            edits.sort();
+            (
+                t.delivered_form_key().to_owned(),
+                t.dependent_owners.len(),
+                edits,
+            )
+        })
+        .unwrap();
+    super::test_model_override::clear();
+    assert_eq!(form, "opt-box", "the transaction delivers");
+    assert_eq!(
+        dependent, 0,
+        "…and its withdrawal key is EMPTY: no revert can withdraw it, and a \
+         held wrap has no class to register"
+    );
+    assert_eq!(
+        edits,
+        vec![
+            ("owned-field-dealloc-transfer".to_owned(), true),
+            ("owned-field-is-null".to_owned(), true),
+            ("owned-field-store".to_owned(), true),
+        ],
+        "every edit it owns is a WRAP — each one a site the sixth arm can hold"
     );
 }
