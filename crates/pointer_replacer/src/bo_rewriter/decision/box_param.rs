@@ -197,9 +197,16 @@ pub(crate) fn append_explicit_declarations(tcx: TyCtxt<'_>, table: &mut Decision
         let binding_type = tcx.typeck(subject.fn_did).node_type(subject.hir_id);
         let TyKind::RawPtr(pointee, _) = binding_type.kind() else { continue };
         let element = pointee_source(tcx, *pointee);
-        let emitted_type = match plan.shape {
+        let base = match plan.shape {
             BoxShape::Sized => format!("Box<{element}>"),
             BoxShape::Slice => format!("Box<[{element}]>"),
+        };
+        // R531-4 (iii): a member an optional producer certified is an
+        // `Option<Box<T>>`, as the certificate's own appender spells it.
+        let emitted_type = if plan.optional {
+            format!("Option<{base}>")
+        } else {
+            base
         };
         sites.push(ExplicitDeclarationSite {
             owner_class: SignatureClassId::of(subject.fn_did),
@@ -913,6 +920,8 @@ pub(crate) fn derive<'tcx>(
         // Rung 2: members that are the caller's own PARAMETER — their plan
         // belongs to the chain that planned that formal, not to this one.
         let mut moved_on_members: FxHashSet<(LocalDefId, HirId)> = FxHashSet::default();
+        // R531-4 (iii): members whose owner is an `Option<Box<T>>`.
+        let mut optional_members = 0usize;
         let mut failure: Option<String> = None;
         let mut callers: Vec<(&LocalDefId, &Scan<'tcx>)> = scans.iter().collect();
         callers.sort_by_key(|(f, _)| f.local_def_index.as_u32());
@@ -969,11 +978,10 @@ pub(crate) fn derive<'tcx>(
                 // an owner too — its plan is the certificate's (the transfer
                 // at this call is what that plan admitted as a sink).
                 if let Some(plan) = certificates.plans.get(&key) {
+                    // R531-4 (iii): an optional owner moves as written; the
+                    // formal takes its type (checked once the chain is known).
                     if plan.optional {
-                        failure = Some(format!(
-                            "box-param-caller-retains:{caller_path}:optional-owner"
-                        ));
-                        break 'callers;
+                        optional_members += 1;
                     }
                     if caller_scan
                         .local_uses
@@ -1003,11 +1011,10 @@ pub(crate) fn derive<'tcx>(
                 // `allocator_contract::confirm_transfers` withdraws the
                 // owner if this chain does not plan the formal.
                 if let Some(plan) = contract_plans.get(&key) {
+                    // R531-4 (iii): an optional owner moves as written; the
+                    // formal takes its type (checked once the chain is known).
                     if plan.optional {
-                        failure = Some(format!(
-                            "box-param-caller-retains:{caller_path}:optional-owner"
-                        ));
-                        break 'callers;
+                        optional_members += 1;
                     }
                     if caller_scan
                         .local_uses
@@ -1185,6 +1192,37 @@ pub(crate) fn derive<'tcx>(
             hold(reason, &mut out);
             continue;
         }
+        // **R531-4 (iii) — an OPTIONAL owner moves into the consuming formal.**
+        // A producer that can return null makes its certified receiver an
+        // `Option<Box<T>>`, and the call hands that owner on as written, so
+        // the formal takes the same type: `free(NULL)` is legal C and
+        // `drop(None)` is its image. The formal's derefs read through
+        // `as_deref_mut().unwrap()` — rendered by the certificate's own owner
+        // walk — and a `None` reaching one is a null deref in the input (§28).
+        // Admitted only where one type serves the whole chain and nothing
+        // else needs an edit: every member optional, the sink a free, a sized
+        // owner, and no raw exposure wrapper to re-enter ownership.
+        let optional = optional_members > 0;
+        if optional {
+            let refusal = if optional_members != member_plans.len() {
+                Some("box-param-caller-retains:{callee_path}:optional-owner-mixed")
+            } else if frees.len() != 1 || store.is_some() || moved_on.is_some() {
+                Some("box-param-shape:{callee_path}:optional-owner-sink")
+            } else if member_plans
+                .iter()
+                .any(|(_, plan, _, _)| matches!(plan.shape, BoxShape::Slice))
+            {
+                Some("box-param-shape:{callee_path}:optional-owner-slice")
+            } else if raw_surface(param.fn_did) {
+                Some("chain-endpoint-raw:{callee_path}:optional-owner")
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
+                hold(refusal.replace("{callee_path}", &callee_path), &mut out);
+                continue;
+            }
+        }
         // R427-4: an EXPORTED consumer whose pointee's surface closes HAS a
         // caller — the exposure family's wrapper, which re-enters ownership
         // (`__crat_safe_f(Box::from_raw(p))`, report 010's arm) — so the
@@ -1360,6 +1398,55 @@ pub(crate) fn derive<'tcx>(
             .drain(..expr_edits.len() - member_edit_count)
             .collect();
         let mut member_edits = expr_edits;
+        // R531-4 (iii): an optional formal's uses are the certificate's owner
+        // walk's (derefs through `as_deref_mut().unwrap()`, null tests as
+        // `is_none` / `is_some`, lends bridged); only the free is this
+        // chain's (`drop`, above). A store, a transfer or a return of the
+        // formal would need a sink of its own, so it holds.
+        let param_edits = if optional {
+            let lend_oracle =
+                super::return_certificate::LendOracle::new(tcx, functions, slots, model);
+            match super::return_certificate::owner_uses(
+                tcx,
+                param,
+                BoxShape::Sized,
+                true,
+                false,
+                &frees,
+                &|did, index| lend_oracle.lend(did, index),
+                &|did, index| consuming.contains(&(did, index)),
+                &|_| false,
+            ) {
+                Ok(uses)
+                    if uses.stores.is_empty()
+                        && uses.transfers.is_empty()
+                        && uses.returns.is_empty() =>
+                {
+                    let mut edits = param_edits
+                        .into_iter()
+                        .filter(|edit| edit.receipt == "box-param-c-free-site-drop")
+                        .collect::<Vec<_>>();
+                    edits.extend(uses.edits);
+                    edits
+                }
+                Ok(_) => {
+                    hold(
+                        format!("box-param-callee-use:{callee_path}:optional-owner-escapes"),
+                        &mut out,
+                    );
+                    continue;
+                }
+                Err(form) => {
+                    hold(
+                        format!("box-param-callee-use:{callee_path}:optional:{form}"),
+                        &mut out,
+                    );
+                    continue;
+                }
+            }
+        } else {
+            param_edits
+        };
         let pointee = {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(param.fn_did)
@@ -1407,11 +1494,12 @@ pub(crate) fn derive<'tcx>(
             (param.fn_did, param.hir_id),
             BoxPlan {
                 shape: if slice { BoxShape::Slice } else { BoxShape::Sized },
-                optional: false,
+                optional,
                 expr_edits: param_edits,
                 delete_statements: Vec::new(),
                 receipts: vec![format!(
-                    "box-param-owning-formal callee={callee_path} index={hir_index} callers={call_count}"
+                    "box-param-owning-formal callee={callee_path} index={hir_index} callers={call_count}{}",
+                    if optional { " optional-owner" } else { "" }
                 )],
                 fabricated_extent: false,
                 pointee_override: None,

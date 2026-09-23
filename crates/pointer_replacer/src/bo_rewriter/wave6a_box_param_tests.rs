@@ -1597,3 +1597,103 @@ fn w6a_a9_an_owned_field_keeps_the_formal() {
         "no formal of an owned-field struct is declined\n{receipts}"
     );
 }
+
+/// quadtree's `quadtree_new` → `test_tree` → `quadtree_free` reduced: the
+/// producer can return null, so its certificate makes the receiver an
+/// `Option<Box<tree_t>>`; the receiver is handed to a consuming callee that
+/// reads through its formal and frees it.
+const OPTIONAL_OWNER_CHAIN: &str = r#"
+#[repr(C)]
+pub struct tree_t { pub length: u32, pub depth: i32, pub root: *mut i32 }
+pub unsafe extern "C" fn tree_new() -> *mut tree_t {
+    let mut tree = 0 as *mut tree_t;
+    tree = malloc(::std::mem::size_of::<tree_t>()) as *mut tree_t;
+    if tree.is_null() { return 0 as *mut tree_t; }
+    (*tree).length = 0 as u32;
+    (*tree).depth = 0 as i32;
+    (*tree).root = malloc(::std::mem::size_of::<i32>()) as *mut i32;
+    if ((*tree).root).is_null() {
+        free(tree as *mut core::ffi::c_void);
+        return 0 as *mut tree_t;
+    }
+    return tree;
+}
+pub unsafe extern "C" fn tree_free(mut tree: *mut tree_t) {
+    (*tree).depth = 0 as i32;
+    free((*tree).root as *mut core::ffi::c_void);
+    free(tree as *mut core::ffi::c_void);
+}
+pub unsafe extern "C" fn run() -> u32 {
+    let mut tree = tree_new();
+    let mut n = (*tree).length;
+    tree_free(tree);
+    return n;
+}
+"#;
+
+/// **R531-4 (iii) — a C1 chain moves an OPTIONAL owner.** The certificate's
+/// receiver is `Option<Box<tree_t>>` (the producer may return null), so the
+/// consuming formal takes the same type — `free(NULL)` is legal C and
+/// `drop(None)` is its image — and its derefs read through
+/// `as_deref_mut().unwrap()`. The call moves the owner as written. Before
+/// this, the chain refused `box-param-caller-retains:run:optional-owner` and
+/// the certificate withdrew `transfer-unconfirmed` (quadtree, report 076 §4).
+#[test]
+fn w6a_r531_an_optional_owner_moves_into_a_consuming_formal() {
+    let out = emitted("r531-owner-moves", &with_prelude(OPTIONAL_OWNER_CHAIN));
+    let src = compact(&out.source);
+    let receipts = format!(
+        "{}\n{}",
+        out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
+    );
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(
+        src.contains("fntree_new()->Option<Box<tree_t>>"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains("fntree_free(muttree:Option<Box<tree_t>>)"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains("(*tree.as_deref_mut().unwrap()).depth=0asi32;"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains(
+            "free((*tree.as_deref_mut().unwrap()).rootas*mutcore::ffi::c_void);drop(tree);"
+        ),
+        "{}",
+        out.source
+    );
+    assert!(src.contains("tree_free(tree);"), "{}", out.source);
+    assert!(
+        !receipts.contains(":optional-owner") && !receipts.contains("transfer-unconfirmed"),
+        "{receipts}"
+    );
+}
+
+/// Control: a second caller hands the same formal a NON-optional owner. One
+/// formal cannot be both `Box<T>` and `Option<Box<T>>` without an edit at
+/// the call the chain does not make, so the mixed chain holds.
+#[test]
+fn w6a_r531_a_mixed_optional_chain_holds() {
+    let source = OPTIONAL_OWNER_CHAIN.replace(
+        "    return n;\n}\n",
+        "    return n;\n}\npub unsafe extern \"C\" fn run_sized() {\n    let mut t = malloc(::std::mem::size_of::<tree_t>()) as *mut tree_t;\n    (*t).length = 1 as u32;\n    (*t).depth = 1 as i32;\n    (*t).root = 0 as *mut i32;\n    tree_free(t);\n}\n",
+    );
+    assert_ne!(source, OPTIONAL_OWNER_CHAIN);
+    let out = emitted("r531-optional-mixed", &with_prelude(&source));
+    let src = compact(&out.source);
+    assert!(!src.contains("tree:Option<Box<tree_t>>"), "{}", out.source);
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("box-param-caller-retains:tree_free:optional-owner-mixed"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+}
