@@ -1953,3 +1953,152 @@ fn w6a_r536_the_exported_waivers_are_counted_per_program() {
         crate::raw_boundary_census_schema::EXPORTED_CONSUMER_WAIVER
     );
 }
+
+/// bst reduced (R536-3): `insert` consumes its formal and returns it — the
+/// re-seat `root = insert(root, key)` — and re-seats the owned children with
+/// `(*node).left = insert((*node).left, key)`. The model is L01⁶'s on the
+/// corpus: both children `Owning`, and `insert::node` `Owning`.
+const BST_RESEAT: &str = r#"
+// w6a-r536-bst-reseat-frame
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct node {
+    pub key: i32,
+    pub left: *mut node,
+    pub right: *mut node,
+}
+pub unsafe extern "C" fn newNode(mut item: i32) -> *mut node {
+    let mut temp = malloc(::std::mem::size_of::<node>()) as *mut node;
+    (*temp).key = item;
+    (*temp).left = 0 as *mut node;
+    (*temp).right = 0 as *mut node;
+    return temp;
+}
+#[no_mangle]
+pub unsafe extern "C" fn insert(mut node: *mut node, mut key: i32) -> *mut node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    if key < (*node).key {
+        (*node).left = insert((*node).left, key);
+    } else {
+        (*node).right = insert((*node).right, key);
+    }
+    return node;
+}
+"#;
+
+fn bst_reseat(name: &str, source: &str) -> super::wave6a_allocation_tests::Emitted {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    super::test_model_override::set_with_contract(
+        "w6a-r536-bst-reseat-frame",
+        vec![
+            ("node".to_owned(), 1, SlotKind::Owning),
+            ("node".to_owned(), 2, SlotKind::Owning),
+        ],
+        vec![("insert::node".to_owned(), SlotKind::Owning)],
+        Vec::new(),
+    );
+    let out = emitted(name, source);
+    super::test_model_override::clear();
+    out
+}
+
+/// **R536-3 — the re-seat.** `insert::node` is not a lend (A9's gate asked it
+/// the wrong question): the body consumes the formal and hands it back. It
+/// takes `Option<Box<node>>`, its null test reads `is_none()`, `return node`
+/// hands the owner out through `Box::into_raw` (the return stays the raw
+/// pointer the source declares, so `return newNode(key)` is untouched), and
+/// the recursive calls move each owned child out with `.take()` and store the
+/// result back through wave-6f's `from_raw` bridge.
+#[test]
+fn w6a_r536_a_consumed_and_returned_formal_is_reseated() {
+    let out = bst_reseat("r536-bst-reseat", BST_RESEAT);
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.box_param_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(
+        receipts.contains("box-param-reseat callee=insert index=0 fields=2"),
+        "{receipts}"
+    );
+    assert!(
+        src.contains("fninsert(mutnode:Option<Box<node>>,mutkey:i32)->*mutnode"),
+        "{}",
+        out.source
+    );
+    assert!(src.contains("ifnode.is_none(){"), "{}", out.source);
+    assert!(
+        src.contains("returnnode.map_or(core::ptr::null_mut(),Box::into_raw);"),
+        "{}",
+        out.source
+    );
+    assert!(src.contains(".left.take()"), "{}", out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "insert::node"),
+        None,
+        "{receipts}"
+    );
+}
+
+/// Control: a call that does not store its result back into the field it
+/// moved out of would leave that field `None` where C left it intact, so the
+/// re-seat holds.
+#[test]
+fn w6a_r536_a_reseat_needs_the_result_stored_back() {
+    let discarded = BST_RESEAT.replace(
+        "        (*node).left = insert((*node).left, key);\n",
+        "        insert((*node).left, key);\n",
+    );
+    assert_ne!(discarded, BST_RESEAT);
+    let out = bst_reseat("r536-bst-discarded", &discarded);
+    let receipts = &out.artifacts.box_param_receipts;
+    assert!(
+        receipts.contains("box-param-reseat-caller:insert:insert((*node).left, key)"),
+        "{receipts}"
+    );
+    assert!(
+        !compact(&out.source).contains("node:Option<Box<node>>"),
+        "{}",
+        out.source
+    );
+}
+
+/// Control: the same `insert` where the children are NOT owned fields (no
+/// transaction delivers them, so they stay `*mut node`). The call sites would
+/// hand a raw pointer to the `Option<Box<node>>` formal, so after the field
+/// transactions finalize the re-seat is withdrawn with a typed hold and the
+/// stage re-derives.
+#[test]
+fn w6a_r536_a_reseat_over_raw_fields_is_withdrawn() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    let source = BST_RESEAT.replace(
+        "// w6a-r536-bst-reseat-frame",
+        "// w6a-r536-raw-fields-frame",
+    );
+    super::test_model_override::set_with_contract(
+        "w6a-r536-raw-fields-frame",
+        Vec::new(),
+        vec![("insert::node".to_owned(), SlotKind::Owning)],
+        Vec::new(),
+    );
+    let out = emitted("r536-bst-raw-fields", &source);
+    super::test_model_override::clear();
+    let receipts = &out.artifacts.box_param_receipts;
+    assert!(
+        receipts.contains("insert::node\theld\tbox-param-reseat-field-not-delivered:insert"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        !compact(&out.source).contains("node:Option<Box<node>>"),
+        "{}",
+        out.source
+    );
+    assert_eq!(out.reverted, 0, "{}", out.source);
+}

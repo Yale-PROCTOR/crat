@@ -8503,7 +8503,10 @@ fn finish_decide<'tcx>(
         );
         let lends_withdrawn =
             decision::box_param::withdraw_delivered_owned_field_lends(&mut box_params, &delivered);
-        if certificates_withdrawn || lends_withdrawn {
+        // R536-3: a re-seat whose moved-out field is not delivered withdraws.
+        let reseats_withdrawn =
+            decision::box_param::withdraw_undelivered_reseats(&mut box_params, &delivered);
+        if certificates_withdrawn || lends_withdrawn || reseats_withdrawn {
             continue;
         }
         table.field_transactions = field_transactions;

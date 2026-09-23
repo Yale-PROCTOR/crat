@@ -78,6 +78,12 @@ pub(crate) struct Chains {
     /// (`withdraw_delivered_owned_field_lends`).
     pub(crate) owned_field_lends:
         FxHashMap<(LocalDefId, HirId), (String, String, Vec<(LocalDefId, usize)>)>,
+    /// **R536-3 — re-seated formals**: binding → (label, callee, the owned
+    /// fields its call sites move out of). The plan stands only while every
+    /// one of those fields is delivered as an owned transaction
+    /// (`withdraw_undelivered_reseats`).
+    pub(crate) reseat_fields:
+        FxHashMap<(LocalDefId, HirId), (String, String, Vec<(LocalDefId, usize)>)>,
 }
 
 /// **wave-6a rule W6A-A9 — a proven lend leaves the owning arm** (relay
@@ -170,6 +176,219 @@ pub(crate) fn withdraw_delivered_owned_field_lends(
         );
     }
     !withdrawn.is_empty()
+}
+
+/// **R536-3** — after `field_reference::finalize`: a re-seated formal whose
+/// call sites move out of a field no applied OWNING transaction delivers
+/// would take a raw pointer into its `Option<Box<T>>`, so its plan is
+/// withdrawn with a typed hold and the caller re-derives the stage.
+pub(crate) fn withdraw_undelivered_reseats(
+    chains: &mut Chains,
+    delivered: &dyn Fn(LocalDefId, usize) -> bool,
+) -> bool {
+    let withdrawn = chains
+        .reseat_fields
+        .iter()
+        .filter(|(key, (_, _, fields))| {
+            chains.plans.contains_key(*key)
+                && fields.iter().any(|(did, index)| !delivered(*did, *index))
+        })
+        .map(|(key, (label, callee, _))| (*key, label.clone(), callee.clone()))
+        .collect::<Vec<_>>();
+    for (key, label, callee) in &withdrawn {
+        chains.plans.remove(key);
+        chains
+            .receipts
+            .retain(|r| !r.starts_with(&format!("box-param-reseat callee={callee} ")));
+        chains.holds.insert(
+            *key,
+            (
+                label.clone(),
+                format!("box-param-reseat-field-not-delivered:{callee}"),
+            ),
+        );
+    }
+    !withdrawn.is_empty()
+}
+
+enum Reseat {
+    /// The body does not return the formal: A9's lend question applies.
+    NotReturned,
+    Held(String),
+    Planned(BoxPlan, Vec<(LocalDefId, usize)>),
+}
+
+/// **R536-3 — a formal consumed AND returned** (`root = insert(root, key)`,
+/// the re-seat `x = f(x)`). The formal is an owner the body hands back: it
+/// takes `Option<Box<T>>` (a C tree's null child is `None`), its uses are the
+/// certificate's owner walk's (null tests `is_none`, derefs through
+/// `as_deref_mut().unwrap()`), and each `return x` hands the owner back out
+/// through `Box::into_raw` — the function's return stays the raw pointer the
+/// source declares, so every other return (`return newNode(key)`) is
+/// untouched. Every in-program call must re-seat an owned FIELD — `(*p).f =
+/// f((*p).f, ..)`, the same place on both sides — so the move out
+/// (`.take()`, wave-6f's owned-field move into an optional Box consumer) is
+/// followed by the move back in (their `from_raw` store of the raw result):
+/// a call that discarded or redirected the result would leave the field
+/// `None` where C left it intact, so it holds. An exported function's
+/// outside callers pass a handle and get it back (the surface pointer is the
+/// same allocation both ways).
+#[allow(clippy::too_many_arguments)]
+fn reseat_plan<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    consuming: &FxHashSet<(DefId, usize)>,
+    fn_values: &FxHashSet<DefId>,
+    param: &Subject,
+    frees: &[(Span, Span)],
+) -> Reseat {
+    let SubjectKind::Param { hir_index } = param.kind else { return Reseat::NotReturned };
+    let slot = slots
+        .fn_local_slots
+        .get(&param.fn_did)
+        .and_then(|u| u.slot_for_local_depth(param.local, 0))
+        .map(|slot| SlotRef::Local(param.fn_did, slot));
+    if slot.and_then(|slot| model.get(&slot).copied()) != Some(SlotKind::Owning) {
+        return Reseat::NotReturned;
+    }
+    let lend_oracle = super::return_certificate::LendOracle::new(tcx, functions, slots, model);
+    let Ok(uses) = super::return_certificate::owner_uses(
+        tcx,
+        param,
+        BoxShape::Sized,
+        true,
+        false,
+        frees,
+        &|did, index| lend_oracle.lend(did, index),
+        &|did, index| consuming.contains(&(did, index)),
+        &|_| false,
+    ) else {
+        return Reseat::NotReturned;
+    };
+    if uses.returns.is_empty() {
+        return Reseat::NotReturned;
+    }
+    let callee_path = tcx.def_path_str(param.fn_did.to_def_id());
+    if !uses.stores.is_empty() || !uses.transfers.is_empty() {
+        return Reseat::Held(format!("box-param-reseat-escapes:{callee_path}"));
+    }
+    if fn_values.contains(&param.fn_did.to_def_id()) {
+        return Reseat::Held(format!("box-param-indirect-callers:{callee_path}"));
+    }
+    let mut calls = ReseatCalls {
+        tcx,
+        callee: param.fn_did.to_def_id(),
+        index: hir_index,
+        fields: Vec::new(),
+        refusal: None,
+    };
+    for &function in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else { continue };
+        calls.visit_body(tcx.hir_body(body_id));
+    }
+    if let Some(refusal) = calls.refusal {
+        return Reseat::Held(format!("box-param-reseat-caller:{callee_path}:{refusal}"));
+    }
+    if calls.fields.is_empty() && !super::exported_pair::exported(tcx, param.fn_did) {
+        return Reseat::Held(format!("box-param-no-callers:{callee_path}"));
+    }
+    let name = param.param_name.clone().unwrap_or_else(|| "?".to_owned());
+    let mut expr_edits = uses.edits;
+    // A C free of the owner on some path is its drop there; Rust's move
+    // checking proves no path frees it twice or uses it after.
+    expr_edits.extend(frees.iter().map(|(call, _)| BoxExprEdit {
+        span: *call,
+        replacement: format!("drop({name})"),
+        receipt: "box-param-c-free-site-drop",
+    }));
+    expr_edits.extend(uses.returns.iter().map(|span| BoxExprEdit {
+        span: *span,
+        replacement: format!("return {name}.map_or(core::ptr::null_mut(), Box::into_raw)"),
+        receipt: "box-param-reseat-return",
+    }));
+    let mut fields = calls.fields;
+    fields.sort_by_key(|(did, index)| (did.local_def_index.as_u32(), *index));
+    fields.dedup();
+    Reseat::Planned(
+        BoxPlan {
+            shape: BoxShape::Sized,
+            optional: true,
+            expr_edits,
+            delete_statements: Vec::new(),
+            receipts: vec![format!(
+                "box-param-reseat callee={callee_path} index={hir_index}"
+            )],
+            fabricated_extent: false,
+            pointee_override: None,
+            inferred_binding: false,
+            overwrite_spans: Vec::new(),
+            retained_sink: true,
+            implicit_scope_close: false,
+        },
+        fields,
+    )
+}
+
+/// Every call of the re-seated callee: the argument at its index must be an
+/// owned-field place `(*p).f`, and the call's result must be assigned back to
+/// that same place.
+struct ReseatCalls<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    callee: DefId,
+    index: usize,
+    fields: Vec<(LocalDefId, usize)>,
+    refusal: Option<String>,
+}
+
+impl<'tcx> Visitor<'tcx> for ReseatCalls<'tcx> {
+    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+        if let ExprKind::Call(callee, args) = &e.kind
+            && let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
+            && let Res::Def(DefKind::Fn, did) = path.res
+            && did == self.callee
+            && self.refusal.is_none()
+        {
+            let snippet = |span: Span| {
+                self.tcx
+                    .sess
+                    .source_map()
+                    .span_to_snippet(span)
+                    .unwrap_or_default()
+            };
+            let field = args.get(self.index).and_then(|arg| {
+                let ExprKind::Field(base, _) = &arg.kind else { return None };
+                if !matches!(base.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
+                    return None;
+                }
+                let owner = arg.hir_id.owner.def_id;
+                let typeck = self.tcx.typeck(owner);
+                let index = typeck.opt_field_index(arg.hir_id)?.as_usize();
+                let TyKind::Adt(adt, _) = typeck.expr_ty(base).kind() else { return None };
+                Some(((adt.did().as_local()?, index), arg.span))
+            });
+            let reseated = field.filter(|(_, arg_span)| {
+                matches!(
+                    self.tcx.parent_hir_node(e.hir_id),
+                    rustc_hir::Node::Expr(parent)
+                        if matches!(parent.kind, ExprKind::Assign(lhs, rhs, _)
+                            if rhs.hir_id == e.hir_id && snippet(lhs.span) == snippet(*arg_span))
+                )
+            });
+            match reseated {
+                Some((field, _)) => self.fields.push(field),
+                None => self.refusal = Some(snippet(e.span)),
+            }
+        }
+        intravisit::walk_expr(self, e);
+    }
 }
 
 /// Decision-phase hook, after the flexible-tail one: a prior parameter /
@@ -835,6 +1054,34 @@ pub(crate) fn derive<'tcx>(
         } else {
             None
         };
+        // **R536-3 — the re-seat** is asked first: a formal the body RETURNS
+        // is consumed and handed back — freed on some paths, perhaps
+        // (`deleteNode`) — not lent, and neither A9's question nor the
+        // second-free count applies to it.
+        if store.is_none() && moved_on.is_none() {
+            match reseat_plan(
+                tcx, functions, slots, model, consuming, &fn_values, param, &frees,
+            ) {
+                Reseat::NotReturned => {}
+                Reseat::Held(reason) => {
+                    out.holds
+                        .insert((param.fn_did, param.hir_id), (param.label.clone(), reason));
+                    continue;
+                }
+                Reseat::Planned(plan, fields) => {
+                    out.receipts.push(format!(
+                        "box-param-reseat callee={callee_path} index={hir_index} fields={}",
+                        fields.len()
+                    ));
+                    out.reseat_fields.insert(
+                        (param.fn_did, param.hir_id),
+                        (param.label.clone(), callee_path.clone(), fields),
+                    );
+                    out.plans.insert((param.fn_did, param.hir_id), plan);
+                    continue;
+                }
+            }
+        }
         if frees.is_empty() && store.is_none() && moved_on.is_none() {
             // Not a consumer: a lend. Only reported for an Owning-modeled formal
             // (the rows the Box arm holds today); a Ref/Raw formal is not (c).
