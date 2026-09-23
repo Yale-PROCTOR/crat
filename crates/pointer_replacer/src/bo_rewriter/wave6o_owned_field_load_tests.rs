@@ -115,7 +115,22 @@ fn walker(owned: bool) -> (String, usize, usize) {
 fn wave6o_an_owned_field_load_defers_to_the_transaction() {
     let (source, emitted, reverted) = walker(true);
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert_eq!((emitted, reverted), (1, 0), "{source}");
+    // **R541-2: a dichotomy on wave-6a's re-seat (`95f485540`), as wave-6f
+    // restated theirs (R217-2).** `insert` consumes and returns its node; the
+    // re-seat makes that formal an owner (`Option<Box<node>>`) and its class
+    // delivers too. The walker's composition below is the same on both
+    // frames; the branch is decided by `insert`'s formal, and each branch pins
+    // its count with no revert.
+    let reseated = flat.contains("fn insert(mut node: Option<Box<node>>, mut key: i32)");
+    assert!(
+        reseated || flat.contains("fn insert(mut node: *mut node, mut key: i32)"),
+        "insert's formal is either raw or the re-seated owner:\n{source}"
+    );
+    assert_eq!(
+        (emitted, reverted),
+        (if reseated { 2 } else { 1 }, 0),
+        "{source}"
+    );
     for needle in [
         "pub left: Option<Box<node>>,",
         "pub right: Option<Box<node>>,",
