@@ -2131,43 +2131,61 @@ fn w6f_the_receipt_says_what_the_tree_got() {
         "`run` is this transaction's only owner: reverting it takes the field with it"
     );
 
-    // …and the column reads `active()`'s OWN predicate, not a looser one.
+    // …and the column reads `active()`'s OWN predicate, not a looser one:
+    // a transaction is withdrawn by its DEPENDENT owners, while an owner of
+    // only value-independent sites keeps its edits under any revert set.
     //
-    // **This is a statement about `receipt_tsv_at`, NOT about the pipeline**
-    // (R469-1). In production the raw revert set is expanded by
-    // `effective_withheld_classes` first, and one of its closures is this
-    // lane's own: a revert of ANY owner pulls in all the others. So the
-    // `newNode` case below is unreachable through the emission — witness 29
-    // pins what the pipeline does, and this one pins the function under it.
-    // Report 040 stated the distinction without that caveat; here it is.
-    // A transaction is withdrawn by its DEPENDENT owners — those carrying a
-    // store, a load or a signature plan — while an owner of only
-    // value-independent sites keeps its edits under any revert set. avl's
-    // `Node.left` has exactly that split: `newNode` is an owner and is not
-    // dependent, so reverting it must leave the transaction active.
-    avl_frame();
-    let (owners, dependent) = transaction_owner_split(AVL, "Node", "left");
-    super::test_model_override::clear();
-    assert!(
-        owners.iter().any(|o| o.ends_with("newNode"))
-            && !dependent.iter().any(|o| o.ends_with("newNode")),
-        "the fixture must keep a non-dependent owner for this to be falsifiable: {owners:?} / {dependent:?}"
+    // **Re-premised (R538-3).** This read avl's `newNode` as the non-dependent
+    // owner. Since ownership-fields' `e780815a8`, `newNode` is a SEAM CONSUMER
+    // (its Box literal takes `Node.left`'s delivered form) and joins the key
+    // by registration — the ruled direction. The split now lives on lodepng's
+    // `LodePNGBitReader.data`, a REFERENCE field: no seam reads a reference
+    // field's form, so its non-dependent owners (`ensureBits9`, which carries
+    // an element edit, and the mention-only `advanceBits`) stay non-dependent
+    // under any registration. The avl case is kept, stating the new fact.
+    let (owners, dependent) = transaction_owner_split(LODEPNG, "LodePNGBitReader", "data");
+    for non_dependent in ["ensureBits9", "advanceBits"] {
+        assert!(
+            owners.iter().any(|o| o.ends_with(non_dependent))
+                && !dependent.iter().any(|o| o.ends_with(non_dependent)),
+            "the fixture must keep {non_dependent} non-dependent for this to be falsifiable: \
+             {owners:?} / {dependent:?}"
+        );
+        let (_, after) =
+            receipt_at_reverts(LODEPNG, &[("LodePNGBitReader", "data")], &[non_dependent]);
+        assert_eq!(
+            after,
+            vec![("applied".to_owned(), "active".to_owned())],
+            "a non-dependent owner's revert ({non_dependent}) does not withdraw the transaction"
+        );
+    }
+    let (_, after_dependent) = receipt_at_reverts(
+        LODEPNG,
+        &[("LodePNGBitReader", "data")],
+        &["LodePNGBitReader_init"],
     );
-    avl_frame();
-    let (_, after_non_dependent) = receipt_at_reverts(AVL, &[("Node", "left")], &["newNode"]);
-    super::test_model_override::clear();
-    assert_eq!(
-        after_non_dependent,
-        vec![("applied".to_owned(), "active".to_owned())],
-        "a non-dependent owner's revert does not withdraw the transaction"
-    );
-    avl_frame();
-    let (_, after_dependent) = receipt_at_reverts(AVL, &[("Node", "left")], &["rightRotate"]);
-    super::test_model_override::clear();
     assert_eq!(
         after_dependent,
         vec![("applied".to_owned(), "withdrawn".to_owned())],
         "a dependent owner's revert does"
+    );
+
+    // avl, stated as it now is: `newNode` is a registered seam consumer, so
+    // its revert withdraws `Node.left` — the atomicity `e780815a8` builds.
+    avl_frame();
+    let (_, avl_dependent) = transaction_owner_split(AVL, "Node", "left");
+    super::test_model_override::clear();
+    assert!(
+        avl_dependent.iter().any(|o| o.ends_with("newNode")),
+        "avl's newNode is in the key as a seam consumer: {avl_dependent:?}"
+    );
+    avl_frame();
+    let (_, after_consumer) = receipt_at_reverts(AVL, &[("Node", "left")], &["newNode"]);
+    super::test_model_override::clear();
+    assert_eq!(
+        after_consumer,
+        vec![("applied".to_owned(), "withdrawn".to_owned())],
+        "a seam consumer's revert takes the transaction with it"
     );
 }
 
@@ -2244,19 +2262,27 @@ fn w6f_the_refresh_expands_the_revert_set() {
         "an unrelated class's revert does not withdraw the transaction"
     );
 
-    // **The dichotomy report 053 owes the note.** `newNode` is an owner of
-    // this transaction and is NOT one of its dependent owners, so reverting
-    // it leaves the transaction active — exactly what `active()` and
-    // `field_reference_ast` do with it. This is main's
-    // `owner-reverted-but-reads-active` shape, through the production
-    // refresh: the column is right and the join was made on `owners`.
-    avl_frame();
-    let non_dependent = refreshed_revert_status(AVL, "Node", "left", &["newNode"], None);
-    super::test_model_override::clear();
+    // **The dichotomy report 053 owes the note** — re-premised (R538-3). A
+    // non-dependent owner's revert leaves the transaction active, exactly as
+    // `active()` and `field_reference_ast` treat it: main's
+    // `owner-reverted-but-reads-active` shape, through the production refresh.
+    // avl's `newNode` carried this until `e780815a8` registered it as a seam
+    // consumer; lodepng's `LodePNGBitReader.data` is a REFERENCE field no seam
+    // reads, so `ensureBits9` stays a non-dependent owner of it.
+    let non_dependent =
+        refreshed_revert_status(LODEPNG, "LodePNGBitReader", "data", &["ensureBits9"], None);
     assert_eq!(
         non_dependent, "active",
         "a non-dependent owner's revert does not withdraw the transaction — \
          the withdrawal key is `dependent_owners`, which the receipt now prints"
+    );
+    // …and the consumer's case, through the same production refresh.
+    avl_frame();
+    let consumer = refreshed_revert_status(AVL, "Node", "left", &["newNode"], None);
+    super::test_model_override::clear();
+    assert_eq!(
+        consumer, "withdrawn",
+        "a registered seam consumer's revert withdraws the transaction"
     );
 }
 
@@ -2451,6 +2477,11 @@ fn w6f_the_edit_set_is_wider_than_the_withdrawal_key() {
         "three functions carry the field's text and cannot withdraw it: {uncovered:?}"
     );
 
+    // **Re-premised (R538-3).** On avl the gap is now CLOSED: `newNode` writes
+    // the field (`owned-field-raw-store`) and, since `e780815a8`, is also a
+    // registered seam consumer, so every owner that carries avl's text can
+    // withdraw it. The gap survives on lodepng's REFERENCE field above — the
+    // case report 054 measured safe (the revert leaves the span-keyed text).
     avl_frame();
     let (_, avl_dependent) = transaction_owner_split(AVL, "Node", "left");
     super::test_model_override::clear();
@@ -2458,10 +2489,14 @@ fn w6f_the_edit_set_is_wider_than_the_withdrawal_key() {
     let avl_edited = transaction_edit_owners(AVL, "Node", "left");
     super::test_model_override::clear();
     assert!(
-        avl_edited.iter().any(|o| o.ends_with("newNode"))
-            && !avl_dependent.iter().any(|o| o.ends_with("newNode")),
-        "avl's `newNode` writes the field (`owned-field-raw-store`) and is not a \
-         dependent owner: {avl_edited:?} / {avl_dependent:?}"
+        avl_edited.iter().any(|o| o.ends_with("newNode")),
+        "avl's `newNode` writes the field: {avl_edited:?}"
+    );
+    assert!(
+        avl_edited
+            .iter()
+            .all(|o| avl_dependent.iter().any(|d| d == o)),
+        "…and on avl every edited owner is now in the key: {avl_edited:?} / {avl_dependent:?}"
     );
 }
 
