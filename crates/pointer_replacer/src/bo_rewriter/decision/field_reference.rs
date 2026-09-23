@@ -479,6 +479,39 @@ impl FieldTransactions {
             .collect()
     }
 
+    /// **Atomic withdrawal (R533-3, relay 066): register a SEAM CONSUMER.**
+    ///
+    /// Another family whose committed plan relies on the form
+    /// [`owning_field_form`] answered for `(struct_did, field_index)` — a
+    /// synthesised `Box::new(S { f: None, .. })` literal, a moved-out owner
+    /// typed from the field, a store the transaction renders — depends on this
+    /// transaction exactly as a store or load site does. Returns whether a
+    /// transaction owns that field.
+    pub(crate) fn register_seam_consumer(
+        &mut self,
+        struct_did: rustc_span::def_id::DefId,
+        field_index: usize,
+        consumer: LocalDefId,
+    ) -> bool {
+        let Some(struct_did) = struct_did.as_local() else { return false };
+        let key = FieldKey {
+            struct_did,
+            field_index,
+        };
+        let Some(t) = self.applied.iter_mut().find(|t| t.key == key) else {
+            return false;
+        };
+        // INTO the withdrawal key itself, not beside it: `active`, the plan's
+        // closure (`owner_sets`), the receipt's `dependent_owners` column and
+        // the sixth arm's hold all read this one set, so none of them can
+        // disagree about what withdraws together.
+        if !t.dependent_owners.contains(&consumer) {
+            t.dependent_owners.push(consumer);
+            t.dependent_owners = sorted_owners(t.dependent_owners.iter().copied());
+        }
+        true
+    }
+
     pub(crate) fn owner_sets(&self) -> Vec<Vec<LocalDefId>> {
         self.applied
             .iter()

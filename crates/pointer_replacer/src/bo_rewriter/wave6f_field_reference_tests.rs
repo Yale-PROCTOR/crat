@@ -2998,3 +2998,107 @@ fn w6f_a_refused_wrap_with_no_withdrawal_key_fails_loud() {
         "…and it registers its dependent owners as held"
     );
 }
+
+/// Witness 38 (R533-3, relay 066) — **a field transaction withdraws
+/// atomically: a registered seam consumer is part of its withdrawal key.**
+///
+/// bst at L01⁶ (measured live on `l01p6`'s head, report 063): `insert::node`
+/// degrades, `insert` is withheld, and the closure withdraws the `node.left` /
+/// `node.right` transactions — declarations back to `*mut node`. But
+/// ownership-fields' plan for `newNode::temp` had rendered
+/// `Box::new(node { left: None, right: None })` from the seam's plan-time
+/// answer, and `newNode` is not a dependent owner (its only sites are null
+/// stores), so that literal survived: `E0308 expected *mut node, found
+/// Option<_>`, every class reverted.
+///
+/// On the bst shape (`left`/`right` Owning by the frame): BEFORE registration
+/// `newNode` can neither withdraw the transaction nor be pulled into the
+/// closure when `insert` is withheld — the half-application's precondition.
+/// AFTER `register_seam_consumer(node, left|right, newNode)` both hold, so a
+/// consumer's edit and the transaction's edits ship together or not at all.
+#[test]
+fn w6f_a_seam_consumer_withdraws_with_its_transaction() {
+    let _frame = frame_lock();
+    bst_frame();
+    let (before, after, unknown) = ::utils::compilation::run_compiler_on_str(BST, |tcx| {
+        let (mut table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let fn_named = |name: &str| {
+            tcx.hir_body_owners()
+                .find(|did| tcx.def_path_str(did.to_def_id()).ends_with(name))
+                .unwrap_or_else(|| panic!("fn {name}"))
+        };
+        let (new_node, insert) = (fn_named("newNode"), fn_named("insert"));
+        let node = table
+            .field_transactions
+            .applied
+            .iter()
+            .find(|t| t.struct_path.ends_with("node") && t.field_name == "left")
+            .expect("the bst frame applies node.left")
+            .key
+            .struct_did
+            .to_def_id();
+        // What the round would withhold, and whether the transactions stay.
+        let observe = |table: &super::decision::DecisionTable| -> (usize, bool) {
+            let one: rustc_hash::FxHashSet<_> = std::iter::once(new_node).collect();
+            let active_under_new_node = table.field_transactions.active(&one).count();
+            let mut plan = super::plan::Plan::default();
+            plan.field_transaction_owners = table
+                .field_transactions
+                .owner_sets()
+                .into_iter()
+                .map(|owners| {
+                    owners
+                        .into_iter()
+                        .map(super::bridge_receipt::SignatureClassId::of)
+                        .collect()
+                })
+                .collect();
+            let raw =
+                std::iter::once(super::bridge_receipt::SignatureClassId::of(insert)).collect();
+            let effective =
+                super::effective_withheld_classes(&plan, &raw, &std::collections::BTreeSet::new());
+            (
+                active_under_new_node,
+                effective.contains(&super::bridge_receipt::SignatureClassId::of(new_node)),
+            )
+        };
+        let before = observe(&table);
+        for field_index in [1, 2] {
+            assert!(
+                table
+                    .field_transactions
+                    .register_seam_consumer(node, field_index, new_node),
+                "a transaction owns node field {field_index}"
+            );
+        }
+        let after = observe(&table);
+        let unknown = table
+            .field_transactions
+            .register_seam_consumer(node, 0, new_node);
+        (before, after, unknown)
+    })
+    .unwrap();
+    super::test_model_override::clear();
+    assert_eq!(
+        before,
+        (2, false),
+        "the half-application's precondition: newNode's revert leaves both \
+         transactions active, and withholding insert does not pull newNode in"
+    );
+    assert_eq!(
+        after,
+        (0, true),
+        "a registered consumer withdraws the transactions, and is withdrawn with them"
+    );
+    assert!(
+        !unknown,
+        "no transaction owns node.key: nothing is registered"
+    );
+}
