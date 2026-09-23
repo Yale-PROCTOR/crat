@@ -424,6 +424,117 @@ pub unsafe fn caller(q: *mut i32, r: *mut i32) {
 }
 "#;
 
+    /// **R544-3 — the hazard behind the degraded-partner hold is aliasing, and a
+    /// pair certificate pays it.** buffer's shape: `r` is a degraded parameter
+    /// stored into a `static mut` (a blocked singleton whose D4 holds its class,
+    /// as the control above pins), and the converting sibling `q` views a STACK
+    /// OBJECT of this body. route (a), `distinct-roots`: storage created in this
+    /// frame cannot be storage `r` named at entry, so no raw write through `r`
+    /// can meet `q`'s view, and the hold has nothing to guard. On the landed
+    /// frame the model calls both raw (an address-taken local); the override
+    /// states the Ref frame buffer's composition has (L01⁵).
+    const FRESH_SIBLING_OF_A_HELD_PARTNER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+// r544-3-fresh-sibling
+pub static mut KEPT: *mut i32 = 0 as *mut i32;
+pub unsafe fn callee(p: *mut i32) { *p += 1; }
+pub unsafe fn caller(r: *mut i32) {
+    let mut x: i32 = 0;
+    let mut q: *mut i32 = &mut x;
+    callee(q);
+    *r = 2;
+    KEPT = r;
+}
+"#;
+
+    fn ref_frame(marker: &str) {
+        use crate::analyses::borrow_ownership::SlotKind;
+        crate::bo_rewriter::test_model_override::set(
+            marker,
+            Vec::new(),
+            vec![
+                ("caller::r".to_owned(), SlotKind::Ref),
+                ("caller::q".to_owned(), SlotKind::Ref),
+            ],
+        );
+    }
+
+    #[test]
+    fn r544_3_a_certified_fresh_sibling_is_not_held_by_a_degraded_partner() {
+        let _frame = crate::bo_rewriter::test_model_override::frame_lock();
+        ref_frame("r544-3-fresh-sibling");
+        let got = run(FRESH_SIBLING_OF_A_HELD_PARTNER);
+        let receipts =
+            ::utils::compilation::run_compiler_on_str(FRESH_SIBLING_OF_A_HELD_PARTNER, |tcx| {
+                let (table, _) = crate::bo_rewriter::decide_table_with_ctx_config(
+                    tcx,
+                    Some((
+                        crate::bo_rewriter::A5Mode::PreciseReplay,
+                        Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+                    )),
+                )
+                .unwrap();
+                table.seams.d4_pair_discharges.clone()
+            })
+            .unwrap();
+        crate::bo_rewriter::test_model_override::clear();
+        assert_eq!(
+            receipts,
+            vec![
+                "d4-paid-by-pair-certificate:caller::r siblings=caller::q:pair-disjoint:distinct-roots"
+                    .to_owned()
+            ],
+            "the discharge is receipted with its certificate"
+        );
+        assert_eq!(
+            column(&got.subjects, "caller::r#1", "reason"),
+            "escapes-via-static-store",
+            "the partner is the degraded, store-escaped node:\n{}",
+            got.subjects
+        );
+        assert_eq!(
+            column(&got.subjects, "caller::q#3", "placed"),
+            "1",
+            "the fresh sibling is not withdrawn by the partner:\n{}",
+            got.subjects
+        );
+        let tree = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            tree.contains("fn caller(r: *mut i32)"),
+            "the partner stays raw:\n{}",
+            got.tree()
+        );
+        assert!(
+            !tree.contains("let mut q: *mut i32"),
+            "the sibling converts:\n{}",
+            got.tree()
+        );
+    }
+
+    /// The control: the same partner beside a sibling with NO certificate
+    /// against it — `q` is a second parameter, entry storage like `r`, so the
+    /// two may be one object and the hold stays.
+    #[test]
+    fn r544_3_an_uncertified_sibling_is_still_held() {
+        let src = FRESH_SIBLING_OF_A_HELD_PARTNER
+            .replace(
+                "pub unsafe fn caller(r: *mut i32) {\n    let mut x: i32 = 0;\n    let mut q: *mut i32 = &mut x;",
+                "pub unsafe fn caller(r: *mut i32, mut q: *mut i32) {",
+            )
+            .replace("r544-3-fresh-sibling", "r544-3-uncertified-sibling");
+        assert!(src.contains("caller(r: *mut i32, mut q: *mut i32)"));
+        let _frame = crate::bo_rewriter::test_model_override::frame_lock();
+        ref_frame("r544-3-uncertified-sibling");
+        let got = run(&src);
+        crate::bo_rewriter::test_model_override::clear();
+        assert!(
+            column(&got.subjects, "caller::q#2", "exclusion")
+                .starts_with("terminal-not-applied:blocked-subject:escapes-via-static-store"),
+            "{}",
+            got.subjects
+        );
+    }
+
     #[test]
     fn zero_syntax_dependency_on_a_held_caller_is_kept() {
         let got = run(ZERO_SYNTAX_DEPENDENCY_SHAPE);

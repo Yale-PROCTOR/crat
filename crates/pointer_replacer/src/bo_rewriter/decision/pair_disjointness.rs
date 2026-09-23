@@ -370,6 +370,10 @@ pub(crate) struct PairDisjointnessIndex {
     /// (e)'s memo, keyed by `(callee, i, j)` with `i < j`.
     parameter_pairs: RefCell<FxHashMap<(u32, usize, usize), Option<PairSeparation>>>,
     ledger: RefCell<Vec<LedgerRow>>,
+    /// R544-3: every function's binding root classes, as the call sites read
+    /// them, so a pair of bindings of ONE function can be certified without a
+    /// call between them ([`Self::certify_bindings`]).
+    binding_roots: FxHashMap<u32, FxHashMap<HirId, RootClass>>,
 }
 
 /// How (e) separated a parameter pair: by the rules alone, or resting on
@@ -426,6 +430,7 @@ impl PairDisjointnessIndex {
         let mut closures: FxHashMap<TypeClass, FxHashSet<TypeClass>> = FxHashMap::default();
 
         let mut sites: FxHashMap<(u32, u32), Vec<SiteRecord>> = FxHashMap::default();
+        let mut binding_roots: FxHashMap<u32, FxHashMap<HirId, RootClass>> = FxHashMap::default();
         for &caller in &program.functions {
             let Some(body_id) = tcx.hir_node_by_def_id(caller).body_id() else {
                 continue;
@@ -433,6 +438,7 @@ impl PairDisjointnessIndex {
             let body = tcx.hir_body(body_id);
             let typeck = tcx.typeck(caller);
             let (classes, why, prefixes) = classify_locals(tcx, typeck, body, &allocators, caller);
+            binding_roots.insert(caller.local_def_index.as_u32(), classes.clone());
             let mut collector = CallCollector {
                 tcx,
                 typeck,
@@ -587,7 +593,25 @@ impl PairDisjointnessIndex {
             exported,
             parameter_pairs: RefCell::new(FxHashMap::default()),
             ledger: RefCell::new(Vec::new()),
+            binding_roots,
         }
+    }
+
+    /// **R544-3 — route (a) between two bindings of one function.** The
+    /// certificate the degraded-partner hold asks for: `a` and `b` are the
+    /// binding `HirId`s of two pointer subjects of `function`, classified as
+    /// its call sites classify them. Only the root rules apply (fresh
+    /// allocation / stack object against another object or entry storage, and
+    /// statics), never the type rule: there is no call, so there is no pair of
+    /// pointee types fixed at one site. `None` when either binding is unknown.
+    pub(crate) fn certify_bindings(
+        &self,
+        function: LocalDefId,
+        a: HirId,
+        b: HirId,
+    ) -> Option<CertificateKind> {
+        let classes = self.binding_roots.get(&function.local_def_index.as_u32())?;
+        certify_roots(*classes.get(&a)?, *classes.get(&b)?)
     }
 
     /// (e) R462-1. Do parameters `left` and `right` of `callee` ever alias?

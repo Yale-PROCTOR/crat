@@ -3144,6 +3144,11 @@ use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape
 /// reason is a yield number nobody can attribute.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
+    /// **R544-3** — degraded partners whose blocked-class D4 was paid by a pair
+    /// certificate against every converting sibling, set where the arm
+    /// requirements are derived (after the seam):
+    /// `d4-paid-by-pair-certificate:<partner> siblings=<s>:<kind>,...`.
+    pub(crate) d4_pair_discharges: Vec<String>,
     /// R538-7: the sites where a raw argument loaded from a field of a
     /// converted root was proved not to be that root's alias.
     pub(crate) field_load_exemptions: Vec<super::counted_void::FieldLoadExemption>,

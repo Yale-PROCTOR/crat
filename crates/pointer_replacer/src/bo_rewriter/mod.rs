@@ -8603,8 +8603,14 @@ fn finish_decide<'tcx>(
             &lifetime_eligibility,
             &mut_facts,
         );
-        let arm_requirements =
+        let mut arm_requirements =
             derive_arm_requirements(&subjects, &table, &coconv, &raw_boundary, &exposure);
+        table.seams.d4_pair_discharges = discharge_d4_by_pair_certificates(
+            &table,
+            &coconv,
+            a5_site_proofs.pair_certificates(),
+            &mut arm_requirements,
+        );
         table.arm_requirements = arm_requirements;
         let seam_wall_s = seam_started.elapsed().as_secs_f64();
         let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
@@ -10324,6 +10330,93 @@ fn derive_arm_requirements(
             (key, required)
         })
         .collect()
+}
+
+/// **R544-3 — a blocked class's D4 on a degraded partner is paid when every
+/// converting sibling carries a pair certificate against that partner.**
+///
+/// `CoConv::required_arms` charges D4 to a subject whose class is BLOCKED, and
+/// [`plan::finalize_signature_classes`] then holds the partner's whole function:
+/// "a form-changing arm on a degraded partner still holds". The hazard that
+/// hold guards is aliasing — the raw partner written through beside a
+/// converting sibling's safe view, two live views of one storage — and that is
+/// exactly what a pair-disjointness certificate between the two discharges
+/// (wave-6p's route (a), [`decision::pair_disjointness::PairDisjointnessIndex::
+/// certify_bindings`]). So D4 is removed only for a degraded partner that is
+/// its class's SOLE member (the D4 comes from the block alone, not from
+/// co-conversion coupling) in a function with at least one converting sibling,
+/// every one of which is certified against it. Every other D4 stays, and the
+/// partner's other arms are untouched. An unavailable index discharges nothing.
+fn discharge_d4_by_pair_certificates(
+    table: &decision::DecisionTable,
+    coconv: &decision::co_conversion::CoConv,
+    certificates: Option<&decision::pair_disjointness::PairDisjointnessIndex>,
+    requirements: &mut rustc_hash::FxHashMap<
+        (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+        decision::RequiredArmSet,
+    >,
+) -> Vec<String> {
+    let Some(certificates) = certificates else {
+        return Vec::new();
+    };
+    let converts = |decision: &decision::Decision| match decision {
+        decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Cursor { .. }
+        | decision::Decision::NestedSlice { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Box(_) => true,
+        decision::Decision::Degraded(_) => false,
+    };
+    let mut receipts = Vec::new();
+    for (partner, decision) in &table.entries {
+        let key = (partner.fn_did, partner.hir_id);
+        if converts(decision)
+            || !requirements
+                .get(&key)
+                .is_some_and(|required| required.contains(decision::Arm::D4))
+            || !coconv.class_of(key).is_some_and(|id| {
+                let class = &coconv.classes()[id];
+                class.blocked.is_some() && class.members == [key]
+            })
+        {
+            continue;
+        }
+        let siblings = table
+            .entries
+            .iter()
+            .filter(|(sibling, decision)| {
+                sibling.fn_did == partner.fn_did
+                    && sibling.hir_id != partner.hir_id
+                    && converts(decision)
+            })
+            .map(|(sibling, _)| sibling)
+            .collect::<Vec<_>>();
+        if siblings.is_empty() {
+            continue;
+        }
+        let certified = siblings
+            .iter()
+            .map(|sibling| {
+                certificates
+                    .certify_bindings(partner.fn_did, sibling.hir_id, partner.hir_id)
+                    .map(|kind| format!("{}:{}", sibling.label, kind.key()))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(certified) = certified else {
+            continue;
+        };
+        if let Some(required) = requirements.get_mut(&key) {
+            required.remove(decision::Arm::D4);
+        }
+        receipts.push(format!(
+            "d4-paid-by-pair-certificate:{} siblings={}",
+            partner.label,
+            certified.join(",")
+        ));
+    }
+    receipts
 }
 
 fn arm_outcomes_tsv(
